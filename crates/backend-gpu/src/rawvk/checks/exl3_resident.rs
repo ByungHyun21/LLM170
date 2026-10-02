@@ -1,8 +1,10 @@
 //! EXL3 레이어 스트리밍 디코드 (plans/118 §3-2) — 트렐리스 13GB 상주 +
 //! 선형층 vk GEMV + 비선형 CPU. 53.8GB F16 전개 없이 전 모델 디코드.
 //!
-//! v2 속도: 입력버퍼 재사용(alloc 제거) + linear_pair(공유 had_in) +
-//! 배치 3커널(run_rw 배리어 — 순차 보장).
+//! v2 속도: 입력버퍼 재사용(alloc 제거) + 배치 3커널(run_rw 배리어).
+//! v3(plans/120 A1): 배치 내 선형별 had_in — suh는 텐서별 입력채널 스케일
+//! (W = diag(suh)·H·diag(svh), trellis.rs)이라 공유 had_in은 수치 오염이다.
+//! ah/yb 슬롯 3종, sb는 run_rw 배리어(WAR/WAW 커버, plans/104)로 공유.
 
 use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use half::f16;
@@ -15,6 +17,14 @@ pub struct VkLinear {
     pub tre: VkBuf,
     pub suh: VkBuf,
     pub svh: VkBuf,
+}
+
+/// 지연 판독 핸들(plans/120 A1, LLM170_VK_DBUF=1) — 제출 후 즉시 반환된
+/// 배치의 결과 슬롯. TrellisResident::fetch()가 wait_pending으로 완료를 보장.
+pub struct PendingLin {
+    /// 결과 yb 슬롯 (0..2).
+    pub yb: usize,
+    pub n: usize,
 }
 
 /// 트렐리스 + 무양자화 가중치 전체를 vk에 상주.
@@ -31,13 +41,18 @@ pub struct TrellisResident {
     p1: Pipes,
     p2: Pipes,
     p3: Pipes,
+    p4: Pipes,
     // 스크래치 (재사용 — alloc 폭탄 제거)
-    ahb: VkBuf,
+    ahb1: VkBuf,
+    ahb2: VkBuf,
+    ahb3: VkBuf,
     sb: VkBuf,
     yb1: VkBuf,
     yb2: VkBuf,
     yb3: VkBuf,
     xb: VkBuf,
+    /// FFN ew 출력(= down의 had_in 입력) — max_n 폭 f16.
+    x2b: VkBuf,
 }
 
 impl TrellisResident {
@@ -49,6 +64,7 @@ impl TrellisResident {
         let p1 = ctx.pipeline_pipes(include_bytes!("../spv/exl3_had_in.spv"), 3, 4)?;
         let p2 = ctx.pipeline_pipes(include_bytes!("../spv/exl3_gemv.spv"), 3, 12)?;
         let p3 = ctx.pipeline_pipes(include_bytes!("../spv/exl3_had_out.spv"), 3, 8)?;
+        let p4 = ctx.pipeline_pipes(include_bytes!("../spv/exl3_ffn_ew.spv"), 3, 4)?;
 
         let mut linears = Vec::new();
         let mut norms = Vec::new();
@@ -165,13 +181,18 @@ impl TrellisResident {
         // 스크래치 버퍼 — 재사용 (linear 호출당 alloc 폭탄 제거)
         let max_k = linears.iter().map(|(_, l)| l.k).max().unwrap_or(5120);
         let max_n = linears.iter().map(|(_, l)| l.n).max().unwrap_or(17408);
-        let nseg = 4u32;
-        let ahb = ctx.alloc(max_k * 2)?;
+        // plans/120 A1: k-분할 4→16 — 병렬성 증가(벤치 72→87GB/s).
+        // had_out 환원 분해 변화 = 규칙 10a(환원 순서, 동일 정밀도).
+        let nseg = 16u32;
+        let ahb1 = ctx.alloc(max_k * 2)?;
+        let ahb2 = ctx.alloc(max_k * 2)?;
+        let ahb3 = ctx.alloc(max_k * 2)?;
         let sb = ctx.alloc(max_n * 4 * nseg as usize)?;
         let yb1 = ctx.alloc(max_n * 4)?;
         let yb2 = ctx.alloc(max_n * 4)?;
         let yb3 = ctx.alloc(max_n * 4)?;
         let xb = ctx.alloc(max_k * 2)?;
+        let x2b = ctx.alloc(max_n * 2)?;
 
         Ok(Self {
             linears,
@@ -184,12 +205,16 @@ impl TrellisResident {
             p1,
             p2,
             p3,
-            ahb,
+            ahb1,
+            ahb2,
+            ahb3,
             sb,
             yb1,
             yb2,
             yb3,
             xb,
+            x2b,
+            p4,
         })
     }
 
@@ -200,104 +225,212 @@ impl TrellisResident {
             .ok_or_else(|| format!("linear not found: {key}"))
     }
 
-    /// x를 f16으로 변환해 재사용 xb에 업로드.
+    /// x를 f16으로 변환해 재사용 xb에 직접 기록.
+    /// plans/120 A1: 임시 Vec+이중 복사 제거, 8청크 기록으로 벡터화 유도.
+    /// from_f32 요소별 호출 유지 — 비트동일.
     fn upload_x(&mut self, x: &[f32]) -> Result<(), String> {
         let k = x.len();
-        let mut x16 = vec![0u8; k * 2];
-        for (i, &v) in x.iter().enumerate() {
-            let h = f16::from_f32(v);
-            x16[i * 2..i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+        // SAFETY: xb는 max_k*2 바이트(k ≤ max_k, 호출자가 linear의 k와
+        // x.len()을 일치시킴). u16 기록은 LE 호스트에서 to_le_bytes와 동일.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.xb.ptr as *mut u16, k) };
+        let (chunks, rem) = x.as_chunks::<8>();
+        for (i, c) in chunks.iter().enumerate() {
+            let b: [u16; 8] = std::array::from_fn(|j| f16::from_f32(c[j]).to_bits());
+            dst[i * 8..i * 8 + 8].copy_from_slice(&b);
         }
-        // SAFETY: xb는 max_k*2 — k ≤ max_k 보장 (linears의 k 중 최대.
-        // 호출자가 linear의 k와 x.len()을 일치시킴).
-        unsafe {
-            std::ptr::copy_nonoverlapping(x16.as_ptr(), self.xb.ptr, k * 2);
+        let base = chunks.len() * 8;
+        for (j, &v) in rem.iter().enumerate() {
+            dst[base + j] = f16::from_f32(v).to_bits();
         }
         Ok(())
     }
 
-    /// 배치 내 had_in 1회 + gemv/had_out N회 (run_rw 배리어).
+    /// 배치: 선형별 had_in→gemv→had_out 체인, 단일 제출·단일 동기.
+    /// suh는 텐서별 스케일이라 had_in을 공유하지 않고 슬롯별 ah에서 변환.
+    /// sb 공유는 run_rw 배리어가 WAR/WAW를 커버(context plans/104 판정식).
+    /// 선형 1개의 3커널 체인 발행 (배치 내부 — begin_batch 후에만 호출).
+    /// x_src: had_in 입력 버퍼(xb 또는 FFN ew 출력 x2b).
+    fn chain_one(
+        &mut self,
+        x_src: ash::vk::Buffer,
+        li: usize,
+        ah: ash::vk::Buffer,
+        yb: ash::vk::Buffer,
+    ) -> Result<(), String> {
+        let nseg = 16u32; // load의 sb 할당과 일치(k-분할)
+        let l = &self.linears[li].1;
+        let (k, n, krate) = (l.k, l.n, l.krate);
+        let (suh_b, tre_b, svh_b) = (l.suh.buf, l.tre.buf, l.svh.buf);
+        let sb_b = self.sb.buf;
+
+        // had_in: x_src × suh_i → ah_i (텐서별 suh — 공유 금지)
+        let ds = self.ctx.fresh_ds_for(&self.p1, 3)?;
+        self.ctx.bind_bufs(ds, &[x_src, suh_b, ah]);
+        let push = (k as u32 / 128).to_le_bytes().to_vec();
+        // ts 표 라벨은 site::tag()(TAG thread-local) — scope은 CUR만 바꾼다.
+        crate::rawvk::context::site::set_tag("e3_had_in");
+        self.ctx.run_rw(
+            self.p1.pl,
+            ds,
+            self.p1.pipe,
+            &push,
+            (k / 128) as u32,
+            1,
+            1,
+            &[x_src, suh_b],
+            &[ah],
+        )?;
+
+        // gemv: ah_i × tre → sb
+        let ds2 = self.ctx.fresh_ds_for(&self.p2, 3)?;
+        self.ctx.bind_bufs(ds2, &[ah, tre_b, sb_b]);
+        let push2: Vec<u8> = [(k / 16) as u32, (n / 16) as u32, krate]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        crate::rawvk::context::site::set_tag("e3_gemv");
+        self.ctx.run_rw(
+            self.p2.pl,
+            ds2,
+            self.p2.pipe,
+            &push2,
+            ((n / 16) as u32).div_ceil(8),
+            nseg,
+            1,
+            &[ah, tre_b],
+            &[sb_b],
+        )?;
+
+        // had_out: sb × svh → yb_slot
+        let ds3 = self.ctx.fresh_ds_for(&self.p3, 3)?;
+        self.ctx.bind_bufs(ds3, &[sb_b, svh_b, yb]);
+        let push3: Vec<u8> = [(n as u32 / 128), nseg]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        crate::rawvk::context::site::set_tag("e3_had_out");
+        self.ctx.run_rw(
+            self.p3.pl,
+            ds3,
+            self.p3.pipe,
+            &push3,
+            (n / 128) as u32,
+            1,
+            1,
+            &[sb_b, svh_b],
+            &[yb],
+        )?;
+        Ok(())
+    }
+
+    /// 배치: 선형별 had_in→gemv→had_out 체인, 단일 제출·단일 동기.
+    /// suh는 텐서별 스케일이라 had_in을 공유하지 않고 슬롯별 ah에서 변환.
+    /// sb 공유는 run_rw 배리어가 WAR/WAW를 커버(context plans/104 판정식).
     fn batch_chain(
         &mut self,
-        inputs: &[usize],  // linear 인덱스 목록
-        outputs: &[usize], // yb 버퍼 번호 (0=yb1, 1=yb2)
+        inputs: &[usize],  // linear 인덱스 목록 (≤3)
+        outputs: &[usize], // 호환 — 결과는 슬롯 순서대로 yb1..yb3
     ) -> Result<(), String> {
-        let k = self.linears[inputs[0]].1.k;
-        let nseg = 4u32;
+        let _ = outputs;
 
         self.ctx.begin_batch()?;
-
-        // 공유 had_in: xb → ahb
-        {
-            let l = &self.linears[inputs[0]].1;
-            let ds = self.ctx.fresh_ds_for(&self.p1, 3)?;
-            self.ctx
-                .bind_bufs(ds, &[self.xb.buf, l.suh.buf, self.ahb.buf]);
-            let push = (k as u32 / 128).to_le_bytes().to_vec();
-            self.ctx.run_rw(
-                self.p1.pl,
-                ds,
-                self.p1.pipe,
-                &push,
-                (k / 128) as u32,
-                1,
-                1,
-                &[self.xb.buf, l.suh.buf],
-                &[self.ahb.buf],
-            )?;
-        }
-
-        // 각 선형: gemv(ahb, tre → sb) + had_out(sb, svh → ybN)
         for (slot, &li) in inputs.iter().enumerate() {
-            let l = &self.linears[li].1;
-            let yb = if outputs[slot] == 0 {
-                &self.yb1
-            } else {
-                &self.yb2
-            };
-
-            // gemv: ahb × tre → sb
-            let ds2 = self.ctx.fresh_ds_for(&self.p2, 3)?;
-            self.ctx
-                .bind_bufs(ds2, &[self.ahb.buf, l.tre.buf, self.sb.buf]);
-            let push2: Vec<u8> = [(k / 16) as u32, (l.n / 16) as u32, l.krate]
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            self.ctx.run_rw(
-                self.p2.pl,
-                ds2,
-                self.p2.pipe,
-                &push2,
-                ((l.n / 16) as u32).div_ceil(8),
-                nseg,
-                1,
-                &[self.ahb.buf, l.tre.buf],
-                &[self.sb.buf],
-            )?;
-
-            // had_out: sb × svh → ybN
-            let ds3 = self.ctx.fresh_ds_for(&self.p3, 3)?;
-            self.ctx.bind_bufs(ds3, &[self.sb.buf, l.svh.buf, yb.buf]);
-            let push3: Vec<u8> = [(l.n as u32 / 128), nseg]
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            self.ctx.run_rw(
-                self.p3.pl,
-                ds3,
-                self.p3.pipe,
-                &push3,
-                (l.n / 128) as u32,
-                1,
-                1,
-                &[self.sb.buf, l.svh.buf],
-                &[yb.buf],
-            )?;
+            let ah = [self.ahb1.buf, self.ahb2.buf, self.ahb3.buf][slot];
+            let yb = [self.yb1.buf, self.yb2.buf, self.yb3.buf][slot];
+            self.chain_one(self.xb.buf, li, ah, yb)?;
         }
-
         self.ctx.end_batch_wait()?;
         Ok(())
+    }
+
+    /// FFN 3선형 + GPU ew 단일 배치 (plans/120 A1):
+    /// gate/up GEMV → ew(silu(g)·u → f16 x2b) → down GEMV — 동기 1회.
+    /// 게이트/업 판독·CPU 활성화·업로드가 사라진다. ew의 GPU exp는
+    /// CPU libm exp와 근사차(10a, 동일 f32 클래스) — vk-check ew 미러가
+    /// 허용치를 검증한다.
+    pub fn ffn_triple(
+        &mut self,
+        key_g: &str,
+        key_u: &str,
+        key_d: &str,
+        x: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        let ig = self.find_linear(key_g)?;
+        let iu = self.find_linear(key_u)?;
+        let id = self.find_linear(key_d)?;
+        let kg = self.linears[ig].1.k;
+        let ng = self.linears[ig].1.n;
+        let nd = self.linears[id].1.n;
+        if x.len() != kg || self.linears[iu].1.k != kg || self.linears[id].1.k != ng {
+            return Err(format!("{key_g}/{key_u}/{key_d}: FFN 차원 불일치"));
+        }
+        self.upload_x(x)?;
+
+        self.ctx.begin_batch()?;
+        self.chain_one(self.xb.buf, ig, self.ahb1.buf, self.yb1.buf)?;
+        self.chain_one(self.xb.buf, iu, self.ahb2.buf, self.yb2.buf)?;
+        // ew: yb1(g) × yb2(u) → x2b (f16 쌍팩)
+        {
+            let ds4 = self.ctx.fresh_ds_for(&self.p4, 3)?;
+            self.ctx
+                .bind_bufs(ds4, &[self.yb1.buf, self.yb2.buf, self.x2b.buf]);
+            let push4 = (ng as u32).to_le_bytes().to_vec();
+            crate::rawvk::context::site::set_tag("e3_ffn_ew");
+            self.ctx.run_rw(
+                self.p4.pl,
+                ds4,
+                self.p4.pipe,
+                &push4,
+                ng.div_ceil(512) as u32,
+                1,
+                1,
+                &[self.yb1.buf, self.yb2.buf],
+                &[self.x2b.buf],
+            )?;
+        }
+        self.chain_one(self.x2b.buf, id, self.ahb3.buf, self.yb3.buf)?;
+        self.ctx.end_batch_wait()?;
+        self.ctx.wait_pending()?; // DBUF 비동기 잔여 배출(비동기 아님 시 무연산)
+
+        let mut y = vec![0f32; nd];
+        // SAFETY: end_batch_wait 후 yb3 판독 — nd ≤ max_n(할당 상한).
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.yb3.ptr as *const f32, y.as_mut_ptr(), nd);
+        }
+        Ok(y)
+    }
+
+    /// 비동기 선형 쌍: 제출만 하고 즉시 반환. 호출자는 qkvz 출력과 무독립한
+    /// CPU 일(예: alpha/beta dot)을 수행한 뒤 fetch로 합류한다. DBUF 부재
+    /// 시 end_batch_wait가 이미 대기 — fetch는 판독만 한다(의미 동일).
+    pub fn linear_pair_deferred(
+        &mut self,
+        key1: &str,
+        key2: &str,
+        x: &[f32],
+    ) -> Result<(PendingLin, PendingLin), String> {
+        let i1 = self.find_linear(key1)?;
+        let i2 = self.find_linear(key2)?;
+        let (n1, n2) = (self.linears[i1].1.n, self.linears[i2].1.n);
+        let k = self.linears[i1].1.k;
+        if x.len() != k || self.linears[i2].1.k != k {
+            return Err(format!("{key1}/{key2}: input dim mismatch"));
+        }
+        self.upload_x(x)?;
+        self.batch_chain(&[i1, i2], &[0, 1])?;
+        Ok((PendingLin { yb: 0, n: n1 }, PendingLin { yb: 1, n: n2 }))
+    }
+
+    /// 지연 결과 판독 — wait_pending 후 슬롯 버퍼에서 복사.
+    pub fn fetch(&mut self, p: PendingLin) -> Result<Vec<f32>, String> {
+        self.ctx.wait_pending()?;
+        let src = [self.yb1.ptr, self.yb2.ptr, self.yb3.ptr][p.yb];
+        let mut y = vec![0f32; p.n];
+        // SAFETY: wait_pending 후 매핑 판독 — n ≤ max_n.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src as *const f32, y.as_mut_ptr(), p.n);
+        }
+        Ok(y)
     }
 
     /// 선형 투영: y = x @ W^T. 단일 선형.
@@ -310,6 +443,7 @@ impl TrellisResident {
 
         self.upload_x(x)?;
         self.batch_chain(&[idx], &[0])?;
+        self.ctx.wait_pending()?; // DBUF 잔여 배출
 
         let mut y = vec![0f32; n];
         // SAFETY: yb1 매핑 — batch_chain의 end_batch_wait 후.
@@ -337,6 +471,7 @@ impl TrellisResident {
 
         self.upload_x(x)?;
         self.batch_chain(&[i1, i2], &[0, 1])?;
+        self.ctx.wait_pending()?; // DBUF 잔여 배출
 
         let mut y1 = vec![0f32; n1];
         let mut y2 = vec![0f32; n2];
@@ -370,6 +505,7 @@ impl TrellisResident {
         }
         self.upload_x(x)?;
         self.batch_chain(&[i1, i2, i3], &[0, 1, 2])?;
+        self.ctx.wait_pending()?; // DBUF 잔여 배출
         let mut y1 = vec![0f32; n1];
         let mut y2 = vec![0f32; n2];
         let mut y3 = vec![0f32; n3];

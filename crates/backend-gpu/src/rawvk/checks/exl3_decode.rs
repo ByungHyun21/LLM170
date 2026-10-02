@@ -6,9 +6,68 @@
 
 use super::exl3_resident::TrellisResident;
 
+// ── 위상 프로파일러 (LLM170_DUMP=exl3_phase, 원장 89: dump 키로만) ──
+// profile_span은 release no-op이라 exl3 프로브 전용 경량 계측.
+// 단일 스레드 오케스트레이션 전제(thread_local) — gdn_ar_batch 내부 스레드는 미계측.
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+struct PhaseAgg {
+    count: u64,
+    ns: u64,
+}
+thread_local! {
+    static PHASES: RefCell<HashMap<&'static str, PhaseAgg>> = RefCell::new(HashMap::new());
+}
+fn phase_on() -> bool {
+    llm170_diag::dump::opts().key("exl3_phase")
+}
+
+/// usize 포인터 래퍼 — core::gdn::ar_pool 잡 캡처용(Send).
+/// SAFETY: 주소의 생명은 run_par 완료 대기로 증명(호출 스코프 내).
+#[derive(Clone, Copy)]
+struct SendP(usize);
+struct PhaseGuard(std::time::Instant, &'static str);
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        let ns = self.0.elapsed().as_nanos() as u64;
+        PHASES.with(|m| {
+            if let Ok(mut m) = m.try_borrow_mut() {
+                let e = m.entry(self.1).or_insert(PhaseAgg { count: 0, ns: 0 });
+                e.count += 1;
+                e.ns += ns;
+            }
+        });
+    }
+}
+fn ph(name: &'static str) -> Option<PhaseGuard> {
+    phase_on().then(|| PhaseGuard(std::time::Instant::now(), name))
+}
+fn phase_report() {
+    if !phase_on() {
+        return;
+    }
+    PHASES.with(|m| {
+        if let Ok(m) = m.try_borrow() {
+            let mut v: Vec<_> = m.iter().collect();
+            v.sort_by_key(|(_, a)| std::cmp::Reverse(a.ns));
+            eprintln!("=== exl3 phase (wall — 중첩 포함: *_fwd 값은 하위 위상 합 포함) ===");
+            for (k, a) in v {
+                eprintln!(
+                    "  {k:20} {:>7}회 {:>10.1}ms  평균 {:>8.3}ms",
+                    a.count,
+                    a.ns as f64 / 1e6,
+                    a.ns as f64 / a.count as f64 / 1e6
+                );
+            }
+        }
+    });
+}
+
 /// GDN 시퀀스 상태 (per-layer per-head 128×128).
 pub struct GdnState {
-    /// [48 heads][128*128] — 기씨 core::gdn 형식과 동일.
+    /// [48 heads][128*128] — core::gdn 형식, **llama.cpp 헤드 순서**로 저장
+    /// (hf_to_lc 순열을 초기화 시 고정 — plans/120 A1, 매 토큰 순열복사 제거).
     pub states: Vec<f32>,
     /// conv1d 링 [conv_k-1][conv_ch].
     pub conv: Vec<f32>,
@@ -82,17 +141,15 @@ fn gdn_forward(
     let eps = 1e-6f32;
 
     // 선형 투영 (vk GEMV) — alpha/beta도 선형이지만 크기가 작아 inline 계산
-    let qkv = tr.linear(&format!("{lp}.in_proj_qkv"), x_normed)?;
-    if il == 0 && seq.pos == 0 {
-        let rms = (qkv.iter().map(|v| v * v).sum::<f32>() / qkv.len() as f32).sqrt();
-        eprintln!(
-            "  [dbg] L0 qkv rms={rms:.4} qkv[0]={:.6} qkv[1]={:.6}",
-            qkv[0],
-            qkv.get(1).copied().unwrap_or(0.0)
-        );
-    }
-    let z = tr.linear(&format!("{lp}.in_proj_z"), x_normed)?;
-
+    // plans/120 A1: qkvz를 지연 패턴으로 제출(DBUF=1 시 비동기)하고
+    // alpha/beta dot·ssm 수학은 qkvz 출력과 무독립이라 GPU 실행과 중첩한
+    // 뒤 fetch로 합류 — 간극 −13ms 목표. DBUF 부재 시 의미 불변.
+    let _gq = ph("gdn:lin_qkvz");
+    let (pq, pz) = tr.linear_pair_deferred(
+        &format!("{lp}.in_proj_qkv"),
+        &format!("{lp}.in_proj_z"),
+        x_normed,
+    )?;
     // alpha: hidden → 48 (V헤드별 스케일러) — 노름에서 읽기
     let a_proj = tr
         .norm(&format!("{lp}.in_proj_a.weight"))
@@ -102,6 +159,9 @@ fn gdn_forward(
         .ok_or("beta missing")?;
 
     // a[b] = dot(x_normed, a_proj[b]) for each V head b
+    // (풀 병렬화는 잡당 고정비 ~3µs에 묻혔 materially 무차 — 스칼라 유지,
+    // plans/120 A1 실험 기록)
+    let _ga = ph("gdn:ab_dot");
     let mut a_vals = vec![0f32; n_v];
     for (h, a_vals_h) in a_vals.iter_mut().enumerate() {
         let row = &a_proj[h * x_normed.len()..(h + 1) * x_normed.len()];
@@ -112,6 +172,7 @@ fn gdn_forward(
         let row = &b_proj[h * x_normed.len()..(h + 1) * x_normed.len()];
         *b_vals_h = x_normed.iter().zip(row.iter()).map(|(&x, &w)| x * w).sum();
     }
+    drop(_ga);
 
     // ssm_a = -exp(A_log) — HF 순서 그대로 (직접 경로는 전체 HF 일관).
     // (GGUF 변환 시에만 V헤드 순열 필요 — §7.1b)
@@ -119,19 +180,38 @@ fn gdn_forward(
     let ssm_a: Vec<f32> = (0..n_v)
         .map(|i| -a_log[i.min(a_log.len() - 1)].exp())
         .collect();
-    let dt_bias = tr.norm(&format!("{lp}.dt_bias")).ok_or("dt_bias missing")?;
+    let dt_bias = tr
+        .norm(&format!("{lp}.dt_bias"))
+        .ok_or("dt_bias missing")?
+        .to_vec(); // fetch(가변) 이후에도 쓴다 — 소유 복사(값 불변)
+
+    // 지연 판독 합류 — 이 시점까지 GPU는 qkvz를 실행했다(DBUF 시).
+    let qkv = tr.fetch(pq)?;
+    let z = tr.fetch(pz)?;
+    drop(_gq);
+    if il == 0 && seq.pos == 0 {
+        let rms = (qkv.iter().map(|v| v * v).sum::<f32>() / qkv.len() as f32).sqrt();
+        eprintln!(
+            "  [dbg] L0 qkv rms={rms:.4} qkv[0]={:.6} qkv[1]={:.6}",
+            qkv[0],
+            qkv.get(1).copied().unwrap_or(0.0)
+        );
+    }
 
     // beta, g
+    let _gm = ph("gdn:ab_math");
     let beta_all: Vec<f32> = (0..n_v).map(|h| sigmoid(b_vals[h])).collect();
     let g_all: Vec<f32> = (0..n_v)
         .map(|h| softplus(a_vals[h] + dt_bias[h]) * ssm_a[h])
         .collect();
+    drop(_gm);
 
     // conv1d (t=1)
     let conv_w = tr
         .norm(&format!("{lp}.conv1d.weight"))
         .ok_or("conv1d missing")?;
     let st = &mut seq.gdn[il];
+    let _gc = ph("gdn:conv");
     let mut q_all = vec![0f32; k_len];
     let mut k_all = vec![0f32; k_len];
     let mut v_all = vec![0f32; v_len];
@@ -162,46 +242,55 @@ fn gdn_forward(
         let headk: Vec<f32> = k_all[b0..b0 + d_state].to_vec();
         k_all[b0..b0 + d_state].copy_from_slice(&l2_norm(&headk, eps));
     }
+    drop(_gc);
 
     // GDN delta rule — core::gdn::gdn_ar_batch 재사용 (헤드 병렬).
     // HF 순서 → llama.cpp 순서 (h%h_k 매핑용) → 역순열로 복귀.
+    // plans/120 A1: 상태는 llama.cpp 순서로 영구 저장 — 층당 3MB×2 순열
+    // 복사(토큰당 288MB) 제거. 순열은 v/beta/g/o(6144f32)에만 적용.
     let hf_to_lc = |h: usize| -> usize { 3 * (h % 16) + h / 16 };
 
+    let _gd = ph("gdn:delta");
     let mut v_lc = vec![0f32; v_len]; // llama.cpp 순서 v
     let mut beta_lc = vec![0f32; n_v];
     let mut g_lc = vec![0f32; n_v];
     let mut o_lc = vec![0f32; v_len];
-    // 상태도 순열 — state[llama.cpp head i] = state[HV head hf_to_lc(i)]
-    let mut st_lc = vec![0f32; n_v * d_state * d_state];
     for i in 0..n_v {
         let j = hf_to_lc(i);
         v_lc[i * d_state..(i + 1) * d_state]
             .copy_from_slice(&v_all[j * d_state..(j + 1) * d_state]);
         beta_lc[i] = beta_all[j];
         g_lc[i] = g_all[j];
-        st_lc[i * d_state * d_state..(i + 1) * d_state * d_state]
-            .copy_from_slice(&st.states[j * d_state * d_state..(j + 1) * d_state * d_state]);
     }
 
     llm170_core::gdn::gdn_ar_batch(
-        &q_all, &k_all, &v_lc, &beta_lc, &g_lc, &mut st_lc, &mut o_lc, 1, n_k, n_v,
+        &q_all,
+        &k_all,
+        &v_lc,
+        &beta_lc,
+        &g_lc,
+        &mut st.states,
+        &mut o_lc,
+        1,
+        n_k,
+        n_v,
     );
 
-    // 결과·상태 역순열 (llama.cpp → HF)
+    // 결과 역순열 (llama.cpp → HF)
     let mut o_all = vec![0f32; v_len];
     for i in 0..n_v {
         let j = hf_to_lc(i);
         o_all[j * d_state..(j + 1) * d_state]
             .copy_from_slice(&o_lc[i * d_state..(i + 1) * d_state]);
-        st.states[j * d_state * d_state..(j + 1) * d_state * d_state]
-            .copy_from_slice(&st_lc[i * d_state * d_state..(i + 1) * d_state * d_state]);
     }
+    drop(_gd);
 
     // norm_gated: rms_norm(o) * silu(z) per V head
     let ssm_norm_w = tr
         .norm(&format!("{lp}.norm.weight"))
         .ok_or("ssm_norm missing")?;
     let mut gated = vec![0f32; d_inner];
+    let _gg = ph("gdn:gate");
     for h in 0..n_v {
         let b0 = h * d_state;
         let head: Vec<f32> = o_all[b0..b0 + d_state].to_vec();
@@ -210,9 +299,13 @@ fn gdn_forward(
             gated[b0 + i] = n[i] * silu(z[b0 + i]);
         }
     }
+    drop(_gg);
 
     // out_proj (vk GEMV)
-    tr.linear(&format!("{lp}.out_proj"), &gated)
+    let _go = ph("gdn:lin_out");
+    let r = tr.linear(&format!("{lp}.out_proj"), &gated)?;
+    drop(_go);
+    Ok(r)
 }
 
 // ── Full attention (t=1) ──
@@ -232,9 +325,15 @@ fn attn_forward(
     let rope_base = 1e7f32;
 
     // q/k/v (vk GEMV) — q는 gate 퓨전 [n_head * head_dim * 2]
-    let q_gate = tr.linear(&format!("{lp}.q_proj"), x_normed)?; // [12288]
-    let k = tr.linear(&format!("{lp}.k_proj"), x_normed)?; // [1024]
-    let v = tr.linear(&format!("{lp}.v_proj"), x_normed)?; // [1024]
+    // plans/120 A1: 3회 개별 배치 → linear_triple 1배치 (동기 3→1).
+    let _g1 = ph("attn:lin_qkv");
+    let (q_gate, k, v) = tr.linear_triple(
+        &format!("{lp}.q_proj"),
+        &format!("{lp}.k_proj"),
+        &format!("{lp}.v_proj"),
+        x_normed,
+    )?;
+    drop(_g1);
 
     // q_norm, k_norm
     let q_norm_w = tr
@@ -248,6 +347,7 @@ fn attn_forward(
     let pos = seq.pos;
     let kv = &mut seq.kv[attn_il];
     let kv_cap = kv.k.len() / (n_kv * head_dim);
+    let _g2 = ph("attn:qknorm_rope");
 
     // q: 헤드별 [q(256), gate(256)] 인터리브 → 분리
     let mut q_heads = vec![0f32; n_head * head_dim];
@@ -285,42 +385,64 @@ fn attn_forward(
         }
         kv.len += 1;
     }
+    drop(_g2);
 
     // attention: GQA — 각 q 헤드가 n_head/n_kv개의 kv 헤드를 공유
+    // plans/120 A1: 헤드별 풀 병렬 + 가중치 사전계산(비트동일 — w[t]는
+    // 원문과 동일 표현식으로 1회 계산, t 누적 순서 보존).
+    let _g3 = ph("attn:core");
     let scale = 1.0 / (head_dim as f32).sqrt();
     let n_rep = n_head / n_kv;
     let mut attn_out = vec![0f32; n_head * head_dim];
+    {
+        let kv_len = kv.len;
+        // SAFETY: 잡은 run_par 완료 대기 내에서만 접근 — q_heads·kv·attn_out은
+        // 이 스코프 내 유효, 헤드별 출력 영역은 서로 분리된다.
+        let (qp, kp, vp, op) = (
+            SendP(q_heads.as_ptr() as usize),
+            SendP(kv.k.as_ptr() as usize),
+            SendP(kv.v.as_ptr() as usize),
+            SendP(attn_out.as_mut_ptr() as usize),
+        );
+        llm170_core::gdn::ar_pool::run_par(n_head, move |h| {
+            Box::new(move || unsafe {
+                let kv_h = h / n_rep;
+                let q =
+                    std::slice::from_raw_parts((qp.0 as *const f32).add(h * head_dim), head_dim);
+                let (kb, vb) = (kp.0 as *const f32, vp.0 as *const f32);
+                let ob = (op.0 as *mut f32).add(h * head_dim);
 
-    for h in 0..n_head {
-        let kv_h = h / n_rep;
-        let q = &q_heads[h * head_dim..(h + 1) * head_dim];
+                // 점수 계산
+                let mut scores = vec![0f32; kv_len];
+                for t in 0..kv_len {
+                    let k_base = t * n_kv * head_dim + kv_h * head_dim;
+                    let mut dot = 0f32;
+                    for d in 0..head_dim {
+                        dot += q[d] * *kb.add(k_base + d);
+                    }
+                    scores[t] = dot * scale;
+                }
 
-        // 점수 계산
-        let mut scores = vec![0f32; kv.len];
-        for t in 0..kv.len {
-            let k_base = t * n_kv * head_dim + kv_h * head_dim;
-            let mut dot = 0f32;
-            for d in 0..head_dim {
-                dot += q[d] * kv.k[k_base + d];
-            }
-            scores[t] = dot * scale;
-        }
+                // softmax
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
+                let inv_sum = 1.0 / exp_sum;
+                let w: Vec<f32> = scores
+                    .iter()
+                    .map(|&s| (s - max_s).exp() * inv_sum)
+                    .collect();
 
-        // softmax
-        let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
-        let inv_sum = 1.0 / exp_sum;
-
-        // 가중 합
-        for d in 0..head_dim {
-            let mut sum = 0f32;
-            for t in 0..kv.len {
-                let w = (scores[t] - max_s).exp() * inv_sum;
-                let v_base = t * n_kv * head_dim + kv_h * head_dim;
-                sum += w * kv.v[v_base + d];
-            }
-            attn_out[h * head_dim + d] = sum;
-        }
+                // 가중 합
+                for d in 0..head_dim {
+                    let mut sum = 0f32;
+                    for t in 0..kv_len {
+                        let v_base = t * n_kv * head_dim + kv_h * head_dim;
+                        sum += w[t] * *vb.add(v_base + d);
+                    }
+                    *ob.add(d) = sum;
+                }
+            })
+        });
     }
 
     // output gate: attn_out * sigmoid(gate)
@@ -330,9 +452,13 @@ fn attn_forward(
             attn_out[b0 + d] *= sigmoid(gate_heads[b0 + d]);
         }
     }
+    drop(_g3);
 
     // o_proj (vk GEMV)
-    tr.linear(&format!("{lp}.o_proj"), &attn_out)
+    let _g4 = ph("attn:lin_o");
+    let r = tr.linear(&format!("{lp}.o_proj"), &attn_out)?;
+    drop(_g4);
+    Ok(r)
 }
 
 // ── 메인 디코드 ──
@@ -368,11 +494,16 @@ pub fn decode_step(
         let xn = rms_norm(&x, norm_w, eps);
 
         let mut attn_out = if full {
+            let _g = ph("attn_fwd");
             let out = attn_forward(tr, seq, il, attn_count, &xn, 24, 4, 256)?;
+            drop(_g);
             attn_count += 1;
             out
         } else {
-            gdn_forward(tr, seq, il, &xn)?
+            let _g = ph("gdn_fwd");
+            let r = gdn_forward(tr, seq, il, &xn)?;
+            drop(_g);
+            r
         };
         // 디버그: attention/GDN 출력 제거 — FFN만 남겨 격리.
         if std::env::var_os("LLM170_EXL3_DBG")
@@ -394,14 +525,16 @@ pub fn decode_step(
             .norm(&format!("{lp}.post_attention_layernorm.weight"))
             .ok_or("ffn norm missing")?;
         let xf = rms_norm(&x, ffn_norm_w, eps);
-        let gate = tr.linear(&format!("{lp}.mlp.gate_proj"), &xf)?;
-        let up = tr.linear(&format!("{lp}.mlp.up_proj"), &xf)?;
-        let hidden_act: Vec<f32> = gate
-            .iter()
-            .zip(up.iter())
-            .map(|(&a, &b)| silu(a) * b)
-            .collect();
-        let ffn_out = tr.linear(&format!("{lp}.mlp.down_proj"), &hidden_act)?;
+        // plans/120 A1: FFN 3선형 + GPU ew(silu·mul) 단일 배치 — 게이트/업
+        // 판독·CPU 활성화·업로드 제거(간극 감소). ew GPU exp는 10a.
+        let _gf = ph("ffn_all");
+        let ffn_out = tr.ffn_triple(
+            &format!("{lp}.mlp.gate_proj"),
+            &format!("{lp}.mlp.up_proj"),
+            &format!("{lp}.mlp.down_proj"),
+            &xf,
+        )?;
+        drop(_gf);
         for i in 0..h {
             x[i] += ffn_out.get(i).copied().unwrap_or(0.0);
         }
@@ -422,7 +555,10 @@ pub fn decode_step(
         .norm("model.language_model.norm.weight")
         .ok_or("output norm missing")?;
     let xn = rms_norm(&x, out_norm_w, eps);
-    tr.linear("lm_head", &xn)
+    let _gh = ph("head");
+    let r = tr.linear("lm_head", &xn)?;
+    drop(_gh);
+    Ok(r)
 }
 
 /// 시퀀스 상태 초기화.
@@ -501,6 +637,12 @@ pub fn exl3_decode(dir: &str, tokens_str: &str, n_predict: usize) -> Result<Stri
         }
     }
     let decode_s = t1.elapsed().as_secs_f64();
+    // 진단 덤프 — VK_TS: GPU 디스패치 집계(프레임 경로와 동일 ts 원장),
+    // exl3_phase: CPU 위상 분해. decode_s 측정 후 호출(쿼리 WAIT 제외).
+    if llm170_diag::flag::on("LLM170_VK_TS") {
+        tr.ctx.ts_report();
+    }
+    phase_report();
     let total = prompt.len() + n_predict;
     let tps = total as f64 / decode_s;
     Ok(format!(

@@ -243,15 +243,68 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
         max_abs = max_abs.max(d);
         max_rel = max_rel.max(d / y_ref[i].abs().max(1e-3));
     }
+    // ── ew 커널 검증 (plans/120 A1): FFN 융합 silu(g)·u f32→f16 미러.
+    // GPU exp는 libm exp와 근사 구현차 — f16 RTNE 타이가 갈릴 수 있어
+    // f32 재해석값 허용치로 판정한다(비트 판정 아님).
+    let (_d4, pl4, _dp4, ds4, pipe4) =
+        ctx.pipeline(include_bytes!("../spv/exl3_ffn_ew.spv"), 3, 4)?;
+    let g_in = y_ref.clone();
+    let u_in = y_gpu.clone(); // 상이한 두 벡터로 곱 검증
+    // `up` 클로저 재사용 불가 — 대여 영역이 전체로 늘어난다(E0499). 인라인 업로드.
+    let upload_f32 = |ctx: &mut VkCtx, v: &[f32]| -> Result<crate::rawvk::context::VkBuf, String> {
+        let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let b = ctx.alloc(bytes.len())?;
+        // SAFETY: 매핑 업로드(크기 일치).
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.ptr, bytes.len()) };
+        Ok(b)
+    };
+    let gbuf = upload_f32(&mut ctx, &g_in)?;
+    let ubuf = upload_f32(&mut ctx, &u_in)?;
+    let abuf = ctx.alloc(n * 2)?;
+    ctx.bind_bufs(ds4, &[gbuf.buf, ubuf.buf, abuf.buf]);
+    let push4 = push_u32s(&[n as u32]);
+    crate::rawvk::context::site::set_tag("e3_ffn_ew");
+    // begin_batch로 감싼다 — 3커널 절의 end_batch_wait 직후 배치 없는
+    // run_rw+end_batch_wait 2연속은 미정의 경로(펜스 재사용)로 관측 크래시.
+    ctx.begin_batch()?;
+    ctx.run_rw(
+        pl4,
+        ds4,
+        pipe4,
+        &push4,
+        n.div_ceil(512) as u32,
+        1,
+        1,
+        &[gbuf.buf, ubuf.buf],
+        &[abuf.buf],
+    )?;
+    ctx.end_batch_wait()?;
+    let mut a16v = vec![0u8; n * 2];
+    // SAFETY: 영구 매핑 버퍼 — end_batch_wait 후 판독.
+    unsafe {
+        std::ptr::copy_nonoverlapping(abuf.ptr as *const u8, a16v.as_mut_ptr(), n * 2);
+    }
+    let mut ew_max = 0f32;
+    let mut ew_bit = 0usize;
+    for i in 0..n {
+        let x = g_in[i];
+        let mirror = x / (1.0 + (-x).exp()) * u_in[i];
+        let bits = u16::from_le_bytes([a16v[2 * i], a16v[2 * i + 1]]);
+        let gv = f16::from_bits(bits).to_f32();
+        ew_max = ew_max.max((gv - mirror).abs());
+        ew_bit += (f16::from_f32(mirror).to_bits() == bits) as usize;
+    }
+    let ew_ok = ew_bit * 100 >= n * 99 && ew_max <= 2e-2;
+
     // 이론 대역폭 기준 하한(tre 독점 가정) — 참고 정보.
     let bytes_per_call = w.trellis.len() as f64;
     let gbps = bytes_per_call / (gpu_us * 1e-6) / 1e9;
     // 판정: had_in 비트 동일. gemv/out은 f16 누산 클래스(참조 FragC_h와
     // 동일 정밀도 — 곱의 f16 중간 반올림·수축 차 ≤ ~1e-5/항, 5120항 랜덤
     // 워크 ~7e-4) — 허용치 5e-3·1e-2.
-    let ok = cmp_ah.0 == 0.0 && cmp_s <= 5e-3 && max_abs <= 1e-2;
+    let ok = cmp_ah.0 == 0.0 && cmp_s <= 5e-3 && max_abs <= 1e-2 && ew_ok;
     let report = format!(
-        "exl3-vk-check {key}: k={k} n={n} K={}\n  had_in: max_abs={:.3e} (f16 일치 {}/{k})\n  gemv : max_abs={:.3e}\n  out  : max_abs={max_abs:.3e} max_rel={max_rel:.3e}\n  gpu {gpu_us:.0} µs/step (trellis {:.1} MB → {gbps:.0} GB/s)\n  cpu 참조 {cpu_ms:.0} ms",
+        "exl3-vk-check {key}: k={k} n={n} K={}\n  had_in: max_abs={:.3e} (f16 일치 {}/{k})\n  gemv : max_abs={:.3e}\n  out  : max_abs={max_abs:.3e} max_rel={max_rel:.3e}\n  ew   : max_abs={ew_max:.3e} (f16 일치 {ew_bit}/{n}, silu GPU exp 10a)\n  gpu {gpu_us:.0} µs/step (trellis {:.1} MB → {gbps:.0} GB/s)\n  cpu 참조 {cpu_ms:.0} ms",
         w.krate,
         cmp_ah.0,
         cmp_ah.1,
