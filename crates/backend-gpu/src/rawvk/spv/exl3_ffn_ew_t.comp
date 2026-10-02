@@ -1,0 +1,58 @@
+#version 450
+
+// exl3_ffn_ew_t (plans/121 A1-pp2) — FFN 활성화 융합 T-배치:
+// a[t] = silu(g[t]) ⊙ u[t] (f32 → f16). exl3_ffn_ew(T=1)의 행 확장 —
+// 게이트·업 GEMM 결과(yb 슬롯, f32)를 down 입력(x2t, f16 쌍팩)으로
+// 프리필 배치 안에서 변환한다. gate/up 판독·CPU ew·down 업로드 제거
+// (병목 원장 #3/#5). 산술 계약은 ffn_ew와 동일(10a).
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer GB { float g[]; };  // f32 [T][n]
+layout(binding = 1) readonly buffer UB { float u[]; };  // f32 [T][n]
+layout(binding = 2) writeonly buffer AB { uint a16[]; }; // f16 쌍팩 [T][n/2]
+layout(push_constant) uniform PC {
+    uint n; // 행 폭(짝수 보장 — FFN 폭 16의 배수)
+} pc;
+
+// f32 → f16 비트 (RTNE) — had_in 계열 동일 구현.
+uint f32_to_f16_rtne(float v) {
+    uint x = floatBitsToUint(v);
+    uint sign = (x >> 16) & 0x8000u;
+    uint rest = x & 0x7FFFFFFFu;
+    if (rest >= 0x7F800000u) return sign | 0x7C00u | uint((rest & 0x7FFFFFu) != 0u);
+    int e = int(rest >> 23) - 127;
+    uint man = rest & 0x7FFFFFu;
+    uint h;
+    if (e >= -14) {
+        h = (uint(e + 15) << 10) | (man >> 13);
+        uint rem = man & 0x1FFFu;
+        if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;
+        if (h >= 0x7C00u) h = 0x7C00u;
+    } else if (e < -25) {
+        return sign;
+    } else {
+        uint m = 0x800000u | man;
+        uint sh = uint(-14 - e) + 13u;
+        uint rem = m & ((1u << sh) - 1u);
+        h = m >> sh;
+        uint halfway = 1u << (sh - 1u);
+        if (rem > halfway || (rem == halfway && (h & 1u) != 0u)) h += 1u;
+    }
+    return sign | h;
+}
+
+float silu_f32(float x) {
+    return x / (1.0 + exp(-x));
+}
+
+void main() {
+    uint row = gl_WorkGroupID.y;
+    // 스레드당 1워드(2원소) — 행 내 i = 2·gid.
+    uint i = row * pc.n + gl_GlobalInvocationID.x * 2u;
+    if (gl_GlobalInvocationID.x * 2u >= pc.n) return;
+    float v0 = silu_f32(g[i]) * u[i];
+    float v1 = ((gl_GlobalInvocationID.x * 2u + 1u) < pc.n)
+        ? (silu_f32(g[i + 1u]) * u[i + 1u])
+        : 0.0;
+    a16[row * (pc.n / 2u) + gl_GlobalInvocationID.x] =
+        f32_to_f16_rtne(v0) | (f32_to_f16_rtne(v1) << 16u);
+}

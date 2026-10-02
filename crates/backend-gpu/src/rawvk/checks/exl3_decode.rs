@@ -709,9 +709,8 @@ fn gdn_batch(
 
     // 선형: qkv+z 공유 입력 1배치
     let _g0 = ph("ppg:lin_qkvz");
-    let mut outs = tr.linear_batch_multi(
+    let mut outs = tr.linear_batch_multi_staged(
         &[&format!("{lp}.in_proj_qkv"), &format!("{lp}.in_proj_z")],
-        xn,
         t_rows,
     )?;
     drop(_g0);
@@ -747,6 +746,7 @@ fn gdn_batch(
     // ssm_a = -exp(A_log) — 행 준비 루프에서 인라인 계산(환원 불변)
 
     // alpha/beta dot — 행 병렬(스칼라 dot는 120 무차 확정, 행 단위 병렬만).
+    let _ga = ph("ppg:ab");
     let mut a_vals = vec![0f32; t_rows * n_v];
     let mut b_vals = vec![0f32; t_rows * n_v];
     {
@@ -773,7 +773,9 @@ fn gdn_batch(
         });
     }
 
+    drop(_ga);
     // conv1d(T) — 채널별 인과 콘볼루션 + 링 갱신. 채널 병렬(쓰기 분리).
+    let _gv = ph("ppg:conv");
     let mut q_all = vec![0f32; t_rows * k_len];
     let mut k_all = vec![0f32; t_rows * k_len];
     let mut v_all = vec![0f32; t_rows * d_inner];
@@ -818,7 +820,9 @@ fn gdn_batch(
         });
     }
 
+    drop(_gv);
     // 행 준비(병렬): L2 q/k + beta/g + lc 순열(v/beta/g).
+    let _gp1 = ph("ppg:prep");
     let hf_to_lc = |hh: usize| -> usize { 3 * (hh % 16) + hh / 16 };
     let mut beta_lc = vec![0f32; t_rows * n_v];
     let mut g_lc = vec![0f32; t_rows * n_v];
@@ -861,7 +865,9 @@ fn gdn_batch(
             }
         });
     }
+    drop(_gp1);
     // v 순열 복사(행 병렬 — v_all(HF) → v_lc(llama.cpp 헤드 순서))
+    let _gp2 = ph("ppg:vperm");
     {
         let (vap, vlp) = (PP(v_all.as_ptr() as usize), PP(v_lc.as_mut_ptr() as usize));
         // SAFETY: 행·헤드별 분리 쓰기.
@@ -876,6 +882,8 @@ fn gdn_batch(
             }
         });
     }
+
+    drop(_gp2);
 
     // 청크 스캔 — core::gdn 재사용(CS=64, AR 등가 검증).
     let mut o_lc = vec![0f32; t_rows * d_inner];
@@ -893,13 +901,15 @@ fn gdn_batch(
         n_v,
     );
 
-    // 역순열 + norm_gated(rms(o)·silu(z)) — 행 병렬.
-    let mut gated = vec![0f32; t_rows * d_inner];
+    // 역순열 + norm_gated(rms(o)·silu(z)) — 행 병렬, 스테이징 직접 기록
+    // (out_proj 입력이 곧 소비되므로 중간 Vec 없이 stage에 쓴다 — 원장 #3).
+    let _gg = ph("ppg:gate");
+    let stage = tr.stage_f32()?;
     {
         let (op, zp, gp, nwp) = (
             PP(o_lc.as_ptr() as usize),
             PP(z.as_ptr() as usize),
-            PP(gated.as_mut_ptr() as usize),
+            PP(stage as usize),
             PP(ssm_norm_w.as_ptr() as usize),
         );
         // SAFETY: 행·헤드별 분리 쓰기(gated).
@@ -923,9 +933,10 @@ fn gdn_batch(
         });
     }
 
-    // out_proj 배치
+    drop(_gg);
+    // out_proj 배치(스테이징)
     let _go = ph("ppg:out");
-    let r = tr.linear_batch(&format!("{lp}.out_proj"), &gated, t_rows)?;
+    let r = tr.linear_batch_staged(&format!("{lp}.out_proj"), t_rows)?;
     drop(_go);
     Ok(r)
 }
@@ -937,7 +948,6 @@ fn attn_batch(
     seq: &mut SeqState,
     il: usize,
     attn_il: usize,
-    xn: &[f32],
     t_rows: usize,
     n_head: usize,
     n_kv: usize,
@@ -948,18 +958,20 @@ fn attn_batch(
     let rope_base = 1e7f32;
     let eps = 1e-6f32;
 
-    let mut outs = tr.linear_batch_multi(
+    // 계약: xn은 호출자가 stage_f32 버퍼에 [T][h]로 미리 스테이징했다.
+    let _a0 = ph("ppa:lin_qkv");
+    let mut outs = tr.linear_batch_multi_staged(
         &[
             &format!("{lp}.q_proj"),
             &format!("{lp}.k_proj"),
             &format!("{lp}.v_proj"),
         ],
-        xn,
         t_rows,
     )?;
     let v = outs.pop().ok_or("qkv 결과 유실")?;
     let k = outs.pop().ok_or("qkv 결과 유실")?;
     let q_gate = outs.pop().ok_or("qkv 결과 유실")?; // [T][n_head*head_dim*2]
+    drop(_a0);
 
     let q_norm_w = tr
         .norm(&format!("{lp}.q_norm.weight"))
@@ -971,6 +983,7 @@ fn attn_batch(
         .to_vec();
 
     // 행별: q 디인터리브 + norm + rope, k norm+rope → KV 적립(순서 보장).
+    let _a1 = ph("ppa:kv");
     let pos0 = seq.pos;
     let mut q_heads = vec![0f32; t_rows * n_head * head_dim];
     let mut gate_heads = vec![0f32; t_rows * n_head * head_dim];
@@ -1019,10 +1032,13 @@ fn attn_batch(
         }
     }
 
+    drop(_a1);
     // 인과 어텐션 — 행 병렬(행 t는 kv[0..=pos0+t] 만 본다).
+    let _a2 = ph("ppa:core");
     let scale = 1.0 / (head_dim as f32).sqrt();
     let n_rep = n_head / n_kv;
-    let mut attn_out = vec![0f32; t_rows * n_head * head_dim];
+    // 어텐션 출력은 스테이징 버퍼에 직접 기록(o_proj가 곧 소비 — 원장 #3).
+    let stage = tr.stage_f32()?;
     {
         let kv = &seq.kv[attn_il];
         let (qp, kp, vp, gp, op) = (
@@ -1030,11 +1046,14 @@ fn attn_batch(
             PP(kv.k.as_ptr() as usize),
             PP(kv.v.as_ptr() as usize),
             PP(gate_heads.as_ptr() as usize),
-            PP(attn_out.as_mut_ptr() as usize),
+            PP(stage as usize),
         );
         // SAFETY: 행별 출력 영역 분리, kv/q/gate는 읽기 공유(scope join 증명).
         par_rows(t_rows, move |t| unsafe {
             let kv_len = (pos0 as usize) + t + 1;
+            // 행당 버퍼 1회 — 이전 (t,h)잙당 scores/w Vec 2개 할당 제거.
+            let mut scores = vec![0f32; kv_len];
+            let mut acc = vec![0f32; head_dim];
             for hh in 0..n_head {
                 let kv_h = hh / n_rep;
                 let q = std::slice::from_raw_parts(
@@ -1043,7 +1062,6 @@ fn attn_batch(
                 );
                 let (kb, vb) = (kp.0 as *const f32, vp.0 as *const f32);
                 let ob = (op.0 as *mut f32).add(t * n_head * head_dim + hh * head_dim);
-                let mut scores = vec![0f32; kv_len];
                 for tt in 0..kv_len {
                     let k_base = tt * n_kv * head_dim + kv_h * head_dim;
                     let mut dot = 0f32;
@@ -1052,77 +1070,41 @@ fn attn_batch(
                     }
                     scores[tt] = dot * scale;
                 }
-                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
-                let inv_sum = 1.0 / exp_sum;
-                let w: Vec<f32> = scores
+                let max_s = scores[..kv_len]
                     .iter()
-                    .map(|&s| (s - max_s).exp() * inv_sum)
-                    .collect();
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                // t-우선 가중합 — v 행 연속 판독(이전 d-우선은 열 스트라이드
+                // 4KB 산재 판독으로 ppa:core 34% 병목의 주원인, 2026-10-03
+                // 원장 #1). 정규화는 누적 후 1회(환원 순서 변경 — 10a).
+                let mut wsum = 0f32;
                 for d in 0..head_dim {
-                    let mut sum = 0f32;
-                    for tt in 0..kv_len {
-                        let v_base = tt * n_kv * head_dim + kv_h * head_dim;
-                        sum += w[tt] * *vb.add(v_base + d);
+                    acc[d] = 0.0;
+                }
+                for tt in 0..kv_len {
+                    let v_base = tt * n_kv * head_dim + kv_h * head_dim;
+                    let wtt = (scores[tt] - max_s).exp();
+                    wsum += wtt;
+                    for d in 0..head_dim {
+                        acc[d] += wtt * *vb.add(v_base + d);
                     }
-                    // 게이트: attn_out · sigmoid(gate)
+                }
+                let inv = 1.0 / wsum;
+                // 게이트: attn_out · sigmoid(gate)
+                for d in 0..head_dim {
                     let gv = *(gp.0 as *const f32).add(t * n_head * head_dim + hh * head_dim + d);
-                    *ob.add(d) = sum * sigmoid(gv);
+                    *ob.add(d) = acc[d] * inv * sigmoid(gv);
                 }
             }
         });
     }
 
-    // o_proj 배치 — 결과는 [T][h] 행 우선
-    let o = tr.linear_batch(&format!("{lp}.o_proj"), &attn_out, t_rows)?;
+    drop(_a2);
+    // o_proj 배치(스테이징 — 어텐션 출력을 stage에 직접 기록했다)
+    let _a3 = ph("ppa:out");
+    let o = tr.linear_batch_staged(&format!("{lp}.o_proj"), t_rows)?;
+    drop(_a3);
     Ok(o)
-}
-
-/// T-행 FFN: gate/up 배치(1동기) → ew(silu·mul) 행 병렬 → down 배치.
-fn ffn_batch(
-    tr: &mut TrellisResident,
-    il: usize,
-    xf: &[f32],
-    t_rows: usize,
-) -> Result<Vec<f32>, String> {
-    let lp = format!("model.language_model.layers.{il}.mlp");
-    let ig = tr
-        .linears
-        .iter()
-        .position(|(k, _)| k == &format!("{lp}.gate_proj"))
-        .ok_or("gate_proj missing")?;
-    let ng = tr.linears[ig].1.n;
-    let _f0 = ph("ppf:lin_gu");
-    let mut outs = tr.linear_batch_multi(
-        &[&format!("{lp}.gate_proj"), &format!("{lp}.up_proj")],
-        xf,
-        t_rows,
-    )?;
-    drop(_f0);
-    let u = outs.pop().ok_or("ffn 결과 유실")?;
-    let g = outs.pop().ok_or("ffn 결과 유실")?;
-    let mut dw = vec![0f32; t_rows * ng];
-    {
-        let _f1 = ph("ppf:ew");
-        let (gp, up, dp) = (
-            PP(g.as_ptr() as usize),
-            PP(u.as_ptr() as usize),
-            PP(dw.as_mut_ptr() as usize),
-        );
-        // SAFETY: 행별 분리 쓰기(dw).
-        par_rows(t_rows, move |t| unsafe {
-            for i in 0..ng {
-                let gv = *(gp.0 as *const f32).add(t * ng + i);
-                let uv = *(up.0 as *const f32).add(t * ng + i);
-                *(dp.0 as *mut f32).add(t * ng + i) = silu(gv) * uv;
-            }
-        });
-        drop(_f1);
-    }
-    let _f2 = ph("ppf:lin_d");
-    let r = tr.linear_batch(&format!("{lp}.down_proj"), &dw, t_rows)?;
-    drop(_f2);
-    Ok(r)
 }
 
 /// 배치 프리필: 전체 프롬프트를 T-배치로 통과(>512 청크 분할) — 마지막
@@ -1142,10 +1124,14 @@ pub fn prefill_batch(
     for chunk_toks in tokens.chunks(super::exl3_resident::BATCH_TMAX) {
         let t_rows = chunk_toks.len();
         // 임베딩 행 조립
+        let _e0 = ph("pp:embed");
         let mut x = vec![0f32; t_rows * h];
         for (t, &tok) in chunk_toks.iter().enumerate() {
             x[t * h..(t + 1) * h].copy_from_slice(tr.embed_row(tok));
         }
+        drop(_e0);
+        // 스테이징 버퍼 — 이 청크의 모든 선형 입력이 여기에 병렬 직접 기록된다.
+        let stage = tr.stage_f32()?;
         let mut attn_count = 0;
         for il in 0..tr.n_layers {
             let lp = format!("model.language_model.layers.{il}");
@@ -1154,29 +1140,36 @@ pub fn prefill_batch(
                 .norm(&format!("{lp}.input_layernorm.weight"))
                 .ok_or("norm missing")?
                 .to_vec();
-            // xn 행 rms — 병렬
+            // xn 행 rms — 병렬 이중 기록(CPU 슬라이스 + 스테이징 —
+            // alpha/beta dot용 xn은 CPU에도 필요).
+            let _n0 = ph("pp:norm_x");
             let mut xn = vec![0f32; t_rows * h];
             {
-                let (xp, np, op) = (
+                let (xp, np, op, sp) = (
                     PP(x.as_ptr() as usize),
                     PP(norm_w.as_ptr() as usize),
                     PP(xn.as_mut_ptr() as usize),
+                    PP(stage as usize),
                 );
-                // SAFETY: 행별 분리 쓰기(xn).
+                // SAFETY: 행별 분리 쓰기(xn·스테이징).
                 par_rows(t_rows, move |t| unsafe {
                     let xr = std::slice::from_raw_parts((xp.0 as *const f32).add(t * h), h);
                     let ss: f32 = xr.iter().map(|&v| v * v).sum();
                     let inv = 1.0 / ((ss / h as f32 + eps).sqrt());
                     let ob = (op.0 as *mut f32).add(t * h);
+                    let sb = (sp.0 as *mut f32).add(t * h);
                     let nw = np.0 as *const f32;
                     for i in 0..h {
-                        *ob.add(i) = *xr.get_unchecked(i) * inv * *nw.add(i);
+                        let v = *xr.get_unchecked(i) * inv * *nw.add(i);
+                        *ob.add(i) = v;
+                        *sb.add(i) = v;
                     }
                 });
             }
+            drop(_n0);
             let attn_out = if full {
                 let _g = ph("pp:attn");
-                let r = attn_batch(tr, seq, il, attn_count, &xn, t_rows, 24, 4, 256)?;
+                let r = attn_batch(tr, seq, il, attn_count, t_rows, 24, 4, 256)?;
                 drop(_g);
                 attn_count += 1;
                 r
@@ -1187,38 +1180,50 @@ pub fn prefill_batch(
                 r
             };
             // 잔차 x += attn_out
+            let _r0 = ph("pp:resid");
             for (a, b) in x.iter_mut().zip(attn_out.iter()) {
                 *a += b;
             }
+            drop(_r0);
             let ffn_norm_w = tr
                 .norm(&format!("{lp}.post_attention_layernorm.weight"))
                 .ok_or("ffn norm missing")?
                 .to_vec();
-            let mut xf = vec![0f32; t_rows * h];
+            // xf 행 rms — 스테이징 단일 기록(FFN 트리오가 곧 소비).
+            let _n1 = ph("pp:norm_f");
             {
-                let (xp, np, op) = (
+                let (xp, np, sp) = (
                     PP(x.as_ptr() as usize),
                     PP(ffn_norm_w.as_ptr() as usize),
-                    PP(xf.as_mut_ptr() as usize),
+                    PP(stage as usize),
                 );
-                // SAFETY: 위와 동일(행별 분리 쓰기).
+                // SAFETY: 행별 분리 쓰기(스테이징).
                 par_rows(t_rows, move |t| unsafe {
                     let xr = std::slice::from_raw_parts((xp.0 as *const f32).add(t * h), h);
                     let ss: f32 = xr.iter().map(|&v| v * v).sum();
                     let inv = 1.0 / ((ss / h as f32 + eps).sqrt());
-                    let ob = (op.0 as *mut f32).add(t * h);
+                    let sb = (sp.0 as *mut f32).add(t * h);
                     let nw = np.0 as *const f32;
                     for i in 0..h {
-                        *ob.add(i) = *xr.get_unchecked(i) * inv * *nw.add(i);
+                        *sb.add(i) = *xr.get_unchecked(i) * inv * *nw.add(i);
                     }
                 });
             }
+            drop(_n1);
+            // FFN 트리오(단일 배치): gate/up gemm → ew_t(GPU) → down gemm.
             let _gf = ph("pp:ffn");
-            let ffn_out = ffn_batch(tr, il, &xf, t_rows)?;
+            let ffn_out = tr.ffn_trio_batch(
+                &format!("{lp}.mlp.gate_proj"),
+                &format!("{lp}.mlp.up_proj"),
+                &format!("{lp}.mlp.down_proj"),
+                t_rows,
+            )?;
             drop(_gf);
+            let _r1 = ph("pp:resid2");
             for (a, b) in x.iter_mut().zip(ffn_out.iter()) {
                 *a += b;
             }
+            drop(_r1);
         }
         seq.pos += t_rows as u32;
         // 마지막 청크: output_norm + lm_head(마지막 행만)
