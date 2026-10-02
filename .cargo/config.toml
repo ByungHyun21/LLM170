@@ -1,0 +1,5 @@
+# rpath: ROCm 10 런타임을 LD_LIBRARY_PATH 없이 찾게 한다 (2026-10-04).
+# vk 전용 경로(EXL3)도 이 경로 덕에 ROCm 라이브러리 로드 가능.
+# 진정한 vk-only 빌드는 별도 피처(후속 — 49곳 rawhip 참조 리팩터 필요).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/opt/rocm-10.0.0/install/lib"]
