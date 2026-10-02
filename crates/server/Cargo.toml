@@ -12,6 +12,7 @@ llm170-diag = { path = "../diag" }
 half = "2"
 memmap2 = "0.9"
 llm170-gguf = { path = "../gguf" }
+llm170-exl3 = { path = "../exl3" }
 llm170-core = { path = "../core" }
 llm170-backend-gpu = { path = "../backend-gpu" }
 log = "0.4"

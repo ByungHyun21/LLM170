@@ -1,0 +1,11 @@
+[package]
+name = "llm170-exl3"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+llm170-diag = { path = "../diag" }
+half = "2"
+
+[lints]
+workspace = true

@@ -103,6 +103,11 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                 t_b,
             )
         }
+        "exl3-check" => {
+            let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
+            let d_q8 = "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q8_K_XL.gguf";
+            cmd_exl3_check(&arg_str(args, 0, d_exl3), &arg_str(args, 1, d_q8))
+        }
         "diag" => {
             // plans/82: 지문 비교 — `llm170 diag diff <A> <B>`
             if args.first().map(String::as_str) == Some("diff") {
@@ -1190,4 +1195,93 @@ fn cmd_ckdiff(a_path: &str, b_path: &str, rel_lim: f64) -> ExitCode {
         println!("  {tag:<16} t={t:<4} A={sa:14.4} B={sb:14.4} rel={rel:.3e}");
     }
     ExitCode::FAILURE
+}
+
+/// llm170 exl3-check <exl3_dir> <q8.gguf> — EXL3 참조 디코드 ↔ GGUF Q8 대조
+/// (plans/118 §3-1). Python 검증기(scripts/exl3_validate.py)의 내부화:
+/// K=3/4/5 혼재 텐서의 128×128 블록 상관계수. 기준: corr ≥ 0.97(K=3 양자화
+/// 오차 수준) — 그 미만이면 디코드 회귀.
+fn cmd_exl3_check(exl3_dir: &str, gguf_path: &str) -> Result<String, String> {
+    let ar =
+        llm170_exl3::StArchive::open(std::path::Path::new(exl3_dir)).map_err(|e| e.to_string())?;
+    let g =
+        llm170_gguf::GgufFile::open(std::path::Path::new(gguf_path)).map_err(|e| e.to_string())?;
+    let cases: &[(&str, &str)] = &[
+        (
+            "model.language_model.layers.0.mlp.gate_proj",
+            "blk.0.ffn_gate.weight",
+        ),
+        (
+            "model.language_model.layers.0.mlp.down_proj",
+            "blk.0.ffn_down.weight",
+        ),
+        (
+            "model.language_model.layers.3.self_attn.o_proj",
+            "blk.3.attn_output.weight",
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_qkv",
+            "blk.0.attn_qkv.weight",
+        ),
+    ];
+    use std::io::{Read, Seek, SeekFrom};
+    let mut report = String::new();
+    let mut all_ok = true;
+    for (key, gname) in cases {
+        let (corr, krate) = (|| -> Result<(f64, u32), String> {
+            let w = llm170_exl3::Exl3Linear::load(&ar, key).map_err(|e| e.to_string())?;
+            let ti = g
+                .find_tensor(gname)
+                .ok_or_else(|| format!("gguf tensor not found: {gname}"))?;
+            if ti.ty != llm170_gguf::GgmlType::Q8_0 {
+                return Err(format!("{gname}: Q8_0 아님({:?})", ti.ty));
+            }
+            let (start, end) = ti
+                .file_range(g.data_offset)
+                .ok_or_else(|| format!("{gname}: 범위 계산 불가"))?;
+            // 참조는 처음 128행(출력)만 — 텐서 전체 미로딩.
+            let row_bytes = (ti.ne[0] as usize / 32) * 34;
+            let nread = ((end - start) as usize).min(128 * row_bytes);
+            let mut raw = vec![0u8; nread];
+            let mut f = std::fs::File::open(&g.path).map_err(|e| e.to_string())?;
+            f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+            f.read_exact(&mut raw).map_err(|e| e.to_string())?;
+            let k = ti.ne[0] as usize;
+            let mut wref = vec![0f64; 128 * 128]; // [k][n]
+            let mut row = vec![0f32; k];
+            for n in 0..128usize {
+                llm170_core::quant::dequant_row(ti.ty, &raw, n as u64, k as u64, &mut row);
+                for (i, v) in row.iter().take(128).enumerate() {
+                    wref[i * 128 + n] = *v as f64;
+                }
+            }
+            let wex = w.dequant_block_f64(0, 0, 128, 128);
+            let (ma, mb) = (
+                wex.iter().sum::<f64>() / 16384.0,
+                wref.iter().sum::<f64>() / 16384.0,
+            );
+            let (mut sab, mut saa, mut sbb) = (0f64, 0f64, 0f64);
+            for i in 0..16384 {
+                let (a, b) = (wex[i] - ma, wref[i] - mb);
+                sab += a * b;
+                saa += a * a;
+                sbb += b * b;
+            }
+            Ok((sab / (saa * sbb).sqrt(), w.krate))
+        })()
+        .inspect_err(|_| all_ok = false)?;
+        let ok = corr >= 0.97;
+        all_ok &= ok;
+        let short: String = key.split('.').rev().take(2).collect::<Vec<_>>().join(".");
+        report.push_str(&format!(
+            "{short:44} K={krate} corr={corr:.5} {}\n",
+            if ok { "ok" } else { "FAIL" }
+        ));
+    }
+    if all_ok {
+        report.push_str("exl3-check: 전 텐서 통과 (기준 corr ≥ 0.97)");
+        Ok(report)
+    } else {
+        Err(report)
+    }
 }
