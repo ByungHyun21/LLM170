@@ -1,0 +1,38 @@
+#version 450
+
+// exl3_had_out (plans/118 §3-1) — EXL3 출력 스테이지:
+// y = H128(S)/√128 ⊙ svh (f32 경로 — 참조 had_ff_r_128_inner<false,true>,
+// qwen3_5 선형은 out_dtype=torch.float).
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer SB { float s[]; };      // f32 [n]
+layout(binding = 1) readonly buffer SvhB { uint svh16[]; }; // f16 쌍팩 [n/2]
+layout(binding = 2) writeonly buffer YB { float y[]; };     // f32 [n]
+layout(push_constant) uniform PC { uint nchunks; } pc;      // n/128
+
+const float R_SCALE = 0.08838834764831845;
+
+shared float smem[128];
+
+void main() {
+    uint chunk = gl_WorkGroupID.x;
+    if (chunk >= pc.nchunks) return;
+    uint base = chunk * 128u;
+    uint th = gl_LocalInvocationID.x;
+
+    smem[th] = s[base + th];
+    barrier();
+    for (uint w = 1u; w < 128u; w <<= 1u) {
+        uint grp = th / w;
+        uint blk = (grp >> 1u) * 2u * w;
+        uint i = blk + (th % w);
+        float a = smem[i];
+        float b = smem[i + w];
+        barrier();
+        smem[i] = a + b;
+        smem[i + w] = a - b;
+        barrier();
+    }
+    uint j = base + th;
+    float sv = unpackHalf2x16(svh16[j >> 1u])[j & 1u];
+    y[j] = smem[th] * R_SCALE * sv;
+}

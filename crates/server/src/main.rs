@@ -51,6 +51,8 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
       디양자화 값 프로브.
   llm170 exl3-check [exl3_dir] [q8.gguf]
       EXL3 트렐리스 디코드 ↔ GGUF Q8 대조 (K=3/4/5 corr 기준 0.97).
+  llm170 exl3-vk-check [exl3_dir] [tensor-key]
+      EXL3 vk GEMV 3커널(had_in/gemv/had_out) ↔ CPU 미러 비트/FMA 검증 + 속도.
 
 개발 프로브 (backend-gpu 검증·타이밍):
   rawhip-check <file> <tensor>   HIP GEMV ↔ CPU 미러 to_bits 검증

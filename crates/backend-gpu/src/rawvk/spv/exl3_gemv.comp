@@ -1,0 +1,62 @@
+#version 450
+
+// exl3_gemv (plans/118 §3-1) — EXL3 트렐리스 GEMV (m=1 디코드 경로):
+// S[n] = Σ_k A_had[k] · Wq[k,n], Wq는 trellis에서 즉석 디코드.
+// 참조: exllamav3 CPU scalar_tiles + decode_state_scalar/decode_mul1_scalar
+// (moe_mul1.cpp) — plans/118 §6 검증 명세의 GLSL 직이식.
+//
+// WG=128 스레드 = n-타일 8개(스레드당 출력 1열). k 전체 순회, f32 누산
+// (참조 CUDA는 f16 누산 — 상위 정밀도, 원장 10a/177).
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer AhB { uint ah16[]; };  // f16 쌍팩 [k/2]
+layout(binding = 1) readonly buffer TreB { uint tre[]; };  // trellis u32 뷰
+layout(binding = 2) writeonly buffer SB { float s[]; };    // f32 [n]
+layout(push_constant) uniform PC {
+    uint ktiles;
+    uint ntiles;
+    uint K;        // bpw(정수부) — u16 폭 16K
+} pc;
+
+// mul1 코드북 — plans/118 §6.2. sum 비트패턴 [0x6400,0x67FC]의 f16 값은
+// 정확히 1024+bytesum([1024,2048) ULP=1) — 참조 half_uint16 트릭과 동치.
+float mul1_decode(uint w) {
+    uint x = w * 0x83DCD12Du;
+    uint sum = (x & 0xFFu) + ((x >> 8u) & 0xFFu) + ((x >> 16u) & 0xFFu) + (x >> 24u);
+    return (1024.0 + float(sum)) * 0.00676727294921875 - 10.3828125;
+}
+
+void main() {
+    uint nt = gl_WorkGroupID.x * 8u + (gl_LocalInvocationID.x >> 4u);
+    if (nt >= pc.ntiles) return;
+    uint c = gl_LocalInvocationID.x & 15u;
+
+    uint words32 = 8u * pc.K;
+    uint tbase = nt * words32;              // 타일(kt=0, nt) u32 오프셋
+    uint tstride = pc.ntiles * words32;     // k-타일 행 보폭
+    float acc = 0.0;
+
+    for (uint kt = 0u; kt < pc.ktiles; kt++) {
+        // 타일 (kt, nt)의 열 c 16가중치(r=0..15) — 순회 내 a_had 로드 공유.
+        for (uint r = 0u; r < 16u; r++) {
+            // tensor_core_perm 역: t = (4*(c&7) + ((r&7)>>1))*8
+            //                      + ((r>>3)*2 + (r&1) + ((c>>3)*4))
+            uint t = (4u * (c & 7u) + ((r & 7u) >> 1u)) * 8u
+                   + ((r >> 3u) * 2u + (r & 1u) + ((c >> 3u) * 4u));
+            // 워드 t = 링 비트 [(t+1)K-16, (t+1)K) — decode_state_scalar 리터럴.
+            uint b0 = t * pc.K + (pc.K + 256u * pc.K - 16u);
+            uint b1 = b0 + 16u;
+            uint i0 = (b0 >> 5u) % words32;
+            uint i1 = ((b1 - 1u) >> 5u) % words32;
+            uint sh = (((b1 - 1u) >> 5u) + 1u) * 32u - b1;
+            uint a = tre[tbase + i0];
+            uint b = tre[tbase + i1];
+            uint w = (sh == 0u) ? (b & 0xFFFFu)
+                                : (((b >> sh) | (a << (32u - sh))) & 0xFFFFu);
+            uint j = kt * 16u + r;
+            float xv = unpackHalf2x16(ah16[j >> 1u])[j & 1u];
+            acc += xv * mul1_decode(w);
+        }
+        tbase += tstride;
+    }
+    s[nt * 16u + c] = acc;
+}

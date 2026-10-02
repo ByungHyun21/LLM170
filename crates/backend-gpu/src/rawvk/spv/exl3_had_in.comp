@@ -1,0 +1,83 @@
+#version 450
+
+// exl3_had_in (plans/118 §3-1) — EXL3 입력 스테이지:
+// A_had = H128(x ⊙ suh) / √128 — 128청크 자연 순서 WHT.
+// 참조: exllamav3 had_hf_r_128_inner<true,false> — f16 pre-scale → f32 변환 →
+// H → ×1/√128 → f16 저장. WG=128 스레드 = 청크 1개, 공유메모리 버터플라이.
+//
+// f32→f16은 수동 RTNE(floatBitsToUint) — 이 드라이버의 packHalf2x16이
+// 절사(RTZ)로 관측되어(하향 1~8 ULP) Rust half(RTNE)와 비트 정합이 깨진다.
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer XB { uint x16[]; };    // f16 쌍팩 [k/2]
+layout(binding = 1) readonly buffer SuhB { uint suh16[]; }; // f16 쌍팩 [k/2]
+layout(binding = 2) writeonly buffer AhB { uint ah16[]; };  // f16 쌍팩 [k/2]
+layout(push_constant) uniform PC { uint kchunks; } pc;      // k/128
+
+const float R_SCALE = 0.08838834764831845; // 1/sqrt(128), 참조 동일값
+
+// f32 → f16 비트 (RTNE) — Rust half::from_f32 미러. 오버플로→inf,
+// |v| < 2^-25 → ±0, 하한 반올림 짝수 규칙 포함.
+uint f32_to_f16_rtne(float v) {
+    uint x = floatBitsToUint(v);
+    uint sign = (x >> 16) & 0x8000u;
+    uint rest = x & 0x7FFFFFFFu;
+    if (rest >= 0x7F800000u) return sign | 0x7C00u | uint((rest & 0x7FFFFFu) != 0u);
+    int e = int(rest >> 23) - 127;
+    uint man = rest & 0x7FFFFFu;
+    uint h;
+    if (e >= -14) {
+        h = (uint(e + 15) << 10) | (man >> 13);
+        uint rem = man & 0x1FFFu;
+        if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;
+        if (h >= 0x7C00u) h = 0x7C00u;
+    } else if (e < -25) {
+        return sign;
+    } else {
+        uint m = 0x800000u | man;
+        uint sh = uint(-14 - e) + 13u;
+        uint rem = m & ((1u << sh) - 1u);
+        h = m >> sh;
+                uint halfway = 1u << (sh - 1u);
+                if (rem > halfway || (rem == halfway && (h & 1u) != 0u)) h += 1u;
+    }
+    return sign | h;
+}
+
+shared float smem[128];
+
+void main() {
+    uint chunk = gl_WorkGroupID.x;
+    if (chunk >= pc.kchunks) return;
+    uint base = chunk * 128u;
+    uint th = gl_LocalInvocationID.x;
+
+    // f16 pre-scale — 참조의 __hmul2: f32 곱 후 f16 RTNE 반올림으로 미러.
+    uint xw = x16[(base + th) >> 1u];
+    uint sw = suh16[(base + th) >> 1u];
+    vec2 xv = unpackHalf2x16(xw);
+    vec2 sv = unpackHalf2x16(sw);
+    uint pre = f32_to_f16_rtne(xv[th & 1u] * sv[th & 1u]);
+    smem[th] = unpackHalf2x16(pre)[0];
+
+    // 자연 순서 WHT — 폭 배증 버터플라이 7단계.
+    for (uint w = 1u; w < 128u; w <<= 1u) {
+        uint grp = th / w;
+        uint blk = (grp >> 1u) * 2u * w;
+        uint i = blk + (th % w);
+        float a = smem[i];
+        float b = smem[i + w];
+        barrier();
+        smem[i] = a + b;
+        smem[i + w] = a - b;
+        barrier();
+    }
+
+    float o = smem[th] * R_SCALE;
+    smem[th] = o;
+    barrier();
+    // f16 쌍팩 스캐터 — 짝수 스레드가 워드 조립.
+    if ((th & 1u) == 0u) {
+        ah16[(base + th) >> 1u] = f32_to_f16_rtne(smem[th])
+                                | (f32_to_f16_rtne(smem[th + 1u]) << 16);
+    }
+}
