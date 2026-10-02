@@ -81,7 +81,7 @@ pub(super) fn ensure_pre_views(
 //
 // 문제: 프리필은 청크마다 **전체 무게 1회 읽기**가 고정비다(FN 104GiB ≈ 0.4s
 // 하한). 슬롯 4개가 함께 도착하면 같은 읽기를 4번 하게 되고, 이것이 np4 셀
-// 0.86x 의 주범이었다(docs/benchmarks.md "Why np4 loses" 2항).
+// 0.86x 의 주범이었다(Why-np4-loses 측정 — plans/archive/benchmarks.md).
 //
 // 구조: dense op(mm_group / hc / MoE / head GEMM)는 t_total = n_seq·per_seq
 // 행을 **1회**로 처리해 무게 읽기를 공유한다. 시퀀스 소유 상태(GDN conv 링·AR,

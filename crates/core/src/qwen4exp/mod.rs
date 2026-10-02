@@ -1,12 +1,16 @@
 //! qwen4exp (Qwen3.8-Flash-Next 125B-A6B) CPU 참조 엔진.
 //!
 //! 그래프 배선: `~/local_llm-runtimes/qwen4exp/src/models/qwen4exp.cpp` + llama-graph.cpp
-//! build_moe_ffn (2026-08-30 판). 스펙: docs/models/qwen4exp.md.
+//! build_moe_ffn (2026-08-30 판).
+//! 하이퍼파라미터: n_embd 2560, vocab 248320, ctx 262144. 파라미터
+//! 125B 본체(A6B) + PLE 51B + MTP 4B(MTP는 UD GGUF에서 누락).
 //! - 48층 = 12×(3×GDN→MoE + 1×QSA→MoE) — compress_ratios[il]==0이 GDN, 4가 QSA
 //! - 잔차 = hyper-connection 4스트림 (모든 norm 대체): mix = grouped RMSNorm(γ=(1+w) 폴딩)
 //!   ·저랭크 게이트·스트림 평균 / combine = s += out·2σ(inject/4)
 //! - GDN: qwen35 동일 모듈, z-gate가 sigmoid
-//! - QSA: 게이트드 GQA(24Q/2KV/256d, IMROPE 64) + indexer(4q/1k/128d) 블록(4) 상위 top_k=2048 마스크
+//! - QSA: 게이트드 GQA(24Q/2KV/256d, IMROPE 64) + indexer(4q/1k/128d) 블록(4) 상위
+//!   top_k=2048 마스크(선폭 = min(n_kv, top_k + ratio − 1)).
+//!   KV f16 24 KiB/token + indexer 3 KiB/token.
 //! - MoE: 512전문가 top-10(softmax→정규화) + shared 1개(sigmoid 게이트)
 //! - PLE(blk.1): n-gram 해시(호스트 u64) → 16행×160 gather → key/value → sgn√|s| 게이트
 //!   → 4스트림 방송 → dilated(3) depthwise conv(4) → 잔차 2경로. 테이블 26.8GiB mmap 오프로드.

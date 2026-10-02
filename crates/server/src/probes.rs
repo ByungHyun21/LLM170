@@ -595,7 +595,7 @@ fn cmd_chunk_check(args: &[String]) -> ExitCode {
             (
                 "PASS",
                 format!(
-                    "near-tie max|Δ|={maxd:.3e} (행 수 의존 잔여축 — docs/chunk-invariance.md)"
+                    "near-tie max|Δ|={maxd:.3e} (행 수 의존 잔여축 — plans/archive/chunk-invariance.md)"
                 ),
             )
         } else {
@@ -607,7 +607,7 @@ fn cmd_chunk_check(args: &[String]) -> ExitCode {
     if all_pass {
         ExitCode::SUCCESS
     } else {
-        println!("chunk-check: FAIL — 청크 불변성 위반 (docs/chunk-invariance.md)");
+        println!("chunk-check: FAIL — 청크 불변성 위반 (plans/archive/chunk-invariance.md)");
         ExitCode::FAILURE
     }
 }

@@ -1,10 +1,16 @@
 //! qwen35 (Qwen3.8-27B 계열) CPU 참조 엔진.
 //!
 //! 그래프 배선: `~/local_llm/llama.cpp/src/models/qwen35.cpp` (2026-08-30 판).
-//! - 잔차: h += attn(rms(h)); h += ffn(rms_post(h))
+//! 하이퍼파라미터(27B): n_embd 5120, FFN 17408(SwiGLU), vocab 248320,
+//! rms_eps 1e-6, ctx 262144. 64층 = 12×(3×GDN→FFN + 1×GatedAttn→FFN)
+//! (full_attention_interval=4 → full-attn il∈{3,7,…,63}), GGUF
+//! block_count=65 (MTP blk.64, mtp_num_hidden_layers=1).
+//! - 잔차: h += attn(rms(h)); h += ffn(rms_post(h)) — FFN 분기는 **post**-attn norm
 //! - GDN층(interval≠3): qkv → depthwise conv+SiLU → L2 norm(q,k) → GDN → rms_norm·silu(z) → ssm_out
-//! - Full-attn층(interval==3): q‖gate fused → per-head rms norm(q,k) → RoPE(n_rot, base, 인접 페어)
-//!   → GQA(scale 1/√head_dim) → ⊙sigmoid(gate) → wo
+//! - Full-attn층(interval==3): wq는 Q‖gate 퓨전 [5120, 12288] 헤드별 인터리브
+//!   (스트라이드 2·head_dim) → per-head rms norm(q,k) [256] → RoPE half-split
+//!   (n_rot 64, base 1e7 — 텍스트 토큰에서 mrope 구간 [11,11,10]과 동치)
+//!   → GQA(24Q/4KV, scale 1/√256) → ⊙sigmoid(gate) → wo. KV f16 64 KiB/token(16층).
 //! - 하이퍼파라미터는 GGUF 메타에서 동적 로드 (소형 검증 모델 지원).
 //! - f32 KV, f32 GDN 상태 (참조 정확도 우선).
 
