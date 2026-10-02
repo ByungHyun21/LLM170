@@ -488,6 +488,7 @@ dependencies = [
  "libc",
  "llm170-core",
  "llm170-diag",
+ "llm170-exl3",
  "llm170-gguf",
  "parking_lot",
 ]

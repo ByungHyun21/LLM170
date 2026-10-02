@@ -9,6 +9,9 @@ coopmat_probe.spv	comp	-	67ceda4d69007179
 copy_off.spv	comp	-	5666ff058b8d3e80
 copy_rows.spv	comp	-	f10b1300e8b89189
 ew_sigmoid.spv	comp	-	444a3b0c6998ba94
+exl3_gemv.spv	comp	-	82e6d5a4b6621843
+exl3_had_in.spv	comp	-	0c0146c4d97ada08
+exl3_had_out.spv	comp	-	eede33d4ffa1cfcf
 fn_argmax_rows.spv	comp	-	6ea8a5b960c1d834
 fn_emb_q8g.spv	comp	-	b5fb4e2d7a683cb3
 fn_emb_q8g_f16.spv	comp	-	4fd775b10899f11c
