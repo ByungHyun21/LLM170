@@ -214,9 +214,161 @@ fn gdn_chunk_head(
     }
 }
 
+// ── GDN AR 헤드 병렬 풀 (plans/120 A1) ──
+// exl3 직접 디코드 계측: gdn:delta 79.6ms/토큰, 그중 상당분이 토큰당
+// 48층 × 48헤드 = 2304회 thread::scope OS 스폰이었다. 상수 풀로 스폰 비용
+// 제거. 잡이 'static이어야 하므로 호출자 소유 버퍼는 원시 포인터로 캡처하고
+// run_par가 완료 카운터 도달 시에만 반환함으로써 수명을 증명한다(아래 SAFETY).
+mod ar_pool {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    type Job = Box<dyn FnOnce() + Send + 'static>;
+
+    struct Queue {
+        jobs: Mutex<VecDeque<Job>>,
+        cv: Condvar,
+    }
+    static QUEUE: OnceLock<Queue> = OnceLock::new();
+
+    fn queue() -> &'static Queue {
+        QUEUE.get_or_init(|| {
+            let n = std::thread::available_parallelism()
+                .map(|v| v.get())
+                .unwrap_or(8)
+                .min(64);
+            for _ in 0..n {
+                let worker = std::thread::Builder::new().name("gdn-ar-pool".into());
+                if worker.spawn(worker_loop).is_err() {
+                    break; // 잔여 워커로 진행 — 전멸 시에만 교착 가능
+                }
+            }
+            Queue {
+                jobs: Mutex::new(VecDeque::new()),
+                cv: Condvar::new(),
+            }
+        })
+    }
+
+    fn worker_loop() {
+        let Some(q) = QUEUE.get() else { return };
+        loop {
+            let job = {
+                let mut g = q.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                while g.is_empty() {
+                    g = q.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                }
+                match g.pop_front() {
+                    Some(j) => j,
+                    None => continue,
+                }
+            };
+            job();
+        }
+    }
+
+    /// n_jobs개 잡 분배 후 전부 완료까지 대기. 잡 패닉은 페이로드를 보관해
+    /// 호출자 스레드에서 재개한다(thread::scope + join().unwrap() 의미 보존).
+    pub fn run_par(n_jobs: usize, make: impl Fn(usize) -> Job) {
+        let q = queue();
+        let done = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let panic_payload: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>> =
+            Arc::new(Mutex::new(None));
+        for i in 0..n_jobs {
+            let job = make(i);
+            let d = Arc::clone(&done);
+            let pp = Arc::clone(&panic_payload);
+            let mut g = q.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            g.push_back(Box::new(move || {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                if let Err(p) = r
+                    && let Ok(mut slot) = pp.lock()
+                    && slot.is_none()
+                {
+                    *slot = Some(p);
+                }
+                let (m, c) = &*d;
+                let mut g2 = m.lock().unwrap_or_else(|e| e.into_inner());
+                *g2 += 1;
+                c.notify_all();
+            }));
+            drop(g);
+            q.cv.notify_one();
+        }
+        let (m, c) = &*done;
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        while *g < n_jobs {
+            g = c.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(g);
+        if let Ok(mut slot) = panic_payload.lock()
+            && let Some(p) = slot.take()
+        {
+            std::panic::resume_unwind(p);
+        }
+    }
+}
+
+/// 원시 포인터의 usize 보관 래퍼 — ar_pool 잡 캡처용.
+/// (usize 필드는 Send — 에디션 2021 정밀 캡처가 구조체가 아닌 필드를
+/// 캡처하므로 *mut 을 직접 넣으면 Send가 깨진다.)
+/// SAFETY: 주소가 가리키는 버퍼는 run_par 반환 전까지 유효하고(완료
+/// 카운터 증명) pair별 접근 영역은 서로 격리된다 — gdn_ar_batch의 SAFETY 참조.
+#[derive(Clone, Copy)]
+struct SendPtr(usize);
+
+/// 단일 (seq, v-head) AR 스텝. 비트동일 보존 전제(plans/120 A1):
+/// · sk/o 순회를 행(kdim) 우량으로 전환하되 kdim 누적 순서와 항 표현식
+///   `(s·q)·scale`·`(s·k)` 을 원문과 동일하게 유지한다(열 우량 그대로면
+///   스트라이드 d 접근으로 캐시·벡터화 모두 실패).
+/// · delta 갱신은 각 원소에 +1회 — 열→행 전환은 값 불변(비트동일).
+#[allow(clippy::too_many_arguments)]
+fn gdn_ar_head(
+    st: &mut [f32],
+    qs: &[f32],
+    ks: &[f32],
+    vs: &[f32],
+    beta_h: f32,
+    g_exp: f32,
+    scale: f32,
+    lo: &mut [f32],
+) {
+    let d = qs.len();
+    let mut sk = vec![0.0f32; d];
+    for kdim in 0..d {
+        let kk = ks[kdim];
+        let row = &mut st[kdim * d..kdim * d + d];
+        for dv in 0..d {
+            row[dv] *= g_exp;
+            sk[dv] += row[dv] * kk;
+        }
+    }
+    let mut delta = vec![0.0f32; d];
+    for dv in 0..d {
+        delta[dv] = (vs[dv] - sk[dv]) * beta_h;
+    }
+    for kdim in 0..d {
+        let kd = ks[kdim];
+        let row = &mut st[kdim * d..kdim * d + d];
+        for dv in 0..d {
+            row[dv] += kd * delta[dv];
+        }
+    }
+    let mut o = vec![0.0f32; d];
+    for kdim in 0..d {
+        let qq = qs[kdim];
+        let row = &st[kdim * d..kdim * d + d];
+        for dv in 0..d {
+            o[dv] += row[dv] * qq * scale;
+        }
+    }
+    lo.copy_from_slice(&o);
+}
+
 /// 배치 디코드: 토큰 1개 × n_seqs. (build_delta_net_autoregressive / fused one_chunk)
 /// 레이아웃: q/k `[B][H_k][d]`, v `[B][H_v][d]`, beta/g `[B][H_v]`,
-/// states `[B][H_v][d*d]`, out `[B][H_v][d]`. (seq, v-head) 쌍별 병렬.
+/// states `[B][H_v][d*d]`, out `[B][H_v][d]`. (seq, v-head) 쌍별 병렬
+/// (ar_pool 상수 풀 — plans/120 A1, 스폰 2304회/토큰 제거).
 pub fn gdn_ar_batch(
     q: &[f32],
     k: &[f32],
@@ -235,60 +387,45 @@ pub fn gdn_ar_batch(
     let k_stride = h_k * d;
     let v_stride = h_v * d;
 
-    let mut local_outs: Vec<Vec<f32>> = vec![vec![0.0f32; d]; n_seqs * h_v];
+    let n_pairs = n_seqs * h_v;
+    let mut local_outs = vec![0.0f32; n_pairs * d];
     {
-        let state_chunks: Vec<&mut [f32]> = states.chunks_mut(d * d).collect();
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for (pair, (st, lo)) in state_chunks
-                .into_iter()
-                .zip(local_outs.iter_mut())
-                .enumerate()
-            {
-                handles.push(scope.spawn(move || {
-                    let (b, h) = (pair / h_v, pair % h_v);
-                    let kh = h % h_k;
-                    let qs = &q[b * k_stride + kh * d..b * k_stride + kh * d + d];
-                    let ks = &k[b * k_stride + kh * d..b * k_stride + kh * d + d];
-                    let vs = &v[b * v_stride + h * d..b * v_stride + h * d + d];
-                    let beta_h = beta[b * h_v + h];
-                    let g_exp = crate::ops::exp_cr(g[b * h_v + h]);
-
-                    // S ← S·e^g;  sk[dv] = Σ_kdim S[kdim,dv]·k[kdim]
-                    let mut sk = vec![0.0f32; d];
-                    for kdim in 0..d {
-                        let kk = ks[kdim];
-                        for dv in 0..d {
-                            let s = &mut st[kdim * d + dv];
-                            *s *= g_exp;
-                            sk[dv] += *s * kk;
-                        }
-                    }
-                    // delta[dv] = (v[dv] − sk[dv])·β;  S += k⊗delta
-                    for dv in 0..d {
-                        let delta = (vs[dv] - sk[dv]) * beta_h;
-                        for kdim in 0..d {
-                            st[kdim * d + dv] += ks[kdim] * delta;
-                        }
-                    }
-                    // o[dv] = Σ_kdim S[kdim,dv]·(q[kdim]·scale)
-                    for dv in 0..d {
-                        let mut o = 0.0f32;
-                        for kdim in 0..d {
-                            o += st[kdim * d + dv] * qs[kdim] * scale;
-                        }
-                        lo[dv] = o;
-                    }
-                }));
-            }
-            for hd in handles {
-                hd.join().unwrap();
-            }
+        // SAFETY: 잡은 원시 포인터(SendPtr)만 캡처한다.
+        // (1) states·local_outs·q·k·v·beta·g는 run_par 반환 전까지 유효 —
+        //     run_par는 완료 카운터가 n_pairs에 도달해야만 반환한다.
+        // (2) pair별 영역은 서로 겹치지 않는다: 상태는 d*d 청크, 로컬 출력은
+        //     d 청크(기존 chunks_mut 분할과 동일), 입력은 읽기 전용 공유.
+        let st_base = SendPtr(states.as_mut_ptr() as usize);
+        let lo_base = SendPtr(local_outs.as_mut_ptr() as usize);
+        let (qb, kb, vb, bb, gb) = (
+            SendPtr(q.as_ptr() as usize),
+            SendPtr(k.as_ptr() as usize),
+            SendPtr(v.as_ptr() as usize),
+            SendPtr(beta.as_ptr() as usize),
+            SendPtr(g.as_ptr() as usize),
+        );
+        ar_pool::run_par(n_pairs, move |pair| {
+            Box::new(move || unsafe {
+                let st = std::slice::from_raw_parts_mut(
+                    (st_base.0 as *mut f32).add(pair * d * d),
+                    d * d,
+                );
+                let lo = std::slice::from_raw_parts_mut((lo_base.0 as *mut f32).add(pair * d), d);
+                let (b, h) = (pair / h_v, pair % h_v);
+                let kh = h % h_k;
+                let qs = std::slice::from_raw_parts((qb.0 as *const f32).add(b * k_stride + kh * d), d);
+                let ks = std::slice::from_raw_parts((kb.0 as *const f32).add(b * k_stride + kh * d), d);
+                let vs = std::slice::from_raw_parts((vb.0 as *const f32).add(b * v_stride + h * d), d);
+                let beta_h = *(bb.0 as *const f32).add(b * h_v + h);
+                let g_exp = crate::ops::exp_cr(*(gb.0 as *const f32).add(b * h_v + h));
+                gdn_ar_head(st, qs, ks, vs, beta_h, g_exp, scale, lo);
+            })
         });
     }
-    for pair in 0..n_seqs * h_v {
+    for pair in 0..n_pairs {
         let (b, h) = (pair / h_v, pair % h_v);
-        out[b * v_stride + h * d..b * v_stride + (h + 1) * d].copy_from_slice(&local_outs[pair]);
+        out[b * v_stride + h * d..b * v_stride + (h + 1) * d]
+            .copy_from_slice(&local_outs[pair * d..(pair + 1) * d]);
     }
 }
 
