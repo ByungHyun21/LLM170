@@ -13,37 +13,43 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 | backend | pp512 | pp4096 | pp8192 | pp16384 | tg128@4k |
 |---|---|---|---|---|---|
-| LLM170 hip | 340 | 323 | 312 | 291 | **11.15** |
+| LLM170 hip | 350.6 | 323 | 312 | 291 | **11.55** |
 | LLM170 vulkan | 336 | 318 | 308 | 284 | 10.02 |
 | llama.cpp hip | **350** | **335** | **327** | **313** | 9.56 |
 | llama.cpp vulkan | 331 | 308 | 291 | 262 | 11.54 |
 
 | mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
 |---|---|---|---|---|
-| tg single | **11.15** | 10.02 | 9.56 | 11.33 |
-| np4 greedy | 32.41 | **33.62** | — | — |
-| MTP k=2 | 2.26 | 2.24 | **~11.3** | — |
-| MTP k=3 | 2.19 | 2.16 | — | — |
-| MTP + np4 k=2 | 16.14 | n/a | **30.09** | — |
-| MTP + np4 k=3 | 12.55 | n/a | — | — |
+| tg single | **11.55** | 10.02 | 9.56 | 11.33 |
+| np4 greedy | 33.18 | **33.62** | 29.22 | — |
+| MTP k=2 | **12.64** | 12.51 | 17.40 | — |
+| MTP k=3 | 10.21 | 10.11 | 17.22 | — |
+| MTP + np4 k=2 | 14.43 | n/a | **35.97** | — |
+| MTP + np4 k=3 | 12.71 | n/a | 33.95 | — |
+
+llama MTP/np: llama-server `--spec-type draft-mtp --spec-draft-n-max K`,
+208-tok 프롬프트 × n_predict 128 × 3회 중앙값 (bench_np 프로토콜).
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
 | backend | pp512 | pp4096 | pp16384 | tg128@8k |
 |---|---|---|---|---|
-| LLM170 hip | 265.6 | 291.4 | 201.9 | 13.76 |
+| LLM170 hip | 299.1 | 291.4 | 201.9 | 14.11 |
 | LLM170 vulkan (frame) | 401.9 | — | — | — |
 | llama.cpp hip | **483** | **482** | **447** | **19.88** |
 | llama.cpp vulkan | 474 | 502 | 448.8 | 23.68 |
 
 | mode | LLM170 hip | llama hip |
 |---|---|---|
-| tg single | 13.76 | **19.88** |
-| np4 greedy | 34.06 | **49.03** |
-| MTP k=2 | 5.29 | — |
-| MTP k=3 | 4.73 | — |
-| MTP + np4 k=2 | 5.67 | — |
-| MTP + np4 k=3 | 7.67 | — |
+| tg single | 14.11 | **19.88** |
+| np4 greedy | 33.19 | **49.03** |
+| MTP k=2 | 7.5 | n/s |
+| MTP k=3 | 7.0 | n/s |
+| MTP + np4 k=2 | 8.41 | n/s |
+| MTP + np4 k=3 | 7.27 | n/s |
+
+llama FN MTP: 미지원 — draft-mtp가 `token_embd`를 요구하나 qwen4exp는
+per-layer embedding(`per_layer_token_embd`)이라 로드 거부 (0c1e57098).
 
 <!-- 금지: 이 영역에 게이트 통과·기능 나열·세션 노트 등 잡다한 산출물을
      적지 않는다 — 표 안의 측정값만 갱신한다 (repo 규칙). -->
