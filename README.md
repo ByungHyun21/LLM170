@@ -13,33 +13,27 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
-| LLM170 hip | — | — | — | — |
 | LLM170 vulkan | — | — | — | — |
-| exllamav3 (ROCm, reference) | — | — | — | — |
 
-| mode | LLM170 hip | LLM170 vulkan | exllamav3 (ROCm) |
-|---|---|---|---|
-| tg single | — | — | — |
-| np4 greedy | — | — | — |
-| MTP k=2 | — | — | — |
-| MTP k=3 | — | — | — |
-| MTP + np4 k=2 | — | — | — |
+| mode | LLM170 vulkan |
+|---|---|
+| tg single | — |
+| np4 greedy | — |
+| MTP k=2 | — |
+| MTP k=3 | — |
+| MTP + np4 k=2 | — |
 
 ### Qwen3.8-Flash-Next (EXL3 5.05bpw, 123.1 GB)
 
 | backend | pp512 | pp4096 | pp16384 | tg128@8k |
 |---|---|---|---|---|
-| LLM170 hip | — | — | — | — |
 | LLM170 vulkan | — | — | — | — |
-| exllamav3 (ROCm, reference) | — | — | — | — |
 
 ### DeepSeek-V4-Flash-Vision-Exp (EXL3 3.04bpw, 118.4 GB, vision + MTP3)
 
 | backend | pp512 | pp4096 | tg128 | VL |
 |---|---|---|---|---|
-| LLM170 hip | — | — | — | — |
 | LLM170 vulkan | — | — | — | — |
-| exllamav3 (ROCm, reference) | — | — | — | — |
 
 ### Q4_K (GGUF) — deprecated (EXL3 transition, 2026-10)
 
