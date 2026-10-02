@@ -14,9 +14,11 @@ mod trellis;
 
 pub use error::{Exl3Error, Result};
 pub use json::Json;
+pub mod convert;
+pub mod gguf_out;
 pub mod model;
 pub use model::{Exl3Config, Exl3Model, LinearRef, PlainRef};
-pub use trellis::{Exl3Linear, MUL1_MULT, PERM_INV, dequant_block, mul1_decode, tile_words};
+pub use trellis::{Exl3Linear, LinearView, MUL1_MULT, PERM_INV, mul1_decode, tile_words};
 
 use std::collections::HashMap;
 use std::io::Read;
