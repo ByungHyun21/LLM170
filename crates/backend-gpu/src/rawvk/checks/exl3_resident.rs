@@ -19,6 +19,14 @@ pub struct VkLinear {
     pub svh: VkBuf,
 }
 
+/// 지연 판독 핸들(plans/120 A1, LLM170_VK_DBUF=1) — 제출 후 즉시 반환된
+/// 배치의 결과 슬롯. TrellisResident::fetch()가 wait_pending으로 완료를 보장.
+pub struct PendingLin {
+    /// 결과 yb 슬롯 (0..2).
+    pub yb: usize,
+    pub n: usize,
+}
+
 /// 트렐리스 + 무양자화 가중치 전체를 vk에 상주.
 pub struct TrellisResident {
     pub linears: Vec<(String, VkLinear)>,
@@ -382,11 +390,45 @@ impl TrellisResident {
         }
         self.chain_one(self.x2b.buf, id, self.ahb3.buf, self.yb3.buf)?;
         self.ctx.end_batch_wait()?;
+        self.ctx.wait_pending()?; // DBUF 비동기 잔여 배출(비동기 아님 시 무연산)
 
         let mut y = vec![0f32; nd];
         // SAFETY: end_batch_wait 후 yb3 판독 — nd ≤ max_n(할당 상한).
         unsafe {
             std::ptr::copy_nonoverlapping(self.yb3.ptr as *const f32, y.as_mut_ptr(), nd);
+        }
+        Ok(y)
+    }
+
+    /// 비동기 선형 쌍: 제출만 하고 즉시 반환. 호출자는 qkvz 출력과 무독립한
+    /// CPU 일(예: alpha/beta dot)을 수행한 뒤 fetch로 합류한다. DBUF 부재
+    /// 시 end_batch_wait가 이미 대기 — fetch는 판독만 한다(의미 동일).
+    pub fn linear_pair_deferred(
+        &mut self,
+        key1: &str,
+        key2: &str,
+        x: &[f32],
+    ) -> Result<(PendingLin, PendingLin), String> {
+        let i1 = self.find_linear(key1)?;
+        let i2 = self.find_linear(key2)?;
+        let (n1, n2) = (self.linears[i1].1.n, self.linears[i2].1.n);
+        let k = self.linears[i1].1.k;
+        if x.len() != k || self.linears[i2].1.k != k {
+            return Err(format!("{key1}/{key2}: input dim mismatch"));
+        }
+        self.upload_x(x)?;
+        self.batch_chain(&[i1, i2], &[0, 1])?;
+        Ok((PendingLin { yb: 0, n: n1 }, PendingLin { yb: 1, n: n2 }))
+    }
+
+    /// 지연 결과 판독 — wait_pending 후 슬롯 버퍼에서 복사.
+    pub fn fetch(&mut self, p: PendingLin) -> Result<Vec<f32>, String> {
+        self.ctx.wait_pending()?;
+        let src = [self.yb1.ptr, self.yb2.ptr, self.yb3.ptr][p.yb];
+        let mut y = vec![0f32; p.n];
+        // SAFETY: wait_pending 후 매핑 판독 — n ≤ max_n.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src as *const f32, y.as_mut_ptr(), p.n);
         }
         Ok(y)
     }
@@ -401,6 +443,7 @@ impl TrellisResident {
 
         self.upload_x(x)?;
         self.batch_chain(&[idx], &[0])?;
+        self.ctx.wait_pending()?; // DBUF 잔여 배출
 
         let mut y = vec![0f32; n];
         // SAFETY: yb1 매핑 — batch_chain의 end_batch_wait 후.
@@ -428,6 +471,7 @@ impl TrellisResident {
 
         self.upload_x(x)?;
         self.batch_chain(&[i1, i2], &[0, 1])?;
+        self.ctx.wait_pending()?; // DBUF 잔여 배출
 
         let mut y1 = vec![0f32; n1];
         let mut y2 = vec![0f32; n2];
@@ -461,6 +505,7 @@ impl TrellisResident {
         }
         self.upload_x(x)?;
         self.batch_chain(&[i1, i2, i3], &[0, 1, 2])?;
+        self.ctx.wait_pending()?; // DBUF 잔여 배출
         let mut y1 = vec![0f32; n1];
         let mut y2 = vec![0f32; n2];
         let mut y3 = vec![0f32; n3];
