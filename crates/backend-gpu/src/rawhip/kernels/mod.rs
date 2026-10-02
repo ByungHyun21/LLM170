@@ -28,6 +28,7 @@ pub const NAMES: &[&str] = &[
     "q4_scale",
     "q4_l2_rows",
     "q4_hc_gate_mean",
+    "q4_hc_gate",
     "q4_hc_combine",
     "q4_norm_gated_sig",
     "q4_moe_group_t1",

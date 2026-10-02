@@ -5,7 +5,9 @@ pub(super) use crate::rawhip::KtraceEv;
 pub(super) use crate::rawhip::ck;
 pub(super) use crate::rawhip::env_on;
 pub(super) use crate::rawhip::kernels;
-pub(super) use crate::rawhip::{CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4};
+pub(super) use crate::rawhip::{
+    CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4, CO_W32M,
+};
 pub(super) use cubecl_hip_sys as hip;
 pub(super) use std::collections::HashMap;
 pub(super) use std::ffi::CString;
@@ -13,7 +15,7 @@ pub(super) use std::ffi::CString;
 pub struct RawCtx {
     pub(crate) fns: HashMap<&'static str, hip::hipFunction_t>,
     /// 로드된 코드오브젝트 패밀리 비트(CO_* 상수) — new() 완료 후 불변 (plans/78 R4).
-    pub(crate) co_fam: std::sync::atomic::AtomicU8,
+    pub(crate) co_fam: std::sync::atomic::AtomicU16,
     pub(crate) scope: std::sync::atomic::AtomicU8,
     pub(crate) stream: hip::hipStream_t,
     /// plans/115 D: 프리필 그래프 캡처 중 — sync/d2h_wait/ktr_ev 건너뜀.
@@ -101,7 +103,7 @@ impl RawCtx {
         self.scope.load(std::sync::atomic::Ordering::Relaxed) == SCOPE_FLASHNEXT
     }
 
-    pub fn co_loaded(&self, bit: u8) -> bool {
+    pub fn co_loaded(&self, bit: u16) -> bool {
         self.co_fam.load(std::sync::atomic::Ordering::Relaxed) & bit != 0
     }
 
@@ -196,15 +198,15 @@ impl RawCtx {
     /// # Safety: compile_rtc와 동일 초기화 경로.
     unsafe fn load_co_families(
         fns: &mut HashMap<&'static str, hip::hipFunction_t>,
-    ) -> Result<u8, String> {
-        let mut fam_bits = 0u8;
+    ) -> Result<u16, String> {
+        let mut fam_bits = 0u16;
         // SAFETY: 초기화 경로(단일 스레드).
         unsafe {
             // 오프라인 코드오브젝트 병행 로드 (wave32 커널 등).
             // 기본: 바이너리 임베딩(crates/.../co/*.co, gfx1151 빌드).
             // LLM170_CO*_PATH가 있으면 그 파일이 우선 (커널 실험 오버라이드).
             {
-                let slots: &[(u8, &str, &[u8], &[&str])] = &[
+                let slots: &[(u16, &str, &[u8], &[&str])] = &[
                     (
                         CO_V4,
                         "LLM170_CO2_PATH",
@@ -282,6 +284,12 @@ impl RawCtx {
                             "gemm_q8_j128",
                         ],
                     ),
+                    (
+                        CO_W32M,
+                        "LLM170_CO9_PATH",
+                        include_bytes!("../co/w32m.co"),
+                        &["gemm_q4k_j128m", "gemm_q5_1_j128m"],
+                    ),
                 ];
                 for (bit, env_key, embedded, names) in slots {
                     let bytes: Vec<u8> = match std::env::var_os(env_key) {
@@ -295,7 +303,7 @@ impl RawCtx {
                         hip::hipModuleLoadData(&mut m, bytes.as_ptr() as *const _),
                         &format!("{env_key} ModuleLoadData"),
                     )?;
-                    let mut loaded = 0u8;
+                    let mut loaded = 0u16;
                     for name in *names {
                         let cname = CString::new(*name).unwrap();
                         let mut f: hip::hipFunction_t = std::ptr::null_mut();
@@ -331,7 +339,7 @@ impl RawCtx {
             Ok(RawCtx {
                 scope: std::sync::atomic::AtomicU8::new(SCOPE_QWEN35),
                 fns,
-                co_fam: std::sync::atomic::AtomicU8::new(fam_bits),
+                co_fam: std::sync::atomic::AtomicU16::new(fam_bits),
                 stream,
                 capturing: std::sync::atomic::AtomicBool::new(false),
                 stream2,
