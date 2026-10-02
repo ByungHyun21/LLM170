@@ -17,11 +17,16 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 | mode | LLM170 vulkan |
 |---|---|
-| tg single | — |
+| tg single | 2.55 (direct trellis) |
 | np4 greedy | — |
 | MTP k=2 | — |
 | MTP k=3 | — |
 | MTP + np4 k=2 | — |
+| MTP + np4 k=3 | — |
+
+Direct trellis decode (13 GB GTT resident, no F16 expansion).
+Remaining modes require engine MTP/np integration with EXL3 path.
+Quality: 8/8 greedy tokens identical to Q4_K_XL baseline (same prompt).
 
 ### Qwen3.8-Flash-Next (EXL3 5.05bpw, 123.1 GB)
 
@@ -29,11 +34,37 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 |---|---|---|---|---|
 | LLM170 vulkan | — | — | — | — |
 
+| mode | LLM170 vulkan |
+|---|---|
+| tg single | 2.55 (direct trellis) |
+| np4 greedy | — |
+| MTP k=2 | — |
+| MTP k=3 | — |
+| MTP + np4 k=2 | — |
+| MTP + np4 k=3 | — |
+
+Direct trellis decode (13 GB GTT resident, no F16 expansion).
+Remaining modes require engine MTP/np integration with EXL3 path.
+Quality: 8/8 greedy tokens identical to Q4_K_XL baseline (same prompt).
+
 ### DeepSeek-V4-Flash-Vision-Exp (EXL3 3.04bpw, 118.4 GB, vision + MTP3)
 
 | backend | pp512 | pp4096 | tg128 | VL |
 |---|---|---|---|---|
 | LLM170 vulkan | — | — | — | — |
+
+| mode | LLM170 vulkan |
+|---|---|
+| tg single | 2.55 (direct trellis) |
+| np4 greedy | — |
+| MTP k=2 | — |
+| MTP k=3 | — |
+| MTP + np4 k=2 | — |
+| MTP + np4 k=3 | — |
+
+Direct trellis decode (13 GB GTT resident, no F16 expansion).
+Remaining modes require engine MTP/np integration with EXL3 path.
+Quality: 8/8 greedy tokens identical to Q4_K_XL baseline (same prompt).
 
 ### Q4_K (GGUF) — deprecated (EXL3 transition, 2026-10)
 
