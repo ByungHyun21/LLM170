@@ -234,17 +234,19 @@ impl TrellisResident {
             self.ctx
                 .bind_bufs(ds, &[self.xb.buf, l.suh.buf, self.ahb.buf]);
             let push = (k as u32 / 128).to_le_bytes().to_vec();
-            self.ctx.run_rw(
-                self.p1.pl,
-                ds,
-                self.p1.pipe,
-                &push,
-                (k / 128) as u32,
-                1,
-                1,
-                &[self.xb.buf, l.suh.buf],
-                &[self.ahb.buf],
-            )?;
+            crate::rawvk::context::site::scope("e3_had_in", || {
+                self.ctx.run_rw(
+                    self.p1.pl,
+                    ds,
+                    self.p1.pipe,
+                    &push,
+                    (k / 128) as u32,
+                    1,
+                    1,
+                    &[self.xb.buf, l.suh.buf],
+                    &[self.ahb.buf],
+                )
+            })?;
         }
 
         // 각 선형: gemv(ahb, tre → sb) + had_out(sb, svh → ybN)
@@ -264,17 +266,19 @@ impl TrellisResident {
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
-            self.ctx.run_rw(
-                self.p2.pl,
-                ds2,
-                self.p2.pipe,
-                &push2,
-                ((l.n / 16) as u32).div_ceil(8),
-                nseg,
-                1,
-                &[self.ahb.buf, l.tre.buf],
-                &[self.sb.buf],
-            )?;
+            crate::rawvk::context::site::scope("e3_gemv", || {
+                self.ctx.run_rw(
+                    self.p2.pl,
+                    ds2,
+                    self.p2.pipe,
+                    &push2,
+                    ((l.n / 16) as u32).div_ceil(8),
+                    nseg,
+                    1,
+                    &[self.ahb.buf, l.tre.buf],
+                    &[self.sb.buf],
+                )
+            })?;
 
             // had_out: sb × svh → ybN
             let ds3 = self.ctx.fresh_ds_for(&self.p3, 3)?;
@@ -283,17 +287,19 @@ impl TrellisResident {
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
-            self.ctx.run_rw(
-                self.p3.pl,
-                ds3,
-                self.p3.pipe,
-                &push3,
-                (l.n / 128) as u32,
-                1,
-                1,
-                &[self.sb.buf, l.svh.buf],
-                &[yb.buf],
-            )?;
+            crate::rawvk::context::site::scope("e3_had_out", || {
+                self.ctx.run_rw(
+                    self.p3.pl,
+                    ds3,
+                    self.p3.pipe,
+                    &push3,
+                    (l.n / 128) as u32,
+                    1,
+                    1,
+                    &[self.sb.buf, l.svh.buf],
+                    &[yb.buf],
+                )
+            })?;
         }
 
         self.ctx.end_batch_wait()?;

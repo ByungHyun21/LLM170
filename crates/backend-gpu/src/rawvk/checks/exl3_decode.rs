@@ -6,6 +6,59 @@
 
 use super::exl3_resident::TrellisResident;
 
+// ── 위상 프로파일러 (LLM170_DUMP=exl3_phase, 원장 89: dump 키로만) ──
+// profile_span은 release no-op이라 exl3 프로브 전용 경량 계측.
+// 단일 스레드 오케스트레이션 전제(thread_local) — gdn_ar_batch 내부 스레드는 미계측.
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+struct PhaseAgg {
+    count: u64,
+    ns: u64,
+}
+thread_local! {
+    static PHASES: RefCell<HashMap<&'static str, PhaseAgg>> = RefCell::new(HashMap::new());
+}
+fn phase_on() -> bool {
+    llm170_diag::dump::opts().key("exl3_phase")
+}
+struct PhaseGuard(std::time::Instant, &'static str);
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        let ns = self.0.elapsed().as_nanos() as u64;
+        PHASES.with(|m| {
+            if let Ok(mut m) = m.try_borrow_mut() {
+                let e = m.entry(self.1).or_insert(PhaseAgg { count: 0, ns: 0 });
+                e.count += 1;
+                e.ns += ns;
+            }
+        });
+    }
+}
+fn ph(name: &'static str) -> Option<PhaseGuard> {
+    phase_on().then(|| PhaseGuard(std::time::Instant::now(), name))
+}
+fn phase_report() {
+    if !phase_on() {
+        return;
+    }
+    PHASES.with(|m| {
+        if let Ok(m) = m.try_borrow() {
+            let mut v: Vec<_> = m.iter().collect();
+            v.sort_by_key(|(_, a)| std::cmp::Reverse(a.ns));
+            eprintln!("=== exl3 phase (wall — 중첩 포함: *_fwd 값은 하위 위상 합 포함) ===");
+            for (k, a) in v {
+                eprintln!(
+                    "  {k:20} {:>7}회 {:>10.1}ms  평균 {:>8.3}ms",
+                    a.count,
+                    a.ns as f64 / 1e6,
+                    a.ns as f64 / a.count as f64 / 1e6
+                );
+            }
+        }
+    });
+}
+
 /// GDN 시퀀스 상태 (per-layer per-head 128×128).
 pub struct GdnState {
     /// [48 heads][128*128] — 기씨 core::gdn 형식과 동일.
@@ -82,7 +135,9 @@ fn gdn_forward(
     let eps = 1e-6f32;
 
     // 선형 투영 (vk GEMV) — alpha/beta도 선형이지만 크기가 작아 inline 계산
+    let _gq = ph("gdn:lin_qkv");
     let qkv = tr.linear(&format!("{lp}.in_proj_qkv"), x_normed)?;
+    drop(_gq);
     if il == 0 && seq.pos == 0 {
         let rms = (qkv.iter().map(|v| v * v).sum::<f32>() / qkv.len() as f32).sqrt();
         eprintln!(
@@ -91,7 +146,9 @@ fn gdn_forward(
             qkv.get(1).copied().unwrap_or(0.0)
         );
     }
+    let _gz = ph("gdn:lin_z");
     let z = tr.linear(&format!("{lp}.in_proj_z"), x_normed)?;
+    drop(_gz);
 
     // alpha: hidden → 48 (V헤드별 스케일러) — 노름에서 읽기
     let a_proj = tr
@@ -102,6 +159,7 @@ fn gdn_forward(
         .ok_or("beta missing")?;
 
     // a[b] = dot(x_normed, a_proj[b]) for each V head b
+    let _ga = ph("gdn:ab_dot");
     let mut a_vals = vec![0f32; n_v];
     for (h, a_vals_h) in a_vals.iter_mut().enumerate() {
         let row = &a_proj[h * x_normed.len()..(h + 1) * x_normed.len()];
@@ -112,6 +170,7 @@ fn gdn_forward(
         let row = &b_proj[h * x_normed.len()..(h + 1) * x_normed.len()];
         *b_vals_h = x_normed.iter().zip(row.iter()).map(|(&x, &w)| x * w).sum();
     }
+    drop(_ga);
 
     // ssm_a = -exp(A_log) — HF 순서 그대로 (직접 경로는 전체 HF 일관).
     // (GGUF 변환 시에만 V헤드 순열 필요 — §7.1b)
@@ -122,16 +181,19 @@ fn gdn_forward(
     let dt_bias = tr.norm(&format!("{lp}.dt_bias")).ok_or("dt_bias missing")?;
 
     // beta, g
+    let _gm = ph("gdn:ab_math");
     let beta_all: Vec<f32> = (0..n_v).map(|h| sigmoid(b_vals[h])).collect();
     let g_all: Vec<f32> = (0..n_v)
         .map(|h| softplus(a_vals[h] + dt_bias[h]) * ssm_a[h])
         .collect();
+    drop(_gm);
 
     // conv1d (t=1)
     let conv_w = tr
         .norm(&format!("{lp}.conv1d.weight"))
         .ok_or("conv1d missing")?;
     let st = &mut seq.gdn[il];
+    let _gc = ph("gdn:conv");
     let mut q_all = vec![0f32; k_len];
     let mut k_all = vec![0f32; k_len];
     let mut v_all = vec![0f32; v_len];
@@ -162,11 +224,13 @@ fn gdn_forward(
         let headk: Vec<f32> = k_all[b0..b0 + d_state].to_vec();
         k_all[b0..b0 + d_state].copy_from_slice(&l2_norm(&headk, eps));
     }
+    drop(_gc);
 
     // GDN delta rule — core::gdn::gdn_ar_batch 재사용 (헤드 병렬).
     // HF 순서 → llama.cpp 순서 (h%h_k 매핑용) → 역순열로 복귀.
     let hf_to_lc = |h: usize| -> usize { 3 * (h % 16) + h / 16 };
 
+    let _gd = ph("gdn:delta");
     let mut v_lc = vec![0f32; v_len]; // llama.cpp 순서 v
     let mut beta_lc = vec![0f32; n_v];
     let mut g_lc = vec![0f32; n_v];
@@ -196,12 +260,14 @@ fn gdn_forward(
         st.states[j * d_state * d_state..(j + 1) * d_state * d_state]
             .copy_from_slice(&st_lc[i * d_state * d_state..(i + 1) * d_state * d_state]);
     }
+    drop(_gd);
 
     // norm_gated: rms_norm(o) * silu(z) per V head
     let ssm_norm_w = tr
         .norm(&format!("{lp}.norm.weight"))
         .ok_or("ssm_norm missing")?;
     let mut gated = vec![0f32; d_inner];
+    let _gg = ph("gdn:gate");
     for h in 0..n_v {
         let b0 = h * d_state;
         let head: Vec<f32> = o_all[b0..b0 + d_state].to_vec();
@@ -210,9 +276,13 @@ fn gdn_forward(
             gated[b0 + i] = n[i] * silu(z[b0 + i]);
         }
     }
+    drop(_gg);
 
     // out_proj (vk GEMV)
-    tr.linear(&format!("{lp}.out_proj"), &gated)
+    let _go = ph("gdn:lin_out");
+    let r = tr.linear(&format!("{lp}.out_proj"), &gated)?;
+    drop(_go);
+    Ok(r)
 }
 
 // ── Full attention (t=1) ──
@@ -232,9 +302,11 @@ fn attn_forward(
     let rope_base = 1e7f32;
 
     // q/k/v (vk GEMV) — q는 gate 퓨전 [n_head * head_dim * 2]
+    let _g1 = ph("attn:lin_qkv");
     let q_gate = tr.linear(&format!("{lp}.q_proj"), x_normed)?; // [12288]
     let k = tr.linear(&format!("{lp}.k_proj"), x_normed)?; // [1024]
     let v = tr.linear(&format!("{lp}.v_proj"), x_normed)?; // [1024]
+    drop(_g1);
 
     // q_norm, k_norm
     let q_norm_w = tr
@@ -248,6 +320,7 @@ fn attn_forward(
     let pos = seq.pos;
     let kv = &mut seq.kv[attn_il];
     let kv_cap = kv.k.len() / (n_kv * head_dim);
+    let _g2 = ph("attn:qknorm_rope");
 
     // q: 헤드별 [q(256), gate(256)] 인터리브 → 분리
     let mut q_heads = vec![0f32; n_head * head_dim];
@@ -285,8 +358,10 @@ fn attn_forward(
         }
         kv.len += 1;
     }
+    drop(_g2);
 
     // attention: GQA — 각 q 헤드가 n_head/n_kv개의 kv 헤드를 공유
+    let _g3 = ph("attn:core");
     let scale = 1.0 / (head_dim as f32).sqrt();
     let n_rep = n_head / n_kv;
     let mut attn_out = vec![0f32; n_head * head_dim];
@@ -330,9 +405,13 @@ fn attn_forward(
             attn_out[b0 + d] *= sigmoid(gate_heads[b0 + d]);
         }
     }
+    drop(_g3);
 
     // o_proj (vk GEMV)
-    tr.linear(&format!("{lp}.o_proj"), &attn_out)
+    let _g4 = ph("attn:lin_o");
+    let r = tr.linear(&format!("{lp}.o_proj"), &attn_out)?;
+    drop(_g4);
+    Ok(r)
 }
 
 // ── 메인 디코드 ──
@@ -368,11 +447,16 @@ pub fn decode_step(
         let xn = rms_norm(&x, norm_w, eps);
 
         let mut attn_out = if full {
+            let _g = ph("attn_fwd");
             let out = attn_forward(tr, seq, il, attn_count, &xn, 24, 4, 256)?;
+            drop(_g);
             attn_count += 1;
             out
         } else {
-            gdn_forward(tr, seq, il, &xn)?
+            let _g = ph("gdn_fwd");
+            let r = gdn_forward(tr, seq, il, &xn)?;
+            drop(_g);
+            r
         };
         // 디버그: attention/GDN 출력 제거 — FFN만 남겨 격리.
         if std::env::var_os("LLM170_EXL3_DBG")
@@ -394,14 +478,20 @@ pub fn decode_step(
             .norm(&format!("{lp}.post_attention_layernorm.weight"))
             .ok_or("ffn norm missing")?;
         let xf = rms_norm(&x, ffn_norm_w, eps);
+        let _gu = ph("ffn:lin_gu");
         let gate = tr.linear(&format!("{lp}.mlp.gate_proj"), &xf)?;
         let up = tr.linear(&format!("{lp}.mlp.up_proj"), &xf)?;
+        drop(_gu);
+        let _ga = ph("ffn:act");
         let hidden_act: Vec<f32> = gate
             .iter()
             .zip(up.iter())
             .map(|(&a, &b)| silu(a) * b)
             .collect();
+        drop(_ga);
+        let _gd = ph("ffn:lin_down");
         let ffn_out = tr.linear(&format!("{lp}.mlp.down_proj"), &hidden_act)?;
+        drop(_gd);
         for i in 0..h {
             x[i] += ffn_out.get(i).copied().unwrap_or(0.0);
         }
@@ -422,7 +512,10 @@ pub fn decode_step(
         .norm("model.language_model.norm.weight")
         .ok_or("output norm missing")?;
     let xn = rms_norm(&x, out_norm_w, eps);
-    tr.linear("lm_head", &xn)
+    let _gh = ph("head");
+    let r = tr.linear("lm_head", &xn)?;
+    drop(_gh);
+    Ok(r)
 }
 
 /// 시퀀스 상태 초기화.
@@ -501,6 +594,12 @@ pub fn exl3_decode(dir: &str, tokens_str: &str, n_predict: usize) -> Result<Stri
         }
     }
     let decode_s = t1.elapsed().as_secs_f64();
+    // 진단 덤프 — VK_TS: GPU 디스패치 집계(프레임 경로와 동일 ts 원장),
+    // exl3_phase: CPU 위상 분해. decode_s 측정 후 호출(쿼리 WAIT 제외).
+    if llm170_diag::flag::on("LLM170_VK_TS") {
+        tr.ctx.ts_report();
+    }
+    phase_report();
     let total = prompt.len() + n_predict;
     let tps = total as f64 / decode_s;
     Ok(format!(
