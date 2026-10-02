@@ -193,6 +193,8 @@ impl TrellisResident {
     }
 
     /// 선형 투영: y = x @ W^T (트렐리스 vk GEMV).
+    /// 배치 모드에서는 발행만 하고 yb에서 직접 판독(호출자 책임).
+    /// 비배치 모드에서는 자체 동기 후 반환.
     pub fn linear(&mut self, key: &str, x: &[f32]) -> Result<Vec<f32>, String> {
         let idx = self
             .linears
@@ -274,26 +276,14 @@ impl TrellisResident {
             &[self.yb.buf],
         )?;
 
-        // run_rw(비배치)는 디스패치마다 자체 wait_for_fences — GPU 완료 보장됨.
-        // (end_batch_wait은 배치 모드 전용 — 비배치에서 호출하면 미개시
-        // cmdbuf2 종료로 세그폴트, exl3-bench 교훈 2026-10-04.)
+        // run_rw(비배치)는 디스패치마다 자체 wait_for_fences — GPU 완료 보장.
 
-        // 결과 다운로드
+        // 최종 결과는 yb(had_out 출력)에서 판독.
         let mut y = vec![0f32; n];
-        // SAFETY: yb 매핑 — end_batch_wait 후 판독.
+        // SAFETY: yb 매핑 판독 — 비배치는 run_rw 자체 동기, 배치는
+        // batch_end() 이후에 호출됨.
         unsafe {
-            // 세그먼트 부분합 합산
-            let mut parts = vec![0f32; n * nseg as usize];
-            std::ptr::copy_nonoverlapping(
-                self.sb.ptr as *const f32,
-                parts.as_mut_ptr(),
-                n * nseg as usize,
-            );
-            for g in 0..nseg as usize {
-                for i in 0..n {
-                    y[i] += parts[g * n + i];
-                }
-            }
+            std::ptr::copy_nonoverlapping(self.yb.ptr as *const f32, y.as_mut_ptr(), n);
         }
         Ok(y)
     }
