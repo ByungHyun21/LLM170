@@ -4,6 +4,8 @@
 mod attention;
 mod exl3;
 mod exl3_bench;
+mod exl3_decode;
+mod exl3_resident;
 mod fault;
 mod frame_check;
 mod gdn;
@@ -14,6 +16,8 @@ mod ops;
 pub use attention::{ft32_check, gemv_check, gemv8_check};
 pub use exl3::exl3_vk_check;
 pub use exl3_bench::exl3_bench;
+pub use exl3_decode::exl3_decode;
+pub use exl3_resident::TrellisResident;
 pub use fault::fault_probe;
 pub use frame_check::frame_check;
 pub use misc::ple_mt_check;
