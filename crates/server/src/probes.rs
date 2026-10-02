@@ -333,6 +333,13 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let tn = arg_str(args, 1, "blk.0.ffn_down_shexp.weight");
             llm170_backend_gpu::rawvk::checks::frame_check(&path, &tn)
         }
+        "exl3-bench" => {
+            let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
+            llm170_backend_gpu::rawvk::checks::exl3_bench(
+                &arg_str(args, 0, d_exl3),
+                arg_num(args, 1, 5usize),
+            )
+        }
         "exl3-vk-check" => {
             let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
             llm170_backend_gpu::rawvk::checks::exl3_vk_check(
