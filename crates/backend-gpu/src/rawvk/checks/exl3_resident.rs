@@ -256,18 +256,17 @@ impl TrellisResident {
             let push = (k as u32 / 128).to_le_bytes().to_vec();
             // ts 표 라벨은 site::tag()(TAG thread-local) — scope은 CUR만 바꾼다.
             crate::rawvk::context::site::set_tag("e3_had_in");
-            self.ctx
-                .run_rw(
-                    self.p1.pl,
-                    ds,
-                    self.p1.pipe,
-                    &push,
-                    (k / 128) as u32,
-                    1,
-                    1,
-                    &[xb_b, suh_b],
-                    &[ah],
-                )?;
+            self.ctx.run_rw(
+                self.p1.pl,
+                ds,
+                self.p1.pipe,
+                &push,
+                (k / 128) as u32,
+                1,
+                1,
+                &[xb_b, suh_b],
+                &[ah],
+            )?;
 
             // gemv: ah_i × tre → sb
             let ds2 = self.ctx.fresh_ds_for(&self.p2, 3)?;

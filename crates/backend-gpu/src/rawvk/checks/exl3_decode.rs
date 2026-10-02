@@ -248,7 +248,16 @@ fn gdn_forward(
     }
 
     llm170_core::gdn::gdn_ar_batch(
-        &q_all, &k_all, &v_lc, &beta_lc, &g_lc, &mut st.states, &mut o_lc, 1, n_k, n_v,
+        &q_all,
+        &k_all,
+        &v_lc,
+        &beta_lc,
+        &g_lc,
+        &mut st.states,
+        &mut o_lc,
+        1,
+        n_k,
+        n_v,
     );
 
     // 결과 역순열 (llama.cpp → HF)

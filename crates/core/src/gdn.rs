@@ -413,9 +413,12 @@ pub fn gdn_ar_batch(
                 let lo = std::slice::from_raw_parts_mut((lo_base.0 as *mut f32).add(pair * d), d);
                 let (b, h) = (pair / h_v, pair % h_v);
                 let kh = h % h_k;
-                let qs = std::slice::from_raw_parts((qb.0 as *const f32).add(b * k_stride + kh * d), d);
-                let ks = std::slice::from_raw_parts((kb.0 as *const f32).add(b * k_stride + kh * d), d);
-                let vs = std::slice::from_raw_parts((vb.0 as *const f32).add(b * v_stride + h * d), d);
+                let qs =
+                    std::slice::from_raw_parts((qb.0 as *const f32).add(b * k_stride + kh * d), d);
+                let ks =
+                    std::slice::from_raw_parts((kb.0 as *const f32).add(b * k_stride + kh * d), d);
+                let vs =
+                    std::slice::from_raw_parts((vb.0 as *const f32).add(b * v_stride + h * d), d);
                 let beta_h = *(bb.0 as *const f32).add(b * h_v + h);
                 let g_exp = crate::ops::exp_cr(*(gb.0 as *const f32).add(b * h_v + h));
                 gdn_ar_head(st, qs, ks, vs, beta_h, g_exp, scale, lo);
