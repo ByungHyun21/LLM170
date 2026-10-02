@@ -8,6 +8,7 @@ mod engine;
 mod http;
 mod infer;
 mod json;
+mod perplexity;
 mod probes;
 mod resource;
 mod tokenize;
@@ -49,6 +50,8 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
       W4A8 변형 ↔ f32 기준 상호검증.
   llm170 dequant <file> <tensor> <row> <n>
       디양자화 값 프로브.
+  llm170 perplexity --model <file.gguf> --prompt-tokens <ids> [--ctx N]
+      NLL·perplexity 산출 (품질 게이트, CPU 전용).
   llm170 exl3-load [exl3_dir]
       EXL3 모델 레지스트리 구축 + §7.1 완전성 검증 (mmap).
   llm170 exl3-check [exl3_dir] [q8.gguf]
@@ -258,6 +261,7 @@ fn main() -> ExitCode {
         Some("rawhip-check") => probes::run("rawhip-check", &args[1..]).unwrap(),
         Some("vl") => vl::cmd_vl(&ma.rest, &ma),
         Some("bench") => bench::cmd_bench(&ma.rest, &ma),
+        Some("perplexity") => perplexity::cmd_perplexity(&ma.rest, &ma),
         Some("check") => probes::run_check(&args[1..]),
         Some("tokenize") => cmd_tokenize(&ma),
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
