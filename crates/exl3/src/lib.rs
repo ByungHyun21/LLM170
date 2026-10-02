@@ -254,6 +254,50 @@ impl StArchive {
         self.entries.get(name)
     }
 
+    /// 텐서 원시 바이트를 호출자 버퍼로 직독(대형 상주 적재 — Vec 회피).
+    ///
+    /// # Safety
+    /// `out`은 `cap >= nbytes(name)` 바이트의 쓰기 가능 영역이어야 한다.
+    pub unsafe fn read_into(&self, name: &str, out: *mut u8, cap: usize) -> Result<()> {
+        let e = self
+            .entries
+            .get(name)
+            .ok_or_else(|| Exl3Error::TensorNotFound(name.into()))?;
+        let n = e.nbytes() as usize;
+        if n > cap {
+            return Err(Exl3Error::BadTensor(format!("{name}: cap {cap} < {n}")));
+        }
+        let sh = &self.shards[e.shard];
+        if e.end > sh.data_len {
+            return Err(Exl3Error::BadHeader(format!(
+                "{name}: offset {} beyond shard data {}/{}",
+                e.end,
+                sh.path.display(),
+                sh.data_len
+            )));
+        }
+        let mut f = std::fs::File::open(&sh.path)?;
+        std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(sh.data_base + e.begin))?;
+        let mut off = 0usize;
+        while off < n {
+            // SAFETY: 상단 계약 — cap 내 영역만 기입.
+            let w = unsafe {
+                std::io::Read::read(
+                    &mut f,
+                    std::slice::from_raw_parts_mut(out.add(off), (n - off).min(1 << 20)),
+                )?
+            };
+            if w == 0 {
+                return Err(Exl3Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "read_into: EOF",
+                )));
+            }
+            off += w;
+        }
+        Ok(())
+    }
+
     /// 텐서 원시 바이트를 읽는다(검증·참조 경로 — 엔진 적재는 mmap 별도).
     pub fn read(&self, name: &str) -> Result<Vec<u8>> {
         let e = self
