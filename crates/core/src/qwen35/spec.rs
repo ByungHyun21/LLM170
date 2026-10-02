@@ -729,10 +729,16 @@ impl Engine {
         // 너무 잦으면 손해. tg128 2회 반복 A/B 로 4 = 15.4, 8 = 13.15 t/s 확정(재현
         // 가능) → 4 를 기본으로 한다 (비스펙 11.6 대비 +33%).
         // LLM170_SPEC_CAPX 로 재정의 가능(진단용).
+        // plans/116-6: 검증 t = 1+k+carried 를 g4 GEMV 한계(t≤4, acc[4]) 안에
+        // 유지 — k≤3이면 cap = 3-k(부분수용 carried가 t를 4 이상으로 못 키움).
+        // k≥4는 종전 4(해당 모드는 large-t 타일 검증 유지). 종전 기본 4는 타일
+        // 검증 시대의 최적값(원장: 4=13.7 > 0=6.7 t/s) — g4 체제에서는 t>4가
+        // 언핀 타일(mm 패밀리)로 떨어져 역전된다.
+        let cap_default = if k <= 3 { 3 - k } else { 4 };
         let cap_extra: usize = std::env::var("LLM170_SPEC_CAPX")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(4);
+            .unwrap_or(cap_default);
         if carried.len() + 1 + k > 1 + k + cap_extra {
             let n_c = self.model.hp.n_embd;
             let (embd_ty_c, embd_arc_c) = self.embd_cache.as_ref().unwrap().clone();
