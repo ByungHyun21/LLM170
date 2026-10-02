@@ -61,7 +61,8 @@ fn phase_report() {
 
 /// GDN 시퀀스 상태 (per-layer per-head 128×128).
 pub struct GdnState {
-    /// [48 heads][128*128] — 기씨 core::gdn 형식과 동일.
+    /// [48 heads][128*128] — core::gdn 형식, **llama.cpp 헤드 순서**로 저장
+    /// (hf_to_lc 순열을 초기화 시 고정 — plans/120 A1, 매 토큰 순열복사 제거).
     pub states: Vec<f32>,
     /// conv1d 링 [conv_k-1][conv_ch].
     pub conv: Vec<f32>,
@@ -229,6 +230,8 @@ fn gdn_forward(
 
     // GDN delta rule — core::gdn::gdn_ar_batch 재사용 (헤드 병렬).
     // HF 순서 → llama.cpp 순서 (h%h_k 매핑용) → 역순열로 복귀.
+    // plans/120 A1: 상태는 llama.cpp 순서로 영구 저장 — 층당 3MB×2 순열
+    // 복사(토큰당 288MB) 제거. 순열은 v/beta/g/o(6144f32)에만 적용.
     let hf_to_lc = |h: usize| -> usize { 3 * (h % 16) + h / 16 };
 
     let _gd = ph("gdn:delta");
@@ -236,30 +239,24 @@ fn gdn_forward(
     let mut beta_lc = vec![0f32; n_v];
     let mut g_lc = vec![0f32; n_v];
     let mut o_lc = vec![0f32; v_len];
-    // 상태도 순열 — state[llama.cpp head i] = state[HV head hf_to_lc(i)]
-    let mut st_lc = vec![0f32; n_v * d_state * d_state];
     for i in 0..n_v {
         let j = hf_to_lc(i);
         v_lc[i * d_state..(i + 1) * d_state]
             .copy_from_slice(&v_all[j * d_state..(j + 1) * d_state]);
         beta_lc[i] = beta_all[j];
         g_lc[i] = g_all[j];
-        st_lc[i * d_state * d_state..(i + 1) * d_state * d_state]
-            .copy_from_slice(&st.states[j * d_state * d_state..(j + 1) * d_state * d_state]);
     }
 
     llm170_core::gdn::gdn_ar_batch(
-        &q_all, &k_all, &v_lc, &beta_lc, &g_lc, &mut st_lc, &mut o_lc, 1, n_k, n_v,
+        &q_all, &k_all, &v_lc, &beta_lc, &g_lc, &mut st.states, &mut o_lc, 1, n_k, n_v,
     );
 
-    // 결과·상태 역순열 (llama.cpp → HF)
+    // 결과 역순열 (llama.cpp → HF)
     let mut o_all = vec![0f32; v_len];
     for i in 0..n_v {
         let j = hf_to_lc(i);
         o_all[j * d_state..(j + 1) * d_state]
             .copy_from_slice(&o_lc[i * d_state..(i + 1) * d_state]);
-        st.states[j * d_state * d_state..(j + 1) * d_state * d_state]
-            .copy_from_slice(&st_lc[i * d_state * d_state..(i + 1) * d_state * d_state]);
     }
     drop(_gd);
 
