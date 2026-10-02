@@ -22,6 +22,11 @@ thread_local! {
 fn phase_on() -> bool {
     llm170_diag::dump::opts().key("exl3_phase")
 }
+
+/// usize 포인터 래퍼 — core::gdn::ar_pool 잡 캡처용(Send).
+/// SAFETY: 주소의 생명은 run_par 완료 대기로 증명(호출 스코프 내).
+#[derive(Clone, Copy)]
+struct SendP(usize);
 struct PhaseGuard(std::time::Instant, &'static str);
 impl Drop for PhaseGuard {
     fn drop(&mut self) {
@@ -372,41 +377,61 @@ fn attn_forward(
     drop(_g2);
 
     // attention: GQA — 각 q 헤드가 n_head/n_kv개의 kv 헤드를 공유
+    // plans/120 A1: 헤드별 풀 병렬 + 가중치 사전계산(비트동일 — w[t]는
+    // 원문과 동일 표현식으로 1회 계산, t 누적 순서 보존).
     let _g3 = ph("attn:core");
     let scale = 1.0 / (head_dim as f32).sqrt();
     let n_rep = n_head / n_kv;
     let mut attn_out = vec![0f32; n_head * head_dim];
+    {
+        let kv_len = kv.len;
+        // SAFETY: 잡은 run_par 완료 대기 내에서만 접근 — q_heads·kv·attn_out은
+        // 이 스코프 내 유효, 헤드별 출력 영역은 서로 분리된다.
+        let (qp, kp, vp, op) = (
+            SendP(q_heads.as_ptr() as usize),
+            SendP(kv.k.as_ptr() as usize),
+            SendP(kv.v.as_ptr() as usize),
+            SendP(attn_out.as_mut_ptr() as usize),
+        );
+        llm170_core::gdn::ar_pool::run_par(n_head, move |h| {
+            Box::new(move || unsafe {
+                let kv_h = h / n_rep;
+                let q =
+                    std::slice::from_raw_parts((qp.0 as *const f32).add(h * head_dim), head_dim);
+                let (kb, vb) = (kp.0 as *const f32, vp.0 as *const f32);
+                let ob = (op.0 as *mut f32).add(h * head_dim);
 
-    for h in 0..n_head {
-        let kv_h = h / n_rep;
-        let q = &q_heads[h * head_dim..(h + 1) * head_dim];
+                // 점수 계산
+                let mut scores = vec![0f32; kv_len];
+                for t in 0..kv_len {
+                    let k_base = t * n_kv * head_dim + kv_h * head_dim;
+                    let mut dot = 0f32;
+                    for d in 0..head_dim {
+                        dot += q[d] * *kb.add(k_base + d);
+                    }
+                    scores[t] = dot * scale;
+                }
 
-        // 점수 계산
-        let mut scores = vec![0f32; kv.len];
-        for t in 0..kv.len {
-            let k_base = t * n_kv * head_dim + kv_h * head_dim;
-            let mut dot = 0f32;
-            for d in 0..head_dim {
-                dot += q[d] * kv.k[k_base + d];
-            }
-            scores[t] = dot * scale;
-        }
+                // softmax
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
+                let inv_sum = 1.0 / exp_sum;
+                let w: Vec<f32> = scores
+                    .iter()
+                    .map(|&s| (s - max_s).exp() * inv_sum)
+                    .collect();
 
-        // softmax
-        let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
-        let inv_sum = 1.0 / exp_sum;
-
-        // 가중 합
-        for d in 0..head_dim {
-            let mut sum = 0f32;
-            for t in 0..kv.len {
-                let w = (scores[t] - max_s).exp() * inv_sum;
-                let v_base = t * n_kv * head_dim + kv_h * head_dim;
-                sum += w * kv.v[v_base + d];
-            }
-            attn_out[h * head_dim + d] = sum;
-        }
+                // 가중 합
+                for d in 0..head_dim {
+                    let mut sum = 0f32;
+                    for t in 0..kv_len {
+                        let v_base = t * n_kv * head_dim + kv_h * head_dim;
+                        sum += w[t] * *vb.add(v_base + d);
+                    }
+                    *ob.add(d) = sum;
+                }
+            })
+        });
     }
 
     // output gate: attn_out * sigmoid(gate)
