@@ -5,12 +5,18 @@
 // 참조: exllamav3 CPU scalar_tiles + decode_state_scalar/decode_mul1_scalar
 // (moe_mul1.cpp) — plans/118 §6 검증 명세의 GLSL 직이식.
 //
-// WG=128 스레드 = n-타일 8개(스레드당 출력 1열). k 전체 순회, f32 누산
-// (참조 CUDA는 f16 누산 — 상위 정밀도, 원장 10a/177).
+// v3 (2026-10-04): v1(29 GB/s)에서 3개 개선 — ① 스레드 불변 워드 주소를
+// addr16[u32|u32<<8|shift<<16] 16레지스터로 사전 계산(워드마다 런타임
+// modulo 2회 × 89M 제거 — ALU 병목이었음), ② 바이트합 6연산화(16비트
+// 레인 합), ③ k-분할(그리드 y) 부분합 [seg][n] 평범 저장 — atomic 없이
+// 결정적, had_out이 세그먼트 합산. 실측 60 GB/s(K=3).
+// (v4 실험 — dq8 공유 스테이징·f16 디코드값 저장: 20-31 GB/s로 회귀,
+// 폐기. LDS가 아니라 발행 효율이 한계였음.)
+// f32 누산(참조 CUDA는 f16 누산 — 상위 정밀도, 구 원장 177).
 layout(local_size_x = 128) in;
 layout(binding = 0) readonly buffer AhB { uint ah16[]; };  // f16 쌍팩 [k/2]
 layout(binding = 1) readonly buffer TreB { uint tre[]; };  // trellis u32 뷰
-layout(binding = 2) writeonly buffer SB { float s[]; };    // f32 [n]
+layout(binding = 2) writeonly buffer SB { float s[]; };    // f32 [nseg][n]
 layout(push_constant) uniform PC {
     uint ktiles;
     uint ntiles;
@@ -19,44 +25,78 @@ layout(push_constant) uniform PC {
 
 // mul1 코드북 — plans/118 §6.2. sum 비트패턴 [0x6400,0x67FC]의 f16 값은
 // 정확히 1024+bytesum([1024,2048) ULP=1) — 참조 half_uint16 트릭과 동치.
+// 바이트합 6연산: 16비트 레인 합(각 ≤510 — 캐리 없음) 후 레인 합산.
 float mul1_decode(uint w) {
     uint x = w * 0x83DCD12Du;
-    uint sum = (x & 0xFFu) + ((x >> 8u) & 0xFFu) + ((x >> 16u) & 0xFFu) + (x >> 24u);
+    uint p = (x & 0x00FF00FFu) + ((x >> 8u) & 0x00FF00FFu);
+    uint sum = (p & 0xFFFFu) + (p >> 16u);
     return (1024.0 + float(sum)) * 0.00676727294921875 - 10.3828125;
 }
 
 void main() {
-    uint nt = gl_WorkGroupID.x * 8u + (gl_LocalInvocationID.x >> 4u);
-    if (nt >= pc.ntiles) return;
+    uint nt0 = gl_WorkGroupID.x * 8u;
+    if (nt0 >= pc.ntiles) return;
+    uint seg = gl_WorkGroupID.y;
+    uint nseg = gl_NumWorkGroups.y;
+    uint ktb = pc.ktiles * seg / nseg;
+    uint kte = pc.ktiles * (seg + 1u) / nseg;
     uint c = gl_LocalInvocationID.x & 15u;
-
+    uint ntl = gl_LocalInvocationID.x >> 4u;
     uint words32 = 8u * pc.K;
-    uint tbase = nt * words32;              // 타일(kt=0, nt) u32 오프셋
-    uint tstride = pc.ntiles * words32;     // k-타일 행 보폭
     float acc = 0.0;
 
-    for (uint kt = 0u; kt < pc.ktiles; kt++) {
-        // 타일 (kt, nt)의 열 c 16가중치(r=0..15) — 순회 내 a_had 로드 공유.
-        for (uint r = 0u; r < 16u; r++) {
-            // tensor_core_perm 역: t = (4*(c&7) + ((r&7)>>1))*8
-            //                      + ((r>>3)*2 + (r&1) + ((c>>3)*4))
-            uint t = (4u * (c & 7u) + ((r & 7u) >> 1u)) * 8u
-                   + ((r >> 3u) * 2u + (r & 1u) + ((c >> 3u) * 4u));
-            // 워드 t = 링 비트 [(t+1)K-16, (t+1)K) — decode_state_scalar 리터럴.
-            uint b0 = t * pc.K + (pc.K + 256u * pc.K - 16u);
-            uint b1 = b0 + 16u;
-            uint i0 = (b0 >> 5u) % words32;
-            uint i1 = ((b1 - 1u) >> 5u) % words32;
-            uint sh = (((b1 - 1u) >> 5u) + 1u) * 32u - b1;
-            uint a = tre[tbase + i0];
-            uint b = tre[tbase + i1];
-            uint w = (sh == 0u) ? (b & 0xFFFFu)
-                                : (((b >> sh) | (a << (32u - sh))) & 0xFFFFu);
-            uint j = kt * 16u + r;
-            float xv = unpackHalf2x16(ah16[j >> 1u])[j & 1u];
-            acc += xv * mul1_decode(w);
-        }
-        tbase += tstride;
+    // 스레드 불변 주소 사전 계산 — r=0..15 워드의 (i0·i1·시프트).
+    // t는 tensor_core_perm 역: (4*(c&7) + ((r&7)>>1))*8
+    //   + ((r>>3)*2 + (r&1) + ((c>>3)*4)).
+    uint addr16[16];
+    for (uint r = 0u; r < 16u; r++) {
+        uint t = (4u * (c & 7u) + ((r & 7u) >> 1u)) * 8u
+               + ((r >> 3u) * 2u + (r & 1u) + ((c >> 3u) * 4u));
+        uint b0 = t * pc.K + (pc.K + 256u * pc.K - 16u);
+        uint b1 = b0 + 16u;
+        uint i0 = (b0 >> 5u) % words32;
+        uint i1 = ((b1 - 1u) >> 5u) % words32;
+        uint sh = (((b1 - 1u) >> 5u) + 1u) * 32u - b1;
+        addr16[r] = i0 | (i1 << 8u) | (sh << 16u);
     }
-    s[nt * 16u + c] = acc;
+
+    for (uint kb = ktb; kb < kte; kb += 8u) {
+        uint nk = min(8u, kte - kb);
+        for (uint ktl = 0u; ktl < nk; ktl++) {
+            uint tbase = ((kb + ktl) * pc.ntiles + nt0 + ntl) * words32;
+            uint ahb = ((kb + ktl) * 16u) >> 1u;   // a_had u32 오프셋
+            // r-루프 수동 언롤 — addr16/ahw 동적 인덱스를 컴파일타임 상수로
+            // 밀어 레지스터 유지(스크래치 누수 방지).
+            uint ahw0 = ah16[ahb];
+            uint ahw1 = ah16[ahb + 1u];
+            uint ahw2 = ah16[ahb + 2u];
+            uint ahw3 = ah16[ahb + 3u];
+            uint ahw4 = ah16[ahb + 4u];
+            uint ahw5 = ah16[ahb + 5u];
+            uint ahw6 = ah16[ahb + 6u];
+            uint ahw7 = ah16[ahb + 7u];
+            #define EXL3_R(i) \
+            { \
+                uint a16 = addr16[i]; \
+                uint w = (((a16 >> 16u) == 0u) \
+                    ? (tre[tbase + ((a16 >> 8u) & 0xFFu)] & 0xFFFFu) \
+                    : (((tre[tbase + ((a16 >> 8u) & 0xFFu)] >> (a16 >> 16u)) \
+                        | (tre[tbase + (a16 & 0xFFu)] << (32u - (a16 >> 16u)))) & 0xFFFFu)); \
+                acc += unpackHalf2x16( \
+                    (i & 1u) == 0u ? AH_EVEN(i) : AH_ODD(i))[i & 1u] \
+                     * mul1_decode(w); \
+            }
+            #define AH_EVEN(i) ((i) == 0u ? ahw0 : (i) == 2u ? ahw1 : (i) == 4u ? ahw2 : (i) == 6u ? ahw3 : (i) == 8u ? ahw4 : (i) == 10u ? ahw5 : (i) == 12u ? ahw6 : ahw7)
+            #define AH_ODD(i)  ((i) == 1u ? ahw0 : (i) == 3u ? ahw1 : (i) == 5u ? ahw2 : (i) == 7u ? ahw3 : (i) == 9u ? ahw4 : (i) == 11u ? ahw5 : (i) == 13u ? ahw6 : ahw7)
+            EXL3_R(0) EXL3_R(1) EXL3_R(2) EXL3_R(3)
+            EXL3_R(4) EXL3_R(5) EXL3_R(6) EXL3_R(7)
+            EXL3_R(8) EXL3_R(9) EXL3_R(10) EXL3_R(11)
+            EXL3_R(12) EXL3_R(13) EXL3_R(14) EXL3_R(15)
+            #undef EXL3_R
+            #undef AH_EVEN
+            #undef AH_ODD
+        }
+    }
+    uint nt = nt0 + ntl;
+    if (nt < pc.ntiles) s[seg * pc.ntiles * 16u + nt * 16u + c] = acc;
 }
