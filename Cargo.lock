@@ -515,6 +515,7 @@ version = "0.1.0"
 dependencies = [
  "half",
  "llm170-diag",
+ "memmap2",
 ]
 
 [[package]]

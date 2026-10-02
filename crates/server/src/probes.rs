@@ -333,6 +333,33 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let tn = arg_str(args, 1, "blk.0.ffn_down_shexp.weight");
             llm170_backend_gpu::rawvk::checks::frame_check(&path, &tn)
         }
+        "exl3-load" => {
+            let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
+            let path = arg_str(args, 0, d_exl3);
+            match llm170_exl3::Exl3Model::open(std::path::Path::new(&path)) {
+                Ok(m) => {
+                    let tre_mb: f64 = m
+                        .linears
+                        .iter()
+                        .map(|l| l.svh.len + l.suh.len + l.tre.len)
+                        .sum::<u64>() as f64
+                        / 1e6;
+                    let plain_mb: f64 =
+                        m.plains.iter().map(|p| p.slab.len).sum::<u64>() as f64 / 1e6;
+                    Ok(format!(
+                        "exl3-load {path}\n  layers={} hidden={} ffn={} vocab={} interval={}\n  선형 {}개 ({tre_mb:.0} MB) · 무양자화 {}개 ({plain_mb:.0} MB) — 완전성 검증 통과",
+                        m.cfg.num_hidden_layers,
+                        m.cfg.hidden_size,
+                        m.cfg.intermediate_size,
+                        m.cfg.vocab_size,
+                        m.cfg.full_attention_interval,
+                        m.linears.len(),
+                        m.plains.len(),
+                    ))
+                }
+                Err(e) => Err(format!("{e}")),
+            }
+        }
         "exl3-bench" => {
             let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
             llm170_backend_gpu::rawvk::checks::exl3_bench(
