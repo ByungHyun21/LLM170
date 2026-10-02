@@ -74,7 +74,10 @@ impl RawCtx {
             .get(name)
             .ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
-            self.ktr_ev(name, gy, self.stream);
+            // plans/116-1: 커널이 cur_stream(프리필 pair=stream3)로 가는데
+            // 이벤트를 self.stream에 찍으면 측정이 엉뚱한 커널로 귀속된다
+            // (hc_combine 406ms 위귀속 사례). 커널의 스트림에 기록한다.
+            self.ktr_ev(name, gy, self.cur_stream());
             ck(
                 hip::hipModuleLaunchKernel(
                     f,
@@ -92,7 +95,7 @@ impl RawCtx {
                 "launch",
             )
             .map_err(|e| format!("{e} kern={name} gx={gx} blk={block}"))?;
-            self.ktr_ev(name, gy, self.stream);
+            self.ktr_ev(name, gy, self.cur_stream());
         }
         if llm170_diag::dump::opts().key("launch_time") {
             LT_US.fetch_add(0, std::sync::atomic::Ordering::Relaxed); // 2D는 극소
@@ -131,7 +134,8 @@ impl RawCtx {
             .get(name)
             .ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
-            self.ktr_ev(name, gy, self.stream);
+            // plans/116-1: launch와 동일 — cur_stream에 이벤트 기록.
+            self.ktr_ev(name, gy, self.cur_stream());
             ck(
                 hip::hipModuleLaunchKernel(
                     f,
@@ -149,7 +153,7 @@ impl RawCtx {
                 "launch3",
             )
             .map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
-            self.ktr_ev(name, gy, self.stream);
+            self.ktr_ev(name, gy, self.cur_stream());
         }
         if lt_on {
             LT_US.fetch_add(

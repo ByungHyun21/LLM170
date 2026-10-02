@@ -17,14 +17,15 @@ pub mod vit;
 /// 오버라이드). RawCtx.co_fam 필드 — RawCtx::new 완료 후 불변(plans/78 R4:
 /// 전역 static → 인스턴스 필드, 인스턴스별 로딩 반영). 타일 발사 게이트는
 /// env가 아니라 이 비트를 본다 — 무환경 기본 성능 = 튜닝 성능.
-pub const CO_J128: u8 = 1; // w32b.co: *_j128 계열 (t≤128)
-pub const CO_V4: u8 = 2; // v4all.co: *_v4 + *_wm 4종
-pub const CO_ODD: u8 = 4; // odd_all.co: nl/q3k/iq3s v4 (plans/04)
-pub const CO_MMQ: u8 = 8; // mmq.co: llama mul_mat_q<q4_K/q5_K,128> + mmq_quant_y
-pub const CO_MMQ2: u8 = 16; // mmq2.co: gemm_f16_v4 (deq-f16 경로)
-pub const CO_MMQ3: u8 = 32; // mmq3.co: llama 프로덕션 mul_mat_q<iq4_xs>
-pub const CO_MMQ8: u8 = 64; // mmq8.co: ROCm 10 fatbin의 mul_mat_q<q8_0>(plans/71)
-pub const CO_QY: u8 = 128; // quanty_new.co: ROCm 10 quantize_mmq_q8_1<D4/DS4>(plans/71)
+pub const CO_J128: u16 = 1; // w32b.co: *_j128 계열 (t≤128)
+pub const CO_V4: u16 = 2; // v4all.co: *_v4 + *_wm 4종
+pub const CO_ODD: u16 = 4; // odd_all.co: nl/q3k/iq3s v4 (plans/04)
+pub const CO_MMQ: u16 = 8; // mmq.co: llama mul_mat_q<q4_K/q5_K,128> + mmq_quant_y
+pub const CO_MMQ2: u16 = 16; // mmq2.co: gemm_f16_v4 (deq-f16 경로)
+pub const CO_MMQ3: u16 = 32; // mmq3.co: llama 프로덕션 mul_mat_q<iq4_xs>
+pub const CO_MMQ8: u16 = 64; // mmq8.co: ROCm 10 fatbin의 mul_mat_q<q8_0>(plans/71)
+pub const CO_QY: u16 = 128; // quanty_new.co: ROCm 10 quantize_mmq_q8_1<D4/DS4>(plans/71)
+pub const CO_W32M: u16 = 256; // w32m.co: MoE 그룹 WMMA 타일 gemm_{q4k,q5_1}_j128m (plans/116-4)
 
 /// 1회 판독 env 게이트 캐시 (plans/78 R7) — 핫패스(런치·스텝당)의 var_os
 /// 반복 조회를 제거한다. 프로세스 내 env 변경은 main 초기화에서만 일어나고
