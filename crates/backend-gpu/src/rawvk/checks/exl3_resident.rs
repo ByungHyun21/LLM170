@@ -208,18 +208,22 @@ impl TrellisResident {
             .ok_or_else(|| format!("linear not found: {key}"))
     }
 
-    /// x를 f16으로 변환해 재사용 xb에 업로드.
+    /// x를 f16으로 변환해 재사용 xb에 직접 기록.
+    /// plans/120 A1: 임시 Vec+이중 복사 제거, 8청크 기록으로 벡터화 유도.
+    /// from_f32 요소별 호출 유지 — 비트동일.
     fn upload_x(&mut self, x: &[f32]) -> Result<(), String> {
         let k = x.len();
-        let mut x16 = vec![0u8; k * 2];
-        for (i, &v) in x.iter().enumerate() {
-            let h = f16::from_f32(v);
-            x16[i * 2..i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+        // SAFETY: xb는 max_k*2 바이트(k ≤ max_k, 호출자가 linear의 k와
+        // x.len()을 일치시킴). u16 기록은 LE 호스트에서 to_le_bytes와 동일.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.xb.ptr as *mut u16, k) };
+        let (chunks, rem) = x.as_chunks::<8>();
+        for (i, c) in chunks.iter().enumerate() {
+            let b: [u16; 8] = std::array::from_fn(|j| f16::from_f32(c[j]).to_bits());
+            dst[i * 8..i * 8 + 8].copy_from_slice(&b);
         }
-        // SAFETY: xb는 max_k*2 — k ≤ max_k 보장 (linears의 k 중 최대.
-        // 호출자가 linear의 k와 x.len()을 일치시킴).
-        unsafe {
-            std::ptr::copy_nonoverlapping(x16.as_ptr(), self.xb.ptr, k * 2);
+        let base = chunks.len() * 8;
+        for (j, &v) in rem.iter().enumerate() {
+            dst[base + j] = f16::from_f32(v).to_bits();
         }
         Ok(())
     }
