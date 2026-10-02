@@ -219,7 +219,7 @@ fn gdn_chunk_head(
 // 48층 × 48헤드 = 2304회 thread::scope OS 스폰이었다. 상수 풀로 스폰 비용
 // 제거. 잡이 'static이어야 하므로 호출자 소유 버퍼는 원시 포인터로 캡처하고
 // run_par가 완료 카운터 도달 시에만 반환함으로써 수명을 증명한다(아래 SAFETY).
-mod ar_pool {
+pub mod ar_pool {
     use std::collections::VecDeque;
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -363,6 +363,30 @@ fn gdn_ar_head(
         }
     }
     lo.copy_from_slice(&o);
+}
+
+/// 행별 도트 병렬 — out[r] = Σ_i x[i]·w[r][i] (행 내 순차 순서 보존, 비트동일).
+/// exl3 alpha/beta 투영용(plans/120 A1) — ar_pool 재사용.
+/// SAFETY: 잡은 run_par 완료 대기 내에서만 원시 포인터를 판독한다.
+#[allow(clippy::indexing_slicing)]
+pub fn dot_rows_par(x: &[f32], w: &[f32], out: &mut [f32]) {
+    let k = x.len();
+    let rows = out.len();
+    debug_assert!(w.len() >= rows * k);
+    let xp = SendPtr(x.as_ptr() as usize);
+    let wp = SendPtr(w.as_ptr() as usize);
+    let op = SendPtr(out.as_mut_ptr() as usize);
+    ar_pool::run_par(rows, move |r| {
+        Box::new(move || unsafe {
+            let xv = std::slice::from_raw_parts(xp.0 as *const f32, k);
+            let wv = std::slice::from_raw_parts((wp.0 as *const f32).add(r * k), k);
+            let mut s = 0f32;
+            for i in 0..k {
+                s += xv[i] * wv[i];
+            }
+            *((op.0 as *mut f32).add(r)) = s;
+        })
+    });
 }
 
 /// 배치 디코드: 토큰 1개 × n_seqs. (build_delta_net_autoregressive / fused one_chunk)
