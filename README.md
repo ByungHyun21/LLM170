@@ -43,7 +43,7 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 ### Q4_K (GGUF) — deprecated (EXL3 전환, 2026-10)
 
-아래는 EXL3 전환(plans/118) 이전의 Q4_K_XL 기준 수치다.
+아래는 EXL3 전환 이전의 Q4_K_XL 기준 수치다.
 
 #### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
