@@ -17,7 +17,7 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 | mode | LLM170 vulkan |
 |---|---|
-| tg single | 4.59 (direct trellis, plan 120 A1) |
+| tg single | 4.69 (direct trellis, LLM170_VK_DBUF=1, plan 120 A1) |
 | np4 greedy | — |
 | MTP k=2 | — |
 | MTP k=3 | — |
