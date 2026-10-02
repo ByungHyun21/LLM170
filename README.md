@@ -27,9 +27,6 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | MTP + np4 k=2 | 14.43 | n/a | **35.97** | — |
 | MTP + np4 k=3 | 12.71 | n/a | 33.95 | — |
 
-llama MTP/np: llama-server `--spec-type draft-mtp --spec-draft-n-max K`,
-208-tok 프롬프트 × n_predict 128 × 3회 중앙값 (bench_np 프로토콜).
-
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
 | backend | pp512 | pp4096 | pp16384 | tg128@8k |
@@ -47,9 +44,6 @@ llama MTP/np: llama-server `--spec-type draft-mtp --spec-draft-n-max K`,
 | MTP k=3 | 7.0 | n/s |
 | MTP + np4 k=2 | 8.41 | n/s |
 | MTP + np4 k=3 | 7.27 | n/s |
-
-llama FN MTP: 미지원 — draft-mtp가 `token_embd`를 요구하나 qwen4exp는
-per-layer embedding(`per_layer_token_embd`)이라 로드 거부 (0c1e57098).
 
 <!-- 금지: 이 영역에 게이트 통과·기능 나열·세션 노트 등 잡다한 산출물을
      적지 않는다 — 표 안의 측정값만 갱신한다 (repo 규칙). -->
