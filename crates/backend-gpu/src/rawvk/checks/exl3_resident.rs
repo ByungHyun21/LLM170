@@ -33,6 +33,7 @@ pub struct TrellisResident {
     p1: Pipes,
     p2: Pipes,
     p3: Pipes,
+    p4: Pipes,
     // 스크래치 (재사용 — alloc 폭탄 제거)
     ahb1: VkBuf,
     ahb2: VkBuf,
@@ -42,6 +43,8 @@ pub struct TrellisResident {
     yb2: VkBuf,
     yb3: VkBuf,
     xb: VkBuf,
+    /// FFN ew 출력(= down의 had_in 입력) — max_n 폭 f16.
+    x2b: VkBuf,
 }
 
 impl TrellisResident {
@@ -53,6 +56,7 @@ impl TrellisResident {
         let p1 = ctx.pipeline_pipes(include_bytes!("../spv/exl3_had_in.spv"), 3, 4)?;
         let p2 = ctx.pipeline_pipes(include_bytes!("../spv/exl3_gemv.spv"), 3, 12)?;
         let p3 = ctx.pipeline_pipes(include_bytes!("../spv/exl3_had_out.spv"), 3, 8)?;
+        let p4 = ctx.pipeline_pipes(include_bytes!("../spv/exl3_ffn_ew.spv"), 3, 4)?;
 
         let mut linears = Vec::new();
         let mut norms = Vec::new();
@@ -180,6 +184,7 @@ impl TrellisResident {
         let yb2 = ctx.alloc(max_n * 4)?;
         let yb3 = ctx.alloc(max_n * 4)?;
         let xb = ctx.alloc(max_k * 2)?;
+        let x2b = ctx.alloc(max_n * 2)?;
 
         Ok(Self {
             linears,
@@ -200,6 +205,8 @@ impl TrellisResident {
             yb2,
             yb3,
             xb,
+            x2b,
+            p4,
         })
     }
 
@@ -233,84 +240,158 @@ impl TrellisResident {
     /// 배치: 선형별 had_in→gemv→had_out 체인, 단일 제출·단일 동기.
     /// suh는 텐서별 스케일이라 had_in을 공유하지 않고 슬롯별 ah에서 변환.
     /// sb 공유는 run_rw 배리어가 WAR/WAW를 커버(context plans/104 판정식).
+    /// 선형 1개의 3커널 체인 발행 (배치 내부 — begin_batch 후에만 호출).
+    /// x_src: had_in 입력 버퍼(xb 또는 FFN ew 출력 x2b).
+    fn chain_one(
+        &mut self,
+        x_src: ash::vk::Buffer,
+        li: usize,
+        ah: ash::vk::Buffer,
+        yb: ash::vk::Buffer,
+    ) -> Result<(), String> {
+        let nseg = 16u32; // load의 sb 할당과 일치(k-분할)
+        let l = &self.linears[li].1;
+        let (k, n, krate) = (l.k, l.n, l.krate);
+        let (suh_b, tre_b, svh_b) = (l.suh.buf, l.tre.buf, l.svh.buf);
+        let sb_b = self.sb.buf;
+
+        // had_in: x_src × suh_i → ah_i (텐서별 suh — 공유 금지)
+        let ds = self.ctx.fresh_ds_for(&self.p1, 3)?;
+        self.ctx.bind_bufs(ds, &[x_src, suh_b, ah]);
+        let push = (k as u32 / 128).to_le_bytes().to_vec();
+        // ts 표 라벨은 site::tag()(TAG thread-local) — scope은 CUR만 바꾼다.
+        crate::rawvk::context::site::set_tag("e3_had_in");
+        self.ctx.run_rw(
+            self.p1.pl,
+            ds,
+            self.p1.pipe,
+            &push,
+            (k / 128) as u32,
+            1,
+            1,
+            &[x_src, suh_b],
+            &[ah],
+        )?;
+
+        // gemv: ah_i × tre → sb
+        let ds2 = self.ctx.fresh_ds_for(&self.p2, 3)?;
+        self.ctx.bind_bufs(ds2, &[ah, tre_b, sb_b]);
+        let push2: Vec<u8> = [(k / 16) as u32, (n / 16) as u32, krate]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        crate::rawvk::context::site::set_tag("e3_gemv");
+        self.ctx.run_rw(
+            self.p2.pl,
+            ds2,
+            self.p2.pipe,
+            &push2,
+            ((n / 16) as u32).div_ceil(8),
+            nseg,
+            1,
+            &[ah, tre_b],
+            &[sb_b],
+        )?;
+
+        // had_out: sb × svh → yb_slot
+        let ds3 = self.ctx.fresh_ds_for(&self.p3, 3)?;
+        self.ctx.bind_bufs(ds3, &[sb_b, svh_b, yb]);
+        let push3: Vec<u8> = [(n as u32 / 128), nseg]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        crate::rawvk::context::site::set_tag("e3_had_out");
+        self.ctx.run_rw(
+            self.p3.pl,
+            ds3,
+            self.p3.pipe,
+            &push3,
+            (n / 128) as u32,
+            1,
+            1,
+            &[sb_b, svh_b],
+            &[yb],
+        )?;
+        Ok(())
+    }
+
+    /// 배치: 선형별 had_in→gemv→had_out 체인, 단일 제출·단일 동기.
+    /// suh는 텐서별 스케일이라 had_in을 공유하지 않고 슬롯별 ah에서 변환.
+    /// sb 공유는 run_rw 배리어가 WAR/WAW를 커버(context plans/104 판정식).
     fn batch_chain(
         &mut self,
         inputs: &[usize],  // linear 인덱스 목록 (≤3)
         outputs: &[usize], // 호환 — 결과는 슬롯 순서대로 yb1..yb3
     ) -> Result<(), String> {
         let _ = outputs;
-        let nseg = 16u32; // load의 sb 할당과 일치(k-분할)
 
         self.ctx.begin_batch()?;
         for (slot, &li) in inputs.iter().enumerate() {
-            let l = &self.linears[li].1;
-            let (k, n, krate) = (l.k, l.n, l.krate);
-            let (suh_b, tre_b, svh_b) = (l.suh.buf, l.tre.buf, l.svh.buf);
             let ah = [self.ahb1.buf, self.ahb2.buf, self.ahb3.buf][slot];
             let yb = [self.yb1.buf, self.yb2.buf, self.yb3.buf][slot];
-            let (xb_b, sb_b) = (self.xb.buf, self.sb.buf);
-
-            // had_in: xb × suh_i → ah_i (텐서별 suh — 공유 금지)
-            let ds = self.ctx.fresh_ds_for(&self.p1, 3)?;
-            self.ctx.bind_bufs(ds, &[xb_b, suh_b, ah]);
-            let push = (k as u32 / 128).to_le_bytes().to_vec();
-            // ts 표 라벨은 site::tag()(TAG thread-local) — scope은 CUR만 바꾼다.
-            crate::rawvk::context::site::set_tag("e3_had_in");
-            self.ctx.run_rw(
-                self.p1.pl,
-                ds,
-                self.p1.pipe,
-                &push,
-                (k / 128) as u32,
-                1,
-                1,
-                &[xb_b, suh_b],
-                &[ah],
-            )?;
-
-            // gemv: ah_i × tre → sb
-            let ds2 = self.ctx.fresh_ds_for(&self.p2, 3)?;
-            self.ctx.bind_bufs(ds2, &[ah, tre_b, sb_b]);
-            let push2: Vec<u8> = [(k / 16) as u32, (n / 16) as u32, krate]
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            crate::rawvk::context::site::set_tag("e3_gemv");
-            self.ctx.run_rw(
-                self.p2.pl,
-                ds2,
-                self.p2.pipe,
-                &push2,
-                ((n / 16) as u32).div_ceil(8),
-                nseg,
-                1,
-                &[ah, tre_b],
-                &[sb_b],
-            )?;
-
-            // had_out: sb × svh → yb_slot
-            let ds3 = self.ctx.fresh_ds_for(&self.p3, 3)?;
-            self.ctx.bind_bufs(ds3, &[sb_b, svh_b, yb]);
-            let push3: Vec<u8> = [(n as u32 / 128), nseg]
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            crate::rawvk::context::site::set_tag("e3_had_out");
-            self.ctx.run_rw(
-                self.p3.pl,
-                ds3,
-                self.p3.pipe,
-                &push3,
-                (n / 128) as u32,
-                1,
-                1,
-                &[sb_b, svh_b],
-                &[yb],
-            )?;
+            self.chain_one(self.xb.buf, li, ah, yb)?;
         }
-
         self.ctx.end_batch_wait()?;
         Ok(())
+    }
+
+    /// FFN 3선형 + GPU ew 단일 배치 (plans/120 A1):
+    /// gate/up GEMV → ew(silu(g)·u → f16 x2b) → down GEMV — 동기 1회.
+    /// 게이트/업 판독·CPU 활성화·업로드가 사라진다. ew의 GPU exp는
+    /// CPU libm exp와 근사차(10a, 동일 f32 클래스) — vk-check ew 미러가
+    /// 허용치를 검증한다.
+    pub fn ffn_triple(
+        &mut self,
+        key_g: &str,
+        key_u: &str,
+        key_d: &str,
+        x: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        let ig = self.find_linear(key_g)?;
+        let iu = self.find_linear(key_u)?;
+        let id = self.find_linear(key_d)?;
+        let kg = self.linears[ig].1.k;
+        let ng = self.linears[ig].1.n;
+        let nd = self.linears[id].1.n;
+        if x.len() != kg
+            || self.linears[iu].1.k != kg
+            || self.linears[id].1.k != ng
+        {
+            return Err(format!("{key_g}/{key_u}/{key_d}: FFN 차원 불일치"));
+        }
+        self.upload_x(x)?;
+
+        self.ctx.begin_batch()?;
+        self.chain_one(self.xb.buf, ig, self.ahb1.buf, self.yb1.buf)?;
+        self.chain_one(self.xb.buf, iu, self.ahb2.buf, self.yb2.buf)?;
+        // ew: yb1(g) × yb2(u) → x2b (f16 쌍팩)
+        {
+            let ds4 = self.ctx.fresh_ds_for(&self.p4, 3)?;
+            self.ctx
+                .bind_bufs(ds4, &[self.yb1.buf, self.yb2.buf, self.x2b.buf]);
+            let push4 = (ng as u32).to_le_bytes().to_vec();
+            crate::rawvk::context::site::set_tag("e3_ffn_ew");
+            self.ctx.run_rw(
+                self.p4.pl,
+                ds4,
+                self.p4.pipe,
+                &push4,
+                ng.div_ceil(512) as u32,
+                1,
+                1,
+                &[self.yb1.buf, self.yb2.buf],
+                &[self.x2b.buf],
+            )?;
+        }
+        self.chain_one(self.x2b.buf, id, self.ahb3.buf, self.yb3.buf)?;
+        self.ctx.end_batch_wait()?;
+
+        let mut y = vec![0f32; nd];
+        // SAFETY: end_batch_wait 후 yb3 판독 — nd ≤ max_n(할당 상한).
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.yb3.ptr as *const f32, y.as_mut_ptr(), nd);
+        }
+        Ok(y)
     }
 
     /// 선형 투영: y = x @ W^T. 단일 선형.
