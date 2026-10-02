@@ -9,7 +9,43 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 <!-- 측정 프로토콜: hip(ROCm) 수치는 반드시 ROCm 10으로 측정한다
      (LD_LIBRARY_PATH=/opt/rocm-10.0.0/install/lib). Vulkan 수치는 무관. -->
 
-### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
+### Qwen3.8-27B (EXL3 SC_4.00bpw, 16.35 GB)
+
+| backend | pp512 | pp4096 | pp16384 | tg128@4k |
+|---|---|---|---|---|
+| LLM170 hip | — | — | — | — |
+| LLM170 vulkan | — | — | — | — |
+| exllamav3 (ROCm, 참조) | — | — | — | — |
+
+| mode | LLM170 hip | LLM170 vulkan | exllamav3 (ROCm) |
+|---|---|---|---|
+| tg single | — | — | — |
+| np4 greedy | — | — | — |
+| MTP k=2 | — | — | — |
+| MTP k=3 | — | — | — |
+| MTP + np4 k=2 | — | — | — |
+
+### Qwen3.8-Flash-Next (EXL3 5.05bpw, 123.1 GB)
+
+| backend | pp512 | pp4096 | pp16384 | tg128@8k |
+|---|---|---|---|---|
+| LLM170 hip | — | — | — | — |
+| LLM170 vulkan | — | — | — | — |
+| exllamav3 (ROCm, 참조) | — | — | — | — |
+
+### DeepSeek-V4-Flash-Vision-Exp (EXL3 3.04bpw, 118.4 GB, 비전+MTP3)
+
+| backend | pp512 | pp4096 | tg128 | VL |
+|---|---|---|---|---|
+| LLM170 hip | — | — | — | — |
+| LLM170 vulkan | — | — | — | — |
+| exllamav3 (ROCm, 참조) | — | — | — | — |
+
+### Q4_K (GGUF) — deprecated (EXL3 전환, 2026-10)
+
+아래는 EXL3 전환(plans/118) 이전의 Q4_K_XL 기준 수치다.
+
+#### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
 | backend | pp512 | pp4096 | pp8192 | pp16384 | tg128@4k |
 |---|---|---|---|---|---|
@@ -27,7 +63,7 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | MTP + np4 k=2 | 14.43 | n/a | **35.97** | — |
 | MTP + np4 k=3 | 12.71 | n/a | 33.95 | — |
 
-### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
+#### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
 | backend | pp512 | pp4096 | pp16384 | tg128@8k |
 |---|---|---|---|---|
