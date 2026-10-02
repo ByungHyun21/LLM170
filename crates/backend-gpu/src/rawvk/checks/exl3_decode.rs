@@ -509,6 +509,6 @@ pub fn exl3_decode(dir: &str, tokens_str: &str, n_predict: usize) -> Result<Stri
         n_predict,
         decode_s,
         tps,
-        &out_tokens[..out_tokens.len().min(8)]
+        out_tokens.as_slice()
     ))
 }
