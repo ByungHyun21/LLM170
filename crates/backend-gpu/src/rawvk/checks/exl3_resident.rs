@@ -353,10 +353,7 @@ impl TrellisResident {
         let kg = self.linears[ig].1.k;
         let ng = self.linears[ig].1.n;
         let nd = self.linears[id].1.n;
-        if x.len() != kg
-            || self.linears[iu].1.k != kg
-            || self.linears[id].1.k != ng
-        {
+        if x.len() != kg || self.linears[iu].1.k != kg || self.linears[id].1.k != ng {
             return Err(format!("{key_g}/{key_u}/{key_d}: FFN 차원 불일치"));
         }
         self.upload_x(x)?;
