@@ -141,22 +141,15 @@ fn gdn_forward(
     let eps = 1e-6f32;
 
     // 선형 투영 (vk GEMV) — alpha/beta도 선형이지만 크기가 작아 inline 계산
-    // plans/120 A1: qkv·z 동일 입력 → linear_pair 1배치 (동기 2→1).
+    // plans/120 A1: qkvz를 지연 패턴으로 제출(DBUF=1 시 비동기)하고
+    // alpha/beta dot·ssm 수학은 qkvz 출력과 무독립이라 GPU 실행과 중첩한
+    // 뒤 fetch로 합류 — 간극 −13ms 목표. DBUF 부재 시 의미 불변.
     let _gq = ph("gdn:lin_qkvz");
-    let (qkv, z) = tr.linear_pair(
+    let (pq, pz) = tr.linear_pair_deferred(
         &format!("{lp}.in_proj_qkv"),
         &format!("{lp}.in_proj_z"),
         x_normed,
     )?;
-    drop(_gq);
-    if il == 0 && seq.pos == 0 {
-        let rms = (qkv.iter().map(|v| v * v).sum::<f32>() / qkv.len() as f32).sqrt();
-        eprintln!(
-            "  [dbg] L0 qkv rms={rms:.4} qkv[0]={:.6} qkv[1]={:.6}",
-            qkv[0],
-            qkv.get(1).copied().unwrap_or(0.0)
-        );
-    }
     // alpha: hidden → 48 (V헤드별 스케일러) — 노름에서 읽기
     let a_proj = tr
         .norm(&format!("{lp}.in_proj_a.weight"))
@@ -187,7 +180,23 @@ fn gdn_forward(
     let ssm_a: Vec<f32> = (0..n_v)
         .map(|i| -a_log[i.min(a_log.len() - 1)].exp())
         .collect();
-    let dt_bias = tr.norm(&format!("{lp}.dt_bias")).ok_or("dt_bias missing")?;
+    let dt_bias = tr
+        .norm(&format!("{lp}.dt_bias"))
+        .ok_or("dt_bias missing")?
+        .to_vec(); // fetch(가변) 이후에도 쓴다 — 소유 복사(값 불변)
+
+    // 지연 판독 합류 — 이 시점까지 GPU는 qkvz를 실행했다(DBUF 시).
+    let qkv = tr.fetch(pq)?;
+    let z = tr.fetch(pz)?;
+    drop(_gq);
+    if il == 0 && seq.pos == 0 {
+        let rms = (qkv.iter().map(|v| v * v).sum::<f32>() / qkv.len() as f32).sqrt();
+        eprintln!(
+            "  [dbg] L0 qkv rms={rms:.4} qkv[0]={:.6} qkv[1]={:.6}",
+            qkv[0],
+            qkv.get(1).copied().unwrap_or(0.0)
+        );
+    }
 
     // beta, g
     let _gm = ph("gdn:ab_math");
