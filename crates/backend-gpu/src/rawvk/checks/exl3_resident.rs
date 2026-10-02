@@ -220,11 +220,13 @@ impl TrellisResident {
         let nseg: u32 = 4;
         let l = &self.linears[idx].1;
 
-        // had_in
+        // 3커널 배치 — submit+wait 1회 (run_rw 3회 → 3× 동기 절감).
+        self.ctx.begin_batch()?;
+
         let ds1 = self.ctx.fresh_ds_for(&self.p1, 3)?;
         self.ctx.bind_bufs(ds1, &[xb.buf, l.suh.buf, self.ahb.buf]);
         let push1 = (k as u32 / 128).to_le_bytes().to_vec();
-        self.ctx.run_rw(
+        self.ctx.run(
             self.p1.pl,
             ds1,
             self.p1.pipe,
@@ -232,11 +234,8 @@ impl TrellisResident {
             (k / 128) as u32,
             1,
             1,
-            &[xb.buf, l.suh.buf],
-            &[self.ahb.buf],
         )?;
 
-        // gemv
         let ds2 = self.ctx.fresh_ds_for(&self.p2, 3)?;
         self.ctx
             .bind_bufs(ds2, &[self.ahb.buf, l.tre.buf, self.sb.buf]);
@@ -244,7 +243,7 @@ impl TrellisResident {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        self.ctx.run_rw(
+        self.ctx.run(
             self.p2.pl,
             ds2,
             self.p2.pipe,
@@ -252,11 +251,8 @@ impl TrellisResident {
             ((n / 16) as u32).div_ceil(8),
             nseg,
             1,
-            &[self.ahb.buf, l.tre.buf],
-            &[self.sb.buf],
         )?;
 
-        // had_out
         let ds3 = self.ctx.fresh_ds_for(&self.p3, 3)?;
         self.ctx
             .bind_bufs(ds3, &[self.sb.buf, l.svh.buf, self.yb.buf]);
@@ -264,7 +260,7 @@ impl TrellisResident {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        self.ctx.run_rw(
+        self.ctx.run(
             self.p3.pl,
             ds3,
             self.p3.pipe,
@@ -272,11 +268,10 @@ impl TrellisResident {
             (n / 128) as u32,
             1,
             1,
-            &[self.sb.buf, l.svh.buf],
-            &[self.yb.buf],
         )?;
 
-        // run_rw(비배치)는 디스패치마다 자체 wait_for_fences — GPU 완료 보장.
+        // 배치 제출 + 완료 대기 (유일한 동기 지점).
+        self.ctx.end_batch_wait()?;
 
         // 최종 결과는 yb(had_out 출력)에서 판독.
         let mut y = vec![0f32; n];
