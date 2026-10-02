@@ -14,6 +14,8 @@ mod trellis;
 
 pub use error::{Exl3Error, Result};
 pub use json::Json;
+pub mod model;
+pub use model::{Exl3Config, Exl3Model, LinearRef, PlainRef};
 pub use trellis::{Exl3Linear, MUL1_MULT, PERM_INV, dequant_block, mul1_decode, tile_words};
 
 use std::collections::HashMap;
@@ -296,6 +298,16 @@ impl StArchive {
             off += w;
         }
         Ok(())
+    }
+
+    /// 샤드 파일 경로(엔진 mmap용).
+    pub fn shard_paths(&self) -> Vec<&Path> {
+        self.shards.iter().map(|s| s.path.as_path()).collect()
+    }
+
+    /// 샤드 i의 데이터 섹션 절대 오프셋.
+    pub fn shard_data_base(&self, i: usize) -> Option<u64> {
+        self.shards.get(i).map(|s| s.data_base)
     }
 
     /// 텐서 원시 바이트를 읽는다(검증·참조 경로 — 엔진 적재는 mmap 별도).

@@ -29,6 +29,13 @@ impl Json {
         Ok(v)
     }
 
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Json::Num(n) => Some(*n),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Json::Str(s) => Some(s),

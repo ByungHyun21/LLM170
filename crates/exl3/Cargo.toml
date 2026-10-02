@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 llm170-diag = { path = "../diag" }
 half = "2"
+memmap2 = "0.9"
 
 [lints]
 workspace = true

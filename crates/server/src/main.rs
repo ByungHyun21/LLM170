@@ -49,6 +49,8 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
       W4A8 변형 ↔ f32 기준 상호검증.
   llm170 dequant <file> <tensor> <row> <n>
       디양자화 값 프로브.
+  llm170 exl3-load [exl3_dir]
+      EXL3 모델 레지스트리 구축 + §7.1 완전성 검증 (mmap).
   llm170 exl3-check [exl3_dir] [q8.gguf]
       EXL3 트렐리스 디코드 ↔ GGUF Q8 대조 (K=3/4/5 corr 기준 0.97).
   llm170 exl3-vk-check [exl3_dir] [tensor-key]
