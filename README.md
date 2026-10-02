@@ -107,12 +107,4 @@ crates/core        dequantization, matmul, Gated DeltaNet, qwen35 + qwen4exp eng
 crates/diag        shared diagnostics (fingerprint differ, NaN guard, trace)
 crates/backend-gpu raw HIP (hipRTC) + raw Vulkan (SPIR-V) GPU backends
 crates/server      llm170 CLI + HTTP server
-docs/              specs & decisions
 ```
-
-## Documentation
-
-- [Architecture](docs/architecture.md)
-- [Benchmarks](docs/benchmarks.md)
-- [Decision records](docs/decisions.md)
-- [CMP 170HX hardware spec](docs/hardware/cmp170hx.md)
