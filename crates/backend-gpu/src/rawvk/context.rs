@@ -818,10 +818,8 @@ impl VkCtx {
                     None,
                 )
                 .map_err(|e| format!("레이아웃: {e:?}"))?;
-            let code: Vec<u32> = spv
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
+            let (chunks, _) = spv.as_chunks::<4>();
+            let code: Vec<u32> = chunks.iter().map(|c| u32::from_le_bytes(*c)).collect();
             let smci = vk::ShaderModuleCreateInfo::default().code(&code);
             let sm = self
                 .device
@@ -927,10 +925,8 @@ impl VkCtx {
                     None,
                 )
                 .map_err(|e| format!("레이아웃: {e:?}"))?;
-            let code: Vec<u32> = spv
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
+            let (chunks, _) = spv.as_chunks::<4>();
+            let code: Vec<u32> = chunks.iter().map(|c| u32::from_le_bytes(*c)).collect();
             let sm = self
                 .device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
@@ -1022,10 +1018,8 @@ impl VkCtx {
                     None,
                 )
                 .map_err(|e| format!("레이아웃: {e:?}"))?;
-            let code: Vec<u32> = spv
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
+            let (chunks, _) = spv.as_chunks::<4>();
+            let code: Vec<u32> = chunks.iter().map(|c| u32::from_le_bytes(*c)).collect();
             let smci = vk::ShaderModuleCreateInfo::default().code(&code);
             let sm = self
                 .device
