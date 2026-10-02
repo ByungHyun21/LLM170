@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 llm170-core = { path = "../core" }
 llm170-gguf = { path = "../gguf" }
+llm170-exl3 = { path = "../exl3" }
 cubecl-hip-sys = { package = "hanzo-cubecl-hip-sys", version = "7.2" }
 bytemuck = "1"
 ash = "0.38.0"
