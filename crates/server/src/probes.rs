@@ -333,6 +333,30 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let tn = arg_str(args, 1, "blk.0.ffn_down_shexp.weight");
             llm170_backend_gpu::rawvk::checks::frame_check(&path, &tn)
         }
+        "exl3-to-gguf" => {
+            let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
+            let out = arg_str(
+                args,
+                1,
+                "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw/exl3-f16.gguf",
+            );
+            // args[2] = 층 상한(스모크용 절단) — 0/생략 = 전체.
+            let maxl = arg_num::<usize>(args, 2, 0);
+            let maxl = if maxl == 0 { None } else { Some(maxl) };
+            match llm170_exl3::convert::exl3_to_gguf(
+                std::path::Path::new(&arg_str(args, 0, d_exl3)),
+                std::path::Path::new(&out),
+                maxl,
+            ) {
+                Ok(s) => Ok(format!(
+                    "exl3-to-gguf: {}개 텐서 {:.1} GB — {:.0}초 → {out}",
+                    s.tensors,
+                    s.bytes as f64 / 1e9,
+                    s.elapsed_s
+                )),
+                Err(e) => Err(format!("{e}")),
+            }
+        }
         "exl3-load" => {
             let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
             let path = arg_str(args, 0, d_exl3);

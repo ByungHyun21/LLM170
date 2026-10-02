@@ -8,5 +8,8 @@ llm170-diag = { path = "../diag" }
 half = "2"
 memmap2 = "0.9"
 
+[dev-dependencies]
+llm170-gguf = { path = "../gguf" }
+
 [lints]
 workspace = true

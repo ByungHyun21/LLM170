@@ -90,6 +90,84 @@ pub fn decode_tile(u16s: &[u16], krate: u32, out: &mut [f32; 256]) {
     }
 }
 
+/// 무게 소유 무관 선형 뷰 — mmap 슬라이스(엔진)·Vec(참조) 공용.
+/// trellis 바이트는 u16 LE × kt×nt×16K, suh/svh는 f16 LE.
+pub struct LinearView<'a> {
+    pub tre: &'a [u8],
+    pub suh: &'a [u8],
+    pub svh: &'a [u8],
+    pub k: usize,
+    pub n: usize,
+    pub krate: u32,
+}
+
+impl LinearView<'_> {
+    /// 타일 (kt, nt) 디코드 — out은 위치 순서 256값.
+    pub fn tile(&self, kt: usize, nt: usize, out: &mut [f32; 256]) {
+        let tw = 16 * self.krate as usize;
+        let ntiles = self.n / 16;
+        let off = ((kt * ntiles + nt) * tw) * 2;
+        let (chunks, _) = self.tre[off..off + tw * 2].as_chunks::<2>();
+        let u16s: Vec<u16> = chunks.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        decode_tile(&u16s, self.krate, out);
+    }
+
+    /// 원 기저 가중치 블록 — W[k0..+bk, n0..+bn] (f64 참조).
+    /// W = diag(suh)·(H·Wq·H)/128·diag(svh), H는 128청크 자연 순서 WHT.
+    /// k0/n0는 16의 배수, bk·bn ≤ 128이며 청크 경계 내부.
+    pub fn dequant_block_f64(&self, k0: usize, n0: usize, bk: usize, bn: usize) -> Vec<f64> {
+        dequant_view(self, k0, n0, bk, bn)
+    }
+}
+
+fn f16le_at(buf: &[u8], i: usize) -> f16 {
+    f16::from_le_bytes([buf[2 * i], buf[2 * i + 1]])
+}
+
+/// 뷰 기반 원 기저 블록 디퀀트 — Exl3Linear::dequant_block_f64의 본체.
+fn dequant_view(w: &LinearView, k0: usize, n0: usize, bk: usize, bn: usize) -> Vec<f64> {
+    assert!(bk <= 128 && bn <= 128);
+    assert!(k0.is_multiple_of(16) && n0.is_multiple_of(16));
+    assert!(k0 % 128 + bk <= 128 && n0 % 128 + bn <= 128);
+    let ck0 = (k0 % 128) / 16;
+    let cn0 = (n0 % 128) / 16;
+    let mut full = vec![0f64; 128 * 128];
+    let mut tile = [0f32; 256];
+    for kt in 0..8 {
+        for nt in 0..8 {
+            w.tile(k0 / 16 - ck0 + kt, n0 / 16 - cn0 + nt, &mut tile);
+            for r in 0..16 {
+                for c in 0..16 {
+                    full[(kt * 16 + r) * 128 + nt * 16 + c] = tile[r * 16 + c] as f64;
+                }
+            }
+        }
+    }
+    let (rows, _) = full.as_chunks_mut::<128>();
+    for row in rows {
+        had128(row);
+    }
+    let mut col = [0f64; 128];
+    for c in 0..128 {
+        for (r, v) in col.iter_mut().enumerate() {
+            *v = full[r * 128 + c];
+        }
+        had128(&mut col);
+        for (r, v) in col.iter().enumerate() {
+            full[r * 128 + c] = v / 128.0;
+        }
+    }
+    let mut out = vec![0f64; bk * bn];
+    for i in 0..bk {
+        let si = f16le_at(w.suh, k0 + i).to_f64();
+        for j in 0..bn {
+            let sj = f16le_at(w.svh, n0 + j).to_f64();
+            out[i * bn + j] = si * sj * full[(ck0 * 16 + i) * 128 + cn0 * 16 + j];
+        }
+    }
+    out
+}
+
 /// EXL3 양자화 선형 레이어(참조 표현 — 엔진 적재는 별도 경로).
 #[derive(Debug)]
 pub struct Exl3Linear {
@@ -150,23 +228,33 @@ impl Exl3Linear {
         })
     }
 
-    /// 타일 (kt, nt) 디코드 — out은 위치 순서 256값.
-    pub fn tile(&self, kt: usize, nt: usize, out: &mut [f32; 256]) {
-        let tw = 16 * self.krate as usize + if self.half_k { 8 } else { 0 };
-        let ntiles = self.n / 16;
-        let off = ((kt * ntiles + nt) * tw) * 2;
-        let (chunks, _) = self.trellis[off..off + tw * 2].as_chunks::<2>();
-        let u16s: Vec<u16> = chunks.iter().map(|c| u16::from_le_bytes(*c)).collect();
-        // 반정수 bpw는 참조 미구현(27B 4.0bpw에 없음) — 상류에서 거부.
-        decode_tile(&u16s, self.krate, out);
+    /// 무소유 뷰 — mmap/참조 공용 경로.
+    pub fn view(&self) -> LinearView<'_> {
+        // SAFETY: f16은 2바이트 — &[f16]을 &[u8]로 재해석(읽기 전용).
+        let (s, v): (&[u8], &[u8]) = unsafe {
+            (
+                std::slice::from_raw_parts(self.suh.as_ptr() as *const u8, self.suh.len() * 2),
+                std::slice::from_raw_parts(self.svh.as_ptr() as *const u8, self.svh.len() * 2),
+            )
+        };
+        LinearView {
+            tre: &self.trellis,
+            suh: s,
+            svh: v,
+            k: self.k,
+            n: self.n,
+            krate: self.krate,
+        }
     }
 
-    /// 원 기저 가중치 블록 — W[k0..k0+bk, n0..n0+bn] (f64 참조).
-    ///
-    /// W = diag(suh)·(H·Wq·H)/128·diag(svh), H는 128청크 자연 순서 WHT.
-    /// k0/n0는 16의 배수, bk/bn ≤ 128이며 청크 경계를 넘지 않아야 한다.
+    /// 타일 (kt, nt) 디코드 — 뷰 위임.
+    pub fn tile(&self, kt: usize, nt: usize, out: &mut [f32; 256]) {
+        self.view().tile(kt, nt, out);
+    }
+
+    /// 원 기저 가중치 블록 — W[k0..+bk, n0..+bn] (f64 참조). 뷰 위임.
     pub fn dequant_block_f64(&self, k0: usize, n0: usize, bk: usize, bn: usize) -> Vec<f64> {
-        dequant_block(self, k0, n0, bk, bn)
+        self.view().dequant_block_f64(k0, n0, bk, bn)
     }
 }
 
@@ -204,73 +292,6 @@ pub fn had128(v: &mut [f64]) {
         }
         width *= 2;
     }
-}
-
-/// 원 기저 블록 디퀀트(f64 참조). 제약: bk·bn ≤ 128, k0/n0 16배수,
-/// 블록은 단일 128청크 내부(상류가 청크 분할 책임).
-pub fn dequant_block(w: &Exl3Linear, k0: usize, n0: usize, bk: usize, bn: usize) -> Vec<f64> {
-    assert!(bk <= 128 && bn <= 128);
-    assert!(k0.is_multiple_of(16) && n0.is_multiple_of(16));
-    assert!(k0 % 128 + bk <= 128 && n0 % 128 + bn <= 128);
-    let ktiles = bk / 16;
-    let ntiles = bn / 16;
-
-    // Wq 블록(bk × bn) — 타일 단위 디코드.
-    let mut wq = vec![0f64; bk * bn];
-    let mut tile = [0f32; 256];
-    for kt in 0..ktiles {
-        for nt in 0..ntiles {
-            w.tile(k0 / 16 + kt, n0 / 16 + nt, &mut tile);
-            for r in 0..16 {
-                for c in 0..16 {
-                    wq[(kt * 16 + r) * bn + nt * 16 + c] = tile[r * 16 + c] as f64;
-                }
-            }
-        }
-    }
-
-    // H·Wq·H / 128 — 좌우 각각 부분 WHT(128열/행 전체가 필요하므로
-    // 청크 내 나머지 타일도 디코드).
-    let ck0 = (k0 % 128) / 16; // 블록의 청크 내 타일 시작
-    let cn0 = (n0 % 128) / 16;
-    let ck = 128 / 16;
-    let mut full = vec![0f64; 128 * 128];
-    for kt in 0..ck {
-        for nt in 0..ck {
-            w.tile(k0 / 16 - ck0 + kt, n0 / 16 - cn0 + nt, &mut tile);
-            for r in 0..16 {
-                for c in 0..16 {
-                    full[(kt * 16 + r) * 128 + nt * 16 + c] = tile[r * 16 + c] as f64;
-                }
-            }
-        }
-    }
-    // 행 방향 H.
-    let (rows, _) = full.as_chunks_mut::<128>();
-    for row in rows {
-        had128(row);
-    }
-    // 열 방향 H.
-    let mut col = [0f64; 128];
-    for c in 0..128 {
-        for (r, v) in col.iter_mut().enumerate() {
-            *v = full[r * 128 + c];
-        }
-        had128(&mut col);
-        for (r, v) in col.iter().enumerate() {
-            full[r * 128 + c] = v / 128.0;
-        }
-    }
-    // 스케일 적용 후 블록 발췌.
-    let mut out = vec![0f64; bk * bn];
-    for i in 0..bk {
-        let si = w.suh[k0 + i].to_f64();
-        for j in 0..bn {
-            let sj = w.svh[n0 + j].to_f64();
-            out[i * bn + j] = si * sj * full[(ck0 * 16 + i) * 128 + cn0 * 16 + j];
-        }
-    }
-    out
 }
 
 #[cfg(test)]
