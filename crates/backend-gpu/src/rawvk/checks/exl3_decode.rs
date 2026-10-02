@@ -166,6 +166,8 @@ fn gdn_forward(
         .ok_or("beta missing")?;
 
     // a[b] = dot(x_normed, a_proj[b]) for each V head b
+    // (풀 병렬화는 잡당 고정비 ~3µs에 묻혔 materially 무차 — 스칼라 유지,
+    // plans/120 A1 실험 기록)
     let _ga = ph("gdn:ab_dot");
     let mut a_vals = vec![0f32; n_v];
     for (h, a_vals_h) in a_vals.iter_mut().enumerate() {
