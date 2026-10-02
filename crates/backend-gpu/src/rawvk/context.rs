@@ -41,6 +41,8 @@ pub struct VkCtx {
     pub mem_ty: u32,
     /// GTT(캐시 host-visible) 타입 — 스크래치용.
     pub mem_ty_host: u32,
+    /// HOST_CACHED 판독 타입(비결합 — flush/invalidate 동반 의무).
+    pub mem_ty_cached: u32,
     /// VK_EXT_pipeline_robustness 사용 가능 — NR 파이프라인이 SSBO 무결역 검사 비활성.
     pub pipeline_robustness: bool,
     pub batching: std::sync::atomic::AtomicBool,
@@ -282,6 +284,17 @@ impl VkCtx {
                     f.contains(hv) && !f.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
                 })
                 .unwrap_or(ty as usize) as u32;
+            // 캐시 판독 타입 — HOST_CACHED(GTT 캐시 힙, 이 기기 ty5/6/10).
+            // 대량 호스트 판독(배치 프리필 yb T×n MB)은 COHERENT 무캐시 타입이
+            // ~300MB/s에 걸린다(2026-10-03 exl3_lindbg 계측). 비결합이라
+            // CPU 쓰기 후 flush·GPU 쓰기 후 invalidate가 obligations다.
+            let ty_cached = (0..mprops.memory_type_count as usize)
+                .find(|&i| {
+                    let f = mprops.memory_types[i].property_flags;
+                    f.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+                        && f.contains(vk::MemoryPropertyFlags::HOST_CACHED)
+                })
+                .unwrap_or(ty_host as usize) as u32;
 
             Ok(Self {
                 entry,
@@ -304,6 +317,7 @@ impl VkCtx {
                 max_ssbo: props.limits.max_storage_buffer_range as usize,
                 mem_ty: ty,
                 mem_ty_host: ty_host,
+                mem_ty_cached: ty_cached,
                 batching: std::sync::atomic::AtomicBool::new(false),
                 submits: std::cell::Cell::new(0),
                 ds_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -443,6 +457,34 @@ impl VkCtx {
     }
 
     /// 배치 시작 — 이후 run()은 cmdbuf2에 녹화만.
+    /// 메모리 타입 원장 덤프(진단 — 힙·플래그·토크 캐시 가능성 판별).
+    pub fn dump_mem_types(&self) {
+        let mprops = unsafe {
+            self.instance
+                .get_physical_device_memory_properties(self.physical)
+        };
+        eprintln!("[memty] 메모리 타입 {}개:", mprops.memory_type_count);
+        for (i, mt) in mprops.memory_types.iter().enumerate() {
+            let f = mt.property_flags;
+            eprintln!(
+                "  ty{i} heap{} D{} V{} C{} CACHED{} LAZILY{}",
+                mt.heap_index,
+                f.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) as u8,
+                f.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) as u8,
+                f.contains(vk::MemoryPropertyFlags::HOST_COHERENT) as u8,
+                f.contains(vk::MemoryPropertyFlags::HOST_CACHED) as u8,
+                f.contains(vk::MemoryPropertyFlags::LAZILY_ALLOCATED) as u8,
+            );
+        }
+        for (i, h) in mprops.memory_heaps.iter().enumerate() {
+            eprintln!(
+                "  heap{i} {:.1} GB D{}",
+                h.size as f64 / 1e9,
+                h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) as u8
+            );
+        }
+    }
+
     pub fn begin_batch(&mut self) -> Result<(), String> {
         // plans/93: 재생 모드 — 이미 녹화된 커맨드 버퍼를 재제출(스킵).
         if self.replay_mode.get() {
@@ -695,6 +737,43 @@ impl VkCtx {
             eprintln!("# alloc_host {bytes}B 실패 — 백트레이스:\n{bt}");
         }
         r
+    }
+
+    /// HOST_CACHED 판독 할당 — 대량 호스트 판독 경로(배치 프리필 스크래치).
+    /// 비결합: CPU 쓰기 후 flush_buf, GPU 쓰기 판독 전 invalidate_buf.
+    pub fn alloc_host_cached(&mut self, bytes: usize) -> Result<VkBuf, String> {
+        let saved = self.mem_ty;
+        self.mem_ty = self.mem_ty_cached;
+        let r = self.alloc(bytes);
+        self.mem_ty = saved;
+        if r.is_err() {
+            llm170_diag::alloc::report();
+        }
+        r
+    }
+
+    /// 매핑 범위 플러시(비결합 캐시 메모리 CPU 쓰기 → GPU 가시화).
+    pub fn flush_buf(&self, b: &VkBuf) {
+        // SAFETY: b.mem 매핑 전체 플러시 — 범위는 할당 크기와 일치.
+        unsafe {
+            let range = vk::MappedMemoryRange::default()
+                .memory(b.mem)
+                .offset(0)
+                .size(b.bytes as u64);
+            let _ = self.device.flush_mapped_memory_ranges(&[range]);
+        }
+    }
+
+    /// 매핑 범위 인밸리데이트(GPU 쓰기 → CPU 가시화, 펜스 대기 후).
+    pub fn invalidate_buf(&self, b: &VkBuf) {
+        // SAFETY: b.mem 매핑 전체 인밸리데이트 — 범위는 할당 크기와 일치.
+        unsafe {
+            let range = vk::MappedMemoryRange::default()
+                .memory(b.mem)
+                .offset(0)
+                .size(b.bytes as u64);
+            let _ = self.device.invalidate_mapped_memory_ranges(&[range]);
+        }
     }
 
     /// 버퍼 할당 — 자체 디바이스 메모리 + 매핑 (호스트 포인터 동반).

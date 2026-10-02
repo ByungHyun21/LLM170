@@ -13,11 +13,12 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
-| LLM170 vulkan | — | — | — | — |
+| LLM170 vulkan | 32.2 (batch trellis GEMM prefill, plan 121 A1-pp) | — | — | — |
 
 | mode | LLM170 vulkan |
 |---|---|
 | tg single | 4.69 (direct trellis, LLM170_VK_DBUF=1, plan 120 A1) |
+| pp batch512 | 32.21 vs 4.00 sequential (greedy 8/8 identical, corr 0.999998, plan 121 A1-pp) |
 | np4 greedy | — |
 | MTP k=2 | — |
 | MTP k=3 | — |
@@ -25,6 +26,7 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | MTP + np4 k=3 | — |
 
 Direct trellis decode (13 GB GTT resident, no F16 expansion).
+Prefill: T-batched trellis GEMM (exl3_gemm, Tt=32) + GDN chunked scan + batched attention — `llm170 exl3-pp`.
 Remaining modes require engine MTP/np integration with EXL3 path.
 Quality: 8/8 greedy tokens identical to Q4_K_XL baseline (same prompt).
 

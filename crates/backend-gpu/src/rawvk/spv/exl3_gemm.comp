@@ -1,0 +1,137 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// exl3_gemm (plans/121 A1-pp) — EXL3 트렐리스 T-배치 GEMM (프리필 경로):
+// S[t][n] = Σ_k A_had[t][k] · Wq[k,n], Wq는 trellis에서 즉석 디코드.
+// exl3_gemv(v6)의 협력 스테이징·추출·mul1 디코드 산술을 그대로 유지하고
+// 디코드된 가중치 1쌍이 Tt=32개 활성화 행에 FMA로 재사용된다 — GEMV의
+// 1 FMA/디코드 대비 32 FMA/디코드, 즉 연산강도 32배(메모리 벽 탈출).
+//
+// 누산 정밀도: GEMV와 동일 클래스 — f16x2 쌍 누산 + 4 k-타일마다 f32 폴드
+// (참조 FOLD 케이던스). nseg(k-분할) 값만 다르다(16→4) — 청크 분해는
+// 규칙 10a(환원 순서) 범위, exl3-pp 검증이 상관·토큰 동일성 확인.
+//
+// 그리드: x = n_wg×ntg(인터리브 — 인접 WG이 같은 가중치 타일의 서로 다른
+// t-그룹 → 동시 실행 시 L2 재사용), y = nseg, WG=128(16열×8 n-타일).
+// 부분합 sb: [T][nseg][n] f32 — had_out_t가 환원.
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer AhB { uint ah16[]; };  // f16 쌍팩 [T][k/2]
+layout(binding = 1) readonly buffer TreB { uint tre[]; };  // trellis u32 뷰
+layout(binding = 2) writeonly buffer SB { float s[]; };    // f32 [T][nseg][n]
+layout(push_constant) uniform PC {
+    uint ktiles;
+    uint ntiles;
+    uint K;        // bpw(정수부) — u16 폭 16K
+    uint T;        // 활성화 행 수
+    uint ntg;      // t-그룹 수 (ceil(T/32))
+} pc;
+
+const uint TT = 32u;  // WG당 활성화 행 타일
+
+float mul1_decode(uint w) {
+    uint x = w * 0x83DCD12Du;
+    uint p = (x & 0x00FF00FFu) + ((x >> 8u) & 0x00FF00FFu);
+    uint sum = (p & 0xFFFFu) + (p >> 16u);
+    return (1024.0 + float(sum)) * 0.00676727294921875 - 10.3828125;
+}
+
+// 스테이징(전역 스코프 — GLSL shared는 함수 내 선언 불가):
+// 8 n-타일 × words32(K≤6 → 48워드) + 활성화 쌍팩 [32][8].
+shared uint stg[8u * 48u];
+shared uint ahta[TT][8u];
+
+void main() {
+    uint wg_lin = gl_WorkGroupID.x;
+    uint tg = wg_lin % pc.ntg;          // t-그룹(행 32개 단위)
+    uint nwg = wg_lin / pc.ntg;
+    uint nt0 = nwg * 8u;
+    if (nt0 >= pc.ntiles) return;
+    uint seg = gl_WorkGroupID.y;
+    uint nseg = gl_NumWorkGroups.y;
+    uint ktb = pc.ktiles * seg / nseg;
+    uint kte = pc.ktiles * (seg + 1u) / nseg;
+    uint c = gl_LocalInvocationID.x & 15u;
+    uint ntl = gl_LocalInvocationID.x >> 4u;
+    uint tid = gl_LocalInvocationID.x;
+    uint words32 = 8u * pc.K;
+    uint stg_words = 8u * words32;
+    uint row0 = tg * TT;
+    uint arow_words = pc.ktiles * 8u;   // 행당 ah u32 워드 수 (k/2)
+
+    f16vec2 acc2[TT];
+    float accf[TT];
+    for (uint t = 0u; t < TT; t++) {
+        acc2[t] = f16vec2(float16_t(0.0));
+        accf[t] = 0.0;
+    }
+
+    // 스레드 불변 주소 사전 계산 — gemv와 동일식(r=0..15 워드의 i0·i1·시프트).
+    uint addr16[16];
+    for (uint r = 0u; r < 16u; r++) {
+        uint t_ = (4u * (c & 7u) + ((r & 7u) >> 1u)) * 8u
+               + ((r >> 3u) * 2u + (r & 1u) + ((c >> 3u) * 4u));
+        uint b0 = t_ * pc.K + (pc.K + 256u * pc.K - 16u);
+        uint b1 = b0 + 16u;
+        uint i0 = (b0 >> 5u) % words32;
+        uint i1 = ((b1 - 1u) >> 5u) % words32;
+        uint sh = (((b1 - 1u) >> 5u) + 1u) * 32u - b1;
+        addr16[r] = i0 | (i1 << 8u) | (sh << 16u);
+    }
+
+    for (uint kb = ktb; kb < kte; kb += 8u) {
+        uint nk = min(8u, kte - kb);
+        for (uint ktl = 0u; ktl < nk; ktl++) {
+            uint tbase = ((kb + ktl) * pc.ntiles + nt0) * words32;
+            // 협력 적재 — 가중치(연속 u32 코얼레스드) + 활성화 쌍팩 32행.
+            for (uint w = tid; w < stg_words; w += 128u) {
+                stg[w] = tre[tbase + w];
+            }
+            for (uint i = tid; i < TT * 8u; i += 128u) {
+                uint t = i >> 3u;
+                uint j = i & 7u;
+                ahta[t][j] = (row0 + t < pc.T)
+                    ? ah16[(row0 + t) * arow_words + (kb + ktl) * 8u + j]
+                    : 0u;
+            }
+            barrier();
+            // 쌍 8개(j=0..7) — 디코드 1회 × 32행 FMA. 추출은 gemv와
+            // 동일식(환형: 두 번째 워드 인덱스는 addr16 하위바이트 i0 —
+            // words32 랩 시 i0가 이미 모듈로 적용됨).
+            for (uint j = 0u; j < 8u; j++) {
+                uint a16e = addr16[2u * j];
+                uint we = (((a16e >> 16u) == 0u)
+                    ? (stg[ntl * words32 + ((a16e >> 8u) & 0xFFu)] & 0xFFFFu)
+                    : (((stg[ntl * words32 + ((a16e >> 8u) & 0xFFu)] >> (a16e >> 16u))
+                        | (stg[ntl * words32 + (a16e & 0xFFu)] << (32u - (a16e >> 16u)))) & 0xFFFFu));
+                uint a16o = addr16[2u * j + 1u];
+                uint wo = (((a16o >> 16u) == 0u)
+                    ? (stg[ntl * words32 + ((a16o >> 8u) & 0xFFu)] & 0xFFFFu)
+                    : (((stg[ntl * words32 + ((a16o >> 8u) & 0xFFu)] >> (a16o >> 16u))
+                        | (stg[ntl * words32 + (a16o & 0xFFu)] << (32u - (a16o >> 16u)))) & 0xFFFFu));
+                f16vec2 wp = f16vec2(float16_t(mul1_decode(we)),
+                                     float16_t(mul1_decode(wo)));
+                for (uint t = 0u; t < TT; t++) {
+                    vec2 av = unpackHalf2x16(ahta[t][j]);
+                    acc2[t] += f16vec2(av.x, av.y) * wp;
+                }
+            }
+            // 참조 FOLD 케이던스 — 4 k-타일마다 f32 폴드(전역 k-타일 카운트).
+            if (((kb + ktl) & 3u) == 3u) {
+                for (uint t = 0u; t < TT; t++) {
+                    accf[t] += float(acc2[t].x) + float(acc2[t].y);
+                    acc2[t] = f16vec2(float16_t(0.0));
+                }
+            }
+            barrier(); // 다음 k-타일 스테이징 전 전 소진 보장
+        }
+    }
+    uint nt = nt0 + ntl;
+    if (nt < pc.ntiles) {
+        for (uint t = 0u; t < TT; t++) {
+            if (row0 + t < pc.T) {
+                accf[t] += float(acc2[t].x) + float(acc2[t].y);
+                s[((row0 + t) * nseg + seg) * (pc.ntiles * 16u) + nt * 16u + c] = accf[t];
+            }
+        }
+    }
+}
