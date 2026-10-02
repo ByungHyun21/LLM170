@@ -162,6 +162,11 @@ impl VkCtx {
             let mut v13sup = vk::PhysicalDeviceVulkan13Features::default();
             let _f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13sup);
             let idot = v13sup.shader_integer_dot_product != 0;
+            // shaderFloat16(명시적 f16 산술 — exl3_gemv f16x2 누산) — 1.2
+            // 코어지만 피처는 명시 활성 필요(쿼리 게이트, RADV RDNA3 지원).
+            let mut v12sup = vk::PhysicalDeviceVulkan12Features::default();
+            let _f3 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v12sup);
+            let f16arith = v12sup.shader_float16 != 0;
 
             let qfams = instance.get_physical_device_queue_family_properties(physical);
             let qf = qfams
@@ -179,7 +184,9 @@ impl VkCtx {
                 .shader_draw_parameters(true);
             // plans/87 §1 — 버퍼 VA 원장(폴트 매처). 쿼리 전용이지만 활성화가
             // RADV 할당 경로를 바꿀 수 있어 게이트 4종 재검증이 완료 판정.
-            let mut v12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+            let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
+                .buffer_device_address(true)
+                .shader_float16(f16arith);
             let mut coopfeat =
                 vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
             let mut feats = vk::PhysicalDeviceFeatures2::default()

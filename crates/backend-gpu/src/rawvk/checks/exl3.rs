@@ -67,18 +67,31 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
             ah[ch * 128 + j] = f16::from_f32(v[j] * R_SCALE).to_f32();
         }
     }
-    // gemv: 타일 디코드 f32 누산.
+    // gemv: f16x2 누산 + 4 k-타일 f32 폴드 — 커널 v5 의미론 미러
+    // (참조 FragC_h FOLD=4 케이던스 동일).
     let mut s = vec![0f32; n];
     let mut tile = [0f32; 256];
     for nt in 0..n / 16 {
         for c in 0..16 {
             let mut acc = 0f32;
+            let mut acc2 = [f16::from_f32(0.0); 2];
             for kt in 0..k / 16 {
                 w.tile(kt, nt, &mut tile);
-                for r in 0..16 {
-                    acc += ah[kt * 16 + r] * tile[r * 16 + c];
+                for j in 0..8 {
+                    let prod = [
+                        f16::from_f32(ah[kt * 16 + 2 * j] * tile[(2 * j) * 16 + c]),
+                        f16::from_f32(ah[kt * 16 + 2 * j + 1] * tile[(2 * j + 1) * 16 + c]),
+                    ];
+                    for l in 0..2 {
+                        acc2[l] = f16::from_f32(acc2[l].to_f32() + prod[l].to_f32());
+                    }
+                }
+                if kt % 4 == 3 {
+                    acc += acc2[0].to_f32() + acc2[1].to_f32();
+                    acc2 = [f16::from_f32(0.0); 2];
                 }
             }
+            acc += acc2[0].to_f32() + acc2[1].to_f32();
             s[nt * 16 + c] = acc;
         }
     }
@@ -233,9 +246,10 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
     // 이론 대역폭 기준 하한(tre 독점 가정) — 참고 정보.
     let bytes_per_call = w.trellis.len() as f64;
     let gbps = bytes_per_call / (gpu_us * 1e-6) / 1e9;
-    // 판정: had_in 비트 동일·gemv/out FMA 수축 수준(abs ≤ 1e-5, y 스케일
-    // 대비) — 상회 시 디코드 회귀. 1e-5는 f32 FMA·스테이지 순서차 상한.
-    let ok = cmp_ah.0 == 0.0 && cmp_s <= 1e-5 && max_abs <= 1e-4;
+    // 판정: had_in 비트 동일. gemv/out은 f16 누산 클래스(참조 FragC_h와
+    // 동일 정밀도 — 곱의 f16 중간 반올림·수축 차 ≤ ~1e-5/항, 5120항 랜덤
+    // 워크 ~7e-4) — 허용치 5e-3·1e-2.
+    let ok = cmp_ah.0 == 0.0 && cmp_s <= 5e-3 && max_abs <= 1e-2;
     let report = format!(
         "exl3-vk-check {key}: k={k} n={n} K={}\n  had_in: max_abs={:.3e} (f16 일치 {}/{k})\n  gemv : max_abs={:.3e}\n  out  : max_abs={max_abs:.3e} max_rel={max_rel:.3e}\n  gpu {gpu_us:.0} µs/step (trellis {:.1} MB → {gbps:.0} GB/s)\n  cpu 참조 {cpu_ms:.0} ms",
         w.krate,

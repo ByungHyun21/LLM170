@@ -1,18 +1,20 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // exl3_gemv (plans/118 §3-1) — EXL3 트렐리스 GEMV (m=1 디코드 경로):
 // S[n] = Σ_k A_had[k] · Wq[k,n], Wq는 trellis에서 즉석 디코드.
 // 참조: exllamav3 CPU scalar_tiles + decode_state_scalar/decode_mul1_scalar
-// (moe_mul1.cpp) — plans/118 §6 검증 명세의 GLSL 직이식.
+// (moe_mul1.cpp), GPU 누산 구조 = exl3_gemv_kernel.cuh FragC_h(f16 누산,
+// FOLD 케이던스 폴딩) — plans/118 §6 검증 명세의 GLSL 직이식.
 //
-// v3 (2026-10-04): v1(29 GB/s)에서 3개 개선 — ① 스레드 불변 워드 주소를
-// addr16[u32|u32<<8|shift<<16] 16레지스터로 사전 계산(워드마다 런타임
-// modulo 2회 × 89M 제거 — ALU 병목이었음), ② 바이트합 6연산화(16비트
-// 레인 합), ③ k-분할(그리드 y) 부분합 [seg][n] 평범 저장 — atomic 없이
-// 결정적, had_out이 세그먼트 합산. 실측 60 GB/s(K=3).
-// (v4 실험 — dq8 공유 스테이징·f16 디코드값 저장: 20-31 GB/s로 회귀,
-// 폐기. LDS가 아니라 발행 효율이 한계였음.)
-// f32 누산(참조 CUDA는 f16 누산 — 상위 정밀도, 구 원장 177).
+// v5 (2026-10-04): f16x2 누산 통일(사용자 결정). 쌍 (r=2j, 2j+1)은 동일
+// 출력열·인접 a_had(같은 u32 워드)이라 f16vec2 FMA 1회/쌍 — f32 2회의
+// 절반. 정밀도는 참조와 동일 클래스: f16 누산 + 4 k-타일마다 f32 폴드
+// (참조 FOLD=4 케이던스). CMP 스톡 정합(FFMA 1/32 쓰로틀 회피, §1.1)
+// 겸용 — 이 커널이 APU·CMP 공통 경로.
+//
+// v3 계습: 스레드 불변 addr16 사전계산·바이트합 6연산·k-분할 부분합
+// [seg][n](결정적, had_out이 합산). 실측 v3(f32 누산) = 61-85 GB/s.
 layout(local_size_x = 128) in;
 layout(binding = 0) readonly buffer AhB { uint ah16[]; };  // f16 쌍팩 [k/2]
 layout(binding = 1) readonly buffer TreB { uint tre[]; };  // trellis u32 뷰
@@ -23,9 +25,7 @@ layout(push_constant) uniform PC {
     uint K;        // bpw(정수부) — u16 폭 16K
 } pc;
 
-// mul1 코드북 — plans/118 §6.2. sum 비트패턴 [0x6400,0x67FC]의 f16 값은
-// 정확히 1024+bytesum([1024,2048) ULP=1) — 참조 half_uint16 트릭과 동치.
-// 바이트합 6연산: 16비트 레인 합(각 ≤510 — 캐리 없음) 후 레인 합산.
+// mul1 코드북 — plans/118 §6.2. 바이트합 6연산(16비트 레인 합 ≤510).
 float mul1_decode(uint w) {
     uint x = w * 0x83DCD12Du;
     uint p = (x & 0x00FF00FFu) + ((x >> 8u) & 0x00FF00FFu);
@@ -43,7 +43,8 @@ void main() {
     uint c = gl_LocalInvocationID.x & 15u;
     uint ntl = gl_LocalInvocationID.x >> 4u;
     uint words32 = 8u * pc.K;
-    float acc = 0.0;
+    float acc = 0.0;          // f32 폴드 누산(4 k-타일마다)
+    f16vec2 acc2 = f16vec2(float16_t(0.0));
 
     // 스레드 불변 주소 사전 계산 — r=0..15 워드의 (i0·i1·시프트).
     // t는 tensor_core_perm 역: (4*(c&7) + ((r&7)>>1))*8
@@ -65,8 +66,6 @@ void main() {
         for (uint ktl = 0u; ktl < nk; ktl++) {
             uint tbase = ((kb + ktl) * pc.ntiles + nt0 + ntl) * words32;
             uint ahb = ((kb + ktl) * 16u) >> 1u;   // a_had u32 오프셋
-            // r-루프 수동 언롤 — addr16/ahw 동적 인덱스를 컴파일타임 상수로
-            // 밀어 레지스터 유지(스크래치 누수 방지).
             uint ahw0 = ah16[ahb];
             uint ahw1 = ah16[ahb + 1u];
             uint ahw2 = ah16[ahb + 2u];
@@ -75,28 +74,35 @@ void main() {
             uint ahw5 = ah16[ahb + 5u];
             uint ahw6 = ah16[ahb + 6u];
             uint ahw7 = ah16[ahb + 7u];
-            #define EXL3_R(i) \
+            // 쌍 8개(j=0..7) — 쌍당 f16x2 FMA 1회. a_had 워드 = ahb+j
+            // (원소 kbase+2j, +2j+1 — f16 변환은 무손실, 본래 f16).
+            #define EXL3_P(j, ahw) \
             { \
-                uint a16 = addr16[i]; \
-                uint w = (((a16 >> 16u) == 0u) \
-                    ? (tre[tbase + ((a16 >> 8u) & 0xFFu)] & 0xFFFFu) \
-                    : (((tre[tbase + ((a16 >> 8u) & 0xFFu)] >> (a16 >> 16u)) \
-                        | (tre[tbase + (a16 & 0xFFu)] << (32u - (a16 >> 16u)))) & 0xFFFFu)); \
-                acc += unpackHalf2x16( \
-                    (i & 1u) == 0u ? AH_EVEN(i) : AH_ODD(i))[i & 1u] \
-                     * mul1_decode(w); \
+                uint a16e = addr16[2u * (j)]; \
+                uint we = (((a16e >> 16u) == 0u) \
+                    ? (tre[tbase + ((a16e >> 8u) & 0xFFu)] & 0xFFFFu) \
+                    : (((tre[tbase + ((a16e >> 8u) & 0xFFu)] >> (a16e >> 16u)) \
+                        | (tre[tbase + (a16e & 0xFFu)] << (32u - (a16e >> 16u)))) & 0xFFFFu)); \
+                uint a16o = addr16[2u * (j) + 1u]; \
+                uint wo = (((a16o >> 16u) == 0u) \
+                    ? (tre[tbase + ((a16o >> 8u) & 0xFFu)] & 0xFFFFu) \
+                    : (((tre[tbase + ((a16o >> 8u) & 0xFFu)] >> (a16o >> 16u)) \
+                        | (tre[tbase + (a16o & 0xFFu)] << (32u - (a16o >> 16u)))) & 0xFFFFu)); \
+                vec2 av32 = unpackHalf2x16(ahw); \
+                acc2 += f16vec2(av32.x, av32.y) \
+                      * f16vec2(float16_t(mul1_decode(we)), float16_t(mul1_decode(wo))); \
             }
-            #define AH_EVEN(i) ((i) == 0u ? ahw0 : (i) == 2u ? ahw1 : (i) == 4u ? ahw2 : (i) == 6u ? ahw3 : (i) == 8u ? ahw4 : (i) == 10u ? ahw5 : (i) == 12u ? ahw6 : ahw7)
-            #define AH_ODD(i)  ((i) == 1u ? ahw0 : (i) == 3u ? ahw1 : (i) == 5u ? ahw2 : (i) == 7u ? ahw3 : (i) == 9u ? ahw4 : (i) == 11u ? ahw5 : (i) == 13u ? ahw6 : ahw7)
-            EXL3_R(0) EXL3_R(1) EXL3_R(2) EXL3_R(3)
-            EXL3_R(4) EXL3_R(5) EXL3_R(6) EXL3_R(7)
-            EXL3_R(8) EXL3_R(9) EXL3_R(10) EXL3_R(11)
-            EXL3_R(12) EXL3_R(13) EXL3_R(14) EXL3_R(15)
-            #undef EXL3_R
-            #undef AH_EVEN
-            #undef AH_ODD
+            EXL3_P(0, ahw0) EXL3_P(1, ahw1) EXL3_P(2, ahw2) EXL3_P(3, ahw3)
+            EXL3_P(4, ahw4) EXL3_P(5, ahw5) EXL3_P(6, ahw6) EXL3_P(7, ahw7)
+            #undef EXL3_P
+            // 참조 FOLD 케이던스 — 4 k-타일마다 f32 폴드(전역 카운트).
+            if (((kb + ktl) & 3u) == 3u) {
+                acc += float(acc2.x) + float(acc2.y);
+                acc2 = f16vec2(float16_t(0.0));
+            }
         }
     }
+    acc += float(acc2.x) + float(acc2.y);
     uint nt = nt0 + ntl;
     if (nt < pc.ntiles) s[seg * pc.ntiles * 16u + nt * 16u + c] = acc;
 }
