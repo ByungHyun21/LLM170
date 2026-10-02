@@ -95,6 +95,12 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
 
     // ── GPU ──
     let mut ctx = VkCtx::new()?;
+    // k-분할 세그먼트 수(그리드 y) — 1이면 단일(비분할과 동일).
+    let nseg: u32 = std::env::var("LLM170_EXL3_KSEG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+
     let mut up = |bytes: &[u8]| -> Result<crate::rawvk::context::VkBuf, String> {
         let b = ctx.alloc(bytes.len())?;
         // SAFETY: alloc 영구 매핑 ptr — 크기 일치, 업로드 후 동기 런치 전.
@@ -116,7 +122,7 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
         // SAFETY: 매핑 업로드(크기 일치).
         unsafe { std::ptr::copy_nonoverlapping(ahp.as_ptr(), ahb.ptr, k * 2) };
     };
-    let sb = ctx.alloc(n * 4)?;
+    let sb = ctx.alloc(n * 4 * nseg as usize)?;
     let yb = ctx.alloc(n * 4)?;
 
     let (_d1, pl1, _p1, ds1, pipe1) =
@@ -134,7 +140,7 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
     let ngroups = ntiles.div_ceil(8);
     let push1 = push_u32s(&[k as u32 / 128]);
     let push2 = push_u32s(&[ktiles, ntiles, w.krate]);
-    let push3 = push_u32s(&[n as u32 / 128]);
+    let push3 = push_u32s(&[n as u32 / 128, nseg]);
 
     let t1 = std::time::Instant::now();
     for _ in 0..reps {
@@ -151,13 +157,14 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
                 &[ahb.buf],
             )?;
         }
+        // 부분합 [seg][n] 저장 — 세그먼트 합산은 had_out이 수행.
         ctx.run_rw(
             pl2,
             ds2,
             pipe2,
             &push2,
             ngroups,
-            1,
+            nseg,
             1,
             &[ahb.buf, treb.buf],
             &[sb.buf],
@@ -182,7 +189,22 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
     let mut ah_gpu = vec![0u8; k * 2];
     unsafe { std::ptr::copy_nonoverlapping(ahb.ptr as *const u8, ah_gpu.as_mut_ptr(), k * 2) };
     let mut s_gpu = vec![0f32; n];
-    unsafe { std::ptr::copy_nonoverlapping(sb.ptr as *const f32, s_gpu.as_mut_ptr(), n) };
+    {
+        // SAFETY: 부분합 [seg][n] 판독 후 세그먼트 합산(had_out과 동일 순서).
+        let mut parts = vec![0f32; n * nseg as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                sb.ptr as *const f32,
+                parts.as_mut_ptr(),
+                n * nseg as usize,
+            )
+        };
+        for g in 0..nseg as usize {
+            for i in 0..n {
+                s_gpu[i] += parts[g * n + i];
+            }
+        }
+    }
     let mut y_gpu = vec![0f32; n];
     unsafe { std::ptr::copy_nonoverlapping(yb.ptr as *const f32, y_gpu.as_mut_ptr(), n) };
 
@@ -192,33 +214,6 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
             let g = f16::from_bits(u16::from_le_bytes([ah_gpu[2 * i], ah_gpu[2 * i + 1]])).to_f32();
             m = m.max((g - ah[i]).abs());
             cnt += (g == ah[i]) as usize;
-        }
-        if llm170_diag::flag::on("LLM170_EXL3_HADDBG") {
-            let mut dump = String::from("ah[0..8] gpu:");
-            for i in 0..8 {
-                let g =
-                    f16::from_bits(u16::from_le_bytes([ah_gpu[2 * i], ah_gpu[2 * i + 1]])).to_f32();
-                dump.push_str(&format!(" {g:.4}"));
-            }
-            dump.push_str("\n          cpu:");
-            for i in 0..8 {
-                dump.push_str(&format!(" {:.4}", ah[i]));
-            }
-            eprintln!("{dump}");
-            // 상이 샘플 비트 패턴 (반올림 모드 진단).
-            let mut shown = 0;
-            for i in 0..k {
-                let gb = u16::from_le_bytes([ah_gpu[2 * i], ah_gpu[2 * i + 1]]);
-                let cb = f16::from_f32(ah[i]).to_bits();
-                if gb != cb && shown < 6 {
-                    eprintln!(
-                        "  diff[{i}]: gpu={gb:#06x} ({}) cpu={cb:#06x} d={}",
-                        f16::from_bits(gb).to_f32(),
-                        (gb as i32 - cb as i32)
-                    );
-                    shown += 1;
-                }
-            }
         }
         (m, cnt)
     };
