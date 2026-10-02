@@ -10,6 +10,7 @@ copy_off.spv	comp	-	5666ff058b8d3e80
 copy_rows.spv	comp	-	f10b1300e8b89189
 ew_sigmoid.spv	comp	-	444a3b0c6998ba94
 exl3_gemv.spv	comp	-	8abade0d20b28013
+exl3_gemv_sg.spv	comp	-	a88febabd049a96e
 exl3_had_in.spv	comp	-	0c0146c4d97ada08
 exl3_had_out.spv	comp	-	5473f25b5dd58dc8
 fn_argmax_rows.spv	comp	-	6ea8a5b960c1d834

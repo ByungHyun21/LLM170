@@ -1,0 +1,103 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// exl3_gemv_sg (plans/118 §3-2) — 서브그룹 셔플 변형.
+// 참조 CUDA gemv의 warp shuffle: 타일 워드를 레인에 분산(1레인 1워드) 후
+// subgroupShuffle로 추출 — 내부 루프 글로벌 로드 0회 (v5: 워드당 2글로벌).
+//
+// 서브그룹(32레인) = 1 n-타일. c=lane/2, r_half=lane%2 (8행씩).
+// 협조 적재 후 각 스레드 8행 가중치를 셔플로 추출.
+// 파트너 교환(lane^1)으로 상하반 열합 병합, 짝수 레인이 기입.
+// f16x2 누산 + FOLD=4 (v5 동일 — CMP FFMA 쓰로틀 정합).
+
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer AhB { uint ah16[]; };
+layout(binding = 1) readonly buffer TreB { uint tre[]; };
+layout(binding = 2) writeonly buffer SB { float s[]; };
+layout(push_constant) uniform PC {
+    uint ktiles;
+    uint ntiles;
+    uint K;
+} pc;
+
+float mul1_decode(uint w) {
+    uint x = w * 0x83DCD12Du;
+    uint p = (x & 0x00FF00FFu) + ((x >> 8u) & 0x00FF00FFu);
+    uint sum = (p & 0xFFFFu) + (p >> 16u);
+    return (1024.0 + float(sum)) * 0.00676727294921875 - 10.3828125;
+}
+
+void main() {
+    if (gl_SubgroupSize != 32u) return;
+
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint nt = gl_WorkGroupID.x * 4u + sg;
+    if (nt >= pc.ntiles) return;
+    uint seg = gl_WorkGroupID.y;
+    uint nseg = gl_NumWorkGroups.y;
+    uint ktb = pc.ktiles * seg / nseg;
+    uint kte = pc.ktiles * (seg + 1u) / nseg;
+    uint words32 = 8u * pc.K;
+    uint c = lane >> 1u;
+    uint r0 = (lane & 1u) * 8u;
+
+    float acc = 0.0;
+    
+
+    // 8행 주소 사전계산
+    uint a8[8];
+    for (uint ri = 0u; ri < 8u; ri++) {
+        uint r = r0 + ri;
+        uint t = (4u * (c & 7u) + ((r & 7u) >> 1u)) * 8u
+               + ((r >> 3u) * 2u + (r & 1u) + ((c >> 3u) * 4u));
+        uint b0 = t * pc.K + (pc.K + 256u * pc.K - 16u);
+        uint b1 = b0 + 16u;
+        uint i0 = (b0 >> 5u) % words32;
+        uint i1 = ((b1 - 1u) >> 5u) % words32;
+        uint sh = (((b1 - 1u) >> 5u) + 1u) * 32u - b1;
+        a8[ri] = i0 | (i1 << 8u) | (sh << 16u);
+    }
+
+    for (uint kb = ktb; kb < kte; kb += 8u) {
+        uint nk = min(8u, kte - kb);
+        for (uint ktl = 0u; ktl < nk; ktl++) {
+            uint tbase = ((kb + ktl) * pc.ntiles + nt) * words32;
+            uint tile_w = (lane < words32) ? tre[tbase + lane] : 0u;
+            uint ahb = ((kb + ktl) * 16u) >> 1u;
+            uint ah0 = ah16[ahb], ah1 = ah16[ahb + 1u];
+            uint ah2 = ah16[ahb + 2u], ah3 = ah16[ahb + 3u];
+
+            // f16x2 쌍: (r0+0, r0+1), (r0+2, r0+3), ...
+            for (uint pj = 0u; pj < 4u; pj++) {
+                uint a0 = a8[pj * 2u];
+                uint a1 = a8[pj * 2u + 1u];
+                uint w0, w1;
+                {
+                    uint i0 = a0 & 0xFFu, i1 = (a0 >> 8u) & 0xFFu, sh = a0 >> 16u;
+                    uint sa = subgroupShuffle(tile_w, i0);
+                    uint sb = subgroupShuffle(tile_w, i1);
+                    w0 = (sh == 0u) ? (sb & 0xFFFFu) : (((sb >> sh) | (sa << (32u - sh))) & 0xFFFFu);
+                }
+                {
+                    uint i0 = a1 & 0xFFu, i1 = (a1 >> 8u) & 0xFFu, sh = a1 >> 16u;
+                    uint sa = subgroupShuffle(tile_w, i0);
+                    uint sb = subgroupShuffle(tile_w, i1);
+                    w1 = (sh == 0u) ? (sb & 0xFFFFu) : (((sb >> sh) | (sa << (32u - sh))) & 0xFFFFu);
+                }
+                // a_had 쌍 (r0+pj*2, r0+pj*2+1)
+                uint j0 = (kb + ktl) * 16u + r0 + pj * 2u;
+                float xv0 = unpackHalf2x16(ah16[j0 >> 1u])[j0 & 1u];
+                float xv1 = unpackHalf2x16(ah16[(j0 + 1u) >> 1u])[(j0 + 1u) & 1u];
+                acc += xv0 * mul1_decode(w0) + xv1 * mul1_decode(w1);
+            }
+
+        }
+    }
+
+    // 파트너(lane^1)와 상하반 병합 — 짝수 레인이 최종 기입.
+    float px = subgroupShuffle(acc, lane ^ 1u);
+    if ((lane & 1u) == 0u) {
+        s[seg * pc.ntiles * 16u + nt * 16u + c] = acc + px;
+    }
+}
