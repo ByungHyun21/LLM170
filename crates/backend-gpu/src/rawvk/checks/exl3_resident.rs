@@ -36,6 +36,7 @@ pub struct TrellisResident {
     sb: VkBuf,
     yb1: VkBuf,
     yb2: VkBuf,
+    yb3: VkBuf,
     xb: VkBuf,
 }
 
@@ -169,6 +170,7 @@ impl TrellisResident {
         let sb = ctx.alloc(max_n * 4 * nseg as usize)?;
         let yb1 = ctx.alloc(max_n * 4)?;
         let yb2 = ctx.alloc(max_n * 4)?;
+        let yb3 = ctx.alloc(max_n * 4)?;
         let xb = ctx.alloc(max_k * 2)?;
 
         Ok(Self {
@@ -186,6 +188,7 @@ impl TrellisResident {
             sb,
             yb1,
             yb2,
+            yb3,
             xb,
         })
     }
@@ -343,6 +346,40 @@ impl TrellisResident {
             std::ptr::copy_nonoverlapping(self.yb2.ptr as *const f32, y2.as_mut_ptr(), n2);
         }
         Ok((y1, y2))
+    }
+
+    /// 공유 입력 선형 3중: attention q+k+v용.
+    pub fn linear_triple(
+        &mut self,
+        key1: &str,
+        key2: &str,
+        key3: &str,
+        x: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let i1 = self.find_linear(key1)?;
+        let i2 = self.find_linear(key2)?;
+        let i3 = self.find_linear(key3)?;
+        let (n1, n2, n3) = (
+            self.linears[i1].1.n,
+            self.linears[i2].1.n,
+            self.linears[i3].1.n,
+        );
+        let k = self.linears[i1].1.k;
+        if x.len() != k || self.linears[i2].1.k != k || self.linears[i3].1.k != k {
+            return Err(format!("{key1}/{key2}/{key3}: input dim mismatch"));
+        }
+        self.upload_x(x)?;
+        self.batch_chain(&[i1, i2, i3], &[0, 1, 2])?;
+        let mut y1 = vec![0f32; n1];
+        let mut y2 = vec![0f32; n2];
+        let mut y3 = vec![0f32; n3];
+        // SAFETY: 배치 완료 후 판독.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.yb1.ptr as *const f32, y1.as_mut_ptr(), n1);
+            std::ptr::copy_nonoverlapping(self.yb2.ptr as *const f32, y2.as_mut_ptr(), n2);
+            std::ptr::copy_nonoverlapping(self.yb3.ptr as *const f32, y3.as_mut_ptr(), n3);
+        }
+        Ok((y1, y2, y3))
     }
 
     /// 무양자화 노름/스케일러 획득.
