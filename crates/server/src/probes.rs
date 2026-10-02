@@ -384,6 +384,14 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                 Err(e) => Err(format!("{e}")),
             }
         }
+        "exl3-decode" => {
+            let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
+            llm170_backend_gpu::rawvk::checks::exl3_decode(
+                &arg_str(args, 0, d_exl3),
+                arg_num(args, 1, 9707u32),
+                arg_num(args, 2, 8usize),
+            )
+        }
         "exl3-bench" => {
             let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
             llm170_backend_gpu::rawvk::checks::exl3_bench(
