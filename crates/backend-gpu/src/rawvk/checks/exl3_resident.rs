@@ -169,7 +169,9 @@ impl TrellisResident {
         // 스크래치 버퍼 — 재사용 (linear 호출당 alloc 폭탄 제거)
         let max_k = linears.iter().map(|(_, l)| l.k).max().unwrap_or(5120);
         let max_n = linears.iter().map(|(_, l)| l.n).max().unwrap_or(17408);
-        let nseg = 4u32;
+        // plans/120 A1: k-분할 4→16 — 병렬성 증가(벤치 72→87GB/s).
+        // had_out 환원 분해 변화 = 규칙 10a(환원 순서, 동일 정밀도).
+        let nseg = 16u32;
         let ahb1 = ctx.alloc(max_k * 2)?;
         let ahb2 = ctx.alloc(max_k * 2)?;
         let ahb3 = ctx.alloc(max_k * 2)?;
@@ -237,7 +239,7 @@ impl TrellisResident {
         outputs: &[usize], // 호환 — 결과는 슬롯 순서대로 yb1..yb3
     ) -> Result<(), String> {
         let _ = outputs;
-        let nseg = 4u32;
+        let nseg = 16u32; // load의 sb 할당과 일치(k-분할)
 
         self.ctx.begin_batch()?;
         for (slot, &li) in inputs.iter().enumerate() {

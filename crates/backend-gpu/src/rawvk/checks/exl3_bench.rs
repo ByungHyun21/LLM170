@@ -97,7 +97,7 @@ pub fn exl3_bench(exl3_dir: &str, reps: usize) -> Result<String, String> {
         (seed >> 33) as f32 / 2147483648.0 - 0.5
     };
     let mut xbufs: Vec<(usize, VkBuf)> = Vec::new();
-    let nseg: u32 = 4;
+    let nseg: u32 = 16; // [E3 실험] plans/120 A1 — k-분할 8→16
     let (mut max_ah, mut max_s, mut max_y) = (0usize, 0usize, 0usize);
     for l in &lins {
         max_ah = max_ah.max(l.k * 2);
