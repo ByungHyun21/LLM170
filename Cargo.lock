@@ -509,6 +509,14 @@ name = "llm170-diag"
 version = "0.1.0"
 
 [[package]]
+name = "llm170-exl3"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "llm170-diag",
+]
+
+[[package]]
 name = "llm170-gguf"
 version = "0.1.0"
 dependencies = [
@@ -525,6 +533,7 @@ dependencies = [
  "llm170-backend-gpu",
  "llm170-core",
  "llm170-diag",
+ "llm170-exl3",
  "llm170-gguf",
  "log",
  "memmap2",
