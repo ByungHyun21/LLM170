@@ -6,8 +6,8 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 ## Benchmarks
 
-<!-- 측정 프로토콜: hip(ROCm) 수치는 반드시 ROCm 10으로 측정한다
-     (LD_LIBRARY_PATH=/opt/rocm-10.0.0/install/lib). Vulkan 수치는 무관. -->
+<!-- Measurement protocol: hip (ROCm) numbers must be measured with ROCm 10
+     (LD_LIBRARY_PATH=/opt/rocm-10.0.0/install/lib). Vulkan numbers are independent. -->
 
 ### Qwen3.8-27B (EXL3 SC_4.00bpw, 16.35 GB)
 
@@ -15,7 +15,7 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 |---|---|---|---|---|
 | LLM170 hip | — | — | — | — |
 | LLM170 vulkan | — | — | — | — |
-| exllamav3 (ROCm, 참조) | — | — | — | — |
+| exllamav3 (ROCm, reference) | — | — | — | — |
 
 | mode | LLM170 hip | LLM170 vulkan | exllamav3 (ROCm) |
 |---|---|---|---|
@@ -31,19 +31,19 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 |---|---|---|---|---|
 | LLM170 hip | — | — | — | — |
 | LLM170 vulkan | — | — | — | — |
-| exllamav3 (ROCm, 참조) | — | — | — | — |
+| exllamav3 (ROCm, reference) | — | — | — | — |
 
-### DeepSeek-V4-Flash-Vision-Exp (EXL3 3.04bpw, 118.4 GB, 비전+MTP3)
+### DeepSeek-V4-Flash-Vision-Exp (EXL3 3.04bpw, 118.4 GB, vision + MTP3)
 
 | backend | pp512 | pp4096 | tg128 | VL |
 |---|---|---|---|---|
 | LLM170 hip | — | — | — | — |
 | LLM170 vulkan | — | — | — | — |
-| exllamav3 (ROCm, 참조) | — | — | — | — |
+| exllamav3 (ROCm, reference) | — | — | — | — |
 
-### Q4_K (GGUF) — deprecated (EXL3 전환, 2026-10)
+### Q4_K (GGUF) — deprecated (EXL3 transition, 2026-10)
 
-아래는 EXL3 전환 이전의 Q4_K_XL 기준 수치다.
+Numbers below are the pre-EXL3 Q4_K_XL baseline.
 
 #### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
@@ -81,8 +81,9 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | MTP + np4 k=2 | 8.41 | n/s |
 | MTP + np4 k=3 | 7.27 | n/s |
 
-<!-- 금지: 이 영역에 게이트 통과·기능 나열·세션 노트 등 잡다한 산출물을
-     적지 않는다 — 표 안의 측정값만 갱신한다 (repo 규칙). -->
+<!-- Forbidden: gate results, feature lists, session notes or other
+     byproducts in this area — update measurement values in the tables
+     only (repo rule). -->
 
 ## Build & run
 
