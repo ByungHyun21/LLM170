@@ -1127,7 +1127,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         {
             let ygp = {
                 let mut g = self.gyp.lock().map_err(|e| e.to_string())?;
-                g.ensure(&self.ctx, rows_pad.max(crate::common::moe::grp_bound(rows, ne)) * n_out * 4)?
+                g.ensure(
+                    &self.ctx,
+                    rows_pad.max(crate::common::moe::grp_bound(rows, ne)) * n_out * 4,
+                )?
             };
             // 입력: 디바이스 경로는 xg가 이미 패딩 도메인. 호스트 경로는
             // perm_pad으로 자체 패딩 gather(gxp).
@@ -1190,7 +1193,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         {
             let ygp = {
                 let mut g = self.gyp.lock().map_err(|e| e.to_string())?;
-                g.ensure(&self.ctx, rows_pad.max(crate::common::moe::grp_bound(rows, ne)) * n_out * 4)?
+                g.ensure(
+                    &self.ctx,
+                    rows_pad.max(crate::common::moe::grp_bound(rows, ne)) * n_out * 4,
+                )?
             };
             let xin = if rows_pad_d != 0 {
                 xg
@@ -2179,8 +2185,11 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
                         &mut cargs!(&mut ip, &mut g_, &mut h, &mut tt),
                     )?;
                 }
-                let (mut rp, mut op_, mut gp_) =
-                    (self.fptr(res)?, self.fptr(out)?, gp as *mut std::ffi::c_void);
+                let (mut rp, mut op_, mut gp_) = (
+                    self.fptr(res)?,
+                    self.fptr(out)?,
+                    gp as *mut std::ffi::c_void,
+                );
                 let tn = n * t;
                 let mut h = hc as i32;
                 let mut nn = n as i32;

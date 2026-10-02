@@ -5,7 +5,9 @@ pub(super) use crate::rawhip::KtraceEv;
 pub(super) use crate::rawhip::ck;
 pub(super) use crate::rawhip::env_on;
 pub(super) use crate::rawhip::kernels;
-pub(super) use crate::rawhip::{CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4, CO_W32M};
+pub(super) use crate::rawhip::{
+    CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4, CO_W32M,
+};
 pub(super) use cubecl_hip_sys as hip;
 pub(super) use std::collections::HashMap;
 pub(super) use std::ffi::CString;
