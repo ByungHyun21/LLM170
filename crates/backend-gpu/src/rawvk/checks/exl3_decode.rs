@@ -654,3 +654,718 @@ pub fn exl3_decode(dir: &str, tokens_str: &str, n_predict: usize) -> Result<Stri
         out_tokens.as_slice()
     ))
 }
+
+// ── T-배치 프리필 (plans/121 A1-pp) ─────────────────────────────────────
+//
+// 순차 디코드 대비: 선형은 T-배치 GEMM(연산강도 32배 — 메모리 벽 탈출),
+// 비선형은 core 자산 재사용 — GDN 청크 스캔(core::gdn::gdn_chunk_seq,
+// AR 등가 검증됨), 어텐션/활성화는 행 병렬. 수치 클래스는 순차 경로와
+// 동일(f16 쌍 누산 + FOLD=4 케이던스 — gemm 커널 주석 참조).
+
+/// 원시 포인터 usize 래퍼 — par_rows 잡 캡처용(gdn.rs SendPtr와 동일 계약).
+#[derive(Clone, Copy)]
+struct PP(usize);
+
+/// 행 병렬 — thread::scope 청크. body는 Sync(공유 읽기)이며 행별 분리
+/// 쓰기는 원시 포인터(PP)로 수행한다(호출 스코프 내 유효 — scope join 증명).
+fn par_rows(t_rows: usize, body: impl Fn(usize) + Sync + Send) {
+    if t_rows == 0 {
+        return;
+    }
+    let nt = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(8)
+        .min(t_rows);
+    let per = t_rows.div_ceil(nt);
+    std::thread::scope(|s| {
+        for lo in (0..t_rows).step_by(per) {
+            let hi = (lo + per).min(t_rows);
+            let body = &body;
+            s.spawn(move || (lo..hi).for_each(body));
+        }
+    });
+}
+
+/// T-행 GDN 층: 배치 선형(qkv+z) + conv1d(T) + 청크 스캔 + norm_gated +
+/// out_proj 배치. 상태(gdn states·conv 링)는 순차 경로와 동일 형식으로
+/// 갱신 — 이후 decode_step 연속 가능.
+fn gdn_batch(
+    tr: &mut TrellisResident,
+    seq: &mut SeqState,
+    il: usize,
+    xn: &[f32],
+    t_rows: usize,
+) -> Result<Vec<f32>, String> {
+    let h = tr.hidden;
+    let lp = format!("model.language_model.layers.{il}.linear_attn");
+    let d_state = 128usize;
+    let n_k = 16usize;
+    let n_v = 48usize;
+    let d_inner = n_v * d_state; // 6144
+    let k_len = n_k * d_state; // 2048
+    let conv_k = 4usize;
+    let conv_ch = k_len * 2 + d_inner; // 10240
+    let eps = 1e-6f32;
+
+    // 선형: qkv+z 공유 입력 1배치
+    let _g0 = ph("ppg:lin_qkvz");
+    let mut outs = tr.linear_batch_multi(
+        &[&format!("{lp}.in_proj_qkv"), &format!("{lp}.in_proj_z")],
+        xn,
+        t_rows,
+    )?;
+    drop(_g0);
+    let z = outs.pop().ok_or("qkv/z 결과 유실")?; // [T][6144]
+    let qkv = outs.pop().ok_or("qkv/z 결과 유실")?; // [T][10240]
+
+    // 무양자화 가중치 — 선형 호출 전 소유 복사(값 불변, borrow 분리)
+    let a_proj = tr
+        .norm(&format!("{lp}.in_proj_a.weight"))
+        .ok_or("alpha missing")?
+        .to_vec();
+    let b_proj = tr
+        .norm(&format!("{lp}.in_proj_b.weight"))
+        .ok_or("beta missing")?
+        .to_vec();
+    let a_log = tr
+        .norm(&format!("{lp}.A_log"))
+        .ok_or("A_log missing")?
+        .to_vec();
+    let dt_bias = tr
+        .norm(&format!("{lp}.dt_bias"))
+        .ok_or("dt_bias missing")?
+        .to_vec();
+    let conv_w = tr
+        .norm(&format!("{lp}.conv1d.weight"))
+        .ok_or("conv1d missing")?
+        .to_vec();
+    let ssm_norm_w = tr
+        .norm(&format!("{lp}.norm.weight"))
+        .ok_or("ssm_norm missing")?
+        .to_vec();
+
+    // ssm_a = -exp(A_log) — 행 준비 루프에서 인라인 계산(환원 불변)
+
+    // alpha/beta dot — 행 병렬(스칼라 dot는 120 무차 확정, 행 단위 병렬만).
+    let mut a_vals = vec![0f32; t_rows * n_v];
+    let mut b_vals = vec![0f32; t_rows * n_v];
+    {
+        let (xp, ap, bp) = (
+            PP(xn.as_ptr() as usize),
+            PP(a_proj.as_ptr() as usize),
+            PP(b_proj.as_ptr() as usize),
+        );
+        let (av, bv) = (
+            PP(a_vals.as_mut_ptr() as usize),
+            PP(b_vals.as_mut_ptr() as usize),
+        );
+        // SAFETY: 쓰기 영역은 행별 분리(t*n_v+hv), 읽기는 공유 불변.
+        par_rows(t_rows, move |t| unsafe {
+            let xr = std::slice::from_raw_parts((xp.0 as *const f32).add(t * h), h);
+            for hv in 0..n_v {
+                let ar = std::slice::from_raw_parts((ap.0 as *const f32).add(hv * h), h);
+                *(av.0 as *mut f32).add(t * n_v + hv) =
+                    xr.iter().zip(ar.iter()).map(|(&x, &w)| x * w).sum();
+                let br = std::slice::from_raw_parts((bp.0 as *const f32).add(hv * h), h);
+                *(bv.0 as *mut f32).add(t * n_v + hv) =
+                    xr.iter().zip(br.iter()).map(|(&x, &w)| x * w).sum();
+            }
+        });
+    }
+
+    // conv1d(T) — 채널별 인과 콘볼루션 + 링 갱신. 채널 병렬(쓰기 분리).
+    let mut q_all = vec![0f32; t_rows * k_len];
+    let mut k_all = vec![0f32; t_rows * k_len];
+    let mut v_all = vec![0f32; t_rows * d_inner];
+    {
+        let st = &mut seq.gdn[il];
+        let (qp, kp, vp) = (
+            PP(q_all.as_mut_ptr() as usize),
+            PP(k_all.as_mut_ptr() as usize),
+            PP(v_all.as_mut_ptr() as usize),
+        );
+        let (ringp, qkvp, cwp) = (
+            PP(st.conv.as_mut_ptr() as usize),
+            PP(qkv.as_ptr() as usize),
+            PP(conv_w.as_ptr() as usize),
+        );
+        // SAFETY: 채널 c의 출력/링 쓰기는 채널별 분리, qkv/conv_w는 읽기 공유.
+        par_rows(conv_ch, move |c| unsafe {
+            let w0 = *(cwp.0 as *const f32).add(c * conv_k);
+            let w1 = *(cwp.0 as *const f32).add(c * conv_k + 1);
+            let w2 = *(cwp.0 as *const f32).add(c * conv_k + 2);
+            let w3 = *(cwp.0 as *const f32).add(c * conv_k + 3);
+            let mut h0 = *(ringp.0 as *mut f32).add(c);
+            let mut h1 = *(ringp.0 as *mut f32).add(conv_ch + c);
+            let mut h2 = *(ringp.0 as *mut f32).add(2 * conv_ch + c);
+            for t in 0..t_rows {
+                let xt = *(qkvp.0 as *const f32).add(t * conv_ch + c);
+                let o = silu(w3 * xt + w0 * h0 + w1 * h1 + w2 * h2);
+                if c < k_len {
+                    *(qp.0 as *mut f32).add(t * k_len + c) = o;
+                } else if c < 2 * k_len {
+                    *(kp.0 as *mut f32).add(t * k_len + (c - k_len)) = o;
+                } else {
+                    *(vp.0 as *mut f32).add(t * d_inner + (c - 2 * k_len)) = o;
+                }
+                h0 = h1;
+                h1 = h2;
+                h2 = xt;
+            }
+            *(ringp.0 as *mut f32).add(c) = h0;
+            *(ringp.0 as *mut f32).add(conv_ch + c) = h1;
+            *(ringp.0 as *mut f32).add(2 * conv_ch + c) = h2;
+        });
+    }
+
+    // 행 준비(병렬): L2 q/k + beta/g + lc 순열(v/beta/g).
+    let hf_to_lc = |hh: usize| -> usize { 3 * (hh % 16) + hh / 16 };
+    let mut beta_lc = vec![0f32; t_rows * n_v];
+    let mut g_lc = vec![0f32; t_rows * n_v];
+    let mut v_lc = vec![0f32; t_rows * d_inner];
+    {
+        let (qp, kp, blp, glp, av, bv, alp, dbp) = (
+            PP(q_all.as_mut_ptr() as usize),
+            PP(k_all.as_mut_ptr() as usize),
+            PP(beta_lc.as_mut_ptr() as usize),
+            PP(g_lc.as_mut_ptr() as usize),
+            PP(a_vals.as_ptr() as usize),
+            PP(b_vals.as_ptr() as usize),
+            PP(a_log.as_ptr() as usize),
+            PP(dt_bias.as_ptr() as usize),
+        );
+        // SAFETY: 행별 분리 쓰기(q_all/k_all/beta_lc/g_lc), 읽기 공유.
+        par_rows(t_rows, move |t| unsafe {
+            // L2 norm q/k per K head
+            for hh in 0..n_k {
+                let b0 = t * k_len + hh * d_state;
+                let head =
+                    std::slice::from_raw_parts((qp.0 as *const f32).add(b0), d_state).to_vec();
+                let n = l2_norm(&head, eps);
+                std::ptr::copy_nonoverlapping(n.as_ptr(), (qp.0 as *mut f32).add(b0), d_state);
+                let headk =
+                    std::slice::from_raw_parts((kp.0 as *const f32).add(b0), d_state).to_vec();
+                let nk = l2_norm(&headk, eps);
+                std::ptr::copy_nonoverlapping(nk.as_ptr(), (kp.0 as *mut f32).add(b0), d_state);
+            }
+            // beta/g — lc 헤드 i는 HF 헤드 j=hf_to_lc(i)의 값(decode의
+            // beta_lc[i]=beta_all[j] 미러). a_log/dt_bias도 HF j로 인덱스.
+            for i in 0..n_v {
+                let j = hf_to_lc(i);
+                let a_v = *(av.0 as *const f32).add(t * n_v + j);
+                let b_v = *(bv.0 as *const f32).add(t * n_v + j);
+                let al = *(alp.0 as *const f32).add(j.min(n_v - 1));
+                let dtb = *(dbp.0 as *const f32).add(j);
+                *(blp.0 as *mut f32).add(t * n_v + i) = sigmoid(b_v);
+                *(glp.0 as *mut f32).add(t * n_v + i) = softplus(a_v + dtb) * -al.exp();
+            }
+        });
+    }
+    // v 순열 복사(행 병렬 — v_all(HF) → v_lc(llama.cpp 헤드 순서))
+    {
+        let (vap, vlp) = (PP(v_all.as_ptr() as usize), PP(v_lc.as_mut_ptr() as usize));
+        // SAFETY: 행·헤드별 분리 쓰기.
+        par_rows(t_rows, move |t| unsafe {
+            for i in 0..n_v {
+                let j = hf_to_lc(i);
+                std::ptr::copy_nonoverlapping(
+                    (vap.0 as *const f32).add(t * d_inner + j * d_state),
+                    (vlp.0 as *mut f32).add(t * d_inner + i * d_state),
+                    d_state,
+                );
+            }
+        });
+    }
+
+    // 청크 스캔 — core::gdn 재사용(CS=64, AR 등가 검증).
+    let mut o_lc = vec![0f32; t_rows * d_inner];
+    let _gc2 = ph("ppg:chunk");
+    llm170_core::gdn::gdn_chunk_seq(
+        &q_all,
+        &k_all,
+        &v_lc,
+        &beta_lc,
+        &g_lc,
+        &mut seq.gdn[il].states,
+        &mut o_lc,
+        t_rows,
+        n_k,
+        n_v,
+    );
+
+    // 역순열 + norm_gated(rms(o)·silu(z)) — 행 병렬.
+    let mut gated = vec![0f32; t_rows * d_inner];
+    {
+        let (op, zp, gp, nwp) = (
+            PP(o_lc.as_ptr() as usize),
+            PP(z.as_ptr() as usize),
+            PP(gated.as_mut_ptr() as usize),
+            PP(ssm_norm_w.as_ptr() as usize),
+        );
+        // SAFETY: 행·헤드별 분리 쓰기(gated).
+        par_rows(t_rows, move |t| unsafe {
+            // lc 헤드 i → HF 헤드 j=hf_to_lc(i): o는 lc 위치 i에서, z/gated는
+            // HF 위치 j에서 (decode의 o_all[j]=o_lc[i]·z HF 미러 — hf_to_lc는
+            // 비대합이므로 방향이 중요하다).
+            for i in 0..n_v {
+                let j = hf_to_lc(i);
+                let src = t * d_inner + i * d_state;
+                let dst = t * d_inner + j * d_state;
+                let head =
+                    std::slice::from_raw_parts((op.0 as *const f32).add(src), d_state).to_vec();
+                let nw = std::slice::from_raw_parts(nwp.0 as *const f32, d_state);
+                let n = rms_norm(&head, nw, eps);
+                for d in 0..d_state {
+                    let zv = *(zp.0 as *const f32).add(dst + d);
+                    *(gp.0 as *mut f32).add(dst + d) = n[d] * silu(zv);
+                }
+            }
+        });
+    }
+
+    // out_proj 배치
+    let _go = ph("ppg:out");
+    let r = tr.linear_batch(&format!("{lp}.out_proj"), &gated, t_rows)?;
+    drop(_go);
+    Ok(r)
+}
+
+/// T-행 full-attention 층: 배치 선형(q/k/v) + 행별 norm·rope·KV 적립 +
+/// 인과 어텐션(행 병렬) + 게이트 + o_proj 배치.
+fn attn_batch(
+    tr: &mut TrellisResident,
+    seq: &mut SeqState,
+    il: usize,
+    attn_il: usize,
+    xn: &[f32],
+    t_rows: usize,
+    n_head: usize,
+    n_kv: usize,
+    head_dim: usize,
+) -> Result<Vec<f32>, String> {
+    let lp = format!("model.language_model.layers.{il}.self_attn");
+    let n_rot = 64usize;
+    let rope_base = 1e7f32;
+    let eps = 1e-6f32;
+
+    let mut outs = tr.linear_batch_multi(
+        &[
+            &format!("{lp}.q_proj"),
+            &format!("{lp}.k_proj"),
+            &format!("{lp}.v_proj"),
+        ],
+        xn,
+        t_rows,
+    )?;
+    let v = outs.pop().ok_or("qkv 결과 유실")?;
+    let k = outs.pop().ok_or("qkv 결과 유실")?;
+    let q_gate = outs.pop().ok_or("qkv 결과 유실")?; // [T][n_head*head_dim*2]
+
+    let q_norm_w = tr
+        .norm(&format!("{lp}.q_norm.weight"))
+        .ok_or("q_norm missing")?
+        .to_vec();
+    let k_norm_w = tr
+        .norm(&format!("{lp}.k_norm.weight"))
+        .ok_or("k_norm missing")?
+        .to_vec();
+
+    // 행별: q 디인터리브 + norm + rope, k norm+rope → KV 적립(순서 보장).
+    let pos0 = seq.pos;
+    let mut q_heads = vec![0f32; t_rows * n_head * head_dim];
+    let mut gate_heads = vec![0f32; t_rows * n_head * head_dim];
+    {
+        let kv = &mut seq.kv[attn_il];
+        let kv_cap = kv.k.len() / (n_kv * head_dim);
+        if kv.len + t_rows > kv_cap {
+            return Err(format!(
+                "attn_batch: kv 용량 초과 ({}+{} > {kv_cap})",
+                kv.len, t_rows
+            ));
+        }
+        for t in 0..t_rows {
+            // q: 헤드별 [q(256), gate(256)] 인터리브 → 분리
+            for hh in 0..n_head {
+                let src = t * n_head * head_dim * 2 + hh * head_dim * 2;
+                q_heads[t * n_head * head_dim + hh * head_dim
+                    ..t * n_head * head_dim + (hh + 1) * head_dim]
+                    .copy_from_slice(&q_gate[src..src + head_dim]);
+                gate_heads[t * n_head * head_dim + hh * head_dim
+                    ..t * n_head * head_dim + (hh + 1) * head_dim]
+                    .copy_from_slice(&q_gate[src + head_dim..src + head_dim * 2]);
+            }
+            // per-head q norm + rope
+            for hh in 0..n_head {
+                let b0 = t * n_head * head_dim + hh * head_dim;
+                let head: Vec<f32> = q_heads[b0..b0 + head_dim].to_vec();
+                let n = rms_norm(&head, &q_norm_w, eps);
+                let mut h_rot = n;
+                rope(&mut h_rot, pos0 + t as u32, n_rot, rope_base);
+                q_heads[b0..b0 + head_dim].copy_from_slice(&h_rot);
+            }
+            // k norm + rope → 캐시 적립, v 적립
+            let k_base = kv.len * n_kv * head_dim;
+            for hh in 0..n_kv {
+                let b0 = t * n_kv * head_dim + hh * head_dim;
+                let head: Vec<f32> = k[b0..b0 + head_dim].to_vec();
+                let n = rms_norm(&head, &k_norm_w, eps);
+                let mut h_rot = n;
+                rope(&mut h_rot, pos0 + t as u32, n_rot, rope_base);
+                kv.k[k_base + hh * head_dim..k_base + (hh + 1) * head_dim].copy_from_slice(&h_rot);
+                kv.v[k_base + hh * head_dim..k_base + (hh + 1) * head_dim]
+                    .copy_from_slice(&v[b0..b0 + head_dim]);
+            }
+            kv.len += 1;
+        }
+    }
+
+    // 인과 어텐션 — 행 병렬(행 t는 kv[0..=pos0+t] 만 본다).
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let n_rep = n_head / n_kv;
+    let mut attn_out = vec![0f32; t_rows * n_head * head_dim];
+    {
+        let kv = &seq.kv[attn_il];
+        let (qp, kp, vp, gp, op) = (
+            PP(q_heads.as_ptr() as usize),
+            PP(kv.k.as_ptr() as usize),
+            PP(kv.v.as_ptr() as usize),
+            PP(gate_heads.as_ptr() as usize),
+            PP(attn_out.as_mut_ptr() as usize),
+        );
+        // SAFETY: 행별 출력 영역 분리, kv/q/gate는 읽기 공유(scope join 증명).
+        par_rows(t_rows, move |t| unsafe {
+            let kv_len = (pos0 as usize) + t + 1;
+            for hh in 0..n_head {
+                let kv_h = hh / n_rep;
+                let q = std::slice::from_raw_parts(
+                    (qp.0 as *const f32).add(t * n_head * head_dim + hh * head_dim),
+                    head_dim,
+                );
+                let (kb, vb) = (kp.0 as *const f32, vp.0 as *const f32);
+                let ob = (op.0 as *mut f32).add(t * n_head * head_dim + hh * head_dim);
+                let mut scores = vec![0f32; kv_len];
+                for tt in 0..kv_len {
+                    let k_base = tt * n_kv * head_dim + kv_h * head_dim;
+                    let mut dot = 0f32;
+                    for d in 0..head_dim {
+                        dot += q[d] * *kb.add(k_base + d);
+                    }
+                    scores[tt] = dot * scale;
+                }
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
+                let inv_sum = 1.0 / exp_sum;
+                let w: Vec<f32> = scores
+                    .iter()
+                    .map(|&s| (s - max_s).exp() * inv_sum)
+                    .collect();
+                for d in 0..head_dim {
+                    let mut sum = 0f32;
+                    for tt in 0..kv_len {
+                        let v_base = tt * n_kv * head_dim + kv_h * head_dim;
+                        sum += w[tt] * *vb.add(v_base + d);
+                    }
+                    // 게이트: attn_out · sigmoid(gate)
+                    let gv = *(gp.0 as *const f32).add(t * n_head * head_dim + hh * head_dim + d);
+                    *ob.add(d) = sum * sigmoid(gv);
+                }
+            }
+        });
+    }
+
+    // o_proj 배치 — 결과는 [T][h] 행 우선
+    let o = tr.linear_batch(&format!("{lp}.o_proj"), &attn_out, t_rows)?;
+    Ok(o)
+}
+
+/// T-행 FFN: gate/up 배치(1동기) → ew(silu·mul) 행 병렬 → down 배치.
+fn ffn_batch(
+    tr: &mut TrellisResident,
+    il: usize,
+    xf: &[f32],
+    t_rows: usize,
+) -> Result<Vec<f32>, String> {
+    let lp = format!("model.language_model.layers.{il}.mlp");
+    let ig = tr
+        .linears
+        .iter()
+        .position(|(k, _)| k == &format!("{lp}.gate_proj"))
+        .ok_or("gate_proj missing")?;
+    let ng = tr.linears[ig].1.n;
+    let _f0 = ph("ppf:lin_gu");
+    let mut outs = tr.linear_batch_multi(
+        &[&format!("{lp}.gate_proj"), &format!("{lp}.up_proj")],
+        xf,
+        t_rows,
+    )?;
+    drop(_f0);
+    let u = outs.pop().ok_or("ffn 결과 유실")?;
+    let g = outs.pop().ok_or("ffn 결과 유실")?;
+    let mut dw = vec![0f32; t_rows * ng];
+    {
+        let _f1 = ph("ppf:ew");
+        let (gp, up, dp) = (
+            PP(g.as_ptr() as usize),
+            PP(u.as_ptr() as usize),
+            PP(dw.as_mut_ptr() as usize),
+        );
+        // SAFETY: 행별 분리 쓰기(dw).
+        par_rows(t_rows, move |t| unsafe {
+            for i in 0..ng {
+                let gv = *(gp.0 as *const f32).add(t * ng + i);
+                let uv = *(up.0 as *const f32).add(t * ng + i);
+                *(dp.0 as *mut f32).add(t * ng + i) = silu(gv) * uv;
+            }
+        });
+        drop(_f1);
+    }
+    let _f2 = ph("ppf:lin_d");
+    let r = tr.linear_batch(&format!("{lp}.down_proj"), &dw, t_rows)?;
+    drop(_f2);
+    Ok(r)
+}
+
+/// 배치 프리필: 전체 프롬프트를 T-배치로 통과(>512 청크 분할) — 마지막
+/// 토큰 logits 반환. 상태는 decode_step 연속 가능 형식으로 적립.
+/// 산술: 10a(환원 순서·청크 분해 — 골든/토큰 기준 갱신 대상).
+pub fn prefill_batch(
+    tr: &mut TrellisResident,
+    seq: &mut SeqState,
+    tokens: &[u32],
+) -> Result<Vec<f32>, String> {
+    let h = tr.hidden;
+    let eps = 1e-6f32;
+    if tokens.is_empty() {
+        return Err("prefill_batch: 빈 프롬프트".into());
+    }
+    let mut logits = Vec::new();
+    for chunk_toks in tokens.chunks(super::exl3_resident::BATCH_TMAX) {
+        let t_rows = chunk_toks.len();
+        // 임베딩 행 조립
+        let mut x = vec![0f32; t_rows * h];
+        for (t, &tok) in chunk_toks.iter().enumerate() {
+            x[t * h..(t + 1) * h].copy_from_slice(tr.embed_row(tok));
+        }
+        let mut attn_count = 0;
+        for il in 0..tr.n_layers {
+            let lp = format!("model.language_model.layers.{il}");
+            let full = il % 4 == 3;
+            let norm_w = tr
+                .norm(&format!("{lp}.input_layernorm.weight"))
+                .ok_or("norm missing")?
+                .to_vec();
+            // xn 행 rms — 병렬
+            let mut xn = vec![0f32; t_rows * h];
+            {
+                let (xp, np, op) = (
+                    PP(x.as_ptr() as usize),
+                    PP(norm_w.as_ptr() as usize),
+                    PP(xn.as_mut_ptr() as usize),
+                );
+                // SAFETY: 행별 분리 쓰기(xn).
+                par_rows(t_rows, move |t| unsafe {
+                    let xr = std::slice::from_raw_parts((xp.0 as *const f32).add(t * h), h);
+                    let ss: f32 = xr.iter().map(|&v| v * v).sum();
+                    let inv = 1.0 / ((ss / h as f32 + eps).sqrt());
+                    let ob = (op.0 as *mut f32).add(t * h);
+                    let nw = np.0 as *const f32;
+                    for i in 0..h {
+                        *ob.add(i) = *xr.get_unchecked(i) * inv * *nw.add(i);
+                    }
+                });
+            }
+            let attn_out = if full {
+                let _g = ph("pp:attn");
+                let r = attn_batch(tr, seq, il, attn_count, &xn, t_rows, 24, 4, 256)?;
+                drop(_g);
+                attn_count += 1;
+                r
+            } else {
+                let _g = ph("pp:gdn");
+                let r = gdn_batch(tr, seq, il, &xn, t_rows)?;
+                drop(_g);
+                r
+            };
+            // 잔차 x += attn_out
+            for (a, b) in x.iter_mut().zip(attn_out.iter()) {
+                *a += b;
+            }
+            let ffn_norm_w = tr
+                .norm(&format!("{lp}.post_attention_layernorm.weight"))
+                .ok_or("ffn norm missing")?
+                .to_vec();
+            let mut xf = vec![0f32; t_rows * h];
+            {
+                let (xp, np, op) = (
+                    PP(x.as_ptr() as usize),
+                    PP(ffn_norm_w.as_ptr() as usize),
+                    PP(xf.as_mut_ptr() as usize),
+                );
+                // SAFETY: 위와 동일(행별 분리 쓰기).
+                par_rows(t_rows, move |t| unsafe {
+                    let xr = std::slice::from_raw_parts((xp.0 as *const f32).add(t * h), h);
+                    let ss: f32 = xr.iter().map(|&v| v * v).sum();
+                    let inv = 1.0 / ((ss / h as f32 + eps).sqrt());
+                    let ob = (op.0 as *mut f32).add(t * h);
+                    let nw = np.0 as *const f32;
+                    for i in 0..h {
+                        *ob.add(i) = *xr.get_unchecked(i) * inv * *nw.add(i);
+                    }
+                });
+            }
+            let _gf = ph("pp:ffn");
+            let ffn_out = ffn_batch(tr, il, &xf, t_rows)?;
+            drop(_gf);
+            for (a, b) in x.iter_mut().zip(ffn_out.iter()) {
+                *a += b;
+            }
+        }
+        seq.pos += t_rows as u32;
+        // 마지막 청크: output_norm + lm_head(마지막 행만)
+        let out_norm_w = tr
+            .norm("model.language_model.norm.weight")
+            .ok_or("output norm missing")?
+            .to_vec();
+        let last = &x[(t_rows - 1) * h..t_rows * h];
+        let xn_last = rms_norm(last, &out_norm_w, eps);
+        logits = tr.linear("lm_head", &xn_last)?;
+    }
+    Ok(logits)
+}
+
+/// `llm170 exl3-pp <dir> <token_ids> [n_predict]` — 배치 프리필 검증+벤치:
+/// ① 순차 프리필 기준 로짓 확보 ② 배치 프리필 로짓 비교(상관·argmax)
+/// ③ 이어서 greedy 생성 토큰 비교(배치→순차 디코드 전환 정합)
+/// ④ 배치 pp 3회 중앙값 t/s.
+pub fn exl3_pp(dir: &str, tokens_str: &str, n_predict: usize) -> Result<String, String> {
+    let prompt: Vec<u32> = tokens_str
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    if prompt.is_empty() {
+        return Err("토큰 ID 필요 (쉼표 구분)".into());
+    }
+    eprintln!("  [exl3-pp] 상주 적재 중...");
+    let t0 = std::time::Instant::now();
+    let mut tr = TrellisResident::load(dir)?;
+    eprintln!(
+        "  [exl3-pp] 적재 완료 {:.1}s — 프롬프트 {} 토큰",
+        t0.elapsed().as_secs_f64(),
+        prompt.len()
+    );
+    let ctx_len = (prompt.len() + n_predict + 64).max(512);
+    // 벤치 전용 모드 — 순차 기준·비교 생략(진단 루프용, 검증은 전체 모드로)
+    let bench_only = llm170_diag::flag::on("LLM170_PP_BENCH_ONLY");
+
+    // ① 순차 기준
+    let mut seq1 = new_seq_state(tr.n_layers, ctx_len);
+    let mut logits_seq = Vec::new();
+    let mut seq_s = 0f64;
+    if !bench_only {
+        let t1 = std::time::Instant::now();
+        for &tok in &prompt {
+            logits_seq = decode_step(&mut tr, &mut seq1, tok)?;
+        }
+        seq_s = t1.elapsed().as_secs_f64();
+    }
+
+    // ② 배치 프리필
+    let mut seq2 = new_seq_state(tr.n_layers, ctx_len);
+    let t2 = std::time::Instant::now();
+    let logits_b = prefill_batch(&mut tr, &mut seq2, &prompt)?;
+    let bat_s = t2.elapsed().as_secs_f64();
+
+    // 비교: 상관·최대차·argmax
+    let n = logits_seq.len().min(logits_b.len());
+    let (mut sxy, mut sx, mut sy, mut sxx, mut syy) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    let mut maxd = 0f32;
+    for i in 0..n {
+        let (a, b) = (logits_seq[i] as f64, logits_b[i] as f64);
+        sxy += a * b;
+        sx += a;
+        sy += b;
+        sxx += a * a;
+        syy += b * b;
+        maxd = maxd.max((logits_seq[i] - logits_b[i]).abs());
+    }
+    let corr = (n as f64 * sxy - sx * sy)
+        / ((n as f64 * sxx - sx * sx) * (n as f64 * syy - sy * sy)).sqrt();
+    let am_seq = logits_seq
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let am_b = logits_b
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    // ③ greedy 생성 비교(각 상태에서 n_predict)
+    let gen_from = |tr: &mut TrellisResident, seq: &mut SeqState, lg: &[f32]| -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut logits = lg.to_vec();
+        for step in 0..n_predict {
+            let (best, _) = logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap_or((0, &0.0));
+            out.push(best as u32);
+            if step + 1 < n_predict {
+                logits = match decode_step(tr, seq, best as u32) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+            }
+        }
+        out
+    };
+    let gen_seq = if bench_only {
+        Vec::new()
+    } else {
+        gen_from(&mut tr, &mut seq1, &logits_seq)
+    };
+    let gen_b = gen_from(&mut tr, &mut seq2, &logits_b);
+
+    // ④ 배치 pp 타이밍 3회 중앙값(상태 할당 제외)
+    let mut times: Vec<f64> = Vec::new();
+    for _ in 0..3 {
+        let mut s = new_seq_state(tr.n_layers, ctx_len);
+        let t = std::time::Instant::now();
+        prefill_batch(&mut tr, &mut s, &prompt)?;
+        times.push(t.elapsed().as_secs_f64());
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = times[times.len() / 2];
+
+    // 진단 덤프 — VK_TS: GPU 디스패치 집계, exl3_phase: CPU 위상 분해.
+    if llm170_diag::flag::on("LLM170_VK_TS") {
+        tr.ctx.ts_report();
+    }
+    phase_report();
+
+    let seq_tps = prompt.len() as f64 / seq_s;
+    let bat_tps = prompt.len() as f64 / med;
+    Ok(format!(
+        "exl3-pp: 프롬프트 {} — 순차 {seq_tps:.2} t/s vs 배치 {bat_tps:.2} t/s (3회 중앙값, 배치 최초 {bat_s:.2}s)\n  로짓 corr={corr:.6} maxdiff={maxd:.4} argmax {}=={}{}\n  생성 {}토큰: 순차 {:?} 배치 {:?} {}",
+        prompt.len(),
+        am_seq,
+        am_b,
+        if am_seq == am_b {
+            "일치"
+        } else {
+            "불일치"
+        },
+        n_predict,
+        gen_seq,
+        gen_b,
+        if gen_seq == gen_b {
+            "일치"
+        } else {
+            "불일치"
+        },
+    ))
+}

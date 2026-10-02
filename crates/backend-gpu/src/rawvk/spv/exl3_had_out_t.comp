@@ -1,0 +1,42 @@
+#version 450
+
+// exl3_had_out_t (plans/121 A1-pp) — T-배치 출력 스테이지:
+// y[t] = H128(S[t])/√128 ⊙ svh — exl3_had_out의 행(T) 확장.
+// sb는 [T][nseg][n] f32(gemm 부분합), grid.y = 행. svh는 행 공유.
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer SB { float s[]; };      // f32 [T][nseg][n]
+layout(binding = 1) readonly buffer SvhB { uint svh16[]; }; // f16 쌍팩 [n/2]
+layout(binding = 2) writeonly buffer YB { float y[]; };     // f32 [T][n]
+layout(push_constant) uniform PC { uint nchunks; uint nseg; uint nstride; } pc;
+
+const float R_SCALE = 0.08838834764831845;
+
+shared float smem[128];
+
+void main() {
+    uint chunk = gl_WorkGroupID.x;
+    if (chunk >= pc.nchunks) return;
+    uint row = gl_WorkGroupID.y;
+    uint base = chunk * 128u;
+    uint th = gl_LocalInvocationID.x;
+
+    float v0 = 0.0;
+    for (uint g = 0u; g < pc.nseg; g++)
+        v0 += s[((row * pc.nseg) + g) * pc.nstride + base + th];
+    smem[th] = v0;
+    barrier();
+    for (uint w = 1u; w < 128u; w <<= 1u) {
+        uint grp = th / w;
+        uint blk = (grp >> 1u) * 2u * w;
+        uint i = blk + (th % w);
+        float a = smem[i];
+        float b = smem[i + w];
+        barrier();
+        smem[i] = a + b;
+        smem[i + w] = a - b;
+        barrier();
+    }
+    uint j = base + th;
+    float sv = unpackHalf2x16(svh16[j >> 1u])[j & 1u];
+    y[row * pc.nstride + j] = smem[th] * R_SCALE * sv;
+}
