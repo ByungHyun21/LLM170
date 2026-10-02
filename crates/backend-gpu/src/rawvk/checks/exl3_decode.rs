@@ -135,8 +135,13 @@ fn gdn_forward(
     let eps = 1e-6f32;
 
     // 선형 투영 (vk GEMV) — alpha/beta도 선형이지만 크기가 작아 inline 계산
-    let _gq = ph("gdn:lin_qkv");
-    let qkv = tr.linear(&format!("{lp}.in_proj_qkv"), x_normed)?;
+    // plans/120 A1: qkv·z 동일 입력 → linear_pair 1배치 (동기 2→1).
+    let _gq = ph("gdn:lin_qkvz");
+    let (qkv, z) = tr.linear_pair(
+        &format!("{lp}.in_proj_qkv"),
+        &format!("{lp}.in_proj_z"),
+        x_normed,
+    )?;
     drop(_gq);
     if il == 0 && seq.pos == 0 {
         let rms = (qkv.iter().map(|v| v * v).sum::<f32>() / qkv.len() as f32).sqrt();
@@ -146,10 +151,6 @@ fn gdn_forward(
             qkv.get(1).copied().unwrap_or(0.0)
         );
     }
-    let _gz = ph("gdn:lin_z");
-    let z = tr.linear(&format!("{lp}.in_proj_z"), x_normed)?;
-    drop(_gz);
-
     // alpha: hidden → 48 (V헤드별 스케일러) — 노름에서 읽기
     let a_proj = tr
         .norm(&format!("{lp}.in_proj_a.weight"))
@@ -302,10 +303,14 @@ fn attn_forward(
     let rope_base = 1e7f32;
 
     // q/k/v (vk GEMV) — q는 gate 퓨전 [n_head * head_dim * 2]
+    // plans/120 A1: 3회 개별 배치 → linear_triple 1배치 (동기 3→1).
     let _g1 = ph("attn:lin_qkv");
-    let q_gate = tr.linear(&format!("{lp}.q_proj"), x_normed)?; // [12288]
-    let k = tr.linear(&format!("{lp}.k_proj"), x_normed)?; // [1024]
-    let v = tr.linear(&format!("{lp}.v_proj"), x_normed)?; // [1024]
+    let (q_gate, k, v) = tr.linear_triple(
+        &format!("{lp}.q_proj"),
+        &format!("{lp}.k_proj"),
+        &format!("{lp}.v_proj"),
+        x_normed,
+    )?;
     drop(_g1);
 
     // q_norm, k_norm
@@ -479,8 +484,12 @@ pub fn decode_step(
             .ok_or("ffn norm missing")?;
         let xf = rms_norm(&x, ffn_norm_w, eps);
         let _gu = ph("ffn:lin_gu");
-        let gate = tr.linear(&format!("{lp}.mlp.gate_proj"), &xf)?;
-        let up = tr.linear(&format!("{lp}.mlp.up_proj"), &xf)?;
+        // plans/120 A1: gate·up 동일 입력 → linear_pair 1배치.
+        let (gate, up) = tr.linear_pair(
+            &format!("{lp}.mlp.gate_proj"),
+            &format!("{lp}.mlp.up_proj"),
+            &xf,
+        )?;
         drop(_gu);
         let _ga = ph("ffn:act");
         let hidden_act: Vec<f32> = gate

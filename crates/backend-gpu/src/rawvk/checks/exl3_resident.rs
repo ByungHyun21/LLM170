@@ -1,8 +1,10 @@
 //! EXL3 레이어 스트리밍 디코드 (plans/118 §3-2) — 트렐리스 13GB 상주 +
 //! 선형층 vk GEMV + 비선형 CPU. 53.8GB F16 전개 없이 전 모델 디코드.
 //!
-//! v2 속도: 입력버퍼 재사용(alloc 제거) + linear_pair(공유 had_in) +
-//! 배치 3커널(run_rw 배리어 — 순차 보장).
+//! v2 속도: 입력버퍼 재사용(alloc 제거) + 배치 3커널(run_rw 배리어).
+//! v3(plans/120 A1): 배치 내 선형별 had_in — suh는 텐서별 입력채널 스케일
+//! (W = diag(suh)·H·diag(svh), trellis.rs)이라 공유 had_in은 수치 오염이다.
+//! ah/yb 슬롯 3종, sb는 run_rw 배리어(WAR/WAW 커버, plans/104)로 공유.
 
 use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use half::f16;
@@ -32,7 +34,9 @@ pub struct TrellisResident {
     p2: Pipes,
     p3: Pipes,
     // 스크래치 (재사용 — alloc 폭탄 제거)
-    ahb: VkBuf,
+    ahb1: VkBuf,
+    ahb2: VkBuf,
+    ahb3: VkBuf,
     sb: VkBuf,
     yb1: VkBuf,
     yb2: VkBuf,
@@ -166,7 +170,9 @@ impl TrellisResident {
         let max_k = linears.iter().map(|(_, l)| l.k).max().unwrap_or(5120);
         let max_n = linears.iter().map(|(_, l)| l.n).max().unwrap_or(17408);
         let nseg = 4u32;
-        let ahb = ctx.alloc(max_k * 2)?;
+        let ahb1 = ctx.alloc(max_k * 2)?;
+        let ahb2 = ctx.alloc(max_k * 2)?;
+        let ahb3 = ctx.alloc(max_k * 2)?;
         let sb = ctx.alloc(max_n * 4 * nseg as usize)?;
         let yb1 = ctx.alloc(max_n * 4)?;
         let yb2 = ctx.alloc(max_n * 4)?;
@@ -184,7 +190,9 @@ impl TrellisResident {
             p1,
             p2,
             p3,
-            ahb,
+            ahb1,
+            ahb2,
+            ahb3,
             sb,
             yb1,
             yb2,
@@ -216,26 +224,34 @@ impl TrellisResident {
         Ok(())
     }
 
-    /// 배치 내 had_in 1회 + gemv/had_out N회 (run_rw 배리어).
+    /// 배치: 선형별 had_in→gemv→had_out 체인, 단일 제출·단일 동기.
+    /// suh는 텐서별 스케일이라 had_in을 공유하지 않고 슬롯별 ah에서 변환.
+    /// sb 공유는 run_rw 배리어가 WAR/WAW를 커버(context plans/104 판정식).
     fn batch_chain(
         &mut self,
-        inputs: &[usize],  // linear 인덱스 목록
-        outputs: &[usize], // yb 버퍼 번호 (0=yb1, 1=yb2)
+        inputs: &[usize],  // linear 인덱스 목록 (≤3)
+        outputs: &[usize], // 호환 — 결과는 슬롯 순서대로 yb1..yb3
     ) -> Result<(), String> {
-        let k = self.linears[inputs[0]].1.k;
+        let _ = outputs;
         let nseg = 4u32;
 
         self.ctx.begin_batch()?;
+        for (slot, &li) in inputs.iter().enumerate() {
+            let l = &self.linears[li].1;
+            let (k, n, krate) = (l.k, l.n, l.krate);
+            let (suh_b, tre_b, svh_b) = (l.suh.buf, l.tre.buf, l.svh.buf);
+            let ah = [self.ahb1.buf, self.ahb2.buf, self.ahb3.buf][slot];
+            let yb = [self.yb1.buf, self.yb2.buf, self.yb3.buf][slot];
+            let (xb_b, sb_b) = (self.xb.buf, self.sb.buf);
 
-        // 공유 had_in: xb → ahb
-        {
-            let l = &self.linears[inputs[0]].1;
+            // had_in: xb × suh_i → ah_i (텐서별 suh — 공유 금지)
             let ds = self.ctx.fresh_ds_for(&self.p1, 3)?;
-            self.ctx
-                .bind_bufs(ds, &[self.xb.buf, l.suh.buf, self.ahb.buf]);
+            self.ctx.bind_bufs(ds, &[xb_b, suh_b, ah]);
             let push = (k as u32 / 128).to_le_bytes().to_vec();
-            crate::rawvk::context::site::scope("e3_had_in", || {
-                self.ctx.run_rw(
+            // ts 표 라벨은 site::tag()(TAG thread-local) — scope은 CUR만 바꾼다.
+            crate::rawvk::context::site::set_tag("e3_had_in");
+            self.ctx
+                .run_rw(
                     self.p1.pl,
                     ds,
                     self.p1.pipe,
@@ -243,63 +259,49 @@ impl TrellisResident {
                     (k / 128) as u32,
                     1,
                     1,
-                    &[self.xb.buf, l.suh.buf],
-                    &[self.ahb.buf],
-                )
-            })?;
-        }
+                    &[xb_b, suh_b],
+                    &[ah],
+                )?;
 
-        // 각 선형: gemv(ahb, tre → sb) + had_out(sb, svh → ybN)
-        for (slot, &li) in inputs.iter().enumerate() {
-            let l = &self.linears[li].1;
-            let yb = if outputs[slot] == 0 {
-                &self.yb1
-            } else {
-                &self.yb2
-            };
-
-            // gemv: ahb × tre → sb
+            // gemv: ah_i × tre → sb
             let ds2 = self.ctx.fresh_ds_for(&self.p2, 3)?;
-            self.ctx
-                .bind_bufs(ds2, &[self.ahb.buf, l.tre.buf, self.sb.buf]);
-            let push2: Vec<u8> = [(k / 16) as u32, (l.n / 16) as u32, l.krate]
+            self.ctx.bind_bufs(ds2, &[ah, tre_b, sb_b]);
+            let push2: Vec<u8> = [(k / 16) as u32, (n / 16) as u32, krate]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
-            crate::rawvk::context::site::scope("e3_gemv", || {
-                self.ctx.run_rw(
-                    self.p2.pl,
-                    ds2,
-                    self.p2.pipe,
-                    &push2,
-                    ((l.n / 16) as u32).div_ceil(8),
-                    nseg,
-                    1,
-                    &[self.ahb.buf, l.tre.buf],
-                    &[self.sb.buf],
-                )
-            })?;
+            crate::rawvk::context::site::set_tag("e3_gemv");
+            self.ctx.run_rw(
+                self.p2.pl,
+                ds2,
+                self.p2.pipe,
+                &push2,
+                ((n / 16) as u32).div_ceil(8),
+                nseg,
+                1,
+                &[ah, tre_b],
+                &[sb_b],
+            )?;
 
-            // had_out: sb × svh → ybN
+            // had_out: sb × svh → yb_slot
             let ds3 = self.ctx.fresh_ds_for(&self.p3, 3)?;
-            self.ctx.bind_bufs(ds3, &[self.sb.buf, l.svh.buf, yb.buf]);
-            let push3: Vec<u8> = [(l.n as u32 / 128), nseg]
+            self.ctx.bind_bufs(ds3, &[sb_b, svh_b, yb]);
+            let push3: Vec<u8> = [(n as u32 / 128), nseg]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
-            crate::rawvk::context::site::scope("e3_had_out", || {
-                self.ctx.run_rw(
-                    self.p3.pl,
-                    ds3,
-                    self.p3.pipe,
-                    &push3,
-                    (l.n / 128) as u32,
-                    1,
-                    1,
-                    &[self.sb.buf, l.svh.buf],
-                    &[yb.buf],
-                )
-            })?;
+            crate::rawvk::context::site::set_tag("e3_had_out");
+            self.ctx.run_rw(
+                self.p3.pl,
+                ds3,
+                self.p3.pipe,
+                &push3,
+                (n / 128) as u32,
+                1,
+                1,
+                &[sb_b, svh_b],
+                &[yb],
+            )?;
         }
 
         self.ctx.end_batch_wait()?;
