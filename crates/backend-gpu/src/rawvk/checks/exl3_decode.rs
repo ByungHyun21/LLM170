@@ -163,45 +163,38 @@ fn gdn_forward(
         k_all[b0..b0 + d_state].copy_from_slice(&l2_norm(&headk, eps));
     }
 
-    // GDN delta rule (t=1) — HF 순서 헤드 매핑 (V헤드 h → K헤드 h/3).
-    // gdn_ar_batch는 llama.cpp 순서(h%h_k)를 기대하므로 인라인 구현.
-    let mut o_all = vec![0f32; v_len];
-    let scale = 1.0f32 / (d_state as f32).sqrt();
-    for h in 0..n_v {
-        let kh = h / (n_v / n_k); // HF: V헤드 h는 K헤드 h/3 사용
-        let qs = &q_all[kh * d_state..(kh + 1) * d_state];
-        let ks = &k_all[kh * d_state..(kh + 1) * d_state];
-        let vs = &v_all[h * d_state..(h + 1) * d_state];
-        let st_h = &mut st.states[h * d_state * d_state..(h + 1) * d_state * d_state];
-        let beta_h = beta_all[h];
-        let g_exp = llm170_core::ops::exp_cr(g_all[h]);
+    // GDN delta rule — core::gdn::gdn_ar_batch 재사용 (헤드 병렬).
+    // HF 순서 → llama.cpp 순서 (h%h_k 매핑용) → 역순열로 복귀.
+    let hf_to_lc = |h: usize| -> usize { 3 * (h % 16) + h / 16 };
 
-        // S ← S·e^g;  sk[dv] = Σ_kdim S[kdim,dv]·k[kdim]
-        let mut sk = vec![0f32; d_state];
-        for kdim in 0..d_state {
-            let kk = ks[kdim];
-            for dv in 0..d_state {
-                let s = &mut st_h[kdim * d_state + dv];
-                *s *= g_exp;
-                sk[dv] += *s * kk;
-            }
-        }
-        // delta[dv] = (v[dv] − sk[dv])·β;  S += k⊗delta
-        for dv in 0..d_state {
-            let delta = (vs[dv] - sk[dv]) * beta_h;
-            for kdim in 0..d_state {
-                st_h[kdim * d_state + dv] += ks[kdim] * delta;
-            }
-        }
-        // o[dv] = Σ_kdim S[kdim,dv]·(q[kdim]·scale)
-        let ob = h * d_state;
-        for dv in 0..d_state {
-            let mut o = 0f32;
-            for kdim in 0..d_state {
-                o += st_h[kdim * d_state + dv] * qs[kdim] * scale;
-            }
-            o_all[ob + dv] = o;
-        }
+    let mut v_lc = vec![0f32; v_len]; // llama.cpp 순서 v
+    let mut beta_lc = vec![0f32; n_v];
+    let mut g_lc = vec![0f32; n_v];
+    let mut o_lc = vec![0f32; v_len];
+    // 상태도 순열 — state[llama.cpp head i] = state[HV head hf_to_lc(i)]
+    let mut st_lc = vec![0f32; n_v * d_state * d_state];
+    for i in 0..n_v {
+        let j = hf_to_lc(i);
+        v_lc[i * d_state..(i + 1) * d_state]
+            .copy_from_slice(&v_all[j * d_state..(j + 1) * d_state]);
+        beta_lc[i] = beta_all[j];
+        g_lc[i] = g_all[j];
+        st_lc[i * d_state * d_state..(i + 1) * d_state * d_state]
+            .copy_from_slice(&st.states[j * d_state * d_state..(j + 1) * d_state * d_state]);
+    }
+
+    llm170_core::gdn::gdn_ar_batch(
+        &q_all, &k_all, &v_lc, &beta_lc, &g_lc, &mut st_lc, &mut o_lc, 1, n_k, n_v,
+    );
+
+    // 결과·상태 역순열 (llama.cpp → HF)
+    let mut o_all = vec![0f32; v_len];
+    for i in 0..n_v {
+        let j = hf_to_lc(i);
+        o_all[j * d_state..(j + 1) * d_state]
+            .copy_from_slice(&o_lc[i * d_state..(i + 1) * d_state]);
+        st.states[j * d_state * d_state..(j + 1) * d_state * d_state]
+            .copy_from_slice(&st_lc[i * d_state * d_state..(i + 1) * d_state * d_state]);
     }
 
     // norm_gated: rms_norm(o) * silu(z) per V head
