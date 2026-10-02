@@ -83,6 +83,14 @@ fn gdn_forward(
 
     // 선형 투영 (vk GEMV) — alpha/beta도 선형이지만 크기가 작아 inline 계산
     let qkv = tr.linear(&format!("{lp}.in_proj_qkv"), x_normed)?;
+    if il == 0 && seq.pos == 0 {
+        let rms = (qkv.iter().map(|v| v * v).sum::<f32>() / qkv.len() as f32).sqrt();
+        eprintln!(
+            "  [dbg] L0 qkv rms={rms:.4} qkv[0]={:.6} qkv[1]={:.6}",
+            qkv[0],
+            qkv.get(1).copied().unwrap_or(0.0)
+        );
+    }
     let z = tr.linear(&format!("{lp}.in_proj_z"), x_normed)?;
 
     // alpha: hidden → 48 (V헤드별 스케일러) — 노름에서 읽기
