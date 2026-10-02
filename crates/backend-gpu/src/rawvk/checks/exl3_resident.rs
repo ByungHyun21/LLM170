@@ -547,22 +547,25 @@ impl TrellisResident {
 // 연산강도 32배로 87GB/s 메모리 벽을 탈출해 pp를 GEMM 연산량 바닥으로.
 // 스크래치는 지연 초기화·영속(ADR-0014) — 디코드 전용 프로세스는 미할당.
 
-/// gemm k-분할 수 — GEMV(16)보다 작다: ntg(T/32) 병렬이 있어 스플릿 수요가
-/// 적고, 작을수록 had_out_t 환원 부담이 줄어든다. 청크 분해 → 규칙 10a.
-const GEMM_NSEG: u32 = 4;
 /// 배치 행 상한 — 초과는 드라이버(프리필)가 청크 분할.
 pub const BATCH_TMAX: usize = 512;
 
 /// T-배치 스크래치 — 슬롯 3종(GEMV ahb/yb 관례와 동일 구조, run_rw
 /// 배리어가 WAR/WAW 커버 — plans/104 판정식, sb는 단일 공유).
 pub struct BatchScratch {
-    xtb: VkBuf, // [TMAX*max_k] f16 — 업로드(xt)·had_in_t 입력
+    /// [TMAX*max_k] f32 캐시 — 스테이징 입력(호스트가 병렬 직접 기록,
+    /// had_in_tf32가 직독 — CPU f16 변환 제거, 병목 원장 #3).
+    xtb: VkBuf,
     ah: [VkBuf; 3],
     yb: [VkBuf; 3], // [TMAX*max_n] f32 ×3
     sb: VkBuf,      // [TMAX*NSEG*max_n] f32
-    p1: Pipes,      // had_in_t
-    p2: Pipes,      // gemm
-    p3: Pipes,      // had_out_t
+    /// [TMAX*max_n] f16 캐브아웃 — ew_t 출력(= down의 had_in_t f16 입력).
+    x2t: VkBuf,
+    p1: Pipes,  // had_in_t (f16 입력 — ew_t 다운 레그)
+    p1f: Pipes, // had_in_tf32 (f32 직독)
+    p2: Pipes,  // gemm
+    p3: Pipes,  // had_out_t
+    p4t: Pipes, // ffn_ew_t
 }
 
 impl TrellisResident {
@@ -577,41 +580,51 @@ impl TrellisResident {
         let p1 = self
             .ctx
             .pipeline_pipes(include_bytes!("../spv/exl3_had_in_t.spv"), 3, 8)?;
+        let p1f = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/exl3_had_in_tf32.spv"), 3, 8)?;
         let p2 = self
             .ctx
-            .pipeline_pipes(include_bytes!("../spv/exl3_gemm.spv"), 3, 20)?;
+            .pipeline_pipes(include_bytes!("../spv/exl3_gemm2.spv"), 3, 16)?;
         let p3 = self
             .ctx
             .pipeline_pipes(include_bytes!("../spv/exl3_had_out_t.spv"), 3, 12)?;
+        let p4t = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/exl3_ffn_ew_t.spv"), 3, 4)?;
         let max_k = self.linears.iter().map(|(_, l)| l.k).max().unwrap_or(5120);
         let max_n = self.linears.iter().map(|(_, l)| l.n).max().unwrap_or(17408);
-        // CPU가 직접 읽/쓰는 버퍼(xtb 업로드·yb 판독)는 호스트 RAM(캐시됨) —
+        // CPU가 직접 읽/쓰는 버퍼(xtb 스테이징·yb 판독)는 호스트 RAM(캐시됨) —
         // APU 커브아웃 매핑 판독은 무캐시로 T×n MB급 판독이 ~300MB/s에
         // 걸려 프리필 병목이었다(2026-10-03 계측: lin_gu 34ms/층 중 대부분).
-        // ah/sb는 GPU 전용 — 커브아웃 유지.
-        let xtb = self.ctx.alloc_host_cached(BATCH_TMAX * max_k * 2)?;
+        // ah/sb/x2t는 GPU 전용 — 커브아웃 유지.
+        let xtb = self.ctx.alloc_host_cached(BATCH_TMAX * max_k * 4)?;
         let ah1 = self.ctx.alloc(BATCH_TMAX * max_k * 2)?;
         let ah2 = self.ctx.alloc(BATCH_TMAX * max_k * 2)?;
         let ah3 = self.ctx.alloc(BATCH_TMAX * max_k * 2)?;
         let y1 = self.ctx.alloc_host_cached(BATCH_TMAX * max_n * 4)?;
         let y2 = self.ctx.alloc_host_cached(BATCH_TMAX * max_n * 4)?;
         let y3 = self.ctx.alloc_host_cached(BATCH_TMAX * max_n * 4)?;
-        let sb = self
-            .ctx
-            .alloc(BATCH_TMAX * GEMM_NSEG as usize * max_n * 4)?;
+        let sb = self.ctx.alloc(BATCH_TMAX * max_n * 4)?;
+        let x2t = self.ctx.alloc(BATCH_TMAX * max_n * 2)?;
         self.batch = Some(BatchScratch {
             xtb,
             ah: [ah1, ah2, ah3],
             yb: [y1, y2, y3],
             sb,
+            x2t,
             p1,
+            p1f,
             p2,
             p3,
+            p4t,
         });
         Ok(())
     }
 
-    /// 배치 선형 1개 체인(had_in_t→gemm→had_out_t) — begin_batch 내부 전용.
+    /// 배치 선형 1개 체인(had_in→gemm→had_out_t) — begin_batch 내부 전용.
+    /// f32_in=true: x_src를 f32 [T][k]로 직독(had_in_tf32) — 스테이징 경로.
+    /// false: f16 쌍팩(ew_t 출력 → down 레그).
     fn chain_batch_one(
         &mut self,
         x_src: ash::vk::Buffer,
@@ -619,6 +632,7 @@ impl TrellisResident {
         t_rows: u32,
         ah: ash::vk::Buffer,
         yb: ash::vk::Buffer,
+        f32_in: bool,
     ) -> Result<(), String> {
         let l = &self.linears[li].1;
         let (k, n, krate) = (l.k, l.n, l.krate);
@@ -626,19 +640,27 @@ impl TrellisResident {
         let b = self.batch.as_ref().ok_or("batch scratch 미초기화")?;
         let sb_b = b.sb.buf;
 
-        // had_in_t: x_src × suh → ah (행별 WHT, grid=(k/128, T))
+        // had_in: x_src × suh → ah (행별 WHT, grid=(k/128, T))
         {
-            let ds = self.ctx.fresh_ds_for(&b.p1, 3)?;
+            let (pl, pipe, tag) = if f32_in {
+                (&b.p1f.pl, b.p1f.pipe, "e3_had_in_tf32")
+            } else {
+                (&b.p1.pl, b.p1.pipe, "e3_had_in_t")
+            };
+            let ds = self
+                .ctx
+                .fresh_ds_for(if f32_in { &b.p1f } else { &b.p1 }, 3)?;
+
             self.ctx.bind_bufs(ds, &[x_src, suh_b, ah]);
             let push: Vec<u8> = [(k / 128) as u32, k as u32]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
-            crate::rawvk::context::site::set_tag("e3_had_in_t");
+            crate::rawvk::context::site::set_tag(tag);
             self.ctx.run_rw(
-                b.p1.pl,
+                *pl,
                 ds,
-                b.p1.pipe,
+                pipe,
                 &push,
                 (k / 128) as u32,
                 t_rows,
@@ -648,37 +670,36 @@ impl TrellisResident {
             )?;
         }
 
-        // gemm: ah × tre → sb (부분합 [T][NSEG][n])
+        // gemm2(coopmat): ah × tre → sb ([T][n], nseg=1 — k-분할 없음,
+        // grid=(n/64, ceil(T/64))). 스칼라 gemm(믹스 ~48%) 대체 — 원장 #2.
         {
             let ktiles = (k / 16) as u32;
             let ntiles = (n / 16) as u32;
-            let n_wgs = ntiles.div_ceil(8);
-            let ntg = t_rows.div_ceil(32);
             let ds = self.ctx.fresh_ds_for(&b.p2, 3)?;
             self.ctx.bind_bufs(ds, &[ah, tre_b, sb_b]);
-            let push: Vec<u8> = [ktiles, ntiles, krate, t_rows, ntg]
+            let push: Vec<u8> = [ktiles, ntiles, krate, t_rows]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
-            crate::rawvk::context::site::set_tag("e3_gemm");
+            crate::rawvk::context::site::set_tag("e3_gemm2");
             self.ctx.run_rw(
                 b.p2.pl,
                 ds,
                 b.p2.pipe,
                 &push,
-                n_wgs * ntg,
-                GEMM_NSEG,
+                ((n / 64) as u32).max(1),
+                t_rows.div_ceil(64),
                 1,
                 &[ah, tre_b],
                 &[sb_b],
             )?;
         }
 
-        // had_out_t: sb 환원 × svh → yb (grid=(n/128, T))
+        // had_out_t: sb 환원 × svh → yb (grid=(n/128, T), nseg=1 — gemm2)
         {
             let ds = self.ctx.fresh_ds_for(&b.p3, 3)?;
             self.ctx.bind_bufs(ds, &[sb_b, svh_b, yb]);
-            let push: Vec<u8> = [(n / 128) as u32, GEMM_NSEG, n as u32]
+            let push: Vec<u8> = [(n / 128) as u32, 1u32, n as u32]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
@@ -698,17 +719,20 @@ impl TrellisResident {
         Ok(())
     }
 
-    /// T-배치 공유 입력 다중 선형: y_i[t] = x[t] @ W_i^T (i ≤ 3).
-    /// 업로드 1회 + 배치 1회(체인 직렬, 슬롯 분리) — 디코드 linear_triple
-    /// 구조의 배치판. x는 [T][k] 행 우선 f32.
-    pub fn linear_batch_multi(
+    /// T-배치 공유 입력 다중 선형(스테이징): y_i[t] = x[t] @ W_i^T (i ≤ 3).
+    /// 입력은 호출자가 stage_f32() 버퍼에 [T][k]로 미리 기록했어야 한다
+    /// (생산 par_rows가 직접 기록 — CPU f16 변환·업로드 복사 제거, 원장 #3).
+    /// 체인 직렬·슬롯 분리·동기 1회 — 디코드 linear_triple의 배치판.
+    pub fn linear_batch_multi_staged(
         &mut self,
         keys: &[&str],
-        x: &[f32],
         t_rows: usize,
     ) -> Result<Vec<Vec<f32>>, String> {
         if keys.is_empty() || keys.len() > 3 {
-            return Err(format!("linear_batch_multi: keys {}개 (1..=3)", keys.len()));
+            return Err(format!(
+                "linear_batch_multi_staged: keys {}개 (1..=3)",
+                keys.len()
+            ));
         }
         if t_rows == 0 || t_rows > BATCH_TMAX {
             return Err(format!("linear_batch: T={t_rows} 상한 {BATCH_TMAX} 위반"));
@@ -717,59 +741,32 @@ impl TrellisResident {
         for key in keys {
             idxs.push(self.find_linear(key)?);
         }
-        let k = self.linears[idxs[0]].1.k;
-        if x.len() != t_rows * k {
-            return Err(format!(
-                "{}: 배치 형상 {t_rows}x{k} != x.len {}",
-                keys[0],
-                x.len()
-            ));
-        }
+        let k0 = self.linears[idxs[0]].1.k;
         for &li in &idxs[1..] {
-            if self.linears[li].1.k != k {
-                return Err("linear_batch_multi: 입력 차원 불일치".to_string());
+            if self.linears[li].1.k != k0 {
+                return Err("linear_batch_multi_staged: 입력 차원 불일치".to_string());
             }
         }
         self.ensure_batch()?;
 
-        // 진단 분해(원장 89 키: exl3_lindbg) — 업로드/디스패치/대기/판독.
+        // 진단 분해(원장 89 키: exl3_lindbg) — flush/디스패치/대기/판독.
         static LINDBG_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let lindbg = llm170_diag::dump::opts().key("exl3_lindbg")
             && LINDBG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24;
         let lt0 = std::time::Instant::now();
-
-        // f32→f16 업로드 — upload_x의 8청크 관례(비트동일 RTNE).
-        {
-            let b = self.batch.as_ref().ok_or("batch scratch")?;
-            // SAFETY: xtb는 TMAX*max_k*2 바이트(t_rows*k ≤ 상한, 호출자가
-            // linear의 k와 x 형상을 일치시킴 — 위에서 검증).
-            let dst = unsafe { std::slice::from_raw_parts_mut(b.xtb.ptr as *mut u16, t_rows * k) };
-            for (r, row) in x.chunks(k).enumerate() {
-                let off = r * k;
-                let (chunks, rem) = row.as_chunks::<8>();
-                for (i, c) in chunks.iter().enumerate() {
-                    let w: [u16; 8] = std::array::from_fn(|j| f16::from_f32(c[j]).to_bits());
-                    dst[off + i * 8..off + i * 8 + 8].copy_from_slice(&w);
-                }
-                let base = off + chunks.len() * 8;
-                for (j, &v) in rem.iter().enumerate() {
-                    dst[base + j] = f16::from_f32(v).to_bits();
-                }
-            }
-        }
-        let lt1 = std::time::Instant::now();
 
         // 캐시(비결합) xtb 쓰기 → GPU 가시화 flush.
         {
             let b = self.batch.as_ref().ok_or("batch scratch")?;
             self.ctx.flush_buf(&b.xtb);
         }
+        let lt1 = std::time::Instant::now();
 
         let xtb = self.batch.as_ref().ok_or("batch scratch")?.xtb.buf;
         self.ctx.begin_batch()?;
         for (slot, &li) in idxs.iter().enumerate() {
             let b = self.batch.as_ref().ok_or("batch scratch")?;
-            self.chain_batch_one(xtb, li, t_rows as u32, b.ah[slot].buf, b.yb[slot].buf)?;
+            self.chain_batch_one(xtb, li, t_rows as u32, b.ah[slot].buf, b.yb[slot].buf, true)?;
         }
         let lt2 = std::time::Instant::now();
         self.ctx.end_batch_wait()?;
@@ -802,7 +799,7 @@ impl TrellisResident {
         if lindbg {
             let lt4 = std::time::Instant::now();
             eprintln!(
-                "[lindbg] {:52} up {:6.2} disp {:6.2} wait {:6.2} rd {:6.2} ms",
+                "[lindbg] {:52} fl {:6.2} disp {:6.2} wait {:6.2} rd {:6.2} ms",
                 keys[0],
                 (lt1 - lt0).as_secs_f64() * 1e3,
                 (lt2 - lt1).as_secs_f64() * 1e3,
@@ -813,16 +810,103 @@ impl TrellisResident {
         Ok(outs)
     }
 
-    /// T-배치 단일 선형: y[t] = x[t] @ W^T. x는 [T][k] 행 우선 f32.
-    pub fn linear_batch(
-        &mut self,
-        key: &str,
-        x: &[f32],
-        t_rows: usize,
-    ) -> Result<Vec<f32>, String> {
-        self.linear_batch_multi(&[key], x, t_rows)?
+    /// T-배치 단일 선형(스테이징) — stage_f32 버퍼의 [T][k]를 소비.
+    pub fn linear_batch_staged(&mut self, key: &str, t_rows: usize) -> Result<Vec<f32>, String> {
+        self.linear_batch_multi_staged(&[key], t_rows)?
             .into_iter()
             .next()
-            .ok_or_else(|| "linear_batch: 결과 없음".to_string())
+            .ok_or_else(|| "linear_batch_staged: 결과 없음".to_string())
+    }
+
+    /// 스테이징 버퍼 포인터 — 호출자의 병렬 생산자가 [T][k] f32 행을 직접
+    /// 기록한다(행 스트라이드 = 해당 선형의 k). 기록 후 staged 호출로 소비.
+    pub fn stage_f32(&mut self) -> Result<*mut f32, String> {
+        self.ensure_batch()?;
+        Ok(self.batch.as_ref().ok_or("batch scratch")?.xtb.ptr as *mut f32)
+    }
+
+    /// FFN 트리오(스테이징, 단일 배치): xf [T][k] → gate/up gemm → ew_t(GPU
+    /// silu·mul → f16 x2t) → down gemm → y [T][n_d]. gate/up 판독·CPU ew·
+    /// down 업로드 전부 제거(원장 #3/#5) — 디코드 ffn_triple의 배치판.
+    pub fn ffn_trio_batch(
+        &mut self,
+        key_g: &str,
+        key_u: &str,
+        key_d: &str,
+        t_rows: usize,
+    ) -> Result<Vec<f32>, String> {
+        if t_rows == 0 || t_rows > BATCH_TMAX {
+            return Err(format!("ffn_trio_batch: T={t_rows} 상한 {BATCH_TMAX} 위반"));
+        }
+        let ig = self.find_linear(key_g)?;
+        let iu = self.find_linear(key_u)?;
+        let id = self.find_linear(key_d)?;
+        let (kg, ng, nd) = (
+            self.linears[ig].1.k,
+            self.linears[ig].1.n,
+            self.linears[id].1.n,
+        );
+        if self.linears[iu].1.k != kg || self.linears[id].1.k != ng {
+            return Err(format!("{key_g}/{key_u}/{key_d}: FFN 차원 불일치"));
+        }
+        self.ensure_batch()?;
+        {
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            self.ctx.flush_buf(&b.xtb);
+        }
+        let b0 = self.batch.as_ref().ok_or("batch scratch")?;
+        let (xtb, ah0, yb0, ah1, yb1, ah2, yb2, x2t_b, p4t_pl, p4t_pipe) = (
+            b0.xtb.buf,
+            b0.ah[0].buf,
+            b0.yb[0].buf,
+            b0.ah[1].buf,
+            b0.yb[1].buf,
+            b0.ah[2].buf,
+            b0.yb[2].buf,
+            b0.x2t.buf,
+            b0.p4t.pl,
+            b0.p4t.pipe,
+        );
+        // ew_t 디스크립터는 체인 전에 선점 확보(borrow 분리 — 복사본 사용).
+        let ds4 = self.ctx.fresh_ds_for(&b0.p4t, 3)?;
+        self.ctx.begin_batch()?;
+        self.chain_batch_one(xtb, ig, t_rows as u32, ah0, yb0, true)?;
+        self.chain_batch_one(xtb, iu, t_rows as u32, ah1, yb1, true)?;
+        // ew_t: yb1(g) × yb2(u) → x2t(f16 쌍팩 [T][ng/2])
+        self.ctx.bind_bufs(ds4, &[yb0, yb1, x2t_b]);
+        let push4 = (ng as u32).to_le_bytes().to_vec();
+        crate::rawvk::context::site::set_tag("e3_ffn_ew_t");
+        self.ctx.run_rw(
+            p4t_pl,
+            ds4,
+            p4t_pipe,
+            &push4,
+            ng.div_ceil(512) as u32,
+            t_rows as u32,
+            1,
+            &[yb0, yb1],
+            &[x2t_b],
+        )?;
+        // down: x2t(f16) 직독 — had_in_t(f16) 레그.
+        self.chain_batch_one(x2t_b, id, t_rows as u32, ah2, yb2, false)?;
+        self.ctx.end_batch_wait()?;
+        self.ctx.wait_pending()?;
+        {
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            self.ctx.invalidate_buf(&b.yb[2]);
+        }
+        let mut y = vec![0f32; t_rows * nd];
+        {
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            // SAFETY: end_batch_wait 후 매핑 판독 — t_rows*nd ≤ TMAX*max_n.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    b.yb[2].ptr as *const f32,
+                    y.as_mut_ptr(),
+                    t_rows * nd,
+                );
+            }
+        }
+        Ok(y)
     }
 }
