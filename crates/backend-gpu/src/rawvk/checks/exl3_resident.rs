@@ -2172,6 +2172,28 @@ impl TrellisResident {
         Ok(())
     }
 
+    /// 선형 원시 트레이리던트 덤프(k, n, krate, suh·tre·svh 바이트) — hip 프로브.
+    pub fn linear_raw(
+        &mut self,
+        key: &str,
+    ) -> Result<(usize, usize, u32, Vec<u8>, Vec<u8>, Vec<u8>), String> {
+        let li = self.find_linear(key)?;
+        let l = &self.linears[li].1;
+        unsafe {
+            let rd = |b: &crate::rawvk::context::VkBuf, n: usize| {
+                std::slice::from_raw_parts(b.ptr as *const u8, n).to_vec()
+            };
+            Ok((
+                l.k,
+                l.n,
+                l.krate,
+                rd(&l.suh, l.k * 2), // f16쌍팩 [k/2]u32 = k half = 2k 바이트
+                rd(&l.tre, l.tre.bytes),
+                rd(&l.svh, l.n * 2),
+            ))
+        }
+    }
+
     /// 선형 suh 버퍼 조회 — norm_resid_had 부착부에서 소비 suh 지정용.
     pub fn suh_of(&mut self, key: &str) -> Result<ash::vk::Buffer, String> {
         let li = self.find_linear(key)?;
