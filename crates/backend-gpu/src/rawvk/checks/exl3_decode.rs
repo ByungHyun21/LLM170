@@ -741,29 +741,23 @@ fn gdn_batch(
         // GPU 상태/ring 버퍼는 alloc_host_cached로 제로 보장 없음 — CPU 상태를
         // 업로드(초기 전부 0, 이후 gdn_state_sync가 갱신된 값 유지).
         {
+            let _gu = ph("ppg:upload");
             let g = &seq.gdn[il];
             tr.gdn_state_upload(gdn_il, &g.states, &g.conv)?;
         }
         let _gf = ph("ppg:gpu_layer");
-        let slots = tr.linear_batch_multi_gpu(
-            &[&format!("{lp}.in_proj_qkv"), &format!("{lp}.in_proj_z")],
-            t_rows,
-        )?;
+        let slots = {
+            let _gl = ph("ppg:lin_qkvz");
+            tr.linear_batch_multi_gpu(
+                &[&format!("{lp}.in_proj_qkv"), &format!("{lp}.in_proj_z")],
+                t_rows,
+            )?
+        };
         let (yb0, _n0) = slots[0];
         let (yb1, _n1) = slots[1];
-        if il == 0 {
-            let qkv_head = tr.read_yb_head(0, 5);
-            let z_head = tr.read_yb_head(1, 5);
-            eprintln!("  [f1dbg] L0 yb0(qkv): {:?} yb1(z): {:?}", qkv_head, z_head);
-        }
-        tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yb0, yb1)?;
-        if il == 0 {
-            let gqr_head = tr.read_gqr_head(5);
-            let gq_head = tr.read_gq_head(5);
-            let gbg_head = tr.read_gbg_head(10);
-            eprintln!("  [f1dbg] L0 gqr(conv q): {:?}", gqr_head);
-            eprintln!("  [f1dbg] L0 gq(L2 q): {:?}", gq_head);
-            eprintln!("  [f1dbg] L0 gbg(beta|g): {:?}", gbg_head);
+        {
+            let _gk = ph("ppg:kern");
+            tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yb0, yb1)?;
         }
         drop(_gf);
         // gate가 xtb에 기록한 gated를 호스트 가시화 — 이후 flush가 올바른
@@ -771,6 +765,7 @@ fn gdn_batch(
         tr.invalidate_xtb(t_rows * 6144 * 4);
         // GPU 상태 → SeqState 동기화(차기 디코드 정합): 상태 다운로드.
         {
+            let _gs = ph("ppg:sync");
             let (states, conv) = {
                 let g = &mut seq.gdn[il];
                 (&mut g.states, &mut g.conv)
@@ -779,9 +774,6 @@ fn gdn_batch(
         }
         // out_proj: gated가 xtb에 있으므로 staged 호출로 결과 반환.
         let out = tr.linear_batch_staged(&format!("{lp}.out_proj"), t_rows)?;
-        if il == 0 {
-            eprintln!("  [f1dbg] L0 out_proj GPU: {:?}", &out[..5.min(out.len())]);
-        }
         return Ok(out);
     }
 
@@ -794,9 +786,6 @@ fn gdn_batch(
     drop(_g0);
     let z = outs.pop().ok_or("qkv/z 결과 유실")?; // [T][6144]
     let qkv = outs.pop().ok_or("qkv/z 결과 유실")?; // [T][10240]
-    if il == 0 {
-        eprintln!("  [f1dbg] L0 CPU qkv: {:?} z: {:?}", &qkv[..5], &z[..5]);
-    }
 
     // 무양자화 가중치 — 선형 호출 전 소유 복사(값 불변, borrow 분리)
     let a_proj = tr

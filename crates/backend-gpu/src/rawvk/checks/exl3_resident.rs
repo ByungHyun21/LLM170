@@ -1194,6 +1194,39 @@ impl TrellisResident {
             )?;
         }
 
+        // 실입력 캡처(모듈 격리 디버그 — plans/121 F2): l2perm 직후 gq/gk/gv/gbg.
+        if gdn_il == 0 {
+            if let Some(path) = llm170_diag::flag::val("LLM170_SCAN_CAP").map(|s| s.to_string()) {
+                let g2 = self.batch.as_ref().and_then(|b| b.gframe.as_ref());
+                if let Some(g) = g2 {
+                    let n_q = t_rows * 2048;
+                    let n_bg = t_rows * 96;
+                    self.ctx.invalidate_range(&g.gq, n_q * 4);
+                    self.ctx.invalidate_range(&g.gk, n_q * 4);
+                    self.ctx.invalidate_range(&g.gv, t_rows * 6144 * 4);
+                    self.ctx.invalidate_range(&g.gbg, n_bg * 4);
+                    // SAFETY: 호스트 매핑 버퍼 직독 — invalidate 직후 유효.
+                    let qs = unsafe { std::slice::from_raw_parts(g.gq.ptr as *const f32, n_q) };
+                    let ks = unsafe { std::slice::from_raw_parts(g.gk.ptr as *const f32, n_q) };
+                    let vs = unsafe {
+                        std::slice::from_raw_parts(g.gv.ptr as *const f32, t_rows * 6144)
+                    };
+                    let bgs = unsafe { std::slice::from_raw_parts(g.gbg.ptr as *const f32, n_bg) };
+                    let mut buf = Vec::with_capacity((n_q * 2 + t_rows * 6144 + n_bg) * 4);
+                    // SAFETY: 위 직독 슬라이스의 원시 바이트 재해석 — 같은 라이프타임.
+                    unsafe {
+                        for s in [qs, ks, vs, bgs] {
+                            buf.extend_from_slice(std::slice::from_raw_parts(
+                                s.as_ptr() as *const u8,
+                                s.len() * 4,
+                            ));
+                        }
+                    }
+                    std::fs::write(&path, &buf).map_err(|e| format!("scan cap: {e}"))?;
+                    eprintln!("  [scancap] L0 t={t_rows} → {path}");
+                }
+            }
+        }
         // ③ scan: gq/gk/gv/gbg + gstate → go
         {
             let ds = self.ctx.fresh_ds_for(&gf.pgs, 6)?;
@@ -1399,4 +1432,338 @@ impl TrellisResident {
         }
         out
     }
+}
+
+// ── scan 모듈 독립 프로브(plans/121 F2) ──
+// 모델 적재 없이 합성 입력으로 scan 커널만 검증: 속도·산술 격리 작업장.
+// Rust f32 기준(커널 수식 미러)과 행별 출력·최종 상태를 직접 비교한다.
+pub fn scan_check(t_len: usize, cap_path: &str) -> Result<String, String> {
+    const HK: usize = 16;
+    const HV: usize = 48;
+    const D: usize = 128;
+    let use_cap = !cap_path.is_empty();
+    if use_cap {
+        let raw = std::fs::read(cap_path).map_err(|e| format!("cap read: {e}"))?;
+        let nf = raw.len() / 4;
+        let fl: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, nf) }.to_vec();
+        let n_q = t_len * 2048;
+        let mut o = 0usize;
+        let take = |o: &mut usize, n: usize| -> Vec<f32> {
+            let v = fl[*o..*o + n].to_vec();
+            *o += n;
+            v
+        };
+        let q = take(&mut o, n_q);
+        let k = take(&mut o, n_q);
+        let v = take(&mut o, t_len * 6144);
+        let bg = take(&mut o, t_len * 96);
+        return scan_check_run(q, k, v, bg, t_len, true);
+    }
+    // 합성 입력(LCG) — q/k는 L2 정규화 후 스케일(≈1/√128), beta∈(0,1), g=음수.
+    let mut seed: u32 = 0x1234_5678;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed >> 8) as f32 / 16_777_216.0
+    };
+    let mut q = vec![0f32; t_len * HK * D];
+    let mut k = vec![0f32; t_len * HK * D];
+    let mut v = vec![0f32; t_len * HV * D];
+    let mut bg = vec![0f32; t_len * 2 * HV];
+    for e in q.iter_mut() {
+        *e = (rnd() * 2.0 - 1.0) * 0.09;
+    }
+    for e in k.iter_mut() {
+        *e = (rnd() * 2.0 - 1.0) * 0.09;
+    }
+    for e in v.iter_mut() {
+        *e = (rnd() * 2.0 - 1.0) * 0.5;
+    }
+    for t in 0..t_len {
+        for h in 0..HV {
+            bg[t * 2 * HV + h] = rnd();
+            bg[t * 2 * HV + HV + h] = -rnd() * 2.0;
+        }
+    }
+
+    scan_check_run(q, k, v, bg, t_len, false)
+}
+
+fn scan_check_run(
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    bg: Vec<f32>,
+    t_len: usize,
+    from_cap: bool,
+) -> Result<String, String> {
+    let mut ctx = crate::rawvk::context::VkCtx::new()?;
+    const HK: usize = 16;
+    const HV: usize = 48;
+    const D: usize = 128;
+    let gq = ctx.alloc_host_cached(t_len.max(64) * HK * D * 4)?;
+    let gk = ctx.alloc_host_cached(t_len.max(64) * HK * D * 4)?;
+    let gv = ctx.alloc_host_cached(t_len.max(64) * HV * D * 4)?;
+    let gbg = ctx.alloc_host_cached(t_len.max(64) * 2 * HV * 4)?;
+    let go = ctx.alloc_host_cached(t_len.max(64) * HV * D * 4)?;
+    let gstate = ctx.alloc_host_cached(HV * D * D * 4)?; // 1층분
+    let st0: Vec<f32> = if llm170_diag::flag::on("LLM170_SCAN_ST0") {
+        let mut sd: u32 = 0xC0FF_EE01;
+        (0..HV * D * D)
+            .map(|_| {
+                sd = sd.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((sd >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
+            })
+            .collect()
+    } else {
+        vec![0f32; HV * D * D]
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(q.as_ptr(), gq.ptr as *mut f32, q.len());
+        std::ptr::copy_nonoverlapping(k.as_ptr(), gk.ptr as *mut f32, k.len());
+        std::ptr::copy_nonoverlapping(v.as_ptr(), gv.ptr as *mut f32, v.len());
+        std::ptr::copy_nonoverlapping(bg.as_ptr(), gbg.ptr as *mut f32, bg.len());
+        std::ptr::copy_nonoverlapping(st0.as_ptr(), gstate.ptr as *mut f32, st0.len());
+        std::ptr::write_bytes(go.ptr, 0, t_len.max(64) * HV * D * 4);
+    }
+    ctx.flush_buf(&gq);
+    ctx.flush_buf(&gk);
+    ctx.flush_buf(&gv);
+    ctx.flush_buf(&gbg);
+    ctx.flush_buf(&gstate);
+    let pgs = ctx.pipeline_pipes(include_bytes!("../spv/exl3_gdn_scan.spv"), 6, 20)?;
+    let dispatch = |ctx: &mut crate::rawvk::context::VkCtx| -> Result<(), String> {
+        ctx.begin_batch()?;
+        let ds = ctx.fresh_ds_for(&pgs, 6)?;
+        ctx.bind_bufs(ds, &[gq.buf, gk.buf, gv.buf, gbg.buf, gstate.buf, go.buf]);
+        let push: Vec<u8> = [t_len as u32, HK as u32, HV as u32, D as u32, 0u32]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        crate::rawvk::context::site::set_tag("e3_scan_probe");
+        ctx.run_rw(
+            pgs.pl,
+            ds,
+            pgs.pipe,
+            &push,
+            HV as u32,
+            1,
+            1,
+            &[gq.buf, gk.buf, gv.buf, gbg.buf, gstate.buf],
+            &[go.buf, gstate.buf],
+        )?;
+        ctx.end_batch_wait()?;
+        ctx.wait_pending()?;
+        Ok(())
+    };
+    dispatch(&mut ctx)?;
+    // 시간 측정(5회 중앙값)
+    let mut times: Vec<f64> = Vec::new();
+    for _ in 0..5 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(st0.as_ptr(), gstate.ptr as *mut f32, st0.len());
+        }
+        ctx.flush_buf(&gstate);
+        let t0 = std::time::Instant::now();
+        dispatch(&mut ctx)?;
+        times.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    // 판독
+    ctx.invalidate_buf(&go);
+    ctx.invalidate_buf(&gstate);
+    let out_gpu: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(go.ptr as *const f32, t_len * HV * D).to_vec() };
+    let st_gpu: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(gstate.ptr as *const f32, HV * D * D).to_vec() };
+
+    // core 기준(gdn_chunk_seq — CPU f32, v1과 동일 경로)
+    let mut beta_v = vec![0f32; t_len * HV];
+    let mut g_v = vec![0f32; t_len * HV];
+    for t in 0..t_len {
+        for h in 0..HV {
+            beta_v[t * HV + h] = bg[t * 2 * HV + h];
+            g_v[t * HV + h] = bg[t * 2 * HV + HV + h];
+        }
+    }
+    let mut st_core = st0.clone();
+    let mut out_core = vec![0f32; t_len * HV * D];
+    llm170_core::gdn::gdn_chunk_seq(
+        &q,
+        &k,
+        &v,
+        &beta_v,
+        &g_v,
+        &mut st_core,
+        &mut out_core,
+        t_len,
+        HK,
+        HV,
+    );
+    let mut kern_vs_core = 0f32;
+    for i in 0..out_gpu.len() {
+        kern_vs_core = kern_vs_core.max((out_gpu[i] - out_core[i]).abs());
+    }
+    let mut stc_max = 0f32;
+    for i in 0..st_gpu.len() {
+        stc_max = stc_max.max((st_gpu[i] - st_core[i]).abs());
+    }
+
+    // Rust f32 기준 — 커널 수식 미러(CS=32)
+    let (out_ref, st_ref) = scan_ref(&q, &k, &v, &bg, t_len, false, &st0);
+    let (out_ref16, _) = scan_ref(&q, &k, &v, &bg, t_len, true, &st0);
+    let mut kern_vs_f16ref = 0f32;
+    for i in 0..out_gpu.len() {
+        kern_vs_f16ref = kern_vs_f16ref.max((out_gpu[i] - out_ref16[i]).abs());
+    }
+    let mut mirror_vs_core = 0f32;
+    for i in 0..out_ref.len() {
+        mirror_vs_core = mirror_vs_core.max((out_ref[i] - out_core[i]).abs());
+    }
+
+    let _ = from_cap;
+    let mut out_max = 0f32;
+    let mut out_rel = 0f64;
+    let mut n_big = 0usize;
+    for i in 0..out_gpu.len() {
+        let d = (out_gpu[i] - out_ref[i]).abs();
+        out_max = out_max.max(d);
+        let denom = out_ref[i].abs().max(1e-3);
+        out_rel = out_rel.max(d as f64 / denom as f64);
+        if d > 1e-3 {
+            n_big += 1;
+        }
+    }
+    let mut st_max = 0f32;
+    for i in 0..st_gpu.len() {
+        st_max = st_max.max((st_gpu[i] - st_ref[i]).abs());
+    }
+    Ok(format!(
+        "scan-check T={t_len}: kern-vs-mirror={out_max:.3e} · kern-vs-f16mirror={kern_vs_f16ref:.3e} · mirror(CS32)-vs-core(CS64)={mirror_vs_core:.3e} · st(kern-vs-core)={stc_max:.3e} · kernel {:.2}ms (5회 중앙값)",
+        times[2]
+    ))
+}
+
+/// scan 커널의 f32 기준 미러 — A/KQ/sk/sv를 f32로 계산(커널의 f16과의 차이가
+/// 판정 대상). CS 고정 32.
+fn h16(x: f32) -> f32 {
+    half::f16::from_f32(x).to_f32()
+}
+
+fn scan_ref(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    bg: &[f32],
+    t_len: usize,
+    f16_emul: bool,
+    st0: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    const CS: usize = 32;
+    const HK: usize = 16;
+    const HV: usize = 48;
+    const D: usize = 128;
+    let qscale = 1.0f32 / (D as f32).sqrt();
+    let mut st = st0.to_vec();
+    let mut out = vec![0f32; t_len * HV * D];
+    let n_chunks = t_len.div_ceil(CS);
+    for c in 0..n_chunks {
+        let t0 = c * CS;
+        let n = (t_len - t0).min(CS);
+        for h in 0..HV {
+            let kh = h % HK;
+            let mut sk = [[0f32; D]; CS];
+            let mut sv = [[0f32; D]; CS];
+            let mut bp = [0f32; CS];
+            let mut gcs = [0f32; CS + 1];
+            for i in 0..CS {
+                let live = i < n;
+                if live {
+                    for s2 in 0..D {
+                        let kv2 = k[(t0 + i) * HK * D + kh * D + s2];
+                        let vv2 = v[(t0 + i) * HV * D + h * D + s2];
+                        sk[i][s2] = if f16_emul { h16(kv2) } else { kv2 };
+                        sv[i][s2] = if f16_emul { h16(vv2) } else { vv2 };
+                    }
+                    bp[i] = bg[(t0 + i) * 2 * HV + h];
+                }
+            }
+            let mut acc = 0f32;
+            for t in 0..CS {
+                acc += if t < n {
+                    bg[(t0 + t) * 2 * HV + HV + h]
+                } else {
+                    0.0
+                };
+                gcs[t] = acc;
+            }
+            gcs[CS] = acc;
+            let mut a = [[0f32; CS]; CS];
+            let mut kq = [[0f32; CS]; CS];
+            for i in 0..n {
+                for j in 0..=i {
+                    let mut dk = 0f32;
+                    let mut dq = 0f32;
+                    for s2 in 0..D {
+                        dk += sk[i][s2] * sk[j][s2];
+                        dq += q[(t0 + i) * HK * D + kh * D + s2] * sk[j][s2];
+                    }
+                    if j < i {
+                        let a2 = dk * bp[i] * (gcs[i] - gcs[j]).exp();
+                        a[i][j] = if f16_emul { h16(a2) } else { a2 };
+                    }
+                    let kq2 = dq * qscale * (gcs[i] - gcs[j]).exp();
+                    kq[i][j] = if f16_emul { h16(kq2) } else { kq2 };
+                }
+            }
+            // ks/qs: [CS][D]
+            let mut ks = [[0f32; D]; CS];
+            let mut qs = [[0f32; D]; CS];
+            for i in 0..n {
+                for col in 0..D {
+                    let mut ak = 0f32;
+                    let mut aq = 0f32;
+                    for s2 in 0..D {
+                        let s_el = st[h * D * D + s2 * D + col];
+                        ak += sk[i][s2] * s_el;
+                        aq += q[(t0 + i) * HK * D + kh * D + s2] * s_el;
+                    }
+                    ks[i][col] = ak;
+                    qs[i][col] = aq * qscale;
+                }
+            }
+            let mut dc = [[0f32; D]; CS];
+            for i in 0..n {
+                for col in 0..D {
+                    let mut rhs = bp[i] * (sv[i][col] - gcs[i].exp() * ks[i][col]);
+                    for j in 0..i {
+                        rhs -= a[i][j] * dc[j][col];
+                    }
+                    dc[i][col] = rhs;
+                    let mut oi = gcs[i].exp() * qs[i][col];
+                    for p in 0..=i {
+                        oi += kq[i][p] * dc[p][col];
+                    }
+                    out[(t0 + i) * HV * D + h * D + col] = oi;
+                }
+            }
+            let gt_exp = gcs[CS].exp();
+            let mut wsm = [0f32; CS];
+            for j in 0..CS {
+                wsm[j] = if j < n { (gcs[CS] - gcs[j]).exp() } else { 0.0 };
+            }
+            for s2 in 0..D {
+                for col in 0..D {
+                    let base = h * D * D + s2 * D + col;
+                    let mut a2 = st[base] * gt_exp;
+                    for j in 0..n {
+                        a2 += sk[j][s2] * wsm[j] * dc[j][col];
+                    }
+                    st[base] = a2;
+                }
+            }
+        }
+    }
+    (out, st)
 }
