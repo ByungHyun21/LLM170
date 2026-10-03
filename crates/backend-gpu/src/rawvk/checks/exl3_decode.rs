@@ -1370,7 +1370,8 @@ pub fn prefill_batch(
         }
         // 벌크 GDN 상태 동기화(plans/121 F2 스케줄) — 층별 sync를 프리필 말미로
         // 지연해 프리필 중 다운로드 대기 제거. 다음 디코드 정합 유지.
-        {
+        // T≤8 CPU 경로(스펙 라운드 포함)는 GPU 프레임이 없다 — 가드.
+        if tr.gpu_frames_active() {
             let n_gdn = tr.n_layers - tr.n_layers / 4;
             let mut gi = 0usize;
             for il in 0..tr.n_layers {
@@ -1388,7 +1389,7 @@ pub fn prefill_batch(
             }
         }
         // 벌크 KV 캐시 동기화(plans/121 F2b) — GPU kvc → seq.kv(차기 디코드).
-        {
+        if tr.gpu_frames_active() {
             let mut ai2 = 0usize;
             for il in 0..tr.n_layers {
                 if il % 4 == 3 {
