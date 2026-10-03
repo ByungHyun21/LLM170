@@ -25,6 +25,7 @@ pub use exl3_decode::{
 };
 pub use exl3_resident::TrellisResident;
 pub use exl3_resident::attn_check;
+pub use exl3_resident::gemm_check;
 pub use exl3_resident::scan_check;
 pub use fault::fault_probe;
 pub use frame_check::frame_check;
