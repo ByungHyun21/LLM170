@@ -942,10 +942,8 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
             }
             rope(&mut hd, pos);
             let dst = (layer * 1024 + pos) * 1024 + m * 256;
-            for i in 0..256 {
-                kc[dst + i] = hd[i];
-                vc[dst + i] = vin[src + i];
-            }
+            kc[dst..dst + 256].copy_from_slice(&hd);
+            vc[dst..dst + 256].copy_from_slice(&vin[src..src + 256]);
         }
     }
     let mut want = vec![0f32; t_rows * 6144];
