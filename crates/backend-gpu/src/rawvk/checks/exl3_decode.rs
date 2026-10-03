@@ -911,21 +911,58 @@ fn gdn_batch(
 
     drop(_gp2);
 
-    // 청크 스캔 — core::gdn 재사용(CS=64, AR 등가 검증).
+    // 청크 스캔 — core::gdn 재사용(CS=64, AR 등가 검증). 소형 T(≤8)는
+    // gdn_chunk_seq의 층당 스레드 스폰(48헤드×스코프)이 3.35ms/층의
+    // 주벽이었다(2026-10-03 스펙 라운드 진단) — ar_pool 순차 AR로 대체:
+    // 디코드 경로와 동일 의미론(비트 일치) + 스폰 비용 0.
     let mut o_lc = vec![0f32; t_rows * d_inner];
     let _gc2 = ph("ppg:chunk");
-    llm170_core::gdn::gdn_chunk_seq(
-        &q_all,
-        &k_all,
-        &v_lc,
-        &beta_lc,
-        &g_lc,
-        &mut seq.gdn[il].states,
-        &mut o_lc,
-        t_rows,
-        n_k,
-        n_v,
-    );
+    if t_rows <= 8 {
+        let k_stride = n_k * d_state;
+        let v_stride = n_v * d_state;
+        for t in 0..t_rows {
+            // SAFETY: par 잡은 run_par 완료 대기 내 유효 — 행별 분리 입력.
+            let (q1, k1, v1) = unsafe {
+                (
+                    std::slice::from_raw_parts(q_all.as_ptr().add(t * k_stride), k_stride),
+                    std::slice::from_raw_parts(k_all.as_ptr().add(t * k_stride), k_stride),
+                    std::slice::from_raw_parts(v_lc.as_ptr().add(t * v_stride), v_stride),
+                )
+            };
+            let (b1, g1) = unsafe {
+                (
+                    std::slice::from_raw_parts(beta_lc.as_ptr().add(t * n_v), n_v),
+                    std::slice::from_raw_parts(g_lc.as_ptr().add(t * n_v), n_v),
+                )
+            };
+            let o1 = &mut o_lc[t * v_stride..(t + 1) * v_stride];
+            llm170_core::gdn::gdn_ar_batch(
+                q1,
+                k1,
+                v1,
+                b1,
+                g1,
+                &mut seq.gdn[il].states,
+                o1,
+                1,
+                n_k,
+                n_v,
+            );
+        }
+    } else {
+        llm170_core::gdn::gdn_chunk_seq(
+            &q_all,
+            &k_all,
+            &v_lc,
+            &beta_lc,
+            &g_lc,
+            &mut seq.gdn[il].states,
+            &mut o_lc,
+            t_rows,
+            n_k,
+            n_v,
+        );
+    }
 
     // 역순열 + norm_gated(rms(o)·silu(z)) — 행 병렬, 스테이징 직접 기록
     // (out_proj 입력이 곧 소비되므로 중간 Vec 없이 stage에 쓴다 — 원장 #3).
@@ -2021,6 +2058,8 @@ pub fn exl3_mtp2(
         }
     }
     let spec_s = t2.elapsed().as_secs_f64();
+    // 진단 덤프 — exl3_phase 위상 분해(exl3_pp와 동일 원장 89 키).
+    phase_report();
     let tps = toks as f64 / spec_s;
 
     // 정합 — 같은 상태에서 순차 greedy 재현(토큰 동일성 게이트).

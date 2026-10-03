@@ -753,27 +753,39 @@ impl VkCtx {
     }
 
     /// 매핑 범위 플러시(비결합 캐시 메모리 CPU 쓰기 → GPU 가시화).
-    pub fn flush_buf(&self, b: &VkBuf) {
-        // SAFETY: b.mem 매핑 전체 플러시 — 범위는 할당 크기와 일치.
+    /// bytes 한정 — 배치 스크래치는 호출당 실사용 구간만(T×k). 전체 버퍼
+    /// msync가 호출당 수 ms였다(스펙 라운드 847ms의 숨은 주벽, 2026-10-03).
+    pub fn flush_range(&self, b: &VkBuf, bytes: usize) {
+        // SAFETY: b.mem 매핑 내 [0, bytes) — bytes는 호출자가 할당 상한 이내 검증.
         unsafe {
             let range = vk::MappedMemoryRange::default()
                 .memory(b.mem)
                 .offset(0)
-                .size(b.bytes as u64);
+                .size(bytes as u64);
             let _ = self.device.flush_mapped_memory_ranges(&[range]);
         }
     }
 
-    /// 매핑 범위 인밸리데이트(GPU 쓰기 → CPU 가시화, 펜스 대기 후).
-    pub fn invalidate_buf(&self, b: &VkBuf) {
-        // SAFETY: b.mem 매핑 전체 인밸리데이트 — 범위는 할당 크기와 일치.
+    /// 매핑 범위 인밸리데이트(GPU 쓰기 → CPU 가시화, 펜스 대기 후) — bytes 한정.
+    pub fn invalidate_range(&self, b: &VkBuf, bytes: usize) {
+        // SAFETY: 동일 — [0, bytes) ⊆ 할당.
         unsafe {
             let range = vk::MappedMemoryRange::default()
                 .memory(b.mem)
                 .offset(0)
-                .size(b.bytes as u64);
+                .size(bytes as u64);
             let _ = self.device.invalidate_mapped_memory_ranges(&[range]);
         }
+    }
+
+    /// 매핑 범위 플러시(비결합 캐시 메모리 CPU 쓰기 → GPU 가시화).
+    pub fn flush_buf(&self, b: &VkBuf) {
+        self.flush_range(b, b.bytes);
+    }
+
+    /// 매핑 범위 인밸리데이트(GPU 쓰기 → CPU 가시화, 펜스 대기 후).
+    pub fn invalidate_buf(&self, b: &VkBuf) {
+        self.invalidate_range(b, b.bytes);
     }
 
     /// 버퍼 할당 — 자체 디바이스 메모리 + 매핑 (호스트 포인터 동반).
