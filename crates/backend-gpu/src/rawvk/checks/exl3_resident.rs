@@ -1195,36 +1195,35 @@ impl TrellisResident {
         }
 
         // 실입력 캡처(모듈 격리 디버그 — plans/121 F2): l2perm 직후 gq/gk/gv/gbg.
-        if gdn_il == 0 {
-            if let Some(path) = llm170_diag::flag::val("LLM170_SCAN_CAP").map(|s| s.to_string()) {
-                let g2 = self.batch.as_ref().and_then(|b| b.gframe.as_ref());
-                if let Some(g) = g2 {
-                    let n_q = t_rows * 2048;
-                    let n_bg = t_rows * 96;
-                    self.ctx.invalidate_range(&g.gq, n_q * 4);
-                    self.ctx.invalidate_range(&g.gk, n_q * 4);
-                    self.ctx.invalidate_range(&g.gv, t_rows * 6144 * 4);
-                    self.ctx.invalidate_range(&g.gbg, n_bg * 4);
-                    // SAFETY: 호스트 매핑 버퍼 직독 — invalidate 직후 유효.
-                    let qs = unsafe { std::slice::from_raw_parts(g.gq.ptr as *const f32, n_q) };
-                    let ks = unsafe { std::slice::from_raw_parts(g.gk.ptr as *const f32, n_q) };
-                    let vs = unsafe {
-                        std::slice::from_raw_parts(g.gv.ptr as *const f32, t_rows * 6144)
-                    };
-                    let bgs = unsafe { std::slice::from_raw_parts(g.gbg.ptr as *const f32, n_bg) };
-                    let mut buf = Vec::with_capacity((n_q * 2 + t_rows * 6144 + n_bg) * 4);
-                    // SAFETY: 위 직독 슬라이스의 원시 바이트 재해석 — 같은 라이프타임.
-                    unsafe {
-                        for s in [qs, ks, vs, bgs] {
-                            buf.extend_from_slice(std::slice::from_raw_parts(
-                                s.as_ptr() as *const u8,
-                                s.len() * 4,
-                            ));
-                        }
+        if gdn_il == 0
+            && let Some(path) = llm170_diag::flag::val("LLM170_SCAN_CAP").map(|s| s.to_string())
+        {
+            let g2 = self.batch.as_ref().and_then(|b| b.gframe.as_ref());
+            if let Some(g) = g2 {
+                let n_q = t_rows * 2048;
+                let n_bg = t_rows * 96;
+                self.ctx.invalidate_range(&g.gq, n_q * 4);
+                self.ctx.invalidate_range(&g.gk, n_q * 4);
+                self.ctx.invalidate_range(&g.gv, t_rows * 6144 * 4);
+                self.ctx.invalidate_range(&g.gbg, n_bg * 4);
+                // SAFETY: 호스트 매핑 버퍼 직독 — invalidate 직후 유효.
+                let qs = unsafe { std::slice::from_raw_parts(g.gq.ptr as *const f32, n_q) };
+                let ks = unsafe { std::slice::from_raw_parts(g.gk.ptr as *const f32, n_q) };
+                let vs =
+                    unsafe { std::slice::from_raw_parts(g.gv.ptr as *const f32, t_rows * 6144) };
+                let bgs = unsafe { std::slice::from_raw_parts(g.gbg.ptr as *const f32, n_bg) };
+                let mut buf = Vec::with_capacity((n_q * 2 + t_rows * 6144 + n_bg) * 4);
+                // SAFETY: 위 직독 슬라이스의 원시 바이트 재해석 — 같은 라이프타임.
+                unsafe {
+                    for s in [qs, ks, vs, bgs] {
+                        buf.extend_from_slice(std::slice::from_raw_parts(
+                            s.as_ptr() as *const u8,
+                            s.len() * 4,
+                        ));
                     }
-                    std::fs::write(&path, &buf).map_err(|e| format!("scan cap: {e}"))?;
-                    eprintln!("  [scancap] L0 t={t_rows} → {path}");
                 }
+                std::fs::write(&path, &buf).map_err(|e| format!("scan cap: {e}"))?;
+                eprintln!("  [scancap] L0 t={t_rows} → {path}");
             }
         }
         // ③ scan: gq/gk/gv/gbg + gstate → go
@@ -1625,15 +1624,12 @@ fn scan_check_run(
     let _ = from_cap;
     let mut out_max = 0f32;
     let mut out_rel = 0f64;
-    let mut n_big = 0usize;
+
     for i in 0..out_gpu.len() {
         let d = (out_gpu[i] - out_ref[i]).abs();
         out_max = out_max.max(d);
         let denom = out_ref[i].abs().max(1e-3);
         out_rel = out_rel.max(d as f64 / denom as f64);
-        if d > 1e-3 {
-            n_big += 1;
-        }
     }
     let mut st_max = 0f32;
     for i in 0..st_gpu.len() {
