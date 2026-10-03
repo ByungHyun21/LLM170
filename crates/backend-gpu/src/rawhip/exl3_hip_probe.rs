@@ -920,9 +920,7 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
         for j in 0..24usize {
             let mut hd = [0f32; 256];
             let src = t * 12288 + j * 512;
-            for i in 0..256 {
-                hd[i] = qg[src + i];
-            }
+            hd.copy_from_slice(&qg[src..src + 256]);
             let ss: f32 = hd.iter().map(|v| v * v).sum::<f32>() / 256.0;
             let inv = 1.0 / (ss + 1e-6).sqrt();
             for i in 0..256 {
@@ -936,9 +934,7 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
         for m in 0..4usize {
             let mut hd = [0f32; 256];
             let src = t * 1024 + m * 256;
-            for i in 0..256 {
-                hd[i] = kin[src + i];
-            }
+            hd.copy_from_slice(&kin[src..src + 256]);
             let ss: f32 = hd.iter().map(|v| v * v).sum::<f32>() / 256.0;
             let inv = 1.0 / (ss + 1e-6).sqrt();
             for i in 0..256 {
@@ -1103,6 +1099,7 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
         md = md.max(d);
     }
     // lim 오프바이원 A/B: t=1,h=0,d=0..3을 lim-1/lim+1 미러와 대조.
+    #[allow(clippy::manual_memcpy)]
     {
         let t = 1usize;
         let h = 0usize;
@@ -1150,6 +1147,7 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
         eprintln!("  [attndbg] lim-1/lim/lim+1 상관 = {variants:?}");
     }
     // lim=1 강제(전 t) — rows>=1 미기록 가설 직접 검증.
+    #[allow(clippy::manual_memcpy)]
     {
         let mut md1 = 0f32;
         for t in 1..t_rows {
