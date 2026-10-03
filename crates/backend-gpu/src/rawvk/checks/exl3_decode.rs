@@ -1365,7 +1365,7 @@ pub fn prefill_batch(
                     tr.ctx.begin_outer()?;
                 }
                 let w_next = if il + 1 == tr.n_layers {
-                    127
+                    128 // output_norm(행 127≠L63 post_ln — 충돌 버그 수정)
                 } else {
                     2 * (il + 1)
                 };
@@ -1467,7 +1467,10 @@ pub fn prefill_batch(
                 drop(_g);
                 attn_count += 1;
                 if llm170_diag::dump::opts().key("exl3_framedbg") {
-                    eprintln!("  [olddbg] L{il} attn out={:?}", &r[..4]);
+                    eprintln!(
+                        "  [olddbg] L{il} attn last={:?}",
+                        &r[r.len() - 5120..r.len() - 5116]
+                    );
                 }
                 r
             } else {
@@ -1475,7 +1478,10 @@ pub fn prefill_batch(
                 let r = gdn_batch(tr, seq, il, &xn, t_rows)?;
                 drop(_g);
                 if llm170_diag::dump::opts().key("exl3_framedbg") {
-                    eprintln!("  [olddbg] L{il} gdn out={:?}", &r[..4]);
+                    eprintln!(
+                        "  [olddbg] L{il} gdn last={:?}",
+                        &r[r.len() - 5120..r.len() - 5116]
+                    );
                 }
                 r
             };

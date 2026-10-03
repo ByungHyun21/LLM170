@@ -35,7 +35,7 @@ void main() {
         if (tid < st) red[tid] += red[tid + st];
         barrier();
     }
-    float inv = inversesqrt(red[0] / 5120.0 + 1e-6);
+    float inv = 1.0 / sqrt(red[0] / 5120.0 + 1e-6); // 정밀 sqrt — inversesqrt는 rsq 근사(~1e-4)가 drift 씨앗
     xn[base + tid] = v0 * inv * nw[pc.w_off + tid];
     xn[base + 1024u + tid] = v1 * inv * nw[pc.w_off + 1024u + tid];
     xn[base + 2048u + tid] = v2 * inv * nw[pc.w_off + 2048u + tid];
