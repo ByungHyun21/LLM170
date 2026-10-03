@@ -486,6 +486,10 @@ impl VkCtx {
     }
 
     pub fn begin_batch(&mut self) -> Result<(), String> {
+        // 프레임 외부 배치(plans/121 원-서브밋) — 깊이 0→1만 실제 시작.
+        if site::depth_inc() > 1 {
+            return Ok(());
+        }
         // plans/93: 재생 모드 — 이미 녹화된 커맨드 버퍼를 재제출(스킵).
         if self.replay_mode.get() {
             return Ok(());
@@ -607,7 +611,21 @@ impl VkCtx {
     }
 
     /// 배치 종료 — 일괄 제출·대기(이중버퍼 모드는 제출 후 즉시 반환).
+    /// 외부 배치 구간(plans/121 프레임) — 내부 begin/end를 중첩 무효화해
+    /// 구간 전체를 단일 제출로 묶는다. 판독(호스트 카피)은 반드시 종료 후.
+    pub fn begin_outer(&mut self) -> Result<(), String> {
+        self.begin_batch()
+    }
+
+    pub fn end_outer(&mut self) -> Result<(), String> {
+        self.end_batch_wait()?;
+        self.wait_pending()
+    }
+
     pub fn end_batch_wait(&mut self) -> Result<(), String> {
+        if site::depth_dec() > 0 {
+            return Ok(());
+        }
         if llm170_diag::flag::on("LLM170_VK_RUNTIME") {
             RUN_US.with(|c| {
                 let us = c.get();
@@ -1720,5 +1738,25 @@ pub mod site {
 
     pub fn current() -> &'static str {
         CUR.with(|c| c.get())
+    }
+
+    thread_local! {
+        static BATCH_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub fn depth_inc() -> u32 {
+        BATCH_DEPTH.with(|d| {
+            let v = d.get() + 1;
+            d.set(v);
+            v
+        })
+    }
+
+    pub fn depth_dec() -> u32 {
+        BATCH_DEPTH.with(|d| {
+            let v = d.get().saturating_sub(1);
+            d.set(v);
+            v
+        })
     }
 }
