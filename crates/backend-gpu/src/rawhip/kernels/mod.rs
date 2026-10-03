@@ -24,6 +24,7 @@ pub const NAMES: &[&str] = &[
     "exl3_had_in",
     "exl3_gemv",
     "exl3_had_out",
+    "exl3_norm_resid",
     "quant_q8",
     "q4_gemm_q5_1",
     "q4_gemm_f32",

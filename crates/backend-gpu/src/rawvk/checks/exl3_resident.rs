@@ -2172,6 +2172,17 @@ impl TrellisResident {
         Ok(())
     }
 
+    /// fframe nw128 판독(hip 프로브용).
+    pub fn nw128_dump(&mut self) -> Result<Vec<f32>, String> {
+        self.fframe_init()?;
+        let ff = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.fframe.as_ref())
+            .ok_or("fframe")?;
+        Ok(unsafe { std::slice::from_raw_parts(ff.nw128.ptr as *const f32, 5120).to_vec() })
+    }
+
     /// 선형 원시 트레이리던트 덤프(k, n, krate, suh·tre·svh 바이트) — hip 프로브.
     pub fn linear_raw(
         &mut self,

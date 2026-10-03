@@ -409,6 +409,15 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             arg_num(args, 1, 0usize),
         ),
         "exl3-nr-check" => llm170_backend_gpu::rawvk::checks::nr_check(),
+        "exl3-hip-linear" => {
+            let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
+            let key = arg_str(args, 1, "model.language_model.layers.0.mlp.gate_proj");
+            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_linear_check(&dir, &key)
+        }
+        "exl3-hip-nr" => {
+            let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
+            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_nr_check(&dir)
+        }
         "exl3-hip-gemv" => {
             let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
             llm170_backend_gpu::rawhip::exl3_hip_probe::hip_gemv_check(&dir)
