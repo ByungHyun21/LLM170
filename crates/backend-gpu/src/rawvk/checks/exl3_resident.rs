@@ -2177,7 +2177,7 @@ impl TrellisResident {
         let mut q = Vec::with_capacity(16 * 256);
         let mut k = Vec::with_capacity(16 * 256);
         for ai in 0..16usize {
-            let il = (ai * 4 + 3) as usize;
+            let il = ai * 4 + 3;
             let lp = format!("model.language_model.layers.{il}");
             q.extend(
                 self.norm(&format!("{lp}.self_attn.q_norm.weight"))
