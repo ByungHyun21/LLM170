@@ -1274,8 +1274,10 @@ impl TrellisResident {
             Some(g) => g,
             None => return Err("gdn_frame ì±ì ìí ëê¸°í ì¤í¨".into()),
         };
-        self.ctx.invalidate_buf(&gf.gstate); // 전체 버퍼(다층 오프셋 누락 수정)
-        self.ctx.invalidate_buf(&gf.gring);
+        let st_bytes = 48 * 16384 * 4;
+        let ring_bytes = 3 * 10240 * 4;
+        self.ctx.invalidate_range_at(&gf.gstate, gdn_il * st_bytes, st_bytes);
+        self.ctx.invalidate_range_at(&gf.gring, gdn_il * ring_bytes, ring_bytes);
         let st_off = gdn_il * 48 * 16384;
         let ring_off = gdn_il * 3 * 10240;
         unsafe {
@@ -1325,8 +1327,10 @@ impl TrellisResident {
                 3 * 10240,
             );
         }
-        self.ctx.flush_buf(&gf.gstate); // 전체 버퍼 — 층별 오프셋 플러시 누락 방지(다층 버그 수정)
-        self.ctx.flush_buf(&gf.gring);
+        let st_bytes = 48 * 16384 * 4;
+        let ring_bytes = 3 * 10240 * 4;
+        self.ctx.flush_range_at(&gf.gstate, gdn_il * st_bytes, st_bytes);
+        self.ctx.flush_range_at(&gf.gring, gdn_il * ring_bytes, ring_bytes);
         Ok(())
     }
 

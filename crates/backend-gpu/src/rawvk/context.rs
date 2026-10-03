@@ -1700,4 +1700,27 @@ pub mod site {
     pub fn current() -> &'static str {
         CUR.with(|c| c.get())
     }
+
+    /// 매핑 범위 플러시(오프셋 지정 — 다층 상태 버퍼의 층별 슬라이스).
+    pub fn flush_range_at(&self, b: &VkBuf, offset: usize, bytes: usize) {
+        unsafe {
+            let range = vk::MappedMemoryRange::default()
+                .memory(b.mem)
+                .offset(offset as u64)
+                .size(bytes as u64);
+            let _ = self.device.flush_mapped_memory_ranges(&[range]);
+        }
+    }
+
+    /// 매핑 범위 인밸리데이트(오프셋 지정 — 층별 슬라이스).
+    pub fn invalidate_range_at(&self, b: &VkBuf, offset: usize, bytes: usize) {
+        unsafe {
+            let range = vk::MappedMemoryRange::default()
+                .memory(b.mem)
+                .offset(offset as u64)
+                .size(bytes as u64);
+            let _ = self.device.invalidate_mapped_memory_ranges(&[range]);
+        }
+    }
+
 }
