@@ -630,20 +630,22 @@ impl Exl3HipDecoder {
             let (dxn, dqh, dgo, dew, dab) = (self.dxn, self.dqh, self.dgo, self.dew, self.dab);
             self.gemv_chain(&lg, dxn, dqh)?;
             self.gemv_chain(&lu, dxn, dgo)?;
-            let mut gb = vec![0u8; lg.n * 4];
-            let mut ub = vec![0u8; lu.n * 4];
-            self.hc.d2h(&mut gb, dqh)?;
-            self.hc.d2h(&mut ub, dgo)?;
+            let mut ewn = lg.n as i32;
+            let (mut w0, mut w1, mut w2) = (dqh, dgo, dew);
+            self.hc.launch3(
+                "exl3_ew",
+                (lg.n.div_ceil(128)) as u32,
+                1,
+                1,
+                128,
+                &mut [
+                    &mut w0 as *mut *mut u8 as *mut _,
+                    &mut w1 as *mut *mut u8 as *mut _,
+                    &mut w2 as *mut *mut u8 as *mut _,
+                    &mut ewn as *mut i32 as *mut _,
+                ],
+            )?;
             self.hc.sync()?;
-            // SAFETY: d2h 완료 후 재해석.
-            let gf: &[f32] = unsafe { std::slice::from_raw_parts(gb.as_ptr() as *const f32, lg.n) };
-            let uf: &[f32] = unsafe { std::slice::from_raw_parts(ub.as_ptr() as *const f32, lu.n) };
-            let mut ew = vec![0f32; lg.n];
-            for i in 0..lg.n {
-                let v = gf[i];
-                ew[i] = (v / (1.0 + (-v).exp())) * uf[i];
-            }
-            self.hc.h2d(dew, f32b(&ew))?;
             self.gemv_chain(&ld, dew, dab)?;
             ab = dab;
             {
@@ -708,3 +710,4 @@ impl Exl3HipDecoder {
 // 마커 abfix
 // 마커 posr
 // 마커 final
+// 마커 ew1
