@@ -693,7 +693,7 @@ impl TrellisResident {
                 b.p2.pipe,
                 &push,
                 ((n / 64) as u32).max(1),
-                t_rows.div_ceil(64),
+                t_rows.div_ceil(128),
                 1,
                 &[ah, tre_b],
                 &[sb_b],

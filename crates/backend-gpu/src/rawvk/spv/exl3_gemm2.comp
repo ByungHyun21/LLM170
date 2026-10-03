@@ -33,13 +33,13 @@ layout(push_constant) uniform PC {
 } pc;
 
 #define BM 64
-#define BN 64
+#define BN 128
 #define BK 32
 #define SHMEM_STRIDE (BK / 2 + 2)   // 18 vec2 (tile_q8ms 관례 패딩)
 
 shared f16vec2 buf_a[BM * SHMEM_STRIDE];
 shared f16vec2 buf_b[BN * SHMEM_STRIDE];
-// 트렐리스 스테이징: k-블록당 2 kt × 4 nt 타일 × words32(K≤6 → 48).
+// 트렐리스 스테이징: k-블록당 4 kt × 4 nt 타일 × words32(K≤6 → 48).
 shared uint tre_s[8u * 48u];
 shared float16_t Ctmp[64][17];
 
@@ -81,9 +81,9 @@ void main() {
     uint nkb = pc.ktiles >> 1u;        // 32k 블록 수
     uint arow_words = pc.ktiles * 8u;  // ah 행당 u32 (k/2)
 
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[4][2];
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[4][4];
     for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 2; j++)
+        for (int j = 0; j < 4; j++)
             acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
     for (uint kb = 0; kb < nkb; kb++) {
@@ -120,28 +120,30 @@ void main() {
                 buf_a[n_loc * SHMEM_STRIDE + (k0 >> 1u) + q] = f16vec2(va, vb);
             }
         }
-        // ── B 적재: BN(토큰)×BK(k) — ah16 f16 쌍팩 그대로(스레드당 8 vec2) ──
+        // ── B 적재: BN(토큰)×BK(k) — ah16 f16 쌍팩 그대로(스레드당 2패스×8 vec2) ──
         {
-            uint e0 = tid * 16u;
-            uint t_loc = e0 / BK;                    // 토큰(0..63)
-            uint k0 = e0 % BK;
-            for (uint q = 0; q < 8u; q++) {
-                f16vec2 v = f16vec2(float16_t(0.0));
-                if (t_loc < nt) {
-                    vec2 uv = unpackHalf2x16(ah16[(t0 + t_loc) * arow_words + (kb * BK + k0) / 2u + q]);
-                    v = f16vec2(float16_t(uv.x), float16_t(uv.y));
+            for (uint p = 0; p < 2u; p++) {
+                uint e0 = (tid + p * 128u) * 16u;
+                uint t_loc = e0 / BK;            // 토큰(0..127)
+                uint k0 = e0 % BK;
+                for (uint q = 0; q < 8u; q++) {
+                    f16vec2 v = f16vec2(float16_t(0.0));
+                    if (t_loc < nt) {
+                        vec2 uv = unpackHalf2x16(ah16[(t0 + t_loc) * arow_words + (kb * BK + k0) / 2u + q]);
+                        v = f16vec2(float16_t(uv.x), float16_t(uv.y));
+                    }
+                    buf_b[t_loc * SHMEM_STRIDE + (k0 >> 1u) + q] = v;
                 }
-                buf_b[t_loc * SHMEM_STRIDE + (k0 >> 1u) + q] = v;
             }
         }
         barrier();
         // ── coopmat: BK/TK = 2 k-스텝. sg: 토큰 반(sg*32). tile_q8ms 동식. ──
-        int tbase = int(sg) * 32;
+        int tbase = int(sg) * 64;
         for (uint ks = 0; ks < BK / 16; ks++) {
             for (uint wm = 0; wm < 4; wm++) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa;
                 coopMatLoad(fa, buf_a, (wm * 16) * SHMEM_STRIDE + ks * 8, SHMEM_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-                for (uint wn = 0; wn < 2; wn++) {
+                for (uint wn = 0; wn < 4; wn++) {
                     // 가드 없음: B 적재가 nt 초과 토큰을 0으로 패딩, 드레인이 클립.
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fbb;
                     coopMatLoad(fbb, buf_b, (tbase + wn * 16) * SHMEM_STRIDE + ks * 8, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
@@ -153,10 +155,10 @@ void main() {
     }
 
     // ── 드레인: 16토큰 슬래브(tile_q8ms 동식, 출력 sb [T][n]) ──
-    for (int q = 0; q < 4; q++) {
+    for (int q = 0; q < 8; q++) {
         if (nt <= uint(q * 16)) break;
-        int wn = q - int(sg) * 2;
-        if (wn >= 0 && wn < 2) {
+        int wn = q - int(sg) * 4;
+        if (wn >= 0 && wn < 4) {
             for (int wm = 0; wm < 4; wm++) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> hf16 =
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[wm][wn]);
