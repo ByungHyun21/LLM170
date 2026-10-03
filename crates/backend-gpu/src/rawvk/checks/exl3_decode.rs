@@ -2307,18 +2307,14 @@ fn frame_spec_forward(
         };
         tr.frame_norm_resid(w_next, t_rows, yf.0)?;
     }
-    // 프레임 종료 후 행별 노름+lm_head GEMV(k행 — 배치 lm_head는 508MB급
-    // 스크래시 터치·시스템 동결 사고로 폐기, 2026-10-03 안전화).
+    // 프레임 종료 후 행별 lm_head GEMV — xtb 행은 마지막 norm_resid가 이미
+    // output_norm(행 128) 적용: 추가 rms_norm 금지(이중 노름 버그 — 삼각
+    // 비교 적발: decode/prefillT1=198 vs spec=1195).
     tr.ctx.end_outer()?;
-    let out_norm_w = tr
-        .norm("model.language_model.norm.weight")
-        .ok_or("output norm")?
-        .to_vec();
     let xn_all = tr.read_xtb_rows(t_rows)?;
     let mut logits = Vec::with_capacity(t_rows * 248320);
     for t in 0..t_rows {
-        let xn = rms_norm(&xn_all[t * h..(t + 1) * h], &out_norm_w, 1e-6);
-        let row = tr.linear("lm_head", &xn)?;
+        let row = tr.linear("lm_head", &xn_all[t * h..(t + 1) * h])?;
         logits.extend_from_slice(&row);
     }
     // seq 갱신
@@ -2364,7 +2360,10 @@ pub fn exl3_spec_step(
         spec_restore(seq, &snap2);
         row
     } else {
-        tr.gdn_state_snapshot()?;
+        // A/B 진단(2026-10-03): 스냅샷 생략 — copy_dev가 verify 오염시키는지 판정.
+        if !llm170_diag::flag::eq1("LLM170_EXL3_NOSNAP") {
+            tr.gdn_state_snapshot()?;
+        }
         let spec_logits = frame_spec_forward(tr, seq, &drafts)?;
         (0..k)
             .map(|i| argmax32(&spec_logits[i * 248320..(i + 1) * 248320]))
@@ -2398,7 +2397,9 @@ pub fn exl3_spec_step(
             }
         } else {
             // kvc는 재실행이 정확히 pos0.. 행을 덮으므로 복원 불요.
-            tr.gdn_state_restore()?;
+            if !llm170_diag::flag::eq1("LLM170_EXL3_NOSNAP") {
+                tr.gdn_state_restore()?;
+            }
             seq.pos -= k as u32; // frame_spec_forward가 다시 증가
             let re_accepted = accepted.clone();
             frame_spec_forward(tr, seq, &re_accepted)?;
@@ -2454,6 +2455,34 @@ pub fn exl3_mtp2(
         let _ = am;
     }
 
+    // 삼각 비교 진단(plans/121 tg): 동일 토큰(=plain[0] 예상 전이)을
+    // ① decode_step ② prefill_batch(T=1) ③ frame_spec_forward 로 각각 처리해
+    // argmax 대조 — verify 오염의 소속(코드 diff vs 상태 반입)을 가른다.
+    if llm170_diag::dump::opts().key("exl3_tri") {
+        let snap3 = spec_snap(&seq);
+        let t_probe = argmax32(&seq.last_logits); // = plain[0] 후보
+        let lg1 = {
+            let l = decode_step(&mut tr, &mut seq, t_probe)?;
+            spec_restore(&mut seq, &snap3);
+            l
+        };
+        let lg2 = {
+            let l = prefill_batch(&mut tr, &mut seq, &[t_probe])?;
+            spec_restore(&mut seq, &snap3);
+            l
+        };
+        let lg3 = {
+            let l = frame_spec_forward(&mut tr, &mut seq, &[t_probe])?;
+            spec_restore(&mut seq, &snap3);
+            l
+        };
+        eprintln!(
+            "  [tri] tok={t_probe} decode={} prefillT1={} specFWD={}",
+            argmax32(&lg1),
+            argmax32(&lg2),
+            argmax32(&lg3)
+        );
+    }
     // 스펙 루프
     let t2 = std::time::Instant::now();
     let (mut toks, mut fwds, mut rounds) = (0u64, 0u64, 0u64);
@@ -2507,3 +2536,4 @@ pub fn exl3_mtp2(
     ))
 }
 // 마커 r1diff
+// 마커 dblnorm
