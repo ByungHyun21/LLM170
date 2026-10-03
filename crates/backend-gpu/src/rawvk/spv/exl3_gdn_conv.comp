@@ -19,10 +19,10 @@ float silu_f(float x) { return x / (1.0 + exp(-x)); }
 void main() {
     uint ch = gl_WorkGroupID.x * 128u + gl_LocalInvocationID.x;
     if (ch >= 10240u) return;
-    float w0 = convw[ch * 4u + 0u];
-    float w1 = convw[ch * 4u + 1u];
-    float w2 = convw[ch * 4u + 2u];
-    float w3 = convw[ch * 4u + 3u];
+    float w0 = convw[pc.layer * 10240u * 4u + ch * 4u + 0u];
+    float w1 = convw[pc.layer * 10240u * 4u + ch * 4u + 1u];
+    float w2 = convw[pc.layer * 10240u * 4u + ch * 4u + 2u];
+    float w3 = convw[pc.layer * 10240u * 4u + ch * 4u + 3u];
     float h0 = ring[pc.layer * 3u * 10240u + 0u * 10240u + ch];
     float h1 = ring[pc.layer * 3u * 10240u + 1u * 10240u + ch];
     float h2 = ring[pc.layer * 3u * 10240u + 2u * 10240u + ch];
