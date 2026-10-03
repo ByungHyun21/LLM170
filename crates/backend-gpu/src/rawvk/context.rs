@@ -1342,10 +1342,11 @@ impl VkCtx {
             if batch && !forced_skip && self.opt_bar.replace(false) {
                 // plans/104: 기본 ON(산술 불변 — 게이트 2회 PASS·A/B 양성
                 // +2%). 킬스위치 =0.
-                // plans/121 tg 최종 판정: dep 선언 감사는 전 커널 정합이었으나
-                // 의존 생략(비행 상한 16 포함)은 스펙 경로에서만 DEVICE_LOST
-                // (pp는 통과) — 스펙 특정 미선언 의존 실재, VVL 없이는 국소화
-                // 불가. 무조건 배리어로 확정(verify 743ms = 768×0.9ms 드레인).
+                // plans/121 tg VVL 최종 판정(2026-10-03): 검증 레이어 활성화에도
+                // DEVICE_LOST 재현·sync 위반 메시지 0건 — 명세 위반이 아니라
+                // RADV가 대량 동시 컴퓨트 디스패치를 처리 못하는 드라이버 결함.
+                // 배리어 생략은 불가 — 무조건 배리어 확정(768×0.9ms 드레인).
+                // verify 단축은 디스패치 수 자체를 줄이는 메가융합만 남음.
                 let _ = dep;
                 let mut need = true;
                 // plans/104 이분법 프로브: 스킵 허용을 현 태그 1종으로 제한.
@@ -1867,3 +1868,4 @@ pub mod site {
 // 마커 depbar
 // 마커 cap16
 // 마커 capfix
+// 마커 vvl
