@@ -412,7 +412,8 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         "exl3-gemmd-check" => {
             let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
             let t = arg_str(args, 1, "8").parse::<usize>().unwrap_or(8);
-            llm170_backend_gpu::rawvk::checks::TrellisResident::gemmd_check(&dir, t)
+            let il = arg_str(args, 2, "0").parse::<usize>().unwrap_or(0);
+            llm170_backend_gpu::rawvk::checks::TrellisResident::gemmd_check(&dir, t, il)
         }
         "exl3-nrh-check" => llm170_backend_gpu::rawvk::checks::TrellisResident::nrh_check(
             &arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw"),

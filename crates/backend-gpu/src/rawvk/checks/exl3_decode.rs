@@ -1336,8 +1336,9 @@ pub fn prefill_batch(
                         let g = &seq.gdn[il];
                         tr.gdn_state_upload(gdn_il, &g.states, &g.conv)?;
                     }
-                    let dslots = tr.linear_pair_preah(
-                        &[
+                    // 듀얼 gemm2d(메가융합 3호) — krate 불일치층은 내부 preah 폴백.
+                    let dslots = tr.linear_pair_dual(
+                        [
                             &format!("{lp}.linear_attn.in_proj_qkv"),
                             &format!("{lp}.linear_attn.in_proj_z"),
                         ],
@@ -2669,3 +2670,4 @@ pub fn exl3_mtp2(
 // 마커 specatt
 // 마커 mf2
 // 마커 dualatt
+// 마커 fb1
