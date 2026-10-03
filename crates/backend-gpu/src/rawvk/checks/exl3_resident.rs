@@ -1835,11 +1835,10 @@ impl TrellisResident {
         {
             f.gsnap = Some(gsnap);
         }
-        let (src, dst) = {
+        let dst = {
             let b = self.batch.as_ref().ok_or("batch")?;
-            let g = b.gframe.as_ref().ok_or("gframe")?;
             let f = b.fframe.as_ref().ok_or("fframe")?;
-            (g.gstate.buf, f.gsnap.as_ref().ok_or("gsnap")?.buf)
+            f.gsnap.as_ref().ok_or("gsnap")?.buf
         };
         let (gs, gr, gn) = {
             let b = self.batch.as_ref().ok_or("batch")?;
