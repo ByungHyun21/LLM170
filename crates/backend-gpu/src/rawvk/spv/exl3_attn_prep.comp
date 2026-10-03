@@ -18,6 +18,7 @@ layout(binding = 7) writeonly buffer VKC { float vc[]; };  // [cap][1024]
 layout(push_constant) uniform PC {
     uint t_len;
     uint pos0;
+    uint layer; // 어텐션 층 인덱스(kvc/qnw 오프셋)
 } pc;
 
 shared float red[128];
@@ -43,8 +44,8 @@ void main() {
             barrier();
         }
         float inv = inversesqrt(red[0] / 256.0 + 1e-6);
-        hd[tid] = hd[tid] * inv * qnw[tid];
-        hd[tid + 128u] = hd[tid + 128u] * inv * qnw[tid + 128u];
+        hd[tid] = hd[tid] * inv * qnw[pc.layer * 256u + tid];
+        hd[tid + 128u] = hd[tid + 128u] * inv * qnw[pc.layer * 256u + 128u + tid];
         barrier();
         // rope half-split(64회전, half=32): (p, p+32)
         if (tid < 32u) {
@@ -72,8 +73,8 @@ void main() {
             barrier();
         }
         float inv = inversesqrt(red[0] / 256.0 + 1e-6);
-        hd[tid] = hd[tid] * inv * knw[tid];
-        hd[tid + 128u] = hd[tid + 128u] * inv * knw[tid + 128u];
+        hd[tid] = hd[tid] * inv * knw[pc.layer * 256u + tid];
+        hd[tid + 128u] = hd[tid + 128u] * inv * knw[pc.layer * 256u + 128u + tid];
         barrier();
         if (tid < 32u) {
             float theta = pow(1e7, -(2.0 * float(tid)) / 64.0);
@@ -84,7 +85,7 @@ void main() {
             hd[tid + 32u] = x0 * s2 + x1 * c;
         }
         barrier();
-        uint dst = pos * 1024u + m * 256u;
+        uint dst = (pc.layer * 1024u + pos) * 1024u + m * 256u;
         kc[dst + tid] = hd[tid];
         kc[dst + 128u + tid] = hd[tid + 128u];
         vc[dst + tid] = vin[src + tid];
