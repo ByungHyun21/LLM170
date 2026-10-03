@@ -30,8 +30,6 @@ GOLDEN="scripts/.charhash-flash${SUF}.txt"
 [[ -x target/release/llm170 ]] || { echo "target/release/llm170 없음 — cargo build --release -p llm170-server"; exit 2; }
 
 run_hashes() {
-    # 107: 벤치 캐시 잔여로 host 가용이 줄면 가드 오탐 — 검증 프로토콜 우회.
-    export LLM170_NO_RSRC_GUARD=1
     LLM170_DUMP=checksum,bufhash ./target/release/llm170 infer --model "$MODEL" \
         --prompt-tokens "$PROMPT" --n-predict 16 --ctx 8192 \
         --backend "$RUNTIME" 2>&1 >/dev/null \
