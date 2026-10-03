@@ -39,7 +39,7 @@ pub fn scan_check(t_len: usize, cap_path: &str) -> Result<String, String> {
         let k = take(&mut o, n_q);
         let v = take(&mut o, t_len * 6144);
         let bg = take(&mut o, t_len * 96);
-        return scan_check_run(q, k, v, bg, t_len, true);
+        return scan_check_run(q, k, v, bg, t_len, true).map(|(s, _)| s);
     }
     // 합성 입력(LCG) — q/k는 L2 정규화 후 스케일(≈1/√128), beta∈(0,1), g=음수.
     let mut seed: u32 = 0x1234_5678;
@@ -67,7 +67,7 @@ pub fn scan_check(t_len: usize, cap_path: &str) -> Result<String, String> {
         }
     }
 
-    scan_check_run(q, k, v, bg, t_len, false)
+    scan_check_run(q, k, v, bg, t_len, false).map(|(s, _)| s)
 }
 
 fn scan_check_run(
@@ -77,7 +77,7 @@ fn scan_check_run(
     bg: Vec<f32>,
     t_len: usize,
     from_cap: bool,
-) -> Result<String, String> {
+) -> Result<(String, Vec<f32>), String> {
     let mut ctx = crate::rawvk::context::VkCtx::new()?;
     const HK: usize = 16;
     const HV: usize = 48;
@@ -217,10 +217,15 @@ fn scan_check_run(
     for i in 0..st_gpu.len() {
         st_max = st_max.max((st_gpu[i] - st_ref[i]).abs());
     }
-    Ok(format!(
+    let s = format!(
         "scan-check T={t_len}: kern-vs-mirror={out_max:.3e} · kern-vs-f16mirror={kern_vs_f16ref:.3e} · mirror(CS32)-vs-core(CS64)={mirror_vs_core:.3e} · st(kern-vs-core)={stc_max:.3e} · kernel {:.2}ms (5회 중앙값)",
         times[2]
-    ))
+    );
+    // SAFETY: end_batch_wait 후 판독 — 단독 go 반환(체인 대조용).
+    let go_out = unsafe {
+        std::slice::from_raw_parts(go.ptr as *const f32, t_len.max(64) * 48 * 128).to_vec()
+    };
+    Ok((s, go_out))
 }
 
 /// scan 커널의 f32 기준 미러 — A/KQ/sk/sv를 f32로 계산(커널의 f16과의 차이가
@@ -930,7 +935,7 @@ pub fn chain_check(dir: &str) -> Result<String, String> {
         }
     }
     // 중간 대조: l2perm gbg / conv gqr — 단계 격리(plans/121).
-    let (gpu_bg, gpu_gq, gpu_gv, gpu_go) = tr.gdn_chain_mids(t_rows)?;
+    let (gpu_bg, gpu_gq, gpu_gk, gpu_gv, gpu_go) = tr.gdn_chain_mids(t_rows)?;
     let mut bg_md = 0f32;
     for i in 0..gpu_bg.len() {
         bg_md = bg_md.max((gpu_bg[i] - bg[i]).abs());
@@ -942,8 +947,19 @@ pub fn chain_check(dir: &str) -> Result<String, String> {
     eprintln!("  [chainmid] conv q maxdiff={q_md:.3e} · l2perm bg maxdiff={bg_md:.3e}");
 
     // ③ scan(레지스터 리페런스 재사용 — scan_ref는 bg [T][96] 포맷)
-    let (_, o_ref) = scan_ref(&q_l2, &k_l2, &v_lc, &bg, t_rows, false, &[0f32; 48 * 16384]);
-    let (_, o_ref16) = scan_ref(&q_l2, &k_l2, &v_lc, &bg, t_rows, true, &[0f32; 48 * 16384]);
+    // 동일 합성 입력의 단독 scan 파이프라인 투입 — 체인 문맥 vs 커널 일반성 바이섹트.
+    let (solo, solo_go) = scan_check_run(
+        q_l2.clone(),
+        k_l2.clone(),
+        v_lc.clone(),
+        bg.clone(),
+        t_rows,
+        false,
+    )?;
+    eprintln!("  [chainsolo] {solo}");
+
+    let (o_ref, _) = scan_ref(&q_l2, &k_l2, &v_lc, &bg, t_rows, false, &[0f32; 48 * 16384]);
+    let (o_ref16, _) = scan_ref(&q_l2, &k_l2, &v_lc, &bg, t_rows, true, &[0f32; 48 * 16384]);
     let mut go16_md = 0f32;
     for i in 0..gpu_go.len().min(o_ref16.len()) {
         go16_md = go16_md.max((gpu_go[i] - o_ref16[i]).abs());
@@ -957,12 +973,32 @@ pub fn chain_check(dir: &str) -> Result<String, String> {
     for i in 0..gpu_gv.len().min(v_lc.len()) {
         gv_md = gv_md.max((gpu_gv[i] - v_lc[i]).abs());
     }
-    eprintln!("  [chainmid] gq maxdiff={gq_md:.3e} · gv maxdiff={gv_md:.3e}");
+    let mut gk_md = 0f32;
+    for i in 0..gpu_gk.len().min(k_l2.len()) {
+        gk_md = gk_md.max((gpu_gk[i] - k_l2[i]).abs());
+    }
+    eprintln!("  [chainmid] gq={gq_md:.3e} gk={gk_md:.3e} gv={gv_md:.3e}");
     let mut go_md = 0f32;
     for i in 0..gpu_go.len().min(o_ref.len()) {
         go_md = go_md.max((gpu_go[i] - o_ref[i]).abs());
     }
     eprintln!("  [chainmid] scan go maxdiff={go_md:.3e}");
+    let mut cg_md = 0f32;
+    let mut cg_at = (0usize, 0f32, 0f32);
+    for i in 0..gpu_go.len().min(solo_go.len()) {
+        let d = (gpu_go[i] - solo_go[i]).abs();
+        if d > cg_md {
+            cg_md = d;
+            cg_at = (i, gpu_go[i], solo_go[i]);
+        }
+    }
+    let (idx, gv, sv) = cg_at;
+    eprintln!(
+        "  [chainmid] chain-vs-solo go maxdiff={cg_md:.3e} @i={idx} (t={},h={},col={}, chain={gv:.4} solo={sv:.4})",
+        idx / 6144,
+        (idx % 6144) / 128,
+        idx % 128
+    );
     // ④ gate: rms(o_lc)·nw·silu(z) → HF 역순열
     let mut want = vec![0f32; t_rows * d_inner];
     let eps = 1e-6f32;
@@ -1002,3 +1038,6 @@ pub fn chain_check(dir: &str) -> Result<String, String> {
 // 마커 chain1
 // 마커 f16ab
 // 마커 gq2
+// 마커 solo1
+// 마커 cs1
+// 마커 tup
