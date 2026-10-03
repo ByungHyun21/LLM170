@@ -760,20 +760,9 @@ fn gdn_batch(
             tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yb0, yb1)?;
         }
         drop(_gf);
-        // gate가 xtb에 기록한 gated를 호스트 가시화 — 이후 flush가 올바른
-        // 데이터를 GPU에 밀게 한다(invalidate 없으면 스테일 xn이 덮어씀).
-        tr.invalidate_xtb(t_rows * 6144 * 4);
-        // GPU 상태 → SeqState 동기화(차기 디코드 정합): 상태 다운로드.
-        {
-            let _gs = ph("ppg:sync");
-            let (states, conv) = {
-                let g = &mut seq.gdn[il];
-                (&mut g.states, &mut g.conv)
-            };
-            tr.gdn_state_sync(gdn_il, states, conv)?;
-        }
-        // out_proj: gated가 xtb에 있으므로 staged 호출로 결과 반환.
-        let out = tr.linear_batch_staged(&format!("{lp}.out_proj"), t_rows)?;
+        // out_proj GPU 직결: gate가 xtb에 기록한 출력을 왕복 없이 소비
+        // (plans/121 F2 스케줄 — invalidate_xtab/flush/재업로드 제거).
+        let out = tr.linear_out_gpu(&format!("{lp}.out_proj"), t_rows)?;
         return Ok(out);
     }
 
@@ -1360,6 +1349,25 @@ pub fn prefill_batch(
                 *a += b;
             }
             drop(_r1);
+        }
+        // 벌크 GDN 상태 동기화(plans/121 F2 스케줄) — 층별 sync를 프리필 말미로
+        // 지연해 프리필 중 다운로드 대기 제거. 다음 디코드 정합 유지.
+        {
+            let n_gdn = tr.n_layers - tr.n_layers / 4;
+            let mut gi = 0usize;
+            for il in 0..tr.n_layers {
+                if il % 4 != 3 {
+                    let (states, conv) = {
+                        let g = &mut seq.gdn[il];
+                        (&mut g.states, &mut g.conv)
+                    };
+                    tr.gdn_state_sync(gi, states, conv)?;
+                    gi += 1;
+                    if gi >= n_gdn {
+                        break;
+                    }
+                }
+            }
         }
         seq.pos += t_rows as u32;
         seq.last_tok = *chunk_toks.last().ok_or("빈 청크")?;

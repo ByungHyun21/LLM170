@@ -408,6 +408,11 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             arg_num(args, 0, 512usize),
             arg_num(args, 1, 0usize),
         ),
+        "exl3-gemm-check" => llm170_backend_gpu::rawvk::checks::gemm_check(&arg_str(
+            args,
+            0,
+            "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw",
+        )),
         "exl3-mtp" => {
             let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
             llm170_backend_gpu::rawvk::checks::exl3_mtp(

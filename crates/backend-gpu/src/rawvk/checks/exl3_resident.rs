@@ -30,6 +30,9 @@ pub struct PendingLin {
 /// 트렐리스 + 무양자화 가중치 전체를 vk에 상주.
 pub struct TrellisResident {
     pub linears: Vec<(String, VkLinear)>,
+    /// GPU GDN 상태 유효 플래그(plans/121 F2 스케줄) — 프리필 중 불요한
+    /// 층별 상태 업로드 스킵. sync(CPU 다운로드) 후 false 복귀.
+    pub gdn_st_valid: Vec<bool>,
     /// 무양자화 노름·스케일러 (CPU f32).
     pub norms: Vec<(String, Vec<f32>)>,
     /// 임베딩 (CPU f32, vocab×hidden).
@@ -204,6 +207,7 @@ impl TrellisResident {
 
         Ok(Self {
             linears,
+            gdn_st_valid: vec![false; n_layers - n_layers / 4],
             norms,
             embed,
             vocab,
@@ -1288,6 +1292,8 @@ impl TrellisResident {
 
     /// GDN 상태 GPU→CPU 동기화(plans/121 F1) — GPU 배치 후 차기 디코드 정합.
     /// states는 [48*16384] f32, conv는 [3*10240] f32 다운로드.
+    /// 다운로드 후 CPU 사본이 권위 — 이후 CPU 디코드가 상태를 진화시킬 수
+    /// 있으므로 GPU 유효 플래그는 해제한다(plans/121 F2 스케줄).
     pub fn gdn_state_sync(
         &mut self,
         gdn_il: usize,
@@ -1318,6 +1324,9 @@ impl TrellisResident {
                 3 * 10240,
             );
         }
+        if gdn_il < self.gdn_st_valid.len() {
+            self.gdn_st_valid[gdn_il] = false;
+        }
         Ok(())
     }
 
@@ -1335,6 +1344,10 @@ impl TrellisResident {
         states: &[f32],
         conv: &[f32],
     ) -> Result<(), String> {
+        // 프리필 스케줄(plans/121 F2): GPU 상태가 이미 유효하면 업로드 스킵.
+        if *self.gdn_st_valid.get(gdn_il).unwrap_or(&false) {
+            return Ok(());
+        }
         let gf = match self.batch.as_ref().and_then(|b| b.gframe.as_ref()) {
             Some(g) => g,
             None => return Err("gdn_frame 미초기화".into()),
@@ -1359,7 +1372,43 @@ impl TrellisResident {
             .flush_range_at(&gf.gstate, gdn_il * st_bytes, st_bytes);
         self.ctx
             .flush_range_at(&gf.gring, gdn_il * ring_bytes, ring_bytes);
+        if gdn_il < self.gdn_st_valid.len() {
+            self.gdn_st_valid[gdn_il] = true;
+        }
         Ok(())
+    }
+
+    /// out_proj GPU 직결(plans/121 F2 스케줄) — gate가 xtb에 GPU 기록한 출력을
+    /// flush/인밸리데이트 왕복 없이 GEMM 입력으로 소비하고 결과만 판독한다.
+    pub fn linear_out_gpu(&mut self, key: &str, t_rows: usize) -> Result<Vec<f32>, String> {
+        let li = self.find_linear(key)?;
+        let n = self.linears[li].1.n;
+        self.ensure_batch()?;
+        let (xtb, ah0, yb0) = {
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            (b.xtb.buf, b.ah[0].buf, b.yb[0].buf)
+        };
+        self.ctx.begin_batch()?;
+        self.chain_batch_one(xtb, li, t_rows as u32, ah0, yb0, true)?;
+        self.ctx.end_batch_wait()?;
+        self.ctx.wait_pending()?;
+        {
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            self.ctx.invalidate_range(&b.yb[0], t_rows * n * 4);
+        }
+        let mut y = vec![0f32; t_rows * n];
+        {
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            // SAFETY: end_batch_wait 후 매핑 판독 — t_rows*n ≤ TMAX*max_n.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    b.yb[0].ptr as *const f32,
+                    y.as_mut_ptr(),
+                    t_rows * n,
+                );
+            }
+        }
+        Ok(y)
     }
 
     /// yb 슬롯 선두 값 판독(디버그) — invalidate 후 읽음.
@@ -1824,7 +1873,7 @@ pub fn attn_check(t_len: usize, pos0: usize) -> Result<String, String> {
         ctx.flush_buf(b);
     }
     let pp = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_prep.spv"), 8, 8)?;
-    let pf = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd.spv"), 5, 8)?;
+    let pf = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd2.spv"), 5, 8)?;
 
     let run = |ctx: &mut VkCtx| -> Result<(), String> {
         ctx.begin_batch()?;
@@ -1996,4 +2045,107 @@ fn attn_ref2(
         }
     }
     (qh_all, kcache, out)
+}
+
+// ── 전 모듈 격리 프로브(plans/121 F2c) ──
+// 실모델의 모든 선형 형상에 대해 GEMM만 단독 측정 — 형상별 유효 TFLOPS로
+// 숨은 타일 비효율을 노출한다(사용자 지시: 전 모듈 격리 점검).
+pub fn gemm_check(dir: &str) -> Result<String, String> {
+    let mut tr = TrellisResident::load(dir)?;
+    let t_rows = 512usize;
+    let stage = tr.stage_f32()?;
+    // 입력: 균일 값(수치 무의미 — 속도 프로브)
+    unsafe {
+        std::ptr::write_bytes(stage, 0, t_rows * 6144 * 4);
+        for t in 0..t_rows {
+            let p = stage.add(t * 6144);
+            for i in 0..6144usize {
+                *p.add(i) = ((i % 17) as f32 - 8.0) * 0.01;
+            }
+        }
+    }
+    let mut report = Vec::new();
+    let shapes: &[(&str, &str)] = &[
+        (
+            "GDN qkv",
+            "model.language_model.layers.0.linear_attn.in_proj_qkv",
+        ),
+        (
+            "GDN z",
+            "model.language_model.layers.0.linear_attn.in_proj_z",
+        ),
+        (
+            "GDN out",
+            "model.language_model.layers.0.linear_attn.out_proj",
+        ),
+        ("ATTN q", "model.language_model.layers.3.self_attn.q_proj"),
+        ("FFN gate", "model.language_model.layers.0.mlp.gate_proj"),
+        ("FFN down", "model.language_model.layers.0.mlp.down_proj"),
+        ("lm_head", "lm_head"),
+    ];
+    // 산술 검증 추가: T=8 배치 1행 vs 순차 GEMV 기준(BK=64 변형 판정용)
+    {
+        let t8 = 8usize;
+        let st8 = tr.stage_f32()?;
+        unsafe {
+            for t in 0..t8 {
+                let p8 = st8.add(t * 5120);
+                for i in 0..5120usize {
+                    *p8.add(i) = ((i % 31) as f32 - 15.0) * 0.013 + (t as f32) * 0.001;
+                }
+            }
+        }
+        let key = "model.language_model.layers.0.mlp.gate_proj";
+        let _slots = tr.linear_batch_multi_gpu(&[key], t8)?;
+        let li0 = tr.find_linear(key)?;
+        let n0 = tr.linears[li0].1.n;
+        let got = tr.read_yb_head(0, 8 * 4096);
+        let xrow: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(st8 as *const f32, 5120).to_vec() };
+        let want = tr.linear(key, &xrow)?;
+        let mut md = 0f32;
+        let mut nan_at: Vec<usize> = Vec::new();
+        let mut nan_cnt = 0usize;
+        let mut nan_last = 0usize;
+        for i in 0..n0.min(4096) {
+            let g = got[i];
+            if !g.is_finite() {
+                nan_cnt += 1;
+                nan_last = i;
+                if nan_at.len() < 6 {
+                    nan_at.push(i);
+                }
+            }
+            let d = (g - want[i]).abs();
+            if d.is_finite() {
+                md = md.max(d);
+            }
+        }
+        let mut row_nan = vec![0usize; 8];
+        for t in 0..8usize {
+            let seg = &got[t * 4096..(t + 1) * 4096];
+            row_nan[t] = seg.iter().filter(|v| !v.is_finite()).count();
+        }
+        eprintln!(
+            "  [gemmdbg] gate T=8 row0 maxdiff={md:.3e} nan={nan_cnt} row_nan={row_nan:?} n0={n0}"
+        );
+    }
+    for (name, key) in shapes {
+        let li = tr.find_linear(key)?;
+        let (k, n) = (tr.linears[li].1.k, tr.linears[li].1.n);
+        // 5회 중앙값
+        let mut ts: Vec<f64> = Vec::new();
+        for _ in 0..5 {
+            let t0 = std::time::Instant::now();
+            tr.linear_batch_multi_gpu(&[key], t_rows)?;
+            ts.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let ms = ts[2];
+        let tf = 2.0 * t_rows as f64 * k as f64 * n as f64 / (ms * 1e-3) / 1e12;
+        report.push(format!(
+            "{name:10} K={k:6} N={n:6}  {ms:7.2}ms  {tf:5.2} TF"
+        ));
+    }
+    Ok(report.join("\n"))
 }

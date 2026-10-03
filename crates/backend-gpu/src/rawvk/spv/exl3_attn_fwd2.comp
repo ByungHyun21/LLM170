@@ -1,0 +1,116 @@
+#version 450
+
+// exl3_attn_fwd2 (plans/121 F2b) — FA 블록 타일링 인과 어텐션 + 게이트 → xtb.
+// 그리드 (ceil(T/16), 24 q헤드). WG=256 = 16행 × 16dim(스레드 = r*16+dc).
+// 스코어 페이즈는 (r,j) 페어 도트, 갱신 페이즈는 행 소유 스레드가 자기 16dim
+// 만 연산 — m/l은 행 소유 스레드 레지스터(경합 원천 제거), acc[16]은 상수
+// 범위 언롤로 레지스터(private 동적 인덱스 금지 — 드라이버 결함).
+// LDS 행 스트라이드 264(뱅크 충돌 회피). 산술: 온라인 소프트맥스(10a).
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer QHB { float qh[]; };   // [T][6144]
+layout(binding = 1) readonly buffer KKC { float kc[]; };   // [cap][1024]
+layout(binding = 2) readonly buffer VKC { float vc[]; };   // [cap][1024]
+layout(binding = 3) readonly buffer QGB { float qg[]; };   // [T][12288] gate
+layout(binding = 4) writeonly buffer OB { float outv[]; }; // [T][6144]
+layout(push_constant) uniform PC {
+    uint t_len;
+    uint pos0;
+} pc;
+
+shared float qb[16 * 264];
+shared float kb2[16 * 264];
+shared float vb2[16 * 264];
+shared float sall[16 * 16];
+
+void main() {
+    uint tb = gl_WorkGroupID.x * 16u;
+    uint h = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint r = tid / 16u;   // 행 소유
+    uint d0 = (tid % 16u) * 16u; // 자기 dim 시작
+    uint kh = h / 6u;
+    float scale = 0.0625;
+
+    // q 블록 적재(coalesced)
+    for (uint rr = 0u; rr < 16u; rr++) {
+        uint row = tb + rr;
+        if (row < pc.t_len) {
+            qb[rr * 264u + tid] = qh[row * 6144u + h * 256u + tid];
+        }
+    }
+    barrier();
+
+    float m_loc = -1e30;
+    float l_loc = 0.0;
+    float a[16]; // d0..d0+15 누적 — 상수 범위 인덱스
+    for (uint i = 0u; i < 16u; i++) {
+        a[i] = 0.0;
+    }
+
+    uint last = pc.pos0 + tb + 16u;
+    for (uint kb = 0u; kb < last; kb += 16u) {
+        for (uint j = 0u; j < 16u; j++) {
+            uint row = kb + j;
+            kb2[j * 264u + tid] = kc[row * 1024u + kh * 256u + tid];
+            vb2[j * 264u + tid] = vc[row * 1024u + kh * 256u + tid];
+        }
+        barrier();
+        // 스코어: 스레드 = (r2, j) 페어 256개
+        {
+            uint r2 = tid / 16u;
+            uint j = tid % 16u;
+            float s = -1e30;
+            uint kv_row = kb + j;
+            uint q_last = pc.pos0 + tb + r2;
+            if (kv_row <= q_last) {
+                s = 0.0;
+                for (uint d = 0u; d < 256u; d++) {
+                    s += qb[r2 * 264u + d] * kb2[j * 264u + d];
+                }
+                s *= scale;
+            }
+            sall[r2 * 16u + j] = s;
+        }
+        barrier();
+        // 갱신: 행 소유 스레드만(16×16) — 나머지 240는 대기(다음 배리어에서 합류)
+        if (tid < 256u) {
+            // r2 == r인 스레드 16개(dc별)가 동일 계산 수행 — m/l은 레지스터라 무경합
+            float bmax = -1e30;
+            for (uint j = 0u; j < 16u; j++) {
+                bmax = max(bmax, sall[r * 16u + j]);
+            }
+            float m_new = max(m_loc, bmax);
+            if (m_new > -1e29) {
+                float rescale = (m_loc > -1e29) ? exp(m_loc - m_new) : 0.0;
+                for (uint i = 0u; i < 16u; i++) {
+                    a[i] *= rescale;
+                }
+                l_loc *= rescale;
+                for (uint j = 0u; j < 16u; j++) {
+                    float p = exp(sall[r * 16u + j] - m_new);
+                    l_loc += p;
+                    if (p != 0.0) {
+                        for (uint i = 0u; i < 16u; i++) {
+                            a[i] += p * vb2[j * 264u + d0 + i];
+                        }
+                    }
+                }
+                m_loc = m_new;
+            }
+        }
+        barrier();
+    }
+    // 에필로그: 정규화 + 게이트(16스레드 × 64B — 근결합)
+    {
+        uint row = tb + r;
+        if (row < pc.t_len && l_loc > 0.0) {
+            for (uint i = 0u; i < 16u; i++) {
+                float g = qg[row * 12288u + h * 512u + 256u + d0 + i];
+                float sg = 1.0 / (1.0 + exp(-g));
+                outv[row * 6144u + h * 256u + d0 + i] = (a[i] / l_loc) * sg;
+            }
+        }
+    }
+}
