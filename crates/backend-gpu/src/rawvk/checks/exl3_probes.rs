@@ -234,7 +234,7 @@ fn h16(x: f32) -> f32 {
     half::f16::from_f32(x).to_f32()
 }
 
-fn scan_ref(
+pub(crate) fn scan_ref(
     q: &[f32],
     k: &[f32],
     v: &[f32],

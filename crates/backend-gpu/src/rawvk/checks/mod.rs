@@ -5,7 +5,7 @@ mod attention;
 mod exl3;
 mod exl3_bench;
 mod exl3_decode;
-mod exl3_probes;
+pub(crate) mod exl3_probes;
 mod exl3_resident;
 mod fault;
 mod frame_check;
