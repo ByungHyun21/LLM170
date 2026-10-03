@@ -391,3 +391,88 @@ extern "C" __global__ void exl3_gdn_gate(
         ov * inv * nw[layer * 128 + tid] * (zv / (1.0f + __expf(-zv)));
 }
 // 마커 cg1
+
+// exl3_gdn_l2perm hip 직이식 — a/b 도트(xn·ab) + q/k L2 + v·beta|g lc 순열.
+// 그리드 (48, T), WG=128.
+extern "C" __global__ void exl3_gdn_l2perm(
+    const float* __restrict__ q_in,   // [T][2048]
+    const float* __restrict__ k_in,   // [T][2048]
+    const float* __restrict__ v_in,   // [T][6144] HF
+    const float* __restrict__ xn,     // [T][5120] (xtb)
+    const float* __restrict__ abuf,   // [L][2][48][5120]
+    const float* __restrict__ alog,   // [L][48]
+    const float* __restrict__ dtb,    // [L][48]
+    float* __restrict__ q_out,        // [T][2048]
+    float* __restrict__ k_out,        // [T][2048]
+    float* __restrict__ v_out,        // [T][6144] lc
+    float* __restrict__ bg,           // [T][96] beta|g lc
+    int t_len, int layer)
+{
+    __shared__ float red[128];
+    int t = blockIdx.y;
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+    if (t >= t_len) return;
+    const float eps = 1e-6f;
+
+    float pa = 0.0f;
+    for (int i = tid; i < 5120; i += 128)
+        pa += xn[t * 5120 + i] * abuf[(layer * 2) * 48 * 5120 + h * 5120 + i];
+    red[tid] = pa;
+    __syncthreads();
+    for (int st = 64; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float a_val = red[0];
+    __syncthreads();
+
+    float pb = 0.0f;
+    for (int i = tid; i < 5120; i += 128)
+        pb += xn[t * 5120 + i] * abuf[(layer * 2 + 1) * 48 * 5120 + h * 5120 + i];
+    red[tid] = pb;
+    __syncthreads();
+    for (int st = 64; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float b_val = red[0];
+    __syncthreads();
+
+    int p_inv = (h % 3) * 16 + h / 3;
+    if (tid == 0) {
+        float al = alog[layer * 48 + h];
+        float dt = dtb[layer * 48 + h];
+        float ssm_a = -__expf(al);
+        float sp = (a_val + dt > 20.0f) ? (a_val + dt) : __logf(1.0f + __expf(a_val + dt));
+        bg[t * 96 + p_inv] = 1.0f / (1.0f + __expf(-b_val));
+        bg[t * 96 + 48 + p_inv] = sp * ssm_a;
+    }
+
+    if (h < 16) {
+        int kh = h;
+        float qv = q_in[t * 2048 + kh * 128 + tid];
+        red[tid] = qv * qv;
+        __syncthreads();
+        for (int st = 64; st > 0; st >>= 1) {
+            if (tid < st) red[tid] += red[tid + st];
+            __syncthreads();
+        }
+        float qi = 1.0f / sqrtf(red[0] + eps);
+        __syncthreads();
+        q_out[t * 2048 + kh * 128 + tid] = qv * qi;
+
+        float kv = k_in[t * 2048 + kh * 128 + tid];
+        red[tid] = kv * kv;
+        __syncthreads();
+        for (int st = 64; st > 0; st >>= 1) {
+            if (tid < st) red[tid] += red[tid + st];
+            __syncthreads();
+        }
+        float ki = 1.0f / sqrtf(red[0] + eps);
+        __syncthreads();
+        k_out[t * 2048 + kh * 128 + tid] = kv * ki;
+    }
+    v_out[t * 6144 + p_inv * 128 + tid] = v_in[t * 6144 + h * 128 + tid];
+}
+// 마커 l2h
