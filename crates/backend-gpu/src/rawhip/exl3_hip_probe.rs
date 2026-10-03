@@ -1290,6 +1290,7 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
     };
 
     let mut ab = dzero;
+    #[allow(unused_mut)]
     for il in 0..n_layers.min(lim_layers) {
         let lp = format!("model.language_model.layers.{il}");
         let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
