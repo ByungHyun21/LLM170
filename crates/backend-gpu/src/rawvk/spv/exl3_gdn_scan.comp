@@ -1,0 +1,143 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// exl3_gdn_scan (plans/121 F1) — GDN 청크 스캔 GPU(전상주 버전):
+// q/k/v/beta/g가 전부 GPU 버퍼 — 업로드 0. 상태도 GPU 버퍼 r/w.
+// 수학은 core::gdn::gdn_chunk_seq 미러(v1 corr 1.0000 검증).
+// 그리드: x = 48 V-헤드 WG(각 헤드 전체 T 순차 처리). WG=128(= d_state).
+// 소형 T(≤8)는 CPU AR 경로 사용 — 이 커널은 T>8에서만 호출.
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer QB { float q[]; };    // [T][2048] L2 norm(HF)
+layout(binding = 1) readonly buffer KB { float k[]; };    // [T][2048] L2 norm(HF)
+layout(binding = 2) readonly buffer VB { float v[]; };    // [T][6144] lc 순열
+layout(binding = 3) readonly buffer BGB { float bg[]; };  // [T][96] beta|g lc interleave
+layout(binding = 4) buffer STB { float st[]; };           // [h_v][d*d] r/w
+layout(binding = 5) writeonly buffer OB { float outv[]; }; // [T][6144] o_lc
+layout(push_constant) uniform PC {
+    uint t_len;
+    uint h_k; // 16
+    uint h_v; // 48
+    uint d;   // 128
+} pc;
+
+#define CS 64
+
+shared float16_t sk[CS * 128];
+shared float16_t sv[CS * 128];
+shared float bp[CS];
+shared float gcs[CS + 1];
+shared float wsm[CS];
+shared float16_t A[CS * CS];
+shared float16_t KQ[CS * CS];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint kh = h % pc.h_k;
+    uint tid = gl_LocalInvocationID.x;
+    uint n_chunks = (pc.t_len + CS - 1u) / CS;
+    float qscale = inversesqrt(float(pc.d));
+
+    for (uint c = 0u; c < n_chunks; c++) {
+        uint t0 = c * CS;
+        uint n = min(pc.t_len - t0, CS);
+
+        // ── 스테이징: k/v f16 + beta/g 누적합 ──
+        {
+            for (uint e = tid; e < CS * pc.d; e += 128u) {
+                uint t = e / pc.d;
+                uint dv = e % pc.d;
+                bool live = t < n;
+                float kv = live ? k[(t0 + t) * (pc.h_k * pc.d) + kh * pc.d + dv] : 0.0;
+                float vv = live ? v[(t0 + t) * (pc.h_v * pc.d) + h * pc.d + dv] : 0.0;
+                sk[e] = float16_t(kv);
+                sv[e] = float16_t(vv);
+            }
+            if (tid < CS) {
+                float acc = 0.0;
+                for (uint t = 0u; t < CS; t++) {
+                    acc += (t < n) ? bg[(t0 + t) * (2u * pc.h_v) + pc.h_v + h] : 0.0;
+                    gcs[t] = acc;
+                }
+                gcs[CS] = acc;
+                for (uint t = 0u; t < CS; t++) {
+                    bp[t] = (t < n) ? bg[(t0 + t) * (2u * pc.h_v) + h] : 0.0;
+                }
+            }
+            barrier();
+        }
+
+        // ── A / KQ 협력 빌드 (k·k, q·k 도트 — q는 글로벌 직독+scale) ──
+        {
+            for (uint p = tid; p < CS * CS; p += 128u) {
+                uint i = p / CS;
+                uint j = p % CS;
+                float dk = 0.0;
+                float dq = 0.0;
+                uint qbase = (i < n) ? (t0 + i) * (pc.h_k * pc.d) + kh * pc.d : 0u;
+                for (uint s2 = 0u; s2 < pc.d; s2++) {
+                    float ki = float(sk[i * pc.d + s2]);
+                    float kj = float(sk[j * pc.d + s2]);
+                    dk += ki * kj;
+                    if (i < n) dq += q[qbase + s2] * qscale * kj;
+                }
+                float bi = bp[i];
+                float aij = (j < i && i < n) ? dk * bi * exp(gcs[i] - gcs[j]) : 0.0;
+                A[p] = float16_t(aij);
+                float kqij = (j <= i && i < n) ? dq * exp(gcs[i] - gcs[j]) : 0.0;
+                KQ[p] = float16_t(kqij);
+            }
+            barrier();
+        }
+
+        // ── 전진 대입 + 인라인 o (CPU 원식 미러) ──
+        float dcol[CS];
+        for (uint i = 0u; i < n; i++) {
+            float bi = bp[i];
+            float gi = gcs[i];
+            float rhs = bi * float(sv[i * pc.d + tid]);
+            if (bi != 0.0) {
+                float w0 = bi * exp(gi);
+                float acc = 0.0;
+                for (uint s2 = 0u; s2 < pc.d; s2++) {
+                    acc += float(sk[i * pc.d + s2]) * st[h * pc.d * pc.d + s2 * pc.d + tid];
+                }
+                rhs -= w0 * acc;
+            }
+            dcol[i] = rhs;
+            for (uint j = 0u; j < i; j++) {
+                float aij = float(A[i * CS + j]);
+                if (aij != 0.0) dcol[i] -= aij * dcol[j];
+            }
+            float oi = 0.0;
+            uint qb = (t0 + i) * (pc.h_k * pc.d) + kh * pc.d;
+            float qe = exp(gi);
+            for (uint s2 = 0u; s2 < pc.d; s2++) {
+                oi += q[qb + s2] * qscale * st[h * pc.d * pc.d + s2 * pc.d + tid];
+            }
+            oi *= qe;
+            for (uint j = 0u; j <= i; j++) {
+                float kqij = float(KQ[i * CS + j]);
+                if (kqij != 0.0) oi += kqij * dcol[j];
+            }
+            outv[(t0 + i) * (pc.h_v * pc.d) + h * pc.d + tid] = oi;
+        }
+
+        // ── 상태 갱신 ──
+        {
+            float gl = gcs[CS];
+            float glast_exp = exp(gl);
+            if (tid < CS) {
+                wsm[tid] = (tid < n) ? exp(gl - gcs[tid]) : 0.0;
+            }
+            barrier();
+            for (uint s2 = 0u; s2 < pc.d; s2++) {
+                float acc = st[h * pc.d * pc.d + s2 * pc.d + tid] * glast_exp;
+                for (uint j = 0u; j < n; j++) {
+                    acc += float(sk[j * pc.d + s2]) * wsm[j] * dcol[j];
+                }
+                st[h * pc.d * pc.d + s2 * pc.d + tid] = acc;
+            }
+            barrier();
+        }
+    }
+}

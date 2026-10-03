@@ -11,6 +11,10 @@ copy_rows.spv	comp	-	f10b1300e8b89189
 ew_sigmoid.spv	comp	-	444a3b0c6998ba94
 exl3_ffn_ew.spv	comp	-	0bc966827ebb2e53
 exl3_ffn_ew_t.spv	comp	-	368eca7a5942762c
+exl3_gdn_conv.spv	comp	-	1006e11b5ed0957f
+exl3_gdn_gate.spv	comp	-	df8b50c66e5505c0
+exl3_gdn_l2perm.spv	comp	-	a134f0fdf568a484
+exl3_gdn_scan.spv	comp	-	e6eb0c6357060a89
 exl3_gemm2.spv	comp	-	59c01ff263cb204d
 exl3_gemv.spv	comp	-	51bf6abe3dfcdf53
 exl3_gemv_sg.spv	comp	-	a88febabd049a96e
