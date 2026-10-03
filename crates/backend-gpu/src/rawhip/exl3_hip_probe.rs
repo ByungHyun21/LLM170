@@ -1116,12 +1116,16 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
     let mut dec = Exl3HipDecoder::load(dir, lim_layers)?;
     let mut tr = TrellisResident::load(dir)?;
     let embed: Vec<f32> = tr.embed_row(tok0).to_vec();
-    let got = dec.forward(&embed)?;
-    let want = {
-        let mut seq = crate::rawvk::checks::exl3_decode::new_seq_state(tr.n_layers, 512);
-        crate::rawvk::checks::exl3_decode::decode_step(&mut tr, &mut seq, tok0)?
-    };
+    let (got, hid) = dec.forward(&embed)?;
+    let mut seq = crate::rawvk::checks::exl3_decode::new_seq_state(tr.n_layers, 512);
+    let want = crate::rawvk::checks::exl3_decode::decode_step(&mut tr, &mut seq, tok0)?;
+    let whid = seq.last_h.clone();
     drop(tr);
+    let mut hmd = 0f32;
+    for i in 0..hid.len().min(whid.len()) {
+        hmd = hmd.max((hid[i] - whid[i]).abs());
+    }
+    eprintln!("  [hiddbg] 히dden(output_norm 전) maxdiff={hmd:.3e}");
     let mut md = 0f32;
     let (mut ga, mut wa) = (0usize, 0usize);
     for i in 0..got.len() {

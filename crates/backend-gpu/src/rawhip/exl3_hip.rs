@@ -305,7 +305,7 @@ impl Exl3HipDecoder {
     }
 
     /// 1토큰 forward → 로짓. ew(silu·mul)는 호스트(정확성 우선 — 추후 커널화).
-    pub fn forward(&mut self, embed_row: &[f32]) -> Result<Vec<f32>, String> {
+    pub fn forward(&mut self, embed_row: &[f32]) -> Result<(Vec<f32>, Vec<f32>), String> {
         let n_layers = self.loaded_layers.min(self.n_layers);
         let f32b =
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
@@ -602,7 +602,29 @@ impl Exl3HipDecoder {
             }
             self.hc.h2d(dew, f32b(&ew))?;
             self.gemv_chain(&ld, dew, dab)?;
+            {
+                let mut xb = vec![0u8; self.hidden * 4];
+                self.hc.d2h(&mut xb, self.dx)?;
+                self.hc.sync()?;
+                // SAFETY: d2h 완료 후 재해석.
+                let xf: &[f32] =
+                    unsafe { std::slice::from_raw_parts(xb.as_ptr() as *const f32, self.hidden) };
+                let r = (xf.iter().map(|v| v * v).sum::<f32>() / self.hidden as f32).sqrt();
+                eprintln!("  [hipl] L{il} post-ffn rms={r:.5}");
+                if il == 0 {
+                    let mut fb = vec![0u8; 8];
+                    self.hc.d2h(&mut fb, self.dab)?;
+                    self.hc.sync()?;
+                    // SAFETY: d2h 완료 후 재해석.
+                    let ff: &[f32] =
+                        unsafe { std::slice::from_raw_parts(fb.as_ptr() as *const f32, 2) };
+                    eprintln!("  [hipl] L0 down[0..2]={ff:?}");
+                }
+            }
         }
+        let mut hb = vec![0u8; self.hidden * 4];
+        self.hc.d2h(&mut hb, self.dx)?;
+        self.hc.sync()?;
         self.norm(128, self.dab)?;
         let lh_key = "lm_head".to_string();
         let llh = HipLin {
@@ -618,10 +640,17 @@ impl Exl3HipDecoder {
         self.hc.d2h(&mut lb, self.dyb)?;
         self.hc.sync()?;
         // SAFETY: d2h 완료 후 재해석.
-        Ok(unsafe { std::slice::from_raw_parts(lb.as_ptr() as *const f32, llh.n).to_vec() })
+        let logits =
+            unsafe { std::slice::from_raw_parts(lb.as_ptr() as *const f32, llh.n).to_vec() };
+        let hidden =
+            unsafe { std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden).to_vec() };
+        Ok((logits, hidden))
     }
 }
 // 마커 mod1
 // 마커 ll
 // 마커 l2d
 // 마커 chk
+// 마커 hid
+// 마커 rms1
+// 마커 dcmp
