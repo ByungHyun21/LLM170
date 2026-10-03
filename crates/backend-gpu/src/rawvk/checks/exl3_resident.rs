@@ -2172,6 +2172,19 @@ impl TrellisResident {
         Ok(())
     }
 
+    /// 어텐션 q/k_norm 가중치(hip 프로브용) — 12층분 각 [256].
+    pub fn attn_norms_dump(&mut self) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let mut q = Vec::with_capacity(16 * 256);
+        let mut k = Vec::with_capacity(16 * 256);
+        for ai in 0..16usize {
+            let il = (ai * 4 + 3) as usize;
+            let lp = format!("model.language_model.layers.{il}");
+            q.extend(self.norm(&format!("{lp}.self_attn.q_norm.weight")).ok_or("qnw")?);
+            k.extend(self.norm(&format!("{lp}.self_attn.k_norm.weight")).ok_or("knw")?);
+        }
+        Ok((q, k))
+    }
+
     /// fframe nw128 판독(hip 프로브용).
     pub fn nw128_dump(&mut self) -> Result<Vec<f32>, String> {
         self.fframe_init()?;

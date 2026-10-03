@@ -883,3 +883,200 @@ pub fn hip_gdn_check(dir: &str) -> Result<String, String> {
     ))
 }
 // 마커 gdn1
+
+
+// ── EXL3 hip 어텐션 체인 프로브(모듈 6-7) ── prep→fwd3, Rust 미러 대조.
+pub fn hip_attn_check(dir: &str) -> Result<String, String> {
+    use crate::rawvk::checks::TrellisResident;
+    let t_rows = 8usize;
+    let pos0 = 0usize;
+    let layer = 0usize;
+    let mut tr = TrellisResident::load(dir)?;
+    let (qnw, knw) = tr.attn_norms_dump()?;
+    drop(tr);
+    let mut seed: u32 = 0xA77E_2024;
+    let rnd = |s: &mut u32| {
+        *s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((*s >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
+    };
+    let qg: Vec<f32> = (0..t_rows * 12288).map(|_| rnd(&mut seed) * 0.5).collect();
+    let kin: Vec<f32> = (0..t_rows * 1024).map(|_| rnd(&mut seed) * 0.4).collect();
+    let vin: Vec<f32> = (0..t_rows * 1024).map(|_| rnd(&mut seed) * 0.4).collect();
+
+    let rope = |hd: &mut [f32; 256], pos: usize| {
+        for tid in 0..32usize {
+            let theta = 1e7f32.powf(-(2.0 * tid as f32) / 64.0);
+            let ang = pos as f32 * theta;
+            let (c, s2) = (ang.cos(), ang.sin());
+            let (x0, x1) = (hd[tid], hd[tid + 32]);
+            hd[tid] = x0 * c - x1 * s2;
+            hd[tid + 32] = x0 * s2 + x1 * c;
+        }
+    };
+    let mut qh = vec![0f32; t_rows * 6144];
+    let mut kc = vec![0f32; 16 * 1024 * 1024];
+    let mut vc = vec![0f32; 16 * 1024 * 1024];
+    for t in 0..t_rows {
+        let pos = pos0 + t;
+        for j in 0..24usize {
+            let mut hd = [0f32; 256];
+            let src = t * 12288 + j * 512;
+            for i in 0..256 {
+                hd[i] = qg[src + i];
+            }
+            let ss: f32 = hd.iter().map(|v| v * v).sum::<f32>() / 256.0;
+            let inv = 1.0 / (ss + 1e-6).sqrt();
+            for i in 0..256 {
+                hd[i] *= inv * qnw[layer * 256 + i];
+            }
+            rope(&mut hd, pos);
+            for i in 0..256 {
+                qh[t * 6144 + j * 256 + i] = hd[i];
+            }
+        }
+        for m in 0..4usize {
+            let mut hd = [0f32; 256];
+            let src = t * 1024 + m * 256;
+            for i in 0..256 {
+                hd[i] = kin[src + i];
+            }
+            let ss: f32 = hd.iter().map(|v| v * v).sum::<f32>() / 256.0;
+            let inv = 1.0 / (ss + 1e-6).sqrt();
+            for i in 0..256 {
+                hd[i] *= inv * knw[layer * 256 + i];
+            }
+            rope(&mut hd, pos);
+            let dst = (layer * 1024 + pos) * 1024 + m * 256;
+            for i in 0..256 {
+                kc[dst + i] = hd[i];
+                vc[dst + i] = vin[src + i];
+            }
+        }
+    }
+    let mut want = vec![0f32; t_rows * 6144];
+    for t in 0..t_rows {
+        let lim = pos0 + t + 1;
+        for h in 0..24usize {
+            let kh = h / 6;
+            let mut sc = vec![0f32; lim];
+            let mut mx = -1e30f32;
+            for row in 0..lim {
+                let mut p = 0f32;
+                for d in 0..256 {
+                    p += qh[t * 6144 + h * 256 + d]
+                        * kc[(layer * 1024 + row) * 1024 + kh * 256 + d];
+                }
+                sc[row] = p * 0.0625;
+                mx = mx.max(sc[row]);
+            }
+            let mut ws = 0f32;
+            for row in 0..lim {
+                sc[row] = (sc[row] - mx).exp();
+                ws += sc[row];
+            }
+            let mut acc = vec![0f32; 256];
+            for row in 0..lim {
+                let w = sc[row];
+                for d in 0..256 {
+                    acc[d] += w * vc[(layer * 1024 + row) * 1024 + kh * 256 + d];
+                }
+            }
+            for d in 0..256 {
+                let g = qg[t * 12288 + h * 512 + 256 + d];
+                let sg2 = 1.0 / (1.0 + (-g).exp());
+                want[t * 6144 + h * 256 + d] = (acc[d] / ws) * sg2;
+            }
+        }
+    }
+
+    let hc = HipCtx::new()?;
+    let f32b = |v: &[f32]| unsafe {
+        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
+    };
+    let dqg = hc.alloc(t_rows * 12288 * 4)?;
+    let dkin = hc.alloc(t_rows * 1024 * 4)?;
+    let dvin = hc.alloc(t_rows * 1024 * 4)?;
+    let dqnw = hc.alloc(qnw.len() * 4)?;
+    let dknw = hc.alloc(knw.len() * 4)?;
+    let dqh = hc.alloc(t_rows * 6144 * 4)?;
+    let dkc = hc.alloc(16 * 1024 * 1024 * 4)?;
+    let dvc = hc.alloc(16 * 1024 * 1024 * 4)?;
+    let dou = hc.alloc(t_rows * 6144 * 4)?;
+    let dpp = hc.alloc(4)?;
+    let mut ppv = pos0 as u32;
+    hc.h2d(dqg, f32b(&qg))?;
+    hc.h2d(dkin, f32b(&kin))?;
+    hc.h2d(dvin, f32b(&vin))?;
+    hc.h2d(dqnw, f32b(&qnw))?;
+    hc.h2d(dknw, f32b(&knw))?;
+    hc.h2d(dpp, &ppv.to_le_bytes())?;
+    let z = vec![0u8; 16 * 1024 * 1024 * 4];
+    hc.h2d(dkc, &z)?;
+    hc.h2d(dvc, &z)?;
+    let mut tl = t_rows as i32;
+    let mut p0 = pos0 as i32;
+    let mut lay = layer as i32;
+    let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) =
+        (dqg, dkin, dvin, dqnw, dknw, dqh, dkc, dvc, dpp);
+    hc.launch3(
+        "exl3_attn_prep",
+        t_rows as u32,
+        28,
+        1,
+        128,
+        &mut [
+            &mut a0 as *mut *mut u8 as *mut _,
+            &mut a1 as *mut *mut u8 as *mut _,
+            &mut a2 as *mut *mut u8 as *mut _,
+            &mut a3 as *mut *mut u8 as *mut _,
+            &mut a4 as *mut *mut u8 as *mut _,
+            &mut a5 as *mut *mut u8 as *mut _,
+            &mut a6 as *mut *mut u8 as *mut _,
+            &mut a7 as *mut *mut u8 as *mut _,
+            &mut a8 as *mut *mut u8 as *mut _,
+            &mut tl as *mut i32 as *mut _,
+            &mut p0 as *mut i32 as *mut _,
+            &mut lay as *mut i32 as *mut _,
+        ],
+    )?;
+    let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5) =
+        (dqh, dkc, dvc, dqg, dou, dpp);
+    hc.launch3(
+        "exl3_attn_fwd3",
+        t_rows.div_ceil(4) as u32,
+        24,
+        1,
+        256,
+        &mut [
+            &mut b0 as *mut *mut u8 as *mut _,
+            &mut b1 as *mut *mut u8 as *mut _,
+            &mut b2 as *mut *mut u8 as *mut _,
+            &mut b3 as *mut *mut u8 as *mut _,
+            &mut b4 as *mut *mut u8 as *mut _,
+            &mut b5 as *mut *mut u8 as *mut _,
+            &mut tl as *mut i32 as *mut _,
+            &mut p0 as *mut i32 as *mut _,
+            &mut lay as *mut i32 as *mut _,
+        ],
+    )?;
+    let mut outb = vec![0u8; t_rows * 6144 * 4];
+    hc.d2h(&mut outb, dou)?;
+    hc.sync()?;
+    let _ = &mut ppv;
+    // SAFETY: d2h 완료 후 재해석.
+    let got: &[f32] =
+        unsafe { std::slice::from_raw_parts(outb.as_ptr() as *const f32, t_rows * 6144) };
+    let mut md = 0f32;
+    let mut nan = 0usize;
+    for i in 0..got.len() {
+        if !got[i].is_finite() {
+            nan += 1;
+            continue;
+        }
+        md = md.max((got[i] - want[i]).abs());
+    }
+    Ok(format!(
+        "hip-attn T={t_rows}: maxdiff={md:.3e} nan={nan}"
+    ))
+}
+// 마커 at1
