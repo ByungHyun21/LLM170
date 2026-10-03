@@ -69,10 +69,16 @@ impl RawCtx {
         if nolaunch_on() {
             return Ok(());
         }
-        let f = *self
-            .fns
-            .get(name)
-            .ok_or_else(|| format!("커널 없음: {name}"))?;
+        let f = *self.fns.get(name).ok_or_else(|| {
+            if name.starts_with("exl3") {
+                eprintln!(
+                    "  [hipdbg] fns={} exl3 keys: {}",
+                    self.fns.len(),
+                    self.fns.keys().filter(|k| k.contains("exl3")).count()
+                );
+            }
+            format!("커널 없음: {name}")
+        })?;
         unsafe {
             // plans/116-1: 커널이 cur_stream(프리필 pair=stream3)로 가는데
             // 이벤트를 self.stream에 찍으면 측정이 엉뚱한 커널로 귀속된다

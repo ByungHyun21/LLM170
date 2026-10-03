@@ -114,6 +114,13 @@ impl RawCtx {
     ) -> Result<(), String> {
         // SAFETY: 초기화 경로(단일 스레드).
         unsafe {
+            if llm170_diag::dump::opts().key("exl3_hipdbg") {
+                eprintln!(
+                    "  [rtcdbg] NAMES={} src_has_exl3={}",
+                    kernels::NAMES.len(),
+                    kernels::SRC.contains("exl3_had_in")
+                );
+            }
             let src = CString::new(kernels::SRC).unwrap();
             let mut prog: hip::hiprtcProgram = std::ptr::null_mut();
             let rs = hip::hiprtcCreateProgram(
@@ -327,6 +334,13 @@ impl RawCtx {
             let _ = hip::hipSetDeviceFlags(hip::hipDeviceScheduleSpin);
             let mut fns = HashMap::new();
             Self::compile_rtc(&mut fns)?;
+            if llm170_diag::dump::opts().key("exl3_hipdbg") {
+                eprintln!(
+                    "  [rtcdbg] post-compile fns={} exl3: {}",
+                    fns.len(),
+                    fns.keys().filter(|k| k.contains("exl3")).count()
+                );
+            }
             let fam_bits = Self::load_co_families(&mut fns)?;
             let mut stream: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream), "StreamCreate")?;
