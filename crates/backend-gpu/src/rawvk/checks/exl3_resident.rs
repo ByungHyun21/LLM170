@@ -1329,4 +1329,17 @@ impl TrellisResident {
         self.ctx.flush_range(&gf.gring, 3 * 10240 * 4);
         Ok(())
     }
+
+    /// yb 슬롯 선두 값 판독(디버그) — invalidate 후 읽음.
+    pub fn read_yb_head(&mut self, slot: usize, count: usize) -> Vec<f32> {
+        let b = match self.batch.as_ref() { Some(b) => b, None => return vec![] };
+        if slot >= 3 { return vec![]; }
+        self.ctx.invalidate_range(&b.yb[slot], count * 4);
+        let mut out = vec![0f32; count];
+        unsafe {
+            std::ptr::copy_nonoverlapping(b.yb[slot].ptr as *const f32, out.as_mut_ptr(), count);
+        }
+        out
+    }
+
 }
