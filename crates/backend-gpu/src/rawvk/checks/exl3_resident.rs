@@ -676,7 +676,9 @@ impl TrellisResident {
         }
 
         // gemm2(coopmat): ah × tre → sb ([T][n], nseg=1 — k-분할 없음,
-        // grid=(n/64, ceil(T/64))). 스칼라 gemm(믹스 ~48%) 대체 — 원장 #2.
+        // grid=(n/64, ceil(T/128))). II-3(reconstruct+hgemm)은 측정 부정
+        // (2026-10-03: 56.2 vs 71.2 t/s — 재구성 트래픽+디스패치가 이득
+        // 상쇄, BN=128 gemm2는 이미 디코드를 128토큰에 상각) — 원장 참조。
         {
             let ktiles = (k / 16) as u32;
             let ntiles = (n / 16) as u32;
