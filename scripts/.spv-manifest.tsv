@@ -14,7 +14,7 @@ exl3_ffn_ew_t.spv	comp	-	368eca7a5942762c
 exl3_gdn_conv.spv	comp	-	c051a0cfa3182d3e
 exl3_gdn_gate.spv	comp	-	f21033edaac3d9d8
 exl3_gdn_l2perm.spv	comp	-	2c39026d033092e5
-exl3_gdn_scan.spv	comp	-	6212c7e266c8ae43
+exl3_gdn_scan.spv	comp	-	c1571cac0bcbb1cc
 exl3_gemm2.spv	comp	-	59c01ff263cb204d
 exl3_gemv.spv	comp	-	51bf6abe3dfcdf53
 exl3_gemv_sg.spv	comp	-	a88febabd049a96e
