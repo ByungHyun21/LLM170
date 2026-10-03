@@ -560,7 +560,8 @@ impl TrellisResident {
 pub const BATCH_TMAX: usize = 512;
 
 fn n_gdn_bytes() -> usize {
-    48 * 48 * 16384 * 4
+    // gstate 151MB + gring(conv 링, 롤백 정합 — 재생 NaN 원인 2026-10-03)
+    48 * 48 * 16384 * 4 + 48 * 3 * 10240 * 4
 }
 
 /// T-배치 스크래치 — 슬롯 3종(GEMV ahb/yb 관례와 동일 구조, run_rw
@@ -1844,7 +1845,17 @@ impl TrellisResident {
                 g.gstate.bytes,
             )
         };
-        self.ctx.copy_dev(&[(src, 0, dst, 0, n as u64)])
+        let _ = n;
+        let (gs, gr, gn) = {
+            let b = self.batch.as_ref().ok_or("batch")?;
+            let g = b.gframe.as_ref().ok_or("gframe")?;
+            (g.gstate.buf, g.gring.buf, g.gstate.bytes)
+        };
+        let rn = 48 * 3 * 10240 * 4;
+        self.ctx.copy_dev(&[
+            (gs, 0, dst, 0, gn as u64),
+            (gr, 0, dst, gn as u64, rn as u64),
+        ])
     }
 
     /// 스냅샷 복원(발산 라운드 — kvc는 재실행이 정확히 덮으므로 미복원).
@@ -1859,7 +1870,17 @@ impl TrellisResident {
                 g.gstate.bytes,
             )
         };
-        self.ctx.copy_dev(&[(src, 0, dst, 0, n as u64)])
+        let _ = n;
+        let (gs, gr, gn) = {
+            let b = self.batch.as_ref().ok_or("batch")?;
+            let g = b.gframe.as_ref().ok_or("gframe")?;
+            (g.gstate.buf, g.gring.buf, g.gstate.bytes)
+        };
+        let rn = 48 * 3 * 10240 * 4;
+        self.ctx.copy_dev(&[
+            (dst, gn as u64, gs, 0, gn as u64),
+            (dst, gn as u64, gr, 0, rn as u64),
+        ])
     }
 
     /// 잔차 버퍼 포인터 — 호출자가 임베딩 행을 직접 기록한다.
