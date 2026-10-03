@@ -17,6 +17,7 @@ layout(binding = 1) readonly buffer KKC { float kc[]; };   // [cap][1024]
 layout(binding = 2) readonly buffer VKC { float vc[]; };   // [cap][1024]
 layout(binding = 3) readonly buffer QGB { float qg[]; };   // [T][12288] gate
 layout(binding = 4) writeonly buffer OB { float outv[]; }; // [T][6144]
+layout(binding = 5) readonly buffer PB { uint pp[]; }; // [1] = pos0(재생용)
 layout(push_constant) uniform PC {
     uint t_len;
     uint pos0;
@@ -43,7 +44,7 @@ void main() {
     uint lim[TB];
     for (uint tl = 0u; tl < TB; tl++) {
         uint t = tb + tl;
-        lim[tl] = (t < pc.t_len) ? (pc.pos0 + t + 1u) : 0u;
+        lim[tl] = (t < pc.t_len) ? (pp[0] + t + 1u) : 0u;
     }
     uint lmax = 0u;
     for (uint tl = 0u; tl < TB; tl++) {

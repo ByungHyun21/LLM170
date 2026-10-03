@@ -62,6 +62,13 @@ pub struct VkCtx {
     pub nobar_next: std::cell::Cell<bool>,
     /// plans/93: 커맨드 버퍼 재생 모드 — true면 begin_batch/run을 스킵하고 end_batch_wait만 제출.
     pub replay_mode: std::cell::Cell<bool>,
+    /// 스펙 verify 재생(plans/121 tg): 형상 키별 녹화 커맨드 버퍼.
+    frame_cbs:
+        std::cell::RefCell<std::collections::HashMap<u32, (vk::CommandPool, vk::CommandBuffer)>>,
+    record_only: std::cell::Cell<bool>,
+    qf_saved: std::cell::Cell<u32>,
+    saved_cb: std::cell::Cell<vk::CommandBuffer>,
+    saved_pool: std::cell::Cell<vk::CommandPool>,
     /// plans/93: 커맨드 버퍼 녹화 완료 플래그(재생 모드 진입 판정).
     pub batch_recorded: std::cell::Cell<bool>,
     /// 107 W1.5-2 — 스텝 타임라인: 배치 녹화 시작 시각(프레임 경계
@@ -328,6 +335,11 @@ impl VkCtx {
                 ts_period_val,
                 nobar_next: std::cell::Cell::new(false),
                 replay_mode: std::cell::Cell::new(false),
+                frame_cbs: std::cell::RefCell::new(std::collections::HashMap::new()),
+                record_only: std::cell::Cell::new(false),
+                qf_saved: std::cell::Cell::new(qf),
+                saved_cb: std::cell::Cell::new(vk::CommandBuffer::null()),
+                saved_pool: std::cell::Cell::new(vk::CommandPool::null()),
                 batch_recorded: std::cell::Cell::new(false),
                 batch_t0: std::cell::Cell::new(None),
                 since_r: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -648,6 +660,15 @@ impl VkCtx {
         let replaying = self.replay_mode.get();
         self.batching
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // 스펙 재생 녹화(plans/121 tg) — 제출 없이 종료 후 원복.
+        if self.record_only.get() {
+            unsafe {
+                self.device
+                    .end_command_buffer(self.cmdbuf2)
+                    .map_err(|e| format!("프레임 녹화 종료: {e:?}"))?;
+            }
+            return Ok(());
+        }
         // 107 W1.5-1 — 이중버퍼: 직전 보류 대기(fence 재사용 전제) 후
         // 제출만 하고 즉시 반환. 호스트는 다음 배치 기록(교대 버퍼)으로
         // 진행 — 판독 필요 시 wait_pending이 완료를 보장.
@@ -1698,6 +1719,7 @@ thread_local! {
 /// 어느 서브시스템이 예산을 쓰는지 구분한다. 기본 "misc".
 /// plans/87 §2/§3 — op 태그(와치독 링·슬롯 타임 라벨)도 함께 산다.
 pub mod site {
+    use ash::vk;
     use std::cell::Cell;
 
     thread_local! {
@@ -1739,6 +1761,82 @@ pub mod site {
         static BATCH_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
+    impl super::VkCtx {
+        /// 형상 키 녹화 존재 여부(재생 경로 판정).
+        pub fn frame_has(&self, key: u32) -> bool {
+            self.frame_cbs.borrow().contains_key(&key)
+        }
+
+        /// 녹화 시작 — cmdbuf2를 프레임 전용 버퍼로 교체(호출부는 그대로
+        /// begin_outer/루프/end_outer 사용). 첫 실행은 실제 수행을 겸한다.
+        pub fn frame_record_begin(&mut self, key: u32) -> Result<(), String> {
+            if self.frame_cbs.borrow().contains_key(&key) {
+                return Err("이미 녹화됨".into());
+            }
+            unsafe {
+                let pool = self
+                    .device
+                    .create_command_pool(
+                        &vk::CommandPoolCreateInfo::default()
+                            .queue_family_index(self.qf_saved.get()),
+                        None,
+                    )
+                    .map_err(|e| format!("프레임 풀: {e:?}"))?;
+                let cb = self
+                    .device
+                    .allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )
+                    .map_err(|e| format!("프레임 cb: {e:?}"))?[0];
+                self.saved_cb.set(self.cmdbuf2);
+                self.saved_pool.set(pool);
+                self.cmdbuf2 = cb;
+                self.record_only.set(true);
+            }
+            Ok(())
+        }
+
+        /// 녹화 종료 저장(end_outer 후 호출 — cb는 이미 end됨).
+        pub fn frame_record_end(&mut self, key: u32) -> Result<(), String> {
+            let cb = self.cmdbuf2;
+            self.cmdbuf2 = self.saved_cb.get();
+            self.record_only.set(false);
+            let pool = self.saved_pool.get();
+            self.frame_cbs.borrow_mut().insert(key, (pool, cb));
+            Ok(())
+        }
+
+        /// 녹화 프레임 재생(제출+펜스 대기 — 호스트는 pbuf/입력 버퍼 선기록).
+        pub fn frame_replay(&mut self, key: u32) -> Result<(), String> {
+            let cb = self
+                .frame_cbs
+                .borrow()
+                .get(&key)
+                .map(|&(_, c)| c)
+                .ok_or("미녹화 키")?;
+            unsafe {
+                let fence = self
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+                    .map_err(|e| format!("재생 펜스: {e:?}"))?;
+                let cbs = [cb];
+                let si = vk::SubmitInfo::default().command_buffers(&cbs);
+                self.device
+                    .queue_submit(self.queue, std::slice::from_ref(&si), fence)
+                    .map_err(|e| format!("재생 제출: {e:?}"))?;
+                self.device
+                    .wait_for_fences(&[fence], true, u64::MAX)
+                    .map_err(|e| format!("재생 대기: {e:?}"))?;
+                self.device.destroy_fence(fence, None);
+                self.submits.set(self.submits.get() + 1);
+            }
+            Ok(())
+        }
+    }
+
     pub fn depth_inc() -> u32 {
         BATCH_DEPTH.with(|d| {
             let v = d.get() + 1;
@@ -1755,3 +1853,4 @@ pub mod site {
         })
     }
 }
+// 마커 replay

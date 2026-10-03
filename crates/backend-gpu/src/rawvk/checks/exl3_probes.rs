@@ -405,8 +405,13 @@ pub fn attn_check(t_len: usize, pos0: usize) -> Result<String, String> {
     for b in [&b_qg, &b_k, &b_v, &b_qnw, &b_knw] {
         ctx.flush_buf(b);
     }
-    let pp = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_prep.spv"), 8, 8)?;
-    let pf = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd3.spv"), 5, 8)?;
+    let ppb = ctx.alloc_host_cached(16)?;
+    unsafe {
+        std::ptr::write_bytes(ppb.ptr, 0, 16);
+    }
+    ctx.flush_buf(&ppb);
+    let pp = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_prep.spv"), 9, 8)?;
+    let pf = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd3.spv"), 6, 8)?;
 
     let run = |ctx: &mut VkCtx| -> Result<(), String> {
         ctx.begin_batch()?;
