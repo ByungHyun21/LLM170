@@ -22,6 +22,7 @@ exl3_gdn_gate.spv	comp	-	f21033edaac3d9d8
 exl3_gdn_l2perm.spv	comp	-	2c39026d033092e5
 exl3_gdn_scan.spv	comp	-	c1571cac0bcbb1cc
 exl3_gemm2.spv	comp	-	59c01ff263cb204d
+exl3_gemm2d.spv	comp	-	9f841ce8f46fa894
 exl3_gemv.spv	comp	-	51bf6abe3dfcdf53
 exl3_gemv_sg.spv	comp	-	a88febabd049a96e
 exl3_had_in.spv	comp	-	0c0146c4d97ada08
@@ -29,6 +30,7 @@ exl3_had_in_t.spv	comp	-	b18727b41d56ef08
 exl3_had_in_tf32.spv	comp	-	2ac248631c50b4c6
 exl3_had_out.spv	comp	-	5473f25b5dd58dc8
 exl3_had_out_t.spv	comp	-	677b09093a83c74a
+exl3_had_out_td.spv	comp	-	fee6460e8a0c3e83
 fn_argmax_rows.spv	comp	-	6ea8a5b960c1d834
 fn_emb_q8g.spv	comp	-	b5fb4e2d7a683cb3
 fn_emb_q8g_f16.spv	comp	-	4fd775b10899f11c
