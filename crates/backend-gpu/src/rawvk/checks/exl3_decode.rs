@@ -2308,9 +2308,11 @@ fn frame_spec_forward(
         let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
         let ab = if il % 4 == 3 {
             let ai = il / 4;
-            let yq = tr.linear_chain(&format!("{lp}.self_attn.q_proj"), t_rows, 0)?;
-            let yk = tr.linear_chain(&format!("{lp}.self_attn.k_proj"), t_rows, 1)?;
-            let yv = tr.linear_chain(&format!("{lp}.self_attn.v_proj"), t_rows, 2)?;
+            // 공유 had_in(plans/121 tg): q/k/v가 같은 xtb — WHT 1회.
+            tr.stage_ah(&format!("{lp}.self_attn.q_proj"), t_rows, 0)?;
+            let yq = tr.linear_chain_gemmonly(&format!("{lp}.self_attn.q_proj"), t_rows, 0)?;
+            let yk = tr.linear_chain_gemmonly(&format!("{lp}.self_attn.k_proj"), t_rows, 1)?;
+            let yv = tr.linear_chain_gemmonly(&format!("{lp}.self_attn.v_proj"), t_rows, 2)?;
             tr.attn_layer_gpu(ai, t_rows, pos0, yq.0, yk.0, yv.0)?;
             seq.kv[ai].len = (pos0 + t_rows as u32) as usize;
             tr.linear_chain(&format!("{lp}.self_attn.o_proj"), t_rows, 0)?
@@ -2320,8 +2322,11 @@ fn frame_spec_forward(
                 let g = &seq.gdn[il];
                 tr.gdn_state_upload(gdn_il, &g.states, &g.conv)?;
             }
-            let yq = tr.linear_chain(&format!("{lp}.linear_attn.in_proj_qkv"), t_rows, 0)?;
-            let yz = tr.linear_chain(&format!("{lp}.linear_attn.in_proj_z"), t_rows, 1)?;
+            // 공유 had_in: qkv/z 같은 xtb.
+            tr.stage_ah(&format!("{lp}.linear_attn.in_proj_qkv"), t_rows, 0)?;
+            let yq =
+                tr.linear_chain_gemmonly(&format!("{lp}.linear_attn.in_proj_qkv"), t_rows, 0)?;
+            let yz = tr.linear_chain_gemmonly(&format!("{lp}.linear_attn.in_proj_z"), t_rows, 1)?;
             tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yq.0, yz.0)?;
             tr.linear_chain(&format!("{lp}.linear_attn.out_proj"), t_rows, 0)?
                 .0
@@ -2604,3 +2609,4 @@ pub fn exl3_mtp2(
 // 마커 r1diff
 // 마커 dblnorm
 // 마커 ls2
+// 마커 share1
