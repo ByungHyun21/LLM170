@@ -178,3 +178,174 @@ pub fn hip_gemv_check(dir: &str) -> Result<String, String> {
     ))
 }
 // 마커 hippr1
+
+// ── EXL3 hip norm_resid 격리 프로브(모듈 2/4) ── vk nr 산술과 동일 입력 대조.
+pub fn hip_nr_check(dir: &str) -> Result<String, String> {
+    use crate::rawvk::checks::TrellisResident;
+    let t_rows = 4usize;
+    let mut tr = TrellisResident::load(dir)?;
+    tr.fframe_init()?;
+    let nw = tr.nw128_dump()?;
+    drop(tr);
+    let mut seed: u32 = 0x1234_ABCD;
+    let rnd = |s: &mut u32| {
+        *s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((*s >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
+    };
+    let (x, ab): (Vec<f32>, Vec<f32>) = (
+        (0..t_rows * 5120).map(|_| rnd(&mut seed)).collect(),
+        (0..t_rows * 5120).map(|_| rnd(&mut seed)).collect(),
+    );
+    let hc = HipCtx::new()?;
+    let dx = hc.alloc(t_rows * 5120 * 4)?;
+    let dab = hc.alloc(t_rows * 5120 * 4)?;
+    let dnw = hc.alloc(5120 * 4)?;
+    let dxn = hc.alloc(t_rows * 5120 * 4)?;
+    let xb: &[u8] =
+        unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, t_rows * 5120 * 4) };
+    let abb: &[u8] =
+        unsafe { std::slice::from_raw_parts(ab.as_ptr() as *const u8, t_rows * 5120 * 4) };
+    let nwb: &[u8] = unsafe { std::slice::from_raw_parts(nw.as_ptr() as *const u8, 5120 * 4) };
+    hc.h2d(dx, xb)?;
+    hc.h2d(dab, abb)?;
+    hc.h2d(dnw, nwb)?;
+    // 시그니처 순서: (x, nw, ab, xn, t_len, w_off)
+    let (mut tl, mut wo) = (t_rows as i32, 0i32);
+    let (mut p_x, mut p_nw, mut p_ab, mut p_xn) = (dx, dnw, dab, dxn);
+    hc.launch(
+        "exl3_norm_resid",
+        t_rows as u32,
+        1,
+        1024,
+        &mut [
+            &mut p_x as *mut *mut u8 as *mut _,
+            &mut p_nw as *mut *mut u8 as *mut _,
+            &mut p_ab as *mut *mut u8 as *mut _,
+            &mut p_xn as *mut *mut u8 as *mut _,
+            &mut tl as *mut i32 as *mut _,
+            &mut wo as *mut i32 as *mut _,
+        ],
+    )?;
+    let mut outb = vec![0u8; t_rows * 5120 * 4];
+    hc.d2h(&mut outb, dxn)?;
+    hc.sync()?;
+    // SAFETY: d2h 완료 후 재해석.
+    let got: &[f32] =
+        unsafe { std::slice::from_raw_parts(outb.as_ptr() as *const f32, t_rows * 5120) };
+    let mut want_xn = vec![0f32; t_rows * 5120];
+    for t in 0..t_rows {
+        let ss: f32 = (0..5120)
+            .map(|i| {
+                let v = x[t * 5120 + i] + ab[t * 5120 + i];
+                v * v
+            })
+            .sum();
+        let inv = 1.0 / (ss / 5120.0 + 1e-6).sqrt();
+        for i in 0..5120 {
+            want_xn[t * 5120 + i] = (x[t * 5120 + i] + ab[t * 5120 + i]) * inv * nw[i];
+        }
+    }
+    let mut md = 0f32;
+    for i in 0..t_rows * 5120 {
+        md = md.max((got[i] - want_xn[i]).abs());
+    }
+    Ok(format!("hip-nr T={t_rows}: xn maxdiff={md:.3e}"))
+}
+// 마커 nrhip
+
+// ── EXL3 hip 실선형 체인 프로브(모듈 3/4) ── 실제 가중치로 had_in→gemv→had_out.
+pub fn hip_linear_check(dir: &str, key: &str) -> Result<String, String> {
+    use crate::rawvk::checks::TrellisResident;
+    let mut tr = TrellisResident::load(dir)?;
+    let (k, n, krate, suh, tre, svh) = tr.linear_raw(key)?;
+    let x: Vec<f32> = {
+        let mut seed: u32 = 0x77AA_0011;
+        (0..k)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f32 / 16_777_216.0 - 0.5) * 0.3
+            })
+            .collect()
+    };
+    let want = tr.linear(key, &x)?;
+    drop(tr);
+    let hc = HipCtx::new()?;
+    let nseg = 16usize;
+    let dx = hc.alloc(k * 4)?;
+    let dsuh = hc.alloc(suh.len())?;
+    let dtre = hc.alloc(tre.len())?;
+    let dsvh = hc.alloc(svh.len())?;
+    let dah = hc.alloc(k * 2)?;
+    let dsb = hc.alloc(nseg * n * 4)?;
+    let dy = hc.alloc(n * 4)?;
+    let xb: &[u8] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+    hc.h2d(dx, xb)?;
+    hc.h2d(dsuh, &suh)?;
+    hc.h2d(dtre, &tre)?;
+    hc.h2d(dsvh, &svh)?;
+    let (mut kc, mut ks) = ((k / 128) as i32, k as i32);
+    let (mut p0, mut p1, mut p2) = (dx, dsuh, dah);
+    hc.launch(
+        "exl3_had_in",
+        (k / 128) as u32,
+        1,
+        128,
+        &mut [
+            &mut p0 as *mut *mut u8 as *mut _,
+            &mut p1 as *mut *mut u8 as *mut _,
+            &mut p2 as *mut *mut u8 as *mut _,
+            &mut kc as *mut i32 as *mut _,
+            &mut ks as *mut i32 as *mut _,
+        ],
+    )?;
+    let (mut kt, mut nt, mut kk) = ((k / 16) as i32, (n / 16) as i32, krate as i32);
+    let (mut g0, mut g1, mut g2) = (dah, dtre, dsb);
+    hc.launch(
+        "exl3_gemv",
+        ((n / 16) / 8) as u32,
+        nseg as u32,
+        128,
+        &mut [
+            &mut g0 as *mut *mut u8 as *mut _,
+            &mut g1 as *mut *mut u8 as *mut _,
+            &mut g2 as *mut *mut u8 as *mut _,
+            &mut kt as *mut i32 as *mut _,
+            &mut nt as *mut i32 as *mut _,
+            &mut kk as *mut i32 as *mut _,
+        ],
+    )?;
+    let (mut nch, mut nsg, mut nst) = ((n / 128) as i32, nseg as i32, n as i32);
+    let (mut c0, mut c1, mut c2) = (dsb, dsvh, dy);
+    hc.launch(
+        "exl3_had_out",
+        (n / 128) as u32,
+        1,
+        128,
+        &mut [
+            &mut c0 as *mut *mut u8 as *mut _,
+            &mut c1 as *mut *mut u8 as *mut _,
+            &mut c2 as *mut *mut u8 as *mut _,
+            &mut nch as *mut i32 as *mut _,
+            &mut nsg as *mut i32 as *mut _,
+            &mut nst as *mut i32 as *mut _,
+        ],
+    )?;
+    let mut yb = vec![0u8; n * 4];
+    hc.d2h(&mut yb, dy)?;
+    hc.sync()?;
+    // SAFETY: d2h 완료 후 재해석.
+    let got: &[f32] = unsafe { std::slice::from_raw_parts(yb.as_ptr() as *const f32, n) };
+    let mut md = 0f32;
+    let mut nan = 0usize;
+    for i in 0..n {
+        if !got[i].is_finite() {
+            nan += 1;
+            continue;
+        }
+        md = md.max((got[i] - want[i]).abs());
+    }
+    Ok(format!(
+        "hip-linear {key} k={k} n={n}: maxdiff={md:.3e} nan={nan}"
+    ))
+}
+// 마커 lin1

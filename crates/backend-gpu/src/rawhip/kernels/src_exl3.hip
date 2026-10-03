@@ -164,3 +164,42 @@ extern "C" __global__ void exl3_had_out(
     float2 sv = __half22float2(*reinterpret_cast<const __half2*>(&svh[j >> 1]));
     y[j] = sm[th] * 0.08838834764831845f * (th & 1 ? sv.y : sv.x);
 }
+
+// e3_norm_resid의 hip 직이식 — xn = rms_norm(x+ab)·w (xtb), x = x+ab (제자리).
+extern "C" __global__ void exl3_norm_resid(
+    float* __restrict__ x,        // [T][5120] r/w
+    const float* __restrict__ nw, // [5120]
+    const float* __restrict__ ab, // [T][5120]
+    float* __restrict__ xn,       // [T][5120]
+    int t_len, int w_off)
+{
+    __shared__ float red[1024];
+    int t = blockIdx.x;
+    int tid = threadIdx.x;
+    if (t >= t_len) return;
+    int base = t * 5120;
+    float v0 = x[base + tid] + ab[base + tid];
+    float v1 = x[base + 1024 + tid] + ab[base + 1024 + tid];
+    float v2 = x[base + 2048 + tid] + ab[base + 2048 + tid];
+    float v3 = x[base + 3072 + tid] + ab[base + 3072 + tid];
+    float v4 = x[base + 4096 + tid] + ab[base + 4096 + tid];
+    float ss = v0*v0 + v1*v1 + v2*v2 + v3*v3 + v4*v4;
+    red[tid] = ss;
+    __syncthreads();
+    for (int st = 512; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    // 정밀 sqrt 계약(vk 원본 주석): rsq 근사는 drift 씨앗.
+    float inv = 1.0f / sqrtf(red[0] / 5120.0f + 1e-6f);
+    xn[base + tid] = v0 * inv * nw[w_off + tid];
+    xn[base + 1024 + tid] = v1 * inv * nw[w_off + 1024 + tid];
+    xn[base + 2048 + tid] = v2 * inv * nw[w_off + 2048 + tid];
+    xn[base + 3072 + tid] = v3 * inv * nw[w_off + 3072 + tid];
+    xn[base + 4096 + tid] = v4 * inv * nw[w_off + 4096 + tid];
+    x[base + tid] = v0;
+    x[base + 1024 + tid] = v1;
+    x[base + 2048 + tid] = v2;
+    x[base + 3072 + tid] = v3;
+    x[base + 4096 + tid] = v4;
+}
