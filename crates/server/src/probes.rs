@@ -409,6 +409,11 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             arg_num(args, 1, 0usize),
         ),
         "exl3-nr-check" => llm170_backend_gpu::rawvk::checks::nr_check(),
+        "exl3-chain-check" => llm170_backend_gpu::rawvk::checks::chain_check(&arg_str(
+            args,
+            0,
+            "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw",
+        )),
         "exl3-ffn-check" => llm170_backend_gpu::rawvk::checks::ffn_check(&arg_str(
             args,
             0,
