@@ -2180,9 +2180,7 @@ impl TrellisResident {
             .as_ref()
             .and_then(|b| b.fframe.as_ref())
             .ok_or("fframe")?;
-        Ok(unsafe {
-            std::slice::from_raw_parts(ff.nw128.ptr as *const f32, 129 * 5120).to_vec()
-        })
+        Ok(unsafe { std::slice::from_raw_parts(ff.nw128.ptr as *const f32, 129 * 5120).to_vec() })
     }
 
     /// 선형 키 전체(hip 프로브용).
