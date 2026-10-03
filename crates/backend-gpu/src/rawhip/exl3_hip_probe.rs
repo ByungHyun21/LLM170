@@ -1155,6 +1155,25 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
             "  [attndbg] lim-1/lim/lim+1 상관 = {variants:?}"
         );
     }
+    // lim=1 강제(전 t) — rows>=1 미기록 가설 직접 검증.
+    {
+        let mut md1 = 0f32;
+        for t in 1..t_rows {
+            let h = 0usize;
+            let kh = 0usize;
+            let mut p2 = 0f32;
+            for d in 0..256 {
+                p2 += qh[t * 6144 + h * 256 + d] * kc[(layer * 1024) * 1024 + kh * 256 + d];
+            }
+            let e = (p2 * 0.0625).exp();
+            let g = qg[t * 12288 + h * 512 + 256];
+            let w = (e / e) * vc[(layer * 1024) * 1024 + kh * 256] / 1.0;
+            let sg2 = 1.0 / (1.0 + (-g).exp());
+            let want1 = w * sg2;
+            md1 = md1.max((got[t * 6144 + h * 256] - want1).abs());
+        }
+        eprintln!("  [attndbg] lim=1강제 t>=1 h0d0 maxdiff={md1:.3e}");
+    }
     eprintln!(
         "  [attndbg] 불일치 t분포={:?} h분포={:?}",
         &bad_t[..t_rows],
@@ -1167,3 +1186,4 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
 // 마커 at1
 // 마커 ab1
 // 마커 ab2
+// 마커 l1f
