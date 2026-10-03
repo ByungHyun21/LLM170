@@ -616,6 +616,13 @@ pub struct GdnFrame {
 }
 
 impl TrellisResident {
+    /// GPU 프레임(GDN/어텐션) 활성 여부 — 벌크 sync 가드(T≤8 CPU 경로 보호).
+    pub fn gpu_frames_active(&self) -> bool {
+        self.batch
+            .as_ref()
+            .is_some_and(|b| b.gframe.is_some() || b.aframe.is_some())
+    }
+
     /// 배치 스크래치 지연 초기화.
     fn ensure_batch(&mut self) -> Result<(), String> {
         if self.batch.is_some() {
