@@ -2433,10 +2433,16 @@ pub fn exl3_spec_step(
             // kvc는 재실행이 정확히 pos0.. 행을 덮으므로 복원 불요.
             if !llm170_diag::flag::eq1("LLM170_EXL3_NOSNAP") {
                 tr.gdn_state_restore()?;
+                if llm170_diag::dump::opts().key("exl3_rpdbg") {
+                    eprintln!("  [rpdbg] restore후 gstate={:?}", tr.debug_gstate_head()?);
+                }
             }
             seq.pos -= k as u32; // frame_spec_forward가 다시 증가
             let re_accepted = accepted.clone();
             frame_spec_forward(tr, seq, &re_accepted)?;
+        }
+        if llm170_diag::dump::opts().key("exl3_rpdbg") {
+            eprintln!("  [rpdbg] 재실행후 gstate={:?}", tr.debug_gstate_head()?);
         }
         2
     } else {
