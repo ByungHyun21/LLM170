@@ -142,11 +142,12 @@ extern "C" __global__ void exl3_had_out(
     __shared__ float sm[128];
     int chunk = blockIdx.x;
     if (chunk >= nchunks) return;
+    int row = blockIdx.y;
     int th = threadIdx.x;
     int base = chunk * 128;
     float v0 = 0.0f;
     for (int g = 0; g < nseg; g++)
-        v0 += s[(long)g * nstride + base + th];
+        v0 += s[((long)row * nseg + g) * nstride + base + th];
     sm[th] = v0;
     __syncthreads();
     for (int w = 1; w < 128; w <<= 1) {
@@ -162,7 +163,7 @@ extern "C" __global__ void exl3_had_out(
     }
     int j = base + th;
     float2 sv = __half22float2(*reinterpret_cast<const __half2*>(&svh[j >> 1]));
-    y[j] = sm[th] * 0.08838834764831845f * (th & 1 ? sv.y : sv.x);
+    y[(long)row * nstride + j] = sm[th] * 0.08838834764831845f * (th & 1 ? sv.y : sv.x);
 }
 
 // e3_norm_resid의 hip 직이식 — xn = rms_norm(x+ab)·w (xtb), x = x+ab (제자리).
