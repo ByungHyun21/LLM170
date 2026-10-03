@@ -856,3 +856,41 @@ extern "C" __global__ void exl3_attn_fwd3s(
     outv[t * 6144 + h * 256 + tid] = (acc / wsum) * (1.0f / (1.0f + expf(-g)));
 }
 // 마커 f3s
+
+extern "C" __global__ void exl3_norm_resid_p(
+    float* __restrict__ x,
+    const float* __restrict__ nw_row,
+    const float* __restrict__ ab,
+    float* __restrict__ xn,
+    int t_len)
+{
+    __shared__ float red[1024];
+    int t = blockIdx.x;
+    int tid = threadIdx.x;
+    if (t >= t_len) return;
+    int base = t * 5120;
+    float v0 = x[base + tid] + ab[base + tid];
+    float v1 = x[base + 1024 + tid] + ab[base + 1024 + tid];
+    float v2 = x[base + 2048 + tid] + ab[base + 2048 + tid];
+    float v3 = x[base + 3072 + tid] + ab[base + 3072 + tid];
+    float v4 = x[base + 4096 + tid] + ab[base + 4096 + tid];
+    float ss = v0*v0 + v1*v1 + v2*v2 + v3*v3 + v4*v4;
+    red[tid] = ss;
+    __syncthreads();
+    for (int st = 512; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float inv = 1.0f / sqrtf(red[0] / 5120.0f + 1e-6f);
+    xn[base + tid] = v0 * inv * nw_row[tid];
+    xn[base + 1024 + tid] = v1 * inv * nw_row[1024 + tid];
+    xn[base + 2048 + tid] = v2 * inv * nw_row[2048 + tid];
+    xn[base + 3072 + tid] = v3 * inv * nw_row[3072 + tid];
+    xn[base + 4096 + tid] = v4 * inv * nw_row[4096 + tid];
+    x[base + tid] = v0;
+    x[base + 1024 + tid] = v1;
+    x[base + 2048 + tid] = v2;
+    x[base + 3072 + tid] = v3;
+    x[base + 4096 + tid] = v4;
+}
+// 마커 nrp
