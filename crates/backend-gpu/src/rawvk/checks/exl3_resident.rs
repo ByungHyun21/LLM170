@@ -1292,4 +1292,11 @@ impl TrellisResident {
         }
         Ok(())
     }
+
+    /// xtb 범위 인밸리데이트(GPU gate 출력 → 호스트 가시화, plans/121 F1).
+    pub fn invalidate_xtb(&mut self, bytes: usize) {
+        if let Some(b) = self.batch.as_ref() {
+            self.ctx.invalidate_range(&b.xtb, bytes);
+        }
+    }
 }
