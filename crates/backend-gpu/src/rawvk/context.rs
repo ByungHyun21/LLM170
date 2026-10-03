@@ -66,9 +66,6 @@ pub struct VkCtx {
     frame_cbs:
         std::cell::RefCell<std::collections::HashMap<u32, (vk::CommandPool, vk::CommandBuffer)>>,
     record_only: std::cell::Cell<bool>,
-    /// 생략 연속 수(plans/121 tg) — 무제한 동시 실행이 드라이버를 죽인다
-    /// (DEVICE_LOST 실측): 상한마다 배리어로 비행 중 디스패치를 제한.
-    since_bar: std::cell::Cell<u32>,
     qf_saved: std::cell::Cell<u32>,
     saved_cb: std::cell::Cell<vk::CommandBuffer>,
     saved_pool: std::cell::Cell<vk::CommandPool>,
@@ -340,7 +337,6 @@ impl VkCtx {
                 replay_mode: std::cell::Cell::new(false),
                 frame_cbs: std::cell::RefCell::new(std::collections::HashMap::new()),
                 record_only: std::cell::Cell::new(false),
-                since_bar: std::cell::Cell::new(0),
                 qf_saved: std::cell::Cell::new(qf),
                 saved_cb: std::cell::Cell::new(vk::CommandBuffer::null()),
                 saved_pool: std::cell::Cell::new(vk::CommandPool::null()),
@@ -1342,11 +1338,10 @@ impl VkCtx {
             if batch && !forced_skip && self.opt_bar.replace(false) {
                 // plans/104: 기본 ON(산술 불변 — 게이트 2회 PASS·A/B 양성
                 // +2%). 킬스위치 =0.
-                // plans/121 tg VVL 최종 판정(2026-10-03): 검증 레이어 활성화에도
-                // DEVICE_LOST 재현·sync 위반 메시지 0건 — 명세 위반이 아니라
-                // RADV가 대량 동시 컴퓨트 디스패치를 처리 못하는 드라이버 결함.
-                // 배리어 생략은 불가 — 무조건 배리어 확정(768×0.9ms 드레인).
-                // verify 단축은 디스패치 수 자체를 줄이는 메가융합만 남음.
+                // plans/121 tg 실측: 무조건 배리어 768회 × ~0.9ms 파이프라인 드레인이
+                // verify 743ms의 본체(층 루프 11ms·녹화 12µs/회·ds 합 ~50ms는 기각).
+                // 의존성 판정 복원 시도는 DEVICE_LOST(미선언 의존 실재) — 차기:
+                // dep 선언 전수 감사(norm_resid xbuf 읽기 누락 후보) 후 재도입.
                 let _ = dep;
                 let mut need = true;
                 // plans/104 이분법 프로브: 스킵 허용을 현 태그 1종으로 제한.
@@ -1358,7 +1353,6 @@ impl VkCtx {
                     need = true;
                 }
                 if need {
-                    self.since_bar.set(0);
                     let bar = vk::MemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                         .dst_access_mask(vk::AccessFlags::SHADER_READ);
@@ -1375,7 +1369,6 @@ impl VkCtx {
                     self.since_w.borrow_mut().clear();
                     self.dep_unknown.set(false);
                 } else {
-                    self.since_bar.set(self.since_bar.get() + 1);
                     SKIP_BY.with(|m| {
                         let prev = LAST_LBL.with(|l| l.take());
                         if let Some(p) = prev {
@@ -1866,6 +1859,3 @@ pub mod site {
 }
 // 마커 replay
 // 마커 depbar
-// 마커 cap16
-// 마커 capfix
-// 마커 vvl
