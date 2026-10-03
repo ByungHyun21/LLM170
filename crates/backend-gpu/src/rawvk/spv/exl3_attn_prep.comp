@@ -15,6 +15,7 @@ layout(binding = 4) readonly buffer KNW { float knw[]; };  // [256]
 layout(binding = 5) writeonly buffer QH { float qh[]; };   // [T][6144]
 layout(binding = 6) writeonly buffer KKC { float kc[]; };  // [cap][1024]
 layout(binding = 7) writeonly buffer VKC { float vc[]; };  // [cap][1024]
+layout(binding = 8) readonly buffer PB { uint pp[]; };     // [1] = pos0(재생용 — 푸시 불변)
 layout(push_constant) uniform PC {
     uint t_len;
     uint pos0;
@@ -28,7 +29,7 @@ void main() {
     uint t = gl_WorkGroupID.x;
     uint j = gl_WorkGroupID.y;
     uint tid = gl_LocalInvocationID.x;
-    uint pos = pc.pos0 + t;
+    uint pos = pp[0] + t;
 
     if (j < 24u) {
         // q 헤드: 디인터리브 + rms + rope

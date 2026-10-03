@@ -2267,6 +2267,33 @@ fn frame_spec_forward(
         }
     }
     tr.frame_x_flush(t_rows)?;
+    // 재생 통합(plans/121 tg): 녹화됨 → 호스트 입력(xbuf/pbuf)만 갱신해 재제출.
+    // 미녹화 → 이번 실행으로 녹화(기록 비용 최초 1회).
+    let fkey = t_rows as u32;
+    // 재생 옵트인(plans/121 tg): 라운드2+ 재생에서 NaN 발생(원장 계류) —
+    // 정합 경로 보호를 위해 LLM170_EXL3_REPLAY=1까지만 활성.
+    let replaying = tr.ctx.frame_has(fkey) && llm170_diag::flag::eq1("LLM170_EXL3_REPLAY");
+    if replaying {
+        tr.attn_set_pos(pos0)?;
+        tr.ctx.frame_replay(fkey)?;
+        let xn_all = tr.read_xtb_rows(t_rows)?;
+        let mut logits = Vec::with_capacity(t_rows * 248320);
+        for t in 0..t_rows {
+            let row = tr.linear("lm_head", &xn_all[t * h..(t + 1) * h])?;
+            logits.extend_from_slice(&row);
+        }
+        seq.pos += t_rows as u32;
+        seq.last_tok = *toks.last().ok_or("빈 스펙 입력")?;
+        seq.last_h = tr.frame_read_x_last(t_rows)?;
+        let last_row = &logits[(t_rows - 1) * 248320..t_rows * 248320];
+        seq.last_logits.clear();
+        seq.last_logits.extend_from_slice(last_row);
+        return Ok(logits);
+    }
+    let recording = llm170_diag::flag::eq1("LLM170_EXL3_REPLAY");
+    if recording {
+        tr.ctx.frame_record_begin(fkey)?;
+    }
     tr.ctx.begin_outer()?;
     let zb = tr.frame_zeros_buf()?;
     tr.frame_norm_resid(0, t_rows, zb)?;
@@ -2311,6 +2338,9 @@ fn frame_spec_forward(
     // output_norm(행 128) 적용: 추가 rms_norm 금지(이중 노름 버그 — 삼각
     // 비교 적발: decode/prefillT1=198 vs spec=1195).
     tr.ctx.end_outer()?;
+    if recording {
+        tr.ctx.frame_record_end(fkey)?;
+    }
     let xn_all = tr.read_xtb_rows(t_rows)?;
     let mut logits = Vec::with_capacity(t_rows * 248320);
     for t in 0..t_rows {

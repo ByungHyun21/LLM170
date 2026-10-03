@@ -596,7 +596,8 @@ pub struct BatchScratch {
 // KV 16층 134MB GPU 상주 + 프리필 말미 kvc 벌크 동기(디코드 정합).
 // 폐기: fwd(3패스 비결합), fwd2(FA블록, 배리어 64회 폭주).
 pub struct AttnFrame {
-    kkc: VkBuf, // [16*1024][1024] f32
+    pbuf: VkBuf, // [4] u32 — pos0(재생: 푸시 불변으로 만들기 위한 매개변수 버퍼)
+    kkc: VkBuf,  // [16*1024][1024] f32
     vkc: VkBuf,
     qh: VkBuf,   // [TMAX*6144] f32 norm+rope q
     qnws: VkBuf, // [16*256]
@@ -1571,10 +1572,15 @@ impl TrellisResident {
         self.ensure_batch()?;
         let pa = self
             .ctx
-            .pipeline_pipes(include_bytes!("../spv/exl3_attn_prep.spv"), 8, 8)?;
+            .pipeline_pipes(include_bytes!("../spv/exl3_attn_prep.spv"), 9, 8)?;
         let pf3 = self
             .ctx
-            .pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd3.spv"), 5, 8)?;
+            .pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd3.spv"), 6, 8)?;
+        let pbuf = self.ctx.alloc_host_cached(16)?;
+        unsafe {
+            std::ptr::write_bytes(pbuf.ptr, 0, 16);
+        }
+        self.ctx.flush_buf(&pbuf);
         let kkc = self.ctx.alloc_host_cached(16 * 1024 * 1024 * 4)?;
         let vkc = self.ctx.alloc_host_cached(16 * 1024 * 1024 * 4)?;
         let qh = self.ctx.alloc_host_cached(BATCH_TMAX * 6144 * 4)?;
@@ -1611,6 +1617,7 @@ impl TrellisResident {
         self.ctx.flush_buf(&vkc);
         if let Some(b) = self.batch.as_mut() {
             b.aframe = Some(AttnFrame {
+                pbuf,
                 kkc,
                 vkc,
                 qh,
@@ -1620,6 +1627,20 @@ impl TrellisResident {
                 pf3,
             });
         }
+        Ok(())
+    }
+
+    /// pos0 매개변수 버퍼 기록(재생 경로 — 호스트가 라운드마다 갱신).
+    pub fn attn_set_pos(&mut self, pos0: u32) -> Result<(), String> {
+        let af = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.aframe.as_ref())
+            .ok_or("aframe")?;
+        unsafe {
+            *(af.pbuf.ptr as *mut u32) = pos0;
+        }
+        self.ctx.flush_range(&af.pbuf, 4);
         Ok(())
     }
 
@@ -1642,13 +1663,24 @@ impl TrellisResident {
             .and_then(|b| b.aframe.as_ref())
             .ok_or("aframe")?;
         let xtb = self.batch.as_ref().ok_or("batch")?.xtb.buf;
-        let (kkc, vkc, qh, qnws, knws) =
-            (af.kkc.buf, af.vkc.buf, af.qh.buf, af.qnws.buf, af.knws.buf);
+        let (kkc, vkc, qh, qnws, knws, pbuf) = (
+            af.kkc.buf,
+            af.vkc.buf,
+            af.qh.buf,
+            af.qnws.buf,
+            af.knws.buf,
+            af.pbuf.buf,
+        );
+        // pos0 → 매개변수 버퍼(재생 지원 — 커널은 pp[0] 판독, 푸시는 불변).
+        unsafe {
+            *(af.pbuf.ptr as *mut u32) = pos0;
+        }
+        self.ctx.flush_range(&af.pbuf, 4);
         self.ctx.begin_batch()?;
         {
-            let ds = self.ctx.fresh_ds_for(&af.pa, 8)?;
+            let ds = self.ctx.fresh_ds_for(&af.pa, 9)?;
             self.ctx
-                .bind_bufs(ds, &[yb0, yb1, yb2, qnws, knws, qh, kkc, vkc]);
+                .bind_bufs(ds, &[yb0, yb1, yb2, qnws, knws, qh, kkc, vkc, pbuf]);
             let push: Vec<u8> = [t_rows as u32, pos0, attn_il as u32]
                 .iter()
                 .flat_map(|x| x.to_le_bytes())
@@ -1667,8 +1699,8 @@ impl TrellisResident {
             )?;
         }
         {
-            let ds = self.ctx.fresh_ds_for(&af.pf3, 5)?;
-            self.ctx.bind_bufs(ds, &[qh, kkc, vkc, yb0, xtb]);
+            let ds = self.ctx.fresh_ds_for(&af.pf3, 6)?;
+            self.ctx.bind_bufs(ds, &[qh, kkc, vkc, yb0, xtb, pbuf]);
             let push: Vec<u8> = [t_rows as u32, pos0, attn_il as u32]
                 .iter()
                 .flat_map(|x| x.to_le_bytes())
@@ -2029,3 +2061,4 @@ impl TrellisResident {
         Ok((b.yb[2].buf, nd))
     }
 }
+// 마커 pbuf
