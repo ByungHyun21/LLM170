@@ -4,7 +4,7 @@ use crate::rawhip::ctx::RawCtx as HipCtx;
 // vk 가중치를 그대로 투입해 hipRTC 컴파일 exl3_had_in→gemv→had_out 체인을
 // 실행, vk 트레이리던트 참조(tr.linear)와 대조 — 8060S hipRTC로 검증.
 pub fn hip_gemv_check(dir: &str) -> Result<String, String> {
-        let mut tr = TrellisResident::load(dir)?;
+    let mut tr = TrellisResident::load(dir)?;
     let key = "lm_head";
     let (k, n, krate, suh, tre, svh) = tr.linear_raw(key)?;
     let x: Vec<f32> = {
@@ -1135,12 +1135,34 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
         crate::rawvk::checks::exl3_decode::decode_step(&mut tr, &mut seq, tok0)?
     };
     let keys = tr.linear_keys();
-
-    let f32b = |v: &[f32]| unsafe {
-        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
+    // 사다리 디버그: lim<전층이면 필요 선형만 업로드(속도).
+    let need: Vec<String> = if lim_layers < n_layers {
+        let mut v: Vec<String> = Vec::new();
+        for il in 0..lim_layers {
+            let lp = format!("model.language_model.layers.{il}");
+            if il % 4 == 3 {
+                for nm in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                    v.push(format!("{lp}.self_attn.{nm}"));
+                }
+            } else {
+                for nm in ["in_proj_qkv", "in_proj_z", "out_proj"] {
+                    v.push(format!("{lp}.linear_attn.{nm}"));
+                }
+            }
+            for nm in ["gate_proj", "up_proj", "down_proj"] {
+                v.push(format!("{lp}.mlp.{nm}"));
+            }
+        }
+        v.push("lm_head".to_string());
+        v
+    } else {
+        keys.clone()
     };
+
+    let f32b =
+        |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
     let mut lin: HashMap<String, HipLin> = HashMap::new();
-    for key in &keys {
+    for key in &need {
         let (k, n, krate, suh, tre, svh) = tr.linear_raw(key)?;
         let dsuh = hc.alloc(suh.len())?;
         let dtre = hc.alloc(tre.len())?;
@@ -1199,73 +1221,74 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
     let dah = hc.alloc(hidden * 2)?;
     let dsb = hc.alloc(16 * 248320 * 4)?;
     let dyb = hc.alloc(248320 * 4)?;
-    let dqkv = hc.alloc(10240 * 4)?;
-    let dzv = hc.alloc(6144 * 4)?;
-    let dgq = hc.alloc(2048 * 4)?;
-    let dgk = hc.alloc(2048 * 4)?;
-    let dgv = hc.alloc(6144 * 4)?;
-    let dq2 = hc.alloc(2048 * 4)?;
-    let dk2 = hc.alloc(2048 * 4)?;
-    let dv2 = hc.alloc(6144 * 4)?;
-    let mut dbg = hc.alloc(96 * 4)?;
-    let dgo = hc.alloc(6144 * 4)?;
-    let dgate = hc.alloc(6144 * 4)?;
-    let dqh = hc.alloc(12288 * 4)?;
-    let dou = hc.alloc(6144 * 4)?;
+    let dqkv = hc.alloc(64 * 10240 * 4)?;
+    let dzv = hc.alloc(64 * 6144 * 4)?;
+    let dgq = hc.alloc(64 * 2048 * 4)?;
+    let dgk = hc.alloc(64 * 2048 * 4)?;
+    let dgv = hc.alloc(64 * 6144 * 4)?;
+    let dq2 = hc.alloc(64 * 2048 * 4)?;
+    let dk2 = hc.alloc(64 * 2048 * 4)?;
+    let dv2 = hc.alloc(64 * 6144 * 4)?;
+    let mut dbg = hc.alloc(64 * 96 * 4)?;
+    let dgo = hc.alloc(64 * 6144 * 4)?;
+    let dgate = hc.alloc(64 * 6144 * 4)?;
+    let dqh = hc.alloc(64 * 12288 * 4)?;
+    let dou = hc.alloc(64 * 6144 * 4)?;
     hc.h2d(dx, f32b(&embed_row))?;
 
-    let mut run_g = |hc: &HipCtx, l: &HipLin, dx_in: *mut u8, dyb_out: *mut u8| -> Result<(), String> {
-        let mut kc = (l.k / 128) as i32;
-        let mut ks = l.k as i32;
-        let (mut p0, mut p1, mut p2) = (dx_in, l.suh, dah);
-        hc.launch(
-            "exl3_had_in",
-            (l.k / 128) as u32,
-            1,
-            128,
-            &mut [
-                &mut p0 as *mut *mut u8 as *mut _,
-                &mut p1 as *mut *mut u8 as *mut _,
-                &mut p2 as *mut *mut u8 as *mut _,
-                &mut kc as *mut i32 as *mut _,
-                &mut ks as *mut i32 as *mut _,
-            ],
-        )?;
-        let (mut kt, mut nt, mut kk) = ((l.k / 16) as i32, (l.n / 16) as i32, l.krate as i32);
-        let (mut g0, mut g1, mut g2) = (dah, l.tre, dsb);
-        hc.launch3(
-            "exl3_gemv",
-            ((l.n / 16) / 8) as u32,
-            16,
-            1,
-            128,
-            &mut [
-                &mut g0 as *mut *mut u8 as *mut _,
-                &mut g1 as *mut *mut u8 as *mut _,
-                &mut g2 as *mut *mut u8 as *mut _,
-                &mut kt as *mut i32 as *mut _,
-                &mut nt as *mut i32 as *mut _,
-                &mut kk as *mut i32 as *mut _,
-            ],
-        )?;
-        let (mut nch, mut nsg, mut nst) = ((l.n / 128) as i32, 16i32, l.n as i32);
-        let (mut c0, mut c1, mut c2) = (dsb, l.svh, dyb_out);
-        hc.launch(
-            "exl3_had_out",
-            (l.n / 128) as u32,
-            1,
-            128,
-            &mut [
-                &mut c0 as *mut *mut u8 as *mut _,
-                &mut c1 as *mut *mut u8 as *mut _,
-                &mut c2 as *mut *mut u8 as *mut _,
-                &mut nch as *mut i32 as *mut _,
-                &mut nsg as *mut i32 as *mut _,
-                &mut nst as *mut i32 as *mut _,
-            ],
-        )?;
-        Ok(())
-    };
+    let mut run_g =
+        |hc: &HipCtx, l: &HipLin, dx_in: *mut u8, dyb_out: *mut u8| -> Result<(), String> {
+            let mut kc = (l.k / 128) as i32;
+            let mut ks = l.k as i32;
+            let (mut p0, mut p1, mut p2) = (dx_in, l.suh, dah);
+            hc.launch(
+                "exl3_had_in",
+                (l.k / 128) as u32,
+                1,
+                128,
+                &mut [
+                    &mut p0 as *mut *mut u8 as *mut _,
+                    &mut p1 as *mut *mut u8 as *mut _,
+                    &mut p2 as *mut *mut u8 as *mut _,
+                    &mut kc as *mut i32 as *mut _,
+                    &mut ks as *mut i32 as *mut _,
+                ],
+            )?;
+            let (mut kt, mut nt, mut kk) = ((l.k / 16) as i32, (l.n / 16) as i32, l.krate as i32);
+            let (mut g0, mut g1, mut g2) = (dah, l.tre, dsb);
+            hc.launch3(
+                "exl3_gemv",
+                ((l.n / 16) / 8) as u32,
+                16,
+                1,
+                128,
+                &mut [
+                    &mut g0 as *mut *mut u8 as *mut _,
+                    &mut g1 as *mut *mut u8 as *mut _,
+                    &mut g2 as *mut *mut u8 as *mut _,
+                    &mut kt as *mut i32 as *mut _,
+                    &mut nt as *mut i32 as *mut _,
+                    &mut kk as *mut i32 as *mut _,
+                ],
+            )?;
+            let (mut nch, mut nsg, mut nst) = ((l.n / 128) as i32, 16i32, l.n as i32);
+            let (mut c0, mut c1, mut c2) = (dsb, l.svh, dyb_out);
+            hc.launch(
+                "exl3_had_out",
+                (l.n / 128) as u32,
+                1,
+                128,
+                &mut [
+                    &mut c0 as *mut *mut u8 as *mut _,
+                    &mut c1 as *mut *mut u8 as *mut _,
+                    &mut c2 as *mut *mut u8 as *mut _,
+                    &mut nch as *mut i32 as *mut _,
+                    &mut nsg as *mut i32 as *mut _,
+                    &mut nst as *mut i32 as *mut _,
+                ],
+            )?;
+            Ok(())
+        };
     let mut norm = |hc: &HipCtx, w: i32, ab_in: *mut u8| -> Result<(), String> {
         let mut tl = 1i32;
         let mut wo = w * 5120;
@@ -1359,8 +1382,11 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
                     &mut lay as *mut i32 as *mut _,
                 ],
             )?;
-            let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5) =
-                (dq2, dk2, dv2, dbg, dgst, dgo);
+            let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5) = (dq2, dk2, dv2, dbg, dgst, dgo);
+            eprintln!(
+                "  [scdbg] q={:p} k={:p} v={:p} bg={:p} st={:p} out={:p} tl=1 hk=16 hv=48 d=128 lay={gdn_il}",
+                dq2, dk2, dv2, dbg, dgst, dgo
+            );
             hc.launch3(
                 "exl3_gdn_scan",
                 48,
@@ -1423,7 +1449,9 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
         run_g(&hc, ld, dxn, dab)?;
     }
     if lim_layers < n_layers {
-        return Ok(format!("hip-decode(부분): L0..{lim_layers} 통과(폴트 없음)"));
+        return Ok(format!(
+            "hip-decode(부분): L0..{lim_layers} 통과(폴트 없음)"
+        ));
     }
     norm(&hc, 128, dab)?;
     let llh = &lin["lm_head"];
@@ -1451,3 +1479,7 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
 }
 // 마커 hd1
 // 마커 lad1
+// 마커 lad2
+// 마커 scd
+// 마커 tl7
+// 마커 tmax
