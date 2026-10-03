@@ -653,6 +653,127 @@ pub struct GdnFrame {
 }
 
 impl TrellisResident {
+    /// GDN 체인 격리 프로브 지원(plans/121 워크플로): 합성 입력으로
+    /// layer0 체인(conv→l2perm→scan→gate) 실행 후 gated 반환.
+    pub fn gdn_chain_run(
+        &mut self,
+        t_rows: usize,
+        xn: &[f32],
+        qkv: &[f32],
+        z: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        self.gdn_frame_init()?;
+        let (xtb_b, yb0_b, yb1_b) = {
+            let b = self.batch.as_ref().ok_or("batch")?;
+            (b.xtb.buf, b.yb[0].buf, b.yb[1].buf)
+        };
+        {
+            let (xptr, qptr, zptr) = {
+                let b = self.batch.as_ref().ok_or("batch")?;
+                (
+                    b.xtb.ptr as *mut f32,
+                    b.yb[0].ptr as *mut f32,
+                    b.yb[1].ptr as *mut f32,
+                )
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(xn.as_ptr(), xptr, t_rows * 5120);
+                std::ptr::copy_nonoverlapping(qkv.as_ptr(), qptr, t_rows * 10240);
+                std::ptr::copy_nonoverlapping(z.as_ptr(), zptr, t_rows * 6144);
+            }
+        }
+        // 상태/ring 제로(layer0 슬라이스)
+        {
+            let gf = self
+                .batch
+                .as_ref()
+                .and_then(|b| b.gframe.as_ref())
+                .ok_or("gframe")?;
+            unsafe {
+                std::ptr::write_bytes(gf.gstate.ptr, 0, 48 * 16384 * 4);
+                std::ptr::write_bytes(gf.gring.ptr, 0, 3 * 10240 * 4);
+            }
+            self.ctx.flush_range(&gf.gstate, 48 * 16384 * 4);
+            self.ctx.flush_range(&gf.gring, 3 * 10240 * 4);
+        }
+        // 입력 flush
+        {
+            let b = self.batch.as_ref().ok_or("batch")?;
+            self.ctx.flush_range(&b.xtb, t_rows * 5120 * 4);
+            self.ctx.flush_range(&b.yb[0], t_rows * 10240 * 4);
+            self.ctx.flush_range(&b.yb[1], t_rows * 6144 * 4);
+        }
+        self.gdn_layer_gpu(0, t_rows, std::ptr::null_mut(), yb0_b, yb1_b)?;
+        // gated 판독
+        let b = self.batch.as_ref().ok_or("batch")?;
+        self.ctx.invalidate_range(&b.xtb, t_rows * 6144 * 4);
+        let out =
+            unsafe { std::slice::from_raw_parts(b.xtb.ptr as *const f32, t_rows * 6144).to_vec() };
+        // 중간 산출(l2perm gbg/conv gqr 선두) 판독 — 단계 격리 진단.
+        {
+            let gf = self
+                .batch
+                .as_ref()
+                .and_then(|b| b.gframe.as_ref())
+                .ok_or("gframe")?;
+            self.ctx.invalidate_range(&gf.gbg, t_rows * 96 * 4);
+            self.ctx.invalidate_range(&gf.gqr, t_rows * 2048 * 4);
+        }
+        Ok(out)
+    }
+
+    /// 체인 중간 산출 판독(gbg·gqr·gq[L2 q]·go[scan]) — 프로브 진단.
+    pub fn gdn_chain_mids(
+        &mut self,
+        t_rows: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let gf = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.gframe.as_ref())
+            .ok_or("gframe")?;
+        let bg =
+            unsafe { std::slice::from_raw_parts(gf.gbg.ptr as *const f32, t_rows * 96).to_vec() };
+        let gqr =
+            unsafe { std::slice::from_raw_parts(gf.gqr.ptr as *const f32, t_rows * 2048).to_vec() };
+        let _ = &gqr;
+        self.ctx.invalidate_range(&gf.gq, t_rows * 2048 * 4);
+        self.ctx.invalidate_range(&gf.gk, t_rows * 2048 * 4);
+        self.ctx.invalidate_range(&gf.gv, t_rows * 6144 * 4);
+        let gq =
+            unsafe { std::slice::from_raw_parts(gf.gq.ptr as *const f32, t_rows * 2048).to_vec() };
+        let gk =
+            unsafe { std::slice::from_raw_parts(gf.gk.ptr as *const f32, t_rows * 2048).to_vec() };
+        let gv =
+            unsafe { std::slice::from_raw_parts(gf.gv.ptr as *const f32, t_rows * 6144).to_vec() };
+        self.ctx.invalidate_range(&gf.go, t_rows * 6144 * 4);
+        let go =
+            unsafe { std::slice::from_raw_parts(gf.go.ptr as *const f32, t_rows * 6144).to_vec() };
+        let _ = (gk,);
+        Ok((bg, gq, gv, go))
+    }
+
+    /// layer0 체인 상수 판독(cw/ab/alog/dtb/nw) — 프로브 미러용.
+    pub fn gdn_chain_consts(
+        &mut self,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        self.gdn_frame_init()?;
+        let gf = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.gframe.as_ref())
+            .ok_or("gframe")?;
+        // 호스트 기록 상수는 그대로 판독(배치 후 GPU 미기입).
+        unsafe {
+            let cw = std::slice::from_raw_parts(gf.cw.ptr as *const f32, 10240 * 4).to_vec();
+            let ab = std::slice::from_raw_parts(gf.ab.ptr as *const f32, 2 * 48 * 5120).to_vec();
+            let alog = std::slice::from_raw_parts(gf.alog.ptr as *const f32, 48).to_vec();
+            let dtb = std::slice::from_raw_parts(gf.dtb.ptr as *const f32, 48).to_vec();
+            let nw = std::slice::from_raw_parts(gf.nw.ptr as *const f32, 128).to_vec();
+            Ok((cw, ab, alog, dtb, nw))
+        }
+    }
+
     /// GPU GDN 상태 유효 플래그 전체 무효화 — fresh 시퀀스(슬롯 교체·기준
     /// 재생) 프리필 전 호출. GPU 상태가 다른 시퀀스의 잔류일 수 있어 강제 재업로드.
     pub fn gdn_st_invalidate_all(&mut self) {
@@ -1369,6 +1490,42 @@ impl TrellisResident {
 
         self.ctx.end_batch_wait()?;
         self.ctx.wait_pending()?;
+        // 체인 입출력 캡처(plans/121 워크플로 — GDN 비선형 전체 프로브용):
+        // 입력 yb0(qkv)/yb1(z) + 게이트 출력 xtb를 gdn_il==0에서 파일로.
+        if gdn_il == 0 {
+            if let Some(path) = llm170_diag::flag::val("LLM170_EXL3_CHAINCAP") {
+                let gf2 = self.batch.as_ref().and_then(|b| b.gframe.as_ref());
+                if let Some(g) = gf2 {
+                    let b2 = self.batch.as_ref().ok_or("batch")?;
+                    let nq = t_rows * 10240;
+                    let nz = t_rows * 6144;
+                    let nx = t_rows * 6144;
+                    self.ctx.invalidate_range(&b2.yb[0], nq * 4);
+                    self.ctx.invalidate_range(&b2.yb[1], nz * 4);
+                    self.ctx.invalidate_range(&b2.xtb, nx * 4);
+                    // SAFETY: end_batch_wait 후 매핑 판독.
+                    let (q, z, x) = unsafe {
+                        (
+                            std::slice::from_raw_parts(b2.yb[0].ptr as *const f32, nq),
+                            std::slice::from_raw_parts(b2.yb[1].ptr as *const f32, nz),
+                            std::slice::from_raw_parts(b2.xtb.ptr as *const f32, nx),
+                        )
+                    };
+                    let mut buf = Vec::with_capacity((nq + nz + nx) * 4);
+                    // SAFETY: 위 직독 슬라이스의 바이트 재해석 — 동일 수명.
+                    unsafe {
+                        for sl in [q, z, x] {
+                            buf.extend_from_slice(std::slice::from_raw_parts(
+                                sl.as_ptr() as *const u8,
+                                sl.len() * 4,
+                            ));
+                        }
+                    }
+                    std::fs::write(&path, &buf).map_err(|e| format!("chain cap: {e}"))?;
+                    eprintln!("  [chaincap] L0 t={t_rows} → {path}");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2090,3 +2247,8 @@ impl TrellisResident {
 // 마커 pbuf
 // 마커 28a
 // 마커 restfx
+// 마커 ch3
+// 마커 mid1
+// 마커 go1
+// 마커 gqgv
+// 마커 gq3

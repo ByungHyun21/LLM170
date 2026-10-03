@@ -833,3 +833,172 @@ pub fn ffn_check(dir: &str) -> Result<String, String> {
     ))
 }
 // 마커 ffn1
+
+// ── GDN 비선형 체인 격리 프로브(plans/121 워크플로 — 마지막 간접 군) ──
+// conv→l2perm→scan→gate 전체를 합성 입력으로 검증: CPU 미러(kernel 수학
+// 직접 이식)와 행별 비교. 속도(4커널 dispatch 벽)도 보고.
+pub fn chain_check(dir: &str) -> Result<String, String> {
+    let t_rows = 32usize;
+    let mut tr = TrellisResident::load(dir)?;
+    let (cw, ab, alog, dtb, nw) = tr.gdn_chain_consts()?;
+    let mut seed: u32 = 0x51DE_2718;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed >> 8) as f32 / 16_777_216.0
+    };
+    let xn: Vec<f32> = (0..t_rows * 5120)
+        .map(|_| (rnd() * 2.0 - 1.0) * 0.3)
+        .collect();
+    let qkv: Vec<f32> = (0..t_rows * 10240)
+        .map(|_| (rnd() * 2.0 - 1.0) * 0.5)
+        .collect();
+    let z: Vec<f32> = (0..t_rows * 6144)
+        .map(|_| (rnd() * 2.0 - 1.0) * 0.4)
+        .collect();
+    let got = tr.gdn_chain_run(t_rows, &xn, &qkv, &z)?;
+    let mut ts: Vec<f64> = Vec::new();
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        let _ = tr.gdn_chain_run(t_rows, &xn, &qkv, &z)?;
+        ts.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // ── CPU 미러 ──
+    let n_k = 16usize;
+    let n_v = 48usize;
+    let d_state = 128usize;
+    let k_len = 2048usize;
+    let d_inner = 6144usize;
+    let silu = |x: f32| x / (1.0 + (-x).exp());
+    let softplus = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+    // ① conv(FIR4, ring=0)
+    let mut q_all = vec![0f32; t_rows * k_len];
+    let mut k_all = vec![0f32; t_rows * k_len];
+    let mut v_all = vec![0f32; t_rows * d_inner];
+    for c in 0..10240usize {
+        let (w0, w1, w2, w3) = (cw[c * 4], cw[c * 4 + 1], cw[c * 4 + 2], cw[c * 4 + 3]);
+        let (mut h0, mut h1, mut h2) = (0f32, 0f32, 0f32);
+        for t in 0..t_rows {
+            let x = qkv[t * 10240 + c];
+            let o = silu(w3 * x + w0 * h0 + w1 * h1 + w2 * h2);
+            if c < k_len {
+                q_all[t * k_len + c] = o;
+            } else if c < 2 * k_len {
+                k_all[t * k_len + (c - k_len)] = o;
+            } else {
+                v_all[t * d_inner + (c - 2 * k_len)] = o;
+            }
+            h0 = h1;
+            h1 = h2;
+            h2 = x;
+        }
+    }
+    // ② l2perm: a/b 도트(xn·ab) + q/k L2 + v/beta|g lc 순열
+    let mut q_l2 = vec![0f32; t_rows * k_len];
+    let mut k_l2 = vec![0f32; t_rows * k_len];
+    let mut v_lc = vec![0f32; t_rows * d_inner];
+    let mut bg = vec![0f32; t_rows * 96];
+    for t in 0..t_rows {
+        // q/k L2(HF 헤드별)
+        for kh in 0..n_k {
+            let b0 = t * k_len + kh * d_state;
+            let qn: f32 = (0..d_state).map(|i| q_all[b0 + i] * q_all[b0 + i]).sum();
+            let kn: f32 = (0..d_state).map(|i| k_all[b0 + i] * k_all[b0 + i]).sum();
+            let qi = 1.0 / (qn + 1e-6).sqrt();
+            let ki = 1.0 / (kn + 1e-6).sqrt();
+            for i in 0..d_state {
+                q_l2[b0 + i] = q_all[b0 + i] * qi;
+                k_l2[b0 + i] = k_all[b0 + i] * ki;
+            }
+        }
+        // v-head별: a/b 도트 + 순열
+        for h in 0..n_v {
+            let xrow = &xn[t * 5120..(t + 1) * 5120];
+            let a_row = &ab[h * 5120..(h + 1) * 5120];
+            let b_row = &ab[(48 + h) * 5120..(48 + h + 1) * 5120];
+            let a_v: f32 = xrow.iter().zip(a_row).map(|(x, w)| x * w).sum();
+            let b_v: f32 = xrow.iter().zip(b_row).map(|(x, w)| x * w).sum();
+            let g = softplus(a_v + dtb[h]) * (-alog[h].exp());
+            let beta = 1.0 / (1.0 + (-b_v).exp());
+            let p_inv = (h % 3) * 16 + h / 3;
+            bg[t * 96 + p_inv] = beta;
+            bg[t * 96 + 48 + p_inv] = g;
+            // v lc 순열
+            let src = t * d_inner + h * d_state;
+            let dst = t * d_inner + p_inv * d_state;
+            v_lc[dst..dst + d_state].copy_from_slice(&v_all[src..src + d_state]);
+        }
+    }
+    // 중간 대조: l2perm gbg / conv gqr — 단계 격리(plans/121).
+    let (gpu_bg, gpu_gq, gpu_gv, gpu_go) = tr.gdn_chain_mids(t_rows)?;
+    let mut bg_md = 0f32;
+    for i in 0..gpu_bg.len() {
+        bg_md = bg_md.max((gpu_bg[i] - bg[i]).abs());
+    }
+    let mut q_md = 0f32;
+    for i in 0..gpu_gq.len().min(q_l2.len()) {
+        q_md = q_md.max((gpu_gq[i] - q_l2[i]).abs());
+    }
+    eprintln!("  [chainmid] conv q maxdiff={q_md:.3e} · l2perm bg maxdiff={bg_md:.3e}");
+
+    // ③ scan(레지스터 리페런스 재사용 — scan_ref는 bg [T][96] 포맷)
+    let (_, o_ref) = scan_ref(&q_l2, &k_l2, &v_lc, &bg, t_rows, false, &[0f32; 48 * 16384]);
+    let (_, o_ref16) = scan_ref(&q_l2, &k_l2, &v_lc, &bg, t_rows, true, &[0f32; 48 * 16384]);
+    let mut go16_md = 0f32;
+    for i in 0..gpu_go.len().min(o_ref16.len()) {
+        go16_md = go16_md.max((gpu_go[i] - o_ref16[i]).abs());
+    }
+    eprintln!("  [chainmid] scan go(f16mirror) maxdiff={go16_md:.3e}");
+    let mut gq_md = 0f32;
+    for i in 0..gpu_gq.len().min(q_l2.len()) {
+        gq_md = gq_md.max((gpu_gq[i] - q_l2[i]).abs());
+    }
+    let mut gv_md = 0f32;
+    for i in 0..gpu_gv.len().min(v_lc.len()) {
+        gv_md = gv_md.max((gpu_gv[i] - v_lc[i]).abs());
+    }
+    eprintln!("  [chainmid] gq maxdiff={gq_md:.3e} · gv maxdiff={gv_md:.3e}");
+    let mut go_md = 0f32;
+    for i in 0..gpu_go.len().min(o_ref.len()) {
+        go_md = go_md.max((gpu_go[i] - o_ref[i]).abs());
+    }
+    eprintln!("  [chainmid] scan go maxdiff={go_md:.3e}");
+    // ④ gate: rms(o_lc)·nw·silu(z) → HF 역순열
+    let mut want = vec![0f32; t_rows * d_inner];
+    let eps = 1e-6f32;
+    for t in 0..t_rows {
+        for h in 0..n_v {
+            let p_inv = (h % 3) * 16 + h / 3;
+            let src = t * d_inner + p_inv * d_state;
+            let dst = t * d_inner + h * d_state;
+            let ss: f32 = (0..d_state).map(|i| o_ref[src + i] * o_ref[src + i]).sum();
+            let inv = 1.0 / (ss / d_state as f32 + eps).sqrt();
+            for i in 0..d_state {
+                let zv = z[dst + i];
+                want[dst + i] = o_ref[src + i] * inv * nw[i] * silu(zv);
+            }
+        }
+    }
+    let mut md = 0f32;
+    let mut nan = 0usize;
+    let mut rel_bad = 0usize;
+    for i in 0..got.len() {
+        if !got[i].is_finite() {
+            nan += 1;
+            continue;
+        }
+        let d = (got[i] - want[i]).abs();
+        md = md.max(d);
+        if d > 1e-3 && d / want[i].abs().max(1e-3) > 0.05 {
+            rel_bad += 1;
+        }
+    }
+    Ok(format!(
+        "chain-check T={t_rows}: maxdiff={md:.3e} nan={nan} rel>5%={rel_bad}/{} · 4커널 {:.1}ms(중앙)",
+        got.len(),
+        ts[1]
+    ))
+}
+// 마커 chain1
+// 마커 f16ab
+// 마커 gq2
