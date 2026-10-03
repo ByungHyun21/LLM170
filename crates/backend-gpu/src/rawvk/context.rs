@@ -1338,10 +1338,10 @@ impl VkCtx {
             if batch && !forced_skip && self.opt_bar.replace(false) {
                 // plans/104: 기본 ON(산술 불변 — 게이트 2회 PASS·A/B 양성
                 // +2%). 킬스위치 =0.
-                // plans/121 프레임: 원-서브밋 대형 배치에서 의존성 누락 선언이
-                // 레이스로 폭발(비결정 corr 0.63-0.94) — 무조건 배리어로 전환.
-                // 비용 ~450회/forward GPU측 마이크로초 — 정확성 우선. 추후
-                // 선언 완전성 검증 후 선택 생략 복원.
+                // plans/121 tg 실측: 무조건 배리어 768회 × ~0.9ms 파이프라인 드레인이
+                // verify 743ms의 본체(층 루프 11ms·녹화 12µs/회·ds 합 ~50ms는 기각).
+                // 의존성 판정 복원 시도는 DEVICE_LOST(미선언 의존 실재) — 차기:
+                // dep 선언 전수 감사(norm_resid xbuf 읽기 누락 후보) 후 재도입.
                 let _ = dep;
                 let mut need = true;
                 // plans/104 이분법 프로브: 스킵 허용을 현 태그 1종으로 제한.
@@ -1858,3 +1858,4 @@ pub mod site {
     }
 }
 // 마커 replay
+// 마커 depbar
