@@ -603,3 +603,86 @@ extern "C" __global__ void exl3_gdn_scan(
     }
 }
 // 마커 sc1
+
+// exl3_attn_prep hip 직이식 — q 디인터리브[rms+rope], k rms+rope→KV, v 복사.
+// 그리드 (T, 28): j<24=q헤드, j>=24=KV헤드(m=j-24). WG=128.
+extern "C" __global__ void exl3_attn_prep(
+    const float* __restrict__ qg,    // [T][12288] q‖gate 인터리브
+    const float* __restrict__ kin,   // [T][1024]
+    const float* __restrict__ vin,   // [T][1024]
+    const float* __restrict__ qnw,   // [L][256]
+    const float* __restrict__ knw,   // [L][256]
+    float* __restrict__ qh,          // [T][6144]
+    float* __restrict__ kc,          // [cap][1024]
+    float* __restrict__ vc,          // [cap][1024]
+    const unsigned* __restrict__ pp, // [1] pos0
+    int t_len, int pos0_, int layer)
+{
+    __shared__ float red[128];
+    __shared__ float hd[256];
+    int t = blockIdx.x;
+    int j = blockIdx.y;
+    int tid = threadIdx.x;
+    int pos = pp[0] + t;
+
+    if (j < 24) {
+        int src = t * 12288 + j * 512;
+        hd[tid] = qg[src + tid];
+        hd[tid + 128] = qg[src + 128 + tid];
+        __syncthreads();
+        float ss = hd[tid] * hd[tid] + hd[tid + 128] * hd[tid + 128];
+        red[tid] = ss;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        float inv = rsqrtf(red[0] / 256.0f + 1e-6f);
+        hd[tid] = hd[tid] * inv * qnw[layer * 256 + tid];
+        hd[tid + 128] = hd[tid + 128] * inv * qnw[layer * 256 + 128 + tid];
+        __syncthreads();
+        if (tid < 32) {
+            float theta = powf(1e7f, -(2.0f * (float)tid) / 64.0f);
+            float ang = (float)pos * theta;
+            float c = cosf(ang), s2 = sinf(ang);
+            float x0 = hd[tid], x1 = hd[tid + 32];
+            hd[tid] = x0 * c - x1 * s2;
+            hd[tid + 32] = x0 * s2 + x1 * c;
+        }
+        __syncthreads();
+        qh[t * 6144 + j * 256 + tid] = hd[tid];
+        qh[t * 6144 + j * 256 + 128 + tid] = hd[tid + 128];
+    } else {
+        int m = j - 24;
+        int src = t * 1024 + m * 256;
+        hd[tid] = kin[src + tid];
+        hd[tid + 128] = kin[src + 128 + tid];
+        __syncthreads();
+        float ss = hd[tid] * hd[tid] + hd[tid + 128] * hd[tid + 128];
+        red[tid] = ss;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        float inv = rsqrtf(red[0] / 256.0f + 1e-6f);
+        hd[tid] = hd[tid] * inv * knw[layer * 256 + tid];
+        hd[tid + 128] = hd[tid + 128] * inv * knw[layer * 256 + 128 + tid];
+        __syncthreads();
+        if (tid < 32) {
+            float theta = powf(1e7f, -(2.0f * (float)tid) / 64.0f);
+            float ang = (float)pos * theta;
+            float c = cosf(ang), s2 = sinf(ang);
+            float x0 = hd[tid], x1 = hd[tid + 32];
+            hd[tid] = x0 * c - x1 * s2;
+            hd[tid + 32] = x0 * s2 + x1 * c;
+        }
+        __syncthreads();
+        long dst = ((long)layer * 1024 + pos) * 1024 + m * 256;
+        kc[dst + tid] = hd[tid];
+        kc[dst + 128 + tid] = hd[tid + 128];
+        vc[dst + tid] = vin[src + tid];
+        vc[dst + 128 + tid] = vin[src + 128 + tid];
+    }
+}
+// 마커 pr1
