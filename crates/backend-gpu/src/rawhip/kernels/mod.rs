@@ -31,6 +31,7 @@ pub const NAMES: &[&str] = &[
     "exl3_gdn_scan",
     "exl3_attn_prep",
     "exl3_attn_fwd3",
+    "exl3_attn_fwd3s",
     "exl3_gdn_gate",
     "quant_q8",
     "q4_gemm_q5_1",

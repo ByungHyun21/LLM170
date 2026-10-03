@@ -795,3 +795,64 @@ extern "C" __global__ void exl3_attn_fwd3(
     }
 }
 // 마커 fw1
+
+// exl3_attn_fwd3s — 단순형(정확성 우선 피벗, 2026-10-04): WG당 (t,h).
+// t-블록 공유 제거 — 스코어 스레드 분할+smem, 트리 max/sum, AV 스레드=dim.
+extern "C" __global__ void exl3_attn_fwd3s(
+    const float* __restrict__ qh,
+    const float* __restrict__ kc,
+    const float* __restrict__ vc,
+    const float* __restrict__ qg,
+    float* __restrict__ outv,
+    const unsigned* __restrict__ pp,
+    int t_len, int pos0_, int layer)
+{
+    __shared__ float qs[256];
+    __shared__ float sarr[1024];
+    __shared__ float reds[256];
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    int kh = h / 6;
+    float scale = 0.0625f;
+    int lim = (int)pp[0] + t + 1;
+    qs[tid] = qh[t * 6144 + h * 256 + tid];
+    __syncthreads();
+    for (int row = tid; row < lim; row += 256) {
+        float p = 0.0f;
+        for (int d = 0; d < 256; d++)
+            p += qs[d] * kc[((long)layer * 1024 + row) * 1024 + kh * 256 + d];
+        sarr[row] = p * scale;
+    }
+    __syncthreads();
+    float lm = -1e30f;
+    for (int i = tid; i < lim; i += 256) lm = fmaxf(lm, sarr[i]);
+    reds[tid] = lm;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (tid < st) reds[tid] = fmaxf(reds[tid], reds[tid + st]);
+        __syncthreads();
+    }
+    float gmax = reds[0];
+    __syncthreads();
+    float ls = 0.0f;
+    for (int i = tid; i < lim; i += 256) {
+        float e = expf(sarr[i] - gmax);
+        sarr[i] = e;
+        ls += e;
+    }
+    reds[tid] = ls;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (tid < st) reds[tid] += reds[tid + st];
+        __syncthreads();
+    }
+    float wsum = reds[0];
+    __syncthreads();
+    float acc = 0.0f;
+    for (int row = 0; row < lim; row++)
+        acc += sarr[row] * vc[((long)layer * 1024 + row) * 1024 + kh * 256 + tid];
+    float g = qg[t * 12288 + h * 512 + 256 + tid];
+    outv[t * 6144 + h * 256 + tid] = (acc / wsum) * (1.0f / (1.0f + expf(-g)));
+}
+// 마커 f3s
