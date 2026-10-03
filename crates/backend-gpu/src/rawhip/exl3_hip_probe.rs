@@ -499,6 +499,21 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
     hc.sync()?;
     // SAFETY: d2h 완료 후 재해석.
     let got: &[f32] = unsafe { std::slice::from_raw_parts(yb.as_ptr() as *const f32, t_rows * n) };
+    // sb 덤프 — gemm2의 s[행0/행1][0..3] vs gemv 세그합(행1).
+    {
+        let mut sbb = vec![0u8; t_rows * n * 4];
+        hc.d2h(&mut sbb, dsb)?;
+        hc.sync()?;
+        // SAFETY: d2h 완료 후 재해석.
+        let sf: &[f32] =
+            unsafe { std::slice::from_raw_parts(sbb.as_ptr() as *const f32, t_rows * n) };
+        eprintln!(
+            "  [sbdbg] gemm s[0][0..4]={:?} s[1][0..4]={:?} s[5][0..4]={:?}",
+            &sf[0..4],
+            &sf[n..n + 4],
+            &sf[5 * n..5 * n + 4]
+        );
+    }
     // 3-way: 검증된 T=1 GEMV 체인으로 행 5 재계산 → gemm 행5·vk 참조 삼각 대조.
     {
         let r5 = samp[1];
@@ -562,6 +577,18 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
             m_gv_vk = m_gv_vk.max((y5f[i] - want[1][i]).abs());
         }
         eprintln!("  [gemmdbg] 행5: gemv-vs-gemm={m_gv_gemm:.3e} gemv-vs-vk={m_gv_vk:.3e}");
+        {
+            let mut seg = vec![0u8; 16 * n * 4];
+            hc.d2h(&mut seg, dsb)?;
+            hc.sync()?;
+            // SAFETY: d2h 완료 후 재해석 — [16세그][n] 부분합.
+            let segf: &[f32] =
+                unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const f32, 16 * n) };
+            let sums: Vec<f32> = (0..4)
+                .map(|c| (0..16).map(|g| segf[g * n + c]).sum())
+                .collect();
+            eprintln!("  [sbdbg] gemv(행5) 세그합[0..4]={sums:?}");
+        }
     }
     let mut worst = 0f32;
     for (si, &r) in samp.iter().enumerate() {
@@ -607,3 +634,4 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
 // 마커 ps1
 // 마커 3w
 // 마커 3wb
+// 마커 sb1
