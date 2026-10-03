@@ -894,3 +894,16 @@ extern "C" __global__ void exl3_norm_resid_p(
     x[base + 4096 + tid] = v4;
 }
 // 마커 nrp
+
+// EXL3 ew(silu·mul) — T=1 디코드용: y[n] = silu(g[n])·u[n].
+extern "C" __global__ void exl3_ew(
+    const float* __restrict__ g,
+    const float* __restrict__ u,
+    float* __restrict__ y,
+    int n)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    float v = g[j];
+    y[j] = (v / (1.0f + __expf(-v))) * u[j];
+}
