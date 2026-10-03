@@ -1102,7 +1102,7 @@ impl TrellisResident {
         &mut self,
         gdn_il: usize,
         t_rows: usize,
-        xn_ptr: *mut f32,
+        _xn_ptr: *mut f32,
         yb0: ash::vk::Buffer,
         yb1: ash::vk::Buffer,
     ) -> Result<(), String> {
@@ -1116,14 +1116,6 @@ impl TrellisResident {
         // ① conv: yb0(qkv) → gqr/gkr/gvr + ring 갱신
         {
             let ds = self.ctx.fresh_ds_for(&gf.pgc, 6)?;
-            let ring_base = gdn_il * 3 * 10240;
-            // ring은 gring의 gdn_il 슬라이스 — 바인딩에 전체 버퍼 + push로 오프셋… 아니,
-            // 커널은 ring[3][10240] 전체를 기대 — 층별 슬라이스를 별도 버퍼로 해야 하나
-            // 간단히 push에 층 오프셋 추가는 커널 수정 필요. V1: 전체 버퍼 바인딩 + 커널이
-            // push.wg_n을 층 인덱스로 활용… conv 커널은 그리드 x=80(채널 청크)라 층 정보 없음.
-            // 실용 해법: conv ring을 gring 전체에서 gdn_il 청크로 포인터 산술하는 대신
-            // 커널 push에 ring_base 추가. → 커널 수정 필요… 일단 TODO 주석만.
-            // TODO: conv 커널에 ring_base push 추가.
             self.ctx.bind_bufs(
                 ds,
                 &[
@@ -1276,8 +1268,10 @@ impl TrellisResident {
         };
         let st_bytes = 48 * 16384 * 4;
         let ring_bytes = 3 * 10240 * 4;
-        self.ctx.invalidate_range_at(&gf.gstate, gdn_il * st_bytes, st_bytes);
-        self.ctx.invalidate_range_at(&gf.gring, gdn_il * ring_bytes, ring_bytes);
+        self.ctx
+            .invalidate_range_at(&gf.gstate, gdn_il * st_bytes, st_bytes);
+        self.ctx
+            .invalidate_range_at(&gf.gring, gdn_il * ring_bytes, ring_bytes);
         let st_off = gdn_il * 48 * 16384;
         let ring_off = gdn_il * 3 * 10240;
         unsafe {
@@ -1329,8 +1323,10 @@ impl TrellisResident {
         }
         let st_bytes = 48 * 16384 * 4;
         let ring_bytes = 3 * 10240 * 4;
-        self.ctx.flush_range_at(&gf.gstate, gdn_il * st_bytes, st_bytes);
-        self.ctx.flush_range_at(&gf.gring, gdn_il * ring_bytes, ring_bytes);
+        self.ctx
+            .flush_range_at(&gf.gstate, gdn_il * st_bytes, st_bytes);
+        self.ctx
+            .flush_range_at(&gf.gring, gdn_il * ring_bytes, ring_bytes);
         Ok(())
     }
 
