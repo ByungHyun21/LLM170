@@ -1117,9 +1117,10 @@ impl TrellisResident {
         key_d: &str,
         t_rows: usize,
     ) -> Result<Vec<f32>, String> {
-        self.ffn_trio_impl(key_g, key_u, key_d, t_rows, false)
+        self.ffn_trio_impl(key_g, key_u, key_d, t_rows, false, false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ffn_trio_impl(
         &mut self,
         key_g: &str,
@@ -1127,6 +1128,7 @@ impl TrellisResident {
         key_d: &str,
         t_rows: usize,
         gpu_input: bool,
+        preah: bool,
     ) -> Result<Vec<f32>, String> {
         if t_rows == 0 || t_rows > BATCH_TMAX {
             return Err(format!("ffn_trio_batch: T={t_rows} 상한 {BATCH_TMAX} 위반"));
@@ -1163,8 +1165,14 @@ impl TrellisResident {
         // ew_t 디스크립터는 체인 전에 선점 확보(borrow 분리 — 복사본 사용).
         let ds4 = self.ctx.fresh_ds_for(&b0.p4t, 3)?;
         self.ctx.begin_batch()?;
-        self.chain_batch_one(xtb, ig, t_rows as u32, ah0, yb0, true)?;
-        self.chain_batch_one(xtb, iu, t_rows as u32, ah1, yb1, true)?;
+        // preah: 선행 norm_resid_had가 ah0(gate)/ah1(up) 기록 — had_in 생략.
+        if preah {
+            self.chain_gemmonly(ig, t_rows as u32, ah0, yb0)?;
+            self.chain_gemmonly(iu, t_rows as u32, ah1, yb1)?;
+        } else {
+            self.chain_batch_one(xtb, ig, t_rows as u32, ah0, yb0, true)?;
+            self.chain_batch_one(xtb, iu, t_rows as u32, ah1, yb1, true)?;
+        }
         // ew_t: yb1(g) × yb2(u) → x2t(f16 쌍팩 [T][ng/2])
         self.ctx.bind_bufs(ds4, &[yb0, yb1, x2t_b]);
         let push4 = (ng as u32).to_le_bytes().to_vec();
@@ -2566,7 +2574,23 @@ impl TrellisResident {
     ) -> Result<(ash::vk::Buffer, usize), String> {
         let id = self.find_linear(key_d)?;
         let nd = self.linears[id].1.n;
-        self.ffn_trio_impl(key_g, key_u, key_d, t_rows, true)?;
+        self.ffn_trio_impl(key_g, key_u, key_d, t_rows, true, false)?;
+        let b = self.batch.as_ref().ok_or("batch")?;
+        Ok((b.yb[2].buf, nd))
+    }
+
+    /// FFN 트리오 preah 변형(메가융합 2호) — ah0/ah1은 선행 norm_resid_had가
+    /// gate/up suh로 기록. down 체인(f16 leg)은 불변.
+    pub fn ffn_trio_preah(
+        &mut self,
+        key_g: &str,
+        key_u: &str,
+        key_d: &str,
+        t_rows: usize,
+    ) -> Result<(ash::vk::Buffer, usize), String> {
+        let id = self.find_linear(key_d)?;
+        let nd = self.linears[id].1.n;
+        self.ffn_trio_impl(key_g, key_u, key_d, t_rows, true, true)?;
         let b = self.batch.as_ref().ok_or("batch")?;
         Ok((b.yb[2].buf, nd))
     }
