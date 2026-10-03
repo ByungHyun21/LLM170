@@ -1763,3 +1763,249 @@ fn scan_ref(
     }
     (out, st)
 }
+
+// ── 어텐션 모듈 독립 프로브(plans/121 F2b) ──
+// 합성 q‖gate/k/v + 규격 노름으로 prep+fwd 2커널만 검증: 속도·산술 격리 작업장.
+// Rust 미러는 core::ops::rope_head를 직접 재사용(수학 단일 진실 공급원).
+pub fn attn_check(t_len: usize, pos0: usize) -> Result<String, String> {
+    use crate::rawvk::context::VkCtx;
+    const NH: usize = 24;
+    const NKV: usize = 4;
+    const D: usize = 256;
+    let mut ctx = VkCtx::new()?;
+
+    let mut seed: u32 = 0xBEEF_5A17;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed >> 8) as f32 / 16_777_216.0
+    };
+    let mut qg = vec![0f32; t_len * NH * D * 2];
+    let mut kin = vec![0f32; t_len * NKV * D];
+    let mut vin = vec![0f32; t_len * NKV * D];
+    let mut qnw = vec![0f32; D];
+    let mut knw = vec![0f32; D];
+    for e in qg.iter_mut() {
+        *e = (rnd() * 2.0 - 1.0) * 0.5;
+    }
+    for e in kin.iter_mut() {
+        *e = (rnd() * 2.0 - 1.0) * 0.3;
+    }
+    for e in vin.iter_mut() {
+        *e = (rnd() * 2.0 - 1.0) * 0.8;
+    }
+    for e in qnw.iter_mut() {
+        *e = 0.9 + rnd() * 0.2;
+    }
+    for e in knw.iter_mut() {
+        *e = 0.9 + rnd() * 0.2;
+    }
+
+    let cap = pos0 + t_len + 8;
+    let b_qg = ctx.alloc_host_cached(t_len.max(64) * NH * D * 2 * 4)?;
+    let b_k = ctx.alloc_host_cached(t_len.max(64) * NKV * D * 4)?;
+    let b_v = ctx.alloc_host_cached(t_len.max(64) * NKV * D * 4)?;
+    let b_qnw = ctx.alloc_host_cached(D * 4)?;
+    let b_knw = ctx.alloc_host_cached(D * 4)?;
+    let b_qh = ctx.alloc_host_cached(t_len.max(64) * NH * D * 4)?;
+    let b_kc = ctx.alloc_host_cached(cap * NKV * D * 4)?;
+    let b_vc = ctx.alloc_host_cached(cap * NKV * D * 4)?;
+    let b_out = ctx.alloc_host_cached(t_len.max(64) * NH * D * 4)?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(qg.as_ptr(), b_qg.ptr as *mut f32, qg.len());
+        std::ptr::copy_nonoverlapping(kin.as_ptr(), b_k.ptr as *mut f32, kin.len());
+        std::ptr::copy_nonoverlapping(vin.as_ptr(), b_v.ptr as *mut f32, vin.len());
+        std::ptr::copy_nonoverlapping(qnw.as_ptr(), b_qnw.ptr as *mut f32, D);
+        std::ptr::copy_nonoverlapping(knw.as_ptr(), b_knw.ptr as *mut f32, D);
+        std::ptr::write_bytes(b_kc.ptr, 0, cap * NKV * D * 4);
+        std::ptr::write_bytes(b_vc.ptr, 0, cap * NKV * D * 4);
+        std::ptr::write_bytes(b_out.ptr, 0, t_len.max(64) * NH * D * 4);
+    }
+    for b in [&b_qg, &b_k, &b_v, &b_qnw, &b_knw] {
+        ctx.flush_buf(b);
+    }
+    let pp = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_prep.spv"), 8, 8)?;
+    let pf = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd.spv"), 5, 8)?;
+
+    let run = |ctx: &mut VkCtx| -> Result<(), String> {
+        ctx.begin_batch()?;
+        let d1 = ctx.fresh_ds_for(&pp, 8)?;
+        ctx.bind_bufs(
+            d1,
+            &[
+                b_qg.buf, b_k.buf, b_v.buf, b_qnw.buf, b_knw.buf, b_qh.buf, b_kc.buf, b_vc.buf,
+            ],
+        );
+        let push1: Vec<u8> = [t_len as u32, pos0 as u32]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        crate::rawvk::context::site::set_tag("e3_attn_prep");
+        ctx.run_rw(
+            pp.pl,
+            d1,
+            pp.pipe,
+            &push1,
+            t_len as u32,
+            28,
+            1,
+            &[b_qg.buf, b_k.buf, b_v.buf],
+            &[b_qh.buf, b_kc.buf, b_vc.buf],
+        )?;
+        let d2 = ctx.fresh_ds_for(&pf, 5)?;
+        ctx.bind_bufs(d2, &[b_qh.buf, b_kc.buf, b_vc.buf, b_qg.buf, b_out.buf]);
+        let push2: Vec<u8> = [t_len as u32, pos0 as u32]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        crate::rawvk::context::site::set_tag("e3_attn_fwd");
+        ctx.run_rw(
+            pf.pl,
+            d2,
+            pf.pipe,
+            &push2,
+            t_len as u32,
+            24,
+            1,
+            &[b_qh.buf, b_kc.buf, b_vc.buf, b_qg.buf],
+            &[b_out.buf],
+        )?;
+        ctx.end_batch_wait()?;
+        ctx.wait_pending()?;
+        Ok(())
+    };
+    run(&mut ctx)?;
+    let mut times: Vec<f64> = Vec::new();
+    for _ in 0..5 {
+        unsafe {
+            std::ptr::write_bytes(b_kc.ptr, 0, cap * NKV * D * 4);
+            std::ptr::write_bytes(b_vc.ptr, 0, cap * NKV * D * 4);
+        }
+        ctx.flush_buf(&b_kc);
+        ctx.flush_buf(&b_vc);
+        let t0 = std::time::Instant::now();
+        run(&mut ctx)?;
+        times.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ctx.invalidate_buf(&b_out);
+    let out_gpu: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(b_out.ptr as *const f32, t_len * NH * D).to_vec() };
+
+    ctx.invalidate_buf(&b_qh);
+    ctx.invalidate_buf(&b_kc);
+    let qh_gpu: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(b_qh.ptr as *const f32, t_len * NH * D).to_vec() };
+    let kc_gpu: Vec<f32> = unsafe {
+        std::slice::from_raw_parts(b_kc.ptr as *const f32, (pos0 + t_len) * NKV * D).to_vec()
+    };
+    let (qh_ref, kc_ref, out_ref) = attn_ref2(&qg, &kin, &vin, &qnw, &knw, t_len, pos0);
+    let mut qh_max = 0f32;
+    for i in 0..qh_gpu.len() {
+        qh_max = qh_max.max((qh_gpu[i] - qh_ref[i]).abs());
+    }
+    let mut kc_max = 0f32;
+    for i in 0..kc_gpu.len() {
+        kc_max = kc_max.max((kc_gpu[i] - kc_ref[i]).abs());
+    }
+    eprintln!("  [attndbg] qh maxdiff={qh_max:.3e} kc maxdiff={kc_max:.3e}");
+    let mut out_max = 0f32;
+    let mut out_rel = 0f64;
+    for i in 0..out_gpu.len() {
+        let d = (out_gpu[i] - out_ref[i]).abs();
+        out_max = out_max.max(d);
+        let denom = out_ref[i].abs().max(1e-3);
+        out_rel = out_rel.max(d as f64 / denom as f64);
+    }
+    Ok(format!(
+        "attn-check T={t_len} pos0={pos0}: maxdiff={out_max:.3e} rel={out_rel:.3e} · {times:.2?}ms"
+    ))
+}
+
+fn attn_ref(
+    qg: &[f32],
+    kin: &[f32],
+    vin: &[f32],
+    qnw: &[f32],
+    knw: &[f32],
+    t_len: usize,
+    pos0: usize,
+) -> Vec<f32> {
+    attn_ref2(qg, kin, vin, qnw, knw, t_len, pos0).2
+}
+
+fn attn_ref2(
+    qg: &[f32],
+    kin: &[f32],
+    vin: &[f32],
+    qnw: &[f32],
+    knw: &[f32],
+    t_len: usize,
+    pos0: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    const NH: usize = 24;
+    const NKV: usize = 4;
+    const D: usize = 256;
+    let mut out = vec![0f32; t_len * NH * D];
+    let mut qh_all = vec![0f32; t_len * NH * D];
+    let mut kcache = vec![0f32; (pos0 + t_len) * NKV * D];
+    let mut vcache = vec![0f32; (pos0 + t_len) * NKV * D];
+    for t in 0..t_len {
+        let pos = pos0 + t;
+        for hh in 0..NKV {
+            let src = t * NKV * D + hh * D;
+            let mut head: Vec<f32> = kin[src..src + D].to_vec();
+            let ss: f32 = head.iter().map(|x| x * x).sum();
+            let inv = 1.0 / ((ss / D as f32 + 1e-6).sqrt());
+            for d in 0..D {
+                head[d] *= inv * knw[d];
+            }
+            llm170_core::ops::rope_head(&mut head, pos as u32, 64, 1e7);
+            let kb = pos * NKV * D + hh * D;
+            kcache[kb..kb + D].copy_from_slice(&head);
+            vcache[kb..kb + D].copy_from_slice(&vin[src..src + D]);
+        }
+    }
+    for t in 0..t_len {
+        let kv_len = pos0 + t + 1;
+        for hh in 0..NH {
+            let kh = hh / 6;
+            let src = t * NH * D * 2 + hh * D * 2;
+            let mut q: Vec<f32> = qg[src..src + D].to_vec();
+            let ss: f32 = q.iter().map(|x| x * x).sum();
+            let inv = 1.0 / ((ss / D as f32 + 1e-6).sqrt());
+            for d in 0..D {
+                q[d] *= inv * qnw[d];
+            }
+            llm170_core::ops::rope_head(&mut q, (pos0 + t) as u32, 64, 1e7);
+            qh_all[t * NH * D + hh * D..t * NH * D + hh * D + D].copy_from_slice(&q);
+            let scale = 1.0f32 / (D as f32).sqrt();
+            let mut scores = vec![0f32; kv_len];
+            for (i, s) in scores.iter_mut().enumerate() {
+                let kb = i * NKV * D + kh * D;
+                *s = q
+                    .iter()
+                    .zip(&kcache[kb..kb + D])
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+                    * scale;
+            }
+            let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut acc = vec![0f32; D];
+            let mut wsum = 0f32;
+            for i in 0..kv_len {
+                let wgt = (scores[i] - mx).exp();
+                wsum += wgt;
+                let vb = i * NKV * D + kh * D;
+                for d in 0..D {
+                    acc[d] += wgt * vcache[vb + d];
+                }
+            }
+            for d in 0..D {
+                let g = qg[t * NH * D * 2 + hh * D * 2 + D + d];
+                let sg = 1.0 / (1.0 + (-g).exp());
+                out[t * NH * D + hh * D + d] = acc[d] / wsum * sg;
+            }
+        }
+    }
+    (qh_all, kcache, out)
+}
