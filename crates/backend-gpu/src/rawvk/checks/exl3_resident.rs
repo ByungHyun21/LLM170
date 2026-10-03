@@ -2179,8 +2179,14 @@ impl TrellisResident {
         for ai in 0..16usize {
             let il = (ai * 4 + 3) as usize;
             let lp = format!("model.language_model.layers.{il}");
-            q.extend(self.norm(&format!("{lp}.self_attn.q_norm.weight")).ok_or("qnw")?);
-            k.extend(self.norm(&format!("{lp}.self_attn.k_norm.weight")).ok_or("knw")?);
+            q.extend(
+                self.norm(&format!("{lp}.self_attn.q_norm.weight"))
+                    .ok_or("qnw")?,
+            );
+            k.extend(
+                self.norm(&format!("{lp}.self_attn.k_norm.weight"))
+                    .ok_or("knw")?,
+            );
         }
         Ok((q, k))
     }

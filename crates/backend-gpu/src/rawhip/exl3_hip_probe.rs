@@ -884,7 +884,6 @@ pub fn hip_gdn_check(dir: &str) -> Result<String, String> {
 }
 // 마커 gdn1
 
-
 // ── EXL3 hip 어텐션 체인 프로브(모듈 6-7) ── prep→fwd3, Rust 미러 대조.
 pub fn hip_attn_check(dir: &str) -> Result<String, String> {
     use crate::rawvk::checks::TrellisResident;
@@ -963,8 +962,8 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
             for row in 0..lim {
                 let mut p = 0f32;
                 for d in 0..256 {
-                    p += qh[t * 6144 + h * 256 + d]
-                        * kc[(layer * 1024 + row) * 1024 + kh * 256 + d];
+                    p +=
+                        qh[t * 6144 + h * 256 + d] * kc[(layer * 1024 + row) * 1024 + kh * 256 + d];
                 }
                 sc[row] = p * 0.0625;
                 mx = mx.max(sc[row]);
@@ -990,9 +989,8 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
     }
 
     let hc = HipCtx::new()?;
-    let f32b = |v: &[f32]| unsafe {
-        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-    };
+    let f32b =
+        |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
     let dqg = hc.alloc(t_rows * 12288 * 4)?;
     let dkin = hc.alloc(t_rows * 1024 * 4)?;
     let dvin = hc.alloc(t_rows * 1024 * 4)?;
@@ -1049,9 +1047,8 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
         // SAFETY: d2h 완료 후 재해석.
         let gh: &[f32] =
             unsafe { std::slice::from_raw_parts(qhb.as_ptr() as *const f32, t_rows * 6144) };
-        let gk: &[f32] = unsafe {
-            std::slice::from_raw_parts(kcb.as_ptr() as *const f32, 16 * 1024 * 1024)
-        };
+        let gk: &[f32] =
+            unsafe { std::slice::from_raw_parts(kcb.as_ptr() as *const f32, 16 * 1024 * 1024) };
         let mut mq = 0f32;
         for i in 0..gh.len() {
             mq = mq.max((gh[i] - qh[i]).abs());
@@ -1063,11 +1060,10 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
         }
         eprintln!("  [attndbg] qh maxdiff={mq:.3e} · kc(적립분) maxdiff={mk:.3e}");
     }
-    let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5) =
-        (dqh, dkc, dvc, dqg, dou, dpp);
+    let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5) = (dqh, dkc, dvc, dqg, dou, dpp);
     hc.launch3(
-        "exl3_attn_fwd3",
-        t_rows.div_ceil(4) as u32,
+        "exl3_attn_fwd3s",
+        t_rows as u32,
         24,
         1,
         256,
@@ -1119,8 +1115,8 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
             for row in 0..lim2 {
                 let mut pp2 = 0f32;
                 for d in 0..256 {
-                    pp2 += qh[t * 6144 + h * 256 + d]
-                        * kc[(layer * 1024 + row) * 1024 + kh * 256 + d];
+                    pp2 +=
+                        qh[t * 6144 + h * 256 + d] * kc[(layer * 1024 + row) * 1024 + kh * 256 + d];
                 }
                 sc[row] = pp2 * 0.0625;
                 mx = mx.max(sc[row]);
@@ -1151,9 +1147,7 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
             }
             variants[vi] = cov / (vg.sqrt() * vw.sqrt());
         }
-        eprintln!(
-            "  [attndbg] lim-1/lim/lim+1 상관 = {variants:?}"
-        );
+        eprintln!("  [attndbg] lim-1/lim/lim+1 상관 = {variants:?}");
     }
     // lim=1 강제(전 t) — rows>=1 미기록 가설 직접 검증.
     {
@@ -1179,9 +1173,7 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
         &bad_t[..t_rows],
         &bad_h[..]
     );
-    Ok(format!(
-        "hip-attn T={t_rows}: maxdiff={md:.3e} nan={nan}"
-    ))
+    Ok(format!("hip-attn T={t_rows}: maxdiff={md:.3e} nan={nan}"))
 }
 // 마커 at1
 // 마커 ab1
