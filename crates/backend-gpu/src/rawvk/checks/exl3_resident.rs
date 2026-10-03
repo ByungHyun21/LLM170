@@ -726,7 +726,7 @@ impl TrellisResident {
     pub fn gdn_chain_mids(
         &mut self,
         t_rows: usize,
-    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String> {
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String> {
         let gf = self
             .batch
             .as_ref()
@@ -749,8 +749,7 @@ impl TrellisResident {
         self.ctx.invalidate_range(&gf.go, t_rows * 6144 * 4);
         let go =
             unsafe { std::slice::from_raw_parts(gf.go.ptr as *const f32, t_rows * 6144).to_vec() };
-        let _ = gk;
-        Ok((bg, gq, gv, go))
+        Ok((bg, gq, gk, gv, go))
     }
 
     /// layer0 체인 상수 판독(cw/ab/alog/dtb/nw) — 프로브 미러용.
@@ -2253,3 +2252,4 @@ impl TrellisResident {
 // 마커 go1
 // 마커 gqgv
 // 마커 gq3
+// 마커 gk1
