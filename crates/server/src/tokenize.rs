@@ -70,6 +70,10 @@ impl Tokenizer {
     }
 
     pub fn load(path: &Path, part2: Option<&Path>) -> Result<Self, String> {
+        // EXL3 디렉터리 (plans/121 A1) — vocab.json/merges.txt/tokenizer_config.json.
+        if path.is_dir() {
+            return Self::from_hf_dir(path);
+        }
         let g = GgufFile::open(path).map_err(|e| e.to_string())?;
         if has_tokens(&g) {
             return Self::from_gguf(&g);
@@ -156,6 +160,18 @@ impl Tokenizer {
         special.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
         special_user.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
+        Self::from_parts(&vocab, bpe_ranks, special, special_user, pre, ignore_merges)
+    }
+
+    /// 공통 꼬리 — 바이트 표·인덱스 조립(from_gguf·from_hf_dir 공유).
+    fn from_parts(
+        vocab: &[String],
+        bpe_ranks: HashMap<Vec<u8>, u32>,
+        special: Vec<(String, u32)>,
+        special_user: Vec<(String, u32)>,
+        pre: Pre,
+        ignore_merges: bool,
+    ) -> Result<Self, String> {
         // GPT-2 bytes_to_unicode 정/역표 (기존 구현과 동일)
         let mut c2b: HashMap<char, u8> = HashMap::new();
         let mut b2c: HashMap<u8, char> = HashMap::new();
@@ -192,7 +208,7 @@ impl Tokenizer {
             text_to_id.insert(t.as_bytes().into(), i as u32);
         }
         Ok(Tokenizer {
-            vocab,
+            vocab: vocab.to_vec(),
             text_to_id,
             bpe_ranks,
             special,
@@ -203,6 +219,120 @@ impl Tokenizer {
             b2c,
             greedy_index,
         })
+    }
+
+    /// EXL3 디렉터리 — vocab.json(조각→id) + merges.txt(BPE 순위) +
+    /// tokenizer_config.json(added_tokens_decoder 특수 토큰) + config.json
+    /// (model_type → pre 스플리터). GGUF 경로와 동일 필드를 구성한다.
+    /// 파서는 llm170_exl3::json 재사용.
+    fn from_hf_dir(dir: &Path) -> Result<Self, String> {
+        let vj = llm170_exl3::Json::parse(
+            &std::fs::read_to_string(dir.join("vocab.json"))
+                .map_err(|e| format!("vocab.json: {e}"))?,
+        )
+        .map_err(|e| format!("vocab.json 파싱: {e}"))?;
+        let obj = vj.as_object().ok_or("vocab.json: 객체 아님")?;
+        let mut max_id = 0usize;
+        let mut pairs: Vec<(String, u32)> = Vec::with_capacity(obj.len());
+        for (k, v) in obj {
+            let f = v
+                .as_f64()
+                .ok_or_else(|| format!("vocab.json: '{k}' id가 숫자 아님"))?;
+            let id = f as i64;
+            if id < 0 || f != id as f64 {
+                return Err(format!("vocab.json: '{k}' id가 정수 아님({f})"));
+            }
+            max_id = max_id.max(id as usize);
+            pairs.push((k.clone(), id as u32));
+        }
+        let mut vocab = vec![String::new(); max_id + 1];
+        for (piece, id) in &pairs {
+            vocab[*id as usize] = piece.clone();
+        }
+
+        // 병합 순위 — GGUF 관례 동일 키(첫 ' ' 분할, 선발 우선). # 헤더는
+        // 순위 소모 없이 스킵(convert_hf_to_gguf의 배열 순서와 정렬).
+        let merges_txt = std::fs::read_to_string(dir.join("merges.txt"))
+            .map_err(|e| format!("merges.txt: {e}"))?;
+        let mut bpe_ranks: HashMap<Vec<u8>, u32> = HashMap::new();
+        let mut rank = 0u32;
+        for line in merges_txt.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let b = line.as_bytes();
+            let Some(p) = b[1..].iter().position(|&c| c == b' ') else {
+                continue;
+            };
+            let (first, second) = (&b[..p + 1], &b[p + 2..]);
+            let mut key = Vec::with_capacity(4 + first.len() + second.len());
+            key.extend_from_slice(&(first.len() as u32).to_le_bytes());
+            key.extend_from_slice(first);
+            key.extend_from_slice(second);
+            bpe_ranks.entry(key).or_insert(rank);
+            rank += 1;
+        }
+
+        // 특수 토큰 — added_tokens_decoder {id: {content, special}}.
+        let mut special: Vec<(String, u32)> = Vec::new();
+        let mut ignore_merges = false;
+        if let Ok(tc) = std::fs::read_to_string(dir.join("tokenizer_config.json"))
+            && let Ok(tj) = llm170_exl3::Json::parse(&tc)
+            && let Some(tobj) = tj.as_object()
+        {
+            for (k, v) in tobj {
+                if k == "ignore_merges"
+                    && let Some(bv) = v.as_bool()
+                {
+                    ignore_merges = bv;
+                }
+                if k != "added_tokens_decoder" {
+                    continue;
+                }
+                if let Some(entries) = v.as_object() {
+                    for (id_str, ent) in entries {
+                        let Ok(id) = id_str.parse::<u32>() else {
+                            continue;
+                        };
+                        let Some(fields) = ent.as_object() else {
+                            continue;
+                        };
+                        let content = fields
+                            .iter()
+                            .find(|(fk, _)| fk == "content")
+                            .and_then(|(_, fv)| fv.as_str().map(str::to_string));
+                        let is_special = fields
+                            .iter()
+                            .find(|(fk, _)| fk == "special")
+                            .and_then(|(_, fv)| fv.as_bool())
+                            .unwrap_or(true);
+                        if let Some(c) = content
+                            && is_special
+                        {
+                            special.push((c, id));
+                        }
+                    }
+                }
+            }
+        }
+        special.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+
+        // pre 스플리터 — config.json model_type(GGUF pre 매핑과 동일 계열).
+        let mut pre = Pre::Other;
+        if let Ok(cfg) = std::fs::read_to_string(dir.join("config.json"))
+            && let Ok(cj) = llm170_exl3::Json::parse(&cfg)
+            && let Some(cobj) = cj.as_object()
+            && let Some((_, mt)) = cobj.iter().find(|(k, _)| k == "model_type")
+            && let Some(mt) = mt.as_str()
+        {
+            pre = match mt {
+                "qwen3_5" => Pre::Qwen35,
+                "qwen2" | "qwen3" => Pre::Qwen2,
+                _ => Pre::Other,
+            };
+        }
+
+        Self::from_parts(&vocab, bpe_ranks, special, Vec::new(), pre, ignore_merges)
     }
     /// 토큰 조각의 원 바이트열 (바이트 수준 BPE 역매핑).
     pub fn piece_bytes(&self, tok: u32) -> Vec<u8> {

@@ -5,6 +5,7 @@
 
 mod bench;
 mod engine;
+mod exl3_engine;
 mod http;
 mod infer;
 mod json;
@@ -36,7 +37,7 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
               [--n-predict N] [--ctx N] [--backend cpu|hip|vulkan] [--spec k]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
       --prompt-tokens 반복 = 병렬 시퀀스(np). --backend hip|vulkan: 원시 디코더 상주 디코드.
-  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
+  llm170 serve --model <file.gguf|exl3_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan|exl3] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
       OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯(기본 1).
   llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
             [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
@@ -138,6 +139,11 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
                     }
                     "cuda" => {
                         return Err("--backend cuda: 미구현 (hip|vulkan 사용)".into());
+                    }
+                    // EXL3 직접 경로 (plans/121 A1) — --model은 EXL3 디렉터리.
+                    "exl3" => {
+                        ma.backend = Some("exl3".into());
+                        ma.gpu_runtime = None;
                     }
                     // 하위호준 별칭 — 종전 2층(--backend gpu --gpu-runtime X) 폐지.
                     "gpu" => {
@@ -356,7 +362,9 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         ple_table: ma.ple_table.clone(),
         ple_cache_mib: ma.ple_cache_mib,
     };
-    let sel = if backend == "gpu" {
+    let sel = if backend == "exl3" {
+        engine::BackendSel::Exl3
+    } else if backend == "gpu" {
         if gpu_runtime.is_empty() {
             engine::BackendSel::Gpu
         } else {
