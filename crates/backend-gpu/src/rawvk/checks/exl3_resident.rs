@@ -1607,7 +1607,7 @@ impl TrellisResident {
                 .iter()
                 .flat_map(|x| x.to_le_bytes())
                 .collect();
-            let nq = (t_rows + 3) / 4;
+            let nq = t_rows.div_ceil(4);
             crate::rawvk::context::site::set_tag("e3_attn_fwd3");
             self.ctx.run_rw(
                 af.pf3.pl,
