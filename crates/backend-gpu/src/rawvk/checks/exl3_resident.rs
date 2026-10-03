@@ -1261,4 +1261,35 @@ impl TrellisResident {
         self.ctx.wait_pending()?;
         Ok(())
     }
+
+    /// GDN 상태 GPU→CPU 동기화(plans/121 F1) — GPU 배치 후 차기 디코드 정합.
+    /// states는 [48*16384] f32, conv는 [3*10240] f32 다운로드.
+    pub fn gdn_state_sync(
+        &mut self,
+        gdn_il: usize,
+        states: &mut [f32],
+        conv: &mut [f32],
+    ) -> Result<(), String> {
+        let gf = match self.batch.as_ref().and_then(|b| b.gframe.as_ref()) {
+            Some(g) => g,
+            None => return Err("gdn_frame ì±ì ìí ëê¸°í ì¤í¨".into()),
+        };
+        self.ctx.invalidate_range(&gf.gstate, 48 * 16384 * 4);
+        self.ctx.invalidate_range(&gf.gring, 3 * 10240 * 4);
+        let st_off = gdn_il * 48 * 16384;
+        let ring_off = gdn_il * 3 * 10240;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                gf.gstate.ptr.add(st_off * 4) as *const f32,
+                states.as_mut_ptr(),
+                48 * 16384,
+            );
+            std::ptr::copy_nonoverlapping(
+                gf.gring.ptr.add(ring_off * 4) as *const f32,
+                conv.as_mut_ptr(),
+                3 * 10240,
+            );
+        }
+        Ok(())
+    }
 }

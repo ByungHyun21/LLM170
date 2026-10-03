@@ -733,7 +733,34 @@ fn gdn_batch(
     let conv_ch = k_len * 2 + d_inner; // 10240
     let eps = 1e-6f32;
 
-    // 선형: qkv+z 공유 입력 1배치
+    // ── F1 GPU 경로(plans/121): T>8에서 전 비선형 GPU 상주 ──
+    // qkv+z를 yb에 남기고 → conv→l2perm→scan→gate 4커널 → gated가 xtb에.
+    if t_rows > 8 {
+        tr.gdn_frame_init()?;
+        let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
+        let _gf = ph("ppg:gpu_layer");
+        let slots = tr.linear_batch_multi_gpu(
+            &[&format!("{lp}.in_proj_qkv"), &format!("{lp}.in_proj_z")],
+            t_rows,
+        )?;
+        let (yb0, _n0) = slots[0];
+        let (yb1, _n1) = slots[1];
+        tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yb0, yb1)?;
+        drop(_gf);
+        // GPU 상태 → SeqState 동기화(차기 디코드 정합): 상태 다운로드.
+        {
+            let (states, conv) = {
+                let g = &mut seq.gdn[il];
+                (&mut g.states, &mut g.conv)
+            };
+            tr.gdn_state_sync(gdn_il, states, conv)?;
+        }
+        // out_proj: gated가 xtb에 있으므로 staged 호출로 결과 반환.
+        let out = tr.linear_batch_staged(&format!("{lp}.out_proj"), t_rows)?;
+        return Ok(out);
+    }
+
+    // ── CPU 경로(기존) — T≤8 스펙 라운드·소형 배치용 ──
     let _g0 = ph("ppg:lin_qkvz");
     let mut outs = tr.linear_batch_multi_staged(
         &[&format!("{lp}.in_proj_qkv"), &format!("{lp}.in_proj_z")],
