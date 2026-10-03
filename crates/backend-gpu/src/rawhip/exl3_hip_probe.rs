@@ -1132,6 +1132,7 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
     let mut tok = tok0;
     let mut hip_toks = Vec::new();
     let mut first: Option<Vec<f32>> = None;
+    let t0f = std::time::Instant::now();
     for _ in 0..4 {
         let (lg, _) = dec.forward(tr.embed_row(tok))?;
         if first.is_none() {
@@ -1146,6 +1147,11 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
         hip_toks.push(am as u32);
         tok = am as u32;
     }
+    let fwd_ms = t0f.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "  [tgdbg] 4스텝 forward {fwd_ms:.0}ms → {:.2} t/s(셔틀 포함)",
+        4000.0 / fwd_ms
+    );
     let got = first.unwrap_or_default();
     let hid: Vec<f32> = Vec::new();
     let mut seq = crate::rawvk::checks::exl3_decode::new_seq_state(tr.n_layers, 512);
@@ -1199,3 +1205,4 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
 // 마커 fm1
 // 마커 md1
 // 마커 g4
+// 마커 tg1
