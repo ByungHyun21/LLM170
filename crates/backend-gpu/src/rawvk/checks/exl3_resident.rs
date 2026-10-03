@@ -995,16 +995,16 @@ impl TrellisResident {
         // 파이프라인 4종
         let pgc = self
             .ctx
-            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_conv.spv"), 6, 4)?;
+            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_conv.spv"), 6, 8)?;
         let pgl = self
             .ctx
-            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_l2perm.spv"), 11, 16)?;
+            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_l2perm.spv"), 11, 20)?;
         let pgs = self
             .ctx
-            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_scan.spv"), 6, 16)?;
+            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_scan.spv"), 6, 20)?;
         let pgg = self
             .ctx
-            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_gate.spv"), 4, 16)?;
+            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_gate.spv"), 4, 20)?;
 
         // 스크래치(TMAX 기준)
         let gq = self.ctx.alloc_host_cached(BATCH_TMAX * 2048 * 4)?;
@@ -1298,5 +1298,35 @@ impl TrellisResident {
         if let Some(b) = self.batch.as_ref() {
             self.ctx.invalidate_range(&b.xtb, bytes);
         }
+    }
+
+    /// GDN 상태 CPU→GPU 업로드(plans/121 F1) — 초기화/리셋용.
+    pub fn gdn_state_upload(
+        &mut self,
+        gdn_il: usize,
+        states: &[f32],
+        conv: &[f32],
+    ) -> Result<(), String> {
+        let gf = match self.batch.as_ref().and_then(|b| b.gframe.as_ref()) {
+            Some(g) => g,
+            None => return Err("gdn_frame 미초기화".into()),
+        };
+        let st_off = gdn_il * 48 * 16384;
+        let ring_off = gdn_il * 3 * 10240;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                states.as_ptr(),
+                gf.gstate.ptr.add(st_off * 4) as *mut f32,
+                48 * 16384,
+            );
+            std::ptr::copy_nonoverlapping(
+                conv.as_ptr(),
+                gf.gring.ptr.add(ring_off * 4) as *mut f32,
+                3 * 10240,
+            );
+        }
+        self.ctx.flush_range(&gf.gstate, 48 * 16384 * 4);
+        self.ctx.flush_range(&gf.gring, 3 * 10240 * 4);
+        Ok(())
     }
 }

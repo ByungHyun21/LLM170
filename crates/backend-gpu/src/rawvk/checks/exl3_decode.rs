@@ -738,6 +738,12 @@ fn gdn_batch(
     if t_rows > 8 {
         tr.gdn_frame_init()?;
         let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
+        // GPU 상태/ring 버퍼는 alloc_host_cached로 제로 보장 없음 — CPU 상태를
+        // 업로드(초기 전부 0, 이후 gdn_state_sync가 갱신된 값 유지).
+        {
+            let g = &seq.gdn[il];
+            tr.gdn_state_upload(gdn_il, &g.states, &g.conv)?;
+        }
         let _gf = ph("ppg:gpu_layer");
         let slots = tr.linear_batch_multi_gpu(
             &[&format!("{lp}.in_proj_qkv"), &format!("{lp}.in_proj_z")],
