@@ -1128,6 +1128,7 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
     let mut dec = Exl3HipDecoder::load(dir, lim_layers)?;
     let mut tr = TrellisResident::load(dir)?;
     let embed: Vec<f32> = tr.embed_row(tok0).to_vec();
+    #[allow(unused_variables)]
     // greedy 4스텝(첫 로짓이 대조 기준 — 상태는 자연 갱신).
     let mut tok = tok0;
     let mut hip_toks = Vec::new();
