@@ -83,6 +83,7 @@ impl Exl3HipDecoder {
         let n_layers = tr.n_layers;
         let n_gdn = n_layers - n_layers / 4;
         let nw = tr.norms_full_dump()?;
+        eprintln!("  [hipl] nw row2[0..3]={:?}", &nw[2 * 5120..2 * 5120 + 3]);
         let (qnw, knw) = tr.attn_norms_dump()?;
         let (cw, ab_c, alog, dtb, nw_g) = tr.gdn_chain_consts()?;
         let keys = tr.linear_keys();
@@ -315,6 +316,26 @@ impl Exl3HipDecoder {
             let lp = format!("model.language_model.layers.{il}");
             let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
             self.norm(2 * il, ab)?;
+            if il == 1 {
+                let mut xb2 = vec![0u8; self.hidden * 4];
+                self.hc.d2h(&mut xb2, self.dx)?;
+                self.hc.sync()?;
+                // SAFETY: d2h 완료 후 재해석.
+                let xf2: &[f32] =
+                    unsafe { std::slice::from_raw_parts(xb2.as_ptr() as *const f32, self.hidden) };
+                let r2 = (xf2.iter().map(|v| v * v).sum::<f32>() / self.hidden as f32).sqrt();
+                eprintln!("  [hipl] L1 진입 x rms={r2:.5} x0={:.6}", xf2[0]);
+            }
+            if il <= 1 {
+                let mut xnb = vec![0u8; self.hidden * 4];
+                self.hc.d2h(&mut xnb, self.dxn)?;
+                self.hc.sync()?;
+                // SAFETY: d2h 완료 후 재해석.
+                let xnf: &[f32] =
+                    unsafe { std::slice::from_raw_parts(xnb.as_ptr() as *const f32, self.hidden) };
+                let r = (xnf.iter().map(|v| v * v).sum::<f32>() / self.hidden as f32).sqrt();
+                eprintln!("  [hipl] L{il} xn rms={r:.5} xn0={:.6}", xnf[0]);
+            }
             if il % 4 == 3 {
                 let mut ai = (il / 4) as i32;
                 let lq_key = format!("{lp}.self_attn.q_proj");
@@ -557,6 +578,25 @@ impl Exl3HipDecoder {
                 self.gemv_chain(&lo, dgate, self.dab)?;
             }
             self.norm(2 * il + 1, self.dab)?;
+            {
+                let mut xb = vec![0u8; self.hidden * 4];
+                self.hc.d2h(&mut xb, self.dx)?;
+                self.hc.sync()?;
+                // SAFETY: d2h 완료 후 재해석.
+                let xf: &[f32] =
+                    unsafe { std::slice::from_raw_parts(xb.as_ptr() as *const f32, self.hidden) };
+                let r = (xf.iter().map(|v| v * v).sum::<f32>() / self.hidden as f32).sqrt();
+                eprintln!("  [hipl] L{il} post-attn rms={r:.5}");
+                if il == 1 {
+                    let mut gb2 = vec![0u8; 8];
+                    self.hc.d2h(&mut gb2, self.dgate)?;
+                    self.hc.sync()?;
+                    // SAFETY: d2h 완료 후 재해석.
+                    let gg: &[f32] =
+                        unsafe { std::slice::from_raw_parts(gb2.as_ptr() as *const f32, 2) };
+                    eprintln!("  [hipl] L1 gated[0..2]={gg:?}");
+                }
+            }
             let lg_key = format!("{lp}.mlp.gate_proj");
             let lu_key = format!("{lp}.mlp.up_proj");
             let ld_key = format!("{lp}.mlp.down_proj");
@@ -602,6 +642,7 @@ impl Exl3HipDecoder {
             }
             self.hc.h2d(dew, f32b(&ew))?;
             self.gemv_chain(&ld, dew, dab)?;
+            ab = dab;
             {
                 let mut xb = vec![0u8; self.hidden * 4];
                 self.hc.d2h(&mut xb, self.dx)?;
@@ -654,3 +695,9 @@ impl Exl3HipDecoder {
 // 마커 hid
 // 마커 rms1
 // 마커 dcmp
+// 마커 l1g
+// 마커 xn1
+// 마커 xn2
+// 마커 lx
+// 마커 rw2
+// 마커 abfix

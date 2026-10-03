@@ -637,12 +637,19 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
 
 // ── EXL3 hip GDN 체인 프로브(모듈 5) ── conv→l2perm→scan→gate 4커널 종단.
 // vk에서 비트검증된 Rust 미러(체인 프로브와 동일 산술)와 대조.
-pub fn hip_gdn_check(dir: &str) -> Result<String, String> {
+pub fn hip_gdn_check(dir: &str, layer_arg: usize) -> Result<String, String> {
     use crate::rawvk::checks::TrellisResident;
     let t_rows = 32usize;
     let n_gdn = 48usize;
     let mut tr = TrellisResident::load(dir)?;
+    // 디코드 완전 미러: 전 깊이 업로드 + lay 인덱싱(슬라이스 검증은 선행 완료).
     let (cw, ab, alog, dtb, nw) = tr.gdn_chain_consts()?;
+    let cw_m = cw[layer_arg * 10240 * 4..(layer_arg + 1) * 10240 * 4].to_vec();
+    let ab_m = ab[layer_arg * 2 * 48 * 5120..(layer_arg + 1) * 2 * 48 * 5120].to_vec();
+    let alog_m = alog[layer_arg * 48..(layer_arg + 1) * 48].to_vec();
+    let dtb_m = dtb[layer_arg * 48..(layer_arg + 1) * 48].to_vec();
+    let nw_m = nw[layer_arg * 128..(layer_arg + 1) * 128].to_vec();
+    let _ = layer_arg;
     drop(tr);
 
     let mut seed: u32 = 0x6E0D_1234;
@@ -663,7 +670,12 @@ pub fn hip_gdn_check(dir: &str) -> Result<String, String> {
     let mut k_all = vec![0f32; t_rows * k_len];
     let mut v_all = vec![0f32; t_rows * d_inner];
     for c in 0..10240usize {
-        let (w0, w1, w2, w3) = (cw[c * 4], cw[c * 4 + 1], cw[c * 4 + 2], cw[c * 4 + 3]);
+        let (w0, w1, w2, w3) = (
+            cw_m[c * 4],
+            cw_m[c * 4 + 1],
+            cw_m[c * 4 + 2],
+            cw_m[c * 4 + 3],
+        );
         let (mut h0, mut h1, mut h2) = (0f32, 0f32, 0f32);
         for t in 0..t_rows {
             let x = qkv[t * 10240 + c];
@@ -698,11 +710,11 @@ pub fn hip_gdn_check(dir: &str) -> Result<String, String> {
         }
         for h in 0..48usize {
             let xrow = &xn[t * 5120..(t + 1) * 5120];
-            let a_row = &ab[h * 5120..(h + 1) * 5120];
-            let b_row = &ab[(48 + h) * 5120..(48 + h + 1) * 5120];
+            let a_row = &ab_m[h * 5120..(h + 1) * 5120];
+            let b_row = &ab_m[(48 + h) * 5120..(48 + h + 1) * 5120];
             let a_v: f32 = xrow.iter().zip(a_row).map(|(x, w)| x * w).sum();
             let b_v: f32 = xrow.iter().zip(b_row).map(|(x, w)| x * w).sum();
-            let g = softplus(a_v + dtb[h]) * (-alog[h].exp());
+            let g = softplus(a_v + dtb_m[h]) * (-alog_m[h].exp());
             let beta = 1.0 / (1.0 + (-b_v).exp());
             let p_inv = (h % 3) * 16 + h / 3;
             bg[t * 96 + p_inv] = beta;
@@ -731,7 +743,7 @@ pub fn hip_gdn_check(dir: &str) -> Result<String, String> {
             let inv = 1.0 / (ss / 128.0 + 1e-6).sqrt();
             for i in 0..128 {
                 let zv = z[dst + i];
-                want[dst + i] = o_ref[src + i] * inv * nw[i] * silu(zv);
+                want[dst + i] = o_ref[src + i] * inv * nw_m[i] * silu(zv);
             }
         }
     }
@@ -774,7 +786,7 @@ pub fn hip_gdn_check(dir: &str) -> Result<String, String> {
         hc.h2d(dst, &zs)?;
     }
     let mut tl = t_rows as i32;
-    let mut lay = 0i32;
+    let mut lay = layer_arg as i32;
     let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) = (dqkv, dcw, dring, dgq, dgk, dgv);
     hc.launch(
         "exl3_gdn_conv",
@@ -1142,3 +1154,6 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
         if ga == wa { "일치" } else { "불일치" }
     ))
 }
+// 마커 gp1
+// 마커 fm1
+// 마커 md1

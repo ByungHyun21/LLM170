@@ -499,6 +499,18 @@ pub fn decode_step(
             .norm(&format!("{lp}.input_layernorm.weight"))
             .ok_or("norm missing")?;
         let xn = rms_norm(&x, norm_w, eps);
+        if std::env::var_os("LLM170_EXL3_DBG")
+            .map(|v| v == "layerdump")
+            .unwrap_or(false)
+            && il <= 1
+        {
+            let r = (xn.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
+            eprintln!(
+                "  [vkl] L{il} xn rms={r:.5} xn[0]={:.6} nw[0..3]={:?}",
+                xn[0],
+                &norm_w[..3.min(norm_w.len())]
+            );
+        }
 
         let mut attn_out = if full {
             let _g = ph("attn_fwd");
@@ -531,7 +543,10 @@ pub fn decode_step(
             .unwrap_or(false)
         {
             let r = (x.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
-            eprintln!("  [vkl] L{il} post-attn rms={r:.5}");
+            eprintln!(
+                "  [vkl] L{il} post-attn rms={r:.5} gdn[0..2]={:?}",
+                &attn_out[..2.min(attn_out.len())]
+            );
         }
 
         // FFN (post_attention_norm)
@@ -557,7 +572,10 @@ pub fn decode_step(
             .unwrap_or(false)
         {
             let r = (x.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
-            eprintln!("  [vkl] L{il} post-ffn rms={r:.5} ffn_out[0..2]={:?}", &ffn_out[..2.min(ffn_out.len())]);
+            eprintln!(
+                "  [vkl] L{il} post-ffn rms={r:.5} ffn_out[0..2]={:?}",
+                &ffn_out[..2.min(ffn_out.len())]
+            );
         }
     }
 
