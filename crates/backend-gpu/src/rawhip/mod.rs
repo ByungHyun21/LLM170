@@ -50,6 +50,7 @@ pub(crate) fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
 
 /// 컴파일된 커널 실행기.
 pub mod ctx;
+pub mod exl3_hip;
 pub mod exl3_hip_probe;
 pub use ctx::*;
 

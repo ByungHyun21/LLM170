@@ -767,11 +767,12 @@ impl TrellisResident {
             .ok_or("gframe")?;
         // 호스트 기록 상수는 그대로 판독(배치 후 GPU 미기입).
         unsafe {
-            let cw = std::slice::from_raw_parts(gf.cw.ptr as *const f32, 10240 * 4).to_vec();
-            let ab = std::slice::from_raw_parts(gf.ab.ptr as *const f32, 2 * 48 * 5120).to_vec();
-            let alog = std::slice::from_raw_parts(gf.alog.ptr as *const f32, 48).to_vec();
-            let dtb = std::slice::from_raw_parts(gf.dtb.ptr as *const f32, 48).to_vec();
-            let nw = std::slice::from_raw_parts(gf.nw.ptr as *const f32, 128).to_vec();
+            let cw = std::slice::from_raw_parts(gf.cw.ptr as *const f32, 48 * 10240 * 4).to_vec();
+            let ab =
+                std::slice::from_raw_parts(gf.ab.ptr as *const f32, 48 * 2 * 48 * 5120).to_vec();
+            let alog = std::slice::from_raw_parts(gf.alog.ptr as *const f32, 48 * 48).to_vec();
+            let dtb = std::slice::from_raw_parts(gf.dtb.ptr as *const f32, 48 * 48).to_vec();
+            let nw = std::slice::from_raw_parts(gf.nw.ptr as *const f32, 48 * 128).to_vec();
             Ok((cw, ab, alog, dtb, nw))
         }
     }
@@ -2927,3 +2928,4 @@ impl TrellisResident {
 // 마커 kr2
 // 마커 l5
 // 마커 l5b
+// 마커 fd
