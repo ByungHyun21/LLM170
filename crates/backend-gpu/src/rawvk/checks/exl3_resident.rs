@@ -571,6 +571,28 @@ pub struct BatchScratch {
     p2: Pipes,  // gemm
     p3: Pipes,  // had_out_t
     p4t: Pipes, // ffn_ew_t
+    /// GDN 프레임(plans/121 F1) — GPU 상주 비선형 체인(지연 초기화).
+    gframe: Option<GdnFrame>,
+}
+
+/// GDN 프레임 버퍼+파이프라인(plans/121 F1).
+pub struct GdnFrame {
+    gq: VkBuf,      // [TMAX*2048] f32 L2 norm q
+    gk: VkBuf,      // [TMAX*2048] f32 L2 norm k
+    gv: VkBuf,      // [TMAX*6144] f32 v lc
+    gbg: VkBuf,     // [TMAX*96] f32 beta|g lc
+    go: VkBuf,      // [TMAX*6144] f32 o lc
+    gqr: VkBuf,     // [TMAX*2048] f32 conv q raw(HF)
+    gkr: VkBuf,     // [TMAX*2048] f32 conv k raw(HF)
+    gvr: VkBuf,     // [TMAX*6144] f32 conv v raw(HF)
+    ab: VkBuf,     // [n_gdn][2*48*5120] f32
+    cw: VkBuf,     // [n_gdn][10240*4] f32
+    alog: VkBuf,   // [n_gdn*48] f32
+    dtb: VkBuf,    // [n_gdn*48] f32
+    nw: VkBuf,     // [n_gdn*128] f32
+    gring: VkBuf,   // [n_gdn*3*10240] f32
+    gstate: VkBuf,  // [n_gdn*48*16384] f32
+    pgc: Pipes, pgl: Pipes, pgs: Pipes, pgg: Pipes,
 }
 
 impl TrellisResident {
@@ -623,6 +645,7 @@ impl TrellisResident {
             p2,
             p3,
             p4t,
+            gframe: None,
         });
         Ok(())
     }
