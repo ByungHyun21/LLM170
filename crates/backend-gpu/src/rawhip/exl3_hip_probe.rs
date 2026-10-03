@@ -1128,16 +1128,57 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
     let mut dec = Exl3HipDecoder::load(dir, lim_layers)?;
     let mut tr = TrellisResident::load(dir)?;
     let embed: Vec<f32> = tr.embed_row(tok0).to_vec();
-    let (got, hid) = dec.forward(&embed)?;
+    // greedy 4스텝(첫 로짓이 대조 기준 — 상태는 자연 갱신).
+    let mut tok = tok0;
+    let mut hip_toks = Vec::new();
+    let mut first: Option<Vec<f32>> = None;
+    for _ in 0..4 {
+        let (lg, _) = dec.forward(&tr.embed_row(tok).to_vec())?;
+        if first.is_none() {
+            first = Some(lg.clone());
+        }
+        let am = lg
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        hip_toks.push(am as u32);
+        tok = am as u32;
+    }
+    let got = first.unwrap_or_default();
+    let hid: Vec<f32> = Vec::new();
     let mut seq = crate::rawvk::checks::exl3_decode::new_seq_state(tr.n_layers, 512);
     let want = crate::rawvk::checks::exl3_decode::decode_step(&mut tr, &mut seq, tok0)?;
     let whid = seq.last_h.clone();
-    drop(tr);
-    let mut hmd = 0f32;
-    for i in 0..hid.len().min(whid.len()) {
-        hmd = hmd.max((hid[i] - whid[i]).abs());
+    let mut vt = Vec::new();
+    let mut vtok = want
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap_or(0) as u32;
+    for _ in 0..3 {
+        vt.push(vtok);
+        let lg2 = crate::rawvk::checks::exl3_decode::decode_step(&mut tr, &mut seq, vtok)?;
+        vtok = lg2
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0) as u32;
     }
-    eprintln!("  [hiddbg] 히dden(output_norm 전) maxdiff={hmd:.3e}");
+    vt.push(vtok);
+    eprintln!("  [vk-greedy] 4토큰 {vt:?}");
+    drop(tr);
+    if !hid.is_empty() {
+        let mut hmd = 0f32;
+        for i in 0..hid.len().min(whid.len()) {
+            hmd = hmd.max((hid[i] - whid[i]).abs());
+        }
+        eprintln!("  [hiddbg] hidden maxdiff={hmd:.3e}");
+    }
+    eprintln!("  [hip-greedy] 4토큰 {hip_toks:?}");
     let mut md = 0f32;
     let (mut ga, mut wa) = (0usize, 0usize);
     for i in 0..got.len() {
@@ -1157,3 +1198,4 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
 // 마커 gp1
 // 마커 fm1
 // 마커 md1
+// 마커 g4
