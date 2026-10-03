@@ -950,6 +950,11 @@ fn gdn_batch(
             );
         }
     } else {
+        // plans/122 II-1 GPU 청크 v1 — 측정 부정(2026-10-03: pp512 62.2 vs CPU 66.7,
+        // 전송 ~2GB/런 + 48WG 저점유) — 원복. 정합 자체는 corr 1.0000/o_maxd 9e-4
+        // 달성(교훈: staged 호출의 wait_pending 누락이 스테일 판독 범인이었다).
+        // 재시도 설계: 2단계 — d 삼각해는 상태 무독립(헤드×청크 전체 병렬) +
+        // 상태 캐리/o만 순차 패스.
         llm170_core::gdn::gdn_chunk_seq(
             &q_all,
             &k_all,

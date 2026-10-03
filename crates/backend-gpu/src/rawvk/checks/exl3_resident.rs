@@ -830,9 +830,6 @@ impl TrellisResident {
         Ok(self.batch.as_ref().ok_or("batch scratch")?.xtb.ptr as *mut f32)
     }
 
-    /// FFN 트리오(스테이징, 단일 배치): xf [T][k] → gate/up gemm → ew_t(GPU
-    /// silu·mul → f16 x2t) → down gemm → y [T][n_d]. gate/up 판독·CPU ew·
-    /// down 업로드 전부 제거(원장 #3/#5) — 디코드 ffn_triple의 배치판.
     pub fn ffn_trio_batch(
         &mut self,
         key_g: &str,
