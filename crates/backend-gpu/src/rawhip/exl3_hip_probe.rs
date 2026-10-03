@@ -53,8 +53,6 @@ pub fn hip_gemv_check(dir: &str) -> Result<String, String> {
     // had_in은 그리드 (kchunks, T=1) — gy=1 행.
     let (mut kt, mut nt, mut kk) = ((k / 16) as i32, (n / 16) as i32, krate as i32);
     let (mut b0, mut b1, mut b2) = (dah, dtre, dsb);
-    let gemv_args = |b0: &mut *mut u8, b1: &mut *mut u8, b2: &mut *mut u8| {};
-    gemv_args(&mut b0, &mut b1, &mut b2);
     hc.launch(
         "exl3_gemv",
         ((n / 16) / 8) as u32,
