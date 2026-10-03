@@ -753,6 +753,7 @@ impl TrellisResident {
         f32_in: bool,
         ah_in_pre: bool,
     ) -> Result<(), String> {
+        let _ = x_src; // ah_in_pre=false 시 미사용(ah가 입력)
         let l = &self.linears[li].1;
         let (k, n, krate) = (l.k, l.n, l.krate);
         let (suh_b, tre_b, svh_b) = (l.suh.buf, l.tre.buf, l.svh.buf);
@@ -2061,7 +2062,7 @@ impl TrellisResident {
             (b.ah[0].buf, b.yb[slot].buf)
         };
         self.ctx.begin_batch()?;
-        let _ = self.chain_batch_impl(ah, li, t_rows as u32, ah, yb0, true, false)?;
+        self.chain_batch_impl(ah, li, t_rows as u32, ah, yb0, true, false)?;
         self.ctx.end_batch_wait()?;
         self.ctx.wait_pending()?;
         Ok((yb0, n))
