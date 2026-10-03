@@ -2353,12 +2353,23 @@ pub fn exl3_spec_step(
     tr.fframe_init()?;
     tr.gdn_frame_init()?;
     tr.attn_frame_init()?;
-    tr.gdn_state_snapshot()?;
-    // ③ [d0..d_{k-1}] T=k 배치 타깃 forward — 행별 argmax(프레임).
-    let spec_logits = frame_spec_forward(tr, seq, &drafts)?;
-    let row_am: Vec<u32> = (0..k)
-        .map(|i| argmax32(&spec_logits[i * 248320..(i + 1) * 248320]))
-        .collect();
+    // ③ 검증 — 기본 프레임 / A/B: CPU 검증(LLM170_EXL3_SPECCPU=1, 진단).
+    let row_am: Vec<u32> = if llm170_diag::flag::eq1("LLM170_EXL3_SPECCPU") {
+        let snap2 = spec_snap(seq);
+        let mut row = Vec::with_capacity(k);
+        for &d in &drafts {
+            let lg = decode_step(tr, seq, d)?;
+            row.push(argmax32(&lg));
+        }
+        spec_restore(seq, &snap2);
+        row
+    } else {
+        tr.gdn_state_snapshot()?;
+        let spec_logits = frame_spec_forward(tr, seq, &drafts)?;
+        (0..k)
+            .map(|i| argmax32(&spec_logits[i * 248320..(i + 1) * 248320]))
+            .collect()
+    };
     // ④ 수용 보행.
     let mut accepted: Vec<u32> = Vec::with_capacity(k + 1);
     let mut diverged = false;
@@ -2379,12 +2390,19 @@ pub fn exl3_spec_step(
         );
     }
     let forwards = if diverged {
-        // ⑤ GPU 상태 롤백 + 수용 접두(보정 토큰 포함) 재실행(프레임).
-        // kvc는 재실행이 정확히 pos0.. 행을 덮으므로 복원 불요.
-        tr.gdn_state_restore()?;
-        seq.pos -= k as u32; // frame_spec_forward가 다시 증가
-        let re_accepted = accepted.clone();
-        frame_spec_forward(tr, seq, &re_accepted)?;
+        // ⑤ 롤백 + 수용 접두 재실행 — 프레임 기본 / CPU A/B.
+        if llm170_diag::flag::eq1("LLM170_EXL3_SPECCPU") {
+            let re_accepted = accepted.clone();
+            for &t in &re_accepted {
+                let _ = decode_step(tr, seq, t)?;
+            }
+        } else {
+            // kvc는 재실행이 정확히 pos0.. 행을 덮으므로 복원 불요.
+            tr.gdn_state_restore()?;
+            seq.pos -= k as u32; // frame_spec_forward가 다시 증가
+            let re_accepted = accepted.clone();
+            frame_spec_forward(tr, seq, &re_accepted)?;
+        }
         2
     } else {
         accepted.push(row_am[k - 1]); // 전 수용 — 선행 보너스 토큰
