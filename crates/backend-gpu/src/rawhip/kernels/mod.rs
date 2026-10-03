@@ -11,6 +11,7 @@ pub const SRC: &str = concat!(
     include_str!("src_gemv4.hip"),
     include_str!("src_gemm.hip"),
     include_str!("src_probe.hip"),
+    include_str!("src_exl3.hip"),
     include_str!("src_ew.hip"),
     include_str!("src_gdn.hip"),
     include_str!("src_qsa.hip"),
@@ -189,3 +190,4 @@ pub const NAMES: &[&str] = &[
     "vit_rope",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
+// 마커 hip1
