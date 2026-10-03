@@ -1267,9 +1267,11 @@ pub fn prefill_batch(
     for chunk_toks in tokens.chunks(super::exl3_resident::BATCH_TMAX) {
         let t_rows = chunk_toks.len();
         // ── 프레임 경로(plans/121 원-서브밋): 잔차 GPU 상주, 층간 판독 0 ──
-        // 옵트인 주의: "LLM170_FRAME"은 qwen4exp 프레임 게이트와 이름 충돌
-        // (워크스테이션 env 상주) — EXL3 전용 엄격 키 사용.
-        if t_rows > 8 && llm170_diag::flag::eq1("LLM170_EXL3_FRAME") {
+        // 기본 경로(2026-10-03 승격): 원-서브밋 프레임 — pp512 123.02 t/s(+12.7%),
+        // corr 0.999999. 옵트아웃 LLM170_EXL3_NOFRAME(A/B·구경로 회귀 디버그).
+        // 주의: "LLM170_FRAME"은 qwen4exp 게이트와 이름 충돌 — 사용 금지.
+        if !llm170_diag::flag::on("LLM170_EXL3_NOFRAME") {
+            // T 전 범위 — 스펙 라운드 포함
             let _g0 = ph("ppf:frame");
             tr.fframe_init()?;
             tr.gdn_frame_init()?;
