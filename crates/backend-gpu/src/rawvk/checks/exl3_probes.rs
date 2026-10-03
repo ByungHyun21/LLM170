@@ -772,11 +772,6 @@ pub fn ffn_check(dir: &str) -> Result<String, String> {
     let mut tr = TrellisResident::load(dir)?;
     let t_rows = 512usize;
     let stage = tr.stage_f32()?;
-    let mut seed: u32 = 0xF00D_1234;
-    let mut rnd = || {
-        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-        (seed >> 8) as f32 / 16_777_216.0
-    };
     unsafe {
         std::ptr::write_bytes(stage, 0, t_rows * 5120 * 4);
         for t in 0..t_rows {
@@ -805,7 +800,7 @@ pub fn ffn_check(dir: &str) -> Result<String, String> {
     let mut ts: Vec<f64> = Vec::new();
     for _ in 0..5 {
         unsafe {
-            let p = stage as *mut f32;
+            let p = stage;
             for i in 0..5120usize {
                 *p.add(i) = x0[i];
             }
@@ -832,7 +827,6 @@ pub fn ffn_check(dir: &str) -> Result<String, String> {
             md = md.max(d);
         }
     }
-    let _ = &mut rnd;
     Ok(format!(
         "ffn-check T={t_rows}: row0 maxdiff={md:.3e} nan={nan} · trio median {:.1}ms",
         ts[2]
