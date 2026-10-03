@@ -1127,13 +1127,13 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
     use crate::rawvk::checks::TrellisResident;
     let mut dec = Exl3HipDecoder::load(dir, lim_layers)?;
     let mut tr = TrellisResident::load(dir)?;
-    let _embed: Vec<f32> = tr.embed_row(tok0).to_vec();
+    let _embed = tr.embed_row(tok0);
     // greedy 4스텝(첫 로짓이 대조 기준 — 상태는 자연 갱신).
     let mut tok = tok0;
     let mut hip_toks = Vec::new();
     let mut first: Option<Vec<f32>> = None;
     for _ in 0..4 {
-        let (lg, _) = dec.forward(&_embed_if(tok, tok0, &_embed))?;
+        let (lg, _) = dec.forward(tr.embed_row(tok))?;
         if first.is_none() {
             first = Some(lg.clone());
         }
