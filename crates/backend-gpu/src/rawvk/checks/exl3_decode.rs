@@ -735,7 +735,7 @@ fn gdn_batch(
 
     // ── F1 GPU 경로(plans/121): T>8에서 전 비선형 GPU 상주 ──
     // qkv+z를 yb에 남기고 → conv→l2perm→scan→gate 4커널 → gated가 xtb에.
-    if t_rows > 8 {
+    if t_rows > 8 && il <= 0 {
         tr.gdn_frame_init()?;
         let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
         // GPU 상태/ring 버퍼는 alloc_host_cached로 제로 보장 없음 — CPU 상태를
@@ -766,6 +766,9 @@ fn gdn_batch(
         }
         // out_proj: gated가 xtb에 있으므로 staged 호출로 결과 반환.
         let out = tr.linear_batch_staged(&format!("{lp}.out_proj"), t_rows)?;
+        if il == 0 {
+            eprintln!("  [f1dbg] L0 out_proj GPU: {:?}", &out[..5.min(out.len())]);
+        }
         return Ok(out);
     }
 
