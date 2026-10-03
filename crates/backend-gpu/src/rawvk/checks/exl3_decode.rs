@@ -751,6 +751,11 @@ fn gdn_batch(
         )?;
         let (yb0, _n0) = slots[0];
         let (yb1, _n1) = slots[1];
+        if il == 0 {
+            let qkv_head = tr.read_yb_head(0, 5);
+            let z_head = tr.read_yb_head(1, 5);
+            eprintln!("  [f1dbg] L0 yb0(qkv): {:?} yb1(z): {:?}", qkv_head, z_head);
+        }
         tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yb0, yb1)?;
         drop(_gf);
         // gate가 xtb에 기록한 gated를 호스트 가시화 — 이후 flush가 올바른
@@ -781,6 +786,9 @@ fn gdn_batch(
     drop(_g0);
     let z = outs.pop().ok_or("qkv/z 결과 유실")?; // [T][6144]
     let qkv = outs.pop().ok_or("qkv/z 결과 유실")?; // [T][10240]
+    if il == 0 {
+        eprintln!("  [f1dbg] L0 CPU qkv: {:?} z: {:?}", &qkv[..5], &z[..5]);
+    }
 
     // 무양자화 가중치 — 선형 호출 전 소유 복사(값 불변, borrow 분리)
     let a_proj = tr
@@ -1045,6 +1053,9 @@ fn gdn_batch(
     let _go = ph("ppg:out");
     let r = tr.linear_batch_staged(&format!("{lp}.out_proj"), t_rows)?;
     drop(_go);
+    if il == 0 {
+        eprintln!("  [f1dbg] L0 out_proj CPU: {:?}", &r[..5.min(r.len())]);
+    }
     Ok(r)
 }
 
