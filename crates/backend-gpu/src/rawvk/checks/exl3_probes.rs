@@ -767,3 +767,75 @@ pub fn nr_check() -> Result<String, String> {
     ))
 }
 // 마커: sqrt 프레임 판정용
+
+pub fn ffn_check(dir: &str) -> Result<String, String> {
+    let mut tr = TrellisResident::load(dir)?;
+    let t_rows = 512usize;
+    let stage = tr.stage_f32()?;
+    let mut seed: u32 = 0xF00D_1234;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed >> 8) as f32 / 16_777_216.0
+    };
+    unsafe {
+        std::ptr::write_bytes(stage, 0, t_rows * 5120 * 4);
+        for t in 0..t_rows {
+            let p = stage.add(t * 5120);
+            for i in 0..5120usize {
+                *p.add(i) = ((i % 23) as f32 - 11.0) * 0.017 + (t as f32) * 0.0007;
+            }
+        }
+    }
+    let lp = "model.language_model.layers.0.mlp";
+    let x0: Vec<f32> = unsafe { std::slice::from_raw_parts(stage as *const f32, 5120) }.to_vec();
+    let g0 = tr.linear(&format!("{lp}.gate_proj"), &x0)?;
+    let u0 = tr.linear(&format!("{lp}.up_proj"), &x0)?;
+    let inter: Vec<f32> = g0
+        .iter()
+        .zip(u0.iter())
+        .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+        .collect();
+    let d0 = tr.linear(&format!("{lp}.down_proj"), &inter)?;
+    tr.ffn_trio_batch(
+        &format!("{lp}.gate_proj"),
+        &format!("{lp}.up_proj"),
+        &format!("{lp}.down_proj"),
+        t_rows,
+    )?;
+    let mut ts: Vec<f64> = Vec::new();
+    for _ in 0..5 {
+        unsafe {
+            let p = stage as *mut f32;
+            for i in 0..5120usize {
+                *p.add(i) = x0[i];
+            }
+        }
+        let t0 = std::time::Instant::now();
+        tr.ffn_trio_batch(
+            &format!("{lp}.gate_proj"),
+            &format!("{lp}.up_proj"),
+            &format!("{lp}.down_proj"),
+            t_rows,
+        )?;
+        ts.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let got = tr.read_yb_rows(2, 1, d0.len())?;
+    let mut md = 0f32;
+    let mut nan = 0usize;
+    for i in 0..d0.len() {
+        let d = (got[i] - d0[i]).abs();
+        if !got[i].is_finite() {
+            nan += 1;
+        }
+        if d.is_finite() {
+            md = md.max(d);
+        }
+    }
+    let _ = &mut rnd;
+    Ok(format!(
+        "ffn-check T={t_rows}: row0 maxdiff={md:.3e} nan={nan} · trio median {:.1}ms",
+        ts[2]
+    ))
+}
+// 마커 ffn1
