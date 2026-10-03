@@ -1358,7 +1358,14 @@ pub fn prefill_batch(
                     eprintln!("  [framedbg] L{il} {kind} out={:?}", &b[..4]);
                     tr.ctx.begin_outer()?;
                 }
-                tr.frame_norm_resid(2 * il + 1, t_rows, ab)?; // post_ln + 잔차
+                // 메가융합 2호: post_ln에 gate/up had 융합.
+                {
+                    let (sg, su) = (
+                        tr.suh_of(&format!("{lp}.mlp.gate_proj"))?,
+                        tr.suh_of(&format!("{lp}.mlp.up_proj"))?,
+                    );
+                    tr.frame_norm_resid_had(2 * il + 1, t_rows, ab, sg, su)?;
+                }
                 if llm170_diag::dump::opts().key("exl3_framedbg") {
                     tr.ctx.end_outer()?;
                     let b = tr.debug_xtb_row()?;
@@ -1372,7 +1379,7 @@ pub fn prefill_batch(
                     );
                     tr.ctx.begin_outer()?;
                 }
-                let yf = tr.ffn_trio_chain(
+                let yf = tr.ffn_trio_preah(
                     &format!("{lp}.mlp.gate_proj"),
                     &format!("{lp}.mlp.up_proj"),
                     &format!("{lp}.mlp.down_proj"),
@@ -2364,8 +2371,15 @@ fn frame_spec_forward(
             tr.linear_chain(&format!("{lp}.linear_attn.out_proj"), t_rows, 0)?
                 .0
         };
-        tr.frame_norm_resid(2 * il + 1, t_rows, ab)?;
-        let yf = tr.ffn_trio_chain(
+        // 메가융합 2호: post_ln에 gate/up had 융합.
+        {
+            let (sg, su) = (
+                tr.suh_of(&format!("{lp}.mlp.gate_proj"))?,
+                tr.suh_of(&format!("{lp}.mlp.up_proj"))?,
+            );
+            tr.frame_norm_resid_had(2 * il + 1, t_rows, ab, sg, su)?;
+        }
+        let yf = tr.ffn_trio_preah(
             &format!("{lp}.mlp.gate_proj"),
             &format!("{lp}.mlp.up_proj"),
             &format!("{lp}.mlp.down_proj"),
@@ -2654,3 +2668,4 @@ pub fn exl3_mtp2(
 // 마커 ls2
 // 마커 att1
 // 마커 specatt
+// 마커 mf2
