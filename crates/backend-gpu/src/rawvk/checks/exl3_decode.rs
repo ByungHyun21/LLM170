@@ -1292,13 +1292,16 @@ pub fn prefill_batch(
             tr.frame_x_flush(t_rows)?;
             tr.ctx.begin_outer()?;
             let zb = tr.frame_zeros_buf()?;
-            // 메가융합 1호: il=0 input_ln에 L0 qkv/z의 had까지 융합.
-            {
+            // 메가융합 1호(T-적응): 융합은 소형-T 전용 — T>64 프리필은
+            // 인라인 WHT가 전용 had_in보다 느림(123→112 역행, 2026-10-04 측정).
+            if t_rows <= 64 {
                 let (s1, s2) = (
                     tr.suh_of("model.language_model.layers.0.linear_attn.in_proj_qkv")?,
                     tr.suh_of("model.language_model.layers.0.linear_attn.in_proj_z")?,
                 );
                 tr.frame_norm_resid_had(0, t_rows, zb, s1, s2)?;
+            } else {
+                tr.frame_norm_resid(0, t_rows, zb)?;
             }
             if llm170_diag::dump::opts().key("exl3_framedbg") {
                 let got = tr.frame_read_xtb_row(1)?;
@@ -1336,15 +1339,25 @@ pub fn prefill_batch(
                         let g = &seq.gdn[il];
                         tr.gdn_state_upload(gdn_il, &g.states, &g.conv)?;
                     }
-                    // 듀얼 gemm2d(메가융합 3호) — krate 불일치층은 내부 preah 폴백.
-                    let dslots = tr.linear_pair_dual(
-                        [
-                            &format!("{lp}.linear_attn.in_proj_qkv"),
-                            &format!("{lp}.linear_attn.in_proj_z"),
-                        ],
-                        t_rows,
-                    )?;
-                    let (yq, yz) = (dslots[0], dslots[1]);
+                    let (yq, yz) = if t_rows <= 64 {
+                        let dslots = tr.linear_pair_dual(
+                            [
+                                &format!("{lp}.linear_attn.in_proj_qkv"),
+                                &format!("{lp}.linear_attn.in_proj_z"),
+                            ],
+                            t_rows,
+                        )?;
+                        (dslots[0], dslots[1])
+                    } else {
+                        let slots = tr.linear_batch_multi_gpu(
+                            &[
+                                &format!("{lp}.linear_attn.in_proj_qkv"),
+                                &format!("{lp}.linear_attn.in_proj_z"),
+                            ],
+                            t_rows,
+                        )?;
+                        (slots[0], slots[1])
+                    };
                     tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yq.0, yz.0)?;
                     drop(_g);
                     tr.linear_chain(&format!("{lp}.linear_attn.out_proj"), t_rows, 0)?
@@ -1358,13 +1371,14 @@ pub fn prefill_batch(
                     eprintln!("  [framedbg] L{il} {kind} out={:?}", &b[..4]);
                     tr.ctx.begin_outer()?;
                 }
-                // 메가융합 2호: post_ln에 gate/up had 융합.
-                {
+                if t_rows <= 64 {
                     let (sg, su) = (
                         tr.suh_of(&format!("{lp}.mlp.gate_proj"))?,
                         tr.suh_of(&format!("{lp}.mlp.up_proj"))?,
                     );
                     tr.frame_norm_resid_had(2 * il + 1, t_rows, ab, sg, su)?;
+                } else {
+                    tr.frame_norm_resid(2 * il + 1, t_rows, ab)?;
                 }
                 if llm170_diag::dump::opts().key("exl3_framedbg") {
                     tr.ctx.end_outer()?;
@@ -1379,12 +1393,21 @@ pub fn prefill_batch(
                     );
                     tr.ctx.begin_outer()?;
                 }
-                let yf = tr.ffn_trio_preah(
-                    &format!("{lp}.mlp.gate_proj"),
-                    &format!("{lp}.mlp.up_proj"),
-                    &format!("{lp}.mlp.down_proj"),
-                    t_rows,
-                )?;
+                let yf = if t_rows <= 64 {
+                    tr.ffn_trio_preah(
+                        &format!("{lp}.mlp.gate_proj"),
+                        &format!("{lp}.mlp.up_proj"),
+                        &format!("{lp}.mlp.down_proj"),
+                        t_rows,
+                    )?
+                } else {
+                    tr.ffn_trio_chain(
+                        &format!("{lp}.mlp.gate_proj"),
+                        &format!("{lp}.mlp.up_proj"),
+                        &format!("{lp}.mlp.down_proj"),
+                        t_rows,
+                    )?
+                };
                 if llm170_diag::dump::opts().key("exl3_framedbg") {
                     tr.ctx.end_outer()?;
                     let b = tr.debug_yb2_row()?;
@@ -1397,7 +1420,7 @@ pub fn prefill_batch(
                     2 * (il + 1)
                 };
                 // 다음 층이 GDN이면 그 qkv/z의 had까지 융합(마지막 층 제외).
-                let nxt_gdn = il + 1 < tr.n_layers && (il + 1) % 4 != 3;
+                let nxt_gdn = il + 1 < tr.n_layers && (il + 1) % 4 != 3 && t_rows <= 64;
                 if nxt_gdn {
                     let lp2 = format!("model.language_model.layers.{}", il + 1);
                     let (s1, s2) = (
@@ -2671,3 +2694,5 @@ pub fn exl3_mtp2(
 // 마커 mf2
 // 마커 dualatt
 // 마커 fb1
+// 마커 tadj
+// 마커 cb1
