@@ -325,3 +325,69 @@ extern "C" __global__ void exl3_gemm2(
     }
 }
 // 마커 g2h
+
+// exl3_gdn_conv hip 직이식 — vk와 동일 산술/레이아웃(링 [n][3][10240] r/w).
+extern "C" __global__ void exl3_gdn_conv(
+    const float* __restrict__ qkv,   // [T][10240]
+    const float* __restrict__ convw, // [10240][4]×층
+    float* __restrict__ ring,        // [L][3][10240]
+    float* __restrict__ q_out,       // [T][2048]
+    float* __restrict__ k_out,       // [T][2048]
+    float* __restrict__ v_out,       // [T][6144]
+    int t_len, int layer)
+{
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= 10240) return;
+    float w0 = convw[layer * 10240 * 4 + ch * 4 + 0];
+    float w1 = convw[layer * 10240 * 4 + ch * 4 + 1];
+    float w2 = convw[layer * 10240 * 4 + ch * 4 + 2];
+    float w3 = convw[layer * 10240 * 4 + ch * 4 + 3];
+    float h0 = ring[layer * 3 * 10240 + 0 * 10240 + ch];
+    float h1 = ring[layer * 3 * 10240 + 1 * 10240 + ch];
+    float h2 = ring[layer * 3 * 10240 + 2 * 10240 + ch];
+    for (int t = 0; t < t_len; t++) {
+        float xt = qkv[t * 10240 + ch];
+        float o = xt / (1.0f + __expf(-xt)) * 0.0f + 0.0f; // 자리표시 — 아래 정정
+        o = (w3 * xt + w0 * h0 + w1 * h1 + w2 * h2);
+        o = o / (1.0f + __expf(-o));
+        if (ch < 2048) {
+            q_out[t * 2048 + ch] = o;
+        } else if (ch < 4096) {
+            k_out[t * 2048 + (ch - 2048)] = o;
+        } else {
+            v_out[t * 6144 + (ch - 4096)] = o;
+        }
+        h0 = h1; h1 = h2; h2 = xt;
+    }
+    ring[layer * 3 * 10240 + 0 * 10240 + ch] = h0;
+    ring[layer * 3 * 10240 + 1 * 10240 + ch] = h1;
+    ring[layer * 3 * 10240 + 2 * 10240 + ch] = h2;
+}
+
+// exl3_gdn_gate hip 직이식 — rms(o_lc)·nw·silu(z) → gated(HF), 역순열 포함.
+extern "C" __global__ void exl3_gdn_gate(
+    const float* __restrict__ o_lc,  // [T][6144]
+    const float* __restrict__ z,     // [T][6144] (HF)
+    const float* __restrict__ nw,    // [128]×층
+    float* __restrict__ gated,       // [T][6144] (HF)
+    int t_len, int layer)
+{
+    __shared__ float red[128];
+    int t = blockIdx.y;
+    int h = blockIdx.x;   // HF 헤드 0..47
+    int tid = threadIdx.x;
+    if (t >= t_len) return;
+    int p_inv = (h % 3) * 16 + h / 3;
+    float ov = o_lc[t * 6144 + p_inv * 128 + tid];
+    red[tid] = ov * ov;
+    __syncthreads();
+    for (int st = 64; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float inv = 1.0f / sqrtf(red[0] / 128.0f + 1e-6f);
+    float zv = z[t * 6144 + h * 128 + tid];
+    gated[t * 6144 + h * 128 + tid] =
+        ov * inv * nw[layer * 128 + tid] * (zv / (1.0f + __expf(-zv)));
+}
+// 마커 cg1
