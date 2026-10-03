@@ -57,7 +57,29 @@ pub fn check(
 }
 
 /// 스플릿 GGUF 전체 파트 크기 합 - `-00001-of-00004.gguf` 패턴(Model4::load와 동일 규약).
+/// EXL3 디렉터리 경로는 재귀 합산 + 런타임 스크래치 가산(2026-10-03:
+/// 디렉터리 metadata≈0으로 통과하던 구멍 — gsnap/배치 스크래치 할당이
+/// 시스템 동결로 폭발한 사고의 근본 가드 결함).
 fn model_bytes(p: &Path) -> u64 {
+    // EXL3 디렉터리: 샤드 전체 합 + GPU 스크래치(yb×3 1.5GB + xtb/ah 1.3GB
+    // + gframe 0.53GB + aframe 0.27GB + fframe/gsnap 0.18GB ≈ 3.7GB → 4GB 가산).
+    if p.is_dir() {
+        let mut total = 0u64;
+        fn walk(d: &Path, acc: &mut u64) {
+            if let Ok(rd) = std::fs::read_dir(d) {
+                for e in rd.flatten() {
+                    let md = e.metadata();
+                    if md.as_ref().is_ok_and(|m| m.is_dir()) {
+                        walk(&e.path(), acc);
+                    } else if let Ok(m) = md {
+                        *acc += m.len();
+                    }
+                }
+            }
+        }
+        walk(p, &mut total);
+        return total.saturating_add(4u64 << 30);
+    }
     let name = match p.file_name().and_then(|s| s.to_str()) {
         Some(n) => n.to_string(),
         None => return 0,
