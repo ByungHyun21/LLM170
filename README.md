@@ -13,17 +13,15 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
-| LLM170 vulkan | 60.2 (batch trellis GEMM prefill + coopmat, plan 121 A1-pp2) | — | — | — |
+| LLM170 vulkan | 60.2 (batch trellis GEMM prefill + coopmat, plan 121 A1-pp2) | — | — | 4.7 (serve exl3) |
 
 | mode | LLM170 vulkan |
 |---|---|
 | tg single | 4.69 (direct trellis, LLM170_VK_DBUF=1, plan 120 A1) |
 | pp batch512 | 60.21 vs 4.00 sequential (greedy 8/8 identical, corr 0.999998, plan 121 A1-pp2) |
-| np4 greedy | — |
-| MTP k=2 | — |
-| MTP k=3 | — |
-| MTP + np4 k=2 | — |
-| MTP + np4 k=3 | — |
+| serve | `llm170 serve --model <exl3_dir> --backend exl3` — batch prefill + slot scheduler; completion tokens verified identical to probe (24/24, plan 121 A1) |
+| MTP k=2 | measured negative: draft acceptance a1=0.79 but T=2 batch verify costs 847ms (> 2x sequential) — effective 0.79 t/s; blocked by small-T batch host overhead (plan 121 A2) |
+| np4 greedy | — (no np head in archive) |
 
 Direct trellis decode (13 GB GTT resident, no F16 expansion).
 Prefill: T-batched trellis GEMM (exl3_gemm, Tt=32) + GDN chunked scan + batched attention — `llm170 exl3-pp`.
