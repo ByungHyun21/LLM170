@@ -1106,6 +1106,55 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
         }
         md = md.max(d);
     }
+    // lim 오프바이원 A/B: t=1,h=0,d=0..3을 lim-1/lim+1 미러와 대조.
+    {
+        let t = 1usize;
+        let h = 0usize;
+        let kh = 0usize;
+        let mut variants = [0f64; 3]; // [lim-1, lim, lim+1] 상관계수
+        for (vi, dl) in [(-1i32), 0, 1].iter().enumerate() {
+            let lim2 = ((pos0 + t + 1) as i32 + dl) as usize;
+            let mut sc = vec![0f32; lim2];
+            let mut mx = -1e30f32;
+            for row in 0..lim2 {
+                let mut pp2 = 0f32;
+                for d in 0..256 {
+                    pp2 += qh[t * 6144 + h * 256 + d]
+                        * kc[(layer * 1024 + row) * 1024 + kh * 256 + d];
+                }
+                sc[row] = pp2 * 0.0625;
+                mx = mx.max(sc[row]);
+            }
+            let mut ws = 0f32;
+            for row in 0..lim2 {
+                sc[row] = (sc[row] - mx).exp();
+                ws += sc[row];
+            }
+            let mut acc = [0f32; 4];
+            for row in 0..lim2 {
+                let w = sc[row];
+                for d in 0..4 {
+                    acc[d] += w * vc[(layer * 1024 + row) * 1024 + kh * 256 + d];
+                }
+            }
+            let mut cov = 0f64;
+            let mut vg = 0f64;
+            let mut vw = 0f64;
+            for d in 0..4 {
+                let g = qg[t * 12288 + h * 512 + 256 + d];
+                let sg2 = 1.0 / (1.0 + (-g).exp());
+                let w = (acc[d] / ws) * sg2;
+                let gg = got[t * 6144 + h * 256 + d] as f64;
+                cov += gg * w as f64;
+                vg += gg * gg;
+                vw += (w as f64) * (w as f64);
+            }
+            variants[vi] = cov / (vg.sqrt() * vw.sqrt());
+        }
+        eprintln!(
+            "  [attndbg] lim-1/lim/lim+1 상관 = {variants:?}"
+        );
+    }
     eprintln!(
         "  [attndbg] 불일치 t분포={:?} h분포={:?}",
         &bad_t[..t_rows],
@@ -1117,3 +1166,4 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
 }
 // 마커 at1
 // 마커 ab1
+// 마커 ab2
