@@ -1630,6 +1630,21 @@ impl TrellisResident {
         Ok(())
     }
 
+    /// 디버그: gstate 선두 8값 판독(재생 NaN 국소화 — plans/121 tg).
+    pub fn debug_gstate_head(&mut self) -> Result<[f32; 8], String> {
+        let g = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.gframe.as_ref())
+            .ok_or("gframe")?;
+        self.ctx.invalidate_range(&g.gstate, 32);
+        let mut out = [0f32; 8];
+        unsafe {
+            std::ptr::copy_nonoverlapping(g.gstate.ptr as *const f32, out.as_mut_ptr(), 8);
+        }
+        Ok(out)
+    }
+
     /// pos0 매개변수 버퍼 기록(재생 경로 — 호스트가 라운드마다 갱신).
     pub fn attn_set_pos(&mut self, pos0: u32) -> Result<(), String> {
         let af = self
