@@ -421,7 +421,8 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         }
         "exl3-hip-gdn" => {
             let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
-            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_gdn_check(&dir)
+            let lay = arg_str(args, 1, "0").parse::<usize>().unwrap_or(0);
+            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_gdn_check(&dir, lay)
         }
         "exl3-hip-gemm" => {
             let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
