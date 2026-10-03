@@ -1921,18 +1921,6 @@ pub fn attn_check(t_len: usize, pos0: usize) -> Result<String, String> {
     ))
 }
 
-fn attn_ref(
-    qg: &[f32],
-    kin: &[f32],
-    vin: &[f32],
-    qnw: &[f32],
-    knw: &[f32],
-    t_len: usize,
-    pos0: usize,
-) -> Vec<f32> {
-    attn_ref2(qg, kin, vin, qnw, knw, t_len, pos0).2
-}
-
 fn attn_ref2(
     qg: &[f32],
     kin: &[f32],
