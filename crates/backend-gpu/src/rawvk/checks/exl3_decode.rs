@@ -1292,7 +1292,14 @@ pub fn prefill_batch(
             tr.frame_x_flush(t_rows)?;
             tr.ctx.begin_outer()?;
             let zb = tr.frame_zeros_buf()?;
-            tr.frame_norm_resid(0, t_rows, zb)?; // il=0 input_ln
+            // 메가융합 1호: il=0 input_ln에 L0 qkv/z의 had까지 융합.
+            {
+                let (s1, s2) = (
+                    tr.suh_of("model.language_model.layers.0.linear_attn.in_proj_qkv")?,
+                    tr.suh_of("model.language_model.layers.0.linear_attn.in_proj_z")?,
+                );
+                tr.frame_norm_resid_had(0, t_rows, zb, s1, s2)?;
+            }
             if llm170_diag::dump::opts().key("exl3_framedbg") {
                 let got = tr.frame_read_xtb_row(1)?;
                 let w0 = tr
@@ -1329,9 +1336,15 @@ pub fn prefill_batch(
                         let g = &seq.gdn[il];
                         tr.gdn_state_upload(gdn_il, &g.states, &g.conv)?;
                     }
-                    let yq =
-                        tr.linear_chain(&format!("{lp}.linear_attn.in_proj_qkv"), t_rows, 0)?;
-                    let yz = tr.linear_chain(&format!("{lp}.linear_attn.in_proj_z"), t_rows, 1)?;
+                    // ah는 선행 norm_resid_had가 기록(메가융합 1호).
+                    let slots = tr.linear_pair_preah(
+                        &[
+                            &format!("{lp}.linear_attn.in_proj_qkv"),
+                            &format!("{lp}.linear_attn.in_proj_z"),
+                        ],
+                        t_rows,
+                    )?;
+                    let (yq, yz) = (slots[0], slots[1]);
                     tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yq.0, yz.0)?;
                     drop(_g);
                     tr.linear_chain(&format!("{lp}.linear_attn.out_proj"), t_rows, 0)?
@@ -1376,7 +1389,18 @@ pub fn prefill_batch(
                 } else {
                     2 * (il + 1)
                 };
-                tr.frame_norm_resid(w_next, t_rows, yf.0)?;
+                // 다음 층이 GDN이면 그 qkv/z의 had까지 융합(마지막 층 제외).
+                let nxt_gdn = il + 1 < tr.n_layers && (il + 1) % 4 != 3;
+                if nxt_gdn {
+                    let lp2 = format!("model.language_model.layers.{}", il + 1);
+                    let (s1, s2) = (
+                        tr.suh_of(&format!("{lp2}.linear_attn.in_proj_qkv"))?,
+                        tr.suh_of(&format!("{lp2}.linear_attn.in_proj_z"))?,
+                    );
+                    tr.frame_norm_resid_had(w_next, t_rows, yf.0, s1, s2)?;
+                } else {
+                    tr.frame_norm_resid(w_next, t_rows, yf.0)?;
+                }
             }
             tr.ctx.end_outer()?;
             drop(_g0);
@@ -2302,7 +2326,14 @@ fn frame_spec_forward(
     }
     tr.ctx.begin_outer()?;
     let zb = tr.frame_zeros_buf()?;
-    tr.frame_norm_resid(0, t_rows, zb)?;
+    // 메가융합 1호: L0 qkv/z had 융합(비트 검증 nrh-check).
+    {
+        let (s1, s2) = (
+            tr.suh_of("model.language_model.layers.0.linear_attn.in_proj_qkv")?,
+            tr.suh_of("model.language_model.layers.0.linear_attn.in_proj_z")?,
+        );
+        tr.frame_norm_resid_had(0, t_rows, zb, s1, s2)?;
+    }
     for il in 0..tr.n_layers {
         let lp = format!("model.language_model.layers.{il}");
         let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
@@ -2320,8 +2351,15 @@ fn frame_spec_forward(
                 let g = &seq.gdn[il];
                 tr.gdn_state_upload(gdn_il, &g.states, &g.conv)?;
             }
-            let yq = tr.linear_chain(&format!("{lp}.linear_attn.in_proj_qkv"), t_rows, 0)?;
-            let yz = tr.linear_chain(&format!("{lp}.linear_attn.in_proj_z"), t_rows, 1)?;
+            // ah는 선행 norm_resid_had가 기록(메가융합 1호).
+            let slots = tr.linear_pair_preah(
+                &[
+                    &format!("{lp}.linear_attn.in_proj_qkv"),
+                    &format!("{lp}.linear_attn.in_proj_z"),
+                ],
+                t_rows,
+            )?;
+            let (yq, yz) = (slots[0], slots[1]);
             tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yq.0, yz.0)?;
             tr.linear_chain(&format!("{lp}.linear_attn.out_proj"), t_rows, 0)?
                 .0
@@ -2338,7 +2376,17 @@ fn frame_spec_forward(
         } else {
             2 * (il + 1)
         };
-        tr.frame_norm_resid(w_next, t_rows, yf.0)?;
+        // 다음 층이 GDN이면 qkv/z had 융합(마지막 층 제외).
+        if il + 1 < tr.n_layers && (il + 1) % 4 != 3 {
+            let lp2 = format!("model.language_model.layers.{}", il + 1);
+            let (s1, s2) = (
+                tr.suh_of(&format!("{lp2}.linear_attn.in_proj_qkv"))?,
+                tr.suh_of(&format!("{lp2}.linear_attn.in_proj_z"))?,
+            );
+            tr.frame_norm_resid_had(w_next, t_rows, yf.0, s1, s2)?;
+        } else {
+            tr.frame_norm_resid(w_next, t_rows, yf.0)?;
+        }
     }
     // 프레임 종료 후 행별 lm_head GEMV — xtb 행은 마지막 norm_resid가 이미
     // output_norm(행 128) 적용: 추가 rms_norm 금지(이중 노름 버그 — 삼각
@@ -2604,3 +2652,5 @@ pub fn exl3_mtp2(
 // 마커 r1diff
 // 마커 dblnorm
 // 마커 ls2
+// 마커 att1
+// 마커 specatt

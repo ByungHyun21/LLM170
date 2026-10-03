@@ -620,6 +620,7 @@ pub struct FFrame {
     zeros: VkBuf,         // [TMAX*5120] 첫 노름용 ab=0
     nw128: VkBuf,         // [128*5120] 노름 행(2il=input_ln, 2il+1=post_ln, 127행=output_norm)
     pnr: Pipes,           // e3_norm_resid
+    pnrh: Pipes,          // e3_norm_resid_had(융합 — 메가융합 1호)
 }
 
 /// GDN 프레임 버퍼+파이프라인(plans/121 F1).
@@ -847,6 +848,66 @@ impl TrellisResident {
     /// 배치 선형 1개 체인(had_in→gemm→had_out_t) — begin_batch 내부 전용.
     /// f32_in=true: x_src를 f32 [T][k]로 직독(had_in_tf32) — 스테이징 경로.
     /// false: f16 쌍팩(ew_t 출력 → down 레그).
+    /// had_in 생략 체인(gemm2+had_out만) — norm_resid_had가 ah를 이미 기록한
+    /// 소비용(plans/121 메가융합 1호). ah는 호출자가 지정(ah[slot]).
+    fn chain_gemmonly(
+        &mut self,
+        li: usize,
+        t_rows: u32,
+        ah: ash::vk::Buffer,
+        yb: ash::vk::Buffer,
+    ) -> Result<(), String> {
+        let l = &self.linears[li].1;
+        let (k, n, krate) = (l.k, l.n, l.krate);
+        let (tre_b, svh_b) = (l.tre.buf, l.svh.buf);
+        let sb_b = self.batch.as_ref().ok_or("batch scratch 미초기화")?.sb.buf;
+        {
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            let ktiles = (k / 16) as u32;
+            let ntiles = (n / 16) as u32;
+            let ds = self.ctx.fresh_ds_for(&b.p2, 3)?;
+            self.ctx.bind_bufs(ds, &[ah, tre_b, sb_b]);
+            let push: Vec<u8> = [ktiles, ntiles, krate, t_rows]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            crate::rawvk::context::site::set_tag("e3_gemm2");
+            self.ctx.run_rw(
+                b.p2.pl,
+                ds,
+                b.p2.pipe,
+                &push,
+                ((n / 64) as u32).max(1),
+                t_rows.div_ceil(128),
+                1,
+                &[ah, tre_b],
+                &[sb_b],
+            )?;
+        }
+        {
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            let ds = self.ctx.fresh_ds_for(&b.p3, 3)?;
+            self.ctx.bind_bufs(ds, &[sb_b, svh_b, yb]);
+            let push: Vec<u8> = [(n / 128) as u32, 1u32, n as u32]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            crate::rawvk::context::site::set_tag("e3_had_out_t");
+            self.ctx.run_rw(
+                b.p3.pl,
+                ds,
+                b.p3.pipe,
+                &push,
+                (n / 128) as u32,
+                t_rows,
+                1,
+                &[sb_b, svh_b],
+                &[yb],
+            )?;
+        }
+        Ok(())
+    }
+
     fn chain_batch_one(
         &mut self,
         x_src: ash::vk::Buffer,
@@ -1928,6 +1989,9 @@ impl TrellisResident {
         let pnr = self
             .ctx
             .pipeline_pipes(include_bytes!("../spv/e3_norm_resid.spv"), 4, 8)?;
+        let pnrh = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/e3_norm_resid_had.spv"), 8, 8)?;
         let xbuf = self.ctx.alloc_host_cached(BATCH_TMAX * 5120 * 4)?;
         let zeros = self.ctx.alloc_host_cached(BATCH_TMAX * 5120 * 4)?;
         let nw128 = self.ctx.alloc_host_cached(129 * 5120 * 4)?;
@@ -1972,6 +2036,8 @@ impl TrellisResident {
                 zeros,
                 nw128,
                 pnr,
+
+                pnrh,
             });
         }
         Ok(())
@@ -2086,6 +2152,267 @@ impl TrellisResident {
             &[xtb, ff.xbuf.buf],
         )?;
         Ok(())
+    }
+
+    /// 선형 suh 버퍼 조회 — norm_resid_had 부착부에서 소비 suh 지정용.
+    pub fn suh_of(&mut self, key: &str) -> Result<ash::vk::Buffer, String> {
+        let li = self.find_linear(key)?;
+        Ok(self.linears[li].1.suh.buf)
+    }
+
+    /// 융합 norm_resid + had 2종(plans/121 메가융합 1호): xtb·xbuf 갱신에 더해
+    /// ah[0]=WHT(xn⊙suh1), ah[1]=WHT(xn⊙suh2)까지 1디스패치로 — 소비 2선형의
+    /// had_in 흡수(-2디스패치/층, 배리어 드레인 절감).
+    pub fn frame_norm_resid_had(
+        &mut self,
+        w_row: usize,
+        t_rows: usize,
+        ab: ash::vk::Buffer,
+        suh1: ash::vk::Buffer,
+        suh2: ash::vk::Buffer,
+    ) -> Result<(), String> {
+        let ff = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.fframe.as_ref())
+            .ok_or("fframe")?;
+        let b = self.batch.as_ref().ok_or("batch")?;
+        let (xtb, ah0, ah1) = (b.xtb.buf, b.ah[0].buf, b.ah[1].buf);
+        let ds = self.ctx.fresh_ds_for(&ff.pnrh, 8)?;
+        self.ctx.bind_bufs(
+            ds,
+            &[ff.xbuf.buf, ff.nw128.buf, ab, xtb, suh1, suh2, ah0, ah1],
+        );
+        let push: Vec<u8> = [t_rows as u32, (w_row * 5120) as u32]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        crate::rawvk::context::site::set_tag("e3_norm_resid_had");
+        self.ctx.run_rw(
+            ff.pnrh.pl,
+            ds,
+            ff.pnrh.pipe,
+            &push,
+            t_rows as u32,
+            1,
+            1,
+            &[ff.nw128.buf, ab, suh1, suh2],
+            &[xtb, ff.xbuf.buf, ah0, ah1],
+        )?;
+        Ok(())
+    }
+
+    /// ah 사전 기록 전제 2선형 배치(gemm2+had_out만) — norm_resid_had 소비용.
+    pub fn linear_pair_preah(
+        &mut self,
+        keys: &[&str],
+        t_rows: usize,
+    ) -> Result<Vec<(ash::vk::Buffer, usize)>, String> {
+        if keys.len() != 2 {
+            return Err(format!("linear_pair_preah: keys {}개 (2 고정)", keys.len()));
+        }
+        let mut idxs = Vec::with_capacity(2);
+        for key in keys {
+            idxs.push(self.find_linear(key)?);
+        }
+        self.ensure_batch()?;
+        self.ctx.begin_batch()?;
+        for (slot, &li) in idxs.iter().enumerate() {
+            let (ah, yb) = {
+                let b = self.batch.as_ref().ok_or("batch")?;
+                (b.ah[slot].buf, b.yb[slot].buf)
+            };
+            self.chain_gemmonly(li, t_rows as u32, ah, yb)?;
+        }
+        self.ctx.end_batch_wait()?;
+        self.ctx.wait_pending()?;
+        let b = self.batch.as_ref().ok_or("batch")?;
+        Ok(idxs
+            .iter()
+            .enumerate()
+            .map(|(slot, &li)| (b.yb[slot].buf, self.linears[li].1.n))
+            .collect())
+    }
+
+    // ── 융합 norm_resid_had 격리 프로브(plans/121 메가융합 1호) ──
+    // xtb/xbuf는 수학 미러와, ah[0]/ah[1]은 Rust WHT 미러(f16 RTNE → 버터플라이 →
+    // f16 팩)와 비트 대조 — 부착 전 산술 게이트.
+    pub fn nrh_check(dir: &str) -> Result<String, String> {
+        let t_rows = 8usize;
+        let mut tr = Self::load(dir)?;
+        tr.fframe_init()?;
+        let (xptr, zeros, nw128) = {
+            let ff = tr
+                .batch
+                .as_ref()
+                .and_then(|b| b.fframe.as_ref())
+                .ok_or("fframe")?;
+            (ff.xbuf.ptr as *mut f32, ff.zeros.buf, &ff.nw128)
+        };
+        let nw: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(nw128.ptr as *const f32, 5120).to_vec() };
+        let mut seed: u32 = 0xABCD_1234;
+        let xs: Vec<f32> = (0..t_rows * 5120)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
+            })
+            .collect();
+        unsafe {
+            std::ptr::copy_nonoverlapping(xs.as_ptr(), xptr, xs.len());
+        }
+        {
+            let ff = tr
+                .batch
+                .as_ref()
+                .and_then(|b| b.fframe.as_ref())
+                .ok_or("fframe")?;
+            tr.ctx.flush_range(&ff.xbuf, t_rows * 5120 * 4);
+        }
+        let lp = "model.language_model.layers.0.linear_attn";
+        let i1 = tr.find_linear(&format!("{lp}.in_proj_qkv"))?;
+        let i2 = tr.find_linear(&format!("{lp}.in_proj_z"))?;
+        let (suh1b, suh2b) = (tr.linears[i1].1.suh.buf, tr.linears[i2].1.suh.buf);
+        // suh는 f16쌍팩 u32[k/2] — f32로 재해석 금지(had_in 바인딩 규약).
+        let suh_unpack = |vkbuf: &crate::rawvk::context::VkBuf| -> Vec<f32> {
+            let raw = unsafe { std::slice::from_raw_parts(vkbuf.ptr as *const u32, 2560) };
+            (0..5120)
+                .map(|k| {
+                    let w = raw[k >> 1];
+                    let h = ((w >> ((k & 1) * 16)) & 0xFFFF) as u16;
+                    half::f16::from_bits(h).to_f32()
+                })
+                .collect()
+        };
+        let suh1f = suh_unpack(&tr.linears[i1].1.suh);
+        let suh2f = suh_unpack(&tr.linears[i2].1.suh);
+        tr.frame_norm_resid_had(0, t_rows, zeros, suh1b, suh2b)?;
+        let (xtb, xb, ah0, ah1) = {
+            let b = tr.batch.as_ref().ok_or("batch")?;
+            let ff = b.fframe.as_ref().ok_or("fframe")?;
+            tr.ctx.invalidate_range(&b.xtb, t_rows * 5120 * 4);
+            tr.ctx.invalidate_range(&ff.xbuf, t_rows * 5120 * 4);
+            tr.ctx.invalidate_range(&b.ah[0], t_rows * 2560 * 4);
+            tr.ctx.invalidate_range(&b.ah[1], t_rows * 2560 * 4);
+            // SAFETY: 상단 배치 종료 후 매핑 판독.
+            unsafe {
+                (
+                    std::slice::from_raw_parts(b.xtb.ptr as *const f32, t_rows * 5120).to_vec(),
+                    std::slice::from_raw_parts(ff.xbuf.ptr as *const f32, t_rows * 5120).to_vec(),
+                    std::slice::from_raw_parts(b.ah[0].ptr as *const u32, t_rows * 2560).to_vec(),
+                    std::slice::from_raw_parts(b.ah[1].ptr as *const u32, t_rows * 2560).to_vec(),
+                )
+            }
+        };
+        let mut want_xn = vec![0f32; t_rows * 5120];
+        for t in 0..t_rows {
+            let ss: f32 = (0..5120).map(|i| xs[t * 5120 + i] * xs[t * 5120 + i]).sum();
+            let inv = 1.0 / (ss / 5120.0 + 1e-6).sqrt();
+            for i in 0..5120 {
+                want_xn[t * 5120 + i] = xs[t * 5120 + i] * inv * nw[i];
+            }
+        }
+        let mut md_xn = 0f32;
+        let mut md_x = 0f32;
+        for i in 0..t_rows * 5120 {
+            md_xn = md_xn.max((xtb[i] - want_xn[i]).abs());
+            md_x = md_x.max((xb[i] - xs[i]).abs());
+        }
+        let wht_mirror = |x_row: &[f32], suh: &[f32]| -> Vec<u32> {
+            let mut ah = vec![0u32; 2560];
+            for ch in 0..40 {
+                let base = ch * 128;
+                let mut sm = [0f32; 128];
+                for i in 0..128 {
+                    let pre = half::f16::from_f32(x_row[base + i] * suh[base + i]);
+                    sm[i] = pre.to_f32();
+                }
+                let mut w = 1usize;
+                while w < 128 {
+                    let mut i = 0;
+                    while i < 128 {
+                        let blk = (i / (2 * w)) * (2 * w);
+                        for j in 0..w {
+                            let a = sm[blk + j];
+                            let b = sm[blk + j + w];
+                            sm[blk + j] = a + b;
+                            sm[blk + j + w] = a - b;
+                        }
+                        i += 2 * w;
+                    }
+                    w *= 2;
+                }
+                for i in (0..128).step_by(2) {
+                    let lo = half::f16::from_f32(sm[i] * 0.08838834764831845);
+                    let hi = half::f16::from_f32(sm[i + 1] * 0.08838834764831845);
+                    ah[(base + i) / 2] = lo.to_bits() as u32 | ((hi.to_bits() as u32) << 16);
+                }
+            }
+            ah
+        };
+        let mut bit1 = 0usize;
+        let mut bit2 = 0usize;
+        for t in 0..t_rows {
+            // 커널 xn(xtb 판독값)을 입력으로 — 미러 재계산의 합산 순서차가 f16
+            // 경계에서 비트를 뒤집는 것을 배제(WHT 자체의 비트 동일성 검증).
+            let row = &xtb[t * 5120..(t + 1) * 5120];
+            let m1 = wht_mirror(row, &suh1f);
+            let m2 = wht_mirror(row, &suh2f);
+            for i in 0..2560 {
+                if ah0[t * 2560 + i] != m1[i] {
+                    bit1 += 1;
+                }
+                if ah1[t * 2560 + i] != m2[i] {
+                    bit2 += 1;
+                }
+            }
+        }
+        // 융합 vs (norm+had_in×2) 시간 — T=512로 측정(10회 중앙).
+        {
+            let t2 = 512usize;
+            unsafe {
+                std::ptr::copy_nonoverlapping(xs.as_ptr(), xptr, t_rows * 5120);
+            }
+            let (x2, z2) = (xs.clone(), vec![0f32; t2 * 5120]);
+            let _ = (x2, z2);
+            let mut tf: Vec<f64> = Vec::new();
+            for _ in 0..10 {
+                let t0 = std::time::Instant::now();
+                tr.frame_norm_resid_had(0, t2, zeros, suh1b, suh2b)?;
+                tf.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            tf.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut tp: Vec<f64> = Vec::new();
+            for _ in 0..10 {
+                let t0 = std::time::Instant::now();
+                tr.frame_norm_resid(0, t2, zeros)?;
+                let _ = tr.linear_batch_multi_gpu(
+                    &[
+                        "model.language_model.layers.0.linear_attn.in_proj_qkv",
+                        "model.language_model.layers.0.linear_attn.in_proj_z",
+                    ],
+                    t2,
+                )?;
+                tp.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            tp.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "  [nrhtime] T512 융합={:.2}ms vs 분리(norm+had2+gemm2)={:.2}ms",
+                tf[5], tp[5]
+            );
+        }
+        eprintln!(
+            "  [nrhdbg] ah0[0..4]={:08x?} m1[0..4]={:08x?} ah1[0..4]={:08x?} m2[0..4]={:08x?}",
+            &ah0[0..4],
+            &wht_mirror(&want_xn[0..5120], &suh1f)[0..4],
+            &ah1[0..4],
+            &wht_mirror(&want_xn[0..5120], &suh2f)[0..4]
+        );
+        Ok(format!(
+            "nrh-check T={t_rows}: xn md={md_xn:.3e} x md={md_x:.3e} · ah1 비트불일치={bit1}/{} · ah2 비트불일치={bit2}/{}",
+            t_rows * 2560,
+            t_rows * 2560
+        ))
     }
 
     pub fn frame_zeros_buf(&mut self) -> Result<ash::vk::Buffer, String> {
@@ -2253,3 +2580,9 @@ impl TrellisResident {
 // 마커 gqgv
 // 마커 gq3
 // 마커 gk1
+// 마커 nrh1
+// 마커 nrh2
+// 마커 nrhdbg
+// 마커 suhf
+// 마커 xtbm
+// 마커 nrht
