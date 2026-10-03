@@ -578,7 +578,9 @@ pub struct BatchScratch {
     p1: Pipes,  // had_in_t (f16 입력 — ew_t 다운 레그)
     p1f: Pipes, // had_in_tf32 (f32 직독)
     p2: Pipes,  // gemm
+    p2d: Pipes, // gemm2d(메가융합 3호 — 듀얼입력)
     p3: Pipes,  // had_out_t
+    p3d: Pipes, // had_out_td(슬래브 오프셋 환원)
     p4t: Pipes, // ffn_ew_t
     /// GDN 프레임(plans/121 F1) — GPU 상주 비선형 체인(지연 초기화).
     gframe: Option<GdnFrame>,
@@ -806,6 +808,12 @@ impl TrellisResident {
         let p2 = self
             .ctx
             .pipeline_pipes(include_bytes!("../spv/exl3_gemm2.spv"), 3, 16)?;
+        let p2d = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/exl3_gemm2d.spv"), 5, 20)?;
+        let p3d = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/exl3_had_out_td.spv"), 3, 20)?;
         let p3 = self
             .ctx
             .pipeline_pipes(include_bytes!("../spv/exl3_had_out_t.spv"), 3, 12)?;
@@ -838,6 +846,8 @@ impl TrellisResident {
             p1,
             p1f,
             p2,
+            p2d,
+            p3d,
             p3,
             p4t,
             gframe: None,
@@ -2210,6 +2220,97 @@ impl TrellisResident {
         Ok(())
     }
 
+    /// 듀얼 GEMM(메가융합 3호): ah0/ah1(선행 norm_had)을 단일 gemm2d로
+    /// 병합 환원 — GEMM 커널 수 절반. 결과 yb[0]/yb[1].
+    pub fn linear_pair_dual(
+        &mut self,
+        keys: [&str; 2],
+        t_rows: usize,
+    ) -> Result<[(ash::vk::Buffer, usize); 2], String> {
+        let i1 = self.find_linear(keys[0])?;
+        let i2 = self.find_linear(keys[1])?;
+        let (k1, n1, kr1, kt1) = {
+            let l = &self.linears[i1].1;
+            (l.k, l.n, l.krate, l.n / 16)
+        };
+        let (k2, n2, kt2) = {
+            let l = &self.linears[i2].1;
+            (l.k, l.n, l.n / 16)
+        };
+        if k1 != k2 || kt1 % 4 != 0 || kt2 % 4 != 0 {
+            return Err(format!(
+                "linear_pair_dual: {}/{} k 불일치 또는 n 비64배수",
+                keys[0], keys[1]
+            ));
+        }
+        let _ = kr1;
+        self.ensure_batch()?;
+        self.ctx.begin_batch()?;
+        {
+            let b = self.batch.as_ref().ok_or("batch")?;
+            let (ah0, ah1, tre1, tre2, sb) = (
+                b.ah[0].buf,
+                b.ah[1].buf,
+                self.linears[i1].1.tre.buf,
+                self.linears[i2].1.tre.buf,
+                b.sb.buf,
+            );
+            let kk = self.linears[i1].1.krate;
+            let ds = self.ctx.fresh_ds_for(&b.p2d, 5)?;
+            self.ctx.bind_bufs(ds, &[ah0, tre1, ah1, tre2, sb]);
+            let push: Vec<u8> = [(k1 / 16) as u32, kt1 as u32, kt2 as u32, kk, t_rows as u32]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            crate::rawvk::context::site::set_tag("e3_gemm2d");
+            self.ctx.run_rw(
+                b.p2d.pl,
+                ds,
+                b.p2d.pipe,
+                &push,
+                ((n1 + n2) / 64) as u32,
+                t_rows.div_ceil(64) as u32,
+                1,
+                &[ah0, tre1, ah1, tre2],
+                &[sb],
+            )?;
+        }
+        // had_out_td 2회 — n_off로 슬래브 분리.
+        for (slot, li, n_off, ntiles) in [(0usize, i1, 0usize, kt1), (1usize, i2, n1, kt2)] {
+            let b = self.batch.as_ref().ok_or("batch")?;
+            let (sb, svh, yb) = (b.sb.buf, self.linears[li].1.svh.buf, b.yb[slot].buf);
+            let ds = self.ctx.fresh_ds_for(&b.p3d, 3)?;
+            self.ctx.bind_bufs(ds, &[sb, svh, yb]);
+            let n_this = ntiles * 16;
+            let push: Vec<u8> = [
+                (n_this / 128) as u32,
+                1u32,
+                ((kt1 + kt2) * 16) as u32,
+                n_off as u32,
+                n_this as u32,
+            ]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+            crate::rawvk::context::site::set_tag("e3_had_out_td");
+            self.ctx.run_rw(
+                b.p3d.pl,
+                ds,
+                b.p3d.pipe,
+                &push,
+                (n_this / 128) as u32,
+                t_rows as u32,
+                1,
+                &[sb, svh],
+                &[yb],
+            )?;
+        }
+        self.ctx.end_batch_wait()?;
+        self.ctx.wait_pending()?;
+        let b = self.batch.as_ref().ok_or("batch")?;
+        Ok([(b.yb[0].buf, n1), (b.yb[1].buf, n2)])
+    }
+
     /// ah 사전 기록 전제 2선형 배치(gemm2+had_out만) — norm_resid_had 소비용.
     pub fn linear_pair_preah(
         &mut self,
@@ -2423,6 +2524,100 @@ impl TrellisResident {
         ))
     }
 
+    // ── 듀얼 gemm2 격리 프로브(메가융합 3호) ── preah(2×gemm2+had_out)와
+    // dual(1×gemm2d+2×had_out_td)을 동일 ah 입력으로 비트 대조.
+    pub fn gemmd_check(dir: &str, t_arg: usize) -> Result<String, String> {
+        let t_rows = t_arg;
+        let mut tr = Self::load(dir)?;
+        tr.fframe_init()?;
+        let (xptr, zeros) = {
+            let ff = tr
+                .batch
+                .as_ref()
+                .and_then(|b| b.fframe.as_ref())
+                .ok_or("fframe")?;
+            (ff.xbuf.ptr as *mut f32, ff.zeros.buf)
+        };
+        let mut seed: u32 = 0x7A11_0001;
+        let xs: Vec<f32> = (0..t_rows * 5120)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
+            })
+            .collect();
+        unsafe {
+            std::ptr::copy_nonoverlapping(xs.as_ptr(), xptr, xs.len());
+        }
+        {
+            let ff = tr
+                .batch
+                .as_ref()
+                .and_then(|b| b.fframe.as_ref())
+                .ok_or("fframe")?;
+            tr.ctx.flush_range(&ff.xbuf, t_rows * 5120 * 4);
+        }
+        let lp = "model.language_model.layers.0.linear_attn";
+        let (s1, s2) = (
+            tr.suh_of(&format!("{lp}.in_proj_qkv"))?,
+            tr.suh_of(&format!("{lp}.in_proj_z"))?,
+        );
+        let n1 = {
+            let i = tr.find_linear(&format!("{lp}.in_proj_qkv"))?;
+            tr.linears[i].1.n
+        };
+        let n2 = {
+            let i = tr.find_linear(&format!("{lp}.in_proj_z"))?;
+            tr.linears[i].1.n
+        };
+        // 기준: preah
+        tr.frame_norm_resid_had(0, t_rows, zeros, s1, s2)?;
+        let _ = tr.linear_pair_preah(
+            &[&format!("{lp}.in_proj_qkv"), &format!("{lp}.in_proj_z")],
+            t_rows,
+        )?;
+        let (yb0_ref, yb1_ref) = {
+            let b = tr.batch.as_ref().ok_or("batch")?;
+            tr.ctx.invalidate_range(&b.yb[0], t_rows * n1 * 4);
+            tr.ctx.invalidate_range(&b.yb[1], t_rows * n2 * 4);
+            // SAFETY: end_batch_wait 후 매핑 판독.
+            unsafe {
+                (
+                    std::slice::from_raw_parts(b.yb[0].ptr as *const f32, t_rows * n1).to_vec(),
+                    std::slice::from_raw_parts(b.yb[1].ptr as *const f32, t_rows * n2).to_vec(),
+                )
+            }
+        };
+        // 듀얼
+        tr.frame_norm_resid_had(0, t_rows, zeros, s1, s2)?;
+        let _ = tr.linear_pair_dual(
+            [&format!("{lp}.in_proj_qkv"), &format!("{lp}.in_proj_z")],
+            t_rows,
+        )?;
+        let (yb0_got, yb1_got) = {
+            let b = tr.batch.as_ref().ok_or("batch")?;
+            tr.ctx.invalidate_range(&b.yb[0], t_rows * n1 * 4);
+            tr.ctx.invalidate_range(&b.yb[1], t_rows * n2 * 4);
+            // SAFETY: end_batch_wait 후 매핑 판독.
+            unsafe {
+                (
+                    std::slice::from_raw_parts(b.yb[0].ptr as *const f32, t_rows * n1).to_vec(),
+                    std::slice::from_raw_parts(b.yb[1].ptr as *const f32, t_rows * n2).to_vec(),
+                )
+            }
+        };
+        let mut md0 = 0f32;
+        let mut md1 = 0f32;
+        for i in 0..yb0_ref.len() {
+            md0 = md0.max((yb0_got[i] - yb0_ref[i]).abs());
+        }
+        for i in 0..yb1_ref.len() {
+            md1 = md1.max((yb1_got[i] - yb1_ref[i]).abs());
+        }
+        Ok(format!(
+            "gemmd-check T={t_rows}: yb0 maxdiff={md0:.3e} yb1 maxdiff={md1:.3e} (n1={n1} n2={n2})"
+        ))
+    }
+
     pub fn frame_zeros_buf(&mut self) -> Result<ash::vk::Buffer, String> {
         Ok(self
             .batch
@@ -2610,3 +2805,10 @@ impl TrellisResident {
 // 마커 suhf
 // 마커 xtbm
 // 마커 nrht
+// 마커 dual1
+// 마커 dual2
+// 마커 dual3
+// 마커 gemmd
+// 마커 t60
+// 마커 t60b
+// 마커 t60c
