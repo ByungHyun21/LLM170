@@ -191,3 +191,4 @@ pub const NAMES: &[&str] = &[
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 // 마커 hip1
+// 마커 hip2
