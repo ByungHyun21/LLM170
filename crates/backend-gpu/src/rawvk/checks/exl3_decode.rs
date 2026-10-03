@@ -1083,6 +1083,24 @@ fn attn_batch(
     let rope_base = 1e7f32;
     let eps = 1e-6f32;
 
+    // GPU 경로(plans/121 F2b): qkv GEMM → prep(norm+rope+KV 적립) → fwd3
+    // (인과 어텐션+게이트→xtb) → o_proj 직결. KV CPU 사본은 프리필 말미 벌크.
+    if t_rows > 8 {
+        let slots = tr.linear_batch_multi_gpu(
+            &[
+                &format!("{lp}.q_proj"),
+                &format!("{lp}.k_proj"),
+                &format!("{lp}.v_proj"),
+            ],
+            t_rows,
+        )?;
+        let pos0 = seq.pos;
+        tr.attn_layer_gpu(attn_il, t_rows, pos0, slots[0].0, slots[1].0, slots[2].0)?;
+        seq.kv[attn_il].len += t_rows;
+        let out = tr.linear_out_gpu(&format!("{lp}.o_proj"), t_rows)?;
+        return Ok(out);
+    }
+
     // 계약: xn은 호출자가 stage_f32 버퍼에 [T][h]로 미리 스테이징했다.
     let _a0 = ph("ppa:lin_qkv");
     let mut outs = tr.linear_batch_multi_staged(
@@ -1366,6 +1384,20 @@ pub fn prefill_batch(
                     if gi >= n_gdn {
                         break;
                     }
+                }
+            }
+        }
+        // 벌크 KV 캐시 동기화(plans/121 F2b) — GPU kvc → seq.kv(차기 디코드).
+        {
+            let mut ai2 = 0usize;
+            for il in 0..tr.n_layers {
+                if il % 4 == 3 {
+                    let len = seq.kv[ai2].len;
+                    let rows = (len * 1024).min(seq.kv[ai2].k.len());
+                    let [k, v] = tr.attn_kv_sync(ai2, rows / 1024)?;
+                    seq.kv[ai2].k[..rows].copy_from_slice(&k[..rows]);
+                    seq.kv[ai2].v[..rows].copy_from_slice(&v[..rows]);
+                    ai2 += 1;
                 }
             }
         }

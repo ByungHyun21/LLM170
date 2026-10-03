@@ -577,6 +577,19 @@ pub struct BatchScratch {
     p4t: Pipes, // ffn_ew_t
     /// GDN 프레임(plans/121 F1) — GPU 상주 비선형 체인(지연 초기화).
     gframe: Option<GdnFrame>,
+    /// 어텐션 프레임(plans/121 F2b) — GPU KV 캐시·prep/fwd3(지연 초기화).
+    aframe: Option<AttnFrame>,
+}
+
+/// 어텐션 프레임(plans/121 F2b) — KV 캐시 16층 GPU 상주 + 파이프라인.
+pub struct AttnFrame {
+    kkc: VkBuf, // [16*1024][1024] f32
+    vkc: VkBuf,
+    qh: VkBuf,   // [TMAX*6144] f32 norm+rope q
+    qnws: VkBuf, // [16*256]
+    knws: VkBuf, // [16*256]
+    pa: Pipes,   // attn_prep
+    pf3: Pipes,  // attn_fwd3
 }
 
 /// GDN 프레임 버퍼+파이프라인(plans/121 F1).
@@ -642,6 +655,7 @@ impl TrellisResident {
         let sb = self.ctx.alloc(BATCH_TMAX * max_n * 4)?;
         let x2t = self.ctx.alloc(BATCH_TMAX * max_n * 2)?;
         self.batch = Some(BatchScratch {
+            aframe: None,
             xtb,
             ah: [ah1, ah2, ah3],
             yb: [y1, y2, y3],
@@ -1482,6 +1496,157 @@ impl TrellisResident {
     }
 }
 
+impl TrellisResident {
+    /// 어텐션 프레임 초기화(plans/121 F2b) — KV 캐시·q/k 노름 상주.
+    pub fn attn_frame_init(&mut self) -> Result<(), String> {
+        if self.batch.as_ref().is_some_and(|b| b.aframe.is_some()) {
+            return Ok(());
+        }
+        self.ensure_batch()?;
+        let pa = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/exl3_attn_prep.spv"), 8, 8)?;
+        let pf3 = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd3.spv"), 5, 8)?;
+        let kkc = self.ctx.alloc_host_cached(16 * 1024 * 1024 * 4)?;
+        let vkc = self.ctx.alloc_host_cached(16 * 1024 * 1024 * 4)?;
+        let qh = self.ctx.alloc_host_cached(BATCH_TMAX * 6144 * 4)?;
+        let qnws = self.ctx.alloc_host_cached(16 * 256 * 4)?;
+        let knws = self.ctx.alloc_host_cached(16 * 256 * 4)?;
+        // 노름 업로드 — 어텐션 층(il%4==3)의 q_norm/k_norm.
+        unsafe {
+            std::ptr::write_bytes(kkc.ptr, 0, 16 * 1024 * 1024 * 4);
+            std::ptr::write_bytes(vkc.ptr, 0, 16 * 1024 * 1024 * 4);
+            let mut ai = 0usize;
+            for il in 0..self.n_layers {
+                if il % 4 != 3 {
+                    continue;
+                }
+                let lp = format!("model.language_model.layers.{il}.self_attn");
+                let qw = self.norm(&format!("{lp}.q_norm.weight")).ok_or("q_norm")?;
+                let kw = self.norm(&format!("{lp}.k_norm.weight")).ok_or("k_norm")?;
+                std::ptr::copy_nonoverlapping(
+                    qw.as_ptr(),
+                    qnws.ptr.add(ai * 256 * 4) as *mut f32,
+                    256,
+                );
+                std::ptr::copy_nonoverlapping(
+                    kw.as_ptr(),
+                    knws.ptr.add(ai * 256 * 4) as *mut f32,
+                    256,
+                );
+                ai += 1;
+            }
+        }
+        self.ctx.flush_buf(&qnws);
+        self.ctx.flush_buf(&knws);
+        self.ctx.flush_buf(&kkc);
+        self.ctx.flush_buf(&vkc);
+        if let Some(b) = self.batch.as_mut() {
+            b.aframe = Some(AttnFrame {
+                kkc,
+                vkc,
+                qh,
+                qnws,
+                knws,
+                pa,
+                pf3,
+            });
+        }
+        Ok(())
+    }
+
+    /// 어텐션 층 GPU 경로(plans/121 F2b): prep(q/k norm+rope+KV 적립) →
+    /// fwd3(인과 어텐션+게이트) → xtb 직접 기록. yb0/1/2 = q‖gate/k/v GEMM 출력.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_layer_gpu(
+        &mut self,
+        attn_il: usize,
+        t_rows: usize,
+        pos0: u32,
+        yb0: ash::vk::Buffer,
+        yb1: ash::vk::Buffer,
+        yb2: ash::vk::Buffer,
+    ) -> Result<(), String> {
+        self.attn_frame_init()?;
+        let af = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.aframe.as_ref())
+            .ok_or("aframe")?;
+        let xtb = self.batch.as_ref().ok_or("batch")?.xtb.buf;
+        let (kkc, vkc, qh, qnws, knws) =
+            (af.kkc.buf, af.vkc.buf, af.qh.buf, af.qnws.buf, af.knws.buf);
+        self.ctx.begin_batch()?;
+        {
+            let ds = self.ctx.fresh_ds_for(&af.pa, 8)?;
+            self.ctx
+                .bind_bufs(ds, &[yb0, yb1, yb2, qnws, knws, qh, kkc, vkc]);
+            let push: Vec<u8> = [t_rows as u32, pos0, attn_il as u32]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect();
+            crate::rawvk::context::site::set_tag("e3_attn_prep");
+            self.ctx.run_rw(
+                af.pa.pl,
+                ds,
+                af.pa.pipe,
+                &push,
+                t_rows as u32,
+                28,
+                1,
+                &[yb0, yb1, yb2, qnws, knws],
+                &[qh, kkc, vkc],
+            )?;
+        }
+        {
+            let ds = self.ctx.fresh_ds_for(&af.pf3, 5)?;
+            self.ctx.bind_bufs(ds, &[qh, kkc, vkc, yb0, xtb]);
+            let push: Vec<u8> = [t_rows as u32, pos0, attn_il as u32]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect();
+            let nq = (t_rows + 3) / 4;
+            crate::rawvk::context::site::set_tag("e3_attn_fwd3");
+            self.ctx.run_rw(
+                af.pf3.pl,
+                ds,
+                af.pf3.pipe,
+                &push,
+                nq as u32,
+                24,
+                1,
+                &[qh, kkc, vkc, yb0],
+                &[xtb],
+            )?;
+        }
+        self.ctx.end_batch_wait()?;
+        self.ctx.wait_pending()?;
+        Ok(())
+    }
+
+    /// 프리필 종료 시 KV 캐시 GPU→CPU 벌크 동기(차기 디코드 정합).
+    pub fn attn_kv_sync(&mut self, attn_il: usize, kv_len: usize) -> Result<[Vec<f32>; 2], String> {
+        let b = self.batch.as_ref().ok_or("batch")?;
+        let a = b.aframe.as_ref().ok_or("aframe")?;
+        let n = kv_len * 1024;
+        self.ctx
+            .invalidate_range_at(&a.kkc, attn_il * 1024 * 1024 * 4, n * 4);
+        self.ctx
+            .invalidate_range_at(&a.vkc, attn_il * 1024 * 1024 * 4, n * 4);
+        let k = unsafe {
+            std::slice::from_raw_parts(a.kkc.ptr.add(attn_il * 1024 * 1024 * 4) as *const f32, n)
+                .to_vec()
+        };
+        let v = unsafe {
+            std::slice::from_raw_parts(a.vkc.ptr.add(attn_il * 1024 * 1024 * 4) as *const f32, n)
+                .to_vec()
+        };
+        Ok([k, v])
+    }
+}
+
 // ── scan 모듈 독립 프로브(plans/121 F2) ──
 // 모델 적재 없이 합성 입력으로 scan 커널만 검증: 속도·산술 격리 작업장.
 // Rust f32 기준(커널 수식 미러)과 행별 출력·최종 상태를 직접 비교한다.
@@ -1849,7 +2014,7 @@ pub fn attn_check(t_len: usize, pos0: usize) -> Result<String, String> {
         *e = 0.9 + rnd() * 0.2;
     }
 
-    let cap = pos0 + t_len + 8;
+    let cap = 1024usize;
     let b_qg = ctx.alloc_host_cached(t_len.max(64) * NH * D * 2 * 4)?;
     let b_k = ctx.alloc_host_cached(t_len.max(64) * NKV * D * 4)?;
     let b_v = ctx.alloc_host_cached(t_len.max(64) * NKV * D * 4)?;
@@ -1873,7 +2038,7 @@ pub fn attn_check(t_len: usize, pos0: usize) -> Result<String, String> {
         ctx.flush_buf(b);
     }
     let pp = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_prep.spv"), 8, 8)?;
-    let pf = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd2.spv"), 5, 8)?;
+    let pf = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd3.spv"), 5, 8)?;
 
     let run = |ctx: &mut VkCtx| -> Result<(), String> {
         ctx.begin_batch()?;
@@ -1884,7 +2049,7 @@ pub fn attn_check(t_len: usize, pos0: usize) -> Result<String, String> {
                 b_qg.buf, b_k.buf, b_v.buf, b_qnw.buf, b_knw.buf, b_qh.buf, b_kc.buf, b_vc.buf,
             ],
         );
-        let push1: Vec<u8> = [t_len as u32, pos0 as u32]
+        let push1: Vec<u8> = [t_len as u32, pos0 as u32, 0u32]
             .iter()
             .flat_map(|x| x.to_le_bytes())
             .collect();
@@ -1902,7 +2067,7 @@ pub fn attn_check(t_len: usize, pos0: usize) -> Result<String, String> {
         )?;
         let d2 = ctx.fresh_ds_for(&pf, 5)?;
         ctx.bind_bufs(d2, &[b_qh.buf, b_kc.buf, b_vc.buf, b_qg.buf, b_out.buf]);
-        let push2: Vec<u8> = [t_len as u32, pos0 as u32]
+        let push2: Vec<u8> = [t_len as u32, pos0 as u32, 0u32]
             .iter()
             .flat_map(|x| x.to_le_bytes())
             .collect();
