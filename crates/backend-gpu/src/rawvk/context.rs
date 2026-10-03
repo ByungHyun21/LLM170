@@ -1811,6 +1811,10 @@ pub mod site {
 
         /// 녹화 프레임 재생(제출+펜스 대기 — 호스트는 pbuf/입력 버퍼 선기록).
         pub fn frame_replay(&mut self, key: u32) -> Result<(), String> {
+            // DBUF 보류 제출 배수(플랜 121 tg): 인접 커맨드 버퍼 간 배리어가
+            // 없어 오버랩 가능 — 재생 전 보류를 마저 기다린다(2회째 제출만
+            // inf던 재생 발산의 유력 원인).
+            self.wait_pending()?;
             let cb = self
                 .frame_cbs
                 .borrow()
