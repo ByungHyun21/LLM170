@@ -1082,7 +1082,7 @@ fn gdn_batch(
         eprintln!(
             "  [f1dbg] L0 out_proj CPU: {:?} conv_q: {:?}",
             &r[..5.min(r.len())],
-            &q_raw_dbg
+            q_raw_dbg
         );
     }
     Ok(r)
