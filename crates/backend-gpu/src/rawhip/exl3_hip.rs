@@ -22,6 +22,7 @@ pub struct Exl3HipDecoder {
     hidden: usize,
     n_layers: usize,
     loaded_layers: usize,
+    pos: u32,
     dx: *mut u8,
     dxn: *mut u8,
     dab: *mut u8,
@@ -190,6 +191,7 @@ impl Exl3HipDecoder {
             hidden,
             n_layers,
             loaded_layers: lim_layers,
+            pos: 0,
             dx,
             dxn,
             dab,
@@ -380,7 +382,7 @@ impl Exl3HipDecoder {
                 self.gemv_chain(&lk, dxn, dgq)?;
                 self.gemv_chain(&lv, dxn, dgv)?;
                 let mut tl2 = 1i32;
-                let mut p0v = 0i32;
+                let mut p0v = self.pos as i32;
                 let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) = (
                     dqh, dgq, dgv, self.dqnw, self.dknw, self.dq2, self.dkc, self.dvc, self.dpp,
                 );
@@ -667,6 +669,8 @@ impl Exl3HipDecoder {
         self.hc.d2h(&mut hb, self.dx)?;
         self.hc.sync()?;
         self.norm(128, self.dab)?;
+        self.pos += 1;
+        self.hc.h2d(self.dpp, &self.pos.to_le_bytes())?;
         let lh_key = "lm_head".to_string();
         let llh = HipLin {
             k: self.lin[&lh_key].k,
@@ -701,3 +705,4 @@ impl Exl3HipDecoder {
 // 마커 lx
 // 마커 rw2
 // 마커 abfix
+// 마커 posr
