@@ -1272,6 +1272,11 @@ pub fn prefill_batch(
         // 주의: "LLM170_FRAME"은 qwen4exp 게이트와 이름 충돌 — 사용 금지.
         if !llm170_diag::flag::on("LLM170_EXL3_NOFRAME") {
             // T 전 범위 — 스펙 라운드 포함
+            if seq.pos == 0 {
+                // fresh 시퀀스 — GPU 상태가 타 시퀀스 잔류일 수 있다(슬롯
+                // 재사용·기준 재생): 강제 재업로드(2026-10-03 사고).
+                tr.gdn_st_invalidate_all();
+            }
             let _g0 = ph("ppf:frame");
             tr.fframe_init()?;
             tr.gdn_frame_init()?;
@@ -2367,6 +2372,12 @@ pub fn exl3_spec_step(
             break;
         }
     }
+    if llm170_diag::dump::opts().key("exl3_specdbg") {
+        eprintln!(
+            "  [specdbg] pos={} drafts={drafts:?} row_am={row_am:?} g0={g0} div={diverged} acc={accepted:?}",
+            seq.pos
+        );
+    }
     let forwards = if diverged {
         // ⑤ GPU 상태 롤백 + 수용 접두(보정 토큰 포함) 재실행(프레임).
         // kvc는 재실행이 정확히 pos0.. 행을 덮으므로 복원 불요.
@@ -2477,3 +2488,4 @@ pub fn exl3_mtp2(
         (spec_s / fwds.max(1) as f64) * 1e3,
     ))
 }
+// 마커 r1diff
