@@ -727,7 +727,6 @@ impl TrellisResident {
     /// 배치 선형 1개 체인(had_in→gemm→had_out_t) — begin_batch 내부 전용.
     /// f32_in=true: x_src를 f32 [T][k]로 직독(had_in_tf32) — 스테이징 경로.
     /// false: f16 쌍팩(ew_t 출력 → down 레그).
-    #[allow(clippy::too_many_arguments)]
     fn chain_batch_one(
         &mut self,
         x_src: ash::vk::Buffer,
@@ -737,23 +736,6 @@ impl TrellisResident {
         yb: ash::vk::Buffer,
         f32_in: bool,
     ) -> Result<(), String> {
-        self.chain_batch_impl(x_src, li, t_rows, ah, yb, f32_in, true)
-    }
-
-    /// ah_in_pre = false: 호출자가 stage_ah로 선행 변환한 ah를 그대로 소비
-    /// (공유 had_in — 같은 xtb 입력의 다중 선형이 WHT 1회만, plans/121 tg).
-    #[allow(clippy::too_many_arguments)]
-    fn chain_batch_impl(
-        &mut self,
-        x_src: ash::vk::Buffer,
-        li: usize,
-        t_rows: u32,
-        ah: ash::vk::Buffer,
-        yb: ash::vk::Buffer,
-        f32_in: bool,
-        ah_in_pre: bool,
-    ) -> Result<(), String> {
-        let _ = x_src; // ah_in_pre=false 시 미사용(ah가 입력)
         let l = &self.linears[li].1;
         let (k, n, krate) = (l.k, l.n, l.krate);
         let (suh_b, tre_b, svh_b) = (l.suh.buf, l.tre.buf, l.svh.buf);
@@ -761,35 +743,33 @@ impl TrellisResident {
         let sb_b = b.sb.buf;
 
         // had_in: x_src × suh → ah (행별 WHT, grid=(k/128, T))
-        if ah_in_pre {
-            {
-                let (pl, pipe, tag) = if f32_in {
-                    (&b.p1f.pl, b.p1f.pipe, "e3_had_in_tf32")
-                } else {
-                    (&b.p1.pl, b.p1.pipe, "e3_had_in_t")
-                };
-                let ds = self
-                    .ctx
-                    .fresh_ds_for(if f32_in { &b.p1f } else { &b.p1 }, 3)?;
+        {
+            let (pl, pipe, tag) = if f32_in {
+                (&b.p1f.pl, b.p1f.pipe, "e3_had_in_tf32")
+            } else {
+                (&b.p1.pl, b.p1.pipe, "e3_had_in_t")
+            };
+            let ds = self
+                .ctx
+                .fresh_ds_for(if f32_in { &b.p1f } else { &b.p1 }, 3)?;
 
-                self.ctx.bind_bufs(ds, &[x_src, suh_b, ah]);
-                let push: Vec<u8> = [(k / 128) as u32, k as u32]
-                    .iter()
-                    .flat_map(|v| v.to_le_bytes())
-                    .collect();
-                crate::rawvk::context::site::set_tag(tag);
-                self.ctx.run_rw(
-                    *pl,
-                    ds,
-                    pipe,
-                    &push,
-                    (k / 128) as u32,
-                    t_rows,
-                    1,
-                    &[x_src, suh_b],
-                    &[ah],
-                )?;
-            }
+            self.ctx.bind_bufs(ds, &[x_src, suh_b, ah]);
+            let push: Vec<u8> = [(k / 128) as u32, k as u32]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            crate::rawvk::context::site::set_tag(tag);
+            self.ctx.run_rw(
+                *pl,
+                ds,
+                pipe,
+                &push,
+                (k / 128) as u32,
+                t_rows,
+                1,
+                &[x_src, suh_b],
+                &[ah],
+            )?;
         }
 
         // gemm2(coopmat): ah × tre → sb ([T][n], nseg=1 — k-분할 없음,
@@ -1885,8 +1865,10 @@ impl TrellisResident {
             (g.gstate.buf, g.gring.buf, g.gstate.bytes)
         };
         let rn = 48 * 3 * 10240 * 4;
+        // 영역 소스: gstate←gsnap+0, gring←gsnap+gn(4703aa3 정리가 첫 소스를
+        // gn 오프셋으로 잘못 바꿔 gstate에 gring 복사+OOB → DEVICE_LOST였음).
         self.ctx.copy_dev(&[
-            (dst, gn as u64, gs, 0, gn as u64),
+            (dst, 0, gs, 0, gn as u64),
             (dst, gn as u64, gr, 0, rn as u64),
         ])
     }
@@ -2005,69 +1987,6 @@ impl TrellisResident {
         })
     }
 
-    /// xtb → ah[slot] 선행 WHT 1회(공유 had_in — 이후 다중 gemmonly 소비).
-    pub fn stage_ah(&mut self, li_key: &str, t_rows: usize, slot: usize) -> Result<(), String> {
-        let li = self.find_linear(li_key)?;
-        let l = &self.linears[li].1;
-        let k = l.k;
-        let suh_b = l.suh.buf;
-        self.ensure_batch()?;
-        let (xtb, ah) = {
-            let b = self.batch.as_ref().ok_or("batch")?;
-            (b.xtb.buf, b.ah[slot].buf)
-        };
-        self.ctx.begin_batch()?;
-        let (pl, pipe) = {
-            let b = self.batch.as_ref().ok_or("batch")?;
-            (b.p1f.pl, b.p1f.pipe)
-        };
-        let ds = self
-            .ctx
-            .fresh_ds_for(&self.batch.as_ref().ok_or("batch")?.p1f, 3)?;
-        self.ctx.bind_bufs(ds, &[xtb, suh_b, ah]);
-        let push: Vec<u8> = [(k / 128) as u32, k as u32]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        crate::rawvk::context::site::set_tag("e3_had_in_tf32");
-        self.ctx.run_rw(
-            pl,
-            ds,
-            pipe,
-            &push,
-            (k / 128) as u32,
-            t_rows as u32,
-            1,
-            &[xtb, suh_b],
-            &[ah],
-        )?;
-        self.ctx.end_batch_wait()?;
-        self.ctx.wait_pending()?;
-        Ok(())
-    }
-
-    /// ah 사전 준비됨 전제 선형(had_in 스킵) — 입력 ah[0](stage_ah 산출물),
-    /// 출력 yb[slot]. plans/121 tg 공유 had_in.
-    pub fn linear_chain_gemmonly(
-        &mut self,
-        key: &str,
-        t_rows: usize,
-        slot: usize,
-    ) -> Result<(ash::vk::Buffer, usize), String> {
-        let li = self.find_linear(key)?;
-        let n = self.linears[li].1.n;
-        self.ensure_batch()?;
-        let (ah, yb0) = {
-            let b = self.batch.as_ref().ok_or("batch")?;
-            (b.ah[0].buf, b.yb[slot].buf)
-        };
-        self.ctx.begin_batch()?;
-        self.chain_batch_impl(ah, li, t_rows as u32, ah, yb0, true, false)?;
-        self.ctx.end_batch_wait()?;
-        self.ctx.wait_pending()?;
-        Ok((yb0, n))
-    }
-
     /// 열린 외부 배치 내부용 선형 체인(begin/end 없음 — 프레임 내 lm_head 등).
     pub fn linear_chain_inside(
         &mut self,
@@ -2169,4 +2088,5 @@ impl TrellisResident {
     }
 }
 // 마커 pbuf
-// 마커 share2
+// 마커 28a
+// 마커 restfx
