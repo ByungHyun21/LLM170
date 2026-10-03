@@ -2344,6 +2344,10 @@ fn frame_spec_forward(
     tr.ctx.end_outer()?;
     if recording {
         tr.ctx.frame_record_end(fkey)?;
+        // 녹화 패스는 제출 없이 종료됐다(record_only) — 여기서 1회 재생해
+        // 이번 라운드의 실행으로 삼는다(설계 결함 수정 2026-10-03:
+        // 미실행 녹화의 스테일 xtb 판독이 재생 NaN의 근원).
+        tr.ctx.frame_replay(fkey)?;
     }
     let xn_all = tr.read_xtb_rows(t_rows)?;
     let mut logits = Vec::with_capacity(t_rows * 248320);
