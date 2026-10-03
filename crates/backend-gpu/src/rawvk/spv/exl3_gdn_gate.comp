@@ -13,6 +13,7 @@ layout(push_constant) uniform PC {
     uint h_k; // 16
     uint h_v; // 48
     uint d;   // 128
+    uint layer; // GDN 층(norm_w 오프셋)
 } pc;
 
 const float eps = 1e-6;
@@ -53,5 +54,5 @@ void main() {
 
     // ── gated[t][h] = rms(o) * silu(z[t][h]) ──
     float zv = z[t * 6144u + h * pc.d + tid];
-    gated[t * 6144u + h * pc.d + tid] = ov * inv * nw[tid] * silu_f(zv);
+    gated[t * 6144u + h * pc.d + tid] = ov * inv * nw[pc.layer * 128u + tid] * silu_f(zv);
 }

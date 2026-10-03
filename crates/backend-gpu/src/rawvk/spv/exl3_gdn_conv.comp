@@ -12,7 +12,7 @@ layout(binding = 2) buffer RingB { float ring[]; };           // [3][10240] r/w
 layout(binding = 3) writeonly buffer QB { float q_out[]; };   // [T][2048]
 layout(binding = 4) writeonly buffer KB { float k_out[]; };   // [T][2048]
 layout(binding = 5) writeonly buffer VB { float v_out[]; };   // [T][6144] (HF 순서)
-layout(push_constant) uniform PC { uint t_len; } pc;
+layout(push_constant) uniform PC { uint t_len; uint layer; } pc;
 
 float silu_f(float x) { return x / (1.0 + exp(-x)); }
 
@@ -23,9 +23,9 @@ void main() {
     float w1 = convw[ch * 4u + 1u];
     float w2 = convw[ch * 4u + 2u];
     float w3 = convw[ch * 4u + 3u];
-    float h0 = ring[0u * 10240u + ch];
-    float h1 = ring[1u * 10240u + ch];
-    float h2 = ring[2u * 10240u + ch];
+    float h0 = ring[pc.layer * 3u * 10240u + 0u * 10240u + ch];
+    float h1 = ring[pc.layer * 3u * 10240u + 1u * 10240u + ch];
+    float h2 = ring[pc.layer * 3u * 10240u + 2u * 10240u + ch];
     for (uint t = 0u; t < pc.t_len; t++) {
         float xt = qkv[t * 10240u + ch];
         float o = silu_f(w3 * xt + w0 * h0 + w1 * h1 + w2 * h2);
@@ -38,7 +38,7 @@ void main() {
         }
         h0 = h1; h1 = h2; h2 = xt;
     }
-    ring[0u * 10240u + ch] = h0;
-    ring[1u * 10240u + ch] = h1;
-    ring[2u * 10240u + ch] = h2;
+    ring[pc.layer * 3u * 10240u + 0u * 10240u + ch] = h0;
+    ring[pc.layer * 3u * 10240u + 1u * 10240u + ch] = h1;
+    ring[pc.layer * 3u * 10240u + 2u * 10240u + ch] = h2;
 }

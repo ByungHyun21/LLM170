@@ -1135,7 +1135,10 @@ impl TrellisResident {
                     gf.gvr.buf,
                 ],
             );
-            let push = (t_rows as u32).to_le_bytes().to_vec();
+            let push: Vec<u8> = [t_rows as u32, gdn_il as u32]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
             crate::rawvk::context::site::set_tag("e3_gdn_conv");
             self.ctx.run_rw(
                 gf.pgc.pl,
@@ -1173,7 +1176,7 @@ impl TrellisResident {
                     gf.gbg.buf,
                 ],
             );
-            let push: Vec<u8> = [t_rows as u32, 16u32, 48u32, 128u32]
+            let push: Vec<u8> = [t_rows as u32, 16u32, 48u32, 128u32, gdn_il as u32]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
@@ -1213,7 +1216,7 @@ impl TrellisResident {
                     gf.go.buf,
                 ],
             );
-            let push: Vec<u8> = [t_rows as u32, 16u32, 48u32, 128u32]
+            let push: Vec<u8> = [t_rows as u32, 16u32, 48u32, 128u32, gdn_il as u32]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
@@ -1236,7 +1239,7 @@ impl TrellisResident {
             let ds = self.ctx.fresh_ds_for(&gf.pgg, 4)?;
             let xtb = self.batch.as_ref().ok_or("batch")?.xtb.buf;
             self.ctx.bind_bufs(ds, &[gf.go.buf, yb1, gf.nw.buf, xtb]);
-            let push: Vec<u8> = [t_rows as u32, 16u32, 48u32, 128u32]
+            let push: Vec<u8> = [t_rows as u32, 16u32, 48u32, 128u32, gdn_il as u32]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
