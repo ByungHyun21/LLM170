@@ -1096,7 +1096,6 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
         }
         md = md.max(d);
     }
-    }
     eprintln!(
         "  [attndbg] 불일치 t분포={:?} h분포={:?}",
         &bad_t[..t_rows],
