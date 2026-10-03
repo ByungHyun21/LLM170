@@ -747,6 +747,9 @@ fn gdn_batch(
         let (yb1, _n1) = slots[1];
         tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yb0, yb1)?;
         drop(_gf);
+        // gate가 xtb에 기록한 gated를 호스트 가시화 — 이후 flush가 올바른
+        // 데이터를 GPU에 밀게 한다(invalidate 없으면 스테일 xn이 덮어씀).
+        tr.invalidate_xtb(t_rows * 6144 * 4);
         // GPU 상태 → SeqState 동기화(차기 디코드 정합): 상태 다운로드.
         {
             let (states, conv) = {
