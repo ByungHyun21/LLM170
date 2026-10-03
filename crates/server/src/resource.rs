@@ -13,7 +13,9 @@
 //! - 측정 불능(비리눅스/프로브 실패)인 항목은 거부하지 않고 경고만 낸다
 //!   - 가드가 오탐으로 정상 실행을 막는 일이 없어야 하기 때문.
 //!
-//! 킬스위치: LLM170_NO_RSRC_GUARD=1.
+//! 킬스위치 폐지(2026-10-03, 사용자 지시): MemAvailable 기반 계정이 회수
+//! 가능 캐시를 이미 반영하므로 오탐 근원이 아니며, 우회 env는 실질 무장
+//! 해제(시스템 동결 사고 재발 위험) — 가드는 상시 동작.
 
 use std::path::Path;
 
@@ -45,8 +47,7 @@ pub fn check(
     if required > capacity {
         return Err(format!(
             "insufficient resources: model needs ~{} (with slack) but only {} available (VRAM {}, host {}). \
-             Another inference process may be resident - free GPU/RAM and retry. \
-             (override: LLM170_NO_RSRC_GUARD=1)",
+             Another inference process may be resident - free GPU/RAM and retry.",
             gib(required),
             gib(capacity),
             vram_free.map(gib).unwrap_or_else(|| "unknown".into()),
@@ -117,9 +118,6 @@ fn host_mem_available() -> Option<u64> {
 /// 적재 시작 전 가드 - 서브커맨드 진입부에서 호출.
 /// `gpu`가 참이면 VRAM 가용을 조회해 산식에 포함한다.
 pub fn preflight(model: &Path, gpu: bool) -> Result<(), String> {
-    if std::env::var_os("LLM170_NO_RSRC_GUARD").is_some() {
-        return Ok(());
-    }
     let bytes = model_bytes(model);
     if bytes == 0 {
         return Ok(()); // 경로 오류는 로더의 에러가 더 정확하다 - 여기서는 통과
