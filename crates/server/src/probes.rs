@@ -409,6 +409,12 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             arg_num(args, 1, 0usize),
         ),
         "exl3-nr-check" => llm170_backend_gpu::rawvk::checks::nr_check(),
+        "exl3-hip-decode" => {
+            let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
+            let tok = arg_str(args, 1, "1000").parse::<u32>().unwrap_or(1000);
+            let lim = arg_str(args, 2, "64").parse::<usize>().unwrap_or(64);
+            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_decode_check(&dir, tok, lim)
+        }
         "exl3-hip-attn" => {
             let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
             llm170_backend_gpu::rawhip::exl3_hip_probe::hip_attn_check(&dir)

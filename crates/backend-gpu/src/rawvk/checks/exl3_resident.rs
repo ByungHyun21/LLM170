@@ -2172,6 +2172,24 @@ impl TrellisResident {
         Ok(())
     }
 
+    /// 노름 전체 [129][5120](hip 프로브용).
+    pub fn norms_full_dump(&mut self) -> Result<Vec<f32>, String> {
+        self.fframe_init()?;
+        let ff = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.fframe.as_ref())
+            .ok_or("fframe")?;
+        Ok(unsafe {
+            std::slice::from_raw_parts(ff.nw128.ptr as *const f32, 129 * 5120).to_vec()
+        })
+    }
+
+    /// 선형 키 전체(hip 프로브용).
+    pub fn linear_keys(&self) -> Vec<String> {
+        self.linears.iter().map(|(k, _)| k.clone()).collect()
+    }
+
     /// 어텐션 q/k_norm 가중치(hip 프로브용) — 12층분 각 [256].
     pub fn attn_norms_dump(&mut self) -> Result<(Vec<f32>, Vec<f32>), String> {
         let mut q = Vec::with_capacity(16 * 256);
