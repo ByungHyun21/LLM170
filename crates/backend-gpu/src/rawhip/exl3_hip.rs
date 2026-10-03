@@ -65,6 +65,7 @@ unsafe impl Send for Exl3HipDecoder {}
 impl Exl3HipDecoder {
     /// 대형 pageable h2d는 페이지 미매핑 사례(47MB ab 내부 +2.6MB 폴트, 2026-10-04)
     /// — 4MB 청크로 나누어 모든 페이지를 확실히 커밋.
+    #[allow(unused_mut)]
     fn h2d_chunked(hc: &HipCtx, mut dst: *mut u8, src: &[u8]) -> Result<(), String> {
         const CH: usize = 4 << 20;
         for off in (0..src.len()).step_by(CH) {
