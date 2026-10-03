@@ -1835,17 +1835,12 @@ impl TrellisResident {
         {
             f.gsnap = Some(gsnap);
         }
-        let (src, dst, n) = {
+        let (src, dst) = {
             let b = self.batch.as_ref().ok_or("batch")?;
             let g = b.gframe.as_ref().ok_or("gframe")?;
             let f = b.fframe.as_ref().ok_or("fframe")?;
-            (
-                g.gstate.buf,
-                f.gsnap.as_ref().ok_or("gsnap")?.buf,
-                g.gstate.bytes,
-            )
+            (g.gstate.buf, f.gsnap.as_ref().ok_or("gsnap")?.buf)
         };
-        let _ = n;
         let (gs, gr, gn) = {
             let b = self.batch.as_ref().ok_or("batch")?;
             let g = b.gframe.as_ref().ok_or("gframe")?;
@@ -1860,17 +1855,12 @@ impl TrellisResident {
 
     /// 스냅샷 복원(발산 라운드 — kvc는 재실행이 정확히 덮으므로 미복원).
     pub fn gdn_state_restore(&mut self) -> Result<(), String> {
-        let (src, dst, n) = {
+        let (src, dst) = {
             let b = self.batch.as_ref().ok_or("batch")?;
             let g = b.gframe.as_ref().ok_or("gframe")?;
             let f = b.fframe.as_ref().ok_or("fframe")?;
-            (
-                f.gsnap.as_ref().ok_or("gsnap")?.buf,
-                g.gstate.buf,
-                g.gstate.bytes,
-            )
+            (f.gsnap.as_ref().ok_or("gsnap")?.buf, g.gstate.buf)
         };
-        let _ = n;
         let (gs, gr, gn) = {
             let b = self.batch.as_ref().ok_or("batch")?;
             let g = b.gframe.as_ref().ok_or("gframe")?;
