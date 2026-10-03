@@ -1712,7 +1712,7 @@ impl TrellisResident {
             .pipeline_pipes(include_bytes!("../spv/e3_norm_resid.spv"), 4, 8)?;
         let xbuf = self.ctx.alloc_host_cached(BATCH_TMAX * 5120 * 4)?;
         let zeros = self.ctx.alloc_host_cached(BATCH_TMAX * 5120 * 4)?;
-        let nw128 = self.ctx.alloc_host_cached(128 * 5120 * 4)?;
+        let nw128 = self.ctx.alloc_host_cached(129 * 5120 * 4)?;
         unsafe {
             std::ptr::write_bytes(zeros.ptr, 0, BATCH_TMAX * 5120 * 4);
             std::ptr::write_bytes(xbuf.ptr, 0, BATCH_TMAX * 5120 * 4);
@@ -1738,9 +1738,10 @@ impl TrellisResident {
             let wo = self
                 .norm("model.language_model.norm.weight")
                 .ok_or("output_norm")?;
+            // 행 128 = output_norm(행 127은 L63의 post_ln — 과거 덮어씀 버그)
             std::ptr::copy_nonoverlapping(
                 wo.as_ptr(),
-                nw128.ptr.add(127 * 5120 * 4) as *mut f32,
+                nw128.ptr.add(128 * 5120 * 4) as *mut f32,
                 5120,
             );
         }
@@ -1862,9 +1863,9 @@ impl TrellisResident {
     }
 
     /// 디버그: yb[0] 선두 행 판독(L0 out row0 검증).
-    pub fn debug_yb0_row(&mut self, _t_rows: usize) -> Result<Vec<f32>, String> {
+    pub fn debug_yb0_row(&mut self, t_rows: usize) -> Result<Vec<f32>, String> {
         let b = self.batch.as_ref().ok_or("batch")?;
-        let base = 0;
+        let base = (t_rows - 1) * 5120;
         self.ctx.invalidate_range_at(&b.yb[0], base * 4, 5120 * 4);
         Ok(unsafe {
             std::slice::from_raw_parts(b.yb[0].ptr.add(base * 4) as *const f32, 5120).to_vec()

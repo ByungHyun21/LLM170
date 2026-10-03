@@ -10,6 +10,7 @@
 //! - gemm: 전 선형 형상 7.6-8.4 TF(피크 18%) — 트렐리스 디코드 25-30%·t-슬랩 중복.
 //!   타일 기하 BM64/BN128/BK32 동결(변형 전부 드라이버 크래시).
 //! - norm_resid: xn 2.6e-6·xo 0.0(얼라이어싱/행오프셋 2버그 수정 후).
+//!
 //! env: LLM170_EXL3_SCAN_CAP(캡처 경로)·LLM170_EXL3_SCAN_ST0(랜덤 초기상태).
 
 use super::exl3_resident::TrellisResident;
@@ -760,3 +761,4 @@ pub fn nr_check() -> Result<String, String> {
         "nr-check: xn maxdiff={md_xn:.3e} xo maxdiff={md_xo:.3e}"
     ))
 }
+// 마커: sqrt 프레임 판정용
