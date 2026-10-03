@@ -18,6 +18,7 @@ pub use exl3::exl3_vk_check;
 pub use exl3_bench::exl3_bench;
 pub use exl3_decode::exl3_decode;
 pub use exl3_decode::exl3_pp;
+pub use exl3_decode::{SeqState, decode_step, new_seq_state, prefill_batch};
 pub use exl3_resident::TrellisResident;
 pub use fault::fault_probe;
 pub use frame_check::frame_check;

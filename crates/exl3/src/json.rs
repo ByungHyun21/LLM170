@@ -50,6 +50,13 @@ impl Json {
         }
     }
 
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Json::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
     /// 정수 배열(u64) — shape/data_offsets용.
     pub fn as_num_array(&self) -> Option<Vec<u64>> {
         match self {
