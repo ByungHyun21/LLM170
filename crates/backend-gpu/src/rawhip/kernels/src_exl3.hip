@@ -476,3 +476,130 @@ extern "C" __global__ void exl3_gdn_l2perm(
     v_out[t * 6144 + p_inv * 128 + tid] = v_in[t * 6144 + h * 128 + tid];
 }
 // 마커 l2h
+
+// exl3_gdn_scan v3 hip 직이식 — FLA 전 LDS 상주(CS=32, TILE=16, 8패스).
+// 산술/구조 vk와 동일: A/KQ/ks/qs f16, dc f32 전진대입, P6 상태 갱신.
+#define EXL3_CS 32
+#define EXL3_TILE 16
+extern "C" __global__ void exl3_gdn_scan(
+    const float* __restrict__ q,     // [T][2048]
+    const float* __restrict__ k,     // [T][2048] L2
+    const float* __restrict__ v,     // [T][6144] lc
+    const float* __restrict__ bg,    // [T][96]
+    float* __restrict__ st,          // [L][48][128*128] r/w
+    float* __restrict__ outv,        // [T][6144] o_lc
+    int t_len, int h_k, int h_v, int d, int layer)
+{
+    __shared__ __half sk[EXL3_CS * 128];
+    __shared__ __half sv[EXL3_CS * 128];
+    __shared__ __half A[EXL3_CS * EXL3_CS];
+    __shared__ __half KQ[EXL3_CS * EXL3_CS];
+    __shared__ __half KS[EXL3_CS * 128];
+    __shared__ __half QS[EXL3_CS * 128];
+    __shared__ float dc[EXL3_CS * 128];
+    __shared__ float Stile[EXL3_TILE * 128];
+    __shared__ float bp[EXL3_CS];
+    __shared__ float gcs[EXL3_CS + 1];
+    __shared__ float wsm[EXL3_CS];
+    int h = blockIdx.x;
+    int kh = h % h_k;
+    int tid = threadIdx.x;
+    int n_chunks = (t_len + EXL3_CS - 1) / EXL3_CS;
+    float qscale = rsqrtf((float)d);
+    long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+
+    for (int c = 0; c < n_chunks; c++) {
+        int t0 = c * EXL3_CS;
+        int n = min(t_len - t0, EXL3_CS);
+
+        for (int e = tid; e < EXL3_CS * 128; e += 128) {
+            int t = e / 128, dv = e % 128;
+            bool live = t < n;
+            sk[e] = __float2half_rn(live ? k[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f);
+            sv[e] = __float2half_rn(live ? v[(t0 + t) * (h_v * d) + h * 128 + dv] : 0.0f);
+        }
+        if (tid < EXL3_CS) {
+            float acc = 0.0f;
+            for (int t = 0; t < EXL3_CS; t++) {
+                acc += (t < n) ? bg[(t0 + t) * (2 * h_v) + h_v + h] : 0.0f;
+                gcs[t] = acc;
+            }
+            gcs[EXL3_CS] = acc;
+            bp[tid] = (tid < n) ? bg[(t0 + tid) * (2 * h_v) + h] : 0.0f;
+        }
+        __syncthreads();
+
+        for (int i = 0; i < EXL3_CS; i++) {
+            if (tid < EXL3_CS && i < n) {
+                int j = tid;
+                float dk = 0.0f, dq = 0.0f;
+                int qbase = (t0 + i) * (h_k * d) + kh * 128;
+                for (int s2 = 0; s2 < 128; s2++) {
+                    float kj = __half2float(sk[j * 128 + s2]);
+                    dk += __half2float(sk[i * 128 + s2]) * kj;
+                    dq += q[qbase + s2] * kj;
+                }
+                float bi = bp[i];
+                A[i * EXL3_CS + j] = __float2half_rn((j < i) ? dk * bi * expf(gcs[i] - gcs[j]) : 0.0f);
+                KQ[i * EXL3_CS + j] = __float2half_rn((j <= i) ? dq * qscale * expf(gcs[i] - gcs[j]) : 0.0f);
+            }
+        }
+        __syncthreads();
+
+        for (int e = tid; e < EXL3_CS * 128; e += 128) {
+            KS[e] = __float2half_rn(0.0f);
+            QS[e] = __float2half_rn(0.0f);
+        }
+        __syncthreads();
+        for (int pass_ = 0; pass_ < 8; pass_++) {
+            int s2b = pass_ * EXL3_TILE;
+            for (int s2p = 0; s2p < EXL3_TILE; s2p++)
+                Stile[s2p * 128 + tid] = st[st_h + (long)(s2b + s2p) * d + tid];
+            __syncthreads();
+            for (int i = 0; i < EXL3_CS; i++) {
+                float ak = 0.0f, aq = 0.0f;
+                int qbase = (t0 + i) * (h_k * d) + kh * 128;
+                for (int s2p = 0; s2p < EXL3_TILE; s2p++) {
+                    float s_el = Stile[s2p * 128 + tid];
+                    ak += __half2float(sk[i * 128 + s2b + s2p]) * s_el;
+                    aq += q[qbase + s2b + s2p] * s_el;
+                }
+                int ib = i * 128 + tid;
+                KS[ib] = __float2half_rn(__half2float(KS[ib]) + ak);
+                QS[ib] = __float2half_rn(__half2float(QS[ib]) + aq * qscale);
+            }
+            __syncthreads();
+        }
+
+        for (int i = 0; i < n; i++) {
+            float rhs = bp[i] * (__half2float(sv[i * 128 + tid]) - expf(gcs[i]) * __half2float(KS[i * 128 + tid]));
+            for (int j = 0; j < i; j++) {
+                float aij = __half2float(A[i * EXL3_CS + j]);
+                if (aij != 0.0f) rhs -= aij * dc[j * 128 + tid];
+            }
+            dc[i * 128 + tid] = rhs;
+            float oi = expf(gcs[i]) * __half2float(QS[i * 128 + tid]);
+            for (int p = 0; p <= i; p++) {
+                float w = __half2float(KQ[i * EXL3_CS + p]);
+                if (w != 0.0f) oi += w * dc[p * 128 + tid];
+            }
+            outv[(t0 + i) * (h_v * d) + h * 128 + tid] = oi;
+        }
+        __syncthreads();
+
+        {
+            float gtot = gcs[EXL3_CS];
+            float gt_exp = expf(gtot);
+            if (tid < EXL3_CS) wsm[tid] = (tid < n) ? expf(gtot - gcs[tid]) : 0.0f;
+            __syncthreads();
+            for (int s2 = 0; s2 < 128; s2++) {
+                float acc = st[st_h + (long)s2 * d + tid] * gt_exp;
+                for (int j = 0; j < n; j++)
+                    acc += __half2float(sk[j * 128 + s2]) * wsm[j] * dc[j * 128 + tid];
+                st[st_h + (long)s2 * d + tid] = acc;
+            }
+            __syncthreads();
+        }
+    }
+}
+// 마커 sc1
