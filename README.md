@@ -13,7 +13,7 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
-| LLM170 vulkan | 109.3 (GDN frame + scan v3 + attention fwd3 GPU, plan 121 F2) | — | — | 4.7 (serve exl3) |
+| LLM170 vulkan | 123.0 (one-submit frame + scan v3 + attention fwd3, plan 121) | — | — | 4.7 (serve exl3) |
 
 | mode | LLM170 vulkan |
 |---|---|
