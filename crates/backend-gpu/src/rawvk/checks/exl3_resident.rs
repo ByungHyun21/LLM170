@@ -2243,7 +2243,28 @@ impl TrellisResident {
                 keys[0], keys[1]
             ));
         }
-        let _ = kr1;
+        let (kr2v, n2b) = {
+            let l = &self.linears[i2].1;
+            (l.krate, l.n)
+        };
+        let _ = n2b;
+        // 혼합정밀 아카이브(8/48층 qkv r=4 vs z r=5/3 — gemmd L5 재현 8.6e0):
+        // krate 불일치 쌍은 듀얈 단일-K 디코드 불가 → preah 2체인 폴백.
+        if kr1 != kr2v {
+            self.ensure_batch()?;
+            self.ctx.begin_batch()?;
+            for (slot, li) in [(0usize, i1), (1usize, i2)] {
+                let (ah, yb) = {
+                    let b = self.batch.as_ref().ok_or("batch")?;
+                    (b.ah[slot].buf, b.yb[slot].buf)
+                };
+                self.chain_gemmonly(li, t_rows as u32, ah, yb)?;
+            }
+            self.ctx.end_batch_wait()?;
+            self.ctx.wait_pending()?;
+            let b = self.batch.as_ref().ok_or("batch")?;
+            return Ok([(b.yb[0].buf, n1), (b.yb[1].buf, n2)]);
+        }
         self.ensure_batch()?;
         self.ctx.begin_batch()?;
         {
@@ -2526,7 +2547,7 @@ impl TrellisResident {
 
     // ── 듀얼 gemm2 격리 프로브(메가융합 3호) ── preah(2×gemm2+had_out)와
     // dual(1×gemm2d+2×had_out_td)을 동일 ah 입력으로 비트 대조.
-    pub fn gemmd_check(dir: &str, t_arg: usize) -> Result<String, String> {
+    pub fn gemmd_check(dir: &str, t_arg: usize, il_arg: usize) -> Result<String, String> {
         let t_rows = t_arg;
         let mut tr = Self::load(dir)?;
         tr.fframe_init()?;
@@ -2556,7 +2577,7 @@ impl TrellisResident {
                 .ok_or("fframe")?;
             tr.ctx.flush_range(&ff.xbuf, t_rows * 5120 * 4);
         }
-        let lp = "model.language_model.layers.0.linear_attn";
+        let lp = format!("model.language_model.layers.{il_arg}.linear_attn");
         let (s1, s2) = (
             tr.suh_of(&format!("{lp}.in_proj_qkv"))?,
             tr.suh_of(&format!("{lp}.in_proj_z"))?,
@@ -2613,8 +2634,30 @@ impl TrellisResident {
         for i in 0..yb1_ref.len() {
             md1 = md1.max((yb1_got[i] - yb1_ref[i]).abs());
         }
+        // 전 GDN층 쌍 krate 균일성(혼합정밀 아카이브 의심 — 3호 prefill 오염)
+        let mut mism = 0usize;
+        for il in 0..tr.n_layers {
+            if il % 4 == 3 {
+                continue;
+            }
+            let lp = format!("model.language_model.layers.{il}.linear_attn");
+            let iq = tr.find_linear(&format!("{lp}.in_proj_qkv"))?;
+            let iz = tr.find_linear(&format!("{lp}.in_proj_z"))?;
+            let (kq, kz, rq, rz) = (
+                tr.linears[iq].1.k,
+                tr.linears[iz].1.k,
+                tr.linears[iq].1.krate,
+                tr.linears[iz].1.krate,
+            );
+            if kq != kz || rq != rz {
+                mism += 1;
+                if mism <= 4 {
+                    eprintln!("  [gemmdk] L{il}: qkv k={kq} r={rq} vs z k={kz} r={rz}");
+                }
+            }
+        }
         Ok(format!(
-            "gemmd-check T={t_rows}: yb0 maxdiff={md0:.3e} yb1 maxdiff={md1:.3e} (n1={n1} n2={n2})"
+            "gemmd-check T={t_rows}: yb0 maxdiff={md0:.3e} yb1 maxdiff={md1:.3e} (n1={n1} n2={n2}) · 쌍 krate 불일치 {mism}/48"
         ))
     }
 
@@ -2812,3 +2855,7 @@ impl TrellisResident {
 // 마커 t60
 // 마커 t60b
 // 마커 t60c
+// 마커 kaud
+// 마커 kr2
+// 마커 l5
+// 마커 l5b
