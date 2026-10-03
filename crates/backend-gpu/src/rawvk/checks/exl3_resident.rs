@@ -559,6 +559,10 @@ impl TrellisResident {
 /// 배치 행 상한 — 초과는 드라이버(프리필)가 청크 분할.
 pub const BATCH_TMAX: usize = 512;
 
+fn n_gdn_bytes() -> usize {
+    48 * 48 * 16384 * 4
+}
+
 /// T-배치 스크래치 — 슬롯 3종(GEMV ahb/yb 관례와 동일 구조, run_rw
 /// 배리어가 WAR/WAW 커버 — plans/104 판정식, sb는 단일 공유).
 pub struct BatchScratch {
@@ -609,10 +613,11 @@ pub struct AttnFrame {
 // end_outer) + norm_resid(잔차+노름 융합, ab 합산 후 norm).
 // 주의: "LLM170_FRAME"은 qwen4exp 게이트와 이름 충돌 — EXL3 접두 필수.
 pub struct FFrame {
-    xbuf: VkBuf,  // [TMAX*5120] f32 잔차
-    zeros: VkBuf, // [TMAX*5120] 첫 노름용 ab=0
-    nw128: VkBuf, // [128*5120] 노름 행(2il=input_ln, 2il+1=post_ln, 127행=output_norm)
-    pnr: Pipes,   // e3_norm_resid
+    xbuf: VkBuf,          // [TMAX*5120] f32 잔차
+    gsnap: Option<VkBuf>, // GDN 상태 스냅샷(스펙 롤백용 — 지연 할당, 비스펙 151MB 절약)
+    zeros: VkBuf,         // [TMAX*5120] 첫 노름용 ab=0
+    nw128: VkBuf,         // [128*5120] 노름 행(2il=input_ln, 2il+1=post_ln, 127행=output_norm)
+    pnr: Pipes,           // e3_norm_resid
 }
 
 /// GDN 프레임 버퍼+파이프라인(plans/121 F1).
@@ -646,6 +651,14 @@ pub struct GdnFrame {
 }
 
 impl TrellisResident {
+    /// GPU GDN 상태 유효 플래그 전체 무효화 — fresh 시퀀스(슬롯 교체·기준
+    /// 재생) 프리필 전 호출. GPU 상태가 다른 시퀀스의 잔류일 수 있어 강제 재업로드.
+    pub fn gdn_st_invalidate_all(&mut self) {
+        for v in self.gdn_st_valid.iter_mut() {
+            *v = false;
+        }
+    }
+
     /// GPU 프레임(GDN/어텐션) 활성 여부 — 벌크 sync 가드(T≤8 CPU 경로 보호).
     pub fn gpu_frames_active(&self) -> bool {
         self.batch
@@ -1750,12 +1763,57 @@ impl TrellisResident {
         if let Some(b) = self.batch.as_mut() {
             b.fframe = Some(FFrame {
                 xbuf,
+                gsnap: None,
                 zeros,
                 nw128,
                 pnr,
             });
         }
         Ok(())
+    }
+
+    /// GDN 상태 전체 스냅샷(스펙 검증 전 — 롤백 보험, plans/121).
+    pub fn gdn_state_snapshot(&mut self) -> Result<(), String> {
+        // 지연 할당(첫 스냅샷 시 151MB — 일반 프리필은 미할당).
+        let need_alloc = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.fframe.as_ref())
+            .is_some_and(|f| f.gsnap.is_none());
+        if need_alloc {
+            let gsnap = self.ctx.alloc_host_cached(n_gdn_bytes())?;
+            if let Some(b) = self.batch.as_mut() {
+                if let Some(f) = b.fframe.as_mut() {
+                    f.gsnap = Some(gsnap);
+                }
+            }
+        }
+        let (src, dst, n) = {
+            let b = self.batch.as_ref().ok_or("batch")?;
+            let g = b.gframe.as_ref().ok_or("gframe")?;
+            let f = b.fframe.as_ref().ok_or("fframe")?;
+            (
+                g.gstate.buf,
+                f.gsnap.as_ref().ok_or("gsnap")?.buf,
+                g.gstate.bytes,
+            )
+        };
+        self.ctx.copy_dev(&[(src, 0, dst, 0, n as u64)])
+    }
+
+    /// 스냅샷 복원(발산 라운드 — kvc는 재실행이 정확히 덮으므로 미복원).
+    pub fn gdn_state_restore(&mut self) -> Result<(), String> {
+        let (src, dst, n) = {
+            let b = self.batch.as_ref().ok_or("batch")?;
+            let g = b.gframe.as_ref().ok_or("gframe")?;
+            let f = b.fframe.as_ref().ok_or("fframe")?;
+            (
+                f.gsnap.as_ref().ok_or("gsnap")?.buf,
+                g.gstate.buf,
+                g.gstate.bytes,
+            )
+        };
+        self.ctx.copy_dev(&[(src, 0, dst, 0, n as u64)])
     }
 
     /// 잔차 버퍼 포인터 — 호출자가 임베딩 행을 직접 기록한다.
@@ -1870,6 +1928,53 @@ impl TrellisResident {
         Ok(unsafe {
             std::slice::from_raw_parts(b.yb[0].ptr.add(base * 4) as *const f32, 5120).to_vec()
         })
+    }
+
+    /// 열린 외부 배치 내부용 선형 체인(begin/end 없음 — 프레임 내 lm_head 등).
+    pub fn linear_chain_inside(
+        &mut self,
+        key: &str,
+        t_rows: usize,
+        slot: usize,
+    ) -> Result<(ash::vk::Buffer, usize), String> {
+        let li = self.find_linear(key)?;
+        let n = self.linears[li].1.n;
+        self.ensure_batch()?;
+        let (xtb, ah0, yb0) = {
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            (b.xtb.buf, b.ah[slot].buf, b.yb[slot].buf)
+        };
+        self.chain_batch_one(xtb, li, t_rows as u32, ah0, yb0, true)?;
+        Ok((yb0, n))
+    }
+
+    /// yb 슬롯에서 t_rows×n 판독(스펙 행별 로짓).
+    pub fn read_yb_rows(
+        &mut self,
+        slot: usize,
+        t_rows: usize,
+        n: usize,
+    ) -> Result<Vec<f32>, String> {
+        let b = self.batch.as_ref().ok_or("batch")?;
+        self.ctx.invalidate_range(&b.yb[slot], t_rows * n * 4);
+        let mut y = vec![0f32; t_rows * n];
+        // SAFETY: end_outer 후 매핑 판독.
+        unsafe {
+            std::ptr::copy_nonoverlapping(b.yb[slot].ptr as *const f32, y.as_mut_ptr(), t_rows * n);
+        }
+        Ok(y)
+    }
+
+    /// xtb 선두 t_rows행 판독(스펙 행별 노름 입력).
+    pub fn read_xtb_rows(&mut self, t_rows: usize) -> Result<Vec<f32>, String> {
+        let b = self.batch.as_ref().ok_or("batch")?;
+        self.ctx.invalidate_range(&b.xtb, t_rows * 5120 * 4);
+        let mut y = vec![0f32; t_rows * 5120];
+        // SAFETY: end_outer 후 매핑 판독.
+        unsafe {
+            std::ptr::copy_nonoverlapping(b.xtb.ptr as *const f32, y.as_mut_ptr(), t_rows * 5120);
+        }
+        Ok(y)
     }
 
     /// xbuf 마지막 행 판독(MTP h 스냅샷) — GPU 갱신 반영(invalidate).

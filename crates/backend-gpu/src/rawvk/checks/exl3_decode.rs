@@ -1379,7 +1379,7 @@ pub fn prefill_batch(
             logits = tr.linear("lm_head", &xn_last)?;
             seq.last_logits.clear();
             seq.last_logits.extend_from_slice(&logits);
-            if tr.gpu_frames_active() {
+            if tr.gpu_frames_active() && !llm170_diag::flag::on("LLM170_EXL3_NOSYNC") {
                 let n_gdn = tr.n_layers - tr.n_layers / 4;
                 let mut gi = 0usize;
                 let mut ai2 = 0usize;
@@ -2239,6 +2239,93 @@ fn spec_restore(seq: &mut SeqState, snap: &SpecSnap) {
 /// 스펙 1라운드: 반환 (수용 토큰열, 타깃 forward 수). 계약 — seq는 마지막
 /// 확정 토큰까지 처리된 상태(last_logits/last_h/last_tok 유효). 수용 토큰은
 /// 최대 k+1(전 수용 시 선행 1 토큰 포함), 최소 1(발산 보정 토큰).
+
+/// 프레임 스펙 검증 forward(plans/121 tg 경로): toks(k행)을 원-서브밋 프레임으로
+/// 처리하고 행별 lm_head 로짓을 반환. 상태는 GPU 권위 그대로(동기 없음).
+/// seq 갱신: pos/last_tok/last_h/last_logits/kv.len(=pos 설정 의미).
+fn frame_spec_forward(
+    tr: &mut TrellisResident,
+    seq: &mut SeqState,
+    toks: &[u32],
+) -> Result<Vec<f32>, String> {
+    let t_rows = toks.len();
+    let h = 5120usize;
+    let pos0 = seq.pos;
+    tr.fframe_init()?;
+    tr.gdn_frame_init()?;
+    let xp = tr.frame_x_ptr()?;
+    for (t, &tok) in toks.iter().enumerate() {
+        // SAFETY: xbuf 프레임 소유 — 행별 분리 기록.
+        unsafe {
+            let src: &[f32] = tr.embed_row(tok);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), xp.add(t * h), h);
+        }
+    }
+    tr.frame_x_flush(t_rows)?;
+    tr.ctx.begin_outer()?;
+    let zb = tr.frame_zeros_buf()?;
+    tr.frame_norm_resid(0, t_rows, zb)?;
+    for il in 0..tr.n_layers {
+        let lp = format!("model.language_model.layers.{il}");
+        let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
+        let ab = if il % 4 == 3 {
+            let ai = il / 4;
+            let yq = tr.linear_chain(&format!("{lp}.self_attn.q_proj"), t_rows, 0)?;
+            let yk = tr.linear_chain(&format!("{lp}.self_attn.k_proj"), t_rows, 1)?;
+            let yv = tr.linear_chain(&format!("{lp}.self_attn.v_proj"), t_rows, 2)?;
+            tr.attn_layer_gpu(ai, t_rows, pos0, yq.0, yk.0, yv.0)?;
+            seq.kv[ai].len = (pos0 + t_rows as u32) as usize;
+            tr.linear_chain(&format!("{lp}.self_attn.o_proj"), t_rows, 0)?
+                .0
+        } else {
+            {
+                let g = &seq.gdn[il];
+                tr.gdn_state_upload(gdn_il, &g.states, &g.conv)?;
+            }
+            let yq = tr.linear_chain(&format!("{lp}.linear_attn.in_proj_qkv"), t_rows, 0)?;
+            let yz = tr.linear_chain(&format!("{lp}.linear_attn.in_proj_z"), t_rows, 1)?;
+            tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yq.0, yz.0)?;
+            tr.linear_chain(&format!("{lp}.linear_attn.out_proj"), t_rows, 0)?
+                .0
+        };
+        tr.frame_norm_resid(2 * il + 1, t_rows, ab)?;
+        let yf = tr.ffn_trio_chain(
+            &format!("{lp}.mlp.gate_proj"),
+            &format!("{lp}.mlp.up_proj"),
+            &format!("{lp}.mlp.down_proj"),
+            t_rows,
+        )?;
+        let w_next = if il + 1 == tr.n_layers {
+            128
+        } else {
+            2 * (il + 1)
+        };
+        tr.frame_norm_resid(w_next, t_rows, yf.0)?;
+    }
+    // 프레임 종료 후 행별 노름+lm_head GEMV(k행 — 배치 lm_head는 508MB급
+    // 스크래시 터치·시스템 동결 사고로 폐기, 2026-10-03 안전화).
+    tr.ctx.end_outer()?;
+    let out_norm_w = tr
+        .norm("model.language_model.norm.weight")
+        .ok_or("output norm")?
+        .to_vec();
+    let xn_all = tr.read_xtb_rows(t_rows)?;
+    let mut logits = Vec::with_capacity(t_rows * 248320);
+    for t in 0..t_rows {
+        let xn = rms_norm(&xn_all[t * h..(t + 1) * h], &out_norm_w, 1e-6);
+        let row = tr.linear("lm_head", &xn)?;
+        logits.extend_from_slice(&row);
+    }
+    // seq 갱신
+    seq.pos += t_rows as u32;
+    seq.last_tok = *toks.last().ok_or("빈 스펙 입력")?;
+    seq.last_h = tr.frame_read_x_last(t_rows)?;
+    let last_row = &logits[(t_rows - 1) * 248320..t_rows * 248320];
+    seq.last_logits.clear();
+    seq.last_logits.extend_from_slice(last_row);
+    Ok(logits)
+}
+
 pub fn exl3_spec_step(
     tr: &mut TrellisResident,
     seq: &mut SeqState,
@@ -2256,11 +2343,17 @@ pub fn exl3_spec_step(
         tok = drafts[i];
         h = hm;
     }
-    // ② 검증 기준 g0(스냅샷 전 last_logits) + 상태 스냅샷.
+    // ② 검증 기준 g0 + GPU 상태 스냅샷(프레임 경로 — plans/121 tg).
     let g0 = argmax32(&seq.last_logits);
-    let snap = spec_snap(seq);
-    // ③ [d0..d_{k-1}] T=k 배치 타깃 forward — 행별 argmax.
-    let row_am = prefill_batch_spec(tr, seq, &drafts)?;
+    tr.fframe_init()?;
+    tr.gdn_frame_init()?;
+    tr.attn_frame_init()?;
+    tr.gdn_state_snapshot()?;
+    // ③ [d0..d_{k-1}] T=k 배치 타깃 forward — 행별 argmax(프레임).
+    let spec_logits = frame_spec_forward(tr, seq, &drafts)?;
+    let row_am: Vec<u32> = (0..k)
+        .map(|i| argmax32(&spec_logits[i * 248320..(i + 1) * 248320]))
+        .collect();
     // ④ 수용 보행.
     let mut accepted: Vec<u32> = Vec::with_capacity(k + 1);
     let mut diverged = false;
@@ -2275,10 +2368,12 @@ pub fn exl3_spec_step(
         }
     }
     let forwards = if diverged {
-        // ⑤ 롤백 + 수용 접두(보정 토큰 포함) 재실행.
-        spec_restore(seq, &snap);
+        // ⑤ GPU 상태 롤백 + 수용 접두(보정 토큰 포함) 재실행(프레임).
+        // kvc는 재실행이 정확히 pos0.. 행을 덮으므로 복원 불요.
+        tr.gdn_state_restore()?;
+        seq.pos -= k as u32; // frame_spec_forward가 다시 증가
         let re_accepted = accepted.clone();
-        prefill_batch_spec(tr, seq, &re_accepted)?;
+        frame_spec_forward(tr, seq, &re_accepted)?;
         2
     } else {
         accepted.push(row_am[k - 1]); // 전 수용 — 선행 보너스 토큰
@@ -2320,8 +2415,8 @@ pub fn exl3_mtp2(
     let ctx_len = (prompt.len() + n_predict + 64).max(512);
     let mut seq = new_seq_state(tr.n_layers, ctx_len);
 
-    // 프리필(배치) — 마지막 토큰 훅으로 다음 드래프트 시드.
-    let am = prefill_batch_spec(&mut tr, &mut seq, &prompt)?;
+    // 프리필(프레임) — GPU kvc/gstate 적립 + 벌크 동기(스펙 시드 정합).
+    let am = prefill_batch(&mut tr, &mut seq, &prompt)?;
     {
         let h_last = seq.last_h.clone();
         let pos = seq.pos - 1;
