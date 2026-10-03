@@ -526,6 +526,13 @@ pub fn decode_step(
         for i in 0..h {
             x[i] += attn_out.get(i).copied().unwrap_or(0.0);
         }
+        if std::env::var_os("LLM170_EXL3_DBG")
+            .map(|v| v == "layerdump")
+            .unwrap_or(false)
+        {
+            let r = (x.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
+            eprintln!("  [vkl] L{il} post-attn rms={r:.5}");
+        }
 
         // FFN (post_attention_norm)
         let ffn_norm_w = tr
@@ -544,6 +551,13 @@ pub fn decode_step(
         drop(_gf);
         for i in 0..h {
             x[i] += ffn_out.get(i).copied().unwrap_or(0.0);
+        }
+        if std::env::var_os("LLM170_EXL3_DBG")
+            .map(|v| v == "layerdump")
+            .unwrap_or(false)
+        {
+            let r = (x.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
+            eprintln!("  [vkl] L{il} post-ffn rms={r:.5} ffn_out[0..2]={:?}", &ffn_out[..2.min(ffn_out.len())]);
         }
     }
 
