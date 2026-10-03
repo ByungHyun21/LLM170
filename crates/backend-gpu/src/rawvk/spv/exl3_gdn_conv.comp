@@ -1,0 +1,44 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// exl3_gdn_conv (plans/121 F1) — GDN conv1d GPU 상주:
+// qkv(yb0 [T][10240])에서 q/k/v를 인과 FIR(+silu)로 분리 출력.
+// 링 상태는 GPU 버퍼(호출 간 유지) — 업로드 0.
+// 그리드: x = 10240/128 = 80 WG(채널 청크), WG=128.
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer QkvB { float qkv[]; };    // [T][10240]
+layout(binding = 1) readonly buffer CW { float convw[]; };    // [10240][4]
+layout(binding = 2) buffer RingB { float ring[]; };           // [3][10240] r/w
+layout(binding = 3) writeonly buffer QB { float q_out[]; };   // [T][2048]
+layout(binding = 4) writeonly buffer KB { float k_out[]; };   // [T][2048]
+layout(binding = 5) writeonly buffer VB { float v_out[]; };   // [T][6144] (HF 순서)
+layout(push_constant) uniform PC { uint t_len; } pc;
+
+float silu_f(float x) { return x / (1.0 + exp(-x)); }
+
+void main() {
+    uint ch = gl_WorkGroupID.x * 128u + gl_LocalInvocationID.x;
+    if (ch >= 10240u) return;
+    float w0 = convw[ch * 4u + 0u];
+    float w1 = convw[ch * 4u + 1u];
+    float w2 = convw[ch * 4u + 2u];
+    float w3 = convw[ch * 4u + 3u];
+    float h0 = ring[0u * 10240u + ch];
+    float h1 = ring[1u * 10240u + ch];
+    float h2 = ring[2u * 10240u + ch];
+    for (uint t = 0u; t < pc.t_len; t++) {
+        float xt = qkv[t * 10240u + ch];
+        float o = silu_f(w3 * xt + w0 * h0 + w1 * h1 + w2 * h2);
+        if (ch < 2048u) {
+            q_out[t * 2048u + ch] = o;
+        } else if (ch < 4096u) {
+            k_out[t * 2048u + (ch - 2048u)] = o;
+        } else {
+            v_out[t * 6144u + (ch - 4096u)] = o;
+        }
+        h0 = h1; h1 = h2; h2 = xt;
+    }
+    ring[0u * 10240u + ch] = h0;
+    ring[1u * 10240u + ch] = h1;
+    ring[2u * 10240u + ch] = h2;
+}
