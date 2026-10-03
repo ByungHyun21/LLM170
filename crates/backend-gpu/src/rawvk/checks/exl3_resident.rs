@@ -663,9 +663,9 @@ impl TrellisResident {
         z: &[f32],
     ) -> Result<Vec<f32>, String> {
         self.gdn_frame_init()?;
-        let (xtb_b, yb0_b, yb1_b) = {
+        let (yb0_b, yb1_b) = {
             let b = self.batch.as_ref().ok_or("batch")?;
-            (b.xtb.buf, b.yb[0].buf, b.yb[1].buf)
+            (b.yb[0].buf, b.yb[1].buf)
         };
         {
             let (xptr, qptr, zptr) = {
@@ -749,7 +749,7 @@ impl TrellisResident {
         self.ctx.invalidate_range(&gf.go, t_rows * 6144 * 4);
         let go =
             unsafe { std::slice::from_raw_parts(gf.go.ptr as *const f32, t_rows * 6144).to_vec() };
-        let _ = (gk,);
+        let _ = gk;
         Ok((bg, gq, gv, go))
     }
 
@@ -1491,11 +1491,12 @@ impl TrellisResident {
         self.ctx.end_batch_wait()?;
         self.ctx.wait_pending()?;
         // 체인 입출력 캡처(plans/121 워크플로 — GDN 비선형 전체 프로브용):
+        #[allow(clippy::collapsible_if, clippy::needless_borrows_for_generic_args)]
         // 입력 yb0(qkv)/yb1(z) + 게이트 출력 xtb를 gdn_il==0에서 파일로.
         if gdn_il == 0 {
             if let Some(path) = llm170_diag::flag::val("LLM170_EXL3_CHAINCAP") {
                 let gf2 = self.batch.as_ref().and_then(|b| b.gframe.as_ref());
-                if let Some(g) = gf2 {
+                if gf2.is_some() {
                     let b2 = self.batch.as_ref().ok_or("batch")?;
                     let nq = t_rows * 10240;
                     let nz = t_rows * 6144;
@@ -1521,7 +1522,7 @@ impl TrellisResident {
                             ));
                         }
                     }
-                    std::fs::write(&path, &buf).map_err(|e| format!("chain cap: {e}"))?;
+                    std::fs::write(&path, buf).map_err(|e| format!("chain cap: {e}"))?;
                     eprintln!("  [chaincap] L0 t={t_rows} → {path}");
                 }
             }
