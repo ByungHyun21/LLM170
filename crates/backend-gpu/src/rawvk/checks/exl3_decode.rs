@@ -735,7 +735,7 @@ fn gdn_batch(
 
     // ── F1 GPU 경로(plans/121): T>8에서 전 비선형 GPU 상주 ──
     // qkv+z를 yb에 남기고 → conv→l2perm→scan→gate 4커널 → gated가 xtb에.
-    if t_rows > 8 && il <= 0 {
+    if t_rows > 8 {
         tr.gdn_frame_init()?;
         let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
         // GPU 상태/ring 버퍼는 alloc_host_cached로 제로 보장 없음 — CPU 상태를
@@ -757,6 +757,14 @@ fn gdn_batch(
             eprintln!("  [f1dbg] L0 yb0(qkv): {:?} yb1(z): {:?}", qkv_head, z_head);
         }
         tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yb0, yb1)?;
+        if il == 0 {
+            let gqr_head = tr.read_gqr_head(5);
+            let gq_head = tr.read_gq_head(5);
+            let gbg_head = tr.read_gbg_head(10);
+            eprintln!("  [f1dbg] L0 gqr(conv q): {:?}", gqr_head);
+            eprintln!("  [f1dbg] L0 gq(L2 q): {:?}", gq_head);
+            eprintln!("  [f1dbg] L0 gbg(beta|g): {:?}", gbg_head);
+        }
         drop(_gf);
         // gate가 xtb에 기록한 gated를 호스트 가시화 — 이후 flush가 올바른
         // 데이터를 GPU에 밀게 한다(invalidate 없으면 스테일 xn이 덮어씀).
@@ -852,6 +860,8 @@ fn gdn_batch(
     let mut q_all = vec![0f32; t_rows * k_len];
     let mut k_all = vec![0f32; t_rows * k_len];
     let mut v_all = vec![0f32; t_rows * d_inner];
+    // conv 직후 원점 덤프(디버그) — GPU gqr와 비교용.
+    let mut q_raw_dbg: Vec<f32> = Vec::new();
     {
         let st = &mut seq.gdn[il];
         let (qp, kp, vp) = (
@@ -894,6 +904,11 @@ fn gdn_batch(
     }
 
     drop(_gv);
+    // conv 직후 원점 캡처(L2 전) — GPU gqr와 비교.
+    if il == 0 {
+        q_raw_dbg = q_all[..5.min(q_all.len())].to_vec();
+    }
+
     // 행 준비(병렬): L2 q/k + beta/g + lc 순열(v/beta/g).
     let _gp1 = ph("ppg:prep");
     let hf_to_lc = |hh: usize| -> usize { 3 * (hh % 16) + hh / 16 };
@@ -939,6 +954,16 @@ fn gdn_batch(
         });
     }
     drop(_gp1);
+    // L2+beta/g 완료 후 디버그 — GPU gq/gbg와 비교.
+    if il == 0 {
+        eprintln!(
+            "  [f1dbg] L0 CPU L2q: {:?} beta: {:?} g: {:?}",
+            &q_all[..5],
+            &beta_lc[..5],
+            &g_lc[..5]
+        );
+    }
+
     // v 순열 복사(행 병렬 — v_all(HF) → v_lc(llama.cpp 헤드 순서))
     let _gp2 = ph("ppg:vperm");
     {
@@ -1054,7 +1079,11 @@ fn gdn_batch(
     let r = tr.linear_batch_staged(&format!("{lp}.out_proj"), t_rows)?;
     drop(_go);
     if il == 0 {
-        eprintln!("  [f1dbg] L0 out_proj CPU: {:?}", &r[..5.min(r.len())]);
+        eprintln!(
+            "  [f1dbg] L0 out_proj CPU: {:?} conv_q: {:?}",
+            &r[..5.min(r.len())],
+            &q_raw_dbg
+        );
     }
     Ok(r)
 }

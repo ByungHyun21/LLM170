@@ -38,11 +38,12 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     if (t >= pc.t_len || h >= pc.h_v) return;
 
-    // 이 헤드(h)는 lc 인덱스 j = hf_to_lc(h)의 o를 소비
-    uint j = 3u * (h % pc.h_k) + h / pc.h_k;
+    // 역순열 — CPU: gated[hf_to_lc(i)] = f(o_lc[i]). 즉 HF head h은
+    // o_lc의 (h%3)*16+h/3 위치에서 읽는다(l2perm 역함수와 동일).
+    uint p_inv = (h % 3u) * 16u + h / 3u;
 
-    // ── rms_norm(o_lc[j]) × ssm_norm_w ──
-    float ov = o_lc[t * 6144u + j * pc.d + tid];
+    // ── rms_norm(o_lc[p_inv]) × ssm_norm_w ──
+    float ov = o_lc[t * 6144u + p_inv * pc.d + tid];
     red[tid] = ov * ov;
     barrier();
     for (uint s = 64u; s > 0u; s >>= 1u) {
