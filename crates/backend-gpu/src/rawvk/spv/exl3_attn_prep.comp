@@ -1,0 +1,93 @@
+#version 450
+
+// exl3_attn_prep (plans/121 F2b) — 어텐션 행 준비 GPU:
+// q 디인터리브[rms+rope], k rms+rope → GPU KV 적립, v 복사.
+// 그리드 (T, 28): j<24=q헤드, j>=24=KV헤드(m=j-24). WG=128.
+// 수학 미러: exl3_decode.rs attn_batch의 ppa:kv 단계(f32, core::ops::rope_head 동일).
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly buffer QGB { float qg[]; };   // [T][12288] q‖gate 인터리브
+layout(binding = 1) readonly buffer KB { float kin[]; };   // [T][1024] k
+layout(binding = 2) readonly buffer VB { float vin[]; };   // [T][1024] v
+layout(binding = 3) readonly buffer QNW { float qnw[]; };  // [256]
+layout(binding = 4) readonly buffer KNW { float knw[]; };  // [256]
+layout(binding = 5) writeonly buffer QH { float qh[]; };   // [T][6144]
+layout(binding = 6) writeonly buffer KKC { float kc[]; };  // [cap][1024]
+layout(binding = 7) writeonly buffer VKC { float vc[]; };  // [cap][1024]
+layout(push_constant) uniform PC {
+    uint t_len;
+    uint pos0;
+} pc;
+
+shared float red[128];
+shared float hd[256];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint j = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint pos = pc.pos0 + t;
+
+    if (j < 24u) {
+        // q 헤드: 디인터리브 + rms + rope
+        uint src = t * 12288u + j * 512u;
+        hd[tid] = qg[src + tid];
+        hd[tid + 128u] = qg[src + 128u + tid];
+        barrier();
+        float ss = hd[tid] * hd[tid] + hd[tid + 128u] * hd[tid + 128u];
+        red[tid] = ss;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (tid < s) red[tid] += red[tid + s];
+            barrier();
+        }
+        float inv = inversesqrt(red[0] / 256.0 + 1e-6);
+        hd[tid] = hd[tid] * inv * qnw[tid];
+        hd[tid + 128u] = hd[tid + 128u] * inv * qnw[tid + 128u];
+        barrier();
+        // rope half-split(64회전, half=32): (p, p+32)
+        if (tid < 32u) {
+            float theta = pow(1e7, -(2.0 * float(tid)) / 64.0);
+            float ang = float(pos) * theta;
+            float c = cos(ang), s2 = sin(ang);
+            float x0 = hd[tid], x1 = hd[tid + 32u];
+            hd[tid] = x0 * c - x1 * s2;
+            hd[tid + 32u] = x0 * s2 + x1 * c;
+        }
+        barrier();
+        qh[t * 6144u + j * 256u + tid] = hd[tid];
+        qh[t * 6144u + j * 256u + 128u + tid] = hd[tid + 128u];
+    } else {
+        uint m = j - 24u;
+        uint src = t * 1024u + m * 256u;
+        hd[tid] = kin[src + tid];
+        hd[tid + 128u] = kin[src + 128u + tid];
+        barrier();
+        float ss = hd[tid] * hd[tid] + hd[tid + 128u] * hd[tid + 128u];
+        red[tid] = ss;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (tid < s) red[tid] += red[tid + s];
+            barrier();
+        }
+        float inv = inversesqrt(red[0] / 256.0 + 1e-6);
+        hd[tid] = hd[tid] * inv * knw[tid];
+        hd[tid + 128u] = hd[tid + 128u] * inv * knw[tid + 128u];
+        barrier();
+        if (tid < 32u) {
+            float theta = pow(1e7, -(2.0 * float(tid)) / 64.0);
+            float ang = float(pos) * theta;
+            float c = cos(ang), s2 = sin(ang);
+            float x0 = hd[tid], x1 = hd[tid + 32u];
+            hd[tid] = x0 * c - x1 * s2;
+            hd[tid + 32u] = x0 * s2 + x1 * c;
+        }
+        barrier();
+        uint dst = pos * 1024u + m * 256u;
+        kc[dst + tid] = hd[tid];
+        kc[dst + 128u + tid] = hd[tid + 128u];
+        vc[dst + tid] = vin[src + tid];
+        vc[dst + 128u + tid] = vin[src + 128u + tid];
+    }
+}

@@ -24,6 +24,7 @@ pub use exl3_decode::{
     SeqState, decode_step, exl3_spec_step, new_seq_state, prefill_batch, prefill_batch_spec,
 };
 pub use exl3_resident::TrellisResident;
+pub use exl3_resident::attn_check;
 pub use exl3_resident::scan_check;
 pub use fault::fault_probe;
 pub use frame_check::frame_check;
