@@ -77,9 +77,10 @@ impl TrellisResident {
         let mut n_layers = 0;
 
         for (name, e) in ar.entries() {
-            if name.contains("model.visual.") || name.starts_with("mtp.") {
+            if name.contains("model.visual.") {
                 continue;
             }
+            // mtp.*는 plans/121 A2부터 상주(MTP 드래프트용 — fc/1층/norm).
             if name.ends_with(".trellis") {
                 let base = &name[..name.len() - 8];
                 let (kt, nt, tw) = (e.shape[0], e.shape[1], e.shape[2]);
@@ -135,7 +136,11 @@ impl TrellisResident {
                             let is_residual = name.ends_with("layernorm.weight")
                                 || name.ends_with("q_norm.weight")
                                 || name.ends_with("k_norm.weight")
-                                || name.ends_with("language_model.norm.weight");
+                                || name.ends_with("language_model.norm.weight")
+                                // mtp.* norm도 동일 규약(w-1 저장) — 접미 불일치
+                                // 3종(plans/121 A2: 누락 시 드래프트 corr 0.17全멸).
+                                || name == "mtp.norm.weight"
+                                || name.starts_with("mtp.pre_fc_norm_");
                             if is_residual {
                                 for f in v.iter_mut() {
                                     *f += 1.0;

@@ -400,6 +400,23 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                 arg_num(args, 2, 8usize),
             )
         }
+        "exl3-mtp" => {
+            let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
+            llm170_backend_gpu::rawvk::checks::exl3_mtp(
+                &arg_str(args, 0, d_exl3),
+                &arg_str(args, 1, "9707"),
+                arg_num(args, 2, 32usize),
+            )
+        }
+        "exl3-mtp2" => {
+            let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
+            llm170_backend_gpu::rawvk::checks::exl3_mtp2(
+                &arg_str(args, 0, d_exl3),
+                &arg_str(args, 1, "9707"),
+                arg_num(args, 2, 48usize),
+                arg_num(args, 3, 2usize),
+            )
+        }
         "exl3-bench" => {
             let d_exl3 = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
             llm170_backend_gpu::rawvk::checks::exl3_bench(
