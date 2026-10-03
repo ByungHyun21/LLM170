@@ -1317,17 +1317,12 @@ impl VkCtx {
             if batch && !forced_skip && self.opt_bar.replace(false) {
                 // plans/104: 기본 ON(산술 불변 — 게이트 2회 PASS·A/B 양성
                 // +2%). 킬스위치 =0.
-                let elide_on = true; // 원장 63 승격 — =0 복원은 plans/109 P6 삭제
-                let mut need = !elide_on || self.dep_unknown.get();
-                if let Some((rs, ws)) = dep {
-                    let sr = self.since_r.borrow();
-                    let sw = self.since_w.borrow();
-                    need = need
-                        || ws.iter().any(|b| sr.contains(b) || sw.contains(b))
-                        || rs.iter().any(|b| sw.contains(b));
-                } else {
-                    need = true;
-                }
+                // plans/121 프레임: 원-서브밋 대형 배치에서 의존성 누락 선언이
+                // 레이스로 폭발(비결정 corr 0.63-0.94) — 무조건 배리어로 전환.
+                // 비용 ~450회/forward GPU측 마이크로초 — 정확성 우선. 추후
+                // 선언 완전성 검증 후 선택 생략 복원.
+                let _ = dep;
+                let mut need = true;
                 // plans/104 이분법 프로브: 스킵 허용을 현 태그 1종으로 제한.
                 if !need
                     && let Some(only) = llm170_diag::flag::val("LLM170_VK_DEPBAR_ONLY")

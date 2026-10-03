@@ -231,7 +231,7 @@ impl TrellisResident {
         })
     }
 
-    fn find_linear(&self, key: &str) -> Result<usize, String> {
+    pub(crate) fn find_linear(&self, key: &str) -> Result<usize, String> {
         self.linears
             .iter()
             .position(|(k, _)| k == key)
@@ -579,9 +579,18 @@ pub struct BatchScratch {
     gframe: Option<GdnFrame>,
     /// 어텐션 프레임(plans/121 F2b) — GPU KV 캐시·prep/fwd3(지연 초기화).
     aframe: Option<AttnFrame>,
+    /// 원-서브밋 프레임(plans/121) — 잔차 스트림 상주.
+    fframe: Option<FFrame>,
 }
 
 /// 어텐션 프레임(plans/121 F2b) — KV 캐시 16층 GPU 상주 + 파이프라인.
+// ═══ 어텐션 모듈(plans/121 F2b, fwd3) ═══════════════════════════════
+// 측정(2026-10-03): fwd3 = warp-shuffle 스코어 + t블록4 k/v 공유(트래픽 ÷4)
+// + LDS 트리 소프트맥스(배리어 10회) + dim-열 AV. 산술 5.3e-7,
+// T512 8.2ms/층(CPU 38.5 → 4.7배, fwd2 1033ms → 126배).
+// 부착 성과 pp512 96.82→109.33 t/s(+13%), corr 0.999999·8/8.
+// KV 16층 134MB GPU 상주 + 프리필 말미 kvc 벌크 동기(디코드 정합).
+// 폐기: fwd(3패스 비결합), fwd2(FA블록, 배리어 64회 폭주).
 pub struct AttnFrame {
     kkc: VkBuf, // [16*1024][1024] f32
     vkc: VkBuf,
@@ -592,7 +601,28 @@ pub struct AttnFrame {
     pf3: Pipes,  // attn_fwd3
 }
 
+/// 프레임 버퍼(plans/121 원-서브밋) — 잔차 스트림 GPU 상주.
+// ═══ 원-서브밋 프레임(plans/121, 옵트인 LLM170_EXL3_FRAME=1) ══════
+// 측정(2026-10-03): T60 68.7 t/s(구경로 54.5 → +26%). **계류: corr 0.944631
+// (결정적 drift — L0-55 모듈출력 일치, L56 FFN부터 이탈, 배리어·얼라이어싱
+// ·행오프셋 3버그 수정 후에도 잔류)**. VkCtx 배치 깊이 인식(begin_outer/
+// end_outer) + norm_resid(잔차+노름 융합, ab 합산 후 norm).
+// 주의: "LLM170_FRAME"은 qwen4exp 게이트와 이름 충돌 — EXL3 접두 필수.
+pub struct FFrame {
+    xbuf: VkBuf,  // [TMAX*5120] f32 잔차
+    zeros: VkBuf, // [TMAX*5120] 첫 노름용 ab=0
+    nw128: VkBuf, // [128*5120] 노름 행(2il=input_ln, 2il+1=post_ln, 127행=output_norm)
+    pnr: Pipes,   // e3_norm_resid
+}
+
 /// GDN 프레임 버퍼+파이프라인(plans/121 F1).
+// ═══ GDN 모듈(plans/121 F1/F2) ═══════════════════════════════════════
+// 측정(2026-10-03): 4커널(conv/l2perm/scan/gate) 전층 GPU 상주.
+// scan v3(FLA 전LDS): T512 9.3ms/디스패치(v1 53.4), corr 0.999998·8/8.
+// 부착 성과 pp512 72.55→96.82 t/s(+33.5%). 컴파일러 결함 2종 확증:
+// ① private 동적 배열[32]은 유입 상태≠0일 때 오염(9.4e-2) — LDS 쓸 것
+// ② 상태 flush는 offset 기반(flush_range_at). 버그 3종: 순열 방향·
+// conv 레이어 오프셋·P6 tid/4 매핑(행당 32열만 기록).
 pub struct GdnFrame {
     gq: VkBuf,     // [TMAX*2048] f32 L2 norm q
     gk: VkBuf,     // [TMAX*2048] f32 L2 norm k
@@ -663,6 +693,7 @@ impl TrellisResident {
         let x2t = self.ctx.alloc(BATCH_TMAX * max_n * 2)?;
         self.batch = Some(BatchScratch {
             aframe: None,
+            fframe: None,
             xtb,
             ah: [ah1, ah2, ah3],
             yb: [y1, y2, y3],
@@ -890,6 +921,17 @@ impl TrellisResident {
         key_d: &str,
         t_rows: usize,
     ) -> Result<Vec<f32>, String> {
+        self.ffn_trio_impl(key_g, key_u, key_d, t_rows, false)
+    }
+
+    fn ffn_trio_impl(
+        &mut self,
+        key_g: &str,
+        key_u: &str,
+        key_d: &str,
+        t_rows: usize,
+        gpu_input: bool,
+    ) -> Result<Vec<f32>, String> {
         if t_rows == 0 || t_rows > BATCH_TMAX {
             return Err(format!("ffn_trio_batch: T={t_rows} 상한 {BATCH_TMAX} 위반"));
         }
@@ -905,7 +947,7 @@ impl TrellisResident {
             return Err(format!("{key_g}/{key_u}/{key_d}: FFN 차원 불일치"));
         }
         self.ensure_batch()?;
-        {
+        if !gpu_input {
             let b = self.batch.as_ref().ok_or("batch scratch")?;
             self.ctx.flush_range(&b.xtb, t_rows * kg * 4);
         }
@@ -946,6 +988,9 @@ impl TrellisResident {
         self.chain_batch_one(x2t_b, id, t_rows as u32, ah2, yb2, false)?;
         self.ctx.end_batch_wait()?;
         self.ctx.wait_pending()?;
+        if gpu_input {
+            return Ok(Vec::new());
+        }
         {
             let b = self.batch.as_ref().ok_or("batch scratch")?;
             self.ctx.invalidate_range(&b.yb[2], t_rows * nd * 4);
@@ -1221,7 +1266,8 @@ impl TrellisResident {
 
         // 실입력 캡처(모듈 격리 디버그 — plans/121 F2): l2perm 직후 gq/gk/gv/gbg.
         if gdn_il == 0
-            && let Some(path) = llm170_diag::flag::val("LLM170_SCAN_CAP").map(|s| s.to_string())
+            && let Some(path) =
+                llm170_diag::flag::val("LLM170_EXL3_SCAN_CAP").map(|s| s.to_string())
         {
             let g2 = self.batch.as_ref().and_then(|b| b.gframe.as_ref());
             if let Some(g) = g2 {
@@ -1654,668 +1700,227 @@ impl TrellisResident {
     }
 }
 
-// ── scan 모듈 독립 프로브(plans/121 F2) ──
-// 모델 적재 없이 합성 입력으로 scan 커널만 검증: 속도·산술 격리 작업장.
-// Rust f32 기준(커널 수식 미러)과 행별 출력·최종 상태를 직접 비교한다.
-pub fn scan_check(t_len: usize, cap_path: &str) -> Result<String, String> {
-    const HK: usize = 16;
-    const HV: usize = 48;
-    const D: usize = 128;
-    let use_cap = !cap_path.is_empty();
-    if use_cap {
-        let raw = std::fs::read(cap_path).map_err(|e| format!("cap read: {e}"))?;
-        let nf = raw.len() / 4;
-        let fl: Vec<f32> =
-            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, nf) }.to_vec();
-        let n_q = t_len * 2048;
-        let mut o = 0usize;
-        let take = |o: &mut usize, n: usize| -> Vec<f32> {
-            let v = fl[*o..*o + n].to_vec();
-            *o += n;
-            v
-        };
-        let q = take(&mut o, n_q);
-        let k = take(&mut o, n_q);
-        let v = take(&mut o, t_len * 6144);
-        let bg = take(&mut o, t_len * 96);
-        return scan_check_run(q, k, v, bg, t_len, true);
-    }
-    // 합성 입력(LCG) — q/k는 L2 정규화 후 스케일(≈1/√128), beta∈(0,1), g=음수.
-    let mut seed: u32 = 0x1234_5678;
-    let mut rnd = || {
-        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-        (seed >> 8) as f32 / 16_777_216.0
-    };
-    let mut q = vec![0f32; t_len * HK * D];
-    let mut k = vec![0f32; t_len * HK * D];
-    let mut v = vec![0f32; t_len * HV * D];
-    let mut bg = vec![0f32; t_len * 2 * HV];
-    for e in q.iter_mut() {
-        *e = (rnd() * 2.0 - 1.0) * 0.09;
-    }
-    for e in k.iter_mut() {
-        *e = (rnd() * 2.0 - 1.0) * 0.09;
-    }
-    for e in v.iter_mut() {
-        *e = (rnd() * 2.0 - 1.0) * 0.5;
-    }
-    for t in 0..t_len {
-        for h in 0..HV {
-            bg[t * 2 * HV + h] = rnd();
-            bg[t * 2 * HV + HV + h] = -rnd() * 2.0;
+impl TrellisResident {
+    /// 프레임 초기화(plans/121 원-서브밋) — 잔차/노름 상주.
+    pub fn fframe_init(&mut self) -> Result<(), String> {
+        if self.batch.as_ref().is_some_and(|b| b.fframe.is_some()) {
+            return Ok(());
         }
+        self.ensure_batch()?;
+        let pnr = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/e3_norm_resid.spv"), 4, 8)?;
+        let xbuf = self.ctx.alloc_host_cached(BATCH_TMAX * 5120 * 4)?;
+        let zeros = self.ctx.alloc_host_cached(BATCH_TMAX * 5120 * 4)?;
+        let nw128 = self.ctx.alloc_host_cached(128 * 5120 * 4)?;
+        unsafe {
+            std::ptr::write_bytes(zeros.ptr, 0, BATCH_TMAX * 5120 * 4);
+            std::ptr::write_bytes(xbuf.ptr, 0, BATCH_TMAX * 5120 * 4);
+            for il in 0..self.n_layers {
+                let lp = format!("model.language_model.layers.{il}");
+                let wi = self
+                    .norm(&format!("{lp}.input_layernorm.weight"))
+                    .ok_or("input_ln")?;
+                let wp = self
+                    .norm(&format!("{lp}.post_attention_layernorm.weight"))
+                    .ok_or("post_ln")?;
+                std::ptr::copy_nonoverlapping(
+                    wi.as_ptr(),
+                    nw128.ptr.add((2 * il) * 5120 * 4) as *mut f32,
+                    5120,
+                );
+                std::ptr::copy_nonoverlapping(
+                    wp.as_ptr(),
+                    nw128.ptr.add((2 * il + 1) * 5120 * 4) as *mut f32,
+                    5120,
+                );
+            }
+            let wo = self
+                .norm("model.language_model.norm.weight")
+                .ok_or("output_norm")?;
+            std::ptr::copy_nonoverlapping(
+                wo.as_ptr(),
+                nw128.ptr.add(127 * 5120 * 4) as *mut f32,
+                5120,
+            );
+        }
+        self.ctx.flush_buf(&nw128);
+        self.ctx.flush_buf(&zeros);
+        if let Some(b) = self.batch.as_mut() {
+            b.fframe = Some(FFrame {
+                xbuf,
+                zeros,
+                nw128,
+                pnr,
+            });
+        }
+        Ok(())
     }
 
-    scan_check_run(q, k, v, bg, t_len, false)
-}
-
-fn scan_check_run(
-    q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    bg: Vec<f32>,
-    t_len: usize,
-    from_cap: bool,
-) -> Result<String, String> {
-    let mut ctx = crate::rawvk::context::VkCtx::new()?;
-    const HK: usize = 16;
-    const HV: usize = 48;
-    const D: usize = 128;
-    let gq = ctx.alloc_host_cached(t_len.max(64) * HK * D * 4)?;
-    let gk = ctx.alloc_host_cached(t_len.max(64) * HK * D * 4)?;
-    let gv = ctx.alloc_host_cached(t_len.max(64) * HV * D * 4)?;
-    let gbg = ctx.alloc_host_cached(t_len.max(64) * 2 * HV * 4)?;
-    let go = ctx.alloc_host_cached(t_len.max(64) * HV * D * 4)?;
-    let gstate = ctx.alloc_host_cached(HV * D * D * 4)?; // 1층분
-    let st0: Vec<f32> = if llm170_diag::flag::on("LLM170_SCAN_ST0") {
-        let mut sd: u32 = 0xC0FF_EE01;
-        (0..HV * D * D)
-            .map(|_| {
-                sd = sd.wrapping_mul(1664525).wrapping_add(1013904223);
-                ((sd >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
-            })
-            .collect()
-    } else {
-        vec![0f32; HV * D * D]
-    };
-    unsafe {
-        std::ptr::copy_nonoverlapping(q.as_ptr(), gq.ptr as *mut f32, q.len());
-        std::ptr::copy_nonoverlapping(k.as_ptr(), gk.ptr as *mut f32, k.len());
-        std::ptr::copy_nonoverlapping(v.as_ptr(), gv.ptr as *mut f32, v.len());
-        std::ptr::copy_nonoverlapping(bg.as_ptr(), gbg.ptr as *mut f32, bg.len());
-        std::ptr::copy_nonoverlapping(st0.as_ptr(), gstate.ptr as *mut f32, st0.len());
-        std::ptr::write_bytes(go.ptr, 0, t_len.max(64) * HV * D * 4);
+    /// 잔차 버퍼 포인터 — 호출자가 임베딩 행을 직접 기록한다.
+    pub fn frame_x_ptr(&mut self) -> Result<*mut f32, String> {
+        self.fframe_init()?;
+        Ok(self
+            .batch
+            .as_ref()
+            .and_then(|b| b.fframe.as_ref())
+            .ok_or("fframe")?
+            .xbuf
+            .ptr as *mut f32)
     }
-    ctx.flush_buf(&gq);
-    ctx.flush_buf(&gk);
-    ctx.flush_buf(&gv);
-    ctx.flush_buf(&gbg);
-    ctx.flush_buf(&gstate);
-    let pgs = ctx.pipeline_pipes(include_bytes!("../spv/exl3_gdn_scan.spv"), 6, 20)?;
-    let dispatch = |ctx: &mut crate::rawvk::context::VkCtx| -> Result<(), String> {
-        ctx.begin_batch()?;
-        let ds = ctx.fresh_ds_for(&pgs, 6)?;
-        ctx.bind_bufs(ds, &[gq.buf, gk.buf, gv.buf, gbg.buf, gstate.buf, go.buf]);
-        let push: Vec<u8> = [t_len as u32, HK as u32, HV as u32, D as u32, 0u32]
+
+    pub fn frame_x_flush(&mut self, t_rows: usize) -> Result<(), String> {
+        let ff = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.fframe.as_ref())
+            .ok_or("fframe")?;
+        self.ctx.flush_range(&ff.xbuf, t_rows * 5120 * 4);
+        Ok(())
+    }
+
+    /// norm_resid 디스패치: xn=norm(x+ab)·w[row] → xtb, x+=ab → xbuf 제자리.
+    /// ab에 zeros를 주면 사전 전용(잔차 0).
+    pub fn frame_norm_resid(
+        &mut self,
+        w_row: usize,
+        t_rows: usize,
+        ab: ash::vk::Buffer,
+    ) -> Result<(), String> {
+        let ff = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.fframe.as_ref())
+            .ok_or("fframe")?;
+        let xtb = self.batch.as_ref().ok_or("batch")?.xtb.buf;
+        let ds = self.ctx.fresh_ds_for(&ff.pnr, 4)?;
+        self.ctx
+            .bind_bufs(ds, &[ff.xbuf.buf, ff.nw128.buf, ab, xtb]);
+        let push: Vec<u8> = [t_rows as u32, (w_row * 5120) as u32]
             .iter()
             .flat_map(|x| x.to_le_bytes())
             .collect();
-        crate::rawvk::context::site::set_tag("e3_scan_probe");
-        ctx.run_rw(
-            pgs.pl,
+        crate::rawvk::context::site::set_tag("e3_norm_resid");
+        self.ctx.run_rw(
+            ff.pnr.pl,
             ds,
-            pgs.pipe,
+            ff.pnr.pipe,
             &push,
-            HV as u32,
+            t_rows as u32,
             1,
             1,
-            &[gq.buf, gk.buf, gv.buf, gbg.buf, gstate.buf],
-            &[go.buf, gstate.buf],
+            &[ff.nw128.buf, ab],
+            &[xtb, ff.xbuf.buf],
         )?;
-        ctx.end_batch_wait()?;
-        ctx.wait_pending()?;
         Ok(())
-    };
-    dispatch(&mut ctx)?;
-    // 시간 측정(5회 중앙값)
-    let mut times: Vec<f64> = Vec::new();
-    for _ in 0..5 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(st0.as_ptr(), gstate.ptr as *mut f32, st0.len());
-        }
-        ctx.flush_buf(&gstate);
-        let t0 = std::time::Instant::now();
-        dispatch(&mut ctx)?;
-        times.push(t0.elapsed().as_secs_f64() * 1000.0);
-    }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    // 판독
-    ctx.invalidate_buf(&go);
-    ctx.invalidate_buf(&gstate);
-    let out_gpu: Vec<f32> =
-        unsafe { std::slice::from_raw_parts(go.ptr as *const f32, t_len * HV * D).to_vec() };
-    let st_gpu: Vec<f32> =
-        unsafe { std::slice::from_raw_parts(gstate.ptr as *const f32, HV * D * D).to_vec() };
-
-    // core 기준(gdn_chunk_seq — CPU f32, v1과 동일 경로)
-    let mut beta_v = vec![0f32; t_len * HV];
-    let mut g_v = vec![0f32; t_len * HV];
-    for t in 0..t_len {
-        for h in 0..HV {
-            beta_v[t * HV + h] = bg[t * 2 * HV + h];
-            g_v[t * HV + h] = bg[t * 2 * HV + HV + h];
-        }
-    }
-    let mut st_core = st0.clone();
-    let mut out_core = vec![0f32; t_len * HV * D];
-    llm170_core::gdn::gdn_chunk_seq(
-        &q,
-        &k,
-        &v,
-        &beta_v,
-        &g_v,
-        &mut st_core,
-        &mut out_core,
-        t_len,
-        HK,
-        HV,
-    );
-    let mut kern_vs_core = 0f32;
-    for i in 0..out_gpu.len() {
-        kern_vs_core = kern_vs_core.max((out_gpu[i] - out_core[i]).abs());
-    }
-    let mut stc_max = 0f32;
-    for i in 0..st_gpu.len() {
-        stc_max = stc_max.max((st_gpu[i] - st_core[i]).abs());
     }
 
-    // Rust f32 기준 — 커널 수식 미러(CS=32)
-    let (out_ref, st_ref) = scan_ref(&q, &k, &v, &bg, t_len, false, &st0);
-    let (out_ref16, _) = scan_ref(&q, &k, &v, &bg, t_len, true, &st0);
-    let mut kern_vs_f16ref = 0f32;
-    for i in 0..out_gpu.len() {
-        kern_vs_f16ref = kern_vs_f16ref.max((out_gpu[i] - out_ref16[i]).abs());
-    }
-    let mut mirror_vs_core = 0f32;
-    for i in 0..out_ref.len() {
-        mirror_vs_core = mirror_vs_core.max((out_ref[i] - out_core[i]).abs());
+    pub fn frame_zeros_buf(&mut self) -> Result<ash::vk::Buffer, String> {
+        Ok(self
+            .batch
+            .as_ref()
+            .and_then(|b| b.fframe.as_ref())
+            .ok_or("fframe")?
+            .zeros
+            .buf)
     }
 
-    let _ = from_cap;
-    let mut out_max = 0f32;
-    let mut out_rel = 0f64;
-
-    for i in 0..out_gpu.len() {
-        let d = (out_gpu[i] - out_ref[i]).abs();
-        out_max = out_max.max(d);
-        let denom = out_ref[i].abs().max(1e-3);
-        out_rel = out_rel.max(d as f64 / denom as f64);
-    }
-    let mut st_max = 0f32;
-    for i in 0..st_gpu.len() {
-        st_max = st_max.max((st_gpu[i] - st_ref[i]).abs());
-    }
-    Ok(format!(
-        "scan-check T={t_len}: kern-vs-mirror={out_max:.3e} · kern-vs-f16mirror={kern_vs_f16ref:.3e} · mirror(CS32)-vs-core(CS64)={mirror_vs_core:.3e} · st(kern-vs-core)={stc_max:.3e} · kernel {:.2}ms (5회 중앙값)",
-        times[2]
-    ))
-}
-
-/// scan 커널의 f32 기준 미러 — A/KQ/sk/sv를 f32로 계산(커널의 f16과의 차이가
-/// 판정 대상). CS 고정 32.
-fn h16(x: f32) -> f32 {
-    half::f16::from_f32(x).to_f32()
-}
-
-fn scan_ref(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    bg: &[f32],
-    t_len: usize,
-    f16_emul: bool,
-    st0: &[f32],
-) -> (Vec<f32>, Vec<f32>) {
-    const CS: usize = 32;
-    const HK: usize = 16;
-    const HV: usize = 48;
-    const D: usize = 128;
-    let qscale = 1.0f32 / (D as f32).sqrt();
-    let mut st = st0.to_vec();
-    let mut out = vec![0f32; t_len * HV * D];
-    let n_chunks = t_len.div_ceil(CS);
-    for c in 0..n_chunks {
-        let t0 = c * CS;
-        let n = (t_len - t0).min(CS);
-        for h in 0..HV {
-            let kh = h % HK;
-            let mut sk = [[0f32; D]; CS];
-            let mut sv = [[0f32; D]; CS];
-            let mut bp = [0f32; CS];
-            let mut gcs = [0f32; CS + 1];
-            for i in 0..CS {
-                let live = i < n;
-                if live {
-                    for s2 in 0..D {
-                        let kv2 = k[(t0 + i) * HK * D + kh * D + s2];
-                        let vv2 = v[(t0 + i) * HV * D + h * D + s2];
-                        sk[i][s2] = if f16_emul { h16(kv2) } else { kv2 };
-                        sv[i][s2] = if f16_emul { h16(vv2) } else { vv2 };
-                    }
-                    bp[i] = bg[(t0 + i) * 2 * HV + h];
-                }
-            }
-            let mut acc = 0f32;
-            for t in 0..CS {
-                acc += if t < n {
-                    bg[(t0 + t) * 2 * HV + HV + h]
-                } else {
-                    0.0
-                };
-                gcs[t] = acc;
-            }
-            gcs[CS] = acc;
-            let mut a = [[0f32; CS]; CS];
-            let mut kq = [[0f32; CS]; CS];
-            for i in 0..n {
-                for j in 0..=i {
-                    let mut dk = 0f32;
-                    let mut dq = 0f32;
-                    for s2 in 0..D {
-                        dk += sk[i][s2] * sk[j][s2];
-                        dq += q[(t0 + i) * HK * D + kh * D + s2] * sk[j][s2];
-                    }
-                    if j < i {
-                        let a2 = dk * bp[i] * (gcs[i] - gcs[j]).exp();
-                        a[i][j] = if f16_emul { h16(a2) } else { a2 };
-                    }
-                    let kq2 = dq * qscale * (gcs[i] - gcs[j]).exp();
-                    kq[i][j] = if f16_emul { h16(kq2) } else { kq2 };
-                }
-            }
-            // ks/qs: [CS][D]
-            let mut ks = [[0f32; D]; CS];
-            let mut qs = [[0f32; D]; CS];
-            for i in 0..n {
-                for col in 0..D {
-                    let mut ak = 0f32;
-                    let mut aq = 0f32;
-                    for s2 in 0..D {
-                        let s_el = st[h * D * D + s2 * D + col];
-                        ak += sk[i][s2] * s_el;
-                        aq += q[(t0 + i) * HK * D + kh * D + s2] * s_el;
-                    }
-                    ks[i][col] = ak;
-                    qs[i][col] = aq * qscale;
-                }
-            }
-            let mut dc = [[0f32; D]; CS];
-            for i in 0..n {
-                for col in 0..D {
-                    let mut rhs = bp[i] * (sv[i][col] - gcs[i].exp() * ks[i][col]);
-                    for j in 0..i {
-                        rhs -= a[i][j] * dc[j][col];
-                    }
-                    dc[i][col] = rhs;
-                    let mut oi = gcs[i].exp() * qs[i][col];
-                    for p in 0..=i {
-                        oi += kq[i][p] * dc[p][col];
-                    }
-                    out[(t0 + i) * HV * D + h * D + col] = oi;
-                }
-            }
-            let gt_exp = gcs[CS].exp();
-            let mut wsm = [0f32; CS];
-            for j in 0..CS {
-                wsm[j] = if j < n { (gcs[CS] - gcs[j]).exp() } else { 0.0 };
-            }
-            for s2 in 0..D {
-                for col in 0..D {
-                    let base = h * D * D + s2 * D + col;
-                    let mut a2 = st[base] * gt_exp;
-                    for j in 0..n {
-                        a2 += sk[j][s2] * wsm[j] * dc[j][col];
-                    }
-                    st[base] = a2;
-                }
-            }
-        }
-    }
-    (out, st)
-}
-
-// ── 어텐션 모듈 독립 프로브(plans/121 F2b) ──
-// 합성 q‖gate/k/v + 규격 노름으로 prep+fwd 2커널만 검증: 속도·산술 격리 작업장.
-// Rust 미러는 core::ops::rope_head를 직접 재사용(수학 단일 진실 공급원).
-pub fn attn_check(t_len: usize, pos0: usize) -> Result<String, String> {
-    use crate::rawvk::context::VkCtx;
-    const NH: usize = 24;
-    const NKV: usize = 4;
-    const D: usize = 256;
-    let mut ctx = VkCtx::new()?;
-
-    let mut seed: u32 = 0xBEEF_5A17;
-    let mut rnd = || {
-        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-        (seed >> 8) as f32 / 16_777_216.0
-    };
-    let mut qg = vec![0f32; t_len * NH * D * 2];
-    let mut kin = vec![0f32; t_len * NKV * D];
-    let mut vin = vec![0f32; t_len * NKV * D];
-    let mut qnw = vec![0f32; D];
-    let mut knw = vec![0f32; D];
-    for e in qg.iter_mut() {
-        *e = (rnd() * 2.0 - 1.0) * 0.5;
-    }
-    for e in kin.iter_mut() {
-        *e = (rnd() * 2.0 - 1.0) * 0.3;
-    }
-    for e in vin.iter_mut() {
-        *e = (rnd() * 2.0 - 1.0) * 0.8;
-    }
-    for e in qnw.iter_mut() {
-        *e = 0.9 + rnd() * 0.2;
-    }
-    for e in knw.iter_mut() {
-        *e = 0.9 + rnd() * 0.2;
+    /// 마지막 행 판독(로그릿용) — end_outer 후 호출.
+    pub fn frame_read_xtb_row(&mut self, t_rows: usize) -> Result<Vec<f32>, String> {
+        let b = self.batch.as_ref().ok_or("batch")?;
+        let base = (t_rows - 1) * 5120;
+        self.ctx.invalidate_range_at(&b.xtb, base * 4, 5120 * 4);
+        let p = unsafe {
+            std::slice::from_raw_parts(b.xtb.ptr.add(base * 4) as *const f32, 5120).to_vec()
+        };
+        Ok(p)
     }
 
-    let cap = 1024usize;
-    let b_qg = ctx.alloc_host_cached(t_len.max(64) * NH * D * 2 * 4)?;
-    let b_k = ctx.alloc_host_cached(t_len.max(64) * NKV * D * 4)?;
-    let b_v = ctx.alloc_host_cached(t_len.max(64) * NKV * D * 4)?;
-    let b_qnw = ctx.alloc_host_cached(D * 4)?;
-    let b_knw = ctx.alloc_host_cached(D * 4)?;
-    let b_qh = ctx.alloc_host_cached(t_len.max(64) * NH * D * 4)?;
-    let b_kc = ctx.alloc_host_cached(cap * NKV * D * 4)?;
-    let b_vc = ctx.alloc_host_cached(cap * NKV * D * 4)?;
-    let b_out = ctx.alloc_host_cached(t_len.max(64) * NH * D * 4)?;
-    unsafe {
-        std::ptr::copy_nonoverlapping(qg.as_ptr(), b_qg.ptr as *mut f32, qg.len());
-        std::ptr::copy_nonoverlapping(kin.as_ptr(), b_k.ptr as *mut f32, kin.len());
-        std::ptr::copy_nonoverlapping(vin.as_ptr(), b_v.ptr as *mut f32, vin.len());
-        std::ptr::copy_nonoverlapping(qnw.as_ptr(), b_qnw.ptr as *mut f32, D);
-        std::ptr::copy_nonoverlapping(knw.as_ptr(), b_knw.ptr as *mut f32, D);
-        std::ptr::write_bytes(b_kc.ptr, 0, cap * NKV * D * 4);
-        std::ptr::write_bytes(b_vc.ptr, 0, cap * NKV * D * 4);
-        std::ptr::write_bytes(b_out.ptr, 0, t_len.max(64) * NH * D * 4);
+    /// 디버그: xbuf 선두 행 판독(잔차 검증).
+    pub fn debug_xbuf_row(&mut self) -> Result<Vec<f32>, String> {
+        let ff = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.fframe.as_ref())
+            .ok_or("fframe")?;
+        self.ctx.invalidate_range_at(&ff.xbuf, 0, 5120 * 4);
+        Ok(unsafe { std::slice::from_raw_parts(ff.xbuf.ptr as *const f32, 5120).to_vec() })
     }
-    for b in [&b_qg, &b_k, &b_v, &b_qnw, &b_knw] {
-        ctx.flush_buf(b);
-    }
-    let pp = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_prep.spv"), 8, 8)?;
-    let pf = ctx.pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd3.spv"), 5, 8)?;
 
-    let run = |ctx: &mut VkCtx| -> Result<(), String> {
-        ctx.begin_batch()?;
-        let d1 = ctx.fresh_ds_for(&pp, 8)?;
-        ctx.bind_bufs(
-            d1,
-            &[
-                b_qg.buf, b_k.buf, b_v.buf, b_qnw.buf, b_knw.buf, b_qh.buf, b_kc.buf, b_vc.buf,
-            ],
-        );
-        let push1: Vec<u8> = [t_len as u32, pos0 as u32, 0u32]
-            .iter()
-            .flat_map(|x| x.to_le_bytes())
-            .collect();
-        crate::rawvk::context::site::set_tag("e3_attn_prep");
-        ctx.run_rw(
-            pp.pl,
-            d1,
-            pp.pipe,
-            &push1,
-            t_len as u32,
-            28,
-            1,
-            &[b_qg.buf, b_k.buf, b_v.buf],
-            &[b_qh.buf, b_kc.buf, b_vc.buf],
-        )?;
-        let d2 = ctx.fresh_ds_for(&pf, 5)?;
-        ctx.bind_bufs(d2, &[b_qh.buf, b_kc.buf, b_vc.buf, b_qg.buf, b_out.buf]);
-        let push2: Vec<u8> = [t_len as u32, pos0 as u32, 0u32]
-            .iter()
-            .flat_map(|x| x.to_le_bytes())
-            .collect();
-        crate::rawvk::context::site::set_tag("e3_attn_fwd");
-        ctx.run_rw(
-            pf.pl,
-            d2,
-            pf.pipe,
-            &push2,
-            t_len as u32,
-            24,
-            1,
-            &[b_qh.buf, b_kc.buf, b_vc.buf, b_qg.buf],
-            &[b_out.buf],
-        )?;
-        ctx.end_batch_wait()?;
-        ctx.wait_pending()?;
-        Ok(())
-    };
-    run(&mut ctx)?;
-    let mut times: Vec<f64> = Vec::new();
-    for _ in 0..5 {
-        unsafe {
-            std::ptr::write_bytes(b_kc.ptr, 0, cap * NKV * D * 4);
-            std::ptr::write_bytes(b_vc.ptr, 0, cap * NKV * D * 4);
-        }
-        ctx.flush_buf(&b_kc);
-        ctx.flush_buf(&b_vc);
-        let t0 = std::time::Instant::now();
-        run(&mut ctx)?;
-        times.push(t0.elapsed().as_secs_f64() * 1000.0);
+    /// 디버그: xtb 선두 행 판독(FFN 입력 xn 검증).
+    pub fn debug_xtb_row(&mut self) -> Result<Vec<f32>, String> {
+        let b = self.batch.as_ref().ok_or("batch")?;
+        self.ctx.invalidate_range_at(&b.xtb, 0, 5120 * 4);
+        Ok(unsafe { std::slice::from_raw_parts(b.xtb.ptr as *const f32, 5120).to_vec() })
     }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    ctx.invalidate_buf(&b_out);
-    let out_gpu: Vec<f32> =
-        unsafe { std::slice::from_raw_parts(b_out.ptr as *const f32, t_len * NH * D).to_vec() };
 
-    ctx.invalidate_buf(&b_qh);
-    ctx.invalidate_buf(&b_kc);
-    let qh_gpu: Vec<f32> =
-        unsafe { std::slice::from_raw_parts(b_qh.ptr as *const f32, t_len * NH * D).to_vec() };
-    let kc_gpu: Vec<f32> = unsafe {
-        std::slice::from_raw_parts(b_kc.ptr as *const f32, (pos0 + t_len) * NKV * D).to_vec()
-    };
-    let (qh_ref, kc_ref, out_ref) = attn_ref2(&qg, &kin, &vin, &qnw, &knw, t_len, pos0);
-    let mut qh_max = 0f32;
-    for i in 0..qh_gpu.len() {
-        qh_max = qh_max.max((qh_gpu[i] - qh_ref[i]).abs());
+    /// 디버그: yb[2] 선두 행 판독(FFN out row0 검증).
+    pub fn debug_yb2_row(&mut self) -> Result<Vec<f32>, String> {
+        let b = self.batch.as_ref().ok_or("batch")?;
+        self.ctx.invalidate_range_at(&b.yb[2], 0, 5120 * 4);
+        Ok(unsafe { std::slice::from_raw_parts(b.yb[2].ptr as *const f32, 5120).to_vec() })
     }
-    let mut kc_max = 0f32;
-    for i in 0..kc_gpu.len() {
-        kc_max = kc_max.max((kc_gpu[i] - kc_ref[i]).abs());
-    }
-    eprintln!("  [attndbg] qh maxdiff={qh_max:.3e} kc maxdiff={kc_max:.3e}");
-    let mut out_max = 0f32;
-    let mut out_rel = 0f64;
-    for i in 0..out_gpu.len() {
-        let d = (out_gpu[i] - out_ref[i]).abs();
-        out_max = out_max.max(d);
-        let denom = out_ref[i].abs().max(1e-3);
-        out_rel = out_rel.max(d as f64 / denom as f64);
-    }
-    Ok(format!(
-        "attn-check T={t_len} pos0={pos0}: maxdiff={out_max:.3e} rel={out_rel:.3e} · {times:.2?}ms"
-    ))
-}
 
-fn attn_ref2(
-    qg: &[f32],
-    kin: &[f32],
-    vin: &[f32],
-    qnw: &[f32],
-    knw: &[f32],
-    t_len: usize,
-    pos0: usize,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    const NH: usize = 24;
-    const NKV: usize = 4;
-    const D: usize = 256;
-    let mut out = vec![0f32; t_len * NH * D];
-    let mut qh_all = vec![0f32; t_len * NH * D];
-    let mut kcache = vec![0f32; (pos0 + t_len) * NKV * D];
-    let mut vcache = vec![0f32; (pos0 + t_len) * NKV * D];
-    for t in 0..t_len {
-        let pos = pos0 + t;
-        for hh in 0..NKV {
-            let src = t * NKV * D + hh * D;
-            let mut head: Vec<f32> = kin[src..src + D].to_vec();
-            let ss: f32 = head.iter().map(|x| x * x).sum();
-            let inv = 1.0 / ((ss / D as f32 + 1e-6).sqrt());
-            for d in 0..D {
-                head[d] *= inv * knw[d];
-            }
-            llm170_core::ops::rope_head(&mut head, pos as u32, 64, 1e7);
-            let kb = pos * NKV * D + hh * D;
-            kcache[kb..kb + D].copy_from_slice(&head);
-            vcache[kb..kb + D].copy_from_slice(&vin[src..src + D]);
-        }
+    /// 디버그: yb[0] 선두 행 판독(L0 out row0 검증).
+    pub fn debug_yb0_row(&mut self, _t_rows: usize) -> Result<Vec<f32>, String> {
+        let b = self.batch.as_ref().ok_or("batch")?;
+        let base = 0;
+        self.ctx.invalidate_range_at(&b.yb[0], base * 4, 5120 * 4);
+        Ok(unsafe {
+            std::slice::from_raw_parts(b.yb[0].ptr.add(base * 4) as *const f32, 5120).to_vec()
+        })
     }
-    for t in 0..t_len {
-        let kv_len = pos0 + t + 1;
-        for hh in 0..NH {
-            let kh = hh / 6;
-            let src = t * NH * D * 2 + hh * D * 2;
-            let mut q: Vec<f32> = qg[src..src + D].to_vec();
-            let ss: f32 = q.iter().map(|x| x * x).sum();
-            let inv = 1.0 / ((ss / D as f32 + 1e-6).sqrt());
-            for d in 0..D {
-                q[d] *= inv * qnw[d];
-            }
-            llm170_core::ops::rope_head(&mut q, (pos0 + t) as u32, 64, 1e7);
-            qh_all[t * NH * D + hh * D..t * NH * D + hh * D + D].copy_from_slice(&q);
-            let scale = 1.0f32 / (D as f32).sqrt();
-            let mut scores = vec![0f32; kv_len];
-            for (i, s) in scores.iter_mut().enumerate() {
-                let kb = i * NKV * D + kh * D;
-                *s = q
-                    .iter()
-                    .zip(&kcache[kb..kb + D])
-                    .map(|(a, b)| a * b)
-                    .sum::<f32>()
-                    * scale;
-            }
-            let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut acc = vec![0f32; D];
-            let mut wsum = 0f32;
-            for i in 0..kv_len {
-                let wgt = (scores[i] - mx).exp();
-                wsum += wgt;
-                let vb = i * NKV * D + kh * D;
-                for d in 0..D {
-                    acc[d] += wgt * vcache[vb + d];
-                }
-            }
-            for d in 0..D {
-                let g = qg[t * NH * D * 2 + hh * D * 2 + D + d];
-                let sg = 1.0 / (1.0 + (-g).exp());
-                out[t * NH * D + hh * D + d] = acc[d] / wsum * sg;
-            }
-        }
-    }
-    (qh_all, kcache, out)
-}
 
-// ── 전 모듈 격리 프로브(plans/121 F2c) ──
-// 실모델의 모든 선형 형상에 대해 GEMM만 단독 측정 — 형상별 유효 TFLOPS로
-// 숨은 타일 비효율을 노출한다(사용자 지시: 전 모듈 격리 점검).
-pub fn gemm_check(dir: &str) -> Result<String, String> {
-    let mut tr = TrellisResident::load(dir)?;
-    let t_rows = 512usize;
-    let stage = tr.stage_f32()?;
-    // 입력: 균일 값(수치 무의미 — 속도 프로브)
-    unsafe {
-        std::ptr::write_bytes(stage, 0, t_rows * 6144 * 4);
-        for t in 0..t_rows {
-            let p = stage.add(t * 6144);
-            for i in 0..6144usize {
-                *p.add(i) = ((i % 17) as f32 - 8.0) * 0.01;
-            }
-        }
+    /// xbuf 마지막 행 판독(MTP h 스냅샷) — GPU 갱신 반영(invalidate).
+    pub fn frame_read_x_last(&mut self, t_rows: usize) -> Result<Vec<f32>, String> {
+        let ff = self
+            .batch
+            .as_ref()
+            .and_then(|b| b.fframe.as_ref())
+            .ok_or("fframe")?;
+        let base = (t_rows - 1) * 5120;
+        self.ctx.invalidate_range_at(&ff.xbuf, base * 4, 5120 * 4);
+        Ok(unsafe {
+            std::slice::from_raw_parts(ff.xbuf.ptr.add(base * 4) as *const f32, 5120).to_vec()
+        })
     }
-    let mut report = Vec::new();
-    let shapes: &[(&str, &str)] = &[
-        (
-            "GDN qkv",
-            "model.language_model.layers.0.linear_attn.in_proj_qkv",
-        ),
-        (
-            "GDN z",
-            "model.language_model.layers.0.linear_attn.in_proj_z",
-        ),
-        (
-            "GDN out",
-            "model.language_model.layers.0.linear_attn.out_proj",
-        ),
-        ("ATTN q", "model.language_model.layers.3.self_attn.q_proj"),
-        ("FFN gate", "model.language_model.layers.0.mlp.gate_proj"),
-        ("FFN down", "model.language_model.layers.0.mlp.down_proj"),
-        ("lm_head", "lm_head"),
-    ];
-    // 산술 검증 추가: T=8 배치 1행 vs 순차 GEMV 기준(BK=64 변형 판정용)
-    {
-        let t8 = 8usize;
-        let st8 = tr.stage_f32()?;
-        unsafe {
-            for t in 0..t8 {
-                let p8 = st8.add(t * 5120);
-                for i in 0..5120usize {
-                    *p8.add(i) = ((i % 31) as f32 - 15.0) * 0.013 + (t as f32) * 0.001;
-                }
-            }
-        }
-        let key = "model.language_model.layers.0.mlp.gate_proj";
-        let _slots = tr.linear_batch_multi_gpu(&[key], t8)?;
-        let li0 = tr.find_linear(key)?;
-        let n0 = tr.linears[li0].1.n;
-        let got = tr.read_yb_head(0, 8 * 4096);
-        let xrow: Vec<f32> =
-            unsafe { std::slice::from_raw_parts(st8 as *const f32, 5120).to_vec() };
-        let want = tr.linear(key, &xrow)?;
-        let mut md = 0f32;
-        let mut nan_at: Vec<usize> = Vec::new();
-        let mut nan_cnt = 0usize;
-        for i in 0..n0.min(4096) {
-            let g = got[i];
-            if !g.is_finite() {
-                nan_cnt += 1;
-                if nan_at.len() < 6 {
-                    nan_at.push(i);
-                }
-            }
-            let d = (g - want[i]).abs();
-            if d.is_finite() {
-                md = md.max(d);
-            }
-        }
-        let mut row_nan = vec![0usize; 8];
-        for t in 0..8usize {
-            let seg = &got[t * 4096..(t + 1) * 4096];
-            row_nan[t] = seg.iter().filter(|v| !v.is_finite()).count();
-        }
-        eprintln!(
-            "  [gemmdbg] gate T=8 row0 maxdiff={md:.3e} nan={nan_cnt} row_nan={row_nan:?} n0={n0}"
-        );
+
+    /// 단일 선형 체인(판독 없음·flush 없음 — xtb가 GPU 기록 전제, plans/121 프레임).
+    /// 결과는 yb[0]에 잔류: (버퍼, n) 반환.
+    pub fn linear_chain(
+        &mut self,
+        key: &str,
+        t_rows: usize,
+        slot: usize,
+    ) -> Result<(ash::vk::Buffer, usize), String> {
+        let li = self.find_linear(key)?;
+        let n = self.linears[li].1.n;
+        self.ensure_batch()?;
+        let (xtb, ah0, yb0) = {
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            (b.xtb.buf, b.ah[slot].buf, b.yb[slot].buf)
+        };
+        self.ctx.begin_batch()?;
+        self.chain_batch_one(xtb, li, t_rows as u32, ah0, yb0, true)?;
+        self.ctx.end_batch_wait()?;
+        self.ctx.wait_pending()?;
+        Ok((yb0, n))
     }
-    for (name, key) in shapes {
-        let li = tr.find_linear(key)?;
-        let (k, n) = (tr.linears[li].1.k, tr.linears[li].1.n);
-        // 5회 중앙값
-        let mut ts: Vec<f64> = Vec::new();
-        for _ in 0..5 {
-            let t0 = std::time::Instant::now();
-            tr.linear_batch_multi_gpu(&[key], t_rows)?;
-            ts.push(t0.elapsed().as_secs_f64() * 1e3);
-        }
-        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let ms = ts[2];
-        let tf = 2.0 * t_rows as f64 * k as f64 * n as f64 / (ms * 1e-3) / 1e12;
-        report.push(format!(
-            "{name:10} K={k:6} N={n:6}  {ms:7.2}ms  {tf:5.2} TF"
-        ));
+
+    /// FFN 트리오 체인(판독 없음) — 결과 yb[0] 잔류(주의: gate/up이 ah/yb 슬롯
+    /// 을 재사용하므로 down은 yb[2]가 아니라 ffn_trio의 슬롯 배정을 그대로
+    /// 둔다 — 여기선 down 결과를 yb[0]으로 재배치한다).
+    pub fn ffn_trio_chain(
+        &mut self,
+        key_g: &str,
+        key_u: &str,
+        key_d: &str,
+        t_rows: usize,
+    ) -> Result<(ash::vk::Buffer, usize), String> {
+        let id = self.find_linear(key_d)?;
+        let nd = self.linears[id].1.n;
+        self.ffn_trio_impl(key_g, key_u, key_d, t_rows, true)?;
+        let b = self.batch.as_ref().ok_or("batch")?;
+        Ok((b.yb[2].buf, nd))
     }
-    Ok(report.join("\n"))
 }
