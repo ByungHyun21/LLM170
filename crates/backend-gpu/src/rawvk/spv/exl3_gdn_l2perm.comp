@@ -22,6 +22,7 @@ layout(push_constant) uniform PC {
     uint h_k; // 16
     uint h_v; // 48
     uint d;   // 128
+    uint layer; // GDN 층 인덱스(상수 오프셋)
 } pc;
 
 const float eps = 1e-6;
@@ -41,7 +42,7 @@ void main() {
     // ── alpha dot ──
     float pa = 0.0;
     for (uint i = tid; i < 5120u; i += 128u) {
-        pa += xn[t * 5120u + i] * abuf[h * 5120u + i];
+        pa += xn[t * 5120u + i] * abuf[pc.layer * 2u * pc.h_v * 5120u + h * 5120u + i];
     }
     red[tid] = pa;
     barrier();
@@ -55,7 +56,7 @@ void main() {
     // ── beta dot ──
     float pb = 0.0;
     for (uint i = tid; i < 5120u; i += 128u) {
-        pb += xn[t * 5120u + i] * abuf[pc.h_v * 5120u + h * 5120u + i];
+        pb += xn[t * 5120u + i] * abuf[pc.layer * 2u * pc.h_v * 5120u + pc.h_v * 5120u + h * 5120u + i];
     }
     red[tid] = pb;
     barrier();
@@ -69,7 +70,9 @@ void main() {
     // ── g + beta → BGB (lc) ──
     uint j = hf_to_lc(h);
     if (tid == 0u) {
-        float ssm_a = -exp(alog[h]);
+        float al = alog[pc.layer * pc.h_v + h];
+        float dt = dtb[pc.layer * pc.h_v + h];
+        float ssm_a = -exp(al);
         bg[t * 96u + j] = sigmoid_f(b_val);
         bg[t * 96u + 48u + j] = softplus_f(a_val + dtb[h]) * ssm_a;
     }

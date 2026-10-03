@@ -18,6 +18,7 @@ layout(push_constant) uniform PC {
     uint h_k; // 16
     uint h_v; // 48
     uint d;   // 128
+    uint layer; // GDN 층 인덱스(상태 오프셋)
 } pc;
 
 #define CS 64
@@ -99,7 +100,7 @@ void main() {
                 float w0 = bi * exp(gi);
                 float acc = 0.0;
                 for (uint s2 = 0u; s2 < pc.d; s2++) {
-                    acc += float(sk[i * pc.d + s2]) * st[h * pc.d * pc.d + s2 * pc.d + tid];
+                    acc += float(sk[i * pc.d + s2]) * st[pc.layer * pc.h_v * pc.d * pc.d + h * pc.d * pc.d + s2 * pc.d + tid];
                 }
                 rhs -= w0 * acc;
             }
@@ -112,7 +113,7 @@ void main() {
             uint qb = (t0 + i) * (pc.h_k * pc.d) + kh * pc.d;
             float qe = exp(gi);
             for (uint s2 = 0u; s2 < pc.d; s2++) {
-                oi += q[qb + s2] * qscale * st[h * pc.d * pc.d + s2 * pc.d + tid];
+                oi += q[qb + s2] * qscale * st[pc.layer * pc.h_v * pc.d * pc.d + h * pc.d * pc.d + s2 * pc.d + tid];
             }
             oi *= qe;
             for (uint j = 0u; j <= i; j++) {
@@ -131,11 +132,11 @@ void main() {
             }
             barrier();
             for (uint s2 = 0u; s2 < pc.d; s2++) {
-                float acc = st[h * pc.d * pc.d + s2 * pc.d + tid] * glast_exp;
+                float acc = st[pc.layer * pc.h_v * pc.d * pc.d + h * pc.d * pc.d + s2 * pc.d + tid] * glast_exp;
                 for (uint j = 0u; j < n; j++) {
                     acc += float(sk[j * pc.d + s2]) * wsm[j] * dcol[j];
                 }
-                st[h * pc.d * pc.d + s2 * pc.d + tid] = acc;
+                st[pc.layer * pc.h_v * pc.d * pc.d + h * pc.d * pc.d + s2 * pc.d + tid] = acc;
             }
             barrier();
         }
