@@ -1,20 +1,20 @@
 #version 450
 
 // e3_norm_resid (plans/121 프레임) — 잔차 스트림 GPU 상주화:
-// xn = rms_norm(x)·w  (xtb 기록 — 선형 입력)
-// x  = x + yb          (xbuf 제자리 갱신 — 잔차)
-// 그리드 (T), WG=1024, 행 5120(1024스레드×5). LDS 리듀스 후 2중 기록.
-// ffn 변형(norm_f): yb2(xtb 기록 후 ffn이 소비) — 동일 커널, w만 교체.
+// xn = rms_norm(x+ab)·w  (xtb 기록 — 선형 입력)
+// x  = x + ab            (xbuf 제자리 — 단일 read-write 바인딩.
+//                          동일 버퍼 2슬롯 얼라이어싱은 쓰기 유실 실측 — 금지)
+// 그리드 (T), WG=1024, 행 5120(1024스레드×5). LDS 리듀스.
 
 layout(local_size_x = 1024) in;
 
-layout(binding = 0) readonly buffer XB { float x[]; };    // [T][5120] 잔차
-layout(binding = 1) readonly buffer NW { float nw[]; };   // [5120]
-layout(binding = 2) readonly buffer AB { float ab[]; };   // [T][5120] attn/ffn 출력
-layout(binding = 3) writeonly buffer XN { float xn[]; };  // [T][5120] → xtb
-layout(binding = 4) buffer XO { float xo[]; };            // [T][5120] 잔차 갱신(=xbuf)
+layout(binding = 0) buffer XB { float x[]; };          // [T][5120] 잔차 r/w
+layout(binding = 1) readonly buffer NW { float nw[]; }; // [5120]
+layout(binding = 2) readonly buffer AB { float ab[]; }; // [T][5120] 모듈 출력
+layout(binding = 3) writeonly buffer XN { float xn[]; }; // [T][5120] → xtb
 layout(push_constant) uniform PC {
     uint t_len;
+    uint w_off; // nw128 행 오프셋(원소 단위)
 } pc;
 
 shared float red[1024];
@@ -23,7 +23,6 @@ void main() {
     uint t = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
     uint base = t * 5120u;
-    // 잔차 먼저: v = x + ab (xn과 xo 모두 이 값에서 나온다)
     float v0 = x[base + tid] + ab[base + tid];
     float v1 = x[base + 1024u + tid] + ab[base + 1024u + tid];
     float v2 = x[base + 2048u + tid] + ab[base + 2048u + tid];
@@ -37,16 +36,14 @@ void main() {
         barrier();
     }
     float inv = inversesqrt(red[0] / 5120.0 + 1e-6);
-    // xn = x·inv·w (xtb — 선형 소비)
-    xn[base + tid] = v0 * inv * nw[tid];
-    xn[base + 1024u + tid] = v1 * inv * nw[1024u + tid];
-    xn[base + 2048u + tid] = v2 * inv * nw[2048u + tid];
-    xn[base + 3072u + tid] = v3 * inv * nw[3072u + tid];
-    xn[base + 4096u + tid] = v4 * inv * nw[4096u + tid];
-    // x += ab (잔차 갱신)
-    xo[base + tid] = v0 + ab[base + tid];
-    xo[base + 1024u + tid] = v1 + ab[base + 1024u + tid];
-    xo[base + 2048u + tid] = v2 + ab[base + 2048u + tid];
-    xo[base + 3072u + tid] = v3 + ab[base + 3072u + tid];
-    xo[base + 4096u + tid] = v4 + ab[base + 4096u + tid];
+    xn[base + tid] = v0 * inv * nw[pc.w_off + tid];
+    xn[base + 1024u + tid] = v1 * inv * nw[pc.w_off + 1024u + tid];
+    xn[base + 2048u + tid] = v2 * inv * nw[pc.w_off + 2048u + tid];
+    xn[base + 3072u + tid] = v3 * inv * nw[pc.w_off + 3072u + tid];
+    xn[base + 4096u + tid] = v4 * inv * nw[pc.w_off + 4096u + tid];
+    x[base + tid] = v0;
+    x[base + 1024u + tid] = v1;
+    x[base + 2048u + tid] = v2;
+    x[base + 3072u + tid] = v3;
+    x[base + 4096u + tid] = v4;
 }

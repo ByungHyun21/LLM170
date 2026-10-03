@@ -5,6 +5,7 @@ mod attention;
 mod exl3;
 mod exl3_bench;
 mod exl3_decode;
+mod exl3_probes;
 mod exl3_resident;
 mod fault;
 mod frame_check;
@@ -23,10 +24,8 @@ pub use exl3_decode::exl3_pp;
 pub use exl3_decode::{
     SeqState, decode_step, exl3_spec_step, new_seq_state, prefill_batch, prefill_batch_spec,
 };
+pub use exl3_probes::{attn_check, gemm_check, nr_check, scan_check};
 pub use exl3_resident::TrellisResident;
-pub use exl3_resident::attn_check;
-pub use exl3_resident::gemm_check;
-pub use exl3_resident::scan_check;
 pub use fault::fault_probe;
 pub use frame_check::frame_check;
 pub use misc::ple_mt_check;

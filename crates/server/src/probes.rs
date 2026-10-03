@@ -408,6 +408,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             arg_num(args, 0, 512usize),
             arg_num(args, 1, 0usize),
         ),
+        "exl3-nr-check" => llm170_backend_gpu::rawvk::checks::nr_check(),
         "exl3-gemm-check" => llm170_backend_gpu::rawvk::checks::gemm_check(&arg_str(
             args,
             0,

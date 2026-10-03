@@ -1266,6 +1266,157 @@ pub fn prefill_batch(
     let mut logits = Vec::new();
     for chunk_toks in tokens.chunks(super::exl3_resident::BATCH_TMAX) {
         let t_rows = chunk_toks.len();
+        // ── 프레임 경로(plans/121 원-서브밋): 잔차 GPU 상주, 층간 판독 0 ──
+        // 옵트인 주의: "LLM170_FRAME"은 qwen4exp 프레임 게이트와 이름 충돌
+        // (워크스테이션 env 상주) — EXL3 전용 엄격 키 사용.
+        if t_rows > 8 && llm170_diag::flag::eq1("LLM170_EXL3_FRAME") {
+            let _g0 = ph("ppf:frame");
+            tr.fframe_init()?;
+            tr.gdn_frame_init()?;
+            let mut attn_count_f = 0usize;
+            let xp = tr.frame_x_ptr()?;
+            for (t, &tok) in chunk_toks.iter().enumerate() {
+                // SAFETY: xbuf [T][5120] 프레임 소유 — 행별 분리 기록.
+                unsafe {
+                    let src: &[f32] = tr.embed_row(tok);
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), xp.add(t * h), h);
+                }
+            }
+            tr.frame_x_flush(t_rows)?;
+            tr.ctx.begin_outer()?;
+            let zb = tr.frame_zeros_buf()?;
+            tr.frame_norm_resid(0, t_rows, zb)?; // il=0 input_ln
+            if llm170_diag::dump::opts().key("exl3_framedbg") {
+                let got = tr.frame_read_xtb_row(1)?;
+                let w0 = tr
+                    .norm("model.language_model.layers.0.input_layernorm.weight")
+                    .ok_or("ln0")?;
+                let em: Vec<f32> = tr.embed_row(chunk_toks[0]).to_vec();
+                let ss: f32 = em.iter().map(|v| v * v).sum();
+                let inv = 1.0 / ((ss / em.len() as f32 + 1e-6).sqrt());
+                let want: Vec<f32> = em
+                    .iter()
+                    .zip(w0)
+                    .map(|(v, w)| v * inv * w)
+                    .take(6)
+                    .collect();
+                eprintln!("  [framedbg] norm0 got={:?} want={:?}", &got[..6], want);
+            }
+            for il in 0..tr.n_layers {
+                let lp = format!("model.language_model.layers.{il}");
+                let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
+                let ab = if il % 4 == 3 {
+                    let _a = ph("ppf:attn");
+                    let yq = tr.linear_chain(&format!("{lp}.self_attn.q_proj"), t_rows, 0)?;
+                    let yk = tr.linear_chain(&format!("{lp}.self_attn.k_proj"), t_rows, 1)?;
+                    let yv = tr.linear_chain(&format!("{lp}.self_attn.v_proj"), t_rows, 2)?;
+                    tr.attn_layer_gpu(attn_count_f, t_rows, seq.pos, yq.0, yk.0, yv.0)?;
+                    seq.kv[attn_count_f].len += t_rows;
+                    attn_count_f += 1;
+                    drop(_a);
+                    tr.linear_chain(&format!("{lp}.self_attn.o_proj"), t_rows, 0)?
+                        .0
+                } else {
+                    let _g = ph("ppf:gdn");
+                    {
+                        let g = &seq.gdn[il];
+                        tr.gdn_state_upload(gdn_il, &g.states, &g.conv)?;
+                    }
+                    let yq =
+                        tr.linear_chain(&format!("{lp}.linear_attn.in_proj_qkv"), t_rows, 0)?;
+                    let yz = tr.linear_chain(&format!("{lp}.linear_attn.in_proj_z"), t_rows, 1)?;
+                    tr.gdn_layer_gpu(gdn_il, t_rows, std::ptr::null_mut(), yq.0, yz.0)?;
+                    drop(_g);
+                    tr.linear_chain(&format!("{lp}.linear_attn.out_proj"), t_rows, 0)?
+                        .0
+                };
+                if llm170_diag::dump::opts().key("exl3_framedbg") {
+                    // 판독을 위해 잠시 외부 배치 해제(추가 대기 — 디버그 전용)
+                    tr.ctx.end_outer()?;
+                    let b = tr.debug_yb0_row(t_rows)?;
+                    let kind = if il % 4 == 3 { "attn" } else { "gdn" };
+                    eprintln!("  [framedbg] L{il} {kind} out={:?}", &b[..4]);
+                    tr.ctx.begin_outer()?;
+                }
+                tr.frame_norm_resid(2 * il + 1, t_rows, ab)?; // post_ln + 잔차
+                if llm170_diag::dump::opts().key("exl3_framedbg") {
+                    tr.ctx.end_outer()?;
+                    let b = tr.debug_xtb_row()?;
+                    let xr = tr.debug_xbuf_row()?;
+                    let em: Vec<f32> = tr.embed_row(chunk_toks[0]).to_vec();
+                    eprintln!(
+                        "  [framedbg] L{il} ffn-in xn={:?} xbuf={:?} embed={:?}",
+                        &b[..4],
+                        &xr[..4],
+                        &em[..4]
+                    );
+                    tr.ctx.begin_outer()?;
+                }
+                let yf = tr.ffn_trio_chain(
+                    &format!("{lp}.mlp.gate_proj"),
+                    &format!("{lp}.mlp.up_proj"),
+                    &format!("{lp}.mlp.down_proj"),
+                    t_rows,
+                )?;
+                if llm170_diag::dump::opts().key("exl3_framedbg") {
+                    tr.ctx.end_outer()?;
+                    let b = tr.debug_yb2_row()?;
+                    eprintln!("  [framedbg] L{il} ffn out={:?}", &b[..4]);
+                    tr.ctx.begin_outer()?;
+                }
+                let w_next = if il + 1 == tr.n_layers {
+                    127
+                } else {
+                    2 * (il + 1)
+                };
+                tr.frame_norm_resid(w_next, t_rows, yf.0)?;
+            }
+            tr.ctx.end_outer()?;
+            drop(_g0);
+            let xn_last = tr.frame_read_xtb_row(t_rows)?;
+            logits = tr.linear("lm_head", &xn_last)?;
+            seq.last_logits.clear();
+            seq.last_logits.extend_from_slice(&logits);
+            if tr.gpu_frames_active() {
+                let n_gdn = tr.n_layers - tr.n_layers / 4;
+                let mut gi = 0usize;
+                let mut ai2 = 0usize;
+                for il in 0..tr.n_layers {
+                    if il % 4 != 3 {
+                        let (states, conv) = {
+                            let g = &mut seq.gdn[il];
+                            (&mut g.states, &mut g.conv)
+                        };
+                        tr.gdn_state_sync(gi, states, conv)?;
+                        gi += 1;
+                        if gi >= n_gdn {
+                            break;
+                        }
+                    } else {
+                        let len = seq.kv[ai2].len;
+                        let rows = (len * 1024).min(seq.kv[ai2].k.len());
+                        let [k, v] = tr.attn_kv_sync(ai2, rows / 1024)?;
+                        seq.kv[ai2].k[..rows].copy_from_slice(&k[..rows]);
+                        seq.kv[ai2].v[..rows].copy_from_slice(&v[..rows]);
+                        ai2 += 1;
+                    }
+                }
+            }
+            seq.pos += t_rows as u32;
+            seq.last_tok = *chunk_toks.last().ok_or("빈 청크")?;
+            seq.last_h.clear();
+            {
+                let xp = tr.frame_x_ptr()?;
+                // SAFETY: 호스트가 기록한 마지막 임베딩/잔차 경로 — end_outer 후
+                // xbuf 마지막 행은 GPU가 갱신했을 수 있어 판독 전 flush 역방향
+                // (GPU→호스트) 동기가 필요하다 — frame_x_flush는 호스트→GPU라
+                // 여기선 invalidate 경로를 쓴다(아래 frame_read_x_last).
+                let row = tr.frame_read_x_last(t_rows)?.to_vec();
+                let _ = xp;
+                seq.last_h.extend_from_slice(&row);
+            }
+            continue;
+        }
         // 임베딩 행 조립
         let _e0 = ph("pp:embed");
         let mut x = vec![0f32; t_rows * h];
@@ -1315,11 +1466,17 @@ pub fn prefill_batch(
                 let r = attn_batch(tr, seq, il, attn_count, t_rows, 24, 4, 256)?;
                 drop(_g);
                 attn_count += 1;
+                if llm170_diag::dump::opts().key("exl3_framedbg") {
+                    eprintln!("  [olddbg] L{il} attn out={:?}", &r[..4]);
+                }
                 r
             } else {
                 let _g = ph("pp:gdn");
                 let r = gdn_batch(tr, seq, il, &xn, t_rows)?;
                 drop(_g);
+                if llm170_diag::dump::opts().key("exl3_framedbg") {
+                    eprintln!("  [olddbg] L{il} gdn out={:?}", &r[..4]);
+                }
                 r
             };
             // 잔차 x += attn_out
@@ -1353,6 +1510,12 @@ pub fn prefill_batch(
                 });
             }
             drop(_n1);
+            if llm170_diag::dump::opts().key("exl3_framedbg") {
+                let st = tr.stage_f32()?;
+                // SAFETY: 스테이징 직독(호스트 기록 직후).
+                let head = unsafe { std::slice::from_raw_parts(st as *const f32, 4) }.to_vec();
+                eprintln!("  [olddbg] L{il} ffn-in xf={head:?}");
+            }
             // FFN 트리오(단일 배치): gate/up gemm → ew_t(GPU) → down gemm.
             let _gf = ph("pp:ffn");
             let ffn_out = tr.ffn_trio_batch(
@@ -1362,6 +1525,9 @@ pub fn prefill_batch(
                 t_rows,
             )?;
             drop(_gf);
+            if llm170_diag::dump::opts().key("exl3_framedbg") {
+                eprintln!("  [olddbg] L{il} ffn out={:?}", &ffn_out[..4]);
+            }
             let _r1 = ph("pp:resid2");
             for (a, b) in x.iter_mut().zip(ffn_out.iter()) {
                 *a += b;
