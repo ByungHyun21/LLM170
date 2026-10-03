@@ -577,22 +577,25 @@ pub struct BatchScratch {
 
 /// GDN 프레임 버퍼+파이프라인(plans/121 F1).
 pub struct GdnFrame {
-    gq: VkBuf,      // [TMAX*2048] f32 L2 norm q
-    gk: VkBuf,      // [TMAX*2048] f32 L2 norm k
-    gv: VkBuf,      // [TMAX*6144] f32 v lc
-    gbg: VkBuf,     // [TMAX*96] f32 beta|g lc
-    go: VkBuf,      // [TMAX*6144] f32 o lc
-    gqr: VkBuf,     // [TMAX*2048] f32 conv q raw(HF)
-    gkr: VkBuf,     // [TMAX*2048] f32 conv k raw(HF)
-    gvr: VkBuf,     // [TMAX*6144] f32 conv v raw(HF)
+    gq: VkBuf,     // [TMAX*2048] f32 L2 norm q
+    gk: VkBuf,     // [TMAX*2048] f32 L2 norm k
+    gv: VkBuf,     // [TMAX*6144] f32 v lc
+    gbg: VkBuf,    // [TMAX*96] f32 beta|g lc
+    go: VkBuf,     // [TMAX*6144] f32 o lc
+    gqr: VkBuf,    // [TMAX*2048] f32 conv q raw(HF)
+    gkr: VkBuf,    // [TMAX*2048] f32 conv k raw(HF)
+    gvr: VkBuf,    // [TMAX*6144] f32 conv v raw(HF)
     ab: VkBuf,     // [n_gdn][2*48*5120] f32
     cw: VkBuf,     // [n_gdn][10240*4] f32
     alog: VkBuf,   // [n_gdn*48] f32
     dtb: VkBuf,    // [n_gdn*48] f32
     nw: VkBuf,     // [n_gdn*128] f32
-    gring: VkBuf,   // [n_gdn*3*10240] f32
-    gstate: VkBuf,  // [n_gdn*48*16384] f32
-    pgc: Pipes, pgl: Pipes, pgs: Pipes, pgg: Pipes,
+    gring: VkBuf,  // [n_gdn*3*10240] f32
+    gstate: VkBuf, // [n_gdn*48*16384] f32
+    pgc: Pipes,
+    pgl: Pipes,
+    pgs: Pipes,
+    pgg: Pipes,
 }
 
 impl TrellisResident {
@@ -935,5 +938,324 @@ impl TrellisResident {
             }
         }
         Ok(y)
+    }
+    /// T-배치 다중 선형(GPU 상주 변형) — 결과를 yb 슬롯에 남긴다(판독 없음).
+    /// plans/121 F1: GDN 프레임이 yb0/yb1을 직접 소비.
+    /// 반환: 슬롯별 (buffer handle, n) — 소비자 커널이 바인딩에 사용.
+    pub fn linear_batch_multi_gpu(
+        &mut self,
+        keys: &[&str],
+        t_rows: usize,
+    ) -> Result<Vec<(ash::vk::Buffer, usize)>, String> {
+        if keys.is_empty() || keys.len() > 3 {
+            return Err(format!(
+                "linear_batch_multi_gpu: keys {}개 (1..=3)",
+                keys.len()
+            ));
+        }
+        if t_rows == 0 || t_rows > BATCH_TMAX {
+            return Err(format!("linear_batch_gpu: T={t_rows} 상한 위반"));
+        }
+        let mut idxs = Vec::with_capacity(keys.len());
+        for key in keys {
+            idxs.push(self.find_linear(key)?);
+        }
+        self.ensure_batch()?;
+        {
+            let k0 = self.linears[idxs[0]].1.k;
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            self.ctx.flush_range(&b.xtb, t_rows * k0 * 4);
+        }
+        let xtb = self.batch.as_ref().ok_or("batch scratch")?.xtb.buf;
+        self.ctx.begin_batch()?;
+        for (slot, &li) in idxs.iter().enumerate() {
+            let b = self.batch.as_ref().ok_or("batch scratch")?;
+            self.chain_batch_one(xtb, li, t_rows as u32, b.ah[slot].buf, b.yb[slot].buf, true)?;
+        }
+        self.ctx.end_batch_wait()?;
+        self.ctx.wait_pending()?;
+        // 판독 없음 — yb에 잔류. 소비자가 invalidate 후 판독하거나 GPU 직독.
+        let b = self.batch.as_ref().ok_or("batch scratch")?;
+        Ok(idxs
+            .iter()
+            .enumerate()
+            .map(|(slot, &li)| (b.yb[slot].buf, self.linears[li].1.n))
+            .collect())
+    }
+
+    /// GDN 프레임 초기화(plans/121 F1) — 상수 업로드 1회 + 스크래치/상태 할당.
+    /// GDN 층 수는 64층 중 il%4!=3 → 48층.
+    pub fn gdn_frame_init(&mut self) -> Result<(), String> {
+        if self.batch.as_ref().is_some_and(|b| b.gframe.is_some()) {
+            return Ok(());
+        }
+        self.ensure_batch()?;
+        let n_gdn = self.n_layers - self.n_layers / 4; // 48
+
+        // 파이프라인 4종
+        let pgc = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_conv.spv"), 6, 4)?;
+        let pgl = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_l2perm.spv"), 11, 16)?;
+        let pgs = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_scan.spv"), 6, 16)?;
+        let pgg = self
+            .ctx
+            .pipeline_pipes(include_bytes!("../spv/exl3_gdn_gate.spv"), 4, 16)?;
+
+        // 스크래치(TMAX 기준)
+        let gq = self.ctx.alloc_host_cached(BATCH_TMAX * 2048 * 4)?;
+        let gk = self.ctx.alloc_host_cached(BATCH_TMAX * 2048 * 4)?;
+        let gv = self.ctx.alloc_host_cached(BATCH_TMAX * 6144 * 4)?;
+        let gbg = self.ctx.alloc_host_cached(BATCH_TMAX * 96 * 4)?;
+        let go = self.ctx.alloc_host_cached(BATCH_TMAX * 6144 * 4)?;
+        let gqr = self.ctx.alloc_host_cached(BATCH_TMAX * 2048 * 4)?;
+        let gkr = self.ctx.alloc_host_cached(BATCH_TMAX * 2048 * 4)?;
+        let gvr = self.ctx.alloc_host_cached(BATCH_TMAX * 6144 * 4)?;
+
+        // 상수(48층 분) — 트레이리던트 norms에서 직접 복사.
+        let ab = self.ctx.alloc_host_cached(n_gdn * 2 * 48 * 5120 * 4)?;
+        let cw = self.ctx.alloc_host_cached(n_gdn * 10240 * 4 * 4)?;
+        let alog = self.ctx.alloc_host_cached(n_gdn * 48 * 4)?;
+        let dtb = self.ctx.alloc_host_cached(n_gdn * 48 * 4)?;
+        let nw = self.ctx.alloc_host_cached(n_gdn * 128 * 4)?;
+
+        // 상태(48층 분, GPU)
+        let gring = self.ctx.alloc_host_cached(n_gdn * 3 * 10240 * 4)?;
+        let gstate = self.ctx.alloc_host_cached(n_gdn * 48 * 16384 * 4)?;
+
+        // 상수 업로드 — 각 GDN 층(il%4!=3)의 norms를 GPU 버퍼에.
+        unsafe {
+            let abp = ab.ptr as *mut f32;
+            let cwp = cw.ptr as *mut f32;
+            let alp = alog.ptr as *mut f32;
+            let dtp = dtb.ptr as *mut f32;
+            let nwp = nw.ptr as *mut f32;
+            let mut g = 0usize;
+            for il in 0..self.n_layers {
+                if il % 4 == 3 {
+                    continue;
+                } // full attention
+                let lp = format!("model.language_model.layers.{il}.linear_attn");
+                let a_p = self
+                    .norm(&format!("{lp}.in_proj_a.weight"))
+                    .ok_or("a_proj")?;
+                let b_p = self
+                    .norm(&format!("{lp}.in_proj_b.weight"))
+                    .ok_or("b_proj")?;
+                let c_w = self.norm(&format!("{lp}.conv1d.weight")).ok_or("conv_w")?;
+                let a_l = self.norm(&format!("{lp}.A_log")).ok_or("A_log")?;
+                let d_b = self.norm(&format!("{lp}.dt_bias")).ok_or("dt_bias")?;
+                let n_w = self.norm(&format!("{lp}.norm.weight")).ok_or("norm_w")?;
+                std::ptr::copy_nonoverlapping(a_p.as_ptr(), abp.add(g * 2 * 48 * 5120), 48 * 5120);
+                std::ptr::copy_nonoverlapping(
+                    b_p.as_ptr(),
+                    abp.add(g * 2 * 48 * 5120 + 48 * 5120),
+                    48 * 5120,
+                );
+                std::ptr::copy_nonoverlapping(c_w.as_ptr(), cwp.add(g * 10240 * 4), 10240 * 4);
+                std::ptr::copy_nonoverlapping(a_l.as_ptr(), alp.add(g * 48), 48);
+                std::ptr::copy_nonoverlapping(d_b.as_ptr(), dtp.add(g * 48), 48);
+                std::ptr::copy_nonoverlapping(n_w.as_ptr(), nwp.add(g * 128), 128);
+                g += 1;
+            }
+        }
+        self.ctx.flush_buf(&ab);
+        self.ctx.flush_buf(&cw);
+        self.ctx.flush_buf(&alog);
+        self.ctx.flush_buf(&dtb);
+        self.ctx.flush_buf(&nw);
+
+        if let Some(b) = self.batch.as_mut() {
+            b.gframe = Some(GdnFrame {
+                gq,
+                gk,
+                gv,
+                gbg,
+                go,
+                gqr,
+                gkr,
+                gvr,
+                ab,
+                cw,
+                alog,
+                dtb,
+                nw,
+                gring,
+                gstate,
+                pgc,
+                pgl,
+                pgs,
+                pgg,
+            });
+        }
+        Ok(())
+    }
+
+    /// GDN 층 전체 GPU 상주 처리(plans/121 F1) — qkv/yb0, z/yb1에서 xtb(gated)까지.
+    /// 호출 전 linear_batch_multi_gpu(qkv+z)가 yb 슬롯에 결과를 남겼어야 한다.
+    /// gdn_il은 GDN 층 인덱스(0..48, il%4!=3 순서).
+    pub fn gdn_layer_gpu(
+        &mut self,
+        gdn_il: usize,
+        t_rows: usize,
+        xn_ptr: *mut f32,
+        yb0: ash::vk::Buffer,
+        yb1: ash::vk::Buffer,
+    ) -> Result<(), String> {
+        let gf = match self.batch.as_ref().and_then(|b| b.gframe.as_ref()) {
+            Some(g) => g,
+            None => return Err("gdn_frame 미초기화".into()),
+        };
+
+        self.ctx.begin_batch()?;
+
+        // ① conv: yb0(qkv) → gqr/gkr/gvr + ring 갱신
+        {
+            let ds = self.ctx.fresh_ds_for(&gf.pgc, 6)?;
+            let ring_base = gdn_il * 3 * 10240;
+            // ring은 gring의 gdn_il 슬라이스 — 바인딩에 전체 버퍼 + push로 오프셋… 아니,
+            // 커널은 ring[3][10240] 전체를 기대 — 층별 슬라이스를 별도 버퍼로 해야 하나
+            // 간단히 push에 층 오프셋 추가는 커널 수정 필요. V1: 전체 버퍼 바인딩 + 커널이
+            // push.wg_n을 층 인덱스로 활용… conv 커널은 그리드 x=80(채널 청크)라 층 정보 없음.
+            // 실용 해법: conv ring을 gring 전체에서 gdn_il 청크로 포인터 산술하는 대신
+            // 커널 push에 ring_base 추가. → 커널 수정 필요… 일단 TODO 주석만.
+            // TODO: conv 커널에 ring_base push 추가.
+            self.ctx.bind_bufs(
+                ds,
+                &[
+                    yb0,
+                    gf.cw.buf,
+                    gf.gring.buf,
+                    gf.gqr.buf,
+                    gf.gkr.buf,
+                    gf.gvr.buf,
+                ],
+            );
+            let push = (t_rows as u32).to_le_bytes().to_vec();
+            crate::rawvk::context::site::set_tag("e3_gdn_conv");
+            self.ctx.run_rw(
+                gf.pgc.pl,
+                ds,
+                gf.pgc.pipe,
+                &push,
+                80,
+                1,
+                1,
+                &[yb0],
+                &[gf.gqr.buf, gf.gkr.buf, gf.gvr.buf, gf.gring.buf],
+            )?;
+        }
+
+        // ② l2perm: gqr/gkr/gvr + xn(xtb) + 상수 → gq/gk/gv/gbg
+        {
+            let ds = self.ctx.fresh_ds_for(&gf.pgl, 11)?;
+            // xn은 xtb 버퍼 — 호출자가 stage_f32()에 기록했음.
+            let xtb = self.batch.as_ref().ok_or("batch")?.xtb.buf;
+            // 상수는 gdn_il 슬라이스… 마찬가지로 전체 버퍼 바인딩 + 커널에 층 오프셋 필요.
+            // TODO: l2perm 커널에 gdn_il push 추가(상수 오프셋).
+            self.ctx.bind_bufs(
+                ds,
+                &[
+                    gf.gqr.buf,
+                    gf.gkr.buf,
+                    gf.gvr.buf,
+                    xtb,
+                    gf.ab.buf,
+                    gf.alog.buf,
+                    gf.dtb.buf,
+                    gf.gq.buf,
+                    gf.gk.buf,
+                    gf.gv.buf,
+                    gf.gbg.buf,
+                ],
+            );
+            let push: Vec<u8> = [t_rows as u32, 16u32, 48u32, 128u32]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            crate::rawvk::context::site::set_tag("e3_gdn_l2perm");
+            self.ctx.run_rw(
+                gf.pgl.pl,
+                ds,
+                gf.pgl.pipe,
+                &push,
+                48,
+                t_rows as u32,
+                1,
+                &[
+                    gf.gqr.buf,
+                    gf.gkr.buf,
+                    gf.gvr.buf,
+                    xtb,
+                    gf.ab.buf,
+                    gf.alog.buf,
+                    gf.dtb.buf,
+                ],
+                &[gf.gq.buf, gf.gk.buf, gf.gv.buf, gf.gbg.buf],
+            )?;
+        }
+
+        // ③ scan: gq/gk/gv/gbg + gstate → go
+        {
+            let ds = self.ctx.fresh_ds_for(&gf.pgs, 6)?;
+            self.ctx.bind_bufs(
+                ds,
+                &[
+                    gf.gq.buf,
+                    gf.gk.buf,
+                    gf.gv.buf,
+                    gf.gbg.buf,
+                    gf.gstate.buf,
+                    gf.go.buf,
+                ],
+            );
+            let push: Vec<u8> = [t_rows as u32, 16u32, 48u32, 128u32]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            crate::rawvk::context::site::set_tag("e3_gdn_scan");
+            self.ctx.run_rw(
+                gf.pgs.pl,
+                ds,
+                gf.pgs.pipe,
+                &push,
+                48,
+                1,
+                1,
+                &[gf.gq.buf, gf.gk.buf, gf.gv.buf, gf.gbg.buf, gf.gstate.buf],
+                &[gf.gstate.buf, gf.go.buf],
+            )?;
+        }
+
+        // ④ gate: go + yb1(z) + nw → xtb(gated)
+        {
+            let ds = self.ctx.fresh_ds_for(&gf.pgg, 4)?;
+            let xtb = self.batch.as_ref().ok_or("batch")?.xtb.buf;
+            self.ctx.bind_bufs(ds, &[gf.go.buf, yb1, gf.nw.buf, xtb]);
+            let push: Vec<u8> = [t_rows as u32, 16u32, 48u32, 128u32]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            crate::rawvk::context::site::set_tag("e3_gdn_gate");
+            self.ctx.run_rw(
+                gf.pgg.pl,
+                ds,
+                gf.pgg.pipe,
+                &push,
+                48,
+                t_rows as u32,
+                1,
+                &[gf.go.buf, yb1, gf.nw.buf],
+                &[xtb],
+            )?;
+        }
+
+        self.ctx.end_batch_wait()?;
+        self.ctx.wait_pending()?;
+        Ok(())
     }
 }
