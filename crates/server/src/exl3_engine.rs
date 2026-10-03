@@ -16,7 +16,6 @@ use llm170_backend_gpu::rawvk::checks::{
 pub struct Exl3Engine {
     tr: TrellisResident,
     seqs: Vec<SeqState>,
-    ctx_len: usize,
 }
 
 // SAFETY: TrellisResident의 매핑 포인터(*mut u8)는 VkCtx 단일 소유로,
@@ -32,7 +31,7 @@ impl Exl3Engine {
         let seqs = (0..n_slots)
             .map(|_| new_seq_state(n_layers, ctx_len))
             .collect();
-        Ok(Self { tr, seqs, ctx_len })
+        Ok(Self { tr, seqs })
     }
 
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
@@ -44,8 +43,23 @@ impl Exl3Engine {
     }
 
     pub fn reset_seq(&mut self, seq: usize) {
-        let (n, c) = (self.tr.n_layers, self.ctx_len);
-        self.seqs[seq] = new_seq_state(n, c);
+        // 제자리 클리어 — new_seq_state 재할당은 스택당 ~700MB memset을
+        // 요청 전환마다 유발한다(plans/123 III-2). 상태/링/KV len만 0으로.
+        let s = &mut self.seqs[seq];
+        for g in s.gdn.iter_mut() {
+            g.states.fill(0.0);
+            g.conv.fill(0.0);
+        }
+        for k in s.kv.iter_mut() {
+            k.len = 0;
+        }
+        for k in s.mtp_kv.iter_mut() {
+            k.len = 0;
+        }
+        s.last_h.clear();
+        s.last_logits.clear();
+        s.last_tok = 0;
+        s.pos = 0;
     }
 
     pub fn reset_states(&mut self) {
