@@ -2106,12 +2106,10 @@ pub fn gemm_check(dir: &str) -> Result<String, String> {
         let mut md = 0f32;
         let mut nan_at: Vec<usize> = Vec::new();
         let mut nan_cnt = 0usize;
-        let mut nan_last = 0usize;
         for i in 0..n0.min(4096) {
             let g = got[i];
             if !g.is_finite() {
                 nan_cnt += 1;
-                nan_last = i;
                 if nan_at.len() < 6 {
                     nan_at.push(i);
                 }
