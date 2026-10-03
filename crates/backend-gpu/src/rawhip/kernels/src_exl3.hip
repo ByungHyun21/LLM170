@@ -740,8 +740,10 @@ extern "C" __global__ void exl3_attn_fwd3(
                     + qs4[tl * 256 + si * 4 + 1] * kr1
                     + qs4[tl * 256 + si * 4 + 2] * kr2
                     + qs4[tl * 256 + si * 4 + 3] * kr3;
-            for (int off = 32; off > 0; off >>= 1)
-                p += __shfl_down(p, off, 64);
+            // 64레인 완전 리덕션: 32-반합 후 xor 결합(폭 파라미터 의존 제거).
+            for (int off = 16; off > 0; off >>= 1)
+                p += __shfl_down(p, off);
+            p += __shfl_xor(p, 32, 64);
             if (si == 0) {
                 bool valid = row < lim[tl];
                 sarr[tl * EXL3_SCAP + row] = valid ? (p * scale) : -1e30f;

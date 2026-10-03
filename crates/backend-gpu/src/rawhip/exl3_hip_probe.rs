@@ -1039,6 +1039,30 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
             &mut lay as *mut i32 as *mut _,
         ],
     )?;
+    // prep 산출 대조 — qh/kc 미러와 직접(국소화: prep vs fwd3).
+    {
+        let mut qhb = vec![0u8; t_rows * 6144 * 4];
+        hc.d2h(&mut qhb, dqh)?;
+        let mut kcb = vec![0u8; 16 * 1024 * 1024 * 4];
+        hc.d2h(&mut kcb, dkc)?;
+        hc.sync()?;
+        // SAFETY: d2h 완료 후 재해석.
+        let gh: &[f32] =
+            unsafe { std::slice::from_raw_parts(qhb.as_ptr() as *const f32, t_rows * 6144) };
+        let gk: &[f32] = unsafe {
+            std::slice::from_raw_parts(kcb.as_ptr() as *const f32, 16 * 1024 * 1024)
+        };
+        let mut mq = 0f32;
+        for i in 0..gh.len() {
+            mq = mq.max((gh[i] - qh[i]).abs());
+        }
+        let mut mk = 0f32;
+        let kvn = (pos0 + t_rows) * 1024;
+        for i in 0..kvn.min(gk.len()) {
+            mk = mk.max((gk[i] - kc[i]).abs());
+        }
+        eprintln!("  [attndbg] qh maxdiff={mq:.3e} · kc(적립분) maxdiff={mk:.3e}");
+    }
     let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5) =
         (dqh, dkc, dvc, dqg, dou, dpp);
     hc.launch3(
@@ -1068,15 +1092,28 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
         unsafe { std::slice::from_raw_parts(outb.as_ptr() as *const f32, t_rows * 6144) };
     let mut md = 0f32;
     let mut nan = 0usize;
+    let mut bad_t = [0usize; 8];
+    let mut bad_h = [0usize; 24];
     for i in 0..got.len() {
         if !got[i].is_finite() {
             nan += 1;
             continue;
         }
-        md = md.max((got[i] - want[i]).abs());
+        let d = (got[i] - want[i]).abs();
+        if d > 1e-3 {
+            bad_t[i / 6144] += 1;
+            bad_h[(i % 6144) / 256] += 1;
+        }
+        md = md.max(d);
     }
+    eprintln!(
+        "  [attndbg] 불일치 t분포={:?} h분포={:?}",
+        &bad_t[..t_rows],
+        &bad_h[..]
+    );
     Ok(format!(
         "hip-attn T={t_rows}: maxdiff={md:.3e} nan={nan}"
     ))
 }
 // 마커 at1
+// 마커 ab1
