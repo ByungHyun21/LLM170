@@ -760,10 +760,11 @@ impl TrellisResident {
             && LINDBG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24;
         let lt0 = std::time::Instant::now();
 
-        // 캐시(비결합) xtb 쓰기 → GPU 가시화 flush.
+        // 캐시(비결합) xtb 쓰기 → GPU 가시화 flush — 실사용 구간만(T×k).
         {
+            let k0 = self.linears[idxs[0]].1.k;
             let b = self.batch.as_ref().ok_or("batch scratch")?;
-            self.ctx.flush_buf(&b.xtb);
+            self.ctx.flush_range(&b.xtb, t_rows * k0 * 4);
         }
         let lt1 = std::time::Instant::now();
 
@@ -778,12 +779,11 @@ impl TrellisResident {
         self.ctx.wait_pending()?; // DBUF 비동기 잔여 배출
         let lt3 = std::time::Instant::now();
 
-        // 캐시(비결합) yb — GPU 쓰기 판독 전 인밸리데이트.
-        {
-            let b = self.batch.as_ref().ok_or("batch scratch")?;
-            for slot in 0..idxs.len() {
-                self.ctx.invalidate_buf(&b.yb[slot]);
-            }
+        // 캐시(비결합) yb — GPU 쓰기 판독 전 인밸리데이트(실사용 구간 T×n).
+        let b = self.batch.as_ref().ok_or("batch scratch")?;
+        for (slot, &li) in idxs.iter().enumerate() {
+            let n = self.linears[li].1.n;
+            self.ctx.invalidate_range(&b.yb[slot], t_rows * n * 4);
         }
 
         let mut outs = Vec::with_capacity(idxs.len());
@@ -857,7 +857,7 @@ impl TrellisResident {
         self.ensure_batch()?;
         {
             let b = self.batch.as_ref().ok_or("batch scratch")?;
-            self.ctx.flush_buf(&b.xtb);
+            self.ctx.flush_range(&b.xtb, t_rows * kg * 4);
         }
         let b0 = self.batch.as_ref().ok_or("batch scratch")?;
         let (xtb, ah0, yb0, ah1, yb1, ah2, yb2, x2t_b, p4t_pl, p4t_pipe) = (
@@ -898,7 +898,7 @@ impl TrellisResident {
         self.ctx.wait_pending()?;
         {
             let b = self.batch.as_ref().ok_or("batch scratch")?;
-            self.ctx.invalidate_buf(&b.yb[2]);
+            self.ctx.invalidate_range(&b.yb[2], t_rows * nd * 4);
         }
         let mut y = vec![0f32; t_rows * nd];
         {
