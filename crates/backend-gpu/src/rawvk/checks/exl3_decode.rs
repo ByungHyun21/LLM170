@@ -2295,6 +2295,8 @@ fn frame_spec_forward(
         return Ok(logits);
     }
     let recording = llm170_diag::flag::eq1("LLM170_EXL3_REPLAY");
+    let vf_dbg = llm170_diag::dump::opts().key("exl3_specphase");
+    let vf_t0 = std::time::Instant::now();
     if recording {
         tr.ctx.frame_record_begin(fkey)?;
     }
@@ -2342,6 +2344,13 @@ fn frame_spec_forward(
     // output_norm(행 128) 적용: 추가 rms_norm 금지(이중 노름 버그 — 삼각
     // 비교 적발: decode/prefillT1=198 vs spec=1195).
     tr.ctx.end_outer()?;
+    let vf_t1 = std::time::Instant::now(); // 층 루프+기록 완료
+    if vf_dbg {
+        eprintln!(
+            "[vphase] record+loop={:.0}ms",
+            (vf_t1 - vf_t0).as_secs_f64() * 1e3
+        );
+    }
     if recording {
         tr.ctx.frame_record_end(fkey)?;
         // 녹화 패스는 제출 없이 종료됐다(record_only) — 여기서 1회 재생해
@@ -2370,6 +2379,8 @@ pub fn exl3_spec_step(
     seq: &mut SeqState,
     k: usize,
 ) -> Result<(Vec<u32>, usize), String> {
+    let _sp_ph = llm170_diag::dump::opts().key("exl3_specphase");
+    let _sp_t0 = std::time::Instant::now();
     let k = k.clamp(1, 4);
     // ① 드래프트 체인 — 시드 (last_tok, last_h), mtp KV 슬롯 = pos+i.
     let mut drafts = Vec::with_capacity(k);
@@ -2382,12 +2393,14 @@ pub fn exl3_spec_step(
         tok = drafts[i];
         h = hm;
     }
+    let _sp_t1 = std::time::Instant::now(); // 드래프트 완료
     // ② 검증 기준 g0 + GPU 상태 스냅샷(프레임 경로 — plans/121 tg).
     let g0 = argmax32(&seq.last_logits);
     tr.fframe_init()?;
     tr.gdn_frame_init()?;
     tr.attn_frame_init()?;
     // ③ 검증 — 기본 프레임 / A/B: CPU 검증(LLM170_EXL3_SPECCPU=1, 진단).
+    let _sp_t2 = std::time::Instant::now(); // 스냅샷 완료
     let row_am: Vec<u32> = if llm170_diag::flag::eq1("LLM170_EXL3_SPECCPU") {
         let snap2 = spec_snap(seq);
         let mut row = Vec::with_capacity(k);
@@ -2419,6 +2432,15 @@ pub fn exl3_spec_step(
             diverged = true;
             break;
         }
+    }
+    let _sp_t3 = std::time::Instant::now(); // 검증 완료
+    if _sp_ph {
+        let (_d1, _d2, _d3) = (
+            (_sp_t1 - _sp_t0).as_secs_f64() * 1e3,
+            (_sp_t2 - _sp_t1).as_secs_f64() * 1e3,
+            (_sp_t3 - _sp_t2).as_secs_f64() * 1e3,
+        );
+        eprintln!("[specphase] draft={_d1:.0}ms snap={_d2:.0}ms verify={_d3:.0}ms");
     }
     if llm170_diag::dump::opts().key("exl3_specdbg") {
         eprintln!(
