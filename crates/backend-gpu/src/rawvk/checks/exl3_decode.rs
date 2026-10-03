@@ -2199,6 +2199,7 @@ pub struct SpecSnap {
     last_logits: Vec<f32>,
 }
 
+#[allow(dead_code)] // 프레임 롤백 대체 전 CPU 스냅샷 — 참조 보존(plans/121 tg)
 fn spec_snap(seq: &SeqState) -> SpecSnap {
     SpecSnap {
         gdn_states: seq.gdn.iter().map(|g| g.states.clone()).collect(),
@@ -2215,6 +2216,7 @@ fn spec_snap(seq: &SeqState) -> SpecSnap {
     }
 }
 
+#[allow(dead_code)]
 fn spec_restore(seq: &mut SeqState, snap: &SpecSnap) {
     for (g, st) in seq.gdn.iter_mut().zip(snap.gdn_states.iter()) {
         g.states.copy_from_slice(st);
@@ -2236,10 +2238,8 @@ fn spec_restore(seq: &mut SeqState, snap: &SpecSnap) {
     seq.last_logits.copy_from_slice(&snap.last_logits);
 }
 
-/// 스펙 1라운드: 반환 (수용 토큰열, 타깃 forward 수). 계약 — seq는 마지막
-/// 확정 토큰까지 처리된 상태(last_logits/last_h/last_tok 유효). 수용 토큰은
-/// 최대 k+1(전 수용 시 선행 1 토큰 포함), 최소 1(발산 보정 토큰).
-
+/// 스펙 1라운드 doc(위) — 프레임 검증 forward가 실체 대체(plans/121 tg).
+///
 /// 프레임 스펙 검증 forward(plans/121 tg 경로): toks(k행)을 원-서브밋 프레임으로
 /// 처리하고 행별 lm_head 로짓을 반환. 상태는 GPU 권위 그대로(동기 없음).
 /// seq 갱신: pos/last_tok/last_h/last_logits/kv.len(=pos 설정 의미).

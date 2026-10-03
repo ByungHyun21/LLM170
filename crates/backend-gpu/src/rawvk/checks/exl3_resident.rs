@@ -1780,13 +1780,12 @@ impl TrellisResident {
             .as_ref()
             .and_then(|b| b.fframe.as_ref())
             .is_some_and(|f| f.gsnap.is_none());
-        if need_alloc {
-            let gsnap = self.ctx.alloc_host_cached(n_gdn_bytes())?;
-            if let Some(b) = self.batch.as_mut() {
-                if let Some(f) = b.fframe.as_mut() {
-                    f.gsnap = Some(gsnap);
-                }
-            }
+        if need_alloc
+            && let Some(gsnap) = self.ctx.alloc_host_cached(n_gdn_bytes()).ok()
+            && let Some(b) = self.batch.as_mut()
+            && let Some(f) = b.fframe.as_mut()
+        {
+            f.gsnap = Some(gsnap);
         }
         let (src, dst, n) = {
             let b = self.batch.as_ref().ok_or("batch")?;
