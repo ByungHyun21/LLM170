@@ -2276,6 +2276,10 @@ fn frame_spec_forward(
     if replaying {
         tr.attn_set_pos(pos0)?;
         tr.ctx.frame_replay(fkey)?;
+        if llm170_diag::dump::opts().key("exl3_rpdbg") {
+            let xh = tr.read_xtb_rows(1)?;
+            eprintln!("  [rpdbg] pos0={pos0} xn0={:?}", &xh[..4]);
+        }
         let xn_all = tr.read_xtb_rows(t_rows)?;
         let mut logits = Vec::with_capacity(t_rows * 248320);
         for t in 0..t_rows {
