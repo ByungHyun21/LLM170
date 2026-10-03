@@ -1332,8 +1332,13 @@ impl TrellisResident {
 
     /// yb 슬롯 선두 값 판독(디버그) — invalidate 후 읽음.
     pub fn read_yb_head(&mut self, slot: usize, count: usize) -> Vec<f32> {
-        let b = match self.batch.as_ref() { Some(b) => b, None => return vec![] };
-        if slot >= 3 { return vec![]; }
+        let b = match self.batch.as_ref() {
+            Some(b) => b,
+            None => return vec![],
+        };
+        if slot >= 3 {
+            return vec![];
+        }
         self.ctx.invalidate_range(&b.yb[slot], count * 4);
         let mut out = vec![0f32; count];
         unsafe {
@@ -1342,4 +1347,56 @@ impl TrellisResident {
         out
     }
 
+    /// GDN 프레임 gqr(conv q 출력) 선두 판독(디버그).
+    pub fn read_gqr_head(&mut self, count: usize) -> Vec<f32> {
+        let b = match self.batch.as_ref() {
+            Some(b) => b,
+            None => return vec![],
+        };
+        let gf = match b.gframe.as_ref() {
+            Some(g) => g,
+            None => return vec![],
+        };
+        self.ctx.invalidate_range(&gf.gqr, count * 4);
+        let mut out = vec![0f32; count];
+        unsafe {
+            std::ptr::copy_nonoverlapping(gf.gqr.ptr as *const f32, out.as_mut_ptr(), count);
+        }
+        out
+    }
+
+    /// GDN 프레임 gq(L2 norm q) 선두 판독(디버그).
+    pub fn read_gq_head(&mut self, count: usize) -> Vec<f32> {
+        let b = match self.batch.as_ref() {
+            Some(b) => b,
+            None => return vec![],
+        };
+        let gf = match b.gframe.as_ref() {
+            Some(g) => g,
+            None => return vec![],
+        };
+        self.ctx.invalidate_range(&gf.gq, count * 4);
+        let mut out = vec![0f32; count];
+        unsafe {
+            std::ptr::copy_nonoverlapping(gf.gq.ptr as *const f32, out.as_mut_ptr(), count);
+        }
+        out
+    }
+    /// GDN 프레임 gbg(beta|g) 선두 판독(디버그).
+    pub fn read_gbg_head(&mut self, count: usize) -> Vec<f32> {
+        let b = match self.batch.as_ref() {
+            Some(b) => b,
+            None => return vec![],
+        };
+        let gf = match b.gframe.as_ref() {
+            Some(g) => g,
+            None => return vec![],
+        };
+        self.ctx.invalidate_range(&gf.gbg, count * 4);
+        let mut out = vec![0f32; count];
+        unsafe {
+            std::ptr::copy_nonoverlapping(gf.gbg.ptr as *const f32, out.as_mut_ptr(), count);
+        }
+        out
+    }
 }
