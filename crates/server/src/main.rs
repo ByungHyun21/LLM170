@@ -218,7 +218,12 @@ fn main() -> ExitCode {
     ) {
         let sub = args.first().map(String::as_str);
         let mut model = ma.model.clone();
-        let mut gpu = ma.backend.as_deref() == Some("gpu") || ma.gpu_runtime.is_some();
+        // exl3·exl3-hip도 GPU 백엔드다(가드 VRAM 항 누락이 2026-10-05 서빙 경계
+        // 오탐의 원인 — 21.2 vs 21.2GiB 거부, plans/128 P0 검증 중 발견).
+        let mut gpu = matches!(
+            ma.backend.as_deref(),
+            Some("gpu") | Some("exl3-hip") | Some("exl3")
+        ) || ma.gpu_runtime.is_some();
         if sub == Some("check") {
             gpu = true; // run_check의 백엔드 기본값이 gpu다.
             if model.is_none()

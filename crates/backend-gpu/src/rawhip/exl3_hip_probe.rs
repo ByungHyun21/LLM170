@@ -997,11 +997,22 @@ pub fn hip_gdn_check(dir: &str, layer_arg: usize) -> Result<String, String> {
 // 마커 gdn1
 
 // ── EXL3 hip 어텐션 체인 프로브(모듈 6-7) ── prep→fwd3, Rust 미러 대조.
-pub fn hip_attn_check(dir: &str) -> Result<String, String> {
+pub fn hip_attn_check(
+    dir: &str,
+    t_arg: usize,
+    pos0_arg: usize,
+    layer_arg: usize,
+) -> Result<String, String> {
     use crate::rawvk::checks::TrellisResident;
-    let t_rows = 8usize;
-    let pos0 = 0usize;
-    let layer = 0usize;
+    let t_rows = t_arg;
+    let pos0 = pos0_arg;
+    let layer = layer_arg;
+    // 프로브 KV 버퍼는 64MiB(=kvcap 1024×16층) 고정 — pos 상한 가드.
+    if t_rows == 0 || t_rows > 1024 || pos0 + t_rows > 1024 || layer > 15 {
+        return Err(format!(
+            "hip_attn_check 인자 범위 외: t={t_rows}(1..1024) pos0={pos0}(pos0+t≤1024) layer={layer}(≤15)"
+        ));
+    }
     // 부분 적재: q/k 노름만 필요 — 선형 전용 스킵 (풀모델 상주 금지).
     let mut tr = TrellisResident::load_keep(dir, &|_| false)?;
     let (qnw, knw) = tr.attn_norms_dump()?;
@@ -1121,6 +1132,7 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
     let mut tl = t_rows as i32;
     let mut p0 = pos0 as i32;
     let mut lay = layer as i32;
+    let mut kvc = 1024i32; // 프로브 KV 버퍼 64MiB(=cap 1024) — 계약 일치
     let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) =
         (dqg, dkin, dvin, dqnw, dknw, dqh, dkc, dvc, dpp);
     hc.launch3(
@@ -1142,6 +1154,7 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
             &mut tl as *mut i32 as *mut _,
             &mut p0 as *mut i32 as *mut _,
             &mut lay as *mut i32 as *mut _,
+            &mut kvc as *mut i32 as *mut _,
         ],
     )?;
     // prep 산출 대조 — qh/kc 미러와 직접(국소화: prep vs fwd3).
@@ -1161,11 +1174,14 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
             mq = mq.max((gh[i] - qh[i]).abs());
         }
         let mut mk = 0f32;
+        // 대상 층 영역 비교(2026-10-05 수정) — 이전 버전은 항상 layer 0
+        // 영역을 비교해 layer≠0에서 무의미(양쪽 0)했다.
+        let lofs = layer * 1024 * 1024;
         let kvn = (pos0 + t_rows) * 1024;
-        for i in 0..kvn.min(gk.len()) {
-            mk = mk.max((gk[i] - kc[i]).abs());
+        for i in 0..kvn {
+            mk = mk.max((gk[lofs + i] - kc[lofs + i]).abs());
         }
-        eprintln!("  [attndbg] qh maxdiff={mq:.3e} · kc(적립분) maxdiff={mk:.3e}");
+        eprintln!("  [attndbg] qh maxdiff={mq:.3e} · kc(L{layer} 적립분) maxdiff={mk:.3e}");
     }
     let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5) = (dqh, dkc, dvc, dqg, dou, dpp);
     hc.launch3(
@@ -1184,6 +1200,7 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
             &mut tl as *mut i32 as *mut _,
             &mut p0 as *mut i32 as *mut _,
             &mut lay as *mut i32 as *mut _,
+            &mut kvc as *mut i32 as *mut _,
         ],
     )?;
     let mut outb = vec![0u8; t_rows * 6144 * 4];
@@ -1195,7 +1212,7 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
         unsafe { std::slice::from_raw_parts(outb.as_ptr() as *const f32, t_rows * 6144) };
     let mut md = 0f32;
     let mut nan = 0usize;
-    let mut bad_t = [0usize; 8];
+    let mut bad_t = vec![0usize; t_rows];
     let mut bad_h = [0usize; 24];
     for i in 0..got.len() {
         if !got[i].is_finite() {
@@ -1229,7 +1246,7 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
     use crate::rawvk::checks::TrellisResident;
     // 동결 방지(2026-10-04 사고 원칙): 한 시점에 한 모델만 상주.
     // 1단계: hip 디코더(임베딩 포함) 단독 — greedy 4스텝.
-    let mut dec = Exl3HipDecoder::load(dir, lim_layers)?;
+    let mut dec = Exl3HipDecoder::load(dir, lim_layers, 1024)?;
     let t0f = std::time::Instant::now();
     let mut tok = tok0;
     let mut hip_toks = Vec::new();
@@ -1306,7 +1323,7 @@ pub fn hip_mtp_check(dir: &str, tok: u32) -> Result<String, String> {
     let h = 5120usize;
     let synth: Vec<f32> = (0..h).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
     // 1단계: hip 단독(mtp 가중치만 사용)
-    let mut dec = Exl3HipDecoder::load(dir, 0)?;
+    let mut dec = Exl3HipDecoder::load(dir, 0, 1024)?;
     // GPU 드래프트 A/B: 동일 입력으로 정합 + 시간(호스트 버전 기준).
     let tg0 = std::time::Instant::now();
     let d_gpu = dec.mtp_draft_gpu(tok, &synth, 0)?;
@@ -1351,7 +1368,7 @@ pub fn hip_mtp_check(dir: &str, tok: u32) -> Result<String, String> {
 pub fn hip_batch_check(dir: &str, tok: u32, t_len: usize) -> Result<String, String> {
     use crate::rawhip::exl3_hip::Exl3HipDecoder;
     let t = t_len.clamp(1, 8);
-    let mut dec = Exl3HipDecoder::load(dir, dec_layers_default(dir))?;
+    let mut dec = Exl3HipDecoder::load(dir, dec_layers_default(dir), 1024)?;
     // 1) 순차 greedy T+1스텝(기준)
     let mut seq_toks = Vec::new();
     let mut seq_lgs: Vec<Vec<f32>> = Vec::new();
@@ -1373,7 +1390,7 @@ pub fn hip_batch_check(dir: &str, tok: u32, t_len: usize) -> Result<String, Stri
     let rows_toks: Vec<u32> = std::iter::once(tok)
         .chain(seq_toks.iter().take(t).copied())
         .collect();
-    let mut dec2 = Exl3HipDecoder::load(dir, dec_layers_default(dir))?;
+    let mut dec2 = Exl3HipDecoder::load(dir, dec_layers_default(dir), 1024)?;
     dec2.dbg_layers = true;
     let mut rows = Vec::with_capacity(rows_toks.len());
     for rt in &rows_toks {
@@ -1444,7 +1461,7 @@ fn dec_layers_default(_dir: &str) -> usize {
 ///   아니면 pp+corr 확정 후 교정 T=1 배치(상태 정렬). 다음 pp=row_last argmax.
 pub fn hip_mtp_round(dir: &str, tok: u32, rounds: usize) -> Result<String, String> {
     use crate::rawhip::exl3_hip::Exl3HipDecoder;
-    let mut dec = Exl3HipDecoder::load(dir, 64)?;
+    let mut dec = Exl3HipDecoder::load(dir, 64, 1024)?;
     // 기준: 순차 greedy 2*rounds+4 토큰(교차 검증용)
     let n_ref = 2 * rounds + 4;
     let mut ref_toks = Vec::new();
@@ -1468,7 +1485,7 @@ pub fn hip_mtp_round(dir: &str, tok: u32, rounds: usize) -> Result<String, Strin
     }
     // MTP 라운드 — 상태 리셋 필요: 새 디코더(순차와 동일 출발).
     drop(dec);
-    let mut dec2 = Exl3HipDecoder::load(dir, 64)?;
+    let mut dec2 = Exl3HipDecoder::load(dir, 64, 1024)?;
     let mut h: Vec<f32>;
     {
         let row0 = dec2.embed_row_host(tok);
@@ -1551,7 +1568,7 @@ pub fn hip_mtp_round(dir: &str, tok: u32, rounds: usize) -> Result<String, Strin
 /// 타깃 순차(+KV 훅) 매 스텝, mtp_draft_gpu(현 토큰, h_현토큰, pos) vs 타깃 실제 다음 토큰.
 pub fn hip_mtp_a1(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
     use crate::rawhip::exl3_hip::Exl3HipDecoder;
-    let mut dec = Exl3HipDecoder::load(dir, 64)?;
+    let mut dec = Exl3HipDecoder::load(dir, 64, 1024)?;
     // 변형 A: 순차(gemv) 타깃 + 호스트 mtp 훅(vk exl3-mtp 동일 구조) —
     // h 클래스(배치 gemm2 h vs 순차 gemv h)가 a1 격차(0.44 vs 0.625) 원인인지 판별.
     let mut h_seq_store: Vec<Vec<f32>> = Vec::new();
@@ -1647,7 +1664,7 @@ pub fn hip_mtp_a1(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
 /// `llm170 exl3-hip-tbench <dir> <tok> [T]` — 배치 forward T별 비용 상각 곡선.
 pub fn hip_tbench(dir: &str, tok: u32, t_max: usize) -> Result<String, String> {
     use crate::rawhip::exl3_hip::Exl3HipDecoder;
-    let mut dec = Exl3HipDecoder::load(dir, 64)?;
+    let mut dec = Exl3HipDecoder::load(dir, 64, 1024)?;
     let mut out = String::new();
     for t in [1usize, 2, 4, 8, 16] {
         if t > t_max {
@@ -1681,7 +1698,7 @@ pub fn hip_tbench(dir: &str, tok: u32, t_max: usize) -> Result<String, String> {
 pub fn hip_graph_check(dir: &str, tok: u32, t_len: usize) -> Result<String, String> {
     use crate::rawhip::exl3_hip::Exl3HipDecoder;
     let t = t_len.clamp(1, 8);
-    let mut dec = Exl3HipDecoder::load(dir, 64)?;
+    let mut dec = Exl3HipDecoder::load(dir, 64, 1024)?;
     // 기준: 일반 배치 1회(캡처 워밍이 상태 전진시킴 — 순서: 워밍→캡처→비교재생은
     // 상태가 다르다. 정합은 "같은 상태에서 재생 vs 비캡처" 비교로: 캡처 후
     // 그래프 재생 2회와 수동 배치의 토큰열 자기일관성으로 판정(재생1 vs 재생2 연속).
@@ -1849,7 +1866,7 @@ pub fn hip_graph_mini2() -> Result<String, String> {
 /// maxdiff ≈1e-2 → 산술 클래스(트레이드오프), 크면 배치-h 결함(수리 가능).
 pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
     use crate::rawhip::exl3_hip::Exl3HipDecoder;
-    let mut dseq = Exl3HipDecoder::load(dir, 64)?;
+    let mut dseq = Exl3HipDecoder::load(dir, 64, 1024)?;
     dseq.dbg_hcurve = true;
     // 순차 h·다음토큰 수집
     let mut toks = vec![tok];
@@ -1869,7 +1886,7 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
     let seq_curve = std::mem::take(&mut dseq.hcurve);
     drop(dseq);
     // 배치 디코더로 같은 스트림 T=1씩(문맥 동일)
-    let mut dbat = Exl3HipDecoder::load(dir, 64)?;
+    let mut dbat = Exl3HipDecoder::load(dir, 64, 1024)?;
     dbat.dbg_hcurve = true;
     // 클린 배치 a1 — 오염 없는 배치 루프 자체 수용률(기존 0.25-0.44는 순차 루프
     // 상태 오염 후 측정이라 무효 가능성).
@@ -1947,7 +1964,7 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
     // 위치가 어긋나 1.07e2 "계통 오차"의 상당분이 상태 비정렬 아티팩트였다.
     // 신규 디코더로 순차와 동일 토큰·동일 위치 진행으로 교체.
     drop(dbat);
-    let mut dbat2 = Exl3HipDecoder::load(dir, 64)?;
+    let mut dbat2 = Exl3HipDecoder::load(dir, 64, 1024)?;
     let mut mds = Vec::new();
     for i in 0..steps {
         let row = dbat2.embed_row_host(toks[i]);

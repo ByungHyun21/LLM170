@@ -58,6 +58,10 @@ pub struct Exl3HipDecoder {
     dgst: *mut u8,
     dkc: *mut u8,
     dvc: *mut u8,
+    /// KV 위치 상한(plans/128 P0) — dkc/dvc·dmtpk/dmtpv 할당 크기와
+    /// exl3_attn_prep/fwd3s kvcap 인자가 이 값으로 일치한다. 과거 1024
+    /// 리터럴이 서빙 ctx를 1023으로 가둬 attn_prep 폴트→디코드 실패를 냈다.
+    kvcap: i32,
     dpp: *mut u8,
     dembed: *mut u8,
     dargmax: *mut u8,
@@ -129,7 +133,10 @@ impl Exl3HipDecoder {
 
 impl Exl3HipDecoder {
     /// lim_layers: 가중치 예산(해당 층까지만 업로드 — 메모리 절약 옵션, 검증 사다리가 악용).
-    pub fn load(dir: &str, lim_layers: usize) -> Result<Self, String> {
+    /// kvcap: KV 위치 상한(plans/128 P0) — dkc/dvc 16층×kvcap×1024×4B×2,
+    /// dmtpk/dmtpv kvcap×1024×4B씩. pos+t가 kvcap에 도달하면 Err로 우아하게
+    /// 거절(폴트 아님). 최소 1024 권장(그 이하는 산술은 유효하나 경제성 없음).
+    pub fn load(dir: &str, lim_layers: usize, kvcap: usize) -> Result<Self, String> {
         let hc = HipCtx::new()?;
         let mut tr = TrellisResident::load(dir)?;
         let hidden = tr.hidden;
@@ -206,12 +213,41 @@ impl Exl3HipDecoder {
         Self::h2d_chunked(&hc, dnw_g, f32b(&nw_g))?;
         let dring = hc.alloc(n_gdn * 3 * 10240 * 4)?;
         let dgst = hc.alloc(n_gdn * 48 * 16384 * 4)?;
-        let dkc = hc.alloc(16 * 1024 * 1024 * 4)?;
-        let dvc = hc.alloc(16 * 1024 * 1024 * 4)?;
+        // KV RAM 예산 가드(plans/128 P0) — kvcap 32768이면 KV+MTP ≈4.5GiB.
+        // 이 UMA 기기의 GTT 과다 할당은 시스템 동결 사고류(2026-10-04 원장)라
+        // 할당 전 가용량 확인 후 명확한 에러로 거절(가드 상시화 정책 준용).
+        let kv_bytes: u64 = (16 * 2 + 2) as u64 * kvcap as u64 * 1024 * 4;
+        {
+            let gib = |b: u64| format!("{:.1} GiB", b as f64 / (1u64 << 30) as f64);
+            let mut free: u64 = 0;
+            if let Some((vf, _)) = crate::gpu_mem_free() {
+                free = free.saturating_add(vf);
+            }
+            if let Ok(s) = std::fs::read_to_string("/proc/meminfo")
+                && let Some(rest) = s.lines().find_map(|l| l.strip_prefix("MemAvailable:"))
+                && let Ok(kb) = rest.trim().trim_end_matches(" kB").parse::<u64>()
+            {
+                // 회수 가능 캐시 이미 반영 — 여유 85%만 가용 산정(가드 정책 동일).
+                free = free.saturating_add(kb * 1024 * 85 / 100);
+            }
+            // 마진 1GiB: 핀 버퍼·스테이징·런타임 변동.
+            if kv_bytes + (1 << 30) > free {
+                return Err(format!(
+                    "KV 예산 부족: kvcap={kvcap}이 KV {}+마진을 요구하나 가용 {} — --ctx 하향",
+                    gib(kv_bytes),
+                    gib(free)
+                ));
+            }
+        }
+        // KV 캐시(plans/128 P0) — 16 어텐션층 × kvcap 위치 × 1024 f32.
+        // kvcap 4096=512MiB · 8192=1GiB · 32768=4GiB(층당×2).
+        // 제로 초기화 생략: 인과적 write-before-read — fwd3s는 [0, pos+t) 행만
+        // 읽고 그 행은 항상 prep가 해당 pos 시점에 기록했다(reset 후에도
+        // pos=0부터 재기록). 과거 64MiB 제로 h2d는 불필요 비용이었다.
+        let dkc = hc.alloc(16 * kvcap * 1024 * 4)?;
+        let dvc = hc.alloc(16 * kvcap * 1024 * 4)?;
         Self::h2d_chunked(&hc, dring, &vec![0u8; n_gdn * 3 * 10240 * 4])?;
         Self::h2d_chunked(&hc, dgst, &vec![0u8; n_gdn * 48 * 16384 * 4])?;
-        Self::h2d_chunked(&hc, dkc, &vec![0u8; 16 * 1024 * 1024 * 4])?;
-        Self::h2d_chunked(&hc, dvc, &vec![0u8; 16 * 1024 * 1024 * 4])?;
         let dpp = hc.alloc(4)?;
         hc.h2d(dpp, &0u32.to_le_bytes())?;
         let embed_all: Vec<f32> = tr.embed.clone();
@@ -267,8 +303,9 @@ impl Exl3HipDecoder {
         let pgout = pin(64 * 248320 * 4)?;
         let pgh = pin(hidden * 4)?;
         let pgall = pin(64 * hidden * 4)?; // 전 행 pre-norm h(MTP 훅 일관성) // kseg 부분합 [T≤8][kseg≤8][n≤17408]
-        let dmtpk = hc.alloc(1024 * 1024 * 4)?;
-        let dmtpv = hc.alloc(1024 * 1024 * 4)?;
+        // MTP 자체 KV — 메인 16층과 동일 kvcap 스케일(1층분, layer=0 인덱싱).
+        let dmtpk = hc.alloc(kvcap * 1024 * 4)?;
+        let dmtpv = hc.alloc(kvcap * 1024 * 4)?;
         let dmtpp = hc.alloc(4)?;
         // 행 간격 5120 고정 — qn/kn(256원소)은 5120 패딩(행 포인터 산술 계약).
         let mut nwflat: Vec<f32> = Vec::with_capacity(7 * hidden);
@@ -340,8 +377,8 @@ impl Exl3HipDecoder {
             dembed,
             dargmax,
             mtp_norms,
-            mtp_kv_k: vec![0f32; 4096 * 4 * 256],
-            mtp_kv_v: vec![0f32; 4096 * 4 * 256],
+            mtp_kv_k: vec![0f32; kvcap * 4 * 256],
+            mtp_kv_v: vec![0f32; kvcap * 4 * 256],
             mtp_kv_len: 0,
             dmtpin,
             dbx,
@@ -369,6 +406,7 @@ impl Exl3HipDecoder {
             dgst,
             dkc,
             dvc,
+            kvcap: kvcap as i32,
             dpp,
             dnw,
             dqnw,
@@ -533,6 +571,13 @@ impl Exl3HipDecoder {
     /// 선형은 전부 hip gemv(GPU), 노름·rope·ew·어텐션 가중합은 호스트(T=1 소형).
     #[allow(clippy::too_many_arguments)]
     pub fn mtp_draft(&mut self, token: u32, h_in: &[f32], pos: u32) -> Result<Vec<f32>, String> {
+        // 호스트 MTP KV도 kvcap 상한(plans/128 P0) — kb0 인덱싱 경계 가드.
+        if pos as usize >= self.kvcap as usize {
+            return Err(format!(
+                "mtp context overflow: pos={} >= kvcap={}",
+                pos, self.kvcap
+            ));
+        }
         let h = self.hidden;
         let eps = 1e-6f32;
         let rms = |x: &[f32], w: &[f32]| -> Vec<f32> {
@@ -669,6 +714,13 @@ impl Exl3HipDecoder {
     /// cat(enorm(e)‖hnorm(h))만 호스트 노름, 이후 전부 디바이스:
     /// fc → attn(prep/fwd3s 자체 KV) → o+resid+ffn_norm(융합) → FFN(ew) → resid+shared norm → lm_head → argmax.
     pub fn mtp_draft_gpu(&mut self, token: u32, h_in: &[f32], pos: u32) -> Result<u32, String> {
+        // MTP 자체 KV(dmtpk)도 kvcap 상한 — pos가 상한이면 초과 행 기록 불가.
+        if pos as usize >= self.kvcap as usize {
+            return Err(format!(
+                "mtp context overflow: pos={} >= kvcap={}",
+                pos, self.kvcap
+            ));
+        }
         let h = self.hidden;
         let eps = 1e-6f32;
         let rms = |x: &[f32], w: &[f32]| -> Vec<f32> {
@@ -725,6 +777,7 @@ impl Exl3HipDecoder {
         // prep+fwd3s(자체 KV, layer=0, pp=dmtpp)
         self.hc.h2d(self.dmtpp, &pos.to_le_bytes())?;
         {
+            let mut kv = self.kvcap;
             let mut tl2 = 1i32;
             let mut p0v = pos as i32;
             let mut ai = 0i32;
@@ -758,6 +811,7 @@ impl Exl3HipDecoder {
                     &mut tl2 as *mut i32 as *mut _,
                     &mut p0v as *mut i32 as *mut _,
                     &mut ai as *mut i32 as *mut _,
+                    &mut kv as *mut i32 as *mut _,
                 ],
             )?;
             let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
@@ -779,6 +833,7 @@ impl Exl3HipDecoder {
                     &mut tl2 as *mut i32 as *mut _,
                     &mut p0v as *mut i32 as *mut _,
                     &mut ai as *mut i32 as *mut _,
+                    &mut kv as *mut i32 as *mut _,
                 ],
             )?;
         }
@@ -919,6 +974,13 @@ impl Exl3HipDecoder {
         if t == 0 || t > 64 {
             return Err(format!("forward_batch: T={t} 범위 외(1..64)"));
         }
+        // KV 상한 가드(plans/128 P0) — 초과 시 폴트 대신 Err로 우아한 거절.
+        if self.pos as usize + t > self.kvcap as usize {
+            return Err(format!(
+                "context overflow: pos={} + T={} > kvcap={} (--ctx 상향 필요)",
+                self.pos, t, self.kvcap
+            ));
+        }
         let flat: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
         // SAFETY: pstage 64×hidden 상한 내 — 핀 쓰기.
         unsafe {
@@ -989,6 +1051,13 @@ impl Exl3HipDecoder {
                 self.gemm2_batch(&lk, t, self.dsb2)?;
                 self.gemm2_batch(&lv, t, self.dsb3)?;
                 let mut ai = (il / 4) as i32;
+                let mut kv = self.kvcap;
+                // 층 진입마다 pp를 청크 기준 pos로 리셋(2026-10-05 수리, hip-batch
+                // 프로브가 발견) — 행별 pos_bump가 층에 누적되어 레이어 a의
+                // rope pos가 start+a·t+r로 밀리고, 슬라이스의 미기록 행 [0, a·t)을
+                // 판독했다(토큰 플립 2/9 · 로짓 maxdiff ~5). T=1 경로(매 호출
+                // dpp=pos)와 동일 규약으로 정렬 — 층 전부가 start+r 위치 사용.
+                self.hc.d2d(self.dpp, self.dpos, 4)?;
                 for r in 0..t {
                     let mut tl2 = 1i32;
                     let mut p0v = (self.pos + r as u32) as i32;
@@ -1025,6 +1094,7 @@ impl Exl3HipDecoder {
                             &mut tl2 as *mut i32 as *mut _,
                             &mut p0v as *mut i32 as *mut _,
                             &mut ai as *mut i32 as *mut _,
+                            &mut kv as *mut i32 as *mut _,
                         ],
                     )?;
                     // SAFETY: 배치 버퍼 내 행 오프셋 — t≤64 경계 내.
@@ -1054,6 +1124,7 @@ impl Exl3HipDecoder {
                             &mut tl2 as *mut i32 as *mut _,
                             &mut p0v as *mut i32 as *mut _,
                             &mut ai as *mut i32 as *mut _,
+                            &mut kv as *mut i32 as *mut _,
                         ],
                     )?;
                     let mut pb0 = self.dpp;
@@ -1400,6 +1471,7 @@ impl Exl3HipDecoder {
             let mut tl2 = 1i32;
             let mut p0v = pos as i32;
             let mut ai = 0i32;
+            let mut kv = self.kvcap;
             let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) = (
                 self.dsb,
                 self.dsb2,
@@ -1430,6 +1502,7 @@ impl Exl3HipDecoder {
                     &mut tl2 as *mut i32 as *mut _,
                     &mut p0v as *mut i32 as *mut _,
                     &mut ai as *mut i32 as *mut _,
+                    &mut kv as *mut i32 as *mut _,
                 ],
             )?;
         }
@@ -1599,6 +1672,13 @@ impl Exl3HipDecoder {
     /// 배치 GEMM(dah16 → out [T][n]) — gemm2 커널.
     /// 1토큰 forward → 로짓. ew(silu·mul)는 호스트(정확성 우선 — 추후 커널화).
     pub fn forward(&mut self, embed_row: &[f32]) -> Result<(Vec<f32>, Vec<f32>), String> {
+        // KV 상한 가드(plans/128 P0) — 초과 시 폴트 대신 Err로 우아한 거절.
+        if self.pos as usize + 1 > self.kvcap as usize {
+            return Err(format!(
+                "context overflow: pos={} + 1 > kvcap={} (--ctx 상향 필요)",
+                self.pos, self.kvcap
+            ));
+        }
         let n_layers = self.loaded_layers.min(self.n_layers);
         let f32b =
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
@@ -1628,6 +1708,7 @@ impl Exl3HipDecoder {
             }
             if il % 4 == 3 {
                 let mut ai = (il / 4) as i32;
+                let mut kv = self.kvcap;
                 let lq_key = format!("{lp}.self_attn.q_proj");
                 let lk_key = format!("{lp}.self_attn.k_proj");
                 let lv_key = format!("{lp}.self_attn.v_proj");
@@ -1693,6 +1774,7 @@ impl Exl3HipDecoder {
                         &mut tl2 as *mut i32 as *mut _,
                         &mut p0v as *mut i32 as *mut _,
                         &mut ai as *mut i32 as *mut _,
+                        &mut kv as *mut i32 as *mut _,
                     ],
                 )?;
                 let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) =
@@ -1713,6 +1795,7 @@ impl Exl3HipDecoder {
                         &mut tl2 as *mut i32 as *mut _,
                         &mut p0v as *mut i32 as *mut _,
                         &mut ai as *mut i32 as *mut _,
+                        &mut kv as *mut i32 as *mut _,
                     ],
                 )?;
                 self.gemv_chain(&lo, dou, dab)?;
