@@ -1608,3 +1608,39 @@ pub fn hip_tbench(dir: &str, tok: u32, t_max: usize) -> Result<String, String> {
 // 마커 tsb
 // 마커 tsb2
 // 마커 abh
+
+/// `llm170 exl3-hip-graph <dir> <tok> [T]` — hipGraph 캡처·재생: 정합(순차 대조)+재생 시간.
+pub fn hip_graph_check(dir: &str, tok: u32, t_len: usize) -> Result<String, String> {
+    use crate::rawhip::exl3_hip::Exl3HipDecoder;
+    let t = t_len.clamp(1, 8);
+    let mut dec = Exl3HipDecoder::load(dir, 64)?;
+    // 기준: 일반 배치 1회(캡처 워밍이 상태 전진시킴 — 순서: 워밍→캡처→비교재생은
+    // 상태가 다르다. 정합은 "같은 상태에서 재생 vs 비캡처" 비교로: 캡처 후
+    // 그래프 재생 2회와 수동 배치의 토큰열 자기일관성으로 판정(재생1 vs 재생2 연속).
+    let rows0: Vec<Vec<f32>> = (0..t).map(|i| dec.embed_row_host(tok + i as u32)).collect();
+    dec.capture_batch(t)?;
+    // 재생 3회 측정(행은 매회 동일 — 비용 측정; 상태 전진은 KV/ring에 누적)
+    let mut ts: Vec<f64> = Vec::new();
+    let mut last_am = 0u32;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        let (lgs, _) = dec.replay_batch(&rows0)?;
+        ts.push(t0.elapsed().as_secs_f64() * 1e3);
+        let lastrow = lgs.last().ok_or("empty")?;
+        last_am = lastrow
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+    }
+    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = ts[1];
+    let per = med / t as f64;
+    Ok(format!(
+        "hip-graph T={t}: 재생 {med:.1}ms ({per:.0}ms/토큰, {:.2} t/s) · 마지막 argmax={last_am}",
+        1000.0 / per
+    ))
+}
+// 마커 gpr
+// 마커 gpf

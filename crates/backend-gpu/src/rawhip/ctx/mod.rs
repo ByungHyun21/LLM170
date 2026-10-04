@@ -12,6 +12,26 @@ pub(super) use cubecl_hip_sys as hip;
 pub(super) use std::collections::HashMap;
 pub(super) use std::ffi::CString;
 
+/// hipGraph 스트림 캡처·재생(plans/121 hip 스케줄링 — 런치 오버헤드 제거).
+/// ROCm 10 시그니처(CUDA12형). 그래프 내부 노드는 실행 시점에 디바이스 상태를 읽는다.
+pub mod hipgraph {
+    use std::ffi::c_void;
+
+    pub type Graph = *mut c_void;
+    pub type GraphExec = *mut c_void;
+
+    unsafe extern "C" {
+        pub fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
+        pub fn hipHostFree(ptr: *mut c_void) -> i32;
+        pub fn hipStreamBeginCapture(stream: *mut c_void, mode: i32) -> i32;
+        pub fn hipStreamEndCapture(stream: *mut c_void, graph: *mut Graph) -> i32;
+        pub fn hipGraphInstantiate(exec: *mut GraphExec, graph: Graph, flags: u64) -> i32;
+        pub fn hipGraphLaunch(exec: GraphExec, stream: *mut c_void) -> i32;
+        pub fn hipGraphExecDestroy(exec: GraphExec) -> i32;
+        pub fn hipGraphDestroy(graph: Graph) -> i32;
+    }
+}
+
 pub struct RawCtx {
     pub(crate) fns: HashMap<&'static str, hip::hipFunction_t>,
     /// 로드된 코드오브젝트 패밀리 비트(CO_* 상수) — new() 완료 후 불변 (plans/78 R4).
@@ -491,3 +511,5 @@ mod alloc;
 mod copy;
 mod gemm;
 pub mod launch;
+// 마커 gcu
+// 마커 pin2

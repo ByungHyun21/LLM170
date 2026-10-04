@@ -1148,3 +1148,9 @@ extern "C" __global__ void exl3_gemm2_kseg(
             s[((long)(t0 + tt) * kseg + seg) * n + row0 + n_loc] = acc[t];
     }
 }
+
+// exl3_pos_bump — pp[0] += 1(어텐션 행 루프용, 캡처 그래프 내 pos 전진 — h2d 불가 대체).
+extern "C" __global__ void exl3_pos_bump(unsigned* __restrict__ pp)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) pp[0] += 1u;
+}
