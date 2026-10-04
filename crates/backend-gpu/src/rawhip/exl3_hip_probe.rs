@@ -1854,6 +1854,7 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
             .unwrap_or(0);
         toks.push(nxt);
     }
+    let seq_curve = std::mem::take(&mut dseq.hcurve);
     drop(dseq);
     // 배치 디코더로 같은 스트림 T=1씩(문맥 동일)
     let mut dbat = Exl3HipDecoder::load(dir, 64)?;
@@ -1878,6 +1879,25 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
                 hit_b += 1;
             }
             cur_b = nxt_b;
+            if tot_b == 1 {
+                eprintln!(
+                    "  [hcvd] seq={} bat={} — 곡선 비교 진입",
+                    seq_curve.len(),
+                    dbat.hcurve.len()
+                );
+            }
+            if tot_b == 1 && !seq_curve.is_empty() && dbat.hcurve.len() >= seq_curve.len() {
+                for (k, (l, hs_cv)) in seq_curve.iter().enumerate() {
+                    let (lb, hb_cv) = &dbat.hcurve[k];
+                    let md = hs_cv
+                        .iter()
+                        .zip(hb_cv)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    let rms = hs_cv.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    eprintln!("  [hcv] L{l}↔L{lb} maxdiff={md:.3e} rms={rms:.1}");
+                }
+            }
         }
         eprintln!("  [a1bat] 클린 배치경로 a1 = {hit_b}/{tot_b}");
     }
@@ -1934,3 +1954,6 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
 // 마커 hhg
 // 마커 cba
 // 마커 hrp
+// 마커 hcx
+// 마커 scv
+// 마커 dcf
