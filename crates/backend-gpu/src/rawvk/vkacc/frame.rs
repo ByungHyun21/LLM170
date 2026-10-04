@@ -252,17 +252,25 @@ impl VkAcc {
         } else {
             // plans/96 G3 — gate+up 연속 쌍: 같은 (x,n_in,rows)의 재양자화를
             // 전용 버퍼 슬롯으로 회수. 두 엔진 호출 사이 어떤 op/quant도
-            // 없고 전용 버퍼는 타 quant가 덮어쓰지 못함 — 히트는 안전.
+            // 없고 전용 버퍼는 타 quant가 덮어쓰지 못함.
+            // [2026-10-04 moech 결함] "세대 불필요" 전제는 같은 핸들·같은 형상에
+            // **내용만 다른 재투입**(청크 프리필가 같은 mx 버퍼 재사용)에서
+            // 깨진다 — 청크 2+가 청크 1의 xq로 계산된다(실측 moech 청크 불변
+            // max|D|=1.0e0). MoeTop10가 라우팅마다 올리는 moe_gen 을 키에
+            // 추가: gate→up 사이(세대 불변)만 히트, 청크/층 경계(세대 증가)는
+            // 재양자화.
             // plans/96: 프리필(t≥2) 전용 — 전층 체크섬으로 프리필 정합 실측 확정.
             // 디코드 q8스택 경로(t=1)에서의 미세 발산(원장 종결 기록)을 원천 차단.
             let pair_on = t >= 2;
+            let pair_gen = self.moe_gen.load(std::sync::atomic::Ordering::Relaxed);
             let mut hit: Option<vk::Buffer> = None;
             if pair_on {
                 let sl = self.moe_xq_pair.lock();
-                if let Some((hx, hn, hr, b)) = sl.as_ref()
+                if let Some((hx, hn, hr, hgen, b)) = sl.as_ref()
                     && *hx == x
                     && *hn == n_in
                     && *hr == rows
+                    && *hgen == pair_gen
                     && b.bytes >= rows * xq_w * 4
                 {
                     hit = Some(b.buf);
@@ -277,15 +285,16 @@ impl VkAcc {
                     let tgt = if pair_on {
                         let mut sl = self.moe_xq_pair.lock();
                         let need = rows * xq_w * 4;
-                        let ok = sl.as_ref().is_some_and(|v| v.3.bytes >= need);
+                        let ok = sl.as_ref().is_some_and(|v| v.4.bytes >= need);
                         if !ok {
-                            *sl = Some((x, n_in, rows, ctx.alloc(need)?));
+                            *sl = Some((x, n_in, rows, pair_gen, ctx.alloc(need)?));
                         } else if let Some(v) = sl.as_mut() {
                             v.0 = x;
                             v.1 = n_in;
                             v.2 = rows;
+                            v.3 = pair_gen;
                         }
-                        sl.as_ref().unwrap().3.buf
+                        sl.as_ref().unwrap().4.buf
                     } else {
                         self.xq_dev_buf(&mut ctx, rows * xq_w * 4)?
                     };
@@ -473,9 +482,6 @@ impl VkAcc {
                         e.inv = ctx.alloc_host(rows * 4)?;
                         e.inv_pad = ctx.alloc_host(rows * 4)?;
                     }
-                    // off/rows_pad 도 bound/rows 와 동일 성장 가드 — MoeTop10가
-                    // 매 스텝 moe_gen 을 올려 !hit 이 항상 참이 되므로, 무가드
-                    // 재할당은 세대마다 구 버퍼를 누수시킨다(90 A2 실측 누수).
                     if e.off_n < ne + 1 {
                         e.off = ctx.alloc_host((ne + 1) * 4)?;
                         e.off_n = ne + 1;

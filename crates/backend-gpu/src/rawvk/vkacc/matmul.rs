@@ -307,17 +307,19 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                     let p = self.pipeline(&mut ctx, Slot::SiluMulQ8)?;
                     let push = push_u32s(&[n_in as u32, rows as u32, xq_w as u32]);
                     let tgt = {
+                        let pair_gen = self.moe_gen.load(std::sync::atomic::Ordering::Relaxed);
                         let mut sl = self.moe_xq_pair.lock();
                         let need = rows * xq_w * 4;
-                        let ok = sl.as_ref().is_some_and(|v| v.3.bytes >= need);
+                        let ok = sl.as_ref().is_some_and(|v| v.4.bytes >= need);
                         if !ok {
-                            *sl = Some((0, 0, 0, ctx.alloc(need)?));
+                            *sl = Some((0, 0, 0, pair_gen, ctx.alloc(need)?));
                         }
                         let v = sl.as_mut().unwrap();
                         v.0 = out;
                         v.1 = n_in;
                         v.2 = rows;
-                        v.3.buf
+                        v.3 = pair_gen;
+                        v.4.buf
                     };
                     let ds2 = ctx.bind_ds(&p, &[gb, ub, tgt])?;
                     ctx.run_rw(
