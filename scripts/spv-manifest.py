@@ -66,6 +66,10 @@ def main():
             spv = comp.with_suffix(".spv")
             if spv.exists() and comp.stat().st_mtime > spv.stat().st_mtime:
                 print(f"  STALE: {comp.name} (comp newer than spv)"); fail += 1
+            elif not spv.exists():
+                # A17(plans/129): .comp 단독(미컴파일) 탐지 — 종전엔 spv 존재
+                # 전제라 신규 .comp가 매니페스트·preflight 양쪽에서 무탐지였다.
+                print(f"  NO-SPV: {comp.name} (comp without spv)"); fail += 1
         print("spv-manifest PASS" if fail == 0 else f"spv-manifest FAIL ({fail})")
         return 0 if fail == 0 else 1
     for r in rows:
