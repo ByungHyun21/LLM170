@@ -687,7 +687,7 @@ pub fn exl3_decode(dir: &str, tokens_str: &str, n_predict: usize) -> Result<Stri
         let (best, _) = logits
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .unwrap_or((0, &0.0));
         out_tokens.push(best as u32);
         if step < 6 {
@@ -1581,13 +1581,13 @@ pub fn exl3_pp(dir: &str, tokens_str: &str, n_predict: usize) -> Result<String, 
     let am_seq = logits_seq
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| i)
         .unwrap_or(0);
     let am_b = logits_b
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| i)
         .unwrap_or(0);
 
@@ -1599,7 +1599,7 @@ pub fn exl3_pp(dir: &str, tokens_str: &str, n_predict: usize) -> Result<String, 
             let (best, _) = logits
                 .iter()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
                 .unwrap_or((0, &0.0));
             out.push(best as u32);
             if step + 1 < n_predict {
@@ -1626,7 +1626,7 @@ pub fn exl3_pp(dir: &str, tokens_str: &str, n_predict: usize) -> Result<String, 
         prefill_batch(&mut tr, &mut s, &prompt)?;
         times.push(t.elapsed().as_secs_f64());
     }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    times.sort_by(|a, b| a.total_cmp(b));
     let med = times[times.len() / 2];
 
     // 진단 덤프 — VK_TS: GPU 디스패치 집계, exl3_phase: CPU 위상 분해.
@@ -1815,7 +1815,7 @@ pub(crate) fn mtp_step(
 fn argmax32(v: &[f32]) -> u32 {
     v.iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| i as u32)
         .unwrap_or(0)
 }

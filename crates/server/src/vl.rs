@@ -172,7 +172,12 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             match v {
                 Ok(rows) => rows,
                 Err(e) => {
-                    eprintln!("vit gpu: {e} — CPU 폴백");
+                    // A21d(plans/129): 폴백 관측성 — 누계 카운터(fb_infr 체계는
+                    // qwen4exp 프레임 전용이라 vl은 국소 카운터로).
+                    static VIT_FB: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let n = VIT_FB.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    eprintln!("vit gpu: {e} — CPU 폴백 (누적 {n}회)");
                     match clip.encode(&px, tw, th) {
                         Ok(r) => r,
                         Err(e) => {
@@ -230,7 +235,7 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         )
         .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
     }
-    let eos = 248044u32;
+    let eos = llm170_core::qwen35::EOS_EOT;
     let t1 = std::time::Instant::now();
     let mut last_logits = Vec::with_capacity(n_img);
     for s in 0..n_img {

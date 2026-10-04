@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# A21g(plans/129): hipconfig PATH 자립(무출력 rc=1 즉사 방지)
+if [ -d /opt/rocm-10.0.0/install/bin ]; then
+    export PATH=/opt/rocm-10.0.0/install/bin:$PATH
+fi
 # Qwen3.8-27B 고정 토큰 게이트 + 벤치 (2026-09-14)
 #
 # 용도: 어떤 변경 후에도 이 스크립트 하나로 (1) 수치 불변 게이트, (2) 성능 벤치를
