@@ -1693,11 +1693,8 @@ pub fn hip_graph_mini() -> Result<String, String> {
         }
         hc.sync()?;
         // SAFETY: 핀 버퍼 판독(재생 완료 후).
-        let v = u32::from_le_bytes(
-            unsafe { std::slice::from_raw_parts(pout, 4) }
-                .try_into()
-                .unwrap(),
-        );
+        // SAFETY: 상위 unsafe 블록 내 — 중첩 제거.
+        let v = u32::from_le_bytes(std::slice::from_raw_parts(pout, 4).try_into().unwrap());
         hg::hipGraphExecDestroy(exec);
         hg::hipGraphDestroy(graph);
         Ok(format!("gmini: 41+2={v} (43 기대) — 캡처·재생 정상"))
