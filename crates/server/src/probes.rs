@@ -423,6 +423,12 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let tmax = arg_num(args, 2, 16usize);
             llm170_backend_gpu::rawhip::exl3_hip_probe::hip_tbench(&dir, tok, tmax)
         }
+        "exl3-hip-hcmp" => {
+            let dir = arg_str(args, 0, "");
+            let tok = arg_num(args, 1, 1000u32);
+            let steps = arg_num(args, 2, 6usize);
+            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_h_pair(&dir, tok, steps)
+        }
         "exl3-hip-a1" => {
             let dir = arg_str(args, 0, "");
             let tok = arg_num(args, 1, 1000u32);
