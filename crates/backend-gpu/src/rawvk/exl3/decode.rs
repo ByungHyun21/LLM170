@@ -4,7 +4,7 @@
 //! 기존 core의 gdn_ar_batch·gdn_norm_gated·rope_head 함수를 재사용 —
 //! 비선형 로직을 재발명하지 않고 검증된 구현을 호출한다.
 
-use super::exl3_resident::TrellisResident;
+use super::resident::TrellisResident;
 
 // ── 위상 프로파일러 (LLM170_DUMP=exl3_phase, 원장 89: dump 키로만) ──
 // profile_span은 release no-op이라 exl3 프로브 전용 경량 계측.
@@ -1303,7 +1303,7 @@ pub fn prefill_batch(
         return Err("prefill_batch: 빈 프롬프트".into());
     }
     let mut logits = Vec::new();
-    for chunk_toks in tokens.chunks(super::exl3_resident::BATCH_TMAX) {
+    for chunk_toks in tokens.chunks(super::resident::BATCH_TMAX) {
         let t_rows = chunk_toks.len();
         // ── 프레임 경로(plans/121 원-서브밋): 잔차 GPU 상주, 층간 판독 0 ──
         // 기본 경로(2026-10-03 승격, 2026-10-04 ENV 계약으로 옵트아웃 삭제):
@@ -1977,7 +1977,7 @@ pub fn prefill_batch_spec(
     let h = tr.hidden;
     let eps = 1e-6f32;
     let mut argmaxes = Vec::new();
-    for chunk_toks in tokens.chunks(super::exl3_resident::BATCH_TMAX) {
+    for chunk_toks in tokens.chunks(super::resident::BATCH_TMAX) {
         let t_rows = chunk_toks.len();
         let _e0 = ph("pp:embed");
         let mut x = vec![0f32; t_rows * h];

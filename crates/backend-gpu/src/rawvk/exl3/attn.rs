@@ -1,6 +1,6 @@
 //! [어텐션 모듈 — vk 측정 원장 2026-10-03]
 //! fwd3(WG256·t블록4 k/v공유·LDS트리): 산술 5.3e-7·8.2ms/층 — pp512 +13% 기여
-use super::exl3_resident::{AttnFrame, BATCH_TMAX, TrellisResident};
+use super::resident::{AttnFrame, BATCH_TMAX, TrellisResident};
 
 impl TrellisResident {
     pub fn attn_frame_init(&mut self) -> Result<(), String> {

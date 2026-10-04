@@ -4,6 +4,7 @@ pub mod checks;
 pub use checks::{gdn_check, smoke_test};
 pub mod context;
 pub mod decoder;
+pub mod exl3;
 pub mod flashcheck;
 pub mod vkacc;
 
