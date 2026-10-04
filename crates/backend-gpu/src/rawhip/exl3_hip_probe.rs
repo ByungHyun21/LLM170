@@ -1838,6 +1838,7 @@ pub fn hip_graph_mini2() -> Result<String, String> {
 pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
     use crate::rawhip::exl3_hip::Exl3HipDecoder;
     let mut dseq = Exl3HipDecoder::load(dir, 64)?;
+    dseq.dbg_hcurve = true;
     // 순차 h·다음토큰 수집
     let mut toks = vec![tok];
     let mut hs: Vec<Vec<f32>> = Vec::new();
@@ -1856,6 +1857,7 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
     drop(dseq);
     // 배치 디코더로 같은 스트림 T=1씩(문맥 동일)
     let mut dbat = Exl3HipDecoder::load(dir, 64)?;
+    dbat.dbg_hcurve = true;
     // 클린 배치 a1 — 오염 없는 배치 루프 자체 수용률(기존 0.25-0.44는 순차 루프
     // 상태 오염 후 측정이라 무효 가능성).
     {
@@ -1931,3 +1933,4 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
 // 마커 hcp
 // 마커 hhg
 // 마커 cba
+// 마커 hrp
