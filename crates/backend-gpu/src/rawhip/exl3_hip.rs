@@ -67,6 +67,8 @@ pub struct Exl3HipDecoder {
     dmtpin: *mut u8,
     dbx: *mut u8,
     pub dbg_layers: bool,
+    pub dbg_hcurve: bool,
+    pub hcurve: Vec<(usize, Vec<f32>)>,
     dbxn: *mut u8,
     dbab: *mut u8,
     dbzero: *mut u8,
@@ -342,6 +344,8 @@ impl Exl3HipDecoder {
             dmtpin,
             dbx,
             dbg_layers: false,
+            dbg_hcurve: false,
+            hcurve: Vec::new(),
             dbxn,
             dbab,
             dbzero,
@@ -1166,6 +1170,16 @@ impl Exl3HipDecoder {
             self.had16_batch(self.dew, ld.k, t, ld.suh)?;
             self.gemm2_batch(&ld, t, self.dbab)?;
             ab = self.dbab;
+            if self.dbg_hcurve && [1usize, 8, 32, 63].contains(&il) {
+                let mut cb = vec![0u8; self.hidden * 4];
+                let _ = self.hc.d2h(&mut cb, self.dbx);
+                let _ = self.hc.sync();
+                // SAFETY: d2h 완료 후 재해석.
+                let cv = unsafe {
+                    std::slice::from_raw_parts(cb.as_ptr() as *const f32, self.hidden).to_vec()
+                };
+                self.hcurve.push((il, cv));
+            }
         }
         // last_h 캡처 — 최종 노름(마지막 FFN 합산) 전 잔차(vk 12/12·a1 0.625가
         // 측정된 규약 = h_seq와 동일 시점. 결함 11호 과교정 정정: '전'이되 dbx).
@@ -1873,6 +1887,16 @@ impl Exl3HipDecoder {
             )?;
             self.gemv_chain(&ld, dew, dab)?;
             ab = dab;
+            if self.dbg_hcurve && [1usize, 8, 32, 63].contains(&il) {
+                let mut cb = vec![0u8; self.hidden * 4];
+                let _ = self.hc.d2h(&mut cb, self.dx);
+                let _ = self.hc.sync();
+                // SAFETY: d2h 완료 후 재해석.
+                let cv = unsafe {
+                    std::slice::from_raw_parts(cb.as_ptr() as *const f32, self.hidden).to_vec()
+                };
+                self.hcurve.push((il, cv));
+            }
 
             {
                 let mut xb = vec![0u8; self.hidden * 4];
@@ -1989,3 +2013,5 @@ impl Exl3HipDecoder {
 // 마커 hpt
 // 마커 hpf
 // 마커 pga
+// 마커 hcv
+// 마커 hcf
