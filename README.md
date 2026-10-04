@@ -15,12 +15,12 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
 | LLM170 vulkan | 137.71 | — | — | 3.31 |
-| LLM170 hip | 18.48 | — | — | 5.78 |
+| LLM170 hip | 39.00 | — | — | 5.78 |
 
 | mode | LLM170 vulkan | LLM170 hip |
 |---|---|---|
 | tg single | 3.31 | 5.78 |
-| pp batch512 | 137.71 | 18.48 |
+| pp batch512 | 137.71 | 39.00 |
 | serve | 3.9 | 5.7 |
 | MTP k=2 | — | — |
 | np4 greedy | — | — |
