@@ -1121,16 +1121,17 @@ impl Exl3HipDecoder {
             self.hadout_batch(self.dbab, ld.svh, ld.n, t)?;
             ab = self.dbab;
         }
-        // MTP 드래프트용 마지막 pre-norm 잔차(vk last_h 규약).
+        // 최종 노름 + lm_head 행별 로짓
+        self.norm_p(128, self.dbab, t)?;
+        // MTP 드래프트용 마지막 pre-norm 잔차(vk last_h 규약) — 잔차 스트림은
+        // dbx(norm_p가 dbx += ab로 누적). 최종 노름 이후 판독해 마지막 FFN 포함.
         let mut hb = vec![0u8; self.hidden * 4];
         {
-            // SAFETY: dbab 마지막 행.
-            let plast = unsafe { self.dbab.add((t - 1) * self.hidden * 4) };
+            // SAFETY: dbx 마지막 행.
+            let plast = unsafe { self.dbx.add((t - 1) * self.hidden * 4) };
             self.hc.d2h(&mut hb, plast)?;
             self.hc.sync()?;
         }
-        // 최종 노름 + lm_head 행별 로짓
-        self.norm_p(128, self.dbab, t)?;
         let llh = self.lin["lm_head"].clone_shallow();
         self.had16_batch(self.dbxn, llh.k, t, llh.suh)?;
         self.gemm2_batch(&llh, t, self.dsb)?;
@@ -1174,10 +1175,10 @@ impl Exl3HipDecoder {
         let nrow = move |i: usize| unsafe { dmtpnw.add(i * 5120 * 4) };
         for r in 0..t {
             let pos = (self.pos as usize - t + r) as u32;
-            // h 행 d2h(호스트 enorm/hnorm 후 다시 올림 — fc 입력 조립)
+            // h 행 d2h — 잔차 스트림 dbx에서(전체 잔차).
             let mut hb = vec![0u8; self.hidden * 4];
-            // SAFETY: dbab 행.
-            let hp = unsafe { self.dbab.add(r * self.hidden * 4) };
+            // SAFETY: dbx 행.
+            let hp = unsafe { self.dbx.add(r * self.hidden * 4) };
             self.hc.d2h(&mut hb, hp)?;
             self.hc.sync()?;
             // SAFETY: d2h 완료 후 재해석.
@@ -1787,3 +1788,4 @@ impl Exl3HipDecoder {
 // 마커 d5p
 // 마커 npz
 // 마커 kvh
+// 마커 lhf
