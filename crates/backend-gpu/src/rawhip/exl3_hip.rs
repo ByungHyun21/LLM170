@@ -1164,16 +1164,16 @@ impl Exl3HipDecoder {
             self.gemm2_batch(&ld, t, self.dbab)?;
             ab = self.dbab;
         }
-        // 최종 노름 + lm_head 행별 로짓
-        self.norm_p(128, self.dbab, t)?;
-        // MTP 드래프트용 마지막 pre-norm 잔차(vk last_h 규약) — 잔차 스트림은
-        // dbx(norm_p가 dbx += ab로 누적). 최종 노름 이후 판독해 마지막 FFN 포함.
+        // last_h 캡처 — 최종 노름(마지막 FFN 합산) 전 잔차(vk 12/12·a1 0.625가
+        // 측정된 규약 = h_seq와 동일 시점. 결함 11호 과교정 정정: '전'이되 dbx).
         {
             // SAFETY: dbx 마지막 행 → g_h 고정 버퍼.
             let plast = unsafe { self.dbx.add((t - 1) * self.hidden * 4) };
             // SAFETY: pgh 원시 핀 d2h(캡처 호환).
             self.hc.d2h_pin_async(self.pgh, plast, self.hidden * 4)?;
         }
+        // 최종 노름 + lm_head 행별 로짓
+        self.norm_p(128, self.dbab, t)?;
         let llh = self.lin["lm_head"].clone_shallow();
         self.had16_batch(self.dbxn, llh.k, t, llh.suh)?;
         self.gemm2_batch(&llh, t, self.dsb)?;
@@ -1292,12 +1292,22 @@ impl Exl3HipDecoder {
         let nrow = move |i: usize| unsafe { dmtpnw.add(i * 5120 * 4) };
         for r in 0..t {
             let pos = (self.pos as usize - t + r) as u32;
-            // h 행 d2h — 잔차 스트림 dbx에서(전체 잔차).
+            // h 행 — g_h 규약('마지막 FFN 합산 전')과 동일 클래스를 쓰려면
+            // norm_p(128) 전 dbx가 필요하지만 훅은 최종 노름 후 실행 — 마지막 행만
+            // g_h(전)에서, 나머지 행은 dbx(후)에서 읽는다(전 행은 마지막 라운드 토큰만
+            // 드래프트 입력이 됨). r<t-1 행의 h는 다음 라운드 검증에서만 사용.
             let mut hb = vec![0u8; self.hidden * 4];
-            // SAFETY: dbx 행.
-            let hp = unsafe { self.dbx.add(r * self.hidden * 4) };
-            self.hc.d2h(&mut hb, hp)?;
-            self.hc.sync()?;
+            if r + 1 == t {
+                // SAFETY: pgh(핀 last_h) 판독 — 상위 forward_batch 완료 동기 후.
+                let ghs =
+                    unsafe { std::slice::from_raw_parts(self.pgh as *const u8, self.hidden * 4) };
+                hb.copy_from_slice(ghs);
+            } else {
+                // SAFETY: dbx 행(후 시점 — 검증 전용).
+                let hp = unsafe { self.dbx.add(r * self.hidden * 4) };
+                self.hc.d2h(&mut hb, hp)?;
+                self.hc.sync()?;
+            }
             // SAFETY: d2h 완료 후 재해석.
             let h: &[f32] =
                 unsafe { std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden) };
@@ -1968,3 +1978,5 @@ impl Exl3HipDecoder {
 // 마커 dpf
 // 마커 ks16
 // 마커 rb1
+// 마커 hpt
+// 마커 hpf
