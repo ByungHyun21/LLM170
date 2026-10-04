@@ -1572,11 +1572,10 @@ pub fn hip_mtp_a1(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
         let _ = &h_seq_store;
     }
     let mut cur = tok;
-    let mut batch_i = 0usize;
     let (mut hit, mut tot, mut hit_h) = (0usize, 0usize, 0usize);
     let mut t_draft = 0f64;
     let t0 = std::time::Instant::now();
-    for _ in 0..steps {
+    for batch_i in 0..steps {
         let row = dec.embed_row_host(cur);
         let pos_before = dec.pos;
         let (lg, h) = dec.forward_batch_with_mtp(&[row], &[cur])?;
@@ -1619,7 +1618,6 @@ pub fn hip_mtp_a1(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
             eprintln!("  [a1dbg] 스텝{tot} gpu={d} host={am_h} target={nxt}");
         }
         cur = nxt;
-        batch_i += 1;
     }
     let el = t0.elapsed().as_secs_f64();
     Ok(format!(
