@@ -458,7 +458,12 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         }
         "exl3-hip-attn" => {
             let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
-            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_attn_check(&dir)
+            // t/pos0/layer 선택 인자(plans/128 P0·P1) — pos0+t>256이면
+            // fwd3s 온라인 소프트맥스의 다중 청크·층 스트라이드를 검증한다.
+            let t = arg_str(args, 1, "8").parse::<usize>().unwrap_or(8);
+            let pos0 = arg_str(args, 2, "0").parse::<usize>().unwrap_or(0);
+            let lay = arg_str(args, 3, "0").parse::<usize>().unwrap_or(0);
+            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_attn_check(&dir, t, pos0, lay)
         }
         "exl3-hip-gdn" => {
             let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
@@ -467,8 +472,10 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         }
         "exl3-hip-gemm" => {
             let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
-            let t = arg_str(args, 1, "64").parse::<usize>().unwrap_or(64);
-            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_gemm_check(&dir, t)
+            // key 단축명(g,u,d,qkv,z,gop,q,k,v,o,lh,g5 — plans/128 P2 형상 스윕) · t
+            let key = arg_str(args, 1, "g");
+            let t = arg_str(args, 2, "64").parse::<usize>().unwrap_or(64);
+            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_gemm_check(&dir, &key, t)
         }
         "exl3-hip-linear" => {
             let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
