@@ -1515,7 +1515,10 @@ impl Exl3HipDecoder {
         self.gemm2_batch_plain(l, t_len, out)
     }
 
-    /// 기존 단일 gemm2(대형-T·lm_head).
+    /// 기존 단일 gemm2(대형-T·lm_head) — [plans/127 B] exl3_gemm2_mma로 승격.
+    /// 스칼라 1.5-2.8TF → mma 실측 9.6-10.5TF(T 64-512, 3.6-6.4倍·정합 ≤3.8e-4,
+    /// 부분 T 16/21 포함 — exl3-hip-gemm T-sweep 원장). 출력 레이아웃[T][n]·
+    /// had_out nseg=1 제자리 후처리 계약은 스칼라팧과 동일 — 교체 전용.
     fn gemm2_batch_plain(&mut self, l: &HipLin, t_len: usize, out: *mut u8) -> Result<(), String> {
         let (mut kt, mut nt, mut kk, mut tt) = (
             (l.k / 16) as i32,
@@ -1525,11 +1528,11 @@ impl Exl3HipDecoder {
         );
         let (mut g0, mut g1, mut g2) = (self.dah16, l.tre, out);
         self.hc.launch3(
-            "exl3_gemm2",
+            "exl3_gemm2_mma",
             (l.n / 64) as u32,
-            t_len.div_ceil(128) as u32,
+            t_len.div_ceil(64) as u32,
             1,
-            128,
+            256,
             &mut [
                 &mut g0 as *mut *mut u8 as *mut _,
                 &mut g1 as *mut *mut u8 as *mut _,

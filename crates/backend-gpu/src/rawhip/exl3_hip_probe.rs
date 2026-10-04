@@ -520,12 +520,18 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
         );
     }
     // 3-way: 검증된 T=1 GEMV 체인으로 행 5 재계산 → gemm 행5·vk 참조 삼각 대조.
+    // [수리 2026-10-04] had_in 출력을 **전용 버퍼 dah5**에 쓴다 — 종전 p2=dah가
+    // dah 행0을 x[samp[1]] 변환으로 덮어썼고, 뒤따르는 wmma/mma 블록이 오염된
+    // 활성으로 토큰0 = 토큰 samp[1]의 dot를 계산했다(“WMMA 행0 오염”의 진범,
+    // plans/125-3 · plans/126 I1 — 커널 무죄, 프로브 하네스 결함).
     {
         let r5 = samp[1];
         let mut gv_nsg = 16i32;
+        let dah5 = hc.alloc(k * 2)?;
         let x5: Vec<f32> = x[r5 * k..(r5 + 1) * k].to_vec();
         let x5b: &[u8] = unsafe { std::slice::from_raw_parts(x5.as_ptr() as *const u8, k * 4) };
         hc.h2d(dx, x5b)?;
+        let mut p2b = dah5;
         hc.launch3(
             "exl3_had_in",
             (k / 128) as u32,
@@ -535,11 +541,12 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
             &mut [
                 &mut p0 as *mut *mut u8 as *mut _,
                 &mut p1 as *mut *mut u8 as *mut _,
-                &mut p2 as *mut *mut u8 as *mut _,
+                &mut p2b as *mut *mut u8 as *mut _,
                 &mut kc as *mut i32 as *mut _,
                 &mut ks as *mut i32 as *mut _,
             ],
         )?;
+        let (mut g0, mut g1, mut g2) = (dah5, dtre, dsb);
         hc.launch3(
             "exl3_gemv",
             ((n / 16) / 8) as u32,
@@ -626,9 +633,8 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
         hc.sync()?;
         ts.push(t0.elapsed().as_secs_f64() * 1e3);
     }
-    // WMMA 변형 A/B — 텐서코어 vs 스칼라.
+    // MMA 변형(plans/127 B) — Q4-MMQ 구조 이식판: 정합+속도 A/B.
     {
-        let tf = 2.0 * k as f64 * n as f64 * t_rows as f64 / 1e12;
         let (mut kt, mut nt2, mut kk2, mut tt2) = (
             (k / 16) as i32,
             (n / 16) as i32,
@@ -636,11 +642,11 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
             t_rows as i32,
         );
         let (mut g0, mut g1, mut g2) = (dah, dtre, dsb);
-        let mut tw: Vec<f64> = Vec::new();
+        let mut tm: Vec<f64> = Vec::new();
         for _ in 0..3 {
             let t0 = std::time::Instant::now();
             hc.launch3(
-                "exl3_gemm2_wmma",
+                "exl3_gemm2_mma",
                 (n / 64) as u32,
                 t_rows.div_ceil(64) as u32,
                 1,
@@ -656,9 +662,9 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
                 ],
             )?;
             hc.sync()?;
-            tw.push(t0.elapsed().as_secs_f64() * 1e3);
+            tm.push(t0.elapsed().as_secs_f64() * 1e3);
         }
-        // H⁻¹⊙svh 후처리 — want가 최종 도메인이므로 비교 전 적용(제자리).
+        // H⁻¹⊙svh 후처리(제자리) — want가 최종 도메인이므로 동일 적용.
         {
             let (mut c0, mut c1, mut c2) = (dsb, dsvh, dsb);
             let (mut nch, mut nsg, mut nst) = ((n / 128) as i32, 1i32, n as i32);
@@ -679,19 +685,18 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
             )?;
             hc.sync()?;
         }
-        tw.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        // 정확도: yb(스칼라 had_out 결과)가 아니라 sb 직독 — 근사 비교
-        let mut sbb = vec![0u8; t_rows * n * 4];
-        hc.d2h(&mut sbb, dsb)?;
+        tm.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut mbb = vec![0u8; t_rows * n * 4];
+        hc.d2h(&mut mbb, dsb)?;
         hc.sync()?;
         // SAFETY: d2h 완료 후 재해석.
-        let sfc: &[f32] =
-            unsafe { std::slice::from_raw_parts(sbb.as_ptr() as *const f32, t_rows * n) };
-        let mut wmd = 0f32;
+        let mfc: &[f32] =
+            unsafe { std::slice::from_raw_parts(mbb.as_ptr() as *const f32, t_rows * n) };
+        let mut mmd = 0f32;
         for (si, &r) in samp.iter().enumerate() {
             let _ = si;
             for i in 0..n {
-                wmd = wmd.max((sfc[r * n + i] - want[si][i]).abs());
+                mmd = mmd.max((mfc[r * n + i] - want[si][i]).abs());
             }
         }
         for (si, &r) in samp.iter().enumerate() {
@@ -700,18 +705,19 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
             }
             let mut rowmd = 0f32;
             for i in 0..n {
-                rowmd = rowmd.max((sfc[r * n + i] - want[si][i]).abs());
+                rowmd = rowmd.max((mfc[r * n + i] - want[si][i]).abs());
             }
-            eprintln!("  [wmrow] 샘플행{r} maxdiff={rowmd:.3e}");
+            eprintln!("  [mmarow] 샘플행{r} maxdiff={rowmd:.3e}");
             if si == 0 && r == 0 {
-                eprintln!("  [wmv0] gpu={:?}", &sfc[0..6]);
-                eprintln!("  [wmv0] ref={:?}", &want[0][0..6]);
+                eprintln!("  [mmav0] gpu={:?}", &mfc[0..6]);
+                eprintln!("  [mmav0] ref={:?}", &want[0][0..6]);
             }
         }
+        let tf2 = 2.0 * k as f64 * n as f64 * t_rows as f64 / 1e12;
         eprintln!(
-            "  [wmdbg] wmma {:.1}ms = {:.1} TF · y-vs-ref maxdiff={wmd:.3e}",
-            tw[1],
-            tf / (tw[1] / 1000.0)
+            "  [mmadbg] mma {:.1}ms = {:.1} TF · y-vs-ref maxdiff={mmd:.3e}",
+            tm[1],
+            tf2 / (tm[1] / 1000.0)
         );
     }
     ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
