@@ -120,8 +120,12 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     // 프롬프트: LLM170_BENCH_TEXT(자연어, Tokenizer 인코딩) 또는 수제 LCG 합성 토큰
     let prompt: Vec<u32> = match std::env::var("LLM170_BENCH_TEXT") {
         Ok(txt) => {
-            let tok = crate::tokenize::Tokenizer::load(&model_path, None)
-                .unwrap_or_else(|e| panic!("토크나이저 로드 실패: {e}"));
+            // A8(plans/129): panic → 오류 반환(usage_err_bench 패턴과 통일 —
+            // 불완전 디렉터리 등 인위 오류 경로가 프로세스 패닉이었다).
+            let tok = match crate::tokenize::Tokenizer::load(&model_path, None) {
+                Ok(t) => t,
+                Err(e) => return usage_err_bench(&format!("토크나이저 로드 실패: {e}")),
+            };
             let mut ids = tok.encode(&txt);
             // QA-23: 0토큰 인코딩 가드 — 빈 ids로 pp 패딩 루프가 무한 회전.
             if ids.is_empty() {
