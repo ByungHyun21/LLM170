@@ -31,7 +31,7 @@ pub struct Exl3HipDecoder {
     hidden: usize,
     n_layers: usize,
     loaded_layers: usize,
-    pos: u32,
+    pub pos: u32,
     dx: *mut u8,
     dxn: *mut u8,
     dab: *mut u8,
@@ -604,7 +604,10 @@ impl Exl3HipDecoder {
     /// 배치 forward(프리필·MTP 검증 공용) — rows: [T][hidden] 임베딩 행.
     /// GDN·FFN·선형은 gemm2 배치, 어텐션은 행별 prep/fwd3s 루프(소형-T 전용).
     /// 상태: dring/dgst/dkc/dvc는 pos..pos+T-1 순차 기록(디코드와 동일 규약).
-    pub fn forward_batch(&mut self, rows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
+    pub fn forward_batch(
+        &mut self,
+        rows: &[Vec<f32>],
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>), String> {
         let t = rows.len();
         if t == 0 || t > 64 {
             return Err(format!("forward_batch: T={t} 범위 외(1..64)"));
@@ -852,6 +855,14 @@ impl Exl3HipDecoder {
             self.hadout_batch(self.dbab, ld.svh, ld.n, t)?;
             ab = self.dbab;
         }
+        // MTP 드래프트용 마지막 pre-norm 잔차(vk last_h 규약).
+        let mut hb = vec![0u8; self.hidden * 4];
+        {
+            // SAFETY: dbab 마지막 행.
+            let plast = unsafe { self.dbab.add((t - 1) * self.hidden * 4) };
+            self.hc.d2h(&mut hb, plast)?;
+            self.hc.sync()?;
+        }
         // 최종 노름 + lm_head 행별 로짓
         self.norm_p(128, self.dbab, t)?;
         let llh = self.lin["lm_head"].clone_shallow();
@@ -872,7 +883,10 @@ impl Exl3HipDecoder {
                 std::slice::from_raw_parts(lb.as_ptr() as *const f32, llh.n).to_vec()
             });
         }
-        Ok(out)
+        // SAFETY: d2h 완료 후 재해석 — vk last_h 규약(output_norm 전 잔차).
+        let last_h =
+            unsafe { std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden).to_vec() };
+        Ok((out, last_h))
     }
 
     /// 배치 노름(norm_resid_p) — dbx += ab, dbxn = norm(dbx)·w. nw는 행 포인터.
@@ -1397,3 +1411,5 @@ impl Exl3HipDecoder {
 // 마커 bd2
 // 마커 gy2
 // 마커 dcl
+// 마커 mr2
+// 마커 mr3
