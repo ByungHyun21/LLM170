@@ -1291,15 +1291,12 @@ pub fn hip_batch_check(dir: &str, tok: u32, t_len: usize) -> Result<String, Stri
     use crate::rawhip::exl3_hip::Exl3HipDecoder;
     let t = t_len.clamp(1, 8);
     let mut dec = Exl3HipDecoder::load(dir, dec_layers_default(dir))?;
-    dec.dbg_layers = true;
     // 1) 순차 greedy T+1스텝(기준)
     let mut seq_toks = Vec::new();
+    let mut seq_lgs: Vec<Vec<f32>> = Vec::new();
     let mut tk = tok;
     for _ in 0..=t {
-        let (lg, _) = {
-            let lgv = dec.forward_tok(tk)?;
-            (lgv, Vec::<f32>::new())
-        };
+        let lg = dec.forward_tok(tk)?;
         let am = lg
             .iter()
             .enumerate()
@@ -1307,6 +1304,7 @@ pub fn hip_batch_check(dir: &str, tok: u32, t_len: usize) -> Result<String, Stri
             .map(|(i, _)| i as u32)
             .unwrap_or(0);
         seq_toks.push(am);
+        seq_lgs.push(lg);
         tk = am;
     }
     drop(dec);
@@ -1340,6 +1338,17 @@ pub fn hip_batch_check(dir: &str, tok: u32, t_len: usize) -> Result<String, Stri
             }
         );
     }
+    // 행별 로짓 maxdiff — 플립이 f16 노이즈(≈1e-2)인지 계통(≥1e-1)인지 정량화.
+    for (ri, lgr) in lgs.iter().enumerate() {
+        if let Some(sl) = seq_lgs.get(ri) {
+            let md = lgr
+                .iter()
+                .zip(sl)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!("  [fbmd] 行{ri} maxdiff={md:.3e}");
+        }
+    }
     let last = lgs.last().ok_or("batch empty")?;
     let bam = last
         .iter()
@@ -1366,3 +1375,4 @@ fn dec_layers_default(_dir: &str) -> usize {
 // 마커 fbc
 // 마커 fbr
 // 마커 blp
+// 마커 mdq
