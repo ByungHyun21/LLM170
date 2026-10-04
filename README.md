@@ -21,7 +21,7 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 |---|---|---|
 | tg single | 3.31 | 5.78 |
 | pp batch512 | 137.71 | 39.00 |
-| serve | 3.9 | 5.7 |
+| serve | 3.9 | 5.62 |
 | MTP k=2 | — | — |
 | np4 greedy | — | — |
 
