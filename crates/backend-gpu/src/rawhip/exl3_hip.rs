@@ -73,6 +73,10 @@ pub struct Exl3HipDecoder {
     dah16: *mut u8,
     dsb2: *mut u8,
     dsb3: *mut u8,
+    dmtpk: *mut u8,
+    dmtpv: *mut u8,
+    dmtpp: *mut u8,
+    dmtpnw: *mut u8,
     dnw: *mut u8,
     dqnw: *mut u8,
     dknw: *mut u8,
@@ -235,6 +239,22 @@ impl Exl3HipDecoder {
         let dah16 = hc.alloc(64 * 34816)?;
         let dsb2 = hc.alloc(64 * 17408 * 4)?; // 층 선형 n 상한(lm_head는 dsb)
         let dsb3 = hc.alloc(64 * 17408 * 4)?;
+        // MTP 자체 KV(메인 16개 어텐션층과 분리 — prep의 layer 인덱스 0으로 사용)
+        let dmtpk = hc.alloc(1024 * 1024 * 4)?;
+        let dmtpv = hc.alloc(1024 * 1024 * 4)?;
+        let dmtpp = hc.alloc(4)?;
+        // 행 간격 5120 고정 — qn/kn(256원소)은 5120 패딩(행 포인터 산술 계약).
+        let mut nwflat: Vec<f32> = Vec::with_capacity(7 * hidden);
+        for (i, v) in mtp_norms.iter().enumerate() {
+            nwflat.extend_from_slice(v);
+            if i >= 5 {
+                nwflat.resize((i + 1) * hidden, 0.0);
+            }
+        }
+        let dmtpnw = hc.alloc(nwflat.len() * 4)?;
+        hc.h2d(dmtpnw, unsafe {
+            std::slice::from_raw_parts(nwflat.as_ptr() as *const u8, nwflat.len() * 4)
+        })?;
         drop(tr);
         let dargmax = hc.alloc(4)?;
 
@@ -304,6 +324,10 @@ impl Exl3HipDecoder {
             dah16,
             dsb2,
             dsb3,
+            dmtpk,
+            dmtpv,
+            dmtpp,
+            dmtpnw,
             dring,
             dgst,
             dkc,
@@ -430,7 +454,7 @@ impl Exl3HipDecoder {
         let row: &[f32] =
             unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, self.hidden) };
         let _ = self.forward(row)?; // 로짓 d2h 포함(검증 경로 겸용) — 최적화 시 read 스킵 분리
-        let mut an = 1i32;
+        let mut an = 248320i32;
         let (mut a0, mut a1) = (self.dyb, self.dargmax);
         self.hc.launch(
             "exl3_argmax",
@@ -444,6 +468,10 @@ impl Exl3HipDecoder {
             ],
         )?;
         self.hc.sync()?;
+        if self.dbg_layers {
+            let d8 = self.dump8_dev(self.dsb);
+            eprintln!("  [glg] lg={d8:?}");
+        }
         let mut ob = vec![0u8; 4];
         self.hc.d2h(&mut ob, self.dargmax)?;
         self.hc.sync()?;
@@ -476,6 +504,9 @@ impl Exl3HipDecoder {
         cat.extend_from_slice(&h_n);
         // mtp.fc GEMV
         let mut cur = self.gemv_host("mtp.fc", &cat)?;
+        if self.dbg_layers {
+            eprintln!("  [hfc] cur={:?}", &cur[..8]);
+        }
         // 어텐션
         let xn = rms(&cur, &self.mtp_norms[2]);
         let lp = "mtp.layers.0.self_attn";
@@ -554,6 +585,9 @@ impl Exl3HipDecoder {
                 attn_out[b0 + i] *= sig;
             }
         }
+        if self.dbg_layers {
+            eprintln!("  [hat] attn={:?}", &attn_out[..8]);
+        }
         let o = self.gemv_host(&format!("{lp}.o_proj"), &attn_out)?;
         for i in 0..h {
             cur[i] += o[i];
@@ -571,8 +605,240 @@ impl Exl3HipDecoder {
         for i in 0..h {
             cur[i] += d_[i];
         }
+        if self.dbg_layers {
+            eprintln!("  [hff] cur2={:?}", &cur[..8]);
+        }
         let hn = rms(&cur, &self.mtp_norms[4]);
+        if self.dbg_layers {
+            eprintln!("  [hxn] hn={:?}", &hn[..8]);
+        }
         self.gemv_host("lm_head", &hn)
+    }
+
+    /// MTP 드래프트 GPU 체인(v2) — 중간 호스트 왕복 제거(라운드당 1 h2d + 종료 4B d2h).
+    /// cat(enorm(e)‖hnorm(h))만 호스트 노름, 이후 전부 디바이스:
+    /// fc → attn(prep/fwd3s 자체 KV) → o+resid+ffn_norm(융합) → FFN(ew) → resid+shared norm → lm_head → argmax.
+    pub fn mtp_draft_gpu(&mut self, token: u32, h_in: &[f32], pos: u32) -> Result<u32, String> {
+        let h = self.hidden;
+        let eps = 1e-6f32;
+        let rms = |x: &[f32], w: &[f32]| -> Vec<f32> {
+            let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+            let sc = 1.0 / (ms + eps).sqrt();
+            x.iter().zip(w).map(|(v, wv)| v * sc * wv).collect()
+        };
+        let mut rb = vec![0u8; h * 4];
+        // SAFETY: dembed 행 오프셋.
+        let ep = unsafe { self.dembed.add(token as usize * h * 4) };
+        self.hc.d2h(&mut rb, ep)?;
+        self.hc.sync()?;
+        // SAFETY: d2h 완료 후 재해석.
+        let e: &[f32] = unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, h) };
+        let e_n = rms(e, &self.mtp_norms[0]);
+        let h_n = rms(h_in, &self.mtp_norms[1]);
+        let mut cat = Vec::with_capacity(2 * h);
+        cat.extend_from_slice(&e_n);
+        cat.extend_from_slice(&h_n);
+        let f32b =
+            |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        self.hc.h2d(self.dbx, f32b(&cat))?;
+
+        let fc = self.lin["mtp.fc"].clone_shallow();
+        let lq = self.lin["mtp.layers.0.self_attn.q_proj"].clone_shallow();
+        let lk = self.lin["mtp.layers.0.self_attn.k_proj"].clone_shallow();
+        let lv = self.lin["mtp.layers.0.self_attn.v_proj"].clone_shallow();
+        let lo = self.lin["mtp.layers.0.self_attn.o_proj"].clone_shallow();
+        let lg = self.lin["mtp.layers.0.mlp.gate_proj"].clone_shallow();
+        let lu = self.lin["mtp.layers.0.mlp.up_proj"].clone_shallow();
+        let ld = self.lin["mtp.layers.0.mlp.down_proj"].clone_shallow();
+        let llh = self.lin["lm_head"].clone_shallow();
+        // mtp 노름 행 포인터(dmtpnw: [0]enorm [1]hnorm [2]attn_ln [3]post_ln [4]shared [5]qn [6]kn)
+        // SAFETY: dmtpnw 내 행 오프셋 — 소유 포인터 캡처(self 대여 회피).
+        let dmtpnw = self.dmtpnw;
+        let nrow = move |i: usize| unsafe { dmtpnw.add(i * 5120 * 4) };
+
+        // fc → cur(dbab)
+        self.had16_batch(self.dbx, fc.k, 1, fc.suh)?;
+        self.gemm2_batch(&fc, 1, self.dbab)?;
+        self.hadout_batch(self.dbab, fc.svh, fc.n, 1)?;
+        if self.dbg_layers {
+            let d8 = self.dump8_dev(self.dbab);
+            eprintln!("  [gfc] cur={d8:?}");
+        }
+        // attn_norm(순수): xn = norm(cur) — cur는 dbab 유지
+        self.norm_ptr(self.dbab, nrow(2), self.dbzero, self.dbxn, 1)?;
+        // q/k/v
+        self.had16_batch(self.dbxn, lq.k, 1, lq.suh)?;
+        self.gemm2_batch(&lq, 1, self.dsb)?;
+        self.hadout_batch(self.dsb, lq.svh, lq.n, 1)?;
+        self.had16_batch(self.dbxn, lk.k, 1, lk.suh)?;
+        self.gemm2_batch(&lk, 1, self.dsb2)?;
+        self.hadout_batch(self.dsb2, lk.svh, lk.n, 1)?;
+        self.had16_batch(self.dbxn, lv.k, 1, lv.suh)?;
+        self.gemm2_batch(&lv, 1, self.dsb3)?;
+        self.hadout_batch(self.dsb3, lv.svh, lv.n, 1)?;
+        // prep+fwd3s(자체 KV, layer=0, pp=dmtpp)
+        self.hc.h2d(self.dmtpp, &pos.to_le_bytes())?;
+        {
+            let mut tl2 = 1i32;
+            let mut p0v = pos as i32;
+            let mut ai = 0i32;
+            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) = (
+                self.dsb,
+                self.dsb2,
+                self.dsb3,
+                nrow(5),
+                nrow(6),
+                self.dq2,
+                self.dmtpk,
+                self.dmtpv,
+                self.dmtpp,
+            );
+            self.hc.launch3(
+                "exl3_attn_prep",
+                1,
+                28,
+                1,
+                128,
+                &mut [
+                    &mut a0 as *mut *mut u8 as *mut _,
+                    &mut a1 as *mut *mut u8 as *mut _,
+                    &mut a2 as *mut *mut u8 as *mut _,
+                    &mut a3 as *mut *mut u8 as *mut _,
+                    &mut a4 as *mut *mut u8 as *mut _,
+                    &mut a5 as *mut *mut u8 as *mut _,
+                    &mut a6 as *mut *mut u8 as *mut _,
+                    &mut a7 as *mut *mut u8 as *mut _,
+                    &mut a8 as *mut *mut u8 as *mut _,
+                    &mut tl2 as *mut i32 as *mut _,
+                    &mut p0v as *mut i32 as *mut _,
+                    &mut ai as *mut i32 as *mut _,
+                ],
+            )?;
+            let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
+                self.dq2, self.dmtpk, self.dmtpv, self.dsb, self.dou, self.dmtpp,
+            );
+            self.hc.launch3(
+                "exl3_attn_fwd3s",
+                1,
+                24,
+                1,
+                256,
+                &mut [
+                    &mut f0 as *mut *mut u8 as *mut _,
+                    &mut f1 as *mut *mut u8 as *mut _,
+                    &mut f2 as *mut *mut u8 as *mut _,
+                    &mut f3 as *mut *mut u8 as *mut _,
+                    &mut f4 as *mut *mut u8 as *mut _,
+                    &mut f5 as *mut *mut u8 as *mut _,
+                    &mut tl2 as *mut i32 as *mut _,
+                    &mut p0v as *mut i32 as *mut _,
+                    &mut ai as *mut i32 as *mut _,
+                ],
+            )?;
+        }
+        if self.dbg_layers {
+            let d8 = self.dump8_dev(self.dou);
+            eprintln!("  [gat] attn={d8:?}");
+        }
+        // o → resid+ffn_norm 융합: dbx(cur=cat? 아니 — cur=dbab)… 주의: resid 스트림은 cur.
+        // cur을 dbx로 옮기고: norm_ptr(x=dbx, ab=o, nw=post_ln) → dbx+=o, dbxn=norm.
+        // (fc 출력을 dbx에 복사하는 대신 — 위에서 dbx는 cat 입력으로 쓰였고 gemm2는 dah16 소진后 재사용 안전)
+        // SAFETY 없음 — gemm2가 dbx를 더 안 읽음(입력은 dah16).
+        // dbx ← cur 복사: gemm2 fc 출력 dbab을 dbx로 20KB 복사는 d2d 필요 — 대신 resid를 반대로:
+        // norm_ptr(x=dbab(cur), ab=o_buf, nw=post_ln) → cur+=o in dbab, dbxn=norm ✓
+        self.had16_batch(self.dou, lo.k, 1, lo.suh)?;
+        self.gemm2_batch(&lo, 1, self.dsb3)?;
+        self.hadout_batch(self.dsb3, lo.svh, lo.n, 1)?;
+        self.norm_ptr(self.dbab, nrow(3), self.dsb3, self.dbxn, 1)?;
+        // FFN
+        self.had16_batch(self.dbxn, lg.k, 1, lg.suh)?;
+        self.gemm2_batch(&lg, 1, self.dsb)?;
+        self.hadout_batch(self.dsb, lg.svh, lg.n, 1)?;
+        self.had16_batch(self.dbxn, lu.k, 1, lu.suh)?;
+        self.gemm2_batch(&lu, 1, self.dsb2)?;
+        self.hadout_batch(self.dsb2, lu.svh, lu.n, 1)?;
+        let mut ewn = lg.n as i32;
+        let (mut w0, mut w1, mut w2) = (self.dsb, self.dsb2, self.dew);
+        self.hc.launch3(
+            "exl3_ew",
+            lg.n.div_ceil(128) as u32,
+            1,
+            1,
+            128,
+            &mut [
+                &mut w0 as *mut *mut u8 as *mut _,
+                &mut w1 as *mut *mut u8 as *mut _,
+                &mut w2 as *mut *mut u8 as *mut _,
+                &mut ewn as *mut i32 as *mut _,
+            ],
+        )?;
+        self.had16_batch(self.dew, ld.k, 1, ld.suh)?;
+        self.gemm2_batch(&ld, 1, self.dsb3)?;
+        self.hadout_batch(self.dsb3, ld.svh, ld.n, 1)?;
+        if self.dbg_layers {
+            let d8 = self.dump8_dev(self.dbab);
+            eprintln!("  [gff] cur2={d8:?}");
+        }
+        // resid+shared norm: cur(dbab)+=ffn, xn=shared norm
+        self.norm_ptr(self.dbab, nrow(4), self.dsb3, self.dbxn, 1)?;
+        // lm_head → argmax
+        self.had16_batch(self.dbxn, llh.k, 1, llh.suh)?;
+        self.gemm2_batch(&llh, 1, self.dsb)?;
+        self.hadout_batch(self.dsb, llh.svh, llh.n, 1)?;
+        let mut an = llh.n as i32;
+        let (mut a0, mut a1) = (self.dsb, self.dargmax);
+        self.hc.launch3(
+            "exl3_argmax",
+            1,
+            1,
+            1,
+            1024,
+            &mut [
+                &mut a0 as *mut *mut u8 as *mut _,
+                &mut a1 as *mut *mut u8 as *mut _,
+                &mut an as *mut i32 as *mut _,
+            ],
+        )?;
+        let mut ob = vec![0u8; 4];
+        self.hc.d2h(&mut ob, self.dargmax)?;
+        self.hc.sync()?;
+        Ok(u32::from_le_bytes([ob[0], ob[1], ob[2], ob[3]]))
+    }
+
+    /// 검증 덤프: 버퍼 선두 8 f32(동기 포함 — 디버그 전용).
+    fn dump8_dev(&mut self, ptr: *mut u8) -> Vec<f32> {
+        let mut rb = vec![0u8; 32];
+        let _ = self.hc.d2h(&mut rb, ptr);
+        let _ = self.hc.sync();
+        // SAFETY: d2h 완료 후 재해석.
+        unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, 8).to_vec() }
+    }
+
+    /// 순수+잔차 노름(norm_resid_p 직접 포인터) — x += ab, xn = norm(x)·nw. 커널 인자 순서.
+    fn norm_ptr(
+        &mut self,
+        x: *mut u8,
+        nw: *mut u8,
+        ab: *mut u8,
+        xn: *mut u8,
+        t_len: usize,
+    ) -> Result<(), String> {
+        let mut tl = t_len as i32;
+        let (mut a0, mut a1, mut a2, mut a3) = (x, nw, ab, xn);
+        self.hc.launch(
+            "exl3_norm_resid_p",
+            t_len as u32,
+            1,
+            1024,
+            &mut [
+                &mut a0 as *mut *mut u8 as *mut _,
+                &mut a1 as *mut *mut u8 as *mut _,
+                &mut a2 as *mut *mut u8 as *mut _,
+                &mut a3 as *mut *mut u8 as *mut _,
+                &mut tl as *mut i32 as *mut _,
+            ],
+        )?;
+        Ok(())
     }
 
     /// 호스트 벡터 → gemv 체인 1회 → 호스트 결과(드래프트 소형 전용 — 본체는 상주 경로).
@@ -887,6 +1153,104 @@ impl Exl3HipDecoder {
         let last_h =
             unsafe { std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden).to_vec() };
         Ok((out, last_h))
+    }
+
+    /// forward_batch + MTP KV 적립 훅(vk 패턴): 각 행의 타깃 hidden으로
+    /// mtp 어텐션 KV[pos]를 채운다 — 이후 mtp_draft_gpu는 전체 문맥을 본다.
+    pub fn forward_batch_with_mtp(
+        &mut self,
+        rows: &[Vec<f32>],
+        toks: &[u32],
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>), String> {
+        let t = rows.len();
+        let out = self.forward_batch(rows)?;
+        // 종료 시점: dbab에 최종 잔차(전 노름 전) t행 존재 — 행별 적립.
+        let fc = self.lin["mtp.fc"].clone_shallow();
+        let lq = self.lin["mtp.layers.0.self_attn.q_proj"].clone_shallow();
+        let lk = self.lin["mtp.layers.0.self_attn.k_proj"].clone_shallow();
+        let lv = self.lin["mtp.layers.0.self_attn.v_proj"].clone_shallow();
+        // SAFETY: dmtpnw 내 행.
+        let dmtpnw = self.dmtpnw;
+        let nrow = move |i: usize| unsafe { dmtpnw.add(i * 5120 * 4) };
+        for r in 0..t {
+            let pos = (self.pos as usize - t + r) as u32;
+            // h 행 d2h(호스트 enorm/hnorm 후 다시 올림 — fc 입력 조립)
+            let mut hb = vec![0u8; self.hidden * 4];
+            // SAFETY: dbab 행.
+            let hp = unsafe { self.dbab.add(r * self.hidden * 4) };
+            self.hc.d2h(&mut hb, hp)?;
+            self.hc.sync()?;
+            // SAFETY: d2h 완료 후 재해석.
+            let h: &[f32] =
+                unsafe { std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden) };
+            let e = self.embed_row_host(toks[r]);
+            let eps = 1e-6f32;
+            let rms = |x: &[f32], w: &[f32]| -> Vec<f32> {
+                let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+                let sc = 1.0 / (ms + eps).sqrt();
+                x.iter().zip(w).map(|(v, wv)| v * sc * wv).collect()
+            };
+            let e_n = rms(&e, &self.mtp_norms[0]);
+            let h_n = rms(h, &self.mtp_norms[1]);
+            let mut cat = Vec::with_capacity(2 * self.hidden);
+            cat.extend_from_slice(&e_n);
+            cat.extend_from_slice(&h_n);
+            let f32b = |v: &[f32]| unsafe {
+                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
+            };
+            self.hc.h2d(self.dbx, f32b(&cat))?;
+            // fc → attn_norm → q/k/v → prep(KV 적립만)
+            self.had16_batch(self.dbx, fc.k, 1, fc.suh)?;
+            self.gemm2_batch(&fc, 1, self.dbab)?;
+            self.hadout_batch(self.dbab, fc.svh, fc.n, 1)?;
+            self.norm_ptr(self.dbab, nrow(2), self.dbzero, self.dbxn, 1)?;
+            self.had16_batch(self.dbxn, lq.k, 1, lq.suh)?;
+            self.gemm2_batch(&lq, 1, self.dsb)?;
+            self.hadout_batch(self.dsb, lq.svh, lq.n, 1)?;
+            self.had16_batch(self.dbxn, lk.k, 1, lk.suh)?;
+            self.gemm2_batch(&lk, 1, self.dsb2)?;
+            self.hadout_batch(self.dsb2, lk.svh, lk.n, 1)?;
+            self.had16_batch(self.dbxn, lv.k, 1, lv.suh)?;
+            self.gemm2_batch(&lv, 1, self.dsb3)?;
+            self.hadout_batch(self.dsb3, lv.svh, lv.n, 1)?;
+            self.hc.h2d(self.dmtpp, &pos.to_le_bytes())?;
+            let mut tl2 = 1i32;
+            let mut p0v = pos as i32;
+            let mut ai = 0i32;
+            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) = (
+                self.dsb,
+                self.dsb2,
+                self.dsb3,
+                nrow(5),
+                nrow(6),
+                self.dq2,
+                self.dmtpk,
+                self.dmtpv,
+                self.dmtpp,
+            );
+            self.hc.launch3(
+                "exl3_attn_prep",
+                1,
+                28,
+                1,
+                128,
+                &mut [
+                    &mut a0 as *mut *mut u8 as *mut _,
+                    &mut a1 as *mut *mut u8 as *mut _,
+                    &mut a2 as *mut *mut u8 as *mut _,
+                    &mut a3 as *mut *mut u8 as *mut _,
+                    &mut a4 as *mut *mut u8 as *mut _,
+                    &mut a5 as *mut *mut u8 as *mut _,
+                    &mut a6 as *mut *mut u8 as *mut _,
+                    &mut a7 as *mut *mut u8 as *mut _,
+                    &mut a8 as *mut *mut u8 as *mut _,
+                    &mut tl2 as *mut i32 as *mut _,
+                    &mut p0v as *mut i32 as *mut _,
+                    &mut ai as *mut i32 as *mut _,
+                ],
+            )?;
+        }
+        Ok(out)
     }
 
     /// 배치 노름(norm_resid_p) — dbx += ab, dbxn = norm(dbx)·w. nw는 행 포인터.
@@ -1413,3 +1777,13 @@ impl Exl3HipDecoder {
 // 마커 dcl
 // 마커 mr2
 // 마커 mr3
+// 마커 dg2
+// 마커 dg3
+// 마커 dg4
+// 마커 npf
+// 마커 amf
+// 마커 nwp
+// 마커 d3p
+// 마커 d5p
+// 마커 npz
+// 마커 kvh
