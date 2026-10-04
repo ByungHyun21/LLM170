@@ -19,8 +19,20 @@ pub struct Exl3HipEngine {
 unsafe impl Send for Exl3HipEngine {}
 
 impl Exl3HipEngine {
-    pub fn load(dir: &str, _n_slots: usize, _ctx_len: usize) -> Result<Self, String> {
-        let dec = Exl3HipDecoder::load(dir, 64)?;
+    pub fn load(dir: &str, _n_slots: usize, ctx_len: usize) -> Result<Self, String> {
+        // kvcap = 서빙 ctx(plans/128 P0) — 과거 req.ctx를 무시해 KV가 1024로
+        // 고정됐고 32k 요청이 pos≈1023에서 attn_prep 폴트로 죽었다.
+        // 상한 32768: 그 이상은 이 UMA 기기의 KV RAM 예산(GTT 동결 위험) 초과 —
+        // 범위 밖 요청은 클램프 후 로그로 알린다(엄청난 --ctx 오타 방지).
+        let kvcap = if ctx_len == 0 {
+            4096
+        } else {
+            ctx_len.clamp(64, 32768)
+        };
+        if kvcap != ctx_len {
+            eprintln!("# hip kvcap: ctx {ctx_len} → {kvcap} (범위 [64, 32768]로 클램프)");
+        }
+        let dec = Exl3HipDecoder::load(dir, 64, kvcap)?;
         Ok(Self { dec })
     }
 
