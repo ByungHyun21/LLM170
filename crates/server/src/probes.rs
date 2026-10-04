@@ -15,12 +15,11 @@ fn arg_num<T: std::str::FromStr>(args: &[String], i: usize, d: T) -> T {
 
 /// 프로브 커맨드이면 실행해 Some(코드) 반환, 아니면 None.
 pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
-    // 107 W4: 프로브 기본 모델 경로 통합(하드코딩 11곳 → 3상수).
-    // 인자 우선 — 기본값은 진단 편의용.
-    let d_fn =
-        "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
-    let d_27 = "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf";
-    let d_q35 = "/home/yoon/models/qwen3.8-27b/q35work.gguf";
+    // 프로브 기본 모델 경로 — 단일 소스는 resource(A2/R1, plans/129): 가드
+    // 표(PROBE_DEFAULT_MODELS)와 같은 상수를 참조해 드리프트 불가.
+    let d_fn = crate::resource::DEFAULT_FN_MODEL;
+    let d_27 = crate::resource::DEFAULT_27_MODEL;
+    let d_q35 = crate::resource::DEFAULT_Q35_MODEL;
     let r: Result<String, String> = match cmd {
         "gpu-raw-probe" => llm170_backend_gpu::rawhip::raw_probe(arg_num(args, 0, 2000)),
         "launch-rate" => llm170_backend_gpu::rawhip::launch_rate(arg_num(args, 0, 20000)),
