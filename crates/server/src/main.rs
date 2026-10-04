@@ -14,6 +14,7 @@ mod oai;
 mod perplexity;
 mod probes;
 mod resource;
+mod sched;
 mod tokenize;
 mod unicode_data;
 mod vl;
