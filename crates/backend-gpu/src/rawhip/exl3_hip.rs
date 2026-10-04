@@ -927,9 +927,9 @@ impl Exl3HipDecoder {
         let n_layers = self.loaded_layers.min(self.n_layers);
         let f32b =
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-        // SAFETY: pstage 고정 길이 슬라이스(캡처 memcpy 노드 — 핀 src).
-        let stg = unsafe { std::slice::from_raw_parts(self.pstage, t * self.hidden * 4) };
-        self.hc.h2d(self.dbx, stg)?;
+        // 캡처 호환 업로드 — 원시 핀 h2d(h2d는 내부 sync 포함 — 캡처 무효화).
+        self.hc
+            .h2d_nosync(self.dbx, self.pstage, t * self.hidden * 4)?;
         self.hc.d2d(self.dpp, self.dpos, 4)?;
         let mut ab = self.dbzero;
         for il in 0..n_layers {
@@ -946,8 +946,6 @@ impl Exl3HipDecoder {
                 self.gemm2_batch(&lk, t, self.dsb2)?;
                 self.gemm2_batch(&lv, t, self.dsb3)?;
                 let mut ai = (il / 4) as i32;
-                // pp[0] = 행0 위치(루프 전 1회 h2d) — 행 전진은 exl3_pos_bump(그래프 캡처 호환).
-                self.hc.h2d(self.dpp, &self.pos.to_le_bytes())?;
                 for r in 0..t {
                     let mut tl2 = 1i32;
                     let mut p0v = (self.pos + r as u32) as i32;
@@ -1174,9 +1172,8 @@ impl Exl3HipDecoder {
         {
             // SAFETY: dbx 마지막 행 → g_h 고정 버퍼.
             let plast = unsafe { self.dbx.add((t - 1) * self.hidden * 4) };
-            // SAFETY: pgh 핀 dst.
-            let ghp = unsafe { std::slice::from_raw_parts_mut(self.pgh, self.hidden * 4) };
-            self.hc.d2h(ghp, plast)?;
+            // SAFETY: pgh 원시 핀 d2h(캡처 호환).
+            self.hc.d2h_pin_async(self.pgh, plast, self.hidden * 4)?;
         }
         let llh = self.lin["lm_head"].clone_shallow();
         self.had16_batch(self.dbxn, llh.k, t, llh.suh)?;
@@ -1197,12 +1194,9 @@ impl Exl3HipDecoder {
         for r in 0..t {
             // SAFETY: dsb 내 lm_head 행 오프셋.
             let rowp = unsafe { self.dsb.add(r * llh.n * 4) };
-            // SAFETY: pgout 행 오프셋(핀 dst — 캡처 노드).
+            // SAFETY: pgout 행 오프셋 — 원시 핀 d2h(캡처 호환).
             let dstp = unsafe { self.pgout.add(r * llh.n * 4) };
-            self.hc.d2h(
-                &mut unsafe { std::slice::from_raw_parts_mut(dstp, llh.n * 4) },
-                rowp,
-            )?;
+            self.hc.d2h_pin_async(dstp, rowp, llh.n * 4)?;
         }
         Ok(())
     }
@@ -1216,12 +1210,14 @@ impl Exl3HipDecoder {
         self.hc.sync()?;
         unsafe {
             let st = hg::hipStreamBeginCapture(self.hc.stream as *mut _, 2);
+            eprintln!("  [gcap] BeginCapture={st}");
             if st != 0 {
                 return Err(format!("BeginCapture {st}"));
             }
             let core = self.batch_core(t);
             let mut graph: hg::Graph = std::ptr::null_mut();
             let en = hg::hipStreamEndCapture(self.hc.stream as *mut _, &mut graph);
+            eprintln!("  [gcap] EndCapture={en} graph={graph:?} core={core:?}");
             core?;
             if en != 0 {
                 return Err(format!("EndCapture {en}"));
@@ -1967,3 +1963,7 @@ impl Exl3HipDecoder {
 // 마커 gcr2
 // 마커 gm2
 // 마커 pin1
+// 마커 fx25
+// 마커 gdb
+// 마커 gdb2
+// 마커 dpf
