@@ -1292,7 +1292,7 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
     drop(dec);
     // 2단계: vk 참조 단독 재로드.
     let mut tr = TrellisResident::load(dir)?;
-    let mut seq = crate::rawvk::exl3::decode::new_seq_state(tr.n_layers, 512);
+    let mut seq = crate::rawvk::exl3::cpu::new_seq_state(tr.n_layers, 512);
     let want = crate::rawvk::exl3::decode::decode_step(&mut tr, &mut seq, tok0)?;
     let mut vt = Vec::new();
     let mut vtok = want
@@ -1360,8 +1360,8 @@ pub fn hip_mtp_check(dir: &str, tok: u32) -> Result<String, String> {
     drop(dec);
     // 2단계: vk 참조 단독
     let mut tr = TrellisResident::load(dir)?;
-    let mut seq = crate::rawvk::exl3::decode::new_seq_state(tr.n_layers, 512);
-    let wl = crate::rawvk::exl3::decode::mtp_step(&mut tr, &mut seq, tok, &synth, 0, true)?;
+    let mut seq = crate::rawvk::exl3::cpu::new_seq_state(tr.n_layers, 512);
+    let wl = crate::rawvk::exl3::mtp::mtp_step(&mut tr, &mut seq, tok, &synth, 0, true)?;
     let mut md = 0f32;
     let (mut ga, mut wa) = (0usize, 0usize);
     for i in 0..tl.len() {
