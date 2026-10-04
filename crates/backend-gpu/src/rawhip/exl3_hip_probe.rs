@@ -1250,3 +1250,37 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
 }
 // 마커 wab
 // 마커 wab2
+
+/// `llm170 exl3-hip-mtp <dir> <tok>` — MTP 드래프트 모듈 격리 검증:
+/// 합성 hidden(결정론 패턴)으로 hip gemv 경로 vs vk 참조 mtp_step 로짓 대조.
+pub fn hip_mtp_check(dir: &str, tok: u32) -> Result<String, String> {
+    use crate::rawhip::exl3_hip::Exl3HipDecoder;
+    use crate::rawvk::checks::TrellisResident;
+    let h = 5120usize;
+    let synth: Vec<f32> = (0..h).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+    // 1단계: hip 단독(mtp 가중치만 사용)
+    let mut dec = Exl3HipDecoder::load(dir, 0)?;
+    let tl = dec.mtp_draft(tok, &synth, 0)?;
+    drop(dec);
+    // 2단계: vk 참조 단독
+    let mut tr = TrellisResident::load(dir)?;
+    let mut seq = crate::rawvk::checks::exl3_decode::new_seq_state(tr.n_layers, 512);
+    let wl = crate::rawvk::checks::exl3_decode::mtp_step(&mut tr, &mut seq, tok, &synth, 0, true)?;
+    let mut md = 0f32;
+    let (mut ga, mut wa) = (0usize, 0usize);
+    for i in 0..tl.len() {
+        md = md.max((tl[i] - wl.0[i]).abs());
+        if tl[i] > tl[ga] {
+            ga = i;
+        }
+        if wl.0[i] > wl.0[wa] {
+            wa = i;
+        }
+    }
+    Ok(format!(
+        "hip-mtp tok{tok}: 로짓 maxdiff={md:.3e} argmax hip={ga} vk={wa} {}",
+        if ga == wa { "일치" } else { "불일치" }
+    ))
+}
+// 마커 mtpd
+// 마커 mtpf

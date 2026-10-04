@@ -409,6 +409,10 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             arg_num(args, 1, 0usize),
         ),
         "exl3-nr-check" => llm170_backend_gpu::rawvk::checks::nr_check(),
+        "exl3-hip-mtp" => llm170_backend_gpu::rawhip::exl3_hip_probe::hip_mtp_check(
+            &arg_str(args, 0, ""),
+            arg_num(args, 1, 1000u32),
+        ),
         "exl3-hip-decode" => {
             let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
             let tok = arg_str(args, 1, "1000").parse::<u32>().unwrap_or(1000);
@@ -1449,3 +1453,4 @@ fn cmd_exl3_check(exl3_dir: &str, gguf_path: &str) -> Result<String, String> {
         Err(report)
     }
 }
+// 마커 mtpg

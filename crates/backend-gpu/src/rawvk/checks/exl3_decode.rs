@@ -1831,7 +1831,7 @@ pub fn exl3_pp(dir: &str, tokens_str: &str, n_predict: usize) -> Result<String, 
 // 잔차)이 다시 쓴다 — 훅이 드래프트 로짓도 함께 낸다(Q35 GPU 경로 패턴).
 
 /// MTP 1스텝: (token, h_in) → (logits, mtp_hidden). pos는 이 토큰의 위치.
-fn mtp_step(
+pub(crate) fn mtp_step(
     tr: &mut TrellisResident,
     seq: &mut SeqState,
     token: u32,
