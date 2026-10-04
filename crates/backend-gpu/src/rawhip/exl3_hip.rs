@@ -903,6 +903,7 @@ impl Exl3HipDecoder {
             std::ptr::copy_nonoverlapping(flat.as_ptr() as *const u8, self.pstage, flat.len() * 4);
         }
         self.batch_core(t)?;
+        self.hc.sync()?; // 판독 배리어 — 캡처 코어는 비동기, g_out 확정 대기
         self.pos += t as u32;
         // SAFETY: g_out 재해석.
         let n = self.llh_n();
@@ -1444,7 +1445,7 @@ impl Exl3HipDecoder {
                     &mut ks as *mut i32 as *mut _,
                 ],
             )?;
-            // had_out nseg=8 합산 → out
+            // had_out nseg=8 합산 → out(kseg8 최적 — 16은 미세 역행 측정)
             let (mut nch, mut nsg, mut nst) = ((l.n / 128) as i32, 8i32, l.n as i32);
             let (mut c0, mut c1, mut c2) = (self.dbat, l.svh, out);
             self.hc.launch3(
@@ -1965,3 +1966,5 @@ impl Exl3HipDecoder {
 // 마커 gdb
 // 마커 gdb2
 // 마커 dpf
+// 마커 ks16
+// 마커 rb1
