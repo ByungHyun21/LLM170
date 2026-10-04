@@ -925,8 +925,6 @@ impl Exl3HipDecoder {
     /// 캡처·재생·비캡처 공용(캡처 호환: 내부 sync/h2d-from-stack 없음).
     fn batch_core(&mut self, t: usize) -> Result<(), String> {
         let n_layers = self.loaded_layers.min(self.n_layers);
-        let f32b =
-            |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         // 캡처 호환 업로드 — 원시 핀 h2d(h2d는 내부 sync 포함 — 캡처 무효화).
         self.hc
             .h2d_nosync(self.dbx, self.pstage, t * self.hidden * 4)?;
