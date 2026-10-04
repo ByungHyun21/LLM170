@@ -1,3 +1,5 @@
+//! [검증층 원장 2026-10-04] exl3-hip-gemv/nr/linear/gemm/gdn/attn 프로브 —
+//! 모듈층(exl3_hip.rs) 헤더의 측정값 참조. 박막 hip-decode는 greedy-4 대조.
 use crate::rawhip::ctx::RawCtx as HipCtx;
 
 // ── EXL3 hip GEMV 체인 프로브(plans/121 CMP 포팅 · todo 2/4) ──

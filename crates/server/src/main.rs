@@ -228,7 +228,10 @@ fn main() -> ExitCode {
         if let Some(sb) = sub
             && sb.starts_with("exl3-")
             && model.is_none()
-            && let Some(p) = ma.rest.iter().find(|a| !a.starts_with("--") && a.contains('/'))
+            && let Some(p) = ma
+                .rest
+                .iter()
+                .find(|a| !a.starts_with("--") && a.contains('/'))
         {
             model = Some(p.clone());
             gpu = true;
