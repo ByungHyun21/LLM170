@@ -32,6 +32,7 @@ pub struct Exl3HipDecoder {
     n_layers: usize,
     loaded_layers: usize,
     pub pos: u32,
+    n_gdn: usize,
     dx: *mut u8,
     dxn: *mut u8,
     dab: *mut u8,
@@ -314,6 +315,7 @@ impl Exl3HipDecoder {
             n_layers,
             loaded_layers: lim_layers,
             pos: 0,
+            n_gdn,
             dx,
             dxn,
             dab,
@@ -451,6 +453,19 @@ impl Exl3HipDecoder {
             ],
         )?;
         Ok(())
+    }
+
+    /// 제자리 상태 리셋 — 링/스캔 상태 0화 + pos 0. KV는 pos 의미론으로
+    /// 도달 시 자연 갱신(재할당 없음 — plans/123 III-2 관례).
+    pub fn reset_state(&mut self) -> Result<(), String> {
+        let zeros_ring = vec![0u8; self.n_gdn as usize * 3 * 10240 * 4];
+        self.hc.h2d(self.dring, &zeros_ring)?;
+        let zeros_st = vec![0u8; self.n_gdn as usize * 48 * 16384 * 4];
+        self.hc.h2d(self.dgst, &zeros_st)?;
+        self.pos = 0;
+        self.hc.h2d(self.dpos, &0u32.to_le_bytes())?;
+        self.hc.h2d(self.dpp, &0u32.to_le_bytes())?;
+        self.hc.sync()
     }
 
     /// 토큰 ID 직접 forward(임베딩 행을 디바이스에서 판독) — 단일 모델 상주용.
@@ -2015,3 +2030,4 @@ impl Exl3HipDecoder {
 // 마커 pga
 // 마커 hcv
 // 마커 hcf
+// 마커 rs1
