@@ -49,6 +49,8 @@ pub struct Exl3HipDecoder {
     dkc: *mut u8,
     dvc: *mut u8,
     dpp: *mut u8,
+    dembed: *mut u8,
+    vocab: usize,
     dnw: *mut u8,
     dqnw: *mut u8,
     dknw: *mut u8,
@@ -134,8 +136,6 @@ impl Exl3HipDecoder {
                 },
             );
         }
-        drop(tr);
-
         let dnw = hc.alloc(nw.len() * 4)?;
         Self::h2d_chunked(&hc, dnw, f32b(&nw))?;
         let dqnw = hc.alloc(qnw.len() * 4)?;
@@ -162,6 +162,11 @@ impl Exl3HipDecoder {
         Self::h2d_chunked(&hc, dvc, &vec![0u8; 16 * 1024 * 1024 * 4])?;
         let dpp = hc.alloc(4)?;
         hc.h2d(dpp, &0u32.to_le_bytes())?;
+        let embed_all: Vec<f32> = tr.embed.clone();
+        let vocab = embed_all.len() / hidden;
+        let dembed = hc.alloc(embed_all.len() * 4)?;
+        Self::h2d_chunked(&hc, dembed, f32b(&embed_all))?;
+        drop(tr);
 
         let tmax = 64usize;
         let dx = hc.alloc(hidden * 4)?;
@@ -214,6 +219,8 @@ impl Exl3HipDecoder {
             dgate,
             dqh,
             dou,
+            dembed,
+            vocab,
             dring,
             dgst,
             dkc,
@@ -304,6 +311,20 @@ impl Exl3HipDecoder {
         )?;
         self.hc.sync()?;
         Ok(())
+    }
+
+    /// 토큰 ID 직접 forward(임베딩 행을 디바이스에서 판독) — 단일 모델 상주용.
+    pub fn forward_tok(&mut self, tok: u32) -> Result<Vec<f32>, String> {
+        let mut rb = vec![0u8; self.hidden * 4];
+        self.hc.d2h(&mut rb, unsafe {
+            self.dembed.add(tok as usize * self.hidden * 4)
+        })?;
+        self.hc.sync()?;
+        // SAFETY: d2h 완료 후 재해석.
+        let row: &[f32] =
+            unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, self.hidden) };
+        let (lg, _) = self.forward(row)?;
+        Ok(lg)
     }
 
     /// 1토큰 forward → 로짓. ew(silu·mul)는 호스트(정확성 우선 — 추후 커널화).
@@ -625,7 +646,7 @@ impl Exl3HipDecoder {
                 tre: self.lin[&ld_key].tre,
                 svh: self.lin[&ld_key].svh,
             };
-       dew, dab) = (self.dxn, self.dqh, self.dgo, self.dew, self.dab);
+            let (dxn, dqh, dgo, dew, dab) = (self.dxn, self.dqh, self.dgo, self.dew, self.dab);
             self.gemv_chain(&lg, dxn, dqh)?;
             self.gemv_chain(&lu, dxn, dgo)?;
             let mut ewn = lg.n as i32;
@@ -710,3 +731,6 @@ impl Exl3HipDecoder {
 // 마커 final
 // 마커 ew1
 // 마커 sy1
+// 마커 sr1
+// 마커 fx649
+// 마커 dropfx

@@ -1125,16 +1125,15 @@ use crate::rawvk::checks::TrellisResident;
 pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<String, String> {
     use crate::rawhip::exl3_hip::Exl3HipDecoder;
     use crate::rawvk::checks::TrellisResident;
+    // 동결 방지(2026-10-04 사고 원칙): 한 시점에 한 모델만 상주.
+    // 1단계: hip 디코더(임베딩 포함) 단독 — greedy 4스텝.
     let mut dec = Exl3HipDecoder::load(dir, lim_layers)?;
-    let mut tr = TrellisResident::load(dir)?;
-    let _embed = tr.embed_row(tok0);
-    // greedy 4스텝(첫 로짓이 대조 기준 — 상태는 자연 갱신).
+    let t0f = std::time::Instant::now();
     let mut tok = tok0;
     let mut hip_toks = Vec::new();
     let mut first: Option<Vec<f32>> = None;
-    let t0f = std::time::Instant::now();
     for _ in 0..4 {
-        let (lg, _) = dec.forward(tr.embed_row(tok))?;
+        let lg = dec.forward_tok(tok)?;
         if first.is_none() {
             first = Some(lg.clone());
         }
@@ -1153,10 +1152,11 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
         4000.0 / fwd_ms
     );
     let got = first.unwrap_or_default();
-    let hid: Vec<f32> = Vec::new();
+    drop(dec);
+    // 2단계: vk 참조 단독 재로드.
+    let mut tr = TrellisResident::load(dir)?;
     let mut seq = crate::rawvk::checks::exl3_decode::new_seq_state(tr.n_layers, 512);
     let want = crate::rawvk::checks::exl3_decode::decode_step(&mut tr, &mut seq, tok0)?;
-    let whid = seq.last_h.clone();
     let mut vt = Vec::new();
     let mut vtok = want
         .iter()
@@ -1176,14 +1176,6 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
     }
     vt.push(vtok);
     eprintln!("  [vk-greedy] 4토큰 {vt:?}");
-    drop(tr);
-    if !hid.is_empty() {
-        let mut hmd = 0f32;
-        for i in 0..hid.len().min(whid.len()) {
-            hmd = hmd.max((hid[i] - whid[i]).abs());
-        }
-        eprintln!("  [hiddbg] hidden maxdiff={hmd:.3e}");
-    }
     eprintln!("  [hip-greedy] 4토큰 {hip_toks:?}");
     let mut md = 0f32;
     let (mut ga, mut wa) = (0usize, 0usize);
@@ -1201,8 +1193,3 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
         if ga == wa { "일치" } else { "불일치" }
     ))
 }
-// 마커 gp1
-// 마커 fm1
-// 마커 md1
-// 마커 g4
-// 마커 tg1
