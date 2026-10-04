@@ -622,6 +622,59 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
         hc.sync()?;
         ts.push(t0.elapsed().as_secs_f64() * 1e3);
     }
+    // WMMA 변형 A/B — 텐서코어 vs 스칼라.
+    {
+        let tf = 2.0 * k as f64 * n as f64 * t_rows as f64 / 1e12;
+        let (mut kt, mut nt2, mut kk2, mut tt2) = (
+            (k / 16) as i32,
+            (n / 16) as i32,
+            krate as i32,
+            t_rows as i32,
+        );
+        let (mut g0, mut g1, mut g2) = (dah, dtre, dsb);
+        let mut tw: Vec<f64> = Vec::new();
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            hc.launch3(
+                "exl3_gemm2_wmma",
+                (n / 64) as u32,
+                t_rows.div_ceil(64) as u32,
+                1,
+                256,
+                &mut [
+                    &mut g0 as *mut *mut u8 as *mut _,
+                    &mut g1 as *mut *mut u8 as *mut _,
+                    &mut g2 as *mut *mut u8 as *mut _,
+                    &mut kt as *mut i32 as *mut _,
+                    &mut nt2 as *mut i32 as *mut _,
+                    &mut kk2 as *mut i32 as *mut _,
+                    &mut tt2 as *mut i32 as *mut _,
+                ],
+            )?;
+            hc.sync()?;
+            tw.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        tw.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // 정확도: yb(스칼라 had_out 결과)가 아니라 sb 직독 — 근사 비교
+        let mut sbb = vec![0u8; t_rows * n * 4];
+        hc.d2h(&mut sbb, dsb)?;
+        hc.sync()?;
+        // SAFETY: d2h 완료 후 재해석.
+        let sfc: &[f32] =
+            unsafe { std::slice::from_raw_parts(sbb.as_ptr() as *const f32, t_rows * n) };
+        let mut wmd = 0f32;
+        for (si, &r) in samp.iter().enumerate() {
+            let _ = si;
+            for i in 0..n {
+                wmd = wmd.max((sfc[r * n + i] - want[si][i]).abs());
+            }
+        }
+        eprintln!(
+            "  [wmdbg] wmma {:.1}ms = {:.1} TF · y-vs-ref maxdiff={wmd:.3e}",
+            tw[1],
+            tf / (tw[1] / 1000.0)
+        );
+    }
     ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let tf = 2.0 * k as f64 * n as f64 * t_rows as f64 / 1e12;
     Ok(format!(
@@ -1195,3 +1248,5 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
         if ga == wa { "일치" } else { "불일치" }
     ))
 }
+// 마커 wab
+// 마커 wab2
