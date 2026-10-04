@@ -171,7 +171,6 @@ impl Exl3HipDecoder {
         let dpp = hc.alloc(4)?;
         hc.h2d(dpp, &0u32.to_le_bytes())?;
         let embed_all: Vec<f32> = tr.embed.clone();
-        let vocab = embed_all.len() / hidden;
         let dembed = hc.alloc(embed_all.len() * 4)?;
         Self::h2d_chunked(&hc, dembed, f32b(&embed_all))?;
         drop(tr);
