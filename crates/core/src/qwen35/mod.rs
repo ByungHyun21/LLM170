@@ -156,6 +156,21 @@ impl Model {
         for name in ["token_embd.weight", "output.weight", "output_norm.weight"] {
             m.w(name).ok_or(ModelError::MissingTensor(name.into()))?;
         }
+        // A7(plans/129): dequant_row 미지원 타입이 런타임 첫 역양자화에서
+        // unimplemented!로 죽던 것을 로드에서 거부(embd/output만 dequant_row 경로).
+        for name in ["token_embd.weight", "output.weight"] {
+            let t = m
+                .gguf
+                .find_tensor(name)
+                .ok_or(ModelError::MissingTensor(name.into()))?;
+            if !crate::quant::deq::dequant_supported(t.ty) {
+                return Err(ModelError::UnsupportedLayout {
+                    name: name.into(),
+                    why: "dequant_row 미지원 양자 타입",
+                }
+                .into());
+            }
+        }
         Ok(m)
     }
 
