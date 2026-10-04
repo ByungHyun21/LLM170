@@ -1,3 +1,6 @@
+//! [GDN 모듈 — vk 측정 원장 2026-10-03]
+//! scan v3(전면 LDS): 53.4→~9ms·corr 0.999998(T512 0.9545→재작성 후)
+//! conv/l2perm/gate: 정합 1.4e-4급 종단 · 역순열 scatter 방향(원장)
 use super::exl3_resident::TrellisResident;
 use super::exl3_resident::{BATCH_TMAX, BatchScratch, GdnFrame};
 

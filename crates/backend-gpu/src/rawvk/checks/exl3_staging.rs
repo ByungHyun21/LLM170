@@ -1,3 +1,5 @@
+//! [스테이징·GEMM API — vk 측정 원장 2026-10-03]
+//! gemm2 coopmat(BN128): 8.4TF · 메가융합 3호(dual입력) — T-적응 스케줄
 use super::exl3_resident::TrellisResident;
 
 impl TrellisResident {

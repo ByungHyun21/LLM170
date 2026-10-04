@@ -6,6 +6,7 @@
 mod bench;
 mod engine;
 mod exl3_engine;
+mod exl3_hip_engine;
 mod http;
 mod infer;
 mod json;
@@ -141,6 +142,9 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
                         return Err("--backend cuda: 미구현 (hip|vulkan 사용)".into());
                     }
                     // EXL3 직접 경로 (plans/121 A1) — --model은 EXL3 디렉터리.
+                    "exl3-hip" => {
+                        ma.backend = Some("exl3-hip".into());
+                    }
                     "exl3" => {
                         ma.backend = Some("exl3".into());
                         ma.gpu_runtime = None;
@@ -375,7 +379,9 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         ple_table: ma.ple_table.clone(),
         ple_cache_mib: ma.ple_cache_mib,
     };
-    let sel = if backend == "exl3" {
+    let sel = if backend == "exl3-hip" {
+        engine::BackendSel::Exl3Hip
+    } else if backend == "exl3" {
         engine::BackendSel::Exl3
     } else if backend == "gpu" {
         if gpu_runtime.is_empty() {
@@ -634,3 +640,4 @@ fn usage_err(msg: &str) -> ExitCode {
     ExitCode::from(2)
 }
 // 마커 gpx
+// 마커 ehi
