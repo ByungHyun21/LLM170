@@ -167,6 +167,7 @@ pub const NAMES: &[&str] = &[
     "q4_ple_conv",
     "q4_ple_residual",
     "q4_emb_q8g",
+    "q4_emb_q8g_f16", // A4(plans/129) 정합 테스트 포착 — value.rs f16 경로가 런치하나 미등록이었다(런타임 실패)
     "q4_ple_gather",
     "argmax_rows_s1",
     "argmax_rows_s2",
@@ -210,3 +211,71 @@ pub const NAMES: &[&str] = &[
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 // 마커 hip1
 // 마커 hip2
+
+#[cfg(test)]
+mod tests {
+    //! A4(plans/129): 커널 이중 등록 계약의 정적 테스트 — NAMES 중복 0,
+    //! NAMES↔SRC extern 정의 쌍방 정합. 무GPU(컴파일 타임 문자열 자산).
+
+    use super::{NAMES, SRC};
+
+    /// SRC에서 extern "C" __global__ 커널 정의명 추출.
+    fn extern_defs() -> Vec<&'static str> {
+        let mut out = Vec::new();
+        let mut rest = SRC;
+        while let Some(i) = rest.find("__global__ void ") {
+            rest = &rest[i + "__global__ void ".len()..];
+            // __launch_bounds__(N) 수식자 스킵(정의명이 아님).
+            if let Some(rb) = rest.strip_prefix("__launch_bounds__") {
+                rest = &rb[rb.find(')').map(|p| p + 1).unwrap_or(0)..];
+                rest = rest.trim_start();
+            }
+            // exl3_tile_word 같은 __device__ inline은 제외됨(전역 아님).
+            if let Some(name) = rest.split(['(', ' ', '\n']).next()
+                && !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                out.push(name);
+            }
+            rest = &rest[1.min(rest.len())..];
+        }
+        out
+    }
+
+    #[test]
+    fn names_no_duplicates() {
+        let mut s = NAMES.to_vec();
+        s.sort_unstable();
+        let dups: Vec<&str> = s
+            .windows(2)
+            .filter(|w| w[0] == w[1])
+            .map(|w| w[0])
+            .collect();
+        assert!(dups.is_empty(), "NAMES 중복: {dups:?}");
+    }
+
+    #[test]
+    fn names_all_defined_in_src() {
+        let defs = extern_defs();
+        for n in NAMES {
+            assert!(defs.contains(n), "NAMES에 등록됐으나 SRC에 정의 없음: {n}");
+        }
+    }
+
+    #[test]
+    fn src_defs_all_registered() {
+        let defs = extern_defs();
+        let unreg: Vec<&str> = defs
+            .iter()
+            .copied()
+            .filter(|d| !NAMES.contains(d))
+            .collect();
+        assert!(
+            unreg.is_empty(),
+            "SRC 정의 중 NAMES 미등록(AGENTS: 누락 시 삭제 대상): {unreg:?}"
+        );
+    }
+}
