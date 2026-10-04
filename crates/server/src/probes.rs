@@ -409,6 +409,12 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             arg_num(args, 1, 0usize),
         ),
         "exl3-nr-check" => llm170_backend_gpu::rawvk::checks::nr_check(),
+        "exl3-hip-mtp-round" => {
+            let dir = arg_str(args, 0, "");
+            let tok = arg_num(args, 1, 1000u32);
+            let rounds = arg_num(args, 2, 8usize);
+            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_mtp_round(&dir, tok, rounds)
+        }
         "exl3-hip-batch" => llm170_backend_gpu::rawhip::exl3_hip_probe::hip_batch_check(
             &arg_str(args, 0, ""),
             arg_num(args, 1, 1000u32),
