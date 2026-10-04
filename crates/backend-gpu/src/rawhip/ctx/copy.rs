@@ -8,6 +8,22 @@ pub static IO_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 
 impl RawCtx {
     /// 사이드 스트림 비동기 h2d — 메인 스트림 작업과 중첩시킨 뒤 join2로 합류.
+    /// 캡처 호환 h2d — hipMemcpyAsync만(내부 sync 없음). 핀 src 전용.
+    pub fn h2d_nosync(&self, dst: *mut u8, src: *const u8, bytes: usize) -> Result<(), String> {
+        unsafe {
+            ck(
+                hip::hipMemcpyAsync(
+                    dst as *mut _,
+                    src as *const _,
+                    bytes,
+                    hip::hipMemcpyKind_hipMemcpyHostToDevice,
+                    self.stream,
+                ),
+                "h2d-nosync",
+            )
+        }
+    }
+
     pub fn h2d_async_s(&self, dst: *mut u8, src: &[u8]) -> Result<(), String> {
         unsafe {
             ck(
@@ -170,6 +186,23 @@ impl RawCtx {
         }
     }
 
+    /// 캡처 호환 원시 d2h — 핀 dst로 hipMemcpyAsync만(내부 동기·스테이징 없음).
+    /// 그래프 캡처 중 사용(ctx.d2h는 내부 sync 때문에 캡처 무효화).
+    pub fn d2h_pin_async(&self, dst: *mut u8, src: *const u8, bytes: usize) -> Result<(), String> {
+        unsafe {
+            ck(
+                hip::hipMemcpyAsync(
+                    dst as *mut _,
+                    src as *const _,
+                    bytes,
+                    hip::hipMemcpyKind_hipMemcpyDeviceToHost,
+                    self.stream,
+                ),
+                "d2h-pin-async",
+            )
+        }
+    }
+
     pub fn d2h(&self, dst: &mut [u8], src: *const u8) -> Result<(), String> {
         if self.capturing.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("d2h: 그래프 캡처 중".into());
@@ -255,3 +288,5 @@ impl RawCtx {
         unsafe { ck(hip::hipEventSynchronize(ev), "evSync") }
     }
 }
+// 마커 rpd
+// 마커 hns
