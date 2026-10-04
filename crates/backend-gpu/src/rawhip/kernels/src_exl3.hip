@@ -1047,3 +1047,104 @@ extern "C" __global__ void exl3_gemm2_wmma(
 // 마커 wm3
 // 마커 wmfix
 // 마커 wmf2
+
+// ── exl3_gemm2_kseg — 소형-T 점유 레버(plans/121): k-타일을 grid.y 세그먼트로 분할,
+// 부분합을 had_out의 nseg 레이아웃 [T][kseg][n]에 기록 — had_out(nseg=kseg)이 합산.
+extern "C" __global__ void exl3_gemm2_kseg(
+    const unsigned* __restrict__ ah16,
+    const unsigned* __restrict__ tre,
+    float* __restrict__ s,          // [T][kseg][n] 부분합
+    int ktiles, int ntiles, int K, int T, int kseg)
+{
+    __shared__ unsigned tre_s[8 * 48];
+    __shared__ __half2 buf_a[64 * 20];
+    __shared__ __half2 buf_b[128 * 20];
+    constexpr int STRIDE = 20;
+    int wg_n = blockIdx.x;
+    int seg = blockIdx.y;
+    int tid = threadIdx.x;
+    int n = ntiles * 16;
+    int row0 = wg_n * 64;
+    int t0 = 0;
+    int nrow = min(64, n - row0);
+    int nt = min(128, T - t0);
+    int words32 = 8 * K;
+    int arow_words = ktiles * 8;
+    int n_loc = tid & 63;
+    int t_half = tid >> 6;
+    int kbp = (ktiles >> 1);
+    int kb_s = (int)((long)kbp * seg / kseg);
+    int kb_e = (int)((long)kbp * (seg + 1) / kseg);
+    float acc[64];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) acc[i] = 0.0f;
+
+    for (int kb = kb_s; kb < kb_e; kb++) {
+        {
+            int stg_words = 8 * words32;
+            for (int w = tid; w < stg_words; w += 128) {
+                int tidx = w / words32;
+                int wq = w % words32;
+                int ktl = tidx >> 2;
+                int ntl = tidx & 3;
+                tre_s[w] = tre[((long)(kb * 2 + ktl) * ntiles + (wg_n * 4 + ntl)) * words32 + wq];
+            }
+            __syncthreads();
+        }
+        {
+            int e0 = tid * 16;
+            int nl = e0 / 32;
+            int k0 = e0 % 32;
+            int c = nl & 15;
+            int nt_hi = nl >> 4;
+            #pragma unroll
+            for (int q = 0; q < 8; q++) {
+                int kA = k0 + 2 * q;
+                int kB = kA + 1;
+                float va = 0.0f, vb = 0.0f;
+                if (nl < nrow) {
+                    va = exl3_mul1_decode(exl3_tile_word(tre_s, words32, K, (kA >> 4) * 4 + nt_hi, kA & 15, c));
+                    vb = exl3_mul1_decode(exl3_tile_word(tre_s, words32, K, (kB >> 4) * 4 + nt_hi, kB & 15, c));
+                }
+                buf_a[nl * STRIDE + k0 / 2 + q] = __floats2half2_rn(va, vb);
+            }
+        }
+        {
+            int e0 = tid * 16;
+            int tl = e0 / 32;
+            int k0 = e0 % 32;
+            #pragma unroll
+            for (int q = 0; q < 8; q++) {
+                unsigned w = 0u;
+                if (tl < nt)
+                    w = ah16[(long)(t0 + tl) * arow_words + (kb * 32 + k0) / 2 + q];
+                buf_b[tl * STRIDE + (k0 >> 1) + q] = *reinterpret_cast<__half2*>(&w);
+            }
+            __syncthreads();
+        }
+        {
+            __half2 ar2[16];
+            #pragma unroll
+            for (int q = 0; q < 16; q++) ar2[q] = buf_a[n_loc * STRIDE + q];
+            for (int t = 0; t < 64; t++) {
+                int tt = t_half * 64 + t;
+                if (tt >= nt) break;
+                float sum = acc[t];
+                #pragma unroll
+                for (int q = 0; q < 16; q++) {
+                    float2 bv = __half22float2(buf_b[tt * STRIDE + q]);
+                    float2 av = __half22float2(ar2[q]);
+                    sum += av.x * bv.x + av.y * bv.y;
+                }
+                acc[t] = sum;
+            }
+        }
+        __syncthreads();
+    }
+    for (int t = 0; t < 64; t++) {
+        int tt = t_half * 64 + t;
+        if (tt >= nt) break;
+        if (n_loc < nrow)
+            s[((long)(t0 + tt) * kseg + seg) * n + row0 + n_loc] = acc[t];
+    }
+}

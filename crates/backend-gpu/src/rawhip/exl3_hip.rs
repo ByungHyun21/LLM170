@@ -73,6 +73,7 @@ pub struct Exl3HipDecoder {
     dah16: *mut u8,
     dsb2: *mut u8,
     dsb3: *mut u8,
+    dbat: *mut u8,
     dmtpk: *mut u8,
     dmtpv: *mut u8,
     dmtpp: *mut u8,
@@ -240,6 +241,7 @@ impl Exl3HipDecoder {
         let dsb2 = hc.alloc(64 * 17408 * 4)?; // 층 선형 n 상한(lm_head는 dsb)
         let dsb3 = hc.alloc(64 * 17408 * 4)?;
         // MTP 자체 KV(메인 16개 어텐션층과 분리 — prep의 layer 인덱스 0으로 사용)
+        let dbat = hc.alloc(8 * 8 * 17408 * 4)?; // kseg 부분합 [T≤8][kseg≤8][n≤17408]
         let dmtpk = hc.alloc(1024 * 1024 * 4)?;
         let dmtpv = hc.alloc(1024 * 1024 * 4)?;
         let dmtpp = hc.alloc(4)?;
@@ -324,6 +326,7 @@ impl Exl3HipDecoder {
             dah16,
             dsb2,
             dsb3,
+            dbat,
             dmtpk,
             dmtpv,
             dmtpp,
@@ -659,7 +662,6 @@ impl Exl3HipDecoder {
         // fc → cur(dbab)
         self.had16_batch(self.dbx, fc.k, 1, fc.suh)?;
         self.gemm2_batch(&fc, 1, self.dbab)?;
-        self.hadout_batch(self.dbab, fc.svh, fc.n, 1)?;
         if self.dbg_layers {
             let d8 = self.dump8_dev(self.dbab);
             eprintln!("  [gfc] cur={d8:?}");
@@ -669,13 +671,10 @@ impl Exl3HipDecoder {
         // q/k/v
         self.had16_batch(self.dbxn, lq.k, 1, lq.suh)?;
         self.gemm2_batch(&lq, 1, self.dsb)?;
-        self.hadout_batch(self.dsb, lq.svh, lq.n, 1)?;
         self.had16_batch(self.dbxn, lk.k, 1, lk.suh)?;
         self.gemm2_batch(&lk, 1, self.dsb2)?;
-        self.hadout_batch(self.dsb2, lk.svh, lk.n, 1)?;
         self.had16_batch(self.dbxn, lv.k, 1, lv.suh)?;
         self.gemm2_batch(&lv, 1, self.dsb3)?;
-        self.hadout_batch(self.dsb3, lv.svh, lv.n, 1)?;
         // prep+fwd3s(자체 KV, layer=0, pp=dmtpp)
         self.hc.h2d(self.dmtpp, &pos.to_le_bytes())?;
         {
@@ -748,15 +747,12 @@ impl Exl3HipDecoder {
         // norm_ptr(x=dbab(cur), ab=o_buf, nw=post_ln) → cur+=o in dbab, dbxn=norm ✓
         self.had16_batch(self.dou, lo.k, 1, lo.suh)?;
         self.gemm2_batch(&lo, 1, self.dsb3)?;
-        self.hadout_batch(self.dsb3, lo.svh, lo.n, 1)?;
         self.norm_ptr(self.dbab, nrow(3), self.dsb3, self.dbxn, 1)?;
         // FFN
         self.had16_batch(self.dbxn, lg.k, 1, lg.suh)?;
         self.gemm2_batch(&lg, 1, self.dsb)?;
-        self.hadout_batch(self.dsb, lg.svh, lg.n, 1)?;
         self.had16_batch(self.dbxn, lu.k, 1, lu.suh)?;
         self.gemm2_batch(&lu, 1, self.dsb2)?;
-        self.hadout_batch(self.dsb2, lu.svh, lu.n, 1)?;
         let mut ewn = lg.n as i32;
         let (mut w0, mut w1, mut w2) = (self.dsb, self.dsb2, self.dew);
         self.hc.launch3(
@@ -774,7 +770,6 @@ impl Exl3HipDecoder {
         )?;
         self.had16_batch(self.dew, ld.k, 1, ld.suh)?;
         self.gemm2_batch(&ld, 1, self.dsb3)?;
-        self.hadout_batch(self.dsb3, ld.svh, ld.n, 1)?;
         if self.dbg_layers {
             let d8 = self.dump8_dev(self.dbab);
             eprintln!("  [gff] cur2={d8:?}");
@@ -784,7 +779,6 @@ impl Exl3HipDecoder {
         // lm_head → argmax
         self.had16_batch(self.dbxn, llh.k, 1, llh.suh)?;
         self.gemm2_batch(&llh, 1, self.dsb)?;
-        self.hadout_batch(self.dsb, llh.svh, llh.n, 1)?;
         let mut an = llh.n as i32;
         let (mut a0, mut a1) = (self.dsb, self.dargmax);
         self.hc.launch3(
@@ -895,11 +889,8 @@ impl Exl3HipDecoder {
                 let lv = self.lin[&format!("{lp}.self_attn.v_proj")].clone_shallow();
                 let lo = self.lin[&format!("{lp}.self_attn.o_proj")].clone_shallow();
                 self.gemm2_batch(&lq, t, self.dsb)?;
-                self.hadout_batch(self.dsb, lq.svh, lq.n, t)?;
                 self.gemm2_batch(&lk, t, self.dsb2)?;
-                self.hadout_batch(self.dsb2, lk.svh, lk.n, t)?;
                 self.gemm2_batch(&lv, t, self.dsb3)?;
-                self.hadout_batch(self.dsb3, lv.svh, lv.n, t)?;
                 let mut ai = (il / 4) as i32;
                 for r in 0..t {
                     // prep은 KV 기록 인덱스를 pp[0](디바이스)에서 판독 — 행마다 갱신 필수.
@@ -975,17 +966,14 @@ impl Exl3HipDecoder {
                 // o_proj gemm2 — 입력 dou [T][6144]
                 self.had16_batch(self.dou, 6144, t, lo.suh)?;
                 self.gemm2_batch(&lo, t, self.dbab)?;
-                self.hadout_batch(self.dbab, lo.svh, lo.n, t)?;
             } else {
                 let lq = self.lin[&format!("{lp}.linear_attn.in_proj_qkv")].clone_shallow();
                 let lz = self.lin[&format!("{lp}.linear_attn.in_proj_z")].clone_shallow();
                 let lo = self.lin[&format!("{lp}.linear_attn.out_proj")].clone_shallow();
                 self.had16_batch(self.dbxn, lq.k, t, lq.suh)?;
                 self.gemm2_batch(&lq, t, self.dsb)?;
-                self.hadout_batch(self.dsb, lq.svh, lq.n, t)?;
                 self.had16_batch(self.dbxn, lz.k, t, lz.suh)?;
                 self.gemm2_batch(&lz, t, self.dsb2)?;
-                self.hadout_batch(self.dsb2, lz.svh, lz.n, t)?;
 
                 let mut tl = t as i32;
                 let mut lay = gdn_il as i32;
@@ -1089,7 +1077,6 @@ impl Exl3HipDecoder {
 
                 self.had16_batch(self.dgate, lo.k, t, lo.suh)?;
                 self.gemm2_batch(&lo, t, self.dbab)?;
-                self.hadout_batch(self.dbab, lo.svh, lo.n, t)?;
             }
             self.norm_p(2 * il + 1, self.dbab, t)?;
             let lg = self.lin[&format!("{lp}.mlp.gate_proj")].clone_shallow();
@@ -1097,10 +1084,8 @@ impl Exl3HipDecoder {
             let ld = self.lin[&format!("{lp}.mlp.down_proj")].clone_shallow();
             self.had16_batch(self.dbxn, lg.k, t, lg.suh)?;
             self.gemm2_batch(&lg, t, self.dsb)?;
-            self.hadout_batch(self.dsb, lg.svh, lg.n, t)?;
             self.had16_batch(self.dbxn, lu.k, t, lu.suh)?;
             self.gemm2_batch(&lu, t, self.dsb2)?;
-            self.hadout_batch(self.dsb2, lu.svh, lu.n, t)?;
             let mut ewn = (t * lg.n) as i32;
             let (mut w0, mut w1, mut w2) = (self.dsb, self.dsb2, self.dew);
             self.hc.launch3(
@@ -1118,7 +1103,6 @@ impl Exl3HipDecoder {
             )?;
             self.had16_batch(self.dew, ld.k, t, ld.suh)?;
             self.gemm2_batch(&ld, t, self.dbab)?;
-            self.hadout_batch(self.dbab, ld.svh, ld.n, t)?;
             ab = self.dbab;
         }
         // 최종 노름 + lm_head 행별 로짓
@@ -1135,7 +1119,6 @@ impl Exl3HipDecoder {
         let llh = self.lin["lm_head"].clone_shallow();
         self.had16_batch(self.dbxn, llh.k, t, llh.suh)?;
         self.gemm2_batch(&llh, t, self.dsb)?;
-        self.hadout_batch(self.dsb, llh.svh, llh.n, t)?;
         self.pos += t as u32;
         self.hc.h2d(self.dpp, &self.pos.to_le_bytes())?;
         let mut out = Vec::with_capacity(t);
@@ -1203,17 +1186,13 @@ impl Exl3HipDecoder {
             // fc → attn_norm → q/k/v → prep(KV 적립만)
             self.had16_batch(self.dbx, fc.k, 1, fc.suh)?;
             self.gemm2_batch(&fc, 1, self.dbab)?;
-            self.hadout_batch(self.dbab, fc.svh, fc.n, 1)?;
             self.norm_ptr(self.dbab, nrow(2), self.dbzero, self.dbxn, 1)?;
             self.had16_batch(self.dbxn, lq.k, 1, lq.suh)?;
             self.gemm2_batch(&lq, 1, self.dsb)?;
-            self.hadout_batch(self.dsb, lq.svh, lq.n, 1)?;
             self.had16_batch(self.dbxn, lk.k, 1, lk.suh)?;
             self.gemm2_batch(&lk, 1, self.dsb2)?;
-            self.hadout_batch(self.dsb2, lk.svh, lk.n, 1)?;
             self.had16_batch(self.dbxn, lv.k, 1, lv.suh)?;
             self.gemm2_batch(&lv, 1, self.dsb3)?;
-            self.hadout_batch(self.dsb3, lv.svh, lv.n, 1)?;
             self.hc.h2d(self.dmtpp, &pos.to_le_bytes())?;
             let mut tl2 = 1i32;
             let mut p0v = pos as i32;
@@ -1303,6 +1282,86 @@ impl Exl3HipDecoder {
         Ok(())
     }
 
+    /// 배치 GEMM — 소형-T(≤8)·층선형(n≤17408)은 k-분할(kseg=8)로 점유 확보,
+    /// 부분합 dbat [T][8][n] → had_out(nseg=8) 합산. 대형은 기존 단일 경로.
+    fn gemm2_batch(&mut self, l: &HipLin, t_len: usize, out: *mut u8) -> Result<(), String> {
+        if t_len <= 8 && l.n <= 17408 {
+            let (mut kt, mut nt, mut kk, mut tt, mut ks) = (
+                (l.k / 16) as i32,
+                (l.n / 16) as i32,
+                l.krate as i32,
+                t_len as i32,
+                8i32,
+            );
+            let (mut g0, mut g1, mut g2) = (self.dah16, l.tre, self.dbat);
+            self.hc.launch3(
+                "exl3_gemm2_kseg",
+                (l.n / 64) as u32,
+                8,
+                1,
+                128,
+                &mut [
+                    &mut g0 as *mut *mut u8 as *mut _,
+                    &mut g1 as *mut *mut u8 as *mut _,
+                    &mut g2 as *mut *mut u8 as *mut _,
+                    &mut kt as *mut i32 as *mut _,
+                    &mut nt as *mut i32 as *mut _,
+                    &mut kk as *mut i32 as *mut _,
+                    &mut tt as *mut i32 as *mut _,
+                    &mut ks as *mut i32 as *mut _,
+                ],
+            )?;
+            // had_out nseg=8 합산 → out
+            let (mut nch, mut nsg, mut nst) = ((l.n / 128) as i32, 8i32, l.n as i32);
+            let (mut c0, mut c1, mut c2) = (self.dbat, l.svh, out);
+            self.hc.launch3(
+                "exl3_had_out",
+                (l.n / 128) as u32,
+                t_len as u32,
+                1,
+                128,
+                &mut [
+                    &mut c0 as *mut *mut u8 as *mut _,
+                    &mut c1 as *mut *mut u8 as *mut _,
+                    &mut c2 as *mut *mut u8 as *mut _,
+                    &mut nch as *mut i32 as *mut _,
+                    &mut nsg as *mut i32 as *mut _,
+                    &mut nst as *mut i32 as *mut _,
+                ],
+            )?;
+            return Ok(());
+        }
+        self.gemm2_batch_plain(l, t_len, out)
+    }
+
+    /// 기존 단일 gemm2(대형-T·lm_head).
+    fn gemm2_batch_plain(&mut self, l: &HipLin, t_len: usize, out: *mut u8) -> Result<(), String> {
+        let (mut kt, mut nt, mut kk, mut tt) = (
+            (l.k / 16) as i32,
+            (l.n / 16) as i32,
+            l.krate as i32,
+            t_len as i32,
+        );
+        let (mut g0, mut g1, mut g2) = (self.dah16, l.tre, out);
+        self.hc.launch3(
+            "exl3_gemm2",
+            (l.n / 64) as u32,
+            t_len.div_ceil(128) as u32,
+            1,
+            128,
+            &mut [
+                &mut g0 as *mut *mut u8 as *mut _,
+                &mut g1 as *mut *mut u8 as *mut _,
+                &mut g2 as *mut *mut u8 as *mut _,
+                &mut kt as *mut i32 as *mut _,
+                &mut nt as *mut i32 as *mut _,
+                &mut kk as *mut i32 as *mut _,
+                &mut tt as *mut i32 as *mut _,
+            ],
+        )?;
+        self.hadout_batch(out, l.svh, l.n, t_len)
+    }
+
     /// gemm2 출력 후처리 — H⁻¹⊙svh(nseg=1 제자리, 청크별 sm 스테이징이라 안전).
     fn hadout_batch(
         &mut self,
@@ -1332,33 +1391,6 @@ impl Exl3HipDecoder {
     }
 
     /// 배치 GEMM(dah16 → out [T][n]) — gemm2 커널.
-    fn gemm2_batch(&mut self, l: &HipLin, t_len: usize, out: *mut u8) -> Result<(), String> {
-        let (mut kt, mut nt, mut kk, mut tt) = (
-            (l.k / 16) as i32,
-            (l.n / 16) as i32,
-            l.krate as i32,
-            t_len as i32,
-        );
-        let (mut g0, mut g1, mut g2) = (self.dah16, l.tre, out);
-        self.hc.launch3(
-            "exl3_gemm2",
-            (l.n / 64) as u32,
-            t_len.div_ceil(128) as u32,
-            1,
-            128,
-            &mut [
-                &mut g0 as *mut *mut u8 as *mut _,
-                &mut g1 as *mut *mut u8 as *mut _,
-                &mut g2 as *mut *mut u8 as *mut _,
-                &mut kt as *mut i32 as *mut _,
-                &mut nt as *mut i32 as *mut _,
-                &mut kk as *mut i32 as *mut _,
-                &mut tt as *mut i32 as *mut _,
-            ],
-        )?;
-        Ok(())
-    }
-
     /// 1토큰 forward → 로짓. ew(silu·mul)는 호스트(정확성 우선 — 추후 커널화).
     pub fn forward(&mut self, embed_row: &[f32]) -> Result<(Vec<f32>, Vec<f32>), String> {
         let n_layers = self.loaded_layers.min(self.n_layers);
@@ -1789,3 +1821,5 @@ impl Exl3HipDecoder {
 // 마커 npz
 // 마커 kvh
 // 마커 lhf
+// 마커 ks2
+// 마커 ho3
