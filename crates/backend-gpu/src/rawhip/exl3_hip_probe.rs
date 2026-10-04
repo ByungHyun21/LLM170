@@ -1856,6 +1856,29 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
     drop(dseq);
     // 배치 디코더로 같은 스트림 T=1씩(문맥 동일)
     let mut dbat = Exl3HipDecoder::load(dir, 64)?;
+    // 클린 배치 a1 — 오염 없는 배치 루프 자체 수용률(기존 0.25-0.44는 순차 루프
+    // 상태 오염 후 측정이라 무효 가능성).
+    {
+        let (mut hit_b, mut tot_b, mut cur_b) = (0usize, 0usize, tok);
+        for _ in 0..steps {
+            let row = dbat.embed_row_host(cur_b);
+            let pos_b = dbat.pos;
+            let (lgb, hb2) = dbat.forward_batch_with_mtp(&[row], &[cur_b])?;
+            let nxt_b = lgb[0]
+                .iter()
+                .enumerate()
+                .max_by(|x, y| x.1.partial_cmp(y.1).unwrap())
+                .map(|(k, _)| k as u32)
+                .unwrap_or(0);
+            let d_b = dbat.mtp_draft_gpu(cur_b, &hb2, pos_b)?;
+            tot_b += 1;
+            if d_b == nxt_b {
+                hit_b += 1;
+            }
+            cur_b = nxt_b;
+        }
+        eprintln!("  [a1bat] 클린 배치경로 a1 = {hit_b}/{tot_b}");
+    }
     let mut mds = Vec::new();
     for i in 0..steps {
         let row = dbat.embed_row_host(toks[i]);
@@ -1866,7 +1889,28 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         mds.push(md);
-        if i < 4 {
+        if i == 0 {
+            // 희소 원소 국소화: 임계 초과 개수·상위 위반 위치의 모듈로 패턴(128=hadout 청크,
+            // 64/16=gemm 타일 경계, 무주기=산술 경계).
+            let diffs: Vec<(usize, f32)> = hb
+                .iter()
+                .zip(&hs[i])
+                .enumerate()
+                .map(|(j, (a, b))| (j, (a - b).abs()))
+                .collect();
+            let big: Vec<usize> = diffs
+                .iter()
+                .filter(|(_, d)| *d > 1.0)
+                .map(|(j, _)| *j)
+                .collect();
+            eprintln!(
+                "  [hhg] >1.0 오염 {}/5120개 · 상위 12: {:?}",
+                big.len(),
+                &big[..big.len().min(12)]
+            );
+            let m128 = big.iter().filter(|j| *j % 128 == 127).count();
+            let m64 = big.iter().filter(|j| *j % 64 == 63).count();
+            eprintln!("  [hhg] mod128==127: {m128}개 · mod64==63: {m64}개");
             let rms = hs[i].iter().map(|v| v * v).sum::<f32>().sqrt();
             eprintln!("  [hcmp] 스텝{i} maxdiff={md:.3e} rms={rms:.1}");
         }
@@ -1885,3 +1929,5 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
     ))
 }
 // 마커 hcp
+// 마커 hhg
+// 마커 cba
