@@ -6,6 +6,7 @@ mod exl3;
 pub(crate) mod exl3_attn;
 mod exl3_bench;
 pub(crate) mod exl3_decode;
+pub(crate) mod exl3_frame;
 pub(crate) mod exl3_gdn;
 pub(crate) mod exl3_probes;
 mod exl3_resident;
