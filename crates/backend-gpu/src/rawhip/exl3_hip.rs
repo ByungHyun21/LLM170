@@ -957,6 +957,28 @@ impl Exl3HipDecoder {
             let lp = format!("model.language_model.layers.{il}");
             let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
             self.norm_p(2 * il, ab, t)?;
+            // [C 계기 2026-10-04] hstage — 순차 경로의 [hipl] L{il} xn 덤프와
+            // 배치 경로의 값을 직접 대조해 첫 발산 층 경계를 확정한다.
+            if llm170_diag::dump::opts().key("hstage") && il <= 1 {
+                let mut xnb = vec![0u8; self.hidden * 4];
+                let _ = self.hc.d2h(&mut xnb, self.dbxn);
+                let _ = self.hc.sync();
+                // SAFETY: d2h 완료 후 재해석 — 행0(5120원소).
+                let xnf: &[f32] =
+                    unsafe { std::slice::from_raw_parts(xnb.as_ptr() as *const f32, self.hidden) };
+                let r = (xnf.iter().map(|v| v * v).sum::<f32>() / self.hidden as f32).sqrt();
+                let mut xb2 = vec![0u8; self.hidden * 4];
+                let _ = self.hc.d2h(&mut xb2, self.dbx);
+                let _ = self.hc.sync();
+                // SAFETY: d2h 완료 후 재해석 — 행0 잔차.
+                let xf2: &[f32] =
+                    unsafe { std::slice::from_raw_parts(xb2.as_ptr() as *const f32, self.hidden) };
+                let r2 = (xf2.iter().map(|v| v * v).sum::<f32>() / self.hidden as f32).sqrt();
+                eprintln!(
+                    "  [hstb] L{il} 진입 x rms={r2:.5} x0={:.6} · xn rms={r:.5} xn0={:.6}",
+                    xf2[0], xnf[0]
+                );
+            }
             if il % 4 == 3 {
                 // 어텐션층 — q/k/v gemm2 후 행별 prep+fwd3s
                 let lq = self.lin[&format!("{lp}.self_attn.q_proj")].clone_shallow();
@@ -1185,7 +1207,7 @@ impl Exl3HipDecoder {
             self.had16_batch(self.dew, ld.k, t, ld.suh)?;
             self.gemm2_batch(&ld, t, self.dbab)?;
             ab = self.dbab;
-            if self.dbg_hcurve && [1usize, 8, 32, 63].contains(&il) {
+            if self.dbg_hcurve && [0usize, 1, 8, 32, 63].contains(&il) {
                 let mut cb = vec![0u8; self.hidden * 4];
                 let _ = self.hc.d2h(&mut cb, self.dbx);
                 let _ = self.hc.sync();
@@ -1905,7 +1927,7 @@ impl Exl3HipDecoder {
             )?;
             self.gemv_chain(&ld, dew, dab)?;
             ab = dab;
-            if self.dbg_hcurve && [1usize, 8, 32, 63].contains(&il) {
+            if self.dbg_hcurve && [0usize, 1, 8, 32, 63].contains(&il) {
                 let mut cb = vec![0u8; self.hidden * 4];
                 let _ = self.hc.d2h(&mut cb, self.dx);
                 let _ = self.hc.sync();

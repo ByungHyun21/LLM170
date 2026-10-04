@@ -1898,13 +1898,12 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
                     dbat.hcurve.len()
                 );
             }
-            // 순차는 steps×4개(스텝당 4) — 최근 스텝의 마지막 4개와 배치 4개를 비교.
+            // [수리 2026-10-04, plans/127 C] 종전 hcv는 seq "마지막" 4개(스텝 6의
+            // 토큰) vs 배치 첫 스텝(토큰 1000)을 비교 — 서로 다른 토큰의 h 곡선
+            // 비교로 "L1 시드 3.42e0" 전체가 아티팩트였다. 배치 스텝1 ↔ 순차
+            // 스텝1(같은 토큰) 비교로 수정.
             let n4 = dbat.hcurve.len();
-            let seq4 = if seq_curve.len() >= n4 {
-                &seq_curve[seq_curve.len() - n4..]
-            } else {
-                &seq_curve[..]
-            };
+            let seq4 = &seq_curve[..n4.min(seq_curve.len())];
             if tot_b == 1 && !seq4.is_empty() && n4 == seq4.len() {
                 for (k, (l, hs_cv)) in seq4.iter().enumerate() {
                     let (lb, hb_cv) = &dbat.hcurve[k];
@@ -1943,10 +1942,16 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
         }
         eprintln!("  [a1bat] 클린 배치경로 a1 = {hit_b}/{tot_b}");
     }
+    // [수리 2026-10-04, plans/127 C] 종전 h-pail은 a1bat 루프가 자체 greedy로
+    // 진행한 상태(링/KV/pos)가 남은 dbat를 그대로 재사용 — 순차 toks 스트림과
+    // 위치가 어긋나 1.07e2 "계통 오차"의 상당분이 상태 비정렬 아티팩트였다.
+    // 신규 디코더로 순차와 동일 토큰·동일 위치 진행으로 교체.
+    drop(dbat);
+    let mut dbat2 = Exl3HipDecoder::load(dir, 64)?;
     let mut mds = Vec::new();
     for i in 0..steps {
-        let row = dbat.embed_row_host(toks[i]);
-        let (_lg, hb) = dbat.forward_batch(&[row])?;
+        let row = dbat2.embed_row_host(toks[i]);
+        let (_lg, hb) = dbat2.forward_batch(&[row])?;
         let md = hb
             .iter()
             .zip(&hs[i])
