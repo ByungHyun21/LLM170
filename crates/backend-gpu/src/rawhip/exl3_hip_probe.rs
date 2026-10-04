@@ -654,6 +654,27 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
             hc.sync()?;
             tw.push(t0.elapsed().as_secs_f64() * 1e3);
         }
+        // H⁻¹⊙svh 후처리 — want가 최종 도메인이므로 비교 전 적용(제자리).
+        {
+            let (mut c0, mut c1, mut c2) = (dsb, dsvh, dsb);
+            let (mut nch, mut nsg, mut nst) = ((n / 128) as i32, 1i32, n as i32);
+            hc.launch3(
+                "exl3_had_out",
+                (n / 128) as u32,
+                t_rows as u32,
+                1,
+                128,
+                &mut [
+                    &mut c0 as *mut *mut u8 as *mut _,
+                    &mut c1 as *mut *mut u8 as *mut _,
+                    &mut c2 as *mut *mut u8 as *mut _,
+                    &mut nch as *mut i32 as *mut _,
+                    &mut nsg as *mut i32 as *mut _,
+                    &mut nst as *mut i32 as *mut _,
+                ],
+            )?;
+            hc.sync()?;
+        }
         tw.sort_by(|a, b| a.partial_cmp(b).unwrap());
         // 정확도: yb(스칼라 had_out 결과)가 아니라 sb 직독 — 근사 비교
         let mut sbb = vec![0u8; t_rows * n * 4];
@@ -1586,3 +1607,4 @@ pub fn hip_tbench(dir: &str, tok: u32, t_max: usize) -> Result<String, String> {
 }
 // 마커 tsb
 // 마커 tsb2
+// 마커 abh
