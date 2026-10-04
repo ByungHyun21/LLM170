@@ -6,7 +6,8 @@ use crate::rawhip::ctx::RawCtx as HipCtx;
 // vk 가중치를 그대로 투입해 hipRTC 컴파일 exl3_had_in→gemv→had_out 체인을
 // 실행, vk 트레이리던트 참조(tr.linear)와 대조 — 8060S hipRTC로 검증.
 pub fn hip_gemv_check(dir: &str) -> Result<String, String> {
-    let mut tr = TrellisResident::load(dir)?;
+    // 부분 적재: lm_head 1개 선형만 (풀모델 상주 금지).
+    let mut tr = TrellisResident::load_keep(dir, &|n: &str| n == "lm_head")?;
     let key = "lm_head";
     let (k, n, krate, suh, tre, svh) = tr.linear_raw(key)?;
     let x: Vec<f32> = {
@@ -184,7 +185,8 @@ pub fn hip_gemv_check(dir: &str) -> Result<String, String> {
 pub fn hip_nr_check(dir: &str) -> Result<String, String> {
     use crate::rawvk::checks::TrellisResident;
     let t_rows = 4usize;
-    let mut tr = TrellisResident::load(dir)?;
+    // 부분 적재: 노름만 필요 — 선형 전용 스킵 (풀모델 상주 금지).
+    let mut tr = TrellisResident::load_keep(dir, &|_| false)?;
     tr.fframe_init()?;
     let nw = tr.nw128_dump()?;
     drop(tr);
@@ -257,7 +259,8 @@ pub fn hip_nr_check(dir: &str) -> Result<String, String> {
 // ── EXL3 hip 실선형 체인 프로브(모듈 3/4) ── 실제 가중치로 had_in→gemv→had_out.
 pub fn hip_linear_check(dir: &str, key: &str) -> Result<String, String> {
     use crate::rawvk::checks::TrellisResident;
-    let mut tr = TrellisResident::load(dir)?;
+    // 부분 적재: 대상 선형 1개만 (풀모델 상주 금지).
+    let mut tr = TrellisResident::load_keep(dir, &|n: &str| n == key)?;
     let (k, n, krate, suh, tre, svh) = tr.linear_raw(key)?;
     let x: Vec<f32> = {
         let mut seed: u32 = 0x77AA_0011;
@@ -356,7 +359,8 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
     use crate::rawvk::checks::TrellisResident;
     let key = "model.language_model.layers.0.mlp.gate_proj";
     let t_rows = t_arg;
-    let mut tr = TrellisResident::load(dir)?;
+    // 부분 적재: L0 gate_proj 1개 선형만 (풀모델 상주 금지).
+    let mut tr = TrellisResident::load_keep(dir, &|n: &str| n == key)?;
     let (k, n, krate, suh, tre, svh) = tr.linear_raw(key)?;
     let x: Vec<f32> = {
         let mut seed: u32 = 0x33CC_0F0F;
@@ -731,7 +735,8 @@ pub fn hip_gdn_check(dir: &str, layer_arg: usize) -> Result<String, String> {
     use crate::rawvk::checks::TrellisResident;
     let t_rows = 32usize;
     let n_gdn = 48usize;
-    let mut tr = TrellisResident::load(dir)?;
+    // 부분 적재: GDN 상수(노름)만 필요 — 선형 전용 스킵 (풀모델 상주 금지).
+    let mut tr = TrellisResident::load_keep(dir, &|_| false)?;
     // 디코드 완전 미러: 전 깊이 업로드 + lay 인덱싱(슬라이스 검증은 선행 완료).
     let (cw, ab, alog, dtb, nw) = tr.gdn_chain_consts()?;
     let cw_m = cw[layer_arg * 10240 * 4..(layer_arg + 1) * 10240 * 4].to_vec();
@@ -991,7 +996,8 @@ pub fn hip_attn_check(dir: &str) -> Result<String, String> {
     let t_rows = 8usize;
     let pos0 = 0usize;
     let layer = 0usize;
-    let mut tr = TrellisResident::load(dir)?;
+    // 부분 적재: q/k 노름만 필요 — 선형 전용 스킵 (풀모델 상주 금지).
+    let mut tr = TrellisResident::load_keep(dir, &|_| false)?;
     let (qnw, knw) = tr.attn_norms_dump()?;
     drop(tr);
     let mut seed: u32 = 0xA77E_2024;

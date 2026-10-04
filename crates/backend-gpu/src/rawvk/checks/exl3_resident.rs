@@ -41,6 +41,15 @@ pub struct TrellisResident {
     pub vocab: usize,
     pub hidden: usize,
     pub n_layers: usize,
+    /// 모델 전체 선형 max(k, n) — 부분 적재(load_keep) 시에도 배치·로드 레벨
+    /// 스크래치가 풀 적재와 동일 크기를 갖게 한다. 2026-10-04: 필터로 max_n이
+    /// 17408로 줄면 248320급 기록이 35MB 버퍼를 넘어 힙 헤더를 깨는 크래시
+    /// (free(): invalid pointer) 재발 방지 — 풀 적재가 가리던 잠재 OOB.
+    pub max_k_g: usize,
+    pub max_n_g: usize,
+    /// 스킵분 포함 전 선형 메타 (base, k, n, krate) — shape는 엔트리 헤더에서
+    /// 무료(텐서 바이트 불요). gemmd krate 스윕 등 메타 전용 감사가 소비.
+    pub all_meta: Vec<(String, usize, usize, u32)>,
     pub ctx: VkCtx,
     pub(crate) p1: Pipes,
     pub(crate) p2: Pipes,
@@ -65,6 +74,15 @@ pub struct TrellisResident {
 impl TrellisResident {
     /// EXL3 디렉터리에서 전 선형을 vk에 업로드.
     pub fn load(dir: &str) -> Result<Self, String> {
+        Self::load_keep(dir, &|_| true)
+    }
+
+    /// 부분 적재 — keep(base)가 true인 .trellis 선형만 vk에 업로드한다.
+    /// 노름·GDN 상수는 수 MB라 전부 유지(n_layers 추론·gdn_chain_consts·
+    /// attn_norms_dump 호환). 임베딩은 keep가 요청할 때만 적재.
+    /// 모듈 격리 검증 기반(2026-10-04): 풀모델(≈13GB) 상주 없이 프로브를
+    /// 필요 텐서만으로 구동 — 엔드투엔드 경로는 load(|_| true) 그대로.
+    pub fn load_keep(dir: &str, keep: &dyn Fn(&str) -> bool) -> Result<Self, String> {
         let ar =
             llm170_exl3::StArchive::open(std::path::Path::new(dir)).map_err(|e| e.to_string())?;
         let mut ctx = VkCtx::new()?;
@@ -79,6 +97,7 @@ impl TrellisResident {
         let mut vocab = 0;
         let mut hidden = 0;
         let mut n_layers = 0;
+        let mut all_meta: Vec<(String, usize, usize, u32)> = Vec::new();
 
         for (name, e) in ar.entries() {
             if name.contains("model.visual.") {
@@ -89,6 +108,16 @@ impl TrellisResident {
                 let base = &name[..name.len() - 8];
                 let (kt, nt, tw) = (e.shape[0], e.shape[1], e.shape[2]);
                 if tw % 16 != 0 {
+                    continue;
+                }
+                // 스킵분 포함 전 선형 메타 기록 — 업로드 여부와 무관.
+                all_meta.push((
+                    base.to_string(),
+                    (kt * 16) as usize,
+                    (nt * 16) as usize,
+                    (tw / 16) as u32,
+                ));
+                if !keep(base) {
                     continue;
                 }
                 let (k, n) = ((kt * 16) as usize, (nt * 16) as usize);
@@ -119,6 +148,11 @@ impl TrellisResident {
                 || name.ends_with("A_log")
                 || name.ends_with("dt_bias")
             {
+                // 임베딩은 호스트 f32 변환 비용(≈3GB RAM)이 커서 keep가
+                // 요청하지 않으면 건너뛴다(모듈 격리 프로브는 미사용).
+                if name.ends_with("embed_tokens.weight") && !keep(name) {
+                    continue;
+                }
                 let bytes = ar.read(name).map_err(|e| e.to_string())?;
                 let shape = &e.shape;
                 let numel: usize = shape.iter().product::<u64>() as usize;
@@ -190,9 +224,10 @@ impl TrellisResident {
             }
         }
 
-        // 스크래치 버퍼 — 재사용 (linear 호출당 alloc 폭탄 제거)
-        let max_k = linears.iter().map(|(_, l)| l.k).max().unwrap_or(5120);
-        let max_n = linears.iter().map(|(_, l)| l.n).max().unwrap_or(17408);
+        // 스크래치 버퍼 — 재사용 (linear 호출당 alloc 폭탄 제거).
+        // 모델 전체 max 기준 — 부분 적재 축소 시에도 풀 적재와 동일 크기(경계 안전).
+        let max_k = all_meta.iter().map(|m| m.1).max().unwrap_or(5120);
+        let max_n = all_meta.iter().map(|m| m.2).max().unwrap_or(17408);
         // plans/120 A1: k-분할 4→16 — 병렬성 증가(벤치 72→87GB/s).
         // had_out 환원 분해 변화 = 규칙 10a(환원 순서, 동일 정밀도).
         let nseg = 16u32;
@@ -206,6 +241,8 @@ impl TrellisResident {
         let xb = ctx.alloc(max_k * 2)?;
         let x2b = ctx.alloc(max_n * 2)?;
 
+        let max_k_g = all_meta.iter().map(|m| m.1).max().unwrap_or(5120);
+        let max_n_g = all_meta.iter().map(|m| m.2).max().unwrap_or(17408);
         Ok(Self {
             linears,
             gdn_st_valid: vec![false; n_layers - n_layers / 4],
@@ -214,6 +251,9 @@ impl TrellisResident {
             vocab,
             hidden,
             n_layers,
+            max_k_g,
+            max_n_g,
+            all_meta,
             ctx,
             p1,
             p2,

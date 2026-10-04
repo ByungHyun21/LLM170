@@ -594,7 +594,10 @@ fn attn_ref2(
 // 실모델의 모든 선형 형상에 대해 GEMM만 단독 측정 — 형상별 유효 TFLOPS로
 // 숨은 타일 비효율을 노출한다(사용자 지시: 전 모듈 격리 점검).
 pub fn gemm_check(dir: &str) -> Result<String, String> {
-    let mut tr = TrellisResident::load(dir)?;
+    // 부분 적재: 측정 대상 L0 선형 + L3 q_proj + lm_head만 (풀모델 상주 금지).
+    let mut tr = TrellisResident::load_keep(dir, &|n: &str| {
+        n.contains(".layers.0.") || n.contains(".layers.3.self_attn.q_proj") || n == "lm_head"
+    })?;
     let t_rows = 512usize;
     let stage = tr.stage_f32()?;
     // 입력: 균일 값(수치 무의미 — 속도 프로브)
@@ -774,7 +777,9 @@ pub fn nr_check() -> Result<String, String> {
 // 마커: sqrt 프레임 판정용
 
 pub fn ffn_check(dir: &str) -> Result<String, String> {
-    let mut tr = TrellisResident::load(dir)?;
+    // 부분 적재: L0 mlp 3선형만 (풀모델 상주 금지). 스크래치는 전역 max 기준
+    // (max_k_g/max_n_g)이라 lm_head 미포함에도 경계 안전 — 2026-10-04 수리.
+    let mut tr = TrellisResident::load_keep(dir, &|n: &str| n.contains(".layers.0.mlp."))?;
     let t_rows = 512usize;
     let stage = tr.stage_f32()?;
     unsafe {
@@ -844,7 +849,8 @@ pub fn ffn_check(dir: &str) -> Result<String, String> {
 // 직접 이식)와 행별 비교. 속도(4커널 dispatch 벽)도 보고.
 pub fn chain_check(dir: &str) -> Result<String, String> {
     let t_rows = 32usize;
-    let mut tr = TrellisResident::load(dir)?;
+    // 부분 적재: GDN 상수(노름)만 필요 — 선형 전용 스킵 (풀모델 상주 금지).
+    let mut tr = TrellisResident::load_keep(dir, &|_| false)?;
     let (cw, ab, alog, dtb, nw) = tr.gdn_chain_consts()?;
     let mut seed: u32 = 0x51DE_2718;
     let mut rnd = || {
@@ -1048,7 +1054,8 @@ impl TrellisResident {
     // f16 팩)와 비트 대조 — 부착 전 산술 게이트.
     pub fn nrh_check(dir: &str) -> Result<String, String> {
         let t_rows = 8usize;
-        let mut tr = Self::load(dir)?;
+        // 부분 적재: L0 GDN in_proj 2종만 (풀모델 상주 금지).
+        let mut tr = Self::load_keep(dir, &|n: &str| n.contains(".layers.0.linear_attn.in_proj_"))?;
         tr.fframe_init()?;
         let (xptr, zeros, nw128) = {
             let ff = tr
@@ -1228,7 +1235,9 @@ impl TrellisResident {
     // dual(1×gemm2d+2×had_out_td)을 동일 ah 입력으로 비트 대조.
     pub fn gemmd_check(dir: &str, t_arg: usize, il_arg: usize) -> Result<String, String> {
         let t_rows = t_arg;
-        let mut tr = Self::load(dir)?;
+        // 부분 적재: 대상 층 GDN in_proj 2종만 (풀모델 상주 금지).
+        let ilp = format!(".layers.{il_arg}.linear_attn.in_proj_");
+        let mut tr = Self::load_keep(dir, &|n: &str| n.contains(&ilp))?;
         tr.fframe_init()?;
         let (xptr, zeros) = {
             let ff = tr
@@ -1314,20 +1323,26 @@ impl TrellisResident {
             md1 = md1.max((yb1_got[i] - yb1_ref[i]).abs());
         }
         // 전 GDN층 쌍 krate 균일성(혼합정밀 아카이브 의심 — 3호 prefill 오염)
+        // 쌍 krate 균일성은 메타만으로 감사 — 스킵 선형 업로드 불요(load_keep 호환,
+        // 2026-10-04: find_linear 전층 순회는 부분 적재에서 실패했었다).
+        let meta = |key: &str| -> Option<(usize, u32)> {
+            tr.all_meta
+                .iter()
+                .find(|(b, _, _, _)| b == key)
+                .map(|(_, k, _, r)| (*k, *r))
+        };
         let mut mism = 0usize;
         for il in 0..tr.n_layers {
             if il % 4 == 3 {
                 continue;
             }
             let lp = format!("model.language_model.layers.{il}.linear_attn");
-            let iq = tr.find_linear(&format!("{lp}.in_proj_qkv"))?;
-            let iz = tr.find_linear(&format!("{lp}.in_proj_z"))?;
-            let (kq, kz, rq, rz) = (
-                tr.linears[iq].1.k,
-                tr.linears[iz].1.k,
-                tr.linears[iq].1.krate,
-                tr.linears[iz].1.krate,
-            );
+            let (Some((kq, rq)), Some((kz, rz))) = (
+                meta(&format!("{lp}.in_proj_qkv")),
+                meta(&format!("{lp}.in_proj_z")),
+            ) else {
+                continue;
+            };
             if kq != kz || rq != rz {
                 mism += 1;
                 if mism <= 4 {
