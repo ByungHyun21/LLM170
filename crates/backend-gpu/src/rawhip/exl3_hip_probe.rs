@@ -690,6 +690,20 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
                 wmd = wmd.max((sfc[r * n + i] - want[si][i]).abs());
             }
         }
+        for (si, &r) in samp.iter().enumerate() {
+            if si >= 4 {
+                break;
+            }
+            let mut rowmd = 0f32;
+            for i in 0..n {
+                rowmd = rowmd.max((sfc[r * n + i] - want[si][i]).abs());
+            }
+            eprintln!("  [wmrow] 샘플행{r} maxdiff={rowmd:.3e}");
+            if si == 0 && r == 0 {
+                eprintln!("  [wmv0] gpu={:?}", &sfc[0..6]);
+                eprintln!("  [wmv0] ref={:?}", &want[0][0..6]);
+            }
+        }
         eprintln!(
             "  [wmdbg] wmma {:.1}ms = {:.1} TF · y-vs-ref maxdiff={wmd:.3e}",
             tw[1],
@@ -1772,3 +1786,5 @@ pub fn hip_graph_mini2() -> Result<String, String> {
     }
 }
 // 마커 gm5
+// 마커 wmr
+// 마커 wv0
