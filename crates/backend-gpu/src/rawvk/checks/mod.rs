@@ -11,13 +11,9 @@ mod harness;
 mod misc;
 mod ops;
 
-pub use crate::rawvk::exl3::decode::exl3_decode;
-pub use crate::rawvk::exl3::decode::exl3_mtp;
-pub use crate::rawvk::exl3::decode::exl3_mtp2;
-pub use crate::rawvk::exl3::decode::exl3_pp;
-pub use crate::rawvk::exl3::decode::{
-    SeqState, decode_step, exl3_spec_step, new_seq_state, prefill_batch, prefill_batch_spec,
-};
+pub use crate::rawvk::exl3::cpu::{SeqState, new_seq_state};
+pub use crate::rawvk::exl3::decode::{decode_step, exl3_decode, exl3_pp, prefill_batch};
+pub use crate::rawvk::exl3::mtp::{exl3_mtp, exl3_mtp2, exl3_spec_step, prefill_batch_spec};
 pub use crate::rawvk::exl3::resident::TrellisResident;
 pub use crate::rawvk::exl3::util::exl3_vk_check;
 pub use attention::{ft32_check, gemv_check, gemv8_check};
