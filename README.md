@@ -6,27 +6,24 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 ## Benchmarks
 
-<!-- Measurement protocol: hip (ROCm) numbers must be measured with ROCm 10
-     (LD_LIBRARY_PATH=/opt/rocm-10.0.0/install/lib). Vulkan numbers are independent. -->
+<!-- 이 섹션에는 표 외 텍스트 기입 금지 (repo rule) — 표 안에는 값만 기입.
+     프로토콜: hip 수치는 ROCm 10(LD_LIBRARY_PATH=/opt/rocm-10.0.0/install/lib),
+     bench --reps 3 중앙값. vk는 독립. -->
 
 ### Qwen3.8-27B (EXL3 SC_4.00bpw, 16.35 GB)
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
-| LLM170 vulkan | 123.0 (one-submit frame + scan v3 + attention fwd3, plan 121) | — | — | 4.7 (serve exl3) |
+| LLM170 vulkan | 123.0 | — | — | 4.7 |
+| LLM170 hip | — | — | — | 6.25 |
 
-| mode | LLM170 vulkan |
-|---|---|
-| tg single | 4.69 (direct trellis, LLM170_VK_DBUF=1, plan 120 A1) |
-| pp batch512 | 71.20 vs 4.00 sequential (greedy 8/8 identical, corr 0.999998, plan 121 pp P1-P2) |
-| serve | `llm170 serve --model <exl3_dir> --backend exl3` — batch prefill + slot scheduler; completion tokens verified identical to probe (24/24, plan 121 A1) |
-| MTP k=2 | measured negative: draft acceptance a1=0.79 but T=2 batch verify costs 847ms (> 2x sequential) — effective 0.79 t/s; blocked by small-T batch host overhead (plan 121 A2) |
-| np4 greedy | — (no np head in archive) |
-
-Direct trellis decode (13 GB GTT resident, no F16 expansion).
-Prefill: T-batched trellis GEMM (exl3_gemm, Tt=32) + GDN chunked scan + batched attention — `llm170 exl3-pp`.
-Remaining modes require engine MTP/np integration with EXL3 path.
-Quality: 8/8 greedy tokens identical to Q4_K_XL baseline (same prompt).
+| mode | LLM170 vulkan | LLM170 hip |
+|---|---|---|
+| tg single | 4.69 | 6.25 |
+| pp batch512 | 71.20 | 18.8 |
+| serve | 4.7 | 6.25 |
+| MTP k=2 | — | — |
+| np4 greedy | — | — |
 
 ### Qwen3.8-Flash-Next (EXL3 5.05bpw, 123.1 GB)
 
@@ -43,10 +40,6 @@ Quality: 8/8 greedy tokens identical to Q4_K_XL baseline (same prompt).
 | MTP + np4 k=2 | — |
 | MTP + np4 k=3 | — |
 
-Direct trellis decode (13 GB GTT resident, no F16 expansion).
-Remaining modes require engine MTP/np integration with EXL3 path.
-Quality: 8/8 greedy tokens identical to Q4_K_XL baseline (same prompt).
-
 ### DeepSeek-V4-Flash-Vision-Exp (EXL3 3.04bpw, 118.4 GB, vision + MTP3)
 
 | backend | pp512 | pp4096 | tg128 | VL |
@@ -62,13 +55,7 @@ Quality: 8/8 greedy tokens identical to Q4_K_XL baseline (same prompt).
 | MTP + np4 k=2 | — |
 | MTP + np4 k=3 | — |
 
-Direct trellis decode (13 GB GTT resident, no F16 expansion).
-Remaining modes require engine MTP/np integration with EXL3 path.
-Quality: 8/8 greedy tokens identical to Q4_K_XL baseline (same prompt).
-
 ### Q4_K (GGUF) — deprecated (EXL3 transition, 2026-10)
-
-Numbers below are the pre-EXL3 Q4_K_XL baseline.
 
 #### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
@@ -106,9 +93,7 @@ Numbers below are the pre-EXL3 Q4_K_XL baseline.
 | MTP + np4 k=2 | 8.41 | n/s |
 | MTP + np4 k=3 | 7.27 | n/s |
 
-<!-- Forbidden: gate results, feature lists, session notes or other
-     byproducts in this area — update measurement values in the tables
-     only (repo rule). -->
+<!-- 표 외 텍스트 금지 — 표 안에는 값만 (plan 참조 등 부가 설명 기입 금지, repo rule). -->
 
 ## Build & run
 
