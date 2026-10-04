@@ -27,6 +27,7 @@ pub const NAMES: &[&str] = &[
     "exl3_norm_resid",
     "exl3_norm_resid_p",
     "exl3_gemm2",
+    "exl3_gemm2_wmma",
     "exl3_gdn_conv",
     "exl3_gdn_l2perm",
     "exl3_gdn_scan",

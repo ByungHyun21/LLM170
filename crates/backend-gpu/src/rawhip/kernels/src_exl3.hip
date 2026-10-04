@@ -940,3 +940,122 @@ extern "C" __global__ void exl3_argmax(
     }
     if (tid == 0) out[0] = si[0];
 }
+
+#include <rocwmma/rocwmma.hpp>
+using namespace rocwmma;
+
+// ── exl3_gemm2 WMMA(텐서코어) — 스칼라 2.8TF → mma(8060S tg 12 레버, plans/121) ──
+#define TC_BM 64
+#define TC_BN 64
+#define TC_BK 16
+extern "C" __global__ void exl3_gemm2_wmma(
+    const unsigned* __restrict__ ah16,
+    const unsigned* __restrict__ tre,
+    float* __restrict__ s,
+    int ktiles, int ntiles, int K, int T)
+{
+    __shared__ unsigned tre_s[8 * 48];
+    __shared__ half A16[TC_BM][TC_BK + 4];
+    __shared__ half B16[TC_BN][TC_BK + 4];
+    __shared__ float Ctmp[64][68];
+    int wg_n = blockIdx.x;
+    int wg_t = blockIdx.y;
+    int tid = threadIdx.x;
+    int n = ntiles * 16;
+    int row0 = wg_n * TC_BM;
+    int t0 = wg_t * TC_BN;
+    int nrow = min(TC_BM, n - row0);
+    int nt = min(TC_BN, T - t0);
+    int words32 = 8 * K;
+    int nkb = ktiles;
+
+    fragment<accumulator, 16, 16, 16, float> fc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            fill_fragment(fc[i][j], 0.0f);
+
+    for (int kb = 0; kb < nkb; kb++) {
+        {
+            int stg_words = 8 * words32;
+            for (int w = tid; w < stg_words; w += 256) {
+                int tidx = w / words32;
+                int wq = w % words32;
+                int ktl = tidx >> 2;
+                int ntl = tidx & 3;
+                tre_s[w] = tre[((long)(kb + ktl) * ntiles + (wg_n * 4 + ntl)) * words32 + wq];
+            }
+            __syncthreads();
+        }
+        {
+            for (int seg = tid; seg < TC_BM * (TC_BK / 4); seg += 256) {
+                int r = seg / (TC_BK / 4);
+                int c4 = seg % (TC_BK / 4);
+                int c = c4 * 4;
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    int kk = kb * TC_BK + c + e;
+                    int t_ = (4 * (r & 7) + ((kk & 15) >> 1)) * 8
+                           + ((kk >> 4) * 2 + (kk & 1) + (r >> 3));
+                    unsigned b0 = (unsigned)t_ * (unsigned)K + (unsigned)(K + 256 * K - 16);
+                    unsigned b1 = b0 + 16u;
+                    unsigned i0 = (b0 >> 5) % (unsigned)words32;
+                    unsigned i1 = ((b1 - 1u) >> 5) % (unsigned)words32;
+                    unsigned sh = (((b1 - 1u) >> 5) + 1u) * 32u - b1;
+                    unsigned w0 = tre_s[((kk >> 4) * 4 + (r >> 4)) * words32 + i0];
+                    unsigned w1 = tre_s[((kk >> 4) * 4 + (r >> 4)) * words32 + i1];
+                    unsigned wd = (sh == 0u) ? (w1 & 0xFFFFu)
+                        : (((w0 << (32u - sh)) | (w1 >> sh)) & 0xFFFFu);
+                    unsigned x = wd * 0x83DCD12Du;
+                    unsigned p = (x & 0x00FF00FFu) + ((x >> 8u) & 0x00FF00FFu);
+                    unsigned sum = (p & 0xFFFFu) + (p >> 16u);
+                    float v = (1024.0f + (float)sum) * 0.00676727294921875f - 10.3828125f;
+                    A16[r][c + e] = __float2half(v);
+                }
+            }
+            __syncthreads();
+        }
+        {
+            for (int e = tid; e < TC_BN * TC_BK; e += 256) {
+                int tl = e / TC_BK;
+                int kk = e % TC_BK;
+                half v = __float2half(0.0f);
+                if (tl < nt) {
+                    unsigned w = ah16[(long)(t0 + tl) * (ktiles * 8) + (kb * TC_BK + kk) / 2];
+                    float2 uv = __half22float2(*reinterpret_cast<const __half2*>(&w));
+                    v = __float2half((kk & 1) ? uv.y : uv.x);
+                }
+                B16[tl][kk] = v;
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                fragment<matrix_a, 16, 16, 16, half, row_major> fa;
+                load_matrix_sync(fa, &A16[i * 16][0], TC_BK + 4);
+                fragment<matrix_b, 16, 16, 16, half, col_major> fb;
+                load_matrix_sync(fb, &B16[j * 16][0], TC_BK + 4);
+                mma_sync(fc[i][j], fa, fb, fc[i][j]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            store_matrix_sync(&Ctmp[i * 16][j * 16], fc[i][j], 68, mem_row_major);
+    }
+    __syncthreads();
+    for (int e = tid; e < nrow * nt; e += 256) {
+        int r = e / nt;
+        int c = e % nt;
+        s[(long)(t0 + c) * n + row0 + r] = Ctmp[r][c];
+    }
+}
+// 마커 wm1
+// 마커 wm2
+// 마커 wm3
