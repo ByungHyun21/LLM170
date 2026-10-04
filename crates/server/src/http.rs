@@ -121,15 +121,52 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("/").to_string();
     let mut len = 0usize;
+    // A18(plans/129): 헤더 라인 상한·개수 상한 — 무상한 push로 악성/고장
+    // 클라가 수십 GB를 소비한 사고 재발 방지. 변형 CL·chunked는 즉시 400
+    // (len=0로 조용히 빈 바디 처리하던 종전 동작은 오해 백롭).
+    let mut hdr_lines = 0usize;
+    let mut hdr_bytes = 0usize;
+    let mut bad_cl = false;
+    let mut chunked = false;
     loop {
         let mut h = String::new();
         reader.read_line(&mut h).map_err(|e| e.to_string())?;
+        hdr_lines += 1;
+        hdr_bytes += h.len();
         if h.trim().is_empty() {
             break;
         }
-        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
-            len = v.trim().parse().unwrap_or(0);
+        if hdr_lines > 128 || hdr_bytes > 64 * 1024 {
+            let _ = write!(
+                reader.get_mut(),
+                "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            return Err("header too large".into());
         }
+        let hl = h.to_ascii_lowercase();
+        if let Some(v) = hl.strip_prefix("content-length:") {
+            match v.trim().parse::<usize>() {
+                Ok(n) => len = n,
+                Err(_) => bad_cl = true,
+            }
+        }
+        if hl.starts_with("transfer-encoding:") && hl.contains("chunked") {
+            chunked = true;
+        }
+    }
+    if bad_cl {
+        let _ = write!(
+            reader.get_mut(),
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        return Err("malformed content-length".into());
+    }
+    if chunked {
+        let _ = write!(
+            reader.get_mut(),
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        return Err("chunked transfer-encoding unsupported".into());
     }
     if len > MAX_BODY {
         // QA-2: 413 응답 후 절단 — 상한 초과 본문은 읽지도 않는다.
