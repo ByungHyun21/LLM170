@@ -18,6 +18,7 @@ mod dispatch;
 use dispatch::{Acc, mm, mm_batch, mm_group};
 mod diag;
 pub(crate) mod frame;
+pub const EOS_EOT: u32 = 248044;
 pub mod hparams;
 pub mod prefill;
 pub mod rawinject;

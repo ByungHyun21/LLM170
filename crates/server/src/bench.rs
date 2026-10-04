@@ -733,7 +733,7 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                 for (i, &s) in act.iter().enumerate() {
                     nexts[s] = l[i];
                     n_gen += 1;
-                    if nexts[s] == 248044 {
+                    if nexts[s] == llm170_core::qwen35::EOS_EOT {
                         eos.push(s);
                     }
                 }
@@ -756,7 +756,7 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                 }
                 n_gen += 1;
                 fwd += 1;
-                if next == 248044 {
+                if next == llm170_core::qwen35::EOS_EOT {
                     break;
                 }
             }

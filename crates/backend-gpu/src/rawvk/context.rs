@@ -801,7 +801,9 @@ impl VkCtx {
                 .memory(b.mem)
                 .offset(0)
                 .size(bytes as u64);
-            let _ = self.device.flush_mapped_memory_ranges(&[range]);
+            if let Err(e) = self.device.flush_mapped_memory_ranges(&[range]) {
+                eprintln!("[vk] flush_mapped_memory_ranges 실패(스테일 뷰 위험): {e}");
+            }
         }
     }
 
@@ -813,7 +815,9 @@ impl VkCtx {
                 .memory(b.mem)
                 .offset(0)
                 .size(bytes as u64);
-            let _ = self.device.invalidate_mapped_memory_ranges(&[range]);
+            if let Err(e) = self.device.invalidate_mapped_memory_ranges(&[range]) {
+                eprintln!("[vk] invalidate_mapped_memory_ranges 실패(스테일 뷰 위험): {e}");
+            }
         }
     }
 
@@ -1572,7 +1576,9 @@ impl VkCtx {
                 .memory(b.mem)
                 .offset(offset as u64)
                 .size(bytes as u64);
-            let _ = self.device.flush_mapped_memory_ranges(&[range]);
+            if let Err(e) = self.device.flush_mapped_memory_ranges(&[range]) {
+                eprintln!("[vk] flush_mapped_memory_ranges 실패(스테일 뷰 위험): {e}");
+            }
         }
     }
 
@@ -1583,7 +1589,9 @@ impl VkCtx {
                 .memory(b.mem)
                 .offset(offset as u64)
                 .size(bytes as u64);
-            let _ = self.device.invalidate_mapped_memory_ranges(&[range]);
+            if let Err(e) = self.device.invalidate_mapped_memory_ranges(&[range]) {
+                eprintln!("[vk] invalidate_mapped_memory_ranges 실패(스테일 뷰 위험): {e}");
+            }
         }
     }
 }

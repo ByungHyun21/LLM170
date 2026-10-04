@@ -125,7 +125,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 eng = crate::engine::attach_q35(eng, gpu_runtime == "vulkan", policy)
                     .map_err(|e| format!("GPU 백엔드 주입 실패(REQUIRE_GPU): {e}"))?;
             }
-            let eos = 248044u32;
+            let eos = llm170_core::qwen35::EOS_EOT;
             // prefill (시퀀스별 — GDN chunked 경로)
             let mut last_logits = Vec::with_capacity(n);
             for (s, p) in prompts.iter().enumerate() {

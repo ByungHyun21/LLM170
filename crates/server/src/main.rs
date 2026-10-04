@@ -262,7 +262,6 @@ fn main() -> ExitCode {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
         Some("infer") => infer::cmd_infer(&ma.rest, &ma),
         Some("serve") => cmd_serve(&ma.rest, &ma),
-        Some("rawhip-check") => probes::run("rawhip-check", &args[1..]).unwrap(),
         Some("vl") => vl::cmd_vl(&ma.rest, &ma),
         Some("bench") => bench::cmd_bench(&ma.rest, &ma),
         Some("perplexity") => perplexity::cmd_perplexity(&ma.rest, &ma),
@@ -419,10 +418,30 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
         }
     };
     let no_special = ma.rest.iter().any(|a| a == "--no-special");
+    // A20(plans/129): 위치인자만 준 사용자에게 stdin 판독 무응답처럼 보였다
+    // (원장 기록 ⑧) — usage 에러로. --text/--file 값 부재(마지막 인자)도
+    // 빈 문자열 조용 인코딩 대신 에러.
+    let has_text = ma.rest.iter().any(|a| a == "--text");
+    let has_file = ma.rest.iter().any(|a| a == "--file");
+    if !has_text && !has_file && ma.rest.iter().any(|a| !a.starts_with("--")) {
+        eprintln!(
+            "error: 텍스트는 --text <문자열> 또는 --file <경로>로 전달 (위치인자는 무시됩니다)"
+        );
+        return ExitCode::FAILURE;
+    }
+    // 플래그도 위치인자도 없으면 stdin 합법 사용 — 계속 진행.
     let text = if let Some(i) = ma.rest.iter().position(|a| a == "--text") {
-        ma.rest.get(i + 1).cloned().unwrap_or_default()
+        let Some(v) = ma.rest.get(i + 1) else {
+            eprintln!("error: --text requires a value");
+            return ExitCode::FAILURE;
+        };
+        v.clone()
     } else if let Some(i) = ma.rest.iter().position(|a| a == "--file") {
-        let p = ma.rest.get(i + 1).cloned().unwrap_or_default();
+        let Some(p) = ma.rest.get(i + 1) else {
+            eprintln!("error: --file requires a path");
+            return ExitCode::FAILURE;
+        };
+        let p = p.clone();
         match std::fs::read_to_string(&p) {
             Ok(t) => t,
             Err(e) => {
@@ -555,7 +574,9 @@ fn cmd_dequant(args: &[String]) -> ExitCode {
     }
     let mut out = vec![0.0f32; k as usize];
     llm170_core::quant::dequant_row(t.ty, &buf, 0, k, &mut out);
-    let vals: Vec<String> = out[..n].iter().map(|v| format!("{v:.6}")).collect();
+    // A21b(plans/129): n>k 슬라이스 패닉 — 클램프(k가 실제 상한).
+    let show = n.min(k as usize);
+    let vals: Vec<String> = out[..show].iter().map(|v| format!("{v:.6}")).collect();
     println!("[{}] row {row}: {}", t.ty.name(), vals.join(", "));
     ExitCode::SUCCESS
 }

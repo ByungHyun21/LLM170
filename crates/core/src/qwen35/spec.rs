@@ -254,7 +254,7 @@ impl Engine {
         {
             return self.spec_step_gpu(seq, last_token, k);
         }
-        let eos = 248044u32;
+        let eos = crate::qwen35::EOS_EOT;
         // 교차 검증: 타깃 decode(토큰) → (hook이 계산한 (토큰,h) 쌍의 draft 로짓) 비교.
         // draft 체인은 직전 draft 토큰 쌍으로 순차 — target decode가 h를 갱신하는 즉시.
         let base_pos = self.seqs[seq].pos; // 슬롯 0..base_pos-1 처리됨; last_token = 위치 base_pos 토큰(미처리)
@@ -326,7 +326,7 @@ impl Engine {
             }
             return Ok(out);
         }
-        let eos = 248044u32;
+        let eos = crate::qwen35::EOS_EOT;
         let rd = self
             .raw_decode
             .clone()
@@ -676,7 +676,7 @@ impl Engine {
         last_token: u32,
         k: usize,
     ) -> Result<(Vec<u32>, usize), ModelError> {
-        let eos = 248044u32;
+        let eos = crate::qwen35::EOS_EOT;
         let rd = self
             .raw_decode
             .clone()
