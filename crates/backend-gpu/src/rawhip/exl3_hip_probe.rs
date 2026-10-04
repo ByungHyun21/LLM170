@@ -1260,6 +1260,20 @@ pub fn hip_mtp_check(dir: &str, tok: u32) -> Result<String, String> {
     let synth: Vec<f32> = (0..h).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
     // 1단계: hip 단독(mtp 가중치만 사용)
     let mut dec = Exl3HipDecoder::load(dir, 0)?;
+    // GPU 드래프트 A/B: 동일 입력으로 정합 + 시간(호스트 버전 기준).
+    let tg0 = std::time::Instant::now();
+    let d_gpu = dec.mtp_draft_gpu(tok, &synth, 0)?;
+    let tg = tg0.elapsed().as_secs_f64() * 1e3;
+    let th0 = std::time::Instant::now();
+    let tl = dec.mtp_draft(tok, &synth, 0)?;
+    let th = th0.elapsed().as_secs_f64() * 1e3;
+    let am_h = tl
+        .iter()
+        .enumerate()
+        .max_by(|x, y| x.1.partial_cmp(y.1).unwrap())
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0);
+    eprintln!("  [dab] gpu={d_gpu} host={am_h} · gpu {tg:.0}ms host {th:.0}ms");
     let tl = dec.mtp_draft(tok, &synth, 0)?;
     drop(dec);
     // 2단계: vk 참조 단독
@@ -1411,7 +1425,7 @@ pub fn hip_mtp_round(dir: &str, tok: u32, rounds: usize) -> Result<String, Strin
     let mut h: Vec<f32>;
     {
         let row0 = dec2.embed_row_host(tok);
-        let (lg0, h0) = dec2.forward(&row0)?;
+        let (lg0, h0) = dec2.forward_batch_with_mtp(&[row0], &[tok])?;
         h = h0;
         let _ = lg0;
     }
@@ -1422,16 +1436,10 @@ pub fn hip_mtp_round(dir: &str, tok: u32, rounds: usize) -> Result<String, Strin
     for _ in 0..rounds {
         // 드래프트(상태 = pp 직전? 규약: mtp_draft(tok=직전 확정, h, pos) — pos는 pp까지)
         let pos_now = dec2.pos;
-        let dl = dec2.mtp_draft(pp, &h, pos_now)?; // pos: pp가 처리된 뒤 위치
-        let d = dl
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
-        // 검증 배치 [pp, d]
+        let d = dec2.mtp_draft_gpu(pp, &h, pos_now)?; // pos: pp가 처리된 뒤 위치
+        // 검증 배치 [pp, d] + mtp KV 적립 훅
         let rows = vec![dec2.embed_row_host(pp), dec2.embed_row_host(d)];
-        let (lgs, hnew) = dec2.forward_batch(&rows)?;
+        let (lgs, hnew) = dec2.forward_batch_with_mtp(&rows, &[pp, d])?;
         let am0 = lgs[0]
             .iter()
             .enumerate()
@@ -1457,7 +1465,7 @@ pub fn hip_mtp_round(dir: &str, tok: u32, rounds: usize) -> Result<String, Strin
             out_toks.push(pp);
             out_toks.push(corr);
             let rrow = dec2.embed_row_host(corr);
-            let (lgc, hc) = dec2.forward_batch(&[rrow])?;
+            let (lgc, hc) = dec2.forward_batch_with_mtp(&[rrow], &[corr])?;
             let amc = lgc[0]
                 .iter()
                 .enumerate()
@@ -1487,3 +1495,7 @@ pub fn hip_mtp_round(dir: &str, tok: u32, rounds: usize) -> Result<String, Strin
 }
 // 마커 mr1
 // 마커 mr4
+// 마커 dg5
+// 마커 dab
+// 마커 d3q
+// 마커 mrf
