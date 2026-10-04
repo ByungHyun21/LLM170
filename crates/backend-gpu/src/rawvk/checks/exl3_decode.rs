@@ -379,7 +379,15 @@ fn attn_forward(
     }
 
     // k norm + rope → KV 캐시 추가
-    if kv.len < kv_cap {
+    // A15(plans/129): KV 만석은 Err — 종전 디코드 무침입 스킵이 프리필의 Err과
+    // 비대칭으로 조용한 품질 오염(마지막 토큰만 넣고 계속 진행)이었다.
+    if kv.len >= kv_cap {
+        return Err(format!(
+            "exl3 KV full: pos {} >= cap {kv_cap} — ctx 상향 필요",
+            kv.len
+        ));
+    }
+    {
         let k_base = kv.len * n_kv * head_dim;
         for h in 0..n_kv {
             let b0 = h * head_dim;

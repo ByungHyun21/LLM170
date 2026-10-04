@@ -356,6 +356,12 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         eprintln!("error: tokenizer load 실패(5회 재시도) — serve 텍스트 요청에 필수");
         return ExitCode::FAILURE;
     };
+    // A19(plans/129): load는 어느 파트에도 토크나이저가 없으면 Ok(empty)를
+    // 돌려준다 — Some(empty) 통과가 쓰레기 스트림을 뿜었다. 치명 오류로.
+    if tok.is_empty() {
+        eprintln!("error: 토크나이저 비음(어느 파트에도 없음) — serve 텍스트 요청에 필수");
+        return ExitCode::FAILURE;
+    }
     let _ = engine::TOKENIZER.set(tok);
     let req = engine::InferRequest {
         model: model_path.clone(),
