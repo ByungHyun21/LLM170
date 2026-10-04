@@ -36,13 +36,14 @@ impl Exl3HipEngine {
         Ok(Self { dec })
     }
 
-    /// 프리필 — 청크 16행(상각 곡선의 실용점). 반환 = 마지막 로짓.
+    /// 프리필 — 청크 64행(plans/128 P1: 어텐션 t-런치 배치화+had16 수리 완료로
+    /// t=64 형상 활성 — mma 상각 개선. 반환 = 마지막 로짓.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
         if tokens.is_empty() {
             return Err("빈 프리필".into());
         }
         let mut last = Vec::new();
-        for chunk in tokens.chunks(16) {
+        for chunk in tokens.chunks(64) {
             let rows: Vec<Vec<f32>> = chunk.iter().map(|&t| self.dec.embed_row_host(t)).collect();
             let (lgs, _) = self.dec.forward_batch(&rows)?;
             last = lgs.last().cloned().ok_or("빈 배치")?;
