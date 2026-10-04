@@ -10,6 +10,7 @@ pub(crate) mod exl3_frame;
 pub(crate) mod exl3_gdn;
 pub(crate) mod exl3_probes;
 mod exl3_resident;
+pub(crate) mod exl3_staging;
 mod fault;
 mod frame_check;
 mod gdn;
