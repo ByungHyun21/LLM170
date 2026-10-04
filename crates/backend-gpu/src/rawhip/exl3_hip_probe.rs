@@ -1886,8 +1886,15 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
                     dbat.hcurve.len()
                 );
             }
-            if tot_b == 1 && !seq_curve.is_empty() && dbat.hcurve.len() >= seq_curve.len() {
-                for (k, (l, hs_cv)) in seq_curve.iter().enumerate() {
+            // 순차는 steps×4개(스텝당 4) — 최근 스텝의 마지막 4개와 배치 4개를 비교.
+            let n4 = dbat.hcurve.len();
+            let seq4 = if seq_curve.len() >= n4 {
+                &seq_curve[seq_curve.len() - n4..]
+            } else {
+                &seq_curve[..]
+            };
+            if tot_b == 1 && !seq4.is_empty() && n4 == seq4.len() {
+                for (k, (l, hs_cv)) in seq4.iter().enumerate() {
                     let (lb, hb_cv) = &dbat.hcurve[k];
                     let md = hs_cv
                         .iter()
@@ -1957,3 +1964,4 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
 // 마커 hcx
 // 마커 scv
 // 마커 dcf
+// 마커 s4
