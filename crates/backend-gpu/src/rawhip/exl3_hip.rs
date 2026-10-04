@@ -59,6 +59,7 @@ pub struct Exl3HipDecoder {
     dvc: *mut u8,
     dpp: *mut u8,
     dembed: *mut u8,
+    dargmax: *mut u8,
     dnw: *mut u8,
     dqnw: *mut u8,
     dknw: *mut u8,
@@ -173,6 +174,7 @@ impl Exl3HipDecoder {
         let embed_all: Vec<f32> = tr.embed.clone();
         let dembed = hc.alloc(embed_all.len() * 4)?;
         Self::h2d_chunked(&hc, dembed, f32b(&embed_all))?;
+        let dargmax = hc.alloc(4)?;
         drop(tr);
 
         let tmax = 64usize;
@@ -227,6 +229,7 @@ impl Exl3HipDecoder {
             dqh,
             dou,
             dembed,
+            dargmax,
             dring,
             dgst,
             dkc,
@@ -329,6 +332,37 @@ impl Exl3HipDecoder {
             unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, self.hidden) };
         let (lg, _) = self.forward(row)?;
         Ok(lg)
+    }
+
+    /// 임베딩 판독 + forward + GPU argmax — 로짓 전체 전송 없이 다음 토큰 ID만.
+    pub fn step_tok(&mut self, tok: u32) -> Result<u32, String> {
+        let mut rb = vec![0u8; self.hidden * 4];
+        self.hc.d2h(&mut rb, unsafe {
+            self.dembed.add(tok as usize * self.hidden * 4)
+        })?;
+        self.hc.sync()?;
+        // SAFETY: d2h 완료 후 재해석.
+        let row: &[f32] =
+            unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, self.hidden) };
+        let _ = self.forward(row)?; // 로짓 d2h 포함(검증 경로 겸용) — 최적화 시 read 스킵 분리
+        let mut an = 1i32;
+        let (mut a0, mut a1) = (self.dyb, self.dargmax);
+        self.hc.launch(
+            "exl3_argmax",
+            1,
+            1,
+            1024,
+            &mut [
+                &mut a0 as *mut *mut u8 as *mut _,
+                &mut a1 as *mut *mut u8 as *mut _,
+                &mut an as *mut i32 as *mut _,
+            ],
+        )?;
+        self.hc.sync()?;
+        let mut ob = vec![0u8; 4];
+        self.hc.d2h(&mut ob, self.dargmax)?;
+        self.hc.sync()?;
+        Ok(u32::from_le_bytes([ob[0], ob[1], ob[2], ob[3]]))
     }
 
     /// 1토큰 forward → 로짓. ew(silu·mul)는 호스트(정확성 우선 — 추후 커널화).
@@ -724,3 +758,4 @@ impl Exl3HipDecoder {
 // 마커 fx649
 // 마커 dropfx
 // 마커 syn2
+// 마커 am1

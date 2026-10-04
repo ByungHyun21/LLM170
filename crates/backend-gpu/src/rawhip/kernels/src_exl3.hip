@@ -907,3 +907,36 @@ extern "C" __global__ void exl3_ew(
     float v = g[j];
     y[j] = (v / (1.0f + __expf(-v))) * u[j];
 }
+
+// exl3_argmax — [n] 로짓에서 최대 인덱스 1개(단일 WG 리덕션, n<=1M).
+extern "C" __global__ void exl3_argmax(
+    const float* __restrict__ lg,
+    unsigned* __restrict__ out,
+    int n)
+{
+    __shared__ float sv[1024];
+    __shared__ unsigned si[1024];
+    int tid = threadIdx.x;
+    float best = -1e30f;
+    unsigned idx = 0u;
+    for (int i = tid; i < n; i += 1024) {
+        float v = lg[i];
+        if (v > best) {
+            best = v;
+            idx = (unsigned)i;
+        }
+    }
+    sv[tid] = best;
+    si[tid] = idx;
+    __syncthreads();
+    for (int st = 512; st > 0; st >>= 1) {
+        if (tid < st) {
+            if (sv[tid + st] > sv[tid]) {
+                sv[tid] = sv[tid + st];
+                si[tid] = si[tid + st];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out[0] = si[0];
+}
