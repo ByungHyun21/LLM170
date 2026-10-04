@@ -458,9 +458,9 @@ impl Exl3HipDecoder {
     /// 제자리 상태 리셋 — 링/스캔 상태 0화 + pos 0. KV는 pos 의미론으로
     /// 도달 시 자연 갱신(재할당 없음 — plans/123 III-2 관례).
     pub fn reset_state(&mut self) -> Result<(), String> {
-        let zeros_ring = vec![0u8; self.n_gdn as usize * 3 * 10240 * 4];
+        let zeros_ring = vec![0u8; self.n_gdn * 3 * 10240 * 4];
         self.hc.h2d(self.dring, &zeros_ring)?;
-        let zeros_st = vec![0u8; self.n_gdn as usize * 48 * 16384 * 4];
+        let zeros_st = vec![0u8; self.n_gdn * 48 * 16384 * 4];
         self.hc.h2d(self.dgst, &zeros_st)?;
         self.pos = 0;
         self.hc.h2d(self.dpos, &0u32.to_le_bytes())?;
