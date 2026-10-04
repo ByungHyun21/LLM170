@@ -409,6 +409,12 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             arg_num(args, 1, 0usize),
         ),
         "exl3-nr-check" => llm170_backend_gpu::rawvk::checks::nr_check(),
+        "exl3-hip-graph" => {
+            let dir = arg_str(args, 0, "");
+            let tok = arg_num(args, 1, 1000u32);
+            let tl = arg_num(args, 2, 4usize);
+            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_graph_check(&dir, tok, tl)
+        }
         "exl3-hip-tbench" => {
             let dir = arg_str(args, 0, "");
             let tok = arg_num(args, 1, 1000u32);

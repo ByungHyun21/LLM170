@@ -74,6 +74,11 @@ pub struct Exl3HipDecoder {
     dsb2: *mut u8,
     dsb3: *mut u8,
     dbat: *mut u8,
+    dpos: *mut u8,
+    pstage: *mut u8,
+    pgout: *mut u8,
+    pgh: *mut u8,
+    gexec: Option<(usize, crate::rawhip::ctx::hipgraph::GraphExec)>,
     dmtpk: *mut u8,
     dmtpv: *mut u8,
     dmtpp: *mut u8,
@@ -241,7 +246,22 @@ impl Exl3HipDecoder {
         let dsb2 = hc.alloc(64 * 17408 * 4)?; // 층 선형 n 상한(lm_head는 dsb)
         let dsb3 = hc.alloc(64 * 17408 * 4)?;
         // MTP 자체 KV(메인 16개 어텐션층과 분리 — prep의 layer 인덱스 0으로 사용)
-        let dbat = hc.alloc(8 * 8 * 17408 * 4)?; // kseg 부분합 [T≤8][kseg≤8][n≤17408]
+        let dbat = hc.alloc(8 * 8 * 17408 * 4)?;
+        let dpos = hc.alloc(4)?;
+        hc.h2d(dpos, &0u32.to_le_bytes())?;
+        // 캡처 호환 스테이징 — 핀(고정) 호스트 버퍼(페이지 가능 memcpy는 캡처 무효화).
+        // SAFETY: hipHostMalloc — 핀(고정) 호스트 버퍼(캡처 호환 memcpy).
+        let pin = |bytes: usize| -> Result<*mut u8, String> {
+            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+            let r = unsafe { crate::rawhip::ctx::hipgraph::hipHostMalloc(&mut p, bytes, 0) };
+            if r != 0 {
+                return Err(format!("hipHostMalloc {r}({bytes}B)"));
+            }
+            Ok(p as *mut u8)
+        };
+        let pstage = pin(64 * hidden * 4)?;
+        let pgout = pin(64 * 248320 * 4)?;
+        let pgh = pin(hidden * 4)?; // kseg 부분합 [T≤8][kseg≤8][n≤17408]
         let dmtpk = hc.alloc(1024 * 1024 * 4)?;
         let dmtpv = hc.alloc(1024 * 1024 * 4)?;
         let dmtpp = hc.alloc(4)?;
@@ -327,6 +347,11 @@ impl Exl3HipDecoder {
             dsb2,
             dsb3,
             dbat,
+            dpos,
+            pstage,
+            pgout,
+            pgh,
+            gexec: None,
             dmtpk,
             dmtpv,
             dmtpp,
@@ -872,11 +897,40 @@ impl Exl3HipDecoder {
         if t == 0 || t > 64 {
             return Err(format!("forward_batch: T={t} 범위 외(1..64)"));
         }
+        let flat: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        // SAFETY: pstage 64×hidden 상한 내 — 핀 쓰기.
+        unsafe {
+            std::ptr::copy_nonoverlapping(flat.as_ptr() as *const u8, self.pstage, flat.len() * 4);
+        }
+        self.batch_core(t)?;
+        self.pos += t as u32;
+        // SAFETY: g_out 재해석.
+        let n = self.llh_n();
+        let out: Vec<Vec<f32>> = (0..t)
+            .map(|r| {
+                // SAFETY: pgout 행 오프셋.
+                let b = unsafe {
+                    std::slice::from_raw_parts(self.pgout.add(r * n * 4) as *const f32, n)
+                };
+                b.to_vec()
+            })
+            .collect();
+        // SAFETY: pgh 재해석.
+        let last_h =
+            unsafe { std::slice::from_raw_parts(self.pgh as *const f32, self.hidden).to_vec() };
+        Ok((out, last_h))
+    }
+
+    /// 그래프 코어 — 모든 입출력이 고정 포인터(stage_rows/g_out/g_h/dpos).
+    /// 캡처·재생·비캡처 공용(캡처 호환: 내부 sync/h2d-from-stack 없음).
+    fn batch_core(&mut self, t: usize) -> Result<(), String> {
         let n_layers = self.loaded_layers.min(self.n_layers);
         let f32b =
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-        let flat: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
-        self.hc.h2d(self.dbx, f32b(&flat))?;
+        // SAFETY: pstage 고정 길이 슬라이스(캡처 memcpy 노드 — 핀 src).
+        let stg = unsafe { std::slice::from_raw_parts(self.pstage, t * self.hidden * 4) };
+        self.hc.h2d(self.dbx, stg)?;
+        self.hc.d2d(self.dpp, self.dpos, 4)?;
         let mut ab = self.dbzero;
         for il in 0..n_layers {
             let lp = format!("model.language_model.layers.{il}");
@@ -892,10 +946,9 @@ impl Exl3HipDecoder {
                 self.gemm2_batch(&lk, t, self.dsb2)?;
                 self.gemm2_batch(&lv, t, self.dsb3)?;
                 let mut ai = (il / 4) as i32;
+                // pp[0] = 행0 위치(루프 전 1회 h2d) — 행 전진은 exl3_pos_bump(그래프 캡처 호환).
+                self.hc.h2d(self.dpp, &self.pos.to_le_bytes())?;
                 for r in 0..t {
-                    // prep은 KV 기록 인덱스를 pp[0](디바이스)에서 판독 — 행마다 갱신 필수.
-                    self.hc
-                        .h2d(self.dpp, &(self.pos + r as u32).to_le_bytes())?;
                     let mut tl2 = 1i32;
                     let mut p0v = (self.pos + r as u32) as i32;
                     // SAFETY: 배치 버퍼 내 행 오프셋 — t≤64 경계 내.
@@ -961,6 +1014,15 @@ impl Exl3HipDecoder {
                             &mut p0v as *mut i32 as *mut _,
                             &mut ai as *mut i32 as *mut _,
                         ],
+                    )?;
+                    let mut pb0 = self.dpp;
+                    self.hc.launch3(
+                        "exl3_pos_bump",
+                        1,
+                        1,
+                        1,
+                        32,
+                        &mut [&mut pb0 as *mut *mut u8 as *mut _],
                     )?;
                 }
                 // o_proj gemm2 — 입력 dou [T][6144]
@@ -1109,34 +1171,111 @@ impl Exl3HipDecoder {
         self.norm_p(128, self.dbab, t)?;
         // MTP 드래프트용 마지막 pre-norm 잔차(vk last_h 규약) — 잔차 스트림은
         // dbx(norm_p가 dbx += ab로 누적). 최종 노름 이후 판독해 마지막 FFN 포함.
-        let mut hb = vec![0u8; self.hidden * 4];
         {
-            // SAFETY: dbx 마지막 행.
+            // SAFETY: dbx 마지막 행 → g_h 고정 버퍼.
             let plast = unsafe { self.dbx.add((t - 1) * self.hidden * 4) };
-            self.hc.d2h(&mut hb, plast)?;
-            self.hc.sync()?;
+            // SAFETY: pgh 핀 dst.
+            let ghp = unsafe { std::slice::from_raw_parts_mut(self.pgh, self.hidden * 4) };
+            self.hc.d2h(ghp, plast)?;
         }
         let llh = self.lin["lm_head"].clone_shallow();
         self.had16_batch(self.dbxn, llh.k, t, llh.suh)?;
         self.gemm2_batch(&llh, t, self.dsb)?;
-        self.pos += t as u32;
-        self.hc.h2d(self.dpp, &self.pos.to_le_bytes())?;
-        let mut out = Vec::with_capacity(t);
-        let mut lb = vec![0u8; llh.n * 4];
+        // dpos += t — 디바이스 pos 전진(그래프 재생 시 다음 라운드 위치).
+        for _ in 0..t {
+            let mut pb1 = self.dpos;
+            self.hc.launch3(
+                "exl3_pos_bump",
+                1,
+                1,
+                1,
+                32,
+                &mut [&mut pb1 as *mut *mut u8 as *mut _],
+            )?;
+        }
+        // 출력 d2h — 고정 호스트 버퍼(캡처 노드).
         for r in 0..t {
             // SAFETY: dsb 내 lm_head 행 오프셋.
             let rowp = unsafe { self.dsb.add(r * llh.n * 4) };
-            self.hc.d2h(&mut lb, rowp)?;
-            self.hc.sync()?;
-            // SAFETY: d2h 완료 후 재해석.
-            out.push(unsafe {
-                std::slice::from_raw_parts(lb.as_ptr() as *const f32, llh.n).to_vec()
-            });
+            // SAFETY: pgout 행 오프셋(핀 dst — 캡처 노드).
+            let dstp = unsafe { self.pgout.add(r * llh.n * 4) };
+            self.hc.d2h(
+                &mut unsafe { std::slice::from_raw_parts_mut(dstp, llh.n * 4) },
+                rowp,
+            )?;
         }
-        // SAFETY: d2h 완료 후 재해석 — vk last_h 규약(output_norm 전 잔차).
+        Ok(())
+    }
+
+    /// 배치 코어를 hipGraph로 캡처(런치 오버헤드 제거 — plans/121 hip 스케줄링).
+    /// 워밍 1회 후 캡처: 모든 입출력이 고정 포인터라 재생은 현재 내용을 읽는다.
+    pub fn capture_batch(&mut self, t: usize) -> Result<(), String> {
+        use crate::rawhip::ctx::hipgraph as hg;
+        // 워밍(커널 자원 초기화 완료 후 캡처)
+        self.batch_core(t)?;
+        self.hc.sync()?;
+        unsafe {
+            let st = hg::hipStreamBeginCapture(self.hc.stream as *mut _, 2);
+            if st != 0 {
+                return Err(format!("BeginCapture {st}"));
+            }
+            let core = self.batch_core(t);
+            let mut graph: hg::Graph = std::ptr::null_mut();
+            let en = hg::hipStreamEndCapture(self.hc.stream as *mut _, &mut graph);
+            core?;
+            if en != 0 {
+                return Err(format!("EndCapture {en}"));
+            }
+            let mut exec: hg::GraphExec = std::ptr::null_mut();
+            let ie = hg::hipGraphInstantiate(&mut exec, graph, 0);
+            hg::hipGraphDestroy(graph);
+            if ie != 0 {
+                return Err(format!("Instantiate {ie}"));
+            }
+            self.gexec = Some((t, exec));
+        }
+        Ok(())
+    }
+
+    /// 그래프 재생 — stage_rows를 채우고 launch. 반환 = (로짓 행들, last_h).
+    pub fn replay_batch(&mut self, rows: &[Vec<f32>]) -> Result<(Vec<Vec<f32>>, Vec<f32>), String> {
+        let (t, exec) = self.gexec.ok_or("그래프 미캡처 — capture_batch 먼저")?;
+        if rows.len() != t {
+            return Err(format!("캡처 T={t}와 불일치 rows={}", rows.len()));
+        }
+        let flat: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        // SAFETY: pstage 핀 쓰기.
+        unsafe {
+            std::ptr::copy_nonoverlapping(flat.as_ptr() as *const u8, self.pstage, flat.len() * 4);
+        }
+        use crate::rawhip::ctx::hipgraph as hg;
+        unsafe {
+            let le = hg::hipGraphLaunch(exec, self.hc.stream as *mut _);
+            if le != 0 {
+                return Err(format!("GraphLaunch {le}"));
+            }
+        }
+        self.hc.sync()?;
+        self.pos += t as u32;
+        let n = self.llh_n();
+        // SAFETY: 재생 완료 후 g_out/g_h 재해석.
+        let out: Vec<Vec<f32>> = (0..t)
+            .map(|r| {
+                // SAFETY: pgout 행 오프셋.
+                let b = unsafe {
+                    std::slice::from_raw_parts(self.pgout.add(r * n * 4) as *const f32, n)
+                };
+                b.to_vec()
+            })
+            .collect();
         let last_h =
-            unsafe { std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden).to_vec() };
+            unsafe { std::slice::from_raw_parts(self.pgh as *const f32, self.hidden).to_vec() };
         Ok((out, last_h))
+    }
+
+    /// lm_head 열수(래퍼 디코딩용).
+    fn llh_n(&self) -> usize {
+        self.lin["lm_head"].n
     }
 
     /// forward_batch + MTP KV 적립 훅(vk 패턴): 각 행의 타깃 hidden으로
@@ -1823,3 +1962,8 @@ impl Exl3HipDecoder {
 // 마커 lhf
 // 마커 ks2
 // 마커 ho3
+// 마커 gcap
+// 마커 gcr
+// 마커 gcr2
+// 마커 gm2
+// 마커 pin1
