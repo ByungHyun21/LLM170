@@ -12,7 +12,7 @@ use std::time::Instant;
 
 fn usage_err_bench(msg: &str) -> ExitCode {
     eprintln!(
-        "error: {msg}\n사용법: llm170 bench --model <gguf> [--pp N] [--tg N] [--reps N] [--ctx N] [--backend cpu|hip|vulkan] [--spec k] [--np K]"
+        "error: {msg}\n사용법: llm170 bench --model <gguf|exl3-dir> [--pp N] [--tg N] [--reps N] [--ctx N] [--backend cpu|gpu|exl3|exl3-hip] [--spec k] [--np K]"
     );
     ExitCode::from(2)
 }
@@ -164,11 +164,16 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         prompt,
         mtp: ma.mtp.clone(),
     };
-    let mut lines = match if arch.as_deref() == Some("qwen4exp") {
+    let res_lines = if cfg.model_path.is_dir() {
+        // EXL3 아카이브 디렉터리(plans/125-4) — GGUF 아키텍처 판별이 아닌
+        // 디렉터리 여부로 판정. arch 변수는 GGUF 파일에만 유효하다.
+        bench_exl3(&cfg)
+    } else if arch.as_deref() == Some("qwen4exp") {
         bench_q4(&cfg)
     } else {
         bench_q35(&cfg)
-    } {
+    };
+    let mut lines = match res_lines {
         Ok(l) => l,
         Err(e) => {
             eprintln!("error: {e}");
@@ -178,6 +183,87 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     median_summary(&mut lines);
     print_table(&lines, &cfg);
     ExitCode::SUCCESS
+}
+
+/// EXL3(아카이브 디렉터리) 측정 — plans/125-4: bench가 GGUF 아키텍처 판별에
+/// 묶여 EXL3 dir을 거부하던 결함 수리. 프로토콜은 bench_q4와 동일(워밍업 1회 +
+/// reps, pp=prefill, tg=순차 greedy decode1 — serve 단일슬롯 경로와 동일).
+/// 백엔드: exl3(vk)·exl3-hip. 힙 수치 측정은 ROCm10 런타임으로 실행할 것.
+fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
+    let dir = cfg
+        .model_path
+        .to_str()
+        .ok_or("exl3: 모델 경로가 utf8가 아님")?
+        .to_string();
+    enum Exl3 {
+        Vk(Box<crate::exl3_engine::Exl3Engine>),
+        Hip(Box<crate::exl3_hip_engine::Exl3HipEngine>),
+    }
+    impl Exl3 {
+        fn prefill(&mut self, toks: &[u32]) -> Result<Vec<f32>, String> {
+            match self {
+                Exl3::Vk(e) => e.prefill(0, toks),
+                Exl3::Hip(e) => e.prefill(toks),
+            }
+        }
+        fn decode1(&mut self, tok: u32) -> Result<Vec<f32>, String> {
+            match self {
+                Exl3::Vk(e) => e.decode1(0, tok),
+                Exl3::Hip(e) => e.decode1(tok),
+            }
+        }
+        fn reset(&mut self) {
+            match self {
+                Exl3::Vk(e) => e.reset_states(),
+                Exl3::Hip(e) => {
+                    if let Err(err) = e.reset_seq() {
+                        eprintln!("# hip reset_seq 실패: {err}");
+                    }
+                }
+            }
+        }
+    }
+    let mut eng = match cfg.backend.as_str() {
+        "exl3-hip" => Exl3::Hip(Box::new(crate::exl3_hip_engine::Exl3HipEngine::load(
+            &dir, 1, cfg.ctx,
+        )?)),
+        _ => Exl3::Vk(Box::new(crate::exl3_engine::Exl3Engine::load(
+            &dir, 1, cfg.ctx,
+        )?)),
+    };
+    // 워밍업 1회 — 측정 형상과 동일(plans/79, llama-bench 정합).
+    {
+        let l = eng.prefill(&cfg.prompt)?;
+        let t = llm170_core::qwen35::greedy(&l);
+        let _ = eng.decode1(t)?;
+    }
+    eng.reset();
+    let mut lines = Vec::new();
+    for r in 0..cfg.reps {
+        eng.reset();
+        let t0 = std::time::Instant::now();
+        let l = eng.prefill(&cfg.prompt)?;
+        let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
+        lines.push(format!(
+            "pp{} gpu | rep{r} | {pp_ms:8.1} ms | {:7.2} t/s",
+            cfg.pp,
+            cfg.pp as f64 / (pp_ms / 1e3)
+        ));
+        let mut next = llm170_core::qwen35::greedy(&l);
+        let t1 = std::time::Instant::now();
+        let mut n_gen = 0usize;
+        while n_gen < cfg.tg {
+            next = llm170_core::qwen35::greedy(&eng.decode1(next)?);
+            n_gen += 1;
+        }
+        let tg_ms = t1.elapsed().as_secs_f64() * 1e3;
+        lines.push(format!(
+            "tg{} gpu | rep{r} | {tg_ms:8.1} ms | {:7.2} t/s (steps {n_gen}, gen {n_gen})",
+            cfg.tg,
+            n_gen as f64 / (tg_ms / 1e3)
+        ));
+    }
+    Ok(lines)
 }
 
 /// qwen4exp 측정 — Engine4 prefill/decode1 greedy + np 배치.
@@ -737,10 +823,10 @@ fn print_table(lines: &[String], cfg: &BenchCfg) {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let bemark = if cfg.backend == "gpu" {
-        format!("gpu:{}", cfg.gpu_runtime)
-    } else {
-        "cpu".into()
+    let bemark = match cfg.backend.as_str() {
+        "gpu" => format!("gpu:{}", cfg.gpu_runtime),
+        "cpu" => "cpu".into(),
+        other => other.to_string(),
     };
     for l in lines {
         // "pp512 | rep0 | ..." → 앞부분 파싱해 정렬
