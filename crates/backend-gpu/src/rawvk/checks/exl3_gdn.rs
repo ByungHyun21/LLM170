@@ -168,8 +168,11 @@ impl TrellisResident {
         let p4t = self
             .ctx
             .pipeline_pipes(include_bytes!("../spv/exl3_ffn_ew_t.spv"), 3, 4)?;
-        let max_k = self.linears.iter().map(|(_, l)| l.k).max().unwrap_or(5120);
-        let max_n = self.linears.iter().map(|(_, l)| l.n).max().unwrap_or(17408);
+        // 모델 전체 max — 부분 적재(load_keep) 축소 시에도 풀 적재와 동일 크기.
+        // 2026-10-04 ffn 크래시: 필터 max_n 17408에서 248320급 기록(yb/sb/x2t
+        // 경계)이 35MB 버퍼를 넘어 힙 파탄 — 풀 적재 508MB가 가리던 잠재 OOB.
+        let max_k = self.max_k_g;
+        let max_n = self.max_n_g;
         // CPU가 직접 읽/쓰는 버퍼(xtb 스테이징·yb 판독)는 호스트 RAM(캐시됨) —
         // APU 커브아웃 매핑 판독은 무캐시로 T×n MB급 판독이 ~300MB/s에
         // 걸려 프리필 병목이었다(2026-10-03 계측: lin_gu 34ms/층 중 대부분).
