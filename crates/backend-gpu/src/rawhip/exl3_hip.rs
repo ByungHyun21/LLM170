@@ -717,6 +717,21 @@ impl Exl3HipDecoder {
                 self.had16_batch(self.dbxn, lz.k, t, lz.suh)?;
                 self.gemm2_batch(&lz, t, self.dsb2)?;
                 self.hadout_batch(self.dsb2, lz.svh, lz.n, t)?;
+                if self.dbg_layers && t >= 2 && il == 0 {
+                    let dump8 = |hc: &crate::rawhip::ctx::RawCtx, ptr: *mut u8, tag: &str| {
+                        let mut rb = vec![0u8; 32];
+                        // SAFETY: 배치 버퍼 행1 오프셋.
+                        let p1 = unsafe { ptr.add(5120 * 4) };
+                        let _ = hc.d2h(&mut rb, p1);
+                        let _ = hc.sync();
+                        // SAFETY: d2h 완료 후 재해석.
+                        let f8: Vec<f32> = unsafe {
+                            std::slice::from_raw_parts(rb.as_ptr() as *const f32, 8).to_vec()
+                        };
+                        eprintln!("  [b{tag}] r1={f8:?}");
+                    };
+                    dump8(&self.hc, self.dsb, "qkv");
+                }
                 let mut tl = t as i32;
                 let mut lay = gdn_il as i32;
                 let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) =
@@ -756,7 +771,7 @@ impl Exl3HipDecoder {
                 self.hc.launch3(
                     "exl3_gdn_l2perm",
                     48,
-                    1,
+                    t as u32,
                     1,
                     128,
                     &mut [
@@ -777,6 +792,18 @@ impl Exl3HipDecoder {
                 )?;
                 let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5) =
                     (self.dq2, self.dk2, self.dv2, self.dbg, self.dgst, self.dgo);
+                if self.dbg_layers && t >= 2 && il == 0 {
+                    let mut rb = vec![0u8; 32];
+                    // SAFETY: dgq 행1(행 폭 2048).
+                    let p1 = unsafe { self.dgq.add(2048 * 4) };
+                    let _ = self.hc.d2h(&mut rb, p1);
+                    let _ = self.hc.sync();
+                    // SAFETY: d2h 완료 후 재해석.
+                    let f8: Vec<f32> = unsafe {
+                        std::slice::from_raw_parts(rb.as_ptr() as *const f32, 8).to_vec()
+                    };
+                    eprintln!("  [bconv] r1={f8:?}");
+                }
                 let (mut hk16, mut hv48, mut dd128) = (16i32, 48i32, 128i32);
                 self.hc.launch3(
                     "exl3_gdn_scan",
@@ -803,7 +830,7 @@ impl Exl3HipDecoder {
                 self.hc.launch3(
                     "exl3_gdn_gate",
                     48,
-                    1,
+                    t as u32,
                     1,
                     128,
                     &mut [
@@ -815,6 +842,21 @@ impl Exl3HipDecoder {
                         &mut lay as *mut i32 as *mut _,
                     ],
                 )?;
+                if self.dbg_layers && t >= 2 && il == 0 {
+                    for (buf, tag, w) in [(self.dgate, "gate", 6144usize), (self.dgo, "scan", 6144)]
+                    {
+                        let mut rb = vec![0u8; 32];
+                        // SAFETY: [T][6144] 행1.
+                        let p1 = unsafe { buf.add(w * 4) };
+                        let _ = self.hc.d2h(&mut rb, p1);
+                        let _ = self.hc.sync();
+                        // SAFETY: d2h 완료 후 재해석.
+                        let f8: Vec<f32> = unsafe {
+                            std::slice::from_raw_parts(rb.as_ptr() as *const f32, 8).to_vec()
+                        };
+                        eprintln!("  [b{tag}] r1={f8:?}");
+                    }
+                }
                 self.had16_batch(self.dgate, lo.k, t, lo.suh)?;
                 self.gemm2_batch(&lo, t, self.dbab)?;
                 self.hadout_batch(self.dbab, lo.svh, lo.n, t)?;
@@ -1159,6 +1201,23 @@ impl Exl3HipDecoder {
                         &mut lay as *mut i32 as *mut _,
                     ],
                 )?;
+                if self.dbg_layers && self.pos >= 1 && il == 0 {
+                    for (buf, tag, w) in [
+                        (self.dqkv, "sqkv", 10240usize),
+                        (self.dgq, "sconv", 2048),
+                        (self.dgo, "sscan", 6144),
+                        (self.dgate, "sgate", 6144),
+                    ] {
+                        let mut rb = vec![0u8; 32];
+                        let _ = self.hc.d2h(&mut rb, buf);
+                        let _ = self.hc.sync();
+                        // SAFETY: d2h 완료 후 재해석.
+                        let f8: Vec<f32> = unsafe {
+                            std::slice::from_raw_parts(rb.as_ptr() as *const f32, 8).to_vec()
+                        };
+                        eprintln!("  [{tag}] = {f8:?}");
+                    }
+                }
                 let (mut hk16, mut hv48, mut dd128) = (16i32, 48i32, 128i32);
                 let (
                     mut b0,
@@ -1409,3 +1468,5 @@ impl Exl3HipDecoder {
 // 마커 dpp
 // 마커 bld
 // 마커 blf
+// 마커 bd2
+// 마커 gy2
