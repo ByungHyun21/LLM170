@@ -117,6 +117,80 @@ fn host_mem_available() -> Option<u64> {
 
 /// 적재 시작 전 가드 - 서브커맨드 진입부에서 호출.
 /// `gpu`가 참이면 VRAM 가용을 조회해 산식에 포함한다.
+/// 진단용 기본 모델 경로(단일 소스 — probes.rs·가드 표가 공유,
+/// plans/129 A2/R1·A13).
+pub const DEFAULT_FN_MODEL: &str =
+    "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+pub const DEFAULT_27_MODEL: &str = "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf";
+pub const DEFAULT_Q35_MODEL: &str = "/home/yoon/models/qwen3.8-27b/q35work.gguf";
+pub const DEFAULT_EXL3_MODEL: &str = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
+
+/// 무인자 실행 시 모델을 적재하는 프로브(가드 우회 폐쇄 — plans/129 A13).
+/// (서브커맨드, 기본 경로) — --model/위치인자 부재 시 기본 경로로 가드한다.
+pub const PROBE_DEFAULT_MODELS: &[(&str, &str)] = &[
+    ("mmq-row-check", DEFAULT_27_MODEL),
+    ("hip-dmmv-check", DEFAULT_27_MODEL),
+    ("tile-row-check", DEFAULT_27_MODEL),
+    ("hip-moe-dmmv-check", DEFAULT_FN_MODEL),
+    ("mtp-load-check", DEFAULT_FN_MODEL),
+    ("vk-frame-check", DEFAULT_FN_MODEL),
+];
+
+/// 가드 대상(plans/129 A2/R1) — 판정 결과.
+pub struct GuardTarget {
+    pub path: std::path::PathBuf,
+    pub gpu: bool,
+}
+
+/// 가드 대상 판정 — main() 인라인에서 추출한 순수함수(plans/129 A2/R1).
+/// 입력: 서브커맨드, --model 값, 정규화 백엔드(hip|vulkan→"gpu"), 런타임,
+/// 위치인자. None = 가드 스킵(메타데이터 서브커맨드 또는 경로 부재 — 로더
+/// 에러가 더 정확). 계약은 테이블 테스트(guard_target_cases)가 고정한다.
+pub fn guard_target(
+    sub: &str,
+    model: Option<&str>,
+    backend: Option<&str>,
+    gpu_runtime: Option<&str>,
+    rest: &[String],
+) -> Option<GuardTarget> {
+    // 메타데이터만 읽는 서브커맨드 — 무게 미적재.
+    if matches!(sub, "gguf-dump" | "tokenize") {
+        return None;
+    }
+    let mut path = model.map(std::path::PathBuf::from);
+    let mut gpu = backend == Some("gpu") || gpu_runtime.is_some();
+    let first_pos = || {
+        rest.iter()
+            .find(|a| !a.starts_with("--"))
+            .map(std::path::PathBuf::from)
+    };
+    if sub == "check" {
+        gpu = true; // run_check의 백엔드 기본값이 gpu다.
+        if path.is_none() {
+            path = first_pos();
+        }
+    } else if sub == "w4a8-check" && path.is_none() {
+        path = first_pos(); // args[0] 필수 — 로더 적재.
+    }
+    // exl3-* 프로브도 모델을 적재한다 — 첫 비플래그 인자(A13: 상대경로 우회를
+    // 닫기 위해 과거 슬래시 조건 폐지, 2026-10-04 사고 재발 방지). 무인자면
+    // EXL3 기본 아카이브로 가드(안전 방향 — 오탐은 가드 에러가 안내).
+    if sub.starts_with("exl3-") {
+        gpu = true;
+        if path.is_none() {
+            path = first_pos().or_else(|| Some(DEFAULT_EXL3_MODEL.into()));
+        }
+    }
+    // A13: 기본 경로로 적재하는 무인자 프로브 — 경로표로 가드.
+    if path.is_none()
+        && let Some((_, def)) = PROBE_DEFAULT_MODELS.iter().find(|(c, _)| *c == sub)
+    {
+        path = Some(std::path::PathBuf::from(*def));
+        gpu = true;
+    }
+    path.map(|path| GuardTarget { path, gpu })
+}
+
 pub fn preflight(model: &Path, gpu: bool) -> Result<(), String> {
     let bytes = model_bytes(model);
     if bytes == 0 {
@@ -177,5 +251,71 @@ mod tests {
         // (이중 적재 동결 방지)상 이것이 옳다(2026-09-16: 통과 기대는 산식과
         // 모순되어 수정).
         assert!(check(103_700 * (1 << 20), Some(90 * GIB), None).is_err());
+    }
+
+    /// guard_target 판정 표(plans/129 A2/R1) — 서브커맨드×인자 형태 계약을
+    /// 고정한다. 무가드 적재 프로브 폐쇄(A13)·exl3 상대경로 우회 폐쇄 포함.
+    #[test]
+    fn guard_target_cases() {
+        use super::{DEFAULT_27_MODEL, DEFAULT_EXL3_MODEL, PROBE_DEFAULT_MODELS, guard_target};
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // serve/infer류: --model + 백엔드 → (경로, gpu)
+        let g = guard_target(
+            "serve",
+            Some("/m/a.gguf"),
+            Some("gpu"),
+            Some("hip"),
+            &s(&[]),
+        );
+        assert_eq!(
+            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
+            Some(("/m/a.gguf".into(), true))
+        );
+        // cpu 백엔드 → gpu=false
+        let g = guard_target("infer", Some("/m/a.gguf"), Some("cpu"), None, &s(&[]));
+        assert_eq!(g.map(|g| g.gpu), Some(false));
+        // check: 첫 위치인자 + gpu 강제
+        let g = guard_target("check", None, None, None, &s(&["/m/a.gguf", "--quick"]));
+        assert_eq!(
+            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
+            Some(("/m/a.gguf".into(), true))
+        );
+        // w4a8-check: 위치인자 (gpu 강제 없음)
+        let g = guard_target("w4a8-check", None, None, None, &s(&["/m/a.gguf"]));
+        assert_eq!(
+            g.map(|g| g.path.to_str().unwrap().to_string()),
+            Some("/m/a.gguf".to_string())
+        );
+        // exl3 프로브: 상대경로(무슬래시)도 우회 없이 가드(A13)
+        let g = guard_target("exl3-hip-decode", None, None, None, &s(&["relmodel"]));
+        assert_eq!(
+            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
+            Some(("relmodel".into(), true))
+        );
+        // exl3 무인자: 기본 EXL3 아카이브로 가드
+        let g = guard_target("exl3-hip-attn", None, None, None, &s(&[]));
+        assert_eq!(
+            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
+            Some((DEFAULT_EXL3_MODEL.to_string(), true))
+        );
+        // 무인자 적재 프로브: 기본 경로표(A13)
+        let g = guard_target("mmq-row-check", None, None, None, &s(&[]));
+        assert_eq!(
+            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
+            Some((DEFAULT_27_MODEL.to_string(), true))
+        );
+        let g = guard_target("vk-frame-check", None, None, None, &s(&[]));
+        assert_eq!(
+            g.map(|g| g.path.to_str().unwrap().to_string()),
+            Some(super::DEFAULT_FN_MODEL.to_string())
+        );
+        // 메타데이터 서브커맨드·경로 부재 → None
+        assert!(guard_target("gguf-dump", None, None, None, &s(&[])).is_none());
+        assert!(guard_target("tokenize", Some("/m/a.gguf"), None, None, &s(&[])).is_none());
+        assert!(guard_target("bench", None, Some("gpu"), None, &s(&[])).is_none());
+        // 표 무결성: 기본 경로 전부 실존(부서진 기본 경로 = 무가드보다 못한 오탐)
+        for (_, def) in PROBE_DEFAULT_MODELS {
+            assert!(std::path::Path::new(def).exists(), "기본 경로 부재: {def}");
+        }
     }
 }

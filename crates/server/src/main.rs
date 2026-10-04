@@ -205,41 +205,22 @@ fn main() -> ExitCode {
         }
     };
     // 사전 리소스 가드(2026-09-16): 이중 적재로 호스트가 먹통되는 사고 방지.
-    // 모든 모델 적재 서브커맨드(serve/infer/vl/bench/check)를 커버한다:
-    //   - --model <v> / --model=<v> (serve·infer·vl·bench)
-    //   - check의 첫 비플래그 위치인자 (모델 경로)
-    //   - GPU 판정: --backend hip|vulkan (통합 1택, gpu-runtime 폐지); check는 기본이 gpu.
-    // gguf-dump·tokenize는 메타데이터만 읽는다(무게 미적재) — 가드 제외.
+    // 대상 판정은 resource::guard_target 순수함수(A2/R1 추출, plans/129) —
+    // 서브커맨드×인자 형태 계약은 표 테스트(guard_target_cases)가 고정하고
+    // 무가드 적재 프로브 폐쇄(A13)도 같은 표가 담당한다.
     if !matches!(
         args.first().map(String::as_str),
         Some("gguf-dump") | Some("tokenize")
     ) {
-        let sub = args.first().map(String::as_str);
-        let mut model = ma.model.clone();
-        let mut gpu = ma.backend.as_deref() == Some("gpu") || ma.gpu_runtime.is_some();
-        if sub == Some("check") {
-            gpu = true; // run_check의 백엔드 기본값이 gpu다.
-            if model.is_none()
-                && let Some(p) = ma.rest.iter().find(|a| !a.starts_with("--"))
-            {
-                model = Some(p.clone());
-            }
-        }
-        // 프로브(exl3-*·mmq 등)도 모델을 적재한다 — 첫 비플래그 인자가 경로.
-        // 2026-10-04 사고: exl3-hip-decode가 가드 밖에서 이중 적재 → 동결.
-        if let Some(sb) = sub
-            && sb.starts_with("exl3-")
-            && model.is_none()
-            && let Some(p) = ma
-                .rest
-                .iter()
-                .find(|a| !a.starts_with("--") && a.contains('/'))
-        {
-            model = Some(p.clone());
-            gpu = true;
-        }
-        if let Some(mp) = model
-            && let Err(e) = resource::preflight(std::path::Path::new(&mp), gpu)
+        // 가드 대상 판정은 resource::guard_target 순수함수(A2/R1 추출, plans/129) —
+        // 표 테이블 테스트가 계약을 고정한다(무가드 프로브 폐쇄 A13 포함).
+        if let Some(gt) = resource::guard_target(
+            args.first().map(String::as_str).unwrap_or(""),
+            ma.model.as_deref(),
+            ma.backend.as_deref(),
+            ma.gpu_runtime.as_deref(),
+            &ma.rest,
+        ) && let Err(e) = resource::preflight(&gt.path, gt.gpu)
         {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
@@ -338,6 +319,12 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let Some(model_path) = ma.model.clone().map(PathBuf::from) else {
         return usage_err("--model required");
     };
+    // A12(plans/129): exl3-hip 엔진은 단일 슬롯 — --slots>1이 슬롯 생성 시점의
+    // 점유 슬롯 reset으로 교묘하게 상태를 파괴했다(엔진 코드는 대응하지만
+    // 진입에서 거부하는 게 계약상 정확). vk 엔진은 다중 슬롯 지원 — 제외.
+    if model_path.is_dir() && gpu_runtime != "vulkan" && slots.unwrap_or(1) > 1 {
+        return usage_err("EXL3 hip 백엔드는 단일 슬롯만 지원 — --slots 1");
+    }
     if spec_k > 0 {
         // GPU 스펙 경로 강제 (스레드 기동 전 단일 스레드 시점 env 설정).
         // 안전성: 이 시점은 단일 스레드 (엔진/슬롯 스레드 기동 전).
