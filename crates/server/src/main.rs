@@ -38,7 +38,7 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
               [--n-predict N] [--ctx N] [--backend cpu|hip|vulkan] [--spec k]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
       --prompt-tokens 반복 = 병렬 시퀀스(np). --backend hip|vulkan: 원시 디코더 상주 디코드.
-  llm170 serve --model <file.gguf|exl3_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan|exl3] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
+  llm170 serve --model <file.gguf|exl3_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
       OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯(기본 1).
   llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
             [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
@@ -141,13 +141,11 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
                     "cuda" => {
                         return Err("--backend cuda: 미구현 (hip|vulkan 사용)".into());
                     }
-                    // EXL3 직접 경로 (plans/121 A1) — --model은 EXL3 디렉터리.
-                    "exl3-hip" => {
-                        ma.backend = Some("exl3-hip".into());
-                    }
-                    "exl3" => {
-                        ma.backend = Some("exl3".into());
-                        ma.gpu_runtime = None;
+                    // EXL3 백엔드값 폐지(사용자 지시 2026-10-05): --backend는
+                    // 런타임만(cpu|hip|vulkan|cuda). EXL3는 --model이 디렉터리면
+                    // 포맷 자동 판별로 라우팅된다.
+                    "exl3" | "exl3-hip" => {
+                        return Err("--backend exl3* 폐지: EXL3는 --model <EXL3 디렉터리>로 자동 판별 — --backend hip|vulkan|cpu".into());
                     }
                     // 하위호준 별칭 — 종전 2층(--backend gpu --gpu-runtime X) 폐지.
                     "gpu" => {
@@ -218,12 +216,7 @@ fn main() -> ExitCode {
     ) {
         let sub = args.first().map(String::as_str);
         let mut model = ma.model.clone();
-        // exl3·exl3-hip도 GPU 백엔드다(가드 VRAM 항 누락이 2026-10-05 서빙 경계
-        // 오탐의 원인 — 21.2 vs 21.2GiB 거부, plans/128 P0 검증 중 발견).
-        let mut gpu = matches!(
-            ma.backend.as_deref(),
-            Some("gpu") | Some("exl3-hip") | Some("exl3")
-        ) || ma.gpu_runtime.is_some();
+        let mut gpu = ma.backend.as_deref() == Some("gpu") || ma.gpu_runtime.is_some();
         if sub == Some("check") {
             gpu = true; // run_check의 백엔드 기본값이 gpu다.
             if model.is_none()
@@ -384,10 +377,19 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         ple_table: ma.ple_table.clone(),
         ple_cache_mib: ma.ple_cache_mib,
     };
-    let sel = if backend == "exl3-hip" {
-        engine::BackendSel::Exl3Hip
-    } else if backend == "exl3" {
-        engine::BackendSel::Exl3
+    // 포맷 자동 판별(사용자 계약 2026-10-05): 모델 경로가 디렉터리(EXL3
+    // 아카이브)면 --backend 런타임(hip|vulkan)으로 EXL3 엔진을 고른다.
+    // cpu+디렉터리는 명확한 에러(무음 Q4 로드 실패 방지).
+    if model_path.is_dir() && backend != "gpu" {
+        eprintln!("error: EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan");
+        return ExitCode::FAILURE;
+    }
+    let sel = if model_path.is_dir() {
+        if gpu_runtime == "vulkan" {
+            engine::BackendSel::Exl3
+        } else {
+            engine::BackendSel::Exl3Hip
+        }
     } else if backend == "gpu" {
         if gpu_runtime.is_empty() {
             engine::BackendSel::Gpu
