@@ -10,6 +10,7 @@ mod exl3_hip_engine;
 mod http;
 mod infer;
 mod json;
+mod oai;
 mod perplexity;
 mod probes;
 mod resource;
