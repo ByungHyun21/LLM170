@@ -60,6 +60,11 @@ pub struct Exl3HipDecoder {
     dpp: *mut u8,
     dembed: *mut u8,
     dargmax: *mut u8,
+    mtp_norms: Vec<Vec<f32>>,
+    mtp_kv_k: Vec<f32>,
+    mtp_kv_v: Vec<f32>,
+    mtp_kv_len: usize,
+    dmtpin: *mut u8,
     dnw: *mut u8,
     dqnw: *mut u8,
     dknw: *mut u8,
@@ -100,7 +105,10 @@ impl Exl3HipDecoder {
         let (qnw, knw) = tr.attn_norms_dump()?;
         let (cw, ab_c, alog, dtb, nw_g) = tr.gdn_chain_consts()?;
         let keys = tr.linear_keys();
-        let need: Vec<String> = if lim_layers < n_layers {
+        // lim_layers=0: 본체 0층 + mtp 전체(모듈 격리 프로브) — 전체 키 사용.
+        let need: Vec<String> = if lim_layers == 0 {
+            keys.clone()
+        } else if lim_layers < n_layers {
             let mut v = Vec::new();
             for il in 0..lim_layers {
                 let lp = format!("model.language_model.layers.{il}");
@@ -174,8 +182,31 @@ impl Exl3HipDecoder {
         let embed_all: Vec<f32> = tr.embed.clone();
         let dembed = hc.alloc(embed_all.len() * 4)?;
         Self::h2d_chunked(&hc, dembed, f32b(&embed_all))?;
-        let dargmax = hc.alloc(4)?;
+        let mtp_keys = [
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.post_attention_layernorm.weight",
+            "mtp.norm.weight",
+        ];
+        let mut mtp_norms = Vec::with_capacity(5);
+        for mk in mtp_keys {
+            let w = tr.norm(mk).ok_or(format!("mtp norm {mk}"))?.to_vec();
+            mtp_norms.push(w);
+        }
+        let (qn_w, kn_w) = (
+            tr.norm("mtp.layers.0.self_attn.q_norm.weight")
+                .ok_or("mtp qn")?
+                .to_vec(),
+            tr.norm("mtp.layers.0.self_attn.k_norm.weight")
+                .ok_or("mtp kn")?
+                .to_vec(),
+        );
+        mtp_norms.push(qn_w);
+        mtp_norms.push(kn_w);
+        let dmtpin = hc.alloc(128 * 1024 * 4)?; // FFN down 입력 17408 f32 상한
         drop(tr);
+        let dargmax = hc.alloc(4)?;
 
         let tmax = 64usize;
         let dx = hc.alloc(hidden * 4)?;
@@ -230,6 +261,11 @@ impl Exl3HipDecoder {
             dou,
             dembed,
             dargmax,
+            mtp_norms,
+            mtp_kv_k: vec![0f32; 4096 * 4 * 256],
+            mtp_kv_v: vec![0f32; 4096 * 4 * 256],
+            mtp_kv_len: 0,
+            dmtpin,
             dring,
             dgst,
             dkc,
@@ -363,6 +399,157 @@ impl Exl3HipDecoder {
         self.hc.d2h(&mut ob, self.dargmax)?;
         self.hc.sync()?;
         Ok(u32::from_le_bytes([ob[0], ob[1], ob[2], ob[3]]))
+    }
+
+    /// MTP 드래프트 1스텝(plans/121 A2 수학 그대로, vk mtp_step 미러):
+    /// enorm(e)‖hnorm(h) → mtp.fc → gated-attn(자체 KV, 호스트) → o+resid → FFN → resid → shared norm → lm_head.
+    /// 선형은 전부 hip gemv(GPU), 노름·rope·ew·어텐션 가중합은 호스트(T=1 소형).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_draft(&mut self, token: u32, h_in: &[f32], pos: u32) -> Result<Vec<f32>, String> {
+        let h = self.hidden;
+        let eps = 1e-6f32;
+        let rms = |x: &[f32], w: &[f32]| -> Vec<f32> {
+            let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+            let s = 1.0 / (ms + eps).sqrt();
+            x.iter().zip(w).map(|(v, wv)| v * s * wv).collect()
+        };
+        // SAFETY: dembed 직접 판독은 d2h 경유가 원칙이나 여기선 h2d 직전 스텝 완료 동기 이후.
+        let mut rb = vec![0u8; h * 4];
+        self.hc
+            .d2h(&mut rb, unsafe { self.dembed.add(token as usize * h * 4) })?;
+        self.hc.sync()?;
+        // SAFETY: d2h 완료 후 재해석.
+        let e: &[f32] = unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, h) };
+        let e_n = rms(e, &self.mtp_norms[0]);
+        let h_n = rms(h_in, &self.mtp_norms[1]);
+        let mut cat = Vec::with_capacity(2 * h);
+        cat.extend_from_slice(&e_n);
+        cat.extend_from_slice(&h_n);
+        // mtp.fc GEMV
+        let mut cur = self.gemv_host("mtp.fc", &cat)?;
+        // 어텐션
+        let xn = rms(&cur, &self.mtp_norms[2]);
+        let lp = "mtp.layers.0.self_attn";
+        let q_gate = self.gemv_host(&format!("{lp}.q_proj"), &xn)?;
+        let k = self.gemv_host(&format!("{lp}.k_proj"), &xn)?;
+        let v = self.gemv_host(&format!("{lp}.v_proj"), &xn)?;
+        let (n_head, n_kv, head_dim, n_rot) = (24usize, 4usize, 256usize, 64usize);
+        let rope_base = 1e7f32;
+        let rope1 = |hd: &mut [f32], pos: u32| {
+            for i in 0..n_rot / 2 {
+                let p = rope_base.powi(-(2 * i as i32) as i32 / n_rot as i32);
+                let (a, b) = (hd[i], hd[i + n_rot / 2]);
+                hd[i] = a * (pos as f32 * p).cos() - b * (pos as f32 * p).sin();
+                hd[i + n_rot / 2] = a * (pos as f32 * p).sin() + b * (pos as f32 * p).sin();
+            }
+        };
+        let mut q_heads = vec![0f32; n_head * head_dim];
+        let mut gate_heads = vec![0f32; n_head * head_dim];
+        for hh in 0..n_head {
+            let src = hh * head_dim * 2;
+            q_heads[hh * head_dim..(hh + 1) * head_dim]
+                .copy_from_slice(&q_gate[src..src + head_dim]);
+            gate_heads[hh * head_dim..(hh + 1) * head_dim]
+                .copy_from_slice(&q_gate[src + head_dim..src + head_dim * 2]);
+        }
+        let kb0 = pos as usize * n_kv * head_dim;
+        for hh in 0..n_head {
+            let b0 = hh * head_dim;
+            let mut head = q_heads[b0..b0 + head_dim].to_vec();
+            head = rms(&head, &self.mtp_norms[5]);
+            rope1(&mut head, pos);
+            q_heads[b0..b0 + head_dim].copy_from_slice(&head);
+        }
+        for hh in 0..n_kv {
+            let b0 = hh * head_dim;
+            let mut head = k[b0..b0 + head_dim].to_vec();
+            head = rms(&head, &self.mtp_norms[6]);
+            rope1(&mut head, pos);
+            self.mtp_kv_k[kb0 + hh * head_dim..kb0 + (hh + 1) * head_dim].copy_from_slice(&head);
+            self.mtp_kv_v[kb0 + hh * head_dim..kb0 + (hh + 1) * head_dim]
+                .copy_from_slice(&v[b0..b0 + head_dim]);
+        }
+        self.mtp_kv_len = (pos as usize + 1).max(self.mtp_kv_len);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let n_rep = n_head / n_kv;
+        let kv_len = self.mtp_kv_len;
+        let mut attn_out = vec![0f32; n_head * head_dim];
+        for hh in 0..n_head {
+            let kv_h = hh / n_rep;
+            let b0 = hh * head_dim;
+            let mut scores = vec![0f32; kv_len];
+            for (tt, sc) in scores.iter_mut().enumerate() {
+                let kb = tt * n_kv * head_dim + kv_h * head_dim;
+                let mut d = 0f32;
+                for i in 0..head_dim {
+                    d += q_heads[b0 + i] * self.mtp_kv_k[kb + i];
+                }
+                *sc = d * scale;
+            }
+            let maxv = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0f64;
+            for sc in scores.iter_mut() {
+                *sc = (*sc - maxv).exp();
+                sum += *sc as f64;
+            }
+            for tt in 0..kv_len {
+                let w = scores[tt] as f32 / sum as f32;
+                let vb = tt * n_kv * head_dim + kv_h * head_dim;
+                for i in 0..head_dim {
+                    attn_out[b0 + i] += w * self.mtp_kv_v[vb + i];
+                }
+            }
+            for i in 0..head_dim {
+                let g = gate_heads[b0 + i];
+                let sig = 1.0 / (1.0 + (-g).exp());
+                attn_out[b0 + i] *= sig;
+            }
+        }
+        let o = self.gemv_host(&format!("{lp}.o_proj"), &attn_out)?;
+        for i in 0..h {
+            cur[i] += o[i];
+        }
+        // FFN
+        let xf = rms(&cur, &self.mtp_norms[3]);
+        let g_ = self.gemv_host("mtp.layers.0.mlp.gate_proj", &xf)?;
+        let u_ = self.gemv_host("mtp.layers.0.mlp.up_proj", &xf)?;
+        let mut ewv = vec![0f32; g_.len()];
+        for i in 0..g_.len() {
+            let s = g_[i] / (1.0 + (-g_[i]).exp());
+            ewv[i] = s * u_[i];
+        }
+        let d_ = self.gemv_host("mtp.layers.0.mlp.down_proj", &ewv)?;
+        for i in 0..h {
+            cur[i] += d_[i];
+        }
+        let hn = rms(&cur, &self.mtp_norms[4]);
+        self.gemv_host("lm_head", &hn)
+    }
+
+    /// 호스트 벡터 → gemv 체인 1회 → 호스트 결과(드래프트 소형 전용 — 본체는 상주 경로).
+    fn gemv_host(&mut self, key: &str, x: &[f32]) -> Result<Vec<f32>, String> {
+        let l = self.lin.get(key).ok_or(format!("lin {key}"))?;
+        let l = HipLin {
+            k: l.k,
+            n: l.n,
+            krate: l.krate,
+            suh: l.suh,
+            tre: l.tre,
+            svh: l.svh,
+        };
+        self.hc.h2d(self.dmtpin, unsafe {
+            std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4)
+        })?;
+        self.hc.sync()?;
+        let out = self.dyb;
+        self.gemv_chain(&l, self.dmtpin, out)?;
+        let mut ob = vec![0u8; l.n * 4];
+        self.hc.d2h(&mut ob, out)?;
+        self.hc.sync()?;
+        // SAFETY: d2h 완료 후 재해석.
+        let y: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, l.n).to_vec() };
+        Ok(y)
     }
 
     /// 1토큰 forward → 로짓. ew(silu·mul)는 호스트(정확성 우선 — 추후 커널화).
@@ -759,3 +946,9 @@ impl Exl3HipDecoder {
 // 마커 dropfx
 // 마커 syn2
 // 마커 am1
+// 마커 mtp1
+// 마커 mtp2
+// 마커 mtp3
+// 마커 mtp4
+// 마커 mtph
+// 마커 mtpi
