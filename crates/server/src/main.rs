@@ -223,6 +223,16 @@ fn main() -> ExitCode {
                 model = Some(p.clone());
             }
         }
+        // 프로브(exl3-*·mmq 등)도 모델을 적재한다 — 첫 비플래그 인자가 경로.
+        // 2026-10-04 사고: exl3-hip-decode가 가드 밖에서 이중 적재 → 동결.
+        if let Some(sb) = sub
+            && sb.starts_with("exl3-")
+            && model.is_none()
+            && let Some(p) = ma.rest.iter().find(|a| !a.starts_with("--") && a.contains('/'))
+        {
+            model = Some(p.clone());
+            gpu = true;
+        }
         if let Some(mp) = model
             && let Err(e) = resource::preflight(std::path::Path::new(&mp), gpu)
         {
@@ -620,3 +630,4 @@ fn usage_err(msg: &str) -> ExitCode {
     eprintln!("error: {msg}\n\n{USAGE}");
     ExitCode::from(2)
 }
+// 마커 gpx
