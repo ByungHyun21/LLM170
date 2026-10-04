@@ -355,9 +355,27 @@ pub fn hip_linear_check(dir: &str, key: &str) -> Result<String, String> {
 // 마커 lin1
 
 // ── EXL3 hip 배치 gemm2 프로브(모듈 4/4) ── T행 체인: had_in→gemm2→had_out.
-pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
+pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, String> {
     use crate::rawvk::checks::TrellisResident;
-    let key = "model.language_model.layers.0.mlp.gate_proj";
+    // 형상 스윕(plans/128 P2): 단축명 → 전체 키. gemm2는 선형 무관 동일 커널이라
+    // 대표 형상별 스윕이 전-선형 검증을 대행한다(n=1024~248320).
+    let key = match key_sel {
+        "g" => "model.language_model.layers.0.mlp.gate_proj",
+        "g5" => "model.language_model.layers.5.mlp.gate_proj", // 혼합정밀 층(P2 krate 스윕)
+        "u" => "model.language_model.layers.0.mlp.up_proj",
+        "d" => "model.language_model.layers.0.mlp.down_proj",
+        "qkv" => "model.language_model.layers.0.linear_attn.in_proj_qkv",
+        "z" => "model.language_model.layers.0.linear_attn.in_proj_z",
+        "gop" => "model.language_model.layers.0.linear_attn.out_proj",
+        "q" => "model.language_model.layers.3.self_attn.q_proj",
+        "k" => "model.language_model.layers.3.self_attn.k_proj",
+        "v" => "model.language_model.layers.3.self_attn.v_proj",
+        "o" => "model.language_model.layers.3.self_attn.o_proj",
+        "lh" => "lm_head",
+        _ => {
+            return Err(format!("미지 key {key_sel}: g,u,d,qkv,z,gop,q,k,v,o,lh,g5"));
+        }
+    };
     let t_rows = t_arg;
     // 부분 적재: L0 gate_proj 1개 선형만 (풀모델 상주 금지).
     let mut tr = TrellisResident::load_keep(dir, &|n: &str| n == key)?;
@@ -723,7 +741,7 @@ pub fn hip_gemm_check(dir: &str, t_arg: usize) -> Result<String, String> {
     ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let tf = 2.0 * k as f64 * n as f64 * t_rows as f64 / 1e12;
     Ok(format!(
-        "hip-gemm T={t_rows} gate_proj: 샘플 maxdiff={worst:.3e} · gemm2 {:.1}ms = {:.1} TF",
+        "hip-gemm T={t_rows} {key_sel}(k={k},n={n}): 샘플 maxdiff={worst:.3e} · gemm2 {:.1}ms = {:.1} TF",
         ts[1],
         tf / (ts[1] / 1000.0)
     ))
