@@ -599,14 +599,14 @@ pub struct BatchScratch {
 // KV 16층 134MB GPU 상주 + 프리필 말미 kvc 벌크 동기(디코드 정합).
 // 폐기: fwd(3패스 비결합), fwd2(FA블록, 배리어 64회 폭주).
 pub struct AttnFrame {
-    pbuf: VkBuf, // [4] u32 — pos0(재생: 푸시 불변으로 만들기 위한 매개변수 버퍼)
-    kkc: VkBuf,  // [16*1024][1024] f32
-    vkc: VkBuf,
-    qh: VkBuf,   // [TMAX*6144] f32 norm+rope q
-    qnws: VkBuf, // [16*256]
-    knws: VkBuf, // [16*256]
-    pa: Pipes,   // attn_prep
-    pf3: Pipes,  // attn_fwd3
+    pub(crate) pbuf: VkBuf, // [4] u32 — pos0(재생: 푸시 불변으로 만들기 위한 매개변수 버퍼)
+    pub(crate) kkc: VkBuf,  // [16*1024][1024] f32
+    pub(crate) vkc: VkBuf,
+    pub(crate) qh: VkBuf,   // [TMAX*6144] f32 norm+rope q
+    pub(crate) qnws: VkBuf, // [16*256]
+    pub(crate) knws: VkBuf, // [16*256]
+    pub(crate) pa: Pipes,   // attn_prep
+    pub(crate) pf3: Pipes,  // attn_fwd3
 }
 
 /// 프레임 버퍼(plans/121 원-서브밋) — 잔차 스트림 GPU 상주.
@@ -762,203 +762,6 @@ impl TrellisResident {
 
 impl TrellisResident {
     /// 어텐션 프레임 초기화(plans/121 F2b) — KV 캐시·q/k 노름 상주.
-    pub fn attn_frame_init(&mut self) -> Result<(), String> {
-        if self.batch.as_ref().is_some_and(|b| b.aframe.is_some()) {
-            return Ok(());
-        }
-        self.ensure_batch()?;
-        let pa = self
-            .ctx
-            .pipeline_pipes(include_bytes!("../spv/exl3_attn_prep.spv"), 9, 8)?;
-        let pf3 = self
-            .ctx
-            .pipeline_pipes(include_bytes!("../spv/exl3_attn_fwd3.spv"), 6, 8)?;
-        let pbuf = self.ctx.alloc_host_cached(16)?;
-        unsafe {
-            std::ptr::write_bytes(pbuf.ptr, 0, 16);
-        }
-        self.ctx.flush_buf(&pbuf);
-        let kkc = self.ctx.alloc_host_cached(16 * 1024 * 1024 * 4)?;
-        let vkc = self.ctx.alloc_host_cached(16 * 1024 * 1024 * 4)?;
-        let qh = self.ctx.alloc_host_cached(BATCH_TMAX * 6144 * 4)?;
-        let qnws = self.ctx.alloc_host_cached(16 * 256 * 4)?;
-        let knws = self.ctx.alloc_host_cached(16 * 256 * 4)?;
-        // 노름 업로드 — 어텐션 층(il%4==3)의 q_norm/k_norm.
-        unsafe {
-            std::ptr::write_bytes(kkc.ptr, 0, 16 * 1024 * 1024 * 4);
-            std::ptr::write_bytes(vkc.ptr, 0, 16 * 1024 * 1024 * 4);
-            let mut ai = 0usize;
-            for il in 0..self.n_layers {
-                if il % 4 != 3 {
-                    continue;
-                }
-                let lp = format!("model.language_model.layers.{il}.self_attn");
-                let qw = self.norm(&format!("{lp}.q_norm.weight")).ok_or("q_norm")?;
-                let kw = self.norm(&format!("{lp}.k_norm.weight")).ok_or("k_norm")?;
-                std::ptr::copy_nonoverlapping(
-                    qw.as_ptr(),
-                    qnws.ptr.add(ai * 256 * 4) as *mut f32,
-                    256,
-                );
-                std::ptr::copy_nonoverlapping(
-                    kw.as_ptr(),
-                    knws.ptr.add(ai * 256 * 4) as *mut f32,
-                    256,
-                );
-                ai += 1;
-            }
-        }
-        self.ctx.flush_buf(&qnws);
-        self.ctx.flush_buf(&knws);
-        self.ctx.flush_buf(&kkc);
-        self.ctx.flush_buf(&vkc);
-        if let Some(b) = self.batch.as_mut() {
-            b.aframe = Some(AttnFrame {
-                pbuf,
-                kkc,
-                vkc,
-                qh,
-                qnws,
-                knws,
-                pa,
-                pf3,
-            });
-        }
-        Ok(())
-    }
-
-    /// 디버그: gstate 선두 8값 판독(재생 NaN 국소화 — plans/121 tg).
-    pub fn debug_gstate_head(&mut self) -> Result<[f32; 8], String> {
-        let g = self
-            .batch
-            .as_ref()
-            .and_then(|b| b.gframe.as_ref())
-            .ok_or("gframe")?;
-        self.ctx.invalidate_range(&g.gstate, 32);
-        let mut out = [0f32; 8];
-        unsafe {
-            std::ptr::copy_nonoverlapping(g.gstate.ptr as *const f32, out.as_mut_ptr(), 8);
-        }
-        Ok(out)
-    }
-
-    /// pos0 매개변수 버퍼 기록(재생 경로 — 호스트가 라운드마다 갱신).
-    pub fn attn_set_pos(&mut self, pos0: u32) -> Result<(), String> {
-        let af = self
-            .batch
-            .as_ref()
-            .and_then(|b| b.aframe.as_ref())
-            .ok_or("aframe")?;
-        unsafe {
-            *(af.pbuf.ptr as *mut u32) = pos0;
-        }
-        self.ctx.flush_range(&af.pbuf, 4);
-        Ok(())
-    }
-
-    /// 어텐션 층 GPU 경로(plans/121 F2b): prep(q/k norm+rope+KV 적립) →
-    /// fwd3(인과 어텐션+게이트) → xtb 직접 기록. yb0/1/2 = q‖gate/k/v GEMM 출력.
-    #[allow(clippy::too_many_arguments)]
-    pub fn attn_layer_gpu(
-        &mut self,
-        attn_il: usize,
-        t_rows: usize,
-        pos0: u32,
-        yb0: ash::vk::Buffer,
-        yb1: ash::vk::Buffer,
-        yb2: ash::vk::Buffer,
-    ) -> Result<(), String> {
-        self.attn_frame_init()?;
-        let af = self
-            .batch
-            .as_ref()
-            .and_then(|b| b.aframe.as_ref())
-            .ok_or("aframe")?;
-        let xtb = self.batch.as_ref().ok_or("batch")?.xtb.buf;
-        let (kkc, vkc, qh, qnws, knws, pbuf) = (
-            af.kkc.buf,
-            af.vkc.buf,
-            af.qh.buf,
-            af.qnws.buf,
-            af.knws.buf,
-            af.pbuf.buf,
-        );
-        // pos0 → 매개변수 버퍼(재생 지원 — 커널은 pp[0] 판독, 푸시는 불변).
-        unsafe {
-            *(af.pbuf.ptr as *mut u32) = pos0;
-        }
-        self.ctx.flush_range(&af.pbuf, 4);
-        self.ctx.begin_batch()?;
-        {
-            let ds = self.ctx.fresh_ds_for(&af.pa, 9)?;
-            self.ctx
-                .bind_bufs(ds, &[yb0, yb1, yb2, qnws, knws, qh, kkc, vkc, pbuf]);
-            let push: Vec<u8> = [t_rows as u32, pos0, attn_il as u32]
-                .iter()
-                .flat_map(|x| x.to_le_bytes())
-                .collect();
-            crate::rawvk::context::site::set_tag("e3_attn_prep");
-            self.ctx.run_rw(
-                af.pa.pl,
-                ds,
-                af.pa.pipe,
-                &push,
-                t_rows as u32,
-                28,
-                1,
-                &[yb0, yb1, yb2, qnws, knws],
-                &[qh, kkc, vkc],
-            )?;
-        }
-        {
-            let ds = self.ctx.fresh_ds_for(&af.pf3, 6)?;
-            self.ctx.bind_bufs(ds, &[qh, kkc, vkc, yb0, xtb, pbuf]);
-            let push: Vec<u8> = [t_rows as u32, pos0, attn_il as u32]
-                .iter()
-                .flat_map(|x| x.to_le_bytes())
-                .collect();
-            let nq = t_rows.div_ceil(4);
-            crate::rawvk::context::site::set_tag("e3_attn_fwd3");
-            self.ctx.run_rw(
-                af.pf3.pl,
-                ds,
-                af.pf3.pipe,
-                &push,
-                nq as u32,
-                24,
-                1,
-                &[qh, kkc, vkc, yb0],
-                &[xtb],
-            )?;
-        }
-        self.ctx.end_batch_wait()?;
-        self.ctx.wait_pending()?;
-        Ok(())
-    }
-
-    /// 프리필 종료 시 KV 캐시 GPU→CPU 벌크 동기(차기 디코드 정합).
-    pub fn attn_kv_sync(&mut self, attn_il: usize, kv_len: usize) -> Result<[Vec<f32>; 2], String> {
-        let b = self.batch.as_ref().ok_or("batch")?;
-        let a = b.aframe.as_ref().ok_or("aframe")?;
-        let n = kv_len * 1024;
-        self.ctx
-            .invalidate_range_at(&a.kkc, attn_il * 1024 * 1024 * 4, n * 4);
-        self.ctx
-            .invalidate_range_at(&a.vkc, attn_il * 1024 * 1024 * 4, n * 4);
-        let k = unsafe {
-            std::slice::from_raw_parts(a.kkc.ptr.add(attn_il * 1024 * 1024 * 4) as *const f32, n)
-                .to_vec()
-        };
-        let v = unsafe {
-            std::slice::from_raw_parts(a.vkc.ptr.add(attn_il * 1024 * 1024 * 4) as *const f32, n)
-                .to_vec()
-        };
-        Ok([k, v])
-    }
-}
-
-impl TrellisResident {
-    /// 프레임 초기화(plans/121 원-서브밋) — 잔차/노름 상주.
     pub fn fframe_init(&mut self) -> Result<(), String> {
         if self.batch.as_ref().is_some_and(|b| b.fframe.is_some()) {
             return Ok(());
@@ -1593,3 +1396,4 @@ impl TrellisResident {
 // 마커 fd
 // 마커 sep1
 // 마커 gdns
+// 마커 atts

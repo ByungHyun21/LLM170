@@ -3,6 +3,7 @@
 
 mod attention;
 mod exl3;
+pub(crate) mod exl3_attn;
 mod exl3_bench;
 pub(crate) mod exl3_decode;
 pub(crate) mod exl3_gdn;
