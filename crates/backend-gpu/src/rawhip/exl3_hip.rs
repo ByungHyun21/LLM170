@@ -247,7 +247,6 @@ impl Exl3HipDecoder {
                 &mut ks as *mut i32 as *mut _,
             ],
         )?;
-        self.hc.sync()?;
         let (mut kt, mut nt, mut kk) = ((l.k / 16) as i32, (l.n / 16) as i32, l.krate as i32);
         let (mut g0, mut g1, mut g2) = (self.dah, l.tre, self.dsb);
         self.hc.launch3(
@@ -265,7 +264,6 @@ impl Exl3HipDecoder {
                 &mut kk as *mut i32 as *mut _,
             ],
         )?;
-        self.hc.sync()?;
         let (mut nch, mut nsg, mut nst) = ((l.n / 128) as i32, 16i32, l.n as i32);
         let (mut c0, mut c1, mut c2) = (self.dsb, l.svh, dyb_out);
         self.hc.launch(
@@ -627,7 +625,7 @@ impl Exl3HipDecoder {
                 tre: self.lin[&ld_key].tre,
                 svh: self.lin[&ld_key].svh,
             };
-            let (dxn, dqh, dgo, dew, dab) = (self.dxn, self.dqh, self.dgo, self.dew, self.dab);
+       dew, dab) = (self.dxn, self.dqh, self.dgo, self.dew, self.dab);
             self.gemv_chain(&lg, dxn, dqh)?;
             self.gemv_chain(&lu, dxn, dgo)?;
             let mut ewn = lg.n as i32;
@@ -711,3 +709,4 @@ impl Exl3HipDecoder {
 // 마커 posr
 // 마커 final
 // 마커 ew1
+// 마커 sy1
