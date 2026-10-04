@@ -12,7 +12,7 @@ use std::time::Instant;
 
 fn usage_err_bench(msg: &str) -> ExitCode {
     eprintln!(
-        "error: {msg}\n사용법: llm170 bench --model <gguf|exl3-dir> [--pp N] [--tg N] [--reps N] [--ctx N] [--backend cpu|gpu|exl3|exl3-hip] [--spec k] [--np K]"
+        "error: {msg}\n사용법: llm170 bench --model <gguf|exl3-dir> [--pp N] [--tg N] [--reps N] [--ctx N] [--backend cpu|hip|vulkan] [--spec k] [--np K]"
     );
     ExitCode::from(2)
 }
@@ -188,7 +188,8 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
 /// EXL3(아카이브 디렉터리) 측정 — plans/125-4: bench가 GGUF 아키텍처 판별에
 /// 묶여 EXL3 dir을 거부하던 결함 수리. 프로토콜은 bench_q4와 동일(워밍업 1회 +
 /// reps, pp=prefill, tg=순차 greedy decode1 — serve 단일슬롯 경로와 동일).
-/// 백엔드: exl3(vk)·exl3-hip. 힙 수치 측정은 ROCm10 런타임으로 실행할 것.
+/// 백엔드: 포맷 자동 판별(2026-10-05) — dir→EXL3 엔진, 런타임은 gpu_runtime
+/// (hip→Exl3Hip, vulkan→Exl3(vk)). 힙 수치 측정은 ROCm10 런타임으로.
 fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
     let dir = cfg
         .model_path
@@ -223,13 +224,18 @@ fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
             }
         }
     }
-    let mut eng = match cfg.backend.as_str() {
-        "exl3-hip" => Exl3::Hip(Box::new(crate::exl3_hip_engine::Exl3HipEngine::load(
+    if cfg.backend == "cpu" {
+        // 포맷 자동 판별 계약(2026-10-05): dir→EXL3는 GPU 런타임 필요.
+        return Err("EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan".into());
+    }
+    let mut eng = if cfg.gpu_runtime == "vulkan" {
+        Exl3::Vk(Box::new(crate::exl3_engine::Exl3Engine::load(
             &dir, 1, cfg.ctx,
-        )?)),
-        _ => Exl3::Vk(Box::new(crate::exl3_engine::Exl3Engine::load(
+        )?))
+    } else {
+        Exl3::Hip(Box::new(crate::exl3_hip_engine::Exl3HipEngine::load(
             &dir, 1, cfg.ctx,
-        )?)),
+        )?))
     };
     // 워밍업 1회 — 측정 형상과 동일(plans/79, llama-bench 정합).
     {

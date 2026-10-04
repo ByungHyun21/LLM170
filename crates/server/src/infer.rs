@@ -52,6 +52,18 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     if prompts.is_empty() {
         return usage_err("at least one --prompt-tokens required");
     }
+    // EXL3 아카이브(디렉터리) — 포맷 자동 판별(사용자 계약 2026-10-05):
+    // --backend는 런타임만 받고 모델 포맷은 경로로 결정. 단일 프롬프트만
+    // 지원(엔진이 단일 슬롯) — 게이트(gate-exl3.sh)의 고정 토큰 러너.
+    if model_path.is_dir() {
+        if backend == "cpu" {
+            return usage_err("EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan");
+        }
+        if prompts.len() > 1 {
+            return usage_err("EXL3 infer는 단일 --prompt-tokens만 지원");
+        }
+        return run_exl3_infer(&model_path, &prompts[0], n_predict, ctx, &gpu_runtime);
+    }
     let max_prompt = prompts.iter().map(|p| p.len()).max().unwrap();
     if max_prompt + n_predict + 8 >= ctx {
         return usage_err(&format!(
@@ -358,4 +370,89 @@ fn emit(seq: usize, pos: u32, token: u32, eng: &llm170_core::qwen35::Engine) {
 }
 fn parse_ids(s: &str) -> Result<Vec<u32>, std::num::ParseIntError> {
     s.split(',').map(|t| t.trim().parse::<u32>()).collect()
+}
+
+/// EXL3 아카이브 infer — 포맷 자동 판별 경로(사용자 계약 2026-10-05).
+/// --backend는 런타임만 받는다: hip→Exl3Hip, vulkan→Exl3(vk).
+/// gate-exl3.sh 고정 토큰 게이트의 러너 — JSONL 형식은 q35 emit과 동일
+/// ({{"seq","pos","token","text"}})해 게이트 grep이 양쪽 공용이다.
+fn run_exl3_infer(
+    dir: &std::path::Path,
+    prompt: &[u32],
+    n_predict: usize,
+    ctx: usize,
+    gpu_runtime: &str,
+) -> ExitCode {
+    if prompt.len() + n_predict + 8 >= ctx {
+        eprintln!(
+            "error: ctx({ctx}) too small for prompt({})+n_predict({n_predict})",
+            prompt.len()
+        );
+        return ExitCode::FAILURE;
+    }
+    let dir_s = dir.to_string_lossy().into_owned();
+    let tok = crate::tokenize::Tokenizer::load(dir, None).ok();
+    let piece = |t: u32| -> String {
+        match &tok {
+            Some(tk) => String::from_utf8_lossy(&tk.piece_bytes(t)).into_owned(),
+            None => String::new(),
+        }
+    };
+    enum E {
+        Vk(Box<crate::exl3_engine::Exl3Engine>),
+        Hip(Box<crate::exl3_hip_engine::Exl3HipEngine>),
+    }
+    impl E {
+        fn prefill(&mut self, toks: &[u32]) -> Result<Vec<f32>, String> {
+            match self {
+                E::Vk(e) => e.prefill(0, toks),
+                E::Hip(e) => e.prefill(toks),
+            }
+        }
+        fn decode1(&mut self, t: u32) -> Result<Vec<f32>, String> {
+            match self {
+                E::Vk(e) => e.decode1(0, t),
+                E::Hip(e) => e.decode1(t),
+            }
+        }
+    }
+    let mut eng = if gpu_runtime == "vulkan" {
+        match crate::exl3_engine::Exl3Engine::load(&dir_s, 1, ctx) {
+            Ok(e) => E::Vk(Box::new(e)),
+            Err(e) => {
+                eprintln!("error: exl3(vk) 로드 실패: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match crate::exl3_hip_engine::Exl3HipEngine::load(&dir_s, 1, ctx) {
+            Ok(e) => E::Hip(Box::new(e)),
+            Err(e) => {
+                eprintln!("error: exl3-hip 로드 실패: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let mut lg = match eng.prefill(prompt) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: prefill: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for pos in (prompt.len() as u32..).take(n_predict) {
+        let t = llm170_core::qwen35::greedy(&lg);
+        println!(
+            "{{\"seq\":0,\"pos\":{pos},\"token\":{t},\"text\":{}}}",
+            crate::json::quoted(&piece(t))
+        );
+        match eng.decode1(t) {
+            Ok(l) => lg = l,
+            Err(e) => {
+                eprintln!("error: decode: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
