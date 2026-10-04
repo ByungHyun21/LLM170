@@ -74,6 +74,20 @@ pub struct Exl3HipDecoder {
     pub dbg_layers: bool,
     pub dbg_hcurve: bool,
     pub hcurve: Vec<(usize, Vec<f32>)>,
+    /// htrace(plans/128 P1 선행): 층 진입 잔차 플랫 목록 — 배치는 [il][t행],
+    /// 순차는 [호출×64+il][1행]. LLM170_DUMP=htrace 게이트 — d2h+sync 포함해
+    /// 그래프 캡처 경로와는 양립 불가(프로브 전용).
+    pub htrace: Vec<Vec<Vec<f32>>>,
+    /// atrace(plans/128 P1 선행): 첫 어텐션층(il==3)의 fwd3s 출력(dou)·o_proj 출력(dab)
+    /// 행 플랫 목록 — 배치·순차 양경로. LLM170_DUMP=atrace 게이트.
+    pub atrace_dou: Vec<Vec<f32>>,
+    pub atrace_dab: Vec<Vec<f32>>,
+    /// atrace 부속: fwd3s 입력 4종(qh·k·v·gate) 행 플랫 — 발산 입력 판별용.
+    pub atrace_qh: Vec<Vec<f32>>,
+    pub atrace_k: Vec<Vec<f32>>,
+    pub atrace_v: Vec<Vec<f32>>,
+    pub atrace_g: Vec<Vec<f32>>,
+    pub atrace_xn: Vec<Vec<f32>>,
     dbxn: *mut u8,
     dbab: *mut u8,
     dbzero: *mut u8,
@@ -384,6 +398,14 @@ impl Exl3HipDecoder {
             dbx,
             dbg_layers: false,
             dbg_hcurve: false,
+            htrace: Vec::new(),
+            atrace_dou: Vec::new(),
+            atrace_dab: Vec::new(),
+            atrace_qh: Vec::new(),
+            atrace_k: Vec::new(),
+            atrace_v: Vec::new(),
+            atrace_g: Vec::new(),
+            atrace_xn: Vec::new(),
             hcurve: Vec::new(),
             dbxn,
             dbab,
@@ -1019,6 +1041,22 @@ impl Exl3HipDecoder {
             let lp = format!("model.language_model.layers.{il}");
             let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
             self.norm_p(2 * il, ab, t)?;
+            if llm170_diag::dump::opts().key("htrace") {
+                // 프로브 전용 덤프(d2h+sync — 그래프 캡처와 양립 불가, plans/128 P1 선행).
+                let mut rows_v = Vec::with_capacity(t);
+                for r in 0..t {
+                    let mut hb = vec![0u8; self.hidden * 4];
+                    // SAFETY: dbx 내 행 오프셋 — t≤64 경계 내.
+                    let p = unsafe { self.dbx.add(r * self.hidden * 4) };
+                    let _ = self.hc.d2h(&mut hb, p);
+                    let _ = self.hc.sync();
+                    // SAFETY: d2h 완료 후 재해석.
+                    rows_v.push(unsafe {
+                        std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden).to_vec()
+                    });
+                }
+                self.htrace.push(rows_v); // 플랫: [il][row] — 배치 호출 1회 가정
+            }
             // [C 계기 2026-10-04] hstage — 순차 경로의 [hipl] L{il} xn 덤프와
             // 배치 경로의 값을 직접 대조해 첫 발산 층 경계를 확정한다.
             if llm170_diag::dump::opts().key("hstage") && il <= 1 {
@@ -1047,99 +1085,146 @@ impl Exl3HipDecoder {
                 let lk = self.lin[&format!("{lp}.self_attn.k_proj")].clone_shallow();
                 let lv = self.lin[&format!("{lp}.self_attn.v_proj")].clone_shallow();
                 let lo = self.lin[&format!("{lp}.self_attn.o_proj")].clone_shallow();
+                // [결함 판정 2026-10-05 P1] gemm2 계약상 입력은 had16의 dah16인데
+                // 이 분기의 had16 호출이 누락돼 q/k/v가 직전 GDN층의 잔여 dah16
+                // (전혀 다른 벡터)로 계산됐다 — L3(첫 어텐션층)부터 계통 발산
+                // (htrace L4 진입 9.06 · fwd3s 입력 4종 전부 11~14 차이·플립 2/9,
+                // hip-batch·atrace로 국소화). suh는 선형별(입력채널 스케일)이라
+                // 세 had16 각각 자기 suh로 호출 — GDN 분기·MTP 경로와 동일 패턴.
+                self.had16_batch(self.dbxn, lq.k, t, lq.suh)?;
                 self.gemm2_batch(&lq, t, self.dsb)?;
+                self.had16_batch(self.dbxn, lk.k, t, lk.suh)?;
                 self.gemm2_batch(&lk, t, self.dsb2)?;
+                self.had16_batch(self.dbxn, lv.k, t, lv.suh)?;
                 self.gemm2_batch(&lv, t, self.dsb3)?;
                 let mut ai = (il / 4) as i32;
                 let mut kv = self.kvcap;
-                // 층 진입마다 pp를 청크 기준 pos로 리셋(2026-10-05 수리, hip-batch
-                // 프로브가 발견) — 행별 pos_bump가 층에 누적되어 레이어 a의
-                // rope pos가 start+a·t+r로 밀리고, 슬라이스의 미기록 행 [0, a·t)을
-                // 판독했다(토큰 플립 2/9 · 로짓 maxdiff ~5). T=1 경로(매 호출
-                // dpp=pos)와 동일 규약으로 정렬 — 층 전부가 start+r 위치 사용.
+                // 층 진입 시 pp를 청크 기준 pos로 리셋 후 **단일 t-런치**(2026-10-05
+                // P1 배치화 — hip-batch·atrace 국소화의 종결). 커널은 이미 전부
+                // t(blockIdx.x) 인덱싱·pos=pp[0]+t·lim=pp[0]+t+1 산출이라 행별
+                // (1,·) 루프는 하네스 중복이었고, 그 행별 구조가 순차 대비
+                // 계통 편차(fwd3s 출력 maxdiff ~1.5)의 담체였다 — 검증된 attn
+                // 프로브의 일괄 런치 형태와 동일 구조로 교체. 행별 pos_bump도
+                // 불필요(층마다 리셋) — 이전 층별 pp 누적 결함의 잔재도 함께 제거.
                 self.hc.d2d(self.dpp, self.dpos, 4)?;
-                for r in 0..t {
-                    let mut tl2 = 1i32;
-                    let mut p0v = (self.pos + r as u32) as i32;
-                    // SAFETY: 배치 버퍼 내 행 오프셋 — t≤64 경계 내.
-                    let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) = unsafe {
-                        (
-                            self.dsb.add(r * 12288 * 4),
-                            self.dsb2.add(r * 1024 * 4),
-                            self.dsb3.add(r * 1024 * 4),
-                            self.dqnw,
-                            self.dknw,
-                            self.dq2,
-                            self.dkc,
-                            self.dvc,
-                            self.dpp,
-                        )
-                    };
-                    self.hc.launch3(
-                        "exl3_attn_prep",
-                        1,
-                        28,
-                        1,
-                        128,
-                        &mut [
-                            &mut a0 as *mut *mut u8 as *mut _,
-                            &mut a1 as *mut *mut u8 as *mut _,
-                            &mut a2 as *mut *mut u8 as *mut _,
-                            &mut a3 as *mut *mut u8 as *mut _,
-                            &mut a4 as *mut *mut u8 as *mut _,
-                            &mut a5 as *mut *mut u8 as *mut _,
-                            &mut a6 as *mut *mut u8 as *mut _,
-                            &mut a7 as *mut *mut u8 as *mut _,
-                            &mut a8 as *mut *mut u8 as *mut _,
-                            &mut tl2 as *mut i32 as *mut _,
-                            &mut p0v as *mut i32 as *mut _,
-                            &mut ai as *mut i32 as *mut _,
-                            &mut kv as *mut i32 as *mut _,
-                        ],
-                    )?;
-                    // SAFETY: 배치 버퍼 내 행 오프셋 — t≤64 경계 내.
-                    let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = unsafe {
-                        (
-                            self.dq2,
-                            self.dkc,
-                            self.dvc,
-                            self.dsb.add(r * 12288 * 4),
-                            self.dou.add(r * 6144 * 4),
-                            self.dpp,
-                        )
-                    };
-                    self.hc.launch3(
-                        "exl3_attn_fwd3s",
-                        1,
-                        24,
-                        1,
-                        256,
-                        &mut [
-                            &mut f0 as *mut *mut u8 as *mut _,
-                            &mut f1 as *mut *mut u8 as *mut _,
-                            &mut f2 as *mut *mut u8 as *mut _,
-                            &mut f3 as *mut *mut u8 as *mut _,
-                            &mut f4 as *mut *mut u8 as *mut _,
-                            &mut f5 as *mut *mut u8 as *mut _,
-                            &mut tl2 as *mut i32 as *mut _,
-                            &mut p0v as *mut i32 as *mut _,
-                            &mut ai as *mut i32 as *mut _,
-                            &mut kv as *mut i32 as *mut _,
-                        ],
-                    )?;
-                    let mut pb0 = self.dpp;
-                    self.hc.launch3(
-                        "exl3_pos_bump",
-                        1,
-                        1,
-                        1,
-                        32,
-                        &mut [&mut pb0 as *mut *mut u8 as *mut _],
-                    )?;
+                let mut tl2 = t as i32;
+                let mut p0v = self.pos as i32;
+                let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) = (
+                    self.dsb, self.dsb2, self.dsb3, self.dqnw, self.dknw, self.dq2, self.dkc,
+                    self.dvc, self.dpp,
+                );
+                self.hc.launch3(
+                    "exl3_attn_prep",
+                    t as u32,
+                    28,
+                    1,
+                    128,
+                    &mut [
+                        &mut a0 as *mut *mut u8 as *mut _,
+                        &mut a1 as *mut *mut u8 as *mut _,
+                        &mut a2 as *mut *mut u8 as *mut _,
+                        &mut a3 as *mut *mut u8 as *mut _,
+                        &mut a4 as *mut *mut u8 as *mut _,
+                        &mut a5 as *mut *mut u8 as *mut _,
+                        &mut a6 as *mut *mut u8 as *mut _,
+                        &mut a7 as *mut *mut u8 as *mut _,
+                        &mut a8 as *mut *mut u8 as *mut _,
+                        &mut tl2 as *mut i32 as *mut _,
+                        &mut p0v as *mut i32 as *mut _,
+                        &mut ai as *mut i32 as *mut _,
+                        &mut kv as *mut i32 as *mut _,
+                    ],
+                )?;
+                let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) =
+                    (self.dq2, self.dkc, self.dvc, self.dsb, self.dou, self.dpp);
+                self.hc.launch3(
+                    "exl3_attn_fwd3s",
+                    t as u32,
+                    24,
+                    1,
+                    256,
+                    &mut [
+                        &mut f0 as *mut *mut u8 as *mut _,
+                        &mut f1 as *mut *mut u8 as *mut _,
+                        &mut f2 as *mut *mut u8 as *mut _,
+                        &mut f3 as *mut *mut u8 as *mut _,
+                        &mut f4 as *mut *mut u8 as *mut _,
+                        &mut f5 as *mut *mut u8 as *mut _,
+                        &mut tl2 as *mut i32 as *mut _,
+                        &mut p0v as *mut i32 as *mut _,
+                        &mut ai as *mut i32 as *mut _,
+                        &mut kv as *mut i32 as *mut _,
+                    ],
+                )?;
+                if llm170_diag::dump::opts().key("atrace") && il == 3 {
+                    for r in 0..t {
+                        let mut hb = vec![0u8; 6144 * 4];
+                        // SAFETY: dou 내 행 오프셋.
+                        let p = unsafe { self.dou.add(r * 6144 * 4) };
+                        let _ = self.hc.d2h(&mut hb, p);
+                        let _ = self.hc.sync();
+                        // SAFETY: d2h 완료 후 재해석.
+                        self.atrace_dou.push(unsafe {
+                            std::slice::from_raw_parts(hb.as_ptr() as *const f32, 6144).to_vec()
+                        });
+                        // fwd3s 입력 4종(plans/128 P1 — 발산 입력 판별):
+                        // qh(dq2 행)·k/vc(슬라이스 ai행)·게이트(dsb 행)
+                        let mut xb = vec![0u8; 5120 * 4];
+                        // SAFETY: dbxn 행 r — 노름 출력(점근 입력).
+                        let _ = self.hc.d2h(&mut xb, unsafe { self.dbxn.add(r * 5120 * 4) });
+                        let mut qb = vec![0u8; 6144 * 4];
+                        let _ = self.hc.d2h(&mut qb, unsafe { self.dq2.add(r * 6144 * 4) });
+                        let mut kb = vec![0u8; 1024 * 4];
+                        // SAFETY: dkc 내 ai(=il/4=0) 슬라이스 행 r.
+                        let _ = self.hc.d2h(&mut kb, unsafe { self.dkc.add(r * 1024 * 4) });
+                        let mut vb = vec![0u8; 1024 * 4];
+                        let _ = self.hc.d2h(&mut vb, unsafe { self.dvc.add(r * 1024 * 4) });
+                        let mut gb = vec![0u8; 12288 * 4];
+                        // SAFETY: dsb 내 행 오프셋.
+                        let _ = self.hc.d2h(&mut gb, unsafe { self.dsb.add(r * 12288 * 4) });
+                        let _ = self.hc.sync();
+                        // SAFETY: d2h 완료 후 재해석.
+                        unsafe {
+                            self.atrace_qh.push(
+                                std::slice::from_raw_parts(qb.as_ptr() as *const f32, 6144)
+                                    .to_vec(),
+                            );
+                            self.atrace_k.push(
+                                std::slice::from_raw_parts(kb.as_ptr() as *const f32, 1024)
+                                    .to_vec(),
+                            );
+                            self.atrace_v.push(
+                                std::slice::from_raw_parts(vb.as_ptr() as *const f32, 1024)
+                                    .to_vec(),
+                            );
+                            self.atrace_g.push(
+                                std::slice::from_raw_parts(gb.as_ptr() as *const f32, 12288)
+                                    .to_vec(),
+                            );
+                            self.atrace_xn.push(
+                                std::slice::from_raw_parts(xb.as_ptr() as *const f32, 5120)
+                                    .to_vec(),
+                            );
+                        }
+                    }
                 }
                 // o_proj gemm2 — 입력 dou [T][6144]
                 self.had16_batch(self.dou, 6144, t, lo.suh)?;
                 self.gemm2_batch(&lo, t, self.dbab)?;
+                if llm170_diag::dump::opts().key("atrace") && il == 3 {
+                    for r in 0..t {
+                        let mut hb = vec![0u8; self.hidden * 4];
+                        // SAFETY: dbab 내 행 오프셋.
+                        let p = unsafe { self.dbab.add(r * self.hidden * 4) };
+                        let _ = self.hc.d2h(&mut hb, p);
+                        let _ = self.hc.sync();
+                        // SAFETY: d2h 완료 후 재해석.
+                        self.atrace_dab.push(unsafe {
+                            std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden)
+                                .to_vec()
+                        });
+                    }
+                }
             } else {
                 let lq = self.lin[&format!("{lp}.linear_attn.in_proj_qkv")].clone_shallow();
                 let lz = self.lin[&format!("{lp}.linear_attn.in_proj_z")].clone_shallow();
@@ -1688,6 +1773,16 @@ impl Exl3HipDecoder {
             let lp = format!("model.language_model.layers.{il}");
             let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
             self.norm(2 * il, ab)?;
+            if llm170_diag::dump::opts().key("htrace") {
+                let mut hb = vec![0u8; self.hidden * 4];
+                let _ = self.hc.d2h(&mut hb, self.dx);
+                let _ = self.hc.sync();
+                // SAFETY: d2h 완료 후 재해석.
+                let row = unsafe {
+                    std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden).to_vec()
+                };
+                self.htrace.push(vec![row]); // 플랫: 호출당 64항 — [호출×64+il][1행]
+            }
             if il == 1 {
                 let mut xb2 = vec![0u8; self.hidden * 4];
                 self.hc.d2h(&mut xb2, self.dx)?;
@@ -1798,7 +1893,60 @@ impl Exl3HipDecoder {
                         &mut kv as *mut i32 as *mut _,
                     ],
                 )?;
+                if llm170_diag::dump::opts().key("atrace") && il == 3 {
+                    let mut hb = vec![0u8; 6144 * 4];
+                    let _ = self.hc.d2h(&mut hb, dou);
+                    let _ = self.hc.sync();
+                    // SAFETY: d2h 완료 후 재해석.
+                    self.atrace_dou.push(unsafe {
+                        std::slice::from_raw_parts(hb.as_ptr() as *const f32, 6144).to_vec()
+                    });
+                    // fwd3s 입력 4종 — 이번 콜의 pos(self.pos) 행이 k/v 기록 위치.
+                    let mut qb = vec![0u8; 6144 * 4];
+                    let _ = self.hc.d2h(&mut qb, self.dq2);
+                    let mut kb = vec![0u8; 1024 * 4];
+                    // SAFETY: dkc ai(=0) 슬라이스 내 현재 pos 행.
+                    let _ = self.hc.d2h(&mut kb, unsafe {
+                        self.dkc.add(self.pos as usize * 1024 * 4)
+                    });
+                    let mut vb = vec![0u8; 1024 * 4];
+                    let _ = self.hc.d2h(&mut vb, unsafe {
+                        self.dvc.add(self.pos as usize * 1024 * 4)
+                    });
+                    let mut gb = vec![0u8; 12288 * 4];
+                    let _ = self.hc.d2h(&mut gb, dqh);
+                    let mut xnb = vec![0u8; 5120 * 4];
+                    let _ = self.hc.d2h(&mut xnb, self.dxn);
+                    let _ = self.hc.sync();
+                    // SAFETY: d2h 완료 후 재해석.
+                    unsafe {
+                        self.atrace_qh.push(
+                            std::slice::from_raw_parts(qb.as_ptr() as *const f32, 6144).to_vec(),
+                        );
+                        self.atrace_k.push(
+                            std::slice::from_raw_parts(kb.as_ptr() as *const f32, 1024).to_vec(),
+                        );
+                        self.atrace_v.push(
+                            std::slice::from_raw_parts(vb.as_ptr() as *const f32, 1024).to_vec(),
+                        );
+                        self.atrace_g.push(
+                            std::slice::from_raw_parts(gb.as_ptr() as *const f32, 12288).to_vec(),
+                        );
+                        self.atrace_xn.push(
+                            std::slice::from_raw_parts(xnb.as_ptr() as *const f32, 5120).to_vec(),
+                        );
+                    }
+                }
                 self.gemv_chain(&lo, dou, dab)?;
+                if llm170_diag::dump::opts().key("atrace") && il == 3 {
+                    let mut hb = vec![0u8; self.hidden * 4];
+                    let _ = self.hc.d2h(&mut hb, self.dab);
+                    let _ = self.hc.sync();
+                    // SAFETY: d2h 완료 후 재해석.
+                    self.atrace_dab.push(unsafe {
+                        std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden).to_vec()
+                    });
+                }
             } else {
                 let lq_key = format!("{lp}.linear_attn.in_proj_qkv");
                 let lz_key = format!("{lp}.linear_attn.in_proj_z");
