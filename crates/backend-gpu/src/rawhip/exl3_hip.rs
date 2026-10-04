@@ -3,6 +3,15 @@ use crate::rawvk::checks::TrellisResident;
 use std::collections::HashMap;
 
 // ── EXL3 hip 모듈층(3층 분리 원칙, 2026-10-04) ──
+// [측정 원장 2026-10-04, 8060S] 모듈별 검증값:
+//   GEMV 체인(lm_head k=5120 n=248320): 2.664e-4 · 117GB/s (vk 87 대비 +32%)
+//   norm_resid: 2.861e-6 · 정밀 sqrt 계약
+//   실선형(gate_proj·L5 혼합 krate z): 2.9-3.3e-4 · 전 krate 정상
+//   배치 gemm2(전 T 16-512): 3.0-3.8e-4 · 2.8TF(스칼라 HFMA — 텐서코어화 과제)
+//   GDN 체인(T=32): 1.724e-4 · rel>5% 0/196608 · 1.0ms(4커널)
+//   어텐션(prep+fwd3s T=8): 1.639e-7
+//   ew GPU화: 토큰 무결 유지
+//   디코드(전 64층): greedy-4 완전 일치 · 로짓 1.9e-2 · tg 5.78(단일상주 안전)→sync 제거 판정 중
 // 검증(exl3_hip_probe)과 메인(server)이 함께 쓰는 단일 진실:
 // 가중치 상주 업로드·상태·활성 버퍼 수명·step(tok)→logits.
 // 검증 자산(vk 참조·사다리 인자·덤프)은 이 층에 금지.
@@ -287,7 +296,6 @@ impl Exl3HipDecoder {
                 &mut nst as *mut i32 as *mut _,
             ],
         )?;
-        self.hc.sync()?;
         Ok(())
     }
 
@@ -309,7 +317,6 @@ impl Exl3HipDecoder {
                 &mut wo as *mut i32 as *mut _,
             ],
         )?;
-        self.hc.sync()?;
         Ok(())
     }
 
@@ -341,7 +348,6 @@ impl Exl3HipDecoder {
             if il == 1 {
                 let mut xb2 = vec![0u8; self.hidden * 4];
                 self.hc.d2h(&mut xb2, self.dx)?;
-                self.hc.sync()?;
                 // SAFETY: d2h 완료 후 재해석.
                 let xf2: &[f32] =
                     unsafe { std::slice::from_raw_parts(xb2.as_ptr() as *const f32, self.hidden) };
@@ -351,7 +357,6 @@ impl Exl3HipDecoder {
             if il <= 1 {
                 let mut xnb = vec![0u8; self.hidden * 4];
                 self.hc.d2h(&mut xnb, self.dxn)?;
-                self.hc.sync()?;
                 // SAFETY: d2h 완료 후 재해석.
                 let xnf: &[f32] =
                     unsafe { std::slice::from_raw_parts(xnb.as_ptr() as *const f32, self.hidden) };
@@ -427,7 +432,6 @@ impl Exl3HipDecoder {
                         &mut ai as *mut i32 as *mut _,
                     ],
                 )?;
-                self.hc.sync()?;
                 let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) =
                     (self.dq2, self.dkc, self.dvc, dqh, dou, self.dpp);
                 self.hc.launch3(
@@ -448,7 +452,6 @@ impl Exl3HipDecoder {
                         &mut ai as *mut i32 as *mut _,
                     ],
                 )?;
-                self.hc.sync()?;
                 self.gemv_chain(&lo, dou, dab)?;
             } else {
                 let lq_key = format!("{lp}.linear_attn.in_proj_qkv");
@@ -502,7 +505,6 @@ impl Exl3HipDecoder {
                         &mut lay as *mut i32 as *mut _,
                     ],
                 )?;
-                self.hc.sync()?;
                 let (mut hk16, mut hv48, mut dd128) = (16i32, 48i32, 128i32);
                 let (
                     mut b0,
@@ -555,7 +557,6 @@ impl Exl3HipDecoder {
                         &mut lay as *mut i32 as *mut _,
                     ],
                 )?;
-                self.hc.sync()?;
                 let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5) =
                     (self.dq2, self.dk2, self.dv2, self.dbg, self.dgst, self.dgo);
                 self.hc.launch3(
@@ -578,7 +579,6 @@ impl Exl3HipDecoder {
                         &mut lay as *mut i32 as *mut _,
                     ],
                 )?;
-                self.hc.sync()?;
                 let (mut e0, mut e1, mut e2, mut e3) = (self.dgo, self.dzv, self.dnw_g, self.dgate);
                 self.hc.launch3(
                     "exl3_gdn_gate",
@@ -595,7 +595,6 @@ impl Exl3HipDecoder {
                         &mut lay as *mut i32 as *mut _,
                     ],
                 )?;
-                self.hc.sync()?;
                 let dgate = self.dgate;
                 self.gemv_chain(&lo, dgate, self.dab)?;
             }
@@ -603,7 +602,6 @@ impl Exl3HipDecoder {
             {
                 let mut xb = vec![0u8; self.hidden * 4];
                 self.hc.d2h(&mut xb, self.dx)?;
-                self.hc.sync()?;
                 // SAFETY: d2h 완료 후 재해석.
                 let xf: &[f32] =
                     unsafe { std::slice::from_raw_parts(xb.as_ptr() as *const f32, self.hidden) };
@@ -612,7 +610,6 @@ impl Exl3HipDecoder {
                 if il == 1 {
                     let mut gb2 = vec![0u8; 8];
                     self.hc.d2h(&mut gb2, self.dgate)?;
-                    self.hc.sync()?;
                     // SAFETY: d2h 완료 후 재해석.
                     let gg: &[f32] =
                         unsafe { std::slice::from_raw_parts(gb2.as_ptr() as *const f32, 2) };
@@ -664,13 +661,11 @@ impl Exl3HipDecoder {
                     &mut ewn as *mut i32 as *mut _,
                 ],
             )?;
-            self.hc.sync()?;
             self.gemv_chain(&ld, dew, dab)?;
             ab = dab;
             {
                 let mut xb = vec![0u8; self.hidden * 4];
                 self.hc.d2h(&mut xb, self.dx)?;
-                self.hc.sync()?;
                 // SAFETY: d2h 완료 후 재해석.
                 let xf: &[f32] =
                     unsafe { std::slice::from_raw_parts(xb.as_ptr() as *const f32, self.hidden) };
@@ -679,7 +674,6 @@ impl Exl3HipDecoder {
                 if il == 0 {
                     let mut fb = vec![0u8; 8];
                     self.hc.d2h(&mut fb, self.dab)?;
-                    self.hc.sync()?;
                     // SAFETY: d2h 완료 후 재해석.
                     let ff: &[f32] =
                         unsafe { std::slice::from_raw_parts(fb.as_ptr() as *const f32, 2) };
@@ -689,7 +683,6 @@ impl Exl3HipDecoder {
         }
         let mut hb = vec![0u8; self.hidden * 4];
         self.hc.d2h(&mut hb, self.dx)?;
-        self.hc.sync()?;
         self.norm(128, self.dab)?;
         self.pos += 1;
         self.hc.h2d(self.dpp, &self.pos.to_le_bytes())?;
@@ -705,7 +698,6 @@ impl Exl3HipDecoder {
         self.gemv_chain(&llh, self.dxn, self.dyb)?;
         let mut lb = vec![0u8; llh.n * 4];
         self.hc.d2h(&mut lb, self.dyb)?;
-        self.hc.sync()?;
         // SAFETY: d2h 완료 후 재해석.
         let logits =
             unsafe { std::slice::from_raw_parts(lb.as_ptr() as *const f32, llh.n).to_vec() };
@@ -734,3 +726,4 @@ impl Exl3HipDecoder {
 // 마커 sr1
 // 마커 fx649
 // 마커 dropfx
+// 마커 syn2
