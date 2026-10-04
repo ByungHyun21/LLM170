@@ -78,6 +78,7 @@ pub struct Exl3HipDecoder {
     pstage: *mut u8,
     pgout: *mut u8,
     pgh: *mut u8,
+    pgall: *mut u8,
     gexec: Option<(usize, crate::rawhip::ctx::hipgraph::GraphExec)>,
     dmtpk: *mut u8,
     dmtpv: *mut u8,
@@ -261,7 +262,8 @@ impl Exl3HipDecoder {
         };
         let pstage = pin(64 * hidden * 4)?;
         let pgout = pin(64 * 248320 * 4)?;
-        let pgh = pin(hidden * 4)?; // kseg 부분합 [T≤8][kseg≤8][n≤17408]
+        let pgh = pin(hidden * 4)?;
+        let pgall = pin(64 * hidden * 4)?; // 전 행 pre-norm h(MTP 훅 일관성) // kseg 부분합 [T≤8][kseg≤8][n≤17408]
         let dmtpk = hc.alloc(1024 * 1024 * 4)?;
         let dmtpv = hc.alloc(1024 * 1024 * 4)?;
         let dmtpp = hc.alloc(4)?;
@@ -351,6 +353,7 @@ impl Exl3HipDecoder {
             pstage,
             pgout,
             pgh,
+            pgall,
             gexec: None,
             dmtpk,
             dmtpv,
@@ -1167,9 +1170,14 @@ impl Exl3HipDecoder {
         // last_h 캡처 — 최종 노름(마지막 FFN 합산) 전 잔차(vk 12/12·a1 0.625가
         // 측정된 규약 = h_seq와 동일 시점. 결함 11호 과교정 정정: '전'이되 dbx).
         {
-            // SAFETY: dbx 마지막 행 → g_h 고정 버퍼.
+            // SAFETY: 전 행 pre-norm dbx → pgall(캡처 호환, 핀).
+            for r in 0..t {
+                let prow = unsafe { self.dbx.add(r * self.hidden * 4) };
+                let dst = unsafe { self.pgall.add(r * self.hidden * 4) };
+                self.hc.d2h_pin_async(dst, prow, self.hidden * 4)?;
+            }
+            // SAFETY: 마지막 행 → g_h(호환 유지).
             let plast = unsafe { self.dbx.add((t - 1) * self.hidden * 4) };
-            // SAFETY: pgh 원시 핀 d2h(캡처 호환).
             self.hc.d2h_pin_async(self.pgh, plast, self.hidden * 4)?;
         }
         // 최종 노름 + lm_head 행별 로짓
@@ -1980,3 +1988,4 @@ impl Exl3HipDecoder {
 // 마커 rb1
 // 마커 hpt
 // 마커 hpf
+// 마커 pga
