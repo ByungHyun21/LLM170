@@ -437,7 +437,7 @@ impl Exl3HipDecoder {
         let rope_base = 1e7f32;
         let rope1 = |hd: &mut [f32], pos: u32| {
             for i in 0..n_rot / 2 {
-                let p = rope_base.powi(-(2 * i as i32) as i32 / n_rot as i32);
+                let p = rope_base.powi(-(2 * i as i32) / n_rot as i32);
                 let (a, b) = (hd[i], hd[i + n_rot / 2]);
                 hd[i] = a * (pos as f32 * p).cos() - b * (pos as f32 * p).sin();
                 hd[i + n_rot / 2] = a * (pos as f32 * p).sin() + b * (pos as f32 * p).sin();
@@ -952,3 +952,4 @@ impl Exl3HipDecoder {
 // 마커 mtp4
 // 마커 mtph
 // 마커 mtpi
+// 마커 cl3
