@@ -292,7 +292,7 @@ impl Exl3HipDecoder {
         let dzero = hc.alloc(hidden * 4)?;
         hc.h2d(dzero, &vec![0u8; hidden * 4])?;
         let dah = hc.alloc(17408 * 2)?;
-        let dsb = hc.alloc(16 * 248320 * 4)?;
+        let dsb = hc.alloc(tmax * 248320 * 4)?; // [조사 2026-10-04] 16행 하드코딩 잔존 — tmax=64 전제 위반(청크>16에서 lm_head mma OOB 폴트)
         let dyb = hc.alloc(248320 * 4)?;
         let dew = hc.alloc(tmax * 17408 * 4)?;
         let dqkv = hc.alloc(tmax * 10240 * 4)?;
