@@ -65,6 +65,14 @@ pub struct Exl3HipDecoder {
     mtp_kv_v: Vec<f32>,
     mtp_kv_len: usize,
     dmtpin: *mut u8,
+    dbx: *mut u8,
+    pub dbg_layers: bool,
+    dbxn: *mut u8,
+    dbab: *mut u8,
+    dbzero: *mut u8,
+    dah16: *mut u8,
+    dsb2: *mut u8,
+    dsb3: *mut u8,
     dnw: *mut u8,
     dqnw: *mut u8,
     dknw: *mut u8,
@@ -77,6 +85,19 @@ pub struct Exl3HipDecoder {
 
 // SAFETY: RawCtx·할당 포인터 소유 — 단일 스레드 사용(서버 slot_loop와 동일 계약).
 unsafe impl Send for Exl3HipDecoder {}
+
+impl HipLin {
+    fn clone_shallow(&self) -> HipLin {
+        HipLin {
+            k: self.k,
+            n: self.n,
+            krate: self.krate,
+            suh: self.suh,
+            tre: self.tre,
+            svh: self.svh,
+        }
+    }
+}
 
 impl Exl3HipDecoder {
     /// 대형 pageable h2d는 페이지 미매핑 사례(47MB ab 내부 +2.6MB 폴트, 2026-10-04)
@@ -205,6 +226,15 @@ impl Exl3HipDecoder {
         mtp_norms.push(qn_w);
         mtp_norms.push(kn_w);
         let dmtpin = hc.alloc(128 * 1024 * 4)?; // FFN down 입력 17408 f32 상한
+        // 배치(prefill/검증) 버퍼 — tmax=64행 상한(plans/121 hip prefill)
+        let dbx = hc.alloc(64 * hidden * 4)?;
+        let dbxn = hc.alloc(64 * hidden * 4)?;
+        let dbab = hc.alloc(64 * hidden * 4)?;
+        let dbzero = hc.alloc(64 * hidden * 4)?;
+        hc.h2d(dbzero, &vec![0u8; 64 * hidden * 4])?;
+        let dah16 = hc.alloc(64 * 34816)?;
+        let dsb2 = hc.alloc(64 * 17408 * 4)?; // 층 선형 n 상한(lm_head는 dsb)
+        let dsb3 = hc.alloc(64 * 17408 * 4)?;
         drop(tr);
         let dargmax = hc.alloc(4)?;
 
@@ -266,6 +296,14 @@ impl Exl3HipDecoder {
             mtp_kv_v: vec![0f32; 4096 * 4 * 256],
             mtp_kv_len: 0,
             dmtpin,
+            dbx,
+            dbg_layers: false,
+            dbxn,
+            dbab,
+            dbzero,
+            dah16,
+            dsb2,
+            dsb3,
             dring,
             dgst,
             dkc,
@@ -368,6 +406,17 @@ impl Exl3HipDecoder {
             unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, self.hidden) };
         let (lg, _) = self.forward(row)?;
         Ok(lg)
+    }
+
+    /// 임베딩 행 호스트 판독(배치 준비용).
+    pub fn embed_row_host(&mut self, tok: u32) -> Vec<f32> {
+        let mut rb = vec![0u8; self.hidden * 4];
+        // SAFETY: dembed 내 행 오프셋(어휘·hidden 경계 내).
+        let p = unsafe { self.dembed.add(tok as usize * self.hidden * 4) };
+        let _ = self.hc.d2h(&mut rb, p);
+        let _ = self.hc.sync();
+        // SAFETY: d2h 완료 후 재해석.
+        unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, self.hidden).to_vec() }
     }
 
     /// 임베딩 판독 + forward + GPU argmax — 로짓 전체 전송 없이 다음 토큰 ID만.
@@ -550,6 +599,393 @@ impl Exl3HipDecoder {
         let y: Vec<f32> =
             unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, l.n).to_vec() };
         Ok(y)
+    }
+
+    /// 배치 forward(프리필·MTP 검증 공용) — rows: [T][hidden] 임베딩 행.
+    /// GDN·FFN·선형은 gemm2 배치, 어텐션은 행별 prep/fwd3s 루프(소형-T 전용).
+    /// 상태: dring/dgst/dkc/dvc는 pos..pos+T-1 순차 기록(디코드와 동일 규약).
+    pub fn forward_batch(&mut self, rows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
+        let t = rows.len();
+        if t == 0 || t > 64 {
+            return Err(format!("forward_batch: T={t} 범위 외(1..64)"));
+        }
+        let n_layers = self.loaded_layers.min(self.n_layers);
+        let f32b =
+            |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        let flat: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        self.hc.h2d(self.dbx, f32b(&flat))?;
+        let mut ab = self.dbzero;
+        for il in 0..n_layers {
+            let lp = format!("model.language_model.layers.{il}");
+            let gdn_il = (0..il).filter(|i| i % 4 != 3).count();
+            self.norm_p(2 * il, ab, t)?;
+            if il % 4 == 3 {
+                // 어텐션층 — q/k/v gemm2 후 행별 prep+fwd3s
+                let lq = self.lin[&format!("{lp}.self_attn.q_proj")].clone_shallow();
+                let lk = self.lin[&format!("{lp}.self_attn.k_proj")].clone_shallow();
+                let lv = self.lin[&format!("{lp}.self_attn.v_proj")].clone_shallow();
+                let lo = self.lin[&format!("{lp}.self_attn.o_proj")].clone_shallow();
+                self.gemm2_batch(&lq, t, self.dsb)?;
+                self.hadout_batch(self.dsb, lq.svh, lq.n, t)?;
+                self.gemm2_batch(&lk, t, self.dsb2)?;
+                self.hadout_batch(self.dsb2, lk.svh, lk.n, t)?;
+                self.gemm2_batch(&lv, t, self.dsb3)?;
+                self.hadout_batch(self.dsb3, lv.svh, lv.n, t)?;
+                let mut ai = (il / 4) as i32;
+                for r in 0..t {
+                    // prep은 KV 기록 인덱스를 pp[0](디바이스)에서 판독 — 행마다 갱신 필수.
+                    self.hc
+                        .h2d(self.dpp, &(self.pos + r as u32).to_le_bytes())?;
+                    let mut tl2 = 1i32;
+                    let mut p0v = (self.pos + r as u32) as i32;
+                    // SAFETY: 배치 버퍼 내 행 오프셋 — t≤64 경계 내.
+                    let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) = unsafe {
+                        (
+                            self.dsb.add(r * 12288 * 4),
+                            self.dsb2.add(r * 1024 * 4),
+                            self.dsb3.add(r * 1024 * 4),
+                            self.dqnw,
+                            self.dknw,
+                            self.dq2,
+                            self.dkc,
+                            self.dvc,
+                            self.dpp,
+                        )
+                    };
+                    self.hc.launch3(
+                        "exl3_attn_prep",
+                        1,
+                        28,
+                        1,
+                        128,
+                        &mut [
+                            &mut a0 as *mut *mut u8 as *mut _,
+                            &mut a1 as *mut *mut u8 as *mut _,
+                            &mut a2 as *mut *mut u8 as *mut _,
+                            &mut a3 as *mut *mut u8 as *mut _,
+                            &mut a4 as *mut *mut u8 as *mut _,
+                            &mut a5 as *mut *mut u8 as *mut _,
+                            &mut a6 as *mut *mut u8 as *mut _,
+                            &mut a7 as *mut *mut u8 as *mut _,
+                            &mut a8 as *mut *mut u8 as *mut _,
+                            &mut tl2 as *mut i32 as *mut _,
+                            &mut p0v as *mut i32 as *mut _,
+                            &mut ai as *mut i32 as *mut _,
+                        ],
+                    )?;
+                    // SAFETY: 배치 버퍼 내 행 오프셋 — t≤64 경계 내.
+                    let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = unsafe {
+                        (
+                            self.dq2,
+                            self.dkc,
+                            self.dvc,
+                            self.dsb.add(r * 12288 * 4),
+                            self.dou.add(r * 6144 * 4),
+                            self.dpp,
+                        )
+                    };
+                    self.hc.launch3(
+                        "exl3_attn_fwd3s",
+                        1,
+                        24,
+                        1,
+                        256,
+                        &mut [
+                            &mut f0 as *mut *mut u8 as *mut _,
+                            &mut f1 as *mut *mut u8 as *mut _,
+                            &mut f2 as *mut *mut u8 as *mut _,
+                            &mut f3 as *mut *mut u8 as *mut _,
+                            &mut f4 as *mut *mut u8 as *mut _,
+                            &mut f5 as *mut *mut u8 as *mut _,
+                            &mut tl2 as *mut i32 as *mut _,
+                            &mut p0v as *mut i32 as *mut _,
+                            &mut ai as *mut i32 as *mut _,
+                        ],
+                    )?;
+                }
+                // o_proj gemm2 — 입력 dou [T][6144]
+                self.had16_batch(self.dou, 6144, t, lo.suh)?;
+                self.gemm2_batch(&lo, t, self.dbab)?;
+                self.hadout_batch(self.dbab, lo.svh, lo.n, t)?;
+            } else {
+                let lq = self.lin[&format!("{lp}.linear_attn.in_proj_qkv")].clone_shallow();
+                let lz = self.lin[&format!("{lp}.linear_attn.in_proj_z")].clone_shallow();
+                let lo = self.lin[&format!("{lp}.linear_attn.out_proj")].clone_shallow();
+                self.had16_batch(self.dbxn, lq.k, t, lq.suh)?;
+                self.gemm2_batch(&lq, t, self.dsb)?;
+                self.hadout_batch(self.dsb, lq.svh, lq.n, t)?;
+                self.had16_batch(self.dbxn, lz.k, t, lz.suh)?;
+                self.gemm2_batch(&lz, t, self.dsb2)?;
+                self.hadout_batch(self.dsb2, lz.svh, lz.n, t)?;
+                let mut tl = t as i32;
+                let mut lay = gdn_il as i32;
+                let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) =
+                    (self.dsb, self.dcw, self.dring, self.dgq, self.dgk, self.dgv);
+                self.hc.launch(
+                    "exl3_gdn_conv",
+                    80,
+                    1,
+                    128,
+                    &mut [
+                        &mut a0 as *mut *mut u8 as *mut _,
+                        &mut a1 as *mut *mut u8 as *mut _,
+                        &mut a2 as *mut *mut u8 as *mut _,
+                        &mut a3 as *mut *mut u8 as *mut _,
+                        &mut a4 as *mut *mut u8 as *mut _,
+                        &mut a5 as *mut *mut u8 as *mut _,
+                        &mut tl as *mut i32 as *mut _,
+                        &mut lay as *mut i32 as *mut _,
+                    ],
+                )?;
+                let (
+                    mut b0,
+                    mut b1,
+                    mut b2,
+                    mut b3,
+                    mut b4,
+                    mut b5,
+                    mut b6,
+                    mut b7,
+                    mut b8,
+                    mut b9,
+                    mut bb,
+                ) = (
+                    self.dgq, self.dgk, self.dgv, self.dbxn, self.dab_c, self.dal, self.ddt,
+                    self.dq2, self.dk2, self.dv2, self.dbg,
+                );
+                self.hc.launch3(
+                    "exl3_gdn_l2perm",
+                    48,
+                    1,
+                    1,
+                    128,
+                    &mut [
+                        &mut b0 as *mut *mut u8 as *mut _,
+                        &mut b1 as *mut *mut u8 as *mut _,
+                        &mut b2 as *mut *mut u8 as *mut _,
+                        &mut b3 as *mut *mut u8 as *mut _,
+                        &mut b4 as *mut *mut u8 as *mut _,
+                        &mut b5 as *mut *mut u8 as *mut _,
+                        &mut b6 as *mut *mut u8 as *mut _,
+                        &mut b7 as *mut *mut u8 as *mut _,
+                        &mut b8 as *mut *mut u8 as *mut _,
+                        &mut b9 as *mut *mut u8 as *mut _,
+                        &mut bb as *mut *mut u8 as *mut _,
+                        &mut tl as *mut i32 as *mut _,
+                        &mut lay as *mut i32 as *mut _,
+                    ],
+                )?;
+                let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5) =
+                    (self.dq2, self.dk2, self.dv2, self.dbg, self.dgst, self.dgo);
+                let (mut hk16, mut hv48, mut dd128) = (16i32, 48i32, 128i32);
+                self.hc.launch3(
+                    "exl3_gdn_scan",
+                    48,
+                    1,
+                    1,
+                    128,
+                    &mut [
+                        &mut c0 as *mut *mut u8 as *mut _,
+                        &mut c1 as *mut *mut u8 as *mut _,
+                        &mut c2 as *mut *mut u8 as *mut _,
+                        &mut c3 as *mut *mut u8 as *mut _,
+                        &mut c4 as *mut *mut u8 as *mut _,
+                        &mut c5 as *mut *mut u8 as *mut _,
+                        &mut tl as *mut i32 as *mut _,
+                        &mut hk16 as *mut i32 as *mut _,
+                        &mut hv48 as *mut i32 as *mut _,
+                        &mut dd128 as *mut i32 as *mut _,
+                        &mut lay as *mut i32 as *mut _,
+                    ],
+                )?;
+                let (mut e0, mut e1, mut e2, mut e3) =
+                    (self.dgo, self.dsb2, self.dnw_g, self.dgate);
+                self.hc.launch3(
+                    "exl3_gdn_gate",
+                    48,
+                    1,
+                    1,
+                    128,
+                    &mut [
+                        &mut e0 as *mut *mut u8 as *mut _,
+                        &mut e1 as *mut *mut u8 as *mut _,
+                        &mut e2 as *mut *mut u8 as *mut _,
+                        &mut e3 as *mut *mut u8 as *mut _,
+                        &mut tl as *mut i32 as *mut _,
+                        &mut lay as *mut i32 as *mut _,
+                    ],
+                )?;
+                self.had16_batch(self.dgate, lo.k, t, lo.suh)?;
+                self.gemm2_batch(&lo, t, self.dbab)?;
+                self.hadout_batch(self.dbab, lo.svh, lo.n, t)?;
+            }
+            self.norm_p(2 * il + 1, self.dbab, t)?;
+            let lg = self.lin[&format!("{lp}.mlp.gate_proj")].clone_shallow();
+            let lu = self.lin[&format!("{lp}.mlp.up_proj")].clone_shallow();
+            let ld = self.lin[&format!("{lp}.mlp.down_proj")].clone_shallow();
+            self.had16_batch(self.dbxn, lg.k, t, lg.suh)?;
+            self.gemm2_batch(&lg, t, self.dsb)?;
+            self.hadout_batch(self.dsb, lg.svh, lg.n, t)?;
+            self.had16_batch(self.dbxn, lu.k, t, lu.suh)?;
+            self.gemm2_batch(&lu, t, self.dsb2)?;
+            self.hadout_batch(self.dsb2, lu.svh, lu.n, t)?;
+            let mut ewn = (t * lg.n) as i32;
+            let (mut w0, mut w1, mut w2) = (self.dsb, self.dsb2, self.dew);
+            self.hc.launch3(
+                "exl3_ew",
+                (t * lg.n).div_ceil(128) as u32,
+                1,
+                1,
+                128,
+                &mut [
+                    &mut w0 as *mut *mut u8 as *mut _,
+                    &mut w1 as *mut *mut u8 as *mut _,
+                    &mut w2 as *mut *mut u8 as *mut _,
+                    &mut ewn as *mut i32 as *mut _,
+                ],
+            )?;
+            self.had16_batch(self.dew, ld.k, t, ld.suh)?;
+            self.gemm2_batch(&ld, t, self.dbab)?;
+            self.hadout_batch(self.dbab, ld.svh, ld.n, t)?;
+            ab = self.dbab;
+            if self.dbg_layers && t >= 2 {
+                let mut rb = vec![0u8; 32];
+                // SAFETY: dbx 행1 오프셋.
+                let p1 = unsafe { self.dbx.add(5120 * 4) };
+                let _ = self.hc.d2h(&mut rb, p1);
+                let _ = self.hc.sync();
+                // SAFETY: d2h 완료 후 재해석.
+                let f8: Vec<f32> =
+                    unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, 8).to_vec() };
+                eprintln!("  [bl{il:02}] dbx1[..4]={f8:?}");
+            }
+        }
+        // 최종 노름 + lm_head 행별 로짓
+        self.norm_p(128, self.dbab, t)?;
+        let llh = self.lin["lm_head"].clone_shallow();
+        self.had16_batch(self.dbxn, llh.k, t, llh.suh)?;
+        self.gemm2_batch(&llh, t, self.dsb)?;
+        self.hadout_batch(self.dsb, llh.svh, llh.n, t)?;
+        self.pos += t as u32;
+        self.hc.h2d(self.dpp, &self.pos.to_le_bytes())?;
+        let mut out = Vec::with_capacity(t);
+        let mut lb = vec![0u8; llh.n * 4];
+        for r in 0..t {
+            // SAFETY: dsb 내 lm_head 행 오프셋.
+            let rowp = unsafe { self.dsb.add(r * llh.n * 4) };
+            self.hc.d2h(&mut lb, rowp)?;
+            self.hc.sync()?;
+            // SAFETY: d2h 완료 후 재해석.
+            out.push(unsafe {
+                std::slice::from_raw_parts(lb.as_ptr() as *const f32, llh.n).to_vec()
+            });
+        }
+        Ok(out)
+    }
+
+    /// 배치 노름(norm_resid_p) — dbx += ab, dbxn = norm(dbx)·w. nw는 행 포인터.
+    fn norm_p(&mut self, w: usize, ab_in: *mut u8, t_len: usize) -> Result<(), String> {
+        let mut tl = t_len as i32;
+        // SAFETY: dnw 내 행 오프셋(w<129 경계 내).
+        let nw_row = unsafe { self.dnw.add(w * 5120 * 4) };
+        let (mut a0, mut a1, mut a2, mut a3) = (self.dbx, nw_row, ab_in, self.dbxn);
+        self.hc.launch(
+            "exl3_norm_resid_p",
+            t_len as u32,
+            1,
+            1024,
+            &mut [
+                &mut a0 as *mut *mut u8 as *mut _,
+                &mut a1 as *mut *mut u8 as *mut _,
+                &mut a2 as *mut *mut u8 as *mut _,
+                &mut a3 as *mut *mut u8 as *mut _,
+                &mut tl as *mut i32 as *mut _,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 배치 had_in(f32 [T][k] → dah16 [T][k/2] f16쌍) — suh는 호출 선형에서 명시 전달.
+    fn had16_batch(
+        &mut self,
+        src: *mut u8,
+        k: usize,
+        t_len: usize,
+        suh: *mut u8,
+    ) -> Result<(), String> {
+        let mut kc = (k / 128) as i32;
+        let mut ks = k as i32;
+        let (mut p0, mut p1, mut p2) = (src, suh, self.dah16);
+        self.hc.launch(
+            "exl3_had_in",
+            (k / 128) as u32,
+            t_len as u32,
+            128,
+            &mut [
+                &mut p0 as *mut *mut u8 as *mut _,
+                &mut p1 as *mut *mut u8 as *mut _,
+                &mut p2 as *mut *mut u8 as *mut _,
+                &mut kc as *mut i32 as *mut _,
+                &mut ks as *mut i32 as *mut _,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// gemm2 출력 후처리 — H⁻¹⊙svh(nseg=1 제자리, 청크별 sm 스테이징이라 안전).
+    fn hadout_batch(
+        &mut self,
+        buf: *mut u8,
+        svh: *mut u8,
+        n: usize,
+        t_len: usize,
+    ) -> Result<(), String> {
+        let (mut nch, mut nsg, mut nst) = ((n / 128) as i32, 1i32, n as i32);
+        let (mut c0, mut c1, mut c2) = (buf, svh, buf);
+        self.hc.launch3(
+            "exl3_had_out",
+            (n / 128) as u32,
+            t_len as u32,
+            1,
+            128,
+            &mut [
+                &mut c0 as *mut *mut u8 as *mut _,
+                &mut c1 as *mut *mut u8 as *mut _,
+                &mut c2 as *mut *mut u8 as *mut _,
+                &mut nch as *mut i32 as *mut _,
+                &mut nsg as *mut i32 as *mut _,
+                &mut nst as *mut i32 as *mut _,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 배치 GEMM(dah16 → out [T][n]) — gemm2 커널.
+    fn gemm2_batch(&mut self, l: &HipLin, t_len: usize, out: *mut u8) -> Result<(), String> {
+        let (mut kt, mut nt, mut kk, mut tt) = (
+            (l.k / 16) as i32,
+            (l.n / 16) as i32,
+            l.krate as i32,
+            t_len as i32,
+        );
+        let (mut g0, mut g1, mut g2) = (self.dah16, l.tre, out);
+        self.hc.launch3(
+            "exl3_gemm2",
+            (l.n / 64) as u32,
+            t_len.div_ceil(128) as u32,
+            1,
+            128,
+            &mut [
+                &mut g0 as *mut *mut u8 as *mut _,
+                &mut g1 as *mut *mut u8 as *mut _,
+                &mut g2 as *mut *mut u8 as *mut _,
+                &mut kt as *mut i32 as *mut _,
+                &mut nt as *mut i32 as *mut _,
+                &mut kk as *mut i32 as *mut _,
+                &mut tt as *mut i32 as *mut _,
+            ],
+        )?;
+        Ok(())
     }
 
     /// 1토큰 forward → 로짓. ew(silu·mul)는 호스트(정확성 우선 — 추후 커널화).
@@ -881,6 +1317,15 @@ impl Exl3HipDecoder {
             )?;
             self.gemv_chain(&ld, dew, dab)?;
             ab = dab;
+            if self.dbg_layers && self.pos >= 1 {
+                let mut rb = vec![0u8; 32];
+                let _ = self.hc.d2h(&mut rb, self.dx);
+                let _ = self.hc.sync();
+                // SAFETY: d2h 완료 후 재해석.
+                let f8: Vec<f32> =
+                    unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, 8).to_vec() };
+                eprintln!("  [sl{il:02}] dx[..4]={f8:?}");
+            }
             {
                 let mut xb = vec![0u8; self.hidden * 4];
                 self.hc.d2h(&mut xb, self.dx)?;
@@ -953,3 +1398,14 @@ impl Exl3HipDecoder {
 // 마커 mtph
 // 마커 mtpi
 // 마커 cl3
+// 마커 fb1
+// 마커 fb2
+// 마커 fb3
+// 마커 fb5
+// 마커 fb6
+// 마커 fbfx
+// 마커 ho1
+// 마커 ho2
+// 마커 dpp
+// 마커 bld
+// 마커 blf
