@@ -355,9 +355,11 @@ pub struct VkAcc {
     /// plans/96 G3 — SiluMul 출력(mglu)→down 융합 학습: (핸들, n_in).
     pub(crate) moe_glu: Mutex<Option<(u64, usize)>>,
     pub(crate) last_silu_out: std::sync::atomic::AtomicU64,
-    /// plans/96 G3 — MoE gate+up 연속 쌍의 quant 전용 슬롯: (x,n_in,rows) 키.
-    /// 전용 버퍼(타 quant 불가침) + 두 엔진 호출 사이 무연산 — 세대 불필요.
-    pub(crate) moe_xq_pair: Mutex<Option<(u64, usize, usize, VkBuf)>>,
+    /// plans/96 G3 — MoE gate+up 연속 쌍의 quant 전용 슬롯: (x,n_in,rows,gen) 키.
+    /// 전용 버퍼(타 quant 불가침) + 두 엔진 호출 사이 무연산. gen=moe_gen —
+    /// [2026-10-04] 같은 핸들·형상의 내용 변경 재투입(청크 프리필) 가짜 히트
+    /// 방지(moech 청크 불변 1.0e0 결함). gate→up 사이는 세대 불변이라 히트 유지.
+    pub(crate) moe_xq_pair: Mutex<Option<(u64, usize, usize, u64, VkBuf)>>,
     /// plans/89 P1.4 — PLE 디바이스 링: seq → (버퍼, 워터마크).
     ple_rings: Mutex<std::collections::HashMap<usize, (VkBuf, usize)>>,
     ple_consts: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,

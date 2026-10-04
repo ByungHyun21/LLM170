@@ -640,7 +640,7 @@ fn sec9b_moe_down_ids(
 /// 않으므로 대량 행이 필요하다.
 fn sec9c_moe_tile(
     acc: &VkAcc,
-    t: usize,
+    _t: usize,
     model: &AnyModel,
     lcg: &mut impl FnMut() -> f32,
 ) -> Result<(String, usize), String> {
@@ -688,7 +688,13 @@ fn sec9c_moe_tile(
             k_sel: k,
         })?;
         acc.frame_moe_gemm(mxh, &wg, idh, mgh, ne, k)?;
-        acc.frame_begin(t);
+        // [I5 수리 2026-10-04] 여기의 두 번째 frame_begin(t)은 §9b 템플릿 잔존이다.
+        // frame_read는 frame_t를 쓰지 않고, begin_batch의 site depth만 +1해
+        // 첫 frame_read의 end_batch_wait를 no-op로 만든다(depth>0 가드) — 즉
+        // 미제출 타일 출력을 스테일 판독해 MoE-tile-2100가 8.07e-1(=|dot|)
+        // FAIL로 결정적으로 오염됐다. §9b는 begin 사이 frame_sync로 균형을
+        // 맞추는데 이 섹션은 그 동기화가 없었다. 삭제 — 단일 begin이면
+        // frame_read의 드레인(depth 1→0)이 실제로 실행된다.
         let mut got = vec![0f32; t2 * k * n_out_m];
         acc.frame_read(mgh, &mut got)?;
         let mut ids_g = vec![0u32; t2 * k];
@@ -742,6 +748,12 @@ fn sec10_attention_half(
 ) -> Result<(String, usize), String> {
     let mut fails = 0usize;
     let mut report = String::new();
+
+    // [I5 수리 2026-10-04] 이 섹션의 커널들(GdnBetaG dr=n_h/t_cur 등)은
+    // frame_t를 사용한다. 과거에는 sec9c의 두 번째 frame_begin(t)이 우연히
+    // frame_t=3을 누출해 통과했던 숨은 결합이었다(sec9c 수리로 노출) —
+    // 섹션 스스로 begin으로 frame_t를 명시한다. 산술 불변(동일 t=3).
+    acc.frame_begin(t);
 
     let n = 48usize;
     let hc = 4usize;
