@@ -1291,7 +1291,6 @@ pub fn prefill_batch(
     tokens: &[u32],
 ) -> Result<Vec<f32>, String> {
     let h = tr.hidden;
-    let eps = 1e-6f32;
     if tokens.is_empty() {
         return Err("prefill_batch: 빈 프롬프트".into());
     }
@@ -1299,10 +1298,9 @@ pub fn prefill_batch(
     for chunk_toks in tokens.chunks(super::exl3_resident::BATCH_TMAX) {
         let t_rows = chunk_toks.len();
         // ── 프레임 경로(plans/121 원-서브밋): 잔차 GPU 상주, 층간 판독 0 ──
-        // 기본 경로(2026-10-03 승격): 원-서브밋 프레임 — pp512 123.02 t/s(+12.7%),
-        // corr 0.999999. 옵트아웃 LLM170_EXL3_NOFRAME(A/B·구경로 회귀 디버그).
-        // 주의: "LLM170_FRAME"은 qwen4exp 게이트와 이름 충돌 — 사용 금지.
-        if !llm170_diag::flag::on("LLM170_EXL3_NOFRAME") {
+        // 기본 경로(2026-10-03 승격, 2026-10-04 ENV 계약으로 옵트아웃 삭제):
+        // 원-서브밋 프레임 — pp512 123.02 t/s(+12.7%), corr 0.999999.
+        {
             // T 전 범위 — 스펙 라운드 포함
             if seq.pos == 0 {
                 // fresh 시퀀스 — GPU 상태가 타 시퀀스 잔류일 수 있다(슬롯
@@ -1470,7 +1468,7 @@ pub fn prefill_batch(
             logits = tr.linear("lm_head", &xn_last)?;
             seq.last_logits.clear();
             seq.last_logits.extend_from_slice(&logits);
-            if tr.gpu_frames_active() && !llm170_diag::flag::on("LLM170_EXL3_NOSYNC") {
+            if tr.gpu_frames_active() {
                 let n_gdn = tr.n_layers - tr.n_layers / 4;
                 let mut gi = 0usize;
                 let mut ai2 = 0usize;
@@ -1511,178 +1509,6 @@ pub fn prefill_batch(
             continue;
         }
         // 임베딩 행 조립
-        let _e0 = ph("pp:embed");
-        let mut x = vec![0f32; t_rows * h];
-        for (t, &tok) in chunk_toks.iter().enumerate() {
-            x[t * h..(t + 1) * h].copy_from_slice(tr.embed_row(tok));
-        }
-        drop(_e0);
-        // 스테이징 버퍼 — 이 청크의 모든 선형 입력이 여기에 병렬 직접 기록된다.
-        let stage = tr.stage_f32()?;
-        let mut attn_count = 0;
-        for il in 0..tr.n_layers {
-            let lp = format!("model.language_model.layers.{il}");
-            let full = il % 4 == 3;
-            let norm_w = tr
-                .norm(&format!("{lp}.input_layernorm.weight"))
-                .ok_or("norm missing")?
-                .to_vec();
-            // xn 행 rms — 병렬 이중 기록(CPU 슬라이스 + 스테이징 —
-            // alpha/beta dot용 xn은 CPU에도 필요).
-            let _n0 = ph("pp:norm_x");
-            let mut xn = vec![0f32; t_rows * h];
-            {
-                let (xp, np, op, sp) = (
-                    PP(x.as_ptr() as usize),
-                    PP(norm_w.as_ptr() as usize),
-                    PP(xn.as_mut_ptr() as usize),
-                    PP(stage as usize),
-                );
-                // SAFETY: 행별 분리 쓰기(xn·스테이징).
-                par_rows(t_rows, move |t| unsafe {
-                    let xr = std::slice::from_raw_parts((xp.0 as *const f32).add(t * h), h);
-                    let ss: f32 = xr.iter().map(|&v| v * v).sum();
-                    let inv = 1.0 / ((ss / h as f32 + eps).sqrt());
-                    let ob = (op.0 as *mut f32).add(t * h);
-                    let sb = (sp.0 as *mut f32).add(t * h);
-                    let nw = np.0 as *const f32;
-                    for i in 0..h {
-                        let v = *xr.get_unchecked(i) * inv * *nw.add(i);
-                        *ob.add(i) = v;
-                        *sb.add(i) = v;
-                    }
-                });
-            }
-            drop(_n0);
-            let attn_out = if full {
-                let _g = ph("pp:attn");
-                let r = attn_batch(tr, seq, il, attn_count, t_rows, 24, 4, 256)?;
-                drop(_g);
-                attn_count += 1;
-                if llm170_diag::dump::opts().key("exl3_framedbg") {
-                    eprintln!(
-                        "  [olddbg] L{il} attn last={:?}",
-                        &r[r.len() - 5120..r.len() - 5116]
-                    );
-                }
-                r
-            } else {
-                let _g = ph("pp:gdn");
-                let r = gdn_batch(tr, seq, il, &xn, t_rows)?;
-                drop(_g);
-                if llm170_diag::dump::opts().key("exl3_framedbg") {
-                    eprintln!(
-                        "  [olddbg] L{il} gdn last={:?}",
-                        &r[r.len() - 5120..r.len() - 5116]
-                    );
-                }
-                r
-            };
-            // 잔차 x += attn_out
-            let _r0 = ph("pp:resid");
-            for (a, b) in x.iter_mut().zip(attn_out.iter()) {
-                *a += b;
-            }
-            drop(_r0);
-            let ffn_norm_w = tr
-                .norm(&format!("{lp}.post_attention_layernorm.weight"))
-                .ok_or("ffn norm missing")?
-                .to_vec();
-            // xf 행 rms — 스테이징 단일 기록(FFN 트리오가 곧 소비).
-            let _n1 = ph("pp:norm_f");
-            {
-                let (xp, np, sp) = (
-                    PP(x.as_ptr() as usize),
-                    PP(ffn_norm_w.as_ptr() as usize),
-                    PP(stage as usize),
-                );
-                // SAFETY: 행별 분리 쓰기(스테이징).
-                par_rows(t_rows, move |t| unsafe {
-                    let xr = std::slice::from_raw_parts((xp.0 as *const f32).add(t * h), h);
-                    let ss: f32 = xr.iter().map(|&v| v * v).sum();
-                    let inv = 1.0 / ((ss / h as f32 + eps).sqrt());
-                    let sb = (sp.0 as *mut f32).add(t * h);
-                    let nw = np.0 as *const f32;
-                    for i in 0..h {
-                        *sb.add(i) = *xr.get_unchecked(i) * inv * *nw.add(i);
-                    }
-                });
-            }
-            drop(_n1);
-            if llm170_diag::dump::opts().key("exl3_framedbg") {
-                let st = tr.stage_f32()?;
-                // SAFETY: 스테이징 직독(호스트 기록 직후).
-                let head = unsafe { std::slice::from_raw_parts(st as *const f32, 4) }.to_vec();
-                eprintln!("  [olddbg] L{il} ffn-in xf={head:?}");
-            }
-            // FFN 트리오(단일 배치): gate/up gemm → ew_t(GPU) → down gemm.
-            let _gf = ph("pp:ffn");
-            let ffn_out = tr.ffn_trio_batch(
-                &format!("{lp}.mlp.gate_proj"),
-                &format!("{lp}.mlp.up_proj"),
-                &format!("{lp}.mlp.down_proj"),
-                t_rows,
-            )?;
-            drop(_gf);
-            if llm170_diag::dump::opts().key("exl3_framedbg") {
-                eprintln!("  [olddbg] L{il} ffn out={:?}", &ffn_out[..4]);
-            }
-            let _r1 = ph("pp:resid2");
-            for (a, b) in x.iter_mut().zip(ffn_out.iter()) {
-                *a += b;
-            }
-            drop(_r1);
-        }
-        // 벌크 GDN 상태 동기화(plans/121 F2 스케줄) — 층별 sync를 프리필 말미로
-        // 지연해 프리필 중 다운로드 대기 제거. 다음 디코드 정합 유지.
-        // T≤8 CPU 경로(스펙 라운드 포함)는 GPU 프레임이 없다 — 가드.
-        if tr.gpu_frames_active() {
-            let n_gdn = tr.n_layers - tr.n_layers / 4;
-            let mut gi = 0usize;
-            for il in 0..tr.n_layers {
-                if il % 4 != 3 {
-                    let (states, conv) = {
-                        let g = &mut seq.gdn[il];
-                        (&mut g.states, &mut g.conv)
-                    };
-                    tr.gdn_state_sync(gi, states, conv)?;
-                    gi += 1;
-                    if gi >= n_gdn {
-                        break;
-                    }
-                }
-            }
-        }
-        // 벌크 KV 캐시 동기화(plans/121 F2b) — GPU kvc → seq.kv(차기 디코드).
-        if tr.gpu_frames_active() {
-            let mut ai2 = 0usize;
-            for il in 0..tr.n_layers {
-                if il % 4 == 3 {
-                    let len = seq.kv[ai2].len;
-                    let rows = (len * 1024).min(seq.kv[ai2].k.len());
-                    let [k, v] = tr.attn_kv_sync(ai2, rows / 1024)?;
-                    seq.kv[ai2].k[..rows].copy_from_slice(&k[..rows]);
-                    seq.kv[ai2].v[..rows].copy_from_slice(&v[..rows]);
-                    ai2 += 1;
-                }
-            }
-        }
-        seq.pos += t_rows as u32;
-        seq.last_tok = *chunk_toks.last().ok_or("빈 청크")?;
-        // MTP h 스냅샷 — 청크 마지막 행의 잔차.
-        seq.last_h.clear();
-        seq.last_h
-            .extend_from_slice(&x[(t_rows - 1) * h..t_rows * h]);
-        // 마지막 청크: output_norm + lm_head(마지막 행만)
-        let out_norm_w = tr
-            .norm("model.language_model.norm.weight")
-            .ok_or("output norm missing")?
-            .to_vec();
-        let last = &x[(t_rows - 1) * h..t_rows * h];
-        let xn_last = rms_norm(last, &out_norm_w, eps);
-        logits = tr.linear("lm_head", &xn_last)?;
-        seq.last_logits.clear();
-        seq.last_logits.extend_from_slice(&logits);
     }
     Ok(logits)
 }
@@ -2358,7 +2184,7 @@ fn frame_spec_forward(
     let fkey = t_rows as u32;
     // 재생 옵트인(plans/121 tg): 라운드2+ 재생에서 NaN 발생(원장 계류) —
     // 정합 경로 보호를 위해 LLM170_EXL3_REPLAY=1까지만 활성.
-    let replaying = tr.ctx.frame_has(fkey) && llm170_diag::flag::eq1("LLM170_EXL3_REPLAY");
+    let replaying = false; // 재생 NaN 미결 — ENV 계약으로 경로 삭제(녹화만 유지)
     if replaying {
         tr.attn_set_pos(pos0)?;
         tr.ctx.frame_replay(fkey)?;
@@ -2518,7 +2344,7 @@ pub fn exl3_spec_step(
     tr.attn_frame_init()?;
     // ③ 검증 — 기본 프레임 / A/B: CPU 검증(LLM170_EXL3_SPECCPU=1, 진단).
     let _sp_t2 = std::time::Instant::now(); // 스냅샷 완료
-    let row_am: Vec<u32> = if llm170_diag::flag::eq1("LLM170_EXL3_SPECCPU") {
+    let row_am: Vec<u32> = if false && llm170_diag::flag::eq1("LLM170_EXL3_SPECCPU") {
         let snap2 = spec_snap(seq);
         let mut row = Vec::with_capacity(k);
         for &d in &drafts {
@@ -2567,7 +2393,7 @@ pub fn exl3_spec_step(
     }
     let forwards = if diverged {
         // ⑤ 롤백 + 수용 접두 재실행 — 프레임 기본 / CPU A/B.
-        if llm170_diag::flag::eq1("LLM170_EXL3_SPECCPU") {
+        if false && llm170_diag::flag::eq1("LLM170_EXL3_SPECCPU") {
             let re_accepted = accepted.clone();
             for &t in &re_accepted {
                 let _ = decode_step(tr, seq, t)?;
@@ -2728,3 +2554,4 @@ pub fn exl3_mtp2(
 // 마커 fb1
 // 마커 tadj
 // 마커 cb1
+// 마커 dcl2
