@@ -944,110 +944,6 @@ extern "C" __global__ void exl3_argmax(
 #include <rocwmma/rocwmma.hpp>
 using namespace rocwmma;
 
-// ── exl3_gemm2 WMMA(텐서코어) — 스칼라 2.8TF → mma(8060S tg 12 레버, plans/121) ──
-#define TC_BM 64
-#define TC_BN 64
-#define TC_BK 16
-extern "C" __global__ void exl3_gemm2_wmma(
-    const unsigned* __restrict__ ah16,
-    const unsigned* __restrict__ tre,
-    float* __restrict__ s,
-    int ktiles, int ntiles, int K, int T)
-{
-    __shared__ unsigned tre_s[8 * 48];
-    __shared__ half A16[TC_BM][TC_BK + 4];
-    __shared__ half B16[TC_BN][TC_BK + 4];
-    __shared__ float Ctmp[64][68];
-    int wg_n = blockIdx.x;
-    int wg_t = blockIdx.y;
-    int tid = threadIdx.x;
-    int n = ntiles * 16;
-    int row0 = wg_n * TC_BM;
-    int t0 = wg_t * TC_BN;
-    int nrow = min(TC_BM, n - row0);
-    int nt = min(TC_BN, T - t0);
-    int words32 = 8 * K;
-    int nkb = ktiles;
-
-    fragment<accumulator, 16, 16, 16, float> fc[4][4];
-    #pragma unroll
-    for (int i = 0; i < 4; i++)
-        #pragma unroll
-        for (int j = 0; j < 4; j++)
-            fill_fragment(fc[i][j], 0.0f);
-
-    for (int kb = 0; kb < nkb; kb++) {
-        {
-            int stg_words = 4 * words32; // 1 k-타일 × 4 n-타일 — 디코드 tidx=(r>>4)와 정합
-            for (int w = tid; w < stg_words; w += 256) {
-                int ntl = w / words32;
-                int wq = w % words32;
-                tre_s[w] = tre[((long)kb * ntiles + (wg_n * 4 + ntl)) * words32 + wq];
-            }
-            __syncthreads();
-        }
-        {
-            for (int seg = tid; seg < TC_BM * (TC_BK / 4); seg += 256) {
-                int r = seg / (TC_BK / 4);
-                int c4 = seg % (TC_BK / 4);
-                int c = c4 * 4;
-                #pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    int kk = kb * TC_BK + c + e;
-                    // 검증된 스칼라 gemm2와 동일 헬퍼 사용 — 인라인 파생 금지(원장 교훈).
-                    float v = exl3_mul1_decode(exl3_tile_word(
-                        tre_s, words32, K, r >> 4, kk & 15, r & 15));
-                    A16[r][c + e] = __float2half(v);
-                }
-            }
-            __syncthreads();
-        }
-        {
-            for (int e = tid; e < TC_BN * TC_BK; e += 256) {
-                int tl = e / TC_BK;
-                int kk = e % TC_BK;
-                half v = __float2half(0.0f);
-                if (tl < nt) {
-                    unsigned w = ah16[(long)(t0 + tl) * (ktiles * 8) + (kb * TC_BK + kk) / 2];
-                    float2 uv = __half22float2(*reinterpret_cast<const __half2*>(&w));
-                    v = __float2half((kk & 1) ? uv.y : uv.x);
-                }
-                B16[tl][kk] = v;
-            }
-            __syncthreads();
-        }
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                fragment<matrix_a, 16, 16, 16, half, row_major> fa;
-                load_matrix_sync(fa, &A16[i * 16][0], TC_BK + 4);
-                fragment<matrix_b, 16, 16, 16, half, col_major> fb;
-                load_matrix_sync(fb, &B16[j * 16][0], TC_BK + 4);
-                mma_sync(fc[i][j], fa, fb, fc[i][j]);
-            }
-        }
-        __syncthreads();
-    }
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        #pragma unroll
-        for (int j = 0; j < 4; j++)
-            store_matrix_sync(&Ctmp[i * 16][j * 16], fc[i][j], 68, mem_row_major);
-    }
-    __syncthreads();
-    for (int e = tid; e < nrow * nt; e += 256) {
-        int r = e / nt;
-        int c = e % nt;
-        s[(long)(t0 + c) * n + row0 + r] = Ctmp[r][c];
-    }
-}
-// 마커 wm1
-// 마커 wm2
-// 마커 wm3
-// 마커 wmfix
-// 마커 wmf2
-
 // ── exl3_gemm2_kseg — 소형-T 점유 레버(plans/121): k-타일을 grid.y 세그먼트로 분할,
 // 부분합을 had_out의 nseg 레이아웃 [T][kseg][n]에 기록 — had_out(nseg=kseg)이 합산.
 extern "C" __global__ void exl3_gemm2_kseg(
@@ -1146,6 +1042,127 @@ extern "C" __global__ void exl3_gemm2_kseg(
         if (tt >= nt) break;
         if (n_loc < nrow)
             s[((long)(t0 + tt) * kseg + seg) * n + row0 + n_loc] = acc[t];
+    }
+}
+
+// ── exl3_gemm2_mma (plans/127 B) — Q4-MMQ(gemm_q5k_wm) 구조의 트렐리스 이식 ──
+// 스칼라 2.8TF의 구조적 한계(스레드당 f16 FMA 체인)를 mma_sync로 대체한다.
+// 분할: 블록=64 가중행×64 토큰, 워프밴드(64스레드)=16 가중행 × wave32 페어
+// (wpar)×32 토큰, fc[2] 파편 누산. [바이섹트 #2] 스테이징+A 디코드는 WMMA 판과
+// 바이트 동일(16k 타일 루프·[ntl] 4슬롯·flat A16) — 오염 프로파일 비교용.
+extern "C" __global__ void __launch_bounds__(256) exl3_gemm2_mma(
+    const unsigned* __restrict__ ah16,  // f16쌍팩 [T][ktiles*8]
+    const unsigned* __restrict__ tre,
+    float* __restrict__ s,              // [T][n]
+    int ktiles, int ntiles, int K, int T)
+{
+    __shared__ unsigned tre_s[8 * 48];
+    __shared__ half A16[64][36];        // flat — WMMA 판과 동일 레이아웃
+    __shared__ half B16[64][36];        // [토큰][32k+4]
+    int bid = blockIdx.x;
+    int wg_t = blockIdx.y;
+    int tid = threadIdx.x;
+    int wid = tid >> 6;                 // 밴드 0..3
+    int n = ntiles * 16;
+    int row0 = bid * 64;
+    if (row0 >= n) return;
+    int t0 = wg_t * 64;
+    int nrow = min(64, n - row0);
+    int nt = min(64, T - t0);
+    int words32 = 8 * K;                // K=krate
+    int arow_words = ktiles * 8;
+    int wpar = (tid >> 5) & 1;          // wave32 페어 분할(Q4 원판 동일)
+
+    fragment<accumulator, 16, 16, 16, float> fc[2];
+    #pragma unroll
+    for (int i = 0; i < 2; i++) fill_fragment(fc[i], 0.0f);
+
+    for (int kb = 0; kb < ktiles; kb++) {
+        {
+            int stg_words = 4 * words32;
+            for (int w = tid; w < stg_words; w += 256) {
+                int ntl = w / words32;
+                int wq = w % words32;
+                tre_s[w] = tre[((long)kb * ntiles + (bid * 4 + ntl)) * words32 + wq];
+            }
+            __syncthreads();
+        }
+        {
+            for (int seg = tid; seg < 64 * 4; seg += 256) {
+                int r = seg / 4;
+                int c = (seg % 4) * 4;
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    int kk = c + e;
+                    float v = exl3_mul1_decode(exl3_tile_word(
+                        tre_s, words32, K, r >> 4, kk & 15, r & 15));
+                    A16[r][kk] = __float2half(v);
+                }
+            }
+        }
+        {
+            int ti = tid >> 2;
+            int kc = tid & 3;
+            if (ti < nt) {
+                const unsigned* xt = ah16 + (long)(t0 + ti) * arow_words;
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    unsigned w = xt[kb * 8 + kc * 4 + e];
+                    float2 uv = __half22float2(*reinterpret_cast<const __half2*>(&w));
+                    B16[ti][kc * 8 + 2 * e] = __float2half(uv.x);
+                    B16[ti][kc * 8 + 2 * e + 1] = __float2half(uv.y);
+                }
+            } else {
+                #pragma unroll
+                for (int e = 0; e < 8; e++) B16[ti][kc * 8 + e] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+        {
+            fragment<matrix_a, 16, 16, 16, half, row_major> fa;
+            load_matrix_sync(fa, &A16[wid * 16][0], 36);
+            #pragma unroll
+            for (int tth = 0; tth < 2; tth++) {
+                int tt = wpar * 2 + tth;
+                fragment<matrix_b, 16, 16, 16, half, col_major> fb;
+                load_matrix_sync(fb, &B16[tt * 16][0], 36);
+                mma_sync(fc[tth], fa, fb, fc[tth]);
+            }
+        }
+        __syncthreads();
+    }
+    // 드레인: D(i=n, j=t)를 s[T][n]에 저장 — 주소 = base + j*n + i → col_major,
+    // ldm=n(row_major는 전치 저장 — 실측 인터리브 오염으로 확정).
+    // 부분 t-타일(끝쪽 T가 16 배수가 아닌 경우)은 직접 저장이 [T][n] 경계를
+    // 넘는다(실측 T=16 메모리 폴트) — 전체 타일만 직접, 부분 타일은 Ctmp 경유
+    // 가드 드레인.
+    int tail = T - t0;
+    #pragma unroll
+    for (int tth = 0; tth < 2; tth++) {
+        int tt = wpar * 2 + tth;
+        if (t0 + tt * 16 + 16 <= T) {
+            store_matrix_sync(
+                &s[(long)(t0 + tt * 16) * n + row0 + wid * 16],
+                fc[tth], n, mem_col_major);
+        }
+    }
+    if (tail < 64 && (tail & 15) != 0) {
+        // 부분 타일 파편은 밴드(wid)마다 하나씩 존재 — Ctmp는 [64행][16열]로
+        // 전 밴드 커버(종전 [16][68] 선언은 r2 16..63이 공유 밖 — T=21 行20 inf 실측).
+        __shared__ float Ctmp[64][20];
+        int tp = tail >> 4;              // 부분 타일 번호(유일)
+        #pragma unroll
+        for (int tth = 0; tth < 2; tth++) {
+            if (wpar * 2 + tth == tp)
+                store_matrix_sync(&Ctmp[wid * 16][0], fc[tth], 20, mem_row_major);
+        }
+        __syncthreads();
+        int valid = tail - tp * 16;      // 타일 내 유효 토큰 수
+        for (int e2 = tid; e2 < nrow * valid; e2 += 256) {
+            int r2 = e2 / valid;
+            int c2 = e2 % valid;
+            s[(long)(t0 + tp * 16 + c2) * n + row0 + r2] = Ctmp[r2][c2];
+        }
     }
 }
 
