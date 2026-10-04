@@ -1540,7 +1540,39 @@ pub fn hip_mtp_round(dir: &str, tok: u32, rounds: usize) -> Result<String, Strin
 pub fn hip_mtp_a1(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
     use crate::rawhip::exl3_hip::Exl3HipDecoder;
     let mut dec = Exl3HipDecoder::load(dir, 64)?;
+    // 변형 A: 순차(gemv) 타깃 + 호스트 mtp 훅(vk exl3-mtp 동일 구조) —
+    // h 클래스(배치 gemm2 h vs 순차 gemv h)가 a1 격차(0.44 vs 0.625) 원인인지 판별.
+    let mut h_seq_store: Vec<Vec<f32>> = Vec::new();
+    {
+        let (mut hit_s, mut tot_s, mut cur_s) = (0usize, 0usize, tok);
+        for _ in 0..steps {
+            let row = dec.embed_row_host(cur_s);
+            let (lg, h) = dec.forward(&row)?;
+            let nxt = lg
+                .iter()
+                .enumerate()
+                .max_by(|x, y| x.1.partial_cmp(y.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            h_seq_store.push(h.clone());
+            let dl = dec.mtp_draft(cur_s, &h, dec.pos - 1)?;
+            tot_s += 1;
+            let am_d = dl
+                .iter()
+                .enumerate()
+                .max_by(|x, y| x.1.partial_cmp(y.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            if am_d == nxt {
+                hit_s += 1;
+            }
+            cur_s = nxt;
+        }
+        eprintln!("  [a1seq] 순차경로 a1 = {hit_s}/{tot_s}");
+        let _ = &h_seq_store;
+    }
     let mut cur = tok;
+    let mut batch_i = 0usize;
     let (mut hit, mut tot, mut hit_h) = (0usize, 0usize, 0usize);
     let mut t_draft = 0f64;
     let t0 = std::time::Instant::now();
@@ -1548,6 +1580,17 @@ pub fn hip_mtp_a1(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
         let row = dec.embed_row_host(cur);
         let pos_before = dec.pos;
         let (lg, h) = dec.forward_batch_with_mtp(&[row], &[cur])?;
+        if let Some(hs) = h_seq_store.get(batch_i) {
+            let md = h
+                .iter()
+                .zip(hs)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!(
+                "  [hmd] 스텝{batch_i} h_batch-vs-seq maxdiff={md:.3e} rms_h={:.3}",
+                h.iter().map(|v| v * v).sum::<f32>().sqrt()
+            );
+        }
         let nxt = lg[0]
             .iter()
             .enumerate()
@@ -1576,6 +1619,7 @@ pub fn hip_mtp_a1(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
             eprintln!("  [a1dbg] 스텝{tot} gpu={d} host={am_h} target={nxt}");
         }
         cur = nxt;
+        batch_i += 1;
     }
     let el = t0.elapsed().as_secs_f64();
     Ok(format!(
@@ -1788,3 +1832,58 @@ pub fn hip_graph_mini2() -> Result<String, String> {
 // 마커 gm5
 // 마커 wmr
 // 마커 wv0
+// 마커 a1s
+// 마커 hmd
+
+/// `llm170 exl3-hip-hcmp <dir> <tok> <steps>` — 같은 토큰 스트림에서 순차 vs 배치 h 쌍 비교.
+/// maxdiff ≈1e-2 → 산술 클래스(트레이드오프), 크면 배치-h 결함(수리 가능).
+pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
+    use crate::rawhip::exl3_hip::Exl3HipDecoder;
+    let mut dseq = Exl3HipDecoder::load(dir, 64)?;
+    // 순차 h·다음토큰 수집
+    let mut toks = vec![tok];
+    let mut hs: Vec<Vec<f32>> = Vec::new();
+    for i in 0..steps {
+        let row = dseq.embed_row_host(toks[i]);
+        let (lg, h) = dseq.forward(&row)?;
+        hs.push(h);
+        let nxt = lg
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(j, _)| j as u32)
+            .unwrap_or(0);
+        toks.push(nxt);
+    }
+    drop(dseq);
+    // 배치 디코더로 같은 스트림 T=1씩(문맥 동일)
+    let mut dbat = Exl3HipDecoder::load(dir, 64)?;
+    let mut mds = Vec::new();
+    for i in 0..steps {
+        let row = dbat.embed_row_host(toks[i]);
+        let (_lg, hb) = dbat.forward_batch(&[row])?;
+        let md = hb
+            .iter()
+            .zip(&hs[i])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        mds.push(md);
+        if i < 4 {
+            let rms = hs[i].iter().map(|v| v * v).sum::<f32>().sqrt();
+            eprintln!("  [hcmp] 스텝{i} maxdiff={md:.3e} rms={rms:.1}");
+        }
+    }
+    let med = {
+        mds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        mds[mds.len() / 2]
+    };
+    Ok(format!(
+        "h-pair: 중앙 maxdiff={med:.3e} — {}",
+        if med < 0.05 {
+            "f16급(산술 클래스)"
+        } else {
+            "계통 오차(배치-h 결함 의심)"
+        }
+    ))
+}
+// 마커 hcp
