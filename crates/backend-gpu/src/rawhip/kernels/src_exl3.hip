@@ -978,13 +978,11 @@ extern "C" __global__ void exl3_gemm2_wmma(
 
     for (int kb = 0; kb < nkb; kb++) {
         {
-            int stg_words = 8 * words32;
+            int stg_words = 4 * words32; // 1 k-타일 × 4 n-타일 — 디코드 tidx=(r>>4)와 정합
             for (int w = tid; w < stg_words; w += 256) {
-                int tidx = w / words32;
+                int ntl = w / words32;
                 int wq = w % words32;
-                int ktl = tidx >> 2;
-                int ntl = tidx & 3;
-                tre_s[w] = tre[((long)(kb + ktl) * ntiles + (wg_n * 4 + ntl)) * words32 + wq];
+                tre_s[w] = tre[((long)kb * ntiles + (wg_n * 4 + ntl)) * words32 + wq];
             }
             __syncthreads();
         }
@@ -996,21 +994,9 @@ extern "C" __global__ void exl3_gemm2_wmma(
                 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     int kk = kb * TC_BK + c + e;
-                    int t_ = (4 * (r & 7) + ((kk & 15) >> 1)) * 8
-                           + ((kk >> 4) * 2 + (kk & 1) + (r >> 3));
-                    unsigned b0 = (unsigned)t_ * (unsigned)K + (unsigned)(K + 256 * K - 16);
-                    unsigned b1 = b0 + 16u;
-                    unsigned i0 = (b0 >> 5) % (unsigned)words32;
-                    unsigned i1 = ((b1 - 1u) >> 5) % (unsigned)words32;
-                    unsigned sh = (((b1 - 1u) >> 5) + 1u) * 32u - b1;
-                    unsigned w0 = tre_s[((kk >> 4) * 4 + (r >> 4)) * words32 + i0];
-                    unsigned w1 = tre_s[((kk >> 4) * 4 + (r >> 4)) * words32 + i1];
-                    unsigned wd = (sh == 0u) ? (w1 & 0xFFFFu)
-                        : (((w0 << (32u - sh)) | (w1 >> sh)) & 0xFFFFu);
-                    unsigned x = wd * 0x83DCD12Du;
-                    unsigned p = (x & 0x00FF00FFu) + ((x >> 8u) & 0x00FF00FFu);
-                    unsigned sum = (p & 0xFFFFu) + (p >> 16u);
-                    float v = (1024.0f + (float)sum) * 0.00676727294921875f - 10.3828125f;
+                    // 검증된 스칼라 gemm2와 동일 헬퍼 사용 — 인라인 파생 금지(원장 교훈).
+                    float v = exl3_mul1_decode(exl3_tile_word(
+                        tre_s, words32, K, r >> 4, kk & 15, r & 15));
                     A16[r][c + e] = __float2half(v);
                 }
             }
@@ -1059,3 +1045,5 @@ extern "C" __global__ void exl3_gemm2_wmma(
 // 마커 wm1
 // 마커 wm2
 // 마커 wm3
+// 마커 wmfix
+// 마커 wmf2
