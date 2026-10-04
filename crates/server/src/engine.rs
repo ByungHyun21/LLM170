@@ -12,6 +12,8 @@ pub enum BackendSel {
     /// EXL3 직접 경로 (plans/121 A1) — --model은 EXL3 디렉터리,
     /// --backend exl3로 지정. vk 배치 프리필+순차 디코드.
     Exl3,
+    /// EXL3 hip 백엔드(plans/121 exl3-sched) — 단일 슬롯, 배치 프리필+순차 디코드.
+    Exl3Hip,
 }
 
 #[derive(Clone)]
@@ -43,7 +45,7 @@ pub fn q4_gpu_wanted(backend: &BackendSel) -> bool {
         return false;
     }
     match backend {
-        BackendSel::Cpu | BackendSel::Exl3 => false,
+        BackendSel::Cpu | BackendSel::Exl3 | BackendSel::Exl3Hip => false,
         BackendSel::Gpu => true,
         BackendSel::GpuRuntime(r) => {
             if r != "hip" && r != "vulkan" {
@@ -396,6 +398,7 @@ pub enum Engine {
     Q4(Box<llm170_core::qwen4exp::layers::Engine4>),
     /// EXL3 직접 경로 (plans/121 A1) — TrellisResident + 슬롯 SeqState.
     Exl3(Box<crate::exl3_engine::Exl3Engine>),
+    Exl3Hip(Box<crate::exl3_hip_engine::Exl3HipEngine>),
 }
 
 /// 슬롯 스케줄러 (04) — llama.cpp 규칙 1:1: 디코드 우선, 잔여 예산만
@@ -709,6 +712,13 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     e.decode1(0, t).map(|_| ())
                 })
                 .map_err(|e| e.to_string()),
+            Engine::Exl3Hip(e) => e
+                .prefill(&warm)
+                .and_then(|l| {
+                    let t = llm170_core::qwen35::greedy(&l);
+                    e.decode1(t).map(|_| ())
+                })
+                .map_err(|e| e.to_string()),
         };
         if let Err(err) = w {
             eprintln!("# warmup 실패(치명 아님): {err}");
@@ -717,6 +727,11 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             Engine::Q35(e) => e.reset_states(),
             Engine::Q4(e) => e.reset_states(),
             Engine::Exl3(e) => e.reset_states(),
+            Engine::Exl3Hip(e) => {
+                if let Err(err) = e.reset_seq() {
+                    eprintln!("# hip 리셋 실패: {err}");
+                }
+            }
         }
     }
     crate::http::READY.store(true, std::sync::atomic::Ordering::Release);
@@ -962,6 +977,26 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         q4_plain_decode(e, &mut slots, &active);
                     }
                 }
+                Engine::Exl3Hip(e) => {
+                    // hip 기본 경로(단일 슬롯 — plans/121 exl3-sched). active는 0성분.
+                    for &i in &active {
+                        let next = slots[i].next;
+                        let r = e.decode1(next).map(|l| {
+                            if slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy()) {
+                                pick(&mut slots[i], &l)
+                            } else {
+                                llm170_core::qwen35::greedy(&l)
+                            }
+                        });
+                        match r {
+                            Ok(t) => slot_emit(&mut slots[i], t),
+                            Err(err) => {
+                                eprintln!("# hip decode 실패({err})");
+                                slot_fail(&mut slots[i], format!("hip decode1: {err}"));
+                            }
+                        }
+                    }
+                }
                 Engine::Exl3(e) => {
                     // EXL3 (plans/121 A1) — 슬롯별 순차 디코드(tg 4.69 t/s).
                     // np 배치·스펙 미보유 — greedy 최적, 샘플링 슬롯은 로짓 판.
@@ -1105,6 +1140,14 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                             // 단일스트림(측정 승리) 전용.
                             r
                         }
+                        Engine::Exl3Hip(e) if i == 0 => e.prefill(&part).map(|l| {
+                            if samp {
+                                pick(&mut slots[i], &l)
+                            } else {
+                                llm170_core::qwen35::greedy(&l)
+                            }
+                        }),
+                        Engine::Exl3Hip(_) => Err("hip 단일 슬롯: 슬롯>0 미지원".to_string()),
                         Engine::Exl3(e) => e
                             .prefill(i, &part)
                             .map(|l| {
@@ -1345,6 +1388,12 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
 /// n_slots 시퀀스로 엔진 구성 (연속 배칭 — 04).
 pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> Engine {
     // EXL3 직접 경로 (plans/121 A1) — --model은 EXL3 디렉터리.
+    if matches!(backend, BackendSel::Exl3Hip) {
+        let dir = req.model.to_string_lossy().into_owned();
+        let eng = crate::exl3_hip_engine::Exl3HipEngine::load(&dir, 1, req.ctx)
+            .unwrap_or_else(|e| panic!("exl3-hip 엔진 로드 실패: {e}"));
+        return Engine::Exl3Hip(Box::new(eng));
+    }
     if matches!(backend, BackendSel::Exl3) {
         let dir = req.model.to_string_lossy().into_owned();
         let eng = crate::exl3_engine::Exl3Engine::load(&dir, n_slots, req.ctx)
@@ -1419,6 +1468,11 @@ impl Engine {
             Engine::Q35(e) => e.reset_seq(seq),
             Engine::Q4(e) => e.reset_seq(seq),
             Engine::Exl3(e) => e.reset_seq(seq),
+            Engine::Exl3Hip(e) => {
+                if let Err(err) = e.reset_seq() {
+                    eprintln!("# hip 슬롯 리셋 오류: {err}");
+                }
+            }
         }
     }
 }
@@ -1467,3 +1521,7 @@ pub static TOKENIZER: std::sync::OnceLock<crate::tokenize::Tokenizer> = std::syn
 pub fn greedy_encode(text: &str) -> Vec<u32> {
     TOKENIZER.get().map(|t| t.encode(text)).unwrap_or_default()
 }
+// 마커 eh2
+// 마커 eh3
+// 마커 eh4
+// 마커 eh5

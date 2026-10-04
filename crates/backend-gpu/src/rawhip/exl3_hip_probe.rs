@@ -1902,7 +1902,30 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
                         .map(|(a, b)| (a - b).abs())
                         .fold(0f32, f32::max);
                     let rms = hs_cv.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    eprintln!("  [hcv] L{l}↔L{lb} maxdiff={md:.3e} rms={rms:.1}");
+                    // 상관계수 + 오차-크기 관계: corr≈1·오차∝값 → 노이즈 증폭,
+                    // 무상관 원소 존재 → 실결함(인덱싱/버퍼).
+                    let n_e = hs_cv.len();
+                    let (mut sa, mut sb, mut saa, mut sbb, mut sab) =
+                        (0f64, 0f64, 0f64, 0f64, 0f64);
+                    let mut big_bad = 0usize; // |seq|<1 인데 |diff|>1 → 무상관 오염
+                    for (a_, b_) in hs_cv.iter().zip(hb_cv) {
+                        let (a_, b_) = (*a_ as f64, *b_ as f64);
+                        sa += a_;
+                        sb += b_;
+                        saa += a_ * a_;
+                        sbb += b_ * b_;
+                        sab += a_ * b_;
+                        if a_.abs() < 1.0 && (a_ - b_).abs() > 1.0 {
+                            big_bad += 1;
+                        }
+                    }
+                    let cov = sab / n_e as f64 - (sa / n_e as f64) * (sb / n_e as f64);
+                    let va = saa / n_e as f64 - (sa / n_e as f64).powi(2);
+                    let vb = sbb / n_e as f64 - (sb / n_e as f64).powi(2);
+                    let corr = cov / (va.sqrt() * vb.sqrt());
+                    eprintln!(
+                        "  [hcv] L{l}↔L{lb} maxdiff={md:.3e} rms={rms:.1} corr={corr:.6} 무상관오염={big_bad}"
+                    );
                 }
             }
         }
@@ -1965,3 +1988,4 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
 // 마커 scv
 // 마커 dcf
 // 마커 s4
+// 마커 cor
