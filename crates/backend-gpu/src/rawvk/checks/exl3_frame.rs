@@ -1,3 +1,5 @@
+//! [프레임 모듈 — vk 측정 원장 2026-10-04]
+//! 원-서브밋 프레임: pp512 123 t/s · norm_resid exact · fframe 스냅샷/롤백
 use super::exl3_resident::{BATCH_TMAX, FFrame, TrellisResident, n_gdn_bytes};
 
 impl TrellisResident {
