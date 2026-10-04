@@ -1284,3 +1284,85 @@ pub fn hip_mtp_check(dir: &str, tok: u32) -> Result<String, String> {
 }
 // 마커 mtpd
 // 마커 mtpf
+
+/// `llm170 exl3-hip-batch <dir> <tok> [T]` — 배치 forward(프리필/검증 경로) 정합:
+/// T행 임베딩으로 forward_batch → 행별 argmax를 순차 디코드와 대조.
+pub fn hip_batch_check(dir: &str, tok: u32, t_len: usize) -> Result<String, String> {
+    use crate::rawhip::exl3_hip::Exl3HipDecoder;
+    let t = t_len.clamp(1, 8);
+    let mut dec = Exl3HipDecoder::load(dir, dec_layers_default(dir))?;
+    dec.dbg_layers = true;
+    // 1) 순차 greedy T+1스텝(기준)
+    let mut seq_toks = Vec::new();
+    let mut tk = tok;
+    for _ in 0..=t {
+        let (lg, _) = {
+            let lgv = dec.forward_tok(tk)?;
+            (lgv, Vec::<f32>::new())
+        };
+        let am = lg
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+        seq_toks.push(am);
+        tk = am;
+    }
+    drop(dec);
+    // 2) 배치: [tok, s1..st] 행 — 마지막 행의 argmax가 순차 t+1번째와 일치해야.
+    let rows_toks: Vec<u32> = std::iter::once(tok)
+        .chain(seq_toks.iter().take(t).copied())
+        .collect();
+    let mut dec2 = Exl3HipDecoder::load(dir, dec_layers_default(dir))?;
+    dec2.dbg_layers = true;
+    let mut rows = Vec::with_capacity(rows_toks.len());
+    for rt in &rows_toks {
+        rows.push(dec2.embed_row_host(*rt));
+    }
+    let lgs = dec2.forward_batch(&rows)?;
+    // 전 행 argmax — 첫 이탈 행 국소화(순차 기준과 행별 대조).
+    let seq_ref: Vec<u32> = std::iter::once(tok).chain(seq_toks.clone()).collect();
+    for (ri, lgr) in lgs.iter().enumerate() {
+        let ra = lgr
+            .iter()
+            .enumerate()
+            .max_by(|x, y| x.1.partial_cmp(y.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+        eprintln!(
+            "  [fbrow] 행{ri} argmax={ra} (순차 다음토큰 {}){}",
+            seq_ref.get(ri + 1).copied().unwrap_or(0),
+            if seq_ref.get(ri + 1) == Some(&ra) {
+                " ✓"
+            } else {
+                " ✗"
+            }
+        );
+    }
+    let last = lgs.last().ok_or("batch empty")?;
+    let bam = last
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0);
+    let ok = bam == seq_toks[t];
+    Ok(format!(
+        "hip-batch T={t}: 순차 {:?} · 배치 마지막 argmax={bam} (기준 {}) — {}",
+        seq_toks,
+        seq_toks[t],
+        if ok { "일치" } else { "불일치" }
+    ))
+}
+
+fn dec_layers_default(_dir: &str) -> usize {
+    64
+}
+// 마커 fb4
+// 마커 fb7
+// 마커 fb8
+// 마커 fbd
+// 마커 fbc
+// 마커 fbr
+// 마커 blp
