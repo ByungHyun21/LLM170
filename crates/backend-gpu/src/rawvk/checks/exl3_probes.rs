@@ -1041,3 +1041,302 @@ pub fn chain_check(dir: &str) -> Result<String, String> {
 // 마커 solo1
 // 마커 cs1
 // 마커 tup
+
+impl TrellisResident {
+    // ── 융합 norm_resid_had 격리 프로브(plans/121 메가융합 1호) ──
+    // xtb/xbuf는 수학 미러와, ah[0]/ah[1]은 Rust WHT 미러(f16 RTNE → 버터플라이 →
+    // f16 팩)와 비트 대조 — 부착 전 산술 게이트.
+    pub fn nrh_check(dir: &str) -> Result<String, String> {
+        let t_rows = 8usize;
+        let mut tr = Self::load(dir)?;
+        tr.fframe_init()?;
+        let (xptr, zeros, nw128) = {
+            let ff = tr
+                .batch
+                .as_ref()
+                .and_then(|b| b.fframe.as_ref())
+                .ok_or("fframe")?;
+            (ff.xbuf.ptr as *mut f32, ff.zeros.buf, &ff.nw128)
+        };
+        let nw: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(nw128.ptr as *const f32, 5120).to_vec() };
+        let mut seed: u32 = 0xABCD_1234;
+        let xs: Vec<f32> = (0..t_rows * 5120)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
+            })
+            .collect();
+        unsafe {
+            std::ptr::copy_nonoverlapping(xs.as_ptr(), xptr, xs.len());
+        }
+        {
+            let ff = tr
+                .batch
+                .as_ref()
+                .and_then(|b| b.fframe.as_ref())
+                .ok_or("fframe")?;
+            tr.ctx.flush_range(&ff.xbuf, t_rows * 5120 * 4);
+        }
+        let lp = "model.language_model.layers.0.linear_attn";
+        let i1 = tr.find_linear(&format!("{lp}.in_proj_qkv"))?;
+        let i2 = tr.find_linear(&format!("{lp}.in_proj_z"))?;
+        let (suh1b, suh2b) = (tr.linears[i1].1.suh.buf, tr.linears[i2].1.suh.buf);
+        // suh는 f16쌍팩 u32[k/2] — f32로 재해석 금지(had_in 바인딩 규약).
+        let suh_unpack = |vkbuf: &crate::rawvk::context::VkBuf| -> Vec<f32> {
+            let raw = unsafe { std::slice::from_raw_parts(vkbuf.ptr as *const u32, 2560) };
+            (0..5120)
+                .map(|k| {
+                    let w = raw[k >> 1];
+                    let h = ((w >> ((k & 1) * 16)) & 0xFFFF) as u16;
+                    half::f16::from_bits(h).to_f32()
+                })
+                .collect()
+        };
+        let suh1f = suh_unpack(&tr.linears[i1].1.suh);
+        let suh2f = suh_unpack(&tr.linears[i2].1.suh);
+        tr.frame_norm_resid_had(0, t_rows, zeros, suh1b, suh2b)?;
+        let (xtb, xb, ah0, ah1) = {
+            let b = tr.batch.as_ref().ok_or("batch")?;
+            let ff = b.fframe.as_ref().ok_or("fframe")?;
+            tr.ctx.invalidate_range(&b.xtb, t_rows * 5120 * 4);
+            tr.ctx.invalidate_range(&ff.xbuf, t_rows * 5120 * 4);
+            tr.ctx.invalidate_range(&b.ah[0], t_rows * 2560 * 4);
+            tr.ctx.invalidate_range(&b.ah[1], t_rows * 2560 * 4);
+            // SAFETY: 상단 배치 종료 후 매핑 판독.
+            unsafe {
+                (
+                    std::slice::from_raw_parts(b.xtb.ptr as *const f32, t_rows * 5120).to_vec(),
+                    std::slice::from_raw_parts(ff.xbuf.ptr as *const f32, t_rows * 5120).to_vec(),
+                    std::slice::from_raw_parts(b.ah[0].ptr as *const u32, t_rows * 2560).to_vec(),
+                    std::slice::from_raw_parts(b.ah[1].ptr as *const u32, t_rows * 2560).to_vec(),
+                )
+            }
+        };
+        let mut want_xn = vec![0f32; t_rows * 5120];
+        for t in 0..t_rows {
+            let ss: f32 = (0..5120).map(|i| xs[t * 5120 + i] * xs[t * 5120 + i]).sum();
+            let inv = 1.0 / (ss / 5120.0 + 1e-6).sqrt();
+            for i in 0..5120 {
+                want_xn[t * 5120 + i] = xs[t * 5120 + i] * inv * nw[i];
+            }
+        }
+        let mut md_xn = 0f32;
+        let mut md_x = 0f32;
+        for i in 0..t_rows * 5120 {
+            md_xn = md_xn.max((xtb[i] - want_xn[i]).abs());
+            md_x = md_x.max((xb[i] - xs[i]).abs());
+        }
+        let wht_mirror = |x_row: &[f32], suh: &[f32]| -> Vec<u32> {
+            let mut ah = vec![0u32; 2560];
+            for ch in 0..40 {
+                let base = ch * 128;
+                let mut sm = [0f32; 128];
+                for i in 0..128 {
+                    let pre = half::f16::from_f32(x_row[base + i] * suh[base + i]);
+                    sm[i] = pre.to_f32();
+                }
+                let mut w = 1usize;
+                while w < 128 {
+                    let mut i = 0;
+                    while i < 128 {
+                        let blk = (i / (2 * w)) * (2 * w);
+                        for j in 0..w {
+                            let a = sm[blk + j];
+                            let b = sm[blk + j + w];
+                            sm[blk + j] = a + b;
+                            sm[blk + j + w] = a - b;
+                        }
+                        i += 2 * w;
+                    }
+                    w *= 2;
+                }
+                for i in (0..128).step_by(2) {
+                    let lo = half::f16::from_f32(sm[i] * 0.08838834764831845);
+                    let hi = half::f16::from_f32(sm[i + 1] * 0.08838834764831845);
+                    ah[(base + i) / 2] = lo.to_bits() as u32 | ((hi.to_bits() as u32) << 16);
+                }
+            }
+            ah
+        };
+        let mut bit1 = 0usize;
+        let mut bit2 = 0usize;
+        for t in 0..t_rows {
+            // 커널 xn(xtb 판독값)을 입력으로 — 미러 재계산의 합산 순서차가 f16
+            // 경계에서 비트를 뒤집는 것을 배제(WHT 자체의 비트 동일성 검증).
+            let row = &xtb[t * 5120..(t + 1) * 5120];
+            let m1 = wht_mirror(row, &suh1f);
+            let m2 = wht_mirror(row, &suh2f);
+            for i in 0..2560 {
+                if ah0[t * 2560 + i] != m1[i] {
+                    bit1 += 1;
+                }
+                if ah1[t * 2560 + i] != m2[i] {
+                    bit2 += 1;
+                }
+            }
+        }
+        // 융합 vs (norm+had_in×2) 시간 — T=512로 측정(10회 중앙).
+        {
+            let t2 = 512usize;
+            unsafe {
+                std::ptr::copy_nonoverlapping(xs.as_ptr(), xptr, t_rows * 5120);
+            }
+            let (x2, z2) = (xs.clone(), vec![0f32; t2 * 5120]);
+            let _ = (x2, z2);
+            let mut tf: Vec<f64> = Vec::new();
+            for _ in 0..10 {
+                let t0 = std::time::Instant::now();
+                tr.frame_norm_resid_had(0, t2, zeros, suh1b, suh2b)?;
+                tf.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            tf.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut tp: Vec<f64> = Vec::new();
+            for _ in 0..10 {
+                let t0 = std::time::Instant::now();
+                tr.frame_norm_resid(0, t2, zeros)?;
+                let _ = tr.linear_batch_multi_gpu(
+                    &[
+                        "model.language_model.layers.0.linear_attn.in_proj_qkv",
+                        "model.language_model.layers.0.linear_attn.in_proj_z",
+                    ],
+                    t2,
+                )?;
+                tp.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            tp.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "  [nrhtime] T512 융합={:.2}ms vs 분리(norm+had2+gemm2)={:.2}ms",
+                tf[5], tp[5]
+            );
+        }
+        eprintln!(
+            "  [nrhdbg] ah0[0..4]={:08x?} m1[0..4]={:08x?} ah1[0..4]={:08x?} m2[0..4]={:08x?}",
+            &ah0[0..4],
+            &wht_mirror(&want_xn[0..5120], &suh1f)[0..4],
+            &ah1[0..4],
+            &wht_mirror(&want_xn[0..5120], &suh2f)[0..4]
+        );
+        Ok(format!(
+            "nrh-check T={t_rows}: xn md={md_xn:.3e} x md={md_x:.3e} · ah1 비트불일치={bit1}/{} · ah2 비트불일치={bit2}/{}",
+            t_rows * 2560,
+            t_rows * 2560
+        ))
+    }
+
+    // ── 듀얼 gemm2 격리 프로브(메가융합 3호) ── preah(2×gemm2+had_out)와
+    // dual(1×gemm2d+2×had_out_td)을 동일 ah 입력으로 비트 대조.
+    pub fn gemmd_check(dir: &str, t_arg: usize, il_arg: usize) -> Result<String, String> {
+        let t_rows = t_arg;
+        let mut tr = Self::load(dir)?;
+        tr.fframe_init()?;
+        let (xptr, zeros) = {
+            let ff = tr
+                .batch
+                .as_ref()
+                .and_then(|b| b.fframe.as_ref())
+                .ok_or("fframe")?;
+            (ff.xbuf.ptr as *mut f32, ff.zeros.buf)
+        };
+        let mut seed: u32 = 0x7A11_0001;
+        let xs: Vec<f32> = (0..t_rows * 5120)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
+            })
+            .collect();
+        unsafe {
+            std::ptr::copy_nonoverlapping(xs.as_ptr(), xptr, xs.len());
+        }
+        {
+            let ff = tr
+                .batch
+                .as_ref()
+                .and_then(|b| b.fframe.as_ref())
+                .ok_or("fframe")?;
+            tr.ctx.flush_range(&ff.xbuf, t_rows * 5120 * 4);
+        }
+        let lp = format!("model.language_model.layers.{il_arg}.linear_attn");
+        let (s1, s2) = (
+            tr.suh_of(&format!("{lp}.in_proj_qkv"))?,
+            tr.suh_of(&format!("{lp}.in_proj_z"))?,
+        );
+        let n1 = {
+            let i = tr.find_linear(&format!("{lp}.in_proj_qkv"))?;
+            tr.linears[i].1.n
+        };
+        let n2 = {
+            let i = tr.find_linear(&format!("{lp}.in_proj_z"))?;
+            tr.linears[i].1.n
+        };
+        // 기준: preah
+        tr.frame_norm_resid_had(0, t_rows, zeros, s1, s2)?;
+        let _ = tr.linear_pair_preah(
+            &[&format!("{lp}.in_proj_qkv"), &format!("{lp}.in_proj_z")],
+            t_rows,
+        )?;
+        let (yb0_ref, yb1_ref) = {
+            let b = tr.batch.as_ref().ok_or("batch")?;
+            tr.ctx.invalidate_range(&b.yb[0], t_rows * n1 * 4);
+            tr.ctx.invalidate_range(&b.yb[1], t_rows * n2 * 4);
+            // SAFETY: end_batch_wait 후 매핑 판독.
+            unsafe {
+                (
+                    std::slice::from_raw_parts(b.yb[0].ptr as *const f32, t_rows * n1).to_vec(),
+                    std::slice::from_raw_parts(b.yb[1].ptr as *const f32, t_rows * n2).to_vec(),
+                )
+            }
+        };
+        // 듀얼
+        tr.frame_norm_resid_had(0, t_rows, zeros, s1, s2)?;
+        let _ = tr.linear_pair_dual(
+            [&format!("{lp}.in_proj_qkv"), &format!("{lp}.in_proj_z")],
+            t_rows,
+        )?;
+        let (yb0_got, yb1_got) = {
+            let b = tr.batch.as_ref().ok_or("batch")?;
+            tr.ctx.invalidate_range(&b.yb[0], t_rows * n1 * 4);
+            tr.ctx.invalidate_range(&b.yb[1], t_rows * n2 * 4);
+            // SAFETY: end_batch_wait 후 매핑 판독.
+            unsafe {
+                (
+                    std::slice::from_raw_parts(b.yb[0].ptr as *const f32, t_rows * n1).to_vec(),
+                    std::slice::from_raw_parts(b.yb[1].ptr as *const f32, t_rows * n2).to_vec(),
+                )
+            }
+        };
+        let mut md0 = 0f32;
+        let mut md1 = 0f32;
+        for i in 0..yb0_ref.len() {
+            md0 = md0.max((yb0_got[i] - yb0_ref[i]).abs());
+        }
+        for i in 0..yb1_ref.len() {
+            md1 = md1.max((yb1_got[i] - yb1_ref[i]).abs());
+        }
+        // 전 GDN층 쌍 krate 균일성(혼합정밀 아카이브 의심 — 3호 prefill 오염)
+        let mut mism = 0usize;
+        for il in 0..tr.n_layers {
+            if il % 4 == 3 {
+                continue;
+            }
+            let lp = format!("model.language_model.layers.{il}.linear_attn");
+            let iq = tr.find_linear(&format!("{lp}.in_proj_qkv"))?;
+            let iz = tr.find_linear(&format!("{lp}.in_proj_z"))?;
+            let (kq, kz, rq, rz) = (
+                tr.linears[iq].1.k,
+                tr.linears[iz].1.k,
+                tr.linears[iq].1.krate,
+                tr.linears[iz].1.krate,
+            );
+            if kq != kz || rq != rz {
+                mism += 1;
+                if mism <= 4 {
+                    eprintln!("  [gemmdk] L{il}: qkv k={kq} r={rq} vs z k={kz} r={rz}");
+                }
+            }
+        }
+        Ok(format!(
+            "gemmd-check T={t_rows}: yb0 maxdiff={md0:.3e} yb1 maxdiff={md1:.3e} (n1={n1} n2={n2}) · 쌍 krate 불일치 {mism}/48"
+        ))
+    }
+}
