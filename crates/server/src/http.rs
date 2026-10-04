@@ -358,53 +358,11 @@ fn jmessages_render(body: &str) -> String {
         return String::new();
     };
     let arr = &seg[ob..];
-    // 객체 순회 — 중괄호 균형(문자열 리터럴 내부 { } 는 건너뜸).
-    let mut objs: Vec<&str> = Vec::new();
-    let bytes = arr.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => {
-                let start = i;
-                let mut depth = 0usize;
-                let mut in_s = false;
-                let mut esc = false;
-                while i < bytes.len() {
-                    let c = bytes[i];
-                    if in_s {
-                        if esc {
-                            esc = false;
-                        } else if c == b'\\' {
-                            esc = true;
-                        } else if c == b'"' {
-                            in_s = false;
-                        }
-                    } else {
-                        match c {
-                            b'"' => in_s = true,
-                            b'{' => depth += 1,
-                            b'}' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    i += 1;
-                                    objs.push(&arr[start..i]);
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    i += 1;
-                }
-            }
-            b']' => break,
-            _ => i += 1,
-        }
-    }
+    let objs = jblocks(arr);
     // 원문 연결(종전 출력) — content에 이미 템플릿이 있으면 원문 통과(종전 동작).
     let mut raw = String::new();
     for o in &objs {
-        if let Some(c) = jstr(o, "content") {
+        if let Some(c) = jcontent(o) {
             raw.push_str(&c);
             raw.push('\n');
         }
@@ -413,10 +371,18 @@ fn jmessages_render(body: &str) -> String {
         return raw;
     }
     let mut out = String::new();
+    // A14(plans/129): 최상위 system 필드 — Anthropic 표준은 messages 밖에 있다.
+    if let Some(sys) = jstr(body, "system")
+        && !sys.is_empty()
+    {
+        out.push_str("<|im_start|>system\n");
+        out.push_str(&sys);
+        out.push_str("<|im_end|>\n");
+    }
     let mut last_assistant = false;
     for o in &objs {
         let role = jstr(o, "role").unwrap_or_else(|| "user".into());
-        let content = jstr(o, "content").unwrap_or_default();
+        let content = jcontent(o).unwrap_or_default();
         out.push_str(match role.as_str() {
             "system" => "<|im_start|>system\n",
             "assistant" => "<|im_start|>assistant\n",
@@ -573,6 +539,7 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
                     n_predict,
                     stream_mode,
                     parse_sampler(&req.body),
+                    jstop(&req.body), // A14: stop_sequences(jstop이 배열 파싱)
                 );
             }
             _ => resp(
@@ -876,6 +843,74 @@ fn run_and_emit(
     let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
+/// JSON 배열 내 최상위 객체 조각들 추출 — 중괄호 균형(문자열 리터럴 내부
+/// { } 무시). jmessages_render·jcontent가 공유(A14, plans/129 — 원본은
+/// jmessages_render 인라인이었다).
+fn jblocks(arr: &str) -> Vec<&str> {
+    let mut objs = Vec::new();
+    let bytes = arr.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                let start = i;
+                let mut depth = 0usize;
+                let mut in_s = false;
+                let mut esc = false;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    if in_s {
+                        if esc {
+                            esc = false;
+                        } else if c == b'\\' {
+                            esc = true;
+                        } else if c == b'"' {
+                            in_s = false;
+                        }
+                    } else {
+                        match c {
+                            b'"' => in_s = true,
+                            b'{' => depth += 1,
+                            b'}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    i += 1;
+                                    objs.push(&arr[start..i]);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            b']' => break,
+            _ => i += 1,
+        }
+    }
+    objs
+}
+
+/// content 필드 추출(A14, plans/129) — Anthropic 표준은 블록 배열
+/// ([{"type":"text","text":"..."}])이라 문자열 전용 jstr은 조용히 빈 값을
+/// 돌려줬다(빈 프롬프트 붕괴). text 블록을 연결하고 비-text 블록은 건너뛴다.
+fn jcontent(o: &str) -> Option<String> {
+    if let Some(s) = jstr(o, "content") {
+        return Some(s);
+    }
+    let k = o.find("\"content\"")?;
+    let seg = &o[k..];
+    let ob = seg.find('[')?;
+    let mut out = String::new();
+    for b in jblocks(&seg[ob..]) {
+        if let Some(t) = jstr(b, "text") {
+            out.push_str(&t);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// 스트림 누적 텍스트에서 stop 문자열 최초 등장 — (바이트 위치, 길이).
 fn earliest_stop(acc: &str, stops: &[String]) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
@@ -921,7 +956,25 @@ fn run_and_emit_anthropic(
     n_predict: usize,
     stream_mode: bool,
     sampler: Option<llm170_core::sampler::SamplerParams>,
+    // A14(plans/129): stop_sequences — jstop이 문자열·배열 모두 파싱.
+    stop_strs: Vec<String>,
 ) {
+    // A14: ctx 사전 검증 — run_and_emit과 동일(엔진 Err→500보다 400이 정확).
+    let ctx = *SERVER_CTX.get().unwrap_or(&4096);
+    if ids.len() + n_predict + 8 >= ctx {
+        resp(
+            stream,
+            400,
+            "application/json",
+            &format!(
+                "{{\"type\":\"error\",\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"context too small: prompt {} + max_tokens {} >= ctx {}\"}}}}",
+                ids.len(),
+                n_predict,
+                ctx
+            ),
+        );
+        return;
+    }
     let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, vec![STOP_EOT], sampler) else {
         return;
     };
@@ -933,25 +986,62 @@ fn run_and_emit_anthropic(
             "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}",
         );
         let mut det = crate::engine::Detok::new();
+        // A14: stop_sequences holdback — run_and_emit과 동일 원리(누적 텍스트에서
+        // stop 최초 등장 직전까지만 방출, 잠재 멀티바이트 경계는 floor_char_boundary).
+        let mut acc = String::new();
+        let mut sent = 0usize;
+        let mut stopped = false;
         for t in prx {
-            let esc = crate::json::esc(&det.push(t));
-            let frame = sse(
+            acc.push_str(&det.push(t));
+            if let Some((sp, _)) = earliest_stop(&acc, &stop_strs) {
+                if sp > sent {
+                    let esc = crate::json::esc(&acc[sent..sp]);
+                    let _ = sse(
+                        stream,
+                        "content_block_delta",
+                        &format!(
+                            "{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{esc}\"}}}}"
+                        ),
+                    );
+                }
+                stopped = true;
+                break;
+            }
+            let hold = stop_strs
+                .iter()
+                .map(|s| s.len().saturating_sub(1))
+                .max()
+                .unwrap_or(0);
+            let mut safe = acc.len().saturating_sub(hold);
+            safe = floor_char_boundary(&acc, safe);
+            if safe > sent {
+                let esc = crate::json::esc(&acc[sent..safe]);
+                let _ = sse(
+                    stream,
+                    "content_block_delta",
+                    &format!(
+                        "{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{esc}\"}}}}"
+                    ),
+                );
+                sent = safe;
+            }
+        }
+        if !stopped && acc.len() > sent {
+            let esc = crate::json::esc(&acc[sent..]);
+            let _ = sse(
                 stream,
                 "content_block_delta",
                 &format!(
                     "{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{esc}\"}}}}"
                 ),
             );
-            // plans/113(sglang P0-1): run_and_emit과 동일 — 절단 시 즉시 취소.
-            if frame.is_err() {
-                return;
-            }
         }
         let _ = orx.recv();
+        let reason = if stopped { "stop_sequence" } else { "end_turn" };
         let _ = sse(
             stream,
             "message_delta",
-            "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}",
+            &format!("{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{reason}\"}}}}"),
         );
         let _ = sse(stream, "message_stop", "{\"type\":\"message_stop\"}");
         let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -991,14 +1081,147 @@ fn run_and_emit_anthropic(
         return;
     }
     let mut det = crate::engine::Detok::new();
-    let text: String = all.iter().map(|&t| det.push(t)).collect();
+    let mut text: String = all.iter().map(|&t| det.push(t)).collect();
+    // A14: stop_sequences 절단(비스트림) — stop 본문 미포함이 Anthropic 규약.
+    let stopped = earliest_stop(&text, &stop_strs);
+    if let Some((sp, _)) = stopped {
+        text.truncate(sp);
+    }
     let esc = crate::json::esc(&text);
     resp(
         stream,
         200,
         "application/json",
         &format!(
-            "{{\"id\":\"msg_llm170\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{esc}\"}}],\"stop_reason\":\"end_turn\"}}"
+            "{{\"id\":\"msg_llm170\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{esc}\"}}],\"stop_reason\":\"{}\"}}",
+            if stopped.is_some() {
+                "stop_sequence"
+            } else {
+                "end_turn"
+            }
         ),
     );
+}
+
+#[cfg(test)]
+mod http_tests {
+    //! A3(plans/129): 핸드롤 JSON 파서군·경계 유틸·렌더의 유닛테스트 — 전부
+    //! CPU 순수(무 GPU). 변형 JSON·UTF-8 절단·stop 오버랩·블록 content가
+    //! 종전 무검증이었다.
+
+    use super::*;
+
+    #[test]
+    fn jstr_shapes() {
+        assert_eq!(jstr(r#"{"a":"x"}"#, "a").as_deref(), Some("x"));
+        assert_eq!(jstr(r#"{"a":  "spaced" }"#, "a").as_deref(), Some("spaced"));
+        // 이스케이프 보존(unescape 여부는 계약상 원문 — 소비자 esc가 왕복)
+        assert!(jstr(r#"{"a":"he said "hi""}"#, "a").is_some());
+        assert_eq!(jstr(r#"{"a":123}"#, "a"), None);
+        assert_eq!(jstr(r#"{"b":"y"}"#, "a"), None);
+    }
+
+    #[test]
+    fn jnum_jbool() {
+        assert_eq!(jnum(r#"{"n":42.5}"#, "n"), Some(42.5));
+        assert_eq!(jnum(r#"{"n":"str"}"#, "n"), None);
+        assert!(jbool(r#"{"f":true}"#, "f"));
+        assert!(!jbool(r#"{"f":false}"#, "f"));
+        assert!(!jbool(r#"{"f":"true"}"#, "f"));
+    }
+
+    #[test]
+    fn jstop_variants() {
+        assert_eq!(jstop(r#"{"stop":"END"}"#), vec!["END".to_string()]);
+        assert_eq!(
+            jstop(r#"{"stop":["A","B"]}"#),
+            vec!["A".to_string(), "B".to_string()]
+        );
+        // Anthropic stop_sequences(A14 경로)
+        assert_eq!(
+            jstop(r#"{"stop_sequences":["\n\n"]}"#),
+            vec!["\n\n".to_string()]
+        );
+        assert!(jstop("{}").is_empty());
+    }
+
+    #[test]
+    fn earliest_stop_boundaries() {
+        let stops = vec!["AB".to_string()];
+        assert_eq!(earliest_stop("xxAByy", &stops), Some((2, 2)));
+        assert_eq!(earliest_stop("", &stops), None);
+        // 빈 stop은 무시(무한 절단 방지 계약)
+        assert_eq!(earliest_stop("any", &[String::new()]), None);
+        // 가장 이른 등장 선택
+        let two = vec!["YY".to_string(), "XX".to_string()];
+        assert_eq!(earliest_stop("aXXbYY", &two), Some((1, 2)));
+    }
+
+    #[test]
+    fn floor_char_boundary_multibyte() {
+        let s = "한글abc"; // '한' 3바이트
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        // 2바이트 지점은 경계 아님 → 0으로 보정
+        assert_eq!(floor_char_boundary(s, 2), 0);
+        assert_eq!(floor_char_boundary(s, 3), 3);
+        assert_eq!(floor_char_boundary(s, 9), 9);
+    }
+
+    #[test]
+    fn jblocks_nested_and_strings() {
+        let arr = r#"[{"r":"a","c":"{x}"},{"r":"b"}]"#;
+        let objs = jblocks(arr);
+        assert_eq!(objs.len(), 2);
+        assert!(objs[0].contains(r#""c":"{x}""#)); // 문자열 내 중괄호 무시
+        // 빈 배열
+        assert!(jblocks("[]").is_empty());
+        // 비객체 원시 배열
+        assert!(jblocks("[1,2]").is_empty());
+    }
+
+    #[test]
+    fn jcontent_string_and_blocks() {
+        // 문자열 content — 종전 호환
+        assert_eq!(jcontent(r#"{"content":"hi"}"#).as_deref(), Some("hi"));
+        // 블록 배열(A14) — text 블록 연결, 비-text 건너뜀
+        let o = r#"{"content":[{"type":"text","text":"a"},{"type":"image","src":"x"},{"type":"text","text":"b"}]}"#;
+        assert_eq!(jcontent(o).as_deref(), Some("ab"));
+        // content 없음
+        assert_eq!(jcontent(r#"{"role":"user"}"#), None);
+    }
+
+    #[test]
+    fn jmessages_render_system_and_blocks() {
+        // 최상위 system 필드(A14) — system 턴 선행
+        let b = r#"{"system":"be brief","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}"#;
+        let r = jmessages_render(b);
+        assert!(r.contains(
+            "<|im_start|>system
+be brief<|im_end|>"
+        ));
+        assert!(r.contains(
+            "<|im_start|>user
+hello<|im_end|>"
+        ));
+        assert!(r.ends_with(
+            "<|im_start|>assistant
+"
+        ));
+        // 블록 배열이 없던 종전 형태(문자열 content) 동작 유지
+        let b2 = r#"{"messages":[{"role":"user","content":"plain"}]}"#;
+        assert!(jmessages_render(b2).contains(
+            "<|im_start|>user
+plain"
+        ));
+        // 원문 템플릿 통과 경로
+        let b3 = r#"{"messages":[{"role":"user","content":"<|im_start|>raw"}]}"#;
+        assert!(jmessages_render(b3).contains("<|im_start|>raw"));
+    }
+
+    #[test]
+    fn esc_roundtrip_control_chars() {
+        assert_eq!(crate::json::esc("a\"b"), "a\\\"b");
+        assert_eq!(crate::json::esc("nl\n"), "nl\\n");
+        assert_eq!(crate::json::esc("tab\t"), "tab\\t");
+    }
 }
