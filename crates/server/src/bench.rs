@@ -309,6 +309,12 @@ fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
 
 /// qwen4exp 측정 — Engine4 prefill/decode1 greedy + np 배치.
 fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
+    // KTRACE 무장(plans/132 F0): 트레이스는 틱(frame_forward_ex 종료)이
+    // 덤프+재무장하지만 최초 무장이 리팟터(plans/129 R7)로 유실돼 죽어 있었다.
+    // 게이트 준수(plans/111): 녹화는 런치당 이벤트 2개 비용 — 플래그 있을 때만.
+    if llm170_diag::flag::on("LLM170_KTRACE") {
+        llm170_backend_gpu::rawhip::ktrace::ktrace_on();
+    }
     let BenchCfg {
         model_path,
         backend,
