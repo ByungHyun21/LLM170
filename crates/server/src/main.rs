@@ -10,6 +10,7 @@ mod exl3_hip_engine;
 mod http;
 mod infer;
 mod json;
+mod modcheck;
 mod oai;
 mod perplexity;
 mod probes;
@@ -268,6 +269,7 @@ fn main() -> ExitCode {
         Some("bench") => bench::cmd_bench(&ma.rest, &ma),
         Some("perplexity") => perplexity::cmd_perplexity(&ma.rest, &ma),
         Some("check") => probes::run_check(&args[1..]),
+        Some("mod-check") => modcheck::cmd_mod_check(&args[1..]),
         Some("tokenize") => cmd_tokenize(&ma),
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
         Some("dequant") => cmd_dequant(&args[1..]),
