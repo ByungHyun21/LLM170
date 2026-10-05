@@ -223,6 +223,12 @@ fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                 Exl3::Hip(e) => e.step_tok(tok),
             }
         }
+        fn spec_round(&mut self, k: usize) -> Result<Vec<u32>, String> {
+            match self {
+                Exl3::Vk(_) => Err("--spec은 hip 런타임만 지원(EXL3)".into()),
+                Exl3::Hip(e) => e.spec_round(k),
+            }
+        }
         fn reset(&mut self) {
             match self {
                 Exl3::Vk(e) => e.reset_states(),
@@ -268,9 +274,28 @@ fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         let mut next = llm170_core::qwen35::greedy(&l);
         let t1 = std::time::Instant::now();
         let mut n_gen = 0usize;
-        while n_gen < cfg.tg {
-            next = eng.step_tok(next)?; // serve greedy 경로와 동일(plans/130 A2)
-            n_gen += 1;
+        // 스펙 경로(plans/130 D2): hip + --spec k — MTP 라운드(롤백 포함).
+        if cfg.spec_k > 0 {
+            let (mut n_round, mut n_emit) = (0usize, 0usize);
+            while n_gen < cfg.tg {
+                let toks = eng.spec_round(cfg.spec_k)?;
+                if let Some(&t) = toks.last() {
+                    next = t;
+                }
+                n_gen += toks.len();
+                n_round += 1;
+                n_emit += toks.len();
+            }
+            eprintln!(
+                "  [spec] 라운드 {n_round} · 배출 {n_emit} ({:.2}/라운드, 드래프트 k={})",
+                n_emit as f64 / n_round as f64,
+                cfg.spec_k
+            );
+        } else {
+            while n_gen < cfg.tg {
+                next = eng.step_tok(next)?; // serve greedy 경로와 동일(plans/130 A2)
+                n_gen += 1;
+            }
         }
         let tg_ms = t1.elapsed().as_secs_f64() * 1e3;
         lines.push(format!(
