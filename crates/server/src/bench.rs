@@ -217,6 +217,12 @@ fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                 Exl3::Hip(e) => e.decode1(tok),
             }
         }
+        fn step_tok(&mut self, tok: u32) -> Result<u32, String> {
+            match self {
+                Exl3::Vk(e) => e.decode1(0, tok).map(|l| llm170_core::qwen35::greedy(&l)),
+                Exl3::Hip(e) => e.step_tok(tok),
+            }
+        }
         fn reset(&mut self) {
             match self {
                 Exl3::Vk(e) => e.reset_states(),
@@ -263,7 +269,7 @@ fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         let t1 = std::time::Instant::now();
         let mut n_gen = 0usize;
         while n_gen < cfg.tg {
-            next = llm170_core::qwen35::greedy(&eng.decode1(next)?);
+            next = eng.step_tok(next)?; // serve greedy 경로와 동일(plans/130 A2)
             n_gen += 1;
         }
         let tg_ms = t1.elapsed().as_secs_f64() * 1e3;

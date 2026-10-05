@@ -583,15 +583,15 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 }
                 Engine::Exl3Hip(e) => {
                     // hip 기본 경로(단일 슬롯 — plans/121 exl3-sched). active는 0성분.
+                    // greedy는 step_tok(GPU argmax — 로짓 1MB d2h 스킵, plans/130 A2),
+                    // 샘플링 슬롯만 로짓 판.
                     for &i in &active {
                         let next = slots[i].next;
-                        let r = e.decode1(next).map(|l| {
-                            if slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy()) {
-                                pick(&mut slots[i], &l)
-                            } else {
-                                llm170_core::qwen35::greedy(&l)
-                            }
-                        });
+                        let r = if slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy()) {
+                            e.decode1(next).map(|l| pick(&mut slots[i], &l))
+                        } else {
+                            e.step_tok(next)
+                        };
                         match r {
                             Ok(t) => slot_emit(&mut slots[i], t),
                             Err(err) => {

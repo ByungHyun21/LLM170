@@ -107,13 +107,57 @@ impl Exl3HipDecoder {
         Ok((out, last_h))
     }
 
+    /// 토큰 id 직행 배치 프리필(plans/130 A3) — 임베딩 행 d2h 판독+h2d 재업로드
+    /// 대신 디바이스 gather. 반환 계약은 forward_batch와 동일.
+    pub fn forward_batch_toks(
+        &mut self,
+        toks: &[u32],
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>), String> {
+        let t = toks.len();
+        if t == 0 || t > 64 {
+            return Err(format!("forward_batch_toks: T={t} 범위 외(1..64)"));
+        }
+        if self.pos as usize + t > self.kvcap as usize {
+            return Err(format!(
+                "context overflow: pos={} + T={} > kvcap={} (--ctx 상향 필요)",
+                self.pos, t, self.kvcap
+            ));
+        }
+        self.embed_gather(toks, self.dbx)?;
+        self.batch_core_opt(t, false)?;
+        self.hc.sync()?; // 판독 배리어 — 캡처 코어는 비동기, g_out 확정 대기
+        self.pos += t as u32;
+        // SAFETY: g_out 재해석.
+        let n = self.llh_n();
+        let out: Vec<Vec<f32>> = (0..t)
+            .map(|r| {
+                // SAFETY: pgout 행 오프셋.
+                let b = unsafe {
+                    std::slice::from_raw_parts(self.pgout.add(r * n * 4) as *const f32, n)
+                };
+                b.to_vec()
+            })
+            .collect();
+        // SAFETY: pgh 재해석.
+        let last_h =
+            unsafe { std::slice::from_raw_parts(self.pgh as *const f32, self.hidden).to_vec() };
+        Ok((out, last_h))
+    }
+
     /// 그래프 코어 — 모든 입출력이 고정 포인터(stage_rows/g_out/g_h/dpos).
     /// 캡처·재생·비캡처 공용(캡처 호환: 내부 sync/h2d-from-stack 없음).
     pub(super) fn batch_core(&mut self, t: usize) -> Result<(), String> {
+        self.batch_core_opt(t, true)
+    }
+
+    /// staged=false: dbx가 임베딩 gather 등으로 이미 기록된 경로(plans/130 A3).
+    pub(super) fn batch_core_opt(&mut self, t: usize, staged: bool) -> Result<(), String> {
         let n_layers = self.loaded_layers.min(self.n_layers);
         // 캡처 호환 업로드 — 원시 핀 h2d(h2d는 내부 sync 포함 — 캡처 무효화).
-        self.hc
-            .h2d_nosync(self.dbx, self.pstage, t * self.hidden * 4)?;
+        if staged {
+            self.hc
+                .h2d_nosync(self.dbx, self.pstage, t * self.hidden * 4)?;
+        }
         self.hc.d2d(self.dpp, self.dpos, 4)?;
         let mut ab = self.dbzero;
         for il in 0..n_layers {
