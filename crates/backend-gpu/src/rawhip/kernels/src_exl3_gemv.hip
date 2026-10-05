@@ -53,14 +53,19 @@ extern "C" __global__ void exl3_had_in(
 }
 
 __device__ __forceinline__ float exl3_mul1_decode(unsigned w) {
-    // plans/130 종결: S=Σbytes(x)은 등가중 바이트합이라 정수 dot로 정확 치환
-    // 가능하나 gfx1151(RDNA3.5)에 dot1-insts가 없다(__dp4a·sdot4 빌트인 모두
-    // 컴파일 거부 실측) — 아래 마스크 춤이 이 하드웨어의 최적 정수열.
-    // extract+decode 체인이 CU 정수 피크 ~77%로 디코드의 벽(원장 plans/130).
+    // [판정 정정 plans/132] gfx1151은 v_dot4_i32_i8가 실존(런타임 기대값
+    // 4/4 실측 — __dp4a/빌트인 거부는 컴파일러 게이팅이었음, 하드웨어 부재 아님).
+    // S=Σbytes(x)은 등가중 바이트합이라 dot4로 정확 치환:
+    // r = dot4(x^0x80808080, 0x01010101) = Σ(x_i-128) = S-512
+    // → value = (r+1536)*c1 - c2. 정수·부동 소수점 연산 순서 모두 종전과
+    // 동일(비트 불변). 종전 마스크 춤(~6연산)을 mul+xor+dot4 3연산으로.
     unsigned x = w * 0x83DCD12Du;
-    unsigned p = (x & 0x00FF00FFu) + ((x >> 8u) & 0x00FF00FFu);
-    unsigned sum = (p & 0xFFFFu) + (p >> 16u);
-    return (1024.0f + (float)sum) * 0.00676727294921875f - 10.3828125f;
+    int r;
+    int one = 0x01010101;
+    asm("v_dot4_i32_i8 %0, %1, %2, %3"
+        : "=v"(r)
+        : "v"(x ^ 0x80808080u), "v"(one), "v"(0));
+    return ((float)(r + 1536)) * 0.00676727294921875f - 10.3828125f;
 }
 
 __device__ __forceinline__ unsigned exl3_extract(unsigned addr, const unsigned* stg_tile) {
