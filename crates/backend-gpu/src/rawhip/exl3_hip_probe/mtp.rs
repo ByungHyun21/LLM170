@@ -12,7 +12,7 @@ pub fn hip_mtp_check(dir: &str, tok: u32) -> Result<String, String> {
     let mut dec = Exl3HipDecoder::load(dir, 0, 1024)?;
     // GPU 드래프트 A/B: 동일 입력으로 정합 + 시간(호스트 버전 기준).
     let tg0 = std::time::Instant::now();
-    let d_gpu = dec.mtp_draft_gpu(tok, &synth, 0)?;
+    let (d_gpu, _) = dec.mtp_draft_gpu(tok, &synth, 0)?;
     let tg = tg0.elapsed().as_secs_f64() * 1e3;
     let th0 = std::time::Instant::now();
     let tl = dec.mtp_draft(tok, &synth, 0)?;

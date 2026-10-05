@@ -63,7 +63,7 @@ pub fn hip_mtp_a1(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
             .unwrap_or(0);
         // 드래프트: (현 토큰 cur, h_cur, pos_before) → 다음 예측 — GPU·호스트 동시 측정
         let td = std::time::Instant::now();
-        let d = dec.mtp_draft_gpu(cur, &h, pos_before)?;
+        let (d, _) = dec.mtp_draft_gpu(cur, &h, pos_before)?;
         t_draft += td.elapsed().as_secs_f64();
         let dh = dec.mtp_draft(cur, &h, pos_before)?;
         let am_h = dh

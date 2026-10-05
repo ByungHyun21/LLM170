@@ -149,7 +149,12 @@ impl Exl3HipDecoder {
     /// MTP 드래프트 GPU 체인(v2) — 중간 호스트 왕복 제거(라운드당 1 h2d + 종료 4B d2h).
     /// cat(enorm(e)‖hnorm(h))만 호스트 노름, 이후 전부 디바이스:
     /// fc → attn(prep/fwd3s 자체 KV) → o+resid+ffn_norm(융합) → FFN(ew) → resid+shared norm → lm_head → argmax.
-    pub fn mtp_draft_gpu(&mut self, token: u32, h_in: &[f32], pos: u32) -> Result<u32, String> {
+    pub fn mtp_draft_gpu(
+        &mut self,
+        token: u32,
+        h_in: &[f32],
+        pos: u32,
+    ) -> Result<(u32, Vec<f32>), String> {
         // MTP 자체 KV(dmtpk)도 kvcap 상한 — pos가 상한이면 초과 행 기록 불가.
         if pos as usize >= self.kvcap as usize {
             return Err(format!(
@@ -314,6 +319,10 @@ impl Exl3HipDecoder {
         }
         // resid+shared norm: cur(dbab)+=ffn, xn=shared norm
         self.norm_ptr(self.dbab, nrow(4), self.dsb3, self.dbxn, 1)?;
+        // 체인용 hidden(plans/130 D1): MTP 층 완전 잔차(dbab, 노름 전) — k연속
+        // 드래프트의 다음 스텝 h_in. d2h(핀 경유, 20KB).
+        let mut hb2 = vec![0u8; h * 4];
+        self.hc.d2h(&mut hb2, self.dbab)?;
         // lm_head → argmax
         self.had16_batch(self.dbxn, llh.k, 1, llh.suh)?;
         self.gemm2_batch(&llh, 1, self.dsb)?;
@@ -334,6 +343,12 @@ impl Exl3HipDecoder {
         let mut ob = vec![0u8; 4];
         self.hc.d2h(&mut ob, self.dargmax)?;
         self.hc.sync()?;
-        Ok(u32::from_le_bytes([ob[0], ob[1], ob[2], ob[3]]))
+        // SAFETY: d2h 완료 후 재해석.
+        let h_out =
+            unsafe { std::slice::from_raw_parts(hb2.as_ptr() as *const f32, h).to_vec() };
+        Ok((
+            u32::from_le_bytes([ob[0], ob[1], ob[2], ob[3]]),
+            h_out,
+        ))
     }
 }

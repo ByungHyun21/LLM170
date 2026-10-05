@@ -29,6 +29,21 @@ pub mod hipgraph {
         pub fn hipGraphLaunch(exec: GraphExec, stream: *mut c_void) -> i32;
         pub fn hipGraphExecDestroy(exec: GraphExec) -> i32;
         pub fn hipGraphDestroy(graph: Graph) -> i32;
+        /// L2 플러시 측정(plans/131 S10) — 대형 memset이 L2 내용을 강제 교체.
+        pub fn hipMemsetAsync(dst: *mut c_void, value: i32, size: usize, stream: *mut c_void) -> i32;
+    }
+}
+
+impl RawCtx {
+    /// L2 플러시용 대형 memset(스트림 순서) — 측정 프로토콜 전용(plans/131 S10).
+    pub fn l2_flush(&self, dst: *mut u8, bytes: usize) -> Result<(), String> {
+        let rc = unsafe {
+            hipgraph::hipMemsetAsync(dst as *mut std::ffi::c_void, 0, bytes, self.stream as *mut _)
+        };
+        if rc != 0 {
+            return Err(format!("l2_flush memset: {rc}"));
+        }
+        Ok(())
     }
 }
 

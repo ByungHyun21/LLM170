@@ -116,7 +116,9 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
             let tok = arg_num(args, 1, 1000u32);
             let rounds = arg_num(args, 2, 8usize);
-            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_mtp_round(&dir, tok, rounds)
+            // k: 라운드당 드래프트 수(1..4, 기본 1) — plans/130 D1 k 확장.
+            let k = arg_num(args, 3, 1usize).clamp(1, 4);
+            llm170_backend_gpu::rawhip::exl3_hip_probe::hip_mtp_round(&dir, tok, rounds, k)
         }
         "exl3-hip-batch" => llm170_backend_gpu::rawhip::exl3_hip_probe::hip_batch_check(
             &arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw"),

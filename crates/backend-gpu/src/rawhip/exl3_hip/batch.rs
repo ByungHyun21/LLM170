@@ -497,8 +497,9 @@ impl Exl3HipDecoder {
                 self.hcurve.push((il, cv));
             }
         }
-        // last_h 캡처 — 최종 노름(마지막 FFN 합산) 전 잔차(vk 12/12·a1 0.625가
-        // 측정된 규약 = h_seq와 동일 시점. 결함 11호 과교정 정정: '전'이되 dbx).
+        // last_h 캡처 — 규약 A/B(plans/121 V-3 미결 → plans/130 D1 판정): exllamav3
+        // qwen3_5_mtp.py는 Qwen3.5/3.6 MTP가 **post-final-norm** hidden 소비를 명시.
+        // V3(이 판): 최종 노름 후 dbxn 마지막 행. 기존 V1(pre-add dbx)은 수용 0.375.
         {
             // SAFETY: 전 행 pre-norm dbx → pgall(캡처 호환, 핀).
             for r in 0..t {
@@ -506,12 +507,15 @@ impl Exl3HipDecoder {
                 let dst = unsafe { self.pgall.add(r * self.hidden * 4) };
                 self.hc.d2h_pin_async(dst, prow, self.hidden * 4)?;
             }
-            // SAFETY: 마지막 행 → g_h(호환 유지).
-            let plast = unsafe { self.dbx.add((t - 1) * self.hidden * 4) };
-            self.hc.d2h_pin_async(self.pgh, plast, self.hidden * 4)?;
         }
         // 최종 노름 + lm_head 행별 로짓
         self.norm_p(128, self.dbab, t)?;
+        // V3: 최종 노름 후 dbxn 마지막 행 → g_h.
+        {
+            // SAFETY: dbxn 마지막 행(노름 적용됨) → pgh.
+            let plast = unsafe { self.dbxn.add((t - 1) * self.hidden * 4) };
+            self.hc.d2h_pin_async(self.pgh, plast, self.hidden * 4)?;
+        };
         let llh = self.lin["lm_head"].clone_shallow();
         self.had16_batch(self.dbxn, llh.k, t, llh.suh)?;
         self.gemm2_batch(&llh, t, self.dsb)?;
