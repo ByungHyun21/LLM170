@@ -5,6 +5,27 @@ impl Exl3HipDecoder {
     /// 배치 GEMM(dah16 → out [T][n]) — gemm2 커널.
     /// 1토큰 forward → 로짓. ew(silu·mul)는 호스트(정확성 우선 — 추후 커널화).
     pub fn forward(&mut self, embed_row: &[f32]) -> Result<(Vec<f32>, Vec<f32>), String> {
+        self.forward_impl(embed_row, true)
+    }
+
+    /// want_logits=false: 로짓/hidden d2h 스킵(서빙 greedy — plans/130 A2).
+    /// 산술·상태 진행은 동일 — 반환 Vec는 빈 값.
+    pub(super) fn forward_impl(
+        &mut self,
+        embed_row: &[f32],
+        want_logits: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let f32b =
+            |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        self.hc.h2d(self.dx, f32b(embed_row))?;
+        self.forward_staged(want_logits)
+    }
+
+    /// dx가 이미 스테이징된 forward 본체(임베딩 gather 경로 공용 — plans/130 A3).
+    pub(super) fn forward_staged(
+        &mut self,
+        want_logits: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
         // KV 상한 가드(plans/128 P0) — 초과 시 폴트 대신 Err로 우아한 거절.
         if self.pos as usize + 1 > self.kvcap as usize {
             return Err(format!(
@@ -13,9 +34,6 @@ impl Exl3HipDecoder {
             ));
         }
         let n_layers = self.loaded_layers.min(self.n_layers);
-        let f32b =
-            |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-        self.hc.h2d(self.dx, f32b(embed_row))?;
         let mut ab = self.dzero;
         for il in 0..n_layers {
             let lp = format!("model.language_model.layers.{il}");
@@ -30,24 +48,6 @@ impl Exl3HipDecoder {
                     std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden).to_vec()
                 };
                 self.htrace.push(vec![row]); // 플랫: 호출당 64항 — [호출×64+il][1행]
-            }
-            if il == 1 {
-                let mut xb2 = vec![0u8; self.hidden * 4];
-                self.hc.d2h(&mut xb2, self.dx)?;
-                // SAFETY: d2h 완료 후 재해석.
-                let xf2: &[f32] =
-                    unsafe { std::slice::from_raw_parts(xb2.as_ptr() as *const f32, self.hidden) };
-                let r2 = (xf2.iter().map(|v| v * v).sum::<f32>() / self.hidden as f32).sqrt();
-                eprintln!("  [hipl] L1 진입 x rms={r2:.5} x0={:.6}", xf2[0]);
-            }
-            if il <= 1 {
-                let mut xnb = vec![0u8; self.hidden * 4];
-                self.hc.d2h(&mut xnb, self.dxn)?;
-                // SAFETY: d2h 완료 후 재해석.
-                let xnf: &[f32] =
-                    unsafe { std::slice::from_raw_parts(xnb.as_ptr() as *const f32, self.hidden) };
-                let r = (xnf.iter().map(|v| v * v).sum::<f32>() / self.hidden as f32).sqrt();
-                eprintln!("  [hipl] L{il} xn rms={r:.5} xn0={:.6}", xnf[0]);
             }
             if il % 4 == 3 {
                 let mut ai = (il / 4) as i32;
@@ -265,19 +265,6 @@ impl Exl3HipDecoder {
                     self.dgq, self.dgk, self.dgv, self.dxn, self.dab_c, self.dal, self.ddt,
                     self.dq2, self.dk2, self.dv2, self.dbg,
                 );
-                eprintln!(
-                    "  [l2dbg] L{il} q={:p} k={:p} v={:p} xn={:p} ab={:p} al={:p} dt={:p} qo={:p} ko={:p} vo={:p}",
-                    self.dgq,
-                    self.dgk,
-                    self.dgv,
-                    self.dxn,
-                    self.dab_c,
-                    self.dal,
-                    self.ddt,
-                    self.dq2,
-                    self.dk2,
-                    self.dv2
-                );
                 self.hc.launch3(
                     "exl3_gdn_l2perm",
                     48,
@@ -342,23 +329,6 @@ impl Exl3HipDecoder {
                 self.gemv_chain(&lo, dgate, self.dab)?;
             }
             self.norm(2 * il + 1, self.dab)?;
-            {
-                let mut xb = vec![0u8; self.hidden * 4];
-                self.hc.d2h(&mut xb, self.dx)?;
-                // SAFETY: d2h 완료 후 재해석.
-                let xf: &[f32] =
-                    unsafe { std::slice::from_raw_parts(xb.as_ptr() as *const f32, self.hidden) };
-                let r = (xf.iter().map(|v| v * v).sum::<f32>() / self.hidden as f32).sqrt();
-                eprintln!("  [hipl] L{il} post-attn rms={r:.5}");
-                if il == 1 {
-                    let mut gb2 = vec![0u8; 8];
-                    self.hc.d2h(&mut gb2, self.dgate)?;
-                    // SAFETY: d2h 완료 후 재해석.
-                    let gg: &[f32] =
-                        unsafe { std::slice::from_raw_parts(gb2.as_ptr() as *const f32, 2) };
-                    eprintln!("  [hipl] L1 gated[0..2]={gg:?}");
-                }
-            }
             let lg_key = format!("{lp}.mlp.gate_proj");
             let lu_key = format!("{lp}.mlp.up_proj");
             let ld_key = format!("{lp}.mlp.down_proj");
@@ -417,26 +387,11 @@ impl Exl3HipDecoder {
                 self.hcurve.push((il, cv));
             }
 
-            {
-                let mut xb = vec![0u8; self.hidden * 4];
-                self.hc.d2h(&mut xb, self.dx)?;
-                // SAFETY: d2h 완료 후 재해석.
-                let xf: &[f32] =
-                    unsafe { std::slice::from_raw_parts(xb.as_ptr() as *const f32, self.hidden) };
-                let r = (xf.iter().map(|v| v * v).sum::<f32>() / self.hidden as f32).sqrt();
-                eprintln!("  [hipl] L{il} post-ffn rms={r:.5}");
-                if il == 0 {
-                    let mut fb = vec![0u8; 8];
-                    self.hc.d2h(&mut fb, self.dab)?;
-                    // SAFETY: d2h 완료 후 재해석.
-                    let ff: &[f32] =
-                        unsafe { std::slice::from_raw_parts(fb.as_ptr() as *const f32, 2) };
-                    eprintln!("  [hipl] L0 down[0..2]={ff:?}");
-                }
-            }
         }
         let mut hb = vec![0u8; self.hidden * 4];
-        self.hc.d2h(&mut hb, self.dx)?;
+        if want_logits {
+            self.hc.d2h(&mut hb, self.dx)?;
+        }
         self.norm(128, self.dab)?;
         self.pos += 1;
         self.hc.h2d(self.dpp, &self.pos.to_le_bytes())?;
@@ -450,6 +405,9 @@ impl Exl3HipDecoder {
             svh: self.lin[&lh_key].svh,
         };
         self.gemv_chain(&llh, self.dxn, self.dyb)?;
+        if !want_logits {
+            return Ok((Vec::new(), Vec::new()));
+        }
         let mut lb = vec![0u8; llh.n * 4];
         self.hc.d2h(&mut lb, self.dyb)?;
         // SAFETY: d2h 완료 후 재해석.

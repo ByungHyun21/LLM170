@@ -70,6 +70,8 @@ pub struct Exl3HipDecoder {
     dpp: *mut u8,
     dembed: *mut u8,
     dargmax: *mut u8,
+    /// 토큰 id 스테이징(임베딩 gather — plans/130 A3) — 최대 64개.
+    dids: *mut u8,
     mtp_norms: Vec<Vec<f32>>,
     mtp_kv_k: Vec<f32>,
     mtp_kv_v: Vec<f32>,
@@ -269,9 +271,8 @@ impl Exl3HipDecoder {
         Self::h2d_chunked(&hc, dgst, &vec![0u8; n_gdn * 48 * 16384 * 4])?;
         let dpp = hc.alloc(4)?;
         hc.h2d(dpp, &0u32.to_le_bytes())?;
-        let embed_all: Vec<f32> = tr.embed.clone();
-        let dembed = hc.alloc(embed_all.len() * 4)?;
-        Self::h2d_chunked(&hc, dembed, f32b(&embed_all))?;
+        let dembed = hc.alloc(tr.embed.len() * 4)?;
+        Self::h2d_chunked(&hc, dembed, f32b(&tr.embed))?;
         let mtp_keys = [
             "mtp.pre_fc_norm_embedding.weight",
             "mtp.pre_fc_norm_hidden.weight",
@@ -338,8 +339,10 @@ impl Exl3HipDecoder {
         hc.h2d(dmtpnw, unsafe {
             std::slice::from_raw_parts(nwflat.as_ptr() as *const u8, nwflat.len() * 4)
         })?;
-        drop(tr);
+        drop(tr); // 가중치는 전부 디바이스 상주 — 호스트 원본 해제(vk 디바이스 버퍼 이중 상주 방지, plans/130 A3 판정)
         let dargmax = hc.alloc(4)?;
+        // 토큰 id 스테이징(임베딩 gather — plans/130 A3): 청크 상한 64.
+        let dids = hc.alloc(64 * 4)?;
 
         let tmax = 64usize;
         let dx = hc.alloc(hidden * 4)?;
@@ -395,6 +398,7 @@ impl Exl3HipDecoder {
             dou,
             dembed,
             dargmax,
+            dids,
             mtp_norms,
             mtp_kv_k: vec![0f32; kvcap * 4 * 256],
             mtp_kv_v: vec![0f32; kvcap * 4 * 256],
@@ -535,15 +539,9 @@ impl Exl3HipDecoder {
 
     /// 토큰 ID 직접 forward(임베딩 행을 디바이스에서 판독) — 단일 모델 상주용.
     pub fn forward_tok(&mut self, tok: u32) -> Result<Vec<f32>, String> {
-        let mut rb = vec![0u8; self.hidden * 4];
-        self.hc.d2h(&mut rb, unsafe {
-            self.dembed.add(tok as usize * self.hidden * 4)
-        })?;
-        self.hc.sync()?;
-        // SAFETY: d2h 완료 후 재해석.
-        let row: &[f32] =
-            unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, self.hidden) };
-        let (lg, _) = self.forward(row)?;
+        // plans/130 A3: 임베딩은 디바이스 gather — d2h+h2d 왕복 없이 dembed→dx.
+        self.embed_gather(std::slice::from_ref(&tok), self.dx)?;
+        let (lg, _) = self.forward_staged(true)?;
         Ok(lg)
     }
 
@@ -558,17 +556,38 @@ impl Exl3HipDecoder {
         unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, self.hidden).to_vec() }
     }
 
+    /// 임베딩 gather(plans/130 A3) — 토큰 id만 업로드해 dembed 행을 dst로 복사
+    /// (디바이스 내). d2h+h2d 행 왕복·호스트 임베딩 상주 없음. t≤64.
+    pub(super) fn embed_gather(&mut self, toks: &[u32], dst: *mut u8) -> Result<(), String> {
+        // SAFETY: pstage 선두 ids 기록(핀 쓰기) — t×4B ≤ 256B.
+        unsafe {
+            for (i, &t) in toks.iter().enumerate() {
+                std::ptr::write_unaligned(self.pstage.add(i * 4) as *mut u32, t);
+            }
+        }
+        self.hc.h2d_nosync(self.dids, self.pstage, toks.len() * 4)?;
+        let mut hid = self.hidden as i32;
+        let (mut a0, mut a1, mut a2) = (self.dembed, self.dids, dst);
+        self.hc.launch(
+            "exl3_embed_gather",
+            toks.len() as u32,
+            1,
+            256,
+            &mut [
+                &mut a0 as *mut *mut u8 as *mut _,
+                &mut a1 as *mut *mut u8 as *mut _,
+                &mut a2 as *mut *mut u8 as *mut _,
+                &mut hid as *mut i32 as *mut _,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 임베딩 판독 + forward + GPU argmax — 로짓 전체 전송 없이 다음 토큰 ID만.
     pub fn step_tok(&mut self, tok: u32) -> Result<u32, String> {
-        let mut rb = vec![0u8; self.hidden * 4];
-        self.hc.d2h(&mut rb, unsafe {
-            self.dembed.add(tok as usize * self.hidden * 4)
-        })?;
-        self.hc.sync()?;
-        // SAFETY: d2h 완료 후 재해석.
-        let row: &[f32] =
-            unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, self.hidden) };
-        let _ = self.forward(row)?; // 로짓 d2h 포함(검증 경로 겸용) — 최적화 시 read 스킵 분리
+        // plans/130 A3: 임베딩은 디바이스 gather — d2h+h2d 왕복 제거.
+        self.embed_gather(std::slice::from_ref(&tok), self.dx)?;
+        let _ = self.forward_staged(false)?; // 로짓 d2h 스킵(plans/130 A2)
         let mut an = 248320i32;
         let (mut a0, mut a1) = (self.dyb, self.dargmax);
         self.hc.launch(

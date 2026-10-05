@@ -1,8 +1,8 @@
 //! EXL3 hip 엔진 어댑터 (plans/121 · exl3-sched) — Exl3HipDecoder 단일 슬롯 v1.
 //!
 //! 기본 서빙 경로(사용자 2026-10-04 지시: MTP·병렬 슬롯 없는 구동 먼저):
-//! 프리필 = forward_batch 청크(상각곡선 고정 ~320ms + 35ms/토큰 — T=16 청크로
-//! 18.8 t/s), 디코드 = forward_tok 순차(6.25 t/s, greedy-4 무결).
+//! 프리필 = forward_batch 청크(64행 — plans/128 P1), 디코드 = greedy는
+//! step_tok GPU argmax(plans/130 A2), 샘플링은 forward_tok 로짓 판.
 //!
 //! 단일 슬롯: Exl3HipDecoder는 상태(dring/dgst/KV/pos)를 1세트만 보유 —
 //! n_slots>1 요청은 Err(다중 슬롯은 병렬-슬롯 캠페인에서 상태 분리 후 개방).
@@ -44,8 +44,8 @@ impl Exl3HipEngine {
         }
         let mut last = Vec::new();
         for chunk in tokens.chunks(64) {
-            let rows: Vec<Vec<f32>> = chunk.iter().map(|&t| self.dec.embed_row_host(t)).collect();
-            let (lgs, _) = self.dec.forward_batch(&rows)?;
+            // plans/130 A3: 임베딩 행 d2h→h2d 왕복 대신 토큰 id 디바이스 gather.
+            let (lgs, _) = self.dec.forward_batch_toks(chunk)?;
             last = lgs.last().cloned().ok_or("빈 배치")?;
         }
         Ok(last)
@@ -54,6 +54,11 @@ impl Exl3HipEngine {
     /// 1토큰 순차 디코드 — 반환 로짓.
     pub fn decode1(&mut self, tok: u32) -> Result<Vec<f32>, String> {
         self.dec.forward_tok(tok)
+    }
+
+    /// 1토큰 순차 디코드(greedy) — GPU argmax, 로짓 1MB d2h 스킵(plans/130 A2).
+    pub fn step_tok(&mut self, tok: u32) -> Result<u32, String> {
+        self.dec.step_tok(tok)
     }
 
     /// 제자리 리셋 — 링/스캔 상태 0화 + pos 초기화(KV는 pos 의미론으로 무해).
