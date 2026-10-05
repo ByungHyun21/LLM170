@@ -19,7 +19,10 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
         }
         let lg = dec.forward_tok(tok)?;
         if tracing {
-            eprintln!("[KTRACE decode 1tok]\n{}", crate::rawhip::ktrace::ktrace_dump());
+            eprintln!(
+                "[KTRACE decode 1tok]\n{}",
+                crate::rawhip::ktrace::ktrace_dump()
+            );
         }
         if first.is_none() {
             first = Some(lg.clone());

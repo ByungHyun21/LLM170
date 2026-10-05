@@ -386,7 +386,6 @@ impl Exl3HipDecoder {
                 };
                 self.hcurve.push((il, cv));
             }
-
         }
         let mut hb = vec![0u8; self.hidden * 4];
         if want_logits {

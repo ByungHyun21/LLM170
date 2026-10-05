@@ -344,11 +344,7 @@ impl Exl3HipDecoder {
         self.hc.d2h(&mut ob, self.dargmax)?;
         self.hc.sync()?;
         // SAFETY: d2h 완료 후 재해석.
-        let h_out =
-            unsafe { std::slice::from_raw_parts(hb2.as_ptr() as *const f32, h).to_vec() };
-        Ok((
-            u32::from_le_bytes([ob[0], ob[1], ob[2], ob[3]]),
-            h_out,
-        ))
+        let h_out = unsafe { std::slice::from_raw_parts(hb2.as_ptr() as *const f32, h).to_vec() };
+        Ok((u32::from_le_bytes([ob[0], ob[1], ob[2], ob[3]]), h_out))
     }
 }
