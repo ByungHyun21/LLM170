@@ -545,7 +545,25 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
 }
 
 /// qwen35 측정 — spec 단일/np·병합·per-seq 변형 + np 집계.
+/// KTRACE 무장(plans/134): qwen35 트랙은 틱이 없어 plans/132 F0-a가 bench_q4만
+/// 무장했었다. 덤프 지점은 프리필 종료·tg 첫 스텝·첫 spec 라운드(single/np) —
+/// 런치당 이벤트 비용이 있어 플래그 있을 때만 기록한다.
 fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
+    fn kt_mark(tag: &str, first: &mut bool) {
+        if *first {
+            *first = false;
+            eprintln!(
+                "== ktrace {tag} ==\n{}",
+                llm170_backend_gpu::rawhip::ktrace::ktrace_dump()
+            );
+            llm170_backend_gpu::rawhip::ktrace::ktrace_on();
+        }
+    }
+    let kt = llm170_diag::flag::on("LLM170_KTRACE");
+    if kt {
+        llm170_backend_gpu::rawhip::ktrace::ktrace_on();
+    }
+    let (mut kt_pp, mut kt_tg, mut kt_spec1, mut kt_ms) = (true, true, true, true);
     let BenchCfg {
         model_path,
         backend,
@@ -607,6 +625,9 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         let t0 = Instant::now();
         let l = eng.prefill(0, prompt).map_err(|e| e.to_string())?;
         let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
+        if kt {
+            kt_mark(&format!("pp{pp} rep{r}"), &mut kt_pp);
+        }
         let mut next = llm170_core::qwen35::greedy(&l);
         let t1 = Instant::now();
         let mut n_gen = 0usize;
@@ -712,6 +733,9 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                 let acc = eng
                     .spec_step_multi(&active, &ns, *spec_k)
                     .map_err(|e| e.to_string())?;
+                if kt {
+                    kt_mark(&format!("np-spec round pp{pp} rep{r}"), &mut kt_ms);
+                }
                 for (i, &s2) in active.iter().enumerate() {
                     for &t2 in &acc[i] {
                         if done[s2] >= *tg {
@@ -734,6 +758,9 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         } else if *spec_k > 0 && has_mtp {
             while n_gen < *tg {
                 let (toks, tf) = eng.spec_step(0, next, *spec_k).map_err(|e| e.to_string())?;
+                if kt {
+                    kt_mark(&format!("spec round pp{pp} rep{r}"), &mut kt_spec1);
+                }
                 fwd += tf;
                 for &t in &toks {
                     if n_gen >= *tg {
@@ -791,6 +818,9 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         } else {
             while n_gen < *tg {
                 next = eng.decode_greedy(0, next).map_err(|e| e.to_string())?;
+                if kt {
+                    kt_mark(&format!("tg step pp{pp} rep{r}"), &mut kt_tg);
+                }
                 if llm170_diag::dump::opts().key("spec_dump") {
                     eprintln!("SPEC_TOK {next}");
                 }
