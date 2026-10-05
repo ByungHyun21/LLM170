@@ -167,3 +167,104 @@ extern "C" __global__ void exl3_had_out(
 }
 
 // e3_norm_resid의 hip 직이식 — xn = rms_norm(x+ab)·w (xtb), x = x+ab (제자리).
+
+// exl3_gemv_m (plans/130) -- m-row batched GEMV (m=T<=8). Per-row arithmetic is
+// bit-identical to exl3_gemv (same addr16, decode, hfma2 order, FOLD=4 cadence).
+// TM is a compile-time template param: acc arrays are sized exactly and every
+// row loop is fully unrolled -- a runtime-T variant kept acc[8]/acc2[8] alive
+// for all T and halved occupancy (T=1 whole-model 416ms vs kseg 286ms; measured
+// plans/130, reverted). Partials go to s[T][nseg][n] (dbat), summed by had_out.
+template <int TM>
+__device__ __forceinline__ void gemv_m_core(
+    const unsigned* __restrict__ ah16,
+    const unsigned* __restrict__ tre,
+    float* __restrict__ s,
+    int ktiles, int ntiles, int K)
+{
+    __shared__ unsigned stg[8 * 48];
+    __shared__ unsigned ahstg[8 * 8];
+    int nt0 = blockIdx.x * 8;
+    if (nt0 >= ntiles) return;
+    int seg = blockIdx.y;
+    int nseg = gridDim.y;
+    int ktb = (int)((long)ktiles * seg / nseg);
+    int kte = (int)((long)ktiles * (seg + 1) / nseg);
+    int c = threadIdx.x & 15;
+    int ntl = threadIdx.x >> 4;
+    int tid = threadIdx.x;
+    int words32 = 8 * K;
+    int stg_words = 8 * words32;
+    int n = ntiles * 16;
+    int arow_words = ktiles * 8;
+    float acc[TM];
+    __half2 acc2[TM];
+    #pragma unroll
+    for (int t = 0; t < TM; t++) { acc2[t] = __float2half2_rn(0.0f); acc[t] = 0.0f; }
+
+    unsigned addr16[16];
+    #pragma unroll
+    for (int r = 0; r < 16; r++) {
+        int tt = (4 * (c & 7) + ((r & 7) >> 1)) * 8
+              + ((r >> 3) * 2 + (r & 1) + ((c >> 3) * 4));
+        unsigned b0 = (unsigned)tt * (unsigned)K + (unsigned)(K + 256 * K - 16);
+        unsigned b1 = b0 + 16u;
+        unsigned i0 = (b0 >> 5) % (unsigned)words32;
+        unsigned i1 = ((b1 - 1u) >> 5) % (unsigned)words32;
+        unsigned sh = (((b1 - 1u) >> 5) + 1u) * 32u - b1;
+        addr16[r] = i0 | (i1 << 8) | (sh << 16);
+    }
+
+    for (int kb = ktb; kb < kte; kb += 8) {
+        int nk = min(8, kte - kb);
+        for (int ktl = 0; ktl < nk; ktl++) {
+            long tbase = ((long)(kb + ktl) * ntiles + nt0) * words32;
+            int ahb = ((kb + ktl) * 16) >> 1;
+            for (int w = tid; w < stg_words; w += 128) stg[w] = tre[tbase + w];
+            #pragma unroll
+            for (int t = 0; t < TM; t++) {
+                if (tid < 8)
+                    ahstg[t * 8 + tid] = ah16[(long)t * arow_words + ahb + tid];
+            }
+            __syncthreads();
+            const unsigned* tile = stg + ntl * words32;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                unsigned we = exl3_extract(addr16[2 * j], tile);
+                unsigned wo = exl3_extract(addr16[2 * j + 1], tile);
+                __half2 w2 = __floats2half2_rn(exl3_mul1_decode(we), exl3_mul1_decode(wo));
+                #pragma unroll
+                for (int t = 0; t < TM; t++) {
+                    __half2 a2 = *reinterpret_cast<__half2*>(&ahstg[t * 8 + j]);
+                    acc2[t] = __hfma2(a2, w2, acc2[t]);
+                }
+            }
+            if (((kb + ktl) & 3) == 3) {
+                #pragma unroll
+                for (int t = 0; t < TM; t++) {
+                    acc[t] += __low2float(acc2[t]) + __high2float(acc2[t]);
+                    acc2[t] = __float2half2_rn(0.0f);
+                }
+            }
+            __syncthreads();
+        }
+    }
+    int nt = nt0 + ntl;
+    if (nt >= ntiles) return;
+    #pragma unroll
+    for (int t = 0; t < TM; t++) {
+        acc[t] += __low2float(acc2[t]) + __high2float(acc2[t]);
+        s[((long)t * nseg + seg) * n + (long)nt * 16 + c] = acc[t];
+    }
+}
+
+#define GVM_ARGS const unsigned* __restrict__ ah16, const unsigned* __restrict__ tre, float* __restrict__ s, int ktiles, int ntiles, int K, int T
+#define GVM_BODY(TT) gemv_m_core<TT>(ah16, tre, s, ktiles, ntiles, K)
+#define GVM_WRAP(TT) extern "C" __global__ void exl3_gemv_m##TT(GVM_ARGS) { GVM_BODY(TT); }
+GVM_WRAP(1)
+GVM_WRAP(2)
+GVM_WRAP(3)
+GVM_WRAP(4)
+GVM_WRAP(5)
+GVM_WRAP(6)
+GVM_WRAP(7)
+GVM_WRAP(8)

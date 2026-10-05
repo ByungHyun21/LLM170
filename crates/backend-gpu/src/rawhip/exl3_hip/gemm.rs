@@ -51,8 +51,10 @@ impl Exl3HipDecoder {
         Ok(())
     }
 
-    /// 배치 GEMM — 소형-T(≤8)·층선형(n≤17408)은 k-분할(kseg=8)로 점유 확보,
-    /// 부분합 dbat [T][8][n] → had_out(nseg=8) 합산. 대형은 기존 단일 경로.
+    /// 배치 GEMM — 소형-T(≤8)·층선형(n≤17408)은 exl3_gemv_m(m행 GEMV,
+    /// plans/130): 가중치 디코드를 m행이 공유해 스트리밍이 GEMV급(단일행
+    /// 117GB/s)으로 유지된다(kseg 스칼라팧은 T≤8에서 57GB/s 실측 — tbench 원장).
+    /// 부분합 dbat [T][8][n] → had_out(nseg=8) 합산. 대형은 mma 경로.
     pub(super) fn gemm2_batch(
         &mut self,
         l: &HipLin,
@@ -60,18 +62,30 @@ impl Exl3HipDecoder {
         out: *mut u8,
     ) -> Result<(), String> {
         if t_len <= 8 && l.n <= 17408 {
-            let (mut kt, mut nt, mut kk, mut tt, mut ks) = (
+            // 컴파일타임 T 특수화(m1..m8) — 런타임 T 판은 미사용 acc[8]로
+            // 점유가 반토랑 나는 부정 판정(T=1 416ms vs kseg 286ms, plans/130).
+            const GVM: [&str; 9] = [
+                "",
+                "exl3_gemv_m1",
+                "exl3_gemv_m2",
+                "exl3_gemv_m3",
+                "exl3_gemv_m4",
+                "exl3_gemv_m5",
+                "exl3_gemv_m6",
+                "exl3_gemv_m7",
+                "exl3_gemv_m8",
+            ];
+            let (mut kt, mut nt, mut kk, mut tt) = (
                 (l.k / 16) as i32,
                 (l.n / 16) as i32,
                 l.krate as i32,
                 t_len as i32,
-                8i32,
             );
             let (mut g0, mut g1, mut g2) = (self.dah16, l.tre, self.dbat);
             self.hc.launch3(
-                "exl3_gemm2_kseg",
-                (l.n / 64) as u32,
-                8,
+                GVM[t_len],
+                ((l.n / 16) / 8) as u32,
+                16,
                 1,
                 128,
                 &mut [
@@ -82,11 +96,10 @@ impl Exl3HipDecoder {
                     &mut nt as *mut i32 as *mut _,
                     &mut kk as *mut i32 as *mut _,
                     &mut tt as *mut i32 as *mut _,
-                    &mut ks as *mut i32 as *mut _,
                 ],
             )?;
-            // had_out nseg=8 합산 → out(kseg8 최적 — 16은 미세 역행 측정)
-            let (mut nch, mut nsg, mut nst) = ((l.n / 128) as i32, 8i32, l.n as i32);
+            // had_out nseg=16 합산(nseg=16 부분합 — 배포 gemv 체인 동일 구조).
+            let (mut nch, mut nsg, mut nst) = ((l.n / 128) as i32, 16i32, l.n as i32);
             let (mut c0, mut c1, mut c2) = (self.dbat, l.svh, out);
             self.hc.launch3(
                 "exl3_had_out",

@@ -306,7 +306,9 @@ impl Exl3HipDecoder {
         let dsb2 = hc.alloc(64 * 17408 * 4)?; // 층 선형 n 상한(lm_head는 dsb)
         let dsb3 = hc.alloc(64 * 17408 * 4)?;
         // MTP 자체 KV(메인 16개 어텐션층과 분리 — prep의 layer 인덱스 0으로 사용)
-        let dbat = hc.alloc(8 * 8 * 17408 * 4)?;
+        // [T≤8][nseg=16][n] — gemv_m 부분합(nseg=16: 배포 gemv 동일 k-분할로
+        // 병렬 스트리밍 확보, plans/130 측정 근거).
+        let dbat = hc.alloc(8 * 16 * 17408 * 4)?;
         let dpos = hc.alloc(4)?;
         hc.h2d(dpos, &0u32.to_le_bytes())?;
         // 캡처 호환 스테이징 — 핀(고정) 호스트 버퍼(페이지 가능 memcpy는 캡처 무효화).

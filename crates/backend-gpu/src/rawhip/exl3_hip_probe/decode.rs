@@ -11,8 +11,16 @@ pub fn hip_decode_check(dir: &str, tok0: u32, lim_layers: usize) -> Result<Strin
     let mut tok = tok0;
     let mut hip_toks = Vec::new();
     let mut first: Option<Vec<f32>> = None;
-    for _ in 0..4 {
+    for i in 0..4 {
+        // 1스텝 KTRACE(3번째) — 디코드 토큰의 커널별 GPU 시간 분해(plans/130).
+        let tracing = i == 2;
+        if tracing {
+            crate::rawhip::ktrace::ktrace_on();
+        }
         let lg = dec.forward_tok(tok)?;
+        if tracing {
+            eprintln!("[KTRACE decode 1tok]\n{}", crate::rawhip::ktrace::ktrace_dump());
+        }
         if first.is_none() {
             first = Some(lg.clone());
         }
