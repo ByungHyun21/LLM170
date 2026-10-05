@@ -89,42 +89,42 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         "exl3-hip-gmini2" => llm170_backend_gpu::rawhip::exl3_hip_probe::hip_graph_mini2(),
         "exl3-hip-gmini" => llm170_backend_gpu::rawhip::exl3_hip_probe::hip_graph_mini(),
         "exl3-hip-graph" => {
-            let dir = arg_str(args, 0, "");
+            let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
             let tok = arg_num(args, 1, 1000u32);
             let tl = arg_num(args, 2, 4usize);
             llm170_backend_gpu::rawhip::exl3_hip_probe::hip_graph_check(&dir, tok, tl)
         }
         "exl3-hip-tbench" => {
-            let dir = arg_str(args, 0, "");
+            let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
             let tok = arg_num(args, 1, 1000u32);
             let tmax = arg_num(args, 2, 16usize);
             llm170_backend_gpu::rawhip::exl3_hip_probe::hip_tbench(&dir, tok, tmax)
         }
         "exl3-hip-hcmp" => {
-            let dir = arg_str(args, 0, "");
+            let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
             let tok = arg_num(args, 1, 1000u32);
             let steps = arg_num(args, 2, 6usize);
             llm170_backend_gpu::rawhip::exl3_hip_probe::hip_h_pair(&dir, tok, steps)
         }
         "exl3-hip-a1" => {
-            let dir = arg_str(args, 0, "");
+            let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
             let tok = arg_num(args, 1, 1000u32);
             let steps = arg_num(args, 2, 24usize);
             llm170_backend_gpu::rawhip::exl3_hip_probe::hip_mtp_a1(&dir, tok, steps)
         }
         "exl3-hip-mtp-round" => {
-            let dir = arg_str(args, 0, "");
+            let dir = arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw");
             let tok = arg_num(args, 1, 1000u32);
             let rounds = arg_num(args, 2, 8usize);
             llm170_backend_gpu::rawhip::exl3_hip_probe::hip_mtp_round(&dir, tok, rounds)
         }
         "exl3-hip-batch" => llm170_backend_gpu::rawhip::exl3_hip_probe::hip_batch_check(
-            &arg_str(args, 0, ""),
+            &arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw"),
             arg_num(args, 1, 1000u32),
             arg_num(args, 2, 4usize),
         ),
         "exl3-hip-mtp" => llm170_backend_gpu::rawhip::exl3_hip_probe::hip_mtp_check(
-            &arg_str(args, 0, ""),
+            &arg_str(args, 0, "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw"),
             arg_num(args, 1, 1000u32),
         ),
         "exl3-hip-decode" => {

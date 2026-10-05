@@ -7,6 +7,7 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     let d_fn = crate::resource::DEFAULT_FN_MODEL;
     let r: Result<String, String> = match cmd {
         "vk-check" => llm170_backend_gpu::rawvk::smoke_test(),
+        "addrms-check" => llm170_backend_gpu::rawvk::checks::addrms_check(),
         // 109 P15-1a(7e06e90)에서 우발 삭제된 진입점 복원(110 P12c 검증용).
         "vk-frame-check" => {
             let path = arg_str(args, 0, d_fn);
