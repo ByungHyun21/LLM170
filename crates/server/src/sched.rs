@@ -291,7 +291,9 @@ impl Sched {
 }
 
 pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slots: usize) {
-    const EOS: u32 = 248044;
+    // plans/130 F5: EOS 하드코드 248044 → 모델 메타 파생(Q4=GGUF 메타,
+    // EXL3=tokenizer_config.json, Q35=아키텍처 상수 — Engine::eos).
+    let eos = eng.eos();
     // 기동 워밍업 — 첫 요청이 지연 초기화(raw_init, ctx 비례 수십 초)를
     // 뒤집어쓰지 않도록 여기서 소진하고 상태를 되돌린다. 준비 전에는 /health가
     // 503이라 클라이언트가 계측을 시작하지 않는다.
@@ -419,7 +421,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                             break;
                                         }
                                         slot_emit(&mut slots[i], t);
-                                        if t == EOS {
+                                        if t == eos {
                                             break;
                                         }
                                     }
@@ -438,7 +440,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                             break;
                                         }
                                         slot_emit(&mut slots[i], t);
-                                        if t == EOS {
+                                        if t == eos {
                                             break;
                                         }
                                     }
@@ -509,7 +511,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                                 break;
                                             }
                                             slot_emit(&mut slots[i], t);
-                                            if t == EOS {
+                                            if t == eos {
                                                 break;
                                             }
                                         }
@@ -549,7 +551,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                                 break;
                                             }
                                             slot_emit(&mut slots[i], t);
-                                            if t == EOS {
+                                            if t == eos {
                                                 break;
                                             }
                                         }
@@ -614,7 +616,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                         break;
                                     }
                                     slot_emit(&mut slots[i], t);
-                                    if t == EOS {
+                                    if t == eos {
                                         break;
                                     }
                                 }
@@ -651,7 +653,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
             // 완료 슬롯 정리 — 결과 전송·반환
             for &i in &active {
-                finish_slot(&mut slots[i], &mut eng, i, EOS);
+                finish_slot(&mut slots[i], &mut eng, i, eos);
             }
         }
 
@@ -708,7 +710,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                         if done {
                                             slot_emit(&mut slots[i], toks[k]);
                                         }
-                                        finish_slot(&mut slots[i], &mut eng, i, EOS);
+                                        finish_slot(&mut slots[i], &mut eng, i, eos);
                                     }
                                     n_pf += 1;
                                     // 이번 회차 프리필 소비 — 슬롯별 경로로 중복 계상 방지.
@@ -818,7 +820,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     // 갱신되지 않는 스피너였다(매 틱 동일 청크 재시도).
                     Err(err) => slot_fail(&mut slots[i], format!("prefill: {err}")),
                 }
-                finish_slot(&mut slots[i], &mut eng, i, EOS);
+                finish_slot(&mut slots[i], &mut eng, i, eos);
             }
         }
 
