@@ -15,7 +15,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let gpu_runtime = ma
         .gpu_runtime
         .clone()
-        .or_else(|| std::env::var("LLM170_GPU_RUNTIME").ok())
+        .or_else(|| llm170_diag::flag::val("LLM170_GPU_RUNTIME").map(str::to_string))
         .unwrap_or_else(|| "hip".into());
     let mut spec_k: Option<usize> = None;
 
@@ -52,6 +52,18 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     if prompts.is_empty() {
         return usage_err("at least one --prompt-tokens required");
     }
+    // EXL3 아카이브(디렉터리) — 포맷 자동 판별(사용자 계약 2026-10-05):
+    // --backend는 런타임만 받고 모델 포맷은 경로로 결정. 단일 프롬프트만
+    // 지원(엔진이 단일 슬롯) — 게이트(gate-exl3.sh)의 고정 토큰 러너.
+    if model_path.is_dir() {
+        if backend == "cpu" {
+            return usage_err("EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan");
+        }
+        if prompts.len() > 1 {
+            return usage_err("EXL3 infer는 단일 --prompt-tokens만 지원");
+        }
+        return run_exl3_infer(&model_path, &prompts[0], n_predict, ctx, &gpu_runtime);
+    }
     let max_prompt = prompts.iter().map(|p| p.len()).max().unwrap();
     if max_prompt + n_predict + 8 >= ctx {
         return usage_err(&format!(
@@ -63,8 +75,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let t_start = std::time::Instant::now();
     // 아키텍처 판별 → qwen4exp 전용 엔진 분기.
     // ENOENT 윈도우 대기 (LLM170_OPEN_WAIT_SECS) — 판별 실패시 재시도.
-    let wait_secs: u64 = std::env::var("LLM170_OPEN_WAIT_SECS")
-        .ok()
+    let wait_secs: u64 = llm170_diag::flag::val("LLM170_OPEN_WAIT_SECS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let mut arch: Option<String> = None;
@@ -102,7 +113,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             }
             // 백엔드 부착 — 단일 경로(attach_q35). LLM170_REQUIRE_GPU=1이면 폴백
             // 금지(2026-09-12: infer 검증이 폴백으로 통과한 사고 방지).
-            let policy = if std::env::var_os("LLM170_REQUIRE_GPU").is_some() {
+            let policy = if llm170_diag::flag::on("LLM170_REQUIRE_GPU") {
                 crate::engine::AttachPolicy::Strict
             } else {
                 crate::engine::AttachPolicy::Warn
@@ -113,7 +124,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 eng = crate::engine::attach_q35(eng, gpu_runtime == "vulkan", policy)
                     .map_err(|e| format!("GPU 백엔드 주입 실패(REQUIRE_GPU): {e}"))?;
             }
-            let eos = 248044u32;
+            let eos = llm170_core::qwen35::EOS_EOT;
             // prefill (시퀀스별 — GDN chunked 경로)
             let mut last_logits = Vec::with_capacity(n);
             for (s, p) in prompts.iter().enumerate() {
@@ -303,7 +314,7 @@ fn run_q4_infer(
                     }
                 } else {
                     for &s in &active {
-                        let d1g = std::env::var_os("LLM170_NO_D1G").is_none();
+                        let d1g = !llm170_diag::flag::on("LLM170_NO_D1G");
                         let t = if !d1g {
                             let l = eng.decode1(s, next[s]).map_err(|e| e.to_string())?;
                             llm170_core::qwen35::greedy(&l)
@@ -358,4 +369,89 @@ fn emit(seq: usize, pos: u32, token: u32, eng: &llm170_core::qwen35::Engine) {
 }
 fn parse_ids(s: &str) -> Result<Vec<u32>, std::num::ParseIntError> {
     s.split(',').map(|t| t.trim().parse::<u32>()).collect()
+}
+
+/// EXL3 아카이브 infer — 포맷 자동 판별 경로(사용자 계약 2026-10-05).
+/// --backend는 런타임만 받는다: hip→Exl3Hip, vulkan→Exl3(vk).
+/// gate-exl3.sh 고정 토큰 게이트의 러너 — JSONL 형식은 q35 emit과 동일
+/// ({{"seq","pos","token","text"}})해 게이트 grep이 양쪽 공용이다.
+fn run_exl3_infer(
+    dir: &std::path::Path,
+    prompt: &[u32],
+    n_predict: usize,
+    ctx: usize,
+    gpu_runtime: &str,
+) -> ExitCode {
+    if prompt.len() + n_predict + 8 >= ctx {
+        eprintln!(
+            "error: ctx({ctx}) too small for prompt({})+n_predict({n_predict})",
+            prompt.len()
+        );
+        return ExitCode::FAILURE;
+    }
+    let dir_s = dir.to_string_lossy().into_owned();
+    let tok = crate::tokenize::Tokenizer::load(dir, None).ok();
+    let piece = |t: u32| -> String {
+        match &tok {
+            Some(tk) => String::from_utf8_lossy(&tk.piece_bytes(t)).into_owned(),
+            None => String::new(),
+        }
+    };
+    enum E {
+        Vk(Box<crate::exl3_engine::Exl3Engine>),
+        Hip(Box<crate::exl3_hip_engine::Exl3HipEngine>),
+    }
+    impl E {
+        fn prefill(&mut self, toks: &[u32]) -> Result<Vec<f32>, String> {
+            match self {
+                E::Vk(e) => e.prefill(0, toks),
+                E::Hip(e) => e.prefill(toks),
+            }
+        }
+        fn decode1(&mut self, t: u32) -> Result<Vec<f32>, String> {
+            match self {
+                E::Vk(e) => e.decode1(0, t),
+                E::Hip(e) => e.decode1(t),
+            }
+        }
+    }
+    let mut eng = if gpu_runtime == "vulkan" {
+        match crate::exl3_engine::Exl3Engine::load(&dir_s, 1, ctx) {
+            Ok(e) => E::Vk(Box::new(e)),
+            Err(e) => {
+                eprintln!("error: exl3(vk) 로드 실패: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match crate::exl3_hip_engine::Exl3HipEngine::load(&dir_s, 1, ctx) {
+            Ok(e) => E::Hip(Box::new(e)),
+            Err(e) => {
+                eprintln!("error: exl3-hip 로드 실패: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let mut lg = match eng.prefill(prompt) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: prefill: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for pos in (prompt.len() as u32..).take(n_predict) {
+        let t = llm170_core::qwen35::greedy(&lg);
+        println!(
+            "{{\"seq\":0,\"pos\":{pos},\"token\":{t},\"text\":{}}}",
+            crate::json::quoted(&piece(t))
+        );
+        match eng.decode1(t) {
+            Ok(l) => lg = l,
+            Err(e) => {
+                eprintln!("error: decode: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }

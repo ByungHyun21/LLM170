@@ -31,13 +31,9 @@ pub const CO_W32M: u16 = 256; // w32m.co: MoE 그룹 WMMA 타일 gemm_{q4k,q5_1}
 /// 반복 조회를 제거한다. 프로세스 내 env 변경은 main 초기화에서만 일어나고
 /// (set_var 2곳, 모두 엔진 기동 전) 이후 불변이므로 첫 판독 캐시가 안전하다.
 pub(crate) fn env_on(name: &'static str) -> bool {
-    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, bool>>> =
-        std::sync::OnceLock::new();
-    *C.get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .entry(name)
-        .or_insert_with(|| std::env::var_os(name).is_some())
+    // A6(plans/129): diag flag 스냅샷으로 위임 — 자체 캐시 제거(스냅샷이
+    // 이미 1회 판독 의미론을 제공한다).
+    llm170_diag::flag::on(name)
 }
 
 pub(crate) fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {

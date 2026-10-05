@@ -44,6 +44,17 @@ impl DumpOpts {
         self.keys.contains(k)
     }
 
+    /// 값 인자 키 조회 — `LLM170_DUMP=key:arg` 멤버의 arg 반환(A6, plans/129).
+    /// 값이 필요한 진단(디렉터리·파일 접두·모드 선택: ms_dump:/tmp/d,
+    /// exl3_dbg:layerdump, …)용. 부재 시 None. 인자 없이 `key` 단독이면
+    /// None(값이 필수인 소비자는 단독 키를 무시한다).
+    pub fn key_arg(&self, k: &str) -> Option<&str> {
+        let pfx = format!("{k}:");
+        self.keys
+            .iter()
+            .find_map(|s| Some(s.strip_prefix(&pfx)?.trim()))
+    }
+
     /// 태그가 rows 지정에 포함되는지.
     pub fn row_on(&self, tag: &str) -> bool {
         self.rows.iter().any(|x| x == tag)

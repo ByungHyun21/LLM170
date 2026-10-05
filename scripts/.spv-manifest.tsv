@@ -1,182 +1,182 @@
-addrms.spv	comp	-	c27d1b8f75d3e3ac
-argmax2.spv	comp	-	6048eb890362f0c6
-axpy_scaled.spv	comp	-	1258d3ae6e36eb1b
-axpy_scaled_t.spv	comp	-	96f5aac751054fc2
-bcast_rows.spv	comp	-	8f8d2d3d5ee24928
-cat2_rows.spv	comp	-	15202846abbde66f
-coopmat_i8_probe.spv	comp	-	6b8772f5c20b02af
-coopmat_probe.spv	comp	-	67ceda4d69007179
-copy_off.spv	comp	-	5666ff058b8d3e80
-copy_rows.spv	comp	-	f10b1300e8b89189
-e3_norm_resid.spv	comp	-	47bcd6fe160d7b1a
-e3_norm_resid_had.spv	comp	sdot	bc472622af09352e
-ew_sigmoid.spv	comp	-	444a3b0c6998ba94
-exl3_attn_fwd.spv	comp	-	32ccedcb78362b02
-exl3_attn_fwd2.spv	comp	-	019f74c2fd96d2bb
-exl3_attn_fwd3.spv	comp	-	450d258ec5d28933
-exl3_attn_prep.spv	comp	-	37792503f0e39915
-exl3_ffn_ew.spv	comp	-	0bc966827ebb2e53
-exl3_ffn_ew_t.spv	comp	-	368eca7a5942762c
-exl3_gdn_conv.spv	comp	-	c051a0cfa3182d3e
-exl3_gdn_gate.spv	comp	-	f21033edaac3d9d8
-exl3_gdn_l2perm.spv	comp	-	2c39026d033092e5
-exl3_gdn_scan.spv	comp	-	c1571cac0bcbb1cc
-exl3_gemm2.spv	comp	-	59c01ff263cb204d
-exl3_gemm2d.spv	comp	-	9f841ce8f46fa894
-exl3_gemv.spv	comp	-	51bf6abe3dfcdf53
-exl3_gemv_sg.spv	comp	-	a88febabd049a96e
-exl3_had_in.spv	comp	-	0c0146c4d97ada08
-exl3_had_in_t.spv	comp	-	b18727b41d56ef08
-exl3_had_in_tf32.spv	comp	-	2ac248631c50b4c6
-exl3_had_out.spv	comp	-	5473f25b5dd58dc8
-exl3_had_out_t.spv	comp	-	677b09093a83c74a
-exl3_had_out_td.spv	comp	-	fee6460e8a0c3e83
-fn_argmax_rows.spv	comp	-	6ea8a5b960c1d834
-fn_emb_q8g.spv	comp	-	b5fb4e2d7a683cb3
-fn_emb_q8g_f16.spv	comp	-	4fd775b10899f11c
-fn_gdn_ar_swap.spv	comp	-	f8112f9c1c30f76d
-fn_gdn_conv_state.spv	comp	-	37446567b9415a6c
-fn_idx_bk_update.spv	comp	-	ab846c32ed11b0fb
-fn_idx_expand.spv	comp	-	bcd7a67b69c26a41
-fn_idx_q_rope.spv	comp	-	0109b3dce55e0956
-fn_idx_rank.spv	comp	-	49d9d99d7bd439b5
-fn_idx_score.spv	comp	-	0eb78c1ad3099a09
-fn_idx_score_mt.spv	comp	-	c3ed3db1a0b58901
-fn_idx_topk_mt.spv	comp	-	231402e6503176e1
-fn_ksred.spv	comp	-	c96d7a6f8b07f7e9
-fn_mm_f32.spv	comp	-	c092c0512fc4d907
-fn_moe_group.spv	comp	-	22243601d8897f7a
-fn_moe_ids.spv	comp	-	00b17ea28e783887
-fn_moe_ids2.spv	comp	-	6eb1e314cb81fc1b
-fn_moe_ids51.spv	comp	-	10b06c22ea67f985
-fn_moe_tile_llmmq.spv	comp	sdot	f2f7da530bcab4af
-fn_moe_tile_q4k.spv	comp	sdot	4738b4ff1b9caf84
-fn_moe_tile_q4k_mmq.spv	comp	sdot	83f45e129c7f503f
-fn_moe_tile_q51.spv	comp	-	1eab81fe1363b18b
-fn_moe_tile_q51_sg1.spv	comp	-	9381cf1e2bc6688b
-fn_moe_tile_q51mmq.spv	comp	sdot	21416423158a68e0
-fn_moe_tile_q5k.spv	comp	-	d6914fd3dd94a683
-fn_moe_tile_q5kmmq.spv	comp	sdot	429742e3ea1bd5ff
-fn_moe_tile_q8.spv	comp	-	35cd803909d6bbac
-fn_moe_tile_q8mmq.spv	comp	sdot	5b5eaf6e9f6e793d
-fn_ple_conv.spv	comp	-	2887dcaf43134427
-fn_ple_gate.spv	comp	-	9098e876512027e1
-fn_ple_gate_f16.spv	comp	-	c9871494bbc1ee6e
-fn_ple_gate_mt.spv	comp	-	5253d449611f76b6
-fn_ple_gate_mt_f16.spv	comp	-	0049af9288a5472c
-fn_ple_gather.spv	comp	-	a3bcabf8ae16e583
-fn_ple_res.spv	comp	-	8273b32c506f6e17
-fn_ple_res_f16.spv	comp	-	09d351a195bb8e70
-fn_qk_norm_rope.spv	comp	-	589f9af58a6eb958
-fn_qsa_attn_sel.spv	comp	-	117f88a15fab5252
-fn_qsa_attn_sel_mh.spv	comp	-	da8502a791e119a7
-fn_quant_q8p.spv	comp	-	839aeb5f24781bf5
-fn_tile_f32.spv	comp	-	a94cc51edf12cf3d
-fn_tile_f32s.spv	comp	-	213ee0bc2d81e599
-fn_tile_q8.spv	comp	-	70d43ebf49a13b44
-gdn_ar.spv	comp	-	958b5644ba89be0b
-gdn_ar4.spv	comp	-	7e7cced6cd9e56d6
-gdn_ar8.spv	comp	-	cd167ef9db306029
-gdn_ar8f.spv	comp	-	8425e32cf32626e6
-gdn_arf.spv	comp	-	27fa05d1fff1b3f6
-gdn_arf_np.spv	comp	-	cae426b55a8e4b5f
-gdn_beta_g.spv	comp	-	6366baf6ad98ff95
-gdn_conv_np.spv	comp	-	cd8ef07e57f0a7a2
-gdn_conv_seq.spv	comp	-	6b7c3847fcafebdd
-gdn_conv_state.spv	comp	-	0a5b7a615b50d174
-gdn_conv_t.spv	comp	-	cf3c52513b5fe46a
-gdn_conv_t2.spv	comp	-	b1e4f83e91d82462
-gdn_exec.spv	comp	-	391b5f5b3a3612df
-gdn_execA.spv	comp	-	994732f707152f30
-gdn_execB.spv	comp	-	642df777de752474
-gdn_lw.spv	comp	-	f6a26e8878534ad3
-gemv3.spv	comp	sdot	506f7cc86d7095a7
-gemv8_i3s.spv	comp	-	e67022ba8885d182
-gemv8_nlb.spv	comp	-	8af659c54ea20059
-gemv8_q3b.spv	comp	-	165621a61d56b266
-gemv8_q4b.spv	comp	-	a8fee6d2de5b6dd4
-gemv8_q5b.spv	comp	-	8a72526deffe6dad
-gemv8_q5n.spv	comp	-	309fe7ddb6697a7d
-gemv8_q6b.spv	comp	-	550cdc0e1bcd826f
-gemv8_q8b.spv	comp	-	fb04712a72fd5829
-gemv8_xsb.spv	comp	-	c51e43843a600c47
-gemv8t_nl.spv	comp	-	8d366c8526099b77
-gemv8t_q3.spv	comp	-	edc9a7f2fba56b8d
-gemv8t_q4.spv	comp	-	87088961ed9f926d
-gemv8t_q5.spv	comp	-	42041d52ce9ac71b
-gemv8t_q6.spv	comp	-	d4b652dfb7fc8b85
-gemv8t_q8.spv	comp	-	2385221a1aa470e7
-gemv8t_xs.spv	comp	-	ea55f5f2c739625e
-hc_combine.spv	comp	-	13a134f55ae10e49
-hc_combine_f16.spv	comp	-	71c30e6502c71148
-hc_gate_mean.spv	comp	-	8a6f3f137b5c6c6d
-i8probe.spv	comp	-	0cb39a29cb9c0f07
-i8probe2.spv	comp	-	dda993d79638b843
-i8probe3.spv	comp	-	0e4789c203a62b33
-idot_probe.spv	prebuilt	sdot	86b508012b5c445d
-kv_app_np.spv	comp	-	31749403e5fbdbef
-kv_append.spv	comp	-	0b1d132a9b4a018a
-l2_rows.spv	comp	-	2750a69fb87f34f5
-l2_rows2.spv	comp	-	5bc005b7f9987cc0
-l2_rows2_scale.spv	comp	-	00b3d84f9529d22b
-llama_mm_f32A_plain.spv	prebuilt	-	7bc7931256c876b7
-llama_mm_q4k_plain.spv	prebuilt	-	87931ccdee24fcbd
-llama_mmidq_q4k_f32.spv	prebuilt	-	9e2a9ee3e62d9b64
-llama_prebuilt_idq.spv	prebuilt	-	a364429774a7e0bc
-llama_prebuilt_idq4k.spv	prebuilt	-	9724b85cffc19e75
-llama_prebuilt_mmf32.spv	prebuilt	-	65845f98131817e8
-llama_sgq_cm1.spv	prebuilt	-	416a9ba2a8713e5e
-mm_f32b.spv	comp	-	2b1a2a57f8a851eb
-mm_f32b_grp.spv	comp	-	88a9bc69351e3b65
-mmv_llm.spv	prebuilt	-	a1877c7ef6dd8c6f
-moe_gather.spv	comp	-	f76902e9647c5eea
-moe_top10.spv	comp	-	156984cb76062bc7
-moe_wsum.spv	comp	-	1bd3047039d69f4f
-norm_gated.spv	comp	-	65b77e03380a9195
-norm_gated_sig.spv	comp	-	27b88e60df49569c
-permute_rows.spv	comp	-	4891295389ae3471
-permute_rows_u32.spv	comp	-	a6029675c70c568a
-qk_rope.spv	comp	-	1c0d9e9d2780a56e
-qk_rope2.spv	comp	-	fc7d16948b077fb0
-qk_rope2_np.spv	comp	-	4ae796a2f3838ebe
-qsa_flash.spv	comp	-	6302c62e16ef90e4
-qsa_flash_gq.spv	comp	-	5abb0bf1ed10b254
-qsa_flash_np.spv	comp	-	8af33ed2ae92129c
-qsa_flash_reg.spv	comp	-	fc134ac88d0080ad
-quant_q8.spv	comp	-	c4831d8c5ed90b7b
-rms.spv	comp	-	dc60d3b9cd7188c7
-rms_wide.spv	comp	-	a747c9fc8137c921
-rms_wide_f16.spv	comp	-	398b3827764f0714
-row_shift_gather.spv	comp	-	ffc6a77d23b1a930
-scale.spv	comp	-	762f01451f39bc93
-sdot_probe.spv	prebuilt	sdot	fb62ca2e760430e3
-silu_div.spv	comp	-	b1906eb124c8d639
-silu_mul.spv	comp	-	b47d51ed9ad6e554
-silu_mul_q8.spv	comp	-	708d3784883eac4d
-smoke.spv	comp	-	8af41c1896ba02dc
-split3.spv	comp	-	a8cc8ecb62b037d4
-subsum.spv	comp	-	a45b81ed79a223a9
-tile128_q5k.spv	comp	-	ca80f85af449d356
-tile_f16.spv	comp	-	242f147d3af592d7
-tile_iq3s.spv	comp	-	5cefff6fec1c2a62
-tile_ms128.spv	comp	-	b446aad49c235310
-tile_ms4.spv	comp	-	e4c7d95153e12e5a
-tile_ms4gy.spv	comp	-	4e08ca99ece69fd5
-tile_nl.spv	comp	-	8f67fc5a8d006d1f
-tile_nl128.spv	comp	-	259104daaecfc1d8
-tile_nlms.spv	comp	-	0bce4d644fdb20a0
-tile_q3k128.spv	comp	-	4a23150a1b2d1d9e
-tile_q3kms.spv	comp	-	77009a48507cee55
-tile_q4k.spv	comp	-	5a0c9b2968a8632c
-tile_q4k128.spv	comp	-	106d829e613b847e
-tile_q4kms.spv	comp	-	8bf3599972e51671
-tile_q6k.spv	comp	-	4b5c847ce58391ca
-tile_q6k128.spv	comp	-	290299276d76244f
-tile_q6kms.spv	comp	-	1a69e9bb23957751
-tile_q8.spv	comp	-	3c5da44c9c127e6f
-tile_q8128.spv	comp	-	b391c86bc60fd70a
-tile_q8128ks.spv	comp	-	de8052bf1c7292d1
-tile_q8ms.spv	comp	-	b8681c322bf0a5cb
-tile_xs.spv	comp	-	1032d97994cd59ee
-tile_xs128.spv	comp	-	5da8928fda7ebc94
-tile_xsms.spv	comp	-	90543c7f874d4884
+addrms.spv	comp	-	c27d1b8f75d3e3ac	direct:addrms-check
+argmax2.spv	comp	-	6048eb890362f0c6	assembly:charhash+gate-27b+gate-flash-next
+axpy_scaled.spv	comp	-	1258d3ae6e36eb1b	assembly:charhash+gate-27b+gate-flash-next
+axpy_scaled_t.spv	comp	-	96f5aac751054fc2	assembly:charhash+gate-27b+gate-flash-next
+bcast_rows.spv	comp	-	8f8d2d3d5ee24928	assembly:charhash+gate-27b+gate-flash-next
+cat2_rows.spv	comp	-	15202846abbde66f	assembly:charhash+gate-27b+gate-flash-next
+coopmat_i8_probe.spv	comp	-	6b8772f5c20b02af	assembly:charhash+gate-27b+gate-flash-next
+coopmat_probe.spv	comp	-	67ceda4d69007179	assembly:charhash+gate-27b+gate-flash-next
+copy_off.spv	comp	-	5666ff058b8d3e80	assembly:charhash+gate-27b+gate-flash-next
+copy_rows.spv	comp	-	f10b1300e8b89189	assembly:charhash+gate-27b+gate-flash-next
+e3_norm_resid.spv	comp	-	47bcd6fe160d7b1a	assembly:charhash+gate-27b+gate-flash-next
+e3_norm_resid_had.spv	comp	sdot	bc472622af09352e	assembly:charhash+gate-27b+gate-flash-next
+ew_sigmoid.spv	comp	-	444a3b0c6998ba94	assembly:charhash+gate-27b+gate-flash-next
+exl3_attn_fwd.spv	comp	-	32ccedcb78362b02	direct:exl3-attn-check
+exl3_attn_fwd2.spv	comp	-	019f74c2fd96d2bb	direct:exl3-attn-check
+exl3_attn_fwd3.spv	comp	-	450d258ec5d28933	direct:exl3-attn-check
+exl3_attn_prep.spv	comp	-	37792503f0e39915	direct:exl3-attn-check
+exl3_ffn_ew.spv	comp	-	0bc966827ebb2e53	direct:exl3-ffn-check
+exl3_ffn_ew_t.spv	comp	-	368eca7a5942762c	direct:exl3-ffn-check
+exl3_gdn_conv.spv	comp	-	c051a0cfa3182d3e	direct:exl3-chain-check
+exl3_gdn_gate.spv	comp	-	f21033edaac3d9d8	direct:exl3-chain-check
+exl3_gdn_l2perm.spv	comp	-	2c39026d033092e5	direct:exl3-chain-check
+exl3_gdn_scan.spv	comp	-	c1571cac0bcbb1cc	direct:exl3-scan-check
+exl3_gemm2.spv	comp	-	59c01ff263cb204d	direct:exl3-gemm-check
+exl3_gemm2d.spv	comp	-	9f841ce8f46fa894	direct:exl3-gemm-check
+exl3_gemv.spv	comp	-	51bf6abe3dfcdf53	assembly:gate-exl3
+exl3_gemv_sg.spv	comp	-	a88febabd049a96e	assembly:gate-exl3
+exl3_had_in.spv	comp	-	0c0146c4d97ada08	assembly:gate-exl3
+exl3_had_in_t.spv	comp	-	b18727b41d56ef08	assembly:gate-exl3
+exl3_had_in_tf32.spv	comp	-	2ac248631c50b4c6	assembly:gate-exl3
+exl3_had_out.spv	comp	-	5473f25b5dd58dc8	assembly:gate-exl3
+exl3_had_out_t.spv	comp	-	677b09093a83c74a	assembly:gate-exl3
+exl3_had_out_td.spv	comp	-	fee6460e8a0c3e83	assembly:gate-exl3
+fn_argmax_rows.spv	comp	-	6ea8a5b960c1d834	assembly:charhash+gate-27b+gate-flash-next
+fn_emb_q8g.spv	comp	-	b5fb4e2d7a683cb3	assembly:charhash+gate-27b+gate-flash-next
+fn_emb_q8g_f16.spv	comp	-	4fd775b10899f11c	assembly:charhash+gate-27b+gate-flash-next
+fn_gdn_ar_swap.spv	comp	-	f8112f9c1c30f76d	assembly:charhash+gate-27b+gate-flash-next
+fn_gdn_conv_state.spv	comp	-	37446567b9415a6c	assembly:charhash+gate-27b+gate-flash-next
+fn_idx_bk_update.spv	comp	-	ab846c32ed11b0fb	assembly:charhash+gate-27b+gate-flash-next
+fn_idx_expand.spv	comp	-	bcd7a67b69c26a41	assembly:charhash+gate-27b+gate-flash-next
+fn_idx_q_rope.spv	comp	-	0109b3dce55e0956	assembly:charhash+gate-27b+gate-flash-next
+fn_idx_rank.spv	comp	-	49d9d99d7bd439b5	assembly:charhash+gate-27b+gate-flash-next
+fn_idx_score.spv	comp	-	0eb78c1ad3099a09	assembly:charhash+gate-27b+gate-flash-next
+fn_idx_score_mt.spv	comp	-	c3ed3db1a0b58901	assembly:charhash+gate-27b+gate-flash-next
+fn_idx_topk_mt.spv	comp	-	231402e6503176e1	assembly:charhash+gate-27b+gate-flash-next
+fn_ksred.spv	comp	-	c96d7a6f8b07f7e9	assembly:charhash+gate-27b+gate-flash-next
+fn_mm_f32.spv	comp	-	c092c0512fc4d907	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_group.spv	comp	-	22243601d8897f7a	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_ids.spv	comp	-	00b17ea28e783887	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_ids2.spv	comp	-	6eb1e314cb81fc1b	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_ids51.spv	comp	-	10b06c22ea67f985	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_tile_llmmq.spv	comp	sdot	f2f7da530bcab4af	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_tile_q4k.spv	comp	sdot	4738b4ff1b9caf84	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_tile_q4k_mmq.spv	comp	sdot	83f45e129c7f503f	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_tile_q51.spv	comp	-	1eab81fe1363b18b	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_tile_q51_sg1.spv	comp	-	9381cf1e2bc6688b	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_tile_q51mmq.spv	comp	sdot	21416423158a68e0	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_tile_q5k.spv	comp	-	d6914fd3dd94a683	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_tile_q5kmmq.spv	comp	sdot	429742e3ea1bd5ff	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_tile_q8.spv	comp	-	35cd803909d6bbac	assembly:charhash+gate-27b+gate-flash-next
+fn_moe_tile_q8mmq.spv	comp	sdot	5b5eaf6e9f6e793d	assembly:charhash+gate-27b+gate-flash-next
+fn_ple_conv.spv	comp	-	2887dcaf43134427	assembly:charhash+gate-27b+gate-flash-next
+fn_ple_gate.spv	comp	-	9098e876512027e1	assembly:charhash+gate-27b+gate-flash-next
+fn_ple_gate_f16.spv	comp	-	c9871494bbc1ee6e	assembly:charhash+gate-27b+gate-flash-next
+fn_ple_gate_mt.spv	comp	-	5253d449611f76b6	assembly:charhash+gate-27b+gate-flash-next
+fn_ple_gate_mt_f16.spv	comp	-	0049af9288a5472c	assembly:charhash+gate-27b+gate-flash-next
+fn_ple_gather.spv	comp	-	a3bcabf8ae16e583	assembly:charhash+gate-27b+gate-flash-next
+fn_ple_res.spv	comp	-	8273b32c506f6e17	assembly:charhash+gate-27b+gate-flash-next
+fn_ple_res_f16.spv	comp	-	09d351a195bb8e70	assembly:charhash+gate-27b+gate-flash-next
+fn_qk_norm_rope.spv	comp	-	589f9af58a6eb958	assembly:charhash+gate-27b+gate-flash-next
+fn_qsa_attn_sel.spv	comp	-	117f88a15fab5252	assembly:charhash+gate-27b+gate-flash-next
+fn_qsa_attn_sel_mh.spv	comp	-	da8502a791e119a7	assembly:charhash+gate-27b+gate-flash-next
+fn_quant_q8p.spv	comp	-	839aeb5f24781bf5	assembly:charhash+gate-27b+gate-flash-next
+fn_tile_f32.spv	comp	-	a94cc51edf12cf3d	assembly:charhash+gate-27b+gate-flash-next
+fn_tile_f32s.spv	comp	-	213ee0bc2d81e599	assembly:charhash+gate-27b+gate-flash-next
+fn_tile_q8.spv	comp	-	70d43ebf49a13b44	assembly:charhash+gate-27b+gate-flash-next
+gdn_ar.spv	comp	-	958b5644ba89be0b	direct:gdn-check
+gdn_ar4.spv	comp	-	7e7cced6cd9e56d6	direct:gdn-check
+gdn_ar8.spv	comp	-	cd167ef9db306029	direct:gdn-check
+gdn_ar8f.spv	comp	-	8425e32cf32626e6	direct:gdn-check
+gdn_arf.spv	comp	-	27fa05d1fff1b3f6	direct:gdn-check
+gdn_arf_np.spv	comp	-	cae426b55a8e4b5f	direct:gdn-check
+gdn_beta_g.spv	comp	-	6366baf6ad98ff95	direct:gdn-check
+gdn_conv_np.spv	comp	-	cd8ef07e57f0a7a2	direct:gdn-check
+gdn_conv_seq.spv	comp	-	6b7c3847fcafebdd	direct:gdn-check
+gdn_conv_state.spv	comp	-	0a5b7a615b50d174	direct:gdn-check
+gdn_conv_t.spv	comp	-	cf3c52513b5fe46a	direct:gdn-check
+gdn_conv_t2.spv	comp	-	b1e4f83e91d82462	direct:gdn-check
+gdn_exec.spv	comp	-	391b5f5b3a3612df	direct:gdn-check
+gdn_execA.spv	comp	-	994732f707152f30	direct:gdn-check
+gdn_execB.spv	comp	-	642df777de752474	direct:gdn-check
+gdn_lw.spv	comp	-	f6a26e8878534ad3	direct:gdn-check
+gemv3.spv	comp	sdot	506f7cc86d7095a7	assembly:charhash+gate-27b+gate-flash-next
+gemv8_i3s.spv	comp	-	e67022ba8885d182	assembly:charhash+gate-27b+gate-flash-next
+gemv8_nlb.spv	comp	-	8af659c54ea20059	direct:vk-gemv8-check
+gemv8_q3b.spv	comp	-	165621a61d56b266	direct:vk-gemv8-check
+gemv8_q4b.spv	comp	-	a8fee6d2de5b6dd4	direct:vk-gemv8-check
+gemv8_q5b.spv	comp	-	8a72526deffe6dad	direct:vk-gemv8-check
+gemv8_q5n.spv	comp	-	309fe7ddb6697a7d	assembly:charhash+gate-27b+gate-flash-next
+gemv8_q6b.spv	comp	-	550cdc0e1bcd826f	direct:vk-gemv8-check
+gemv8_q8b.spv	comp	-	fb04712a72fd5829	direct:vk-gemv8-check
+gemv8_xsb.spv	comp	-	c51e43843a600c47	direct:vk-gemv8-check
+gemv8t_nl.spv	comp	-	8d366c8526099b77	assembly:charhash+gate-27b+gate-flash-next
+gemv8t_q3.spv	comp	-	edc9a7f2fba56b8d	assembly:charhash+gate-27b+gate-flash-next
+gemv8t_q4.spv	comp	-	87088961ed9f926d	assembly:charhash+gate-27b+gate-flash-next
+gemv8t_q5.spv	comp	-	42041d52ce9ac71b	assembly:charhash+gate-27b+gate-flash-next
+gemv8t_q6.spv	comp	-	d4b652dfb7fc8b85	assembly:charhash+gate-27b+gate-flash-next
+gemv8t_q8.spv	comp	-	2385221a1aa470e7	assembly:charhash+gate-27b+gate-flash-next
+gemv8t_xs.spv	comp	-	ea55f5f2c739625e	assembly:charhash+gate-27b+gate-flash-next
+hc_combine.spv	comp	-	13a134f55ae10e49	direct:q4-hc-check
+hc_combine_f16.spv	comp	-	71c30e6502c71148	direct:q4-hc-check
+hc_gate_mean.spv	comp	-	8a6f3f137b5c6c6d	direct:q4-hc-check
+i8probe.spv	comp	-	0cb39a29cb9c0f07	assembly:charhash+gate-27b+gate-flash-next
+i8probe2.spv	comp	-	dda993d79638b843	assembly:charhash+gate-27b+gate-flash-next
+i8probe3.spv	comp	-	0e4789c203a62b33	assembly:charhash+gate-27b+gate-flash-next
+idot_probe.spv	prebuilt	sdot	86b508012b5c445d	assembly:charhash+gate-27b+gate-flash-next
+kv_app_np.spv	comp	-	31749403e5fbdbef	assembly:charhash+gate-27b+gate-flash-next
+kv_append.spv	comp	-	0b1d132a9b4a018a	assembly:charhash+gate-27b+gate-flash-next
+l2_rows.spv	comp	-	2750a69fb87f34f5	assembly:charhash+gate-27b+gate-flash-next
+l2_rows2.spv	comp	-	5bc005b7f9987cc0	assembly:charhash+gate-27b+gate-flash-next
+l2_rows2_scale.spv	comp	-	00b3d84f9529d22b	assembly:charhash+gate-27b+gate-flash-next
+llama_mm_f32A_plain.spv	prebuilt	-	7bc7931256c876b7	assembly:charhash+gate-27b+gate-flash-next
+llama_mm_q4k_plain.spv	prebuilt	-	87931ccdee24fcbd	assembly:charhash+gate-27b+gate-flash-next
+llama_mmidq_q4k_f32.spv	prebuilt	-	9e2a9ee3e62d9b64	assembly:charhash+gate-27b+gate-flash-next
+llama_prebuilt_idq.spv	prebuilt	-	a364429774a7e0bc	assembly:charhash+gate-27b+gate-flash-next
+llama_prebuilt_idq4k.spv	prebuilt	-	9724b85cffc19e75	assembly:charhash+gate-27b+gate-flash-next
+llama_prebuilt_mmf32.spv	prebuilt	-	65845f98131817e8	assembly:charhash+gate-27b+gate-flash-next
+llama_sgq_cm1.spv	prebuilt	-	416a9ba2a8713e5e	assembly:charhash+gate-27b+gate-flash-next
+mm_f32b.spv	comp	-	2b1a2a57f8a851eb	assembly:charhash+gate-27b+gate-flash-next
+mm_f32b_grp.spv	comp	-	88a9bc69351e3b65	assembly:charhash+gate-27b+gate-flash-next
+mmv_llm.spv	prebuilt	-	a1877c7ef6dd8c6f	assembly:charhash+gate-27b+gate-flash-next
+moe_gather.spv	comp	-	f76902e9647c5eea	direct:moe-row-check
+moe_top10.spv	comp	-	156984cb76062bc7	direct:moe-row-check
+moe_wsum.spv	comp	-	1bd3047039d69f4f	direct:moe-row-check
+norm_gated.spv	comp	-	65b77e03380a9195	assembly:charhash+gate-27b+gate-flash-next
+norm_gated_sig.spv	comp	-	27b88e60df49569c	assembly:charhash+gate-27b+gate-flash-next
+permute_rows.spv	comp	-	4891295389ae3471	assembly:charhash+gate-27b+gate-flash-next
+permute_rows_u32.spv	comp	-	a6029675c70c568a	assembly:charhash+gate-27b+gate-flash-next
+qk_rope.spv	comp	-	1c0d9e9d2780a56e	assembly:charhash+gate-27b+gate-flash-next
+qk_rope2.spv	comp	-	fc7d16948b077fb0	assembly:charhash+gate-27b+gate-flash-next
+qk_rope2_np.spv	comp	-	4ae796a2f3838ebe	assembly:charhash+gate-27b+gate-flash-next
+qsa_flash.spv	comp	-	6302c62e16ef90e4	direct:q4-qsa-check
+qsa_flash_gq.spv	comp	-	5abb0bf1ed10b254	direct:q4-qsa-check
+qsa_flash_np.spv	comp	-	8af33ed2ae92129c	direct:q4-qsa-check
+qsa_flash_reg.spv	comp	-	fc134ac88d0080ad	direct:q4-qsa-check
+quant_q8.spv	comp	-	c4831d8c5ed90b7b	assembly:charhash+gate-27b+gate-flash-next
+rms.spv	comp	-	dc60d3b9cd7188c7	assembly:charhash+gate-27b+gate-flash-next
+rms_wide.spv	comp	-	a747c9fc8137c921	assembly:charhash+gate-27b+gate-flash-next
+rms_wide_f16.spv	comp	-	398b3827764f0714	assembly:charhash+gate-27b+gate-flash-next
+row_shift_gather.spv	comp	-	ffc6a77d23b1a930	assembly:charhash+gate-27b+gate-flash-next
+scale.spv	comp	-	762f01451f39bc93	assembly:charhash+gate-27b+gate-flash-next
+sdot_probe.spv	prebuilt	sdot	fb62ca2e760430e3	assembly:charhash+gate-27b+gate-flash-next
+silu_div.spv	comp	-	b1906eb124c8d639	assembly:charhash+gate-27b+gate-flash-next
+silu_mul.spv	comp	-	b47d51ed9ad6e554	assembly:charhash+gate-27b+gate-flash-next
+silu_mul_q8.spv	comp	-	708d3784883eac4d	assembly:charhash+gate-27b+gate-flash-next
+smoke.spv	comp	-	8af41c1896ba02dc	assembly:charhash+gate-27b+gate-flash-next
+split3.spv	comp	-	a8cc8ecb62b037d4	assembly:charhash+gate-27b+gate-flash-next
+subsum.spv	comp	-	a45b81ed79a223a9	assembly:charhash+gate-27b+gate-flash-next
+tile128_q5k.spv	comp	-	ca80f85af449d356	assembly:charhash+gate-27b+gate-flash-next
+tile_f16.spv	comp	-	242f147d3af592d7	assembly:charhash+gate-27b+gate-flash-next
+tile_iq3s.spv	comp	-	5cefff6fec1c2a62	assembly:charhash+gate-27b+gate-flash-next
+tile_ms128.spv	comp	-	b446aad49c235310	assembly:charhash+gate-27b+gate-flash-next
+tile_ms4.spv	comp	-	e4c7d95153e12e5a	assembly:charhash+gate-27b+gate-flash-next
+tile_ms4gy.spv	comp	-	4e08ca99ece69fd5	assembly:charhash+gate-27b+gate-flash-next
+tile_nl.spv	comp	-	8f67fc5a8d006d1f	assembly:charhash+gate-27b+gate-flash-next
+tile_nl128.spv	comp	-	259104daaecfc1d8	assembly:charhash+gate-27b+gate-flash-next
+tile_nlms.spv	comp	-	0bce4d644fdb20a0	assembly:charhash+gate-27b+gate-flash-next
+tile_q3k128.spv	comp	-	4a23150a1b2d1d9e	assembly:charhash+gate-27b+gate-flash-next
+tile_q3kms.spv	comp	-	77009a48507cee55	assembly:charhash+gate-27b+gate-flash-next
+tile_q4k.spv	comp	-	5a0c9b2968a8632c	assembly:charhash+gate-27b+gate-flash-next
+tile_q4k128.spv	comp	-	106d829e613b847e	assembly:charhash+gate-27b+gate-flash-next
+tile_q4kms.spv	comp	-	8bf3599972e51671	assembly:charhash+gate-27b+gate-flash-next
+tile_q6k.spv	comp	-	4b5c847ce58391ca	assembly:charhash+gate-27b+gate-flash-next
+tile_q6k128.spv	comp	-	290299276d76244f	assembly:charhash+gate-27b+gate-flash-next
+tile_q6kms.spv	comp	-	1a69e9bb23957751	assembly:charhash+gate-27b+gate-flash-next
+tile_q8.spv	comp	-	3c5da44c9c127e6f	assembly:charhash+gate-27b+gate-flash-next
+tile_q8128.spv	comp	-	b391c86bc60fd70a	assembly:charhash+gate-27b+gate-flash-next
+tile_q8128ks.spv	comp	-	de8052bf1c7292d1	assembly:charhash+gate-27b+gate-flash-next
+tile_q8ms.spv	comp	-	b8681c322bf0a5cb	assembly:charhash+gate-27b+gate-flash-next
+tile_xs.spv	comp	-	1032d97994cd59ee	assembly:charhash+gate-27b+gate-flash-next
+tile_xs128.spv	comp	-	5da8928fda7ebc94	assembly:charhash+gate-27b+gate-flash-next
+tile_xsms.spv	comp	-	90543c7f874d4884	assembly:charhash+gate-27b+gate-flash-next

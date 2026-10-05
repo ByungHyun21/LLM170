@@ -248,13 +248,11 @@ impl Engine {
         // GPU 검증 경로 (rawhip): draft 체인(CPU MTP층 + GPU head) → 1배치 검증.
         if self.raw_decode.is_some()
             && !self.seqs[seq].mtp_h.is_empty()
-            && std::env::var("LLM170_RAWHIP")
-                .map(|v| v != "0")
-                .unwrap_or(true)
+            && llm170_diag::flag::ne0("LLM170_RAWHIP")
         {
             return self.spec_step_gpu(seq, last_token, k);
         }
-        let eos = 248044u32;
+        let eos = crate::qwen35::EOS_EOT;
         // 교차 검증: 타깃 decode(토큰) → (hook이 계산한 (토큰,h) 쌍의 draft 로짓) 비교.
         // draft 체인은 직전 draft 토큰 쌍으로 순차 — target decode가 h를 갱신하는 즉시.
         let base_pos = self.seqs[seq].pos; // 슬롯 0..base_pos-1 처리됨; last_token = 위치 base_pos 토큰(미처리)
@@ -326,7 +324,7 @@ impl Engine {
             }
             return Ok(out);
         }
-        let eos = 248044u32;
+        let eos = crate::qwen35::EOS_EOT;
         let rd = self
             .raw_decode
             .clone()
@@ -676,7 +674,7 @@ impl Engine {
         last_token: u32,
         k: usize,
     ) -> Result<(Vec<u32>, usize), ModelError> {
-        let eos = 248044u32;
+        let eos = crate::qwen35::EOS_EOT;
         let rd = self
             .raw_decode
             .clone()
@@ -735,8 +733,7 @@ impl Engine {
         // 검증 시대의 최적값(원장: 4=13.7 > 0=6.7 t/s) — g4 체제에서는 t>4가
         // 언핀 타일(mm 패밀리)로 떨어져 역전된다.
         let cap_default = if k <= 3 { 3 - k } else { 4 };
-        let cap_extra: usize = std::env::var("LLM170_SPEC_CAPX")
-            .ok()
+        let cap_extra: usize = llm170_diag::flag::val("LLM170_SPEC_CAPX")
             .and_then(|v| v.parse().ok())
             .unwrap_or(cap_default);
         if carried.len() + 1 + k > 1 + k + cap_extra {

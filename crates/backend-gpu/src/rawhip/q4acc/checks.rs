@@ -51,6 +51,112 @@ pub fn ar_check() -> Result<String, String> {
 }
 
 /// t토큰 AR 대조 — t>1은 커널 내부 순차 재귀 경로.
+/// `ple-gate-t-check` (plans/129 잔계 RCA) — q4_ple_gate **워프판 ↔ 직렬참조판** 커널 직접 대조.
+/// t∈{1,2,4,16,64,128} 스윕(기존 ple_gate_check는 t=1만 봐서 f1176482 회귀를 못 잡았다).
+/// 직렬판은 f1176482 직전의 lane-0 순차판(호스트 미러와 비트동일 입증됨).
+pub fn ple_gate_t_check() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let (n_embd, hc) = (2560usize, 4usize);
+    let mut out = String::new();
+    for t in [1usize, 2, 4, 16, 64, 128] {
+        let rows = t * hc * n_embd;
+        let mut seed = 0x1234_5678_9abc_def0u64 ^ (t as u64);
+        let mut lcg = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+        };
+        let res: Vec<f32> = (0..rows).map(|_| lcg()).collect();
+        let key: Vec<f32> = (0..rows).map(|_| lcg()).collect();
+        let val: Vec<f32> = (0..t * n_embd).map(|_| lcg()).collect();
+        let nk: Vec<f32> = (0..hc * n_embd).map(|_| 0.8 + lcg().abs()).collect();
+        let nq: Vec<f32> = (0..hc * n_embd).map(|_| 0.8 + lcg().abs()).collect();
+        let nc: Vec<f32> = (0..hc * n_embd).map(|_| 0.8 + lcg().abs()).collect();
+        let rd = ctx.alloc(rows * 4)?;
+        let kd = ctx.alloc(rows * 4)?;
+        let vd = ctx.alloc(t * n_embd * 4)?;
+        let nkd = ctx.alloc(hc * n_embd * 4)?;
+        let nqd = ctx.alloc(hc * n_embd * 4)?;
+        let ncd = ctx.alloc(hc * n_embd * 4)?;
+        let g1 = ctx.alloc(rows * 4)?; // 워프판 gated
+        let go1 = ctx.alloc(t * hc * 4)?;
+        let g2 = ctx.alloc(rows * 4)?; // 직렬판 gated
+        let go2 = ctx.alloc(t * hc * 4)?;
+        ctx.h2d(rd, bytemuck::cast_slice(&res))?;
+        ctx.h2d(kd, bytemuck::cast_slice(&key))?;
+        ctx.h2d(vd, bytemuck::cast_slice(&val))?;
+        ctx.h2d(nkd, bytemuck::cast_slice(&nk))?;
+        ctx.h2d(nqd, bytemuck::cast_slice(&nq))?;
+        ctx.h2d(ncd, bytemuck::cast_slice(&nc))?;
+        let run = |kern: &'static str, g: *mut u8, go: *mut u8| -> Result<(), String> {
+            let (mut rp, mut kp, mut vp, mut nk_, mut nq_, mut nc_, mut gp_, mut gop_) = (
+                rd as *mut c_void,
+                kd as *mut c_void,
+                vd as *mut c_void,
+                nkd as *mut c_void,
+                nqd as *mut c_void,
+                ncd as *mut c_void,
+                g as *mut c_void,
+                go as *mut c_void,
+            );
+            let (mut e, mut ne, mut hcc, mut tt) = (1e-6f32, n_embd as i32, hc as i32, t as i32);
+            let mut args: Vec<*mut c_void> = vec![
+                &mut rp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut nk_ as *mut _ as *mut c_void,
+                &mut nq_ as *mut _ as *mut c_void,
+                &mut nc_ as *mut _ as *mut c_void,
+                &mut gp_ as *mut _ as *mut c_void,
+                &mut gop_ as *mut _ as *mut c_void,
+                &mut e as *mut _ as *mut c_void,
+                &mut ne as *mut _ as *mut c_void,
+                &mut hcc as *mut _ as *mut c_void,
+                &mut tt as *mut _ as *mut c_void,
+            ];
+            ctx.launch3(kern, hc.div_ceil(8) as u32, t as u32, 1, 256, &mut args)?;
+            ctx.sync()
+        };
+        run("q4_ple_gate", g1, go1)?;
+        run("q4_ple_gate_serial", g2, go2)?;
+        let mut gate1 = vec![0f32; t * hc];
+        let mut gate2 = vec![0f32; t * hc];
+        let mut dg1 = vec![0f32; rows];
+        let mut dg2 = vec![0f32; rows];
+        ctx.d2h(bytemuck::cast_slice_mut(&mut gate1).as_mut(), go1)?;
+        ctx.d2h(bytemuck::cast_slice_mut(&mut gate2).as_mut(), go2)?;
+        ctx.d2h(bytemuck::cast_slice_mut(&mut dg1).as_mut(), g1)?;
+        ctx.d2h(bytemuck::cast_slice_mut(&mut dg2).as_mut(), g2)?;
+        let mdg = gate1
+            .iter()
+            .zip(&gate2)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let mdo = dg1
+            .iter()
+            .zip(&dg2)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let bitg = gate1
+            .iter()
+            .zip(&gate2)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let bito = dg1
+            .iter()
+            .zip(&dg2)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        out.push_str(&format!(
+            "  t={t}: gate maxdiff={mdg:.3e}({bitg}비트불일치/{})) gated maxdiff={mdo:.3e}({bito}/{})\n",
+            t * hc, rows
+        ));
+    }
+    Ok(format!("ple-gate-t-check (워프↔직렬 커널 대조):\n{out}"))
+}
+
 /// `q4-ple-check` — q4_ple_gate 커널 ↔ 호스트 산술 미러 대조(합성 입력).
 pub fn ple_gate_check() -> Result<String, String> {
     use std::ffi::c_void;
@@ -129,10 +235,21 @@ pub fn ple_gate_check() -> Result<String, String> {
             &nq[s * n_embd..(s + 1) * n_embd],
             eps,
         );
-        let mut dot = 0.0f32;
-        for i in 0..n_embd {
-            dot += kn[i] * qn[i];
+        // 워프 순서 미러(f1176482+CPU ple.rs 정렬 — 32청크 f32 + 레인순 f64 결합)
+        let chunk = n_embd.div_ceil(32);
+        let mut pd = [0.0f32; 32];
+        for lane in 0..32 {
+            let lo = lane * chunk;
+            let hi = (lo + chunk).min(n_embd);
+            for i in lo..hi {
+                pd[lane] += kn[i] * qn[i];
+            }
         }
+        let mut dsum = 0.0f64;
+        for lane in 0..32 {
+            dsum += pd[lane] as f64;
+        }
+        let mut dot = dsum as f32;
         dot /= (n_embd as f32).sqrt();
         let mag = dot.abs().max(1e-6).sqrt();
         let g = llm170_core::ops::sigmoid(if dot >= 0.0 { mag } else { -mag });

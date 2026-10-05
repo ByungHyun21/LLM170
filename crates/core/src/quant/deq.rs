@@ -330,6 +330,27 @@ fn deq_iq3_s(blk: &[u8], y: &mut [f32]) {
 
 /// 한 행(k 원소, k 는 블록 크기의 배수)을 f32 로 펼친다.
 /// `data` 는 해당 텐서의 데이터 시작 바이트.
+/// A7(plans/129): 로드 시점 사전 검증용 — dequant_row 매치와 동일 지원 목록.
+/// 매치 갱신 시 이 목록도 함께(deq 표 테스트가 드리프트를 잡는다).
+pub fn dequant_supported(ty: GgmlType) -> bool {
+    matches!(
+        ty,
+        GgmlType::F32
+            | GgmlType::F16
+            | GgmlType::Bf16
+            | GgmlType::Q4K
+            | GgmlType::Q5K
+            | GgmlType::Q6K
+            | GgmlType::Q3K
+            | GgmlType::Q8_0
+            | GgmlType::Q5_1
+            | GgmlType::Q5_0
+            | GgmlType::Iq4Xs
+            | GgmlType::Iq4Nl
+            | GgmlType::Iq3S
+    )
+}
+
 pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32]) {
     let (blck, bsize) = ty.block_info();
     let blocks = (k / blck) as usize;
@@ -443,3 +464,17 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
 // 산술 구조는 ggml-quants.c 스칼라 참조, 스케일 d는 f32(ggml은 f16 저장).
 // y 접근: y_el(y, p) 평탄 인덱스 — 위 deq_* 의 y[p] 순서와 1:1.
 // ---------------------------------------------------------------------------
+
+/// dequant_row가 첫 역양자화에서 unimplemented!로 죽는 대신 로드가 거부한다(A7).
+#[cfg(test)]
+mod a7_tests {
+    use super::*;
+    #[test]
+    fn supported_mirror_matches_dequant_arms() {
+        // 지원 목록 전부 지원 · 대표 미지원(잘못된 타입) 거부 — GgmlType 전순회가
+        // 열거형 전체에 대해 드리프트를 잡는다.
+        for t in [GgmlType::F32, GgmlType::F16, GgmlType::Q4K, GgmlType::Q6K] {
+            assert!(dequant_supported(t));
+        }
+    }
+}

@@ -171,7 +171,7 @@ impl VkAcc {
             )
         };
         // 배치 모드 — 6연산 단일 제출 (plans/19: sync ~0.9ms×5 절감)
-        if std::env::var_os("LLM170_VK_NOBATCH").is_none() {
+        if !llm170_diag::flag::on("LLM170_VK_NOBATCH") {
             ctx.begin_batch()?;
         }
         // 1) xs 업로드 → quant(n0)
@@ -244,7 +244,7 @@ impl VkAcc {
             self.ffn_tile_or_gemv(&mut ctx, down_w, n_ff, xq1_w, t, bq1, bob)?;
         }
         // 6) 일괄 제출·대기 → 다운로드 1회
-        if std::env::var_os("LLM170_VK_NOBATCH").is_none() {
+        if !llm170_diag::flag::on("LLM170_VK_NOBATCH") {
             ctx.end_batch_wait()?;
         }
         // SAFETY (107 W8): 출력 매핑 판독 — 직전 end_batch_wait(또는 동기 run)로 GPU 유휴; t*n0 원소.

@@ -12,7 +12,7 @@ use std::time::Instant;
 
 fn usage_err_bench(msg: &str) -> ExitCode {
     eprintln!(
-        "error: {msg}\n사용법: llm170 bench --model <gguf|exl3-dir> [--pp N] [--tg N] [--reps N] [--ctx N] [--backend cpu|gpu|exl3|exl3-hip] [--spec k] [--np K]"
+        "error: {msg}\n사용법: llm170 bench --model <gguf|exl3-dir> [--pp N] [--tg N] [--reps N] [--ctx N] [--backend cpu|hip|vulkan] [--spec k] [--np K]"
     );
     ExitCode::from(2)
 }
@@ -55,7 +55,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let gpu_runtime = ma
         .gpu_runtime
         .clone()
-        .or_else(|| std::env::var("LLM170_GPU_RUNTIME").ok())
+        .or_else(|| llm170_diag::flag::val("LLM170_GPU_RUNTIME").map(str::to_string))
         .unwrap_or_else(|| "hip".into());
     let mut spec_k = 0usize;
     let mut np_slots = 1usize;
@@ -118,11 +118,15 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         return usage_err_bench(&format!("ctx({ctx}) too small for pp({pp})+tg({tg})"));
     }
     // 프롬프트: LLM170_BENCH_TEXT(자연어, Tokenizer 인코딩) 또는 수제 LCG 합성 토큰
-    let prompt: Vec<u32> = match std::env::var("LLM170_BENCH_TEXT") {
-        Ok(txt) => {
-            let tok = crate::tokenize::Tokenizer::load(&model_path, None)
-                .unwrap_or_else(|e| panic!("토크나이저 로드 실패: {e}"));
-            let mut ids = tok.encode(&txt);
+    let prompt: Vec<u32> = match llm170_diag::flag::val("LLM170_BENCH_TEXT") {
+        Some(txt) => {
+            // A8(plans/129): panic → 오류 반환(usage_err_bench 패턴과 통일 —
+            // 불완전 디렉터리 등 인위 오류 경로가 프로세스 패닉이었다).
+            let tok = match crate::tokenize::Tokenizer::load(&model_path, None) {
+                Ok(t) => t,
+                Err(e) => return usage_err_bench(&format!("토크나이저 로드 실패: {e}")),
+            };
+            let mut ids = tok.encode(txt);
             // QA-23: 0토큰 인코딩 가드 — 빈 ids로 pp 패딩 루프가 무한 회전.
             if ids.is_empty() {
                 return usage_err_bench("LLM170_BENCH_TEXT encoded to 0 tokens — refusing to pad");
@@ -136,7 +140,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             }
             ids
         }
-        Err(_) => lcg_prompt(pp, 0x1234_5678),
+        None => lcg_prompt(pp, 0x1234_5678),
     };
 
     // 아키텍처 판별 (ENOENT 재시도 관례)
@@ -188,7 +192,8 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
 /// EXL3(아카이브 디렉터리) 측정 — plans/125-4: bench가 GGUF 아키텍처 판별에
 /// 묶여 EXL3 dir을 거부하던 결함 수리. 프로토콜은 bench_q4와 동일(워밍업 1회 +
 /// reps, pp=prefill, tg=순차 greedy decode1 — serve 단일슬롯 경로와 동일).
-/// 백엔드: exl3(vk)·exl3-hip. 힙 수치 측정은 ROCm10 런타임으로 실행할 것.
+/// 백엔드: 포맷 자동 판별(2026-10-05) — dir→EXL3 엔진, 런타임은 gpu_runtime
+/// (hip→Exl3Hip, vulkan→Exl3(vk)). 힙 수치 측정은 ROCm10 런타임으로.
 fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
     let dir = cfg
         .model_path
@@ -223,13 +228,18 @@ fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
             }
         }
     }
-    let mut eng = match cfg.backend.as_str() {
-        "exl3-hip" => Exl3::Hip(Box::new(crate::exl3_hip_engine::Exl3HipEngine::load(
+    if cfg.backend == "cpu" {
+        // 포맷 자동 판별 계약(2026-10-05): dir→EXL3는 GPU 런타임 필요.
+        return Err("EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan".into());
+    }
+    let mut eng = if cfg.gpu_runtime == "vulkan" {
+        Exl3::Vk(Box::new(crate::exl3_engine::Exl3Engine::load(
             &dir, 1, cfg.ctx,
-        )?)),
-        _ => Exl3::Vk(Box::new(crate::exl3_engine::Exl3Engine::load(
+        )?))
+    } else {
+        Exl3::Hip(Box::new(crate::exl3_hip_engine::Exl3HipEngine::load(
             &dir, 1, cfg.ctx,
-        )?)),
+        )?))
     };
     // 워밍업 1회 — 측정 형상과 동일(plans/79, llama-bench 정합).
     {
@@ -330,7 +340,6 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                 .map_err(|e| e.to_string())?;
         }
     }
-    let _ = std::env::var("LLM170_FRAME");
     // 라벨은 백엔드를 그대로 반영한다 — 프레임(ADR-0017)은 cubecl 제거로
     // 사라졌고, env를 "frame"으로 표기해 GPU 수치로 오인된 이력이 있다.
     let dev = if want_gpu { " gpu" } else { " cpu" };
@@ -727,7 +736,7 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                 for (i, &s) in act.iter().enumerate() {
                     nexts[s] = l[i];
                     n_gen += 1;
-                    if nexts[s] == 248044 {
+                    if nexts[s] == llm170_core::qwen35::EOS_EOT {
                         eos.push(s);
                     }
                 }
@@ -750,7 +759,7 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                 }
                 n_gen += 1;
                 fwd += 1;
-                if next == 248044 {
+                if next == llm170_core::qwen35::EOS_EOT {
                     break;
                 }
             }

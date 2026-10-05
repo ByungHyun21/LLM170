@@ -14,7 +14,7 @@ use super::weight::Weight;
 use llm170_diag::profile_span;
 pub fn w4a8_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LLM170_W4A8").is_some())
+    *ON.get_or_init(|| llm170_diag::flag::on("LLM170_W4A8"))
 }
 
 /// W4A8 대상 타입 (정수 커널·미러 구현 완료분).

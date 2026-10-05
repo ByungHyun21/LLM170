@@ -88,9 +88,8 @@ impl DecoderState {
         // q5_K 원본 캡처 (i8 언패용 — 루프가 weights를 소비하기 전)
         // plans/40: 빌림 유지 — 클론 제거 (구 d.clone()가 q5 전체 ~8GB 복제)
         let f16w_on = llm170_diag::flag::eq1("LLM170_VK_F16W");
-        let f16w_max = std::env::var("LLM170_VK_F16W_MAX")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+        let f16w_max =
+            llm170_diag::flag::val("LLM170_VK_F16W_MAX").and_then(|v| v.parse::<usize>().ok());
         let mut f16w: HashMap<String, VkBuf> = HashMap::new();
         if f16w_on {
             let e0 = std::time::Instant::now();

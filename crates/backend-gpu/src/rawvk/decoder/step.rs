@@ -20,9 +20,8 @@ impl DecoderState {
         let _tw_rec = std::time::Instant::now();
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
-        let layer_cut = std::env::var("LLM170_VK_LAYERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+        let layer_cut =
+            llm170_diag::flag::val("LLM170_VK_LAYERS").and_then(|v| v.parse::<usize>().ok());
         let npck = llm170_diag::flag::on("LLM170_VK_NPCK");
         for il in 0..self.n_layer {
             if layer_cut.is_some_and(|c| il >= c) {
@@ -61,8 +60,7 @@ impl DecoderState {
                         ),
                     ],
                 )?;
-                let gskip = std::env::var("LLM170_VK_GDN_SKIP")
-                    .ok()
+                let gskip = llm170_diag::flag::val("LLM170_VK_GDN_SKIP")
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(0);
                 // conv (t=1 — ring)
@@ -258,8 +256,7 @@ impl DecoderState {
                 recr_idx += 1;
             } else {
                 // 어텐션 (LLM170_VK_ATTN: 1=qkv gemv만, 2=+rope/kv, 3=+flash, 4=+wo)
-                let attn_cut = std::env::var("LLM170_VK_ATTN")
-                    .ok()
+                let attn_cut = llm170_diag::flag::val("LLM170_VK_ATTN")
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(4);
                 self.gemv_stage(

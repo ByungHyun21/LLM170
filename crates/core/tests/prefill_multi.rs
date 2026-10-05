@@ -61,6 +61,10 @@ fn prefill_multi_matches_sequential() {
         eprintln!("skip: {MODEL} 없음");
         return;
     }
+    // 배치 forward 게이트(기본 off) — 등가성 정책 확정 전 옵트인.
+    // 스냅샷 계약(A6, plans/129): env는 기동 1회 스냅숏이라 set_var는 모든
+    // 계산(모델 적재·가속기 생성 — 내부에서 flag 판독이 스냅숏을 동결) **이전**에.
+    unsafe { std::env::set_var("LLM170_PREFILL_MULTI", "1") };
     let m = Model4::load(Path::new(MODEL)).expect("load");
     let acc = match llm170_backend_gpu::new_q4_acc_with_sources(m.part_sources()) {
         Ok(a) => a,
@@ -70,8 +74,6 @@ fn prefill_multi_matches_sequential() {
         }
     };
     let hp = m.hp.clone();
-    // 배치 forward 게이트(기본 off) — 등가성 정책 확정 전 옵트인.
-    unsafe { std::env::set_var("LLM170_PREFILL_MULTI", "1") };
     acc.set_ctx_len(CTX);
     let ctx = Ctx {
         model: &m,

@@ -77,7 +77,7 @@ pub(crate) fn attn_layer(
     let q_norm_w = ctx.model.f32_vec(&format!("blk.{il}.attn_q_norm.weight"))?;
     let k_norm_w = ctx.model.f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?;
 
-    if il == 3 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+    if il == 3 && llm170_diag::dump::opts().key("debug_layers") {
         crate::qwen35::diag::a3_normed(&xs[0]);
     }
     // q·k·v 동일 입력 xs — 1그룹 배치
@@ -137,7 +137,7 @@ pub(crate) fn attn_layer(
                 continue;
             }
             let mut attn_out = std::mem::take(&mut attn_all[row]);
-            let dbg3 = il == 3 && t == 0 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some();
+            let dbg3 = il == 3 && t == 0 && llm170_diag::dump::opts().key("debug_layers");
             if dbg3 {
                 crate::qwen35::diag::a3_cache(
                     pos as usize,

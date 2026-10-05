@@ -1,6 +1,6 @@
 //! [스테이징·GEMM API — vk 측정 원장 2026-10-03]
 //! gemm2 coopmat(BN128): 8.4TF · 메가융합 3호(dual입력) — T-적응 스케줄
-use super::exl3_resident::TrellisResident;
+use super::resident::TrellisResident;
 
 impl TrellisResident {
     pub fn frame_norm_resid_had(
@@ -71,8 +71,18 @@ impl TrellisResident {
         };
         let _ = n2b;
         // 혼합정밀 아카이브(8/48층 qkv r=4 vs z r=5/3 — gemmd L5 재현 8.6e0):
-        // krate 불일치 쌍은 듀얈 단일-K 디코드 불가 → preah 2체인 폴백.
+        // krate 불일치 쌍은 듀얼 단일-K 디코드 불가 → preah 2체인 폴백.
+        // A5(plans/129): 폴백 원장 등재 — 아카이브 구조상 확정 경로라 매 forward
+        // 적립된다(정상 동작이지만 원장으로 프로덕션 혼입 여부가 판별된다).
         if kr1 != kr2v {
+            llm170_diag::fb::incr("exl3-krate-preah");
+            static ONCE_KRATE: std::sync::Once = std::sync::Once::new();
+            ONCE_KRATE.call_once(|| {
+                eprintln!(
+                    "[fb] exl3-krate-preah: {}/{} krate({kr1}/{kr2v}) 불일치 — preah 2체인",
+                    keys[0], keys[1]
+                );
+            });
             self.ensure_batch()?;
             self.ctx.begin_batch()?;
             for (slot, li) in [(0usize, i1), (1usize, i2)] {
