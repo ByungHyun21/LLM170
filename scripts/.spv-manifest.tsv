@@ -1,4 +1,4 @@
-addrms.spv	comp	-	c27d1b8f75d3e3ac	assembly:charhash+gate-27b+gate-flash-next
+addrms.spv	comp	-	c27d1b8f75d3e3ac	direct:addrms-check
 argmax2.spv	comp	-	6048eb890362f0c6	assembly:charhash+gate-27b+gate-flash-next
 axpy_scaled.spv	comp	-	1258d3ae6e36eb1b	assembly:charhash+gate-27b+gate-flash-next
 axpy_scaled_t.spv	comp	-	96f5aac751054fc2	assembly:charhash+gate-27b+gate-flash-next
@@ -92,14 +92,14 @@ gdn_execB.spv	comp	-	642df777de752474	direct:gdn-check
 gdn_lw.spv	comp	-	f6a26e8878534ad3	direct:gdn-check
 gemv3.spv	comp	sdot	506f7cc86d7095a7	assembly:charhash+gate-27b+gate-flash-next
 gemv8_i3s.spv	comp	-	e67022ba8885d182	assembly:charhash+gate-27b+gate-flash-next
-gemv8_nlb.spv	comp	-	8af659c54ea20059	assembly:charhash+gate-27b+gate-flash-next
-gemv8_q3b.spv	comp	-	165621a61d56b266	assembly:charhash+gate-27b+gate-flash-next
-gemv8_q4b.spv	comp	-	a8fee6d2de5b6dd4	assembly:charhash+gate-27b+gate-flash-next
-gemv8_q5b.spv	comp	-	8a72526deffe6dad	assembly:charhash+gate-27b+gate-flash-next
+gemv8_nlb.spv	comp	-	8af659c54ea20059	direct:vk-gemv8-check
+gemv8_q3b.spv	comp	-	165621a61d56b266	direct:vk-gemv8-check
+gemv8_q4b.spv	comp	-	a8fee6d2de5b6dd4	direct:vk-gemv8-check
+gemv8_q5b.spv	comp	-	8a72526deffe6dad	direct:vk-gemv8-check
 gemv8_q5n.spv	comp	-	309fe7ddb6697a7d	assembly:charhash+gate-27b+gate-flash-next
-gemv8_q6b.spv	comp	-	550cdc0e1bcd826f	assembly:charhash+gate-27b+gate-flash-next
-gemv8_q8b.spv	comp	-	fb04712a72fd5829	assembly:charhash+gate-27b+gate-flash-next
-gemv8_xsb.spv	comp	-	c51e43843a600c47	assembly:charhash+gate-27b+gate-flash-next
+gemv8_q6b.spv	comp	-	550cdc0e1bcd826f	direct:vk-gemv8-check
+gemv8_q8b.spv	comp	-	fb04712a72fd5829	direct:vk-gemv8-check
+gemv8_xsb.spv	comp	-	c51e43843a600c47	direct:vk-gemv8-check
 gemv8t_nl.spv	comp	-	8d366c8526099b77	assembly:charhash+gate-27b+gate-flash-next
 gemv8t_q3.spv	comp	-	edc9a7f2fba56b8d	assembly:charhash+gate-27b+gate-flash-next
 gemv8t_q4.spv	comp	-	87088961ed9f926d	assembly:charhash+gate-27b+gate-flash-next
