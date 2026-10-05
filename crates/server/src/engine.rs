@@ -398,6 +398,19 @@ pub enum Engine {
     Exl3Hip(Box<crate::exl3_hip_engine::Exl3HipEngine>),
 }
 
+impl Engine {
+    /// 정지 토큰(plans/130 F5 — 하드코드 248044 일반화): Q4는 GGUF 메타,
+    /// EXL3는 tokenizer_config.json 파생, Q35는 아키텍처 상수.
+    pub fn eos(&self) -> u32 {
+        match self {
+            Engine::Q4(e) => e.model.eos,
+            Engine::Exl3(e) => e.eos,
+            Engine::Exl3Hip(e) => e.eos,
+            Engine::Q35(_) => llm170_core::qwen35::EOS_EOT,
+        }
+    }
+}
+
 /// n_slots 시퀀스로 엔진 구성 (연속 배칭 — 04).
 pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> Engine {
     // EXL3 직접 경로 (plans/121 A1) — --model은 EXL3 디렉터리.

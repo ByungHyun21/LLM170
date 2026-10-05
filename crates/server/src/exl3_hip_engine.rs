@@ -10,12 +10,17 @@
 
 use llm170_backend_gpu::rawhip::exl3_hip::Exl3HipDecoder;
 
+use crate::exl3_engine::exl3_eos_of;
+
 pub struct Exl3HipEngine {
     dec: Exl3HipDecoder,
     /// MTP 스펙 상태(plans/130 D2): 마지막 커밋 시점 hidden(V3 post-final-norm)
     /// + 타깃 자신의 다음 예측(미처리). spec_round가 소비·갱신.
     mtp_h: Option<Vec<f32>>,
     mtp_pp: u32,
+    /// 정지 토큰(plans/130 F5) — tokenizer_config.json eos_token_id 파생,
+    /// 실패 시 qwen 계열 기본 248044.
+    pub eos: u32,
 }
 
 // SAFETY: decoder의 모든 GPU 접근은 slot_loop 단일 스레드에서 직렬 실행 —
@@ -37,7 +42,7 @@ impl Exl3HipEngine {
             eprintln!("# hip kvcap: ctx {ctx_len} → {kvcap} (범위 [64, 32768]로 클램프)");
         }
         let dec = Exl3HipDecoder::load(dir, 64, kvcap)?;
-        Ok(Self { dec, mtp_h: None, mtp_pp: 0 })
+        Ok(Self { dec, mtp_h: None, mtp_pp: 0, eos: exl3_eos_of(dir) })
     }
 
     /// 프리필 — 청크 64행(plans/128 P1: 어텐션 t-런치 배치화+had16 수리 완료로
@@ -83,11 +88,11 @@ impl Exl3HipEngine {
     /// pp 자체는 호출자가 이미 배출). 거부 시 GDN 스냅샷 복원 후 수용 접두+
     /// 교정 재처리로 진짜 상태 정렬(무롤백 재사용 오염 없음).
     pub fn spec_round(&mut self, k: usize) -> Result<Vec<u32>, String> {
-        let mut h = self
+        let h = self
             .mtp_h
             .clone()
             .ok_or("spec_round: prefill 선행 필요")?;
-        let mut pp = self.mtp_pp;
+        let pp = self.mtp_pp;
         let pos_now = self.dec.pos;
         // 드래프트 k체인 — MTP 헤드가 pp를 자체 처리해 pp+1..을 예측.
         let mut drafts: Vec<u32> = Vec::with_capacity(k);

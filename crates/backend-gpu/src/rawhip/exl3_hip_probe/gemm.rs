@@ -202,7 +202,7 @@ pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, 
         // T<16에서는 nsg=T로 줄인다 — dsb는 [t_rows][n] 할당이라 16세그 기록이
         // 버퍼를 초과한다(plans/130: T≤8 스윕 시 발견된 프로브 하네스 결함).
         let mut gv_nsg = 16i32.min(t_rows as i32);
-        let dah5 = hc.alloc(k * 2)?;;
+        let dah5 = hc.alloc(k * 2)?;
         let x5: Vec<f32> = x[r5 * k..(r5 + 1) * k].to_vec();
         let x5b: &[u8] = unsafe { std::slice::from_raw_parts(x5.as_ptr() as *const u8, k * 4) };
         hc.h2d(dx, x5b)?;
