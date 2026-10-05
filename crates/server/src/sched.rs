@@ -598,7 +598,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                             .unwrap_or(0)
                             .clamp(0, 4);
                         let r: Result<Vec<u32>, String> = if greedy && k > 0 {
-                            e.spec_round(k as usize)
+                            e.spec_round(k)
                         } else if greedy {
                             e.step_tok(next).map(|t| vec![t])
                         } else {

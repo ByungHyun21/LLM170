@@ -40,10 +40,8 @@ pub(crate) fn exl3_eos_of(dir: &str) -> u32 {
             if let Some(n) = v.as_f64() {
                 return n as u32;
             }
-            if let Some(arr) = v.as_num_array() {
-                if let Some(&first) = arr.first() {
-                    return first as u32;
-                }
+            if let Some(first) = v.as_num_array().and_then(|a| a.first().copied()) {
+                return first as u32;
             }
             eprintln!("# [f5] eos_token_id 형태 미인식 — EOS 기본 {DEFAULT_EOS}");
             DEFAULT_EOS
