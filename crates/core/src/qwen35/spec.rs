@@ -578,14 +578,10 @@ impl Engine {
                         for j in 0..matched {
                             c.push(all_drafts[si][j]);
                         }
-                        // per-seq carried 상한(plans/134): 12행 초과 시 즉시
-                        // 커밋. 종전 4는 solo flush(raw_verify 전체 trunk 패스
-                        // ~220ms)를 3라운드당 1회꼴로 유발 — [specT] state
-                        // ~245ms 스파이크의 진범. carried는 다음 verify 배치의
-                        // 선행 행으로 편승하는 편이 싸다(행 marginal ~15ms vs
-                        // solo 라운드 전체). 상한 12는 np4×(k+1)+carried가
-                        // 60행 청크 분할 한계 안에 머물게 한다.
-                        if c.len() > 12 {
+                        // per-seq carried 상한(plans/80 §C): 4행 초과 시 즉시
+                        // 커밋 — verify 배치가 자라는 것을 막는다. 단일 스트림의
+                        // SPEC_CAPX=4와 동일 기준.
+                        if c.len() > 4 {
                             let pos0 = self.seqs[seq].pos as usize - carried[si].len();
                             let mut crows = Vec::with_capacity(c.len() * n_e);
                             for &tk in &c {
