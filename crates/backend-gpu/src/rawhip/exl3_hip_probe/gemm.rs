@@ -178,10 +178,18 @@ pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, 
         let sf: &[f32] =
             unsafe { std::slice::from_raw_parts(sbb.as_ptr() as *const f32, t_rows * n) };
         eprintln!(
-            "  [sbdbg] gemm s[0][0..4]={:?} s[1][0..4]={:?} s[5][0..4]={:?}",
+            "  [sbdbg] gemm s[0][0..4]={:?}{}{}",
             &sf[0..4],
-            &sf[n..n + 4],
-            &sf[5 * n..5 * n + 4]
+            if t_rows >= 2 {
+                format!(" s[1][0..4]={:?}", &sf[n..n + 4])
+            } else {
+                String::new()
+            },
+            if t_rows > 5 {
+                format!(" s[5][0..4]={:?}", &sf[5 * n..5 * n + 4])
+            } else {
+                String::new()
+            }
         );
     }
     // 3-way: 검증된 T=1 GEMV 체인으로 행 5 재계산 → gemm 행5·vk 참조 삼각 대조.
@@ -191,8 +199,10 @@ pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, 
     // plans/125-3 · plans/126 I1 — 커널 무죄, 프로브 하네스 결함).
     {
         let r5 = samp[1];
-        let mut gv_nsg = 16i32;
-        let dah5 = hc.alloc(k * 2)?;
+        // T<16에서는 nsg=T로 줄인다 — dsb는 [t_rows][n] 할당이라 16세그 기록이
+        // 버퍼를 초과한다(plans/130: T≤8 스윕 시 발견된 프로브 하네스 결함).
+        let mut gv_nsg = 16i32.min(t_rows as i32);
+        let dah5 = hc.alloc(k * 2)?;;
         let x5: Vec<f32> = x[r5 * k..(r5 + 1) * k].to_vec();
         let x5b: &[u8] = unsafe { std::slice::from_raw_parts(x5.as_ptr() as *const u8, k * 4) };
         hc.h2d(dx, x5b)?;
@@ -215,7 +225,7 @@ pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, 
         hc.launch3(
             "exl3_gemv",
             ((n / 16) / 8) as u32,
-            16,
+            gv_nsg as u32,
             1,
             128,
             &mut [
@@ -255,16 +265,18 @@ pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, 
         }
         eprintln!("  [gemmdbg] 행5: gemv-vs-gemm={m_gv_gemm:.3e} gemv-vs-vk={m_gv_vk:.3e}");
         {
-            let mut seg = vec![0u8; 16 * n * 4];
-            hc.d2h(&mut seg, dsb)?;
-            hc.sync()?;
-            // SAFETY: d2h 완료 후 재해석 — [16세그][n] 부분합.
-            let segf: &[f32] =
-                unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const f32, 16 * n) };
-            let sums: Vec<f32> = (0..4)
-                .map(|c| (0..16).map(|g| segf[g * n + c]).sum())
-                .collect();
-            eprintln!("  [sbdbg] gemv(행5) 세그합[0..4]={sums:?}");
+            if t_rows >= 16 {
+                let mut seg = vec![0u8; 16 * n * 4];
+                hc.d2h(&mut seg, dsb)?;
+                hc.sync()?;
+                // SAFETY: d2h 완료 후 재해석 — [16세그][n] 부분합.
+                let segf: &[f32] =
+                    unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const f32, 16 * n) };
+                let sums: Vec<f32> = (0..4)
+                    .map(|c| (0..16).map(|g| segf[g * n + c]).sum())
+                    .collect();
+                eprintln!("  [sbdbg] gemv(행5) 세그합[0..4]={sums:?}");
+            }
         }
     }
     let mut worst = 0f32;
@@ -383,6 +395,86 @@ pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, 
             "  [mmadbg] mma {:.1}ms = {:.1} TF · y-vs-ref maxdiff={mmd:.3e}",
             tm[1],
             tf2 / (tm[1] / 1000.0)
+        );
+    }
+    // gemv_m(plans/130) — 소형-T(≤8) m행 GEMV: kseg 대체 후보. 정합+속도 A/B.
+    if t_rows <= 8 {
+        let dbat = hc.alloc(t_rows * 16 * n * 4)?;
+        let (mut gkt, mut gnt, mut gkk, mut gtt) = (
+            (k / 16) as i32,
+            (n / 16) as i32,
+            krate as i32,
+            t_rows as i32,
+        );
+        let (mut a0, mut a1, mut a2) = (dah, dtre, dbat);
+        let mut tg: Vec<f64> = Vec::new();
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            const GVM: [&str; 9] = [
+                "",
+                "exl3_gemv_m1",
+                "exl3_gemv_m2",
+                "exl3_gemv_m3",
+                "exl3_gemv_m4",
+                "exl3_gemv_m5",
+                "exl3_gemv_m6",
+                "exl3_gemv_m7",
+                "exl3_gemv_m8",
+            ];
+            hc.launch3(
+                GVM[t_rows],
+                ((n / 16) / 8) as u32,
+                16,
+                1,
+                128,
+                &mut [
+                    &mut a0 as *mut *mut u8 as *mut _,
+                    &mut a1 as *mut *mut u8 as *mut _,
+                    &mut a2 as *mut *mut u8 as *mut _,
+                    &mut gkt as *mut i32 as *mut _,
+                    &mut gnt as *mut i32 as *mut _,
+                    &mut gkk as *mut i32 as *mut _,
+                    &mut gtt as *mut i32 as *mut _,
+                ],
+            )?;
+            let (mut c0, mut c1, mut c2) = (dbat, dsvh, dy);
+            let (mut nch, mut nsg, mut nst) = ((n / 128) as i32, 16i32, n as i32);
+            hc.launch3(
+                "exl3_had_out",
+                (n / 128) as u32,
+                t_rows as u32,
+                1,
+                128,
+                &mut [
+                    &mut c0 as *mut *mut u8 as *mut _,
+                    &mut c1 as *mut *mut u8 as *mut _,
+                    &mut c2 as *mut *mut u8 as *mut _,
+                    &mut nch as *mut i32 as *mut _,
+                    &mut nsg as *mut i32 as *mut _,
+                    &mut nst as *mut i32 as *mut _,
+                ],
+            )?;
+            hc.sync()?;
+            tg.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        let mut gb = vec![0u8; t_rows * n * 4];
+        hc.d2h(&mut gb, dy)?;
+        hc.sync()?;
+        // SAFETY: d2h 완료 후 재해석.
+        let gmf: &[f32] =
+            unsafe { std::slice::from_raw_parts(gb.as_ptr() as *const f32, t_rows * n) };
+        let mut gmd = 0f32;
+        for (si, &r) in samp.iter().enumerate() {
+            for i in 0..n {
+                gmd = gmd.max((gmf[r * n + i] - want[si][i]).abs());
+            }
+        }
+        // 가중치 스트리밍 관점(GB/s): tre는 체인 전체에서 1회 판독.
+        let tre_gb = tre.len() as f64 / 1e9;
+        eprintln!(
+            "  [gvmdbg] gemv_m T={t_rows}: {:.1}ms(중앙값) · tre {:.0}GB/s · y-vs-ref maxdiff={gmd:.3e}",
+            tg[1],
+            tre_gb / (tg[1] / 1000.0),
         );
     }
     ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
