@@ -227,7 +227,6 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     Some(super::finish(r))
 }
 
-
 /// llm170 exl3-check <exl3_dir> <q8.gguf> — EXL3 참조 디코드 ↔ GGUF Q8 대조
 /// (plans/118 §3-1). Python 검증기(scripts/exl3_validate.py)의 내부화:
 /// K=3/4/5 혼재 텐서의 128×128 블록 상관계수. 기준: corr ≥ 0.97(K=3 양자화
@@ -317,4 +316,3 @@ fn cmd_exl3_check(exl3_dir: &str, gguf_path: &str) -> Result<String, String> {
     }
 }
 // 마커 mtpg
-

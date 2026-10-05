@@ -23,25 +23,27 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "/tmp/model_link.gguf".into());
-            return Some(match llm170_gguf::GgufFile::open(std::path::Path::new(&path)) {
-                Ok(g) => {
-                    use std::collections::BTreeMap;
-                    let mut cnt: BTreeMap<u32, usize> = BTreeMap::new();
-                    let mut bytes: BTreeMap<u32, u64> = BTreeMap::new();
-                    for t in &g.tensors {
-                        *cnt.entry(t.ty as u32).or_insert(0) += 1;
-                        *bytes.entry(t.ty as u32).or_insert(0) += t.nbytes().unwrap_or(0);
+            return Some(
+                match llm170_gguf::GgufFile::open(std::path::Path::new(&path)) {
+                    Ok(g) => {
+                        use std::collections::BTreeMap;
+                        let mut cnt: BTreeMap<u32, usize> = BTreeMap::new();
+                        let mut bytes: BTreeMap<u32, u64> = BTreeMap::new();
+                        for t in &g.tensors {
+                            *cnt.entry(t.ty as u32).or_insert(0) += 1;
+                            *bytes.entry(t.ty as u32).or_insert(0) += t.nbytes().unwrap_or(0);
+                        }
+                        for (k, c) in cnt {
+                            println!("ty{k}: {c} tensors {:.1}MB", bytes[&k] as f64 / 1e6);
+                        }
+                        ExitCode::SUCCESS
                     }
-                    for (k, c) in cnt {
-                        println!("ty{k}: {c} tensors {:.1}MB", bytes[&k] as f64 / 1e6);
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
                     }
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            });
+                },
+            );
         }
         _ => return None,
     };
