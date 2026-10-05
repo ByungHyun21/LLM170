@@ -1,63 +1,49 @@
-//! 폴백 카운터 (plans/107 W8) — GPU→CPU/값경로 폴백이 조용히 발산 원인을
-//! 가리는 일을 막는다. eprintln 로그는 ONCE라 반복 폴백이 보이지 않는다;
-//! 카운터는 전수를 센다. `llm170 diag fb`로 관측.
+//! 폴백 카운터 qwen4exp 진입점 (plans/107 W8) — 원장 구현은 plans/129 A5로
+//! diag 공유층(`llm170_diag::fb`)으로 이동했다: EXL3(vk)·vl 등 core 밖
+//! 폴백과 같은 이름 공간을 써야 `diag fb`/main 종료 [fb] 출력이 단일 원장을
+//! 보이기 때문. 이 파일은 기존 호출부(forward.rs·layers.rs 등 17지점)의
+//! 타입화 API(Id → 이름 문자열)만 유지한다.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use llm170_diag::fb as dfb;
 
 #[repr(usize)]
 pub enum Id {
-    EmbQ8g = 0,
-    PleGgpu = 1,
-    QsaDevsel = 2,
-    QsaDevselMt = 3,
-    QsaIdxpool = 4,
-    QsaAttn = 5,
-    FrameCreate = 6,
-    FrameCreateNp = 7,
-    MtpDraft = 8,
-    MtpSpec = 9,
+    EmbQ8g,
+    PleGgpu,
+    QsaDevsel,
+    QsaDevselMt,
+    QsaIdxpool,
+    QsaAttn,
+    FrameCreate,
+    FrameCreateNp,
+    MtpDraft,
+    MtpSpec,
 }
 
-const NAMES: [&str; 10] = [
-    "emb-q8g",
-    "ple-ggpu",
-    "qsa-devsel",
-    "qsa-devsel-mt",
-    "qsa-idxpool",
-    "qsa-attn",
-    "frame-create",
-    "frame-create-np",
-    "mtp-draft",
-    "mtp-spec",
-];
-
-static COUNTS: [AtomicUsize; 10] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
-
-pub fn incr(id: Id) {
-    COUNTS[id as usize].fetch_add(1, Ordering::Relaxed);
-}
-
-/// 0이 아닌 카운터만 `name count` 한 줄씩. 전부 0이면 빈 문자열.
-pub fn report() -> String {
-    let mut out = String::new();
-    for (i, n) in NAMES.iter().enumerate() {
-        let c = COUNTS[i].load(Ordering::Relaxed);
-        if c > 0 {
-            out.push_str(&format!("{n} {c}\n"));
+impl Id {
+    fn name(self) -> &'static str {
+        match self {
+            Id::EmbQ8g => "emb-q8g",
+            Id::PleGgpu => "ple-ggpu",
+            Id::QsaDevsel => "qsa-devsel",
+            Id::QsaDevselMt => "qsa-devsel-mt",
+            Id::QsaIdxpool => "qsa-idxpool",
+            Id::QsaAttn => "qsa-attn",
+            Id::FrameCreate => "frame-create",
+            Id::FrameCreateNp => "frame-create-np",
+            Id::MtpDraft => "mtp-draft",
+            Id::MtpSpec => "mtp-spec",
         }
     }
-    out
+}
+
+pub fn incr(id: Id) {
+    dfb::incr(id.name());
+}
+
+/// 전체 원장 보고 — diag 공유 원장(EXL3·vl 카운터 포함), 0이 아닌 것만.
+pub fn report() -> String {
+    dfb::report()
 }
 
 #[cfg(test)]
@@ -66,13 +52,10 @@ mod tests {
 
     #[test]
     fn incr_bumps_named_counter() {
-        let before = COUNTS[Id::QsaAttn as usize].load(Ordering::Relaxed);
+        let before = dfb::count("qsa-attn");
         incr(Id::QsaAttn);
         incr(Id::QsaAttn);
-        assert_eq!(
-            COUNTS[Id::QsaAttn as usize].load(Ordering::Relaxed),
-            before + 2
-        );
+        assert_eq!(dfb::count("qsa-attn"), before + 2);
         assert!(report().contains("qsa-attn"));
     }
 }

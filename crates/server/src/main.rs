@@ -184,6 +184,19 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
 }
 
 fn main() -> ExitCode {
+    let code = run_main();
+    // A5(plans/129): 폴백 누계 종료 출력 — 카운터는 프로세스 로컬이라
+    // `llm170 diag fb`(신규 프로세스)는 향상 0건이다. 폴백이 일어난 바로 그
+    // 프로세스(infer·bench·프로브 등)가 자기 누계를 stderr에 남긴다.
+    // serve는 Ctrl-C로 즉사해 이 출력을 건너뜀 — serve 관측은 ONCE 로그가 담당.
+    let r = llm170_diag::fb::report();
+    if !r.is_empty() {
+        eprint!("[fb] 폴백 누계:\n{r}");
+    }
+    code
+}
+
+fn run_main() -> ExitCode {
     // plans/87 §2 — 와치독(스텔 보고·옵션 FAIL 자결).
     if let Some(v) = std::env::var("LLM170_WATCHDOG")
         .ok()
