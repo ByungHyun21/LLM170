@@ -23,6 +23,28 @@ MANIFEST = ROOT / "scripts/.spv-manifest.tsv"
 SDOT_OP = 4450
 
 
+def covered_by(name: str) -> str:
+    """A22(plans/129) — spv 커버리지 원장(v1 분류). direct = 모듈 검증기,
+    assembly = 조립 게이트. 전수 1:1 금지(ADR-0019): 원장이 빠짐을 계약으로
+    막는다. 커널 추가 시 분류 갱신 — check 모드에서 빈 값/미기입은 FAIL."""
+    n = name.removesuffix(".spv")
+    if n.startswith("exl3_"):
+        if "scan" in n: return "direct:exl3-scan-check"
+        if "gdn" in n: return "direct:exl3-chain-check"
+        if "attn" in n: return "direct:exl3-attn-check"
+        if "gemmd" in n: return "direct:exl3-gemmd-check"
+        if "gemm" in n: return "direct:exl3-gemm-check"
+        if "nrh" in n or "norm" in n: return "direct:exl3-nr-check"
+        if "ffn" in n: return "direct:exl3-ffn-check"
+        return "assembly:gate-exl3"
+    if n.startswith("gdn"): return "direct:gdn-check"
+    if n.startswith("qsa"): return "direct:q4-qsa-check"
+    if n.startswith("hc"): return "direct:q4-hc-check"
+    if n.startswith("ple"): return "direct:q4-ple-check"
+    if n.startswith("moe"): return "direct:moe-row-check"
+    return "assembly:charhash+gate-27b+gate-flash-next"
+
+
 def scan():
     rows = []
     for spv in sorted(SPV.glob("*.spv")):
@@ -33,7 +55,8 @@ def scan():
             for i in range(0, len(data) - 1, 4)
         )
         rows.append((spv.name, "comp" if has_comp else "prebuilt",
-                     "sdot" if patched else "-", hashlib.sha256(data).hexdigest()[:16]))
+                     "sdot" if patched else "-", hashlib.sha256(data).hexdigest()[:16],
+                     covered_by(spv.name)))
     return rows
 
 
@@ -70,6 +93,11 @@ def main():
                 # A17(plans/129): .comp 단독(미컴파일) 탐지 — 종전엔 spv 존재
                 # 전제라 신규 .comp가 매니페스트·preflight 양쪽에서 무탐지였다.
                 print(f"  NO-SPV: {comp.name} (comp without spv)"); fail += 1
+        # A22: covered_by 원장 정합 — 컬럼 5가 비었으면 FAIL
+        for line in MANIFEST.read_text().splitlines():
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) >= 5 and not cols[4].strip():
+                print(f"  UNCOVERED: {cols[0]}"); fail += 1
         print("spv-manifest PASS" if fail == 0 else f"spv-manifest FAIL ({fail})")
         return 0 if fail == 0 else 1
     for r in rows:
