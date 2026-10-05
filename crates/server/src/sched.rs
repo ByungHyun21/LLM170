@@ -589,8 +589,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     // (D2 — 롤백 포함, k≤4). 샘플링 슬롯은 로짓 판.
                     for &i in &active {
                         let next = slots[i].next;
-                        let greedy =
-                            !slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
+                        let greedy = !slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
                         let k = slots[i]
                             .job
                             .as_ref()

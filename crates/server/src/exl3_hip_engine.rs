@@ -42,7 +42,12 @@ impl Exl3HipEngine {
             eprintln!("# hip kvcap: ctx {ctx_len} → {kvcap} (범위 [64, 32768]로 클램프)");
         }
         let dec = Exl3HipDecoder::load(dir, 64, kvcap)?;
-        Ok(Self { dec, mtp_h: None, mtp_pp: 0, eos: exl3_eos_of(dir) })
+        Ok(Self {
+            dec,
+            mtp_h: None,
+            mtp_pp: 0,
+            eos: exl3_eos_of(dir),
+        })
     }
 
     /// 프리필 — 청크 64행(plans/128 P1: 어텐션 t-런치 배치화+had16 수리 완료로
@@ -88,10 +93,7 @@ impl Exl3HipEngine {
     /// pp 자체는 호출자가 이미 배출). 거부 시 GDN 스냅샷 복원 후 수용 접두+
     /// 교정 재처리로 진짜 상태 정렬(무롤백 재사용 오염 없음).
     pub fn spec_round(&mut self, k: usize) -> Result<Vec<u32>, String> {
-        let h = self
-            .mtp_h
-            .clone()
-            .ok_or("spec_round: prefill 선행 필요")?;
+        let h = self.mtp_h.clone().ok_or("spec_round: prefill 선행 필요")?;
         let pp = self.mtp_pp;
         let pos_now = self.dec.pos;
         // 드래프트 k체인 — MTP 헤드가 pp를 자체 처리해 pp+1..을 예측.

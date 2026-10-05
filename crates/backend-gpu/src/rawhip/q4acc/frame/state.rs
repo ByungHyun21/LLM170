@@ -1156,7 +1156,11 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     // t=rows(ge와 동일 가드). 디바이스 경로(rows_pad_d≠0)는
                     // 패딩 도메인 rows_pad — 단 현재 디바이스 그룹화는 t=1 전용이라
                     // 이 분기(dmmv 선행 반환)에는 도달하지 않는다(방어 분기).
-                    if rows_pad_d != 0 { rows_pad as i32 } else { rows as i32 },
+                    if rows_pad_d != 0 {
+                        rows_pad as i32
+                    } else {
+                        rows as i32
+                    },
                     per_expert as i32,
                 );
                 let mut margs: Vec<*mut std::ffi::c_void> = vec![
