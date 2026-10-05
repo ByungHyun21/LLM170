@@ -165,9 +165,10 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             else if args.first().map(String::as_str) == Some("watchdog-selftest") {
                 return Some(cmd_watchdog_selftest());
             }
-            // plans/107 W8 — 폴백 카운터 관측.
+            // plans/107 W8 — 폴백 카운터 관측. A5(plans/129)부터 diag 공유 원장
+            // (EXL3·vl 포함 — 실측 프로세스 종료 [fb] 출력과 같은 소스).
             else if args.first().map(String::as_str) == Some("fb") {
-                let r = llm170_core::qwen4exp::frame::fb_report();
+                let r = llm170_diag::fb::report();
                 if r.is_empty() {
                     Ok("폴백 0건 (전 경로 GPU)".into())
                 } else {

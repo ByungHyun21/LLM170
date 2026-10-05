@@ -172,11 +172,9 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             match v {
                 Ok(rows) => rows,
                 Err(e) => {
-                    // A21d(plans/129): 폴백 관측성 — 누계 카운터(fb_infr 체계는
-                    // qwen4exp 프레임 전용이라 vl은 국소 카운터로).
-                    static VIT_FB: std::sync::atomic::AtomicUsize =
-                        std::sync::atomic::AtomicUsize::new(0);
-                    let n = VIT_FB.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    // A21d(plans/129): 폴백 관측성 — A5부터 diag 공유 원장(diag fb)
+                    // 적립(누적 {n}회 로그 관례 유지).
+                    let n = llm170_diag::fb::incr("vl-vit");
                     eprintln!("vit gpu: {e} — CPU 폴백 (누적 {n}회)");
                     match clip.encode(&px, tw, th) {
                         Ok(r) => r,

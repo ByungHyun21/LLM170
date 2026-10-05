@@ -6,6 +6,7 @@
 
 pub mod alloc;
 pub mod dump;
+pub mod fb;
 pub mod flag;
 pub mod fp;
 pub mod span;
