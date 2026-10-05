@@ -85,18 +85,13 @@ impl Engine {
         let mut last = None;
         // 원시 HIP 활성 시 프리필도 t=1 raw 스텝으로 — 상태 동기화 불필요
         // (KV/GDN/conv 링이 raw 디코더에 직접 적립).
-        if std::env::var("LLM170_T1_PREFILL").is_ok()
-            || (self.raw_decode.is_some()
-                && std::env::var("LLM170_RAWHIP")
-                    .map(|v| v != "0")
-                    .unwrap_or(true))
+        if llm170_diag::flag::on("LLM170_T1_PREFILL")
+            || (self.raw_decode.is_some() && llm170_diag::flag::ne0("LLM170_RAWHIP"))
         {
             // plans/84 A: 단일 토큰 prefill 호출(청크 꼬리 t=1)도 배치 경로로 —
             // decode 경로는 GEMM 패밀리가 달라 청크 불변성이 깨진다.
             // 핀(step_batch)이 large-t 패밀리로 통일하므로 t=1도 비트 일치.
-            let use_batch = std::env::var("LLM170_RAWHIP")
-                .map(|v| v != "0")
-                .unwrap_or(true)
+            let use_batch = llm170_diag::flag::ne0("LLM170_RAWHIP")
                 && (tokens.len() > 1 || self.raw_decode.is_some());
             if use_batch {
                 let rd = self.raw_decode.clone().unwrap();
@@ -165,7 +160,7 @@ impl Engine {
                             pf_t0.elapsed().as_secs_f64() * 1e3
                         );
                     }
-                    if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+                    if llm170_diag::dump::opts().key("debug_layers") {
                         let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                         eprintln!("logits(batch): max={m:.4} argmax={}", greedy(&logits));
                     }

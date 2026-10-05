@@ -328,7 +328,7 @@ mod tests {
         let _ = tile_word(&u32s, 3, 0); // 파닉 없이 동작
 
         // 픽스처가 있으면 전체 타일·골든 검증(모델 의존 스킵).
-        let Ok(dir) = std::env::var("LLM170_M27_EXL3") else {
+        let Some(dir) = llm170_diag::flag::val("LLM170_M27_EXL3") else {
             return;
         };
         let Ok(ar) = crate::StArchive::open(std::path::Path::new(&dir)) else {

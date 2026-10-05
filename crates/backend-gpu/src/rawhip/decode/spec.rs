@@ -140,8 +140,8 @@ impl DecodeState {
         // 성공(gy 스위프 검증). 동일 직접 경로로 실행 (산술은 gemm_q6k로 동일).
         self.mm_direct(self.mtp_xq2, we, te, nie, noe, self.mtp_cur)?;
         // 진단 덤프 (MTP 헤드 1단계 수치 미러 대조): tok_emb/h/cat/eh
-        if let Some(pref) = std::env::var_os("LLM170_MTP_DUMP") {
-            let pref = pref.to_string_lossy().to_string();
+        if let Some(pref) = llm170_diag::dump::opts().key_arg("mtp_dump") {
+            let pref = pref.to_string();
             self.ctx.sync()?;
             let mut hv = vec![0f32; n];
             self.ctx

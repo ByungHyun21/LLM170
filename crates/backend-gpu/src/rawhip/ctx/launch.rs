@@ -348,4 +348,4 @@ pub(crate) fn nolaunch_on() -> bool {
 }
 
 static NOLAUNCH: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var_os("LLM170_NOLAUNCH").is_some());
+    std::sync::LazyLock::new(|| llm170_diag::flag::on("LLM170_NOLAUNCH"));

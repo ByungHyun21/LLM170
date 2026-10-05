@@ -73,7 +73,7 @@ pub(crate) fn gdn_layer(
     let mut gpu_done = false;
     if t_len == 1
         && n_seqs == 1
-        && std::env::var_os("LLM170_GDN_CPU").is_none()
+        && !llm170_diag::flag::on("LLM170_GDN_CPU")
         && let Some(acc_ref) = acc.as_deref()
     {
         let mut conv_out = vec![0.0f32; conv_ch];
@@ -190,7 +190,7 @@ pub(crate) fn gdn_layer(
                     n_group,
                     dt_rank,
                 );
-                if il == 0 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+                if il == 0 && llm170_diag::dump::opts().key("debug_layers") {
                     crate::qwen35::diag::g0_gdn(
                         r0, r1, &o_all, &q_all, &k_all, &v_all, &beta_all, &g_all, v_len, k_len,
                         dt_rank,
@@ -199,7 +199,7 @@ pub(crate) fn gdn_layer(
             } else {
                 // GPU 청크 (03 §3.1) — 값 스타일, 실패 시 CPU 청크.
                 let mut done = false;
-                if std::env::var_os("LLM170_GDN_CPU").is_none()
+                if !llm170_diag::flag::on("LLM170_GDN_CPU")
                     && let Some(acc_ref) = acc.as_deref()
                 {
                     let flat_st: &mut [f32] = st;

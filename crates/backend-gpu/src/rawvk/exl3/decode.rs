@@ -42,11 +42,7 @@ pub fn decode_step(
             .norm(&format!("{lp}.input_layernorm.weight"))
             .ok_or("norm missing")?;
         let xn = rms_norm(&x, norm_w, eps);
-        if std::env::var_os("LLM170_EXL3_DBG")
-            .map(|v| v == "layerdump")
-            .unwrap_or(false)
-            && il <= 1
-        {
+        if llm170_diag::dump::opts().key_arg("exl3_dbg") == Some("layerdump") && il <= 1 {
             let r = (xn.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
             eprintln!(
                 "  [vkl] L{il} xn rms={r:.5} xn[0]={:.6} nw[0..3]={:?}",
@@ -68,10 +64,7 @@ pub fn decode_step(
             r
         };
         // 디버그: attention/GDN 출력 제거 — FFN만 남겨 격리.
-        if std::env::var_os("LLM170_EXL3_DBG")
-            .map(|v| v == "attn_skip")
-            .unwrap_or(false)
-        {
+        if llm170_diag::dump::opts().key_arg("exl3_dbg") == Some("attn_skip") {
             for v in attn_out.iter_mut() {
                 *v = 0.0;
             }
@@ -81,10 +74,7 @@ pub fn decode_step(
         for i in 0..h {
             x[i] += attn_out.get(i).copied().unwrap_or(0.0);
         }
-        if std::env::var_os("LLM170_EXL3_DBG")
-            .map(|v| v == "layerdump")
-            .unwrap_or(false)
-        {
+        if llm170_diag::dump::opts().key_arg("exl3_dbg") == Some("layerdump") {
             let r = (x.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
             eprintln!(
                 "  [vkl] L{il} post-attn rms={r:.5} gdn[0..2]={:?}",
@@ -110,10 +100,7 @@ pub fn decode_step(
         for i in 0..h {
             x[i] += ffn_out.get(i).copied().unwrap_or(0.0);
         }
-        if std::env::var_os("LLM170_EXL3_DBG")
-            .map(|v| v == "layerdump")
-            .unwrap_or(false)
-        {
+        if llm170_diag::dump::opts().key_arg("exl3_dbg") == Some("layerdump") {
             let r = (x.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
             eprintln!(
                 "  [vkl] L{il} post-ffn rms={r:.5} ffn_out[0..2]={:?}",

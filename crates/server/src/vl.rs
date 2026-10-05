@@ -16,7 +16,7 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let gpu_runtime = ma
         .gpu_runtime
         .clone()
-        .or_else(|| std::env::var("LLM170_GPU_RUNTIME").ok())
+        .or_else(|| llm170_diag::flag::val("LLM170_GPU_RUNTIME").map(str::to_string))
         .unwrap_or_else(|| "hip".into());
     let mut spec_k = 0usize;
     // 장문·임의 질문 지원 (plans/28): prefix는 vision_start 앞, question은
@@ -199,7 +199,7 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             vis.len(),
             t0.elapsed().as_secs_f64()
         );
-        if std::env::var_os("LLM170_VIS_HASH").is_some() {
+        if llm170_diag::dump::opts().key("vis_hash") {
             let mut x: u64 = 0x9E3779B97F4A7C15;
             for row in &vis[..vis.len().min(2)] {
                 for &v in row[..row.len().min(256)].iter() {

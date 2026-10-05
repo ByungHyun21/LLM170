@@ -278,11 +278,7 @@ impl DecoderState {
                     // 이식(LDS·배리어 0, 점유 8WG/CU급). 종전 gq는 LDS 61KB/WG로
                     // 점유 1WG/CU — 장문 프리필 어텐션이 npmax 선형 지연의 주벚.
                     // hd≠256·킬스위치(LLM170_VK_NOREG=1)는 gq로.
-                    if hd == 256
-                        && std::env::var("LLM170_VK_NOREG")
-                            .map(|v| v != "1")
-                            .unwrap_or(true)
-                    {
+                    if hd == 256 && llm170_diag::flag::val("LLM170_VK_NOREG") != Some("1") {
                         let push = Self::push_u32s(&[
                             pos0 as u32,
                             n_head as u32,
@@ -413,8 +409,7 @@ impl DecoderState {
             if llm170_diag::dump::opts().key("vkd_lsum") {
                 // 107 W1: vk 레이스 국소화 — 층별 b_xn 첫 64합(il % MOD).
                 // 판독 직전 배치를 닫았다 재시작(진단 전용 모드).
-                let m = std::env::var("LLM170_VKD_LSUM_MOD")
-                    .ok()
+                let m = llm170_diag::flag::val("LLM170_VKD_LSUM_MOD")
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(8);
                 if il % m == 0 {

@@ -727,15 +727,14 @@ fn cmd_chunk_check(args: &[String]) -> ExitCode {
                             }
                         }
                     }
-                    // 기준: 단일 청크(프롬프트 전체)
-                    unsafe {
-                        std::env::set_var("LLM170_Q4_CHUNK", format!("{}", ids.len().max(1)))
-                    };
+                    // 기준: 단일 청크(프롬프트 전체) — 청크 크기는 env 스냅샷이
+                    // 아니라 하네스 오버라이드 API로(A6: set_var는 스냅샷 이후 무효).
+                    llm170_core::qwen4exp::layers::set_q4_chunk(ids.len().max(1));
                     let r = eng.prefill(0, &ids).map_err(|e| e.to_string())?;
                     eng.reset_seq(0);
                     let mut runs = Vec::new();
                     for &sz in &sizes {
-                        unsafe { std::env::set_var("LLM170_Q4_CHUNK", format!("{sz}")) };
+                        llm170_core::qwen4exp::layers::set_q4_chunk(sz);
                         let l = eng.prefill(0, &ids).map_err(|e| e.to_string())?;
                         eng.reset_states();
                         runs.push((sz, l));

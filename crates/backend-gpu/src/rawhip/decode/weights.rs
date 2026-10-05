@@ -103,8 +103,7 @@ impl DecodeState {
         let max_rows = (n / 32).max(n_ff.max(g6)).max(hp.n_head + hp.n_kv).max(1);
         let bs = |nb: usize| Self::a(&ctx, nb).unwrap();
         // 배치 아레나 — 기본 청크 512 (z-그리드). LLM170_CHUNK≤128이면 128.
-        let t_max = std::env::var("LLM170_CHUNK")
-            .ok()
+        let t_max = llm170_diag::flag::val("LLM170_CHUNK")
             .and_then(|v| v.parse::<usize>().ok())
             .map(|c| if c > 128 { 512 } else { 128 })
             .unwrap_or(512);
@@ -690,9 +689,7 @@ impl DecodeState {
         if !matches!(ty, 12 | 13 | 14 | 23) {
             return false;
         }
-        let only = std::env::var("LLM170_MMQ_ONLY")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok());
+        let only = llm170_diag::flag::val("LLM170_MMQ_ONLY").and_then(|v| v.parse::<u32>().ok());
         if let Some(m) = only
             && m & (1u32 << (ty - 12)) == 0
         {

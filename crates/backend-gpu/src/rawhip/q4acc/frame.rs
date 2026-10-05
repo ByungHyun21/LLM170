@@ -1248,7 +1248,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         }
         gather_xg(self)?;
         MOE_FALLBACK_USED.store(true, std::sync::atomic::Ordering::Relaxed);
-        if std::env::var_os("LLM170_PF_GRAPH_DEBUG").is_some() {
+        if llm170_diag::flag::on("LLM170_PF_GRAPH_DEBUG") {
             eprintln!(
                 "# pfgraph fallback: ty={:?} f32w={f32w} rows={rows} rpd={}",
                 ws.ty,

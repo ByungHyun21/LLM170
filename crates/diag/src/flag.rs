@@ -34,6 +34,13 @@ pub fn val(name: &str) -> Option<&str> {
     VALUES.get(name).map(|v| v.as_str())
 }
 
+/// `존재 && 값 != "0"` — `var(name).is_ok_and(|v| v != "0")` 대응.
+/// 부재 시 false(ne0와 반대 — 옵트인 값 게이트: LLM170_FRAME35·
+/// LLM170_FRAME 등 "설정돼 있고 0이 아니면 ON" 관례). A6(plans/129).
+pub fn on_nonzero(name: &str) -> bool {
+    VALUES.get(name).is_some_and(|v| v != "0")
+}
+
 /// 스냅샷↔라이브 동치 검사 (plans/108 P1) — 현재 환경의 LLM170_ 키 전수에
 /// 대해 4개 의미론(on/eq1/ne0/val)을 라이브 getenv 판정과 독립 대조한다.
 /// 불일치 목록(빈 벡터 = 정상).
@@ -61,6 +68,13 @@ pub fn env_check() -> Vec<String> {
         }
         if val(k) != Some(v) {
             bad.push(format!("{k}: val()={:?} live={v:?}", val(k)));
+        }
+        let live_nz = v != "0";
+        if on_nonzero(k) != live_nz {
+            bad.push(format!(
+                "{k}: on_nonzero()={} live={live_nz}",
+                on_nonzero(k)
+            ));
         }
     }
     bad

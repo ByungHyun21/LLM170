@@ -34,9 +34,7 @@ pub fn q4_gpu_env_off() -> bool {
     if llm170_diag::flag::on("LLM170_Q4_CPU") {
         return true;
     }
-    std::env::var("LLM170_RAWHIP")
-        .map(|v| v == "0")
-        .unwrap_or(false)
+    llm170_diag::flag::val("LLM170_RAWHIP") == Some("0")
 }
 
 pub fn q4_gpu_wanted(backend: &BackendSel) -> bool {
@@ -290,7 +288,7 @@ pub fn generate_q35(
 ) -> Result<(&'static str, SpecStats), String> {
     let n = st.next.len();
     let mut stats = SpecStats::default();
-    let spec_on = spec_k > 0 && eng.has_mtp() && std::env::var_os("LLM170_SPEC_GPU").is_some();
+    let spec_on = spec_k > 0 && eng.has_mtp() && llm170_diag::flag::on("LLM170_SPEC_GPU");
     if spec_k > 0 && !eng.has_mtp() {
         eprintln!("# --spec 무시: MTP(nextn) 텐서 없음");
     }
