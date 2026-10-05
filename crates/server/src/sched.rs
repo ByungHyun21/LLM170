@@ -582,18 +582,43 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     }
                 }
                 Engine::Exl3Hip(e) => {
-                    // hip 기본 경로(단일 슬롯 — plans/121 exl3-sched). active는 0성분.
-                    // greedy는 step_tok(GPU argmax — 로짓 1MB d2h 스킵, plans/130 A2),
-                    // 샘플링 슬롯만 로짓 판.
+                    // hip 기본 경로(단일 슬롯 — plans/121 exl3-sched). greedy는
+                    // step_tok(GPU argmax, plans/130 A2), spec_k>0면 MTP 라운드
+                    // (D2 — 롤백 포함, k≤4). 샘플링 슬롯은 로짓 판.
                     for &i in &active {
                         let next = slots[i].next;
-                        let r = if slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy()) {
-                            e.decode1(next).map(|l| pick(&mut slots[i], &l))
+                        let greedy =
+                            !slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
+                        let k = slots[i]
+                            .job
+                            .as_ref()
+                            .map(|j| j.spec_k)
+                            .unwrap_or(0)
+                            .clamp(0, 4);
+                        let r: Result<Vec<u32>, String> = if greedy && k > 0 {
+                            e.spec_round(k as usize)
+                        } else if greedy {
+                            e.step_tok(next).map(|t| vec![t])
                         } else {
-                            e.step_tok(next)
+                            e.decode1(next).map(|l| vec![pick(&mut slots[i], &l)])
                         };
                         match r {
-                            Ok(t) => slot_emit(&mut slots[i], t),
+                            Ok(toks) => {
+                                let cap = slots[i]
+                                    .job
+                                    .as_ref()
+                                    .map(|j| j.n_predict)
+                                    .unwrap_or(usize::MAX);
+                                for &t in &toks {
+                                    if slots[i].generated as usize >= cap {
+                                        break;
+                                    }
+                                    slot_emit(&mut slots[i], t);
+                                    if t == EOS {
+                                        break;
+                                    }
+                                }
+                            }
                             Err(err) => {
                                 eprintln!("# hip decode 실패({err})");
                                 slot_fail(&mut slots[i], format!("hip decode1: {err}"));

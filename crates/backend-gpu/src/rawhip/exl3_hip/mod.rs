@@ -108,6 +108,12 @@ pub struct Exl3HipDecoder {
     pgh: *mut u8,
     pgall: *mut u8,
     gexec: Option<(usize, crate::rawhip::ctx::hipgraph::GraphExec)>,
+    /// 스펙 롤백 지속 스냅샷(plans/130 D2) — gsnap_ring/st는 최초 저장 시 할당.
+    gsnap_ring: *mut u8,
+    gsnap_st: *mut u8,
+    gsnap_pos: u32,
+    gsnap_dpos: u32,
+    gsnap_valid: bool,
     dmtpk: *mut u8,
     dmtpv: *mut u8,
     dmtpp: *mut u8,
@@ -431,6 +437,11 @@ impl Exl3HipDecoder {
             pgh,
             pgall,
             gexec: None,
+            gsnap_ring: std::ptr::null_mut(),
+            gsnap_st: std::ptr::null_mut(),
+            gsnap_pos: 0,
+            gsnap_dpos: 0,
+            gsnap_valid: false,
             dmtpk,
             dmtpv,
             dmtpp,
@@ -537,6 +548,42 @@ impl Exl3HipDecoder {
         self.hc.h2d(self.dpos, &0u32.to_le_bytes())?;
         self.hc.h2d(self.dpp, &0u32.to_le_bytes())?;
         self.hc.sync()
+    }
+
+    /// GDN 상태 저장(plans/130 D2 스펙 롤백) — 지속 스냅샷 버퍼(최초 1회
+    /// 할당 ~157MB, 재사용 — 라운드당 할당은 VRAM 고갈). 링+스캔 d2d + pos.
+    pub fn gdn_save(&mut self) -> Result<(), String> {
+        let ring_b = self.n_gdn * 3 * 10240 * 4;
+        let st_b = self.n_gdn * 48 * 16384 * 4;
+        if self.gsnap_ring.is_null() {
+            self.gsnap_ring = self.hc.alloc(ring_b)?;
+            self.gsnap_st = self.hc.alloc(st_b)?;
+        }
+        self.hc.d2d(self.gsnap_ring, self.dring, ring_b)?;
+        self.hc.d2d(self.gsnap_st, self.dgst, st_b)?;
+        let mut b = [0u8; 4];
+        self.hc.d2h(&mut b, self.dpos)?;
+        self.gsnap_dpos = u32::from_le_bytes(b);
+        self.gsnap_pos = self.pos;
+        self.gsnap_valid = true;
+        Ok(())
+    }
+
+    /// 저장 복원 + pos 되감기. KV는 pos 인덱스 쓰기라 되감기만으로
+    /// 무해(이후 쓰기가 덮어씀 — 인과적 write-before-read).
+    pub fn gdn_rollback(&mut self) -> Result<(), String> {
+        if !self.gsnap_valid {
+            return Err("gdn_rollback: 스냅샷 없음".into());
+        }
+        let ring_b = self.n_gdn * 3 * 10240 * 4;
+        let st_b = self.n_gdn * 48 * 16384 * 4;
+        self.hc.d2d(self.dring, self.gsnap_ring, ring_b)?;
+        self.hc.d2d(self.dgst, self.gsnap_st, st_b)?;
+        self.pos = self.gsnap_pos;
+        let d = self.gsnap_dpos.to_le_bytes();
+        self.hc.h2d(self.dpos, &d)?;
+        self.hc.h2d(self.dpp, &d)?;
+        Ok(())
     }
 
     /// 토큰 ID 직접 forward(임베딩 행을 디바이스에서 판독) — 단일 모델 상주용.
