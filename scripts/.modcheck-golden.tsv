@@ -15,6 +15,6 @@ exl3-vk-nrh	maxdiff	2.384000e-6	363
 exl3-vk-scan	maxdiff	3.099000e-6	1254
 q4-ar	maxdiff	1.234000e-5	8139
 q4-hc	maxdiff	1.490000e-5	8293
-q4-ple	maxdiff	0.000000e0	8432
+q4-ple	maxdiff	0.000000e0	8437
 q4-qsa	maxdiff	2.348000e-4	8240
 q4-vk-addrms	maxdiff	0.000000e0	103

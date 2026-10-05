@@ -138,12 +138,26 @@ pub fn ple_block(
                         let q_n =
                             super::hc::grouped_rms(&res_hc_v[ti], n_query, hc, n_embd, hp.eps);
                         // per-stream s = Σ key·query / √n_embd → sigmoid(sgn·√|s|)
+                        // dot은 GPU q4_ple_gate 워프판(f1176482)의 순서 미러 —
+                        // 32청크 순차 f32 부분합 + 레인순 f64 결합. 배치(CPU ple_block)와
+                        // 단일(GPU 프레임)의 비트동일 계약(prefill_multi n=1)이 이
+                        // 순서를 요구한다(규칙 10a — 같은 f32 클래스 내 환원 변경).
                         let mut gate = vec![0.0f32; hc];
                         for s in 0..hc {
-                            let mut dot = 0.0f32;
-                            for i in 0..n_embd {
-                                dot += k_n[s * n_embd + i] * q_n[s * n_embd + i];
+                            let chunk = n_embd.div_ceil(32);
+                            let mut pd = [0.0f32; 32];
+                            for lane in 0..32 {
+                                let lo = lane * chunk;
+                                let hi = (lo + chunk).min(n_embd);
+                                for i in lo..hi {
+                                    pd[lane] += k_n[s * n_embd + i] * q_n[s * n_embd + i];
+                                }
                             }
+                            let mut dsum = 0.0f64;
+                            for lane in 0..32 {
+                                dsum += pd[lane] as f64;
+                            }
+                            let mut dot = dsum as f32;
                             dot /= (n_embd as f32).sqrt();
                             let mag = dot.abs().max(1e-6).sqrt();
                             gate[s] = sigmoid(if dot >= 0.0 { mag } else { -mag });

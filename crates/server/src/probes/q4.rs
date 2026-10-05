@@ -9,6 +9,7 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     let d_q35 = crate::resource::DEFAULT_Q35_MODEL;
     let r: Result<String, String> = match cmd {
         "rawhip-check" => return Some(cmd_rawhip_check(args)),
+        "ple-gate-t-check" => llm170_backend_gpu::rawhip::q4acc::ple_gate_t_check(),
         "gpu-raw-probe" => llm170_backend_gpu::rawhip::raw_probe(arg_num(args, 0, 2000)),
         "launch-rate" => llm170_backend_gpu::rawhip::launch_rate(arg_num(args, 0, 20000)),
         "f16-bench" => llm170_backend_gpu::rawhip::f16_bench(
