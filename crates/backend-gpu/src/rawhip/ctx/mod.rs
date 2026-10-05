@@ -177,6 +177,10 @@ impl RawCtx {
             };
             let o1 = CString::new(format!("-I{inc}")).unwrap();
             let o2 = CString::new("--std=c++17").unwrap();
+            // -O3 확정(plans/130 원장): -O2 실험에서 exl3_gemv VGPR 112→43·2블록/CU
+            // 점유가 개션됐으나 gemv 137→140ms·tg 5.96→5.89로 미세 역행 — -O3의
+            // ILP가 실제 이득. 컴퓨트 바닥은 점유가 아니라 연산량(extract+decode
+            // ALU 체인, ISA 원장: 정수 곱셈계 ~190명령)임이 확정.
             let o3 = CString::new("-O3").unwrap();
             // FMA 수축 차단 — CPU 비트계약 (a+=b*c 축약이 비트 불일치,
             // 2026-09-03 AR xor RCA)
