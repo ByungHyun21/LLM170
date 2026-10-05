@@ -823,6 +823,28 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                             tilexp[tg] = e as u32;
                         }
                     }
+                    if llm170_diag::dump::opts().key("moe_pad") {
+                        // plans/133 A 진단: 실 라우팅의 패딩 폐기 분포 — 캐시 미스
+                        // (층당 첫 투영) 시에만 도달한다. rows_pad/rows 비가
+                        // 컴팩트 배치의 회복 상한을 정산한다(원장 1.158 vs
+                        // 라우터 텐서 형상 [2560,512] 모순 판별용).
+                        let mut under16 = 0usize;
+                        let mut seg_max = 0usize;
+                        let mut seg_sum = 0usize;
+                        for e in 0..ne {
+                            let r = off[e + 1] - off[e];
+                            if r < 16 {
+                                under16 += 1;
+                            }
+                            seg_max = seg_max.max(r);
+                            seg_sum += r;
+                        }
+                        eprintln!(
+                            "# moepad rows={rows} ne={ne} rows_pad={rows_pad} ratio={:.3} under16={under16} seg_max={seg_max} seg_avg={:.1}",
+                            rows_pad as f64 / rows.max(1) as f64,
+                            seg_sum as f64 / ne.max(1) as f64
+                        );
+                    }
                     let (ppd, ipd, txd) = {
                         let mut a = self.gp.lock().map_err(|e| e.to_string())?;
                         let ppd = a.ensure(&self.ctx, rows_pad * 4)? as u64;
@@ -980,7 +1002,43 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 let mut g = self.gyp.lock().map_err(|e| e.to_string())?;
                 g.ensure(&self.ctx, rows_pad * n_out * 4)?
             };
-            {
+            // plans/116-4 잠자는 WMMA 그룹 타일 가동 (plans/133 B): 16행 전문가
+            // 타일 × 128출력 f16 스테이징 WMMA — gm dot4(~1 TMAC/s)를 WMMA
+            // (~8 TMAC/s)로 대체. 타일 계약 동일(tile_exp·패딩 도메인)이라
+            // gather/scatter 무변경. 니블 인덱싱 결함은 w32m_d.cu에서 수리.
+            // A/B: LLM170_CO9_PATH=/dev/null → 비트 클리어 → 종전 gm 경로.
+            if self.ctx.co_loaded(crate::rawhip::CO_W32M) {
+                let mut x_p = xgp as *mut std::ffi::c_void;
+                let mut w_p = wd as *mut std::ffi::c_void;
+                let mut o_p = ygp as *mut std::ffi::c_void;
+                let mut tx_p = tilexp_d as *mut std::ffi::c_void;
+                let (mut ni, mut no, mut xw, mut tt, mut eb) = (
+                    n_in as i32,
+                    n_out as i32,
+                    xq_w as i32,
+                    rows_pad as i32,
+                    per_expert as i32,
+                );
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut tx_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                    (&mut no) as *mut _ as *mut std::ffi::c_void,
+                    (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                    (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                    (&mut eb) as *mut _ as *mut std::ffi::c_void,
+                ];
+                self.ctx.launch3(
+                    "gemm_q5_1_j128m",
+                    n_out.div_ceil(128).min(65535) as u32,
+                    rows_pad.div_ceil(16) as u32,
+                    1,
+                    256,
+                    &mut args,
+                )?;
+            } else {
                 let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
                 let mut x_p = xgp as *mut std::ffi::c_void;
                 let mut w_p = wd as *mut std::ffi::c_void;
@@ -1081,6 +1139,49 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     fnv(&pmf),
                     fnv(&ivf)
                 );
+            }
+            // plans/116-4 잠자는 WMMA 그룹 타일 가동 (plans/133 B) — q4k 변형은
+            // 원장 167에서 moe-row-check + 전모델 드리프트 ~3e-3(f16급) 검증
+            // 완료. 레이아웃 계약 동일(tilexp·패딩 도메인 gather).
+            if self.ctx.co_loaded(crate::rawhip::CO_W32M) {
+                let mut xm_p = xg as *mut std::ffi::c_void;
+                let mut wm_p = wd as *mut std::ffi::c_void;
+                let mut om_p = yg as *mut std::ffi::c_void;
+                let mut txm_p = tilexp_d as *mut std::ffi::c_void;
+                let (mut mi, mut mo, mut mw, mut mt, mut me) = (
+                    n_in as i32,
+                    n_out as i32,
+                    xq_w as i32,
+                    // 호스트 경로(프리필)의 xg/yg는 perm gather로 rows행만 —
+                    // t=rows(ge와 동일 가드). 디바이스 경로(rows_pad_d≠0)는
+                    // 패딩 도메인 rows_pad — 단 현재 디바이스 그룹화는 t=1 전용이라
+                    // 이 분기(dmmv 선행 반환)에는 도달하지 않는다(방어 분기).
+                    if rows_pad_d != 0 { rows_pad as i32 } else { rows as i32 },
+                    per_expert as i32,
+                );
+                let mut margs: Vec<*mut std::ffi::c_void> = vec![
+                    (&mut xm_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut wm_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut om_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut txm_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut mi) as *mut _ as *mut std::ffi::c_void,
+                    (&mut mo) as *mut _ as *mut std::ffi::c_void,
+                    (&mut mw) as *mut _ as *mut std::ffi::c_void,
+                    (&mut mt) as *mut _ as *mut std::ffi::c_void,
+                    (&mut me) as *mut _ as *mut std::ffi::c_void,
+                ];
+                self.ctx.launch3(
+                    "gemm_q4k_j128m",
+                    n_out.div_ceil(128).min(65535) as u32,
+                    rows_pad.div_ceil(16) as u32,
+                    1,
+                    256,
+                    &mut margs,
+                )?;
+                let scat = if pad_layout { inv_pad_d } else { inv_d };
+                self.rows_permute_dev(yg, scat as *mut u8, op_, n_out, rows)?;
+                self.moe_hash_check("gem", op_, rows, n_out)?;
+                return Ok(());
             }
             self.ctx.launch3(
                 "q4_gemm_q4k_ge",
