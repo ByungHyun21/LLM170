@@ -75,7 +75,7 @@ extern "C" __global__ void exl3_gemv(
     float* __restrict__ s,              // [nseg][n]
     int ktiles, int ntiles, int K)
 {
-    __shared__ unsigned stg[8 * 48];
+    __shared__ __align__(16) unsigned stg[8 * 48];
     __shared__ unsigned ahstg[8];
     int nt0 = blockIdx.x * 8;
     if (nt0 >= ntiles) return;
@@ -109,7 +109,12 @@ extern "C" __global__ void exl3_gemv(
         for (int ktl = 0; ktl < nk; ktl++) {
             long tbase = ((long)(kb + ktl) * ntiles + nt0) * words32;
             int ahb = ((kb + ktl) * 16) >> 1;
-            for (int w = tid; w < stg_words; w += 128) stg[w] = tre[tbase + w];
+            // plans/130: tre는 재사용 0 스트림 — 16B 백터 로드(__ldcs는 uint4 부재로 제외).
+            // stg_words=8*words32는 krate=4에서 256(1KB)이라 128스레드×2렬 — uint4로 1렬.
+            for (int w4 = tid * 4; w4 < stg_words; w4 += 128 * 4) {
+                uint4 v = *reinterpret_cast<const uint4*>(tre + tbase + w4);
+                *reinterpret_cast<uint4*>(&stg[w4]) = v;
+            }
             if (tid < 8) ahstg[tid] = ah16[ahb + tid];
             __syncthreads();
             const unsigned* tile = stg + ntl * words32;
@@ -181,7 +186,7 @@ __device__ __forceinline__ void gemv_m_core(
     float* __restrict__ s,
     int ktiles, int ntiles, int K)
 {
-    __shared__ unsigned stg[8 * 48];
+    __shared__ __align__(16) unsigned stg[8 * 48];
     __shared__ unsigned ahstg[8 * 8];
     int nt0 = blockIdx.x * 8;
     if (nt0 >= ntiles) return;
@@ -219,7 +224,12 @@ __device__ __forceinline__ void gemv_m_core(
         for (int ktl = 0; ktl < nk; ktl++) {
             long tbase = ((long)(kb + ktl) * ntiles + nt0) * words32;
             int ahb = ((kb + ktl) * 16) >> 1;
-            for (int w = tid; w < stg_words; w += 128) stg[w] = tre[tbase + w];
+            // plans/130: tre는 재사용 0 스트림 — 16B 백터 로드(__ldcs는 uint4 부재로 제외).
+            // stg_words=8*words32는 krate=4에서 256(1KB)이라 128스레드×2렬 — uint4로 1렬.
+            for (int w4 = tid * 4; w4 < stg_words; w4 += 128 * 4) {
+                uint4 v = *reinterpret_cast<const uint4*>(tre + tbase + w4);
+                *reinterpret_cast<uint4*>(&stg[w4]) = v;
+            }
             #pragma unroll
             for (int t = 0; t < TM; t++) {
                 if (tid < 8)
