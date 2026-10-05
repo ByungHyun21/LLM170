@@ -319,8 +319,11 @@ pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, 
             t_rows as i32,
         );
         let (mut g0, mut g1, mut g2) = (dah, dtre, dsb);
+        let dflush_m = hc.alloc(128 << 20)?;
         let mut tm: Vec<f64> = Vec::new();
         for _ in 0..3 {
+            hc.l2_flush(dflush_m, 128 << 20)?;
+            hc.sync()?;
             let t0 = std::time::Instant::now();
             hc.launch3(
                 "exl3_gemm2_mma",
@@ -392,7 +395,7 @@ pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, 
         }
         let tf2 = 2.0 * k as f64 * n as f64 * t_rows as f64 / 1e12;
         eprintln!(
-            "  [mmadbg] mma {:.1}ms = {:.1} TF · y-vs-ref maxdiff={mmd:.3e}",
+            "  [mmadbg] mma {:.1}ms(콜드 L2플러시) = {:.1} TF · y-vs-ref maxdiff={mmd:.3e}",
             tm[1],
             tf2 / (tm[1] / 1000.0)
         );
@@ -400,6 +403,9 @@ pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, 
     // gemv_m(plans/130) — 소형-T(≤8) m행 GEMV: kseg 대체 후보. 정합+속도 A/B.
     if t_rows <= 8 {
         let dbat = hc.alloc(t_rows * 16 * n * 4)?;
+        // L2 플러시 측정(plans/131 S10): 반복 사이 128MB memset으로 L2 교체 —
+        // 고립 측정의 웜 편향을 걷어내고 콜드 스트리밍 레이트를 잰다.
+        let dflush = hc.alloc(128 << 20)?;
         let (mut gkt, mut gnt, mut gkk, mut gtt) = (
             (k / 16) as i32,
             (n / 16) as i32,
@@ -409,6 +415,8 @@ pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, 
         let (mut a0, mut a1, mut a2) = (dah, dtre, dbat);
         let mut tg: Vec<f64> = Vec::new();
         for _ in 0..3 {
+            hc.l2_flush(dflush, 128 << 20)?;
+            hc.sync()?;
             let t0 = std::time::Instant::now();
             const GVM: [&str; 9] = [
                 "",
@@ -469,10 +477,10 @@ pub fn hip_gemm_check(dir: &str, key_sel: &str, t_arg: usize) -> Result<String, 
                 gmd = gmd.max((gmf[r * n + i] - want[si][i]).abs());
             }
         }
-        // 가중치 스트리밍 관점(GB/s): tre는 체인 전체에서 1회 판독.
+        // 가중치 스트리밍 관점(GB/s): tre는 체인 전체에서 1회 판독(콜드 — L2 플러시 후).
         let tre_gb = tre.len() as f64 / 1e9;
         eprintln!(
-            "  [gvmdbg] gemv_m T={t_rows}: {:.1}ms(중앙값) · tre {:.0}GB/s · y-vs-ref maxdiff={gmd:.3e}",
+            "  [gvmdbg] gemv_m T={t_rows}: {:.1}ms(중앙값, 콜드 L2플러시) · tre {:.0}GB/s · y-vs-ref maxdiff={gmd:.3e}",
             tg[1],
             tre_gb / (tg[1] / 1000.0),
         );

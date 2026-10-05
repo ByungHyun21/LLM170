@@ -40,7 +40,7 @@ pub fn hip_h_pair(dir: &str, tok: u32, steps: usize) -> Result<String, String> {
                 .max_by(|x, y| x.1.partial_cmp(y.1).unwrap())
                 .map(|(k, _)| k as u32)
                 .unwrap_or(0);
-            let d_b = dbat.mtp_draft_gpu(cur_b, &hb2, pos_b)?;
+            let (d_b, _) = dbat.mtp_draft_gpu(cur_b, &hb2, pos_b)?;
             tot_b += 1;
             if d_b == nxt_b {
                 hit_b += 1;
