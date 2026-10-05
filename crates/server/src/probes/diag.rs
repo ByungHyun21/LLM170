@@ -92,7 +92,6 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     Some(super::finish(r))
 }
 
-
 /// `llm170 diag chunk-check <model> <prompt> [sizes...] [--backend cpu]`
 /// 청크 불변성 자동 검증 (plans/83 C3, docs/chunk-invariance.md 계약).
 ///

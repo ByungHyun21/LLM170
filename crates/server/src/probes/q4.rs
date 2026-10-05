@@ -237,7 +237,6 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     Some(super::finish(r))
 }
 
-
 /// llm170 rawhip-check <file> <tensor> — 원시 HIP GEMV(quant·gemm·reduce)
 /// 대 CPU 레인 미러 to_bits 전행 검증 + 속도.
 fn cmd_rawhip_check(args: &[String]) -> ExitCode {
