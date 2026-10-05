@@ -10,9 +10,12 @@ mod exl3_hip_engine;
 mod http;
 mod infer;
 mod json;
+mod modcheck;
+mod oai;
 mod perplexity;
 mod probes;
 mod resource;
+mod sched;
 mod tokenize;
 mod unicode_data;
 mod vl;
@@ -38,7 +41,7 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
               [--n-predict N] [--ctx N] [--backend cpu|hip|vulkan] [--spec k]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
       --prompt-tokens 반복 = 병렬 시퀀스(np). --backend hip|vulkan: 원시 디코더 상주 디코드.
-  llm170 serve --model <file.gguf|exl3_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan|exl3] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
+  llm170 serve --model <file.gguf|exl3_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
       OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯(기본 1).
   llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
             [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
@@ -141,13 +144,11 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
                     "cuda" => {
                         return Err("--backend cuda: 미구현 (hip|vulkan 사용)".into());
                     }
-                    // EXL3 직접 경로 (plans/121 A1) — --model은 EXL3 디렉터리.
-                    "exl3-hip" => {
-                        ma.backend = Some("exl3-hip".into());
-                    }
-                    "exl3" => {
-                        ma.backend = Some("exl3".into());
-                        ma.gpu_runtime = None;
+                    // EXL3 백엔드값 폐지(사용자 지시 2026-10-05): --backend는
+                    // 런타임만(cpu|hip|vulkan|cuda). EXL3는 --model이 디렉터리면
+                    // 포맷 자동 판별로 라우팅된다.
+                    "exl3" | "exl3-hip" => {
+                        return Err("--backend exl3* 폐지: EXL3는 --model <EXL3 디렉터리>로 자동 판별 — --backend hip|vulkan|cpu".into());
                     }
                     // 하위호준 별칭 — 종전 2층(--backend gpu --gpu-runtime X) 폐지.
                     "gpu" => {
@@ -183,6 +184,19 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
 }
 
 fn main() -> ExitCode {
+    let code = run_main();
+    // A5(plans/129): 폴백 누계 종료 출력 — 카운터는 프로세스 로컬이라
+    // `llm170 diag fb`(신규 프로세스)는 향상 0건이다. 폴백이 일어난 바로 그
+    // 프로세스(infer·bench·프로브 등)가 자기 누계를 stderr에 남긴다.
+    // serve는 Ctrl-C로 즉사해 이 출력을 건너뜀 — serve 관측은 ONCE 로그가 담당.
+    let r = llm170_diag::fb::report();
+    if !r.is_empty() {
+        eprint!("[fb] 폴백 누계:\n{r}");
+    }
+    code
+}
+
+fn run_main() -> ExitCode {
     // plans/87 §2 — 와치독(스텔 보고·옵션 FAIL 자결).
     if let Some(v) = std::env::var("LLM170_WATCHDOG")
         .ok()
@@ -207,46 +221,22 @@ fn main() -> ExitCode {
         }
     };
     // 사전 리소스 가드(2026-09-16): 이중 적재로 호스트가 먹통되는 사고 방지.
-    // 모든 모델 적재 서브커맨드(serve/infer/vl/bench/check)를 커버한다:
-    //   - --model <v> / --model=<v> (serve·infer·vl·bench)
-    //   - check의 첫 비플래그 위치인자 (모델 경로)
-    //   - GPU 판정: --backend hip|vulkan (통합 1택, gpu-runtime 폐지); check는 기본이 gpu.
-    // gguf-dump·tokenize는 메타데이터만 읽는다(무게 미적재) — 가드 제외.
+    // 대상 판정은 resource::guard_target 순수함수(A2/R1 추출, plans/129) —
+    // 서브커맨드×인자 형태 계약은 표 테스트(guard_target_cases)가 고정하고
+    // 무가드 적재 프로브 폐쇄(A13)도 같은 표가 담당한다.
     if !matches!(
         args.first().map(String::as_str),
         Some("gguf-dump") | Some("tokenize")
     ) {
-        let sub = args.first().map(String::as_str);
-        let mut model = ma.model.clone();
-        // exl3·exl3-hip도 GPU 백엔드다(가드 VRAM 항 누락이 2026-10-05 서빙 경계
-        // 오탐의 원인 — 21.2 vs 21.2GiB 거부, plans/128 P0 검증 중 발견).
-        let mut gpu = matches!(
+        // 가드 대상 판정은 resource::guard_target 순수함수(A2/R1 추출, plans/129) —
+        // 표 테이블 테스트가 계약을 고정한다(무가드 프로브 폐쇄 A13 포함).
+        if let Some(gt) = resource::guard_target(
+            args.first().map(String::as_str).unwrap_or(""),
+            ma.model.as_deref(),
             ma.backend.as_deref(),
-            Some("gpu") | Some("exl3-hip") | Some("exl3")
-        ) || ma.gpu_runtime.is_some();
-        if sub == Some("check") {
-            gpu = true; // run_check의 백엔드 기본값이 gpu다.
-            if model.is_none()
-                && let Some(p) = ma.rest.iter().find(|a| !a.starts_with("--"))
-            {
-                model = Some(p.clone());
-            }
-        }
-        // 프로브(exl3-*·mmq 등)도 모델을 적재한다 — 첫 비플래그 인자가 경로.
-        // 2026-10-04 사고: exl3-hip-decode가 가드 밖에서 이중 적재 → 동결.
-        if let Some(sb) = sub
-            && sb.starts_with("exl3-")
-            && model.is_none()
-            && let Some(p) = ma
-                .rest
-                .iter()
-                .find(|a| !a.starts_with("--") && a.contains('/'))
-        {
-            model = Some(p.clone());
-            gpu = true;
-        }
-        if let Some(mp) = model
-            && let Err(e) = resource::preflight(std::path::Path::new(&mp), gpu)
+            ma.gpu_runtime.as_deref(),
+            &ma.rest,
+        ) && let Err(e) = resource::preflight(&gt.path, gt.gpu)
         {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
@@ -288,11 +278,11 @@ fn main() -> ExitCode {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
         Some("infer") => infer::cmd_infer(&ma.rest, &ma),
         Some("serve") => cmd_serve(&ma.rest, &ma),
-        Some("rawhip-check") => probes::run("rawhip-check", &args[1..]).unwrap(),
         Some("vl") => vl::cmd_vl(&ma.rest, &ma),
         Some("bench") => bench::cmd_bench(&ma.rest, &ma),
         Some("perplexity") => perplexity::cmd_perplexity(&ma.rest, &ma),
         Some("check") => probes::run_check(&args[1..]),
+        Some("mod-check") => modcheck::cmd_mod_check(&args[1..]),
         Some("tokenize") => cmd_tokenize(&ma),
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
         Some("dequant") => cmd_dequant(&args[1..]),
@@ -345,6 +335,12 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let Some(model_path) = ma.model.clone().map(PathBuf::from) else {
         return usage_err("--model required");
     };
+    // A12(plans/129): exl3-hip 엔진은 단일 슬롯 — --slots>1이 슬롯 생성 시점의
+    // 점유 슬롯 reset으로 교묘하게 상태를 파괴했다(엔진 코드는 대응하지만
+    // 진입에서 거부하는 게 계약상 정확). vk 엔진은 다중 슬롯 지원 — 제외.
+    if model_path.is_dir() && gpu_runtime != "vulkan" && slots.unwrap_or(1) > 1 {
+        return usage_err("EXL3 hip 백엔드는 단일 슬롯만 지원 — --slots 1");
+    }
     if spec_k > 0 {
         // GPU 스펙 경로 강제 (스레드 기동 전 단일 스레드 시점 env 설정).
         // 안전성: 이 시점은 단일 스레드 (엔진/슬롯 스레드 기동 전).
@@ -376,6 +372,12 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         eprintln!("error: tokenizer load 실패(5회 재시도) — serve 텍스트 요청에 필수");
         return ExitCode::FAILURE;
     };
+    // A19(plans/129): load는 어느 파트에도 토크나이저가 없으면 Ok(empty)를
+    // 돌려준다 — Some(empty) 통과가 쓰레기 스트림을 뿜었다. 치명 오류로.
+    if tok.is_empty() {
+        eprintln!("error: 토크나이저 비음(어느 파트에도 없음) — serve 텍스트 요청에 필수");
+        return ExitCode::FAILURE;
+    }
     let _ = engine::TOKENIZER.set(tok);
     let req = engine::InferRequest {
         model: model_path.clone(),
@@ -384,10 +386,19 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         ple_table: ma.ple_table.clone(),
         ple_cache_mib: ma.ple_cache_mib,
     };
-    let sel = if backend == "exl3-hip" {
-        engine::BackendSel::Exl3Hip
-    } else if backend == "exl3" {
-        engine::BackendSel::Exl3
+    // 포맷 자동 판별(사용자 계약 2026-10-05): 모델 경로가 디렉터리(EXL3
+    // 아카이브)면 --backend 런타임(hip|vulkan)으로 EXL3 엔진을 고른다.
+    // cpu+디렉터리는 명확한 에러(무음 Q4 로드 실패 방지).
+    if model_path.is_dir() && backend != "gpu" {
+        eprintln!("error: EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan");
+        return ExitCode::FAILURE;
+    }
+    let sel = if model_path.is_dir() {
+        if gpu_runtime == "vulkan" {
+            engine::BackendSel::Exl3
+        } else {
+            engine::BackendSel::Exl3Hip
+        }
     } else if backend == "gpu" {
         if gpu_runtime.is_empty() {
             engine::BackendSel::Gpu
@@ -424,10 +435,30 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
         }
     };
     let no_special = ma.rest.iter().any(|a| a == "--no-special");
+    // A20(plans/129): 위치인자만 준 사용자에게 stdin 판독 무응답처럼 보였다
+    // (원장 기록 ⑧) — usage 에러로. --text/--file 값 부재(마지막 인자)도
+    // 빈 문자열 조용 인코딩 대신 에러.
+    let has_text = ma.rest.iter().any(|a| a == "--text");
+    let has_file = ma.rest.iter().any(|a| a == "--file");
+    if !has_text && !has_file && ma.rest.iter().any(|a| !a.starts_with("--")) {
+        eprintln!(
+            "error: 텍스트는 --text <문자열> 또는 --file <경로>로 전달 (위치인자는 무시됩니다)"
+        );
+        return ExitCode::FAILURE;
+    }
+    // 플래그도 위치인자도 없으면 stdin 합법 사용 — 계속 진행.
     let text = if let Some(i) = ma.rest.iter().position(|a| a == "--text") {
-        ma.rest.get(i + 1).cloned().unwrap_or_default()
+        let Some(v) = ma.rest.get(i + 1) else {
+            eprintln!("error: --text requires a value");
+            return ExitCode::FAILURE;
+        };
+        v.clone()
     } else if let Some(i) = ma.rest.iter().position(|a| a == "--file") {
-        let p = ma.rest.get(i + 1).cloned().unwrap_or_default();
+        let Some(p) = ma.rest.get(i + 1) else {
+            eprintln!("error: --file requires a path");
+            return ExitCode::FAILURE;
+        };
+        let p = p.clone();
         match std::fs::read_to_string(&p) {
             Ok(t) => t,
             Err(e) => {
@@ -560,7 +591,9 @@ fn cmd_dequant(args: &[String]) -> ExitCode {
     }
     let mut out = vec![0.0f32; k as usize];
     llm170_core::quant::dequant_row(t.ty, &buf, 0, k, &mut out);
-    let vals: Vec<String> = out[..n].iter().map(|v| format!("{v:.6}")).collect();
+    // A21b(plans/129): n>k 슬라이스 패닉 — 클램프(k가 실제 상한).
+    let show = n.min(k as usize);
+    let vals: Vec<String> = out[..show].iter().map(|v| format!("{v:.6}")).collect();
     println!("[{}] row {row}: {}", t.ty.name(), vals.join(", "));
     ExitCode::SUCCESS
 }

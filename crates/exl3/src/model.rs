@@ -390,7 +390,7 @@ mod tests {
     /// mmap 뷰 ↔ 파일 판독(Exl3Linear) 교차검증 — 픽스처 게이트.
     #[test]
     fn mmap_matches_file_read() {
-        let Ok(dir) = std::env::var("LLM170_M27_EXL3") else {
+        let Some(dir) = llm170_diag::flag::val("LLM170_M27_EXL3") else {
             return;
         };
         let m = Exl3Model::open(std::path::Path::new(&dir)).unwrap();

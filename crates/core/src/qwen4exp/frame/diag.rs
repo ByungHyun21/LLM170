@@ -21,9 +21,8 @@ pub(super) fn ftime_on() -> bool {
 
 /// 진단용 스테이지 스킵(LLM170_STAGE_SKIP="qsa,gdn,moe") — 비용 분해 전용.
 pub fn stage_skipped(name: &str) -> bool {
-    std::env::var("LLM170_STAGE_SKIP")
-        .map(|v| v.split(',').any(|x| x.trim() == name))
-        .unwrap_or(false)
+    llm170_diag::flag::val("LLM170_STAGE_SKIP")
+        .is_some_and(|v| v.split(',').any(|x| x.trim() == name))
 }
 
 /// 107 W6: 진단 침투 정리 — `ck!(acc, il, buf, n, t, "tag")`가 게이트

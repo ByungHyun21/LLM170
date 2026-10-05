@@ -145,7 +145,10 @@ fn perplexity_cpu(model_path: &str, prompt: &[u32]) -> ExitCode {
     }
 
     let n_eval = token_logprobs.len();
-    let ppl = total_nll.exp();
+    // A16(plans/129): ppl = exp(평균 NLL)이 표준 정의 — 종전 exp(총합)은
+    // 토큰 수에 비례해 부푸는 값이었다. (프롬프트 NLL 포함 실험 정의는 유지하되
+    // 토큰 수가 함께 출력되니 해석 가능하다.)
+    let ppl = (total_nll / n_eval.max(1) as f64).exp();
     println!("perplexity: n_eval={n_eval} total_nll={total_nll:.4} ppl={ppl:.4}");
     for (i, (tok, lp)) in token_logprobs.iter().enumerate() {
         println!("  [{i}] token={tok} logprob={lp:.4}");

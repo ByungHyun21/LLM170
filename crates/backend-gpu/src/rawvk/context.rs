@@ -140,7 +140,7 @@ impl VkCtx {
             if exts
                 .iter()
                 .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::pipeline_robustness::NAME))
-                && std::env::var("LLM170_VK_NOROBUST").as_deref() != Ok("1")
+                && llm170_diag::flag::val("LLM170_VK_NOROBUST") != Some("1")
             // plans/87 §1 — OOB 접근이 실제 폴트로 터지게 하는 개발 스위치
             // (기본 robustness는 클램프로 조용히 넘긴다 — 폴트 프로브용).
             {
@@ -801,7 +801,9 @@ impl VkCtx {
                 .memory(b.mem)
                 .offset(0)
                 .size(bytes as u64);
-            let _ = self.device.flush_mapped_memory_ranges(&[range]);
+            if let Err(e) = self.device.flush_mapped_memory_ranges(&[range]) {
+                eprintln!("[vk] flush_mapped_memory_ranges 실패(스테일 뷰 위험): {e}");
+            }
         }
     }
 
@@ -813,7 +815,9 @@ impl VkCtx {
                 .memory(b.mem)
                 .offset(0)
                 .size(bytes as u64);
-            let _ = self.device.invalidate_mapped_memory_ranges(&[range]);
+            if let Err(e) = self.device.invalidate_mapped_memory_ranges(&[range]) {
+                eprintln!("[vk] invalidate_mapped_memory_ranges 실패(스테일 뷰 위험): {e}");
+            }
         }
     }
 
@@ -1572,7 +1576,9 @@ impl VkCtx {
                 .memory(b.mem)
                 .offset(offset as u64)
                 .size(bytes as u64);
-            let _ = self.device.flush_mapped_memory_ranges(&[range]);
+            if let Err(e) = self.device.flush_mapped_memory_ranges(&[range]) {
+                eprintln!("[vk] flush_mapped_memory_ranges 실패(스테일 뷰 위험): {e}");
+            }
         }
     }
 
@@ -1583,7 +1589,9 @@ impl VkCtx {
                 .memory(b.mem)
                 .offset(offset as u64)
                 .size(bytes as u64);
-            let _ = self.device.invalidate_mapped_memory_ranges(&[range]);
+            if let Err(e) = self.device.invalidate_mapped_memory_ranges(&[range]) {
+                eprintln!("[vk] invalidate_mapped_memory_ranges 실패(스테일 뷰 위험): {e}");
+            }
         }
     }
 }

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# A21g(plans/129): hipconfig PATH 자립(무출력 rc=1 즉사 방지)
+if [ -d /opt/rocm-10.0.0/install/bin ]; then
+    export PATH=/opt/rocm-10.0.0/install/bin:$PATH
+fi
 # W10 프리플라이트 — 커밋 전 로컬 검증 단일 진실 공급원 (plans/107)
 #
 # 검증: (1) rustfmt, (2) clippy -D warnings, (3) cargo 경고 0,
@@ -36,6 +40,9 @@ for comp in crates/backend-gpu/src/rawvk/spv/*.comp; do
         echo "  stale: ${comp##*/}"; stale=$((stale+1))
     fi
 done
+# A17(plans/129): stale이 fail로 연결되지 않아 미컴파일/갱신 미반영 .comp가
+# preflight를 통과했다 — 카운터를 판정에 연결.
+if [[ $stale -gt 0 ]]; then echo "FAIL — spv stale ${stale}건"; fail=1; fi
 if ! python3 scripts/spv-manifest.py --check; then fail=1; fi
 
 echo "== 5/6 env 동치 (108 P1) =="

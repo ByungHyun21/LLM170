@@ -229,8 +229,9 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.step_batch(seq, pos0, emb)?;
         let r = ds.read_logits();
-        if let (Some(path), Ok(v)) = (std::env::var_os("LLM170_DUMP_LOGITS"), r.as_ref()) {
-            let _ = std::fs::write(&path, bytemuck::cast_slice(v));
+        if let (Some(path), Ok(v)) = (llm170_diag::dump::opts().key_arg("dump_logits"), r.as_ref())
+        {
+            let _ = std::fs::write(path, bytemuck::cast_slice(v));
         }
         if env_on("LLM170_RAWHIP_TIMING") {
             eprintln!(
@@ -692,9 +693,7 @@ impl DecodeState {
         // q6=1<<2, iq4xs=1<<11). plans/79 C: NO_MMQ·Q8MMQ·Q1MMQ·DEQ16 실험 게이트
         // 폐기 — K계열 MMQ(t≥32·CO 로드)가 확정 경로다.
         // plans/73 우선순위 수정 계승: t 게이트·CO 검사는 분기 공통 적용.
-        let only = std::env::var("LLM170_MMQ_ONLY")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok());
+        let only = llm170_diag::flag::val("LLM170_MMQ_ONLY").and_then(|v| v.parse::<u32>().ok());
         if (only.is_none() || only.is_some_and(|m| m & (1u32 << (ty - 12)) != 0))
             && matches!(ty, 12 | 13 | 14 | 23)
             && (t >= 32 || self.pin_prefill.get())
@@ -713,8 +712,7 @@ impl DecodeState {
     fn trace_il(&self) -> usize {
         static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *V.get_or_init(|| {
-            std::env::var("LLM170_MS_IL")
-                .ok()
+            llm170_diag::flag::val("LLM170_MS_IL")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4)
         })
@@ -724,7 +722,8 @@ impl DecodeState {
     fn tracing(&self) -> bool {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| {
-            llm170_diag::dump::opts().key("ms_trace") || llm170_diag::dump::opts().key("ms_dump")
+            llm170_diag::dump::opts().key("ms_trace")
+                || llm170_diag::dump::opts().key_arg("ms_dump").is_some()
         })
     }
 
@@ -737,7 +736,7 @@ impl DecodeState {
         t: usize,
     ) -> Result<(), String> {
         if !llm170_diag::dump::opts().key("ms_trace")
-            && std::env::var_os("LLM170_MS_DUMP").is_none()
+            && llm170_diag::dump::opts().key_arg("ms_dump").is_none()
         {
             return Ok(());
         }
@@ -745,7 +744,7 @@ impl DecodeState {
         self.ctx.sync()?;
         self.ctx
             .d2h(bytemuck::cast_slice_mut(&mut buf).as_mut(), ptr)?;
-        if let Some(dir) = std::env::var_os("LLM170_MS_DUMP") {
+        if let Some(dir) = llm170_diag::dump::opts().key_arg("ms_dump") {
             // plans/84 A: 스테이지 버퍼 원본 비트 덤프 — 청크 A/B 비트 비교용.
             // 호출 시퀀스 번호 병기: 내부 청킹의 콜별 파일 보존.
             static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

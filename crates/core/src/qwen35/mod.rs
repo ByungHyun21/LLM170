@@ -18,6 +18,7 @@ mod dispatch;
 use dispatch::{Acc, mm, mm_batch, mm_group};
 mod diag;
 pub(crate) mod frame;
+pub const EOS_EOT: u32 = 248044;
 pub mod hparams;
 pub mod prefill;
 pub mod rawinject;
@@ -154,6 +155,21 @@ impl Model {
         };
         for name in ["token_embd.weight", "output.weight", "output_norm.weight"] {
             m.w(name).ok_or(ModelError::MissingTensor(name.into()))?;
+        }
+        // A7(plans/129): dequant_row 미지원 타입이 런타임 첫 역양자화에서
+        // unimplemented!로 죽던 것을 로드에서 거부(embd/output만 dequant_row 경로).
+        for name in ["token_embd.weight", "output.weight"] {
+            let t = m
+                .gguf
+                .find_tensor(name)
+                .ok_or(ModelError::MissingTensor(name.into()))?;
+            if !crate::quant::deq::dequant_supported(t.ty) {
+                return Err(ModelError::UnsupportedLayout {
+                    name: name.into(),
+                    why: "dequant_row 미지원 양자 타입",
+                }
+                .into());
+            }
         }
         Ok(m)
     }
@@ -484,7 +500,7 @@ impl Engine {
                 }
             }
             let ffn_residual = xs.clone();
-            if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+            if llm170_diag::dump::opts().key("debug_layers") {
                 let sum: f64 = xs[0].iter().map(|&v| v as f64).sum();
                 eprintln!("  A{il} xs sum={sum:.6}");
             }
@@ -557,7 +573,7 @@ impl Engine {
                     xs[t][i] += ffn_residual[t][i];
                 }
             }
-            if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+            if llm170_diag::dump::opts().key("debug_layers") {
                 let m = xs[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let nan = xs[0].iter().any(|v| v.is_nan());
                 let v4: Vec<String> = xs[0][..4].iter().map(|v| format!("{v:.5}")).collect();
@@ -583,7 +599,7 @@ impl Engine {
             let h = rms_norm(last, &out_norm, hp.eps);
             let mut logits = vec![0.0f32; head.n_out as usize];
             mm(&acc, &h, &head, &mut logits)?;
-            if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+            if llm170_diag::dump::opts().key("debug_layers") {
                 let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let nan = logits.iter().any(|v| v.is_nan());
                 eprintln!("logits: max={m:.4} nan={nan} argmax={}", greedy(&logits));
@@ -651,9 +667,7 @@ impl Engine {
         // 원시 HIP 디코드 (t=1 단일) — LLM170_RAWHIP=1, 최우선 게이트.
         if tokens.len() == 1
             && seq_ids.len() == 1
-            && std::env::var("LLM170_RAWHIP")
-                .map(|v| v != "0")
-                .unwrap_or(true)
+            && llm170_diag::flag::ne0("LLM170_RAWHIP")
             && let Some(rd) = self.raw_decode.as_ref()
         {
             let seq = seq_ids[0];
@@ -685,7 +699,7 @@ impl Engine {
             } else {
                 rd.raw_step(seq, pos, &row).map_err(ModelError::Accel)?
             };
-            if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+            if llm170_diag::dump::opts().key("debug_layers") {
                 let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let nan = logits.iter().any(|v| v.is_nan());
                 eprintln!("logits: max={m:.4} nan={nan} argmax={}", greedy(&logits));
@@ -697,7 +711,7 @@ impl Engine {
         if tokens.len() == 1
             && seq_ids.len() == 1
             && self.acc.is_some()
-            && std::env::var("LLM170_FRAME35").is_ok_and(|v| v != "0")
+            && llm170_diag::flag::on_nonzero("LLM170_FRAME35")
         {
             let logits = self.decode1_frame(seq_ids[0], tokens[0])?;
             self.seqs[seq_ids[0]].pos += 1;
@@ -707,9 +721,7 @@ impl Engine {
         if tokens.len() > 1
             && seq_ids.len() > 1
             && self.raw_decode.is_some()
-            && std::env::var("LLM170_RAWHIP")
-                .map(|v| v != "0")
-                .unwrap_or(true)
+            && llm170_diag::flag::ne0("LLM170_RAWHIP")
         {
             let rd = self.raw_decode.clone().unwrap();
             let n = self.model.hp.n_embd;
@@ -750,9 +762,7 @@ impl Engine {
         if tokens.len() > 1
             && seq_ids.len() > 1
             && self.raw_decode.is_some()
-            && std::env::var("LLM170_RAWHIP")
-                .map(|v| v != "0")
-                .unwrap_or(true)
+            && llm170_diag::flag::ne0("LLM170_RAWHIP")
         {
             let rd = self.raw_decode.clone().unwrap();
             let n = self.model.hp.n_embd;

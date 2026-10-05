@@ -109,8 +109,7 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
     // ── GPU ──
     let mut ctx = VkCtx::new()?;
     // k-분할 세그먼트 수(그리드 y) — 1이면 단일(비분할과 동일).
-    let nseg: u32 = std::env::var("LLM170_EXL3_KSEG")
-        .ok()
+    let nseg: u32 = llm170_diag::flag::val("LLM170_EXL3_KSEG")
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
 
@@ -128,6 +127,13 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
     // 디버그 우회: had_in 스킵·CPU ah 직접 업로드 — 스테이지 격리.
     let had_cpu = llm170_diag::flag::eq1("LLM170_EXL3_HADCPU");
     if had_cpu {
+        // A5(plans/129): 검증 하네스의 GPU had_in 우회도 폴백 원장 등재 —
+        // 하네스 경로 전환이 "커널 결함"으로 오독된 사고(127-A dah 오염) 클래스.
+        llm170_diag::fb::incr("exl3-hadcpu");
+        static ONCE_HADCPU: std::sync::Once = std::sync::Once::new();
+        ONCE_HADCPU.call_once(|| {
+            eprintln!("[fb] exl3-hadcpu: LLM170_EXL3_HADCPU=1 — had_in CPU 우회(진단 경로)");
+        });
         let mut ahp = vec![0u8; k * 2];
         for i in 0..k {
             ahp[2 * i..2 * i + 2].copy_from_slice(&f16::from_f32(ah[i]).to_bits().to_le_bytes());

@@ -563,7 +563,7 @@ impl Engine {
                     n,
                 },
             )?;
-            if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+            if llm170_diag::dump::opts().key("debug_layers") {
                 let mut hv = vec![0.0f32; n];
                 acc.frame_read(f.xs, &mut hv).map_err(ModelError::Accel)?;
                 let m = hv.iter().fold(0.0f32, |a, v| a.max(v.abs()));

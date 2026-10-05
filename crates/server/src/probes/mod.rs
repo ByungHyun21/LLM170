@@ -1,0 +1,61 @@
+//! 원오프 GPU 프로브/체크 서브커맨드 — main.rs에서 이관(plans/35 P4).
+//! 본체는 backend-gpu(rawhip 프로브 fn, rawvk check fn)에 있고 여기는
+//! 인자 파싱+호출만. 결론난 A/B 하니스(batch-abtest·tree-test·q6k-abtest·
+//! exp-ab)는 2026-09-08 폐기.
+use std::process::ExitCode;
+
+/// 위치 인자 규약 헬퍼 (plans/109 P5) — `args[i] | default` 파싱이
+/// 디스패치 전체에 ~30번 손베껴져 있었다. 프로브 전용(경로/텐서명/수치).
+pub(crate) fn arg_str(args: &[String], i: usize, d: &str) -> String {
+    args.get(i).cloned().unwrap_or_else(|| d.into())
+}
+pub(crate) fn arg_num<T: std::str::FromStr>(args: &[String], i: usize, d: T) -> T {
+    args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+// ## 프로브 하네스 저작 원칙 (A10, plans/129 — 사고 4건+회귀루프 5건의 교훈)
+//
+// 검증 하네스 자체가 결함을 만든 클래스: ① 선행 단계의 공유 버퍼 오염
+// (dah 행0 — "WMMA 행0 오염" 3일 오답의 진범) ② 하네스의 이중 상태 진입
+// (sec9c 이중 frame_begin 스테일 판독) ③ 하네스 비정렬(hcmp 토큰/위치)
+// ④ 하네스 형상 하드코딩(dsb 16행·ffn 부분적재 경계). 새 프로브 작성 시:
+// 1. 선행 단계가 공유 버퍼(dah/dsb/dq2…)를 덮어쓰는지 먼저 점검 — 전용
+//    버퍼(dah5 선례)로 분리.
+// 2. 형상은 하드코딩 금지 — 전 선형 메타에서 자동 열거(t·krate·S0≠0
+//    합성/실캡처). "모듈 완성" = 격리 검증 PASS + 전 형상 스윕 + 헤더
+//    corr·속도 기입 + covered_by 등재(A22)까지. 미완 모듈을 다음 스텝에
+//    끌고 가면 조립 단계에서 역행 루프(conv 오프셋·l2perm·nw127·KV ctx).
+// 3. 상태 경로 버그는 S0=0 합성이 숨긴다 — 비영 초기 상태 필수.
+// 4. 캡처-재생 3방향(커널 vs f32 미러 vs core 기준)이 국소화의 표준.
+// 5. 종단 최종 상태가 버전 간 유일 불변량(형상이 다르면 중간값 비교 무의미).
+
+mod diag;
+mod exl3;
+mod misc;
+mod q4;
+
+pub use q4::run_check;
+
+/// 프로브 커맨드이면 실행해 Some(코드) 반환, 아니면 None.
+/// R2③(플랜 129): 단일 match는 그룹 디스패치 체인으로 — arm 본문은 각
+/// 그룹 파일에 무변경 이동. special() 출력 특수 arm은 misc/q4가 편입.
+pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
+    diag::try_run(cmd, args)
+        .or_else(|| q4::try_run(cmd, args))
+        .or_else(|| exl3::try_run(cmd, args))
+        .or_else(|| misc::try_run(cmd, args))
+}
+
+/// Result<String, String> → ExitCode 공통 변환(구 run() 테일).
+pub(crate) fn finish(r: Result<String, String>) -> ExitCode {
+    match r {
+        Ok(msg) => {
+            println!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}

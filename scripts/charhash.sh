@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# A21g(plans/129): hipconfig PATH 자립(무출력 rc=1 즉사 방지)
+if [ -d /opt/rocm-10.0.0/install/bin ]; then
+    export PATH=/opt/rocm-10.0.0/install/bin:$PATH
+fi
 # W10 특성화 해시 — 스테이지별 golden bufhash/체크섬 캡처·검증 (plans/107)
 #
 # 용도: 대규모 삭제·이동 리팩터 각 단계가 '스테이지 수준'에서 비트동일임을

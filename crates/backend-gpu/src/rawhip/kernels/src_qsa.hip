@@ -1711,3 +1711,41 @@ extern "C" __global__ void __launch_bounds__(64) qsa_flash_wmma2v2(
         pb[hd + 1] = srow;
     }
 }
+
+// ── 직렬 참조판(plans/129 잔계 RCA — 워프판 대조용, f1176482 직전 판) ──
+extern "C" __global__ void __launch_bounds__(256) q4_ple_gate_serial(
+        const float* __restrict__ res, const float* __restrict__ key,
+        const float* __restrict__ value,
+        const float* __restrict__ nk, const float* __restrict__ nq,
+        const float* __restrict__ nc,
+        float* __restrict__ gated_hist, float* __restrict__ gate_out,
+        float eps, int n_embd, int hc, int t) {
+    const int s = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int ti = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    if (s >= hc || ti >= t || lane != 0) return;
+    const float* ks_row = key + (size_t)ti * hc * n_embd + (size_t)s * n_embd;
+    const float* rs_row = res + (size_t)ti * hc * n_embd + (size_t)s * n_embd;
+    const float sk = ple_rms_scale(ks_row, n_embd, eps);
+    const float sq = ple_rms_scale(rs_row, n_embd, eps);
+    // dot: k_n[i]·q_n[i] 를 i 오름차순 f32 직렬 누산(호스트와 동일).
+    // k_n[i] = (key[i]·sk)·nk[i] — 저장 없이 동일 반올림 사슬로 재현.
+    float dot = 0.0f;
+    const float* nk_s = nk + (size_t)s * n_embd;   // 노름 가중치는 스트림별 슬라이스
+    const float* nq_s = nq + (size_t)s * n_embd;
+    for (int i = 0; i < n_embd; i++) {
+        const float a = (ks_row[i] * sk) * nk_s[i];
+        const float b = (rs_row[i] * sq) * nq_s[i];
+        dot += a * b;
+    }
+    dot /= (float)sqrt((float)n_embd);
+    const float mag = fmaxf(fabsf(dot), 1e-6f);
+    const float g = 1.0f / (1.0f + exp_cr_exact(dot >= 0.0f ? -sqrtf(mag) : sqrtf(mag)));
+    gate_out[(size_t)ti * hc + s] = g;
+    // gated = value·gate → rms(n_conv). value는 [t][n_embd] 스트림 공유.
+    const float* val = value + (size_t)ti * n_embd;
+    float* out = gated_hist + (size_t)ti * hc * n_embd + (size_t)s * n_embd;
+    for (int i = 0; i < n_embd; i++) out[i] = val[i] * g;
+    const float sg = ple_rms_scale(out, n_embd, eps);
+    for (int i = 0; i < n_embd; i++) out[i] = out[i] * sg * nc[(size_t)s * n_embd + i];
+}

@@ -335,6 +335,13 @@ impl Tokenizer {
         Self::from_parts(&vocab, bpe_ranks, special, Vec::new(), pre, ignore_merges)
     }
     /// 토큰 조각의 원 바이트열 (바이트 수준 BPE 역매핑).
+    /// 어휘 비었는지(A19, plans/129) — part1/part2 어느 쪽에도 토크나이저가
+    /// 없으면 load가 Ok(empty)를 돌려주므로 serve 텍스트 요청에 치명 여부를
+    /// 호출자가 판정해야 한다.
+    pub fn is_empty(&self) -> bool {
+        self.vocab.is_empty()
+    }
+
     pub fn piece_bytes(&self, tok: u32) -> Vec<u8> {
         self.vocab
             .get(tok as usize)

@@ -16,7 +16,7 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let gpu_runtime = ma
         .gpu_runtime
         .clone()
-        .or_else(|| std::env::var("LLM170_GPU_RUNTIME").ok())
+        .or_else(|| llm170_diag::flag::val("LLM170_GPU_RUNTIME").map(str::to_string))
         .unwrap_or_else(|| "hip".into());
     let mut spec_k = 0usize;
     // 장문·임의 질문 지원 (plans/28): prefix는 vision_start 앞, question은
@@ -172,7 +172,10 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             match v {
                 Ok(rows) => rows,
                 Err(e) => {
-                    eprintln!("vit gpu: {e} — CPU 폴백");
+                    // A21d(plans/129): 폴백 관측성 — A5부터 diag 공유 원장(diag fb)
+                    // 적립(누적 {n}회 로그 관례 유지).
+                    let n = llm170_diag::fb::incr("vl-vit");
+                    eprintln!("vit gpu: {e} — CPU 폴백 (누적 {n}회)");
                     match clip.encode(&px, tw, th) {
                         Ok(r) => r,
                         Err(e) => {
@@ -196,7 +199,7 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             vis.len(),
             t0.elapsed().as_secs_f64()
         );
-        if std::env::var_os("LLM170_VIS_HASH").is_some() {
+        if llm170_diag::dump::opts().key("vis_hash") {
             let mut x: u64 = 0x9E3779B97F4A7C15;
             for row in &vis[..vis.len().min(2)] {
                 for &v in row[..row.len().min(256)].iter() {
@@ -230,7 +233,7 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         )
         .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
     }
-    let eos = 248044u32;
+    let eos = llm170_core::qwen35::EOS_EOT;
     let t1 = std::time::Instant::now();
     let mut last_logits = Vec::with_capacity(n_img);
     for s in 0..n_img {

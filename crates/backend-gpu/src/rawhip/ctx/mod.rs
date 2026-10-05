@@ -156,8 +156,8 @@ impl RawCtx {
             }
             // LLM170_HIP_INC: hipconfig 서브프로세스 없이 include 경로를 준다
             // (rocprof 등 서브프로세스를 방해하는 도구 아래에서 필요).
-            let inc = match std::env::var_os("LLM170_HIP_INC") {
-                Some(v) => v.to_string_lossy().into_owned(),
+            let inc = match llm170_diag::flag::val("LLM170_HIP_INC") {
+                Some(v) => v.to_string(),
                 None => cubecl_hip_sys::get_hip_include_path().map_err(|e| e.to_string())?,
             };
             let o1 = CString::new(format!("-I{inc}")).unwrap();
@@ -319,9 +319,9 @@ impl RawCtx {
                     ),
                 ];
                 for (bit, env_key, embedded, names) in slots {
-                    let bytes: Vec<u8> = match std::env::var_os(env_key) {
+                    let bytes: Vec<u8> = match llm170_diag::flag::val(env_key) {
                         Some(p) => {
-                            std::fs::read(&p).map_err(|e| format!("{env_key} 읽기({p:?}): {e}"))?
+                            std::fs::read(p).map_err(|e| format!("{env_key} 읽기({p}): {e}"))?
                         }
                         None => embedded.to_vec(),
                     };

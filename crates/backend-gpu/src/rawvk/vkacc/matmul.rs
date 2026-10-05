@@ -855,7 +855,7 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
         let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
         self.quant_upload(&mut ctx, xs, n_in, xq)?;
         // 배치: 모든 가중 GEMV 녹화 → 단일 제출 → 일괄 다운로드 (plans/19)
-        let do_batch = std::env::var_os("LLM170_VK_NOBATCH").is_none();
+        let do_batch = !llm170_diag::flag::on("LLM170_VK_NOBATCH");
         if do_batch {
             ctx.begin_batch()?;
         }
@@ -1147,8 +1147,7 @@ impl VkAcc {
                                     && t >= 128
                                     && !hout
                                     && n_out
-                                        <= std::env::var("LLM170_VK_Q8KS_MAX")
-                                            .ok()
+                                        <= llm170_diag::flag::val("LLM170_VK_Q8KS_MAX")
                                             .and_then(|v| v.parse::<usize>().ok())
                                             // plans/105: 기본 512 — 0.28nat 드리프트
                                             // (f32s 밴드)·skinny −19%·스킵 20스텝 불변.
@@ -1327,8 +1326,7 @@ impl VkAcc {
                         // 승격(2026-09-25, f64 참조에 더 근사·llama.cpp와 동일
                         // 클래스의 실행치 양자화). 킬스위치 =0.
                         if (dty == 0 || dty == 1)   // plans/105 잔여: bf16 f16입력 분기 폐지
-                            && n_out <= std::env::var("LLM170_VK_FT32S_MAX")
-                                .ok()
+                            && n_out <= llm170_diag::flag::val("LLM170_VK_FT32S_MAX")
                                 .and_then(|v| v.parse::<usize>().ok())
                                 .unwrap_or(512)
                         {

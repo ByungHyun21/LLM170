@@ -13,7 +13,7 @@
 //!
 //! env: LLM170_EXL3_SCAN_CAP(캡처 경로)·LLM170_EXL3_SCAN_ST0(랜덤 초기상태).
 
-use super::exl3_resident::TrellisResident;
+use crate::rawvk::exl3::resident::TrellisResident;
 
 // ── scan 모듈 독립 프로브(plans/121 F2) ──
 // 모델 적재 없이 합성 입력으로 scan 커널만 검증: 속도·산술 격리 작업장.
