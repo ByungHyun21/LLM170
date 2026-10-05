@@ -6,7 +6,9 @@ extern "C" __global__ void exl3_gemm2_kseg(
     float* __restrict__ s,          // [T][kseg][n] 부분합
     int ktiles, int ntiles, int K, int T, int kseg)
 {
-    __shared__ unsigned tre_s[8 * 48];
+    // S7(plans/131): BLOCK_K 2 merge - tre_s 2 ktile (8*words32, krate8 headroom 64),
+    // A16/B16 doubled - barriers 3 -> 1.5 per ktile, MMA batch x2.
+    __shared__ unsigned tre_s[8 * 64];
     __shared__ __half2 buf_a[64 * 20];
     __shared__ __half2 buf_b[128 * 20];
     constexpr int STRIDE = 20;
@@ -111,8 +113,8 @@ extern "C" __global__ void __launch_bounds__(256) exl3_gemm2_mma(
     int ktiles, int ntiles, int K, int T)
 {
     __shared__ unsigned tre_s[8 * 48];
-    __shared__ half A16[64][36];        // flat — WMMA 판과 동일 레이아웃
-    __shared__ half B16[64][36];        // [토큰][32k+4]
+    __shared__ half A16[2][64][36];        // flat — WMMA 판과 동일 레이아웃
+    __shared__ half B16[2][64][36];        // [토큰][32k+4]
     int bid = blockIdx.x;
     int wg_t = blockIdx.y;
     int tid = threadIdx.x;
@@ -131,13 +133,19 @@ extern "C" __global__ void __launch_bounds__(256) exl3_gemm2_mma(
     #pragma unroll
     for (int i = 0; i < 2; i++) fill_fragment(fc[i], 0.0f);
 
-    for (int kb = 0; kb < ktiles; kb++) {
+    // S7(plans/131): ktile 2-per-loop merge - kb,kb+1 outputs keep the exact
+    // ascending-kb accumulation order (arithmetic unchanged, bit-identical).
+    for (int kb = 0; kb < ktiles; kb += 2) {
         {
-            int stg_words = 4 * words32;
+            int nk2 = ktiles - kb >= 2 ? 2 : 1;
+            int stg_words = nk2 * 4 * words32;
             for (int w = tid; w < stg_words; w += 256) {
-                int ntl = w / words32;
-                int wq = w % words32;
-                tre_s[w] = tre[((long)kb * ntiles + (bid * 4 + ntl)) * words32 + wq];
+                int q = w / (4 * words32);
+                int rem = w % (4 * words32);
+                int ntl = rem / words32;
+                int wq = rem % words32;
+                tre_s[w] =
+                    tre[((long)(kb + q) * ntiles + (bid * 4 + ntl)) * words32 + wq];
             }
             __syncthreads();
         }
@@ -150,41 +158,59 @@ extern "C" __global__ void __launch_bounds__(256) exl3_gemm2_mma(
                     int kk = c + e;
                     float v = exl3_mul1_decode(exl3_tile_word(
                         tre_s, words32, K, r >> 4, kk & 15, r & 15));
-                    A16[r][kk] = __float2half(v);
+                    A16[0][r][kk] = __float2half(v);
+                    if (kb + 1 < ktiles) {
+                        float v1 = exl3_mul1_decode(exl3_tile_word(
+                            tre_s + 4 * words32, words32, K, r >> 4, kk & 15, r & 15));
+                        A16[1][r][kk] = __float2half(v1);
+                    }
                 }
             }
-        }
-        {
             int ti = tid >> 2;
             int kc = tid & 3;
             if (ti < nt) {
                 const unsigned* xt = ah16 + (long)(t0 + ti) * arow_words;
                 #pragma unroll
                 for (int e = 0; e < 4; e++) {
-                    unsigned w = xt[kb * 8 + kc * 4 + e];
-                    float2 uv = __half22float2(*reinterpret_cast<const __half2*>(&w));
-                    B16[ti][kc * 8 + 2 * e] = __float2half(uv.x);
-                    B16[ti][kc * 8 + 2 * e + 1] = __float2half(uv.y);
+                    unsigned w0 = xt[kb * 8 + kc * 4 + e];
+                    float2 uv = __half22float2(*reinterpret_cast<const __half2*>(&w0));
+                    B16[0][ti][kc * 8 + 2 * e] = __float2half(uv.x);
+                    B16[0][ti][kc * 8 + 2 * e + 1] = __float2half(uv.y);
+                    if (kb + 1 < ktiles) {
+                        unsigned w1 = xt[(kb + 1) * 8 + kc * 4 + e];
+                        float2 uv2 =
+                            __half22float2(*reinterpret_cast<const __half2*>(&w1));
+                        B16[1][ti][kc * 8 + 2 * e] = __float2half(uv2.x);
+                        B16[1][ti][kc * 8 + 2 * e + 1] = __float2half(uv2.y);
+                    }
                 }
             } else {
                 #pragma unroll
-                for (int e = 0; e < 8; e++) B16[ti][kc * 8 + e] = __float2half(0.0f);
+                for (int e = 0; e < 8; e++) {
+                    B16[0][ti][kc * 8 + e] = __float2half(0.0f);
+                    B16[1][ti][kc * 8 + e] = __float2half(0.0f);
+                }
             }
         }
         __syncthreads();
         {
-            fragment<matrix_a, 16, 16, 16, half, row_major> fa;
-            load_matrix_sync(fa, &A16[wid * 16][0], 36);
             #pragma unroll
-            for (int tth = 0; tth < 2; tth++) {
-                int tt = wpar * 2 + tth;
-                fragment<matrix_b, 16, 16, 16, half, col_major> fb;
-                load_matrix_sync(fb, &B16[tt * 16][0], 36);
-                mma_sync(fc[tth], fa, fb, fc[tth]);
+            for (int q = 0; q < 2; q++) {
+                if (q > 0 && kb + 1 >= ktiles) break;
+                fragment<matrix_a, 16, 16, 16, half, row_major> fa;
+                load_matrix_sync(fa, &A16[q][wid * 16][0], 36);
+                #pragma unroll
+                for (int tth = 0; tth < 2; tth++) {
+                    int tt = wpar * 2 + tth;
+                    fragment<matrix_b, 16, 16, 16, half, col_major> fb;
+                    load_matrix_sync(fb, &B16[q][tt * 16][0], 36);
+                    mma_sync(fc[tth], fa, fb, fc[tth]);
+                }
             }
         }
         __syncthreads();
     }
+
     // 드레인: D(i=n, j=t)를 s[T][n]에 저장 — 주소 = base + j*n + i → col_major,
     // ldm=n(row_major는 전치 저장 — 실측 인터리브 오염으로 확정).
     // 부분 t-타일(끝쪽 T가 16 배수가 아닌 경우)은 직접 저장이 [T][n] 경계를
