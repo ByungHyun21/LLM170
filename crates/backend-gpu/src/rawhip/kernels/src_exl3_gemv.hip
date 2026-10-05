@@ -53,6 +53,10 @@ extern "C" __global__ void exl3_had_in(
 }
 
 __device__ __forceinline__ float exl3_mul1_decode(unsigned w) {
+    // plans/130 종결: S=Σbytes(x)은 등가중 바이트합이라 정수 dot로 정확 치환
+    // 가능하나 gfx1151(RDNA3.5)에 dot1-insts가 없다(__dp4a·sdot4 빌트인 모두
+    // 컴파일 거부 실측) — 아래 마스크 춤이 이 하드웨어의 최적 정수열.
+    // extract+decode 체인이 CU 정수 피크 ~77%로 디코드의 벽(원장 plans/130).
     unsigned x = w * 0x83DCD12Du;
     unsigned p = (x & 0x00FF00FFu) + ((x >> 8u) & 0x00FF00FFu);
     unsigned sum = (p & 0xFFFFu) + (p >> 16u);
@@ -75,8 +79,12 @@ extern "C" __global__ void exl3_gemv(
     float* __restrict__ s,              // [nseg][n]
     int ktiles, int ntiles, int K)
 {
-    __shared__ __align__(16) unsigned stg[8 * 48];
-    __shared__ unsigned ahstg[8];
+    // plans/130: 이중 버퍼 스테이징 — 다음 k-타일 tre 로드를 현재 연산과 중첩.
+    // 커널은 블록 처리량(~4.5K blocks/ms)으로 묶여 있었고(중형-n 63GB/s vs
+    // 대형-n 118GB/s — 블록당 시간 동일·시간 ∝ 블록 수 실측), 벽은 k-체인의
+    // load→compute 직렬화. 산술(행별 환원 순서)은 불변.
+    __shared__ __align__(16) unsigned stg[2][8 * 48];
+    __shared__ unsigned ahstg[2][8];
     int nt0 = blockIdx.x * 8;
     if (nt0 >= ntiles) return;
     int seg = blockIdx.y;
@@ -104,34 +112,40 @@ extern "C" __global__ void exl3_gemv(
         addr16[r] = i0 | (i1 << 8) | (sh << 16);
     }
 
-    for (int kb = ktb; kb < kte; kb += 8) {
-        int nk = min(8, kte - kb);
-        for (int ktl = 0; ktl < nk; ktl++) {
-            long tbase = ((long)(kb + ktl) * ntiles + nt0) * words32;
-            int ahb = ((kb + ktl) * 16) >> 1;
-            // plans/130: tre는 재사용 0 스트림 — 16B 백터 로드(__ldcs는 uint4 부재로 제외).
-            // stg_words=8*words32는 krate=4에서 256(1KB)이라 128스레드×2렬 — uint4로 1렬.
-            for (int w4 = tid * 4; w4 < stg_words; w4 += 128 * 4) {
-                uint4 v = *reinterpret_cast<const uint4*>(tre + tbase + w4);
-                *reinterpret_cast<uint4*>(&stg[w4]) = v;
-            }
-            if (tid < 8) ahstg[tid] = ah16[ahb + tid];
-            __syncthreads();
-            const unsigned* tile = stg + ntl * words32;
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                unsigned we = exl3_extract(addr16[2 * j], tile);
-                unsigned wo = exl3_extract(addr16[2 * j + 1], tile);
-                __half2 w2 = __floats2half2_rn(exl3_mul1_decode(we), exl3_mul1_decode(wo));
-                __half2 a2 = *reinterpret_cast<__half2*>(&ahstg[j]);
-                acc2 = __hfma2(a2, w2, acc2);
-            }
-            if (((kb + ktl) & 3) == 3) {
-                acc += __low2float(acc2) + __high2float(acc2);
-                acc2 = __float2half2_rn(0.0f);
-            }
-            __syncthreads();
+    {
+        long tbase = ((long)ktb * ntiles + nt0) * words32;
+        int ahb = (ktb * 16) >> 1;
+        for (int w4 = tid * 4; w4 < stg_words; w4 += 128 * 4)
+            *reinterpret_cast<uint4*>(&stg[0][w4]) =
+                *reinterpret_cast<const uint4*>(tre + tbase + w4);
+        if (tid < 8) ahstg[0][tid] = ah16[ahb + tid];
+        __syncthreads();
+    }
+    for (int i = 0, n_tile = kte - ktb; i < n_tile; i++) {
+        int cur = i & 1;
+        int kt = ktb + i;
+        if (i + 1 < n_tile) {
+            long tbase = ((long)(kt + 1) * ntiles + nt0) * words32;
+            int ahb = ((kt + 1) * 16) >> 1;
+            for (int w4 = tid * 4; w4 < stg_words; w4 += 128 * 4)
+                *reinterpret_cast<uint4*>(&stg[cur ^ 1][w4]) =
+                    *reinterpret_cast<const uint4*>(tre + tbase + w4);
+            if (tid < 8) ahstg[cur ^ 1][tid] = ah16[ahb + tid];
         }
+        const unsigned* tile = stg[cur] + ntl * words32;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            unsigned we = exl3_extract(addr16[2 * j], tile);
+            unsigned wo = exl3_extract(addr16[2 * j + 1], tile);
+            __half2 w2 = __floats2half2_rn(exl3_mul1_decode(we), exl3_mul1_decode(wo));
+            __half2 a2 = *reinterpret_cast<__half2*>(&ahstg[cur][j]);
+            acc2 = __hfma2(a2, w2, acc2);
+        }
+        if ((kt & 3) == 3) {
+            acc += __low2float(acc2) + __high2float(acc2);
+            acc2 = __float2half2_rn(0.0f);
+        }
+        __syncthreads();
     }
     acc += __low2float(acc2) + __high2float(acc2);
     int nt = nt0 + ntl;
@@ -186,8 +200,8 @@ __device__ __forceinline__ void gemv_m_core(
     float* __restrict__ s,
     int ktiles, int ntiles, int K)
 {
-    __shared__ __align__(16) unsigned stg[8 * 48];
-    __shared__ unsigned ahstg[8 * 8];
+    __shared__ __align__(16) unsigned stg[2][8 * 48];
+    __shared__ unsigned ahstg[2][8 * 8];
     int nt0 = blockIdx.x * 8;
     if (nt0 >= ntiles) return;
     int seg = blockIdx.y;
@@ -219,44 +233,52 @@ __device__ __forceinline__ void gemv_m_core(
         addr16[r] = i0 | (i1 << 8) | (sh << 16);
     }
 
-    for (int kb = ktb; kb < kte; kb += 8) {
-        int nk = min(8, kte - kb);
-        for (int ktl = 0; ktl < nk; ktl++) {
-            long tbase = ((long)(kb + ktl) * ntiles + nt0) * words32;
-            int ahb = ((kb + ktl) * 16) >> 1;
-            // plans/130: tre는 재사용 0 스트림 — 16B 백터 로드(__ldcs는 uint4 부재로 제외).
-            // stg_words=8*words32는 krate=4에서 256(1KB)이라 128스레드×2렬 — uint4로 1렬.
-            for (int w4 = tid * 4; w4 < stg_words; w4 += 128 * 4) {
-                uint4 v = *reinterpret_cast<const uint4*>(tre + tbase + w4);
-                *reinterpret_cast<uint4*>(&stg[w4]) = v;
-            }
+    {
+        long tbase = ((long)ktb * ntiles + nt0) * words32;
+        int ahb = (ktb * 16) >> 1;
+        for (int w4 = tid * 4; w4 < stg_words; w4 += 128 * 4)
+            *reinterpret_cast<uint4*>(&stg[0][w4]) =
+                *reinterpret_cast<const uint4*>(tre + tbase + w4);
+        #pragma unroll
+        for (int t = 0; t < TM; t++)
+            if (tid < 8)
+                ahstg[0][t * 8 + tid] = ah16[(long)t * arow_words + ahb + tid];
+        __syncthreads();
+    }
+    for (int i = 0, n_tile = kte - ktb; i < n_tile; i++) {
+        int cur = i & 1;
+        int kt = ktb + i;
+        if (i + 1 < n_tile) {
+            long tbase = ((long)(kt + 1) * ntiles + nt0) * words32;
+            int ahb = ((kt + 1) * 16) >> 1;
+            for (int w4 = tid * 4; w4 < stg_words; w4 += 128 * 4)
+                *reinterpret_cast<uint4*>(&stg[cur ^ 1][w4]) =
+                    *reinterpret_cast<const uint4*>(tre + tbase + w4);
+            #pragma unroll
+            for (int t = 0; t < TM; t++)
+                if (tid < 8)
+                    ahstg[cur ^ 1][t * 8 + tid] = ah16[(long)t * arow_words + ahb + tid];
+        }
+        const unsigned* tile = stg[cur] + ntl * words32;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            unsigned we = exl3_extract(addr16[2 * j], tile);
+            unsigned wo = exl3_extract(addr16[2 * j + 1], tile);
+            __half2 w2 = __floats2half2_rn(exl3_mul1_decode(we), exl3_mul1_decode(wo));
             #pragma unroll
             for (int t = 0; t < TM; t++) {
-                if (tid < 8)
-                    ahstg[t * 8 + tid] = ah16[(long)t * arow_words + ahb + tid];
+                __half2 a2 = *reinterpret_cast<__half2*>(&ahstg[cur][t * 8 + j]);
+                acc2[t] = __hfma2(a2, w2, acc2[t]);
             }
-            __syncthreads();
-            const unsigned* tile = stg + ntl * words32;
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                unsigned we = exl3_extract(addr16[2 * j], tile);
-                unsigned wo = exl3_extract(addr16[2 * j + 1], tile);
-                __half2 w2 = __floats2half2_rn(exl3_mul1_decode(we), exl3_mul1_decode(wo));
-                #pragma unroll
-                for (int t = 0; t < TM; t++) {
-                    __half2 a2 = *reinterpret_cast<__half2*>(&ahstg[t * 8 + j]);
-                    acc2[t] = __hfma2(a2, w2, acc2[t]);
-                }
-            }
-            if (((kb + ktl) & 3) == 3) {
-                #pragma unroll
-                for (int t = 0; t < TM; t++) {
-                    acc[t] += __low2float(acc2[t]) + __high2float(acc2[t]);
-                    acc2[t] = __float2half2_rn(0.0f);
-                }
-            }
-            __syncthreads();
         }
+        if ((kt & 3) == 3) {
+            #pragma unroll
+            for (int t = 0; t < TM; t++) {
+                acc[t] += __low2float(acc2[t]) + __high2float(acc2[t]);
+                acc2[t] = __float2half2_rn(0.0f);
+            }
+        }
+        __syncthreads();
     }
     int nt = nt0 + ntl;
     if (nt >= ntiles) return;
