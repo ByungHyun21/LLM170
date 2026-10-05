@@ -608,7 +608,7 @@ pub fn qsa_layer(
         }
     }
     ctx.mm_batch(&attn_all, &wo, &mut out)?;
-    if std::env::var_os("LLM170_QSA_HASH").is_some() {
+    if llm170_diag::dump::opts().key("qsa_hash") {
         let used_kv = (((pos0 as usize) + t_len) * n_kv * hd).min(seq.kv_k[full_idx].len());
         let used_idx = (((pos0 as usize) + t_len) * hp.idx_dim).min(seq.idx_k[full_idx].len());
         let h = |v: &[f32]| -> u64 {

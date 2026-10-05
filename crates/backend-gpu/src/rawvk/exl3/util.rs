@@ -109,8 +109,7 @@ pub fn exl3_vk_check(exl3_dir: &str, key: &str) -> Result<String, String> {
     // ── GPU ──
     let mut ctx = VkCtx::new()?;
     // k-분할 세그먼트 수(그리드 y) — 1이면 단일(비분할과 동일).
-    let nseg: u32 = std::env::var("LLM170_EXL3_KSEG")
-        .ok()
+    let nseg: u32 = llm170_diag::flag::val("LLM170_EXL3_KSEG")
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
 

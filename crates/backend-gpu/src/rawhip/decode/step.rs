@@ -274,15 +274,16 @@ impl DecodeState {
                     self.trace_rows(&format!("tr{il}_gconv"), self.gconv_t, conv_ch, t)?;
                 }
 
-                if il == self.trace_il() && llm170_diag::dump::opts().key("ms_dump") {
+                if let Some(dump_dir) = llm170_diag::dump::opts().key_arg("ms_dump")
+                    && il == self.trace_il()
+                {
                     let ring_len = (self.conv_k - 1) * self.conv_ch;
                     let mut ring = vec![0f32; ring_len];
                     let _ = self.ctx.d2h(
                         bytemuck::cast_slice_mut(&mut ring),
                         self.st_conv[recr_idx][seq],
                     );
-                    let p = std::path::Path::new(&std::env::var_os("LLM170_MS_DUMP").unwrap())
-                        .join("tr4_ring.f32");
+                    let p = std::path::Path::new(dump_dir).join("tr4_ring.f32");
                     let _ = std::fs::write(p, bytemuck::cast_slice(&ring));
                 }
                 // split3 — 공용 헬퍼(plans/109 P10)
@@ -383,16 +384,16 @@ impl DecodeState {
                         )?;
                     } else {
                         // 부록88 기본: 축스왑(u블록 인접) — k/q L2 국소성 +1.1% (350-354)
-                        if il == self.trace_il() && llm170_diag::dump::opts().key("ms_dump") {
+                        if let Some(dump_dir) = llm170_diag::dump::opts().key_arg("ms_dump")
+                            && il == self.trace_il()
+                        {
                             let gl = self.dt_rank * self.d_state * self.d_state;
                             let mut st = vec![0f32; gl];
                             let _ = self.ctx.d2h(
                                 bytemuck::cast_slice_mut(&mut st),
                                 self.st_gdn[recr_idx][seq],
                             );
-                            let p =
-                                std::path::Path::new(&std::env::var_os("LLM170_MS_DUMP").unwrap())
-                                    .join("tr4_sstate_in.f32");
+                            let p = std::path::Path::new(dump_dir).join("tr4_sstate_in.f32");
                             let _ = std::fs::write(p, bytemuck::cast_slice(&st));
                         }
                         self.ctx.launch3(

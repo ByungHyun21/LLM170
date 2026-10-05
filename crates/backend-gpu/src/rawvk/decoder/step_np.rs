@@ -78,9 +78,8 @@ impl DecoderState {
         let np_t0 = std::time::Instant::now();
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
-        let layer_cut = std::env::var("LLM170_VK_LAYERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+        let layer_cut =
+            llm170_diag::flag::val("LLM170_VK_LAYERS").and_then(|v| v.parse::<usize>().ok());
         let n_layer_eff = layer_cut
             .map(|c| c.min(self.n_layer))
             .unwrap_or(self.n_layer);

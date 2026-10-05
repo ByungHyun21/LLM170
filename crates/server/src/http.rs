@@ -43,9 +43,8 @@ pub fn serve(
     // 이전엔 env 기본 1이 조용히 직렬 서버를 만들었다(np4 10.5 t/s 정체).
     let (slots, src) = if let Some(n) = slots_flag {
         (n.clamp(1, 16), "flag")
-    } else if let Some(n) = std::env::var("LLM170_SLOTS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    } else if let Some(n) =
+        llm170_diag::flag::val("LLM170_SLOTS").and_then(|v| v.parse::<usize>().ok())
     {
         (n.clamp(1, 16), "env LLM170_SLOTS")
     } else {
@@ -56,8 +55,7 @@ pub fn serve(
     // 호스트 객체(건당 수백 바이트)라 넉넉해도 비용이 없고, 동시 요청 폭주 시
     let qcap = match queue_flag {
         Some(q) => q,
-        None => std::env::var("LLM170_QUEUE")
-            .ok()
+        None => llm170_diag::flag::val("LLM170_QUEUE")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(512),
     };

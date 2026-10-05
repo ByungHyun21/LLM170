@@ -15,7 +15,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let gpu_runtime = ma
         .gpu_runtime
         .clone()
-        .or_else(|| std::env::var("LLM170_GPU_RUNTIME").ok())
+        .or_else(|| llm170_diag::flag::val("LLM170_GPU_RUNTIME").map(str::to_string))
         .unwrap_or_else(|| "hip".into());
     let mut spec_k: Option<usize> = None;
 
@@ -75,8 +75,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let t_start = std::time::Instant::now();
     // 아키텍처 판별 → qwen4exp 전용 엔진 분기.
     // ENOENT 윈도우 대기 (LLM170_OPEN_WAIT_SECS) — 판별 실패시 재시도.
-    let wait_secs: u64 = std::env::var("LLM170_OPEN_WAIT_SECS")
-        .ok()
+    let wait_secs: u64 = llm170_diag::flag::val("LLM170_OPEN_WAIT_SECS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let mut arch: Option<String> = None;
@@ -114,7 +113,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             }
             // 백엔드 부착 — 단일 경로(attach_q35). LLM170_REQUIRE_GPU=1이면 폴백
             // 금지(2026-09-12: infer 검증이 폴백으로 통과한 사고 방지).
-            let policy = if std::env::var_os("LLM170_REQUIRE_GPU").is_some() {
+            let policy = if llm170_diag::flag::on("LLM170_REQUIRE_GPU") {
                 crate::engine::AttachPolicy::Strict
             } else {
                 crate::engine::AttachPolicy::Warn
@@ -315,7 +314,7 @@ fn run_q4_infer(
                     }
                 } else {
                     for &s in &active {
-                        let d1g = std::env::var_os("LLM170_NO_D1G").is_none();
+                        let d1g = !llm170_diag::flag::on("LLM170_NO_D1G");
                         let t = if !d1g {
                             let l = eng.decode1(s, next[s]).map_err(|e| e.to_string())?;
                             llm170_core::qwen35::greedy(&l)

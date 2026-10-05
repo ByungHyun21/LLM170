@@ -55,7 +55,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let gpu_runtime = ma
         .gpu_runtime
         .clone()
-        .or_else(|| std::env::var("LLM170_GPU_RUNTIME").ok())
+        .or_else(|| llm170_diag::flag::val("LLM170_GPU_RUNTIME").map(str::to_string))
         .unwrap_or_else(|| "hip".into());
     let mut spec_k = 0usize;
     let mut np_slots = 1usize;
@@ -118,15 +118,15 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         return usage_err_bench(&format!("ctx({ctx}) too small for pp({pp})+tg({tg})"));
     }
     // 프롬프트: LLM170_BENCH_TEXT(자연어, Tokenizer 인코딩) 또는 수제 LCG 합성 토큰
-    let prompt: Vec<u32> = match std::env::var("LLM170_BENCH_TEXT") {
-        Ok(txt) => {
+    let prompt: Vec<u32> = match llm170_diag::flag::val("LLM170_BENCH_TEXT") {
+        Some(txt) => {
             // A8(plans/129): panic → 오류 반환(usage_err_bench 패턴과 통일 —
             // 불완전 디렉터리 등 인위 오류 경로가 프로세스 패닉이었다).
             let tok = match crate::tokenize::Tokenizer::load(&model_path, None) {
                 Ok(t) => t,
                 Err(e) => return usage_err_bench(&format!("토크나이저 로드 실패: {e}")),
             };
-            let mut ids = tok.encode(&txt);
+            let mut ids = tok.encode(txt);
             // QA-23: 0토큰 인코딩 가드 — 빈 ids로 pp 패딩 루프가 무한 회전.
             if ids.is_empty() {
                 return usage_err_bench("LLM170_BENCH_TEXT encoded to 0 tokens — refusing to pad");
@@ -140,7 +140,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             }
             ids
         }
-        Err(_) => lcg_prompt(pp, 0x1234_5678),
+        None => lcg_prompt(pp, 0x1234_5678),
     };
 
     // 아키텍처 판별 (ENOENT 재시도 관례)
@@ -340,7 +340,6 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                 .map_err(|e| e.to_string())?;
         }
     }
-    let _ = std::env::var("LLM170_FRAME");
     // 라벨은 백엔드를 그대로 반영한다 — 프레임(ADR-0017)은 cubecl 제거로
     // 사라졌고, env를 "frame"으로 표기해 GPU 수치로 오인된 이력이 있다.
     let dev = if want_gpu { " gpu" } else { " cpu" };

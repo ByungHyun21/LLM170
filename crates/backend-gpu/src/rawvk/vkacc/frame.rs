@@ -44,7 +44,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
         // 호스트 간극에 지배됐다(실측 제출 2548/스텝). 스텝 도중 브리지의
         // frame_read가 플러시하면 프레임 op 진입마다 재개(frame_resume_batch).
         // 값경로는 이 게이트를 보지 않아 배치 상태가 새지 않는다.
-        if std::env::var_os("LLM170_VK_NOBATCH").is_none() {
+        if !llm170_diag::flag::on("LLM170_VK_NOBATCH") {
             self.frame_step_batch
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = self.ctx.lock().begin_batch();
@@ -888,7 +888,7 @@ impl VkAcc {
         // plans/84 B: 게더→전문가별 GEMV→스캐터를 배치 세션으로 — 비배치
         // run은 매 발사마다 제출+펜스 대기라 전문가 수만큼 동기가 걸린다
         // (프레임 경로 2.9배 열세의 주원인). 1회 제출로 묶는다.
-        let batching = std::env::var_os("LLM170_VK_NOBATCH").is_none();
+        let batching = !llm170_diag::flag::on("LLM170_VK_NOBATCH");
         if batching {
             ctx.begin_batch()?;
         }

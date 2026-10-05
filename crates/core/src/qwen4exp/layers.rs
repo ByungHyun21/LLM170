@@ -177,11 +177,29 @@ fn frame_t_max_cap(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
 fn frame_t_max(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
     let cap = frame_t_max_cap(acc);
     // 기본값 = 적응형 상한(env는 "요청"이고 상한이 최종 결정 — VRAM이 작으면 내려간다).
+    q4_chunk_env(cap).min(cap)
+}
+
+// 청크 크기 소스 — env 스냅샷(A6 계약: 기동 1회) + 하네스 오버라이드.
+// chunk-check 프로브는 프로세스 중간 값 변경이 필요해서 set_var 대신
+// 이 오버라이드를 쓴다(스냅샷 이후 set_var는 계약 밖 — prefill_multi 사고,
+// plans/129 A6).
+static CHUNK_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 프리필 청크 크기 오버라이드(하네스용) — 0이면 env 기본으로 복귀.
+pub fn set_q4_chunk(n: usize) {
+    CHUNK_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn q4_chunk_env(default: usize) -> usize {
+    let o = CHUNK_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if o > 0 {
+        return o.clamp(16, 4096);
+    }
     llm170_diag::flag::val("LLM170_Q4_CHUNK")
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(cap)
+        .unwrap_or(default)
         .clamp(16, 4096)
-        .min(cap)
 }
 
 /// 프레임 환경 게이트(캐시) — LLM170_FRAME!=0 && {PREFILL,DECODE}!=0.
@@ -190,14 +208,12 @@ fn frame_env_on(decode: bool) -> bool {
     static DEC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let lk = if decode { &DEC } else { &PRE };
     *lk.get_or_init(|| {
-        std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
-            && std::env::var(if decode {
-                "LLM170_FRAME_DECODE"
+        llm170_diag::flag::on_nonzero("LLM170_FRAME")
+            && if decode {
+                llm170_diag::flag::ne0("LLM170_FRAME_DECODE")
             } else {
-                "LLM170_FRAME_PREFILL"
-            })
-            .map(|v| v != "0")
-            .unwrap_or(true)
+                llm170_diag::flag::ne0("LLM170_FRAME_PREFILL")
+            }
     })
 }
 
@@ -1800,10 +1816,7 @@ impl Engine4 {
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, Q4Error> {
         // LLM170_Q4_CHUNK: 프리필 청크 토큰 수 (기본 1024; 프레임 경로는 t_max 상한).
         let cap0 = frame_t_max_cap(self.acc.as_deref());
-        let chunk: usize = llm170_diag::flag::val("LLM170_Q4_CHUNK")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(cap0)
-            .clamp(16, 4096); // 상한은 frame_t_max_cap이 결정(적응형)
+        let chunk: usize = q4_chunk_env(cap0);
         // 프레임 상태가 권위적이면(직전 디코드) CPU 사본을 GPU에서 갱신 —
         // 값 경로 prefill이 정합 상태에서 시작하기 위함. 프레임 프리필(기본)은
         // 디바이스 상태를 그대로 쓰므로 이 풀백이 데드 워크다 — 슬롯당 수십 회의
@@ -1920,11 +1933,7 @@ impl Engine4 {
             return Ok(crate::qwen35::greedy(&l));
         }
         let cap0 = frame_t_max_cap(self.acc.as_deref());
-        let chunk: usize = llm170_diag::flag::val("LLM170_Q4_CHUNK")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(cap0)
-            .clamp(16, 4096)
-            .min(frame_t_max_cap(self.acc.as_deref()));
+        let chunk: usize = q4_chunk_env(cap0).min(frame_t_max_cap(self.acc.as_deref()));
         // 프레임 경로(이 함수의 주경로)는 CPU 상태 불필요 — 풀백 생략(데드 워크).
         if !self.frame_ensure() {
             let l = self.prefill(seq, tokens)?;
