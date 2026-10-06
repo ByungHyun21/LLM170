@@ -1209,6 +1209,10 @@ pub fn mm_bench() -> Result<String, String> {
                     m2 += 1;
                 }
             } else if c2.to_bits() != o2[ti * n_out + oo].to_bits() {
+                if m2 == 0 {
+                    eprintln!("# first mism ti={ti} oo={oo} got={:08x} want={:08x} ({:+.6} vs {:+.6})",
+                        o2[ti * n_out + oo].to_bits(), c2.to_bits(), o2[ti * n_out + oo], c2);
+                }
                 m2 += 1;
             }
         }
