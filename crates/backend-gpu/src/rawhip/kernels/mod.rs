@@ -157,6 +157,7 @@ pub const NAMES: &[&str] = &[
     "l2_rows2_scale_w",
     "kv_append_t",
     "gemm_q5k_mm",
+    "gemm_q5k_wm8",
     "gemm_q5k_wm",
     "dequant_f16_q5k",
     "q4_idx_q_rope",
@@ -472,6 +473,7 @@ pub const COVERED_BY: &[(&str, &str)] = &[
     ),
     ("kv_append_t", "assembly:charhash+gate-27b+gate-flash-next"),
     ("gemm_q5k_mm", "assembly:charhash+gate-27b+gate-flash-next"),
+    ("gemm_q5k_wm8", "assembly:charhash+gate-27b+gate-flash-next"),
     ("gemm_q5k_wm", "assembly:charhash+gate-27b+gate-flash-next"),
     (
         "dequant_f16_q5k",

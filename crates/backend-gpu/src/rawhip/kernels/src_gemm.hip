@@ -137,6 +137,148 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
 // ─── MMQ 포트 (llama.cpp 타일: 64행×16토큰×256스레드, 파편 sb%4) ───
 // 미러(q*_mm)와 쌍: 파편 f32 누산 + p0+p1+p2+p3.
 
+// q5_K WMMA i8 (ty13, plans/135 §22 i8 WMMA MMQ) — v_wmma_i32_16x16x16_iu8
+// (RDNA3 8192 ops/32clk = dp4a 4×; hipRTC gfx1151 기본 wavefrontsize32 —
+// clang --offload-arch=gfx1151에서 _w64는 wavefrontsize64 feature 요구로
+// 실험 확정, _w32는 무요 — 2026-10-06). mm 판(dp4a)의 t=5..15 ALU 바운드
+// 구간 교체 후보. 64행×16토큰 타일, 128스레드(4 wave32, 웨이프=16행 서브타일).
+// A=x q8(signed, a_neg)·B=w 언팩 u8 0..31 — sb(32원소)당 2 k16 WMMA 체인
+// (i32 정확합) → sb별 f32 접기, mm 판과 동일 문순(yd*d0*isum 가산 −
+// yd*d1*qsum 감산, 선형 sb) — 비트 동일 계약(프로브 to_bits로 검증).
+// D 프래그: (i,j)=(g*2+L/16, L%16) — i=토큰·j=행(ROCm 핸드북 RDNA3 레이아웃).
+// lane 복제: A/B 프래그 li=L&15 인덱스(0-15↔16-31 동일 데이터).
+// LDS 뱅크: wvs/ys 행 스트라이드 +1 패드(9워드) — 프래그 로드 무충돌.
+// blockIdx.z = M-타일(t0=16단위) — verify 대배치 t>16 커버.
+extern "C" __global__ void __launch_bounds__(128) gemm_q5k_wm8(
+        const unsigned* xq, const unsigned* w, float* out,
+        int n_in, int n_out, int xq_w, int t) {
+    typedef int v4i __attribute__((ext_vector_type(4)));
+    typedef int v8i __attribute__((ext_vector_type(8)));
+    __shared__ unsigned wvs[8][64][9];    // [sb][행][워드] — 언팩 완료(+1 패드)
+    __shared__ float dsc[8][64][2];       // d·sc, dm·m
+    __shared__ unsigned ys[8][16][9];     // [sb][토큰][워드] y q8(+1 패드)
+    __shared__ float ydt[8][16];          // [sb][토큰] yd
+    __shared__ int qst[8][16];            // [sb][토큰] qsum16 합
+
+    int i = blockIdx.x * 64;              // 행 타일 기저
+    int t0 = blockIdx.z * 16;             // M-타일 기저
+    int tid = threadIdx.x;                // 0..127
+    int wave = tid >> 5;                  // 서브타일 0..3 (16행 담당)
+    int lane = tid & 31;
+    int li = lane & 15;                   // 프래그 인덱스 (lane 복제)
+    if (i >= n_out || t0 >= t) return;
+    int nt = min(16, t - t0);
+    int nrow = min(64, n_out - i);
+    int n_sub = n_in >> 5;
+    int blocks = n_in >> 8;
+    int qsb = (n_in >> 2) + (n_in >> 5);
+    float acc[8];
+    #pragma unroll
+    for (int g = 0; g < 8; g++) acc[g] = 0.0f;
+    for (int k0 = 0; k0 < n_sub; k0 += 8) {
+        // ── 협력 언팩 스테이징: 512유닛 / 128스레드 = 4패스 (mm 판 본문 동일) ──
+        for (int pass = 0; pass < 4; pass++) {
+            int u = pass * 128 + tid;             // 0..511
+            int sbl = u >> 6;                     // 0..7
+            int r  = u & 63;                      // 0..63
+            int sb = k0 + sbl;
+            if (r < nrow && sb < n_sub) {
+                int o = i + r;
+                int js = sb & 7;
+                int it = js >> 1;
+                int half = js & 1;
+                int wb = o * blocks * 176 + (sb >> 3) * 176;
+                int wq = wb >> 2;
+                unsigned w0 = w[wq];
+                float d = bits_f16(w0 & 0xFFFFu);
+                float dm = bits_f16(w0 >> 16);
+                unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
+                unsigned rr = (js & 3) * 8;
+                unsigned b1 = js < 4 ? (sc0 >> rr) & 0xFFu : (sc1 >> rr) & 0xFFu;
+                unsigned b4 = js < 4 ? (sc1 >> rr) & 0xFFu : (sc2 >> rr) & 0xFFu;
+                unsigned bm = (sc0 >> rr) & 0xFFu;
+                unsigned sc_v, m_v;
+                if (js < 4) { sc_v = b1 & 63u; m_v = b4 & 63u; }
+                else { sc_v = (b4 & 0xFu) | ((bm >> 6) << 4); m_v = (b4 >> 4) | ((b1 >> 6) << 4); }
+                dsc[sbl][r][0] = d * (float)sc_v;
+                dsc[sbl][r][1] = dm * (float)m_v;
+                int qhw = wq + 4;
+                unsigned nsh = half << 2;
+                int sh = 2 * it + half;
+                unsigned hb = (1u << sh) * 0x01010101u;
+                int qlb = wq + 12 + it * 8;
+                #pragma unroll
+                for (int kk = 0; kk < 8; kk++) {
+                    unsigned nib = (w[qlb + kk] >> nsh) & 0x0F0F0F0Fu;
+                    unsigned bit = ((w[qhw + kk] & hb) >> sh) << 4;
+                    wvs[sbl][r][kk] = nib | bit;
+                }
+            }
+        }
+        // y 스테이징: 128유닛(8sb×16토큰) — 1패스. ti≥nt 제로 패드(stale 방지).
+        {
+            int sbl = tid >> 4;
+            int ti = tid & 15;
+            int sb = k0 + sbl;
+            if (sb < n_sub) {
+                if (ti < nt) {
+                    const unsigned* xt = xq + (size_t)(t0 + ti) * xq_w;
+                    int xw = (sb << 5) >> 2;
+                    #pragma unroll
+                    for (int kk = 0; kk < 8; kk++) ys[sbl][ti][kk] = xt[xw + kk];
+                    ydt[sbl][ti] = __uint_as_float(xt[(n_in >> 2) + sb]);
+                    qst[sbl][ti] = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
+                } else {
+                    #pragma unroll
+                    for (int kk = 0; kk < 8; kk++) ys[sbl][ti][kk] = 0u;
+                    ydt[sbl][ti] = 0.0f;
+                    qst[sbl][ti] = 0;
+                }
+            }
+        }
+        __syncthreads();
+        // ── WMMA 계산: 웨이프당 16행×16토큰, sb당 2 k16 체인 → sb별 접기 ──
+        if (wave * 16 < nrow) {
+            #pragma unroll
+            for (int sbl = 0; sbl < 8; sbl++) {
+                int sb = k0 + sbl;
+                if (sb >= n_sub) break;
+                unsigned af[2][4], bf[2][4];
+                #pragma unroll
+                for (int g = 0; g < 4; g++) {
+                    bf[0][g] = wvs[sbl][wave * 16 + li][g];
+                    bf[1][g] = wvs[sbl][wave * 16 + li][4 + g];
+                    af[0][g] = ys[sbl][li][g];
+                    af[1][g] = ys[sbl][li][4 + g];
+                }
+                v8i d8 = {};
+                d8 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                    true, *reinterpret_cast<v4i*>(&af[0][0]), false,
+                    *reinterpret_cast<v4i*>(&bf[0][0]), d8, false);
+                d8 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                    true, *reinterpret_cast<v4i*>(&af[1][0]), false,
+                    *reinterpret_cast<v4i*>(&bf[1][0]), d8, false);
+                float d0 = dsc[sbl][wave * 16 + li][0];
+                float d1 = dsc[sbl][wave * 16 + li][1];
+                #pragma unroll
+                for (int g = 0; g < 8; g++) {
+                    int ti = g * 2 + (lane >> 4);
+                    acc[g] += ydt[sbl][ti] * d0 * (float)d8[g];
+                    acc[g] -= ydt[sbl][ti] * d1 * (float)qst[sbl][ti];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (i + wave * 16 + li < n_out) {
+        #pragma unroll
+        for (int g = 0; g < 8; g++) {
+            int ti = g * 2 + (lane >> 4);
+            if (ti < nt) out[(size_t)(t0 + ti) * n_out + i + wave * 16 + li] = acc[g];
+        }
+    }
+}
+
 // q5_K WMMA (ty13, fast path) — 듀얼모드: 비트계약 아님(스트림 검증).
 // 구조: 64행×64토큰, 워프당 16행×4 B타일, sb 2배치, ldm=36 (≡4 mod 8).
 // 스케일 접힘: A=(w_int·ds0−ds1) f16, B=y_int·yd f16 — min항 대수동치.

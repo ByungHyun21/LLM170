@@ -583,6 +583,10 @@ impl RawCtx {
                     "gemm_q5k_j128"
                 } else if !env_on("LLM170_EXACT") && big {
                     "gemm_q5k_wm"
+                } else if !env_on("LLM170_EXACT") && t >= 5 {
+                    // plans/135 §22 i8 WMMA MMQ — mm 판(dp4a) t=5..15 구간 교체.
+                    // A/B 전까지 본 분기; 역행 시 mm 원복.
+                    "gemm_q5k_wm8"
                 } else {
                     "gemm_q5k_mm"
                 }
@@ -663,7 +667,9 @@ impl RawCtx {
                 }
             }
         }
+        let is_wm8 = kern.ends_with("_wm8");
         let mm = kern.ends_with("_mm")
+            || is_wm8
             || kern.ends_with("_wm")
             || kern.ends_with("_j128")
             || kern.ends_with("_v4");
@@ -686,14 +692,24 @@ impl RawCtx {
             xw: xq_w as i32,
             // z-그리드 토큰 사분면: t≤128이면 gz=1 (무변형). 초과분은 128씩.
             // j128/v4 판은 토큰 사분면(blockIdx.z) 지원 — t를 그대로 넘긴다(§51 수정판).
-            tt: if kern.ends_with("_j128") || kern.ends_with("_v4") {
+            tt: if is_wm8 || kern.ends_with("_j128") || kern.ends_with("_v4") {
                 t as i32
             } else {
                 t.min(128) as i32
             },
             gx: nblocks.min(65535) as u32,
-            gz: (nblocks.div_ceil(65535) * t.div_ceil(128)) as u32,
-            block: if mm { 256 } else { 64 },
+            gz: if is_wm8 {
+                t.div_ceil(16) as u32
+            } else {
+                (nblocks.div_ceil(65535) * t.div_ceil(128)) as u32
+            },
+            block: if is_wm8 {
+                128
+            } else if mm {
+                256
+            } else {
+                64
+            },
             ktab: ty == 23 || kern == "gemm_nl_v4",
         })
     }

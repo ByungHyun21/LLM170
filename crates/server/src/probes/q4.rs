@@ -229,6 +229,7 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         "gqa-bench" => llm170_backend_gpu::rawhip::gqa_bench(),
         "mm-tile" => llm170_backend_gpu::rawhip::mm_tile_bench(),
         "mm-bench" => llm170_backend_gpu::rawhip::mm_batch_bench(),
+        "mm-bench2" => llm170_backend_gpu::rawhip::mm_bench(),
         "bw-test" => llm170_backend_gpu::rawhip::bw_test(),
         "dp4a-test" => llm170_backend_gpu::rawhip::dp4a_test(),
         "iq3s-probe" => llm170_backend_gpu::rawhip::iq3s_probe(),
