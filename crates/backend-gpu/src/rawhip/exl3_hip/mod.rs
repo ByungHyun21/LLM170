@@ -464,6 +464,31 @@ impl Exl3HipDecoder {
     }
 
     fn gemv_chain(&mut self, l: &HipLin, dx_in: *mut u8, dyb_out: *mut u8) -> Result<(), String> {
+        // plans/136 P1-1 (승격 2026-10-06): fork WMMA GEMV(f32-누산 WMMA, 가중
+        // 1패스) 기본화 — A/B: tg128 6.72→8.42(+25.3%, reps3 spread 2.8%),
+        // 디코드 토큰 스트림 완전 동일(OFF/ON diff 0). krate==4 한정(27B 4.0bpw),
+        // 타 krate·m>1은 종전 경로. exl3_gemv_j128_w32<4,FP32,MMODE0,CFG1>:
+        // A=f16 활성[k], B=트렐리스 스트림, C=f32[n], grid=ceil(n/128)·blk=256.
+        if l.krate == 4 {
+            let (mut a, mut b, mut c) = (self.dah, l.tre, self.dsb);
+            let (mut sm, mut sk, mut sn) = (1i32, l.k as i32, l.n as i32);
+            self.hc.launch3(
+                "_Z18exl3_gemv_j128_w32ILi4ELb1ELi0ELi1EEvPK6__halfPKtPviii",
+                (l.n / 128) as u32,
+                1,
+                1,
+                256,
+                &mut [
+                    &mut a as *mut *mut u8 as *mut _,
+                    &mut b as *mut *mut u8 as *mut _,
+                    &mut c as *mut *mut u8 as *mut _,
+                    &mut sm as *mut i32 as *mut _,
+                    &mut sk as *mut i32 as *mut _,
+                    &mut sn as *mut i32 as *mut _,
+                ],
+            )?;
+            return Ok(());
+        }
         let mut kc = (l.k / 128) as i32;
         let mut ks = l.k as i32;
         let (mut p0, mut p1, mut p2) = (dx_in, l.suh, self.dah);
