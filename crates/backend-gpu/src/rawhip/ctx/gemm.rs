@@ -317,7 +317,7 @@ impl RawCtx {
         }
         // plans/135 실험(2026-10-06, ADR-0019 삭제): 대형 n_out w-패널 —
         // head(151936)·ssm_out에 LLM170_Q8W_BIG=1 A/B → tg 18.38 vs 19.08 역행.
-        // 원판(레인당 연속 34B 블록 1개)이 이 형상 상한. 재시도 금지.
+        // 원판(레인당 연속 34B 블록 1개)이 이 형상 상한(2026-10-06 A/B).
         let gz2 = n_out.div_ceil(65535) as u32;
         match ty {
             23 | 20 => args_v.insert(4, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
@@ -558,6 +558,10 @@ impl RawCtx {
         if t > 64 && !j128 {
             return Err(format!("타일 미지원: t={t}는 CO 사전컴파일(j128/v4) 필요"));
         }
+        // plans/135 item 3 (ADR-0019 삭제): WM16 실험 — t≥16 WMMA(F16) 하향
+        // A/B → rows≥17 verify 388-411 vs dp4a mm 338-385 역행. gfx1151 F16
+        // WMMA ×64토큰 패딩이 dp4a를 이기지 못함. 정답은 llama RDNA3의
+        // i8 텐서코어 MMQ(4× dp4a) — 별도 커널 과제로 원장화.
         let big = t >= 32 || large_t;
         let (v4, odd) = (self.co_loaded(CO_V4), self.co_loaded(CO_ODD));
         let kern: &'static str = match ty {

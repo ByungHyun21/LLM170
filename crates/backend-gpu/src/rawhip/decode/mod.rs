@@ -807,7 +807,7 @@ impl DecodeState {
         // plans/135 실험(2026-10-06): g4 t≤24 확장 A/B → np4-spec2 21.50→19.41
         // (-9.7% 역행, reps3 spread 0.6%) — g4의 워프당 직렬 적재 사슬이 t=12-24의
         // ALU 증가에서 MLP 부족으로 드러난다. mm 타일이 이 구간 상한. 커널 acc[16]
-        // 확장 포함 전량 원복(ADR-0019 패자 경로 삭제) — 재시도 금지.
+        // 확장 포함 전량 원복(ADR-0019 패자 경로 삭제).
         if !pin && (2..=4).contains(&t) && matches!(ty, 12 | 13 | 14 | 23) {
             return self.ctx.gemm_g4(
                 ty,
