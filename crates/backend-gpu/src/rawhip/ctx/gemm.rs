@@ -598,6 +598,9 @@ impl RawCtx {
                     "gemm_q4k_j128"
                 } else if !env_on("LLM170_EXACT") && big {
                     "gemm_q4k_wm"
+                } else if !env_on("LLM170_EXACT") && t >= 5 {
+                    // plans/135 §22 i8 WMMA MMQ — q4K mm 판 t=5..15 교체(q5K 동일).
+                    "gemm_q4k_wm8"
                 } else {
                     "gemm_q4k_mm"
                 }
@@ -608,6 +611,7 @@ impl RawCtx {
                 } else if !env_on("LLM170_EXACT") && big {
                     "gemm_q6k_wm"
                 } else {
+                    // q6K wm8은 부정(ADR-0019 — src_gemm.hip 원장 주석) — mm 유지.
                     "gemm_q6k_mm"
                 }
             }
@@ -620,6 +624,9 @@ impl RawCtx {
                     "gemm_xs_v4"
                 } else if !env_on("LLM170_EXACT") && big {
                     "gemm_xs_wm"
+                } else if !env_on("LLM170_EXACT") && t >= 5 {
+                    // plans/135 §22 i8 WMMA MMQ — iq4_xs mm 판 t=5..15 교체(LUT 부호 i8).
+                    "gemm_xs_wm8"
                 } else {
                     "gemm_xs_mm"
                 }

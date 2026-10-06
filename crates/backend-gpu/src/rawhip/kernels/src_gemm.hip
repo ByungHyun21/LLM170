@@ -1143,6 +1143,130 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
 }
 
 
+// q4_K WMMA i8 (ty12) — gemm_q4k_mm의 dp4a 계산부를 i8 WMMA로 교체. q5k wm8과
+// 동일 골격(64행×16토큰·128스레드·sb당 2 k16 체인·mm 문순 접기 — 비트동일 계약),
+// 차이는 언팩뿐: ql 4bit nibble(qh 없음·값 0..15 무부호), 블록 144B, ql=wq+4.
+extern "C" __global__ void __launch_bounds__(128) gemm_q4k_wm8(
+        const unsigned* xq, const unsigned* w, float* out,
+        int n_in, int n_out, int xq_w, int t) {
+    typedef int v4i __attribute__((ext_vector_type(4)));
+    typedef int v8i __attribute__((ext_vector_type(8)));
+    __shared__ unsigned wvs[8][64][9];
+    __shared__ float dsc[8][64][2];
+    __shared__ unsigned ys[8][16][9];
+    __shared__ float ydt[8][16];
+    __shared__ int qst[8][16];
+
+    int i = blockIdx.x * 64;
+    int t0 = blockIdx.z * 16;
+    int tid = threadIdx.x;
+    int wave = tid >> 5;
+    int lane = tid & 31;
+    int li = lane & 15;
+    if (i >= n_out || t0 >= t) return;
+    int nt = min(16, t - t0);
+    int nrow = min(64, n_out - i);
+    int n_sub = n_in >> 5;
+    int blocks = n_in >> 8;
+    int qsb = (n_in >> 2) + (n_in >> 5);
+    float acc[8];
+    #pragma unroll
+    for (int g = 0; g < 8; g++) acc[g] = 0.0f;
+    for (int k0 = 0; k0 < n_sub; k0 += 8) {
+        for (int pass = 0; pass < 4; pass++) {
+            int u = pass * 128 + tid;
+            int sbl = u >> 6;
+            int r  = u & 63;
+            int sb = k0 + sbl;
+            if (r < nrow && sb < n_sub) {
+                int o = i + r;
+                int js = sb & 7;
+                int it = js >> 1;
+                int half = js & 1;
+                int wb = o * blocks * 144 + (sb >> 3) * 144;
+                int wq = wb >> 2;
+                unsigned w0 = w[wq];
+                float d = bits_f16(w0 & 0xFFFFu);
+                float dm = bits_f16(w0 >> 16);
+                unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
+                unsigned rr = (js & 3) * 8;
+                unsigned b1 = js < 4 ? (sc0 >> rr) & 0xFFu : (sc1 >> rr) & 0xFFu;
+                unsigned b4 = js < 4 ? (sc1 >> rr) & 0xFFu : (sc2 >> rr) & 0xFFu;
+                unsigned bm = (sc0 >> rr) & 0xFFu;
+                unsigned sc_v, m_v;
+                if (js < 4) { sc_v = b1 & 63u; m_v = b4 & 63u; }
+                else { sc_v = (b4 & 0xFu) | ((bm >> 6) << 4); m_v = (b4 >> 4) | ((b1 >> 6) << 4); }
+                dsc[sbl][r][0] = d * (float)sc_v;
+                dsc[sbl][r][1] = dm * (float)m_v;
+                unsigned nsh = half << 2;
+                int qlb = wq + 4 + it * 8;
+                #pragma unroll
+                for (int kk = 0; kk < 8; kk++)
+                    wvs[sbl][r][kk] = (w[qlb + kk] >> nsh) & 0x0F0F0F0Fu;
+            }
+        }
+        {
+            int sbl = tid >> 4;
+            int ti = tid & 15;
+            int sb = k0 + sbl;
+            if (sb < n_sub) {
+                if (ti < nt) {
+                    const unsigned* xt = xq + (size_t)(t0 + ti) * xq_w;
+                    int xw = (sb << 5) >> 2;
+                    #pragma unroll
+                    for (int kk = 0; kk < 8; kk++) ys[sbl][ti][kk] = xt[xw + kk];
+                    ydt[sbl][ti] = __uint_as_float(xt[(n_in >> 2) + sb]);
+                    qst[sbl][ti] = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
+                } else {
+                    #pragma unroll
+                    for (int kk = 0; kk < 8; kk++) ys[sbl][ti][kk] = 0u;
+                    ydt[sbl][ti] = 0.0f;
+                    qst[sbl][ti] = 0;
+                }
+            }
+        }
+        __syncthreads();
+        if (wave * 16 < nrow) {
+            #pragma unroll
+            for (int sbl = 0; sbl < 8; sbl++) {
+                int sb = k0 + sbl;
+                if (sb >= n_sub) break;
+                unsigned af[2][4], bf[2][4];
+                #pragma unroll
+                for (int g = 0; g < 4; g++) {
+                    bf[0][g] = wvs[sbl][wave * 16 + li][g];
+                    bf[1][g] = wvs[sbl][wave * 16 + li][4 + g];
+                    af[0][g] = ys[sbl][li][g];
+                    af[1][g] = ys[sbl][li][4 + g];
+                }
+                v8i d8 = {};
+                d8 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                    true, *reinterpret_cast<v4i*>(&af[0][0]), false,
+                    *reinterpret_cast<v4i*>(&bf[0][0]), d8, false);
+                d8 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                    true, *reinterpret_cast<v4i*>(&af[1][0]), false,
+                    *reinterpret_cast<v4i*>(&bf[1][0]), d8, false);
+                float d0 = dsc[sbl][wave * 16 + li][0];
+                float d1 = dsc[sbl][wave * 16 + li][1];
+                #pragma unroll
+                for (int g = 0; g < 8; g++) {
+                    int ti = g * 2 + (lane >> 4);
+                    acc[g] += ydt[sbl][ti] * d0 * (float)d8[g];
+                    acc[g] -= ydt[sbl][ti] * d1 * (float)qst[sbl][ti];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (i + wave * 16 + li < n_out) {
+        #pragma unroll
+        for (int g = 0; g < 8; g++) {
+            int ti = g * 2 + (lane >> 4);
+            if (ti < nt) out[(size_t)(t0 + ti) * n_out + i + wave * 16 + li] = acc[g];
+        }
+    }
+}
+
 // q6_K MMQ (ty14) — 16원소 그룹: w = nib + 16·hi2 − 32 (qsum 테이블 분해).
 // 그룹 2개/서브블록? 아님 — q6_K 그룹=16원소, 서브블록 32원소=2그룹.
 // 여기선 k청크를 16원소 그룹 16개(256원소)로: wvs[16그룹][64행][4워드].
@@ -1273,6 +1397,133 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
     }
 }
 
+// q6_K WMMA i8 (ty14) — 부정 원장(ADR-0019, 2026-10-06): gemm_q6k_wm8 128스레드판
+// A/B t=12 0.285ms vs mm 0.222ms(−22%) — q6K mm이 이미 116GB/s(가중 25.8MB 기준)
+// 이고 16그룹×64행=1024유닛 언팩이 128스레드에서 8패스로 스테이징 비용 2배.
+// 커널·NAMES·디스패치 분기 삭제. 참고: q4K wm8은 동일 A/B에서 +40%(0.167 vs 0.278).
+
+// iq4_xs WMMA i8 (ty23) — gemm_xs_mm의 dp4a 교체. LUT 언팩값이 부호 i8(−8..7)이므로
+// b_neg=true·A 부호 — 쌍방 부호. 스케일 = 32원소 서브블록당 1개(ls−32 사전곱) →
+// sb당 2 k16 체인·mm 문순 접기(단일항, qst 불요). ktab2 인자 유지(ktab 계약).
+extern "C" __global__ void __launch_bounds__(128) gemm_xs_wm8(
+        const unsigned* xq, const unsigned* w, float* out, const unsigned* ktab2,
+        int n_in, int n_out, int xq_w, int t) {
+    typedef int v4i __attribute__((ext_vector_type(4)));
+    typedef int v8i __attribute__((ext_vector_type(8)));
+    __shared__ unsigned wvs[8][64][9];
+    __shared__ float dsc[8][64];
+    __shared__ unsigned ys[8][16][9];
+    __shared__ float ydt[8][16];
+    __shared__ unsigned kt_s[256];
+    for (int a = threadIdx.x; a < 256; a += 128) kt_s[a] = ktab2[a];
+    __syncthreads();   // LUT 가시성 — 언팩 룩업 전 필수 (gemm_xs_mm 경합 수정 선례)
+
+    int i = blockIdx.x * 64;
+    int t0 = blockIdx.z * 16;
+    int tid = threadIdx.x;
+    int wave = tid >> 5;
+    int lane = tid & 31;
+    int li = lane & 15;
+    if (i >= n_out || t0 >= t) return;
+    int nt = min(16, t - t0);
+    int nrow = min(64, n_out - i);
+    int n_sub = n_in >> 5;
+    int blocks = n_in >> 8;
+    float acc[8];
+    #pragma unroll
+    for (int g = 0; g < 8; g++) acc[g] = 0.0f;
+    for (int k0 = 0; k0 < n_sub; k0 += 8) {
+        for (int pass = 0; pass < 4; pass++) {
+            int u = pass * 128 + tid;
+            int sbl = u >> 6;
+            int r  = u & 63;
+            int sb = k0 + sbl;
+            if (r < nrow && sb < n_sub) {
+                int o = i + r;
+                int ib = sb & 7;
+                int wb = o * blocks * 136 + (sb >> 3) * 136;
+                int wq = wb >> 2;
+                unsigned w0 = w[wq];
+                float d = bits_f16(w0 & 0xFFFFu);
+                int ls = (int)((w[wq + 1] >> (((ib >> 1) * 8 + (ib & 1) * 4))) & 0xFu)
+                      | (int)((((w0 >> 16) >> (2 * ib)) & 3u) << 4);
+                dsc[sbl][r] = d * (float)(ls - 32);
+                int qw = (wb + 8 + ib * 16) >> 2;
+                #pragma unroll
+                for (int kk = 0; kk < 4; kk++) {
+                    unsigned qv = w[qw + kk];
+                    unsigned lov = 0, hiv = 0;
+                    #pragma unroll
+                    for (int b2 = 3; b2 >= 0; b2--) {
+                        unsigned tt2 = kt_s[(qv >> (8 * b2)) & 0xFFu];
+                        lov = (lov << 8) | (tt2 & 0xFFu);
+                        hiv = (hiv << 8) | (tt2 >> 8);
+                    }
+                    wvs[sbl][r][kk * 2] = lov;
+                    wvs[sbl][r][kk * 2 + 1] = hiv;
+                }
+            }
+        }
+        // y: 8sb×16토큰 = 128유닛 — 1패스 정확 커버(2패스화 시 sbl 8..15 OOB — 실측 segfault)
+        {
+            int sbl = tid >> 4;
+            int ti = tid & 15;
+            int sb = k0 + sbl;
+            if (sb < n_sub) {
+                if (ti < nt) {
+                    const unsigned* xt = xq + (size_t)(t0 + ti) * xq_w;
+                    int xw = (sb << 5) >> 2;
+                    #pragma unroll
+                    for (int kk = 0; kk < 8; kk++) ys[sbl][ti][kk] = xt[xw + kk];
+                    ydt[sbl][ti] = __uint_as_float(xt[(n_in >> 2) + sb]);
+                } else {
+                    #pragma unroll
+                    for (int kk = 0; kk < 8; kk++) ys[sbl][ti][kk] = 0u;
+                    ydt[sbl][ti] = 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+        if (wave * 16 < nrow) {
+            #pragma unroll
+            for (int sbl = 0; sbl < 8; sbl++) {
+                int sb = k0 + sbl;
+                if (sb >= n_sub) break;
+                unsigned af[2][4], bf[2][4];
+                #pragma unroll
+                for (int g = 0; g < 4; g++) {
+                    // LUT 언팩: 워드 2k=원소 4k..4k+3(low nibble)·2k+1=원소 16+4k..(high) —
+                    // 미러 y_el(j / j+16) 대응. k16 앞=짝수 워드·뒤=홀수 워드.
+                    bf[0][g] = wvs[sbl][wave * 16 + li][2 * g];
+                    bf[1][g] = wvs[sbl][wave * 16 + li][2 * g + 1];
+                    af[0][g] = ys[sbl][li][g];
+                    af[1][g] = ys[sbl][li][4 + g];
+                }
+                v8i d8 = {};
+                d8 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                    true, *reinterpret_cast<v4i*>(&af[0][0]), true,
+                    *reinterpret_cast<v4i*>(&bf[0][0]), d8, false);
+                d8 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                    true, *reinterpret_cast<v4i*>(&af[1][0]), true,
+                    *reinterpret_cast<v4i*>(&bf[1][0]), d8, false);
+                float d0 = dsc[sbl][wave * 16 + li];
+                #pragma unroll
+                for (int g = 0; g < 8; g++) {
+                    int ti = g * 2 + (lane >> 4);
+                    acc[g] += ydt[sbl][ti] * d0 * (float)d8[g];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (i + wave * 16 + li < n_out) {
+        #pragma unroll
+        for (int g = 0; g < 8; g++) {
+            int ti = g * 2 + (lane >> 4);
+            if (ti < nt) out[(size_t)(t0 + ti) * n_out + i + wave * 16 + li] = acc[g];
+        }
+    }
+}
 
 // iq4_xs MMQ (ty23) — ktab2 룩업 언팩, 공유 LUT.
 extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
