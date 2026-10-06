@@ -749,6 +749,9 @@ impl Engine {
         k: usize,
     ) -> Result<(Vec<u32>, usize), ModelError> {
         let eos = crate::qwen35::EOS_EOT;
+        // plans/135 §22 MTP k3: np1 솔로 라운드 계측 — draft/verify/state 분해
+        let tm_on = llm170_diag::dump::opts().key("spec_time");
+        let t0 = std::time::Instant::now();
         let rd = self
             .raw_decode
             .clone()
@@ -790,6 +793,8 @@ impl Engine {
             }
         }
         // ── verify: [carried..., last_token, d0, d1, ...] 1배치 — 행별 argmax = 다음 토큰 정답
+        let t_draft = t0.elapsed();
+        let t1 = std::time::Instant::now();
         // carried = 직전 부분수용에서 GDN이 미확정인 행 — 같은 토큰·같은 위치 재실행
         // (결정론적 커널 → 동일 결과, KV는 동일값 재기입). 재실행 배치를 대체한다.
         let mut carried: Vec<u32> = std::mem::take(&mut self.seqs[seq].gdn_carried);
@@ -897,6 +902,8 @@ impl Engine {
         }
         // ── MTP 상태 진행 (시프트 페어링): 행 0은 draft step-0이 이미 처리.
         // carried 구간은 직전 스텝이 이미 적립(멱등) — 신규 행부터만.
+        let t_verify = t1.elapsed();
+        let t2 = std::time::Instant::now();
         {
             let kept = carried_n + kept_new;
             for i in (carried_n.max(1))..kept {
@@ -909,6 +916,18 @@ impl Engine {
         }
         // 시퀀스 pos 동기 — 유지 신규 행 수만 반영
         self.seqs[seq].pos = base_pos + (kept_new as u32);
+        if tm_on {
+            eprintln!(
+                "[specT] draft={:6.1}ms verify={:6.1}ms state={:6.1}ms acc={}/{} t={} carried={}",
+                t_draft.as_secs_f64() * 1e3,
+                t_verify.as_secs_f64() * 1e3,
+                t2.elapsed().as_secs_f64() * 1e3,
+                accepted.len().saturating_sub(1),
+                drafts.len(),
+                t,
+                carried_n,
+            );
+        }
         let n = accepted.len().max(1);
         Ok((accepted, n))
     }
