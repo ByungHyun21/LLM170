@@ -929,7 +929,9 @@ pub(super) fn qsa_frame(
     // ─── plans/89 재개: 프리필 다중 토큰 디바이스 선택 — d2h 4회(배치
     // 플러시)와 호스트 점수/정렬을 전부 소거. 실패 시 종전 호스트 경로.
     // 스위치 LLM170_QSA_NODEVSEL=1, 검증 LLM170_QSA_DEVCHECK(호스트 병행).
-    if t > 1 {
+    // plans/135 §22: mt는 다중 청크(t≥1024)에서만 승 — 단일 소청크(pp512 t=512)
+    // 에선 토큰별 그리드 오버헤드가 d2h 절감을 초과 (-29 t/s 실측, A/B 확정).
+    if t >= 1024 {
         let ikw3 = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
         let iqw3 = model.f32_vec4(&format!("blk.{il}.indexer.q_norm.weight"))?;
         let devsel = acc.qsa_sel_dev_mt(
