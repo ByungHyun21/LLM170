@@ -969,7 +969,12 @@ pub fn mm_bench() -> Result<String, String> {
     }
     let kern_name = match w.ty {
         llm170_gguf::GgmlType::Q5K => {
-            if v4 {
+            if std::env::var_os("LLM170_MM_WM8").is_some() {
+                "gemm_q5k_wm8"
+            } else if std::env::var_os("LLM170_EXACT").is_some() {
+                // EXACT 우선(v4/j128 CO 상재 무관 mm 강제 — 베이스라인 측정용)
+                "gemm_q5k_mm"
+            } else if v4 {
                 "gemm_q5k_v4"
             } else if j128f {
                 "gemm_q5k_j128"
@@ -1074,8 +1079,13 @@ pub fn mm_bench() -> Result<String, String> {
         };
         let gx = n_out.div_ceil(rpb).min(65535) as u32;
         let _gz = n_out.div_ceil(rpb).div_ceil(65535) as u32;
-        let gz = n_out.div_ceil(64).div_ceil(65535) as u32;
-        ctx.launch3(kern_name, gx, 1, gz, 256, &mut args)
+        let gz = if kern_name == "gemm_q5k_wm8" {
+            t.div_ceil(16) as u32
+        } else {
+            n_out.div_ceil(64).div_ceil(65535) as u32
+        };
+        let thr = if kern_name == "gemm_q5k_wm8" { 128 } else { 256 };
+        ctx.launch3(kern_name, gx, 1, gz, thr, &mut args)
     };
     launch(&ctx)?;
     ctx.sync()?;
