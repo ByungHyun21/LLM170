@@ -389,8 +389,8 @@ impl DecodeState {
         // 마지막 위상 — fn 종료로 리셋 불요 (데드 할당 경고 회피)
         if mtp_tm {
             self.ctx.sync().ok();
-            ph[7] += mt.elapsed().as_micros() as u128;
-            phw[7] += mtw.elapsed().as_micros() as u128;
+            ph[7] += mt.elapsed().as_micros();
+            phw[7] += mtw.elapsed().as_micros();
         }
         if mtp_tm {
             eprintln!(
