@@ -94,6 +94,21 @@ impl DecodeState {
         if !self.mtp_on {
             return Err("mtp_step_gpu: MTP 미로드".into());
         }
+        // plans/135 §22 MTP k3: 패스 위상 분해 (LLM170_DUMP=spec_time)
+        let mtp_tm = llm170_diag::dump::opts().key("spec_time");
+        let mut mt = std::time::Instant::now();
+        let mut mtw = std::time::Instant::now();
+        let mut ph = [0u128; 8];
+        let mut phw = [0u128; 8];
+        macro_rules! mmark { ($i:expr) => {{
+            if mtp_tm {{
+                phw[$i] += mtw.elapsed().as_micros() as u128; // wall (호스트 포함)
+                self.ctx.sync().ok(); // 커널 비동기 — sync 후 GPU 실측
+                ph[$i] += mt.elapsed().as_micros() as u128;
+                mt = std::time::Instant::now();
+                mtw = std::time::Instant::now();
+            }
+        }} }}
         let n = self.n_embd;
         let (n_head, n_kv, hd) = (self.n_head, self.n_kv, self.hd);
         let n_ao = n_head * hd; // wo 입력 길이
@@ -106,6 +121,7 @@ impl DecodeState {
         self.rms(self.mtp_e, en, self.mtp_cat, n)?;
         let cat_h = unsafe { self.mtp_cat.add(n * 4) };
         self.rms(h_gpu, hn, cat_h, n)?;
+        mmark!(0);
         // eh_proj [2n → n]
         if llm170_diag::dump::opts().key("mtp_stage") {
             self.ctx.sync()?;
@@ -124,6 +140,7 @@ impl DecodeState {
             );
         }
         self.quant(self.mtp_cat, self.mtp_xq2, 2 * n)?;
+        mmark!(1);
         if env_on("LLM170_MTP_DBG") {
             self.ctx.sync()?;
             eprintln!("[mtp] quant2 ok");
@@ -138,6 +155,7 @@ impl DecodeState {
         // RCA 대상: gemv_q8_out 경로가 ni=10240에서만 700 — 직접 launch는 동일 파라미터로
         // 성공(gy 스위프 검증). 동일 직접 경로로 실행 (산술은 gemm_q6k로 동일).
         self.mm_direct(self.mtp_xq2, we, te, nie, noe, self.mtp_cur)?;
+        mmark!(2);
         // 진단 덤프 (MTP 헤드 1단계 수치 미러 대조): tok_emb/h/cat/eh
         if let Some(pref) = llm170_diag::dump::opts().key_arg("mtp_dump") {
             let pref = pref.to_string();
@@ -206,12 +224,14 @@ impl DecodeState {
         let an = *self.consts.get("blk.64.attn_norm").ok_or("attn_norm")?;
         self.rms(self.mtp_cur, an, self.mtp_e, n)?;
         self.quant(self.mtp_e, self.mtp_xq, n)?;
+        mmark!(3);
         let (wq, tq, niq, noq) = self.w("blk.64.attn_q.weight")?;
         self.mm_into(self.mtp_xq, wq, tq, niq, noq, self.aq)?;
         let (wk, tk, nik, nok) = self.w("blk.64.attn_k.weight")?;
         self.mm_into(self.mtp_xq, wk, tk, nik, nok, self.ak)?;
         let (wv, tv, niv, nov) = self.w("blk.64.attn_v.weight")?;
         self.mm_into(self.mtp_xq, wv, tv, niv, nov, self.av)?;
+        mmark!(4);
         // q/k norm+rope
         let qn = *self.consts.get("blk.64.attn_q_norm").ok_or("qn")?;
         let kn = *self.consts.get("blk.64.attn_k_norm").ok_or("kn")?;
@@ -299,6 +319,7 @@ impl DecodeState {
             self.ctx
                 .launch3("qsa_flash", 1, n_head as u32, 1, 256, &mut args)?;
         }
+        mmark!(5);
         // wo + 잔차 (입력 길이 = n_head*hd)
         self.quant(self.mtp_ao, self.mtp_xq, n_ao)?;
         let (wo, two, nio, noo) = self.w("blk.64.attn_output.weight")?;
@@ -343,6 +364,7 @@ impl DecodeState {
         let (wd, td, nid, nod) = self.w("blk.64.ffn_down.weight")?;
         self.mm_into(self.xq_f, wd, td, nid, nod, self.fdown)?;
         self.axpy(self.mtp_cur, self.fdown, n)?;
+        mmark!(6);
         if llm170_diag::dump::opts().key("mtp_stage") {
             self.ctx.sync()?;
             let mut v = vec![0f32; n];
@@ -364,6 +386,20 @@ impl DecodeState {
             .ok_or("shn")?;
         self.rms(self.mtp_cur, shn, self.mtp_e, n)?;
         let _t0h = std::time::Instant::now();
+        mmark!(7);
+        if mtp_tm {
+            eprintln!(
+                "[mtpP] cat={:6.3}/{:6.3} q8={:6.3}/{:6.3} eh={:6.3}/{:6.3} anq={:6.3}/{:6.3} qkv={:6.3}/{:6.3} attn={:6.3}/{:6.3} ffn={:6.3}/{:6.3} head={:6.3}/{:6.3} ms wall/GPU",
+                phw[0] as f64 / 1000.0, ph[0] as f64 / 1000.0,
+                phw[1] as f64 / 1000.0, ph[1] as f64 / 1000.0,
+                phw[2] as f64 / 1000.0, ph[2] as f64 / 1000.0,
+                phw[3] as f64 / 1000.0, ph[3] as f64 / 1000.0,
+                phw[4] as f64 / 1000.0, ph[4] as f64 / 1000.0,
+                phw[5] as f64 / 1000.0, ph[5] as f64 / 1000.0,
+                phw[6] as f64 / 1000.0, ph[6] as f64 / 1000.0,
+                phw[7] as f64 / 1000.0, ph[7] as f64 / 1000.0
+            );
+        }
         let am = self.head_argmax_gpu(self.mtp_e)?;
         Ok(Some(am))
     }
