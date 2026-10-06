@@ -811,7 +811,9 @@ impl Engine {
         // k≥4는 종전 4(해당 모드는 large-t 타일 검증 유지). 종전 기본 4는 타일
         // 검증 시대의 최적값(원장: 4=13.7 > 0=6.7 t/s) — g4 체제에서는 t>4가
         // 언핀 타일(mm 패밀리)로 떨어져 역전된다.
-        let cap_default = if k <= 3 { 3 - k } else { 4 };
+        // plans/135 §22 MTP k3: mm8 절반 판(t≤8)이 verify 커버 — 캡 7-k(k3=4)로
+        // carried 라이딩 허용(플러시 제거). 과거 3-k는 g4 t≤4 한계 시절 값.
+        let cap_default = if k <= 3 { 7 - k } else { 4 };
         let cap_extra: usize = llm170_diag::flag::val("LLM170_SPEC_CAPX")
             .and_then(|v| v.parse().ok())
             .unwrap_or(cap_default);
