@@ -1207,6 +1207,104 @@ extern "C" __global__ void __launch_bounds__(64) q5_1_gemm_dmmv_ids(
 
 
 
+// q5_K (176B [d f16][dmin f16][scales 12B][qs 128B][qh 32B]) — q5_1 dmmv 골격
+// (레인 8원소, 스트라이드 512, 2행/WG, ids 간접)에 Q5_K 블록 산술 접목:
+// v = nib + 16·hi (0..31), rr = d·sc[js]·Σv·x − dmin·m[js]·Σx.
+// qs는 ql@48(원소 e: 바이트 48+(e>>6)*32+(e&31), 니블 = (e>>5)&1 저/상),
+// qh@16(바이트 e&31, 비트 2*(e>>6)+(e>>5&1)) — deq_q5_k(deq.rs)과 동일 레이아웃.
+// 8원소 그룹(s0 8-정렬)은 한 (m, half) 사분면 안에 완전히 들어가므로 ql 2워드 +
+// qh 1바이트(비트는 그룹 상수)로 처리된다.
+// 스케일 디코드는 gemm_q5k 계열의 6비트 패킹과 동일. FN 2층의 Q5_K 전문가
+// 스택이 그룹 타일 경로(7ms/스텝)로 떨어지던 것을 dmmv로 (plans/135 항목 15).
+extern "C" __global__ void __launch_bounds__(64) q5k_gemm_dmmv_ids(
+        const float* __restrict__ x, const unsigned* __restrict__ w,
+        float* __restrict__ out, const unsigned* __restrict__ ids,
+        int n_in, int n_out, int rows, int expert_bytes) {
+    const int l = threadIdx.x;
+    if (l >= 64) return;
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const int wg = blockIdx.y + (int)blockIdx.z * gridDim.y;
+    const int first_row = wg << 1;
+    if (first_row >= n_out) return;
+    const int num_rows = min(2, n_out - first_row);
+    const size_t ebase = (size_t)ids[r] * (size_t)expert_bytes;
+    const int rstride = (n_in >> 8) * 176;
+    const float* xr = x + (size_t)r * n_in;
+    float t0 = 0.0f, t1 = 0.0f;
+    for (int col0 = l << 3; col0 < n_in; col0 += 512) {
+        float xw[8];
+        float sx = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            xw[j] = xr[col0 + j];
+            sx += xw[j];
+        }
+        const int s0 = col0 & 255;            // 초대블록 내 오프셋 (8-정렬)
+        const int sb = col0 >> 8;             // 초대블록 256원소
+        const int js = (s0 >> 5) & 7;         // 서브블록 32 = is = m*2+half
+        const int ql0 = 48 + ((s0 >> 6) << 5) + (s0 & 31); // ql 바이트 (그룹 시작)
+        const int half = (s0 >> 5) & 1;       // 0=저니블, 1=상니블 (그룹 상수)
+        const unsigned hibit = 2u * (unsigned)(s0 >> 6) + (unsigned)half;
+        #pragma unroll
+        for (int n = 0; n < 2; n++) {
+            if (n >= num_rows) break;
+            const size_t bb = ebase + (size_t)(first_row + n) * (size_t)rstride
+                            + (size_t)sb * 176u;
+            const unsigned w0 = w[bb >> 2];
+            const float d = bits_f16(w0 & 0xFFFFu);
+            const float dmin = bits_f16(w0 >> 16);
+            // 스케일 3워드(12B) — 6비트 sc/m 패킹 (scale_min_k4와 동일 디코드)
+            const unsigned rr_ = (unsigned)(js & 3) << 3;
+            const unsigned sc0w = w[(bb + 4) >> 2];
+            const unsigned sc1w = w[(bb + 8) >> 2];
+            const unsigned sc2w = w[(bb + 12) >> 2];
+            const unsigned b1 = js < 4 ? (sc0w >> rr_) & 0xFFu : (sc1w >> rr_) & 0xFFu;
+            const unsigned b4 = js < 4 ? (sc1w >> rr_) & 0xFFu : (sc2w >> rr_) & 0xFFu;
+            const unsigned bm = (sc0w >> rr_) & 0xFFu;
+            unsigned sc_v, m_v;
+            if (js < 4) { sc_v = b1 & 63u; m_v = b4 & 63u; }
+            else {
+                sc_v = (b4 & 0xFu) | ((bm >> 6) << 4);
+                m_v  = (b4 >> 4) | ((b1 >> 6) << 4);
+            }
+            const unsigned qsw0 = w[(bb + (unsigned)ql0) >> 2];
+            const unsigned qsw1 = w[(bb + (unsigned)ql0 + 4u) >> 2];
+            const unsigned qhv = w[(bb + 16 + (unsigned)(s0 & 31)) >> 2];
+            const unsigned hibit_v = (qhv >> hibit) & 1u;   // 그룹 전체 동일 비트
+            const unsigned vhi = hibit_v << 4;
+            float aq = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const unsigned bytev = (j < 4 ? (qsw0 >> ((unsigned)(j & 3) << 3))
+                                              : (qsw1 >> ((unsigned)(j & 3) << 3))) & 0xFFu;
+                const unsigned nib = (half != 0) ? (bytev >> 4) : (bytev & 0xFu);
+                aq += (float)(nib | vhi) * xw[j];
+            }
+            const float rr2 = d * (float)sc_v * aq - dmin * (float)m_v * sx;
+            if (n == 0) t0 += rr2; else t1 += rr2;
+        }
+    }
+    __shared__ double sh0[32], sh1[32];
+    double a0 = (double)t0, a1 = (double)t1;
+    if (l >= 32) { sh0[l - 32] = a0; sh1[l - 32] = a1; }
+    __syncthreads();
+    if (l < 32) {
+        a0 += sh0[l];
+        a1 += sh1[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a0 += __shfl_down_sync(0xffffffffffffffffull, a0, off);
+            a1 += __shfl_down_sync(0xffffffffffffffffull, a1, off);
+        }
+        if (l == 0) {
+            float* orow = out + (size_t)r * n_out;
+            orow[first_row] = (float)a0;
+            if (num_rows > 1) orow[first_row + 1] = (float)a1;
+        }
+    }
+}
+
 // 4헤드-퍼-워프 — 선택 목록이 **토큰 단위**라(인덱서가 헤드 합산) 같은 토큰의
 // 여러 Q헤드가 같은 K/V 행을 쓴다. 워프가 4헤드를 맡아 K/V 로드를 1/4로 줄인다
 // (24 Q헤드 = 2 KV헤드 → 12 Q헤드가 같은 키를 읽던 것을 3워프로 접음).

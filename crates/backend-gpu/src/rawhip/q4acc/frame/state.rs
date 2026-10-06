@@ -331,6 +331,8 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             let idp = self.fptr(ids)?;
             let kern: &'static str = if ws.ty == GgmlType::Q4K {
                 "q4_gemm_q4k_dmmv_ids"
+            } else if ws.ty == GgmlType::Q5K {
+                "q5k_gemm_dmmv_ids"
             } else {
                 "q5_1_gemm_dmmv_ids"
             };
