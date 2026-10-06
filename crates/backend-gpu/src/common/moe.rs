@@ -137,7 +137,9 @@ pub fn grp_padded(off: &[usize], ne: usize, pad: usize) -> (Vec<usize>, usize) {
 /// (2b)는 q5_K·q8_0 도 포함하지만 그 판들은 xq 를 소비하므로 이 게이트와
 /// 다르다. 런치 판 선택 자체는 백엔드별(원장 114).
 pub fn ids2_takes(rows: usize, t: usize, ty: GgmlType) -> bool {
-    rows > 0 && (t == 1 || rows <= 64) && matches!(ty, GgmlType::Q4K | GgmlType::Q5_1)
+    // plans/135 항목 15: Q5K 추가 — FN 2층의 Q5_K 전문가 스택이 그룹 타일
+    // 경로(스텝당 14ms)로 떨어지던 것을 dmmv direct-ids로 (q5k_gemm_dmmv_ids).
+    rows > 0 && (t == 1 || rows <= 64) && matches!(ty, GgmlType::Q4K | GgmlType::Q5_1 | GgmlType::Q5K)
 }
 
 #[cfg(test)]

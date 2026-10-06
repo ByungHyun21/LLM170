@@ -784,6 +784,10 @@ impl DecodeState {
         // 독서로 토큰별 독립 누산. LLM170_NO_G4=1로 끔.
         // 프리필 핀(plans/84 A) 시 g4/q5v2 스킵 — 환원 순서가 large-t 패밀리와
         // 달라 청크 경계 수치가 갈린다.
+        // plans/135 실험(2026-10-06): g4 t≤24 확장 A/B → np4-spec2 21.50→19.41
+        // (-9.7% 역행, reps3 spread 0.6%) — g4의 워프당 직렬 적재 사슬이 t=12-24의
+        // ALU 증가에서 MLP 부족으로 드러난다. mm 타일이 이 구간 상한. 커널 acc[16]
+        // 확장 포함 전량 원복(ADR-0019 패자 경로 삭제) — 재시도 금지.
         if !pin && (2..=4).contains(&t) && matches!(ty, 12 | 13 | 14 | 23) {
             return self.ctx.gemm_g4(
                 ty,
