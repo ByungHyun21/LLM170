@@ -344,9 +344,80 @@ impl Engine {
         let mut t_state = std::time::Duration::ZERO;
         let t_cyc = std::time::Instant::now();
 
-        // ── 시퀀스별 draft 체인
-        let mut all_drafts: Vec<Vec<u32>> = Vec::with_capacity(n_seq);
-        {
+        // ── 드래프트 체인 — plans/135 항목 4: 슬롯 배칭(승격, 2026-10-06 A/B).
+        // j-단계마다 슬롯 전체를 한 배치로(mtp_draft_batch): head 가중 4→1회.
+        // A/B(np4-spec2 reps): draft 75.4→68ms, kept 패턴 동일(수용 무손실),
+        // 사이클 450→438ms. 미지원 백엔드(vk)는 Err → 기존 직렬 경로 폴백.
+        let mut all_drafts: Vec<Vec<u32>> = vec![Vec::with_capacity(k); n_seq];
+        let mut batched = n_seq > 1 && rd.mtp_draft_batch_supported();
+        if batched {
+            let mut tok_embs: Vec<f32> = Vec::with_capacity(n_seq * n_e);
+            let mut hs: Vec<f32> = Vec::with_capacity(n_seq * n_e);
+            {
+                let mut trow = vec![0.0f32; n_e];
+                for si in 0..n_seq {
+                    hs.extend_from_slice(&self.seqs[seqs[si]].mtp_pending_h);
+                    crate::quant::dequant_row(
+                        embd_ty,
+                        &embd_arc,
+                        nexts[si] as u64,
+                        n_e as u64,
+                        &mut trow,
+                    );
+                    tok_embs.extend_from_slice(&trow);
+                }
+            }
+            let mut done = vec![false; n_seq];
+            let mut hs_cur = hs;
+            for j in 0..k {
+                let poss: Vec<usize> = (0..n_seq)
+                    .map(|si| self.seqs[seqs[si]].pos as usize + j)
+                    .collect();
+                let mut hs_next: Vec<f32> = vec![0.0f32; hs_cur.len()];
+                let ds = match rd.mtp_draft_batch(seqs, &tok_embs, &hs_cur, &poss, &mut hs_next)
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // 부분 실행 롤백 — 초안 폐기 후 직렬 경로로(다음 라운드 재시도 없음).
+                        batched = false;
+                        break;
+                    }
+                };
+                hs_cur = hs_next;
+                let mut any = false;
+                for si in 0..n_seq {
+                    if done[si] {
+                        continue;
+                    }
+                    // QA-27 규약: j 단계 초안은 위치 pos+j KV 소비
+                    let d = ds[si];
+                    all_drafts[si].push(d);
+                    if d == eos {
+                        done[si] = true;
+                    } else {
+                        any = true;
+                    }
+                }
+                // 다음 단계 피드 토큰 임베딩 갱신 (활성 슬롯만 바뀌지만 전체 재디코드가 단순)
+                if j + 1 < k {
+                    for si in 0..n_seq {
+                        if !done[si] {
+                            crate::quant::dequant_row(
+                                embd_ty,
+                                &embd_arc,
+                                ds[si] as u64,
+                                n_e as u64,
+                                &mut tok_embs[si * n_e..(si + 1) * n_e],
+                            );
+                        }
+                    }
+                }
+                if !any {
+                    break;
+                }
+            }
+        }
+        if !batched {
             let mut trow = vec![0.0f32; n_e];
             for si in 0..n_seq {
                 let seq = seqs[si];
@@ -381,7 +452,7 @@ impl Engine {
                         break;
                     }
                 }
-                all_drafts.push(drafts);
+                all_drafts[si] = drafts;
             }
         }
         if tm_on {

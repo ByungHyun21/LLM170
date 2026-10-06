@@ -133,6 +133,26 @@ pub trait RawDecode: Send + Sync {
         Err("mtp_prefill_batch: 미지원(백엔드)".into())
     }
 
+    /// MTP 드래프트 스텝 슬롯 배칭 (plans/135 항목 4): 슬롯 t행을 한 번에 —
+    /// eh_proj·qkv·FFN·head 가중을 t행 상각(head 0.95GB를 4→1회),
+    /// rope/KV/flash만 슬롯별 런치(테이블·pos 상이). 초안 토큰은 제안이라
+    /// 산술 변화는 수용률에만 영향. 기본 Err(백엔드 미지원).
+    fn mtp_draft_batch(
+        &self,
+        _seqs: &[usize],
+        _tok_embs: &[f32],
+        _hs: &[f32],
+        _poss: &[usize],
+        _hs_out: &mut [f32],
+    ) -> Result<Vec<u32>, String> {
+        Err("mtp_draft_batch: 미지원(백엔드)".into())
+    }
+
+    /// mtp_draft_batch 지원 여부(정적 캐파 쿼리 — GPU 부작용 없음).
+    fn mtp_draft_batch_supported(&self) -> bool {
+        false
+    }
+
     /// MTP KV 적립 전용 스텝 — with_head=false면 전체 vocab 헤드(argmax)를 생략한다.
     /// 프롬프트 전 토큰의 KV를 쌓는 동안 헤드는 마지막 토큰만 필요하다.
     /// 기본 구현은 항상 헤드를 계산한다(미지원 백엔드 폴백).

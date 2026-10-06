@@ -443,6 +443,26 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         ds.mtp_prefill_batch(seq, tok_embs, carry_h, t, pos0, with_head)
     }
 
+    /// plans/135 항목 4 — MTP 드래프트 스텝 슬롯 배칭 위임.
+    fn mtp_draft_batch(
+        &self,
+        seqs: &[usize],
+        tok_embs: &[f32],
+        hs: &[f32],
+        poss: &[usize],
+        hs_out: &mut [f32],
+    ) -> Result<Vec<u32>, String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        guard
+            .as_ref()
+            .ok_or("raw_decode: 미초기화")?
+            .mtp_draft_batch(seqs, tok_embs, hs, poss, hs_out)
+    }
+
+    fn mtp_draft_batch_supported(&self) -> bool {
+        true
+    }
+
     /// MTP KV 적립 전용 — 헤드 생략 시 전체 vocab GEMV(953MB 읽기)를 건너뛴다.
     fn mtp_step_hidden(
         &self,

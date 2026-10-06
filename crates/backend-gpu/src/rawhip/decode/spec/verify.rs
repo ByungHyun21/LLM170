@@ -797,6 +797,312 @@ impl DecodeState {
         Ok(am)
     }
 
+    /// plans/135 항목 4 — MTP 드래프트 스텝 슬롯 배칭: 슬롯 t행을 한 번에.
+    /// eh_proj·qkv·wo·FFN·head 가중을 t행 상각(head 0.95GB를 4→1회, GEMV 재독
+    /// 상각 합계 ≈ -23ms/드래프트 스텝 @np4). rope·KV 적립·flash만 슬롯별
+    /// 런치(MTP KV 테이블·pos가 슬롯마다 상이). 산술은 슬롯별 t=1과 같은
+    /// mm_b2 패밀리(t=4 → g4 상간) — 초안은 제안이라 수용률에만 영향.
+    /// 반환: [t] 초안 토큰 + hs_out = [t][n] h_next (체인 다음 단계 피드 —
+    /// 층 출력 mtp_b_cur 행의 d2h). h 입력은 호출자가 관리(초기 = mtp_pending_h).
+    pub fn mtp_draft_batch(
+        &self,
+        seqs: &[usize],
+        tok_embs: &[f32],
+        hs: &[f32],
+        poss: &[usize],
+        hs_out: &mut [f32],
+    ) -> Result<Vec<u32>, String> {
+        if !self.mtp_on {
+            return Err("mtp_draft_batch: MTP 미로드".into());
+        }
+        let t = seqs.len();
+        if t == 0 || t > self.b_t_max {
+            return Err(format!("mtp_draft_batch: t={t} 범위 밖"));
+        }
+        let n = self.n_embd;
+        let (n_head, n_kv, hd) = (self.n_head, self.n_kv, self.hd);
+        let xq_n = crate::rawhip::q4acc::xq_words(n);
+        let xq2_w = crate::rawhip::q4acc::xq_words(2 * n);
+        let xq_sf = crate::rawhip::q4acc::xq_words(self.n_ff);
+        let xq_sg = crate::rawhip::q4acc::xq_words(n_head * hd);
+        let mask = self.consts.get("mask").copied().ok_or("mask")?;
+        // ① 토큰 임베딩·h 입력 적체 → enorm/hnorm → cat
+        self.ctx.h2d(self.mtp_b_e, bytemuck::cast_slice(tok_embs))?;
+        self.ctx.h2d(self.mtp_b_hs, bytemuck::cast_slice(hs))?;
+        let en = *self.consts.get("blk.64.nextn.enorm").ok_or("enorm")?;
+        let hn = *self.consts.get("blk.64.nextn.hnorm").ok_or("hnorm")?;
+        self.rms_rows(self.mtp_b_e, en, self.mtp_b_cur, n, t)?;
+        self.rms_rows(self.mtp_b_hs, hn, self.mtp_b_e, n, t)?;
+        {
+            let mut ep = self.mtp_b_cur as *mut std::ffi::c_void;
+            let mut hp = self.mtp_b_e as *mut std::ffi::c_void;
+            let mut op = self.mtp_b_cat as *mut std::ffi::c_void;
+            let mut na = n as i32;
+            let mut ta = t as i32;
+            let gx = (n.div_ceil(256)) as u32;
+            let mut args = vec![
+                Self::p(&mut ep),
+                Self::p(&mut hp),
+                Self::p(&mut op),
+                Self::p(&mut na),
+                Self::p(&mut ta),
+            ];
+            self.ctx.launch3("cat2_rows", gx, t as u32, 1, 256, &mut args)?;
+        }
+        // ② eh_proj [2n → n] (t행)
+        self.ctx
+            .quant_q8_b(self.mtp_b_cat, self.mtp_b_xq2, 2 * n, xq2_w, t)?;
+        let (we, te, nie, noe) = self.w("blk.64.nextn.eh_proj.weight")?;
+        self.mm_b2(
+            self.mtp_b_cat,
+            self.mtp_b_xq2,
+            xq2_w,
+            we,
+            te,
+            nie,
+            noe,
+            self.mtp_b_cur,
+            t,
+        )?;
+        // ③ attn_norm → q/k/v (t행)
+        let an = *self.consts.get("blk.64.attn_norm").ok_or("attn_norm")?;
+        self.rms_rows(self.mtp_b_cur, an, self.mtp_b_e, n, t)?;
+        self.ctx
+            .quant_q8_b(self.mtp_b_e, self.mtp_b_xqn, n, xq_n, t)?;
+        let (wq, tq, niq, noq) = self.w("blk.64.attn_q.weight")?;
+        self.mm_b2(
+            self.mtp_b_e,
+            self.mtp_b_xqn,
+            xq_n,
+            wq,
+            tq,
+            niq,
+            noq,
+            self.aq_t,
+            t,
+        )?;
+        let (wk, tk, nik, nok) = self.w("blk.64.attn_k.weight")?;
+        self.mm_b2(
+            self.mtp_b_e,
+            self.mtp_b_xqn,
+            xq_n,
+            wk,
+            tk,
+            nik,
+            nok,
+            self.ak_t,
+            t,
+        )?;
+        let (wv, tv, niv, nov) = self.w("blk.64.attn_v.weight")?;
+        self.mm_b2(
+            self.mtp_b_e,
+            self.mtp_b_xqn,
+            xq_n,
+            wv,
+            tv,
+            niv,
+            nov,
+            self.av_t,
+            t,
+        )?;
+        let qn = *self.consts.get("blk.64.attn_q_norm").ok_or("qn")?;
+        let kn = *self.consts.get("blk.64.attn_k_norm").ok_or("kn")?;
+        let cs = *self.consts.get("cs").ok_or("cs")?;
+        // ④ rope·KV 적립·flash — 슬롯별 (테이블·pos 상이). 행 스트라이드는
+        // mm_b2가 쓴 실제 n_out(noq/nok/nov) 준수.
+        for si in 0..t {
+            let sq = seqs[si];
+            let pos = poss[si];
+            let aq_row = unsafe { self.aq_t.add(si * noq * 4) };
+            let ak_row = unsafe { self.ak_t.add(si * nok * 4) };
+            let av_row = unsafe { self.av_t.add(si * nov * 4) };
+            {
+                let mut qp = aq_row as *mut std::ffi::c_void;
+                let mut kp = ak_row as *mut std::ffi::c_void;
+                let mut qwp = qn as *mut std::ffi::c_void;
+                let mut kwp = kn as *mut std::ffi::c_void;
+                let mut csp = cs as *mut std::ffi::c_void;
+                let mut ep = self.eps;
+                let mut kq = self.kq_scale;
+                let mut pp = pos as i32;
+                let mut nh = n_head as i32;
+                let mut nk = n_kv as i32;
+                let mut h = hd as i32;
+                let mut nr = self.n_rot as i32;
+                let rows = n_head + n_kv;
+                let mut args = vec![
+                    Self::p(&mut qp),
+                    Self::p(&mut kp),
+                    Self::p(&mut qwp),
+                    Self::p(&mut kwp),
+                    Self::p(&mut csp),
+                    Self::p(&mut ep),
+                    Self::p(&mut kq),
+                    Self::p(&mut pp),
+                    Self::p(&mut nh),
+                    Self::p(&mut nk),
+                    Self::p(&mut h),
+                    Self::p(&mut nr),
+                ];
+                self.ctx
+                    .launch("qk_norm_rope", rows as u32, 1, 32, &mut args)?;
+            }
+            self.copy(ak_row, self.mtp_kv_k[sq], 0, pos * n_kv * hd, n_kv * hd)?;
+            self.copy(av_row, self.mtp_kv_v[sq], 0, pos * n_kv * hd, n_kv * hd)?;
+            kv_to_f16(
+                &self.ctx,
+                ak_row,
+                self.mtp_kv_k16[sq],
+                0,
+                pos * n_kv * hd,
+                n_kv * hd,
+            )?;
+            kv_to_f16(
+                &self.ctx,
+                av_row,
+                self.mtp_kv_v16[sq],
+                0,
+                pos * n_kv * hd,
+                n_kv * hd,
+            )?;
+            {
+            let aout_row = unsafe { self.aout_t.add(si * n_head * hd * 4) };
+                let mut qp = aq_row as *mut std::ffi::c_void;
+                let mut ckp = self.mtp_kv_k16[sq] as *mut std::ffi::c_void;
+                let mut cvp = self.mtp_kv_v16[sq] as *mut std::ffi::c_void;
+                let mut mp = mask as *mut std::ffi::c_void;
+                let mut op = aout_row as *mut std::ffi::c_void;
+                let mut np_ = (pos + 1) as i32;
+                let mut nh = n_head as i32;
+                let mut nk = n_kv as i32;
+                let mut h = hd as i32;
+                let mut tl = 1i32;
+                let mut ss = self.ctx_len as i32;
+                let mut p0 = pos as i32;
+                let mut args = vec![
+                    Self::p(&mut qp),
+                    Self::p(&mut ckp),
+                    Self::p(&mut cvp),
+                    Self::p(&mut mp),
+                    Self::p(&mut op),
+                    Self::p(&mut np_),
+                    Self::p(&mut nh),
+                    Self::p(&mut nk),
+                    Self::p(&mut h),
+                    Self::p(&mut tl),
+                    Self::p(&mut ss),
+                    Self::p(&mut p0),
+                ];
+                self.ctx
+                    .launch3("qsa_flash", 1, n_head as u32, 1, 256, &mut args)?;
+            }
+        }
+        // ⑤ wo + 잔차 (t행)
+        self.ctx
+            .quant_q8_b(self.aout_t, self.mtp_b_xqn, n_head * hd, xq_sg, t)?;
+        let (wo, two, nio, noo) = self.w("blk.64.attn_output.weight")?;
+        self.mm_b2(
+            self.aout_t,
+            self.mtp_b_xqn,
+            xq_sg,
+            wo,
+            two,
+            nio,
+            noo,
+            self.gout_t,
+            t,
+        )?;
+        self.axpy(self.mtp_b_cur, self.gout_t, n * t)?;
+        // ⑥ FFN + 잔차 (t행)
+        let pn = *self
+            .consts
+            .get("blk.64.post_attention_norm")
+            .ok_or("post_norm")?;
+        self.rms_rows(self.mtp_b_cur, pn, self.mtp_b_e, n, t)?;
+        self.ctx
+            .quant_q8_b(self.mtp_b_e, self.mtp_b_xqn, n, xq_n, t)?;
+        let (wg, tg, nig, nog) = self.w("blk.64.ffn_gate.weight")?;
+        self.mm_b2(
+            self.mtp_b_e,
+            self.mtp_b_xqn,
+            xq_n,
+            wg,
+            tg,
+            nig,
+            nog,
+            self.fgate_t,
+            t,
+        )?;
+        let (wu, tu, niu, nou) = self.w("blk.64.ffn_up.weight")?;
+        self.mm_b2(
+            self.mtp_b_e,
+            self.mtp_b_xqn,
+            xq_n,
+            wu,
+            tu,
+            niu,
+            nou,
+            self.fup_t,
+            t,
+        )?;
+        {
+            let mut gp = self.fgate_t as *mut std::ffi::c_void;
+            let mut up = self.fup_t as *mut std::ffi::c_void;
+            let mut op = self.fglu_t as *mut std::ffi::c_void;
+            let mut na = (self.n_ff * t) as i32;
+            let mut args = vec![
+                Self::p(&mut gp),
+                Self::p(&mut up),
+                Self::p(&mut op),
+                Self::p(&mut na),
+            ];
+            self.ew_l("silu_mul_f32", self.n_ff * t, &mut args)?;
+        }
+        self.ctx
+            .quant_q8_b(self.fglu_t, self.mtp_b_xq2, self.n_ff, xq_sf, t)?;
+        let (wd, td, nid, nod) = self.w("blk.64.ffn_down.weight")?;
+        self.mm_b2(
+            self.fglu_t,
+            self.mtp_b_xq2,
+            xq_sf,
+            wd,
+            td,
+            nid,
+            nod,
+            self.fdown_t,
+            t,
+        )?;
+        self.axpy(self.mtp_b_cur, self.fdown_t, n * t)?;
+        // ⑦ 헤드 배치: shared head norm → gemm_tile_head(t행, 가중 1회 독서)
+        // → argmax_rows (행별 GPU argmax)
+        let shn = *self
+            .consts
+            .get("blk.64.nextn.shared_head_norm")
+            .ok_or("shn")?;
+        self.rms_rows(self.mtp_b_cur, shn, self.xn_t, n, t)?;
+        self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_n, t)?;
+        let (wh, th, nih, noh) = self.w("output.weight")?;
+        self.ctx.gemm_tile_head(
+            self.xq_n_t as *const u8,
+            wh as *const u8,
+            self.ktab2 as *const u8,
+            th,
+            nih,
+            noh,
+            xq_n,
+            t,
+            self.logits_all,
+        )?;
+        let out = self.argmax_rows(self.logits_all, t, noh)?;
+        // h_next 회수 — 체인 다음 단계의 h 입력(층 출력 = mtp_b_cur 행).
+        // argmax d2h가 이미 큐를 드레인하므로 동기 비용 추가 없음.
+        if hs_out.len() >= t * n {
+            self.ctx
+                .d2h(bytemuck::cast_slice_mut(&mut hs_out[..t * n]), self.mtp_b_cur)?;
+        }
+        Ok(out)
+    }
+
     /// MTP 1스텝 (호스트 h, head, h_next 회수) — 프리필/디코드 훅용.
     pub fn mtp_step_gpu(
         &self,
