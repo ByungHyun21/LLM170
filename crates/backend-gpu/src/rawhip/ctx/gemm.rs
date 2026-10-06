@@ -506,6 +506,11 @@ impl RawCtx {
         // spread 0.6%), pp np4 무영향. mm 타일(dp4a)은 t≥16 연산 바운드 — j128은
         // 1가중패스·WMMA 연산. 10a: verify 트렁크 환원 변경 → np4-spec2 토큰
         // 기준선은 spec 프로토콜 재측정값으로 갱신(디코드 게이트 무영향 확인 완료).
+        // 후속 실험 t≥5 하향: MTP k3 무효(t=5 로드바운드) + np4-spec2 21.12(-6.5%
+        // 역행 — t<16은 mm 타일이 정밀 t 연산으로 우위) — 원복 확정(2026-10-06).
+        // plans/135 item 3 연장(실험): j128 t-게이트 16→5 — 단일 MTP k3 verify
+        // t=5가 mm 타일(dp4a) 대신 rocwmma j128(1가중패스·WMMA)로. t=16-26 승격
+        // 선례의 소형-t 확장 — np4-spec2/MTP k2 회귀 여부를 A/B로 판정.
         let j128 = !env_on("LLM170_EXACT") && self.co_loaded(CO_J128) && t >= 16;
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, false)
     }
