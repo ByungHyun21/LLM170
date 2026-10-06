@@ -500,7 +500,13 @@ impl RawCtx {
             let j128 = self.co_loaded(CO_J128);
             return self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, true);
         }
-        let j128 = !env_on("LLM170_EXACT") && self.co_loaded(CO_J128) && t > 64;
+        // plans/135 item 3 (승격 2026-10-06): j128 t-게이트 64→16 하향 — verify
+        // t=16..26을 rocwmma j128(w32b.co, CO_J128)로. A/B(np4-spec2 reps3):
+        // verify rows≥19 -2~-14%(행수 클수록 WMMA 이득 확대), 21.82→22.65(+3.8%,
+        // spread 0.6%), pp np4 무영향. mm 타일(dp4a)은 t≥16 연산 바운드 — j128은
+        // 1가중패스·WMMA 연산. 10a: verify 트렁크 환원 변경 → np4-spec2 토큰
+        // 기준선은 spec 프로토콜 재측정값으로 갱신(디코드 게이트 무영향 확인 완료).
+        let j128 = !env_on("LLM170_EXACT") && self.co_loaded(CO_J128) && t >= 16;
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, false)
     }
 
