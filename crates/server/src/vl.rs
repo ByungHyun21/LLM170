@@ -231,7 +231,7 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             gpu_runtime == "vulkan",
             crate::engine::AttachPolicy::Warn,
         )
-        .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
+        .unwrap_or_else(|e| panic!("gpu attach: {e}"));
     }
     let eos = llm170_core::qwen35::EOS_EOT;
     let t1 = std::time::Instant::now();

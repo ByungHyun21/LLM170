@@ -315,6 +315,9 @@ impl RawCtx {
                 &mut args,
             );
         }
+        // plans/135 실험(2026-10-06, ADR-0019 삭제): 대형 n_out w-패널 —
+        // head(151936)·ssm_out에 LLM170_Q8W_BIG=1 A/B → tg 18.38 vs 19.08 역행.
+        // 원판(레인당 연속 34B 블록 1개)이 이 형상 상한. 재시도 금지.
         let gz2 = n_out.div_ceil(65535) as u32;
         match ty {
             23 | 20 => args_v.insert(4, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
