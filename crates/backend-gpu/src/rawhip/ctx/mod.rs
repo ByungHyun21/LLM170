@@ -6,7 +6,7 @@ pub(super) use crate::rawhip::ck;
 pub(super) use crate::rawhip::env_on;
 pub(super) use crate::rawhip::kernels;
 pub(super) use crate::rawhip::{
-    CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4, CO_W32M,
+    CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4, CO_W32M, CO_W32F,
 };
 pub(super) use cubecl_hip_sys as hip;
 pub(super) use std::collections::HashMap;
@@ -345,6 +345,19 @@ impl RawCtx {
                         "LLM170_CO9_PATH",
                         include_bytes!("../co/w32m.co"),
                         &["gemm_q4k_j128m", "gemm_q5_1_j128m"],
+                    ),
+                    (
+                        CO_W32F,
+                        "LLM170_CO12_PATH",
+                        include_bytes!("../co/w32f.co"),
+                        &[
+                            "_Z18exl3_gemv_j128_w32ILi4ELb0ELi0ELi1EEvPK6__halfPKtPviii",
+                            "_Z18exl3_gemv_j128_w32ILi4ELb0ELi1ELi1EEvPK6__halfPKtPviii",
+                            "_Z18exl3_gemv_j128_w32ILi4ELb1ELi0ELi0EEvPK6__halfPKtPviii",
+                            "_Z18exl3_gemv_j128_w32ILi4ELb1ELi0ELi1EEvPK6__halfPKtPviii",
+                            "_Z18exl3_gemv_j128_w32ILi4ELb1ELi1ELi0EEvPK6__halfPKtPviii",
+                            "_Z18exl3_gemv_j128_w32ILi4ELb1ELi1ELi1EEvPK6__halfPKtPviii",
+                        ],
                     ),
                 ];
                 for (bit, env_key, embedded, names) in slots {
