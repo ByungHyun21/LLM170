@@ -100,6 +100,41 @@ fn model_bytes(p: &Path) -> u64 {
             }
         }
     }
+    // PLE 테이블(per_layer_token_embd) 스트리밍 제외 — 4-split qwen4exp GGUF의
+    // PLE 테이블(26.8GiB)은 mmap+ssd pread로 스트리밍(ple_table auto/ssd,
+    // plans/111 W4c·§21-4)되어 상주 불요. ram 모드(28.8GB pin)는 30GB 체제에서
+    // 선택 불가 — 상수 차감이 무해. 파일을 못 읽으면 0(보수적으로 과대 가드).
+    // (2026-10-07: host 19.5GB에서 FN 기동 거부 — max-ctx 실사용 장벽 수리.)
+    total = total.saturating_sub(ple_stream_bytes(p));
+    total
+}
+
+/// GGUF 파트들에서 PLE 테이블(per_layer_token_embd) 바이트 합 — mmap 스트리밍
+/// 되어 상주 불요한 테이블의 가드 차감용. GGUF 헤더 파싱 실패 시 0.
+fn ple_stream_bytes(p: &Path) -> u64 {
+    let name = match p.file_name().and_then(|s| s.to_str()) {
+        Some(n) => n.to_string(),
+        None => return 0,
+    };
+    let Some(idx) = name.find("-of-") else { return 0 };
+    let dir = p.parent().map(Path::new).unwrap_or_else(|| Path::new("."));
+    let prefix = &name[..idx];
+    let mut total = 0u64;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let n = e.file_name();
+            let Some(n) = n.to_str() else { continue };
+            if !n.starts_with(prefix) || !n.ends_with(".gguf") {
+                continue;
+            }
+            if let Ok(g) = llm170_gguf::GgufFile::open(&dir.join(n))
+                && let Some(t) = g.find_tensor("per_layer_token_embd.weight")
+                && let Some(nb) = t.nbytes()
+            {
+                total += nb;
+            }
+        }
+    }
     total
 }
 
