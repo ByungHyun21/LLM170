@@ -174,6 +174,10 @@ impl DecoderState {
             let b = ctx.alloc_host(vals.len() * 4)?;
             // SAFETY (107 W8): b는 vals.len()*4 바이트 alloc_host — f32 원소수×4와 복사 길이 일치.
             unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), b.ptr as *mut f32, vals.len()) };
+            // HOST_CACHED 비결합 타입 — flush 없이는 CPU 캐시라인이 메모리에 도달 전
+            // GPU가 스테일 바이트를 읽는다(런마다 드레인 타이밍 의존 = 확산형 비결정
+            // 원장 87/90의 근원, plans/135 §21-3 14차). conv_w 등 모델 상수가 이 경로.
+            ctx.flush_range(&b, vals.len() * 4);
             cmap.insert(name, b);
         }
         // gemv 공유 테이블
@@ -244,6 +248,8 @@ impl DecoderState {
             let t = ctx.alloc_host(v.len() * 8)?;
             // SAFETY (107 W8): t는 v.len()*8 바이트 alloc_host — u64 테이블 바이트 재해석 기입, 길이 일치.
             unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, t.ptr, v.len() * 8) };
+            // HOST_CACHED 비결합 — 상수 테이블도 flush 의무 (§21-3 14차).
+            ctx.flush_range(&t, v.len() * 8);
             Ok(t)
         };
         let np_conv_tbl = np_mk_tbl(&st_conv)?;
