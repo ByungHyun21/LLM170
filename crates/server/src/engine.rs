@@ -156,17 +156,12 @@ pub fn attach_q35(
     if !llm170_diag::flag::ne0("LLM170_RAWHIP") {
         return Ok(eng);
     }
-    // 107(원장 87·90): qwen35 vk 디코드 프리필 비결정 레이스(확산형).
-    // plans/135 항목 6: 침묵 폴백 제거 — 명시적 실패로 승격. vk가 필요하면
-    // LLM170_VK_Q35_FORCE=1(비결정 감수 진단 강행) 또는 --backend hip 지정.
-    let vk_q35_blocked = vulkan && !llm170_diag::flag::on("LLM170_VK_Q35_FORCE");
-    if vk_q35_blocked {
-        return Err(
-            "vulkan qwen35 decode is nondeterministic (ledger 87/90) — use --backend hip, or set LLM170_VK_Q35_FORCE=1 to force vk diagnostics (plans/135 item 6)"
-                .to_string(),
-        );
-    }
-    if vulkan && !vk_q35_blocked {
+    // 107(원장 87·90) → plans/135 §21-3 16차 종결: qwen35 vk 디코드 비결정의
+    // 근원 = gemv8_q5b 발사의 배리어 생략(gemv_stage 내부 skip이 q5b에선 경합).
+    // gemv.rs q5b bar=true 근원 수정 + alloc flush·DEVICE_ADDRESS 사양 정정으로
+    // 3연속 결정론 확인 — 봉인 해제. LLM170_VK_Q35_FORCE는 진단 강행용으로 유지
+    // (무해 — 봉인 조건은 이제 항상 거짓이므로 미동작).
+    if vulkan {
         if llm170_diag::flag::on("LLM170_VK_ACC") {
             match llm170_backend_gpu::rawvk::vkacc::VkAcc::new() {
                 Ok(acc) => {

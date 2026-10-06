@@ -73,6 +73,11 @@ impl DecoderState {
             let slot_v: Vec<u32> = seqs.iter().map(|&s| s as u32).collect();
             std::ptr::copy_nonoverlapping(poss.as_ptr(), self.np_pos.ptr as *mut u32, t);
             std::ptr::copy_nonoverlapping(slot_v.as_ptr(), self.np_slot.ptr as *mut u32, t);
+            // HOST_CACHED 비결합 — 스텝마다 호스트 기입 후 GPU 판독 전 flush 의무
+            // (context.rs 297 주석 · plans/135 §21-3 14차 — 무-flush가 원장 87/90
+            // 확산형 비결정의 근원). 스텝당 16B×2 — flush 비용 무시 가능.
+            self.ctx.flush_range(&self.np_pos, t * 4);
+            self.ctx.flush_range(&self.np_slot, t * 4);
         }
         self.ctx.begin_batch()?;
         let np_t0 = std::time::Instant::now();

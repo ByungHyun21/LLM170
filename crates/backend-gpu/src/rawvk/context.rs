@@ -866,9 +866,17 @@ impl VkCtx {
                 .device
                 .create_buffer(&bci, None)
                 .map_err(|e| format!("버퍼: {e:?}"))?;
+            // VUID-vkBindBufferMemory-bufferDeviceAddress-03339: SHADER_DEVICE_ADDRESS
+            // usage 버퍼의 메모리는 DEVICE_ADDRESS 플래그로 할당해야 한다 — 누락 시
+            // 버퍼 디바이스 주소가 비안정(unstable) → raw 주소 참조 커널이 런마다
+            // 다른 주소를 읽는 확산형 비결정(원장 87/90 qwen35 vk 디코드)의 근원.
+            // (plans/135 항목 7 — validation layer VUID-03339 대량 검출로 확정)
+            let mut aflags = vk::MemoryAllocateFlagsInfo::default()
+                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
             let ai = vk::MemoryAllocateInfo::default()
                 .allocation_size(bytes as u64)
-                .memory_type_index(self.mem_ty);
+                .memory_type_index(self.mem_ty)
+                .push_next(&mut aflags);
             let mem = self
                 .device
                 .allocate_memory(&ai, None)

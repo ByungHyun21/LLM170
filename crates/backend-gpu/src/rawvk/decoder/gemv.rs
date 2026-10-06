@@ -307,6 +307,10 @@ impl DecoderState {
         // 단일 청크 typed 뷰 — 143→225GB/s.
         let nr: u32 = 2; // llama GCN rm_kq=4 — t=1 지연 바운드
         let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, nr]);
+        // 근원 수정(plans/135 §21-3 16차 — 원장 87/90 종결): q5b 발사는 bar=false
+        // 생략이 불가 — GPU가 생략 구간을 겹쳐 실행하면 다음 소비 커널과 경합
+        // (q5b만 강제해도 3/3 결정론, 타 타입 무관 — BAR_ONLY 이분 확정). 타
+        // 타입 생략은 안전(독립 출력) — q5b만 상주 의존이 있다고 관측됨.
         self.run_pipe_b(
             "gemv8_q5b",
             GEMV8_Q5B_SPV,
@@ -317,7 +321,7 @@ impl DecoderState {
             1,
             no.div_ceil(nr as usize) as u32,
             t as u32,
-            bar,
+            true,
         )
     }
 

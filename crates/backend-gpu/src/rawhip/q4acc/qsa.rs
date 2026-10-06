@@ -1355,7 +1355,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
                 return Err(format!("hip qsa_sel_dev_mt: nb={nb} > 4096"));
             }
             nb_max = nb_max.max(nb);
-            let (n_sel, ll) = crate::common::qsa::sel_counts(n_past, nb, r, idx_top_k);
+            let (_n_sel, ll) = crate::common::qsa::sel_counts(n_past, nb, r, idx_top_k);
             list_len += ll;
             of_host[tok] = (list_len - ll) as u32;
             of_host[tok + 1] = list_len as u32;
@@ -1448,7 +1448,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
             let ofdev = e2.ensure(&self.ctx, (t + 1) * 4)? as u64;
             (sdev, ofdev)
         };
-        unsafe {
+        {
             self.ctx
                 .h2d(ofdev as *mut u8, bytemuck::cast_slice(of_host.as_slice()))?;
         }
