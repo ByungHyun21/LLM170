@@ -199,7 +199,10 @@ pub fn guard_target(
 fn ple_ssd_deduction(model: &Path) -> u64 {
     const TENSOR: &str = "per_layer_token_embd.weight";
     const SSD_MIN: u64 = 8u64 << 30; // 8GiB+ 테이블만 SSD 행선으로 간주
-    let dir = model.parent().map(Path::new).unwrap_or_else(|| Path::new("."));
+    let dir = model
+        .parent()
+        .map(Path::new)
+        .unwrap_or_else(|| Path::new("."));
     let name = model.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let mut shards: Vec<std::path::PathBuf> = Vec::new();
     if let Some(idx) = name.rfind("-00001-of-") {
@@ -218,7 +221,9 @@ fn ple_ssd_deduction(model: &Path) -> u64 {
         shards.push(model.to_path_buf());
     }
     for sh in &shards {
-        let Ok(f) = llm170_gguf::GgufFile::open(sh) else { continue };
+        let Ok(f) = llm170_gguf::GgufFile::open(sh) else {
+            continue;
+        };
         if let Some(sz) = f.find_tensor(TENSOR).and_then(|t| t.nbytes()) {
             // 스플릿 텐서는 단일 샤드에 온전히 존재 (GGUF v3 배치 규약).
             return if sz >= SSD_MIN { sz } else { 0 };
