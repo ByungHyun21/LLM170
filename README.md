@@ -55,7 +55,7 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | MTP + np4 k=2 | — |
 | MTP + np4 k=3 | — |
 
-### Q4_K (GGUF) — deprecated (EXL3 transition, 2026-10)
+### Q4_K (GGUF)
 
 #### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
