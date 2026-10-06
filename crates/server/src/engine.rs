@@ -156,12 +156,14 @@ pub fn attach_q35(
     if !llm170_diag::flag::ne0("LLM170_RAWHIP") {
         return Ok(eng);
     }
-    // 107(원장 87·90): qwen35 vk 디코드 프리필 비결정 레이스(확산형). 조용한
-    // 오염 대신 가시 폴백 — LLM170_VK_Q35_FORCE=1로 vk 진단 강행.
+    // 107(원장 87·90): qwen35 vk 디코드 프리필 비결정 레이스(확산형).
+    // plans/135 항목 6: 침묵 폴백 제거 — 명시적 실패로 승격. vk가 필요하면
+    // LLM170_VK_Q35_FORCE=1(비결정 감수 진단 강행) 또는 --backend hip 지정.
     let vk_q35_blocked = vulkan && !llm170_diag::flag::on("LLM170_VK_Q35_FORCE");
     if vk_q35_blocked {
-        eprintln!(
-            "error: vulkan qwen35 decode is nondeterministic (ledger 87/90) — falling back to hip"
+        return Err(
+            "vulkan qwen35 decode is nondeterministic (ledger 87/90) — use --backend hip, or set LLM170_VK_Q35_FORCE=1 to force vk diagnostics (plans/135 item 6)"
+                .to_string(),
         );
     }
     if vulkan && !vk_q35_blocked {
@@ -481,7 +483,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         let vulkan = matches!(&backend, BackendSel::GpuRuntime(r) if r == "vulkan");
         if !matches!(&backend, BackendSel::Cpu) {
             eng = attach_q35(eng, vulkan, AttachPolicy::Warn)
-                .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
+                .unwrap_or_else(|e| panic!("gpu attach: {e}"));
         }
         Engine::Q35(Box::new(eng))
     }
