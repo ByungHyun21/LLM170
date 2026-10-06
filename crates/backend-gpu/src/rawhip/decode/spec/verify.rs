@@ -847,7 +847,8 @@ impl DecodeState {
                 Self::p(&mut na),
                 Self::p(&mut ta),
             ];
-            self.ctx.launch3("cat2_rows", gx, t as u32, 1, 256, &mut args)?;
+            self.ctx
+                .launch3("cat2_rows", gx, t as u32, 1, 256, &mut args)?;
         }
         // ② eh_proj [2n → n] (t행)
         self.ctx
@@ -966,7 +967,7 @@ impl DecodeState {
                 n_kv * hd,
             )?;
             {
-            let aout_row = unsafe { self.aout_t.add(si * n_head * hd * 4) };
+                let aout_row = unsafe { self.aout_t.add(si * n_head * hd * 4) };
                 let mut qp = aq_row as *mut std::ffi::c_void;
                 let mut ckp = self.mtp_kv_k16[sq] as *mut std::ffi::c_void;
                 let mut cvp = self.mtp_kv_v16[sq] as *mut std::ffi::c_void;
@@ -1097,8 +1098,10 @@ impl DecodeState {
         // h_next 회수 — 체인 다음 단계의 h 입력(층 출력 = mtp_b_cur 행).
         // argmax d2h가 이미 큐를 드레인하므로 동기 비용 추가 없음.
         if hs_out.len() >= t * n {
-            self.ctx
-                .d2h(bytemuck::cast_slice_mut(&mut hs_out[..t * n]), self.mtp_b_cur)?;
+            self.ctx.d2h(
+                bytemuck::cast_slice_mut(&mut hs_out[..t * n]),
+                self.mtp_b_cur,
+            )?;
         }
         Ok(out)
     }

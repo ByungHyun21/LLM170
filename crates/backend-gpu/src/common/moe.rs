@@ -139,7 +139,9 @@ pub fn grp_padded(off: &[usize], ne: usize, pad: usize) -> (Vec<usize>, usize) {
 pub fn ids2_takes(rows: usize, t: usize, ty: GgmlType) -> bool {
     // plans/135 항목 15: Q5K 추가 — FN 2층의 Q5_K 전문가 스택이 그룹 타일
     // 경로(스텝당 14ms)로 떨어지던 것을 dmmv direct-ids로 (q5k_gemm_dmmv_ids).
-    rows > 0 && (t == 1 || rows <= 64) && matches!(ty, GgmlType::Q4K | GgmlType::Q5_1 | GgmlType::Q5K)
+    rows > 0
+        && (t == 1 || rows <= 64)
+        && matches!(ty, GgmlType::Q4K | GgmlType::Q5_1 | GgmlType::Q5K)
 }
 
 #[cfg(test)]
