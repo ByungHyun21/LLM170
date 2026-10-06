@@ -636,6 +636,7 @@ mod tests {
             // exl3_tile_word 같은 __device__ inline은 제외됨(전역 아님).
             if let Some(name) = rest.split(['(', ' ', '\n']).next()
                 && !name.is_empty()
+                && !name.contains('#')
                 && name
                     .chars()
                     .next()
@@ -663,7 +664,22 @@ mod tests {
     #[test]
     fn names_all_defined_in_src() {
         let defs = extern_defs();
+        // 토큰-붙여넣기 매크로(GVM_WRAP, src_exl3_gemv.hip) 확장 커널(m1..m8) — SRC 정적
+        // 그리프에 리터럴 정의가 없고 존재 검증은 초기화 GetFunction 경로가 담당.
+        const MACRO_EXPANDED: &[&str] = &[
+            "exl3_gemv_m1",
+            "exl3_gemv_m2",
+            "exl3_gemv_m3",
+            "exl3_gemv_m4",
+            "exl3_gemv_m5",
+            "exl3_gemv_m6",
+            "exl3_gemv_m7",
+            "exl3_gemv_m8",
+        ];
         for n in NAMES {
+            if MACRO_EXPANDED.contains(&n) {
+                continue;
+            }
             assert!(defs.contains(n), "NAMES에 등록됐으나 SRC에 정의 없음: {n}");
         }
     }

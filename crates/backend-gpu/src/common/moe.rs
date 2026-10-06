@@ -208,7 +208,7 @@ mod tests {
         assert!(!ids2_takes(65, 8, GgmlType::Q4K)); // rows>64 且 t>1
         assert!(ids2_takes(65, 1, GgmlType::Q4K)); // t=1 이면 rows 무관
         assert!(!ids2_takes(64, 8, GgmlType::Q8_0)); // 타입 미지원
-        assert!(!ids2_takes(64, 8, GgmlType::Q5K));
+        assert!(ids2_takes(64, 8, GgmlType::Q5K)); // e255e832: Q5K 직접 ids dmmv 승격 (+31%)
         assert!(!ids2_takes(0, 1, GgmlType::Q4K)); // 빈 라우팅
     }
 }
