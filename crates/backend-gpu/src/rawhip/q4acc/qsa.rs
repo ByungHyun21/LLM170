@@ -1363,7 +1363,17 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         let iqp = self.fptr(iq)?;
         let ikp = self.fptr(ik)?;
         let (_idxk_p, bk_p) = self.qsa_idx_append(
-            full_idx, seq, ikp, &[], t, pos0, idx_dim, r, ikw, cs_idx, eps,
+            full_idx,
+            seq,
+            ikp,
+            &[],
+            t,
+            pos0,
+            idx_dim,
+            r,
+            ikw,
+            cs_idx,
+            eps,
         )?;
         // ① iq norm+rope — 배치판(gy=t, 기존 커널 재사용).
         let iqr = {
@@ -1458,12 +1468,8 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
                 sdev as *mut std::ffi::c_void,
                 ofdev as *mut std::ffi::c_void,
             );
-            let (mut nbm, mut tk, mut rr, mut pp2) = (
-                nb_max as i32,
-                idx_top_k as i32,
-                r as i32,
-                pos0 as i32,
-            );
+            let (mut nbm, mut tk, mut rr, mut pp2) =
+                (nb_max as i32, idx_top_k as i32, r as i32, pos0 as i32);
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut sp) as *mut _ as *mut std::ffi::c_void,
                 (&mut si) as *mut _ as *mut std::ffi::c_void,
@@ -1473,7 +1479,8 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
                 (&mut rr) as *mut _ as *mut std::ffi::c_void,
                 (&mut pp2) as *mut _ as *mut std::ffi::c_void,
             ];
-            self.ctx.launch3("q4_idx_topk_mt", 1, t as u32, 1, 256, &mut args)?;
+            self.ctx
+                .launch3("q4_idx_topk_mt", 1, t as u32, 1, 256, &mut args)?;
         }
         Ok((sdev, ofdev, list_len))
     }

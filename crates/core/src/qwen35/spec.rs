@@ -374,8 +374,7 @@ impl Engine {
                     .map(|si| self.seqs[seqs[si]].pos as usize + j)
                     .collect();
                 let mut hs_next: Vec<f32> = vec![0.0f32; hs_cur.len()];
-                let ds = match rd.mtp_draft_batch(seqs, &tok_embs, &hs_cur, &poss, &mut hs_next)
-                {
+                let ds = match rd.mtp_draft_batch(seqs, &tok_embs, &hs_cur, &poss, &mut hs_next) {
                     Ok(v) => v,
                     Err(_) => {
                         // 부분 실행 롤백 — 초안 폐기 후 직렬 경로로(다음 라운드 재시도 없음).

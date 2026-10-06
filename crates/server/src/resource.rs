@@ -191,8 +191,44 @@ pub fn guard_target(
     path.map(|path| GuardTarget { path, gpu })
 }
 
+/// PLE 테이블(per_layer_token_embd) SSD 스테이징 차감 — 상주 계정에서 제외.
+/// ple-ssd 모드(8GiB+ 테이블은 auto 정책상 SSD 행선)에선 테이블이 RAM/VRAM
+/// 비상주(pread 요구 시 판독)이므로 model_bytes에 포함하면 과대계상 — 버퍼드
+/// PLE(plans/135 long-ctx)가 페이지캐시를 쓰며 MemAvailable이 오르내리는
+/// 지금은 가드 오탐의 직접 원인. 메타데이터만 저비용 판독(GGUF 헤더+텐서 표).
+fn ple_ssd_deduction(model: &Path) -> u64 {
+    const TENSOR: &str = "per_layer_token_embd.weight";
+    const SSD_MIN: u64 = 8u64 << 30; // 8GiB+ 테이블만 SSD 행선으로 간주
+    let dir = model.parent().map(Path::new).unwrap_or_else(|| Path::new("."));
+    let name = model.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let mut shards: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(idx) = name.rfind("-00001-of-") {
+        let prefix = &name[..idx];
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let n = e.file_name();
+                let Some(n) = n.to_str() else { continue };
+                if n.starts_with(prefix) && n.ends_with(".gguf") {
+                    shards.push(dir.join(n));
+                }
+            }
+            shards.sort();
+        }
+    } else {
+        shards.push(model.to_path_buf());
+    }
+    for sh in &shards {
+        let Ok(f) = llm170_gguf::GgufFile::open(sh) else { continue };
+        if let Some(sz) = f.find_tensor(TENSOR).and_then(|t| t.nbytes()) {
+            // 스플릿 텐서는 단일 샤드에 온전히 존재 (GGUF v3 배치 규약).
+            return if sz >= SSD_MIN { sz } else { 0 };
+        }
+    }
+    0
+}
+
 pub fn preflight(model: &Path, gpu: bool) -> Result<(), String> {
-    let bytes = model_bytes(model);
+    let bytes = model_bytes(model).saturating_sub(ple_ssd_deduction(model));
     if bytes == 0 {
         return Ok(()); // 경로 오류는 로더의 에러가 더 정확하다 - 여기서는 통과
     }
