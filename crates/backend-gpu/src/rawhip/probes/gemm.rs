@@ -985,7 +985,11 @@ pub fn mm_bench() -> Result<String, String> {
             }
         }
         llm170_gguf::GgmlType::Q4K => {
-            if v4 {
+            if std::env::var_os("LLM170_MM_WM8").is_some() {
+                "gemm_q4k_wm8"
+            } else if std::env::var_os("LLM170_EXACT").is_some() {
+                "gemm_q4k_mm"
+            } else if v4 {
                 "gemm_q4k_v4"
             } else if j128f {
                 "gemm_q4k_j128"
@@ -996,7 +1000,9 @@ pub fn mm_bench() -> Result<String, String> {
             }
         }
         llm170_gguf::GgmlType::Q6K => {
-            if j128f {
+            if std::env::var_os("LLM170_EXACT").is_some() {
+                "gemm_q6k_mm"
+            } else if j128f {
                 "gemm_q6k_j128"
             } else if std::env::var_os("LLM170_EXACT").is_none() {
                 "gemm_q6k_wm"
@@ -1012,7 +1018,11 @@ pub fn mm_bench() -> Result<String, String> {
             }
         }
         llm170_gguf::GgmlType::Iq4Xs => {
-            if v4 {
+            if std::env::var_os("LLM170_MM_WM8").is_some() {
+                "gemm_xs_wm8"
+            } else if std::env::var_os("LLM170_EXACT").is_some() {
+                "gemm_xs_mm"
+            } else if v4 {
                 "gemm_xs_v4"
             } else if j128f {
                 "gemm_xs_j128"
@@ -1062,6 +1072,7 @@ pub fn mm_bench() -> Result<String, String> {
         ];
         if kern_name == "gemm_xs_mm"
             || kern_name == "gemm_xs_wm"
+            || kern_name == "gemm_xs_wm8"
             || kern_name == "gemm_xs_j128"
             || kern_name == "gemm_xs_v4"
             || kern_name == "gemm_nl_v4"
@@ -1079,12 +1090,12 @@ pub fn mm_bench() -> Result<String, String> {
         };
         let gx = n_out.div_ceil(rpb).min(65535) as u32;
         let _gz = n_out.div_ceil(rpb).div_ceil(65535) as u32;
-        let gz = if kern_name == "gemm_q5k_wm8" {
+        let gz = if kern_name.ends_with("_wm8") {
             t.div_ceil(16) as u32
         } else {
             n_out.div_ceil(64).div_ceil(65535) as u32
         };
-        let thr = if kern_name == "gemm_q5k_wm8" { 128 } else { 256 };
+        let thr = if kern_name.ends_with("_wm8") { 128 } else { 256 };
         ctx.launch3(kern_name, gx, 1, gz, thr, &mut args)
     };
     launch(&ctx)?;
@@ -1099,17 +1110,29 @@ pub fn mm_bench() -> Result<String, String> {
     ctx.sync()?;
     let dt2 = t0.elapsed().as_secs_f64() / reps as f64;
     // 순수 런치 CPU 비용: 그리드 1x1 소형 발사 (GPU 즉시 완료) 100회
+    // xs/nl 계열은 ktab2 8인자 — 인자수 불일치 발사가 args 배열 초과 독해로
+    // 세그폴트(기존 결함 — mm-bench2가 라우팅 누락 죽은 코드라 미노출, 2026-10-06 수리).
     let (mut sxa, mut swa, mut soa) = (xq, wd, out);
     let (mut sni, mut sno, mut sxw, mut stt) = (n_in as i32, n_out as i32, xq_w as i32, t as i32);
+    let mut sktp = kt_d;
+    let small_ktab = kern_name == "gemm_xs_mm"
+        || kern_name == "gemm_xs_wm"
+        || kern_name == "gemm_xs_wm8"
+        || kern_name == "gemm_xs_j128"
+        || kern_name == "gemm_xs_v4"
+        || kern_name == "gemm_nl_v4";
     let mut sargs: Vec<*mut std::ffi::c_void> = vec![
         (&mut sxa) as *mut _ as *mut std::ffi::c_void,
         (&mut swa) as *mut _ as *mut std::ffi::c_void,
         (&mut soa) as *mut _ as *mut std::ffi::c_void,
-        (&mut sni) as *mut _ as *mut std::ffi::c_void,
-        (&mut sno) as *mut _ as *mut std::ffi::c_void,
-        (&mut sxw) as *mut _ as *mut std::ffi::c_void,
-        (&mut stt) as *mut _ as *mut std::ffi::c_void,
     ];
+    if small_ktab {
+        sargs.push((&mut sktp) as *mut _ as *mut std::ffi::c_void);
+    }
+    sargs.push((&mut sni) as *mut _ as *mut std::ffi::c_void);
+    sargs.push((&mut sno) as *mut _ as *mut std::ffi::c_void);
+    sargs.push((&mut sxw) as *mut _ as *mut std::ffi::c_void);
+    sargs.push((&mut stt) as *mut _ as *mut std::ffi::c_void);
     let tl0 = std::time::Instant::now();
     for _ in 0..100 {
         let _ = ctx.launch3(kern_name, 1, 1, 1, 64, &mut sargs);
