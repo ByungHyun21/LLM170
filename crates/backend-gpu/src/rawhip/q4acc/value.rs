@@ -602,8 +602,15 @@ fn ple_ensure_block(st: &mut crate::rawhip::q4acc::PleSsd, bidx: u64) -> Result<
     }
     // 4차 W-O: 전체 블록은 O_DIRECT(정렬 scratch) — 실패 시 버퍼드
     // 폴백 + direct 영구 해제(파일시스템 미지원 등).
+    // plans/135 long-ctx (승격 2026-10-06): **버퍼드 우선 기본화** — O_DIRECT가
+    // 시스템 페이지캐시(~23GB)를 우회해 16K n-gram 스팬에서 랜덤 리드 스톰
+    // (2.2s/청크). 버퍼드 pread는 페이지캐시를 쓰므로 재조회가 DRAM 속도.
+    // A/B: pp16384 202.66→380.37(+87.7%, reps3 spread 1.4%), tg1 17.53 동반
+    // 개선, 게이트 PASS(바이트 동일 — 읽기 경로만 변경). LLM170_PLE_ODIRECT=1로
+    // 구형 동작 옵트인(1GiB FIFO 캐시+O_DIRECT가 유리한 소형 스팬용).
+    let buf_first = !llm170_diag::flag::on("LLM170_PLE_ODIRECT");
     let mut read_err = None;
-    if want == crate::rawhip::q4acc::PLE_SSD_BLOCK {
+    if !buf_first && want == crate::rawhip::q4acc::PLE_SSD_BLOCK {
         let df = st.direct.take();
         if let Some(f) = &df
             && let Err(e) = f.read_exact_at(&mut st.scratch.0[..], boff)
