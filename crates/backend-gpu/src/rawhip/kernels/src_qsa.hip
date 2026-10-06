@@ -1749,3 +1749,105 @@ extern "C" __global__ void __launch_bounds__(256) q4_ple_gate_serial(
     const float sg = ple_rms_scale(out, n_embd, eps);
     for (int i = 0; i < n_embd; i++) out[i] = out[i] * sg * nc[(size_t)s * n_embd + i];
 }
+
+
+// (6) plans/135 long-ctx: score 다중 토큰판 — grid (ceil(nb_max/256), t).
+// 토큰별 n_blocks = (pos0+tok+1)/r 은 디바이스 산정, scr 행 폭은 nb_max 고정.
+// q4_idx_score와 스코어 산술 동일(점수 비트 불변 — 토큰 차원 병렬화만).
+extern "C" __global__ void q4_idx_score_mt(
+        const float* __restrict__ iqr, const float* __restrict__ bk,
+        float* __restrict__ scores, int nb_max, int t, int idx_heads,
+        int idx_dim, int r, int pos0) {
+    const int b = (int)blockIdx.x * blockDim.x + threadIdx.x;
+    const int tok = (int)blockIdx.y;
+    const int nb_tok = (pos0 + tok + 1) / r;
+    if (b >= nb_tok || tok >= t) return;
+    const float* pk = bk + (size_t)b * idx_dim;
+    const float* q0 = iqr + (size_t)tok * idx_heads * idx_dim;
+    float score = 0.0f;
+    for (int h = 0; h < idx_heads; h++) {
+        const float* qh = q0 + (size_t)h * idx_dim;
+        float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+        int i2 = 0;
+        for (; i2 + 4 <= idx_dim; i2 += 4) {
+            d0 += qh[i2] * pk[i2];
+            d1 += qh[i2 + 1] * pk[i2 + 1];
+            d2 += qh[i2 + 2] * pk[i2 + 2];
+            d3 += qh[i2 + 3] * pk[i2 + 3];
+        }
+        for (; i2 < idx_dim; i2++) d0 += qh[i2] * pk[i2];
+        const float dot = (d0 + d1) + (d2 + d3);
+        if (dot > 0.0f) score += dot;
+    }
+    scores[(size_t)tok * nb_max + b] = score;
+}
+
+// (7) plans/135 long-ctx: topk 다중 토큰판 — grid (1, t), 블록당 토큰 1개.
+// q4_idx_topk와 정렬·선택 산술 동일(점수 내림, 인덱스 오름 — 비트 불변), 출력은
+// sel_off[tok] 베이스에 기록(호스트가 sel_counts로 선계산·h2d한 접두 오프셋).
+// n_sel = min(idx_top_k, n_blocks) 인커널 산정(sel_counts와 동일식).
+extern "C" __global__ void q4_idx_topk_mt(
+        const float* __restrict__ scores, unsigned* __restrict__ sel_idx,
+        const unsigned* __restrict__ sel_off, int nb_max, int idx_top_k,
+        int r, int pos0) {
+    __shared__ unsigned long long sh[4096];
+    __shared__ unsigned sel_ids[4096];
+    const int tid = threadIdx.x;
+    const int tok = (int)blockIdx.y;
+    const int n_past = pos0 + tok + 1;
+    const int n_blocks = n_past / r;
+    const int n_sel = (idx_top_k < n_blocks) ? idx_top_k : n_blocks;
+    const float* sc = scores + (size_t)tok * nb_max;
+    unsigned* si = sel_idx + sel_off[tok];
+    for (int b = tid; b < n_blocks; b += 256) {
+        unsigned u = __float_as_uint(sc[b]);
+        u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+        sh[b] = ((unsigned long long)u << 32) | (unsigned)b;
+    }
+    int npad = 1;
+    while (npad < n_blocks) npad <<= 1;
+    if (npad < 2) npad = 2;
+    for (int b = n_blocks + tid; b < npad; b += 256) sh[b] = 0ull;
+    __syncthreads();
+    for (int k = 2; k <= npad; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tid; i < npad; i += 256) {
+                const int l = i ^ j;
+                if (l > i) {
+                    const unsigned long long a = sh[i], b2 = sh[l];
+                    const bool sw = ((i & k) == 0) ? (a < b2) : (a > b2);
+                    if (sw) { sh[i] = b2; sh[l] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (int k2 = tid; k2 < n_sel; k2 += 256)
+        sel_ids[k2] = (unsigned)(sh[k2] & 0xFFFFFFFFull);
+    int np = 1;
+    while (np < n_sel) np <<= 1;
+    for (int k2 = n_sel + tid; k2 < np; k2 += 256) sel_ids[k2] = 0xFFFFFFFFu;
+    __syncthreads();
+    for (int k = 2; k <= np; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tid; i < np; i += 256) {
+                const int l = i ^ j;
+                if (l > i) {
+                    const unsigned long long a = sel_ids[i], b2 = sel_ids[l];
+                    const bool sw = ((i & k) == 0) ? (a > b2) : (a < b2);
+                    if (sw) { sel_ids[i] = b2; sel_ids[l] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    // 전개: 선택 블록 r개씩 오름차순 + 꼬리(tail = n_past - n_blocks*r).
+    const int tail_start = n_blocks * r;
+    const int tail_cnt = n_past - tail_start;
+    for (int k2 = tid; k2 < n_sel; k2 += 256) {
+        const unsigned o = sel_ids[k2] * (unsigned)r;
+        for (int j = 0; j < r; j++) si[o + j] = (unsigned)(sel_ids[k2] * r + j);
+    }
+    for (int j = tid; j < tail_cnt; j += 256)
+        si[(unsigned)n_sel * (unsigned)r + (unsigned)j] = (unsigned)(tail_start + j);
+}

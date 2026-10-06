@@ -166,6 +166,8 @@ pub const NAMES: &[&str] = &[
     "q4_idx_expand",
     "q4_gemm_f32_w",
     "q4_idx_topk",
+    "q4_idx_score_mt",
+    "q4_idx_topk_mt",
     "gemm_q8_0_w",
     "gemm_q8_0_mt",
     "gemm_q8_0_mt_w",
@@ -485,6 +487,8 @@ pub const COVERED_BY: &[(&str, &str)] = &[
         "assembly:charhash+gate-27b+gate-flash-next",
     ),
     ("q4_idx_topk", "assembly:charhash+gate-flash-next"),
+    ("q4_idx_score_mt", "assembly:charhash+gate-flash-next"),
+    ("q4_idx_topk_mt", "assembly:charhash+gate-flash-next"),
     ("gemm_q8_0_w", "assembly:charhash+gate-27b+gate-flash-next"),
     ("gemm_q8_0_mt", "assembly:charhash+gate-27b+gate-flash-next"),
     (
