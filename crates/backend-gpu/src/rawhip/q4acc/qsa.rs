@@ -1315,6 +1315,169 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
     }
 
     /// 인덱서 k 행 디바이스 적립 — t>1 프리필 단축 경로(항등 선택) 전용.
+    /// plans/135 long-ctx — QSA 선택 다중 토큰판: score/topk를 토큰 차원 병렬
+    /// (score grid=(nb/256,t)·topk grid=(1,t))로 수행. 호스트 d2h·선택 루프 0회 —
+    /// vk qsa_sel_dev_mt 미러(버퍼 산정·sel_counts 전개 동일). 반환 (sd,of,ll).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_sel_dev_mt(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        iq: u64,
+        ik: u64,
+        t: usize,
+        pos0: usize,
+        idx_heads: usize,
+        idx_dim: usize,
+        r: usize,
+        idx_top_k: usize,
+        iqw: &[f32],
+        ikw: &[f32],
+        cs_idx: &[f32],
+        eps: f32,
+    ) -> Result<(u64, u64, usize), String> {
+        if r == 0 || idx_dim != 128 {
+            return Err(format!("hip qsa_sel_dev_mt: r={r} idx_dim={idx_dim}"));
+        }
+        if t == 0 {
+            return Err("hip qsa_sel_dev_mt: t=0".into());
+        }
+        // 토큰별 nb/n_sel/list_len 호스트 선계산(sel_counts 동일식, 무동기) —
+        // of 접두 오프셋은 h2d로 sel_off 디바이스에 주입(topk_mt가 tok 오프셋으로
+        // 읽음). nb_max는 scr 행 폭.
+        let mut of_host = vec![0u32; t + 1];
+        let mut list_len = 0usize;
+        let mut nb_max = 0usize;
+        for tok in 0..t {
+            let n_past = pos0 + tok + 1;
+            let nb = n_past / r;
+            if nb > 4096 {
+                return Err(format!("hip qsa_sel_dev_mt: nb={nb} > 4096"));
+            }
+            nb_max = nb_max.max(nb);
+            let (n_sel, ll) = crate::common::qsa::sel_counts(n_past, nb, r, idx_top_k);
+            list_len += ll;
+            of_host[tok] = (list_len - ll) as u32;
+            of_host[tok + 1] = list_len as u32;
+        }
+        let iqp = self.fptr(iq)?;
+        let ikp = self.fptr(ik)?;
+        let (_idxk_p, bk_p) = self.qsa_idx_append(
+            full_idx, seq, ikp, &[], t, pos0, idx_dim, r, ikw, cs_idx, eps,
+        )?;
+        // ① iq norm+rope — 배치판(gy=t, 기존 커널 재사용).
+        let iqr = {
+            let mut g = self.qsa_iqr.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, t * idx_heads * idx_dim * 4)?
+        };
+        let iqw_d = self.upload_map(&self.qsa_iqw, "qsa_iqw", iqw)?;
+        let cs_d = self.upload_by_ptr(&self.qsa_csidx, cs_idx)?;
+        {
+            let (mut qp, mut op, mut iw, mut cp) = (
+                iqp as *mut std::ffi::c_void,
+                iqr as *mut std::ffi::c_void,
+                iqw_d as *mut std::ffi::c_void,
+                cs_d as *mut std::ffi::c_void,
+            );
+            let (mut e, mut pp, mut tt, mut ih, mut dd) =
+                (eps, pos0 as i32, t as i32, idx_heads as i32, idx_dim as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut qp) as *mut _ as *mut std::ffi::c_void,
+                (&mut op) as *mut _ as *mut std::ffi::c_void,
+                (&mut iw) as *mut _ as *mut std::ffi::c_void,
+                (&mut cp) as *mut _ as *mut std::ffi::c_void,
+                (&mut e) as *mut _ as *mut std::ffi::c_void,
+                (&mut pp) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                (&mut ih) as *mut _ as *mut std::ffi::c_void,
+                (&mut dd) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_idx_q_rope",
+                idx_heads as u32,
+                t as u32,
+                1,
+                32,
+                &mut args,
+            )?;
+        }
+        // ② score_mt — grid (ceil(nb_max/256), t), scr 행 폭 nb_max.
+        let scr = {
+            let mut g = self.qsa_scr.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, t * nb_max.max(1) * 4)?
+        };
+        if nb_max > 0 {
+            let (mut qp, mut bp, mut sp) = (
+                iqr as *mut std::ffi::c_void,
+                bk_p as *mut std::ffi::c_void,
+                scr as *mut std::ffi::c_void,
+            );
+            let (mut nbm, mut tt, mut ih, mut dd, mut rr, mut pp2) = (
+                nb_max as i32,
+                t as i32,
+                idx_heads as i32,
+                idx_dim as i32,
+                r as i32,
+                pos0 as i32,
+            );
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut qp) as *mut _ as *mut std::ffi::c_void,
+                (&mut bp) as *mut _ as *mut std::ffi::c_void,
+                (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nbm) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                (&mut ih) as *mut _ as *mut std::ffi::c_void,
+                (&mut dd) as *mut _ as *mut std::ffi::c_void,
+                (&mut rr) as *mut _ as *mut std::ffi::c_void,
+                (&mut pp2) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_idx_score_mt",
+                (nb_max as u32).div_ceil(256),
+                t as u32,
+                1,
+                256,
+                &mut args,
+            )?;
+        }
+        // ③ sel_off h2d + topk_mt — grid (1, t), 토큰당 블록 1개.
+        let (sdev, ofdev) = {
+            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
+            let sdev = d.ensure(&self.ctx, list_len.max(1) * 4)? as u64;
+            let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
+            let ofdev = e2.ensure(&self.ctx, (t + 1) * 4)? as u64;
+            (sdev, ofdev)
+        };
+        unsafe {
+            self.ctx
+                .h2d(ofdev as *mut u8, bytemuck::cast_slice(of_host.as_slice()))?;
+        }
+        {
+            let (mut sp, mut si, mut so) = (
+                scr as *mut std::ffi::c_void,
+                sdev as *mut std::ffi::c_void,
+                ofdev as *mut std::ffi::c_void,
+            );
+            let (mut nbm, mut tk, mut rr, mut pp2) = (
+                nb_max as i32,
+                idx_top_k as i32,
+                r as i32,
+                pos0 as i32,
+            );
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                (&mut si) as *mut _ as *mut std::ffi::c_void,
+                (&mut so) as *mut _ as *mut std::ffi::c_void,
+                (&mut nbm) as *mut _ as *mut std::ffi::c_void,
+                (&mut tk) as *mut _ as *mut std::ffi::c_void,
+                (&mut rr) as *mut _ as *mut std::ffi::c_void,
+                (&mut pp2) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3("q4_idx_topk_mt", 1, t as u32, 1, 256, &mut args)?;
+        }
+        Ok((sdev, ofdev, list_len))
+    }
+
     fn qsa_idx_append_dev(
         &self,
         full_idx: usize,
