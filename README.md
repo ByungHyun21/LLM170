@@ -69,11 +69,11 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
 |---|---|---|---|---|
 | tg single | **11.55** | 10.02 | 9.56 | 11.33 |
-| np4 greedy | 33.18 | **33.62** | 29.22 | — |
-| MTP k=2 | **12.64** | 12.51 | 17.40 | — |
-| MTP k=3 | 10.21 | 10.11 | 17.22 | — |
-| MTP + np4 k=2 | 14.43 | n/a | **35.97** | — |
-| MTP + np4 k=3 | 12.71 | n/a | 33.95 | — |
+| np4 greedy | 33.25 | **33.62** | 29.22 | — |
+| MTP k=2 | **18.96** | 12.51 | 17.40 | — |
+| MTP k=3 | 16.96 | 10.11 | **17.22** | — |
+| MTP + np4 k=2 | 21.50 | n/a | **35.97** | — |
+| MTP + np4 k=3 | 13.20 | n/a | 33.95 | — |
 
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 

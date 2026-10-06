@@ -46,6 +46,28 @@ fn lcg_prompt(len: usize, seed0: u64) -> Vec<u32> {
     (0..len).map(|_| lcg()).collect()
 }
 
+/// 고정 자연어 텍스트 → 토큰열 (스펙 벤치 표준 프로토콜, plans/135).
+/// LCG 프롬프트는 수용률을 0으로 만든다(원장: 12.46 vs 자연어 18.66) — 스펙 측정은 자연어 필수.
+fn natural_text_ids(
+    txt: &str,
+    pp: usize,
+    model_path: &std::path::Path,
+) -> Result<Vec<u32>, String> {
+    let tok = crate::tokenize::Tokenizer::load(model_path, None)
+        .map_err(|e| format!("토크나이저 로드 실패: {e}"))?;
+    let mut ids = tok.encode(txt);
+    if ids.is_empty() {
+        return Err("encoded to 0 tokens — refusing to pad".into());
+    }
+    ids.truncate(pp);
+    while ids.len() < pp {
+        let ext = ids.clone();
+        ids.extend(ext);
+        ids.truncate(pp);
+    }
+    Ok(ids)
+}
+
 pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let mut pp = 512usize;
     let mut tg = 128usize;
@@ -117,29 +139,22 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     if pp + tg + 16 >= ctx {
         return usage_err_bench(&format!("ctx({ctx}) too small for pp({pp})+tg({tg})"));
     }
-    // 프롬프트: LLM170_BENCH_TEXT(자연어, Tokenizer 인코딩) 또는 수제 LCG 합성 토큰
+    // 프롬프트: LLM170_BENCH_TEXT(자연어) 또는 수제 LCG 합성 토큰.
+    // plans/135: --spec 벤치에서 env 미지정이면 scripts/bench-text-ko.txt(고정 자연어)
+    // 폴백 — LCG는 수용률 0이라 스펙 수치가 무의미해진다. plain 벤치는 기존 LCG 유지
+    // (llama-bench 비교 가능성).
     let prompt: Vec<u32> = match llm170_diag::flag::val("LLM170_BENCH_TEXT") {
-        Some(txt) => {
-            // A8(plans/129): panic → 오류 반환(usage_err_bench 패턴과 통일 —
-            // 불완전 디렉터리 등 인위 오류 경로가 프로세스 패닉이었다).
-            let tok = match crate::tokenize::Tokenizer::load(&model_path, None) {
-                Ok(t) => t,
-                Err(e) => return usage_err_bench(&format!("토크나이저 로드 실패: {e}")),
-            };
-            let mut ids = tok.encode(txt);
-            // QA-23: 0토큰 인코딩 가드 — 빈 ids로 pp 패딩 루프가 무한 회전.
-            if ids.is_empty() {
-                return usage_err_bench("LLM170_BENCH_TEXT encoded to 0 tokens — refusing to pad");
-            }
-            // pp 길이에 맞게 자르기/반복
-            ids.truncate(pp);
-            while ids.len() < pp {
-                let ext = ids.clone();
-                ids.extend(ext);
-                ids.truncate(pp);
-            }
-            ids
-        }
+        Some(txt) => match natural_text_ids(txt, pp, &model_path) {
+            Ok(ids) => ids,
+            Err(e) => return usage_err_bench(&e),
+        },
+        None if spec_k > 0 => match std::fs::read_to_string("scripts/bench-text-ko.txt") {
+            Ok(txt) => match natural_text_ids(&txt, pp, &model_path) {
+                Ok(ids) => ids,
+                Err(e) => return usage_err_bench(&e),
+            },
+            Err(_) => lcg_prompt(pp, 0x1234_5678),
+        },
         None => lcg_prompt(pp, 0x1234_5678),
     };
 
