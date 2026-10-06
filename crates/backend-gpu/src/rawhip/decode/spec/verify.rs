@@ -386,7 +386,12 @@ impl DecodeState {
             .ok_or("shn")?;
         self.rms(self.mtp_cur, shn, self.mtp_e, n)?;
         let _t0h = std::time::Instant::now();
-        mmark!(7);
+        // 마지막 위상 — fn 종료로 리셋 불요 (데드 할당 경고 회피)
+        if mtp_tm {
+            self.ctx.sync().ok();
+            ph[7] += mt.elapsed().as_micros() as u128;
+            phw[7] += mtw.elapsed().as_micros() as u128;
+        }
         if mtp_tm {
             eprintln!(
                 "[mtpP] cat={:6.3}/{:6.3} q8={:6.3}/{:6.3} eh={:6.3}/{:6.3} anq={:6.3}/{:6.3} qkv={:6.3}/{:6.3} attn={:6.3}/{:6.3} ffn={:6.3}/{:6.3} head={:6.3}/{:6.3} ms wall/GPU",
