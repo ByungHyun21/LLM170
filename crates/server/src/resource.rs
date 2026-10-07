@@ -116,7 +116,9 @@ fn ple_stream_bytes(p: &Path) -> u64 {
         Some(n) => n.to_string(),
         None => return 0,
     };
-    let Some(idx) = name.find("-of-") else { return 0 };
+    let Some(idx) = name.find("-of-") else {
+        return 0;
+    };
     let dir = p.parent().map(Path::new).unwrap_or_else(|| Path::new("."));
     let prefix = &name[..idx];
     let mut total = 0u64;

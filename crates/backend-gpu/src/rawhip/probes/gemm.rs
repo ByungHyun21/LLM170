@@ -1095,7 +1095,11 @@ pub fn mm_bench() -> Result<String, String> {
         } else {
             n_out.div_ceil(64).div_ceil(65535) as u32
         };
-        let thr = if kern_name.ends_with("_wm8") { 128 } else { 256 };
+        let thr = if kern_name.ends_with("_wm8") {
+            128
+        } else {
+            256
+        };
         ctx.launch3(kern_name, gx, 1, gz, thr, &mut args)
     };
     launch(&ctx)?;
@@ -1210,8 +1214,13 @@ pub fn mm_bench() -> Result<String, String> {
                 }
             } else if c2.to_bits() != o2[ti * n_out + oo].to_bits() {
                 if m2 == 0 {
-                    eprintln!("# first mism ti={ti} oo={oo} got={:08x} want={:08x} ({:+.6} vs {:+.6})",
-                        o2[ti * n_out + oo].to_bits(), c2.to_bits(), o2[ti * n_out + oo], c2);
+                    eprintln!(
+                        "# first mism ti={ti} oo={oo} got={:08x} want={:08x} ({:+.6} vs {:+.6})",
+                        o2[ti * n_out + oo].to_bits(),
+                        c2.to_bits(),
+                        o2[ti * n_out + oo],
+                        c2
+                    );
                 }
                 m2 += 1;
             }

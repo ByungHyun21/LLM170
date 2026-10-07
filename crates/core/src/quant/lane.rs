@@ -486,7 +486,11 @@ mod w4a16_tests {
         let half_man = man >> 13;
         let round = (man >> 12) & 1;
         let m = half_man + round;
-        let (m, e) = if m & 0x400 != 0 { (m & 0x3FF, exp + 1) } else { (m, exp) };
+        let (m, e) = if m & 0x400 != 0 {
+            (m & 0x3FF, exp + 1)
+        } else {
+            (m, exp)
+        };
         sign | ((e as u16) << 10) | (m as u16)
     }
 
@@ -527,7 +531,10 @@ mod w4a16_tests {
             want += (w * f16b(x[i])) as f64;
         }
         let rel = (got as f64 - want).abs() / want.abs().max(1e-9);
-        assert!(rel < 1e-6, "w4a16 미러 불일치: got={got} want={want} rel={rel}");
+        assert!(
+            rel < 1e-6,
+            "w4a16 미러 불일치: got={got} want={want} rel={rel}"
+        );
     }
 
     #[test]

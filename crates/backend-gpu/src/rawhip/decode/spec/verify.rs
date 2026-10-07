@@ -100,15 +100,19 @@ impl DecodeState {
         let mut mtw = std::time::Instant::now();
         let mut ph = [0u128; 8];
         let mut phw = [0u128; 8];
-        macro_rules! mmark { ($i:expr) => {{
-            if mtp_tm {{
-                phw[$i] += mtw.elapsed().as_micros() as u128; // wall (호스트 포함)
-                self.ctx.sync().ok(); // 커널 비동기 — sync 후 GPU 실측
-                ph[$i] += mt.elapsed().as_micros() as u128;
-                mt = std::time::Instant::now();
-                mtw = std::time::Instant::now();
-            }
-        }} }}
+        macro_rules! mmark {
+            ($i:expr) => {{
+                if mtp_tm {
+                    {
+                        phw[$i] += mtw.elapsed().as_micros() as u128; // wall (호스트 포함)
+                        self.ctx.sync().ok(); // 커널 비동기 — sync 후 GPU 실측
+                        ph[$i] += mt.elapsed().as_micros() as u128;
+                        mt = std::time::Instant::now();
+                        mtw = std::time::Instant::now();
+                    }
+                }
+            }};
+        }
         let n = self.n_embd;
         let (n_head, n_kv, hd) = (self.n_head, self.n_kv, self.hd);
         let n_ao = n_head * hd; // wo 입력 길이
@@ -395,14 +399,22 @@ impl DecodeState {
         if mtp_tm {
             eprintln!(
                 "[mtpP] cat={:6.3}/{:6.3} q8={:6.3}/{:6.3} eh={:6.3}/{:6.3} anq={:6.3}/{:6.3} qkv={:6.3}/{:6.3} attn={:6.3}/{:6.3} ffn={:6.3}/{:6.3} head={:6.3}/{:6.3} ms wall/GPU",
-                phw[0] as f64 / 1000.0, ph[0] as f64 / 1000.0,
-                phw[1] as f64 / 1000.0, ph[1] as f64 / 1000.0,
-                phw[2] as f64 / 1000.0, ph[2] as f64 / 1000.0,
-                phw[3] as f64 / 1000.0, ph[3] as f64 / 1000.0,
-                phw[4] as f64 / 1000.0, ph[4] as f64 / 1000.0,
-                phw[5] as f64 / 1000.0, ph[5] as f64 / 1000.0,
-                phw[6] as f64 / 1000.0, ph[6] as f64 / 1000.0,
-                phw[7] as f64 / 1000.0, ph[7] as f64 / 1000.0
+                phw[0] as f64 / 1000.0,
+                ph[0] as f64 / 1000.0,
+                phw[1] as f64 / 1000.0,
+                ph[1] as f64 / 1000.0,
+                phw[2] as f64 / 1000.0,
+                ph[2] as f64 / 1000.0,
+                phw[3] as f64 / 1000.0,
+                ph[3] as f64 / 1000.0,
+                phw[4] as f64 / 1000.0,
+                ph[4] as f64 / 1000.0,
+                phw[5] as f64 / 1000.0,
+                ph[5] as f64 / 1000.0,
+                phw[6] as f64 / 1000.0,
+                ph[6] as f64 / 1000.0,
+                phw[7] as f64 / 1000.0,
+                ph[7] as f64 / 1000.0
             );
         }
         let am = self.head_argmax_gpu(self.mtp_e)?;

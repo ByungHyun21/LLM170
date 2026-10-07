@@ -677,7 +677,7 @@ mod tests {
             "exl3_gemv_m8",
         ];
         for n in NAMES {
-            if MACRO_EXPANDED.contains(&n) {
+            if MACRO_EXPANDED.contains(n) {
                 continue;
             }
             assert!(defs.contains(n), "NAMES에 등록됐으나 SRC에 정의 없음: {n}");
