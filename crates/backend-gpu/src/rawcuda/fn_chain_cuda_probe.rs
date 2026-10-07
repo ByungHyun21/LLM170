@@ -1819,12 +1819,16 @@ fn read_w2d(g: &FnGguf, name: &str) -> Result<Vec<f32>, String> {
     let raw = g.read_rows(name, 0, rows as u64)?;
     let v: Vec<f32> = match t.ty {
         0 => raw
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         8 => dequant_q8_rows(&raw, rows, k),
         30 => raw
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
         other => return Err(format!("{name}: gguf ty {other} — 체인 투영 계약 밖")),
@@ -1936,7 +1940,9 @@ fn load_fixture(gguf_main: &str) -> Result<ChainFx, String> {
         .collect();
     let (dr, cch) = (dims.dt_rank, dims.gdn_conv_ch());
     let f32s = |raw: &[u8]| -> Vec<f32> {
-        raw.as_chunks::<4>().0.iter()
+        raw.as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     };
@@ -1980,15 +1986,21 @@ fn load_fixture(gguf_main: &str) -> Result<ChainFx, String> {
         let raw = g.read_rows(name, 0, rows)?;
         let v: Vec<f32> = match t.ty {
             0 => raw
-                .as_chunks::<4>().0.iter()
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
             1 => raw
-                .as_chunks::<2>().0.iter()
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect(),
             30 => raw
-                .as_chunks::<2>().0.iter()
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                 .collect(),
             other => return Err(format!("{name}: ty {other} 미지원(노름)")),
@@ -2248,7 +2260,6 @@ struct SpecOut {
     accepted_or: Vec<u32>,
     verify_logits_md: Vec<f32>,
 }
-
 
 /// 모듈층 인스턴스 꾸러미(단일 상주 원칙 — 체인 프로브 수명).
 struct ChainMods {

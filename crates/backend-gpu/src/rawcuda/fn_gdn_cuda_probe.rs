@@ -573,7 +573,9 @@ impl FnGdnFixture {
         }
         let (dr, cch) = (dims.dt_rank, dims.gdn_conv_ch());
         let f32s = |raw: &[u8]| -> Vec<f32> {
-            raw.as_chunks::<4>().0.iter()
+            raw.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         };

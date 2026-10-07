@@ -691,15 +691,21 @@ fn mtp_rms_reference(x: &[f32], w: &[f32]) -> Vec<f32> {
 fn st_to_f32(bytes: &[u8], dt: u8) -> Result<Vec<f32>, String> {
     match dt {
         1 => Ok(bytes
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect()),
         2 => Ok(bytes
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect()),
         0 => Ok(bytes
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
             .collect()),
         other => Err(format!("mtp 상수 dtype 코드 {other} 미지원")),
@@ -736,7 +742,9 @@ impl LinBuf {
             return Err(format!("{key}: 판독 suh/svh 길이 이상"));
         }
         let tre_u32: Vec<u32> = tre
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         Ok(Self {

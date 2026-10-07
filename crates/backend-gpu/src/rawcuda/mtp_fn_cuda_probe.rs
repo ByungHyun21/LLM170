@@ -801,7 +801,9 @@ fn patch_mixer(dir: &Path, dims: &MtpFnDims) -> Result<(Vec<f32>, Vec<f32>, Vec<
         let mut buf = vec![0u8; (e - b) as usize];
         f.read_exact(&mut buf).map_err(|e| e.to_string())?;
         let vals: Vec<f32> = buf
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
         if name.ends_with("hc_norm.weight") {
@@ -878,7 +880,9 @@ fn gguf_f32(g: &FnGguf, name: &str) -> Result<Vec<f32>, String> {
         return Err(format!("gguf f32: {name} ty{} — F32 계약", t.ty));
     }
     Ok(raw
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }

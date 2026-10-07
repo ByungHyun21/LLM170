@@ -188,7 +188,9 @@ fn h2d_chunked(cc: &CudaCtx, dst: CUdeviceptr, src: &[u8]) -> Result<(), String>
 
 /// f32 바이트 → Vec<f32>(d2h 출력 재해석 — LE 바이트 조립).
 fn bytes_f32(b: &[u8]) -> Vec<f32> {
-    b.as_chunks::<4>().0.iter()
+    b.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
