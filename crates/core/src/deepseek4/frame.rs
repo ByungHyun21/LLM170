@@ -397,8 +397,8 @@ mod tests {
     use super::*;
 
     fn fixture_dir() -> Option<std::path::PathBuf> {
-        let p = std::env::var("LLM170_DS4_EXL3")
-            .unwrap_or_else(|_| "D:/models/DeepSeek-V4-Flash-Vision-Exp-exl3-3.04bpw".into());
+        let p = llm170_diag::flag::val("LLM170_DS4_EXL3")
+            .unwrap_or("D:/models/DeepSeek-V4-Flash-Vision-Exp-exl3-3.04bpw");
         let p = std::path::PathBuf::from(p);
         p.exists().then_some(p)
     }

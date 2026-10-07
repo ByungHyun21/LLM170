@@ -479,7 +479,7 @@ mod tests {
     /// 픽스처 없으면 skip(관례). 실측 계약: 엔트리 수·plain/linear 형상.
     #[test]
     fn loader_contract() {
-        let Ok(dir) = std::env::var("LLM170_DS4_EXL3") else {
+        let Some(dir) = llm170_diag::flag::val("LLM170_DS4_EXL3") else {
             eprintln!("skip: LLM170_DS4_EXL3 없음");
             return;
         };
