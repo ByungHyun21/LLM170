@@ -2,6 +2,7 @@
 
 pub mod clip;
 pub mod clip_preproc;
+pub mod deepseek4;
 pub mod gdn;
 pub mod gdn_norm;
 pub mod matmul;
