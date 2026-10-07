@@ -5,6 +5,7 @@
 
 mod bench;
 mod engine;
+mod exl3_cuda_engine;
 mod exl3_engine;
 mod exl3_hip_engine;
 mod http;
@@ -142,7 +143,8 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
                         ma.gpu_runtime = Some(v.clone());
                     }
                     "cuda" => {
-                        return Err("--backend cuda: 미구현 (hip|vulkan 사용)".into());
+                        ma.backend = Some("gpu".into());
+                        ma.gpu_runtime = Some("cuda".into());
                     }
                     // EXL3 백엔드값 폐지(사용자 지시 2026-10-05): --backend는
                     // 런타임만(cpu|hip|vulkan|cuda). EXL3는 --model이 디렉터리면
@@ -339,7 +341,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     // 점유 슬롯 reset으로 교묘하게 상태를 파괴했다(엔진 코드는 대응하지만
     // 진입에서 거부하는 게 계약상 정확). vk 엔진은 다중 슬롯 지원 — 제외.
     if model_path.is_dir() && gpu_runtime != "vulkan" && slots.unwrap_or(1) > 1 {
-        return usage_err("EXL3 hip 백엔드는 단일 슬롯만 지원 — --slots 1");
+        return usage_err("EXL3 hip/cuda 백엔드는 단일 슬롯만 지원 — --slots 1");
     }
     if spec_k > 0 {
         // GPU 스펙 경로 강제 (스레드 기동 전 단일 스레드 시점 env 설정).
@@ -390,12 +392,14 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     // 아카이브)면 --backend 런타임(hip|vulkan)으로 EXL3 엔진을 고른다.
     // cpu+디렉터리는 명확한 에러(무음 Q4 로드 실패 방지).
     if model_path.is_dir() && backend != "gpu" {
-        eprintln!("error: EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan");
+        eprintln!("error: EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan|cuda");
         return ExitCode::FAILURE;
     }
     let sel = if model_path.is_dir() {
         if gpu_runtime == "vulkan" {
             engine::BackendSel::Exl3
+        } else if gpu_runtime == "cuda" {
+            engine::BackendSel::Exl3Cuda
         } else {
             engine::BackendSel::Exl3Hip
         }
