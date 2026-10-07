@@ -578,7 +578,13 @@ fn attn_run_chunk_case(
     dec.attn_seed_kv(0, lay, &fx.kc_hist, &fx.vc_hist)?;
     let got = dec.attn_chain_host(0, lay, t_len, &fx.qg, &fx.kin, &fx.vin, pos0)?;
     let want_chunk = attn_reference_chunked(
-        &dims, &fx.want.qh, &fx.kc_full, &fx.vc_full, &fx.qg, pos0, t_len,
+        &dims,
+        &fx.want.qh,
+        &fx.kc_full,
+        &fx.vc_full,
+        &fx.qg,
+        pos0,
+        t_len,
     );
     let (md_chunk, n1) = maxdiff_nan(&got.outv, &want_chunk);
     let (md_full, n2) = maxdiff_nan(&got.outv, &fx.want.outv);
@@ -586,7 +592,11 @@ fn attn_run_chunk_case(
     // lim ≤ 256이면 청크가 하나여서 트윈과 전체배열이 **반드시** 0.000e0
     // 이어야 한다(환원 순서가 물리적으로 같음). lim>256에서만 넓은 허용치.
     let single_chunk = (pos0 as usize + t_len) <= 256;
-    let tol_full = if single_chunk { ATTN_THRESH } else { CHUNK_EQ_TOL };
+    let tol_full = if single_chunk {
+        ATTN_THRESH
+    } else {
+        CHUNK_EQ_TOL
+    };
     let pass = md_chunk == 0.0 && md_full <= tol_full && nan == 0;
     println!(
         "device: {dev} | exl3-cuda-attn-chunk ({tag}) {mname} q_heads={} kv_heads={} cap={} \
