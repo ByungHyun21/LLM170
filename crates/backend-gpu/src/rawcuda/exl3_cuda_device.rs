@@ -35,18 +35,14 @@ impl Exl3CudaDecoder {
             return Err(format!("exl3-cuda: slot={slot} >= n_slots={n_slots}"));
         }
         let pos = self.slot_pos[slot];
-        let s9 = crate::rawcuda::attn_cuda::ATTN_SCORE_SCAP;
         if pos as usize >= self.attn_dims()?.cap {
             return Err(format!(
                 "context overflow: slot{slot} pos={pos}+1 > kvcap (--ctx 상향 필요)"
             ));
         }
-        if pos as usize + 1 > s9 {
-            return Err(format!(
-                "context overflow: slot{slot} pos={pos}+1 > {s9} \
-                 (CUDA fwd3s 위치축 한계 — 위치 청크 미구현, plans/cuda-port.md S9)"
-            ));
-        }
+        // [S12] 옛 fwd3s 위치축(공유메모리 1024행) 거절은 제거 — 커널이
+        // 청크 온라인 소프트맥스(rawhip plans/128 P0 판 이식)로 바뀌어
+        // 공유메모리가 kvcap과 무관해졌다. 위 cap 검사가 유일한 상한이다.
         if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.is_none() {
             return Err("exl3-cuda: 디코더 상수 미등록 — load_slots 필요".into());
         }

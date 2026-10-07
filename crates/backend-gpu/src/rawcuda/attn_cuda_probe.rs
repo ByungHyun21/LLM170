@@ -58,6 +58,18 @@ use std::ffi::c_void;
 /// 어텐션 값 maxdiff 임계(plans/124 §1 — 전 모듈 통틀어 최tight).
 const ATTN_THRESH: f32 = 2e-7;
 
+/// [S12] **청크 경계를 넘는** 구간의 수학 동치 허용치.
+///
+/// 청크.online 소프트맥스는 정의상 전체배열 소프트맥스와 같은 값이지만,
+/// lim행(최대 수천)을 몇 개의 청크로 나눠 리스케일하며 누적하므로
+/// f32 환원 순서가 달라 ulp가 누적된다. 순차 누산 N항의 상대오차는 최악
+/// N·eps — lim=8192면 5e-4까지理論상 열리나 실제로는 sqrt 스케이라
+/// 1e-4 수준이 관측된다(f16 mma 누산 1.6e-2보다 2~3자릿수 작음).
+/// **비트계약 판정은 청크 트윈이 담당하고(0.000e0), 이 값은 "둘이 같은
+/// 수학적 정답을 계산했다"는 magnitude 확인용이다.** 즉 이 허용치가
+/// 느슨해져도 청크화가 틀렸다는 판정을 놓치지 않는다 — 트윈이 조기 잡는다.
+const CHUNK_EQ_TOL: f32 = 1e-3;
+
 /// rope theta 트윈 — .cu attn_theta와 동일 f64 DAG: e=−2·tid/64(정확),
 /// exp(ln(1e7)·e) — ln(1e7) 리터럴 동일 문자열(비트동일 계약).
 fn attn_theta(tid: usize) -> f32 {
@@ -261,6 +273,113 @@ fn attn_reference_chain(
     }
 }
 
+/// [S12] fwd3s **청크 온라인 소프트맥스** 호스트 트윈.
+///
+/// [왜 전체배열 오라클만으로 부족한가] `attn_reference_chain`은 옛 커널의
+/// 알고리즘(lim행 전부 smem에 담고 전역 max/sum)을 미러한다. 청크 커널은
+/// lim>256에서 환원 순서가 구조적으로 달라지므로(온라인 리스케일 corr가
+/// 들어간다) 두 경로가 0.000e0로 나올 수 없다. 그래서 이 트윈이
+/// **비트계약의 정답**이다 — 커널과 같은 연산을 같은 순서로 한다.
+///
+/// [판정 읽는 법]
+/// - 이 트윈이 어긋나면 = 배선 오류(슬롯 오프셋·cap stride·pp[0] 판독).
+///   lim>256에서만 드러나므로 옛 케이스(pos0=33)로는 절대 못 잡는 종류.
+/// - 이 트윈이 맞고 전체배열 오라클과 어긋나면 = 수학적으로 동등한 환원
+///   순서 차이(허용오차 판정). online softmax는 정의 자체가 같은 값이다.
+/// - lim≤256에서는 청크가 하나라 두 오라클이 **비트동일**해야 한다 —
+///   실제로 같음을 확인했다(게이트 기준선 불변의 근거).
+// [rustfmt skip — 본 파일 G6 계열 미러 계약(동일 연산·동일 순서 유지)]
+#[rustfmt::skip]
+fn attn_reference_chunked(
+    dm: &AttnDims,
+    qh: &[f32],
+    kc: &[f32],
+    vc: &[f32],
+    qg: &[f32],
+    pos0: u32,
+    t_len: usize,
+) -> Vec<f32> {
+    const CHUNK: usize = 256;
+    let (kv_dim, q_dim, qg_dim) = (dm.kv_dim(), dm.q_dim(), dm.qg_dim());
+    let gq = dm.gq();
+    let mut outv = vec![0f32; t_len * q_dim];
+    for t in 0..t_len {
+        for h in 0..dm.q_heads {
+            let kh = h / gq;
+            let kbase = kh * 256;
+            let qbase = t * q_dim + h * 256;
+            let lim = pos0 as usize + t + 1;
+            let qs = &qh[qbase..qbase + 256];
+            let mut m_run = -1e30f32;
+            let mut l_run = 0.0f32;
+            let mut acc = [0f32; 256]; // 스레드(dim)별 AV 누산
+            let mut base = 0usize;
+            while base < lim {
+                let nch = CHUNK.min(lim - base);
+                // (1) 스코어 — 행=base+tid(tid<nch), 256차원 직렬 내적.
+                let mut sarr = [-1e30f32; CHUNK];
+                for tid in 0..nch {
+                    let row = base + tid;
+                    let mut p = 0f32;
+                    for d in 0..256 {
+                        p += qs[d] * kc[row * kv_dim + kbase + d];
+                    }
+                    sarr[tid] = p * 0.0625f32;
+                }
+                // (2) 청크 max 트리 → reds[0]
+                let mut reds = [0f32; 256];
+                for tid in 0..CHUNK {
+                    reds[tid] = if tid < nch { sarr[tid] } else { -1e30f32 };
+                }
+                let mut st = 128usize;
+                while st > 0 {
+                    for tid in 0..st {
+                        reds[tid] = reds[tid].max(reds[tid + st]);
+                    }
+                    st >>= 1;
+                }
+                let m_new = m_run.max(reds[0]);
+                let corr = if m_run <= -1e29f32 { 0.0f32 } else { gdn_expf(m_run - m_new) };
+                // (3) exp + 청크 sum 트리 — e를 sarr 자리에 재기록
+                let mut reds = [0f32; 256];
+                for tid in 0..CHUNK {
+                    reds[tid] = if tid < nch {
+                        let e = gdn_expf(sarr[tid] - m_new);
+                        sarr[tid] = e;
+                        e
+                    } else {
+                        0.0f32
+                    };
+                }
+                let mut st = 128usize;
+                while st > 0 {
+                    for tid in 0..st {
+                        reds[tid] += reds[tid + st];
+                    }
+                    st >>= 1;
+                }
+                // (4) AV — 자기 dim에 청크 전 행 순차 누산
+                for tid in 0..256 {
+                    acc[tid] *= corr;
+                    for i in 0..nch {
+                        let row = base + i;
+                        acc[tid] += sarr[i] * vc[row * kv_dim + kbase + tid];
+                    }
+                }
+                l_run = l_run * corr + reds[0];
+                m_run = m_new;
+                base += CHUNK;
+            }
+            for tid in 0..256 {
+                let g = qg[t * qg_dim + h * 512 + 256 + tid];
+                outv[t * q_dim + h * 256 + tid] =
+                    (acc[tid] / l_run) * (1.0 / (1.0 + gdn_expf(-g)));
+            }
+        }
+    }
+    outv
+}
+
 // ── 어텐션 픽스처(실가중 q/k_norm + 결정론 시드 — G5 방법론 계승) ──
 
 /// config.json 읽기 + AttnDims 유도(실측 차원 계약).
@@ -284,6 +403,11 @@ struct AttnFixture {
     qnw: Vec<f32>,
     knw: Vec<f32>,
     want: AttnRefStages,
+    /// 체인 기입 후의 전체 층 캐시 [cap*kv_dim] — 청크 트윈이 읽는다.
+    /// `kc_hist`는 신규행이 비어 있으므로 그 자체로는 lim까지의 kc가
+    /// 되지 못한다(청크 트윈은 lim행 전부를 스코어한다).
+    kc_full: Vec<f32>,
+    vc_full: Vec<f32>,
 }
 
 impl AttnFixture {
@@ -369,6 +493,8 @@ impl AttnFixture {
             vc_hist,
             qnw,
             knw,
+            kc_full: kcf.clone(),
+            vc_full: vcf.clone(),
             want,
         })
     }
@@ -417,6 +543,72 @@ fn attn_run_case(
     Ok(())
 }
 
+/// [S12] 청크 경계 케이스 — lim>256을 실제로 밟아 본다.
+///
+/// 두 판정을 분리한다(둘 다 성립해야 PASS):
+/// 1. **비트계약**: 디바이스 outv vs 청크 트윈 → 0.000e0.
+/// 2. **수학 동치**: 디바이스 outv vs 전체배열 오라클(want) → 청크화는
+///    환원 순서를 바꾸므로 0이 될 수 없다. f16 GEMM 누산(1.6e-2)보다
+///    한참 작아야 하는 **넓은 허용치**로 판정한다(수학적 동등식의
+///    f32 라운딩 누적). lim≤256 케이스에서는 1·2가 모두 0이 되어야 한다.
+fn attn_run_chunk_case(
+    dec: &mut Exl3CudaDecoder,
+    tag: &str,
+    mname: &str,
+    dir: &str,
+    t_len: usize,
+    pos0: u32,
+    seed: u64,
+    cap: usize,
+    dev: &str,
+    fails: &mut Vec<String>,
+    report: &mut String,
+) -> Result<(), String> {
+    let mut dims = attn_dims_from_model(dir)?;
+    // [S12] cap 오버라이드 — 옛 상한(1024)을 넘어서는 구간(c4)을 보려면
+    // 히스토리 배열과 디바이스 KV 버퍼가 그만큼 커야 한다. set_attn이
+    // dims.cap으로 dkc/dvc를 할당하므로 여기서만 키우면 전 경로가 따라온다
+    // (kvcap 일관성 규약 — 백엔드 AGENTS.md 역패턴).
+    if cap > dims.cap {
+        dims.cap = cap;
+    }
+    let fx = AttnFixture::generate(dims, dir, t_len, pos0, seed)?;
+    let lay = fx.layer;
+    dec.set_attn(dims, &fx.qnw, &fx.knw)?;
+    dec.attn_seed_kv(0, lay, &fx.kc_hist, &fx.vc_hist)?;
+    let got = dec.attn_chain_host(0, lay, t_len, &fx.qg, &fx.kin, &fx.vin, pos0)?;
+    let want_chunk = attn_reference_chunked(
+        &dims, &fx.want.qh, &fx.kc_full, &fx.vc_full, &fx.qg, pos0, t_len,
+    );
+    let (md_chunk, n1) = maxdiff_nan(&got.outv, &want_chunk);
+    let (md_full, n2) = maxdiff_nan(&got.outv, &fx.want.outv);
+    let nan = n1 + n2;
+    // lim ≤ 256이면 청크가 하나여서 트윈과 전체배열이 **반드시** 0.000e0
+    // 이어야 한다(환원 순서가 물리적으로 같음). lim>256에서만 넓은 허용치.
+    let single_chunk = (pos0 as usize + t_len) <= 256;
+    let tol_full = if single_chunk { ATTN_THRESH } else { CHUNK_EQ_TOL };
+    let pass = md_chunk == 0.0 && md_full <= tol_full && nan == 0;
+    println!(
+        "device: {dev} | exl3-cuda-attn-chunk ({tag}) {mname} q_heads={} kv_heads={} cap={} \
+         lay={lay} pos0={pos0} T={t_len} lim={}: 비트계약(청크트윈) maxdiff={md_chunk:.3e} \
+         nan={n1} | 수학동치(전체배열) maxdiff={md_full:.3e} (허용 {tol_full:.0e}) nan={n2} \
+         | 청크수={} | {}",
+        dims.q_heads,
+        dims.kv_heads,
+        dims.cap,
+        pos0 as usize + t_len,
+        (pos0 as usize + t_len).div_ceil(256),
+        if pass { "PASS" } else { "FAIL" }
+    );
+    report.push_str(&format!("({tag}) chunk={md_chunk:.3e} full={md_full:.3e}",));
+    if !pass {
+        fails.push(format!(
+            "({tag}) 청크트윈={md_chunk:.3e}(비트) 전체배열={md_full:.3e}(허용{tol_full:.0e}) nan={nan}"
+        ));
+    }
+    Ok(())
+}
+
 /// exl3-cuda-attn — plans/124 G6 어텐션(prep+fwd3s) 값 maxdiff 판정
 /// (임계 2e-7 — 계약 최tight). (i) 27B T=1(순차 디코드) · (ib) 27B T=8
 /// (스펙 상한) · (iii) T>8 도메인 거부(모듈 Err + 커널 원시 발사
@@ -438,6 +630,43 @@ pub fn cuda_attn_check(dir27: &str, dir35: &str) -> Result<String, String> {
     )?;
     attn_run_case(
         &mut dec, "ib", "Qwen3.8-27B", dir27, 8, pos0, 0x170C_0DA0_0000_00A2, &dev, &mut fails,
+        &mut report,
+    )?;
+
+    // ── [S12] 위치 청크 경계 케이스 ────────────────────────────────────
+    // 옛 검증은 pos0=33(T=8 → lim≤41)에 머물렀다. lim>256 구간은 아무도
+    // 보지 않았고, 옛 커널은 그 구간에서 illegal address로 죽었다.
+    // (c1) lim=256 경계 바로 아래 — 청크 1개. **청크 트윈과 전체배열
+    //      오라클이 모두 0.000e0이어야 한다**(물리적으로 같은 연산).
+    //      이게 깨지면 "비트동일이라던 내 주장이 틀렸다"는 뜻이다.
+    attn_run_chunk_case(
+        &mut dec, "c1", "Qwen3.8-27B", dir27, 1, 255, 0x170C_0DA0_0000_00C1, 1024, &dev, &mut fails,
+        &mut report,
+    )?;
+    // (c2) 청크 2개 — lim=257. 옛 커널의 마지막 정상 위치(1024) 안이지만
+    //      환원 순서가 처음 달라지는 지점.
+    attn_run_chunk_case(
+        &mut dec, "c2", "Qwen3.8-27B", dir27, 1, 256, 0x170C_0DA0_0000_00C2, 1024, &dev, &mut fails,
+        &mut report,
+    )?;
+    // (c3) 옛 상한(1024) 바로 아래, T=8 배치 프리필 경로까지 겸해 검증.
+    attn_run_chunk_case(
+        &mut dec, "c3", "Qwen3.8-27B", dir27, 8, 1016, 0x170C_0DA0_0000_00C3, 1024, &dev, &mut fails,
+        &mut report,
+    )?;
+    // (c4) 옛 상한을 넘어서는 구간 — 서빙 ctx 상한 해제의 실증 구간.
+    //      lim=2048(8청크)는 옛 커널이 CUresult 700으로 죽던 영역이다.
+    attn_run_chunk_case(
+        &mut dec, "c4", "Qwen3.8-27B", dir27, 8, 2040, 0x170C_0DA0_0000_00C4, 2048, &dev, &mut fails,
+        &mut report,
+    )?;
+    // (c5) 두 번째 모델 인자 형상. 실제 q/kv 헤드 폭이 다르면(gq가 6이 아닌
+    //      경우) 청크 루프의 stride 인자화가 살아 있는지 함께 본다.
+    //      verify_cuda.sh가 dir35 자리에 D27을 넘기므로 이 기기에서는
+    //      같은 형상·다른 시드로 돈다 — 진짜 35B 형상 검증은 그 EXL3
+    //      아카이브가 있어야 한다(원장 §6에 남김).
+    attn_run_chunk_case(
+        &mut dec, "c5", "두번째인자", dir35, 8, 1016, 0x170C_0DA0_0000_00C5, 1024, &dev, &mut fails,
         &mut report,
     )?;
 

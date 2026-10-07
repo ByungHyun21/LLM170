@@ -34,17 +34,10 @@ impl Exl3CudaEngine {
         if kvcap != ctx_len {
             eprintln!("# cuda kvcap: ctx {ctx_len} → {kvcap} (범위 [64, 32768]로 클램프)");
         }
-        // plans/cuda-port.md S9: fwd3s 점수 scratch가 공유메모리 1024행이라
-        // 위치축이 그 이상이면 illegal address로 죽는다. 조용히 넘어가면
-        // 어중간한 오답이 나가므로 로드 시점에 명확히 알린다.
-        let s9_cap = llm170_backend_gpu::rawcuda::attn_cuda::ATTN_SCORE_SCAP;
-        if kvcap > s9_cap {
-            eprintln!(
-                "# cuda: ctx {kvcap} > fwd3s 위치 한계 {s9_cap} — pos {s9_cap} 부근에서 \
-                 거절된다(위치 청크 미구현, plans/cuda-port.md S9). \
-                 --ctx {s9_cap}로 줄여서 서빙할 것."
-            );
-        }
+        // plans/cuda-port.md S12: 옛엔 여기서 fwd3s 점수 scratch가 공유메모리
+        // 1024행이라 ctx>1024를 로드 시점에 경고했다(S9). 커널이 위치 청크
+        // 온라인 소프트맥스로 바뀌면서 그 상한이 사라졌으므로 경고도 함께
+        // 걷는다 — 이제 위치축 상한은 kvcap(=clamp된 ctx) 자체다.
         let dec = Exl3CudaDecoder::load_slots(dir, usize::MAX, kvcap, slots)?;
         Ok(Self {
             dec,

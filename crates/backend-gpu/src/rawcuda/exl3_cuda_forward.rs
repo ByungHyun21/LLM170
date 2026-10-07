@@ -74,16 +74,9 @@ impl Exl3CudaDecoder {
                 "context overflow: slot{slot} pos={pos} + 1 > kvcap={cap} (--ctx 상향 필요)"
             ));
         }
-        // 위치축 한계(fwd3s 공유메모리 sarr 1024행, S9). cap이 커도 이 값을
-        // 넘으면 커널이 illegal address로 죽는다 — 여기가 진짜 상한이다.
-        // 조용한 오답이 아니라 조기에 명확히 거부한다.
-        if pos as usize + 1 > crate::rawcuda::attn_cuda::ATTN_SCORE_SCAP {
-            return Err(format!(
-                "context overflow: slot{slot} pos={pos}+1 > {} \
-                 (CUDA fwd3s 위치축 한계 — 위치 청크 미구현, plans/cuda-port.md S9)",
-                crate::rawcuda::attn_cuda::ATTN_SCORE_SCAP
-            ));
-        }
+        // [S12] 옛 fwd3s 공유메모리 sarr[1024] 위치축 거절은 제거 —
+        // 커널이 청크 온라인 소프트맥스로 바뀌어 공유메모리가 kvcap과
+        // 무관해졌다. 위 cap 검사가 유일한 위치축 상한이다.
         if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.is_none() {
             return Err("exl3-cuda: 디코더 상수 미등록 — load_with_ctx 필요".into());
         }
