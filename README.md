@@ -79,15 +79,15 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 | backend | pp512 | pp4096 | pp16384 | tg128@8k |
 |---|---|---|---|---|
-| LLM170 hip | 319.1 | 332.0 | 308.3 | 14.57 |
+| LLM170 hip | 319.1 | 332.0 | 308.3 | 18.13 |
 | LLM170 vulkan (frame) | 401.9 | — | — | — |
 | llama.cpp hip | 417.67 | **511.95** | **466.97** | 21.81 |
 | llama.cpp vulkan | **546.01** | 497.66 | 478.40 | **25.63** |
 
 | mode | LLM170 hip | llama hip |
 |---|---|---|
-| tg single | 14.57 | **22.07** |
-| np4 greedy | 31.90 | **41.01** |
+| tg single | 18.13 | **22.07** |
+| np4 greedy | 32.30 | **41.01** |
 | MTP k=2 | 3.02 | n/s |
 | MTP k=3 | 4.05 | n/s |
 | MTP + np4 k=2 | 3.28 | n/s |
