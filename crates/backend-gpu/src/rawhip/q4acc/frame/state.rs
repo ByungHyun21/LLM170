@@ -617,7 +617,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // j128m WMMA 타일(plans/133, 구형 gm/ge 5× 원장 151 극복) —
                 // pad_layout 플래그(plans/115 D 유산)로 패딩 도메인 소비.
                 // 게이트(토큰 스트림)+pp16384 A/B로 검증. 실패 시 t==1 복귀.
-                if ne <= 512 && rows > 0 {
+                // 2026-10-07 plans/141: 실패 확인 — j128m을 꺼도 이 t>1 활성화
+                // 상태에서는 FN 게이트가 퇴화했다(수리 후 실측 `0 18 18 ...`).
+                // t==1 전용으로 원복. 재활성화는 패딩 도메인 gm/ge 정합 증명 후에만.
+                if self.t_cur() == 1 && ne <= 512 && rows > 0 {
                     // **단일 상한**: Σ_e ceil(r_e/16)*16 ≤ rows + 16*ne
                     // (전문가당 ≤15행 패딩). 종전 rows*16+16은 16배 과대였고,
                     // 그 값으로 커널 zero-fill·호스트 버퍼가 어긋나 OOB가 났다.
@@ -1010,43 +1013,12 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 let mut g = self.gyp.lock().map_err(|e| e.to_string())?;
                 g.ensure(&self.ctx, rows_pad * n_out * 4)?
             };
-            // plans/116-4 잠자는 WMMA 그룹 타일 가동 (plans/133 B): 16행 전문가
-            // 타일 × 128출력 f16 스테이징 WMMA — gm dot4(~1 TMAC/s)를 WMMA
-            // (~8 TMAC/s)로 대체. 타일 계약 동일(tile_exp·패딩 도메인)이라
-            // gather/scatter 무변경. 니블 인덱싱 결함은 w32m_d.cu에서 수리.
-            // A/B: LLM170_CO9_PATH=/dev/null → 비트 클리어 → 종전 gm 경로.
-            if self.ctx.co_loaded(crate::rawhip::CO_W32M) {
-                let mut x_p = xgp as *mut std::ffi::c_void;
-                let mut w_p = wd as *mut std::ffi::c_void;
-                let mut o_p = ygp as *mut std::ffi::c_void;
-                let mut tx_p = tilexp_d as *mut std::ffi::c_void;
-                let (mut ni, mut no, mut xw, mut tt, mut eb) = (
-                    n_in as i32,
-                    n_out as i32,
-                    xq_w as i32,
-                    rows_pad as i32,
-                    per_expert as i32,
-                );
-                let mut args: Vec<*mut std::ffi::c_void> = vec![
-                    (&mut x_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut w_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut o_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut tx_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut ni) as *mut _ as *mut std::ffi::c_void,
-                    (&mut no) as *mut _ as *mut std::ffi::c_void,
-                    (&mut xw) as *mut _ as *mut std::ffi::c_void,
-                    (&mut tt) as *mut _ as *mut std::ffi::c_void,
-                    (&mut eb) as *mut _ as *mut std::ffi::c_void,
-                ];
-                self.ctx.launch3(
-                    "gemm_q5_1_j128m",
-                    n_out.div_ceil(128).min(65535) as u32,
-                    rows_pad.div_ceil(16) as u32,
-                    1,
-                    256,
-                    &mut args,
-                )?;
-            } else {
+            // 2026-10-07 plans/141: 이 자리에 j128m WMMA 그룹 타일(6800ce02)이
+            // 있었고, 그 경로만 켜면 FN 출력이 6800ce02가 커밋한 열화 기준선과
+            // 16토큰 정확히 일치했다(실측). 규칙 9(ADR-0019)에 따라 커널 ·
+            // CO_W32M 등록 · .co 자산을 같은 변경에서 삭제하고 종전 gm 경로를
+            // 무조건 실행으로 원복한다.
+            {
                 let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
                 let mut x_p = xgp as *mut std::ffi::c_void;
                 let mut w_p = wd as *mut std::ffi::c_void;
@@ -1148,53 +1120,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     fnv(&ivf)
                 );
             }
-            // plans/116-4 잠자는 WMMA 그룹 타일 가동 (plans/133 B) — q4k 변형은
-            // 원장 167에서 moe-row-check + 전모델 드리프트 ~3e-3(f16급) 검증
-            // 완료. 레이아웃 계약 동일(tilexp·패딩 도메인 gather).
-            if self.ctx.co_loaded(crate::rawhip::CO_W32M) {
-                let mut xm_p = xg as *mut std::ffi::c_void;
-                let mut wm_p = wd as *mut std::ffi::c_void;
-                let mut om_p = yg as *mut std::ffi::c_void;
-                let mut txm_p = tilexp_d as *mut std::ffi::c_void;
-                let (mut mi, mut mo, mut mw, mut mt, mut me) = (
-                    n_in as i32,
-                    n_out as i32,
-                    xq_w as i32,
-                    // 호스트 경로(프리필)의 xg/yg는 perm gather로 rows행만 —
-                    // t=rows(ge와 동일 가드). 디바이스 경로(rows_pad_d≠0)는
-                    // 패딩 도메인 rows_pad — 단 현재 디바이스 그룹화는 t=1 전용이라
-                    // 이 분기(dmmv 선행 반환)에는 도달하지 않는다(방어 분기).
-                    if rows_pad_d != 0 {
-                        rows_pad as i32
-                    } else {
-                        rows as i32
-                    },
-                    per_expert as i32,
-                );
-                let mut margs: Vec<*mut std::ffi::c_void> = vec![
-                    (&mut xm_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut wm_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut om_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut txm_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut mi) as *mut _ as *mut std::ffi::c_void,
-                    (&mut mo) as *mut _ as *mut std::ffi::c_void,
-                    (&mut mw) as *mut _ as *mut std::ffi::c_void,
-                    (&mut mt) as *mut _ as *mut std::ffi::c_void,
-                    (&mut me) as *mut _ as *mut std::ffi::c_void,
-                ];
-                self.ctx.launch3(
-                    "gemm_q4k_j128m",
-                    n_out.div_ceil(128).min(65535) as u32,
-                    rows_pad.div_ceil(16) as u32,
-                    1,
-                    256,
-                    &mut margs,
-                )?;
-                let scat = if pad_layout { inv_pad_d } else { inv_d };
-                self.rows_permute_dev(yg, scat as *mut u8, op_, n_out, rows)?;
-                self.moe_hash_check("gem", op_, rows, n_out)?;
-                return Ok(());
-            }
+            // 2026-10-07 plans/141: 여기 j128m WMMA 그룹 타일(6800ce02) 분기가
+            // 있었고 그 경로가 FN 출력을 퇴화시켰다 — 같은 변경에서 커널 ·
+            // CO_W32M 등록 · .co 자산까지 삭제(규칙 9/ADR-0019). 아래 ge 경로가
+            // 이 타입의 유일한 소비자다.
             self.ctx.launch3(
                 "q4_gemm_q4k_ge",
                 n_out.div_ceil(16) as u32,
