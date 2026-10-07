@@ -498,11 +498,23 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             return Ok(());
         }
         // plans/73: Q8_0 다운 전문가도 direct-ids 워프판으로 — 종전엔 이 층들이
+        //
+        // plans/141: `n_in/32 <= 32` 상한을 n_in ≤ 4096으로 완화했다. 커널 인덱스는
+        // 이미 그 범위를 안전하게 덮는다 — xq 워드 로드는 `xw = sb*8`로 서브블록
+        // 하나당 8 unsigned를 읽어 최대 (n_sub-1)*8+7 = n_in/4-1이므로 32 서브블록
+        // 제한이 없어도 q8 영역을 넘지 않는다. 스케일 `xr[n_in/4 + sb]`도
+        // xq_words = n/4+n/32+n/16 안이다. 레인 위임은 `sb = lane; sb += 32`로
+        // 이미 처리되어 산술 순서는 불변이다(f32 부분합 + 32레인 shfl 트리).
+        //
+        // 상한 때문에 MTP 드래프트 Q8_0 스택(n_in=2560)이 전부 걸러져 512-전문가
+        // 그룹 타일(q4_gemm_q8_gm)로 내려갔다. 그 타일은 **전문가당 격리 블록**을
+        // gy=513으로 발사해 드래프트 63스텝에 126회·1058ms를 태웠다(라우팅된
+        // 전문가가 10개여도 512 전체를 순회). 직접 ids 판은 rows 블록만 쓴다.
         if (self.t_cur() == 1 || rows <= 64)
             && ws.ty == GgmlType::Q8_0
             && !f32w
             && rows > 0
-            && n_in / 32 <= 32
+            && n_in <= 4096
         {
             let idp = self.fptr(ids)?;
             let mut x_p = xq as *mut std::ffi::c_void;
