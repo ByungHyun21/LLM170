@@ -110,6 +110,43 @@ impl RawCtx {
         )
     }
 
+    /// iq4_xs t=1 dmmv — f32 활성 직소비(plans/141 부록 설계 2026-10-07).
+    /// q8_0 dmmv와 동일 그리드(2행/WG)·ktab2(LUT)만 추가.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // 원시 포인터 프레임 계약(107 W8)
+    pub fn gemv_xs_dmmv_out(
+        &self,
+        x: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        n_in: usize,
+        n_out: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
+        let mut x_p = x as *mut std::ffi::c_void;
+        let mut w_p = w as *mut std::ffi::c_void;
+        let mut o_p = out as *mut std::ffi::c_void;
+        let mut kt_p = ktab2 as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut kt_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni) as *mut _ as *mut std::ffi::c_void,
+            (&mut no) as *mut _ as *mut std::ffi::c_void,
+        ];
+        let wgs = n_out.div_ceil(2);
+        self.launch3(
+            "gemm_xs_dmmv",
+            1,
+            wgs.min(65535) as u32,
+            wgs.div_ceil(65535) as u32,
+            64,
+            &mut args,
+        )
+    }
+
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // 원시 포인터 프레임 계약(107 W8)
     pub fn gemv_q8_out(
         &self,

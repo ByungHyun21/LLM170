@@ -202,7 +202,7 @@ fn hc_mix_draft(
     let w_inject = model.w4(&format!("blk.{il}.hc_{kind}_inject.weight"))?;
     acc.frame_mm_group(mf.xn, &[w_down, w_inject], &[mf.lo, mf.inj], 1)
         .map_err(Q4Error::Io)?;
-    sync_mark(acc, &format!("mtp.hc_{kind}.down"), mf.lo)?;
+    sync_mark(acc, "dft_hc_down", mf.lo)?;
     op(
         acc,
         FrameOp::SiluDiv {
@@ -233,7 +233,7 @@ fn hc_mix_draft(
             n,
         },
     )?;
-    sync_mark(acc, &format!("mtp.hc_{kind}.mix"), mf.mix)?;
+    sync_mark(acc, "dft_hc_mix", mf.mix)?;
     Ok(())
 }
 
@@ -292,11 +292,13 @@ fn moe_draft(
         },
     )?;
     let fs: &dyn FrameState = acc;
+    sync_mark(acc, "dftpreroute", mf.mroute)?;
     let w_gate = model.w4(&format!("blk.{il}.ffn_gate_exps.weight"))?;
     let w_up = model.w4(&format!("blk.{il}.ffn_up_exps.weight"))?;
     let w_down = model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
     fs.frame_moe_gemm(mf.mxsel, &w_gate, mf.mids, mf.mgu, hp.n_expert, k_sel)
         .map_err(Q4Error::Io)?;
+    sync_mark(acc, "dftxgate", mf.mgu)?;
     fs.frame_moe_gemm(mf.mxsel, &w_up, mf.mids, mf.mup, hp.n_expert, k_sel)
         .map_err(Q4Error::Io)?;
     op(
@@ -310,6 +312,7 @@ fn moe_draft(
     )?;
     fs.frame_moe_gemm(mf.mglu, &w_down, mf.mids, mf.my, hp.n_expert, k_sel)
         .map_err(Q4Error::Io)?;
+    sync_mark(acc, "dftxdown", mf.my)?;
     op(
         acc,
         FrameOp::MoeWeightedSum {
@@ -320,7 +323,7 @@ fn moe_draft(
             n,
         },
     )?;
-    sync_mark(acc, "mtp.moe.wsum", mf.mout)?;
+    sync_mark(acc, "dftmoewsum", mf.mout)?;
     // shared 전문가 — 일반 경로(Sigmoid→gate/up 그룹→SiluMul→down→Axpy).
     // 융합 커널(q4_shexp_gu/da)은 Q8_0 전용 레이아웃인데 드래프트 shexp
     // gate/up은 q4_K이라 조용한 오염이 된다 — trunk 프리필 판 산술을 쓴다.
@@ -350,7 +353,7 @@ fn moe_draft(
             n,
         },
     )?;
-    sync_mark(acc, "mtp.moe.shared", mf.mout)?;
+    sync_mark(acc, "dftmoeshared", mf.mout)?;
     Ok(())
 }
 
@@ -390,20 +393,22 @@ pub(crate) fn mtp_draft_frame(
     let weh = model.w4(&format!("blk.{il}.nextn.eh_proj.weight"))?;
     acc.frame_mm(mf.cat, &weh, mf.res, hc)
         .map_err(Q4Error::Io)?;
-    sync_mark(acc, "mtp.eh", mf.res)?;
+    sync_mark(acc, "dfteh", mf.res)?;
 
     // 2) attn 반쪽 hc_mix
     hc_mix_draft(acc, model, f, mf, il, "attn", eps, n, hc)?;
+    sync_mark(acc, "dftattnmix", mf.mix)?;
 
     // 3) dense 어텐션 — 투영/wo GPU, norm·rope·KV·softmax·게이트 CPU
     //    (mtp_dense_attn과 동일 산술 — layers.rs mtp_attn_cpu_row 공유).
+    sync_mark(acc, "dftpreattn", mf.mix)?;
     let wq = model.w4(&format!("blk.{il}.attn_q.weight"))?;
     let wk = model.w4(&format!("blk.{il}.attn_k.weight"))?;
     let wv = model.w4(&format!("blk.{il}.attn_v.weight"))?;
     let wo = model.w4(&format!("blk.{il}.attn_output.weight"))?;
     acc.frame_mm_group(mf.mix, &[wq, wk, wv], &[mf.q, mf.k, mf.v], 1)
         .map_err(Q4Error::Io)?;
-    sync_mark(acc, "mtp.qkv", mf.q)?;
+    sync_mark(acc, "dftqkv", mf.q)?;
     let qn = model.f32_vec4(&format!("blk.{il}.attn_q_norm.weight"))?;
     let kn = model.f32_vec4(&format!("blk.{il}.attn_k_norm.weight"))?;
     let mut q = vec![0.0f32; hp.n_head * 2 * hp.head_dim];
@@ -417,14 +422,19 @@ pub(crate) fn mtp_draft_frame(
     acc.frame_mm_group(mf.attn, &[wo], &[mf.ao], 1)
         .map_err(Q4Error::Io)?;
     hc_combine_draft(acc, mf, mf.ao, n, hc)?;
+    sync_mark(acc, "dftattn", mf.ao)?;
 
     // 4) ffn 반쪽 — hc_mix + MoE + combine
     hc_mix_draft(acc, model, f, mf, il, "ffn", eps, n, hc)?;
+    sync_mark(acc, "dftffnmix", mf.mix)?;
     moe_draft(acc, model, mf, il, n)?;
+    sync_mark(acc, "dftmoe", mf.mout)?;
     hc_combine_draft(acc, mf, mf.mout, n, hc)?;
+    sync_mark(acc, "dftffncomb", mf.mout)?;
 
     // 5) 헤드 — nextn.hc_head_{norm,down,up}(trunk output_hc_*와 동일 구조)
     let w_norm = f.consts[&format!("blk.{il}.nextn.hc_head_norm")];
+    sync_mark(acc, "dftprehead", mf.hxn)?;
     op(
         acc,
         FrameOp::RmsRows {
@@ -472,9 +482,11 @@ pub(crate) fn mtp_draft_frame(
         .ok_or(Q4Error::MissingTensor("output.weight".into()))?;
     acc.frame_mm(mf.hin, &wout, mf.logits, 1)
         .map_err(Q4Error::Io)?;
+    sync_mark(acc, "dftout", mf.logits)?;
     let toks = acc
         .frame_argmax_rows(mf.logits, 1, hp.vocab)
         .map_err(Q4Error::Io)?;
+    sync_mark(acc, "dftargmax", mf.logits)?;
 
     // 7) 체인 h 반출 — 다음 드래프트 스텝의 hnorm 입력(프리-믹서 잔차).
     let mut chain = vec![0.0f32; hc * n];

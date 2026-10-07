@@ -400,10 +400,24 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         // KTRACE — 프레임 op/커널의 GPU 시간을 t/s 옆에서 확정한다.
         let t0 = Instant::now();
         let l = eng.prefill(0, prompt).map_err(|e| e.to_string())?;
-        if has_mtp && let Err(err) = eng.mtp_draft_prefill(0, prompt, 0) {
-            eprintln!("# mtp prefill 생략({err})");
-        }
+        // plans/141: 드래프트 프리필을 프리필 시간에 흡수시키지 않는다. 종전엔
+        // 이 512회 드래프트 스텝(pp512 기준 ~3.7s)이 pp_ms 안에 들어갔고,
+        // 그 결과 spec pp512가 94.6 t/s로 과대 표시되며 스펙의 실제 비용을
+        // 감췄다 — tg 라운드 안에 드래프트가 다시 지불되기 때문이다.
+        // 스펙 가동의 선행 비용이므로 별도 행으로 보고한다.
         let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
+        if has_mtp {
+            let d0 = Instant::now();
+            match eng.mtp_draft_prefill(0, prompt, 0) {
+                Ok(()) => lines.push(format!(
+                    "draft-prefill | rep{r} | {:8.1} ms | ({} tok, {} draft steps)",
+                    d0.elapsed().as_secs_f64() * 1e3,
+                    prompt.len(),
+                    prompt.len().saturating_sub(1)
+                )),
+                Err(err) => eprintln!("# mtp prefill 생략({err})"),
+            }
+        }
         let mut next = llm170_core::qwen35::greedy(&l);
         // TG — 프레임 경로는 decode1 내부 분기
         let t1 = Instant::now();
