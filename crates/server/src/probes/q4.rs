@@ -106,7 +106,9 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         "hip-moe-dmmv-check" => {
             let path = arg_str(args, 0, d_fn);
             let tn = arg_str(args, 1, "blk.0.ffn_gate_exps.weight");
-            llm170_backend_gpu::rawhip::hip_moe_dmmv_check(&path, &tn)
+            let kmax = arg_num::<usize>(args, 2, 0);
+            let k_max = if kmax == 0 { None } else { Some(kmax) };
+            llm170_backend_gpu::rawhip::hip_moe_dmmv_check(&path, &tn, k_max)
         }
         "tile-row-check" => {
             let path = arg_str(args, 0, d_27);

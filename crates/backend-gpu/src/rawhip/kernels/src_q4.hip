@@ -1270,15 +1270,22 @@ extern "C" __global__ void __launch_bounds__(64) q5k_gemm_dmmv_ids(
             }
             const unsigned qsw0 = w[(bb + (unsigned)ql0) >> 2];
             const unsigned qsw1 = w[(bb + (unsigned)ql0 + 4u) >> 2];
-            const unsigned qhv = w[(bb + 16 + (unsigned)(s0 & 31)) >> 2];
-            const unsigned hibit_v = (qhv >> hibit) & 1u;   // 그룹 전체 동일 비트
-            const unsigned vhi = hibit_v << 4;
+            // qh: 원소 e의 바이트 = qh[e&31], 비트 = 2g+half(llama.cpp
+            // dequantize_row_q5_K 정본과 동일). 8원소 그룹은 qh 8바이트 = 2워드를
+            // 건너며 바이트 내 위치 (j&3)*8 시프트가 필요하다 — plans/141: 이전
+            // 구현은 워드 비트만 쓰고 바이트 시프트/2워드를 빠뜨려 틀렸다
+            // (hip-moe-dmmv-check dmmv_err>refmax, k=256 이분에서 첫 블록 발산).
+            const unsigned qhw0 = w[(bb + 16u + (unsigned)(s0 & 31)) >> 2];
+            const unsigned qhw1 = w[(bb + 16u + (unsigned)(s0 & 31) + 4u) >> 2];
             float aq = 0.0f;
             #pragma unroll
             for (int j = 0; j < 8; j++) {
                 const unsigned bytev = (j < 4 ? (qsw0 >> ((unsigned)(j & 3) << 3))
                                               : (qsw1 >> ((unsigned)(j & 3) << 3))) & 0xFFu;
+                const unsigned qhb = (j < 4 ? (qhw0 >> ((unsigned)(j & 3) << 3))
+                                             : (qhw1 >> ((unsigned)(j & 3) << 3))) & 0xFFu;
                 const unsigned nib = (half != 0) ? (bytev >> 4) : (bytev & 0xFu);
+                const unsigned vhi = ((qhb >> hibit) & 1u) << 4;
                 aq += (float)(nib | vhi) * xw[j];
             }
             const float rr2 = d * (float)sc_v * aq - dmin * (float)m_v * sx;

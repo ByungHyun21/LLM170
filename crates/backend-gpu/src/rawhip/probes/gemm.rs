@@ -1337,7 +1337,7 @@ pub fn hip_dmmv_check(path: &str, tname: &str) -> Result<String, String> {
 /// q4_gemm_q4k_ge_ids / q4_gemm_q5_1_w_ids)와 dmmv를 계산해 f64 CPU 기준과
 /// 비교한다. 활성은 t=1 시맨틱(전 행 동일 벡터 — 구경로 q4k_ge_ids가 전 행
 /// 0번 활성을 읽는다). 판정: dmmv 오차 ≤ 2× 구경로 오차 && ≤ 1e-2.
-pub fn hip_moe_dmmv_check(path: &str, tname: &str) -> Result<String, String> {
+pub fn hip_moe_dmmv_check(path: &str, tname: &str, k_max: Option<usize>) -> Result<String, String> {
     let m = llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = m.w(tname).ok_or("tensor 없음")?;
@@ -1346,10 +1346,15 @@ pub fn hip_moe_dmmv_check(path: &str, tname: &str) -> Result<String, String> {
         ty,
         llm170_gguf::GgmlType::Q4K | llm170_gguf::GgmlType::Q5_1 | llm170_gguf::GgmlType::Q5K
     ) {
-        return Err(format!("hip-moe-dmmv-check: q4_K/q5_1/q5_K 전용 (ty={ty:?})"));
+        return Err(format!(
+            "hip-moe-dmmv-check: q4_K/q5_1/q5_K 전용 (ty={ty:?})"
+        ));
     }
     let ne = m.hp.n_expert.max(1);
-    let (n_in, n_out) = (w.n_in as usize, (w.n_out as usize) / ne);
+    let (n_in_full, n_out) = (w.n_in as usize, (w.n_out as usize) / ne);
+    // plans/141: k_max = k구간 이분 탐사 — 커널과 f64 참조를 같은 k로 잘라 첫 발산
+    // 초대블록을 지목한다(둘 중 어느 쪽이 틀렸는지 즉시 판별).
+    let n_in = k_max.map(|v| v.min(n_in_full)).unwrap_or(n_in_full);
     let per_expert = w.data.len() / ne;
     let ctx = RawCtx::new()?;
     let wd = ctx.alloc(w.data.len())?;
