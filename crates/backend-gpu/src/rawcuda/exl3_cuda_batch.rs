@@ -164,7 +164,13 @@ impl Exl3CudaDecoder {
     }
 
     /// 배치 GEMM → 스테이징 슬롯 s. [T][k] 입력을 받아 [T][n]을 쓴다.
-    pub(crate) fn bstage(&mut self, key: &str, x_dev: CUdeviceptr, s: usize, t: usize) -> Result<(), String> {
+    pub(crate) fn bstage(
+        &mut self,
+        key: &str,
+        x_dev: CUdeviceptr,
+        s: usize,
+        t: usize,
+    ) -> Result<(), String> {
         let n = self.lin_copy(key).map(|l| l.n)?;
         // ensure_stage가 할당하므로 bchain보다 먼저 부른다.
         self.ensure_stage(s, n, t)?;
@@ -222,7 +228,12 @@ impl Exl3CudaDecoder {
     }
 
     /// silu(g)·u 배치 — ew 커널은 T 인자가 없어 행별로 T회 발사한다.
-    pub(crate) fn ew_batch(&mut self, g: CUdeviceptr, u: CUdeviceptr, t: usize) -> Result<(), String> {
+    pub(crate) fn ew_batch(
+        &mut self,
+        g: CUdeviceptr,
+        u: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
         let n = self.stg_w2;
         self.ensure_stage(3, n, t)?;
         let dst = self.bchain(3)?;
