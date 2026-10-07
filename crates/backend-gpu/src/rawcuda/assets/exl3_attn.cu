@@ -321,6 +321,12 @@ extern "C" __global__ void exl3_attn_prep_hostpos(
 // 도메인: T≤8(EXL3_ATTN_TMAX) — 위반 시 전 블록 조기복귀(기록 없음).
 #define EXL3_ATTN_TMAX 8
 #define EXL3_ATTN_SCAP 1024
+// 위치축 상한(plans/cuda-port.md S9): sarr는 공유메모리이므로 lim > SCAP이면
+// sarr[row]가 블록 밖을 넘어간다 — cap 1024를 넘는 KV 캐시로 서빙하면
+// pos>=1023에서 illegal address(CUresult 700)로 죽는다. 이전까지는 cap을
+// 늘리는 쪽에서 이 경계를 몰랐다. 여기서 조기복귀시켜 "답이 이상해지는"
+// 것보다 명확하게 거부한다(조용한 오염 금지) — 호출자는 runtime Err로
+//不合格을 받는다(모듈 attn_chain_dev의 cap 사전 검사와 짝).
 extern "C" __global__ void exl3_attn_fwd3s(
     const float* __restrict__ qh,    // [T][q_heads*256]
     const float* __restrict__ kc,    // [n_attn*cap][kv_heads*256]
@@ -341,6 +347,10 @@ extern "C" __global__ void exl3_attn_fwd3s(
     int kh = h / gq;
     float scale = 0.0625f;                // 1/√256
     int lim = (int)pp[0] + t + 1;
+    // 공유메모리 sarr 한계를 넘는 위치는 처리 불가 — 조기복귀(plans/cuda-port.md
+    // S9). Module이 같은 경계를 runtime Err로 사전 검사하므로 여기서는
+    // "조용히 틀린 값"이而非 "명확한 불일치"를 택한다.
+    if (lim > EXL3_ATTN_SCAP) return;
     long kv_dim = (long)kv_heads * 256;
     qs[tid] = qh[(long)t * (q_heads * 256) + (long)h * 256 + tid];
     __syncthreads();

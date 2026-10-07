@@ -30,6 +30,10 @@ use crate::rawcuda::ffi::CUdeviceptr;
 /// fwd3s T 상한(plans/124 §1 "fwd3s는 T≤8 소형 전용" — 모듈 Err·커널
 /// 조기복귀 이중 강제, assets/exl3_attn.cu EXL3_ATTN_TMAX와 동일 값).
 pub const ATTN_F3S_TMAX: usize = 8;
+/// fwd3s 점수 scratch 공유메모리 행 수(= assets/exl3_attn.cu EXL3_ATTN_SCAP).
+/// 위치축 상한을 이 값이 결정한다: pos+1이 이를 넘으면 공유메모리 범위를
+/// 벗어난다(plans/cuda-port.md S9 — cap 1024가 실질 정합 상한의 원인).
+pub const ATTN_SCORE_SCAP: usize = 1024;
 /// KV 캐시 층당 위치 상한(hip 규약 — dkc/dvc [n_attn][cap][kv_dim]).
 pub const ATTN_KV_CAP: usize = 1024;
 
@@ -491,6 +495,17 @@ impl Exl3CudaDecoder {
             return Err(format!(
                 "attn: pos0={pos0} + T={t_len} > cap={}(KV 캐시 상한)",
                 dm.cap
+            ));
+        }
+        // fwd3s의 공유메모리 sarr[ATTN_SCORE_SCAP] 한계(pos축). 커널도
+        // 조기복귀하지만 그건 "조용히 오답"이므로 여기서 runtime Err로 명시적
+        // 거부한다(plans/cuda-port.md S9). 진짜 해법은 위치 청크 분할 온라인
+        // 소프트맥스 재작성 — 그전까지 cap 1024가 실질 정합 상한이다.
+        let end_pos = pos0 as usize + t_len;
+        if end_pos > ATTN_SCORE_SCAP {
+            return Err(format!(
+                "attn: 위치 {end_pos} > fwd3s 공유메모리 한계 {ATTN_SCORE_SCAP} — \
+                 CUDA 어텐션은 cap {ATTN_SCORE_SCAP}까지만 정합(위치 청크 미구현, S9)"
             ));
         }
         self.attn_prep_launch(slot, layer, t_len, false, 0)?;
