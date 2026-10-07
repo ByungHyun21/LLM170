@@ -68,6 +68,11 @@ BASE = [
 ]
 
 PROMPTS = [BASE * k for k in (1, 2, 3, 5)]
+# 동시 요청 수(진단용). 기본 4. 2나 3으로 낮춰 "몇 행부터 깨지는가"를
+# 좁히는 용도 — 슬롯 간 배치는 T행이 커질수록 공유 자원이 늘어난다.
+CONC = int(os.environ.get("LLM170_SLOT_CONC", "4"))
+if CONC < 1 or CONC > len(PROMPTS):
+    die(f"LLM170_SLOT_CONC={CONC} — 1..{len(PROMPTS)} 범위여야 함")
 
 
 def die(msg: str) -> None:
@@ -131,9 +136,10 @@ def start_server(port: int, slots: int):
 def run_phase(slots: int, port: int, parallel: bool):
     proc, log = start_server(port, slots)
     try:
-        outs = [None] * len(PROMPTS)
-        errs = [None] * len(PROMPTS)
-        lat = [0.0] * len(PROMPTS)
+        n = CONC
+        outs = [None] * n
+        errs = [None] * n
+        lat = [0.0] * n
 
         def one(i):
             t = time.time()
@@ -145,7 +151,7 @@ def run_phase(slots: int, port: int, parallel: bool):
 
         if parallel:
             # 진짜 동시 — 스케줄러가 4슬롯을 섞어야 하는 상황.
-            ths = [threading.Thread(target=one, args=(i,)) for i in range(len(PROMPTS))]
+            ths = [threading.Thread(target=one, args=(i,)) for i in range(n)]
             t0 = time.time()
             for t in ths:
                 t.start()
@@ -168,9 +174,9 @@ def run_phase(slots: int, port: int, parallel: bool):
                     f"이 판정은 버린다.")
         else:
             t0 = time.time()
-            for i in range(len(PROMPTS)):
+            for i in range(n):
                 one(i)
-                print(f"[slot-verify] slots={slots} 직렬 {i + 1}/{len(PROMPTS)} "
+                print(f"[slot-verify] slots={slots} 직렬 {i + 1}/{n} "
                       f"({lat[i]:.1f}s)")
             print(f"[slot-verify] slots={slots} 직렬 wall={time.time() - t0:.1f}s")
 
@@ -195,8 +201,8 @@ def main() -> None:
     print(f"[slot-verify] 프롬프트 토큰 수: "
           f"{[len(p) for p in PROMPTS]}")
 
-    a = run_phase(4, 8951, parallel=True)   # 슬롯 4 + 동시
-    b = run_phase(1, 8952, parallel=False)  # 슬롯 1 + 직렬
+    a = run_phase(CONC, 8951, parallel=True)   # 슬롯 N + 동시
+    b = run_phase(CONC, 8952, parallel=False)  # 슬롯 N + 직렬
 
     fails = []
     for i, (ra, rb) in enumerate(zip(a, b)):

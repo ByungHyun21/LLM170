@@ -164,7 +164,7 @@ impl Exl3CudaDecoder {
     }
 
     /// 배치 GEMM → 스테이징 슬롯 s. [T][k] 입력을 받아 [T][n]을 쓴다.
-    fn bstage(&mut self, key: &str, x_dev: CUdeviceptr, s: usize, t: usize) -> Result<(), String> {
+    pub(crate) fn bstage(&mut self, key: &str, x_dev: CUdeviceptr, s: usize, t: usize) -> Result<(), String> {
         let n = self.lin_copy(key).map(|l| l.n)?;
         // ensure_stage가 할당하므로 bchain보다 먼저 부른다.
         self.ensure_stage(s, n, t)?;
@@ -180,7 +180,7 @@ impl Exl3CudaDecoder {
     /// 어텐션 o_proj · GDN out_proj — 산출이 이미 [T][n]이므로 T=1 GEMV를
     /// 행별로 T회 돌린다(GEMV 커널에 T 인자가 없다). **x_stride는 입력
     /// 산출의 행 폭**(어텐션 q_dim / GDN v_len)이고 출력 n과 다르다.
-    fn bgemv(
+    pub(crate) fn bgemv(
         &mut self,
         key: &str,
         x_dev: CUdeviceptr,
@@ -202,7 +202,7 @@ impl Exl3CudaDecoder {
     }
 
     /// down_proj — [T][ffn] → [T][hidden]. GEMV에 T 인자가 없어 행별 T회다.
-    fn bgemv_down(
+    pub(crate) fn bgemv_down(
         &mut self,
         key: &str,
         x_dev: CUdeviceptr,
@@ -222,7 +222,7 @@ impl Exl3CudaDecoder {
     }
 
     /// silu(g)·u 배치 — ew 커널은 T 인자가 없어 행별로 T회 발사한다.
-    fn ew_batch(&mut self, g: CUdeviceptr, u: CUdeviceptr, t: usize) -> Result<(), String> {
+    pub(crate) fn ew_batch(&mut self, g: CUdeviceptr, u: CUdeviceptr, t: usize) -> Result<(), String> {
         let n = self.stg_w2;
         self.ensure_stage(3, n, t)?;
         let dst = self.bchain(3)?;
@@ -237,7 +237,7 @@ impl Exl3CudaDecoder {
         Ok(())
     }
 
-    fn bchain(&self, s: usize) -> Result<CUdeviceptr, String> {
+    pub(crate) fn bchain(&self, s: usize) -> Result<CUdeviceptr, String> {
         self.bchain
             .get(s)
             .copied()
@@ -250,7 +250,7 @@ impl Exl3CudaDecoder {
             })
     }
 
-    fn ensure_stage(&mut self, s: usize, n: usize, t: usize) -> Result<(), String> {
+    pub(crate) fn ensure_stage(&mut self, s: usize, n: usize, t: usize) -> Result<(), String> {
         let want = n * t;
         if self.bchain_cap[s] < want {
             if self.bchain[s] != 0 {

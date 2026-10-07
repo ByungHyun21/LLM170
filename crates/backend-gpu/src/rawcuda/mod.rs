@@ -36,6 +36,7 @@ pub mod ew_argmax_cuda_probe;
 pub mod exl3_cuda;
 pub mod exl3_cuda_batch;
 pub mod exl3_cuda_batch_probe;
+pub mod exl3_cuda_multislot;
 pub mod exl3_cuda_device;
 pub mod exl3_cuda_device_bench;
 pub mod exl3_cuda_device_probe;
