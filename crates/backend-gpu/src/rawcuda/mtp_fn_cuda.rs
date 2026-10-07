@@ -763,7 +763,8 @@ impl MtpFnCuda {
 
         // 2) attn 반쪽 hc_mix — HcCuda(FNC) 재사용(t=1). 반환은 토큰 행
         //    리스트 — 단일 행(스텝 계약)을 소출한다.
-        let (mix_attn_rows, inj_attn_rows) = self.hc.hc_mix(0, "attn", std::slice::from_ref(&eh))?;
+        let (mix_attn_rows, inj_attn_rows) =
+            self.hc.hc_mix(0, "attn", std::slice::from_ref(&eh))?;
         let mix_attn = mix_attn_rows
             .into_iter()
             .next()
@@ -805,7 +806,8 @@ impl MtpFnCuda {
         let res_attn = self.read_f32(self.d_res, hcn)?;
 
         // 4) ffn 반쪽 — hc_mix + MoE(FNE) + combine.
-        let (mix_ffn_rows, inj_ffn_rows) = self.hc.hc_mix(0, "ffn", std::slice::from_ref(&res_attn))?;
+        let (mix_ffn_rows, inj_ffn_rows) =
+            self.hc.hc_mix(0, "ffn", std::slice::from_ref(&res_attn))?;
         let mix_ffn = mix_ffn_rows
             .into_iter()
             .next()
@@ -825,7 +827,9 @@ impl MtpFnCuda {
         let chain_h = self.read_f32(self.d_res, hcn)?;
 
         // 5) 헤드 — nextn.hc_head 믹서(HcCuda) → output GEMV + argmax.
-        let hin_rows = self.hc.hc_mix_nextn_head(0, std::slice::from_ref(&chain_h))?;
+        let hin_rows = self
+            .hc
+            .hc_mix_nextn_head(0, std::slice::from_ref(&chain_h))?;
         let hin = hin_rows
             .into_iter()
             .next()

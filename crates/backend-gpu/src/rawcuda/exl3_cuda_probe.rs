@@ -486,7 +486,6 @@ pub(crate) fn maxdiff_nan(got: &[f32], want: &[f32]) -> (f32, usize) {
     (md, nan)
 }
 
-
 // ── 공유 생성기(norm·ew/argmax 프루브 공용 — G10 분할 이동) ──
 /// 결정론 균일 ±amp(잔류 스트림 계급 ±0.2 — 초기층 잔차 스케일급).
 pub(crate) fn gen_unif(n: usize, seed: u64, amp: f64) -> Vec<f32> {
@@ -501,20 +500,26 @@ pub(crate) fn gen_unif(n: usize, seed: u64, amp: f64) -> Vec<f32> {
 pub(crate) fn st_to_f32(bytes: &[u8], dt: u8) -> Result<Vec<f32>, String> {
     match dt {
         1 => Ok(bytes
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect()),
         2 => Ok(bytes
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect()),
         0 => Ok(bytes
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
             .collect()),
         other => Err(format!("GDN 상수 dtype 코드 {other} 미지원")),
     }
-}
+}
 // ── 합성 선형·등록·입력 생성(gemv·gemm2 프루브 공용 — G10 분할 이동) ──
 // ── 합성 선형(결정론 시드) ──
 pub(crate) struct SynthLin {
@@ -579,7 +584,6 @@ pub(crate) fn gen_x(k: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-
 /// 합성 선형 등록(모듈 add_linear_bytes 경유 — 상주는 모듈층 소유).
 pub(crate) fn register(dec: &mut Exl3CudaDecoder, key: &str, lin: &SynthLin) -> Result<(), String> {
     dec.add_linear_bytes(
@@ -611,9 +615,13 @@ pub(crate) fn gdn_exp_d(x: f64) -> f64 {
     let k = (x * invln2 + 0.5).floor() as i32;
     let mut r = x - k as f64 * ln2_hi;
     r -= k as f64 * ln2_lo;
-    let p = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666666666666666f64
-        + r * (0.041666666666666664f64 + r * (0.008333333333333333f64
-        + r * (0.001388888888888889f64 + r * 0.0001984126984126984f64))))));
+    let p = 1.0
+        + r * (1.0
+            + r * (0.5
+                + r * (0.16666666666666666f64
+                    + r * (0.041666666666666664f64
+                        + r * (0.008333333333333333f64
+                            + r * (0.001388888888888889f64 + r * 0.0001984126984126984f64))))));
     let scale = f64::from_bits(((1023 + k) as u64) << 52);
     p * scale
 }
@@ -624,6 +632,11 @@ pub(crate) fn gdn_expf(x: f32) -> f32 {
 }
 
 /// gdn_log_d 트윈(m·2^e 규약 → atanh 급수 z^11차 → +e·ln2).
+// [rustfmt 병리 실측 2026-10-07] z^11 중첩 다항식(12단)에서 --check가
+// 초선형 폭주(30s+ 미완 — gdn_reference_chain 1362s 사고와 동일 계열).
+// #[rustfmt::skip]로 본체는 수동 rustfmt 스타일 유지(본문은 비트동일
+// 계약 산술 — 재작성 금지, 원장 17호).
+#[rustfmt::skip]
 pub(crate) fn gdn_log_d(y: f64) -> f64 {
     let ln2 = 6.9314718036912382e-01f64;
     let bits = y.to_bits();

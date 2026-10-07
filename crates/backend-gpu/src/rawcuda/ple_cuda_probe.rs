@@ -490,7 +490,9 @@ fn load_fixture(gguf_main: &str) -> Result<PleFixture, String> {
     want_tensor("blk.1.ple_value.weight", 8, &[2560, 2560])?;
     let f32_1d = |name: &str| -> Result<Vec<f32>, String> {
         let b = g.read_rows(name, 0, 1)?;
-        Ok(b.as_chunks::<4>().0.iter()
+        Ok(b.as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
     };
@@ -500,7 +502,9 @@ fn load_fixture(gguf_main: &str) -> Result<PleFixture, String> {
     // conv1d [4,10240] 행우선 전체 — flat c·kern+k(core f32_vec4 파일 순서).
     let cb = g.read_rows("blk.1.ple_conv1d.weight", 0, 10240)?;
     let conv_w: Vec<f32> = cb
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let kb = g.read_rows("blk.1.ple_key.weight", 0, 10240)?;

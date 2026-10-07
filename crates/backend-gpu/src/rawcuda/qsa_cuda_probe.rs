@@ -536,15 +536,21 @@ fn gguf_norm_f32(g: &FnGguf, name: &str, want: usize) -> Result<Vec<f32>, String
     let raw = g.read_rows(name, 0, rows)?;
     let v: Vec<f32> = match t.ty {
         0 => raw
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         1 => raw
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
         30 => raw
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
         other => return Err(format!("{name}: gguf ty {other} 미지원(노름 텐서)")),

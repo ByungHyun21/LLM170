@@ -29,18 +29,18 @@
 //! 동일하게 상시 컴파일(드라이버 부재는 CudaCtx::new에서 런타임 Err).
 
 pub mod attn_cuda;
-pub mod exl3_cuda_batch;
-pub mod exl3_cuda_batch_probe;
 pub mod attn_cuda_probe;
 pub mod ctx;
 pub mod ew_argmax_cuda;
 pub mod ew_argmax_cuda_probe;
 pub mod exl3_cuda;
+pub mod exl3_cuda_batch;
+pub mod exl3_cuda_batch_probe;
 pub mod exl3_cuda_device;
 pub mod exl3_cuda_device_bench;
 pub mod exl3_cuda_device_probe;
-pub mod exl3_cuda_gemv_probe;
 pub mod exl3_cuda_forward;
+pub mod exl3_cuda_gemv_probe;
 pub mod exl3_cuda_probe;
 pub mod ffi;
 pub mod fn_gdn_cuda;

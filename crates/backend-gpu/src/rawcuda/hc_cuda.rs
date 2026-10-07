@@ -229,9 +229,10 @@ impl HcCuda {
             return Err(format!("hc: up {} != {hcn}×{lr}", up.len()));
         }
         if let Some(wi) = inject
-            && wi.len() != hc * hcn {
-                return Err(format!("hc: inject {} != {hc}×{hcn}", wi.len()));
-            }
+            && wi.len() != hc * hcn
+        {
+            return Err(format!("hc: inject {} != {hc}×{hcn}", wi.len()));
+        }
         let _g = self.cc.guard()?;
         if let Some(old) = self.mixers.remove(&(il, kind.to_string())) {
             self.cc.free(old.dnorm)?;

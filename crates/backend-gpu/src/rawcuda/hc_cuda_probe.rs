@@ -325,7 +325,9 @@ fn patch_mixer(dir: &Path, dims: &HcDims) -> Result<(Vec<f32>, Vec<f32>, Vec<f32
         let mut buf = vec![0u8; (e - b) as usize];
         std::io::Read::read_exact(&mut f, &mut buf).map_err(|e| e.to_string())?;
         let vals: Vec<f32> = buf
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
         if name.ends_with("hc_norm.weight") {
