@@ -412,14 +412,14 @@ fn run_exl3_infer(
             match self {
                 E::Vk(e) => e.prefill(0, toks),
                 E::Hip(e) => e.prefill(toks),
-                E::Cuda(e) => e.prefill(toks),
+                E::Cuda(e) => e.prefill(0, toks),
             }
         }
         fn decode1(&mut self, t: u32) -> Result<Vec<f32>, String> {
             match self {
                 E::Vk(e) => e.decode1(0, t),
                 E::Hip(e) => e.decode1(t),
-                E::Cuda(e) => e.decode1(t),
+                E::Cuda(e) => e.decode1(0, t),
             }
         }
     }

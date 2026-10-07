@@ -339,9 +339,10 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     };
     // A12(plans/129): exl3-hip 엔진은 단일 슬롯 — --slots>1이 슬롯 생성 시점의
     // 점유 슬롯 reset으로 교묘하게 상태를 파괴했다(엔진 코드는 대응하지만
-    // 진입에서 거부하는 게 계약상 정확). vk 엔진은 다중 슬롯 지원 — 제외.
-    if model_path.is_dir() && gpu_runtime != "vulkan" && slots.unwrap_or(1) > 1 {
-        return usage_err("EXL3 hip/cuda 백엔드는 단일 슬롯만 지원 — --slots 1");
+    // 진입에서 거부하는 게 계약상 정확). vk·cuda 엔진은 슬롯별 상태를
+    // 디코더가 보유하므로 다중 슬롯 지원(S8) — 제외.
+    if model_path.is_dir() && gpu_runtime == "hip" && slots.unwrap_or(1) > 1 {
+        return usage_err("EXL3 hip 백엔드는 단일 슬롯만 지원 — --slots 1");
     }
     if model_path.is_dir() && gpu_runtime == "cuda" && spec_k > 0 {
         return usage_err("EXL3 CUDA 스펙 디코드는 미구현 — --spec 없이 실행");

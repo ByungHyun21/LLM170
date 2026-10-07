@@ -391,8 +391,8 @@ fn attn_run_case(
     let fx = AttnFixture::generate(dims, dir, t_len, pos0, seed)?;
     let lay = fx.layer;
     dec.set_attn(dims, &fx.qnw, &fx.knw)?;
-    dec.attn_seed_kv(lay, &fx.kc_hist, &fx.vc_hist)?;
-    let got = dec.attn_chain_host(lay, t_len, &fx.qg, &fx.kin, &fx.vin, pos0)?;
+    dec.attn_seed_kv(0, lay, &fx.kc_hist, &fx.vc_hist)?;
+    let got = dec.attn_chain_host(0, lay, t_len, &fx.qg, &fx.kin, &fx.vin, pos0)?;
     let (md_qh, n1) = maxdiff_nan(&got.qh, &fx.want.qh);
     let (md_kc, n2) = maxdiff_nan(&got.kc_rows, &fx.want.kc_rows);
     let (md_vc, n3) = maxdiff_nan(&got.vc_rows, &fx.want.vc_rows);
@@ -453,7 +453,7 @@ pub fn cuda_attn_check(dir27: &str, dir35: &str) -> Result<String, String> {
             vec![0f32; t9 * dims.kv_dim()],
             vec![0f32; t9 * dims.kv_dim()],
         );
-        let rej = dec.attn_chain_host(0, t9, &qg9, &k9, &v9, pos0);
+        let rej = dec.attn_chain_host(0, 0, t9, &qg9, &k9, &v9, pos0);
         let mod_rejected = matches!(&rej, Err(e) if e.contains("도메인"));
         println!(
             "device: {dev} | exl3-cuda-attn (iii) T=9 module entry: {} (Err 마커: 도메인)",
@@ -574,14 +574,14 @@ pub fn cuda_attn_negative_check(dir27: &str) -> Result<String, String> {
     let fx = AttnFixture::generate(dims, dir27, t_len, pos0_dev, 0x170C_0DA0_0000_00A4)?;
     let lay = fx.layer;
     dec.set_attn(dims, &fx.qnw, &fx.knw)?;
-    dec.attn_seed_kv(lay, &fx.kc_hist, &fx.vc_hist)?;
+    dec.attn_seed_kv(0, lay, &fx.kc_hist, &fx.vc_hist)?;
 
     // 장치 pp: 32 기록 → bump 1회 → 33(bump 실측 — d2h 판정).
-    dec.attn_set_pos(pos0_host)?;
+    dec.attn_set_pos(0, pos0_host)?;
     let mut pb = [0u8; 4];
     dec.cc.d2h(&mut pb, dec.dpp)?;
     let v0 = u32::from_le_bytes(pb);
-    dec.attn_pos_bump()?;
+    dec.attn_pos_bump(0)?;
     dec.cc.d2h(&mut pb, dec.dpp)?;
     dec.cc.sync()?;
     let v1 = u32::from_le_bytes(pb);
@@ -592,7 +592,7 @@ pub fn cuda_attn_negative_check(dir27: &str) -> Result<String, String> {
     );
 
     // (a) 실경로 — 디바이스 판독(33) + 동일 입력 → 오라클 정합(전제).
-    let got_a = dec.attn_chain_host(lay, t_len, &fx.qg, &fx.kin, &fx.vin, pos0_dev)?;
+    let got_a = dec.attn_chain_host(0, lay, t_len, &fx.qg, &fx.kin, &fx.vin, pos0_dev)?;
     let (md_a, nan_a) = maxdiff_nan(&got_a.outv, &fx.want.outv);
     println!(
         "device: {dev} | exl3-cuda-attn (iva) real device-read path pp[0]={pos0_dev}: outv maxdiff={md_a:.3e} nan={nan_a} | {}",
@@ -605,8 +605,8 @@ pub fn cuda_attn_negative_check(dir27: &str) -> Result<String, String> {
 
     // (b) 쌍둥이 — 호스트 사본 32로 KV 기록 + 디바이스 33 판독 fwd3s.
     // 캐시 재시딩((a)이 신규행을 기록했으므로 히스토리 상태로 복원).
-    dec.attn_seed_kv(lay, &fx.kc_hist, &fx.vc_hist)?;
-    let got_b = dec.attn_chain_host_hostpos(lay, t_len, &fx.qg, &fx.kin, &fx.vin, pos0_host)?;
+    dec.attn_seed_kv(0, lay, &fx.kc_hist, &fx.vc_hist)?;
+    let got_b = dec.attn_chain_host_hostpos(0, lay, t_len, &fx.qg, &fx.kin, &fx.vin, pos0_host)?;
     let (md_b, nan_b) = maxdiff_nan(&got_b, &fx.want.outv);
     println!(
         "device: {dev} | exl3-cuda-attn (ivb) negative control host-pos copy ({pos0_host}) vs device pp[0] ({pos0_dev}): outv maxdiff={md_b:.3e} nan={nan_b} | FAIL(expected)"

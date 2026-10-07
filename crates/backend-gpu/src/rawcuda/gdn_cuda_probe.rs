@@ -489,7 +489,13 @@ fn gdn_dims_from_model(dir: &str) -> Result<GdnDims, String> {
 /// (기본 D:/models 실측 인벤토리 — plans/124 §5). 하나라도 FAIL이면
 /// Err(→ CLI 비영).
 pub fn cuda_gdn_check(dir27: &str, dir35: &str) -> Result<String, String> {
+    // plans/cuda-port.md S8: 슬롯 격리를 프로브로 증명한다. 슬롯 1로
+    // 할당해 슬롯 0/1에 서로 다른 층 시드를 넣고 각자 CPU 미러와
+    // 0.000e0로 맞는지 본다 — 슬롯 오프셋이 없으면 층 간 상태가 섞여
+    // 반드시 어긋난다(가중치 인덱스 오염은 별도로 qnw 재사용으로 방어).
     let mut dec = Exl3CudaDecoder::empty()?;
+    dec.n_slots = 2;
+    dec.slot_pos = vec![0; 2];
     let dev = dec.device_name().to_string();
     let t_len = 32usize;
     let mut fails: Vec<String> = Vec::new();
@@ -505,6 +511,7 @@ pub fn cuda_gdn_check(dir27: &str, dir35: &str) -> Result<String, String> {
         dec.set_gdn(dims, &fx.cw, &fx.ab, &fx.alog, &fx.dtb, &fx.nw)?;
         let want = fx.reference();
         let got = dec.gdn_chain_host(
+            0,
             lay,
             t_len,
             &fx.xn,
@@ -539,7 +546,7 @@ pub fn cuda_gdn_check(dir27: &str, dir35: &str) -> Result<String, String> {
 
         // (iii) 단계별 국소화 — 직전 체인의 잔류 버퍼 판독(링 회전·
         // scatter 방향·소거 순서가 각 단계 값으로 잡히는지).
-        let mids = dec.gdn_mids_host(lay, t_len)?;
+        let mids = dec.gdn_mids_host(0, lay, t_len)?;
         let stages: [(&str, &[f32], &[f32]); 10] = [
             ("conv q", &mids.conv_q, &want.conv_q),
             ("conv k", &mids.conv_k, &want.conv_k),
@@ -590,6 +597,7 @@ pub fn cuda_gdn_check(dir27: &str, dir35: &str) -> Result<String, String> {
                 1,
             );
             let got1 = dec.gdn_chain_host(
+                0,
                 layer,
                 1,
                 &fx.xn[..hd],
@@ -608,6 +616,66 @@ pub fn cuda_gdn_check(dir27: &str, dir35: &str) -> Result<String, String> {
             if !pass1 {
                 fails.push(format!(
                     "({tag}) GI={layer} T=1 maxdiff={md1:.3e} nan={nan1} rel={rel1}"
+                ));
+            }
+        }
+        // S8 슬롯 격리: 슬롯 0(층 0)과 슬롯 1(층 lay)에 각각 시드를 넣고
+        // 서로 다른 층·상태로 두 슬롯을 교차 실행한다. 슬롯 오프셋이 없으면
+        // 슬롯 1이 슬롯 0의 링/상태를 덮어써 둘 중 하나가 반드시 어긋난다.
+        let (cch, hv, hd) = (dims.conv_ch(), dims.h_v, dims.hidden);
+        let seed_of = |l: usize| -> (Vec<f32>, Vec<f32>) {
+            let base = 0x5177_0000u64.wrapping_mul(l as u64 + 1);
+            let mut r = Rng::new(base);
+            let mut st = vec![0f32; hv * 128 * 128];
+            for v in st.iter_mut() {
+                *v = ((r.next_f64() * 2.0 - 1.0) * 0.05) as f32;
+            }
+            let mut ring = vec![0f32; 3 * cch];
+            for v in ring.iter_mut() {
+                *v = ((r.next_f64() * 2.0 - 1.0) * 0.1) as f32;
+            }
+            (st, ring)
+        };
+        let (st0, ring0a) = seed_of(0);
+        let (st1, ring0b) = seed_of(lay);
+        for &(slot, layer, st, ring) in &[
+            (0usize, 0usize, &st0, &ring0a),
+            (1usize, lay, &st1, &ring0b),
+        ] {
+            let want = gdn_reference_chain(
+                &dims,
+                &fx.cw[layer * cch * 4..(layer + 1) * cch * 4],
+                &fx.ab[layer * 2 * hv * hd..(layer + 1) * 2 * hv * hd],
+                &fx.alog[layer * hv..(layer + 1) * hv],
+                &fx.dtb[layer * hv..(layer + 1) * hv],
+                &fx.nw[layer * 128..(layer + 1) * 128],
+                &fx.xn[..hd],
+                &fx.qkv[..cch],
+                &fx.z[..dims.v_len()],
+                ring,
+                st,
+                1,
+            );
+            let got = dec.gdn_chain_host(
+                slot,
+                layer,
+                1,
+                &fx.xn[..hd],
+                &fx.qkv[..cch],
+                &fx.z[..dims.v_len()],
+                Some(st),
+                Some(ring),
+            )?;
+            let (md, nan) = maxdiff_nan(&got, &want.gated);
+            let rel = gdn_rel_bad(&got, &want.gated);
+            let pass = md <= GDN_THRESH && nan == 0 && rel == 0;
+            println!(
+                "device: {dev} | exl3-cuda-gdn ({tag}) S8 slot={slot} GI={layer} T=1 S0!=0 maxdiff={md:.3e} nan={nan} rel={rel} | {}",
+                if pass { "PASS" } else { "FAIL" }
+            );
+            if !pass {
+                fails.push(format!(
+                    "({tag}) slot{slot} GI={layer} maxdiff={md:.3e} nan={nan} rel={rel}"
                 ));
             }
         }
@@ -640,6 +708,7 @@ pub fn cuda_gdn_negative_check(dir27: &str) -> Result<String, String> {
 
     // (a) gather l2perm(검증 전용 모듈 진입) vs scatter 오라클.
     let got_a = dec.gdn_chain_host_gather_l2perm(
+        0,
         lay,
         32,
         &fx.xn,
@@ -657,6 +726,7 @@ pub fn cuda_gdn_negative_check(dir27: &str) -> Result<String, String> {
     // (b) S0=0 상태 입력 vs S0≠0 참오라클(상태 경로 판별력 증명).
     let zero_s0 = vec![0f32; dims.h_v * 128 * 128];
     let got_b = dec.gdn_chain_host(
+        0,
         lay,
         32,
         &fx.xn,

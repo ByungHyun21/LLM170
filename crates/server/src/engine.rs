@@ -423,8 +423,9 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         return Engine::Exl3Hip(Box::new(eng));
     }
     if matches!(backend, BackendSel::Exl3Cuda) {
+        // plans/cuda-port.md S8: 슬롯 수가 상태(링/스캔/KV) 할당량을 정한다.
         let dir = req.model.to_string_lossy().into_owned();
-        let eng = crate::exl3_cuda_engine::Exl3CudaEngine::load(&dir, 1, req.ctx)
+        let eng = crate::exl3_cuda_engine::Exl3CudaEngine::load(&dir, n_slots, req.ctx)
             .unwrap_or_else(|e| panic!("exl3-cuda 엔진 로드 실패: {e}"));
         return Engine::Exl3Cuda(Box::new(eng));
     }
@@ -508,8 +509,8 @@ impl Engine {
                 }
             }
             Engine::Exl3Cuda(e) => {
-                if let Err(err) = e.reset_seq() {
-                    eprintln!("# cuda 슬롯 리셋 오류: {err}");
+                if let Err(err) = e.reset_seq(seq) {
+                    eprintln!("# cuda 슬롯 리셋 오류(slot{seq}): {err}");
                 }
             }
         }
