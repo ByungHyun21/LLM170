@@ -72,7 +72,7 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | np4 greedy | 33.40 | **33.62** | 28.35 | 23.00 |
 | MTP k=2 | 18.93 | 12.51 | **19.88** | 18.41 |
 | MTP k=3 | 16.91 | 10.11 | **21.37** | 18.94 |
-| MTP + np4 k=2 | 22.39 | n/a | **40.79** | 23.86 |
+| MTP + np4 k=2 | 23.99 | n/a | **40.79** | 23.86 |
 | MTP + np4 k=3 | 14.68 | n/a | **43.39** | 23.94 |
 
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
