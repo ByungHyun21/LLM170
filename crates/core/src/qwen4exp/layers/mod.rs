@@ -429,6 +429,18 @@ impl Engine4 {
     /// 시퀀스 상태 전체 초기화 (무상태 HTTP 서버용).
     pub fn reset_states(&mut self) {
         self.ckpt_clear(None);
+        // plans/141: MTP 드래프트 h 행 누산 초기화. prefill은 청크마다
+        // last_res_hc_rows에 **적립**하므로(멀티청크 드래프트 프리필 계약)
+        // 초기화 없이 재사용하면 이전 잡의 행이 남아 새 프롬프트보다 길어진다.
+        // 실측 그 결과 mtp_draft_prefill의 `행 수 == 토큰 수` 계약이 영구히
+        // 깨져 드래프트 프리필이 생략되고, 드래프트 KV가 빈 문맥으로 시작해
+        // 스펙 수용률이 0이 된다(벤치 tg 3 t/s). 서버는 슬롯 시작에
+        // hrows_reset으로 같은 정리를 하므로 bench 경로가 남은 누락이었다.
+        self.last_res_hc_rows.clear();
+        self.last_res_hc.clear();
+        if let Some(f) = &mut self.frame {
+            f.last_res_hc_rows.clear();
+        }
         // CPU 상태를 영점화했다 — 프레임 GPU 상태는 stale이므로 pull 금지
         // (dirty=true → 다음 prefill 후 decode에서 재동기).
         if let Some(f) = &mut self.frame {

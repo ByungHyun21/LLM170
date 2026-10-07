@@ -66,12 +66,15 @@ impl Engine4 {
             let _ = hp0;
         }
         // ② 드래프트 체인 — h는 pre-mix 멀티[10240]로 연결(chain export).
+        // plans/141: 프레임 판과 동일하게 k회 반복 — 마지막 예측 g_{k-1}까지
+        // 제안에 실어야 검증 비교가 성립한다(종전 k-1회 = 제안 k-1행이라
+        // 마지막 항을 버리고 수용 판정 대상이 사라졌다).
         let snap_d = self.mtp_seqs[seq].clone();
         let snap_t = self.seqs[seq].clone();
         let mut proposals: Vec<u32> = Vec::new();
         let mut chain_h = h_after_first.clone();
         let mut next = t0;
-        for _ in 0..k.saturating_sub(1) {
+        for _ in 0..k {
             let _acc = self.acc.clone();
             let (next_d, dh) = self.mtp_draft_step_h(seq, next, &chain_h, _acc.as_deref())?;
             proposals.push(next);
@@ -329,25 +332,36 @@ impl Engine4 {
         let t0 = self.decode1_greedy(seq, last_token)?;
         let mut forwards = 1usize;
         let h_after_first = self.last_res_hc.clone();
+        // ② 드래프트 체인 — proposals = [t0, g1, .., g_{k-1}](k개).
+        //
+        // plans/141: 종전 `k-1`회 반복은 마지막 예측 `g_{k-1}`을 계산만 하고
+        // 버려 검증 목록에서 제외했다. 결과적으로 검증 행이 t0로 끝나 다음
+        // 제안과 비교할 행이 없어 매 라운드 matched=0·full=true(수용 0)이 되었고,
+        // 드래프트 비용만 더해 순수 디코드보다 느렸다(k=2 실측 3.09 vs 18.14 t/s).
+        // k회 반복은 두 가지를 함께 맞춘다: 검증 대상이 k행이 되어 g_{k-1}까지
+        // 비교되고, 드래프트 KV도 전 라운드 커밋 토큰(t0·g_1..g_{k-1})을 덮는다
+        // — 전 수용 시 다음 라운드 ④′ 이전 드래프트 문맥이 비지 않는다.
+        let snap_t = self.seqs[seq].clone();
+        // 거각 복원 기준 — ④′ 이전. 복원 후 재체인(아래)이 last_token 행부터
+        // 다시 적립하므로, ④′까지 진행한 상태를 기준으로 잡으면 last_token 행이
+        // 한 번 더 쌓여 드래프트 위치가 어긋난다.
+        let snap_d = self.mtp_seqs[seq].clone();
         // ④′ 주기 시작 커밋 토큰의 드래프트 KV 행 진위치 기입.
         {
             let _acc = self.acc.clone();
             self.mtp_draft_step_h(seq, last_token, &h_prev, _acc.as_deref())?;
         }
-        // ② 드래프트 체인 — proposals = [t0, g1, .., g_{k-2}](k-1개).
         let mut proposals: Vec<u32> = Vec::new();
         let mut chain_h = h_after_first.clone();
         let mut next = t0;
-        for _ in 0..k.saturating_sub(1) {
+        for _ in 0..k {
             let _acc = self.acc.clone();
             let (next_d, dh) = self.mtp_draft_step_h(seq, next, &chain_h, _acc.as_deref())?;
             proposals.push(next);
             chain_h = dh;
             next = next_d;
         }
-        // ── 배치 검증: t=k-1행 1회 포워드 + 행별 GPU argmax ──
-        let snap_t = self.seqs[seq].clone();
-        let snap_d = self.mtp_seqs[seq].clone();
+        // ── 배치 검증: t=k행 1회 포워드 + 행별 GPU argmax ──
         let y: Vec<u32>;
         {
             let Engine4 {
@@ -394,12 +408,12 @@ impl Engine4 {
         }
         let full = n_acc + 1 >= proposals.len();
         // plans/141: 수용률 0의 원인을 GPU 수치 전에 판별한다. 프레임 스펙의
-        // 실제 제안열·검증열과 채택 수를 함께 남겨 k-1 제안 누락을 식별한다.
+        // 실제 제안열·검증열과 채택 수를 함께 남겨 제안 누락을 식별한다.
+        // `n_acc` = 검증 출력과 일치한 드래프트 수(y[i] == proposals[i+1]).
         if llm170_diag::dump::opts().key("spec_accept") {
             eprintln!(
-                "# spec-accept pos={} k={k} proposals={proposals:?} verify={y:?} matched={} full={full}",
+                "# spec-accept pos={} k={k} proposals={proposals:?} verify={y:?} matched={n_acc} full={full}",
                 snap_t.pos,
-                n_acc.saturating_sub(1),
             );
         }
         // 그림자 진단(LLM170_DUMP=spec_check) — 배치 y·상태와 순차 decode1
