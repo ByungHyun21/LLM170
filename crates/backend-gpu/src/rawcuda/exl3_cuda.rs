@@ -48,8 +48,8 @@ pub struct CudaLin {
 
 /// EXL3 CUDA 디코더 — Exl3HipDecoder 미러.
 /// G2 상태: lin 레지스트리·GEMV 체인 버퍼(dah/dsb/dyb/dx) 유효.
-/// G3 상태: 노름 상주(dnw)·버퍼(dab/dxn) 유효.
-/// G4+ 필드(GDN·어텐션·MTP·배치·그래프)는 0/null 유지.
+/// S5(plans/cuda-port.md §3): load는 임베딩 호스트 상주 + 노름·GDN·어텐션
+/// 상수 등록. load_keys는 검증용 선형 전용 경로로 유지한다.
 pub struct Exl3CudaDecoder {
     /// 디바이스 컨텍스트(디바이스·스트림·커널 레지스트리).
     pub cc: CudaCtx,
@@ -59,7 +59,11 @@ pub struct Exl3CudaDecoder {
     pub n_layers: usize,
     pub loaded_layers: usize,
     pub pos: u32,
-    /// 임베딩 행 상주(어휘×hidden) — G3+(전체 디코더 조립 단계).
+    /// plans/cuda-port.md S5: 전층 선형 VRAM 예산 때문에 임베딩은 RAM에 유지.
+    /// [vocab][hidden] f32; 디코드 시 해당 행만 장치로 옮긴다.
+    pub embed: Vec<f32>,
+    pub vocab: usize,
+    /// 구형 디바이스 임베딩 슬롯 — S5 호스트 스테이징에서는 0 유지.
     pub dembed: CUdeviceptr,
     /// 현 스텝 잔류 스트림 x — GEMV 체인 입력 스테이징 겸용(G2 유효).
     pub dx: CUdeviceptr,
@@ -406,7 +410,7 @@ pub(crate) struct StEntry {
     end: u64,
     shard: usize,
     shape: Vec<u64>,
-    /// dtype 코드(0 F32 · 1 F16 · 2 BF16 · 3 기타 2B — GDN 상수 해독용).
+    /// dtype 코드(0 F32 · 1 F16 · 2 BF16 · 3 I16 · 4 I32 · 5 I64 · 6 U8).
     pub(crate) dt: u8,
 }
 
@@ -522,9 +526,10 @@ impl StArchive {
                 "F16" => (2u64, 1u8),
                 "BF16" => (2, 2),
                 "I16" => (2, 3),
-                "F32" | "I32" => (4, 0),
-                "I64" => (8, 0),
-                "U8" => (1, 0),
+                "F32" => (4, 0),
+                "I32" => (4, 4),
+                "I64" => (8, 5),
+                "U8" => (1, 6),
                 other => return Err(format!("{name}: 미지원 dtype {other}")),
             };
             let shape = tv
@@ -578,6 +583,62 @@ impl StArchive {
         Ok(buf)
     }
 
+    /// plans/cuda-port.md S5: 지정 형상·부동 dtype을 확인한 뒤 원시 텐서를
+    /// f32로 확장한다. 프로브의 st_to_f32와 독립된 생산 경로(정수 오인 금지).
+    fn read_f32(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
+        let entry = self
+            .entries
+            .get(name)
+            .ok_or_else(|| format!("텐서 없음: {name}"))?;
+        if entry.shape.len() != shape.len()
+            || !entry
+                .shape
+                .iter()
+                .zip(shape)
+                .all(|(&got, &want)| got == want as u64)
+        {
+            return Err(format!("{name}: shape {:?} != {shape:?}", entry.shape));
+        }
+        let n = shape
+            .iter()
+            .try_fold(1usize, |a, b| a.checked_mul(*b))
+            .ok_or_else(|| format!("{name}: 원소 수 범위 초과"))?;
+        let stride = match entry.dt {
+            0 => 4usize, // F32
+            1 | 2 => 2,  // F16 / BF16
+            dt => return Err(format!("{name}: 부동 dtype 필요, 코드 {dt}")),
+        };
+        let bytes = n
+            .checked_mul(stride)
+            .ok_or_else(|| format!("{name}: 바이트 수 범위 초과"))?;
+        if entry.end - entry.begin != bytes as u64 {
+            return Err(format!("{name}: 원소 수/바이트 길이 불일치"));
+        }
+        let raw = self.read(name)?;
+        let mut out = Vec::with_capacity(n);
+        match entry.dt {
+            0 => {
+                for b in raw.as_chunks::<4>().0 {
+                    out.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                }
+            }
+            1 => {
+                for b in raw.as_chunks::<2>().0 {
+                    out.push(exl3_f16_to_f32(u16::from_le_bytes([b[0], b[1]])));
+                }
+            }
+            2 => {
+                for b in raw.as_chunks::<2>().0 {
+                    out.push(f32::from_bits(
+                        (u16::from_le_bytes([b[0], b[1]]) as u32) << 16,
+                    ));
+                }
+            }
+            _ => unreachable!(),
+        }
+        Ok(out)
+    }
+
     /// 텐서 dtype 코드(0 F32 · 1 F16 · 2 BF16 — 상수 해독용).
     pub(crate) fn dtype_of(&self, name: &str) -> Option<u8> {
         self.entries.get(name).map(|e| e.dt)
@@ -616,6 +677,32 @@ impl StArchive {
         v.sort();
         v
     }
+}
+
+/// plans/cuda-port.md S5: 반정밀 형상/서브노멀까지 보존하는 std 전용 변환.
+/// 검증층(exl3_cuda_probe.rs) 함수를 참조하지 않는 생산 경로.
+fn exl3_f16_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x03ff) as u32;
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            let mut m = mant;
+            let mut shift = 0u32;
+            while m & 0x0400 == 0 {
+                m <<= 1;
+                shift += 1;
+            }
+            sign | ((113 - shift) << 23) | ((m & 0x03ff) << 13)
+        }
+    } else if exp == 0x1f {
+        sign | 0x7f80_0000 | (mant << 13)
+    } else {
+        sign | ((exp + 112) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
 }
 
 // ── 모듈층 본체 ──
@@ -803,6 +890,8 @@ impl Exl3CudaDecoder {
             n_layers: 0,
             loaded_layers: 0,
             pos: 0,
+            embed: Vec::new(),
+            vocab: 0,
             dembed: 0,
             dx: 0,
             dxn: 0,
@@ -982,11 +1071,17 @@ impl Exl3CudaDecoder {
         Ok(d)
     }
 
-    /// 가중치 상주 업로드 — lim_layers: 가중치 예산(hip load 미러).
-    /// 0 = 전체 키(본체+mtp) · 1..n_layers = 해당 층 접두 + lm_head ·
-    /// ≥n_layers = 전체. 노름·임베딩·GDN 상수는 G3+ 모듈 단계(이 시점
-    /// 미적재 — 선형 레지스트리만 채운다).
+    /// 가중치 상주 업로드 — 기존 2인자 API는 검증/서버 호환용 1024 KV 상한.
+    /// 컨텍스트가 1024를 넘는 서빙은 load_with_ctx를 사용한다(plans/128 P0).
     pub fn load(dir: &str, lim_layers: usize) -> Result<Self, String> {
+        Self::load_with_ctx(dir, lim_layers, crate::rawcuda::attn_cuda::ATTN_KV_CAP)
+    }
+
+    /// plans/cuda-port.md S5: 선형은 lim_layers 접두만 업로드하되, set_gdn /
+    /// set_attn은 모델 전층 배열로 색인하므로 일반 텐서 메타·상수는 모두 조립.
+    /// 0 또는 ≥n_layers는 기존대로 모든 선형(본체+mtp)을 적재한다.
+    /// kvcap=0은 hip 어댑터와 같은 기본 4096, 그 밖은 64..32768 클램프.
+    pub fn load_with_ctx(dir: &str, lim_layers: usize, kvcap: usize) -> Result<Self, String> {
         let cfg = std::fs::read_to_string(format!("{dir}/config.json"))
             .map_err(|e| format!("config.json: {e}"))?;
         let v = JParser {
@@ -1003,11 +1098,21 @@ impl Exl3CudaDecoder {
             .get("num_hidden_layers")
             .and_then(JVal::as_f64)
             .ok_or("config.json: num_hidden_layers 없음")? as usize;
+        // 현재 모듈 체인 인덱스는 il%4==3 / il/4에 고정되어 있다.
+        let interval = tc
+            .get("full_attention_interval")
+            .and_then(JVal::as_f64)
+            .unwrap_or(4.0);
+        if n_layers == 0 || !n_layers.is_multiple_of(4) || interval != 4.0 {
+            return Err(format!(
+                "EXL3 CUDA: n_layers={n_layers}, attention interval={interval} — 4층 주기 필요"
+            ));
+        }
         let ar = StArchive::open(Path::new(dir))?;
         let need: Vec<String> = if lim_layers == 0 || lim_layers >= n_layers {
             ar.linear_base_keys()
         } else {
-            // hip load의 층별 키 전개 미라(어텐션 il%4==3 / 나머지 GDN).
+            // hip load의 층별 키 전개 미러(어텐션 il%4==3 / 나머지 GDN).
             let mut v2 = Vec::new();
             for il in 0..lim_layers {
                 let lp = format!("model.language_model.layers.{il}");
@@ -1030,12 +1135,119 @@ impl Exl3CudaDecoder {
         let mut d = Self::empty()?;
         d.hidden = hidden;
         d.n_layers = n_layers;
-        d.loaded_layers = lim_layers;
+        // 0·상한초과도 전체 적재 — 런타임 반복 상한과 레지스트리 일치.
+        d.loaded_layers = if lim_layers == 0 {
+            n_layers
+        } else {
+            lim_layers.min(n_layers)
+        };
         for key in &need {
             let (k, n, krate, suh, tre, svh) = d.load_linear_from_archive(&ar, key)?;
             d.add_linear_bytes(key, k, n, krate, &suh, &tre, &svh)?;
         }
+        d.load_plain_tensors(&ar, &cfg, kvcap)?;
         Ok(d)
+    }
+
+    /// S5 원장: embedding은 24GB 선형 상주와 중복 VRAM 상주 금지.
+    /// BF16 norm(w−1)만 +1하고 GDN A_log·dt_bias·conv·in_proj는 원값 유지
+    /// (rawvk/exl3/{resident,gdn,frame}.rs 색인/편향 규약 미러).
+    fn load_plain_tensors(
+        &mut self,
+        ar: &StArchive,
+        cfg: &str,
+        kvcap: usize,
+    ) -> Result<(), String> {
+        let key = "model.language_model.embed_tokens.weight";
+        let shape = ar
+            .shape_of(key)
+            .ok_or_else(|| format!("텐서 없음: {key}"))?;
+        if shape.len() != 2 || shape[0] == 0 || shape[1] != self.hidden as u64 {
+            return Err(format!(
+                "{key}: shape {shape:?} != [vocab, {}]",
+                self.hidden
+            ));
+        }
+        self.vocab = usize::try_from(shape[0]).map_err(|_| format!("{key}: vocab 범위 초과"))?;
+        self.embed = ar.read_f32(key, &[self.vocab, self.hidden])?;
+
+        let mut nw = Vec::with_capacity((2 * self.n_layers + 1) * self.hidden);
+        for il in 0..self.n_layers {
+            let lp = format!("model.language_model.layers.{il}");
+            for name in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+                let k = format!("{lp}.{name}");
+                let mut w = ar.read_f32(&k, &[self.hidden])?;
+                if ar.dtype_of(&k) == Some(2) {
+                    for v in &mut w {
+                        *v += 1.0;
+                    }
+                }
+                nw.extend(w);
+            }
+        }
+        let k = "model.language_model.norm.weight";
+        let mut w = ar.read_f32(k, &[self.hidden])?;
+        if ar.dtype_of(k) == Some(2) {
+            for v in &mut w {
+                *v += 1.0;
+            }
+        }
+        nw.extend(w);
+        let mut nwb = Vec::with_capacity(nw.len() * 4);
+        for f in nw {
+            nwb.extend_from_slice(&f.to_le_bytes());
+        }
+        self.set_norm_weights(&nwb, 2 * self.n_layers + 1)?;
+
+        let gd = GdnDims::from_config(cfg)?;
+        if gd.hidden != self.hidden || gd.n_gdn != self.n_layers - self.n_layers / 4 {
+            return Err("GDN: config 형상/층수 불일치".into());
+        }
+        let mut cw = Vec::with_capacity(gd.n_gdn * gd.conv_ch() * 4);
+        let mut ab = Vec::with_capacity(gd.n_gdn * 2 * gd.h_v * self.hidden);
+        let mut alog = Vec::with_capacity(gd.n_gdn * gd.h_v);
+        let mut dtb = Vec::with_capacity(gd.n_gdn * gd.h_v);
+        let mut gnw = Vec::with_capacity(gd.n_gdn * gd.d);
+        for il in 0..self.n_layers {
+            if il % 4 == 3 {
+                continue;
+            }
+            let lp = format!("model.language_model.layers.{il}.linear_attn");
+            cw.extend(ar.read_f32(&format!("{lp}.conv1d.weight"), &[gd.conv_ch(), 1, 4])?);
+            for nm in ["in_proj_a.weight", "in_proj_b.weight"] {
+                ab.extend(ar.read_f32(&format!("{lp}.{nm}"), &[gd.h_v, self.hidden])?);
+            }
+            alog.extend(ar.read_f32(&format!("{lp}.A_log"), &[gd.h_v])?);
+            dtb.extend(ar.read_f32(&format!("{lp}.dt_bias"), &[gd.h_v])?);
+            gnw.extend(ar.read_f32(&format!("{lp}.norm.weight"), &[gd.d])?);
+        }
+        self.set_gdn(gd, &cw, &ab, &alog, &dtb, &gnw)?;
+
+        let mut ad = AttnDims::from_config(cfg)?;
+        if ad.n_attn != self.n_layers / 4 {
+            return Err("attn: config 층수 불일치".into());
+        }
+        ad.cap = if kvcap == 0 {
+            4096
+        } else {
+            kvcap.clamp(64, 32768)
+        };
+        let mut qnw = Vec::with_capacity(ad.n_attn * ad.d);
+        let mut knw = Vec::with_capacity(ad.n_attn * ad.d);
+        for ai in 0..ad.n_attn {
+            let lp = format!("model.language_model.layers.{}.self_attn", ai * 4 + 3);
+            for (name, out) in [("q_norm.weight", &mut qnw), ("k_norm.weight", &mut knw)] {
+                let k = format!("{lp}.{name}");
+                let mut w = ar.read_f32(&k, &[ad.d])?;
+                if ar.dtype_of(&k) == Some(2) {
+                    for v in &mut w {
+                        *v += 1.0;
+                    }
+                }
+                out.extend(w);
+            }
+        }
+        self.set_attn(ad, &qnw, &knw)
     }
 
     /// 디바이스 명(프로브 보고용).
@@ -1095,19 +1307,33 @@ impl Exl3CudaDecoder {
         Ok((l.k, l.n, l.krate, suh, tre, svh))
     }
 
-    /// 토큰 임베딩 → 로짓 1스텝(순차 디코드 경로) — G7+ 모듈 조립.
-    pub fn forward_tok(&mut self, _tok: u32) -> Result<Vec<f32>, String> {
-        Err("TODO(plans/124 G3+): forward_tok — 전체 디코더 조립 단계".into())
+    /// 토큰 임베딩 → 로짓 1스텝(plans/cuda-port.md S5 순차 디코드).
+    pub fn forward_tok(&mut self, tok: u32) -> Result<Vec<f32>, String> {
+        let row = self.embed_row_host(tok);
+        if row.len() != self.hidden {
+            return Err(format!("exl3-cuda: 임베딩 토큰 {tok} 범위 밖 또는 미적재"));
+        }
+        self.forward(&row).map(|(logits, _)| logits)
     }
 
-    /// 임베딩 행 호스트 판독(검증층 편의) — G3+(dembed 미적재).
-    pub fn embed_row_host(&mut self, _tok: u32) -> Vec<f32> {
-        Vec::new()
+    /// 임베딩은 RAM 상주: 토큰에 해당하는 20KB 행만 복사한다(S5).
+    /// 범위 밖이면 빈 행을 반환해 forward_tok이 상태 변경 전에 거부한다.
+    pub fn embed_row_host(&mut self, tok: u32) -> Vec<f32> {
+        if tok as usize >= self.vocab {
+            return Vec::new();
+        }
+        let start = tok as usize * self.hidden;
+        self.embed[start..start + self.hidden].to_vec()
     }
 
-    /// 1스텝 greedy(argmax n은 로짓 길이 — 결함 8호) — G3+.
-    pub fn step_tok(&mut self, _tok: u32) -> Result<u32, String> {
-        Err("TODO(plans/124 G3+): step_tok — 전체 디코더 조립 단계".into())
+    /// 1스텝 greedy: argmax 스캔 폭은 로짓 전체 길이(결함 8호).
+    /// forward와 argmax가 같은 컨텍스트 스코프를 써야 하므로 가드를
+    /// 여기로 올린다(슬롯 스레드에 전파되지 않는 current 컨텍스트 —
+    /// plans/cuda-port.md S5). 중첩 가드는 재진입 가능(prev=자신).
+    pub fn step_tok(&mut self, tok: u32) -> Result<u32, String> {
+        let _g = self.cc.guard()?;
+        let logits = self.forward_tok(tok)?;
+        self.argmax_host(&logits)
     }
 
     /// MTP 드래프트(호스트 경로, §4.13 참고) — G4+.
@@ -1150,8 +1376,8 @@ impl Exl3CudaDecoder {
         Err("TODO(plans/124 G4+): forward_batch_with_mtp 미구현".into())
     }
 
-    /// 임베딩 행 1개 → (h, 로짓) — 모듈 프로브의 기본 진입점 — G3+.
-    pub fn forward(&mut self, _embed_row: &[f32]) -> Result<(Vec<f32>, Vec<f32>), String> {
-        Err("TODO(plans/124 G3+): forward — 전체 디코더 조립 단계".into())
+    /// 임베딩 행 1개 → (로짓, 마지막 노름 이전 잔차) — plans/cuda-port.md S5.
+    pub fn forward(&mut self, embed_row: &[f32]) -> Result<(Vec<f32>, Vec<f32>), String> {
+        self.forward_host_staged(embed_row)
     }
 }

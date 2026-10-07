@@ -31,6 +31,7 @@ pub mod ctx;
 pub mod ew_argmax_cuda;
 pub mod ew_argmax_cuda_probe;
 pub mod exl3_cuda;
+pub mod exl3_cuda_forward;
 pub mod exl3_cuda_probe;
 pub mod ffi;
 pub mod fn_gdn_cuda;

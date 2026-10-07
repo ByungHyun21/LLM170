@@ -239,7 +239,14 @@ fn gdn_reference_chain(
                         for s2p in 0..16 {
                             let s_el = st[h * 128 * 128 + (s2b + s2p) * 128 + col];
                             ak += sk[i][s2b + s2p] * s_el;
-                            aq += q2[(t0 + i) * kl + kh * 128 + s2b + s2p] * s_el;
+                            // plans/cuda-port.md S5: 마지막 청크의 비활성
+                            // q행은 GPU와 동일하게 0으로 마스킹한다.
+                            let qv = if i < n {
+                                q2[(t0 + i) * kl + kh * 128 + s2b + s2p]
+                            } else {
+                                0.0
+                            };
+                            aq += qv * s_el;
                         }
                         ks[i][col] = h16f(ks[i][col] + ak);
                         qsm[i][col] = h16f(qsm[i][col] + aq * qs);
@@ -561,6 +568,49 @@ pub fn cuda_gdn_check(dir27: &str, dir35: &str) -> Result<String, String> {
             if worst <= GDN_THRESH { "PASS" } else { "FAIL" }
         );
         report.push_str(&format!(" · ({tag}) stages worst={worst:.3e}"));
+        // plans/cuda-port.md S5: 순차 디코드는 T=1, 첫 층 GI=0부터
+        // 시작한다. T=32·마지막 층 프로브만으로는 메모리 경계가 검증되지 않는다.
+        dec.set_gdn(dims, &fx.cw, &fx.ab, &fx.alog, &fx.dtb, &fx.nw)?;
+        let s0 = vec![0.0f32; dims.h_v * dims.d * dims.d];
+        let ring0 = vec![0.0f32; 3 * dims.conv_ch()];
+        for layer in [0, lay] {
+            let (cch, hv, hd) = (dims.conv_ch(), dims.h_v, dims.hidden);
+            let want1 = gdn_reference_chain(
+                &dims,
+                &fx.cw[layer * cch * 4..(layer + 1) * cch * 4],
+                &fx.ab[layer * 2 * hv * hd..(layer + 1) * 2 * hv * hd],
+                &fx.alog[layer * hv..(layer + 1) * hv],
+                &fx.dtb[layer * hv..(layer + 1) * hv],
+                &fx.nw[layer * 128..(layer + 1) * 128],
+                &fx.xn[..hd],
+                &fx.qkv[..cch],
+                &fx.z[..dims.v_len()],
+                &ring0,
+                &s0,
+                1,
+            );
+            let got1 = dec.gdn_chain_host(
+                layer,
+                1,
+                &fx.xn[..hd],
+                &fx.qkv[..cch],
+                &fx.z[..dims.v_len()],
+                None,
+                None,
+            )?;
+            let (md1, nan1) = maxdiff_nan(&got1, &want1.gated);
+            let rel1 = gdn_rel_bad(&got1, &want1.gated);
+            let pass1 = md1 <= GDN_THRESH && nan1 == 0 && rel1 == 0;
+            println!(
+                "device: {dev} | exl3-cuda-gdn ({tag}) GI={layer} T=1 zero-state maxdiff={md1:.3e} nan={nan1} rel={rel1} | {}",
+                if pass1 { "PASS" } else { "FAIL" }
+            );
+            if !pass1 {
+                fails.push(format!(
+                    "({tag}) GI={layer} T=1 maxdiff={md1:.3e} nan={nan1} rel={rel1}"
+                ));
+            }
+        }
     }
 
     if fails.is_empty() {

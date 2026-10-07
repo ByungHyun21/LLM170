@@ -33,16 +33,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = r#"
-llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
+llm170 — 순수 Rust 추론 엔진 (CPU·HIP·Vulkan·CUDA)
 
 주요 커맨드:
   llm170 gguf-dump [--meta-only] [--limit N] <file.gguf>
       GGUF 메타데이터·텐서 구성 덤프 (무게 미로딩)
-  llm170 infer --model <file.gguf> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
-              [--n-predict N] [--ctx N] [--backend cpu|hip|vulkan] [--spec k]
+  llm170 infer --model <file.gguf|exl3_dir> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
+              [--n-predict N] [--ctx N] [--backend cpu|hip|vulkan|cuda] [--spec k]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
-      --prompt-tokens 반복 = 병렬 시퀀스(np). --backend hip|vulkan: 원시 디코더 상주 디코드.
-  llm170 serve --model <file.gguf|exl3_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
+      --prompt-tokens 반복 = 병렬 시퀀스(np). CUDA는 EXL3 디렉터리 단일 슬롯 순차 디코드만 지원.
+  llm170 serve --model <file.gguf|exl3_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan|cuda] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
       OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯(기본 1).
   llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
             [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
@@ -343,6 +343,9 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     if model_path.is_dir() && gpu_runtime != "vulkan" && slots.unwrap_or(1) > 1 {
         return usage_err("EXL3 hip/cuda 백엔드는 단일 슬롯만 지원 — --slots 1");
     }
+    if model_path.is_dir() && gpu_runtime == "cuda" && spec_k > 0 {
+        return usage_err("EXL3 CUDA 스펙 디코드는 미구현 — --spec 없이 실행");
+    }
     if spec_k > 0 {
         // GPU 스펙 경로 강제 (스레드 기동 전 단일 스레드 시점 env 설정).
         // 안전성: 이 시점은 단일 스레드 (엔진/슬롯 스레드 기동 전).
@@ -393,6 +396,10 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     // cpu+디렉터리는 명확한 에러(무음 Q4 로드 실패 방지).
     if model_path.is_dir() && backend != "gpu" {
         eprintln!("error: EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan|cuda");
+        return ExitCode::FAILURE;
+    }
+    if !model_path.is_dir() && gpu_runtime == "cuda" {
+        eprintln!("error: CUDA는 현재 EXL3 디렉터리만 지원 (GGUF/W4A16은 S6/S7 대기)");
         return ExitCode::FAILURE;
     }
     let sel = if model_path.is_dir() {
