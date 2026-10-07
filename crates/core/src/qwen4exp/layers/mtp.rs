@@ -393,6 +393,15 @@ impl Engine4 {
             }
         }
         let full = n_acc + 1 >= proposals.len();
+        // plans/141: 수용률 0의 원인을 GPU 수치 전에 판별한다. 프레임 스펙의
+        // 실제 제안열·검증열과 채택 수를 함께 남겨 k-1 제안 누락을 식별한다.
+        if llm170_diag::dump::opts().key("spec_accept") {
+            eprintln!(
+                "# spec-accept pos={} k={k} proposals={proposals:?} verify={y:?} matched={} full={full}",
+                snap_t.pos,
+                n_acc.saturating_sub(1),
+            );
+        }
         // 그림자 진단(LLM170_DUMP=spec_check) — 배치 y·상태와 순차 decode1
         // 재현을 전수 대조. 그림자 종료 상태 = 순차 전이(배치가 도달해야 할
         // 상태)라 관측이 스트림을 오염시키지 않는다.
