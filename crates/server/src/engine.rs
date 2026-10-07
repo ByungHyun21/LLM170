@@ -13,6 +13,9 @@ pub enum BackendSel {
     Exl3,
     /// EXL3 hip 백엔드(plans/121 exl3-sched) — 단일 슬롯, 배치 프리필+순차 디코드.
     Exl3Hip,
+    /// EXL3 cuda 백엔드(rawcuda 포팅, plans/124) — 단일 슬롯. S4 배선:
+    /// 라우팅·상주 적재까지, forward 체인은 디코더 G3+ 스텁 위임.
+    Exl3Cuda,
 }
 
 #[derive(Clone)]
@@ -42,7 +45,7 @@ pub fn q4_gpu_wanted(backend: &BackendSel) -> bool {
         return false;
     }
     match backend {
-        BackendSel::Cpu | BackendSel::Exl3 | BackendSel::Exl3Hip => false,
+        BackendSel::Cpu | BackendSel::Exl3 | BackendSel::Exl3Hip | BackendSel::Exl3Cuda => false,
         BackendSel::Gpu => true,
         BackendSel::GpuRuntime(r) => {
             if r != "hip" && r != "vulkan" {
@@ -393,6 +396,7 @@ pub enum Engine {
     /// EXL3 직접 경로 (plans/121 A1) — TrellisResident + 슬롯 SeqState.
     Exl3(Box<crate::exl3_engine::Exl3Engine>),
     Exl3Hip(Box<crate::exl3_hip_engine::Exl3HipEngine>),
+    Exl3Cuda(Box<crate::exl3_cuda_engine::Exl3CudaEngine>),
 }
 
 impl Engine {
@@ -403,6 +407,7 @@ impl Engine {
             Engine::Q4(e) => e.model.eos,
             Engine::Exl3(e) => e.eos,
             Engine::Exl3Hip(e) => e.eos,
+            Engine::Exl3Cuda(e) => e.eos,
             Engine::Q35(_) => llm170_core::qwen35::EOS_EOT,
         }
     }
@@ -416,6 +421,13 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         let eng = crate::exl3_hip_engine::Exl3HipEngine::load(&dir, 1, req.ctx)
             .unwrap_or_else(|e| panic!("exl3-hip 엔진 로드 실패: {e}"));
         return Engine::Exl3Hip(Box::new(eng));
+    }
+    if matches!(backend, BackendSel::Exl3Cuda) {
+        // plans/cuda-port.md S8: 슬롯 수가 상태(링/스캔/KV) 할당량을 정한다.
+        let dir = req.model.to_string_lossy().into_owned();
+        let eng = crate::exl3_cuda_engine::Exl3CudaEngine::load(&dir, n_slots, req.ctx)
+            .unwrap_or_else(|e| panic!("exl3-cuda 엔진 로드 실패: {e}"));
+        return Engine::Exl3Cuda(Box::new(eng));
     }
     if matches!(backend, BackendSel::Exl3) {
         let dir = req.model.to_string_lossy().into_owned();
@@ -494,6 +506,11 @@ impl Engine {
             Engine::Exl3Hip(e) => {
                 if let Err(err) = e.reset_seq() {
                     eprintln!("# hip 슬롯 리셋 오류: {err}");
+                }
+            }
+            Engine::Exl3Cuda(e) => {
+                if let Err(err) = e.reset_seq(seq) {
+                    eprintln!("# cuda 슬롯 리셋 오류(slot{seq}): {err}");
                 }
             }
         }

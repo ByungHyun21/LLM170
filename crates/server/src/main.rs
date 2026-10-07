@@ -5,6 +5,7 @@
 
 mod bench;
 mod engine;
+mod exl3_cuda_engine;
 mod exl3_engine;
 mod exl3_hip_engine;
 mod http;
@@ -32,16 +33,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = r#"
-llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
+llm170 — 순수 Rust 추론 엔진 (CPU·HIP·Vulkan·CUDA)
 
 주요 커맨드:
   llm170 gguf-dump [--meta-only] [--limit N] <file.gguf>
       GGUF 메타데이터·텐서 구성 덤프 (무게 미로딩)
-  llm170 infer --model <file.gguf> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
-              [--n-predict N] [--ctx N] [--backend cpu|hip|vulkan] [--spec k]
+  llm170 infer --model <file.gguf|exl3_dir> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
+              [--n-predict N] [--ctx N] [--backend cpu|hip|vulkan|cuda] [--spec k]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
-      --prompt-tokens 반복 = 병렬 시퀀스(np). --backend hip|vulkan: 원시 디코더 상주 디코드.
-  llm170 serve --model <file.gguf|exl3_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
+      --prompt-tokens 반복 = 병렬 시퀀스(np). CUDA는 EXL3 디렉터리 단일 슬롯 순차 디코드만 지원.
+  llm170 serve --model <file.gguf|exl3_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan|cuda] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
       OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯(기본 1).
   llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
             [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
@@ -142,7 +143,8 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
                         ma.gpu_runtime = Some(v.clone());
                     }
                     "cuda" => {
-                        return Err("--backend cuda: 미구현 (hip|vulkan 사용)".into());
+                        ma.backend = Some("gpu".into());
+                        ma.gpu_runtime = Some("cuda".into());
                     }
                     // EXL3 백엔드값 폐지(사용자 지시 2026-10-05): --backend는
                     // 런타임만(cpu|hip|vulkan|cuda). EXL3는 --model이 디렉터리면
@@ -337,9 +339,13 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     };
     // A12(plans/129): exl3-hip 엔진은 단일 슬롯 — --slots>1이 슬롯 생성 시점의
     // 점유 슬롯 reset으로 교묘하게 상태를 파괴했다(엔진 코드는 대응하지만
-    // 진입에서 거부하는 게 계약상 정확). vk 엔진은 다중 슬롯 지원 — 제외.
-    if model_path.is_dir() && gpu_runtime != "vulkan" && slots.unwrap_or(1) > 1 {
+    // 진입에서 거부하는 게 계약상 정확). vk·cuda 엔진은 슬롯별 상태를
+    // 디코더가 보유하므로 다중 슬롯 지원(S8) — 제외.
+    if model_path.is_dir() && gpu_runtime == "hip" && slots.unwrap_or(1) > 1 {
         return usage_err("EXL3 hip 백엔드는 단일 슬롯만 지원 — --slots 1");
+    }
+    if model_path.is_dir() && gpu_runtime == "cuda" && spec_k > 0 {
+        return usage_err("EXL3 CUDA 스펙 디코드는 미구현 — --spec 없이 실행");
     }
     if spec_k > 0 {
         // GPU 스펙 경로 강제 (스레드 기동 전 단일 스레드 시점 env 설정).
@@ -390,12 +396,18 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     // 아카이브)면 --backend 런타임(hip|vulkan)으로 EXL3 엔진을 고른다.
     // cpu+디렉터리는 명확한 에러(무음 Q4 로드 실패 방지).
     if model_path.is_dir() && backend != "gpu" {
-        eprintln!("error: EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan");
+        eprintln!("error: EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan|cuda");
+        return ExitCode::FAILURE;
+    }
+    if !model_path.is_dir() && gpu_runtime == "cuda" {
+        eprintln!("error: CUDA는 현재 EXL3 디렉터리만 지원 (GGUF/W4A16은 S6/S7 대기)");
         return ExitCode::FAILURE;
     }
     let sel = if model_path.is_dir() {
         if gpu_runtime == "vulkan" {
             engine::BackendSel::Exl3
+        } else if gpu_runtime == "cuda" {
+            engine::BackendSel::Exl3Cuda
         } else {
             engine::BackendSel::Exl3Hip
         }

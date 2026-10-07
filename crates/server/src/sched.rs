@@ -318,6 +318,13 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     e.decode1(0, t).map(|_| ())
                 })
                 .map_err(|e| e.to_string()),
+            Engine::Exl3Cuda(e) => e
+                .prefill(0, &warm)
+                .and_then(|l| {
+                    let t = llm170_core::qwen35::greedy(&l);
+                    e.decode1(0, t).map(|_| ())
+                })
+                .map_err(|e| e.to_string()),
             Engine::Exl3Hip(e) => e
                 .prefill(&warm)
                 .and_then(|l| {
@@ -333,6 +340,11 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             Engine::Q35(e) => e.reset_states(),
             Engine::Q4(e) => e.reset_states(),
             Engine::Exl3(e) => e.reset_states(),
+            Engine::Exl3Cuda(e) => {
+                if let Err(err) = e.reset_states() {
+                    eprintln!("# cuda 리셋 실패: {err}");
+                }
+            }
             Engine::Exl3Hip(e) => {
                 if let Err(err) = e.reset_seq() {
                     eprintln!("# hip 리셋 실패: {err}");
@@ -583,6 +595,44 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         q4_plain_decode(e, &mut slots, &active);
                     }
                 }
+                Engine::Exl3Cuda(e) => {
+                    // cuda 기본 경로(단일 슬롯 — rawcuda 포팅, plans/124). greedy는
+                    // step_tok(G3+ 스텁 위임), 그 외는 decode1 로짓 판. MTP는
+                    // 디코더 G4+ 이후(spec_round가 명시 Err).
+                    // S8 다중 슬롯: 슬롯마다 디코더가 GDN/KV/pos를 따로 보유하므로
+                    // 스케줄러의 연속 배칭이 그대로 병렬 요청으로 확장된다.
+                    for &i in &active {
+                        let next = slots[i].next;
+                        let greedy = !slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
+                        let r: Result<Vec<u32>, String> = if greedy {
+                            e.step_tok_device(i, next).map(|t| vec![t])
+                        } else {
+                            e.decode1(i, next).map(|l| vec![pick(&mut slots[i], &l)])
+                        };
+                        match r {
+                            Ok(toks) => {
+                                let cap = slots[i]
+                                    .job
+                                    .as_ref()
+                                    .map(|j| j.n_predict)
+                                    .unwrap_or(usize::MAX);
+                                for &t in &toks {
+                                    if slots[i].generated as usize >= cap {
+                                        break;
+                                    }
+                                    slot_emit(&mut slots[i], t);
+                                    if t == eos {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("# cuda decode 실패(slot{i}): {err}");
+                                slot_fail(&mut slots[i], format!("cuda decode1: {err}"));
+                            }
+                        }
+                    }
+                }
                 Engine::Exl3Hip(e) => {
                     // hip 기본 경로(단일 슬롯 — plans/121 exl3-sched). greedy는
                     // step_tok(GPU argmax, plans/130 A2), spec_k>0면 MTP 라운드
@@ -770,6 +820,13 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                             // 단일스트림(측정 승리) 전용.
                             r
                         }
+                        Engine::Exl3Cuda(e) => e.prefill(i, &part).map(|l| {
+                            if samp {
+                                pick(&mut slots[i], &l)
+                            } else {
+                                llm170_core::qwen35::greedy(&l)
+                            }
+                        }),
                         Engine::Exl3Hip(e) if i == 0 => e.prefill(&part).map(|l| {
                             if samp {
                                 pick(&mut slots[i], &l)
