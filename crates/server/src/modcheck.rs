@@ -260,7 +260,7 @@ fn fingerprint(sources: &[&str]) -> Option<u64> {
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
-                if std::env::var_os("FPDBG").is_some() {
+                if llm170_diag::flag::on("FPDBG") {
                     eprintln!("FPDBG 읽기실패 {} ({e})", path.display());
                 }
                 return None;
