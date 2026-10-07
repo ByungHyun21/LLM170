@@ -709,6 +709,18 @@ impl DecodeState {
                 out,
             );
         }
+        // plans/141 부록(2026-10-07): iq4_xs t=1 dmmv — f32 활성 직소비. W4A8 GEMV
+        // 대체(킬스위치 LLM170_XS_DMMV_OFF). 검증: hip-dmmv-check(xs 확장) + gate-27b.
+        if t == 1 && ty == 23 && !self.pin_prefill.get() && !env_on("LLM170_XS_DMMV_OFF") {
+            return self.ctx.gemv_xs_dmmv_out(
+                y_f32 as *const u8,
+                wp as *const u8,
+                self.ktab2 as *const u8,
+                n_in,
+                n_out,
+                out,
+            );
+        }
         // 진단: LLM170_MMQ_ONLY=타입 비트마스크 — MMQ 바이섹트(q4=1<<0, q5=1<<1,
         // q6=1<<2, iq4xs=1<<11). plans/79 C: NO_MMQ·Q8MMQ·Q1MMQ·DEQ16 실험 게이트
         // 폐기 — K계열 MMQ(t≥32·CO 로드)가 확정 경로다.

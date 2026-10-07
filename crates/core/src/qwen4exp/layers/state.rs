@@ -4,6 +4,50 @@
 use super::super::Hparams4;
 use super::Engine4;
 
+/// 스펙 거각 스냅샷 — `SeqState4` 전체가 아니라 **되돌려야 하는 필드만** 담는다.
+///
+/// plans/141: 종전 스펙 라운드는 `seqs[seq].clone()`으로 스냅샷을 떠서
+/// 라운드당 **67ms**를 냈다(FN pp512 tg16 실측). `SeqState4`의 `kv_k`·`kv_v`·
+/// `idx_k`·`idx_bk`는 컨텍스트 길이에 비례하는 대형 캐시라 복사 비용이 지배적이었다.
+/// 그 캐시들은 **위치 색인**이라 기각 후 재실행이 같은 칸을 덮어쓰며 자가치유한다
+/// (frame/verify.rs의 롤백 계약과 동일 — "QSA KV/idx 풀은 pos 키 쓰기라 재실행에
+/// 멱등"). 따라서 복원이 필요한 것은 스텝 상태뿐이다:
+/// `pos`·`gdn_s`·`conv`·`ple_conv`·`ple_hist`·`ple_next_pos`·`qsa_host_stale`.
+#[derive(Clone)]
+pub(super) struct SpecSnap {
+    pub pos: u32,
+    pub gdn_s: Vec<Vec<f32>>,
+    pub conv: Vec<Vec<f32>>,
+    pub ple_conv: Vec<f32>,
+    pub ple_hist: Vec<u32>,
+    pub ple_next_pos: u32,
+    pub qsa_host_stale: bool,
+}
+
+impl SpecSnap {
+    pub(super) fn of(st: &SeqState4) -> Self {
+        Self {
+            pos: st.pos,
+            gdn_s: st.gdn_s.clone(),
+            conv: st.conv.clone(),
+            ple_conv: st.ple_conv.clone(),
+            ple_hist: st.ple_hist.clone(),
+            ple_next_pos: st.ple_next_pos,
+            qsa_host_stale: st.qsa_host_stale,
+        }
+    }
+    /// 스냅샷이 취해진 상태로 되돌린다(KV 캐시는 자가치유라 건드리지 않는다).
+    pub(super) fn restore(&self, st: &mut SeqState4) {
+        st.pos = self.pos;
+        st.gdn_s = self.gdn_s.clone();
+        st.conv = self.conv.clone();
+        st.ple_conv = self.ple_conv.clone();
+        st.ple_hist = self.ple_hist.clone();
+        st.ple_next_pos = self.ple_next_pos;
+        st.qsa_host_stale = self.qsa_host_stale;
+    }
+}
+
 #[derive(Clone)]
 pub struct SeqState4 {
     pub pos: u32,

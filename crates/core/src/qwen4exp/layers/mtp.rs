@@ -2,6 +2,7 @@
 //! spec_step 계열(단일·multi·frame 변형)·suffix 드래프터·CPU MTP층 헤드.
 use super::super::stages::{self, Ctx};
 use super::super::{Hparams4, Q4Error};
+use super::state::SpecSnap;
 use super::{Engine4, SeqState4};
 use crate::matmul::Accelerator;
 use crate::ops::sigmoid;
@@ -66,12 +67,15 @@ impl Engine4 {
             let _ = hp0;
         }
         // ② 드래프트 체인 — h는 pre-mix 멀티[10240]로 연결(chain export).
+        // plans/141: 프레임 판과 동일하게 k회 반복 — 마지막 예측 g_{k-1}까지
+        // 제안에 실어야 검증 비교가 성립한다(종전 k-1회 = 제안 k-1행이라
+        // 마지막 항을 버리고 수용 판정 대상이 사라졌다).
         let snap_d = self.mtp_seqs[seq].clone();
         let snap_t = self.seqs[seq].clone();
         let mut proposals: Vec<u32> = Vec::new();
         let mut chain_h = h_after_first.clone();
         let mut next = t0;
-        for _ in 0..k.saturating_sub(1) {
+        for _ in 0..k {
             let _acc = self.acc.clone();
             let (next_d, dh) = self.mtp_draft_step_h(seq, next, &chain_h, _acc.as_deref())?;
             proposals.push(next);
@@ -326,28 +330,51 @@ impl Engine4 {
         } else {
             std::mem::take(&mut self.spec_h_prev[seq])
         };
+        // plans/141: 라운드 비용 분해 — q35판 `[specT]`와 같은 키(dump:spec_time).
+        // q4exp에는 이 분해가 없어 드래프트/검증/기각재실행 중 무엇이 비용인지
+        // GPU 계측으로는 구분되지 않았다(커널 표는 트렁크와 섞여 나온다).
+        let tm_on = llm170_diag::dump::opts().key("spec_time");
+        let t_d0 = std::time::Instant::now();
         let t0 = self.decode1_greedy(seq, last_token)?;
         let mut forwards = 1usize;
+        let t_commit = t_d0.elapsed().as_secs_f64() * 1e3;
         let h_after_first = self.last_res_hc.clone();
+        // ② 드래프트 체인 — proposals = [t0, g1, .., g_{k-1}](k개).
+        //
+        // plans/141: 종전 `k-1`회 반복은 마지막 예측 `g_{k-1}`을 계산만 하고
+        // 버려 검증 목록에서 제외했다. 결과적으로 검증 행이 t0로 끝나 다음
+        // 제안과 비교할 행이 없어 매 라운드 matched=0·full=true(수용 0)이 되었고,
+        // 드래프트 비용만 더해 순수 디코드보다 느렸다(k=2 실측 3.09 vs 18.14 t/s).
+        // k회 반복은 두 가지를 함께 맞춘다: 검증 대상이 k행이 되어 g_{k-1}까지
+        // 비교되고, 드래프트 KV도 전 라운드 커밋 토큰(t0·g_1..g_{k-1})을 덮는다
+        // — 전 수용 시 다음 라운드 ④′ 이전 드래프트 문맥이 비지 않는다.
+        let t_snap0 = std::time::Instant::now();
+        let snap_t = SpecSnap::of(&self.seqs[seq]);
+        // 거각 복원 기준 — ④′ 이전. 복원 후 재체인(아래)이 last_token 행부터
+        // 다시 적립하므로, ④′까지 진행한 상태를 기준으로 잡으면 last_token 행이
+        // 한 번 더 쌓여 드래프트 위치가 어긋난다.
+        let snap_d = SpecSnap::of(&self.mtp_seqs[seq]);
+        if tm_on {
+            eprintln!("# spec-snap {:.2}ms", t_snap0.elapsed().as_secs_f64() * 1e3);
+        }
         // ④′ 주기 시작 커밋 토큰의 드래프트 KV 행 진위치 기입.
         {
             let _acc = self.acc.clone();
             self.mtp_draft_step_h(seq, last_token, &h_prev, _acc.as_deref())?;
         }
-        // ② 드래프트 체인 — proposals = [t0, g1, .., g_{k-2}](k-1개).
         let mut proposals: Vec<u32> = Vec::new();
         let mut chain_h = h_after_first.clone();
         let mut next = t0;
-        for _ in 0..k.saturating_sub(1) {
+        for _ in 0..k {
             let _acc = self.acc.clone();
             let (next_d, dh) = self.mtp_draft_step_h(seq, next, &chain_h, _acc.as_deref())?;
             proposals.push(next);
             chain_h = dh;
             next = next_d;
         }
-        // ── 배치 검증: t=k-1행 1회 포워드 + 행별 GPU argmax ──
-        let snap_t = self.seqs[seq].clone();
-        let snap_d = self.mtp_seqs[seq].clone();
+        let t_draft = t_d0.elapsed().as_secs_f64() * 1e3 - t_commit;
+        let t_v0 = std::time::Instant::now();
+        // ── 배치 검증: t=k행 1회 포워드 + 행별 GPU argmax ──
         let y: Vec<u32>;
         {
             let Engine4 {
@@ -382,6 +409,7 @@ impl Engine4 {
             }
         }
         forwards += 1;
+        let t_verify = t_v0.elapsed().as_secs_f64() * 1e3;
         // y[i] = proposals[i] 처리 후 greedy — 수용 접두 판정(순차 판과 동일식).
         let mut n_acc = proposals.len();
         for i in 0..proposals.len() {
@@ -393,6 +421,17 @@ impl Engine4 {
             }
         }
         let full = n_acc + 1 >= proposals.len();
+        // plans/141: 수용률 0의 원인을 GPU 수치 전에 판별한다. 프레임 스펙의
+        // 실제 제안열·검증열과 채택 수를 함께 남겨 제안 누락을 식별한다.
+        // `n_acc` = 검증 출력과 일치한 드래프트 수(y[i] == proposals[i+1]).
+        // 드래프트 pos도 함께 찍는다 — 거각 복원·재체인이 어긋나면 pos가
+        // 라운드마다 상승해 CPU 어텐션 비용이 늘어난다(spawn O(pos)).
+        if llm170_diag::dump::opts().key("spec_accept") {
+            eprintln!(
+                "# spec-accept pos={} dpos={} k={k} proposals={proposals:?} verify={y:?} matched={n_acc} full={full}",
+                snap_t.pos, self.mtp_seqs[seq].pos,
+            );
+        }
         // 그림자 진단(LLM170_DUMP=spec_check) — 배치 y·상태와 순차 decode1
         // 재현을 전수 대조. 그림자 종료 상태 = 순차 전이(배치가 도달해야 할
         // 상태)라 관측이 스트림을 오염시키지 않는다.
@@ -426,8 +465,8 @@ impl Engine4 {
                 };
                 super::super::frame::verify_snap_restore(a, f, seq)?;
             }
-            self.seqs[seq] = snap_t.clone();
-            self.mtp_seqs[seq] = snap_d.clone();
+            snap_t.restore(&mut self.seqs[seq]);
+            snap_d.restore(&mut self.mtp_seqs[seq]);
             let seq_y: Vec<u32> = proposals
                 .iter()
                 .map(|&p| self.decode1_greedy(seq, p))
@@ -483,12 +522,24 @@ impl Engine4 {
             // 배치가 정확히 proposals행만큼 상태를 전진시켰다 — pos 정산.
             self.seqs[seq].pos += proposals.len() as u32;
             self.spec_h_prev[seq] = self.last_res_hc.clone();
+            if tm_on {
+                eprintln!(
+                    "[specT] commit={:6.1} draft={:6.1} verify={:6.1} state={:6.1} acc={}/{} rows={}",
+                    t_commit,
+                    t_draft,
+                    t_verify,
+                    t_v0.elapsed().as_secs_f64() * 1e3,
+                    n_acc,
+                    proposals.len().saturating_sub(1),
+                    proposals.len(),
+                );
+            }
             Ok((accepted, forwards))
         } else {
             // 기각 — 스냅샷 복원(GDN 디바이스 + CPU) 후 수용분 재실행.
             let snap_pos = snap_t.pos;
-            self.seqs[seq] = snap_t;
-            self.mtp_seqs[seq] = snap_d;
+            snap_t.restore(&mut self.seqs[seq]);
+            snap_d.restore(&mut self.mtp_seqs[seq]);
             {
                 let Engine4 {
                     frame,
@@ -568,6 +619,18 @@ impl Engine4 {
             accepted.extend_from_slice(&proposals[1..=n_acc]);
             accepted.push(y[n_acc]);
             self.spec_h_prev[seq] = self.last_res_hc.clone();
+            if tm_on {
+                eprintln!(
+                    "[specT] commit={:6.1} draft={:6.1} verify={:6.1} state={:6.1} acc={}/{} rows={} REJECT",
+                    t_commit,
+                    t_draft,
+                    t_verify,
+                    t_v0.elapsed().as_secs_f64() * 1e3,
+                    n_acc,
+                    proposals.len().saturating_sub(1),
+                    proposals.len(),
+                );
+            }
             Ok((accepted, forwards))
         }
     }
@@ -821,6 +884,10 @@ impl Engine4 {
                 hc_dim
             )));
         }
+        let h_prep = llm170_diag::dump::opts().key("mtp_prep");
+        let tp0 = std::time::Instant::now();
+        #[allow(unused_variables)]
+        let _ = (&h_prep, &tp0);
         let embd = self.model.w4("token_embd.weight")?;
         let mut e = vec![0.0f32; n];
         dequant_row(embd.ty, embd.data, x as u64, n as u64, &mut e);
@@ -841,6 +908,9 @@ impl Engine4 {
                 .f32_vec4(&format!("blk.{il}.nextn.hnorm.weight"))?,
             hp.eps,
         );
+        if h_prep {
+            eprintln!("# mtp-prep {:.2}ms", tp0.elapsed().as_secs_f64() * 1e3);
+        }
         // ── plans/110 W1: 프레임 경로 — 상주 버퍼 GEMV 체인 ──
         let mtp_t = std::time::Instant::now();
         if self.frame_on(true) && self.frame_ensure() {
@@ -1014,6 +1084,10 @@ impl Engine4 {
         let il = hp.n_layer; // 블록 48
         let hc_dim = hc * n;
         // 1) e = emb(x) — 본체 임베딩 공유
+        let h_prep = llm170_diag::dump::opts().key("mtp_prep");
+        let tp0 = std::time::Instant::now();
+        #[allow(unused_variables)]
+        let _ = (&h_prep, &tp0);
         let embd = self.model.w4("token_embd.weight")?;
         let mut e = vec![0.0f32; n];
         dequant_row(embd.ty, embd.data, x as u64, n as u64, &mut e);
@@ -1144,45 +1218,105 @@ pub(crate) fn mtp_attn_cpu_row(
     // dense softmax 어텐션 + 게이트 — cpu_attn_row 열에서 **cell 0은
     // 스킵**(드래프트 KV는 위치 1부터 기입 — 팬텀 0키가 softmax 질량을
     // 훔치는 결함, P15④-5).
+    //
+    // plans/141: 헤드별 루프를 스레드 파티션으로 나눴다. 이 계산은 드래프트
+    // 스텝에서 컨텍스트에 비례해 grow하는 유일한 부분이다(스텝당 5ms → 12ms,
+    // pp512 → 수천 토큰 구간). 헤드는 q/k/v와 KV를 **읽기만** 하고 out의
+    // 서로 겹치지 않는 구간[ob, ob+hd)에 쓴다 — 헤드 간 공유 상태가 없어
+    // 파티션이 정확하며, 각 헤드의 산술 순서(부분합 → softmax → 가중합 → 게이트)는
+    // 그대로여서 비트 동일하다. frame/forward.rs의 ple_gatherMT와 같은 관례.
     let n_past = pos as usize;
     let (ck, cv) = (&st.kv_k[0], &st.kv_v[0]);
     let mut out = vec![0.0f32; n_head * hd];
-    for h in 0..n_head {
-        let kvh = h / (n_head / n_kv);
-        let mut maxv = f32::NEG_INFINITY;
-        let mut scores = vec![0.0f32; n_past];
-        for (p, sc) in scores.iter_mut().enumerate() {
-            let p = p + 1; // cell 0 스킵
-            let b = p * n_kv * hd + kvh * hd;
-            let mut d = 0.0f32;
-            for i in 0..hd {
-                d += q_row[h * 2 * hd + i] * ck[b + i];
-            }
-            *sc = d * kq_scale;
-            maxv = maxv.max(*sc);
+    // q는 헤드 앞처리(rms_norm+rope)가 앞에서 in-place로 끝났으므로 읽기 전용이다.
+    let q_ro: &[f32] = q_row;
+    let nt = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(n_head)
+        .min(32);
+    let per = n_head.div_ceil(nt);
+    std::thread::scope(|sc| {
+        let mut rest: &mut [f32] = &mut out;
+        let mut base = 0usize;
+        while base < n_head {
+            let take = per.min(n_head - base);
+            let (chunk, tail) = rest.split_at_mut(take * hd);
+            rest = tail;
+            let b = base;
+            sc.spawn(move || {
+                for j in 0..take {
+                    head_attn(
+                        b + j,
+                        n_head,
+                        n_kv,
+                        hd,
+                        n_past,
+                        kq_scale,
+                        q_ro,
+                        ck,
+                        cv,
+                        chunk,
+                        j * hd,
+                    );
+                }
+            });
+            base += take;
         }
-        let mut sum = 0.0f32;
-        for sc in scores.iter_mut() {
-            *sc = (*sc - maxv).exp();
-            sum += *sc;
-        }
-        let ob = h * hd;
-        for (p0, sc) in scores.iter().enumerate() {
-            let w = sc / sum;
-            if w == 0.0 {
-                continue;
-            }
-            let b = (p0 + 1) * n_kv * hd + kvh * hd;
-            for i in 0..hd {
-                out[ob + i] += w * cv[b + i];
-            }
-        }
-        let gb = h * 2 * hd + hd;
+    });
+    out
+}
+
+/// 단일 헤드의 dense 어텐션 + 게이트. `slot`은 파티션 버퍼 내 오프셋
+/// (헤드 h는 `slot..slot+hd`를 쓴다). 산술 순서는 mtp_attn_cpu_row의 종전
+/// 본문과 동일 — 병렬화만 바뀌고 계산 순서는 그대로다.
+#[allow(clippy::too_many_arguments)]
+fn head_attn(
+    h: usize,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+    n_past: usize,
+    kq_scale: f32,
+    q_row: &[f32],
+    ck: &[f32],
+    cv: &[f32],
+    out: &mut [f32],
+    slot: usize,
+) {
+    let kvh = h / (n_head / n_kv);
+    let qb = h * 2 * hd;
+    let mut scores = vec![0.0f32; n_past];
+    let mut maxv = f32::NEG_INFINITY;
+    for (p, sc) in scores.iter_mut().enumerate() {
+        let p = p + 1; // cell 0 스킵
+        let b = p * n_kv * hd + kvh * hd;
+        let mut d = 0.0f32;
         for i in 0..hd {
-            out[ob + i] *= sigmoid(q_row[gb + i]);
+            d += q_row[qb + i] * ck[b + i];
+        }
+        *sc = d * kq_scale;
+        maxv = maxv.max(*sc);
+    }
+    let mut sum = 0.0f32;
+    for sc in scores.iter_mut() {
+        *sc = (*sc - maxv).exp();
+        sum += *sc;
+    }
+    for (p0, sc) in scores.iter().enumerate() {
+        let w = sc / sum;
+        if w == 0.0 {
+            continue;
+        }
+        let b = (p0 + 1) * n_kv * hd + kvh * hd;
+        for i in 0..hd {
+            out[slot + i] += w * cv[b + i];
         }
     }
-    out
+    let gb = h * 2 * hd + hd;
+    for i in 0..hd {
+        out[slot + i] *= sigmoid(q_row[gb + i]);
+    }
 }
 /// hc_combine: res[s] += out·(2·σ(inject_s/4)).
 pub(super) fn hc_combine(

@@ -242,9 +242,11 @@ impl VkAcc {
         let xb = self.fbuf(x)?;
         let ob = self.fbuf(out)?;
         let xq_w = xq_words(n_in);
-        // plans/89 P1.2 — ids dmmv 판이 이 호출을 가져갈 거면 xq 양자화 자체가
-        // 불필요(f32 직결). 아래 조건은 ids2 분기와 동일해야 한다.
-        let ids2_takes = crate::common::moe::ids2_takes(rows, t, w.ty);
+        // plans/141: HIP 전용 Q5K dmmv 승격을 공유하면 VK fn_moe_ids(Q5K)가
+        // xq=null을 읽어 L2.moe_sc를 전부 0으로 만든다. 단일 SSBO의 Q4K/Q5_1
+        // f32 직독 셰이더에만 양자화를 생략한다(청크 폴백도 xq 필요).
+        let ids2_takes =
+            crate::common::moe::vk_ids2_takes(rows, t, w.ty, w.data.len(), ctx.max_ssbo);
         // plans/105(원장 80): 팩 등록 히트 — 상위 정량 스킵(llmmq가 팩 소비).
         let pack_skip_quant = w.ty == GgmlType::Q4K && self.packbufs.lock().0.contains_key(&x);
         let xq = if ids2_takes || pack_skip_quant {

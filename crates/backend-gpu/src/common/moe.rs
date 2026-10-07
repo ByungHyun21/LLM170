@@ -123,19 +123,10 @@ pub fn grp_padded(off: &[usize], ne: usize, pad: usize) -> (Vec<usize>, usize) {
     (off_pad, rows_pad)
 }
 
-/// ids dmmv 판 게이트 — f32 활성 직결(q4_K·q5_1) dmmv 커널이 이 호출을
-/// 가져가면 활성 양자화(xq) 자체가 불필요하다.
-///
-/// 양쪽 비교(공통핵 3조건 바이트 동일):
-/// - hip `frame_moe_gemm` dmmv 분기(rawhip/q4acc/frame.rs):
-///   `(t_cur()==1 || rows<=64) && rows>0 && … && matches!(ty, Q4K|Q5_1)`
-///   (여기에 hip 전용 `!f32w && !env_on("LLM170_HIP_DMMV_OFF")` 가 추가로 붙는다)
-/// - vk `moe_gemm_impl`(rawvk/vkacc/frame.rs):
-///   `rows > 0 && (t == 1 || rows <= 64) && matches!(w.ty, Q4K | Q5_1)`
-///
-/// vk 주석 계약: "아래 조건은 ids2 분기와 동일해야 한다" — 디스패치 분기
-/// (2b)는 q5_K·q8_0 도 포함하지만 그 판들은 xq 를 소비하므로 이 게이트와
-/// 다르다. 런치 판 선택 자체는 백엔드별(원장 114).
+/// HIP ids dmmv 판 게이트 — f32 활성 직결 커널이 이 호출을 가져가면
+/// 활성 양자화(xq) 자체가 불필요하다. VK는 별도의 `vk_ids2_takes`를 쓴다:
+/// HIP에만 Q5K f32 직독 커널이 있어 이 게이트를 공유하면 VK의 Q5K xq
+/// 소비자가 null 버퍼를 읽고 0을 출력한다(plans/141, L2.moe_sc 실측).
 pub fn ids2_takes(rows: usize, t: usize, ty: GgmlType) -> bool {
     // 2026-10-07 plans/141: q5k dmmv 재승격 — 커널의 qh 바이트 추출 결함을 수리했다
     // (워드 비트 → 바이트 (j&3)*8 시프트 + 2워드 처리). hip-moe-dmmv-check f64 대조:
@@ -144,6 +135,21 @@ pub fn ids2_takes(rows: usize, t: usize, ty: GgmlType) -> bool {
     rows > 0
         && (t == 1 || rows <= 64)
         && matches!(ty, GgmlType::Q4K | GgmlType::Q5_1 | GgmlType::Q5K)
+}
+
+/// VK에서 실제로 f32 직독 ids2 커널이 선택되는 조건. Q5K·Q8_0은
+/// `fn_moe_ids`가 xq를 소비한다. 단일 SSBO가 아니면 ids2 분기가
+/// 기존 ids 셰이더로 내려가므로 그때도 xq를 생략하면 안 된다.
+pub fn vk_ids2_takes(
+    rows: usize,
+    t: usize,
+    ty: GgmlType,
+    weight_bytes: usize,
+    max_ssbo: usize,
+) -> bool {
+    ids2_takes(rows, t, ty)
+        && matches!(ty, GgmlType::Q4K | GgmlType::Q5_1)
+        && weight_bytes <= max_ssbo
 }
 
 #[cfg(test)]
@@ -212,5 +218,18 @@ mod tests {
         assert!(!ids2_takes(64, 8, GgmlType::Q8_0)); // 타입 미지원
         assert!(ids2_takes(64, 8, GgmlType::Q5K)); // q5k dmmv 재승격(plans/141 커널 수리 후)
         assert!(!ids2_takes(0, 1, GgmlType::Q4K)); // 빈 라우팅
+    }
+
+    /// HIP의 Q5K 승격과 VK의 xq 소비 계약은 서로 독립이다.
+    #[test]
+    fn vk_ids2_gate_keeps_xq_for_fallbacks() {
+        let one = 128 * 1024 * 1024;
+        assert!(vk_ids2_takes(10, 1, GgmlType::Q4K, one, one));
+        assert!(vk_ids2_takes(10, 1, GgmlType::Q5_1, one - 1, one));
+        assert!(!vk_ids2_takes(10, 1, GgmlType::Q5K, one, one));
+        assert!(!vk_ids2_takes(10, 1, GgmlType::Q8_0, one, one));
+        assert!(!vk_ids2_takes(10, 1, GgmlType::Q4K, one + 1, one));
+        assert!(!vk_ids2_takes(65, 8, GgmlType::Q4K, one, one));
+        assert!(!vk_ids2_takes(0, 1, GgmlType::Q4K, one, one));
     }
 }
