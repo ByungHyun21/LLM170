@@ -191,6 +191,10 @@ pub struct Exl3CudaDecoder {
     pub(crate) stg_w1: usize,
     pub(crate) stg_w2: usize,
     pub(crate) chain_bufs_ok: bool,
+    /// S11 배치 스테이징 5개(qg/kv-k/v-in · ew · o_proj/out_proj · xn).
+    /// 각 슬롯은 [n][TMAX] 용량.
+    pub(crate) bchain: [CUdeviceptr; 5],
+    pub(crate) bchain_cap: [usize; 5],
     /// GEMV 체인 작업 버퍼 상한(ensure_bufs가 갱신 — 재할당 최소화).
     pub(crate) kmax: usize,
     pub(crate) nmax: usize,
@@ -987,6 +991,8 @@ impl Exl3CudaDecoder {
             stg_w1: 0,
             stg_w2: 0,
             chain_bufs_ok: false,
+            bchain: [0; 5],
+            bchain_cap: [0; 5],
             kmax: 0,
             nmax: 0,
             x_cap: 0,

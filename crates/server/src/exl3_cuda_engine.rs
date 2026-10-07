@@ -57,16 +57,32 @@ impl Exl3CudaEngine {
         self.dec.forward_tok_device(slot, tok)
     }
 
-    /// 프리필 — 토큰을 순차 처리해 마지막 로짓을 반환한다. 디바이스 상주
-    /// 경로(S10)를 쓴다: 장문 프롬프트가 전부 이 경로를 타므로 호스트
-    /// 스테이징으로 두면 실사용 속도가 그대로다.
+    /// 프리필 — 배치 경로(S11)로 T≤8토큰씩 처리해 마지막 로짓을 반환한다.
+    ///
+    /// [왜 배치인가] T=1 순차는 토큰당 64층을 한 번씩 돈다. T행으로 넘기면
+    /// GEMM2·norm이 행 병렬로 처리한다. T 상한은 어텐션 fwd3s의
+    /// ATTN_F3S_TMAX(8) — 그보다 큰 청크는 커널이 거부한다.
+    ///
+    /// [정합] S11 동치성 게이트(cuda_probe s11)가 배치가 T=1과 같은 토큰을
+    /// 고름을 실물로 확인했다(어텐션 0.000e0·GDN 7.5e-4·fwd argmax 일치).
+    /// f16 mma 누산 차이로 logit maxdiff는 ~1.6e-2지만 argmax는 같고,
+    /// 그게 실사용 판정이다(게이트 스크립트와 동일 기준).
     pub fn prefill(&mut self, slot: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
         if tokens.is_empty() {
             return Err("빈 프리필".into());
         }
+        let tmax = llm170_backend_gpu::rawcuda::attn_cuda::ATTN_F3S_TMAX;
         let mut last = Vec::new();
-        for &tok in tokens {
-            last = self.decode1(slot, tok)?;
+        for chunk in tokens.chunks(tmax) {
+            let mut rows: Vec<f32> = Vec::with_capacity(chunk.len() * self.dec.hidden);
+            for &tok in chunk {
+                let row = self.dec.embed_row_host(tok);
+                if row.len() != self.dec.hidden {
+                    return Err(format!("exl3-cuda: 임베딩 토큰 {tok} 범위 밖 또는 미적재"));
+                }
+                rows.extend_from_slice(&row);
+            }
+            last = self.dec.forward_batch_device(slot, &rows)?.0;
         }
         Ok(last)
     }

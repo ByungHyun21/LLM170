@@ -218,6 +218,11 @@ impl Exl3CudaDecoder {
         Ok(())
     }
 
+    /// GDN 작업 버퍼 보장 — 배치 경로(S11)가 T를 명시해 호출한다.
+    pub(crate) fn ensure_gdn_bufs_pub(&mut self, t_len: usize) -> Result<(), String> {
+        self.ensure_gdn_bufs(t_len)
+    }
+
     /// GDN 작업 버퍼 보장(t 상한 확장 시에만 재할당).
     fn ensure_gdn_bufs(&mut self, t_len: usize) -> Result<(), String> {
         if t_len <= self.gdn_t_cap {

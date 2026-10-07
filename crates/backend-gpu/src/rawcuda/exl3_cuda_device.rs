@@ -158,13 +158,17 @@ impl Exl3CudaDecoder {
         self.cc.d2d(dst, p, n * 4)
     }
 
-    /// 체인 버퍼 보장 — 검증층에서 직접 호출할 수 있는 공개 진입점.
+    /// 체인 버퍼 보장 — 배치 경로(S11)·검증층에서 함께 쓴다.
     pub(crate) fn ensure_chain_probe_bufs_pub(&mut self) -> Result<(), String> {
         self.ensure_chain_bufs()
     }
 
     /// 체인 작업 버퍼 보장(상주). 폭은 모듈 형상에서 산출한다 — hidden을
     /// 가정하면 어텐션 qg(27B 12288)·GDN qkv(10240)·ew(17408)가 넘친다.
+    ///
+    /// [S11] dres·dab_dev는 **T×hidden** 용량이어야 한다(배치 forward가
+    /// T행 임베딩을 한 번에 올린다). T=1(S10)만 보면 1행분이면 충분해
+    /// 보이지만, 배치 경로는 h2d가 INVALID_VALUE로 죽는다.
     fn ensure_chain_bufs(&mut self) -> Result<(), String> {
         if self.chain_bufs_ok {
             return Ok(());
@@ -201,18 +205,20 @@ impl Exl3CudaDecoder {
                 self.cc.free(p)?;
             }
         }
-        self.dres = self.cc.alloc(h * 4)?;
-        self.dab_dev = self.cc.alloc(h * 4)?;
+        // 잔차·분기는 TMAX행까지 확보한다(S11 배치 forward가 T행으로 한 번에 쓴다).
+        let tmax = crate::rawcuda::attn_cuda::ATTN_F3S_TMAX;
+        self.dres = self.cc.alloc(h * tmax * 4)?;
+        self.dab_dev = self.cc.alloc(h * tmax * 4)?;
         // 첫 층의 분기(ab)는 0이어야 한다 — 잔차 스트림이 복구(reset)되지
         // 않으면 직전 실행의 down_proj 결과가 첫 층에 더해진다(원장 S10:
         // 초기화 누락은 첫 norm까지는 0.000e0로看似 정상이나 두 번째
         // forward부터 hidden이 벌어진다).
-        self.cc.h2d(self.dab_dev, &vec![0u8; h * 4])?;
+        self.cc.h2d(self.dab_dev, &vec![0u8; h * tmax * 4])?;
         let b0 = self.cc.alloc(w0 * 4)?;
         let b1 = self.cc.alloc(w1 * 4)?;
         let b1b = self.cc.alloc(w1 * 4)?;
         let b2 = self.cc.alloc(ff * 4)?;
-        let b3 = self.cc.alloc(h * 4)?;
+        let b3 = self.cc.alloc(h * tmax * 4)?;
         self.dchain = [b0, b1, b1b, b2, b3];
         self.stg_w0 = w0;
         self.stg_w1 = w1;

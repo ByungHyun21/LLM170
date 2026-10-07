@@ -29,6 +29,8 @@
 //! 동일하게 상시 컴파일(드라이버 부재는 CudaCtx::new에서 런타임 Err).
 
 pub mod attn_cuda;
+pub mod exl3_cuda_batch;
+pub mod exl3_cuda_batch_probe;
 pub mod attn_cuda_probe;
 pub mod ctx;
 pub mod ew_argmax_cuda;

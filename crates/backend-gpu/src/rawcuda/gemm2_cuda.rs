@@ -34,6 +34,27 @@ pub const GEMM2_KSEG_MAX_N: usize = 17408;
 pub const GEMM2_T_TILE: usize = 32;
 
 impl Exl3CudaDecoder {
+    /// 배치 GEMM 디바이스 상주(S11): dx [t][k]가 이미 장치에 있으면
+    /// had16→gemm2→had_out 체인을 발사하고 dyt(장치)를 남긴다.
+    /// t=1에서는 gemv 체인과 같은 연산을 한다 — 회귀 게이트로 쓸 수 있다.
+    pub fn gemm2_dev(
+        &mut self,
+        key: &str,
+        rows_dev: CUdeviceptr,
+        t_len: usize,
+    ) -> Result<CUdeviceptr, String> {
+        let l = self.lin_copy(key)?;
+        if t_len == 0 {
+            return Err("gemm2_dev: t_len=0".into());
+        }
+        self.ensure_gemm2_bufs(l.k, l.n, t_len)?;
+        // rows_dev가 자체 dx라면 복사 불필요. 다른 버퍼면 장치 내 복사.
+        if rows_dev != self.dx {
+            self.cc.d2d(self.dx, rows_dev, t_len * l.k * 4)?;
+        }
+        self.gemm2_chain_dev(&l, t_len, false)?;
+        Ok(self.dyt)
+    }
     // ── 배치 GEMM(gemm2/kseg — plans/124 G4 §3.1·§4.18) ──
 
     /// 배치 GEMM 작업 버퍼 보장(daht [t][k]f16팩 · dyt [t][n] f32 ·
