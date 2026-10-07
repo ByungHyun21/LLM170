@@ -202,7 +202,7 @@ def main() -> None:
           f"{[len(p) for p in PROMPTS]}")
 
     a = run_phase(CONC, 8951, parallel=True)   # 슬롯 N + 동시
-    b = run_phase(CONC, 8952, parallel=False)  # 슬롯 N + 직렬
+    b = run_phase(1, 8952, parallel=False)  # 슬롯 1 + 직렬 — CONC와 무관하게 항상 1
 
     fails = []
     for i, (ra, rb) in enumerate(zip(a, b)):
