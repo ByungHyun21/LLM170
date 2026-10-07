@@ -9,6 +9,7 @@ pub mod rawcuda;
 pub mod rawhip;
 pub mod rawvk;
 
+pub use rawcuda::q4acc_cuda::new_q4_acc_cuda;
 pub use rawhip::decode::{RawDecoder, inject as inject_rawhip};
 pub use rawhip::q4acc::new_acc_with_sources as new_q4_acc_with_sources;
 

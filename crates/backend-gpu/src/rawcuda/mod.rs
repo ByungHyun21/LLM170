@@ -69,6 +69,7 @@ pub mod ple_cuda;
 pub mod ple_cuda_probe;
 pub mod q4_cuda;
 pub mod q4_cuda_probe;
+pub mod q4acc_cuda;
 
 pub mod ds4_attn_cuda;
 pub mod ds4_attn_cuda_probe;
