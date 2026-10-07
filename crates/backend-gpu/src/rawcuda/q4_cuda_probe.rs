@@ -31,14 +31,14 @@
 //! [판정 계약 — plans/124 §5: 값 maxdiff, argmax 아님]
 //! - (i)   디양자화: **비트동일**(to_bits 전원 일치) — deq_q4_k 미러와.
 //! - (ii)  GEMV(t=1): maxdiff ≤1e-5 + bitdiff 인쇄(커널 = 레인 미러 그
-//!         자체라 비트동일 기대 — 환원 순서 선택: 64레인 분할 f32 누산
-//!         → f64 트리64 = lane.rs dot_row_w4a8_q4k_lane 미러. bit-exact
-//!         GEMV 누산이 가능한 구조라 별도 maxdiff 방어 계약 불요).
+//!   자체라 비트동일 기대 — 환원 순서 선택: 64레인 분할 f32 누산
+//!   → f64 트리64 = lane.rs dot_row_w4a8_q4k_lane 미러. bit-exact
+//!   GEMV 누산이 가능한 구조라 별도 maxdiff 방어 계약 불요).
 //! - (iii) GEMM(T=32): maxdiff ≤1e-5 + bitdiff(블록 순차 f32 = dot_q4k_q8
-//!         좌폴드 미리 — 역시 비트동일 기대, 환원 순서 선택 사유 동일).
+//!   좌폴드 미리 — 역시 비트동일 기대, 환원 순서 선택 사유 동일).
 //! - (iv)  음성대조: 슈퍼블록 d 지수 비트 반전(0x0100 xor)이 maxdiff
-//!         >1e-4 로 탐지되어야(NEG-DETECTED + 비영 exit — 원장 17호:
-//!         검증 계기도 스스로 검증).
+//!   >1e-4 로 탐지되어야(NEG-DETECTED + 비영 exit — 원장 17호:
+//!   > 검증 계기도 스스로 검증).
 //!
 //! [실측 원장 2026-10-04, RTX 4070 SUPER(sm_89) — 검증 호스트]
 //!   (i)   디양자화 blk.1.attn_gate.weight 8행×5120(160블록): bitdiff=0
@@ -71,6 +71,28 @@ const Q4_NEG_THRESH: f32 = 1e-4;
 const GGUF27: &str = "D:/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf";
 const CFG27: &str = "D:/models/Qwen3.8-27B-exl3-4.00bpw/config.json";
 const CFG35: &str = "D:/models/Qwen3.6-35B-A3B-exl3-4.00bpw/config.json";
+
+/// GGUF 픽스처 경로 — LLM170_CUDA_Q4_GGUF 오버라이드(fatbin 리졸버와 동일
+/// ENV 오버라이드 패턴; 기본값은 원 검증기기 경로, 2026-10-07 리눅스 포팅).
+fn gguf27() -> String {
+    std::env::var_os("LLM170_CUDA_Q4_GGUF")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| GGUF27.to_string())
+}
+
+/// config.json 픽스처 경로 — LLM170_CUDA_EXL3_27_CONFIG / _35_CONFIG 오버라이드
+/// (동일 패턴). 픽스처는 hidden_size·moe_intermediate_size 판독만 한다.
+fn cfg27_path() -> String {
+    std::env::var_os("LLM170_CUDA_EXL3_27_CONFIG")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| CFG27.to_string())
+}
+
+fn cfg35_path() -> String {
+    std::env::var_os("LLM170_CUDA_EXL3_35_CONFIG")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| CFG35.to_string())
+}
 
 // ── 결정론 RNG(splitmix64 변환 — 결정성이 계약; core sampler.rs 참조) ──
 struct Rng(u64);
@@ -548,13 +570,13 @@ fn cfg_num(cfg: &str, key: &str) -> Result<usize, String> {
 
 /// 27B hidden(config.json 판독 — 형상 명시 계약).
 fn hidden27() -> Result<usize, String> {
-    let cfg = std::fs::read_to_string(CFG27).map_err(|e| format!("{CFG27}: {e}"))?;
+    let cfg = std::fs::read_to_string(cfg27_path()).map_err(|e| format!("{CFG27}: {e}"))?;
     cfg_num(&cfg, "hidden_size")
 }
 
 /// 35B-A3B MoE 형상(hidden·moe_intermediate — config.json 판독).
 fn moe35() -> Result<(usize, usize), String> {
-    let cfg = std::fs::read_to_string(CFG35).map_err(|e| format!("{CFG35}: {e}"))?;
+    let cfg = std::fs::read_to_string(cfg35_path()).map_err(|e| format!("{CFG35}: {e}"))?;
     let h = cfg_num(&cfg, "hidden_size")?;
     let m = cfg_num(&cfg, "moe_intermediate_size")?;
     Ok((h, m))
@@ -581,10 +603,10 @@ fn cmp_f32(got: &[f32], want: &[f32]) -> (f32, usize) {
 /// 8행 × hidden(=Q4_K 열폭) — 27B hidden=5120 → 160 슈퍼블록.
 pub fn cuda_q4_dequant_check() -> Result<String, String> {
     let hidden = hidden27()?;
-    let (tensors, data_base) = gguf_scan(GGUF27)?;
+    let (tensors, data_base) = gguf_scan(&gguf27())?;
     let t = gguf_pick_q4k(&tensors, hidden)?;
     let rows = 8usize;
-    let bytes = gguf_read_q4k_rows(GGUF27, &t, data_base, 0, rows)?;
+    let bytes = gguf_read_q4k_rows(&gguf27(), &t, data_base, 0, rows)?;
     let mut m = Q4Cuda::new()?;
     let dev = m.device_name().to_string();
     m.add_q4k_bytes("t", &bytes, hidden, rows)?;
@@ -626,10 +648,10 @@ pub fn cuda_q4_dequant_check() -> Result<String, String> {
 /// 실 텐서 전 행(n_out) vs 레인 미러(lane.rs dot_row_w4a8_q4k_lane).
 pub fn cuda_q4_gemv_check() -> Result<String, String> {
     let hidden = hidden27()?;
-    let (tensors, data_base) = gguf_scan(GGUF27)?;
+    let (tensors, data_base) = gguf_scan(&gguf27())?;
     let t = gguf_pick_q4k(&tensors, hidden)?;
     let n_out = t.dims[1] as usize;
-    let bytes = gguf_read_q4k_rows(GGUF27, &t, data_base, 0, n_out)?;
+    let bytes = gguf_read_q4k_rows(&gguf27(), &t, data_base, 0, n_out)?;
     let mut m = Q4Cuda::new()?;
     let dev = m.device_name().to_string();
     m.add_q4k_bytes("t", &bytes, hidden, n_out)?;
@@ -673,7 +695,7 @@ pub fn cuda_q4_gemm_check() -> Result<String, String> {
     if n_in % 256 != 0 {
         return Err(format!("q4-cuda-gemm: hidden={n_in} — 256배수 계약 위반"));
     }
-    let (tensors, data_base) = gguf_scan(GGUF27)?;
+    let (tensors, data_base) = gguf_scan(&gguf27())?;
     let hidden27b = hidden27()?;
     let ts = gguf_pick_q4k(&tensors, hidden27b)?;
     let tt = 32usize;
@@ -681,7 +703,7 @@ pub fn cuda_q4_gemm_check() -> Result<String, String> {
     // 필요 블록 수만큼 실 텐서 행을 읽어 잘라낸다(행폭 2880B=20블록).
     let src_row_blocks = hidden27b / 256;
     let need_rows = gemm_blocks.div_ceil(src_row_blocks);
-    let raw = gguf_read_q4k_rows(GGUF27, &ts, data_base, 0, need_rows)?;
+    let raw = gguf_read_q4k_rows(&gguf27(), &ts, data_base, 0, need_rows)?;
     let bytes: Vec<u8> = raw[..gemm_blocks * 144].to_vec();
     let mut m = Q4Cuda::new()?;
     let dev = m.device_name().to_string();
@@ -748,10 +770,10 @@ pub fn cuda_q4_gemm_check() -> Result<String, String> {
 /// 정상 동작 시 NEG-DETECTED 마커와 함께 Err(→ CLI 비영 exit).
 pub fn cuda_q4_negative_check() -> Result<String, String> {
     let hidden = hidden27()?;
-    let (tensors, data_base) = gguf_scan(GGUF27)?;
+    let (tensors, data_base) = gguf_scan(&gguf27())?;
     let t = gguf_pick_q4k(&tensors, hidden)?;
     let rows = 8usize;
-    let mut bytes = gguf_read_q4k_rows(GGUF27, &t, data_base, 0, rows)?;
+    let mut bytes = gguf_read_q4k_rows(&gguf27(), &t, data_base, 0, rows)?;
     // 오라클(원본 기준) — 오염 전에 계산.
     let blocks = hidden / 256;
     let mut want = vec![0.0f32; rows * hidden];

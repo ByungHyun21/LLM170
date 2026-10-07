@@ -583,7 +583,9 @@ fn dequant_kmat(
 
 /// trellis 3중(u16 뷰) — raw 바이트 LE 변환(단일 소스).
 fn u16_view(raw: &[u8]) -> Vec<u16> {
-    raw.chunks_exact(2)
+    raw.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect()
 }
@@ -700,7 +702,9 @@ fn load_gate(
             return Err(format!("{p}.ffn.gate.tid2eid: i64 정렬 아님"));
         }
         Some(
-            traw.chunks_exact(8)
+            traw.as_chunks::<8>()
+                .0
+                .iter()
                 .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
                 .collect(),
         )
@@ -958,7 +962,7 @@ fn gen_engineered_gate(dim: usize, n_routed: usize) -> (Vec<f32>, Vec<f32>) {
     bias[6] = -1.0;
     let mut tie_col = vec![0.0f32; dim];
     tie_col[0] = 0.8;
-    let mut rng2 = Rng::new(0xA11C_E5);
+    let mut rng2 = Rng::new(0x00A1_1CE5);
     for v in tie_col.iter_mut().skip(1) {
         *v = ((rng2.next_f64() * 2.0 - 1.0) * 0.01) as f32;
     }
@@ -1152,7 +1156,7 @@ pub fn cuda_ds4_moe_check(dir: Option<&str>) -> Result<String, String> {
             (dims.route_scale, dims.swiglu_limit)
         ));
     }
-    if n_hash < 1 || n_hash as usize + 1 > 42 {
+    if n_hash < 1 || n_hash + 1 > 42 {
         return Err(format!(
             "ds4-moe: num_hash_layers={n_hash} — L0 해시/L3 라우티드 불가"
         ));
@@ -1329,9 +1333,10 @@ pub fn cuda_ds4_moe_negative_check(dir: Option<&str>) -> Result<String, String> 
             }
         );
         if !ids_differ {
-            return Err(format!(
+            return Err(
                 "NEG-MISSED (b) transposed tid2eid — 선택 불변(전치 오독 미탐지): 검증계기 결함"
-            ));
+                    .to_string(),
+            );
         }
     }
     // (c) 클램프 누락 — 오라클 결함 주입(limit=∞, (iii)과 동일 픽스처).
@@ -1379,8 +1384,8 @@ pub fn cuda_ds4_moe_negative_check(dir: Option<&str>) -> Result<String, String> 
                 "NEG-MISSED (c) clamp-missing maxdiff={md_c:.3e} — 검증계기 결함(클램프 이탈 미탐지)"
             ));
         }
-        return Err(format!(
+        Err(format!(
             "NEG-DETECTED (a) bias-in-weights w_maxdiff > {ROUTE_W_THRESH} (b) transposed-tid2eid ids_differ (c) clamp-missing maxdiff={md_c:.3e} > {MOE_VAL_THRESH} — 검증계기 정상(가중치식·해시 표·SwiGLU 클램프 결함 감지)"
-        ));
+        ))
     }
 }

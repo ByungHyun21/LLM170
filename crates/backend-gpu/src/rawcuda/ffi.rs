@@ -217,11 +217,25 @@ mod loader {
         }
     }
 
+    // unix 수동 dl 바인딩 — std 외 크레이트 금지 계약(plans/124)으로 libc 크레이트를
+    // 쓰지 않는다. glibc 2.34+는 dlopen/dlsym이 libc 내장(구분 libdl 폐지)이고
+    // std 타깃은 libc에 링크되므로 extern "C" 선언만으로 해석된다(2026-10-07
+    // 리눅스 포팅). RTLD_NOW=2는 glibc·musl 공통값.
+    #[cfg(unix)]
+    const RTLD_NOW: std::ffi::c_int = 2;
+
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn dlopen(filename: *const std::ffi::c_char, flags: std::ffi::c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const std::ffi::c_char) -> *mut c_void;
+    }
+
     #[cfg(unix)]
     pub fn open() -> Result<*mut c_void, String> {
-        for cand in [b"libcuda.so.1\0", b"libcuda.so\0"] {
+        // 바이트 문자열 길이가 달라 [u8; N] 배열 단일형이 불가 — 슬라이스로.
+        for cand in [&b"libcuda.so.1\0"[..], &b"libcuda.so\0"[..]] {
             // SAFETY: 드라이버 라이브러리 로드 — 참조수 증가만(해제 없음).
-            let h = unsafe { libc::dlopen(cstr(cand) as *const libc::c_char, libc::RTLD_NOW) };
+            let h = unsafe { dlopen(cstr(cand) as *const std::ffi::c_char, RTLD_NOW) };
             if !h.is_null() {
                 return Ok(h);
             }
@@ -234,7 +248,7 @@ mod loader {
         let mut b = name.as_bytes().to_vec();
         b.push(0);
         // SAFETY: lib는 open()이 돌려준 유효 핸들, b는 NUL 종료.
-        let p = unsafe { libc::dlsym(lib, cstr(&b) as *const libc::c_char) };
+        let p = unsafe { dlsym(lib, cstr(&b) as *const std::ffi::c_char) };
         if p.is_null() {
             Err(format!("심볼 없음: {name}"))
         } else {

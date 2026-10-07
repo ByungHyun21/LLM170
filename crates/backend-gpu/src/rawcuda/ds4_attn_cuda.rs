@@ -11,7 +11,7 @@
 //!
 //! [정합 목표 — 비트동일] 본 스테이지 산술은 f32 연산별 반올림(-fmad=false)
 //! + f64 트윈 exp(ops.rs exp_cr)+호스트 rope 표라 core 미러와 비트동일이
-//! 가능하다(판정 기준 bitdiff=0 — ds4_attn_cuda_probe.rs 원장).
+//!   가능하다(판정 기준 bitdiff=0 — ds4_attn_cuda_probe.rs 원장).
 //!
 //! [층 유형 — config.rs layer map] compress_ratios[il] 0=SWA(윈도우 128) /
 //! 4=CSA(겹침 압축+인덱서) / 128=HCA(비겹침 밀도). 컴프레서는 L2+ 전층,
@@ -355,7 +355,7 @@ impl Ds4AttnCuda {
     /// RoPE 표 등록 — cs: [len][half][2] f32(호스트 RopeTable::build 산출물).
     /// half = rope_head_dim/2. 층 재등록은 이전 표 해제 후 교체.
     pub fn set_rope(&mut self, il: usize, cs: &[f32], half: usize) -> Result<(), String> {
-        if half == 0 || cs.len() % (half * 2) != 0 {
+        if half == 0 || !cs.len().is_multiple_of(half * 2) {
             return Err(format!("ds4: rope 표 {} × half {half} 정합 오류", cs.len()));
         }
         let len = cs.len() / (half * 2);
@@ -1174,8 +1174,7 @@ impl Ds4AttnCuda {
         let mut idxs = vec![-1i32; t * stride];
         for (ti, srow) in sel.iter().enumerate() {
             let win = self.window_idx(ti, d.window);
-            let mut n = 0usize;
-            for &v in win.iter().chain(srow.iter()) {
+            for (n, &v) in win.iter().chain(srow.iter()).enumerate() {
                 if n >= stride {
                     return Err(format!("ds4: t={ti} 인덱스 수 초과(win+sel > {stride})"));
                 }
@@ -1183,7 +1182,6 @@ impl Ds4AttnCuda {
                     return Err(format!("ds4: t={ti} 인덱스 {v} 범위 외(행 {rows_tot})"));
                 }
                 idxs[ti * stride + n] = v;
-                n += 1;
             }
         }
         Exl3CudaDecoder::h2d_chunked(&self.cc, self.didx, &i32_bytes(&idxs))?;

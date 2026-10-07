@@ -1063,7 +1063,9 @@ fn dequant_linear(ar: &StArchive, key: &str) -> Result<Vec<f32>, String> {
     let suh = ar.read(&format!("{key}.suh"))?;
     let svh = ar.read(&format!("{key}.svh"))?;
     let tre_u32: Vec<u32> = tre
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let lin = LinearMirror {
@@ -1111,7 +1113,9 @@ fn linear_mirror(ar: &StArchive, key: &str) -> Result<(LinearMirror, usize), Str
     let (k, n, krate) = (kt * 16, nt * 16, (tw / 16) as u32);
     let tre = ar.read(&format!("{key}.trellis"))?;
     let tre_u32: Vec<u32> = tre
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     Ok((
@@ -2032,8 +2036,8 @@ pub fn cuda_ds4_mtp_check(dir: &str) -> Result<String, String> {
     let mut logits_o = vec![0.0f32; b * vocab];
     let mut logits_a = vec![0.0f32; b * vocab];
     let mut logits_c = vec![0.0f32; b * vocab];
-    let h_a_flat: Vec<f32> = h_a.iter().flatten().copied().collect();
-    let h_c_flat: Vec<f32> = h_c.iter().flatten().copied().collect();
+    let _h_a_flat: Vec<f32> = h_a.iter().flatten().copied().collect();
+    let _h_c_flat: Vec<f32> = h_c.iter().flatten().copied().collect();
     for n0 in (0..vocab).step_by(128) {
         // 스트립 디양자화 [k][128](k-major 재팩) — 블록당 1회.
         let mut w_strip = vec![0.0f32; dim * 128];
@@ -2182,7 +2186,7 @@ pub fn cuda_ds4_mtp_negative_check(dir: &str) -> Result<String, String> {
     })?;
     let dims = Ds4MtpDims::from_config(&cfg_text)?;
     let ad = Ds4AttnDims::from_config(&cfg_text)?;
-    let (dim, hc, vocab, rank) = (dims.dim, dims.hc, dims.vocab, dims.markov_rank);
+    let (dim, hc, _vocab, _rank) = (dims.dim, dims.hc, dims.vocab, dims.markov_rank);
     let ar = StArchive::open(dir)?;
     let mut modl = Ds4MtpCuda::open(&cfg_text)?;
     let dev = modl.device_name().to_string();

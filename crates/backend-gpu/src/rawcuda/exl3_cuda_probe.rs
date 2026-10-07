@@ -63,12 +63,12 @@
 //!
 //! 오라클 산술 계약(G2 정합 기준 = 코어 f32 미러, 값 maxdiff ≤3e-4):
 //! - gemv 누산은 코어 미러 순서 그대로: prod=f16(a·w) → acc=f16(acc+prod)
-//!  (f32 곱/합 각 1회). 커널 __hfma2의 단일 반올림과의 반올림 지점 차이는
+//!   (f32 곱/합 각 1회). 커널 __hfma2의 단일 반올림과의 반올림 지점 차이는
 //!   연산당 ≤1 ulp의 예상 계급 — hip도 같은 계급으로 2.664e-4 통과(원장).
 //! - mul1은 trellis.rs 원식(f32 fma) — 이 호스트에 +fma 특성이 없어
 //!   f32::mul_add가 소프트웨어 이중 반올림으로 떨어지므로, 참조가 의도한
 //!   correctly-rounded fma를 f64 정확합→f16 1회 반올림으로 대체
-//!  (실측 2026-10-04: 타이 예 mul1(0xd52e)=-1.2875977에서 2연산은
+//!   (실측 2026-10-04: 타이 예 mul1(0xd52e)=-1.2875977에서 2연산은
 //!   절반-ULP 경계를 어겨 GPU FFMA 결과와 1 ulp 어긋남).
 //! - nseg=16 분할·FOLD=4 케이던스·had_out nseg 합산 순서는 커널과 동일.
 //!
@@ -501,15 +501,15 @@ pub(crate) fn gen_unif(n: usize, seed: u64, amp: f64) -> Vec<f32> {
 pub(crate) fn st_to_f32(bytes: &[u8], dt: u8) -> Result<Vec<f32>, String> {
     match dt {
         1 => Ok(bytes
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect()),
         2 => Ok(bytes
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect()),
         0 => Ok(bytes
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
             .collect()),
         other => Err(format!("GDN 상수 dtype 코드 {other} 미지원")),
@@ -614,7 +614,7 @@ pub(crate) fn gdn_exp_d(x: f64) -> f64 {
     let p = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666666666666666f64
         + r * (0.041666666666666664f64 + r * (0.008333333333333333f64
         + r * (0.001388888888888889f64 + r * 0.0001984126984126984f64))))));
-    let scale = f64::from_bits((((1023 + k) as u64) << 52) as u64);
+    let scale = f64::from_bits(((1023 + k) as u64) << 52);
     p * scale
 }
 

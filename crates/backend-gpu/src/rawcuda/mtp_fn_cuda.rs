@@ -178,20 +178,20 @@ impl MtpFnDims {
             ));
         }
         let n_rot = n_rot_f as usize;
-        if n_rot % 2 != 0 {
+        if !n_rot.is_multiple_of(2) {
             return Err(format!("mtp-frame: n_rot={n_rot} — 짝수 계약(rope 페어링)"));
         }
-        if hc == 0 || hc > 8 || n == 0 || n % 32 != 0 || low_rank == 0 || eps <= 0.0 {
+        if hc == 0 || hc > 8 || n == 0 || !n.is_multiple_of(32) || low_rank == 0 || eps <= 0.0 {
             return Err(format!(
                 "mtp-frame: n={n} hc={hc} lr={low_rank} eps={eps} — HcDims 도메인 위반"
             ));
         }
-        if n_head == 0 || n_kv == 0 || n_head % n_kv != 0 {
+        if n_head == 0 || n_kv == 0 || !n_head.is_multiple_of(n_kv) {
             return Err(format!(
                 "mtp-frame: n_head={n_head} n_kv={n_kv} — q%kv==0 계약(GQA)"
             ));
         }
-        if head_dim == 0 || head_dim % n_rot != 0 {
+        if head_dim == 0 || !head_dim.is_multiple_of(n_rot) {
             return Err(format!(
                 "mtp-frame: head_dim={head_dim} n_rot={n_rot} — dim 배수 계약"
             ));
@@ -763,7 +763,7 @@ impl MtpFnCuda {
 
         // 2) attn 반쪽 hc_mix — HcCuda(FNC) 재사용(t=1). 반환은 토큰 행
         //    리스트 — 단일 행(스텝 계약)을 소출한다.
-        let (mix_attn_rows, inj_attn_rows) = self.hc.hc_mix(0, "attn", &[eh.clone()])?;
+        let (mix_attn_rows, inj_attn_rows) = self.hc.hc_mix(0, "attn", std::slice::from_ref(&eh))?;
         let mix_attn = mix_attn_rows
             .into_iter()
             .next()
@@ -775,7 +775,7 @@ impl MtpFnCuda {
 
         // 3) dense 어텐션 — 투영 GPU(3종)·CPU 코어(프레임 경로 계약)·wo GPU.
         let mix_b = f32_view(&mix_attn);
-        self.cc.h2d(self.d_x, &mix_b)?;
+        self.cc.h2d(self.d_x, mix_b)?;
         self.gemv(self.d_x, self.d_wq, self.d_q, 1, n, qg)?;
         self.gemv(self.d_x, self.d_wk, self.d_k, 1, n, kvd)?;
         self.gemv(self.d_x, self.d_wv, self.d_v, 1, n, kvd)?;
@@ -805,7 +805,7 @@ impl MtpFnCuda {
         let res_attn = self.read_f32(self.d_res, hcn)?;
 
         // 4) ffn 반쪽 — hc_mix + MoE(FNE) + combine.
-        let (mix_ffn_rows, inj_ffn_rows) = self.hc.hc_mix(0, "ffn", &[res_attn.clone()])?;
+        let (mix_ffn_rows, inj_ffn_rows) = self.hc.hc_mix(0, "ffn", std::slice::from_ref(&res_attn))?;
         let mix_ffn = mix_ffn_rows
             .into_iter()
             .next()
@@ -814,7 +814,7 @@ impl MtpFnCuda {
             .into_iter()
             .next()
             .ok_or("mtp-frame: hc_mix(ffn) inject 빈 반환")?;
-        let moe_rows = self.moe.moe_ffn(&[mix_ffn.clone()])?;
+        let moe_rows = self.moe.moe_ffn(std::slice::from_ref(&mix_ffn))?;
         let mout = moe_rows
             .into_iter()
             .next()
@@ -825,7 +825,7 @@ impl MtpFnCuda {
         let chain_h = self.read_f32(self.d_res, hcn)?;
 
         // 5) 헤드 — nextn.hc_head 믹서(HcCuda) → output GEMV + argmax.
-        let hin_rows = self.hc.hc_mix_nextn_head(0, &[chain_h.clone()])?;
+        let hin_rows = self.hc.hc_mix_nextn_head(0, std::slice::from_ref(&chain_h))?;
         let hin = hin_rows
             .into_iter()
             .next()

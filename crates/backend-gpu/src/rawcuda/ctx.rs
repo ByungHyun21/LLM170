@@ -229,6 +229,10 @@ impl CudaCtx {
     /// 커널 발사 — rawhip RawCtx::launch(name, gx, gy, block, args) 미러
     /// (gz/bz=1 고정, shared=0, extra=null). args 원소는 각 커널 인자값을
     /// 가리키는 포인터(cuLaunchKernel 규격 — 인자 주소 배열).
+    /// clippy allow: f는 드라이버 불투명 핸들 — 해드 유효성은 본문 SAFETY 계약
+    /// (호출자 보증)과 드라이버 CUresult 검증에 맡긴다. unsafe fn화 시 호출점
+    /// 200+곳 러플이 계약 강화 없이 노이즈만 늘린다(2026-10-07 판정).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn launch(
         &self,
         f: CUfunction,
@@ -263,6 +267,8 @@ impl CudaCtx {
     /// 함수 속성: 동적 공유메모리 상한 opt-in(정적 48KB 초과 커널 —
     /// G5 exl3_gdn_scan 61,828B). CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_
     /// SIZE_BYTES=8(cuda.h 규약 — sm_80 164KB/SM 상한 내에서만 성공).
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn set_dynamic_smem(&self, f: CUfunction, bytes: u32) -> Result<(), String> {
         // SAFETY: f는 function()이 돌려준 유효 핸들 — 스칼라 속성값만 전달.
         unsafe {
@@ -279,6 +285,8 @@ impl CudaCtx {
 
     /// 커널 발사(동적 공유메모리 지정) — launch의 shared=0 고정을 푼 변형
     /// (G5 scan). 48KB 초과 분은 set_dynamic_smem 사전 opt-in이 필수.
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn launch_shared(
         &self,
         f: CUfunction,

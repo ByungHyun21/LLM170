@@ -368,7 +368,7 @@ pub fn cuda_gemv_real_check(dir: &str, key: &str) -> Result<String, String> {
         return Err(format!("{key}: 판독 형상 불일치 ({rk},{rn},{rkrate})"));
     }
     let tre_u32: Vec<u32> = tre
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let lin = RefLin {

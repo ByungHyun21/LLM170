@@ -22,7 +22,7 @@
 //! - 종결: hc_head(ds4_hc) → norm(본 모듈) → 공유 head 스트립 gemv
 //!   (frame.rs head_gemv_stripwise L41-77 — 호스트 trellis 스트립 디양자화
 //!   + 본 모듈 head_strip 커널, k블록 부분합 순서) → 마르코프 바이어스
-//!   (markov_logits_bias L373-383) → 신뢰도(confidence_score L386-397).
+//!     (markov_logits_bias L373-383) → 신뢰도(confidence_score L386-397).
 //!
 //! [모듈 조립 계약] 블록 내부 산술이 착지 모듈과 일치하는 곳은 전부 그
 //! 모듈 API 로 재사용한다(ds4_attn/ds4_hc/ds4_moe — 커널 재구현 금지).
@@ -139,7 +139,7 @@ impl Ds4MtpDims {
                 dims.dspark_noise_token, dims.vocab
             ));
         }
-        if dims.dim % 128 != 0 || dims.vocab % 128 != 0 {
+        if !dims.dim.is_multiple_of(128) || !dims.vocab.is_multiple_of(128) {
             return Err(format!(
                 "ds4-mtp: dim={} vocab={} — 128 배수 계약",
                 dims.dim, dims.vocab
@@ -367,7 +367,7 @@ impl Ds4MtpCuda {
     /// 산출물, 윈도우 계열 base). 길이는 워밍 t + 여유 확보(호출부 계약).
     /// 시프트표는 dspark_decode_attn 이 본 사본에서 행 단위 절출해 구축.
     pub fn set_rope_main(&mut self, cs: &[f32], half: usize) -> Result<(), String> {
-        if half == 0 || cs.len() % (half * 2) != 0 {
+        if half == 0 || !cs.len().is_multiple_of(half * 2) {
             return Err(format!(
                 "ds4-mtp: rope 표 {} × half {half} 정합 오류",
                 cs.len()
@@ -715,7 +715,7 @@ impl Ds4MtpCuda {
         if self.d_proj == 0 || self.d_main_norm == 0 {
             return Err("ds4-mtp: main_proj/main_norm 미등록".into());
         }
-        if main_hidden.is_empty() || main_hidden.len() % (3 * d) != 0 {
+        if main_hidden.is_empty() || !main_hidden.len().is_multiple_of(3 * d) {
             return Err(format!(
                 "ds4-mtp: main_hidden {} — t·3·{d} 정합 오류",
                 main_hidden.len()
@@ -744,7 +744,7 @@ impl Ds4MtpCuda {
     /// project_kv 는 ds4_attn 모듈(정상 로프표, 위치 0..t-1).
     pub fn window_warm(&mut self, main_x: &[f32]) -> Result<Vec<f32>, String> {
         let (d, hd, win) = (self.dims.dim, self.dims.head_dim, self.dims.window);
-        if main_x.is_empty() || main_x.len() % d != 0 {
+        if main_x.is_empty() || !main_x.len().is_multiple_of(d) {
             return Err(format!(
                 "ds4-mtp: main_x {} — t·{d} 정합 오류",
                 main_x.len()

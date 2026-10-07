@@ -96,7 +96,7 @@ impl AttnDims {
                 "attn: head_dim {d} — 256 고정 계약(attn_theta 64차 rope)"
             ));
         }
-        if q_heads == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
+        if q_heads == 0 || kv_heads == 0 || !q_heads.is_multiple_of(kv_heads) {
             return Err(format!(
                 "attn: q_heads={q_heads} kv_heads={kv_heads} — q%kv==0 계약(GQA 그룹)"
             ));

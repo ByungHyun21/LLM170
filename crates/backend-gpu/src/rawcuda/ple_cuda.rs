@@ -29,8 +29,8 @@
 //!   분할 res·상태 비트동일(2청크째 상태 비영 — S0≠0).
 //! - 음성대조: 해시 계수 vs[3]+7 오염 maxdiff 3.277e-2·게더 인덱스 오염
 //!   3.178e-2 → NEG-DETECTED(비영 exit, 임계 1e-3 초과).
-//! [속도] 측정 대기 sm_80 — CMP 170HX 도착 후(개발기 4070 SUPER는 정합
-//! 검증 전용, plans/124 §0).
+//!   [속도] 측정 대기 sm_80 — CMP 170HX 도착 후(개발기 4070 SUPER는 정합
+//!   검증 전용, plans/124 §0).
 //!
 //! [독립 컴파일 계약] scripts/cuda_probe_shim.rs가 rustc로 단독 컴파일 —
 //! std 외 크레이트 금지(G1 원장). 청크 h2d는 G8 패턴 미러(임포트 아닌
@@ -188,7 +188,7 @@ fn h2d_chunked(cc: &CudaCtx, dst: CUdeviceptr, src: &[u8]) -> Result<(), String>
 
 /// f32 바이트 → Vec<f32>(d2h 출력 재해석 — LE 바이트 조립).
 fn bytes_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
+    b.as_chunks::<4>().0.iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }

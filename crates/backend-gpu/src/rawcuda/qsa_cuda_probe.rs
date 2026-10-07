@@ -24,15 +24,15 @@
 //!   rms_norm L33-37 · exp_cr L52-86(게이트 sigmoid용 — 명시적 f64 fma
 //!   호너라 **비트동일 직접 미러**) · sigmoid L133-136 · rope_head
 //!   L149-163(f32 powf/cos/sin — libm).
-//! [트랜센던트 트윈 계약 — 과제 지정 G5/G6/G7 패턴] 초월함수 3종(rope
-//! theta=base.powf·cos/sin, 소프트맥스 exp)은 호스트 libm(UCRT)과 장치
-//! libdevice가 비트재현 불가(G5 원장: libdevice expf 3.1M 표본 30% ±1ulp)
-//! → 오라클을 twin 모드로도 실행(q_theta/q_sincos_d/q_expf — .cu 트윈과
-//! 리터럴까지 동일 DAG)해 **커널↔twin 오라클 비트동일**을 1차 게이트로,
-//! **커널↔core-libm 오라클**(순수 코어 산술 — 이 호스트에서 코어 자신이
-//! 계산할 값과 동일) maxdiff를 2차 게이트(임계 문서화)로 판정한다. 선택
-//! 리스트는 두 오라클 모두와 **완전일치**를 요구한다(이산 판정 — 이것이
-//! "vs core" 이산 계약). sigmoid(exp_cr)은 트윈 불필요 — 비트동일 미러.
+//!   [트랜센던트 트윈 계약 — 과제 지정 G5/G6/G7 패턴] 초월함수 3종(rope
+//!   theta=base.powf·cos/sin, 소프트맥스 exp)은 호스트 libm(UCRT)과 장치
+//!   libdevice가 비트재현 불가(G5 원장: libdevice expf 3.1M 표본 30% ±1ulp)
+//!   → 오라클을 twin 모드로도 실행(q_theta/q_sincos_d/q_expf — .cu 트윈과
+//!   리터럴까지 동일 DAG)해 **커널↔twin 오라클 비트동일**을 1차 게이트로,
+//!   **커널↔core-libm 오라클**(순수 코어 산술 — 이 호스트에서 코어 자신이
+//!   계산할 값과 동일) maxdiff를 2차 게이트(임계 문서화)로 판정한다. 선택
+//!   리스트는 두 오라클 모두와 **완전일치**를 요구한다(이산 판정 — 이것이
+//!   "vs core" 이산 계약). sigmoid(exp_cr)은 트윈 불필요 — 비트동일 미러.
 //!
 //! [검증층 원장 — sm_89(RTX 4070 SUPER) 실측 2026-10-05, Flash-Next 27B
 //! GGUF 실측 형상 n_head=24·n_kv=2·hd=256·n_rot=64·idx 4×128·top_k 2048·r=4]
@@ -373,7 +373,7 @@ impl QsaOracle {
                     .filter(|b| !sb.contains(b))
                     .map(|b| block_score[b])
                     .fold(f32::NEG_INFINITY, f32::max);
-                if !(unsel_max < sel_min) {
+                if unsel_max >= sel_min {
                     return Err(format!(
                         "qsa 오라클: t={t} 선택 경계 동점(선택 집합 비유일) — 픽스처 부적격"
                     ));
@@ -536,15 +536,15 @@ fn gguf_norm_f32(g: &FnGguf, name: &str, want: usize) -> Result<Vec<f32>, String
     let raw = g.read_rows(name, 0, rows)?;
     let v: Vec<f32> = match t.ty {
         0 => raw
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         1 => raw
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
         30 => raw
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
         other => return Err(format!("{name}: gguf ty {other} 미지원(노름 텐서)")),
