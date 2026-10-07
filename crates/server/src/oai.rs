@@ -8,6 +8,81 @@ use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 
 // --- 최소 JSON 파싱 (중첩 없는 평탄 필드 추출) ---
+/// 단순 이스케이프 1글자 해석(`n`,`t`,`u` 이외).
+fn push_simple(out: &mut String, c: char) {
+    match c {
+        'n' => out.push('\n'),
+        't' => out.push('\t'),
+        'r' => out.push('\r'),
+        'b' => out.push('\u{8}'),
+        'f' => out.push('\u{c}'),
+        '/' => out.push('/'),
+        '"' => out.push('"'),
+        '\\' => out.push('\\'),
+        // 미지의 이스케이프는 관례대로 문자를 그대로 통과시킨다.
+        other => out.push(other),
+    }
+}
+
+/// `tail` 앞 4자리 16진수를 잘라내 `(값, 소비 후 나머지)`.
+/// 4자리가 모자라면 `None`이고 나머지는 **소비한 만큼만** 잘라낸 위치다 —
+/// 호출부가 원문 보존 후 그 지점부터 파싱을 재개해야 닫는 따옴표를
+/// 올바르게 처리할 수 있다.
+fn take_hex4(tail: &str) -> (Option<u32>, &str) {
+    let mut v: u32 = 0;
+    let mut rest = tail;
+    let mut n = 0usize;
+    while n < 4 {
+        let Some(c) = rest.chars().next() else {
+            break;
+        };
+        let Some(d) = c.to_digit(16) else {
+            break;
+        };
+        v = v * 16 + d;
+        n += 1;
+        rest = &rest[c.len_utf8()..];
+    }
+    (if n == 4 { Some(v) } else { None }, rest)
+}
+
+/// 이스케이프 하나를 해석해 `(결과, 소비 후 나머지)`를 돌려준다.
+/// 입력 `rest`는 `\` 다음부터 시작한다.
+fn take_escape(rest: &str) -> (String, &str) {
+    let Some(first) = rest.chars().next() else {
+        return (String::new(), rest);
+    };
+    if first != 'u' {
+        let mut s = String::new();
+        push_simple(&mut s, first);
+        let n = first.len_utf8();
+        return (s, &rest[n..]);
+    }
+    let (hi, after) = take_hex4(&rest[1..]);
+    let Some(hi) = hi else {
+        // 형식 이상 — `\u`만 원문 보존하고 소비한 16진수 뒤에서 재개한다.
+        // 남은 문자열을 통째로 삼키면 닫는 따옴표를 놓쳐 파싱이 무너진다.
+        return ("\\u".to_string(), after);
+    };
+    // 상위 서로게이트면 뒤따르는 `\uXXXX` 하위와 짝을 이룬다(BMP 밖 문자).
+    if (0xD800..0xDC00).contains(&hi) {
+        let low_src = after.strip_prefix("\\u").unwrap_or("");
+        let (lo, after2) = take_hex4(low_src);
+        if let Some(lo) = lo
+            && (0xDC00..0xE000).contains(&lo)
+            && let Some(c) = char::from_u32(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00))
+        {
+            return (c.to_string(), after2);
+        }
+        // 짝이 안 맞으면 상위만 보존(무손실).
+        return (format!("\\u{hi:04x}"), after);
+    }
+    match char::from_u32(hi) {
+        Some(c) => (c.to_string(), after),
+        None => (format!("\\u{hi:04x}"), after),
+    }
+}
+
 fn jstr(body: &str, key: &str) -> Option<String> {
     let pat = format!("\"{key}\":");
     let i = body.find(&pat)? + pat.len();
@@ -16,22 +91,21 @@ fn jstr(body: &str, key: &str) -> Option<String> {
         return None;
     }
     let mut out = String::new();
-    let mut esc = false;
-    for c in b[1..].chars() {
-        if esc {
-            out.push(match c {
-                'n' => '\n',
-                't' => '\t',
-                'r' => '\r',
-                other => other,
-            });
-            esc = false;
-        } else if c == '\\' {
-            esc = true;
-        } else if c == '"' {
-            break;
-        } else {
-            out.push(c);
+    let mut rest = &b[1..];
+    loop {
+        match rest.chars().next() {
+            None => break,
+            Some('\\') => {
+                let (s, tail) = take_escape(&rest[1..]);
+                out.push_str(&s);
+                rest = tail;
+            }
+            Some('"') => break,
+            Some(c) => {
+                let n = c.len_utf8();
+                out.push(c);
+                rest = &rest[n..];
+            }
         }
     }
     Some(out)
@@ -947,6 +1021,27 @@ mod http_tests {
         assert!(jstr(r#"{"a":"he said "hi""}"#, "a").is_some());
         assert_eq!(jstr(r#"{"a":123}"#, "a"), None);
         assert_eq!(jstr(r#"{"b":"y"}"#, "a"), None);
+    }
+
+    /// 2026-10-07: `\uXXXX`를 실제로 디코딩해야 한다. 종전 구현은 `\u`를
+    /// `other` 갈래로 흘려 `u`만 남겼다(`\uc778` → `uc778`) — 비ASCII를
+    /// 이스케이프해 보내는 클라이언트(파이썬 json.dumps 기본값)의 한국어가
+    /// 조용히 깨졌다. 게이트는 토큰 ID를 직접 넘겨 이 경로를 걷지 않는다.
+    #[test]
+    fn jstr_unicode_escape() {
+        // BMP 한국자
+        assert_eq!(jstr(r#"{"a":"서울"}"#, "a").as_deref(), Some("서울"));
+        // BMP 밖 문자(서로게이트 페어) — 😀
+        assert_eq!(jstr(r#"{"a":"😀"}"#, "a").as_deref(), Some("😀"));
+        // 한글 + 이모지 혼합
+        assert_eq!(
+            jstr(r#"{"a":"한국어 😀 mix"}"#, "a").as_deref(),
+            Some("한국어 😀 mix")
+        );
+        // 기존 단순 이스케이프는 그대로
+        assert_eq!(jstr(r#"{"a":"x\ny"}"#, "a").as_deref(), Some("x\ny"));
+        // 형식이 깨진 이스케이프는 원문 보존(무손실) — 조용히 지우지 않는다
+        assert_eq!(jstr(r#"{"a":"\uZZZZ"}"#, "a").as_deref(), Some("\\uZZZZ"));
     }
 
     #[test]
