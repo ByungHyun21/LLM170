@@ -443,7 +443,7 @@ impl FnNgramHead {
         let mut buf = vec![0u8; n * 8];
         f.read_exact(&mut buf).map_err(|e| e.to_string())?;
         Ok(buf
-            .chunks_exact(8)
+            .as_chunks::<8>().0.iter()
             .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
             .collect())
     }
@@ -552,11 +552,10 @@ pub fn fn_quant_config_stream(path: &Path) -> Result<FnQuantSummary, String> {
                     // cap_key로 이미 이동했으므로 여기서 판독),
                     // (b) tensor_storage 내부 "키:" 뒤 객체면 항목 계수.
                     if depth == 1 {
-                        if let Some(k) = cap_key.take() {
-                            if k == "tensor_storage" {
+                        if let Some(k) = cap_key.take()
+                            && k == "tensor_storage" {
                                 ts_depth = 2;
                             }
-                        }
                     } else if depth == 2 && ts_pending {
                         entries += 1;
                         ts_pending = false;
@@ -568,11 +567,10 @@ pub fn fn_quant_config_stream(path: &Path) -> Result<FnQuantSummary, String> {
                 b'}' => {
                     if depth == 1 {
                         // 마지막 멤버(콜론 뒤 쉽표 없음)도 누락 없이 확정.
-                        if let Some(k) = cap_key.take() {
-                            if !val_buf.trim().is_empty() {
+                        if let Some(k) = cap_key.take()
+                            && !val_buf.trim().is_empty() {
                                 vals.insert(k, val_buf.trim().to_string());
                             }
-                        }
                     }
                     depth -= 1;
                     after_colon.truncate(depth + 1);
@@ -610,13 +608,11 @@ pub fn fn_quant_config_stream(path: &Path) -> Result<FnQuantSummary, String> {
                     }
                 }
                 b',' => {
-                    if depth == 1 {
-                        if let Some(k) = cap_key.take() {
-                            if !val_buf.trim().is_empty() {
+                    if depth == 1
+                        && let Some(k) = cap_key.take()
+                            && !val_buf.trim().is_empty() {
                                 vals.insert(k, val_buf.trim().to_string());
                             }
-                        }
-                    }
                     after_colon[depth] = false;
                     ts_pending = false;
                 }
@@ -892,13 +888,13 @@ impl FnGguf {
                         let b = g.take((S[et as usize] * cnt) as usize)?;
                         if et == 4 || et == 5 {
                             let v = b
-                                .chunks_exact(4)
+                                .as_chunks::<4>().0.iter()
                                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                                 .collect();
                             kv.insert(key, FnGgufVal::ArrI32(v));
                         } else {
                             let v = b
-                                .chunks_exact(8)
+                                .as_chunks::<8>().0.iter()
                                 .map(|c| {
                                     u64::from_le_bytes([
                                         c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
@@ -971,11 +967,10 @@ impl FnGguf {
             });
         }
         let mut align = 32u64;
-        if first {
-            if let Some(FnGgufVal::U32(v)) = kv.get("general.alignment") {
+        if first
+            && let Some(FnGgufVal::U32(v)) = kv.get("general.alignment") {
                 align = *v as u64;
             }
-        }
         let data_base = g.pos.div_ceil(align) * align;
         let split_count = match kv.get("split.count") {
             Some(FnGgufVal::U64(v)) => *v as u32,

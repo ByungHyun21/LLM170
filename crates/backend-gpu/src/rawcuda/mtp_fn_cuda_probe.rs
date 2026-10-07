@@ -577,8 +577,8 @@ fn o_draft_step(
     //    (모듈 등록·오라클 계산이 동일 가중을 본다 — 이원 검증 계약).
     let (mix2, inj2) = o_hc_mix(dims, &w.fn_n, &w.fd, &w.fu, Some(&w.fi), &res2);
     for &(e, _) in &o_route_select(dims, w, &mix2) {
-        if !exps.contains_key(&(e as usize)) {
-            exps.insert(e as usize, exp_fn(e as usize)?);
+        if let std::collections::hash_map::Entry::Vacant(ent) = exps.entry(e as usize) {
+            ent.insert(exp_fn(e as usize)?);
         }
     }
     let (mout, sel) = o_moe(dims, w, exps, &mix2)?;
@@ -801,7 +801,7 @@ fn patch_mixer(dir: &Path, dims: &MtpFnDims) -> Result<(Vec<f32>, Vec<f32>, Vec<
         let mut buf = vec![0u8; (e - b) as usize];
         f.read_exact(&mut buf).map_err(|e| e.to_string())?;
         let vals: Vec<f32> = buf
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
         if name.ends_with("hc_norm.weight") {
@@ -843,12 +843,12 @@ fn gguf_rows(g: &FnGguf, t: &FnGgufTensor, row0: u64, nrows: u64) -> Result<Vec<
 
 /// Q8_0 행 디양자화 — deq.rs deq_q8_0(L181-185) 미러(y[j] = qs·d).
 fn deq_q8_0_rows(raw: &[u8], n_in: usize) -> Result<Vec<f32>, String> {
-    if n_in % 32 != 0 {
+    if !n_in.is_multiple_of(32) {
         return Err(format!("deq q8_0: n_in={n_in} — 32 배수 계약"));
     }
     let nblk = n_in / 32;
     let rowb = nblk * 34;
-    if raw.len() % rowb != 0 {
+    if !raw.len().is_multiple_of(rowb) {
         return Err(format!(
             "deq q8_0: bytes={} — 행 바이트 {rowb} 정렬 가드",
             raw.len()
@@ -878,7 +878,7 @@ fn gguf_f32(g: &FnGguf, name: &str) -> Result<Vec<f32>, String> {
         return Err(format!("gguf f32: {name} ty{} — F32 계약", t.ty));
     }
     Ok(raw
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }
@@ -1089,8 +1089,7 @@ pub fn cuda_mtp_frame_check(dir: &str, gguf_arg: &str) -> Result<String, String>
         let (mdc, bdc, nc) = o_judge(&got.chain_h, &o.chain);
         let pass = mdh <= MTP_CHAIN_THRESH && nh == 0 && mdc <= MTP_CHAIN_THRESH && nc == 0;
         println!(
-            "device: {dev} | mtp-frame (iii) patch fixture nextn_head (F16 {}: {}·{}·{}): hin maxdiff={mdh:.3e}/{bdh}b chain={mdc:.3e}/{bdc}b nan={nh}/{nc} | {}",
-            "정확변환",
+            "device: {dev} | mtp-frame (iii) patch fixture nextn_head (F16 정확변환: {}·{}·{}): hin maxdiff={mdh:.3e}/{bdh}b chain={mdc:.3e}/{bdc}b nan={nh}/{nc} | {}",
             pn.len(),
             pd.len(),
             pu.len(),

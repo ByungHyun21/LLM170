@@ -27,7 +27,7 @@
 //!   토큰. 스펙 라운드 후 프로브 종료(롤백 재실행은 연속 생성 계약 —
 //!   프로브는 수용 목록 동일성으로 판정).
 
-//! ═══ 체인 배선 계약 — 원천 core frame/forward.rs(워크트리 기준 줄번호) ═══
+//!   ═══ 체인 배선 계약 — 원천 core frame/forward.rs(워크트리 기준 줄번호) ═══
 //! - 층 루프 순서: PLE(is_ple) → hc attn mix → GDN(is_recr)|QSA →
 //!   hc_combine → hc ffn mix → MoE → hc_combine — frame_forward_ex의
 //!   스테이지 발행 순서 그대로.
@@ -53,13 +53,13 @@
 //!    검증한다.
 //! ② 형상은 실측 GGUF 메타에서 자동 열거(FnDims::from_gguf — 추정 금지)
 //!    + 실측치 대조 가드(48L·2560·hc4·lr320·GDN 48/128/16/4·QSA
-//!    24/2/256/64·idx 4×128·top2048·r4·MoE 512e/10/640·ple [1]·ngram3).
-//! ③ 캡처-재생: 실측 토큰(smf64) → 실 token_embd 행 → 실 해시 → 실
-//!    IQ4_NL 표 행 pread → 실가중 체인 3스텝(증분 상태 — 2스텝째 진입
-//!    상태는 1스텝 산출물로 비영, S0≠0 정신 plans/124 §3.3).
-//! ④ 종단 값이 유일 불변량: 스텝별 logits maxdiff + 그리디 토큰 동일성
-//!    (argmax는 체인 수준 토큰 동일성 관찰로만 허용 — 판정 본체는 값
-//!    maxdiff. 과제 계약 §6).
+//!      24/2/256/64·idx 4×128·top2048·r4·MoE 512e/10/640·ple [1]·ngram3).
+//!      ③ 캡처-재생: 실측 토큰(smf64) → 실 token_embd 행 → 실 해시 → 실
+//!      IQ4_NL 표 행 pread → 실가중 체인 3스텝(증분 상태 — 2스텝째 진입
+//!      상태는 1스텝 산출물로 비영, S0≠0 정신 plans/124 §3.3).
+//!      ④ 종단 값이 유일 불변량: 스텝별 logits maxdiff + 그리디 토큰 동일성
+//!      (argmax는 체인 수준 토큰 동일성 관찰로만 허용 — 판정 본체는 값
+//!      maxdiff. 과제 계약 §6).
 //!
 //! ═══ 가중치 원장 — REAL vs 합성(형상은 전부 실측) ═══
 //! · REAL(GGUF 오프셋 직독, 전량 적재 금지 계약): 메타·스케줄·eps·해시
@@ -375,8 +375,7 @@ fn nthreads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(12)
-        .max(1)
+        .clamp(1, 12)
 }
 
 /// out[o] = Σ_i x[i]·w[o·k+i] — 출력 행 분할 병렬(행 내 순차 누산이라
@@ -397,8 +396,6 @@ fn par_dot_rows(x: &[f32], w: &[f32], n_out: usize, k: usize) -> Vec<f32> {
     let per = n_out.div_ceil(nt);
     std::thread::scope(|sc| {
         for (t, chunk) in out.chunks_mut(per).enumerate() {
-            let x = x;
-            let w = w;
             let base = t * per;
             sc.spawn(move || {
                 for (j, ov) in chunk.iter_mut().enumerate() {
@@ -691,7 +688,7 @@ fn gdn_ref_pre(
     let mut ring = ring0.to_vec();
     let cch = ng * ds * 2 + dr * ds;
     for c in 0..cch {
-        let (mut s0, mut s1, mut s2) = (ring[0 * cch + c], ring[1 * cch + c], ring[2 * cch + c]);
+        let (mut s0, mut s1, mut s2) = (ring[c], ring[cch + c], ring[2 * cch + c]);
         for t in 0..t_len {
             let x = qkv[t * cch + c];
             let mut sum = cw_l[c * ck + (ck - 1)] * x;
@@ -710,8 +707,8 @@ fn gdn_ref_pre(
             s1 = s2;
             s2 = x;
         }
-        ring[0 * cch + c] = s0;
-        ring[1 * cch + c] = s1;
+        ring[c] = s0;
+        ring[cch + c] = s1;
         ring[2 * cch + c] = s2;
     }
     let mut q2 = vec![0f32; t_len * k_len];
@@ -1648,7 +1645,7 @@ fn mtp_draft_oracle(fx: &ChainFx, st: &mut MtpOracleSt, en: &[f32], hn: &[f32]) 
         &fx.moe_sh_up,
         &fx.moe_sh_down,
         &fx.moe_experts,
-        &[mix2.clone()],
+        std::slice::from_ref(&mix2),
     )
     .into_iter()
     .next()
@@ -1822,12 +1819,12 @@ fn read_w2d(g: &FnGguf, name: &str) -> Result<Vec<f32>, String> {
     let raw = g.read_rows(name, 0, rows as u64)?;
     let v: Vec<f32> = match t.ty {
         0 => raw
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         8 => dequant_q8_rows(&raw, rows, k),
         30 => raw
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
         other => return Err(format!("{name}: gguf ty {other} — 체인 투영 계약 밖")),
@@ -1939,7 +1936,7 @@ fn load_fixture(gguf_main: &str) -> Result<ChainFx, String> {
         .collect();
     let (dr, cch) = (dims.dt_rank, dims.gdn_conv_ch());
     let f32s = |raw: &[u8]| -> Vec<f32> {
-        raw.chunks_exact(4)
+        raw.as_chunks::<4>().0.iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     };
@@ -1983,15 +1980,15 @@ fn load_fixture(gguf_main: &str) -> Result<ChainFx, String> {
         let raw = g.read_rows(name, 0, rows)?;
         let v: Vec<f32> = match t.ty {
             0 => raw
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
             1 => raw
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect(),
             30 => raw
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                 .collect(),
             other => return Err(format!("{name}: ty {other} 미지원(노름)")),
@@ -2241,6 +2238,7 @@ struct ChainOut {
 }
 
 /// 스펙 라운드 종착(모듈·오라클 쌍).
+#[derive(Default)]
 struct SpecOut {
     proposals_mod: Vec<u32>,
     proposals_or: Vec<u32>,
@@ -2251,19 +2249,6 @@ struct SpecOut {
     verify_logits_md: Vec<f32>,
 }
 
-impl Default for SpecOut {
-    fn default() -> Self {
-        SpecOut {
-            proposals_mod: Vec::new(),
-            proposals_or: Vec::new(),
-            tgt_mod: Vec::new(),
-            tgt_or: Vec::new(),
-            accepted_mod: Vec::new(),
-            accepted_or: Vec::new(),
-            verify_logits_md: Vec::new(),
-        }
-    }
-}
 
 /// 모듈층 인스턴스 꾸러미(단일 상주 원칙 — 체인 프로브 수명).
 struct ChainMods {
@@ -2394,13 +2379,7 @@ fn run_chain(fx: &mut ChainFx, mods: &mut ChainMods, neg: ChainNeg) -> Result<Ch
     let mut spec_h_prev_or: Vec<f32> = Vec::new();
     for step in 0..STEPS + 1 {
         let verify = step == STEPS;
-        let t = if verify {
-            2
-        } else if step == 0 {
-            2
-        } else {
-            1
-        };
+        let t = if verify || step == 0 { 2 } else { 1 };
         let toks: Vec<u32> = if verify {
             verify_toks.clone()
         } else if step == 0 {

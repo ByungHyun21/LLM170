@@ -232,7 +232,7 @@ fn ref_pre_stages(
     let mut ring = ring0.to_vec();
     let cch = ng * ds * 2 + dr * ds;
     for c in 0..cch {
-        let (mut s0, mut s1, mut s2) = (ring[0 * cch + c], ring[1 * cch + c], ring[2 * cch + c]);
+        let (mut s0, mut s1, mut s2) = (ring[c], ring[cch + c], ring[2 * cch + c]);
         for t in 0..t_len {
             let x = qkv[t * cch + c];
             let mut sum = cw_l[c * ck + (ck - 1)] * x;
@@ -251,8 +251,8 @@ fn ref_pre_stages(
             s1 = s2;
             s2 = x;
         }
-        ring[0 * cch + c] = s0;
-        ring[1 * cch + c] = s1;
+        ring[c] = s0;
+        ring[cch + c] = s1;
         ring[2 * cch + c] = s2;
     }
     // q/k l2 — L86-97(n_group 헤드 · eps floor · 순열 없음).
@@ -573,7 +573,7 @@ impl FnGdnFixture {
         }
         let (dr, cch) = (dims.dt_rank, dims.gdn_conv_ch());
         let f32s = |raw: &[u8]| -> Vec<f32> {
-            raw.chunks_exact(4)
+            raw.as_chunks::<4>().0.iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         };

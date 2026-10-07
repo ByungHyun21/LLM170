@@ -28,7 +28,7 @@
 //! - crates/exl3/src/trellis.rs — PERM_INV L24 · mul1_decode L47 · tile_word
 //!   L60 · dequant_view L128 · had128(f64) L279 — 가중치 디양자화 미러.
 //! - crates/core/src/deepseek4/loader.rs — linear L344(스트립 병렬 디양자화)
-//!    · conv/plain_f32 L156 · plain_kmat L385 · embed_rows L437(오프셋 행 독).
+//!   · conv/plain_f32 L156 · plain_kmat L385 · embed_rows L437(오프셋 행 독).
 //!
 //! [정합 원장 요약 — 전 케이스 비트동일 목표(B3 판정 기준)] L0/L2/L3 전
 //! 스테이지(c_Q·q·kv·압축 엔트리·qI·kI·인덱서 가중치·스코어·선택·어텐션
@@ -1060,7 +1060,9 @@ fn dequant_linear(ar: &StArchive, key: &str) -> Result<Vec<f32>, String> {
     let suh = ar.read(&format!("{key}.suh"))?;
     let svh = ar.read(&format!("{key}.svh"))?;
     let tre_u32: Vec<u32> = tre
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let lin = LinearMirror {

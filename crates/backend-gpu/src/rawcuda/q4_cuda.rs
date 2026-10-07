@@ -131,7 +131,7 @@ impl Q4Cuda {
         n_in: usize,
         n_out: usize,
     ) -> Result<(), String> {
-        if n_in == 0 || n_in % Q4K_BLCK != 0 || n_out == 0 {
+        if n_in == 0 || !n_in.is_multiple_of(Q4K_BLCK) || n_out == 0 {
             return Err(format!(
                 "q4 add: n_in={n_in} n_out={n_out} — n_in>0·256배수·n_out>0 계약 위반"
             ));
@@ -262,7 +262,7 @@ impl Q4Cuda {
         let (n_in, n_out) = self
             .lin_shape(key)
             .ok_or_else(|| format!("q4 gemm: 미등록 선형 {key}"))?;
-        if rows.len() % n_in != 0 {
+        if !rows.len().is_multiple_of(n_in) {
             return Err(format!(
                 "q4 gemm: rows.len={} % n_in={n_in} != 0 — 행 배치 계약 위반",
                 rows.len()

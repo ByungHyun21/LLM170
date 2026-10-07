@@ -29,8 +29,8 @@
 //! - 블록: stages/ple.rs L119-235 — 토큰·스트림 산출을 단일 스레드로 재현
 //!   (core 병렬 분할은 "토큰별 결과가 그대로" 주석 L77·L87과 같이 수치
 //!   불변 — 트윈은 순서만 계약).
-//! key/value 투영값은 양측 공유 입력(실 Q8_0 가중 디양자 + 순차 f32
-//! 내적 — 투영 자체는 REUSE 영역이라 판정 대상 아님).
+//!   key/value 투영값은 양측 공유 입력(실 Q8_0 가중 디양자 + 순차 f32
+//!   내적 — 투영 자체는 REUSE 영역이라 판정 대상 아님).
 //!
 //! 프로브(plans/124 §5·§6 — 판정은 값 maxdiff/정수 불일치, argmax 금지):
 //! (i)   ple_block: 실가중·실해시·실테이블 t=13 — emb/gates/gated/conv_out/
@@ -490,7 +490,7 @@ fn load_fixture(gguf_main: &str) -> Result<PleFixture, String> {
     want_tensor("blk.1.ple_value.weight", 8, &[2560, 2560])?;
     let f32_1d = |name: &str| -> Result<Vec<f32>, String> {
         let b = g.read_rows(name, 0, 1)?;
-        Ok(b.chunks_exact(4)
+        Ok(b.as_chunks::<4>().0.iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
     };
@@ -500,7 +500,7 @@ fn load_fixture(gguf_main: &str) -> Result<PleFixture, String> {
     // conv1d [4,10240] 행우선 전체 — flat c·kern+k(core f32_vec4 파일 순서).
     let cb = g.read_rows("blk.1.ple_conv1d.weight", 0, 10240)?;
     let conv_w: Vec<f32> = cb
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let kb = g.read_rows("blk.1.ple_key.weight", 0, 10240)?;

@@ -31,7 +31,7 @@ impl Exl3CudaDecoder {
     /// 오프셋 계약(w·hidden)은 이 등록 형상에서 나온다(27B는 w·5120 —
     /// 오프셋 누락이 결함 2호: 전 노름 L0 행 판독).
     pub fn set_norm_weights(&mut self, nw: &[u8], rows: usize) -> Result<(), String> {
-        if self.hidden == 0 || self.hidden % 1024 != 0 || self.hidden > 8192 {
+        if self.hidden == 0 || !self.hidden.is_multiple_of(1024) || self.hidden > 8192 {
             return Err(format!(
                 "norm: hidden={} — 1024 배수·8192 이하 계약(커널 v[8] 상한)",
                 self.hidden
@@ -119,7 +119,7 @@ impl Exl3CudaDecoder {
         if self.hidden == 0 {
             return Err("norm: hidden 미설정".into());
         }
-        if x.len() != ab.len() || x.is_empty() || x.len() % self.hidden != 0 {
+        if x.len() != ab.len() || x.is_empty() || !x.len().is_multiple_of(self.hidden) {
             return Err(format!(
                 "norm: x.len={} ab.len={} hidden={} — [t][hidden] 계약 위반",
                 x.len(),

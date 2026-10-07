@@ -578,7 +578,7 @@ pub fn cuda_ds4_hc_check(dir: &str) -> Result<String, String> {
     // maxdiff > 임계 — 순서가 판정에 고정되어 있음을 증명).
     if let Some(comb3) = &first_comb {
         let c0 = &comb3[0];
-        let pos_ok;
+
         let mut rs_max = 0.0f32;
         let mut cs_max = 0.0f32;
         for j in 0..hc {
@@ -589,7 +589,7 @@ pub fn cuda_ds4_hc_check(dir: &str) -> Result<String, String> {
             let cs: f32 = (0..hc).map(|j| c0[j * hc + k]).sum();
             cs_max = cs_max.max((cs - 1.0).abs());
         }
-        pos_ok = c0.iter().all(|&v| v > 0.0);
+        let pos_ok = c0.iter().all(|&v| v > 0.0);
         // 교환 변형 comb — 동일 토큰 mixes 로 재계산.
         let res0 = gen_res_hc(1, hcd, 0x5EED_F00D_0000_1100, 0.5);
         let x0 = &res0[0];

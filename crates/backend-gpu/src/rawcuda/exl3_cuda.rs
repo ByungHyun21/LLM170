@@ -904,7 +904,7 @@ impl Exl3CudaDecoder {
         if self.lin.contains_key(key) {
             return Err(format!("{key}: 중복 등록"));
         }
-        if k == 0 || k % 128 != 0 || n == 0 || n % 128 != 0 {
+        if k == 0 || !k.is_multiple_of(128) || n == 0 || !n.is_multiple_of(128) {
             return Err(format!("{key}: k={k} n={n} — 128 배수 계약 위반"));
         }
         if !(1..=6).contains(&krate) {
@@ -987,7 +987,7 @@ impl Exl3CudaDecoder {
     /// ≥n_layers = 전체. 노름·임베딩·GDN 상수는 G3+ 모듈 단계(이 시점
     /// 미적재 — 선형 레지스트리만 채운다).
     pub fn load(dir: &str, lim_layers: usize) -> Result<Self, String> {
-        let cfg = std::fs::read_to_string(&format!("{dir}/config.json"))
+        let cfg = std::fs::read_to_string(format!("{dir}/config.json"))
             .map_err(|e| format!("config.json: {e}"))?;
         let v = JParser {
             b: cfg.as_bytes(),

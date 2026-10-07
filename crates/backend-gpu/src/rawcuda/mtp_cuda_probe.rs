@@ -294,7 +294,7 @@ fn gemv_reference_range(lin: &RefLin, x: &[f32], nseg: usize, n0: usize, n1: usi
     let (k, n, krate) = (lin.k, lin.n, lin.krate);
     let ktiles = k / 16;
     let ntiles = n / 16;
-    debug_assert!(n0 % 128 == 0 && n1 % 128 == 0 && n0 < n1 && n1 <= n);
+    debug_assert!(n0.is_multiple_of(128) && n1.is_multiple_of(128) && n0 < n1 && n1 <= n);
 
     let mut ah = vec![0f32; k];
     for ch in 0..k / 128 {
@@ -410,7 +410,7 @@ fn gdn_exp_d(x: f64) -> f64 {
                     + r * (0.041666666666666664f64
                         + r * (0.008333333333333333f64
                             + r * (0.001388888888888889f64 + r * 0.0001984126984126984f64))))));
-    let scale = f64::from_bits((((1023 + k) as u64) << 52) as u64);
+    let scale = f64::from_bits(((1023 + k) as u64) << 52);
     p * scale
 }
 
@@ -691,15 +691,15 @@ fn mtp_rms_reference(x: &[f32], w: &[f32]) -> Vec<f32> {
 fn st_to_f32(bytes: &[u8], dt: u8) -> Result<Vec<f32>, String> {
     match dt {
         1 => Ok(bytes
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect()),
         2 => Ok(bytes
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect()),
         0 => Ok(bytes
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
             .collect()),
         other => Err(format!("mtp 상수 dtype 코드 {other} 미지원")),
@@ -736,7 +736,7 @@ impl LinBuf {
             return Err(format!("{key}: 판독 suh/svh 길이 이상"));
         }
         let tre_u32: Vec<u32> = tre
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         Ok(Self {

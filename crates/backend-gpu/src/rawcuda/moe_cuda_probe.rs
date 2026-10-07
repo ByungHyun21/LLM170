@@ -250,7 +250,7 @@ fn moe_ffn_ref(
 }
 
 /// 라우터 행 가우기(가변 슬라이스 — 폐규칙 회피용 자유 함수).
-fn row_of<'a>(r: &'a mut [u16], e: usize, w: usize) -> &'a mut [u16] {
+fn row_of(r: &mut [u16], e: usize, w: usize) -> &mut [u16] {
     &mut r[e * w..(e + 1) * w]
 }
 
@@ -566,7 +566,17 @@ pub fn cuda_moe_check() -> Result<String, String> {
 
     // (ii) 실측 MoE 형상 — config.json이 단일 진실(누락 시 비영: 실 파일
     // 증명이 목적 — fn-inv 계급과 동일 계약).
-    let d35 = moe_dims_from_config("D:/models/Qwen3.6-35B-A3B-exl3-4.00bpw/config.json")?;
+    // config 경로 — LLM170_CUDA_EXL3_35_CONFIG / _FN_CONFIG 오버라이드
+    // (기기별 픽스처 경로 계약 — 2026-10-07 리눅스 포팅, fatbin 리졸버 동일 패턴).
+    let moe_cfg = |env: &str, def: &str| -> String {
+        std::env::var_os(env)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| def.to_string())
+    };
+    let d35 = moe_dims_from_config(&moe_cfg(
+        "LLM170_CUDA_EXL3_35_CONFIG",
+        "D:/models/Qwen3.6-35B-A3B-exl3-4.00bpw/config.json",
+    ))?;
     let (_, s, p, f) = run_case("(ii-a) 35B-A3B cfg", &d35, 0x5EED_F00D_0000_0002, 4)?;
     report.push_str(" · ");
     report.push_str(&s);
@@ -574,7 +584,10 @@ pub fn cuda_moe_check() -> Result<String, String> {
         fails.push(f);
     }
 
-    let dfn = moe_dims_from_config("D:/models/Qwen3.8-Flash-Next-exl3-5.05bpw/config.json")?;
+    let dfn = moe_dims_from_config(&moe_cfg(
+        "LLM170_CUDA_EXL3_FN_CONFIG",
+        "D:/models/Qwen3.8-Flash-Next-exl3-5.05bpw/config.json",
+    ))?;
     let (_, s, p, f) = run_case("(ii-b) Flash-Next cfg", &dfn, 0x5EED_F00D_0000_0003, 4)?;
     report.push_str(" · ");
     report.push_str(&s);
@@ -633,7 +646,7 @@ pub fn cuda_moe_negative_check() -> Result<String, String> {
     let (sel_cor, _) = route_ref(&fxc, &xs);
     for row in &sel_cor {
         for &(e, _) in row {
-            if !experts.contains_key(&e) {
+            if let std::collections::hash_map::Entry::Vacant(ent) = experts.entry(e) {
                 let w = gen_expert16(&d, e, seed);
                 m.add_expert_f16(
                     e as usize,
@@ -641,7 +654,7 @@ pub fn cuda_moe_negative_check() -> Result<String, String> {
                     &u16s_bytes(&w.1),
                     &u16s_bytes(&w.2),
                 )?;
-                experts.insert(e, w);
+                ent.insert(w);
             }
         }
     }

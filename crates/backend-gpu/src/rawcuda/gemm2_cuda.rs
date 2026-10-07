@@ -200,7 +200,7 @@ impl Exl3CudaDecoder {
     /// 처리(plain 경로 grid.y가 ceil(T/32)로 분할).
     pub fn gemm2_host(&mut self, key: &str, rows: &[f32]) -> Result<Vec<f32>, String> {
         let l = self.lin_copy(key)?;
-        if rows.is_empty() || rows.len() % l.k != 0 {
+        if rows.is_empty() || !rows.len().is_multiple_of(l.k) {
             return Err(format!(
                 "gemm2: rows.len={} k={} — [t][k] 계약 위반",
                 rows.len(),
@@ -230,7 +230,7 @@ impl Exl3CudaDecoder {
         rows: &[f32],
     ) -> Result<Vec<f32>, String> {
         let l = self.lin_copy(key)?;
-        if rows.is_empty() || rows.len() % l.k != 0 {
+        if rows.is_empty() || !rows.len().is_multiple_of(l.k) {
             return Err(format!(
                 "gemm2: rows.len={} k={} — [t][k] 계약 위반",
                 rows.len(),
@@ -255,7 +255,7 @@ impl Exl3CudaDecoder {
     /// 검증층 진단 — 단계별 산출 판독(G2 debug_run_stages 미러):
     /// stages=1: had_in만(f16 [t][k] 바이트 → out_ah). stages=2:
     /// + gemm2 H도메인 s(kseg 부분합은 nseg 순서로 호스트 합산 —
-    /// had_out 적용 전 값, 결함 국소화 계기·원장 17호).
+    ///   had_out 적용 전 값, 결함 국소화 계기·원장 17호).
     pub fn debug_gemm2_stages(
         &mut self,
         key: &str,
@@ -268,7 +268,7 @@ impl Exl3CudaDecoder {
             return Err(format!("debug_gemm2_stages: stages={stages} — 1 또는 2"));
         }
         let l = self.lin_copy(key)?;
-        if rows.is_empty() || rows.len() % l.k != 0 {
+        if rows.is_empty() || !rows.len().is_multiple_of(l.k) {
             return Err(format!(
                 "gemm2: rows.len={} k={} — [t][k] 계약 위반",
                 rows.len(),

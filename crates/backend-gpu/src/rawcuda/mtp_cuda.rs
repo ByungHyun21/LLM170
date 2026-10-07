@@ -161,12 +161,12 @@ impl MtpDims {
                 "mtp: head_dim {d} — 256 고정 계약(exl3_attn 64차 rope)"
             ));
         }
-        if q_heads == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
+        if q_heads == 0 || kv_heads == 0 || !q_heads.is_multiple_of(kv_heads) {
             return Err(format!(
                 "mtp: q_heads={q_heads} kv_heads={kv_heads} — q%kv==0 계약(GQA)"
             ));
         }
-        if hidden % 1024 != 0 || hidden > 8192 || hidden == 0 {
+        if !hidden.is_multiple_of(1024) || hidden > 8192 || hidden == 0 {
             return Err(format!(
                 "mtp: hidden={hidden} — 1024 배수·8192 이하 계약(rms v[8])"
             ));

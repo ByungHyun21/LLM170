@@ -128,7 +128,7 @@ impl QsaCuda {
         if n_full == 0 {
             return Err("qsa: QSA층(compress≠0) 없음".into());
         }
-        if cap == 0 || cap % 4 != 0 || cap / 4 + 2 > QSA_BK_MAX {
+        if cap == 0 || !cap.is_multiple_of(4) || cap / 4 + 2 > QSA_BK_MAX {
             return Err(format!(
                 "qsa: cap={cap} — 4배수·n_blocks 상한 QSA_BK_MAX={QSA_BK_MAX} 계약"
             ));

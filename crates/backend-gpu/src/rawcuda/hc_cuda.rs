@@ -18,7 +18,7 @@
 //! - silu(lo/hc)·게이트 sigmoid·스트림 평균: stages/hc.rs L58-79 ·
 //!   ops.rs L127-133 공식 그대로(-fmad=false 빌드 — assets/exl3_fn_hc.cu
 //!   헤드 [빌드 계약]).
-//! 판정은 값 maxdiff(비트 불일치 수 보고) — argmax 판정 금지(§6).
+//!   판정은 값 maxdiff(비트 불일치 수 보고) — argmax 판정 금지(§6).
 //!
 //! [토큰축 배치] hc.rs 헤드 원장: down/up/inject 전 토큰 1회 체인 —
 //! 호출당 h2d(잔류 전체) 1회 + 커널 5-6회 + d2h 2회(mixed·inject).
@@ -93,7 +93,7 @@ impl HcDims {
         if hc == 0 || hc > 8 {
             return Err(format!("hc: 스트림 수 {hc} — 1..=8 계약(블록 32세그먼트)"));
         }
-        if n_embd == 0 || n_embd % 32 != 0 {
+        if n_embd == 0 || !n_embd.is_multiple_of(32) {
             return Err(format!(
                 "hc: n_embd={n_embd} — 32 배수 계약(sq_sum 세그먼트)"
             ));
@@ -105,7 +105,7 @@ impl HcDims {
             hc,
             n_embd,
             low_rank,
-            eps: eps as f32,
+            eps,
         })
     }
 }
@@ -228,11 +228,10 @@ impl HcCuda {
         if up.len() != hcn * lr {
             return Err(format!("hc: up {} != {hcn}×{lr}", up.len()));
         }
-        if let Some(wi) = inject {
-            if wi.len() != hc * hcn {
+        if let Some(wi) = inject
+            && wi.len() != hc * hcn {
                 return Err(format!("hc: inject {} != {hc}×{hcn}", wi.len()));
             }
-        }
         let _g = self.cc.guard()?;
         if let Some(old) = self.mixers.remove(&(il, kind.to_string())) {
             self.cc.free(old.dnorm)?;

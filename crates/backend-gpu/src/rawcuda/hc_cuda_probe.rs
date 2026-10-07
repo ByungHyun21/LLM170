@@ -325,7 +325,7 @@ fn patch_mixer(dir: &Path, dims: &HcDims) -> Result<(Vec<f32>, Vec<f32>, Vec<f32
         let mut buf = vec![0u8; (e - b) as usize];
         std::io::Read::read_exact(&mut f, &mut buf).map_err(|e| e.to_string())?;
         let vals: Vec<f32> = buf
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
         if name.ends_with("hc_norm.weight") {
@@ -440,8 +440,7 @@ pub fn cuda_hc_check(dir: &str) -> Result<String, String> {
     let (mdp, bdp, np_) = flat_judge(&got_p, &want_p);
     let pass = bdp == 0 && np_ == 0;
     println!(
-        "device: {dev} | fn-hc (iii) patch fixture nextn_head T=2 (F16→f32 {}: {}·{}·{}): maxdiff={mdp:.3e} bitdiff={bdp}/{} nan={np_} | {}",
-        "정확변환",
+        "device: {dev} | fn-hc (iii) patch fixture nextn_head T=2 (F16→f32 정확변환: {}·{}·{}): maxdiff={mdp:.3e} bitdiff={bdp}/{} nan={np_} | {}",
         pn.len(),
         pd.len(),
         pu.len(),

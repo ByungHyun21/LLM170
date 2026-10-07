@@ -1,9 +1,9 @@
 //! DeepSeek-V4 MoE 스테이지 CUDA 모듈층 — plans/130 B3, 2026-10-05.
 //! 해시 라우팅(L0-2, tid2eid 표 룩업) + noaux_tc 라우팅(L3+, sqrtsoftplus
 //! + e_score_correction_bias top-k) + EXL3 trellis 전문가 SwiGLU(limit 10
-//! 비대칭 클램프) + 공유 전문가 무스케일 가산의 단일 진실.
-//! 원천 산술 계약: crates/core/src/deepseek4/stages/moe.rs(CPU 황금 기준)
-//! — 커널 산술 계약은 assets/ds4_moe.cu 헤더.
+//!   비대칭 클램프) + 공유 전문가 무스케일 가산의 단일 진실.
+//!   원천 산술 계약: crates/core/src/deepseek4/stages/moe.rs(CPU 황금 기준)
+//!   — 커널 산술 계약은 assets/ds4_moe.cu 헤더.
 //!
 //! 3층 분리 원칙(plans/124 §5): 이 층은 가중치 상주 + 계산 API. 검증 자산
 //! (오라클·픽스처·판정)은 ds4_moe_cuda_probe.rs — 모듈 파일 오염 금지(원장).
@@ -189,7 +189,11 @@ impl Ds4MoeCuda {
                 dims.n_routed, dims.n_active
             ));
         }
-        if dims.dim == 0 || dims.dim % 128 != 0 || dims.inter == 0 || dims.inter % 128 != 0 {
+        if dims.dim == 0
+            || !dims.dim.is_multiple_of(128)
+            || dims.inter == 0
+            || !dims.inter.is_multiple_of(128)
+        {
             return Err(format!(
                 "ds4_moe new: dim={} inter={} — 128 배수 계약(fp8-sim 블록·trellis 정렬)",
                 dims.dim, dims.inter
@@ -307,23 +311,23 @@ impl Ds4MoeCuda {
                 d.dim * d.n_routed
             ));
         }
-        if let Some(b) = bias {
-            if b.len() != d.n_routed {
-                return Err(format!(
-                    "ds4_moe gate: bias.len={} != n_routed={}",
-                    b.len(),
-                    d.n_routed
-                ));
-            }
+        if let Some(b) = bias
+            && b.len() != d.n_routed
+        {
+            return Err(format!(
+                "ds4_moe gate: bias.len={} != n_routed={}",
+                b.len(),
+                d.n_routed
+            ));
         }
-        if let Some(tt) = tid2eid {
-            if tt.len() % d.n_active != 0 {
-                return Err(format!(
-                    "ds4_moe gate: tid2eid.len={} — n_active={} 배수 아님",
-                    tt.len(),
-                    d.n_active
-                ));
-            }
+        if let Some(tt) = tid2eid
+            && tt.len() % d.n_active != 0
+        {
+            return Err(format!(
+                "ds4_moe gate: tid2eid.len={} — n_active={} 배수 아님",
+                tt.len(),
+                d.n_active
+            ));
         }
         let _g = self.cc.guard()?;
         Self::replace_w(&mut self.w_gate, &self.cc, &Self::f32_bytes(weight))?;

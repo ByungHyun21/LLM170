@@ -94,10 +94,10 @@ impl GdnDims {
         if d != 128 || dv != 128 {
             return Err(format!("GDN: head_dim {d}/{dv} — 128 고정 계약"));
         }
-        if hidden % 128 != 0 || hidden < 128 {
+        if !hidden.is_multiple_of(128) || hidden < 128 {
             return Err(format!("GDN: hidden={hidden} — 128 배수 계약"));
         }
-        if h_v % h_k != 0 || h_k == 0 {
+        if !h_v.is_multiple_of(h_k) || h_k == 0 {
             return Err(format!(
                 "GDN: h_v={h_v} h_k={h_k} — h_v%h_k==0 계약(lc 순열 전치)"
             ));

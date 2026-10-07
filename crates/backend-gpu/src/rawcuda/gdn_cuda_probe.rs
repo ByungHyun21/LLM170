@@ -93,8 +93,8 @@ fn gdn_reference_chain(
     for c in 0..cch {
         let (w0, w1, w2, w3) = (cw_l[c * 4], cw_l[c * 4 + 1], cw_l[c * 4 + 2], cw_l[c * 4 + 3]);
         let (mut h0, mut h1, mut h2) = (
-            ring[0 * cch + c],
-            ring[1 * cch + c],
+            ring[c],
+            ring[cch + c],
             ring[2 * cch + c],
         );
         for t in 0..t_len {
@@ -112,8 +112,8 @@ fn gdn_reference_chain(
             h1 = h2;
             h2 = x;
         }
-        ring[0 * cch + c] = h0;
-        ring[1 * cch + c] = h1;
+        ring[c] = h0;
+        ring[cch + c] = h1;
         ring[2 * cch + c] = h2;
     }
 
