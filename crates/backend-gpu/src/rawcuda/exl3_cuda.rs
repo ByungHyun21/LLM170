@@ -58,7 +58,13 @@ pub struct Exl3CudaDecoder {
     pub hidden: usize,
     pub n_layers: usize,
     pub loaded_layers: usize,
-    pub pos: u32,
+    /// 슬롯 수 — GDN 링/스캔 상태·KV 캐시·pos가 슬롯별로 분리된다
+    /// (plans/cuda-port.md S8). 커널은 `layer` 인덱스로 가중치와 상태를
+    /// 함께 읽으므로, 슬롯은 상태 버퍼 **포인터 오프셋**으로만 구분한다.
+    /// 가중치 인덱스를 오염시키면 전 층 가중치가 다른 슬롯의 것으로 읽힌다.
+    pub n_slots: usize,
+    /// 슬롯별 현재 위치 — 슬롯 s는 slot_pos[s].
+    pub slot_pos: Vec<u32>,
     /// plans/cuda-port.md S5: 전층 선형 VRAM 예산 때문에 임베딩은 RAM에 유지.
     /// [vocab][hidden] f32; 디코드 시 해당 행만 장치로 옮긴다.
     pub embed: Vec<f32>,
@@ -108,10 +114,12 @@ pub struct Exl3CudaDecoder {
     pub dgo: CUdeviceptr,
     /// gate 산출 gated [t][v_len](HF) — G5.
     pub dgate: CUdeviceptr,
-    /// conv 3탭 링 [n_gdn][3][conv_ch](커널이 r/w — T행 순차 계약,
-    /// 상주) — G5.
+    /// conv 3탭 링 [n_slots][n_gdn][3][conv_ch](커널이 r/w — T행 순차
+    /// 계약, 상주). 슬롯이 최외곽 차원이다: 슬롯 오프셋은 이 버퍼에서만
+    /// 계산해 커널에 넘긴다(가중치 dcw/dalog 등은 슬롯 공유).
     pub dring: CUdeviceptr,
-    /// GDN 상태 [n_gdn][h_v][128·128](커널 r/w — S0≠0 경로 의무) — G5.
+    /// GDN 상태 [n_slots][n_gdn][h_v][128·128](커널 r/w — S0≠0 경로
+    /// 의무, 슬롯 최외곽).
     pub dgst: CUdeviceptr,
     /// GDN 상수 상주: conv 가중 [n_gdn][conv_ch][4] · a/b
     /// [n_gdn][2][h_v][hidden] · alog/dtb [n_gdn][h_v] · 노름가중
@@ -121,11 +129,14 @@ pub struct Exl3CudaDecoder {
     pub dalog: CUdeviceptr,
     pub ddtb: CUdeviceptr,
     pub dnwg: CUdeviceptr,
+    /// KV 캐시 [n_slots][n_attn][cap][kv_dim](슬롯 최외곽 — S8).
     pub dkc: CUdeviceptr,
     pub dvc: CUdeviceptr,
     /// KV 인덱스 — pp[0] 디바이스 판독 계약(결함 4호). prep/fwd3s가
     /// 발사 인자가 아니라 이 버퍼에서 pos를 판독한다(그래프/루프 설계
     /// 핵심 — 그래프 내 전진은 exl3_attn_pos_bump) — G6.
+    /// [n_slots]u32: 슬롯 s는 dpp[s]. 커널은 pp[0]만 읽으므로 슬롯
+    /// 오프셋 포인터를 넘긴다(가중치 색인과 무관).
     pub dpp: CUdeviceptr,
     // ── 어텐션 체인(prep + fwd3s, §3.4/q_norm·rope base 1e7) G6 유효 ──
     /// 어텐션 형상(set_attn 등록 — None이면 미초기화).
@@ -889,7 +900,8 @@ impl Exl3CudaDecoder {
             hidden: 0,
             n_layers: 0,
             loaded_layers: 0,
-            pos: 0,
+            n_slots: 1,
+            slot_pos: vec![0],
             embed: Vec::new(),
             vocab: 0,
             dembed: 0,
@@ -1071,10 +1083,22 @@ impl Exl3CudaDecoder {
         Ok(d)
     }
 
-    /// 가중치 상주 업로드 — 기존 2인자 API는 검증/서버 호환용 1024 KV 상한.
-    /// 컨텍스트가 1024를 넘는 서빙은 load_with_ctx를 사용한다(plans/128 P0).
+    /// 가중치 상주 업로드 — 검증/서버 호환 2인자 API(1024 KV, 단일 슬롯).
+    /// 컨텍스트·슬롯을 지정하려면 load_slots를 사용한다(plans/128 P0).
     pub fn load(dir: &str, lim_layers: usize) -> Result<Self, String> {
-        Self::load_with_ctx(dir, lim_layers, crate::rawcuda::attn_cuda::ATTN_KV_CAP)
+        Self::load_slots(dir, lim_layers, crate::rawcuda::attn_cuda::ATTN_KV_CAP, 1)
+    }
+
+    /// 슬롯 수를 지정한 적재(plans/cuda-port.md S8). n_slots은 set_gdn /
+    /// set_attn이 링·스캔 상태·KV 캐시를 할당할 때 최외곽 차원으로 쓰인다.
+    /// 슬롯당 VRAM(27B·ctx 4096 기준 GDN 157MB + KV 536MB)이 여기서 결정된다.
+    pub fn load_slots(
+        dir: &str,
+        lim_layers: usize,
+        kvcap: usize,
+        n_slots: usize,
+    ) -> Result<Self, String> {
+        Self::load_full(dir, lim_layers, kvcap, n_slots)
     }
 
     /// plans/cuda-port.md S5: 선형은 lim_layers 접두만 업로드하되, set_gdn /
@@ -1082,6 +1106,17 @@ impl Exl3CudaDecoder {
     /// 0 또는 ≥n_layers는 기존대로 모든 선형(본체+mtp)을 적재한다.
     /// kvcap=0은 hip 어댑터와 같은 기본 4096, 그 밖은 64..32768 클램프.
     pub fn load_with_ctx(dir: &str, lim_layers: usize, kvcap: usize) -> Result<Self, String> {
+        Self::load_full(dir, lim_layers, kvcap, 1)
+    }
+
+    /// 슬롯 수를 포함한 본체 적재(plans/cuda-port.md S8). n_slots은
+    /// load_plain_tensors → set_gdn/set_attn이 상태 할당에 쓴다.
+    pub fn load_full(
+        dir: &str,
+        lim_layers: usize,
+        kvcap: usize,
+        n_slots: usize,
+    ) -> Result<Self, String> {
         let cfg = std::fs::read_to_string(format!("{dir}/config.json"))
             .map_err(|e| format!("config.json: {e}"))?;
         let v = JParser {
@@ -1135,6 +1170,13 @@ impl Exl3CudaDecoder {
         let mut d = Self::empty()?;
         d.hidden = hidden;
         d.n_layers = n_layers;
+        // 슬롯 0 금지: 0으로 두면 모든 슬롯 접근이 무조건 실패한다(조용한
+        // 무상태 디코드가 아니라 명확한 오류가 낫다).
+        if n_slots == 0 {
+            return Err("EXL3 CUDA: n_slots=0".into());
+        }
+        d.n_slots = n_slots;
+        d.slot_pos = vec![0; n_slots];
         // 0·상한초과도 전체 적재 — 런타임 반복 상한과 레지스트리 일치.
         d.loaded_layers = if lim_layers == 0 {
             n_layers
@@ -1307,15 +1349,6 @@ impl Exl3CudaDecoder {
         Ok((l.k, l.n, l.krate, suh, tre, svh))
     }
 
-    /// 토큰 임베딩 → 로짓 1스텝(plans/cuda-port.md S5 순차 디코드).
-    pub fn forward_tok(&mut self, tok: u32) -> Result<Vec<f32>, String> {
-        let row = self.embed_row_host(tok);
-        if row.len() != self.hidden {
-            return Err(format!("exl3-cuda: 임베딩 토큰 {tok} 범위 밖 또는 미적재"));
-        }
-        self.forward(&row).map(|(logits, _)| logits)
-    }
-
     /// 임베딩은 RAM 상주: 토큰에 해당하는 20KB 행만 복사한다(S5).
     /// 범위 밖이면 빈 행을 반환해 forward_tok이 상태 변경 전에 거부한다.
     pub fn embed_row_host(&mut self, tok: u32) -> Vec<f32> {
@@ -1324,16 +1357,6 @@ impl Exl3CudaDecoder {
         }
         let start = tok as usize * self.hidden;
         self.embed[start..start + self.hidden].to_vec()
-    }
-
-    /// 1스텝 greedy: argmax 스캔 폭은 로짓 전체 길이(결함 8호).
-    /// forward와 argmax가 같은 컨텍스트 스코프를 써야 하므로 가드를
-    /// 여기로 올린다(슬롯 스레드에 전파되지 않는 current 컨텍스트 —
-    /// plans/cuda-port.md S5). 중첩 가드는 재진입 가능(prev=자신).
-    pub fn step_tok(&mut self, tok: u32) -> Result<u32, String> {
-        let _g = self.cc.guard()?;
-        let logits = self.forward_tok(tok)?;
-        self.argmax_host(&logits)
     }
 
     /// MTP 드래프트(호스트 경로, §4.13 참고) — G4+.
@@ -1374,10 +1397,5 @@ impl Exl3CudaDecoder {
         _toks: &[u32],
     ) -> Result<(Vec<Vec<f32>>, Vec<f32>), String> {
         Err("TODO(plans/124 G4+): forward_batch_with_mtp 미구현".into())
-    }
-
-    /// 임베딩 행 1개 → (로짓, 마지막 노름 이전 잔차) — plans/cuda-port.md S5.
-    pub fn forward(&mut self, embed_row: &[f32]) -> Result<(Vec<f32>, Vec<f32>), String> {
-        self.forward_host_staged(embed_row)
     }
 }

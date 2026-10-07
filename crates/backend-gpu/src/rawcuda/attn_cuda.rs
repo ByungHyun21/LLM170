@@ -69,6 +69,12 @@ impl AttnDims {
     pub fn qg_dim(&self) -> usize {
         self.q_heads * 2 * self.d
     }
+    /// 슬롯 s의 KV 캐시 오프셋(원소) — 레이아웃 [n_slots][n_attn][cap][kv_dim]
+    /// (plans/cuda-port.md S8). 커널 layer 인덱스는 0..n_attn을 유지하므로
+    /// 슬롯 구분은 이 오프셋으로만 한다.
+    pub fn kv_slot_elems(&self, slot: usize) -> usize {
+        slot * self.n_attn * self.cap * self.kv_dim()
+    }
 
     /// config.json 본문 → 형상(GdnDims와 동일 파서·규약 — 실측 차원).
     pub fn from_config(cfg: &str) -> Result<Self, String> {
@@ -150,7 +156,10 @@ impl Exl3CudaDecoder {
                 knw.len()
             ));
         }
-        let kv_elems = n * dims.cap * dims.kv_dim();
+        let slots = self.n_slots.max(1);
+        // plans/cuda-port.md S8: KV 캐시는 슬롯 최외곽. 27B·ctx 4096 기준
+        // 슬롯당 16층×4096×1024×4B×2(K·V) ≈ 536MB — 슬롯 수의 실질 상한.
+        let kv_elems = slots * n * dims.cap * dims.kv_dim();
         for q in [
             self.dqnw_a,
             self.dknw_a,
@@ -187,8 +196,8 @@ impl Exl3CudaDecoder {
         Self::h2d_chunked(&self.cc, dkc, &vec![0u8; kv_elems * 4])?;
         let dvc = self.cc.alloc(kv_elems * 4)?;
         Self::h2d_chunked(&self.cc, dvc, &vec![0u8; kv_elems * 4])?;
-        let dpp = self.cc.alloc(4)?;
-        Self::h2d_chunked(&self.cc, dpp, &0u32.to_le_bytes())?;
+        let dpp = self.cc.alloc(slots * 4)?;
+        Self::h2d_chunked(&self.cc, dpp, &vec![0u8; slots * 4])?;
         self.dqnw_a = dq;
         self.dknw_a = dk;
         self.dkc = dkc;
@@ -226,26 +235,63 @@ impl Exl3CudaDecoder {
 
     /// pp[0] 상주값 갱신(h2d — 결함 4호: pos의 진실은 장치 버퍼. 캡처
     /// 그래프 내 전진은 attn_pos_bump 커널 — h2d는 캡처 무효화, 결함 16호).
-    pub fn attn_set_pos(&mut self, pos: u32) -> Result<(), String> {
+    pub fn attn_set_pos(&mut self, slot: usize, pos: u32) -> Result<(), String> {
         if self.dpp == 0 {
             return Err("attn: pp 미할당(set_attn 먼저)".into());
         }
-        self.cc.h2d(self.dpp, &pos.to_le_bytes())
+        if slot >= self.n_slots.max(1) {
+            return Err(format!("attn slot={slot} >= n_slots={}", self.n_slots));
+        }
+        // SAFETY: 슬롯 s는 dpp[s] (4B) — n_slots×4B 할당 경계 내(S8).
+        self.cc
+            .h2d(self.dpp + (slot as u64) * 4, &pos.to_le_bytes())
+    }
+
+    /// 슬롯별 pp 슬라이스 포인터 — 커널은 pp[0]만 읽으므로 슬롯 오프셋을
+    /// 넘긴다(plans/cuda-port.md S8: 가중치 색인과 무관한 유일한 예외).
+    fn attn_pp_ptr(&self, slot: usize) -> CUdeviceptr {
+        self.dpp + (slot as u64) * 4
+    }
+
+    /// 슬롯별 KV 캐시 포인터(바이트 오프셋 적용) — set_attn이 슬롯
+    /// 최외곽 레이아웃으로 할당한다.
+    fn attn_kv_ptr(&self, slot: usize) -> CUdeviceptr {
+        match self.attn {
+            Some(dm) => self.dkc + (dm.kv_slot_elems(slot) as u64) * 4,
+            None => self.dkc,
+        }
+    }
+
+    /// 슬롯별 VC 캐시 포인터(attn_kv_ptr의 V 대응).
+    fn attn_vc_ptr(&self, slot: usize) -> CUdeviceptr {
+        match self.attn {
+            Some(dm) => self.dvc + (dm.kv_slot_elems(slot) as u64) * 4,
+            None => self.dvc,
+        }
     }
 
     /// pp[0] += 1 커널 발사(exl3_attn_pos_bump) — 장치 내 pos 전진.
-    pub fn attn_pos_bump(&mut self) -> Result<(), String> {
+    pub fn attn_pos_bump(&mut self, slot: usize) -> Result<(), String> {
         let f = self.cc.function("exl3_attn_pos_bump")?;
-        let mut p0 = self.dpp;
+        let mut p0 = self.attn_pp_ptr(slot);
         let mut args: [*mut std::ffi::c_void; 1] = [(&mut p0) as *mut _ as *mut _];
         self.cc.launch(f, 1, 1, 32, &mut args)
     }
 
     /// 어텐션 층 KV 캐시 시딩(프리필 히스토리) — kc/vc: [cap][kv_dim].
-    pub fn attn_seed_kv(&mut self, layer: usize, kc: &[f32], vc: &[f32]) -> Result<(), String> {
+    pub fn attn_seed_kv(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        kc: &[f32],
+        vc: &[f32],
+    ) -> Result<(), String> {
         let dm = self.attn_dims()?;
         if layer >= dm.n_attn {
             return Err(format!("attn layer={layer} >= n_attn={}", dm.n_attn));
+        }
+        if slot >= self.n_slots.max(1) {
+            return Err(format!("attn slot={slot} >= n_slots={}", self.n_slots));
         }
         let elems = dm.cap * dm.kv_dim();
         if kc.len() != elems || vc.len() != elems {
@@ -260,11 +306,11 @@ impl Exl3CudaDecoder {
         // SAFETY: f32 슬라이스 → 바이트 뷰(길이·정렬 일치).
         let b =
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-        // SAFETY: 층 슬라이스 오프셋 — n_attn×cap×kv_dim 경계 내.
-        let off_k = self.dkc + (layer * elems) as u64 * 4;
+        // SAFETY: 슬롯×층 슬라이스 오프셋 — n_slots×n_attn×cap×kv_dim 경계 내(S8).
+        let off_k = self.dkc + ((slot * dm.n_attn + layer) * elems) as u64 * 4;
         Self::h2d_chunked(&self.cc, off_k, b(kc))?;
-        // SAFETY: 층 슬라이스 오프셋 — 경계 내.
-        let off_v = self.dvc + (layer * elems) as u64 * 4;
+        // SAFETY: 슬롯×층 슬라이스 오프셋 — 경계 내(S8).
+        let off_v = self.dvc + ((slot * dm.n_attn + layer) * elems) as u64 * 4;
         Self::h2d_chunked(&self.cc, off_v, b(vc))?;
         Ok(())
     }
@@ -274,12 +320,16 @@ impl Exl3CudaDecoder {
     /// pos 파라미터, 결함 4호 재현). 검증 경로 외 발사 금지.
     fn attn_prep_launch(
         &mut self,
+        slot: usize,
         layer: usize,
         t_len: usize,
         hostpos: bool,
         pos0_host: u32,
     ) -> Result<(), String> {
         let dm = self.attn_dims()?;
+        // S8: KV·pp만 슬롯 오프셋. qnw/knw는 슬롯 공유 가중치라
+        // layer 인덱스를 그대로 둔다(오염 시 전 층 가중치 오독).
+        let kv = self.attn_kv_ptr(slot);
         let f = if hostpos {
             self.cc.function("exl3_attn_prep_hostpos")?
         } else {
@@ -294,9 +344,9 @@ impl Exl3CudaDecoder {
             self.dqnw_a,
             self.dknw_a,
             self.dqh_a,
-            self.dkc,
-            self.dvc,
-            self.dpp,
+            kv,
+            self.attn_vc_ptr(slot),
+            self.attn_pp_ptr(slot),
         );
         let grid_y = (dm.q_heads + dm.kv_heads) as u32;
         if hostpos {
@@ -342,7 +392,7 @@ impl Exl3CudaDecoder {
 
     /// fwd3s 발사(내부) — 그리드 (t_len, q_heads), 블록 256. T≤8 도메인
     /// 사전 강제(Err — 커널 미발사; 커널 내 조기복귀와 이중 계약).
-    fn attn_fwd3s_launch(&mut self, layer: usize, t_len: usize) -> Result<(), String> {
+    fn attn_fwd3s_launch(&mut self, slot: usize, layer: usize, t_len: usize) -> Result<(), String> {
         let dm = self.attn_dims()?;
         if t_len == 0 || t_len > ATTN_F3S_TMAX {
             return Err(format!(
@@ -354,11 +404,11 @@ impl Exl3CudaDecoder {
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
         let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
             self.dqh_a,
-            self.dkc,
-            self.dvc,
+            self.attn_kv_ptr(slot),
+            self.attn_vc_ptr(slot),
             self.dqg_a,
             self.doutv_a,
-            self.dpp,
+            self.attn_pp_ptr(slot),
         );
         let mut args: [*mut std::ffi::c_void; 11] = [
             (&mut f0) as *mut _ as *mut _,
@@ -381,6 +431,7 @@ impl Exl3CudaDecoder {
     /// 않는다: 결함 4호 계약상 pos는 attn_set_pos/pos_bump가 별도 소유).
     pub fn attn_upload(
         &mut self,
+        slot: usize,
         layer: usize,
         t_len: usize,
         qg: &[f32],
@@ -390,6 +441,9 @@ impl Exl3CudaDecoder {
         let dm = self.attn_dims()?;
         if layer >= dm.n_attn {
             return Err(format!("attn layer={layer} >= n_attn={}", dm.n_attn));
+        }
+        if slot >= self.n_slots.max(1) {
+            return Err(format!("attn slot={slot} >= n_slots={}", self.n_slots));
         }
         if qg.len() != t_len * dm.qg_dim()
             || kin.len() != t_len * dm.kv_dim()
@@ -417,7 +471,13 @@ impl Exl3CudaDecoder {
     /// 판독) → fwd3s → qh·outv·KC/VC 신규 행 판독. T 도메인(1..=8)과
     /// 캐시 상한을 검사한다(pos0는 경계 판정용 판독값 — fwd3s 산출은
     /// 전적으로 디바이스 pp[0]에 의존, 결함 4호).
-    fn attn_chain_dev(&mut self, layer: usize, t_len: usize, pos0: u32) -> Result<AttnOut, String> {
+    fn attn_chain_dev(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        pos0: u32,
+    ) -> Result<AttnOut, String> {
         let dm = self.attn_dims()?;
         if t_len == 0 || t_len > ATTN_F3S_TMAX {
             return Err(format!(
@@ -433,8 +493,8 @@ impl Exl3CudaDecoder {
                 dm.cap
             ));
         }
-        self.attn_prep_launch(layer, t_len, false, 0)?;
-        self.attn_fwd3s_launch(layer, t_len)?;
+        self.attn_prep_launch(slot, layer, t_len, false, 0)?;
+        self.attn_fwd3s_launch(slot, layer, t_len)?;
         let take = |n: usize, src: CUdeviceptr| -> Result<Vec<f32>, String> {
             let mut buf = vec![0u8; n * 4];
             self.cc.d2h(&mut buf, src)?;
@@ -443,15 +503,15 @@ impl Exl3CudaDecoder {
         };
         let qh = take(t_len * dm.q_dim(), self.dqh_a)?;
         let outv = take(t_len * dm.q_dim(), self.doutv_a)?;
-        // SAFETY: 층·위치 슬라이스 오프셋 — n_attn×cap×kv_dim 경계 내.
+        // SAFETY: 슬롯×층×위치 슬라이스 오프셋 — 경계 내(S8).
         let row = t_len * dm.kv_dim();
         let kc_rows = take(
             row,
-            self.dkc + ((layer * dm.cap + pos0 as usize) * dm.kv_dim()) as u64 * 4,
+            self.attn_kv_ptr(slot) + ((layer * dm.cap + pos0 as usize) * dm.kv_dim()) as u64 * 4,
         )?;
         let vc_rows = take(
             row,
-            self.dvc + ((layer * dm.cap + pos0 as usize) * dm.kv_dim()) as u64 * 4,
+            self.attn_vc_ptr(slot) + ((layer * dm.cap + pos0 as usize) * dm.kv_dim()) as u64 * 4,
         )?;
         self.cc.sync()?;
         Ok(AttnOut {
@@ -467,6 +527,7 @@ impl Exl3CudaDecoder {
     /// 신규 행 판독. T>8이면 Err(도메인 거부 — 커널 미발사).
     pub fn attn_chain_host(
         &mut self,
+        slot: usize,
         layer: usize,
         t_len: usize,
         qg: &[f32],
@@ -474,9 +535,9 @@ impl Exl3CudaDecoder {
         vin: &[f32],
         pos0: u32,
     ) -> Result<AttnOut, String> {
-        self.attn_upload(layer, t_len, qg, kin, vin)?;
-        self.attn_set_pos(pos0)?;
-        self.attn_chain_dev(layer, t_len, pos0)
+        self.attn_upload(slot, layer, t_len, qg, kin, vin)?;
+        self.attn_set_pos(slot, pos0)?;
+        self.attn_chain_dev(slot, layer, t_len, pos0)
     }
 
     /// 음성대조 계기(원장 17호 — 결함 4호 재현): prep을 호스트 pos 사본
@@ -488,6 +549,7 @@ impl Exl3CudaDecoder {
     /// 검증층 전용 API(정상 호출 금지 — gdn gather 계기와 동일 계열).
     pub fn attn_chain_host_hostpos(
         &mut self,
+        slot: usize,
         layer: usize,
         t_len: usize,
         qg: &[f32],
@@ -495,9 +557,9 @@ impl Exl3CudaDecoder {
         vin: &[f32],
         pos0_host: u32,
     ) -> Result<Vec<f32>, String> {
-        self.attn_upload(layer, t_len, qg, kin, vin)?;
-        self.attn_prep_launch(layer, t_len, true, pos0_host)?;
-        self.attn_fwd3s_launch(layer, t_len)?;
+        self.attn_upload(slot, layer, t_len, qg, kin, vin)?;
+        self.attn_prep_launch(slot, layer, t_len, true, pos0_host)?;
+        self.attn_fwd3s_launch(slot, layer, t_len)?;
         let dm = self.attn_dims()?;
         let mut buf = vec![0u8; t_len * dm.q_dim() * 4];
         self.cc.d2h(&mut buf, self.doutv_a)?;

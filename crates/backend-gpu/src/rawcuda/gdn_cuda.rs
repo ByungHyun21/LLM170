@@ -203,10 +203,14 @@ impl Exl3CudaDecoder {
         Self::h2d_chunked(&self.cc, ddt, b(dtb))?;
         let dnw = self.cc.alloc(nw.len() * 4)?;
         Self::h2d_chunked(&self.cc, dnw, b(nw))?;
-        let dring = self.cc.alloc(n * 3 * cch * 4)?;
-        Self::h2d_chunked(&self.cc, dring, &vec![0u8; n * 3 * cch * 4])?;
-        let dgst = self.cc.alloc(n * hv * 128 * 128 * 4)?;
-        Self::h2d_chunked(&self.cc, dgst, &vec![0u8; n * hv * 128 * 128 * 4])?;
+        let slots = self.n_slots.max(1);
+        // plans/cuda-port.md S8: 링/스캔 상태는 슬롯 최외곽. 27B 기준
+        // 슬롯당 (48·3·10240 + 48·48·16384)·4B ≈ 157MB이므로 슬롯 수에
+        // 비례해 VRAM을 먹는다 — 호출자가 n_slots를 정하는 지점이다.
+        let dring = self.cc.alloc(slots * n * 3 * cch * 4)?;
+        Self::h2d_chunked(&self.cc, dring, &vec![0u8; slots * n * 3 * cch * 4])?;
+        let dgst = self.cc.alloc(slots * n * hv * 128 * 128 * 4)?;
+        Self::h2d_chunked(&self.cc, dgst, &vec![0u8; slots * n * hv * 128 * 128 * 4])?;
         (self.dcw, self.dab_c, self.dalog, self.ddtb, self.dnwg) = (dcw, dab, dal, ddt, dnw);
         self.dring = dring;
         self.dgst = dgst;
@@ -249,15 +253,29 @@ impl Exl3CudaDecoder {
     /// 상주 버퍼(r/w). gather=true는 음성대조 계기(l2perm 방향 반전,
     /// 결함류: 방향 — 원장 17호. 정상 호출 금지). 그리드 계약(결함 5호):
     /// l2perm/gate는 (h_v, T), conv는 (conv_ch/128, 1), scan은 (h_v, 1).
-    fn gdn_chain_dev(&mut self, layer: usize, t_len: usize, gather: bool) -> Result<(), String> {
+    fn gdn_chain_dev(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        gather: bool,
+    ) -> Result<(), String> {
         let dm = self.gdn_dims()?;
         if layer >= dm.n_gdn {
             return Err(format!("GDN layer={layer} >= n_gdn={}", dm.n_gdn));
+        }
+        if slot >= self.n_slots.max(1) {
+            return Err(format!("GDN slot={slot} >= n_slots={}", self.n_slots));
         }
         if t_len == 0 {
             return Err("GDN t_len=0".into());
         }
         self.ensure_gdn_bufs(t_len)?;
+        // plans/cuda-port.md S8: 상수(dcw/alog/dtb)는 슬롯 공유이고 링/스캔
+        // 상태만 슬롯별이다. 커널 layer 인덱스는 그대로 두고 상태 포인터만
+        // 슬롯 오프셋 — 가중치 색인을 오염시키면 안 된다(결함 1호 계열).
+        let ring_slot = slot * dm.n_gdn * 3 * dm.conv_ch();
+        let st_slot = slot * dm.n_gdn * dm.h_v * 128 * 128;
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let (mut hk, mut hv, mut dd) = (dm.h_k as i32, dm.h_v as i32, dm.d as i32);
         let (mut hd, mut kl, mut vl, mut cch) = (
@@ -271,7 +289,12 @@ impl Exl3CudaDecoder {
         // 커널이 순차 회전(링 계약 — 한 런치).
         let f = self.cc.function("exl3_gdn_conv")?;
         let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5) = (
-            self.dqkv, self.dcw, self.dring, self.dgq, self.dgk, self.dgv,
+            self.dqkv,
+            self.dcw,
+            self.dring + (ring_slot as u64) * 4,
+            self.dgq,
+            self.dgk,
+            self.dgv,
         );
         let mut ac: [*mut std::ffi::c_void; 11] = [
             (&mut c0) as *mut _ as *mut _,
@@ -335,8 +358,14 @@ impl Exl3CudaDecoder {
         // scan — grid (h_v, 1), 블록 128, 동적 공유 61,828B(opt-in).
         let f = self.cc.function("exl3_gdn_scan")?;
         self.cc.set_dynamic_smem(f, GDN_SCAN_SMEM)?;
-        let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5) =
-            (self.dq2, self.dk2, self.dv2, self.dbg, self.dgst, self.dgo);
+        let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5) = (
+            self.dq2,
+            self.dk2,
+            self.dv2,
+            self.dbg,
+            self.dgst + (st_slot as u64) * 4,
+            self.dgo,
+        );
         let mut as_: [*mut std::ffi::c_void; 11] = [
             (&mut s0) as *mut _ as *mut _,
             (&mut s1) as *mut _ as *mut _,
@@ -378,6 +407,7 @@ impl Exl3CudaDecoder {
     /// 최초는 제로). 상태·링은 체인 후 갱신된 채 상주(순차 디코드 계약).
     pub fn gdn_chain_host(
         &mut self,
+        slot: usize,
         layer: usize,
         t_len: usize,
         xn: &[f32],
@@ -412,19 +442,19 @@ impl Exl3CudaDecoder {
             if s.len() != dm.h_v * 128 * 128 {
                 return Err(format!("GDN s0 {} != {}x16384", s.len(), dm.h_v));
             }
-            // SAFETY: 층 슬라이스 오프셋 — n_gdn×hv×16384 경계 내.
-            let off = self.dgst + (layer * dm.h_v * 128 * 128) as u64 * 4;
+            // SAFETY: 슬롯×층 슬라이스 오프셋 — n_slots×n_gdn×hv×16384 경계 내(S8).
+            let off = self.dgst + ((slot * dm.n_gdn + layer) * dm.h_v * 128 * 128) as u64 * 4;
             self.cc.h2d(off, b(s))?;
         }
         if let Some(r) = ring0 {
             if r.len() != 3 * dm.conv_ch() {
                 return Err(format!("GDN ring0 {} != 3x{}", r.len(), dm.conv_ch()));
             }
-            // SAFETY: 층 슬라이스 오프셋 — n_gdn×3×conv_ch 경계 내.
-            let off = self.dring + (layer * 3 * dm.conv_ch()) as u64 * 4;
+            // SAFETY: 슬롯×층 슬라이스 오프셋 — 경계 내(S8).
+            let off = self.dring + ((slot * dm.n_gdn + layer) * 3 * dm.conv_ch()) as u64 * 4;
             self.cc.h2d(off, b(r))?;
         }
-        self.gdn_chain_dev(layer, t_len, false)?;
+        self.gdn_chain_dev(slot, layer, t_len, false)?;
         let mut ob = vec![0u8; t_len * dm.v_len() * 4];
         self.cc.d2h(&mut ob, self.dgate)?;
         self.cc.sync()?;
@@ -438,6 +468,7 @@ impl Exl3CudaDecoder {
     /// (CPU 미러 쪽 — 결함류: 방향)으로 실행한 체인. 검증층 전용 API.
     pub fn gdn_chain_host_gather_l2perm(
         &mut self,
+        slot: usize,
         layer: usize,
         t_len: usize,
         xn: &[f32],
@@ -461,16 +492,16 @@ impl Exl3CudaDecoder {
         self.cc.h2d(self.dqkv, b(qkv))?;
         self.cc.h2d(self.dzv, b(z))?;
         if let Some(s) = s0 {
-            // SAFETY: 층 슬라이스 오프셋 — 경계 내.
-            let off = self.dgst + (layer * dm.h_v * 128 * 128) as u64 * 4;
+            // SAFETY: 슬롯×층 슬라이스 오프셋 — 경계 내(S8).
+            let off = self.dgst + ((slot * dm.n_gdn + layer) * dm.h_v * 128 * 128) as u64 * 4;
             self.cc.h2d(off, b(s))?;
         }
         if let Some(r) = ring0 {
-            // SAFETY: 층 슬라이스 오프셋 — 경계 내.
-            let off = self.dring + (layer * 3 * dm.conv_ch()) as u64 * 4;
+            // SAFETY: 슬롯×층 슬라이스 오프셋 — 경계 내(S8).
+            let off = self.dring + ((slot * dm.n_gdn + layer) * 3 * dm.conv_ch()) as u64 * 4;
             self.cc.h2d(off, b(r))?;
         }
-        self.gdn_chain_dev(layer, t_len, true)?;
+        self.gdn_chain_dev(slot, layer, t_len, true)?;
         let mut ob = vec![0u8; t_len * dm.v_len() * 4];
         self.cc.d2h(&mut ob, self.dgate)?;
         self.cc.sync()?;
@@ -483,7 +514,12 @@ impl Exl3CudaDecoder {
     /// GDN 체인 중간 산출 전량 판독(검증층 진단 — 단계별 값 판정·링
     /// 회전·순열 방향·소거 순서 국소화). 직전 gdn_chain_host 실행의
     /// 잔류 버퍼를 읽는다(3층 분리: 판독만, 계산 없음).
-    pub fn gdn_mids_host(&mut self, layer: usize, t_len: usize) -> Result<GdnMids, String> {
+    pub fn gdn_mids_host(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+    ) -> Result<GdnMids, String> {
         let dm = self.gdn_dims()?;
         if self.gdn_t_cap < t_len {
             return Err(format!(
@@ -506,12 +542,15 @@ impl Exl3CudaDecoder {
         let v2 = take(t_len * vl, self.dv2)?;
         let bg = take(t_len * dm.bg_len(), self.dbg)?;
         let o_lc = take(t_len * vl, self.dgo)?;
-        // SAFETY: 층 슬라이스 오프셋 — 경계 내.
-        let ring_post = take(3 * cch, self.dring + (layer * 3 * cch) as u64 * 4)?;
-        // SAFETY: 층 슬라이스 오프셋 — 경계 내.
+        // SAFETY: 슬롯×층 슬라이스 오프셋 — 경계 내(S8).
+        let ring_post = take(
+            3 * cch,
+            self.dring + ((slot * dm.n_gdn + layer) * 3 * cch) as u64 * 4,
+        )?;
+        // SAFETY: 슬롯×층 슬라이스 오프셋 — 경계 내(S8).
         let st_post = take(
             dm.h_v * 128 * 128,
-            self.dgst + (layer * dm.h_v * 128 * 128) as u64 * 4,
+            self.dgst + ((slot * dm.n_gdn + layer) * dm.h_v * 128 * 128) as u64 * 4,
         )?;
         self.cc.sync()?;
         Ok(GdnMids {

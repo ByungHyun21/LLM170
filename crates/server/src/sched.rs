@@ -319,10 +319,10 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 })
                 .map_err(|e| e.to_string()),
             Engine::Exl3Cuda(e) => e
-                .prefill(&warm)
+                .prefill(0, &warm)
                 .and_then(|l| {
                     let t = llm170_core::qwen35::greedy(&l);
-                    e.decode1(t).map(|_| ())
+                    e.decode1(0, t).map(|_| ())
                 })
                 .map_err(|e| e.to_string()),
             Engine::Exl3Hip(e) => e
@@ -341,7 +341,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             Engine::Q4(e) => e.reset_states(),
             Engine::Exl3(e) => e.reset_states(),
             Engine::Exl3Cuda(e) => {
-                if let Err(err) = e.reset_seq() {
+                if let Err(err) = e.reset_states() {
                     eprintln!("# cuda 리셋 실패: {err}");
                 }
             }
@@ -599,13 +599,15 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     // cuda 기본 경로(단일 슬롯 — rawcuda 포팅, plans/124). greedy는
                     // step_tok(G3+ 스텁 위임), 그 외는 decode1 로짓 판. MTP는
                     // 디코더 G4+ 이후(spec_round가 명시 Err).
+                    // S8 다중 슬롯: 슬롯마다 디코더가 GDN/KV/pos를 따로 보유하므로
+                    // 스케줄러의 연속 배칭이 그대로 병렬 요청으로 확장된다.
                     for &i in &active {
                         let next = slots[i].next;
                         let greedy = !slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
                         let r: Result<Vec<u32>, String> = if greedy {
-                            e.step_tok(next).map(|t| vec![t])
+                            e.step_tok(i, next).map(|t| vec![t])
                         } else {
-                            e.decode1(next).map(|l| vec![pick(&mut slots[i], &l)])
+                            e.decode1(i, next).map(|l| vec![pick(&mut slots[i], &l)])
                         };
                         match r {
                             Ok(toks) => {
@@ -625,7 +627,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                 }
                             }
                             Err(err) => {
-                                eprintln!("# cuda decode 실패({err})");
+                                eprintln!("# cuda decode 실패(slot{i}): {err}");
                                 slot_fail(&mut slots[i], format!("cuda decode1: {err}"));
                             }
                         }
@@ -818,14 +820,13 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                             // 단일스트림(측정 승리) 전용.
                             r
                         }
-                        Engine::Exl3Cuda(e) if i == 0 => e.prefill(&part).map(|l| {
+                        Engine::Exl3Cuda(e) => e.prefill(i, &part).map(|l| {
                             if samp {
                                 pick(&mut slots[i], &l)
                             } else {
                                 llm170_core::qwen35::greedy(&l)
                             }
                         }),
-                        Engine::Exl3Cuda(_) => Err("cuda 단일 슬롯: 슬롯>0 미지원".to_string()),
                         Engine::Exl3Hip(e) if i == 0 => e.prefill(&part).map(|l| {
                             if samp {
                                 pick(&mut slots[i], &l)
