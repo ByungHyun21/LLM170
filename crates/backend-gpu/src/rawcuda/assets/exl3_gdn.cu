@@ -381,7 +381,11 @@ extern "C" __global__ void exl3_gdn_scan(
                 for (int s2p = 0; s2p < EXL3_TILE; s2p++) {
                     float s_el = Stile[s2p * 128 + tid];
                     ak += __half2float(sk[i * 128 + s2b + s2p]) * s_el;
-                    aq += q[qbase + s2b + s2p] * s_el;
+                    // plans/cuda-port.md S5: T=1이면 i=1..31의 q 행은
+                    // 할당되지 않는다. 프로브 T=32에서 숨었던 CUresult=700;
+                    // 비활성 행만 0으로 마스킹(활성 산술 순서 불변).
+                    float qv = (i < n) ? q[qbase + s2b + s2p] : 0.0f;
+                    aq += qv * s_el;
                 }
                 int ib = i * 128 + tid;
                 KS[ib] = __float2half_rn(__half2float(KS[ib]) + ak);

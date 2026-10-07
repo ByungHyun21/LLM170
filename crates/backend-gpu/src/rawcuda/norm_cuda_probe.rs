@@ -143,6 +143,37 @@ pub fn cuda_norm_check() -> Result<String, String> {
                 fails.push(format!("(i,w{w}) xn={md:.3e} resid={mdr:.3e} nan={nan}"));
             }
         }
+        // S5 잔차 프로토콜: GEMV가 공유 dx를 덮어써도 별도 dres의
+        // 두 번째 노름은 첫 번째 출력을 이어받아야 한다(plans/cuda-port.md).
+        let dres = dec.cc.alloc(x.len() * 4)?;
+        let xb = x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+        dec.cc.h2d(dres, &xb)?;
+        let ab2 = gen_unif(5120, 0x5EED_0000_0000_1003, 0.2);
+        let (want_r0, want1) = norm_resid_reference(&x, &ab, &rows[1], 1e-6, dec.hidden);
+        let (want_r1, want2) = norm_resid_reference(&want_r0, &ab2, &rows[129], 1e-6, dec.hidden);
+        let got1 = dec.norm_resid_staged(1, dres, &ab)?;
+        dec.cc.h2d(dec.dx, &vec![0x7fu8; x.len() * 4])?;
+        let got2 = dec.norm_resid_staged(129, dres, &ab2)?;
+        let mut rb = vec![0u8; x.len() * 4];
+        dec.cc.d2h(&mut rb, dres)?;
+        dec.cc.sync()?;
+        // SAFETY: d2h 동기 완료; rb는 x.len개의 f32 LE 값이다.
+        let got_r = unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, x.len()) };
+        let (md1, n1) = maxdiff_nan(&got1, &want1);
+        let (md2, n2) = maxdiff_nan(&got2, &want2);
+        let (mdr, nr) = maxdiff_nan(got_r, &want_r1);
+        dec.cc.free(dres)?;
+        let pass = md1 <= NORM_THRESH && md2 <= NORM_THRESH && mdr == 0.0 && n1 + n2 + nr == 0;
+        println!(
+            "device: {dev} | exl3-cuda-norm S5 별도 잔차(dx 오염) maxdiff={md1:.3e}/{md2:.3e} resid={mdr:.3e} | {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        if !pass {
+            fails.push(format!(
+                "S5 dres xn={md1:.3e}/{md2:.3e} resid={mdr:.3e} nan={}",
+                n1 + n2 + nr
+            ));
+        }
     }
 
     // (ii) Qwen3.6-35B-A3B 형상 hidden=2048(config.json text_config 실측

@@ -81,20 +81,33 @@ impl Exl3CudaDecoder {
         ab_dev: CUdeviceptr,
         t_len: usize,
     ) -> Result<CUdeviceptr, String> {
+        self.ensure_norm_bufs(t_len)?;
+        self.norm_resid_at(w, self.dx, ab_dev, t_len)
+    }
+
+    /// 별도 잔차 버퍼(dres)를 사용하는 동일 커널 — GEMV 호스트 래퍼가 dx를
+    /// 덮어써도 잔차는 dres에 보존된다(plans/cuda-port.md S5). x_dev는
+    /// 호출자가 할당한 [t_len][hidden] 버퍼이며 호출 동안 재할당하지 않는다.
+    fn norm_resid_at(
+        &mut self,
+        w: usize,
+        x_dev: CUdeviceptr,
+        ab_dev: CUdeviceptr,
+        t_len: usize,
+    ) -> Result<CUdeviceptr, String> {
         if self.dnw == 0 {
             return Err("norm: 노름 가중 미등록(set_norm_weights)".into());
         }
         if w >= self.norm_w_rows {
             return Err(format!("norm: w={w} >= rows={}", self.norm_w_rows));
         }
-        self.ensure_norm_bufs(t_len)?;
         let f = self.cc.function("exl3_norm_resid")?;
         let mut tl = t_len as i32;
         let mut wo = (w * self.hidden) as i32; // 결함 2호: 행 오프셋 w·hidden
         let mut hd = self.hidden as i32;
         // 인자 순서 (x, nw, ab, xn) 고정 — 교차 시 잔차에 노름가중치가
         // 더해진다(결함 7호).
-        let (mut a0, mut a1, mut a2, mut a3) = (self.dx, self.dnw, ab_dev, self.dxn);
+        let (mut a0, mut a1, mut a2, mut a3) = (x_dev, self.dnw, ab_dev, self.dxn);
         let mut args: [*mut std::ffi::c_void; 7] = [
             (&mut a0) as *mut _ as *mut _,
             (&mut a1) as *mut _ as *mut _,
@@ -106,6 +119,32 @@ impl Exl3CudaDecoder {
         ];
         self.cc.launch(f, t_len as u32, 1, 1024, &mut args)?;
         Ok(self.dxn)
+    }
+
+    /// 별도 디바이스 잔차에 ab만 업로드 → 노름 산출 xn만 호스트로 판독.
+    /// GEMV가 공유 dx를 덮어써도 x_dev는 영향을 받지 않는다(S5 호스트 스테이징).
+    pub(crate) fn norm_resid_staged(
+        &mut self,
+        w: usize,
+        x_dev: CUdeviceptr,
+        ab: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        if self.hidden == 0 || ab.len() != self.hidden || x_dev == 0 {
+            return Err("norm: 순차 잔차/분기 폭 계약 위반".into());
+        }
+        self.ensure_norm_bufs(1)?;
+        // SAFETY: f32 원소 hidden개가 연속이며 호출 완료까지 살아 있다.
+        let abb = unsafe { std::slice::from_raw_parts(ab.as_ptr() as *const u8, ab.len() * 4) };
+        self.cc.h2d(self.dab, abb)?;
+        let xn = self.norm_resid_at(w, x_dev, self.dab, 1)?;
+        let mut bytes = vec![0u8; self.hidden * 4];
+        self.cc.d2h(&mut bytes, xn)?;
+        self.cc.sync()?;
+        // SAFETY: d2h 동기 완료; bytes는 hidden개의 f32 LE 값이다.
+        Ok(
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, self.hidden) }
+                .to_vec(),
+        )
     }
 
     /// 호스트 래퍼(hip gemv_host 노선 — 검증층 기본 진입): x·ab 업로드 →
