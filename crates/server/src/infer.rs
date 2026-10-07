@@ -66,6 +66,20 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     }
     // plans/cuda-port.md §1.3 S6 — GGUF+cuda는 Q4AccCuda 값경로로 진행한다
     // (attach_q4 cuda 분기). W4A16(safetensors)은 여전히 미지원 — S7.
+    //
+    // [S7 착수 전제 실측 — 2026-10-08, plans/cuda-port.md §1.3 전제 정정]
+    // 플랜의 "W4A16 커널 비트일치 인증 완료"는 성립하지 않는다 — rawcuda·
+    // rawhip에 w4a16/gptq 커널이 없고, core/quant/lane.rs의
+    // dot_row_w4a16_lane(GPU gemm_gptq4 64레인 미러, plans/137 §3.5)은
+    // 호출부 0개 미검증 상태다. 대상 모델 실측
+    // (../models/Qwen3.8-27B-W4A16-AutoRound, 7파트+extra 전부 존재 —
+    // 1999 텐서): arch가 Qwen3_5ForConditionalGeneration(qwen4exp 아님 —
+    // qwen35 엔진 계열), quantization_config는 compressed-tensors
+    // pack-quantized(int4 sym g128, weight_packed/scale/shape 3조),
+    // linear_attn in_proj_a/b와 lm_head·visual은 미양자화 ignore.
+    // 즉 S7의 실제 남은 일은 "매핑"이 아니라 (1) gemm_gptq4 CUDA 커널
+    // 신규 작성+비트계약 확립, (2) compressed-tensors safetensors 로더,
+    // (3) qwen35 계열 Engine 가속기 매핑이다 — 커널 프로젝트 규모.
     if gpu_runtime == "cuda"
         && !model_path
             .extension()
