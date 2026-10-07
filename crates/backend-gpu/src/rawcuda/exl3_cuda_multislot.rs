@@ -140,9 +140,8 @@ impl Exl3CudaDecoder {
         for &(_, tok) in items {
             embed.extend_from_slice(&self.embed_row_host(tok));
         }
-        let eb = unsafe {
-            std::slice::from_raw_parts(embed.as_ptr() as *const u8, embed.len() * 4)
-        };
+        let eb =
+            unsafe { std::slice::from_raw_parts(embed.as_ptr() as *const u8, embed.len() * 4) };
         self.cc
             .h2d(self.dres, eb)
             .map_err(|e| format!("슬롯 간 배치 임베딩 {t}행 업로드: {e}"))?;
@@ -179,11 +178,8 @@ impl Exl3CudaDecoder {
                         c1 + (i * v_len) as u64 * 4,
                         c2 + (i * v_len) as u64 * 4,
                     )?;
-                    self.cc.d2d(
-                        rowbuf + (i * q_dim) as u64 * 4,
-                        out,
-                        q_dim * 4,
-                    )?;
+                    self.cc
+                        .d2d(rowbuf + (i * q_dim) as u64 * 4, out, q_dim * 4)?;
                 }
                 rowbuf
             } else {
@@ -201,11 +197,8 @@ impl Exl3CudaDecoder {
                         c0 + (i * conv_ch) as u64 * 4,
                         c1 + (i * v_len) as u64 * 4,
                     )?;
-                    self.cc.d2d(
-                        rowbuf + (i * v_len) as u64 * 4,
-                        out,
-                        v_len * 4,
-                    )?;
+                    self.cc
+                        .d2d(rowbuf + (i * v_len) as u64 * 4, out, v_len * 4)?;
                 }
                 gi += 1;
                 rowbuf
@@ -238,8 +231,7 @@ impl Exl3CudaDecoder {
         self.cc.d2h(&mut lb, logits_ptr)?;
         self.cc.sync()?;
         // SAFETY: d2h 동기 완료 — lb는 t*n_head개의 f32 LE 값.
-        let all =
-            unsafe { std::slice::from_raw_parts(lb.as_ptr() as *const f32, t * n_head) };
+        let all = unsafe { std::slice::from_raw_parts(lb.as_ptr() as *const f32, t * n_head) };
         let mut toks = Vec::with_capacity(t);
         for r in 0..t {
             let row = &all[r * n_head..(r + 1) * n_head];
