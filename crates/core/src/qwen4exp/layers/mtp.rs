@@ -2,6 +2,7 @@
 //! spec_step 계열(단일·multi·frame 변형)·suffix 드래프터·CPU MTP층 헤드.
 use super::super::stages::{self, Ctx};
 use super::super::{Hparams4, Q4Error};
+use super::state::SpecSnap;
 use super::{Engine4, SeqState4};
 use crate::matmul::Accelerator;
 use crate::ops::sigmoid;
@@ -329,8 +330,14 @@ impl Engine4 {
         } else {
             std::mem::take(&mut self.spec_h_prev[seq])
         };
+        // plans/141: 라운드 비용 분해 — q35판 `[specT]`와 같은 키(dump:spec_time).
+        // q4exp에는 이 분해가 없어 드래프트/검증/기각재실행 중 무엇이 비용인지
+        // GPU 계측으로는 구분되지 않았다(커널 표는 트렁크와 섞여 나온다).
+        let tm_on = llm170_diag::dump::opts().key("spec_time");
+        let t_d0 = std::time::Instant::now();
         let t0 = self.decode1_greedy(seq, last_token)?;
         let mut forwards = 1usize;
+        let t_commit = t_d0.elapsed().as_secs_f64() * 1e3;
         let h_after_first = self.last_res_hc.clone();
         // ② 드래프트 체인 — proposals = [t0, g1, .., g_{k-1}](k개).
         //
@@ -341,11 +348,15 @@ impl Engine4 {
         // k회 반복은 두 가지를 함께 맞춘다: 검증 대상이 k행이 되어 g_{k-1}까지
         // 비교되고, 드래프트 KV도 전 라운드 커밋 토큰(t0·g_1..g_{k-1})을 덮는다
         // — 전 수용 시 다음 라운드 ④′ 이전 드래프트 문맥이 비지 않는다.
-        let snap_t = self.seqs[seq].clone();
+        let t_snap0 = std::time::Instant::now();
+        let snap_t = SpecSnap::of(&self.seqs[seq]);
         // 거각 복원 기준 — ④′ 이전. 복원 후 재체인(아래)이 last_token 행부터
         // 다시 적립하므로, ④′까지 진행한 상태를 기준으로 잡으면 last_token 행이
         // 한 번 더 쌓여 드래프트 위치가 어긋난다.
-        let snap_d = self.mtp_seqs[seq].clone();
+        let snap_d = SpecSnap::of(&self.mtp_seqs[seq]);
+        if tm_on {
+            eprintln!("# spec-snap {:.2}ms", t_snap0.elapsed().as_secs_f64() * 1e3);
+        }
         // ④′ 주기 시작 커밋 토큰의 드래프트 KV 행 진위치 기입.
         {
             let _acc = self.acc.clone();
@@ -361,6 +372,8 @@ impl Engine4 {
             chain_h = dh;
             next = next_d;
         }
+        let t_draft = t_d0.elapsed().as_secs_f64() * 1e3 - t_commit;
+        let t_v0 = std::time::Instant::now();
         // ── 배치 검증: t=k행 1회 포워드 + 행별 GPU argmax ──
         let y: Vec<u32>;
         {
@@ -396,6 +409,7 @@ impl Engine4 {
             }
         }
         forwards += 1;
+        let t_verify = t_v0.elapsed().as_secs_f64() * 1e3;
         // y[i] = proposals[i] 처리 후 greedy — 수용 접두 판정(순차 판과 동일식).
         let mut n_acc = proposals.len();
         for i in 0..proposals.len() {
@@ -451,8 +465,8 @@ impl Engine4 {
                 };
                 super::super::frame::verify_snap_restore(a, f, seq)?;
             }
-            self.seqs[seq] = snap_t.clone();
-            self.mtp_seqs[seq] = snap_d.clone();
+            snap_t.restore(&mut self.seqs[seq]);
+            snap_d.restore(&mut self.mtp_seqs[seq]);
             let seq_y: Vec<u32> = proposals
                 .iter()
                 .map(|&p| self.decode1_greedy(seq, p))
@@ -508,12 +522,24 @@ impl Engine4 {
             // 배치가 정확히 proposals행만큼 상태를 전진시켰다 — pos 정산.
             self.seqs[seq].pos += proposals.len() as u32;
             self.spec_h_prev[seq] = self.last_res_hc.clone();
+            if tm_on {
+                eprintln!(
+                    "[specT] commit={:6.1} draft={:6.1} verify={:6.1} state={:6.1} acc={}/{} rows={}",
+                    t_commit,
+                    t_draft,
+                    t_verify,
+                    t_v0.elapsed().as_secs_f64() * 1e3,
+                    n_acc,
+                    proposals.len().saturating_sub(1),
+                    proposals.len(),
+                );
+            }
             Ok((accepted, forwards))
         } else {
             // 기각 — 스냅샷 복원(GDN 디바이스 + CPU) 후 수용분 재실행.
             let snap_pos = snap_t.pos;
-            self.seqs[seq] = snap_t;
-            self.mtp_seqs[seq] = snap_d;
+            snap_t.restore(&mut self.seqs[seq]);
+            snap_d.restore(&mut self.mtp_seqs[seq]);
             {
                 let Engine4 {
                     frame,
@@ -593,6 +619,18 @@ impl Engine4 {
             accepted.extend_from_slice(&proposals[1..=n_acc]);
             accepted.push(y[n_acc]);
             self.spec_h_prev[seq] = self.last_res_hc.clone();
+            if tm_on {
+                eprintln!(
+                    "[specT] commit={:6.1} draft={:6.1} verify={:6.1} state={:6.1} acc={}/{} rows={} REJECT",
+                    t_commit,
+                    t_draft,
+                    t_verify,
+                    t_v0.elapsed().as_secs_f64() * 1e3,
+                    n_acc,
+                    proposals.len().saturating_sub(1),
+                    proposals.len(),
+                );
+            }
             Ok((accepted, forwards))
         }
     }
@@ -846,6 +884,10 @@ impl Engine4 {
                 hc_dim
             )));
         }
+        let h_prep = llm170_diag::dump::opts().key("mtp_prep");
+        let tp0 = std::time::Instant::now();
+        #[allow(unused_variables)]
+        let _ = (&h_prep, &tp0);
         let embd = self.model.w4("token_embd.weight")?;
         let mut e = vec![0.0f32; n];
         dequant_row(embd.ty, embd.data, x as u64, n as u64, &mut e);
@@ -866,6 +908,9 @@ impl Engine4 {
                 .f32_vec4(&format!("blk.{il}.nextn.hnorm.weight"))?,
             hp.eps,
         );
+        if h_prep {
+            eprintln!("# mtp-prep {:.2}ms", tp0.elapsed().as_secs_f64() * 1e3);
+        }
         // ── plans/110 W1: 프레임 경로 — 상주 버퍼 GEMV 체인 ──
         let mtp_t = std::time::Instant::now();
         if self.frame_on(true) && self.frame_ensure() {
@@ -1039,6 +1084,10 @@ impl Engine4 {
         let il = hp.n_layer; // 블록 48
         let hc_dim = hc * n;
         // 1) e = emb(x) — 본체 임베딩 공유
+        let h_prep = llm170_diag::dump::opts().key("mtp_prep");
+        let tp0 = std::time::Instant::now();
+        #[allow(unused_variables)]
+        let _ = (&h_prep, &tp0);
         let embd = self.model.w4("token_embd.weight")?;
         let mut e = vec![0.0f32; n];
         dequant_row(embd.ty, embd.data, x as u64, n as u64, &mut e);
