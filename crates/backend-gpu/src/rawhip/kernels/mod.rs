@@ -175,6 +175,7 @@ pub const NAMES: &[&str] = &[
     "gemm_q8_0_w4",
     "gemm_q8_0_w16",
     "gemm_q8_0_dmmv",
+    "gemm_xs_dmmv",
     "q4_gemm_q4k_dmmv_ids",
     "q5_1_gemm_dmmv_ids",
     "q5k_gemm_dmmv_ids",
@@ -508,6 +509,7 @@ pub const COVERED_BY: &[(&str, &str)] = &[
         "gemm_q8_0_dmmv",
         "assembly:charhash+gate-27b+gate-flash-next",
     ),
+    ("gemm_xs_dmmv", "assembly:charhash+gate-27b+gate-flash-next"),
     (
         "q4_gemm_q4k_dmmv_ids",
         "assembly:charhash+gate-27b+gate-flash-next",

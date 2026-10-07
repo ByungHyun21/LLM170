@@ -1192,3 +1192,80 @@ extern "C" __global__ void __launch_bounds__(64) gemm_q8_0_dmmv(
         }
     }
 }
+
+// iq4_xs dense dmmv — t=1(f32 활성 직소비). q8_0 dmmv 골격 + iq4_xs 블록 산술
+// (plans/141 부록 설계, 2026-10-07). 블록 136B = [d f16][scales_h u16][scales_l 4B]
+// [qs 128B]. 서브블록 32원소: dl = d*(ls-32), 값 = dl*ktab[nib] — min 항이 없어
+// dot = Σ dl*ktab[nib]*x = 서브블록별 dl*(Σ ktab*x). 8원소 그룹은 서브블록 니블
+// 반(high/low)을 안 건넌다(8|16 정렬) → qs 2워드(각 4원소)로 커버.
+extern "C" __global__ void __launch_bounds__(64) gemm_xs_dmmv(
+        const float* __restrict__ x, const unsigned* __restrict__ w,
+        float* __restrict__ out, const unsigned* __restrict__ ktab2,
+        int n_in, int n_out) {
+    __shared__ unsigned kt_s[256];
+    for (int i = threadIdx.x; i < 256; i += 64) kt_s[i] = ktab2[i];
+    __syncthreads();
+    const int l = threadIdx.x;
+    if (l >= 64) return;
+    const int wg = blockIdx.y + (int)blockIdx.z * gridDim.y;
+    const int first_row = wg << 1;
+    if (first_row >= n_out) return;
+    const int num_rows = min(2, n_out - first_row);
+    const int blocks = n_in >> 8;
+    const int rstride = blocks * 136;
+    const float* xr = x;
+    float t0 = 0.0f, t1 = 0.0f;
+    for (int col0 = l << 3; col0 < n_in; col0 += 512) {
+        float xw[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) xw[j] = xr[col0 + j];
+        const int ib = (col0 >> 5) & 7;      // 서브블록 32
+        const int j0 = col0 & 31;            // 서브블록 내 오프셋 (8-정렬)
+        const int half = (j0 >= 16) ? 1 : 0; // 니블 반 (그룹 상수)
+        const int qoff = 8 + ib * 16 + (j0 & 15); // 블록 내 qs 바이트 오프셋
+        #pragma unroll
+        for (int n = 0; n < 2; n++) {
+            if (n >= num_rows) break;
+            const size_t rb = (size_t)(first_row + n) * (size_t)rstride + (size_t)((col0 >> 8) * 136);
+            const unsigned w0 = w[rb >> 2];
+            const float d = bits_f16(w0 & 0xFFFFu);
+            const int ls = (int)((w[(rb + 4) >> 2] >> ((ib >> 1) * 8 + (ib & 1) * 4)) & 0xFu)
+                         | (int)(((w0 >> 16) >> (2 * ib)) & 3u) << 4;
+            const float dl = d * (float)(ls - 32);
+            const unsigned qsw0 = w[(rb + (unsigned)qoff) >> 2];
+            const unsigned qsw1 = w[(rb + (unsigned)qoff + 4u) >> 2];
+            float aq = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const unsigned qv = (qsw0 >> (8 * j)) & 0xFFu;
+                const unsigned kv = half ? ((kt_s[qv] >> 8) & 0xFFu) : (kt_s[qv] & 0xFFu);
+                aq += (float)(signed char)kv * xw[j];
+            }
+            #pragma unroll
+            for (int j = 4; j < 8; j++) {
+                const unsigned qv = (qsw1 >> (8 * (j - 4))) & 0xFFu;
+                const unsigned kv = half ? ((kt_s[qv] >> 8) & 0xFFu) : (kt_s[qv] & 0xFFu);
+                aq += (float)(signed char)kv * xw[j];
+            }
+            if (n == 0) t0 += dl * aq; else t1 += dl * aq;
+        }
+    }
+    __shared__ double sh0[32], sh1[32];
+    double a0 = (double)t0, a1 = (double)t1;
+    if (l >= 32) { sh0[l - 32] = a0; sh1[l - 32] = a1; }
+    __syncthreads();
+    if (l < 32) {
+        a0 += sh0[l];
+        a1 += sh1[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a0 += __shfl_down_sync(0xffffffffffffffffull, a0, off);
+            a1 += __shfl_down_sync(0xffffffffffffffffull, a1, off);
+        }
+        if (l == 0) {
+            float* orow = out;
+            orow[first_row] = (float)a0;
+            if (num_rows > 1) orow[first_row + 1] = (float)a1;
+        }
+    }
+}
