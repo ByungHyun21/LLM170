@@ -57,12 +57,17 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     // 지원(엔진이 단일 슬롯) — 게이트(gate-exl3.sh)의 고정 토큰 러너.
     if model_path.is_dir() {
         if backend == "cpu" {
-            return usage_err("EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan");
+            return usage_err("EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan|cuda");
         }
         if prompts.len() > 1 {
             return usage_err("EXL3 infer는 단일 --prompt-tokens만 지원");
         }
         return run_exl3_infer(&model_path, &prompts[0], n_predict, ctx, &gpu_runtime);
+    }
+    // plans/cuda-port.md S6/S7 이전에는 GGUF/W4A16 CUDA 경로가 없다.
+    // cuda 요청을 HIP 부착으로 잘못 해석하는 조용한 폴백을 금지한다.
+    if gpu_runtime == "cuda" {
+        return usage_err("CUDA는 현재 EXL3 디렉터리만 지원 (GGUF/W4A16은 S6/S7 대기)");
     }
     let max_prompt = prompts.iter().map(|p| p.len()).max().unwrap();
     if max_prompt + n_predict + 8 >= ctx {
@@ -372,7 +377,7 @@ fn parse_ids(s: &str) -> Result<Vec<u32>, std::num::ParseIntError> {
 }
 
 /// EXL3 아카이브 infer — 포맷 자동 판별 경로(사용자 계약 2026-10-05).
-/// --backend는 런타임만 받는다: hip→Exl3Hip, vulkan→Exl3(vk).
+/// --backend는 런타임만 받는다: hip→Exl3Hip, vulkan→Exl3(vk), cuda→Exl3Cuda.
 /// gate-exl3.sh 고정 토큰 게이트의 러너 — JSONL 형식은 q35 emit과 동일
 /// ({{"seq","pos","token","text"}})해 게이트 grep이 양쪽 공용이다.
 fn run_exl3_infer(
@@ -400,18 +405,21 @@ fn run_exl3_infer(
     enum E {
         Vk(Box<crate::exl3_engine::Exl3Engine>),
         Hip(Box<crate::exl3_hip_engine::Exl3HipEngine>),
+        Cuda(Box<crate::exl3_cuda_engine::Exl3CudaEngine>),
     }
     impl E {
         fn prefill(&mut self, toks: &[u32]) -> Result<Vec<f32>, String> {
             match self {
                 E::Vk(e) => e.prefill(0, toks),
                 E::Hip(e) => e.prefill(toks),
+                E::Cuda(e) => e.prefill(0, toks),
             }
         }
         fn decode1(&mut self, t: u32) -> Result<Vec<f32>, String> {
             match self {
                 E::Vk(e) => e.decode1(0, t),
                 E::Hip(e) => e.decode1(t),
+                E::Cuda(e) => e.decode1(0, t),
             }
         }
     }
@@ -423,7 +431,7 @@ fn run_exl3_infer(
                 return ExitCode::FAILURE;
             }
         }
-    } else {
+    } else if gpu_runtime == "hip" {
         match crate::exl3_hip_engine::Exl3HipEngine::load(&dir_s, 1, ctx) {
             Ok(e) => E::Hip(Box::new(e)),
             Err(e) => {
@@ -431,6 +439,18 @@ fn run_exl3_infer(
                 return ExitCode::FAILURE;
             }
         }
+    } else if gpu_runtime == "cuda" {
+        // plans/cuda-port.md S5: 명시적 CUDA 런타임만 디코더에 연결한다.
+        match crate::exl3_cuda_engine::Exl3CudaEngine::load(&dir_s, 1, ctx) {
+            Ok(e) => E::Cuda(Box::new(e)),
+            Err(e) => {
+                eprintln!("error: exl3-cuda 로드 실패: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        eprintln!("error: EXL3 GPU 런타임 미지원: {gpu_runtime} (hip|vulkan|cuda 필요)");
+        return ExitCode::FAILURE;
     };
     let mut lg = match eng.prefill(prompt) {
         Ok(l) => l,

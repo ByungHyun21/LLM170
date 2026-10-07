@@ -5,6 +5,7 @@
 //! 비트계약: raw-HIP greedy 스트림 ≡ CPU W4A8 참조 엔진 (12+64토큰 교차검증).
 
 pub mod common;
+pub mod rawcuda;
 pub mod rawhip;
 pub mod rawvk;
 
