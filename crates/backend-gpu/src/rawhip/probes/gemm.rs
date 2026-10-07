@@ -1342,8 +1342,11 @@ pub fn hip_moe_dmmv_check(path: &str, tname: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     let w = m.w(tname).ok_or("tensor 없음")?;
     let ty = w.ty;
-    if !matches!(ty, llm170_gguf::GgmlType::Q4K | llm170_gguf::GgmlType::Q5_1) {
-        return Err(format!("hip-moe-dmmv-check: q4_K/q5_1 전용 (ty={ty:?})"));
+    if !matches!(
+        ty,
+        llm170_gguf::GgmlType::Q4K | llm170_gguf::GgmlType::Q5_1 | llm170_gguf::GgmlType::Q5K
+    ) {
+        return Err(format!("hip-moe-dmmv-check: q4_K/q5_1/q5_K 전용 (ty={ty:?})"));
     }
     let ne = m.hp.n_expert.max(1);
     let (n_in, n_out) = (w.n_in as usize, (w.n_out as usize) / ne);
@@ -1374,7 +1377,12 @@ pub fn hip_moe_dmmv_check(path: &str, tname: &str) -> Result<String, String> {
     ctx.quant_q8_b(xfd, xq, n_in, xq_w, rows)?;
     let out_old = ctx.alloc(rows * n_out * 4)?;
     let part = ctx.scratch(4)?;
-    if ty == llm170_gguf::GgmlType::Q4K {
+    if ty == llm170_gguf::GgmlType::Q5K {
+        // plans/141: Q5K의 종전 t=1 소비자는 디바이스 그룹핑 도메인에 묶인 그룹
+        // 타일(q4_gemm_q5k_gm + tilexp/perm_pad)이라 이 하네스에서 재현할 수 없다.
+        // 인시투 관측으로는 그 경로가 정확히 0을 냈다(L2.moe_sc=0 — 정의상 오차
+        // 100%). 따라서 여기서는 dmmv의 f64 기준 오차만 판정한다.
+    } else if ty == llm170_gguf::GgmlType::Q4K {
         let mut xp = xq as *mut std::ffi::c_void;
         let mut wp = wd as *mut std::ffi::c_void;
         let mut pp = part as *mut std::ffi::c_void;
@@ -1443,6 +1451,8 @@ pub fn hip_moe_dmmv_check(path: &str, tname: &str) -> Result<String, String> {
     let out_dm = ctx.alloc(rows * n_out * 4)?;
     let kern = if ty == llm170_gguf::GgmlType::Q4K {
         "q4_gemm_q4k_dmmv_ids"
+    } else if ty == llm170_gguf::GgmlType::Q5K {
+        "q5k_gemm_dmmv_ids"
     } else {
         "q5_1_gemm_dmmv_ids"
     };
@@ -1484,6 +1494,7 @@ pub fn hip_moe_dmmv_check(path: &str, tname: &str) -> Result<String, String> {
     let mut wrow = vec![0f32; n_in];
     let mut eo = 0f64;
     let mut ed = 0f64;
+    let mut refmax = 0f64;
     for r in 0..rows {
         let ebase = ids[r] as usize * per_expert;
         for o in 0..n_out {
@@ -1500,12 +1511,18 @@ pub fn hip_moe_dmmv_check(path: &str, tname: &str) -> Result<String, String> {
             }
             eo = eo.max((vo[r * n_out + o] as f64 - s).abs());
             ed = ed.max((vd[r * n_out + o] as f64 - s).abs());
+            refmax = refmax.max(s.abs());
         }
     }
-    let pass = ed <= 2.0 * eo && ed <= 1e-2;
+    let pass = if ty == llm170_gguf::GgmlType::Q5K {
+        // 종전 경로 부재 → f64 기준 대비 상대오차로 판정(정의상 정확도 검사).
+        ed <= 1e-4 * refmax.max(1.0)
+    } else {
+        ed <= 2.0 * eo && ed <= 1e-2
+    };
     let verdict = if pass { "PASS" } else { "FAIL" };
     Ok(format!(
-        "hip-moe-dmmv-check {tname} ty={ty:?} n_in={n_in} n_out={n_out}/expert rows={rows} ne={ne}: {verdict} — old_err={eo:.3e} dmmv_err={ed:.3e} (f64 기준)\n  old[0..4]={:?}\n  dmmv[0..4]={:?}",
+        "hip-moe-dmmv-check {tname} ty={ty:?} n_in={n_in} n_out={n_out}/expert rows={rows} ne={ne}: {verdict} — old_err={eo:.3e} dmmv_err={ed:.3e} refmax={refmax:.3e} (f64 기준)\n  old[0..4]={:?}\n  dmmv[0..4]={:?}",
         &vo[..4.min(vo.len())],
         &vd[..4.min(vd.len())]
     ))
