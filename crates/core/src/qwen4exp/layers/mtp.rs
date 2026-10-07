@@ -410,10 +410,12 @@ impl Engine4 {
         // plans/141: 수용률 0의 원인을 GPU 수치 전에 판별한다. 프레임 스펙의
         // 실제 제안열·검증열과 채택 수를 함께 남겨 제안 누락을 식별한다.
         // `n_acc` = 검증 출력과 일치한 드래프트 수(y[i] == proposals[i+1]).
+        // 드래프트 pos도 함께 찍는다 — 거각 복원·재체인이 어긋나면 pos가
+        // 라운드마다 상승해 CPU 어텐션 비용이 늘어난다(spawn O(pos)).
         if llm170_diag::dump::opts().key("spec_accept") {
             eprintln!(
-                "# spec-accept pos={} k={k} proposals={proposals:?} verify={y:?} matched={n_acc} full={full}",
-                snap_t.pos,
+                "# spec-accept pos={} dpos={} k={k} proposals={proposals:?} verify={y:?} matched={n_acc} full={full}",
+                snap_t.pos, self.mtp_seqs[seq].pos,
             );
         }
         // 그림자 진단(LLM170_DUMP=spec_check) — 배치 y·상태와 순차 decode1
@@ -1167,45 +1169,105 @@ pub(crate) fn mtp_attn_cpu_row(
     // dense softmax 어텐션 + 게이트 — cpu_attn_row 열에서 **cell 0은
     // 스킵**(드래프트 KV는 위치 1부터 기입 — 팬텀 0키가 softmax 질량을
     // 훔치는 결함, P15④-5).
+    //
+    // plans/141: 헤드별 루프를 스레드 파티션으로 나눴다. 이 계산은 드래프트
+    // 스텝에서 컨텍스트에 비례해 grow하는 유일한 부분이다(스텝당 5ms → 12ms,
+    // pp512 → 수천 토큰 구간). 헤드는 q/k/v와 KV를 **읽기만** 하고 out의
+    // 서로 겹치지 않는 구간[ob, ob+hd)에 쓴다 — 헤드 간 공유 상태가 없어
+    // 파티션이 정확하며, 각 헤드의 산술 순서(부분합 → softmax → 가중합 → 게이트)는
+    // 그대로여서 비트 동일하다. frame/forward.rs의 ple_gatherMT와 같은 관례.
     let n_past = pos as usize;
     let (ck, cv) = (&st.kv_k[0], &st.kv_v[0]);
     let mut out = vec![0.0f32; n_head * hd];
-    for h in 0..n_head {
-        let kvh = h / (n_head / n_kv);
-        let mut maxv = f32::NEG_INFINITY;
-        let mut scores = vec![0.0f32; n_past];
-        for (p, sc) in scores.iter_mut().enumerate() {
-            let p = p + 1; // cell 0 스킵
-            let b = p * n_kv * hd + kvh * hd;
-            let mut d = 0.0f32;
-            for i in 0..hd {
-                d += q_row[h * 2 * hd + i] * ck[b + i];
-            }
-            *sc = d * kq_scale;
-            maxv = maxv.max(*sc);
+    // q는 헤드 앞처리(rms_norm+rope)가 앞에서 in-place로 끝났으므로 읽기 전용이다.
+    let q_ro: &[f32] = q_row;
+    let nt = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(n_head)
+        .min(32);
+    let per = n_head.div_ceil(nt);
+    std::thread::scope(|sc| {
+        let mut rest: &mut [f32] = &mut out;
+        let mut base = 0usize;
+        while base < n_head {
+            let take = per.min(n_head - base);
+            let (chunk, tail) = rest.split_at_mut(take * hd);
+            rest = tail;
+            let b = base;
+            sc.spawn(move || {
+                for j in 0..take {
+                    head_attn(
+                        b + j,
+                        n_head,
+                        n_kv,
+                        hd,
+                        n_past,
+                        kq_scale,
+                        q_ro,
+                        ck,
+                        cv,
+                        chunk,
+                        j * hd,
+                    );
+                }
+            });
+            base += take;
         }
-        let mut sum = 0.0f32;
-        for sc in scores.iter_mut() {
-            *sc = (*sc - maxv).exp();
-            sum += *sc;
-        }
-        let ob = h * hd;
-        for (p0, sc) in scores.iter().enumerate() {
-            let w = sc / sum;
-            if w == 0.0 {
-                continue;
-            }
-            let b = (p0 + 1) * n_kv * hd + kvh * hd;
-            for i in 0..hd {
-                out[ob + i] += w * cv[b + i];
-            }
-        }
-        let gb = h * 2 * hd + hd;
+    });
+    out
+}
+
+/// 단일 헤드의 dense 어텐션 + 게이트. `slot`은 파티션 버퍼 내 오프셋
+/// (헤드 h는 `slot..slot+hd`를 쓴다). 산술 순서는 mtp_attn_cpu_row의 종전
+/// 본문과 동일 — 병렬화만 바뀌고 계산 순서는 그대로다.
+#[allow(clippy::too_many_arguments)]
+fn head_attn(
+    h: usize,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+    n_past: usize,
+    kq_scale: f32,
+    q_row: &[f32],
+    ck: &[f32],
+    cv: &[f32],
+    out: &mut [f32],
+    slot: usize,
+) {
+    let kvh = h / (n_head / n_kv);
+    let qb = h * 2 * hd;
+    let mut scores = vec![0.0f32; n_past];
+    let mut maxv = f32::NEG_INFINITY;
+    for (p, sc) in scores.iter_mut().enumerate() {
+        let p = p + 1; // cell 0 스킵
+        let b = p * n_kv * hd + kvh * hd;
+        let mut d = 0.0f32;
         for i in 0..hd {
-            out[ob + i] *= sigmoid(q_row[gb + i]);
+            d += q_row[qb + i] * ck[b + i];
+        }
+        *sc = d * kq_scale;
+        maxv = maxv.max(*sc);
+    }
+    let mut sum = 0.0f32;
+    for sc in scores.iter_mut() {
+        *sc = (*sc - maxv).exp();
+        sum += *sc;
+    }
+    for (p0, sc) in scores.iter().enumerate() {
+        let w = sc / sum;
+        if w == 0.0 {
+            continue;
+        }
+        let b = (p0 + 1) * n_kv * hd + kvh * hd;
+        for i in 0..hd {
+            out[slot + i] += w * cv[b + i];
         }
     }
-    out
+    let gb = h * 2 * hd + hd;
+    for i in 0..hd {
+        out[slot + i] *= sigmoid(q_row[gb + i]);
+    }
 }
 /// hc_combine: res[s] += out·(2·σ(inject_s/4)).
 pub(super) fn hc_combine(
