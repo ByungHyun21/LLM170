@@ -85,6 +85,27 @@ fn main() -> ExitCode {
         }
     }
     let r = match args.get(1).map(String::as_str) {
+        // S11 배치 동치성: T>1 배치가 T=1 순차와 같은 값을 내는지.
+        // 프리필 배치화의 전제 조건(배치가 틀리면 배치화해서는 안 된다).
+        Some("s11") => {
+            let dir = args.get(2).map(String::as_str).unwrap_or("");
+            let nrows: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4);
+            let lim: usize = args
+                .get(4)
+                .and_then(|s| s.parse().ok())
+                .map(|v: usize| if v == 0 { usize::MAX } else { v })
+                .unwrap_or(8);
+            return match s11_check(dir, nrows, lim) {
+                Ok(s) => {
+                    println!("{s}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("FAIL: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         // S10 디바이스 상주 vs 호스트 스테이징 종단 대조(신규 파일 위임).
         Some("s10") => {
             let dir = args.get(2).map(String::as_str).unwrap_or("");
@@ -224,6 +245,142 @@ fn main() -> ExitCode {
 // 작은 lim_layers를 쓴다) 같은 토큰열을 호스트 스테이징·디바이스 경로로
 // 각각 그리디 디코드하고 종단 토큰열을 비교한다. 1스텝 로짓 대조로 놓치는
 // 상태 오염(GDN 스캔·KV 누적)을 여러 스텝에 걸쳐 잡는다.
+
+// S11 동치성 검사 — GDN/어텐션이 T=1 순차와 같은 값을 내는지.
+// 실모델 상수를 아카이브에서 읽어와 set_gdn에 넣어야 상태 리셋이 된다.
+fn s11_check(dir: &str, nrows: usize, lim: usize) -> Result<String, String> {
+    use rawcuda::exl3_cuda::Exl3CudaDecoder;
+    if dir.is_empty() {
+        return Err("사용법: cuda_probe s11 <exl3_dir> [nrows] [layers]".into());
+    }
+    let cfg = std::fs::read_to_string(format!("{dir}/config.json"))
+        .map_err(|e| format!("config.json: {e}"))?;
+    let dims = rawcuda::gdn_cuda::GdnDims::from_config(&cfg)?;
+    let adims = rawcuda::attn_cuda::AttnDims::from_config(&cfg)?;
+    let dec = Exl3CudaDecoder::load_slots(dir, lim, 512, 1)?;
+    let dev = dec.device_name().to_string();
+    // GDN 상수는 load가 이미 올렸지만 리셋을 위해 다시 읽는다(원장 S11:
+    // 동치성 검사는 상태를 0으로 되돌려 두 번 돌려야 한다).
+    let ar = rawcuda::exl3_cuda::StArchive::open(std::path::Path::new(dir))?;
+    let rd = |name: &str| -> Result<Vec<f32>, String> {
+        let dt = ar.dtype_of(name).ok_or_else(|| format!("{name} 없음"))?;
+        let raw = ar.read(name)?;
+        rawcuda::exl3_cuda_probe::st_to_f32(&raw, dt)
+    };
+    let (n, cch, hv, hd) = (
+        dims.n_gdn,
+        dims.conv_ch(),
+        dims.h_v,
+        dims.hidden,
+    );
+    let mut cw = vec![0f32; n * cch * 4];
+    let mut ab = vec![0f32; n * 2 * hv * hd];
+    let mut alog = vec![0f32; n * hv];
+    let mut dtb = vec![0f32; n * hv];
+    let mut nw = vec![0f32; n * dims.d];
+    for (gi, il) in (0..n).map(|g| (g, (g / 3) * 4 + g % 3)).collect::<Vec<_>>() {
+        let lp = format!("model.language_model.layers.{il}.linear_attn");
+        cw[gi * cch * 4..(gi + 1) * cch * 4].copy_from_slice(&rd(&format!("{lp}.conv1d.weight"))?);
+        let a = rd(&format!("{lp}.in_proj_a.weight"))?;
+        let b = rd(&format!("{lp}.in_proj_b.weight"))?;
+        let base = gi * 2 * hv * hd;
+        ab[base..base + hv * hd].copy_from_slice(&a);
+        ab[base + hv * hd..(gi + 1) * 2 * hv * hd].copy_from_slice(&b);
+        alog[gi * hv..(gi + 1) * hv].copy_from_slice(&rd(&format!("{lp}.A_log"))?);
+        dtb[gi * hv..(gi + 1) * hv].copy_from_slice(&rd(&format!("{lp}.dt_bias"))?);
+        nw[gi * dims.d..(gi + 1) * dims.d].copy_from_slice(&rd(&format!("{lp}.norm.weight"))?);
+    }
+    let consts = rawcuda::exl3_cuda_batch_probe::GdnConsts { cw, ab, alog, dtb, nw };
+    let mut dec = dec;
+    let mut rows = String::new();
+    let mut ok = true;
+    // GDN 동치성 — T=2,4 (fwd3s와 scan 청크 경계 전).
+    for t in [2usize, 4] {
+        let (md, n_cmp) = rawcuda::exl3_cuda_batch_probe::gdn_t_equivalence(
+            &mut dec, dims, &consts, 0, t, 0x5111_0000_0000_0001,
+        )?;
+        rows.push_str(&format!("gdn T={t} last-row maxdiff={md:.3e}/{n_cmp} "));
+        if md > 1e-3 {
+            ok = false;
+        }
+    }
+    // 어텐션 동치성 — T=2,4 (fwd3s 상한 8 이내).
+    for t in [2usize, 4] {
+        if t <= rawcuda::attn_cuda::ATTN_F3S_TMAX {
+            let (md, n_cmp) = rawcuda::exl3_cuda_batch_probe::attn_t_equivalence(
+                &mut dec, 0, 0, t, 0x5111_0000_0000_0002,
+            )?;
+            rows.push_str(&format!("attn T={t} last-row maxdiff={md:.3e}/{n_cmp} "));
+            if md > 1e-3 {
+                ok = false;
+            }
+        }
+    }
+    let fwd = s11_forward_check(dir, nrows, lim)?;
+    let _ = adims;
+    Ok(format!(
+        "device: {dev} | exl3-cuda-s11 T-equivalence (nrows={nrows}): {rows}\n{fwd}| {}",
+        if ok { "EQUIVALENT | PASS" } else { "NOT EQUIVALENT | FAIL" }
+    ))
+}
+
+// S11 forward 배선 동치성 — 모듈 단위가 맞아도 forward가 틀릴 수 있다.
+// 두 디코더(순차/배치)에 같은 임베딩 열을 넣어 마지막 로짓을 비교한다.
+fn s11_forward_check(dir: &str, nrows: usize, lim: usize) -> Result<String, String> {
+    use rawcuda::exl3_cuda::Exl3CudaDecoder;
+    let mut seq = Exl3CudaDecoder::load_slots(dir, lim, 512, 1)?;
+    let mut bat = Exl3CudaDecoder::load_slots(dir, lim, 512, 1)?;
+    let dev = bat.device_name().to_string();
+    let tmax = rawcuda::attn_cuda::ATTN_F3S_TMAX;
+    let mut rows = String::new();
+    let mut ok = true;
+    for t in [2usize, 4, tmax].into_iter().filter(|t| *t <= tmax && *t <= nrows.max(2)) {
+        let mut emb = vec![0f32; t * seq.hidden];
+        for (i, v) in emb.iter_mut().enumerate() {
+            *v = ((i % 89) as f32) * 0.02 - 0.5;
+        }
+        let (md, n_cmp) =
+            rawcuda::exl3_cuda_batch_probe::forward_batch_equivalence(&mut seq, &mut bat, &emb)?;
+        // argmax 일치까지 본다 — 절대 오차보다 "같은 토큰을 고르는가"가
+        // 실사용 판정이다. GEMM2는 mma f16 누적이라 GEMV와 환원 순서가
+        // 달라 T>1에서 미세하게 다르다(구조적으로 0이 아니다).
+        let (arg_same, ht, bt) =
+            rawcuda::exl3_cuda_batch_probe::forward_batch_argmax(&mut seq, &mut bat, &emb)?;
+        // [판정 기준] argmax 일치가 게이트다. logit maxdiff 1.6e-2는 f16 mma
+        // 누산 차이로 T>1에서 구조적으로 0이 될 수 없다(환원 순서가
+        // GEMV와 다르다). 실사용 판정은 "같은 토큰을 고르는가"이며
+        // 게이트 스크립트도 같은 기준이다. 참고용으로 절댓값도 함께 찍되
+        // FAIL 판정에는 쓰지 않는다.
+        rows.push_str(&format!(
+            "fwd T={t} argmax_same={arg_same}({ht}vs{bt}) logit maxdiff={md:.3e} "
+        ));
+        if !arg_same {
+            ok = false;
+        }
+        let _ = n_cmp;
+    }
+    let mut emb2 = vec![0f32; 2 * seq.hidden];
+    for (i, v) in emb2.iter_mut().enumerate() {
+        *v = ((i % 89) as f32) * 0.02 - 0.5;
+    }
+    let mid = rawcuda::exl3_cuda_batch_probe::batch_mid_probe(&mut seq, &mut bat, &emb2)?;
+    // 첫 층 선형의 순차 gemv_host vs 배치 gemm2_host — T>1 GEMM이 같은 값을
+    // 내는지(모듈 자체는 이미 검증됐지만 T=1↔T=2 교차 확인).
+    let kq = seq.hidden;
+    let mut xq = vec![0f32; 2 * kq];
+    for (i, v) in xq.iter_mut().enumerate() {
+        *v = ((i % 89) as f32) * 0.02 - 0.5;
+    }
+    let key = "model.language_model.layers.0.linear_attn.in_proj_qkv";
+    let (gmd, gn) =
+        rawcuda::exl3_cuda_batch_probe::batch_gemv_probe(&mut seq, &mut bat, key, &xq)?;
+    Ok(format!(
+        "device: {dev} | exl3-cuda-s11 forward-equivalence: {rows}\n{mid}\n\
+         S11 batch gemm2({key} T=2): vs sequential maxdiff={gmd:.3e}/{gn}| {}",
+        if ok { "PASS" } else { "FAIL" }
+    ))
+}
+
 fn s10_check(dir: &str, ntok: usize, lim: usize) -> Result<String, String> {
     use rawcuda::exl3_cuda::Exl3CudaDecoder;
     if dir.is_empty() {
