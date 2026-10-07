@@ -261,4 +261,155 @@ impl Exl3CudaDecoder {
         }
         Ok(out)
     }
+
+    // ── 행병렬 gemv_t(슬롯 간 배치 — plans/cuda-port.md §1 착수조건 1) ──
+
+    /// gemv_t 체인 T 상한 — 커널 누산기 배열 폭과 동일(변경 시 커널과
+    /// 함께 고칠 것 — 임의 상향 금지).
+    pub const GEMV_T_TMAX: usize = 8;
+
+    /// 행병렬 gemv_t 작업 버퍼 보장 — dx [t][k] · daht [t][k/2]팩 ·
+    /// dsbt [t][nseg=16][n] · dyt [t][n]. daht·dyt는 gemm2 버퍼와
+    /// 공유(용량 계열 동일), dsbt만 별도다(nseg=16 분할 — had_out 합산
+    /// 순서가 T=1 gemv와 같으려면 nseg=16이어야 한다).
+    fn ensure_gemv_t_bufs(&mut self, k: usize, n: usize, t: usize) -> Result<(), String> {
+        self.ensure_x(t * k)?;
+        let ah_bytes = t * k * 2;
+        if ah_bytes > self.gemm_ah_cap {
+            if self.daht != 0 {
+                self.cc.free(self.daht)?;
+            }
+            self.daht = self.cc.alloc(ah_bytes)?;
+            self.gemm_ah_cap = ah_bytes;
+        }
+        let y_bytes = t * n * 4;
+        if y_bytes > self.gemm_y_cap {
+            if self.dyt != 0 {
+                self.cc.free(self.dyt)?;
+            }
+            self.dyt = self.cc.alloc(y_bytes)?;
+            self.gemm_y_cap = y_bytes;
+        }
+        let sbt_bytes = t * GEMV_NSEG * n * 4;
+        if sbt_bytes > self.gemv_t_sbt_cap {
+            if self.dsbt != 0 {
+                self.cc.free(self.dsbt)?;
+            }
+            self.dsbt = self.cc.alloc(sbt_bytes)?;
+            self.gemv_t_sbt_cap = sbt_bytes;
+        }
+        Ok(())
+    }
+
+    /// 슬롯 간 배치 체인 진행 **전** gemv_t 버퍼를 전 선형 최대 형상으로
+    /// 한 번에 확보한다 — prewarm_chain_bufs와 같은 이유(진행 중
+    /// 재할당이 이전 포인터를 읽는 커널과 경쟁한다, 원장 S10·S11).
+    /// lm_head n=어휘 폭까지 포함해 잡는다(첫 호출이 q_proj 폭이면
+    /// lm_head 시점에 dsbt가 재할당되는 것을 원천 차단).
+    pub(crate) fn prewarm_gemv_t_bufs(&mut self, t: usize) -> Result<(), String> {
+        let mut kmax = 0usize;
+        let mut nmax = 0usize;
+        for l in self.lin.values() {
+            kmax = kmax.max(l.k);
+            nmax = nmax.max(l.n);
+        }
+        self.ensure_gemv_t_bufs(kmax, nmax, t)
+    }
+
+    /// 행병렬 gemv_t 체인 내부: dx [t][k] → had16_batch → exl3_gemv_t
+    /// ([t][nseg=16][n] 부분합) → had_out(nseg=16 합산) → dyt [t][n].
+    ///
+    /// [비트계약] exl3_gemv_t는 트렐리스 추출·디코드를 T행 공유하되
+    /// hfma2 누산·FOLD=4 케이던스·nseg=16 분할·had_out 합산 순서를
+    /// 행마다 T=1 exl3_gemv 체인과 동일하게 유지한다 — 같은 피연산자가
+    /// 같은 순서로 같은 반올림을 통과하므로 행별 출력은 T=1 GEMV와
+    /// **비트동일**이다(cuda_probe gemv-t가 to_bits로 판정). gemm2(mma
+    /// f32 누산) 경로는 이 계약을 만족하지 못한다(원장: 24스텝 argmax
+    /// 뒤집힘) — 배치 디코드는 반드시 이 체인을 쓴다.
+    fn gemv_t_chain_dev(&mut self, l: &CudaLin, t: usize) -> Result<(), String> {
+        if t == 0 || t > Self::GEMV_T_TMAX {
+            return Err(format!(
+                "gemv_t: T={t} — 도메인 1..={} 위반(커널 누산기 폭)",
+                Self::GEMV_T_TMAX
+            ));
+        }
+        self.ensure_gemv_t_bufs(l.k, l.n, t)?;
+        self.had16_batch(l.k, t, l.suh)?;
+        // exl3_gemv_t: grid ((n/16)/8, nseg=16), 블록 128 — sbt [T][nseg][n].
+        let f_gt = self.cc.function("exl3_gemv_t")?;
+        let (mut kt, mut nt, mut kk, mut tt) = (
+            (l.k / 16) as i32,
+            (l.n / 16) as i32,
+            l.krate as i32,
+            t as i32,
+        );
+        let (mut b0, mut b1, mut b2) = (self.daht, l.tre, self.dsbt);
+        let mut args_gt: [*mut std::ffi::c_void; 7] = [
+            (&mut b0) as *mut _ as *mut _,
+            (&mut b1) as *mut _ as *mut _,
+            (&mut b2) as *mut _ as *mut _,
+            (&mut kt) as *mut _ as *mut _,
+            (&mut nt) as *mut _ as *mut _,
+            (&mut kk) as *mut _ as *mut _,
+            (&mut tt) as *mut _ as *mut _,
+        ];
+        self.cc.launch(
+            f_gt,
+            ((l.n / 16) / 8) as u32,
+            GEMV_NSEG as u32,
+            128,
+            &mut args_gt,
+        )?;
+        // had_out T행 — nseg=16 합산 순서는 T=1 had_out과 동일(행별 비트동일).
+        self.hadout_batch(self.dsbt, l.svh, self.dyt, l.n, t, GEMV_NSEG)
+    }
+
+    /// 디바이스 상주 입력 [t][k] → 행병렬 gemv_t 체인 → dyt [t][n].
+    /// 반환 포인터는 self.dyt(다음 체인이 덮으므로 즉시 소비할 것 —
+    /// gemv_dev의 dyb 규약과 동일).
+    pub fn gemv_t_dev(
+        &mut self,
+        key: &str,
+        rows_dev: CUdeviceptr,
+        t_len: usize,
+    ) -> Result<CUdeviceptr, String> {
+        let l = self.lin_copy(key)?;
+        if rows_dev == 0 {
+            return Err(format!("gemv_t_dev({key}): 입력 포인터 0"));
+        }
+        self.ensure_gemv_t_bufs(l.k, l.n, t_len)?;
+        if rows_dev != self.dx {
+            self.cc.d2d(self.dx, rows_dev, t_len * l.k * 4)?;
+        }
+        self.gemv_t_chain_dev(&l, t_len)?;
+        Ok(self.dyt)
+    }
+
+    /// 호스트 rows [t][k] → 행병렬 gemv_t 체인 → [t][n](검증층 진입 —
+    /// gemv_host의 T행 판).
+    pub fn gemv_t_host(&mut self, key: &str, rows: &[f32]) -> Result<Vec<f32>, String> {
+        let l = self.lin_copy(key)?;
+        if rows.is_empty() || !rows.len().is_multiple_of(l.k) {
+            return Err(format!(
+                "gemv_t: rows.len={} k={} — [t][k] 계약 위반",
+                rows.len(),
+                l.k
+            ));
+        }
+        let t = rows.len() / l.k;
+        if t > Self::GEMV_T_TMAX {
+            return Err(format!("gemv_t: T={t} > {}", Self::GEMV_T_TMAX));
+        }
+        self.ensure_gemv_t_bufs(l.k, l.n, t)?;
+        // SAFETY: rows는 f32 슬라이스 — 바이트 뷰 변환(업로드까지 생존).
+        let xb = unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, rows.len() * 4) };
+        self.cc.h2d(self.dx, xb)?;
+        self.gemv_t_chain_dev(&l, t)?;
+        let mut ob = vec![0u8; t * l.n * 4];
+        self.cc.d2h(&mut ob, self.dyt)?;
+        self.cc.sync()?;
+        // SAFETY: d2h 동기 완료 후 재해석(길이·정렬 일치).
+        let y: &[f32] = unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, t * l.n) };
+        Ok(y.to_vec())
+    }
 }

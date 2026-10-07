@@ -596,12 +596,19 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     }
                 }
                 Engine::Exl3Cuda(e) => {
-                    // cuda 기본 경로(단일 슬롯 — rawcuda 포팅, plans/124). greedy는
-                    // step_tok(G3+ 스텁 위임), 그 외는 decode1 로짓 판. MTP는
-                    // 디코더 G4+ 이후(spec_round가 명시 Err).
-                    // S8 다중 슬롯: 슬롯마다 디코더가 GDN/KV/pos를 따로 보유하므로
-                    // 스케줄러의 연속 배칭이 그대로 병렬 요청으로 확장된다.
-                    for &i in &active {
+                    // cuda 경로(rawcuda 포팅, plans/124). greedy 슬롯이
+                    // 2개 이상이면 슬롯 간 배치로 한 번에 돈다(gemv_t —
+                    // 행별 T=1 순차와 비트동일, plans/cuda-port.md §1).
+                    // greedy 1개는 기존 step_tok_device 기본선(게이트
+                    // 무변화), 샘플링 슬롯은 로짓 판이 필요해 단슬롯.
+                    // MTP는 디코더 G4+ 이후(spec_round가 명시 Err).
+                    let (batch, solo): (Vec<usize>, Vec<usize>) =
+                        active.iter().copied().partition(|&i| !sampling(&slots[i]));
+                    // 단슬롯 1스텝 공용 — greedy는 step_tok_device(GPU
+                    // argmax), 샘플링은 decode1 로짓 판.
+                    let step_one = |e: &mut crate::exl3_cuda_engine::Exl3CudaEngine,
+                                    slots: &mut [Slot],
+                                    i: usize| {
                         let next = slots[i].next;
                         let greedy = !slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
                         let r: Result<Vec<u32>, String> = if greedy {
@@ -631,6 +638,49 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                 slot_fail(&mut slots[i], format!("cuda decode1: {err}"));
                             }
                         }
+                    };
+                    if batch.len() >= 2 {
+                        let items: Vec<(usize, u32)> =
+                            batch.iter().map(|&i| (i, slots[i].next)).collect();
+                        match e.step_batch(&items) {
+                            Ok(toks) => {
+                                for (k, &i) in batch.iter().enumerate() {
+                                    let cap = slots[i]
+                                        .job
+                                        .as_ref()
+                                        .map(|j| j.n_predict)
+                                        .unwrap_or(usize::MAX);
+                                    // [배치 소비 계약] decode_batch_slots는
+                                    // 전 슬롯 상태를 이미 1스텝 전진시켰다 —
+                                    // 한 슬롯의 cap/EOS 사정으로 청크의 다른
+                                    // 슬롯 방출을 건너뛰면(break) 그 슬롯들이
+                                    // 토큰 없이 상태만 전진해 어긋난다(과거
+                                    // 잠재 결함). 완료 판정(eos·stops·
+                                    // n_predict)은 아래 공통 finish_slot이
+                                    // 담당하므로 여기선 방출만 한다.
+                                    if slots[i].generated as usize >= cap {
+                                        continue;
+                                    }
+                                    slot_emit(&mut slots[i], toks[k]);
+                                }
+                            }
+                            Err(err) => {
+                                // 배치 거절(예: 한 슬롯의 문맥 초과)은 그
+                                // 슬롯만 실패시키도록 단슬롯 경로로 물러난다
+                                // — 나머지 슬롯이 연쇄 실패하지 않게.
+                                eprintln!("# cuda 슬롯 간 배치 실패({err}) — 단슬롯 폴백");
+                                for &i in &batch {
+                                    step_one(e, &mut slots, i);
+                                }
+                            }
+                        }
+                    } else {
+                        for &i in &batch {
+                            step_one(e, &mut slots, i);
+                        }
+                    }
+                    for &i in &solo {
+                        step_one(e, &mut slots, i);
                     }
                 }
                 Engine::Exl3Hip(e) => {

@@ -129,6 +129,68 @@ fn main() -> ExitCode {
                 }
             };
         }
+        // 동일 프롬프트 순수 배치 — 행 상태 오염 vs 행별 산술 편차 분리.
+        Some("ms4") => {
+            let dir = args.get(2).map(String::as_str).unwrap_or("");
+            let pt: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(41);
+            let lim: usize = args
+                .get(4)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            return match ms4_check(dir, pt, lim) {
+                Ok(s) => {
+                    println!("{s}");
+                    if s.contains("FAIL") {
+                        ExitCode::FAILURE
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => {
+                    eprintln!("FAIL: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        // 1스텝 비트 판정 — argmax 마스킹 우회.
+        Some("ms4b") => {
+            let dir = args.get(2).map(String::as_str).unwrap_or("");
+            let pt: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(41);
+            let lim: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+            return match ms4b_check(dir, pt, lim) {
+                Ok(s) => {
+                    println!("{s}");
+                    if s.contains("FAIL") {
+                        ExitCode::FAILURE
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => {
+                    eprintln!("FAIL: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        // 서버 타임라인 재현 — 슬롯 간 배치 배선 결함 국소화(2026-10-08).
+        // msrv=배치 디코드, msrv-ser=동일 타임라인을 step_tok으로(요인 분리).
+        Some("msrv") | Some("msrv-ser") => {
+            let dir = args.get(2).map(String::as_str).unwrap_or("");
+            return match msrv_check(dir, args.get(1).map(String::as_str) == Some("msrv")) {
+                Ok(s) => {
+                    println!("{s}");
+                    if s.contains("FAIL") {
+                        ExitCode::FAILURE
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => {
+                    eprintln!("FAIL: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         // S10 디바이스 상주 vs 호스트 스테이징 종단 대조(신규 파일 위임).
         Some("s10") => {
             let dir = args.get(2).map(String::as_str).unwrap_or("");
@@ -152,6 +214,8 @@ fn main() -> ExitCode {
         Some("smoke") => rawcuda::exl3_cuda_probe::cuda_smoke_check(),
         Some("gemv") => rawcuda::gemv_cuda_probe::cuda_gemv_check(),
         Some("gemv-neg") => rawcuda::gemv_cuda_probe::cuda_gemv_negative_check(),
+        Some("gemv-t") => rawcuda::gemv_cuda_probe::cuda_gemv_t_check(),
+        Some("gemv-t-neg") => rawcuda::gemv_cuda_probe::cuda_gemv_t_negative_check(),
         Some("norm") => rawcuda::norm_cuda_probe::cuda_norm_check(),
         Some("norm-neg") => rawcuda::norm_cuda_probe::cuda_norm_negative_check(),
         Some("gemm2") => rawcuda::gemm2_cuda_probe::cuda_gemm2_check(),
@@ -160,10 +224,9 @@ fn main() -> ExitCode {
         Some("gemv-debug") => rawcuda::gemv_cuda_probe::cuda_gemv_debug_check(),
         Some("gdn") => match (args.get(2), args.get(3)) {
             (Some(a), Some(b)) => rawcuda::gdn_cuda_probe::cuda_gdn_check(a, b),
-            (Some(a), None) => rawcuda::gdn_cuda_probe::cuda_gdn_check(
-                a,
-                "D:/models/Qwen3.6-35B-A3B-exl3-4.00bpw",
-            ),
+            (Some(a), None) => {
+                rawcuda::gdn_cuda_probe::cuda_gdn_check(a, "D:/models/Qwen3.6-35B-A3B-exl3-4.00bpw")
+            }
             _ => rawcuda::gdn_cuda_probe::cuda_gdn_check(
                 "D:/models/Qwen3.8-27B-exl3-4.00bpw",
                 "D:/models/Qwen3.6-35B-A3B-exl3-4.00bpw",
@@ -201,9 +264,7 @@ fn main() -> ExitCode {
         },
         Some("mtp") => match args.get(2) {
             Some(d) => rawcuda::mtp_cuda_probe::cuda_mtp_check(d),
-            None => rawcuda::mtp_cuda_probe::cuda_mtp_check(
-                "D:/models/Qwen3.8-27B-exl3-4.00bpw",
-            ),
+            None => rawcuda::mtp_cuda_probe::cuda_mtp_check("D:/models/Qwen3.8-27B-exl3-4.00bpw"),
         },
         Some("mtp-neg") => match args.get(2) {
             Some(d) => rawcuda::mtp_cuda_probe::cuda_mtp_negative_check(d),
@@ -219,7 +280,9 @@ fn main() -> ExitCode {
         },
         Some("ple-neg") => match args.get(2) {
             Some(d) => rawcuda::ple_cuda_probe::cuda_ple_negative_check(d),
-            None => rawcuda::ple_cuda_probe::cuda_ple_negative_check(rawcuda::fn_support::FN_GGUF_MAIN),
+            None => {
+                rawcuda::ple_cuda_probe::cuda_ple_negative_check(rawcuda::fn_support::FN_GGUF_MAIN)
+            }
         },
         Some("moe") => rawcuda::moe_cuda_probe::cuda_moe_check(),
         Some("moe-neg") => rawcuda::moe_cuda_probe::cuda_moe_negative_check(),
@@ -248,7 +311,7 @@ fn main() -> ExitCode {
             args.get(2).map(String::as_str),
         ),
         _ => Err(format!(
-            "사용법: {prog} smoke|gemv|gemv-neg|norm|norm-neg|gemm2|gemm2-neg|gemm2-debug|gemv-debug|gdn [dir27 [dir35]]|gdn-neg [dir27]|gemv-real <dir> <key>|attn [dir27 [dir35]]|attn-neg [dir27] [dir27 [dir35]]|attn-neg [dir27]|ew|argmax|argmax-neg|mtp [dir27]|mtp-neg [dir27]|fn|fn-inv|ple [gguf_main]|ple-neg [gguf_main]|moe|moe-neg|hc [dir]|hc-neg [dir]|mtp-frame [dir [gguf]]|mtp-frame-neg [dir]|qsa [gguf_main]|qsa-neg [gguf_main]|fn-chain [gguf_main]|fn-chain-neg [gguf_main]|ds4-moe [dir]|ds4-moe-neg [dir]|ds4-mtp [dir]|ds4-mtp-neg [dir]"
+            "사용법: {prog} smoke|gemv|gemv-neg|gemv-t|gemv-t-neg|norm|norm-neg|gemm2|gemm2-neg|gemm2-debug|gemv-debug|gdn [dir27 [dir35]]|gdn-neg [dir27]|gemv-real <dir> <key>|attn [dir27 [dir35]]|attn-neg [dir27] [dir27 [dir35]]|attn-neg [dir27]|ew|argmax|argmax-neg|mtp [dir27]|mtp-neg [dir27]|fn|fn-inv|ple [gguf_main]|ple-neg [gguf_main]|moe|moe-neg|hc [dir]|hc-neg [dir]|mtp-frame [dir [gguf]]|mtp-frame-neg [dir]|qsa [gguf_main]|qsa-neg [gguf_main]|fn-chain [gguf_main]|fn-chain-neg [gguf_main]|ds4-moe [dir]|ds4-moe-neg [dir]|ds4-mtp [dir]|ds4-mtp-neg [dir]"
         )),
     };
     match r {
@@ -293,7 +356,9 @@ fn ms_check(dir: &str, lim: usize) -> Result<String, String> {
     }
     // 두 프롬프트의 토큰열(게이트 한국어 문장의 앞부분에서 유효 어휘 id만).
     const P0: [u32; 5] = [148678, 65233, 202419, 220, 49849];
-    const P1: [u32; 9] = [148678, 65233, 202419, 220, 49849, 155497, 220, 151314, 39504];
+    const P1: [u32; 9] = [
+        148678, 65233, 202419, 220, 49849, 155497, 220, 151314, 39504,
+    ];
     const NEXT0: u32 = 149635;
     const NEXT1: u32 = 174675;
 
@@ -354,6 +419,358 @@ fn ms_check(dir: &str, lim: usize) -> Result<String, String> {
     ))
 }
 
+// msrv 스텝 공용 — batch=true면 슬롯 간 배치 1스텝, false면 행별 step_tok.
+// (A) 타임라인의 프리필 교차는 그대로 두고 **디코드 요인만** 분리한다:
+// msrv-ser에서도 발산하면 프리필 교차·상태 쪽 결함, 발산하지 않으면
+// 배치 디코드(gemv_t 체인) 쪽 결함이다.
+fn msrv_step_group(
+    d: &mut rawcuda::exl3_cuda::Exl3CudaDecoder,
+    items: &[(usize, u32)],
+    batch: bool,
+) -> Result<Vec<u32>, String> {
+    if batch {
+        d.decode_batch_slots(items)
+    } else {
+        items.iter().map(|&(s, tok)| d.step_tok(s, tok)).collect()
+    }
+}
+
+// ms4 — 동일 프롬프트 4슬롯 순수 배치: 프리필 교차 없이 슬롯 0..3에 같은
+// 프롬프트를 프리필하고 T=4 배치로 24스텝. 행 i가 (a) 직렬 기준선과
+// (b) 다른 행과 어긋나는지를 분리한다 — 행 간 어긋남 = 배치 내부 행 상태
+// 오염(프롬프트 이질성 무관), 전 행 일치+직렬만 어긋남 = 행별 산술 편차.
+// ptokens로 프리필 길이를 조절한다(기본 41 — msrv #0과 동일).
+fn ms4_check(dir: &str, ptokens: usize, lim: usize) -> Result<String, String> {
+    use rawcuda::exl3_cuda::Exl3CudaDecoder;
+    if dir.is_empty() {
+        return Err("사용법: cuda_probe ms4 <exl3_dir> [ptokens] [layers]".into());
+    }
+    const BASE: [u32; 41] = [
+        148678, 65233, 202419, 220, 49849, 155497, 220, 151314, 39504, 149635, 13, 220, 174675,
+        30061, 220, 152055, 152065, 12434, 220, 154854, 149248, 80102, 20673, 220, 214009, 149789,
+        11, 220, 60177, 148726, 22836, 220, 149965, 176289, 220, 12434, 160288, 220, 158201,
+        149635, 13,
+    ];
+    let toks: Vec<u32> = BASE.iter().cycle().take(ptokens).copied().collect();
+    const NGEN: usize = 24;
+    let tmax = rawcuda::attn_cuda::ATTN_F3S_TMAX;
+    let lim = if lim == 0 { usize::MAX } else { lim };
+    let mut d = Exl3CudaDecoder::load_slots(dir, lim, 512, 4)?;
+    let dev = d.device_name().to_string();
+    let prefill = |d: &mut Exl3CudaDecoder, slot: usize, toks: &[u32]| -> Result<u32, String> {
+        let mut last = Vec::new();
+        for ch in toks.chunks(tmax) {
+            let mut rows = Vec::with_capacity(ch.len() * d.hidden);
+            for &tk in ch {
+                rows.extend_from_slice(&d.embed_row_host(tk));
+            }
+            last = d.forward_batch_device(slot, &rows)?.0;
+        }
+        d.argmax_host(&last)
+    };
+    // 직렬 기준선 — 슬롯 0.
+    let t0 = prefill(&mut d, 0, &toks)?;
+    let mut ser = vec![t0];
+    let mut nx = t0;
+    let ts_start = std::time::Instant::now();
+    while ser.len() < NGEN {
+        let logits = d.forward_tok_device(0, nx)?;
+        nx = d.argmax_host(&logits)?;
+        ser.push(nx);
+    }
+    let serial_ms = ts_start.elapsed().as_secs_f64() * 1000.0 / (NGEN - 1) as f64;
+    // 4슬롯 동일 프롬프트 재프리필.
+    for s in 0..4 {
+        d.reset_state(s)?;
+    }
+    let mut next = [0u32; 4];
+    for s in 0..4 {
+        next[s] = prefill(&mut d, s, &toks)?;
+    }
+    // 순수 T=4 배치 24스텝 — 스텝 시간 측정 포함(§1.2 launch/스텝 분해 기초).
+    let mut rows: Vec<Vec<u32>> = vec![Vec::new(); 4];
+    for s in 0..4 {
+        rows[s].push(next[s]);
+    }
+    let t_start = std::time::Instant::now();
+    let mut steps = 0usize;
+    while rows.iter().all(|r| r.len() < NGEN) {
+        let items: Vec<(usize, u32)> = (0..4).map(|i| (i, next[i])).collect();
+        let tb = d.decode_batch_slots(&items)?;
+        for (i, &t) in tb.iter().enumerate() {
+            rows[i].push(t);
+            next[i] = t;
+        }
+        steps += 1;
+    }
+    let batch_ms = t_start.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+    let mut out = Vec::new();
+    let mut fails = 0;
+    for s in 0..4 {
+        let first = (0..NGEN).find(|&j| rows[s][j] != ser[j]);
+        let cross = (0..NGEN).any(|j| rows[s][j] != rows[0][j]);
+        match first {
+            None => out.push(format!("행{s}: 24 일치",)),
+            Some(j) => {
+                fails += 1;
+                out.push(format!(
+                    "행{s}: 최초 발산 idx={j} 배치={:?} 직렬={:?} 행간불일치={cross}",
+                    &rows[s][j..(j + 4).min(NGEN)],
+                    &ser[j..(j + 4).min(NGEN)]
+                ));
+            }
+        }
+    }
+    if fails == 0 {
+        Ok(format!(
+            "device: {dev} | ms4 프롬프트 {ptokens}토큰 ×4슬롯 순수 T=4 (layers={lim}): 전 행 직렬과 24 일치 | PASS | 직렬 {serial_ms:.1}ms/스텝 · 배치 {batch_ms:.1}ms/스텝"
+        ))
+    } else {
+        Ok(format!(
+            "device: {dev} | ms4 FAIL({fails}/4) (layers={lim}) — {} | 직렬 {serial_ms:.1}ms · 배치 {batch_ms:.1}ms",
+            out.join(" · ")
+        ))
+    }
+}
+
+/// 서버 타임라인 재현 탐침 — 슬롯 간 배치 배선 결함 국소화(2026-10-08,
+/// plans/cuda-port.md §1). verify_cuda_slots.py에서 일부 슬롯이 idx=9부터
+/// "빈 문맥 고정 출력"(25 198 16 13 …)으로 어긋나는 증상을 스케줄러 없이
+/// 디코더 호출 순서만으로 재현한다 — 재현되면 디코더/타임라인 결함,
+/// 재현되지 않으면 sched.rs·HTTP 계층 결함으로 좁혀진다.
+///
+/// [타임라인 — sched.rs ②디코드 우선·③프리필 1청크(512토큰 → 엔진이
+/// 8토큰씩)의 실제 순서를 그대로 밟는다]
+///   tick1: (활성 없음) 프리필 슬롯0 완료 → 첫 토큰 방출
+///   tick2: 디코드 [0](단독 step_tok) → 프리필 슬롯1
+///   tick3: 디코드 배치 [0,1] → 프리필 슬롯2
+///   tick4: 디코드 배치 [0,1,2] → 프리필 슬롯3
+///   tick5+: 디코드 배치 [0,1,2,3]
+///
+/// [판정] 슬롯 1 서버 직렬(모든 요청을 슬롯 0에서 reset→프리필→step_tok)
+/// 의 토큰열과 행별 완전 일치해야 한다(gemv_t 비트계약 — 일치하지 않으면
+/// 배치 타임라인이 상태를 오염시킨다).
+fn msrv_check(dir: &str, batch: bool) -> Result<String, String> {
+    use rawcuda::exl3_cuda::Exl3CudaDecoder;
+    if dir.is_empty() {
+        return Err("사용법: cuda_probe msrv <exl3_dir>".into());
+    }
+    // verify_cuda_slots.py와 동일한 41토큰 기본 프롬프트 × k(1,2,3,5).
+    const BASE: [u32; 41] = [
+        148678, 65233, 202419, 220, 49849, 155497, 220, 151314, 39504, 149635, 13, 220, 174675,
+        30061, 220, 152055, 152065, 12434, 220, 154854, 149248, 80102, 20673, 220, 214009, 149789,
+        11, 220, 60177, 148726, 22836, 220, 149965, 176289, 220, 12434, 160288, 220, 158201,
+        149635, 13,
+    ];
+    let prompts: Vec<Vec<u32>> = [1usize, 2, 3, 5]
+        .iter()
+        .map(|&k| BASE.iter().cycle().take(41 * k).copied().collect())
+        .collect();
+    const NGEN: usize = 24;
+    let tmax = rawcuda::attn_cuda::ATTN_F3S_TMAX;
+
+    let mut d = Exl3CudaDecoder::load_slots(dir, usize::MAX, 512, 4)?;
+    let dev = d.device_name().to_string();
+
+    // 프리필 — 엔진 prefill 규약(8토큰 청크 forward_batch_device) 그대로.
+    // 반환 = 마지막 청크 로짓의 argmax(서버가 첫 토큰으로 방출하는 값).
+    let prefill = |d: &mut Exl3CudaDecoder, slot: usize, toks: &[u32]| -> Result<u32, String> {
+        let mut last = Vec::new();
+        for ch in toks.chunks(tmax) {
+            let mut rows = Vec::with_capacity(ch.len() * d.hidden);
+            for &tk in ch {
+                rows.extend_from_slice(&d.embed_row_host(tk));
+            }
+            last = d.forward_batch_device(slot, &rows)?.0;
+        }
+        d.argmax_host(&last)
+    };
+
+    // (A) 동시 타임라인 — 슬롯 i가 프롬프트 i를 담당(서버 배정 순서와
+    // 동일 — 활성화 순서 0→1→2→3, 배치 구성 1→2→3→4로 단조 확장).
+    let mut emit: Vec<Vec<u32>> = vec![Vec::new(); 4];
+    let mut next = [0u32; 4];
+    {
+        // tick1: 프리필 슬롯0.
+        let t = prefill(&mut d, 0, &prompts[0])?;
+        emit[0].push(t);
+        next[0] = t;
+        // tick2: 디코드 [0] 단독 → 프리필 슬롯1.
+        let t0 = d.step_tok(0, next[0])?;
+        emit[0].push(t0);
+        next[0] = t0;
+        let t = prefill(&mut d, 1, &prompts[1])?;
+        emit[1].push(t);
+        next[1] = t;
+        // tick3: 배치 [0,1] → 프리필 슬롯2.
+        let tb = msrv_step_group(&mut d, &[(0, next[0]), (1, next[1])], batch)?;
+        for (i, &t) in tb.iter().enumerate() {
+            emit[i].push(t);
+            next[i] = t;
+        }
+        let t = prefill(&mut d, 2, &prompts[2])?;
+        emit[2].push(t);
+        next[2] = t;
+        // tick4: 배치 [0,1,2] → 프리필 슬롯3.
+        let tb = msrv_step_group(
+            &mut d,
+            &[(0, next[0]), (1, next[1]), (2, next[2])],
+            batch,
+        )?;
+        for (i, &t) in tb.iter().enumerate() {
+            emit[i].push(t);
+            next[i] = t;
+        }
+        let t = prefill(&mut d, 3, &prompts[3])?;
+        emit[3].push(t);
+        next[3] = t;
+        // tick5+: 배치 [0,1,2,3] — 전원 24토큰까지.
+        while emit.iter().any(|e| e.len() < NGEN) {
+            let items: Vec<(usize, u32)> = (0..4).map(|i| (i, next[i])).collect();
+            let tb = msrv_step_group(&mut d, &items, batch)?;
+            for (i, &t) in tb.iter().enumerate() {
+                if emit[i].len() < NGEN {
+                    emit[i].push(t);
+                    next[i] = t;
+                }
+            }
+        }
+    }
+
+    // (B) 직렬 기준선 — 전 요청을 슬롯 0에서 reset→프리필→step_tok
+    // (슬롯 1 서버 = 직렬 4요청의 재현).
+    let mut ser: Vec<Vec<u32>> = Vec::new();
+    for toks in &prompts {
+        for s in 0..4 {
+            d.reset_state(s)?;
+        }
+        let t0 = prefill(&mut d, 0, toks)?;
+        let mut row = vec![t0];
+        let mut nx = t0;
+        while row.len() < NGEN {
+            nx = d.step_tok(0, nx)?;
+            row.push(nx);
+        }
+        ser.push(row);
+    }
+
+    let mut fails = Vec::new();
+    for i in 0..4 {
+        let (a, b) = (&emit[i], &ser[i]);
+        let first = (0..NGEN).find(|&j| a[j] != b[j]);
+        match first {
+            None => println!(
+                "device: {dev} | msrv 프롬프트#{i}({}토큰): 24토큰 일치",
+                41 * (i + 1)
+            ),
+            Some(j) => {
+                println!(
+                    "device: {dev} | msrv 프롬프트#{i}({}토큰): 최초 발산 idx={j} \
+                     동시={:?} 직렬={:?}",
+                    41 * (i + 1),
+                    &a[j..(j + 6).min(NGEN)],
+                    &b[j..(j + 6).min(NGEN)]
+                );
+                fails.push(format!("#{i} idx={j}"));
+            }
+        }
+    }
+    if fails.is_empty() {
+        Ok(format!(
+            "device: {dev} | msrv 서버 타임라인 재현: 전 슬롯 24토큰 일치 — \
+             디코더·타임라인 무결(결함은 sched/http 계층)"
+        ))
+    } else {
+        Ok(format!(
+            "device: {dev} | msrv FAIL — 재현됨({}) — 디코더 배치 타임라인 결함",
+            fails.join(", ")
+        ))
+    }
+}
+
+// ms4b — 1스텝 비트 판정: 배치 T=4 로짓 vs 직렬(S10 디바이스 경로) 로짓을
+// to_bits로 행별 비교한다. argmax 다중스텝 판정의 마스킹(비단조 lim —
+// lim=13 PASS·14 FAIL·15 PASS 실측)을 우회하는 자이그: 1스텝에서 이미
+// rows≥1에 비트 편차가 있으면 전 lim에서 잡힌다.
+fn ms4b_check(dir: &str, ptokens: usize, lim: usize) -> Result<String, String> {
+    use rawcuda::exl3_cuda::Exl3CudaDecoder;
+    if dir.is_empty() {
+        return Err("사용법: cuda_probe ms4b <exl3_dir> [ptokens] [layers]".into());
+    }
+    const BASE: [u32; 41] = [
+        148678, 65233, 202419, 220, 49849, 155497, 220, 151314, 39504, 149635, 13, 220, 174675,
+        30061, 220, 152055, 152065, 12434, 220, 154854, 149248, 80102, 20673, 220, 214009, 149789,
+        11, 220, 60177, 148726, 22836, 220, 149965, 176289, 220, 12434, 160288, 220, 158201,
+        149635, 13,
+    ];
+    let toks: Vec<u32> = BASE.iter().cycle().take(ptokens).copied().collect();
+    let tmax = rawcuda::attn_cuda::ATTN_F3S_TMAX;
+    let lim = if lim == 0 { usize::MAX } else { lim };
+    let mut d = Exl3CudaDecoder::load_slots(dir, lim, 512, 4)?;
+    let dev = d.device_name().to_string();
+    let prefill = |d: &mut Exl3CudaDecoder, slot: usize, toks: &[u32]| -> Result<u32, String> {
+        let mut last = Vec::new();
+        for ch in toks.chunks(tmax) {
+            let mut rows = Vec::with_capacity(ch.len() * d.hidden);
+            for &tk in ch {
+                rows.extend_from_slice(&d.embed_row_host(tk));
+            }
+            last = d.forward_batch_device(slot, &rows)?.0;
+        }
+        d.argmax_host(&last)
+    };
+    // 배치 1스텝 로짓 — 동일 프롬프트라 4슬롯 첫 토큰이 같다.
+    let t0 = prefill(&mut d, 0, &toks)?;
+    for s in 1..4 {
+        let ts = prefill(&mut d, s, &toks)?;
+        if ts != t0 {
+            return Err(format!("ms4b: 슬롯 {s} 프리필 첫 토큰 {ts} ≠ 슬롯 0 {t0}"));
+        }
+    }
+    let items: Vec<(usize, u32)> = (0..4).map(|i| (i, t0)).collect();
+    let (bl, n_head) = d.decode_batch_slots_logits(&items)?;
+    // 직렬 기준선 — 리셋 후 재프리필, S10 디바이스 경로 1스텝.
+    for s in 0..4 {
+        d.reset_state(s)?;
+    }
+    let mut ser: Vec<Vec<f32>> = Vec::new();
+    for s in 0..4 {
+        let ts = prefill(&mut d, s, &toks)?;
+        ser.push(d.forward_tok_device(s, ts)?);
+    }
+    let mut out = Vec::new();
+    let mut fails = 0;
+    for s in 0..4 {
+        let bd: usize = (0..n_head)
+            .filter(|&j| bl[s * n_head + j].to_bits() != ser[s][j].to_bits())
+            .count();
+        if bd == 0 {
+            out.push(format!("행{s}: 비트일치"));
+        } else {
+            fails += 1;
+            let first = (0..n_head)
+                .find(|&j| bl[s * n_head + j].to_bits() != ser[s][j].to_bits())
+                .unwrap();
+            let md = (0..n_head)
+                .map(|j| (bl[s * n_head + j] - ser[s][j]).abs())
+                .fold(0f32, f32::max);
+            out.push(format!(
+                "행{s}: bit-diff {bd}/{n_head} 첫={first} maxdiff={md:.3e}"
+            ));
+        }
+    }
+    if fails == 0 {
+        Ok(format!(
+            "device: {dev} | ms4b 1스텝 비트 (layers={lim}, 프롬프트 {ptokens}): 전 행 비트일치 | PASS"
+        ))
+    } else {
+        Ok(format!(
+            "device: {dev} | ms4b FAIL({fails}/4) (layers={lim}) — {}",
+            out.join(" · ")
+        ))
+    }
+}
+
 fn s11_check(dir: &str, nrows: usize, lim: usize) -> Result<String, String> {
     use rawcuda::exl3_cuda::Exl3CudaDecoder;
     if dir.is_empty() {
@@ -373,12 +790,7 @@ fn s11_check(dir: &str, nrows: usize, lim: usize) -> Result<String, String> {
         let raw = ar.read(name)?;
         rawcuda::exl3_cuda_probe::st_to_f32(&raw, dt)
     };
-    let (n, cch, hv, hd) = (
-        dims.n_gdn,
-        dims.conv_ch(),
-        dims.h_v,
-        dims.hidden,
-    );
+    let (n, cch, hv, hd) = (dims.n_gdn, dims.conv_ch(), dims.h_v, dims.hidden);
     let mut cw = vec![0f32; n * cch * 4];
     let mut ab = vec![0f32; n * 2 * hv * hd];
     let mut alog = vec![0f32; n * hv];
@@ -396,14 +808,25 @@ fn s11_check(dir: &str, nrows: usize, lim: usize) -> Result<String, String> {
         dtb[gi * hv..(gi + 1) * hv].copy_from_slice(&rd(&format!("{lp}.dt_bias"))?);
         nw[gi * dims.d..(gi + 1) * dims.d].copy_from_slice(&rd(&format!("{lp}.norm.weight"))?);
     }
-    let consts = rawcuda::exl3_cuda_batch_probe::GdnConsts { cw, ab, alog, dtb, nw };
+    let consts = rawcuda::exl3_cuda_batch_probe::GdnConsts {
+        cw,
+        ab,
+        alog,
+        dtb,
+        nw,
+    };
     let mut dec = dec;
     let mut rows = String::new();
     let mut ok = true;
     // GDN 동치성 — T=2,4 (fwd3s와 scan 청크 경계 전).
     for t in [2usize, 4] {
         let (md, n_cmp) = rawcuda::exl3_cuda_batch_probe::gdn_t_equivalence(
-            &mut dec, dims, &consts, 0, t, 0x5111_0000_0000_0001,
+            &mut dec,
+            dims,
+            &consts,
+            0,
+            t,
+            0x5111_0000_0000_0001,
         )?;
         rows.push_str(&format!("gdn T={t} last-row maxdiff={md:.3e}/{n_cmp} "));
         if md > 1e-3 {
@@ -414,7 +837,11 @@ fn s11_check(dir: &str, nrows: usize, lim: usize) -> Result<String, String> {
     for t in [2usize, 4] {
         if t <= rawcuda::attn_cuda::ATTN_F3S_TMAX {
             let (md, n_cmp) = rawcuda::exl3_cuda_batch_probe::attn_t_equivalence(
-                &mut dec, 0, 0, t, 0x5111_0000_0000_0002,
+                &mut dec,
+                0,
+                0,
+                t,
+                0x5111_0000_0000_0002,
             )?;
             rows.push_str(&format!("attn T={t} last-row maxdiff={md:.3e}/{n_cmp} "));
             if md > 1e-3 {
@@ -426,7 +853,11 @@ fn s11_check(dir: &str, nrows: usize, lim: usize) -> Result<String, String> {
     let _ = adims;
     Ok(format!(
         "device: {dev} | exl3-cuda-s11 T-equivalence (nrows={nrows}): {rows}\n{fwd}| {}",
-        if ok { "EQUIVALENT | PASS" } else { "NOT EQUIVALENT | FAIL" }
+        if ok {
+            "EQUIVALENT | PASS"
+        } else {
+            "NOT EQUIVALENT | FAIL"
+        }
     ))
 }
 
@@ -440,7 +871,10 @@ fn s11_forward_check(dir: &str, nrows: usize, lim: usize) -> Result<String, Stri
     let tmax = rawcuda::attn_cuda::ATTN_F3S_TMAX;
     let mut rows = String::new();
     let mut ok = true;
-    for t in [2usize, 4, tmax].into_iter().filter(|t| *t <= tmax && *t <= nrows.max(2)) {
+    for t in [2usize, 4, tmax]
+        .into_iter()
+        .filter(|t| *t <= tmax && *t <= nrows.max(2))
+    {
         let mut emb = vec![0f32; t * seq.hidden];
         for (i, v) in emb.iter_mut().enumerate() {
             *v = ((i % 89) as f32) * 0.02 - 0.5;
@@ -478,8 +912,7 @@ fn s11_forward_check(dir: &str, nrows: usize, lim: usize) -> Result<String, Stri
         *v = ((i % 89) as f32) * 0.02 - 0.5;
     }
     let key = "model.language_model.layers.0.linear_attn.in_proj_qkv";
-    let (gmd, gn) =
-        rawcuda::exl3_cuda_batch_probe::batch_gemv_probe(&mut seq, &mut bat, key, &xq)?;
+    let (gmd, gn) = rawcuda::exl3_cuda_batch_probe::batch_gemv_probe(&mut seq, &mut bat, key, &xq)?;
     Ok(format!(
         "device: {dev} | exl3-cuda-s11 forward-equivalence: {rows}\n{mid}\n\
          S11 batch gemm2({key} T=2): vs sequential maxdiff={gmd:.3e}/{gn}| {}",
@@ -499,21 +932,15 @@ fn s10_check(dir: &str, ntok: usize, lim: usize) -> Result<String, String> {
     let mut dev = Exl3CudaDecoder::load_slots(dir, lim, 256, 1)?;
     // 결정론 프롬프트: 작은 정수 토큰열(어휘 앞쪽, 임베딩 범위 내).
     let toks: Vec<u32> = (0..ntok).map(|i| 100 + i as u32 * 7).collect();
-    let line = rawcuda::exl3_cuda_device_probe::cuda_s10_stream_check(
-        &mut host, &mut dev, &toks, 6,
-    )?;
+    let line =
+        rawcuda::exl3_cuda_device_probe::cuda_s10_stream_check(&mut host, &mut dev, &toks, 6)?;
     // 진단 계기 — 결함 시 규위 좁히기용(정상 시 전부 0.000e0이어야 한다).
-    let d_embed = rawcuda::exl3_cuda_device_probe::embed_resid_probe(
-        &mut host, &mut dev, toks[0],
-    )?;
-    let d_norm = rawcuda::exl3_cuda_device_probe::first_norm_probe(
-        &mut host, &mut dev, toks[0],
-    )?;
+    let d_embed = rawcuda::exl3_cuda_device_probe::embed_resid_probe(&mut host, &mut dev, toks[0])?;
+    let d_norm = rawcuda::exl3_cuda_device_probe::first_norm_probe(&mut host, &mut dev, toks[0])?;
     let d_mid = rawcuda::exl3_cuda_device_probe::mid_layer_probe(&mut host, &mut dev, toks[0])?;
     let d_attn = rawcuda::exl3_cuda_device_probe::attn_input_probe(&mut host, &mut dev)?;
-    let d_step = rawcuda::exl3_cuda_device_probe::one_step_state_probe(
-        &mut host, &mut dev, toks[0],
-    )?;
+    let d_step =
+        rawcuda::exl3_cuda_device_probe::one_step_state_probe(&mut host, &mut dev, toks[0])?;
     let d_trace = rawcuda::exl3_cuda_device_probe::layer_trace_probe(
         &mut host,
         &mut dev,
@@ -524,13 +951,6 @@ fn s10_check(dir: &str, ntok: usize, lim: usize) -> Result<String, String> {
     // layer_trace는 z를 제로 대입해 두 경로의 입력이 달라지는 계기라
     // 판정 근거가 아니라 진단 전용이다 — 결함 규위가 앞 단계에서 좁혀지지
     // 않을 때만 본다.
-    let probe1 = rawcuda::exl3_cuda_device_probe::one_step_state_probe(
-        &mut host, &mut dev, toks[0],
-    )?;
-    let probe2 = rawcuda::exl3_cuda_device_probe::mid_layer_probe(
-        &mut host, &mut dev, toks[0],
-    )?;
-    let probe3 = rawcuda::exl3_cuda_device_probe::attn_input_probe(&mut host, &mut dev)?;
     // 격리: 동일 x에 대한 단일 GEMV 2회만 비교한다. 여기서 다르면 GEMV
     // 체인 문제, 같으면 forward 배선 문제로 갈린다. x 폭은 키마다 다르므로
     // 키별로 그 선형의 k에 맞춰 만든다(같은 **내용 패턴**을 폭만 맞춘다).
@@ -548,9 +968,8 @@ fn s10_check(dir: &str, ntok: usize, lim: usize) -> Result<String, String> {
             None => continue,
         };
         let xg: Vec<f32> = (0..k).map(|i| ((i % 97) as f32) * 0.01).collect();
-        let (md, _) = rawcuda::exl3_cuda_gemv_probe::single_gemv_compare(
-            &mut host, &mut dev, key, &xg,
-        )?;
+        let (md, _) =
+            rawcuda::exl3_cuda_gemv_probe::single_gemv_compare(&mut host, &mut dev, key, &xg)?;
         iso_rows.push(format!("{key}={md:.1e}"));
     }
     let iso = format!("S10 gemv-isolation: {}", iso_rows.join(" "));
@@ -561,9 +980,9 @@ fn s10_check(dir: &str, ntok: usize, lim: usize) -> Result<String, String> {
     let d = rawcuda::exl3_cuda_device_bench::time_device_steps(&mut dev, &toks, BENCH_STEPS)?;
     let prof = rawcuda::exl3_cuda_device_bench::report(h, d, dev.device_name());
     Ok(format!(
-    "{line}\n{iso}\n{d_embed}\n{d_norm}\n{d_mid}\n{d_attn}\n{d_step}\n{d_trace}\n\
+        "{line}\n{iso}\n{d_embed}\n{d_norm}\n{d_mid}\n{d_attn}\n{d_step}\n{d_trace}\n\
      {prof} (layers={lim})"
-))
+    ))
 }
 
 // ── G8 Q4 모듈 서브커맨드(2026-10-04 — 독립 파일 q4_cuda_probe 위임) ──
@@ -575,9 +994,7 @@ fn q4_main(prog: &str, sub: &str) -> ExitCode {
         "gemv" => rawcuda::q4_cuda_probe::cuda_q4_gemv_check(),
         "gemm" => rawcuda::q4_cuda_probe::cuda_q4_gemm_check(),
         "neg" => rawcuda::q4_cuda_probe::cuda_q4_negative_check(),
-        _ => Err(format!(
-            "사용법: {prog} q4-dequant|q4-gemv|q4-gemm|q4-neg"
-        )),
+        _ => Err(format!("사용법: {prog} q4-dequant|q4-gemv|q4-gemm|q4-neg")),
     };
     match r {
         Ok(s) => {
@@ -595,13 +1012,15 @@ fn q4_main(prog: &str, sub: &str) -> ExitCode {
 // fn-gdn | fn-gdn-neg. 인자는 GGUF 메인 샤드 경로(기본 Flash-Next 실측
 // 픽스처). 실패는 전부 비영 exit.
 fn fn_gdn_main(sub: &str) -> ExitCode {
-    let gguf = std::env::args().nth(2).unwrap_or_else(|| {
-        rawcuda::fn_support::FN_GGUF_MAIN.to_string()
-    });
+    let gguf = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| rawcuda::fn_support::FN_GGUF_MAIN.to_string());
     let r = match sub {
         "" | "-check" => rawcuda::fn_gdn_cuda_probe::cuda_fn_gdn_check(&gguf),
         "-neg" => rawcuda::fn_gdn_cuda_probe::cuda_fn_gdn_negative_check(&gguf),
-        _ => Err(format!("사용법: fn-gdn [gguf_main] | fn-gdn-neg [gguf_main]")),
+        _ => Err(format!(
+            "사용법: fn-gdn [gguf_main] | fn-gdn-neg [gguf_main]"
+        )),
     };
     match r {
         Ok(s) => {

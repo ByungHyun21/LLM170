@@ -398,3 +398,155 @@ pub fn cuda_gemv_real_check(dir: &str, key: &str) -> Result<String, String> {
         Err(format!("real {key}: maxdiff={md:.3e} nan={nan}"))
     }
 }
+
+/// 두 f32 슬라이스의 비트(f32::to_bits) 불일치 수 — gemv_t 비트계약
+/// 판정기(plans/cuda-port.md §1). 값 maxdiff가 아니라 **비트 동일**을
+/// 본다 — 행별 환원 순서 보존 계약은 ulp 하나도 허용하지 않는다.
+fn bitdiff_count(got: &[f32], want: &[f32]) -> usize {
+    got.iter()
+        .zip(want.iter())
+        .filter(|(g, w)| g.to_bits() != w.to_bits())
+        .count()
+}
+
+/// exl3-cuda-gemv-t — 행병렬 gemv_t 비트계약 판정. 임계가 아니라
+/// **to_bits 0불일치**를 요구한다(슬롯 간 배치가 T=1 GEMV와 행별
+/// 비트동일이어야 다중 스텝 토큰 스트림이 유지된다 — 1스텝 동치성이
+/// 다중 스텝 동등성을 함축하지 않는다는 원장의 교훈).
+///
+/// (i) 27B gate_proj 형상 T=2 (ii) 35B in_proj_qkv 형상 T=8(상한)
+/// (iii) T=1 항등 — 전 항목 행별 gemv_host와 비트동일.
+pub fn cuda_gemv_t_check() -> Result<String, String> {
+    let mut dec = Exl3CudaDecoder::empty()?;
+    let dev = dec.device_name().to_string();
+    let mut fails: Vec<String> = Vec::new();
+    let mut report = String::new();
+
+    // (i) Qwen3.8-27B mlp.gate_proj 형상 [320,1088,48](K=3) — T=1..8 전수.
+    // T=3·4는 ms4 발산(idx=9) 재현 구간이라 상한 T=8과 함께 매 스텝 비트 판정.
+    {
+        let key = "synth.27b.mlp.gate_proj";
+        let lin = SynthLin::generate(5120, 17408, 3, 0x170C_0DA0_0000_0001);
+        register(&mut dec, key, &lin)?;
+        let mut serials: Vec<Vec<f32>> = Vec::new();
+        for r in 0..8 {
+            serials.push(dec.gemv_host(key, &gen_x(5120, 0x5EED_0000_0000_0101 + r as u64))?);
+        }
+        let mut worst = (0usize, 0usize); // (t, bitdiff)
+        for t in 1..=8usize {
+            let mut rows = Vec::new();
+            for r in 0..t {
+                rows.extend_from_slice(&gen_x(5120, 0x5EED_0000_0000_0101 + r as u64));
+            }
+            let got = dec.gemv_t_host(key, &rows)?;
+            let d: usize = (0..t)
+                .map(|r| bitdiff_count(&got[r * 17408..(r + 1) * 17408], &serials[r]))
+                .sum();
+            if d > worst.1 {
+                worst = (t, d);
+            }
+            println!(
+                "device: {dev} | exl3-cuda-gemv-t (i) 27B gate_proj k=5120 n=17408 K=3 T={t}: bit-diff {d} | {}",
+                if d == 0 { "PASS" } else { "FAIL" }
+            );
+        }
+        let pass = worst.1 == 0;
+        report.push_str(&format!("(i) worst T={} {} · ", worst.0, worst.1));
+        if !pass {
+            fails.push(format!("(i) T={} bit-diff {}", worst.0, worst.1));
+        }
+    }
+
+    // (ii) Qwen3.6-35B-A3B in_proj_qkv 형상(K=4) — T=8 상한.
+    {
+        let key = "synth.35b.linear_attn.in_proj_qkv";
+        let lin = SynthLin::generate(2048, 8192, 4, 0x170C_0DA0_0000_0002);
+        register(&mut dec, key, &lin)?;
+        let mut rows = Vec::new();
+        let mut serials = Vec::new();
+        for r in 0..8 {
+            let x = gen_x(2048, 0x5EED_0000_0000_0200 + r as u64);
+            serials.push(dec.gemv_host(key, &x)?);
+            rows.extend_from_slice(&x);
+        }
+        let got = dec.gemv_t_host(key, &rows)?;
+        let total: usize = (0..8)
+            .map(|r| bitdiff_count(&got[r * 8192..(r + 1) * 8192], &serials[r]))
+            .sum();
+        let pass = total == 0;
+        println!(
+            "device: {dev} | exl3-cuda-gemv-t (ii) 35B in_proj_qkv k=2048 n=8192 K=4 T=8: bit-diff {total} | {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        report.push_str(&format!(" · (ii) {total}"));
+        if !pass {
+            fails.push(format!("(ii) bit-diff {total}"));
+        }
+    }
+
+    // (iii) T=1 항등 — 배치 경로의 퇴화형도 순차 GEMV와 비트동일.
+    {
+        let key = "synth.27b.mlp.gate_proj";
+        let x = gen_x(5120, 0x5EED_0000_0000_0103);
+        let got = dec.gemv_t_host(key, &x)?;
+        let want = dec.gemv_host(key, &x)?;
+        let d = bitdiff_count(&got, &want);
+        let pass = d == 0;
+        println!(
+            "device: {dev} | exl3-cuda-gemv-t (iii) T=1 identity: bit-diff {d} | {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        report.push_str(&format!(" · (iii) {d}"));
+        if !pass {
+            fails.push(format!("(iii) bit-diff {d}"));
+        }
+    }
+
+    if fails.is_empty() {
+        Ok(format!(
+            "device: {dev} | {report} — to_bits 0불일치 | ALL PASS"
+        ))
+    } else {
+        Err(format!(
+            "exl3-cuda-gemv-t 비트계약 위반 — {} (device: {dev})",
+            fails.join(", ")
+        ))
+    }
+}
+
+/// exl3-cuda-gemv-t-neg — 음성대조(원장 17호: 검증 계기도 스스로 검증).
+/// 행 순서를 뒤집은 입력([x1,x0])의 출력을 원래 순서 기준([x0,x1])과
+/// 비교해 **비트 불일치가 대량으로** 나와야 한다 — 행 정렬 결함(과거
+/// 슬롯 간 배치의 증상 계열)을 판정기가 잡아내는지 확인한다.
+pub fn cuda_gemv_t_negative_check() -> Result<String, String> {
+    let mut dec = Exl3CudaDecoder::empty()?;
+    let dev = dec.device_name().to_string();
+    let key = "synth.27b.mlp.gate_proj";
+    let lin = SynthLin::generate(5120, 17408, 3, 0x170C_0DA0_0000_0001);
+    register(&mut dec, key, &lin)?;
+    let r0 = gen_x(5120, 0x5EED_0000_0000_0101);
+    let r1 = gen_x(5120, 0x5EED_0000_0000_0102);
+    let mut swapped = r1.clone();
+    swapped.extend_from_slice(&r0);
+    let got = dec.gemv_t_host(key, &swapped)?;
+    let s0 = dec.gemv_host(key, &r0)?;
+    let s1 = dec.gemv_host(key, &r1)?;
+    let (d0, d1) = (
+        bitdiff_count(&got[..17408], &s0),
+        bitdiff_count(&got[17408..], &s1),
+    );
+    println!(
+        "device: {dev} | exl3-cuda-gemv-t (iv) negative control row-swap: bit-diff {d0}+{d1} | FAIL(expected)"
+    );
+    // 두 행의 입력이 다르므로 정상이라면 거의 전 열이 어긋난다(동시
+    // 만족 확률 0). 어긋남이 없으면 판정기가 행 혼열을 못 잡는 것이다.
+    if d0 + d1 > 17408 {
+        Err(format!(
+            "NEG-DETECTED bit-diff {d0}+{d1} — 검증계기 정상(행 정렬 결함 감지)"
+        ))
+    } else {
+        Err(format!(
+            "NEG-MISSED bit-diff {d0}+{d1} — 검증계기 결함: 행 혼열이 탐지되지 않음"
+        ))
+    }
+}

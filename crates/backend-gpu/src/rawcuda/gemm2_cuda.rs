@@ -91,7 +91,12 @@ impl Exl3CudaDecoder {
     /// 배치 had_in(dx [t][k] f32 → daht [t][k/2] f16쌍) — suh는 선형별
     /// (호출 선형에서 명시 전달, 결함 1호). exl3_had_in은 grid.y=T로
     /// 이미 다중행 지원(G2 커널 원형 그대로).
-    fn had16_batch(&mut self, k: usize, t_len: usize, suh: CUdeviceptr) -> Result<(), String> {
+    pub(crate) fn had16_batch(
+        &mut self,
+        k: usize,
+        t_len: usize,
+        suh: CUdeviceptr,
+    ) -> Result<(), String> {
         let f_hin = self.cc.function("exl3_had_in")?;
         let (mut kc, mut ks) = ((k / 128) as i32, k as i32);
         let (mut a0, mut a1, mut a2) = (self.dx, suh, self.daht);
@@ -109,7 +114,7 @@ impl Exl3CudaDecoder {
     /// had_out 발사 범용(hip hadout_batch 미러): nseg 합산 + WHT⁻¹·R·svh
     /// → dst. 제자리(src=dst)는 청크별 공유메모리 스테이징이라 안전.
     /// had_out은 체인당 정확 1회(결함 3·15호).
-    fn hadout_batch(
+    pub(crate) fn hadout_batch(
         &mut self,
         src: CUdeviceptr,
         svh: CUdeviceptr,
