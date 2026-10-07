@@ -1241,6 +1241,63 @@ pub fn hip_dmmv_check(path: &str, tname: &str) -> Result<String, String> {
         llm170_core::qwen35::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("tensor 없음")?;
     let ty = w.ty as u32;
+    if ty == 23 {
+        // plans/141 부록: iq4_xs t=1 dmmv(gemm_xs_dmmv) 검증 — 동일 활성으로
+        // 구경로(quant_q8 + gemv_q8/gemm_xs GEMV)와 dmmv를 f64 기준과 비교.
+        let ctx = RawCtx::new()?;
+        let (n_in, n_out) = (w.n_in as usize, w.n_out as usize);
+        let wd = ctx.alloc(w.data.len())?;
+        ctx.h2d(wd, w.data)?;
+        let ktab2: Vec<u32> = llm170_core::ktab2_packed();
+        let kt_d = ctx.alloc(1024)?;
+        ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))?;
+        let mut seed = 0x9e3779b9u64;
+        let mut lcg = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as f32 / 2147483648.0 - 0.5
+        };
+        let xf: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+        let xfd = ctx.alloc(n_in * 4)?;
+        ctx.h2d(xfd, bytemuck::cast_slice(&xf))?;
+        // 구경로: 활성 quant_q8 + gemv_q8(gemm_xs) — 현재 t=1 산술과 동일 열.
+        let xq_w = crate::rawhip::q4acc::xq_words(n_in);
+        let xq = ctx.alloc(xq_w * 4)?;
+        ctx.quant_q8_b(xfd, xq, n_in, xq_w, 1)?;
+        let vo = ctx.gemv_q8(xq, wd, kt_d, ty, n_in, n_out)?;
+        // 신경로: dmmv(f32 직소비).
+        let out_dm = ctx.alloc(n_out * 4)?;
+        ctx.gemv_xs_dmmv_out(xfd, wd, kt_d, n_in, n_out, out_dm)?;
+        ctx.sync()?;
+        let mut vd = vec![0f32; n_out];
+        ctx.d2h(bytemuck::cast_slice_mut(&mut vd), out_dm)?;
+        // f64 CPU 기준: dequant_row(iq4_xs) × 동일 활성 내적.
+        let mut wrow = vec![0f32; n_in];
+        let mut refr = vec![0f64; n_out];
+        for o in 0..n_out {
+            llm170_core::quant::dequant_row(w.ty, w.data, o as u64, n_in as u64, &mut wrow);
+            let mut acc = 0f64;
+            for i in 0..n_in {
+                acc += xf[i] as f64 * wrow[i] as f64;
+            }
+            refr[o] = acc;
+        }
+        let mut eo = 0f64;
+        let mut ed = 0f64;
+        for o in 0..n_out {
+            eo = eo.max((vo[o] as f64 - refr[o]).abs());
+            ed = ed.max((vd[o] as f64 - refr[o]).abs());
+        }
+        let pass = ed <= 2.0 * eo && ed <= 1e-2;
+        let verdict = if pass { "PASS" } else { "FAIL" };
+        return Ok(format!(
+            "hip-dmmv-check {tname} ty=iq4_xs n_in={n_in} n_out={n_out}: {verdict} — old_err={eo:.3e} dmmv_err={ed:.3e} (f64 기준)\n  old[0..4]={:?}\n  dmmv[0..4]={:?}\n  ref[0..4]={:?}",
+            &vo[..4.min(n_out)],
+            &vd[..4.min(n_out)],
+            &refr[..4.min(n_out)]
+        ));
+    }
     if ty != 8 {
         return Err(format!("hip-dmmv-check: q8_0 전용 (ty={ty})"));
     }
