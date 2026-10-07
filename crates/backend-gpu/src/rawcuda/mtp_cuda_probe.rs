@@ -45,6 +45,18 @@
 //! (StArchive::read — 전모델 상주 금지, 12GB VRAM 예산). 선형 9종은
 //! 모듈 load_keys → readback_linear(디바이스 판독 — 오라클과 모듈의
 //! 단일 진실), 노름 7종은 BF16 w−1 → +1 등록(§3.4 규약).
+//!
+//! [§1.4 발산 격리 — 2026-10-08, plans/cuda-port.md §1.4 다음 단계 실행]
+//! MtpMids에 gout·pn·fg·fglu·fdown 캡처를 추가해 (i-1) 발산을 단계별로
+//! 분리했다(seed 0x…9a1, pos=33): gout=0.000e0(⑤ o_proj 정합) →
+//! pn=9.537e-7(⑥ rms — 1ulp 경계) → fg=5.292e-4(**⑥ gate gemv가 최초
+//! 의미 발산 — gemv per-op 계급 3e-4의 ~1.8배**) → fglu=1.013e-3(ew
+//! 증폭) → fdown=5.844e-3 → h_next=5.844e-3. (i-2)·(iii)은 체인 전체가
+//! 비트일치 — s1 입력 경계값에서의 반올림 진입이 증폭된 계급 문제다.
+//! 토큰은 일치(4412=4412 — greedy 무해). 2026-10-04 원장의 "종단
+//! 비트일치"와 어긋나므로 10-04 이후 rms/gemv 체인 어딘가에서 1ulp가
+//! 새로 들어왔을 가능성이 남는다 — 임계(2e-4) 재조정 여부는 판정 기준
+//! 합의 사항으로 남기고 격리만 확정한다.
 
 use crate::rawcuda::exl3_cuda::{Exl3CudaDecoder, GEMV_NSEG, StArchive};
 use crate::rawcuda::mtp_cuda::{Exl3CudaMtp, MTP_LIN_KEYS, MtpDims, MtpMids};
@@ -799,6 +811,16 @@ struct MtpOracleOut {
     kc_row: Vec<f32>,
     vc_row: Vec<f32>,
     outv: Vec<f32>,
+    /// ⑤ o_proj 산출(잔차 가산 전 — MtpMids.gout 대응).
+    gout: Vec<f32>,
+    /// ⑥ post_norm 산출(MtpMids.pn 대응).
+    pn: Vec<f32>,
+    /// ⑥ gate_proj 산출(MtpMids.fg 대응).
+    fg: Vec<f32>,
+    /// ⑥ silu·mul 산출(MtpMids.fglu 대응).
+    fglu: Vec<f32>,
+    /// ⑥ down 산출(잔차 가산 전 — MtpMids.fdown 대응).
+    fdown: Vec<f32>,
     h_next: Vec<f32>,
     head_in: Vec<f32>,
     /// 로짓(범위 내).
@@ -914,6 +936,11 @@ impl MtpOracle {
             kc_row,
             vc_row,
             outv,
+            gout,
+            pn,
+            fg,
+            fglu,
+            fdown,
             h_next: cur,
             head_in,
             logits,
@@ -1030,6 +1057,11 @@ fn gpu_step(
         outv: Vec::new(),
         kc_row: Vec::new(),
         vc_row: Vec::new(),
+        gout: Vec::new(),
+        pn: Vec::new(),
+        fg: Vec::new(),
+        fglu: Vec::new(),
+        fdown: Vec::new(),
         cur_attn: Vec::new(),
         h_next: Vec::new(),
         head_in: Vec::new(),
@@ -1061,6 +1093,11 @@ struct StepCmp {
     kc: f32,
     vc: f32,
     outv: f32,
+    gout: f32,
+    pn: f32,
+    fg: f32,
+    fglu: f32,
+    fdown: f32,
     h_next: f32,
     head_in: f32,
     nan: usize,
@@ -1080,6 +1117,11 @@ fn cmp_steps(m: &MtpMids, w: &MtpOracleOut) -> Result<StepCmp, String> {
     let (kc, n3) = maxdiff_nan(&m.kc_row, &w.kc_row);
     let (vc, n4) = maxdiff_nan(&m.vc_row, &w.vc_row);
     let (outv, n5) = maxdiff_nan(&m.outv, &w.outv);
+    let (go, n8) = maxdiff_nan(&m.gout, &w.gout);
+    let (pn, n11) = maxdiff_nan(&m.pn, &w.pn);
+    let (fgd, n12) = maxdiff_nan(&m.fg, &w.fg);
+    let (fg, n9) = maxdiff_nan(&m.fglu, &w.fglu);
+    let (fd, n10) = maxdiff_nan(&m.fdown, &w.fdown);
     let (hn, n6) = maxdiff_nan(&m.h_next, &w.h_next);
     let (hi, n7) = maxdiff_nan(&m.head_in, &w.head_in);
     Ok(StepCmp {
@@ -1088,19 +1130,29 @@ fn cmp_steps(m: &MtpMids, w: &MtpOracleOut) -> Result<StepCmp, String> {
         kc,
         vc,
         outv,
+        gout: go,
+        pn,
+        fg: fgd,
+        fglu: fg,
+        fdown: fd,
         h_next: hn,
         head_in: hi,
-        nan: n1 + n2 + n3 + n4 + n5 + n6 + n7,
+        nan: n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8 + n9 + n10 + n11 + n12,
     })
 }
 
 impl StepCmp {
-    /// 단계 게이트: cat/qh/kc/vc/outv ≤4e-4(gemv per-op 계급)·
-    /// 종단 h_next/head_in ≤2e-4(계약)·nan 0.
+    /// 단계 게이트: cat/qh/kc/vc/outv·gout/fglu/fdown ≤4e-4(gemv per-op
+    /// 계급)·종단 h_next/head_in ≤2e-4(계약)·nan 0.
     fn pass(&self) -> bool {
         self.cat <= MTP_STAGE_THRESH
             && self.qh.max(self.kc).max(self.vc) <= MTP_STAGE_THRESH
             && self.outv <= MTP_STAGE_THRESH
+            && self.gout <= MTP_STAGE_THRESH
+            && self.pn <= MTP_STAGE_THRESH
+            && self.fg <= MTP_STAGE_THRESH
+            && self.fglu <= MTP_STAGE_THRESH
+            && self.fdown <= MTP_STAGE_THRESH
             && self.h_next <= MTP_E2E_THRESH
             && self.head_in <= MTP_E2E_THRESH
             && self.nan == 0
@@ -1171,7 +1223,7 @@ pub fn cuda_mtp_check(dir27: &str) -> Result<String, String> {
         let tok_g = t1.unwrap_or(u32::MAX);
         let pass1 = c1.pass() && lg_md <= MTP_STAGE_THRESH && lg_nan == 0;
         println!(
-            "device: {dev} | exl3-cuda-mtp (i-1) Qwen3.8-27B q_heads={} kv_heads={} d={} n_ff={} vocab={} pos=33 seed={seed:#x}: cat={:.3e} qh={:.3e} kc={:.3e} vc={:.3e} outv={:.3e} | h_next={:.3e} head_in={:.3e} | logits[full]={:.3e} tok gpu={tok_g} oracle={} | {}",
+            "device: {dev} | exl3-cuda-mtp (i-1) Qwen3.8-27B q_heads={} kv_heads={} d={} n_ff={} vocab={} pos=33 seed={seed:#x}: cat={:.3e} qh={:.3e} kc={:.3e} vc={:.3e} outv={:.3e} | gout={:.3e} pn={:.3e} fg={:.3e} fglu={:.3e} fdown={:.3e} | h_next={:.3e} head_in={:.3e} | logits[full]={:.3e} tok gpu={tok_g} oracle={} | {}",
             dims.q_heads,
             dims.kv_heads,
             dims.d,
@@ -1182,6 +1234,11 @@ pub fn cuda_mtp_check(dir27: &str) -> Result<String, String> {
             c1.kc,
             c1.vc,
             c1.outv,
+            c1.gout,
+            c1.pn,
+            c1.fg,
+            c1.fglu,
+            c1.fdown,
             c1.h_next,
             c1.head_in,
             lg_md,
@@ -1190,12 +1247,17 @@ pub fn cuda_mtp_check(dir27: &str) -> Result<String, String> {
         );
         if !pass1 {
             fails.push(format!(
-                "(i-1) stage cat={:.3e} qh={:.3e} kc={:.3e} vc={:.3e} outv={:.3e} e2e h_next={:.3e} head_in={:.3e} logits={lg_md:.3e} nan={}",
+                "(i-1) stage cat={:.3e} qh={:.3e} kc={:.3e} vc={:.3e} outv={:.3e} gout={:.3e} pn={:.3e} fg={:.3e} fglu={:.3e} fdown={:.3e} e2e h_next={:.3e} head_in={:.3e} logits={lg_md:.3e} nan={}",
                 c1.cat,
                 c1.qh,
                 c1.kc,
                 c1.vc,
                 c1.outv,
+                c1.gout,
+                c1.pn,
+                c1.fg,
+                c1.fglu,
+                c1.fdown,
                 c1.h_next,
                 c1.head_in,
                 c1.nan + lg_nan
@@ -1219,10 +1281,15 @@ pub fn cuda_mtp_check(dir27: &str) -> Result<String, String> {
         let tok_g2 = t2.unwrap_or(u32::MAX);
         let pass2 = c2.pass() && lg2_md <= MTP_STAGE_THRESH && lg2_nan == 0;
         println!(
-            "device: {dev} | exl3-cuda-mtp (i-2) pos=34 KV-accumulated: cat={:.3e} qh={:.3e} outv={:.3e} | h_next={:.3e} head_in={:.3e} | logits[slice0..{HEAD_SLICE}]={:.3e} tok gpu[full]={tok_g2} oracle[slice]={} | {}",
+            "device: {dev} | exl3-cuda-mtp (i-2) pos=34 KV-accumulated: cat={:.3e} qh={:.3e} outv={:.3e} | gout={:.3e} pn={:.3e} fg={:.3e} fglu={:.3e} fdown={:.3e} | h_next={:.3e} head_in={:.3e} | logits[slice0..{HEAD_SLICE}]={:.3e} tok gpu[full]={tok_g2} oracle[slice]={} | {}",
             c2.cat,
             c2.qh,
             c2.outv,
+            c2.gout,
+            c2.pn,
+            c2.fg,
+            c2.fglu,
+            c2.fdown,
             c2.h_next,
             c2.head_in,
             lg2_md,
@@ -1231,10 +1298,15 @@ pub fn cuda_mtp_check(dir27: &str) -> Result<String, String> {
         );
         if !pass2 {
             fails.push(format!(
-                "(i-2) e2e h_next={:.3e} head_in={:.3e} outv={:.3e} logits={lg2_md:.3e} nan={}",
+                "(i-2) e2e h_next={:.3e} head_in={:.3e} outv={:.3e} gout={:.3e} pn={:.3e} fg={:.3e} fglu={:.3e} fdown={:.3e} logits={lg2_md:.3e} nan={}",
                 c2.h_next,
                 c2.head_in,
                 c2.outv,
+                c2.gout,
+                c2.pn,
+                c2.fg,
+                c2.fglu,
+                c2.fdown,
                 c2.nan + lg2_nan
             ));
         }

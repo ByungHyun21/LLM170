@@ -205,6 +205,19 @@ pub struct MtpMids {
     /// 현 스텝이 적립한 KC/KV 행 [kv_dim] 각각.
     pub kc_row: Vec<f32>,
     pub vc_row: Vec<f32>,
+    /// ⑤ o_proj 산출 [hidden](잔차 가산 전 값 — 2026-10-08 발산 분리용,
+    /// plans/cuda-port.md §1.4: outv는 0불일치인데 h_next가 어긋나므로
+    /// ⑤/⑥ 합성 중 처음 어긋나는 선형을 가린다).
+    pub gout: Vec<f32>,
+    /// ⑥ post_attention_layernorm 산출 [hidden](mids 경로 한정 — 체인
+    /// 중간 판독. ⑥ 내부 rms/gemv/ew 분리용).
+    pub pn: Vec<f32>,
+    /// ⑥ gate_proj 산출 [n_ff](pn이 정확한데 fglu가 어긋나면 gate gemv).
+    pub fg: Vec<f32>,
+    /// ⑥ silu·mul 산출 [hidden](gate/up과 down 사이 — ⑥ 내부 분리용).
+    pub fglu: Vec<f32>,
+    /// ⑥ down 산출 [hidden](잔차 가산 전 값).
+    pub fdown: Vec<f32>,
     /// o+resid 직후 잔류(hidden).
     pub cur_attn: Vec<f32>,
     /// FFN+resid 직후 잔류 = h_next(hidden).
@@ -706,6 +719,16 @@ impl Exl3CudaMtp {
         self.axpy_dev(cc, self.dcur, self.dgout, n)?;
         // ⑥ FFN: post_norm → gate/up → silu·mul → down → 잔차 가산
         self.rms_dev(cc, self.dcur, MTP_NORM_POST, self.dnrm)?;
+        // pn 캡처는 mids 경로 한정 체인 중간 판독 — ⑦ rms가 dnrm을
+        // 덮으므로 지금 읽지 않으면 복원 불가(프로덕션 None은 판독 0).
+        let pn_cap = if mids.is_some() {
+            let mut buf = vec![0u8; n * 4];
+            cc.d2h(&mut buf, self.dnrm)?;
+            // SAFETY: d2h 동기 완료 — buf는 n개 f32 LE.
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, n) }.to_vec()
+        } else {
+            Vec::new()
+        };
         let lg = self.lin_key(dec, MTP_LIN_GATE)?;
         self.lin_dev(cc, &lg, self.dnrm, self.dfg)?;
         let lu = self.lin_key(dec, MTP_LIN_UP)?;
@@ -723,14 +746,15 @@ impl Exl3CudaMtp {
             token = Some(dec.argmax_dev(self.dlogits, dm.vocab)?);
         }
         if let Some(m) = mids {
-            self.read_mids(&dec.cc, m)?;
+            self.read_mids(&dec.cc, m, pn_cap)?;
         }
         Ok(token)
     }
 
     /// 중간 산출 판독(검증층 — mtp_step_g mids 경로의 실체.
     /// cur는 스테이지별로 변형되므로 지정 시점 값을 순차 판독한다).
-    fn read_mids(&self, cc: &CudaCtx, m: &mut MtpMids) -> Result<(), String> {
+    /// pn_cap은 ⑥ rms 시점 체인 중간 판독값(⑦이 dnrm을 덮기 전).
+    fn read_mids(&self, cc: &CudaCtx, m: &mut MtpMids, pn_cap: Vec<f32>) -> Result<(), String> {
         let dm = self.dims;
         let n = dm.hidden;
         let take = |v: &mut Vec<f32>, elems: usize, src: CUdeviceptr| -> Result<(), String> {
@@ -756,6 +780,14 @@ impl Exl3CudaMtp {
         // 주: eh·cur_attn은 스텝 종료 시점 dcur(h_next)로 덮어씀 —
         // 단계별 값이 필요한 프로브는 이 판독 계열을 확장하지 않고
         // h_next·head_in 판독으로 종단 판정한다(값 maxdiff 계약).
+        // gout·fglu·fdown은 스텝 내 전용 버퍼(dgout·dfglu·dfdown)라
+        // axpy가 덮지 않는다 — 다음 스텝 체인이 덮을 때까지 유효.
+        // pn은 체인 중간 판독값(인자), fg는 dfg(ew까지 생존).
+        m.pn = pn_cap;
+        take(&mut m.gout, n, self.dgout)?;
+        take(&mut m.fg, dm.n_ff, self.dfg)?;
+        take(&mut m.fglu, n, self.dfglu)?;
+        take(&mut m.fdown, n, self.dfdown)?;
         take(&mut m.h_next, n, self.dcur)?;
         take(&mut m.head_in, n, self.dnrm)?;
         Ok(())
