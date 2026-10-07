@@ -362,6 +362,7 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         sources,
         want_gpu,
         crate::engine::q4_vk_runtime_str(gpu_runtime),
+        crate::engine::q4_cuda_runtime_str(gpu_runtime),
         false,
         crate::engine::AttachPolicy::Strict,
     )?;

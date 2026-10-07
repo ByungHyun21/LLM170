@@ -64,10 +64,14 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         }
         return run_exl3_infer(&model_path, &prompts[0], n_predict, ctx, &gpu_runtime);
     }
-    // plans/cuda-port.md S6/S7 이전에는 GGUF/W4A16 CUDA 경로가 없다.
-    // cuda 요청을 HIP 부착으로 잘못 해석하는 조용한 폴백을 금지한다.
-    if gpu_runtime == "cuda" {
-        return usage_err("CUDA는 현재 EXL3 디렉터리만 지원 (GGUF/W4A16은 S6/S7 대기)");
+    // plans/cuda-port.md §1.3 S6 — GGUF+cuda는 Q4AccCuda 값경로로 진행한다
+    // (attach_q4 cuda 분기). W4A16(safetensors)은 여전히 미지원 — S7.
+    if gpu_runtime == "cuda"
+        && !model_path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+    {
+        return usage_err("CUDA+GGUF는 S6 값경로 지원 — W4A16(safetensors)은 S7 대기");
     }
     let max_prompt = prompts.iter().map(|p| p.len()).max().unwrap();
     if max_prompt + n_predict + 8 >= ctx {
@@ -237,6 +241,7 @@ fn run_q4_infer(
                 sources,
                 want_gpu,
                 crate::engine::q4_vk_runtime_str(gpu_runtime),
+                crate::engine::q4_cuda_runtime_str(gpu_runtime),
                 false,
                 crate::engine::AttachPolicy::Strict,
             )?;

@@ -48,7 +48,7 @@ pub fn q4_gpu_wanted(backend: &BackendSel) -> bool {
         BackendSel::Cpu | BackendSel::Exl3 | BackendSel::Exl3Hip | BackendSel::Exl3Cuda => false,
         BackendSel::Gpu => true,
         BackendSel::GpuRuntime(r) => {
-            if r != "hip" && r != "vulkan" {
+            if r != "hip" && r != "vulkan" && r != "cuda" {
                 eprintln!(
                     "# qwen4exp: --gpu-runtime {r}은 미지원(QSA 커널·용량) — HIP로 진행 (plans/64 §7)"
                 );
@@ -63,6 +63,12 @@ pub fn q4_vk_runtime(backend: &BackendSel) -> bool {
     matches!(backend, BackendSel::GpuRuntime(r) if r == "vulkan")
 }
 
+/// qwen4exp의 cuda 런타임 선택 여부 (plans/cuda-port.md §1.3 S6 — 값경로
+/// Q4AccCuda).
+pub fn q4_cuda_runtime(backend: &BackendSel) -> bool {
+    matches!(backend, BackendSel::GpuRuntime(r) if r == "cuda")
+}
+
 /// qwen4exp GPU 요청 판정 — CLI 문자열판 (infer/bench).
 pub fn q4_gpu_wanted_str(backend: &str, runtime: &str) -> bool {
     if q4_gpu_env_off() {
@@ -71,7 +77,7 @@ pub fn q4_gpu_wanted_str(backend: &str, runtime: &str) -> bool {
     if backend != "gpu" {
         return false;
     }
-    if runtime != "hip" && runtime != "vulkan" {
+    if runtime != "hip" && runtime != "vulkan" && runtime != "cuda" {
         eprintln!(
             "# qwen4exp: --gpu-runtime {runtime}은 미지원(QSA 커널·용량) — HIP로 진행 (plans/64 §7)"
         );
@@ -134,6 +140,11 @@ pub fn apply_mtp(
 /// CLI 문자열판 vulkan 선택 (plans/84 B).
 pub fn q4_vk_runtime_str(runtime: &str) -> bool {
     runtime == "vulkan"
+}
+
+/// CLI 문자열판 cuda 선택 (plans/cuda-port.md §1.3 S6).
+pub fn q4_cuda_runtime_str(runtime: &str) -> bool {
+    runtime == "cuda"
 }
 
 /// 백엔드 부착 실패 정책 — serve·vl은 경고 후 CPU 지속, bench·infer 검증은
@@ -210,12 +221,32 @@ pub fn attach_q4(
     sources: Vec<(usize, usize, PathBuf)>,
     want_gpu: bool,
     vk: bool,
+    cuda: bool,
     res_f16: bool,
     policy: AttachPolicy,
 ) -> Result<llm170_core::qwen4exp::layers::Engine4, String> {
     llm170_core::qwen4exp::frame::set_backend_res_f16(res_f16);
     if !want_gpu {
         return Ok(eng);
+    }
+    if cuda {
+        // plans/cuda-port.md §1.3 S6 — CUDA 값경로: Q4AccCuda(MatmulHost).
+        // 프레임 미구현 → Engine4는 값 경로로 동작(모든 GEMV를 호스트
+        // 스테이징). sources는 미소비 — Q4AccCuda는 Weight 식별 등록판이라
+        // 텐서 사전 적재가 없다(첫 matmul에서 디바이스 적재).
+        return match llm170_backend_gpu::new_q4_acc_cuda() {
+            Ok(acc) => {
+                eprintln!("# backend: gpu (qwen4exp CUDA 값경로 — plans/cuda-port.md §1.3 S6)");
+                Ok(eng.with_acc(acc))
+            }
+            Err(e) => {
+                eprintln!("error: qwen4exp CUDA 가속기 생성 실패 — {e}");
+                match policy {
+                    AttachPolicy::Warn => Ok(eng),
+                    AttachPolicy::Strict => Err(e),
+                }
+            }
+        };
     }
     if vk {
         // plans/84 B — Vulkan 값경로: VkAcc(MatmulHost). 프레임 미구현 →
@@ -464,6 +495,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             sources,
             q4_gpu_wanted(&backend),
             q4_vk_runtime(&backend),
+            q4_cuda_runtime(&backend),
             // plans/115: f16 버스 기본 박탈(원장 105 승격 회수) — serve hip에서
             // 토큰 전수 파괴 실측(2026-09-30): [760,6511]→가비지 vs f32 버스로는
             // infer 골든과 완전 일치. B1 잔여(infer f16 골든 발산)와 동일 결함.

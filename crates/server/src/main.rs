@@ -399,10 +399,8 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         eprintln!("error: EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan|cuda");
         return ExitCode::FAILURE;
     }
-    if !model_path.is_dir() && gpu_runtime == "cuda" {
-        eprintln!("error: CUDA는 현재 EXL3 디렉터리만 지원 (GGUF/W4A16은 S6/S7 대기)");
-        return ExitCode::FAILURE;
-    }
+    // plans/cuda-port.md §1.3 S6 — GGUF+cuda(qwen4exp)는 Q4AccCuda 값경로로
+    // 진행한다(attach_q4 cuda 분기). 디렉터리(EXL3)는 위 라우팅 그대로.
     let sel = if model_path.is_dir() {
         if gpu_runtime == "vulkan" {
             engine::BackendSel::Exl3
