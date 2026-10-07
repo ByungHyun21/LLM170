@@ -612,20 +612,29 @@ fn ple_ensure_block(st: &mut crate::rawhip::q4acc::PleSsd, bidx: u64) -> Result<
     let mut read_err = None;
     if !buf_first && want == crate::rawhip::q4acc::PLE_SSD_BLOCK {
         let df = st.direct.take();
-        if let Some(f) = &df
-            && let Err(e) = f.read_exact_at(&mut st.scratch.0[..], boff)
+        match df
+            .as_ref()
+            .map(|f| f.read_exact_at(&mut st.scratch.0[..], boff))
         {
-            read_err = Some(e);
-        }
-        if read_err.is_none() {
-            st.direct = df;
-            st.arena[base..base + crate::rawhip::q4acc::PLE_SSD_BLOCK]
-                .copy_from_slice(&st.scratch.0);
-        } else {
-            eprintln!("# ple-ssd: O_DIRECT 실패({:?}) — 버퍼드 폴백", read_err);
+            Some(Ok(())) => {
+                st.direct = df;
+                st.arena[base..base + crate::rawhip::q4acc::PLE_SSD_BLOCK]
+                    .copy_from_slice(&st.scratch.0);
+            }
+            Some(Err(e)) => {
+                eprintln!("# ple-ssd: O_DIRECT 실패({e:?}) — 버퍼드 폴백");
+                read_err = Some(e);
+            }
+            // O_DIRECT fd 없음(미지원 FS) — 아래 버퍼드 pread로 내려간다.
+            None => read_err = Some(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         }
     }
-    if read_err.is_some() || want < crate::rawhip::q4acc::PLE_SSD_BLOCK {
+    // 2026-10-07 수리: 버퍼드 우선 기본화(0aff61bf) 때 이 가드에서 buf_first 항이
+    // 빠져, 기본 설정에서는 4KB 완전 블록이 **어느 경로로도 판독되지 않은 채**
+    // 캐시에 등록됐다(arena는 0 초기값, 슬롯 재사용 후에는 stale). PLE를 ssd
+    // 모드로 돌리는 모델(FN, 테이블 26.8GiB)은 전 스텝 임베딩이 오염돼 게이트
+    // 기준선 스트림이 소실됐다(27B는 ple-table이 캐시 예산 내라 ram 모드 — 무사).
+    if read_err.is_some() || buf_first || want < crate::rawhip::q4acc::PLE_SSD_BLOCK {
         let mut buf = vec![0u8; crate::rawhip::q4acc::PLE_SSD_BLOCK];
         st.file
             .read_exact_at(&mut buf[..want], boff)
