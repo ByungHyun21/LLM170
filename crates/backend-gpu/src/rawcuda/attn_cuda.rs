@@ -30,11 +30,24 @@ use crate::rawcuda::ffi::CUdeviceptr;
 /// fwd3s T 상한(plans/124 §1 "fwd3s는 T≤8 소형 전용" — 모듈 Err·커널
 /// 조기복귀 이중 강제, assets/exl3_attn.cu EXL3_ATTN_TMAX와 동일 값).
 pub const ATTN_F3S_TMAX: usize = 8;
-/// fwd3s 점수 scratch 공유메모리 행 수(= assets/exl3_attn.cu EXL3_ATTN_SCAP).
-/// 위치축 상한을 이 값이 결정한다: pos+1이 이를 넘으면 공유메모리 범위를
-/// 벗어난다(plans/cuda-port.md S9 — cap 1024가 실질 정합 상한의 원인).
-pub const ATTN_SCORE_SCAP: usize = 1024;
+/// fwd3s 점수 scratch 청크 행 수(= assets/exl3_attn.cu EXL3_ATTN_CHUNK).
+///
+/// [S12 — plans/cuda-port.md] 옛엔 이 자리가 `ATTN_SCORE_SCAP = 1024`였고
+/// 그 값이 CUDA 서빙의 실질 ctx 상한이었다: fwd3s가 `sarr[1024]`에 lim행
+/// 스코어를 전부 담아 두다 보니 pos≥1023에서 illegal address로 죽었고,
+/// cap을 키워도 못 넘었다. 이제 커널이 256행 청크마다 running max/l/acc를
+/// 갱신하는 온라인 소프트맥스(plans/128 P0 hip 판을 이식)로 바뀌어
+/// **공유메모리가 kvcap과 무관**해졌다. 따라서 이 상수는 더 이상 위치축을
+/// 제한하지 않으며, 유일한 위치축 상한은 아래 `ATTN_KV_CAP`(KV 캐시 할당)
+/// 다. `ATTN_KV_CAP`은 기본값일 뿐이고 `load_slots`가 인자로 받으므로
+/// 실제 서빙 상한은 서버의 `--ctx`가 정한다.
+pub const ATTN_F3S_CHUNK: usize = 256;
 /// KV 캐시 층당 위치 상한(hip 규약 — dkc/dvc [n_attn][cap][kv_dim]).
+///
+/// [S12] fwd3s 공유메모리 상한이 사라진 뒤 이 값이 유일한 위치축 상한이
+/// 됐다 — dkc/dvc/dmtpk/dmtpv 할당과 `exl3_attn_prep` 인자가 모두 같은
+/// cap을 공유해야 한다(하드코딩 1024로 남기면 attn_prep가 fault한다 —
+/// 백엔드 AGENTS.md 역패턴 참조).
 pub const ATTN_KV_CAP: usize = 1024;
 
 /// 어텐션 형상 — 모델 config.json text_config에서 유도(27B/35B 상이).
@@ -501,12 +514,16 @@ impl Exl3CudaDecoder {
         if slot >= self.n_slots.max(1) {
             return Err(format!("attn slot={slot} >= n_slots={}", self.n_slots));
         }
-        // 위치축 한계(S9) — 커널 조기복귀 대신 여기서 명시적 거부.
+        // 위치축 검사 — [S12] 옛 S9 가드(공유메모리 1024행)는 커널이
+        // 청크 온라인 소프트맥스로 바뀌어 더 이상 필요 없다. 남는 유일한
+        // 상한은 KV 캐시 할당량 dm.cap이다(아래 attn_chain_dev의 cap 검사와
+        // 짝). 여기서는 pos가 캐시 범위를 넘는지만 본다.
         let pos = self.slot_pos.get(slot).copied().unwrap_or(0);
-        if pos as usize + t_len > ATTN_SCORE_SCAP {
+        if pos as usize + t_len > dm.cap {
             return Err(format!(
-                "attn: 위치 {} > fwd3s 공유메모리 한계 {ATTN_SCORE_SCAP} (S9)",
-                pos as usize + t_len
+                "attn: 위치 {} > KV 캐시 cap {} (--ctx 상향 필요)",
+                pos as usize + t_len,
+                dm.cap
             ));
         }
         // **pp[0]을 현재 위치로 기입한다.** prep/fwd3s는 발사 인자가 아니라
@@ -554,17 +571,11 @@ impl Exl3CudaDecoder {
                 dm.cap
             ));
         }
-        // fwd3s의 공유메모리 sarr[ATTN_SCORE_SCAP] 한계(pos축). 커널도
-        // 조기복귀하지만 그건 "조용히 오답"이므로 여기서 runtime Err로 명시적
-        // 거부한다(plans/cuda-port.md S9). 진짜 해법은 위치 청크 분할 온라인
-        // 소프트맥스 재작성 — 그전까지 cap 1024가 실질 정합 상한이다.
-        let end_pos = pos0 as usize + t_len;
-        if end_pos > ATTN_SCORE_SCAP {
-            return Err(format!(
-                "attn: 위치 {end_pos} > fwd3s 공유메모리 한계 {ATTN_SCORE_SCAP} — \
-                 CUDA 어텐션은 cap {ATTN_SCORE_SCAP}까지만 정합(위치 청크 미구현, S9)"
-            ));
-        }
+        // [S12] 옛 fwd3s 공유메모리 sarr[1024] 위치축 거절은 제거했다 —
+        // 커널이 청크 온라인 소프트맥스(hip 판 plans/128 P0 이식)로 바뀌어
+        // 공유메모리가 kvcap과 무관해졌다. cap 검사가 위(pos0+T>cap)에 있어
+        // 이 함수의 위치축 상한은 그 하나로 충분하다. 남는 한계는
+        // fwd3s의 T≤8 도메인(위)이며, 이는 위치축과 독립적인 축이다.
         self.attn_prep_launch(slot, layer, t_len, false, 0)?;
         self.attn_fwd3s_launch(slot, layer, t_len)?;
         let take = |n: usize, src: CUdeviceptr| -> Result<Vec<f32>, String> {

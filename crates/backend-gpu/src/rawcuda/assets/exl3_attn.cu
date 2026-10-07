@@ -25,6 +25,9 @@
 //    소형 전용"). 커널 첫 줄 t_len>8 균등 조기복귀(기록 없음 — 부분 기록
 //    오염 없는 깨끗한 거부) + 모듈층 사전 Err의 이중 계약.
 // 5) 원본 fwd3s의 1e30f 무한대 대체치·환원 구조는 불변(값 계약).
+// 6) [S12] 위치축 청크.online 소프트맥스 이식 — hip 판 L202-276( plans/128
+//    P0 재작성본)을 그대로 옮겨 공유메모리 sarr를 [1024]→[256]으로 줄이고
+//    kvcap과 무관하게 했다. exp는 attn_expf 미러를 쓰는 CUDA 규약을 유지한다.
 //
 // 그리드 계약(결함 5호 정신 — T축은 grid.x): prep는 (T, q_heads+kv_heads),
 // fwd3s는 (T, q_heads). 블록 128(prep)·256(fwd3s) — 원본과 동일.
@@ -35,12 +38,14 @@
 //   qg [T][q_heads·512] 판독(27B T=8 393KB) — 완전 coalesce 스트리밍,
 //   HBM2e 대역 포화 관점 무해수. rope는 32레인만 회전(partial_rotary 0.25×
 //   256=64차원=쌍32) — 원본 구조 1:1(정합 우선, 구조 재설계 금지).
-// - fwd3s: 그리드 (T≤8, 24[27B]/16[35B]), 블록 256, 정적 공유 6KB(qs 1KB +
-//   sarr 4KB + reds 1KB). 블록당 kc lim행×1KB 순차 판독 + vc lim행×256B —
-//   메모리 본드. T=1 디코드(24블록)는 70SM 대비 저점유가 설계 의도다:
-//   정확성 우선 피벗(원본 주석)이며 처리량 경로는 t-블록 fwd3(후속 목표).
-//   T=8 스펙 디코드(192블록)는 70SM의 ~3블록/SM로 확산 — 소형 전용
-//   도메인(T≤8)이 점유 상한과 짝한다.
+// - fwd3s: 그리드 (T≤8, 24[27B]/16[35B]), 블록 256, 정적 공유 2KB(qs 1KB +
+//   sarr 1KB + reds 1KB — S12 청크화로 6KB에서 축소). 블록당 kc lim행×1KB
+//   순차 판독 + vc lim행×256B — 메모리 본드. T=1 디코드(24블록)는 70SM 대비
+//   저점유가 설계 의도다: 정확성 우선 피벗(원본 주석)이며 처리량 경로는
+//   t-블록 fwd3(후속 목표). T=8 스펙 디코드(192블록)는 70SM의 ~3블록/SM로
+//   확산 — 소형 전용 도메인(T≤8)이 점유 상한과 짝한다.
+//   [S12] 공유메모리가 kvcap과 무관해졌으므로 블록당 점유가 위치축으로
+//   늘어나지 않는다 — 옛 1024행 상한은 sarr에서 사라졌다.
 // - pos_bump: 1스레드 — 캡처 그래프 내 pos 전진(h2d 불가 대체, 결함 16호
 //   정신). 원본 그대로.
 #include <cuda_fp16.h>
@@ -320,13 +325,34 @@ extern "C" __global__ void exl3_attn_prep_hostpos(
 // 게이트 sigmoid 곱. WG당 (t,h). lim = pp[0](디바이스)+t+1 — 결함 4호.
 // 도메인: T≤8(EXL3_ATTN_TMAX) — 위반 시 전 블록 조기복귀(기록 없음).
 #define EXL3_ATTN_TMAX 8
-#define EXL3_ATTN_SCAP 1024
-// 위치축 상한(plans/cuda-port.md S9): sarr는 공유메모리이므로 lim > SCAP이면
-// sarr[row]가 블록 밖을 넘어간다 — cap 1024를 넘는 KV 캐시로 서빙하면
-// pos>=1023에서 illegal address(CUresult 700)로 죽는다. 이전까지는 cap을
-// 늘리는 쪽에서 이 경계를 몰랐다. 여기서 조기복귀시켜 "답이 이상해지는"
-// 것보다 명확하게 거부한다(조용한 오염 금지) — 호출자는 runtime Err로
-//不合格을 받는다(모듈 attn_chain_dev의 cap 사전 검사와 짝).
+// ── [S12 2026-10-07] 위치축 청크.online 소프트맥스 — 공유메모리 6KB→2KB ──
+// 이전 구현은 sarr[1024]에 lim행 스코어를 전부 담아 두었다. 공유메모리 고정
+// 크기라 lim(=pp[0]+t+1)이 1024를 넘으면 sarr[row]가 블록 밖을 넘어가고
+// CUresult 700(illegal address)으로 죽는다 — cap을 아무리 키워도 pos≥1023
+// 에서 서빙이 막혀, CUDA의 실질 ctx 상한이 1024로 고정돼 있었다
+// (plans/cuda-port.md S9가 규칙적으로 확인해 봉인한 한계).
+//
+// 해법은 알고리즘 새로 쓰기가 아니라 **hip 판의 청크 온라인 소프트맥스를
+// 그대로 이식**하는 것이었다(rawhip/kernels/src_exl3_attn.hip L202-276가
+// plans/128 P0에서 이미 그 형태로 재작성돼 있다 — 청크 256행마다 running
+// max/l/acc를 갱신하므로 smem이 kvcap과 무관해진다).
+//
+// [왜 lim≤256 구간은 비트동일인가 — 게이트 기준선이 깨지지 않는 근거]
+// 청크 경계 안(lim≤256)에서는 청크가 하나뿐이라 이식 전후가 같은 연산을
+// 같은 순서로 한다: 스코어(행당 1스레드 256차원 순차 내적·scale 곱은 동일),
+// max 트리(동일 값에 대한 fmaxf 트리), exp+sum 트리(동일 per-스레드 값),
+// AV 누산(acc=0에서 lim행 순차 — 청크 하나면 base=0이므로 행 순서 동일),
+// 최종 (acc/l)·sigmoid 동일. corr은 첫 청크에서 0이고(acc=0·0), l_run은
+// 0·0+sum이라 첫 청크 결과가 그대로다. 즉 **기존 ctx 1024 게이트의 프롬프트
+// (41토큰)+16 = lim≤57은 비트 단위로 동일** — 기준선 재기록이 불필요하고,
+// lim>256 구간(게이트가 처음 밟지 않던 영역)만 환원 순서가 달라진다.
+// 그 구간은 이전엔 서빙이 불가능했으므로 회귀 판정 대상 자체가 없다.
+//
+// [환원 순서 변경 — 규칙 10a] 청크 경계를 넘는 구간은 max/sum 리덕션 순서가
+// 달라져 값이 ulp 수준으로 움직인다. 수학적으로는 동등(온라인 소프트맥스
+// 정의 그대로)하며 f16 GEMM 누산(1.6e-2)보다 작다. 실사용 판정은 기존과
+// 동일하게 argmax 일치다.
+#define EXL3_ATTN_CHUNK 256
 extern "C" __global__ void exl3_attn_fwd3s(
     const float* __restrict__ qh,    // [T][q_heads*256]
     const float* __restrict__ kc,    // [n_attn*cap][kv_heads*256]
@@ -338,7 +364,7 @@ extern "C" __global__ void exl3_attn_fwd3s(
 {
     if (t_len > EXL3_ATTN_TMAX) return;   // 도메인 강제: T≤8(깨끗한 거부)
     __shared__ float qs[256];
-    __shared__ float sarr[EXL3_ATTN_SCAP];
+    __shared__ float sarr[EXL3_ATTN_CHUNK]; // 청크 스코어(온라인 — 전체 보관 아님)
     __shared__ float reds[256];
     int t = blockIdx.x;
     int h = blockIdx.y;
@@ -347,50 +373,63 @@ extern "C" __global__ void exl3_attn_fwd3s(
     int kh = h / gq;
     float scale = 0.0625f;                // 1/√256
     int lim = (int)pp[0] + t + 1;
-    // 공유메모리 sarr 한계를 넘는 위치는 처리 불가 — 조기복귀(plans/cuda-port.md
-    // S9). Module이 같은 경계를 runtime Err로 사전 검사하므로 여기서는
-    // "조용히 틀린 값"이而非 "명확한 불일치"를 택한다.
-    if (lim > EXL3_ATTN_SCAP) return;
     long kv_dim = (long)kv_heads * 256;
-    qs[tid] = qh[(long)t * (q_heads * 256) + (long)h * 256 + tid];
+    long qrow = (long)t * (q_heads * 256) + (long)h * 256;   // qh·outv 행 오프셋
+    qs[tid] = qh[qrow + tid];
     __syncthreads();
-    for (int row = tid; row < lim; row += 256) {
-        float p = 0.0f;
-        for (int d = 0; d < 256; d++)
-            p += qs[d] * kc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + d];
-        sarr[row] = p * scale;
-    }
-    __syncthreads();
-    float lm = -1e30f;
-    for (int i = tid; i < lim; i += 256) lm = fmaxf(lm, sarr[i]);
-    reds[tid] = lm;
-    __syncthreads();
-    for (int st = 128; st > 0; st >>= 1) {
-        if (tid < st) reds[tid] = fmaxf(reds[tid], reds[tid + st]);
+    // [S12] 청크 온라인 소프트맥스. m_run/l_run/acc는 청크를 넘어 유지되고
+    // 청크마다 corr=exp(m_run−m_new)로 리스케일된다 — smem이 kvcap과
+    // 무관해지므로 위치축 상한이 사라진다(위 S12 주석).
+    float m_run = -1e30f;
+    float l_run = 0.0f;
+    float acc = 0.0f;   // 스레드(dim=tid)별 AV 누산
+    for (int base = 0; base < lim; base += EXL3_ATTN_CHUNK) {
+        int nch = min(EXL3_ATTN_CHUNK, lim - base);
+        // 스코어: 행=base+tid(tid<nch), 256차원 직렬 내적(hip L232-239 동일)
+        float p = -1e30f;
+        if (tid < nch) {
+            int row = base + tid;
+            p = 0.0f;
+            for (int d = 0; d < 256; d++)
+                p += qs[d] * kc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + d];
+            p *= scale;
+        }
+        sarr[tid] = p;
         __syncthreads();
-    }
-    float gmax = reds[0];
-    __syncthreads();
-    float ls = 0.0f;
-    for (int i = tid; i < lim; i += 256) {
-        float e = attn_expf(sarr[i] - gmax);
-        sarr[i] = e;
-        ls += e;
-    }
-    reds[tid] = ls;
-    __syncthreads();
-    for (int st = 128; st > 0; st >>= 1) {
-        if (tid < st) reds[tid] += reds[tid + st];
+        // 청크 max(트리) — reds[0] 확정(균질)
+        reds[tid] = (tid < nch) ? sarr[tid] : -1e30f;
         __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (tid < st) reds[tid] = fmaxf(reds[tid], reds[tid + st]);
+            __syncthreads();
+        }
+        float m_new = fmaxf(m_run, reds[0]);
+        float corr = (m_run <= -1e29f) ? 0.0f : attn_expf(m_run - m_new);
+        __syncthreads(); // reds[0](청크 max) 판독 완료 후 e 기록 — 덮어쓰기 레이스 방지
+        // exp+청크 sum — e를 sarr에 재기록(AV 재사용)
+        float e = 0.0f;
+        if (tid < nch) {
+            e = attn_expf(sarr[tid] - m_new);
+            sarr[tid] = e;
+        }
+        reds[tid] = e;
+        __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (tid < st) reds[tid] += reds[tid + st];
+            __syncthreads();
+        }
+        // AV: 자기 dim에 청크 전 행 누산(행 순서는 이전 구현과 동일 — 순차)
+        acc *= corr;
+        for (int i = 0; i < nch; i++) {
+            int row = base + i;
+            acc += sarr[i] * vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid];
+        }
+        l_run = l_run * corr + reds[0];
+        m_run = m_new;
+        __syncthreads(); // sarr 재사용 전 전체 완료(다음 청크 스코어 덮어쓰기 보호)
     }
-    float wsum = reds[0];
-    __syncthreads();
-    float acc = 0.0f;
-    for (int row = 0; row < lim; row++)
-        acc += sarr[row] * vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid];
     float g = qg[(long)t * (q_heads * 512) + (long)h * 512 + 256 + tid];
-    outv[(long)t * (q_heads * 256) + (long)h * 256 + tid] =
-        (acc / wsum) * (1.0f / (1.0f + attn_expf(-g)));
+    outv[qrow + tid] = (acc / l_run) * (1.0f / (1.0f + attn_expf(-g)));
 }
 // 마커 f3sc
 

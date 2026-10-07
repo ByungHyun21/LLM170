@@ -47,11 +47,12 @@ impl Exl3CudaDecoder {
             ));
         }
         let pos = self.slot_pos[slot];
-        let s9 = crate::rawcuda::attn_cuda::ATTN_SCORE_SCAP;
-        if pos as usize + t > s9 {
+        // [S12] 위치축은 cap(=--ctx)만 제한한다 — fwd3s가 청크 온라인
+        // 소프트맥스로 바뀌어 공유메모리 상한(1024)이 사라졌다.
+        let cap = self.attn_dims()?.cap;
+        if pos as usize + t > cap {
             return Err(format!(
-                "context overflow: slot{slot} pos={pos}+T={t} > {s9} \
-                 (CUDA fwd3s 위치축 한계 — 위치 청크 미구현, plans/cuda-port.md S9)"
+                "context overflow: slot{slot} pos={pos}+T={t} > kvcap={cap} (--ctx 상향 필요)"
             ));
         }
         if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.is_none() {
