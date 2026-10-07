@@ -92,6 +92,11 @@ pub struct Exl3CudaDecoder {
     pub dyt: CUdeviceptr,
     /// kseg 부분합 [T≤8][kseg=8][n] f32 — G4 유효(had_out이 합산).
     pub dbat: CUdeviceptr,
+    /// 행병렬 gemv_t 부분합 [T≤8][nseg=16][n] f32 — 슬롯 간 배치 전용
+    /// (plans/cuda-port.md §1). dbat(kseg=8)와 용량 계열이 달라 별도
+    /// 버퍼다 — nseg=16 분할이 T=1 gemv와 같은 had_out 합산 순서를
+    /// 만드는 핵심이라 kseg 버퍼로 대체할 수 없다.
+    pub dsbt: CUdeviceptr,
     // ── GDN 체인(conv→l2perm→scan→gate, §3.3) G5 유효 ──
     /// GDN 형상(set_gdn 등록 — None이면 미초기화).
     pub gdn: Option<GdnDims>,
@@ -207,6 +212,8 @@ pub struct Exl3CudaDecoder {
     pub(crate) gemm_ah_cap: usize,
     pub(crate) gemm_y_cap: usize,
     pub(crate) gemm_bat_n: usize,
+    /// 행병렬 gemv_t 부분합 dsbt 용량(바이트 — plans/cuda-port.md §1).
+    pub(crate) gemv_t_sbt_cap: usize,
     /// GDN 작업 버퍼 t 상한(행수 — 확장 시에만 재할당, set_gdn 리셋).
     pub(crate) gdn_t_cap: usize,
     /// 어텐션 작업 버퍼 t 상한(행수 — 확장 시에만 재할당, set_attn 리셋).
@@ -878,7 +885,7 @@ impl Exl3CudaDecoder {
         cc.load_fatbin(
             "exl3gemv",
             &image,
-            &["exl3_had_in", "exl3_gemv", "exl3_had_out"],
+            &["exl3_had_in", "exl3_gemv", "exl3_gemv_t", "exl3_had_out"],
         )?;
         cc.load_fatbin("exl3norm", &image_n, &["exl3_norm_resid"])?;
         cc.load_fatbin("exl3gemm2", &image_g, &["exl3_gemm2", "exl3_gemm2_kseg"])?;
@@ -936,6 +943,7 @@ impl Exl3CudaDecoder {
             daht: 0,
             dyt: 0,
             dbat: 0,
+            dsbt: 0,
             gdn: None,
             dqkv: 0,
             dzv: 0,
@@ -1001,6 +1009,7 @@ impl Exl3CudaDecoder {
             gemm_ah_cap: 0,
             gemm_y_cap: 0,
             gemm_bat_n: 0,
+            gemv_t_sbt_cap: 0,
             gdn_t_cap: 0,
             attn_t_cap: 0,
             ew_cap: 0,

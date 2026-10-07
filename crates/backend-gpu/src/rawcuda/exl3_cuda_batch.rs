@@ -279,6 +279,54 @@ impl Exl3CudaDecoder {
         Ok(())
     }
 
+    /// bstage의 gemv_t 판(plans/cuda-port.md §1 착수조건 1) — bstage와
+    /// 동일 계약([T][k] 입력 → 슬롯 s에 [T][n] 사본)이나 gemm2(mma f32
+    /// 누산) 대신 행병렬 gemv_t를 써서 행별 T=1 GEMV와 **비트동일**을
+    /// 보장한다. 슬롯 간 배치 디코드 전용 — S11 프리필은 기존
+    /// bstage(gemm2) 기본선을 그대로 유지한다(게이트 무변화).
+    pub(crate) fn bstage_gt(
+        &mut self,
+        key: &str,
+        x_dev: CUdeviceptr,
+        s: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        let n = self.lin_copy(key).map(|l| l.n)?;
+        // ensure_stage가 할당하므로 bchain보다 먼저 부른다.
+        self.ensure_stage(s, n, t)?;
+        let dst = self.bchain(s)?;
+        let p = self
+            .gemv_t_dev(key, x_dev, t)
+            .map_err(|e| format!("bstage_gt({key}, T={t}): {e}"))?;
+        self.cc
+            .d2d(dst, p, t * n * 4)
+            .map_err(|e| format!("bstage_gt({key}) 복사 {t}x{n}: {e}"))
+    }
+
+    /// bgemv/bgemv_down의 gemv_t 판 — 입력이 [T][k] 연속 행이므로 행별
+    /// 스테이징 T회(gemm2 체인의 d2d 왕복) 없이 한 번에 들어간다.
+    /// 어텐션 산출 [T][q_dim](o_proj.k=q_dim)·GDN 산출 [T][v_len]
+    /// (out_proj.k=v_len)·ew 산출 [T][ffn](down_proj.k=ffn) 모두 행 폭이
+    /// 곧 해당 선형의 k라 이 계약이 성립한다. 출력은 bchain(4) 스테이징
+    /// 사본(dyt는 다음 gemv_t가 덮는다 — 즉시 소비 규약).
+    pub(crate) fn bgemv_gt(
+        &mut self,
+        key: &str,
+        x_dev: CUdeviceptr,
+        t: usize,
+    ) -> Result<CUdeviceptr, String> {
+        let n = self.lin_copy(key).map(|l| l.n)?;
+        self.ensure_stage(4, n, t)?;
+        let dst = self.bchain(4)?;
+        let p = self
+            .gemv_t_dev(key, x_dev, t)
+            .map_err(|e| format!("bgemv_gt({key}, T={t}): {e}"))?;
+        self.cc
+            .d2d(dst, p, t * n * 4)
+            .map_err(|e| format!("bgemv_gt({key}) 복사 {t}x{n}: {e}"))?;
+        Ok(dst)
+    }
+
     fn ensure_batch_bufs(&mut self) -> Result<(), String> {
         Ok(())
     }

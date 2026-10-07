@@ -155,6 +155,117 @@ extern "C" __global__ void exl3_gemv(
     if (nt < ntiles) s[(long)seg * ntiles * 16 + (long)nt * 16 + c] = acc;
 }
 
+// exl3_gemv_t (슬롯 간 배치 — plans/cuda-port.md §1 착수조건 1, 2026-10-08)
+// — T행을 한 번에 처리하되 **행별 환원 순서를 exl3_gemv(T=1)와 비트동일하게
+// 보존**한다. gemm2(mma m16n8k16)는 f32 누산 순서가 T=1 gemv(k-연속
+// hfma2)와 구조적으로 달라 1스텝차가 다중 스텝 argmax 뒤집힘으로 누적된다
+// (원장: 24스텝 T=4에서 토큰 2/4 어긋남). 이 커널은:
+//   - 트렐리스 추출·mul1 디코드는 스레드당 k-타일별 **1회**(T행 공유) —
+//     배치 이득(역양자화 공유)은 그대로.
+//   - hfma2 누산·FOLD=4 케이던스·nseg=16 k-분할·had_out 합산 순서는
+//     행마다 exl3_gemv와 동일 — 같은 a2·w2 피연산자가 같은 순서로 같은
+//     단일반올림 f16 FMA를 통과하므로 행별 결과는 T=1과 비트동일.
+// 산술식(exl3_extract·mul1·addr16·폴드)은 위 exl3_gemv에서 한 글자도
+// 수정하지 않는다(파생 금지 — 2회 사고 원장).
+//
+// 도메인: 1 ≤ T ≤ 8(ATTN_F3S_TMAX와 동일 상한 — 슬롯 간 배치 청크 계약).
+// grid/블록 기하는 exl3_gemv와 동일(((n/16)/8, nseg=16), 128스레드) —
+// 행축은 그리드가 아니라 블록 내 루프로 처리한다(트렐리스 스테이징이
+// 행 수만큼 반복되지 않게).
+extern "C" __global__ void exl3_gemv_t(
+    const unsigned* __restrict__ ah16,  // f16쌍팩 [T][k/2]
+    const unsigned* __restrict__ tre,   // trellis u32
+    float* __restrict__ s,              // [T][nseg][n] 분할 부분합
+    int ktiles, int ntiles, int K, int T)
+{
+    __shared__ unsigned stg[8 * 48];
+    __shared__ unsigned ahstg[8 * 8]; // [T≤8][8] — k-타일당 T행 활성 8 u32
+    int nt0 = blockIdx.x * 8;
+    if (nt0 >= ntiles) return;
+    int seg = blockIdx.y;
+    int nseg = gridDim.y;
+    int ktb = (int)((long)ktiles * seg / nseg);
+    int kte = (int)((long)ktiles * (seg + 1) / nseg);
+    int c = threadIdx.x & 15;
+    int ntl = threadIdx.x >> 4;
+    int tid = threadIdx.x;
+    int words32 = 8 * K;
+    int stg_words = 8 * words32;
+    int arow_words = (ktiles * 16) >> 1; // k/2 — ah16 행 폭
+    // 누산기는 행별로 독립(배열 인덱스 r = 행). T<8 행은 쓰지 않고
+    // 끝난다 — 값은 버려도 순서는 행마다 T=1과 같다.
+    float acc[8];
+    __half2 acc2[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) {
+        acc[r] = 0.0f;
+        acc2[r] = __float2half2_rn(0.0f);
+    }
+
+    unsigned addr16[16];
+    #pragma unroll
+    for (int r = 0; r < 16; r++) {
+        int t = (4 * (c & 7) + ((r & 7) >> 1)) * 8
+              + ((r >> 3) * 2 + (r & 1) + ((c >> 3) * 4));
+        unsigned b0 = (unsigned)t * (unsigned)K + (unsigned)(K + 256 * K - 16);
+        unsigned b1 = b0 + 16u;
+        unsigned i0 = (b0 >> 5) % (unsigned)words32;
+        unsigned i1 = ((b1 - 1u) >> 5) % (unsigned)words32;
+        unsigned sh = (((b1 - 1u) >> 5) + 1u) * 32u - b1;
+        addr16[r] = i0 | (i1 << 8) | (sh << 16);
+    }
+
+    for (int kb = ktb; kb < kte; kb += 8) {
+        int nk = min(8, kte - kb);
+        for (int ktl = 0; ktl < nk; ktl++) {
+            long tbase = ((long)(kb + ktl) * ntiles + nt0) * words32;
+            int ahb = ((kb + ktl) * 16) >> 1;
+            for (int w = tid; w < stg_words; w += 128) stg[w] = tre[tbase + w];
+            // 활성 스테이징은 T행 × 8워드 — 행 폭 k/2로 행별 오프셋.
+            for (int i = tid; i < 8 * T; i += 128) {
+                int r = i >> 3;
+                int w = i & 7;
+                ahstg[i] = ah16[(long)r * arow_words + ahb + w];
+            }
+            __syncthreads();
+            const unsigned* tile = stg + ntl * words32;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                unsigned we = exl3_extract(addr16[2 * j], tile);
+                unsigned wo = exl3_extract(addr16[2 * j + 1], tile);
+                __half2 w2 = __floats2half2_rn(exl3_mul1_decode(we), exl3_mul1_decode(wo));
+                #pragma unroll
+                for (int r = 0; r < 8; r++) {
+                    if (r < T) {
+                        __half2 a2 = *reinterpret_cast<const __half2*>(&ahstg[r * 8 + j]);
+                        acc2[r] = __hfma2(a2, w2, acc2[r]);
+                    }
+                }
+            }
+            if (((kb + ktl) & 3) == 3) {
+                #pragma unroll
+                for (int r = 0; r < 8; r++) {
+                    if (r < T) {
+                        acc[r] += __low2float(acc2[r]) + __high2float(acc2[r]);
+                        acc2[r] = __float2half2_rn(0.0f);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    int nt = nt0 + ntl;
+    if (nt < ntiles) {
+        #pragma unroll
+        for (int r = 0; r < 8; r++) {
+            if (r < T) {
+                acc[r] += __low2float(acc2[r]) + __high2float(acc2[r]);
+                s[((long)r * nseg + seg) * (long)ntiles * 16 + (long)nt * 16 + c] = acc[r];
+            }
+        }
+    }
+}
+
 extern "C" __global__ void exl3_had_out(
     const float* __restrict__ s,       // [nseg][n]
     const unsigned* __restrict__ svh,  // f16쌍팩 [n/2]

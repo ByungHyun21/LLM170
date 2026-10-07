@@ -1,53 +1,36 @@
 // ============================================================================
-// ⚠️ 미배선 — 결함은 "배선" 쪽. 원시 자체는 검증 완료 (2026-10-07)
+// 슬롯 간 배치 — 배선·검증 완료(2026-10-08, plans/cuda-port.md §1 착수조건 1)
 // ============================================================================
-// **진단 갱신 — 아래 옛 판단은 정정되었다.**
-//
-// [정정] `cuda_probe ms`(a9c7158)로 **원시 자체는 정확함**이 확정됐다.
-// lim_layers 1·2·3·4·8·16·24·32·**full(64층)** 전부 PASS — 길이가 다른
-// 프롬프트(5/9토큰)로 프리필한 슬롯 2개를 T=2 한 번 vs T=1 두 번으로
-// 디코드하면 **64층 전체에서 같은 토큰**을 고른다. 행 오프셋·슬롯 상태
-// 인자·잔차 누산이 모두 맞다는 뜻이다. 그러므로 배선을 되돌린 이유는
-// 산술이 아니라 **스케줄러 배선**이다.
-//
-// [관측 증상 — 배선 버그의 서명]
-// 슬롯 4 동시 vs 직렬에서 서로 다른 두 프롬프트가 idx=9부터 동일한
-// 24토큰열을 냈고, 그 열(`25 198 16 13 48455 264 …`)은 **어느 프롬프트에
-// 대해서도 같은 고정값**이었다. 프롬프트와 무관한 값은 그 슬롯의 문맥이
-// 비었다는 뜻이다 — KV가 비어 pos=0이면 fwd3s의 lim=1로 퇴화해 결정론적
-// 고정 출력을 낸다. 즉 두 요청이 **문맥이 없는 슬롯을 디코드**했다.
-//
-// [기각된 가설] 프리필 미완 슬롯의 혼입은 아니다 — `sched.rs`의 `active`는
-// `slots[i].prefilled == job.tokens.len()`인 슬롯만 담는다(sched.rs:390-395).
-//
-// [재배선 시 반드시 고칠 것 — 잠재 결함 1건 · 단 이번 증상의 근원은 아니다]
-// 배치 결과 소비부에서 `if t == eos { break; }`가 **청크의 나머지 슬롯을
-// 건너뛴다**. `decode_batch_slots`는 이미 그 슬롯들의 pos·KV·GDN을 전진시켰는데
-// 토큰을 내보내지 않아, 그 슬롯들은 한 스텝을 진행한 채 남는다. EOS가 나온
-// 슬롯이 있는 청크에서 나머지가 조용히 어긋난다. **고쳐야 하지만, 관측된
-// 증상의 원인은 아니다** — 그 증상은 n_predict=24로 재현됐고 이 구간에서는
-// EOS(248044)가 사실상 나오지 않는다. 이것은 아직 특정하지 못한 배선 결함과
-// 별개로 반드시 손봐야 할 지연 잠재 결함이다.
-//
-// [아직 특정하지 못한 배선 결함]
-// 관측 증상(프롬프트 무관한 고정 출력 = 문맥이 비은 슬롯을 디코드)의 직접
-// 원인은 아직 몰라. 남아 있는 가설은 (a) 스케줄러가 같은 슬롯을 두 작업에
-// 준 뒤 한쪽이 교체되는 구간, (b) 프리필 청크가 슬롯 간 교차 진행되는
-// 스케줄러 루프에서 위치·KV 반영 시점의 어긋남. 배선을 되돌린 상태로 두는
-// 이유가 이것이다 — 검증 두 벌(verify_cuda_slots.py·cuda_probe ms) 없이
-// 켜지 않는다.
-//
-// [다음 세션이 할 일]
-//   1. 위 EOS `break` 결함을 고친다.
-//   2. 배선 후 `scripts/verify_cuda_slots.py`(겹침배율 가드 포함)를 돌린다 —
-//      이 하네스가 "서로 다른 입력이 같은 출력을 내는가"를 본다.
-//   3. 게이트 2종(기본·--ctx-long)이 기준선 그대로인지 확인한다.
-//   4. `cuda_probe ms`를 배선 후에도 회귀 게이트로 유지한다.
+// [경과 요약 — 원장 계승]
+// 1. (2026-10-07) `cuda_probe ms`(a9c7158)로 원시 자체는 64층 전체
+//    T=2≡T=1 검증 완료. 단 그 판정은 **같은 배치 경로 안에서의 T 비교**
+//    라 상태 격리만 본다.
+// 2. (2026-10-07) 실측 원장: T=4 동시 디코드 24스텝에서 토큰 2/4가
+//    T=1 기준과 어긋났다. 당시 "gemm2 환원 순서" 진단은 **오진** —
+//    msrv(서버 타임라인 재현)가 gemv_t(비트동일 선형)로도 같은 증상을
+//    재현해 반증됐다.
+// 3. (2026-10-08) 진짜 원인: 배치 경로가 어텐션 k/v 스테이징 행 폭을
+//    GDN v_len로 썼다. 어텐션 k/v 폭은 **kv_dim**(kv_heads·256)이며
+//    v_len(GDN v_heads 폭)과 다르다 — 0행(오프셋 0)만 우연히 맞고 1행부터
+//    엉뚱한 오프셋을 읽었다. ms4b(1스텝 로짓 to_bits) lim 스윕으로 국소화:
+//    GDN 전수(≤3층) 비트일치 · 최초 어텐션 층(4층)부터 rows≥1 전체
+//    로짓 maxdiff ~2.3e-2. kv_dim 수정 후 1스텝 비트일치(전 층).
+// 4. (2026-10-08) 종단 검증 전부 PASS — gemv_t T=1..8 to_bits 0불일치,
+//    ms(T=2 1스텝)·ms4(동일 프롬프트 4슬롯 순수 T=4 24스텝)·msrv(서버
+//    타임라인 24스텝)·verify_cuda_slots.py(슬롯 4 동시 vs 슬롯 1 직렬,
+//    겹침배율 3.96x, 4 프롬프트 길이 41/82/123/205 전부 24토큰 일치).
+// 5. (2026-10-08) 실측 배율: bench_cuda_slots.py 4슬롯 집합 39.3 tok/s =
+//    단일 24.2 tok/s의 **1.62배**(목표 ≥3x 미달). ms4 스텝 시간 분해:
+//    직렬 33.0ms · 배치 T=4 67.6ms — 이상적(가중치 1회 판독)은 ~34ms라
+//    **+34ms는 행별 어텐션·GDN 체인**(스텝당 ~256개 소형 체인, 슬롯
+//    인자가 달라 배치 불가)이 지배한다. ≥3x의 다음 레버는 GDN·어텐션
+//    커널의 행배치(행마다 슬롯 인덱스 배열 인자 — 커널 변경 + 비트계약
+//    재검증)다. 선형(gemv_t) 공유는 이미 정상.
 // ============================================================================
 
 //! 슬롯 간 디코드 배치 — 활성 슬롯 N개를 T=N으로 한 번에 디코드한다.
 //!
-//! [왜 필요한가 — plans/cuda-port.md §5 우선순위 1의 근거)
+//! [왜 필요한가 — plans/cuda-port.md §1 우선순위 1의 근거]
 //! S8는 다중 슬롯을 열었지만 **연속배치가 아니었다**. `sched.rs`의 CUDA
 //! 분기는 `for &i in &active { e.step_tok_device(i, next) }`로 슬롯마다
 //! 64층 forward를 통째로 따로 돌린다 — 시간분할이다. 실측이 증명한다
@@ -60,34 +43,35 @@
 //!
 //! 원인은 가중치를 슬롯 간에 공유하지 않는 것이다. EXL3 5.00bpw는 행마다
 //! 트렐리스 역양자화가 필요하므로, GEMV를 T회 따로 부르면 역양자화도 T번
-//! 한다. `gemm2`(=배치 GEMM)는 타일 역양자화를 **한 번** 하고 T행에
-//! 적용하므로, T행이 한 번에 들어가면 그만큼 절약된다.
+//! 한다. `gemv_t`는 스레드당 추출·디코드 1회를 T행이 공유하므로 T행이
+//! 한 번에 들어가면 그만큼 절약된다.
 //!
-//! [구조 — 커널 변경 없음]
-//! S11의 `forward_batch_device`(슬롯 **내** 프리필 T≤8)를 그대로 재사용한다.
-//! 유일한 차이는 어텐션·GDN 호출을 슬롯별로 나눈다는 것인데, 커널은 상태를
-//! 슬롯 오프셋으로寻기 때문에(원장 S8) 행마다 다른 슬롯 인자를 넘기는 것만
-//!으로 정확하다. 잔차 `dres`도 문제가 아니다 — `norm_resid_dev`가 `dres`를
-//! **인자**로 받으므로 T행 전체를 한 번에 잔차 누산할 수 있고, 행 포인터
-//! 오프셋은 `dxn`(=[T][hidden]) 쪽만 하면 된다.
+//! [구조 — 커널 변경 없음(어텐션·GDN) + gemv_t(선형)]
+//! S11의 `forward_batch_device`(슬롯 **내** 프리필 T≤8) 구조를 재사용하되
+//! 트렐리스 선형은 전부 gemv_t 체인을 쓴다(bstage_gt·bgemv_gt).
+//! 어텐션·GDN만 행별(T=1씩 T회)인데, 커널은 상태를 슬롯 오프셋으로
+//! 찾으므로(원장 S8) 행마다 다른 슬롯 인자를 넘기는 것만으로 정확하다.
+//! 잔차 `dres`도 문제가 아니다 — `norm_resid_dev`가 `dres`를 **인자**로
+//! 받으므로 T행 전체를 한 번에 잔차 누산할 수 있다.
 //!
 //! 층 루프(행 i = items[i]):
 //! 1. `norm_resid_dev(..., T)` — 배치. 잔차 누산이 행 독립이므로 한 번에.
-//! 2. q/k/v·in_proj — `bstage`(gemm2 T행) **배치**. 트렐리스 역양자화 공유.
+//! 2. q/k/v·in_proj — `bstage_gt`(gemv_t T행) **배치**. 역양자화 공유.
 //! 3. 어텐션·GDN — **행별**(T회). 슬롯 인자가 다르므로 나눌 수밖에 없다.
 //!    산출을 [T][q_dim]/[T][v_len]로 모아 다음 단계를 배치화한다.
-//! 4. o_proj·out_proj·gate/up·down — `bgemv`/`bgemv_down`(행별 T회) + `bstage`.
-//! 5. lm_head — `gemm2` T행 → 행별 argmax.
+//! 4. o_proj·out_proj·down — `bgemv_gt`(gemv_t) — 행 폭이 곧 k라 직통.
+//! 5. lm_head — `gemv_t` T행 → 행별 argmax.
 //!
-//! [정합 — 이 경로가 기존 결과를 바꾸지 않아야 한다]
-//! 행 i의 계산은 (a) 같은 커널,(b) 같은 슬롯 상태,(c) 같은 입력 행을 쓴다.
-//! 배치화는 T행을 한 번의 커널에 넣을 뿐 산술 순서를 바꾸지 않는다. 단
-//! `gemm2` 경로의 f16 mma 누산 때문에 T>1 로짓은 T=1과 ulp 수준으로
-//! 다르다(S11이 이미 기록한 사실 · 1.6e-2). 판정은 **argmax 일치**다 —
-//! 게이트 스크립트와 같은 기준. `scripts/verify_cuda_slots.py`가 이
-//! 경로의 슬롯 격리를 토큰열로 검증한다.
+//! [정합 — 비트계약, plans/cuda-port.md §1 착수조건 1]
+//! 행 i의 계산은 (a) T=1 순차 경로(forward_device)와 같은 커널·같은
+//! 인자,(b) 같은 슬롯 상태,(c) 같은 입력 행을 쓴다. 선형은 gemv_t가
+//! 행별로 T=1 GEMV와 **비트동일**하고(위 커널 주석), 노름·ew·had_in/
+//! had_out은 행 인덱스 커널이라 T와 무관하게 행별 동일하다. 따라서 배치
+//! 디코드의 토큰 스트림은 슬롯 1 직렬 디코드와 정확히 같다 —
+//! `scripts/verify_cuda_slots.py`(슬롯 N 동시 vs **슬롯 1** 직렬)가
+//! 종단 판정한다.
 //!
-//! [도메인] T ≤ ATTN_F3S_TMAX(8) — 어텐션 fwd3s 소형 전용. 활성 슬롯이
+//! [도메인] T ≤ GEMV_T_TMAX(=8, 어텐션 fwd3s 상한과 동일) — 활성 슬롯이
 //! 넘으면 호출자가 청크로 나눠야 한다(에러로 알린다 — 조용한 절단 금지).
 
 use crate::rawcuda::exl3_cuda::Exl3CudaDecoder;
@@ -103,20 +87,45 @@ const ROWBUF: usize = 5;
 impl Exl3CudaDecoder {
     /// `(슬롯, 토큰)` 목록을 T행으로 묶어 한 번에 디코드한다.
     ///
-    /// 스케줄러 배선은 `crates/server/src/sched.rs`의 Exl3Cuda 분기다.
-    /// 활성 슬롯이 `ATTN_F3S_TMAX`(8)를 넘으면 호출자가 청크로 나눈다.
+    /// 스케줄러 배선은 `crates/server/src/sched.rs`의 Exl3Cuda 분기가
+    /// `Exl3CudaEngine::step_batch`로 호출한다. 활성 슬롯이 상한을 넘으면
+    /// 엔진 쪽에서 청크로 나눈다.
     ///
     /// 반환은 각 행의 argmax 토큰(행 순서 = `items` 순서). 전 슬롯의
     /// 위치가 1씩 전진한다. `items` 안의 슬롯은 **중복 불가** — 같은 슬롯을
     /// 두 번 넣으면 그 슬롯의 GDN/KV 상태가 한 스텝에 두 번 갱신되어
     /// 상태가 깨진다(조용한 오염 금지이므로 에러로 거절한다).
     pub fn decode_batch_slots(&mut self, items: &[(usize, u32)]) -> Result<Vec<u32>, String> {
+        let (all, n_head) = self.decode_batch_slots_logits(items)?;
+        let t = items.len();
+        let mut toks = Vec::with_capacity(t);
+        for r in 0..t {
+            let row = &all[r * n_head..(r + 1) * n_head];
+            let mut best = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &v) in row.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    best = i;
+                }
+            }
+            toks.push(best as u32);
+        }
+        Ok(toks)
+    }
+
+    /// `decode_batch_slots`의 로짓 판 — 상태 전진·계약은 동일하고 반환만
+    /// [T][n_head] f32 로짓(행 우선)이다. 비트 판정 탐침(ms4b) 전용.
+    pub fn decode_batch_slots_logits(
+        &mut self,
+        items: &[(usize, u32)],
+    ) -> Result<(Vec<f32>, usize), String> {
         let (h, n_slots) = (self.hidden, self.n_slots.max(1));
         let t = items.len();
         if h == 0 || t == 0 {
             return Err("exl3-cuda: 배치 디코드 — 빈 입력".into());
         }
-        let tmax = crate::rawcuda::attn_cuda::ATTN_F3S_TMAX;
+        let tmax = Exl3CudaDecoder::GEMV_T_TMAX;
         if t > tmax {
             return Err(format!(
                 "exl3-cuda: T={t} > 슬롯 간 배치 상한 {tmax} — 활성 슬롯을 \
@@ -152,6 +161,9 @@ impl Exl3CudaDecoder {
         let _g = self.cc.guard()?;
         self.ensure_chain_probe_bufs_pub()?;
         self.prewarm_chain_bufs()?;
+        // gemv_t 체인 버퍼(dx·daht·dsbt·dyt)도 최대 형상으로 선확보 —
+        // 진행 중 재할당 금지(원장 S10·S11, lm_head 어휘 폭 포함).
+        self.prewarm_gemv_t_bufs(t)?;
 
         // 임베딩 [T][hidden] 한 번에 업로드(forward당 유일한 대량 h2d).
         let mut embed = Vec::with_capacity(t * h);
@@ -165,6 +177,7 @@ impl Exl3CudaDecoder {
             .map_err(|e| format!("슬롯 간 배치 임베딩 {t}행 업로드: {e}"))?;
 
         let q_dim = self.attn_dims()?.q_dim();
+        let kv_dim = self.attn_dims()?.kv_dim();
         let v_len = self.gdn_dims()?.v_len();
         let conv_ch = self.gdn_dims()?.conv_ch();
         let qg_dim = self.attn_dims()?.qg_dim();
@@ -181,20 +194,23 @@ impl Exl3CudaDecoder {
             let xn = self.norm_resid_dev(2 * il, self.dres, ab, t)?;
             let branch = if il % 4 == 3 {
                 let att = format!("{lp}.self_attn");
-                self.bstage(&format!("{att}.q_proj"), xn, 0, t)?;
-                self.bstage(&format!("{att}.k_proj"), xn, 1, t)?;
-                self.bstage(&format!("{att}.v_proj"), xn, 2, t)?;
+                self.bstage_gt(&format!("{att}.q_proj"), xn, 0, t)?;
+                self.bstage_gt(&format!("{att}.k_proj"), xn, 1, t)?;
+                self.bstage_gt(&format!("{att}.v_proj"), xn, 2, t)?;
                 let (c0, c1, c2) = (self.bchain(0)?, self.bchain(1)?, self.bchain(2)?);
                 self.ensure_attn_bufs_pub(1)?;
                 for (i, &(slot, _)) in items.iter().enumerate() {
-                    // qg는 q_heads*512, kin/vin은 kv_heads*256 — 행 폭이 다르다.
+                    // qg는 q_heads·512, kin/vin은 **어텐션 kv_dim**(kv_heads·256)
+                    // — 행 폭은 각 선형의 n이다. v_len(GDN v_head 폭)을 쓰면
+                    // 0행만 우연히 맞고 1행부터 엉뚱한 오프셋을 읽는다
+                    // (ms4b lim=4 실측 — 2026-10-08).
                     let out = self.attn_chain_dev_run(
                         slot,
                         il / 4,
                         1,
                         c0 + (i * qg_dim) as u64 * 4,
-                        c1 + (i * v_len) as u64 * 4,
-                        c2 + (i * v_len) as u64 * 4,
+                        c1 + (i * kv_dim) as u64 * 4,
+                        c2 + (i * kv_dim) as u64 * 4,
                     )?;
                     self.cc
                         .d2d(rowbuf + (i * q_dim) as u64 * 4, out, q_dim * 4)?;
@@ -202,8 +218,8 @@ impl Exl3CudaDecoder {
                 rowbuf
             } else {
                 let att = format!("{lp}.linear_attn");
-                self.bstage(&format!("{att}.in_proj_qkv"), xn, 0, t)?;
-                self.bstage(&format!("{att}.in_proj_z"), xn, 1, t)?;
+                self.bstage_gt(&format!("{att}.in_proj_qkv"), xn, 0, t)?;
+                self.bstage_gt(&format!("{att}.in_proj_z"), xn, 1, t)?;
                 let (c0, c1) = (self.bchain(0)?, self.bchain(1)?);
                 self.ensure_gdn_bufs_pub(1)?;
                 for (i, &(slot, _)) in items.iter().enumerate() {
@@ -226,49 +242,35 @@ impl Exl3CudaDecoder {
             } else {
                 format!("{lp}.linear_attn.out_proj")
             };
-            // 입력 행 폭을 층 종류별로 정확히 넘긴다(원장 S11 stride 결함).
-            let bstride = if il % 4 == 3 { q_dim } else { v_len };
-            let out = self.bgemv(&lo, branch, bstride, t)?;
+            // branch의 행 폭(어텐션 q_dim / GDN v_len)은 곧 해당 선형의
+            // k라 [T][k] 연속 입력으로 직통한다(원장 S11 stride 결함 가드).
+            let out = self.bgemv_gt(&lo, branch, t)?;
             let xn2 = self.norm_resid_dev(2 * il + 1, self.dres, out, t)?;
             let mlp = format!("{lp}.mlp");
-            self.bstage(&format!("{mlp}.gate_proj"), xn2, 0, t)?;
-            self.bstage(&format!("{mlp}.up_proj"), xn2, 1, t)?;
+            self.bstage_gt(&format!("{mlp}.gate_proj"), xn2, 0, t)?;
+            self.bstage_gt(&format!("{mlp}.up_proj"), xn2, 1, t)?;
             let (c0, c1) = (self.bchain(0)?, self.bchain(1)?);
             self.ew_batch(c0, c1, t)?;
             let act = self.bchain(3)?;
-            ab = self.bgemv_down(&format!("{mlp}.down_proj"), act, t)?;
+            ab = self.bgemv_gt(&format!("{mlp}.down_proj"), act, t)?;
         }
 
-        // lm_head — [T][hidden] → [T][n_head] 한 번에(gemm2가 역양자화 공유).
+        // lm_head — [T][hidden] → [T][n_head] 한 번에(gemv_t가 역양자화
+        // 공유 · 행별 T=1 비트동일). xn_final(dxn)을 직통 건다.
         let xn_final = self.norm_resid_dev(2 * self.n_layers, self.dres, ab, t)?;
         let n_head = self.lin_copy("lm_head").map(|l| l.n)?;
-        let hd_src = self.bchain(3)?;
-        self.cc.d2d(hd_src, xn_final, t * self.hidden * 4)?;
-        let logits_ptr = self.gemm2_dev("lm_head", hd_src, t)?;
+        let logits_ptr = self.gemv_t_dev("lm_head", xn_final, t)?;
         let mut lb = vec![0u8; t * n_head * 4];
         self.cc.d2h(&mut lb, logits_ptr)?;
         self.cc.sync()?;
         // SAFETY: d2h 동기 완료 — lb는 t*n_head개의 f32 LE 값.
         let all = unsafe { std::slice::from_raw_parts(lb.as_ptr() as *const f32, t * n_head) };
-        let mut toks = Vec::with_capacity(t);
-        for r in 0..t {
-            let row = &all[r * n_head..(r + 1) * n_head];
-            let mut best = 0usize;
-            let mut bv = f32::NEG_INFINITY;
-            for (i, &v) in row.iter().enumerate() {
-                if v > bv {
-                    bv = v;
-                    best = i;
-                }
-            }
-            toks.push(best as u32);
-        }
         // 위치 전진은 행마다 1씩 — 슬롯 상태(attn_set_pos)가 이미 갱신됐지만
         // 호스트 pos도 맞춰야 다음 스텝이 맞는 위치에서 시작한다.
         for (i, &(slot, _)) in items.iter().enumerate() {
             self.slot_pos[slot] = pos_of[i] + 1;
             self.attn_set_pos(slot, pos_of[i] + 1)?;
         }
-        Ok(toks)
+        Ok((all.to_vec(), n_head))
     }
 }

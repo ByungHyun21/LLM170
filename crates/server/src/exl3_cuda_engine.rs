@@ -95,6 +95,28 @@ impl Exl3CudaEngine {
         self.dec.argmax_host(&logits)
     }
 
+    /// 슬롯 간 배치 디코드(greedy) — 활성 greedy 슬롯을 T≤8 청크로 나눠
+    /// 한 번에 64층 forward 한다(plans/cuda-port.md §1). 트렐리스 선형이
+    /// 행병렬 gemv_t 체인이라 행별 출력이 step_tok_device(T=1)와
+    /// **비트동일**하다 — 동시 요청 토큰 스트림이 직렬과 같다
+    /// (scripts/verify_cuda_slots.py가 종단 판정).
+    ///
+    /// 청크 분할을 엔진 안에서 한다 — 호출자(sched)는 상한을 몰라도
+    /// 된다. 반환 순서 = items 순서.
+    pub fn step_batch(&mut self, items: &[(usize, u32)]) -> Result<Vec<u32>, String> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _g = self.dec.cc.guard()?;
+        let tmax =
+            llm170_backend_gpu::rawcuda::attn_cuda::ATTN_F3S_TMAX.min(Exl3CudaDecoder::GEMV_T_TMAX);
+        let mut out = Vec::with_capacity(items.len());
+        for ch in items.chunks(tmax) {
+            out.extend(self.dec.decode_batch_slots(ch)?);
+        }
+        Ok(out)
+    }
+
     /// 슬롯 제자리 리셋 — GDN 링/스캔 상태와 pos를 디코더에서 함께 초기화.
     pub fn reset_seq(&mut self, slot: usize) -> Result<(), String> {
         self.dec.reset_state(slot)
