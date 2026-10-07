@@ -106,6 +106,29 @@ fn main() -> ExitCode {
                 }
             };
         }
+        // 슬롯 간 배치(T=2) 동치성 — 최초 발산층 이분 탐색.
+        Some("ms") => {
+            let dir = args.get(2).map(String::as_str).unwrap_or("");
+            let lim: usize = args
+                .get(3)
+                .and_then(|s| s.parse().ok())
+                .map(|v: usize| if v == 0 { usize::MAX } else { v })
+                .unwrap_or(8);
+            return match ms_check(dir, lim) {
+                Ok(s) => {
+                    println!("{s}");
+                    if s.contains("FAIL") {
+                        ExitCode::FAILURE
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => {
+                    eprintln!("FAIL: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         // S10 디바이스 상주 vs 호스트 스테이징 종단 대조(신규 파일 위임).
         Some("s10") => {
             let dir = args.get(2).map(String::as_str).unwrap_or("");
@@ -248,6 +271,89 @@ fn main() -> ExitCode {
 
 // S11 동치성 검사 — GDN/어텐션이 T=1 순차와 같은 값을 내는지.
 // 실모델 상수를 아카이브에서 읽어와 set_gdn에 넣어야 상태 리셋이 된다.
+/// 슬롯 간 배치(T=2) 동치성 탐침 — 최초 발산층 이분 탐색용.
+///
+/// [왜 이 탐침이 필요한가] `decode_batch_slots`(슬롯 간 디코드 배치)는 T=1에서
+/// 게이트 기준선 그대로 PASS하지만 T>1에서 행 간 상태 오염이 관측됐다 —
+/// 서로 다른 두 프롬프트가 idx=9부터 완전히 동일한 토큰열을 냈다. 서버 배선은
+/// 하지 않은 상태이고, 원인을 확정해야 배선 여부를 결정할 수 있다.
+///
+/// [방법] `lim_layers`로 층을 1·2·3·4·8… 줄여가며 같은 비교를 반복한다. 처음
+/// 어긋나기 시작하는 lim이 곧 최초 발산층이다. lim=0은 전체 층.
+///
+/// [판정] 슬롯 0·1에 **길이가 다른** 프롬프트(5/9토큰)를 프리필한 뒤,
+/// 같은 다음 토큰을 (a) T=2 한 번 vs (b) T=1 두 번으로 디코드해 슬롯별
+/// argmax를 비교한다. 길이가 달라야 상태 공유가 드러난다(같은 길이는 우연히
+/// 맞을 수 있다). 환원 순서 차이는 판정 대상이 아니다 — 같은 코드 경로에서
+/// T만 다르므로 여기서 어긋나면 배선 오류다.
+fn ms_check(dir: &str, lim: usize) -> Result<String, String> {
+    use rawcuda::exl3_cuda::Exl3CudaDecoder;
+    if dir.is_empty() {
+        return Err("사용법: cuda_probe ms <exl3_dir> [layers]".into());
+    }
+    // 두 프롬프트의 토큰열(게이트 한국어 문장의 앞부분에서 유효 어휘 id만).
+    const P0: [u32; 5] = [148678, 65233, 202419, 220, 49849];
+    const P1: [u32; 9] = [148678, 65233, 202419, 220, 49849, 155497, 220, 151314, 39504];
+    const NEXT0: u32 = 149635;
+    const NEXT1: u32 = 174675;
+
+    // **디코더는 한 벌만** 쓴다 — 두 벌(각 64층 × 19.5GB)은 24GB 카드를 넘겨
+    // OOM한다(같은 제약이 슬롯 격리 하네스에도 있다). 대신 (a) 배치 → 상태
+    // 리셋 → (b) 직렬 을 **같은 디코더**에서 순서대로 돌린다. `reset_state`가
+    // 슬롯의 GDN 링·스캔·KV·pos를 0으로 돌려주므로 두 실행의 상태가 같다.
+    // (단 한 가지 예외 — §6의 '단일 배치 경로 T>1은 슬롯 0만 실측' 계열: 리셋이
+    //  호출 사이의 상태만 지우므로 로직 결함은 그대로 드러난다.)
+    let mut d = Exl3CudaDecoder::load_slots(dir, lim, 512, 2)?;
+    let dev = d.device_name().to_string();
+
+    let embed = |d: &mut Exl3CudaDecoder, toks: &[u32]| -> Result<Vec<f32>, String> {
+        let mut rows = Vec::new();
+        for &tk in toks {
+            rows.extend_from_slice(&d.embed_row_host(tk));
+        }
+        Ok(rows)
+    };
+    // 프리필 — 슬롯 0은 5토큰, 슬롯 1은 9토큰(위치 다름). fwd3s 도메인(T≤8)에
+    // 맞춰 8토큰 단위로 나눠 넣는다(S11 규약).
+    let prefill = |d: &mut Exl3CudaDecoder| -> Result<(), String> {
+        for (slot, toks) in [(0usize, &P0[..]), (1usize, &P1[..])] {
+            let rows = embed(d, toks)?;
+            for ch in rows.chunks(8 * d.hidden) {
+                d.forward_batch_device(slot, ch)?;
+            }
+        }
+        Ok(())
+    };
+
+    // (a) T=2 한 번.
+    prefill(&mut d)?;
+    let tb = d.decode_batch_slots(&[(0, NEXT0), (1, NEXT1)])?;
+    // 리셋 후 (b) T=1 두 번 — 순서·상태를 (a)와 같게 만든다.
+    d.reset_state(0)?;
+    d.reset_state(1)?;
+    prefill(&mut d)?;
+    let s0 = d.decode_batch_slots(&[(0, NEXT0)])?;
+    let s1 = d.decode_batch_slots(&[(1, NEXT1)])?;
+    let ok0 = tb[0] == s0[0];
+    let ok1 = tb[1] == s1[0];
+    let lim_s = if lim == usize::MAX {
+        "full".to_string()
+    } else {
+        lim.to_string()
+    };
+    Ok(format!(
+        "device: {dev} | exl3-cuda-multislot (ms) lim_layers={lim_s} T=2 vs T=1: \
+         slot0 {} (batch {} / serial {}) · slot1 {} (batch {} / serial {}) | {}",
+        if ok0 { "OK" } else { "MISMATCH" },
+        tb[0],
+        s0[0],
+        if ok1 { "OK" } else { "MISMATCH" },
+        tb[1],
+        s1[0],
+        if ok0 && ok1 { "PASS" } else { "FAIL" }
+    ))
+}
+
 fn s11_check(dir: &str, nrows: usize, lim: usize) -> Result<String, String> {
     use rawcuda::exl3_cuda::Exl3CudaDecoder;
     if dir.is_empty() {
