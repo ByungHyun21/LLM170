@@ -175,6 +175,22 @@ pub struct Exl3CudaDecoder {
     pub gexec: Option<(usize, *mut std::ffi::c_void)>,
     /// argmax 출력 토큰 [1]u32 — G7(ensure_argmax_buf가 최초 할당).
     pub dargmax: CUdeviceptr,
+    /// ── S10 디바이스 상주 체인 버퍼(plans/cuda-port.md) ──
+    /// 순차 잔차 [hidden] — 호스트 스테이징 없이 층을 관통한다.
+    pub dres: CUdeviceptr,
+    /// S10 전용 분기(ab) 버퍼 [hidden] — norm 모듈의 dab는 ensure_norm_bufs가
+    /// 소유하므로 공유하지 않는다(재할당 시 체인 커널 인자가 dangling).
+    pub dab_dev: CUdeviceptr,
+    /// 상주 스테이징 [w0][w1][w1][w2][hidden] — GEMV 결과(dyb) 사본.
+    /// dyb는 다음 GEMV가 덮으므로 어텐션/GDN/ew 입력에 사본이 필요하다.
+    /// 슬롯 1과 2는 어텐션의 kin·vin용으로 분리된다 — prep 커널이 둘을
+    /// **동시에** 읽으므로 한 버퍼를 공유하면 v가 k를 덮는다.
+    pub dchain: [CUdeviceptr; 5],
+    /// 각 스테이징 버퍼의 원소 폭(형상 산출 — hidden 가정 금지).
+    pub(crate) stg_w0: usize,
+    pub(crate) stg_w1: usize,
+    pub(crate) stg_w2: usize,
+    pub(crate) chain_bufs_ok: bool,
     /// GEMV 체인 작업 버퍼 상한(ensure_bufs가 갱신 — 재할당 최소화).
     pub(crate) kmax: usize,
     pub(crate) nmax: usize,
@@ -964,6 +980,13 @@ impl Exl3CudaDecoder {
             hcurve: Vec::new(),
             gexec: None,
             dargmax: 0,
+            dres: 0,
+            dab_dev: 0,
+            dchain: [0; 5],
+            stg_w0: 0,
+            stg_w1: 0,
+            stg_w2: 0,
+            chain_bufs_ok: false,
             kmax: 0,
             nmax: 0,
             x_cap: 0,

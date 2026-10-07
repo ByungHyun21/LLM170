@@ -23,8 +23,26 @@
 //! 독립 컴파일 계약(plans/124 G1): std 외 크레이트 의존 금지 — scripts/cuda_probe_shim.rs 단독 컴파일.
 
 use crate::rawcuda::exl3_cuda::{CudaLin, Exl3CudaDecoder, GEMV_NSEG};
+use crate::rawcuda::ffi::CUdeviceptr;
 
 impl Exl3CudaDecoder {
+    /// 체인 진행 **전** 모든 선형의 k·n으로 작업 버퍼를 한 번에 확보한다.
+    ///
+    /// [S10 필수] 이게 없으면 진행 중 `ensure_bufs`가 nmax/kmax를 키워
+    /// `dyb`·`dah`·`dsb`를 해제·재할당한다. 이미 잡아 둔 이전 GEMV 결과
+    /// 포인터(dyb)가 dangling이 되어 다음 층이 엉뚱한 값을 읽는다 —
+    /// 증상은 "어떤 층부터 hidden이 크게 벌어진다"이고, 실제로 16층에서
+    /// hidden maxdiff 73.5로 재현됐다(원장 S10).
+    pub fn prewarm_chain_bufs(&mut self) -> Result<(), String> {
+        let mut kmax = 0usize;
+        let mut nmax = 0usize;
+        for l in self.lin.values() {
+            kmax = kmax.max(l.k);
+            nmax = nmax.max(l.n);
+        }
+        self.ensure_bufs(kmax, nmax)
+    }
+
     /// GEMV 체인 작업 버퍼 보장(kmax/nmax 확장 시에만 재할당).
     fn ensure_bufs(&mut self, k: usize, n: usize) -> Result<(), String> {
         self.ensure_x(k)?;
@@ -48,30 +66,25 @@ impl Exl3CudaDecoder {
     }
 
     /// GEMV 체인 1회(had_in → gemv → had_out) — Exl3HipDecoder::gemv_chain
-    /// 미러. had_out은 항상 1회(결함 3·15호). had_out=false는 검증층
-    /// 음성대조 계기 전용(원장 17호 — 계기 자체 검증)이며 이 경우
-    /// H도메인 부분합(nseg 합산까지만)을 돌려준다.
-    fn gemv_chain_opt(
+    /// 미러. 입력은 디바이스 상주 포인터(x_dev), 출력은 self.dyb에 남는다.
+    /// had_out은 항상 1회(결함 3·15호).
+    ///
+    /// [S10 디바이스 체인] x_dev가 이미 디바이스에 있으면 호스트 왕복 없이
+    /// 그대로 had_in을 건다. had_out=false는 검증층 음성대조 계기 전용이며
+    /// H도메인 부분합만 self.dsb에 남긴다(호스트 판독은 호출자 몫).
+    fn gemv_chain_dev(
         &mut self,
         l: &CudaLin,
-        x: &[f32],
+        x_dev: CUdeviceptr,
         had_out: bool,
-        raw_out: &mut Vec<f32>,
     ) -> Result<(), String> {
-        if x.len() != l.k {
-            return Err(format!("gemv: x.len={} != k={}", x.len(), l.k));
-        }
         self.ensure_bufs(l.k, l.n)?;
-        // SAFETY: x는 길이 k*4 바이트의 f32 슬라이스 — 바이트 뷰 변환.
-        let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
-        self.cc.h2d(self.dx, xb)?;
-
         let f_hin = self.cc.function("exl3_had_in")?;
         let f_gv = self.cc.function("exl3_gemv")?;
         let f_hout = self.cc.function("exl3_had_out")?;
 
         // had_in: 그리드 (k/128, T=1), 블록 128.
-        let (mut a0, mut a1, mut a2) = (self.dx, l.suh, self.dah);
+        let (mut a0, mut a1, mut a2) = (x_dev, l.suh, self.dah);
         let (mut kc, mut ks) = ((l.k / 128) as i32, l.k as i32);
         let mut args_hin: [*mut std::ffi::c_void; 5] = [
             (&mut a0) as *mut _ as *mut _,
@@ -101,25 +114,10 @@ impl Exl3CudaDecoder {
             128,
             &mut args_gv,
         )?;
-
         if !had_out {
-            // 음성대조: H도메인 부분합만 판독(had_out 생략 — 결함 3호 재현).
-            let mut sb = vec![0u8; GEMV_NSEG * l.n * 4];
-            self.cc.d2h(&mut sb, self.dsb)?;
-            self.cc.sync()?;
-            // SAFETY: d2h 완료 후 재해석 — nseg 합산은 had_out과 동일 순서.
-            let s: &[f32] =
-                unsafe { std::slice::from_raw_parts(sb.as_ptr() as *const f32, GEMV_NSEG * l.n) };
-            raw_out.clear();
-            raw_out.resize(l.n, 0.0);
-            for g in 0..GEMV_NSEG {
-                for j in 0..l.n {
-                    raw_out[j] += s[g * l.n + j];
-                }
-            }
+            // 음성대조: H도메인 부분합만 남긴다(had_out 생략 — 결함 3호 재현).
             return Ok(());
         }
-
         // had_out: 그리드 (n/128, 1), 블록 128 — nseg 합산 + WHT⁻¹·R·svh.
         let (mut c0, mut c1, mut c2) = (self.dsb, l.svh, self.dyb);
         let (mut nch, mut nsg, mut nst) = ((l.n / 128) as i32, GEMV_NSEG as i32, l.n as i32);
@@ -132,24 +130,38 @@ impl Exl3CudaDecoder {
             (&mut nst) as *mut _ as *mut _,
         ];
         self.cc
-            .launch(f_hout, (l.n / 128) as u32, 1, 128, &mut args_hout)?;
+            .launch(f_hout, (l.n / 128) as u32, 1, 128, &mut args_hout)
+    }
 
-        let mut ob = vec![0u8; l.n * 4];
-        self.cc.d2h(&mut ob, self.dyb)?;
-        self.cc.sync()?;
-        // SAFETY: d2h 완료 후 재해석.
-        let y: &[f32] = unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, l.n) };
-        raw_out.clear();
-        raw_out.extend_from_slice(y);
-        Ok(())
+    /// 디바이스 상주 입력 → GEMV 체인 → 결과를 dyb에 남긴다(호스트 왕복 0).
+    /// 반환 포인터는 self.dyb(다음 GEMV가 재사용하므로 즉시 소비할 것).
+    /// S10 성능 캠페인 진입점 — 산술은 gemv_host와 동일 경로다.
+    pub fn gemv_dev(&mut self, key: &str, x_dev: CUdeviceptr) -> Result<CUdeviceptr, String> {
+        let l = self.lin_copy(key)?;
+        if x_dev == 0 {
+            return Err(format!("gemv_dev({key}): 입력 포인터 0"));
+        }
+        self.gemv_chain_dev(&l, x_dev, true)?;
+        Ok(self.dyb)
     }
 
     /// 호스트 벡터 → GEMV 체인 1회 → 호스트 결과(hip gemv_host 미러).
     pub fn gemv_host(&mut self, key: &str, x: &[f32]) -> Result<Vec<f32>, String> {
         let l = self.lin_copy(key)?;
-        let mut y = Vec::new();
-        self.gemv_chain_opt(&l, x, true, &mut y)?;
-        Ok(y)
+        if x.len() != l.k {
+            return Err(format!("gemv: x.len={} != k={}", x.len(), l.k));
+        }
+        self.ensure_bufs(l.k, l.n)?;
+        // SAFETY: x는 길이 k*4 바이트의 f32 슬라이스 — 바이트 뷰 변환.
+        let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
+        self.cc.h2d(self.dx, xb)?;
+        self.gemv_chain_dev(&l, self.dx, true)?;
+        let mut ob = vec![0u8; l.n * 4];
+        self.cc.d2h(&mut ob, self.dyb)?;
+        self.cc.sync()?;
+        // SAFETY: d2h 완료 후 재해석.
+        let y: &[f32] = unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, l.n) };
+        Ok(y.to_vec())
     }
 
     /// 검증층 진단 — 단계별 산출 판독(3층 분리: 호출은 검증층, 상태는
@@ -227,8 +239,26 @@ impl Exl3CudaDecoder {
     /// gemv_host(had_out 항상 1회).
     pub fn gemv_host_skip_had_out(&mut self, key: &str, x: &[f32]) -> Result<Vec<f32>, String> {
         let l = self.lin_copy(key)?;
-        let mut y = Vec::new();
-        self.gemv_chain_opt(&l, x, false, &mut y)?;
-        Ok(y)
+        if x.len() != l.k {
+            return Err(format!("x.len={} != k={}", x.len(), l.k));
+        }
+        self.ensure_bufs(l.k, l.n)?;
+        // SAFETY: x는 길이 k*4 바이트의 f32 슬라이스 — 바이트 뷰 변환.
+        let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
+        self.cc.h2d(self.dx, xb)?;
+        self.gemv_chain_dev(&l, self.dx, false)?;
+        let mut sb = vec![0u8; GEMV_NSEG * l.n * 4];
+        self.cc.d2h(&mut sb, self.dsb)?;
+        self.cc.sync()?;
+        // SAFETY: d2h 완료 후 재해석 — nseg 합산은 had_out과 동일 순서.
+        let s: &[f32] =
+            unsafe { std::slice::from_raw_parts(sb.as_ptr() as *const f32, GEMV_NSEG * l.n) };
+        let mut out = vec![0.0f32; l.n];
+        for g in 0..GEMV_NSEG {
+            for j in 0..l.n {
+                out[j] += s[g * l.n + j];
+            }
+        }
+        Ok(out)
     }
 }

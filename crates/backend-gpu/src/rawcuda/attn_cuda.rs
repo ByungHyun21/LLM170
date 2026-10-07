@@ -471,6 +471,58 @@ impl Exl3CudaDecoder {
         self.cc.h2d(self.dvin_a, b(vin))
     }
 
+    /// 어텐션 체인 디바이스 상주(S10): qg·kin·vin이 이미 디바이스에 있을 때
+    /// prep → fwd3s를 발사하고 outv(디바이스)를 반환한다. 호스트 왕복 0.
+    /// pos는 attn_set_pos로 설정된 장치 pp[0]을 그대로 쓴다(결함 4호).
+    /// 반환 포인터는 self.doutv_a(임시 — 다음 호출이 덮어쓴다).
+    pub fn attn_chain_dev_run(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        qg_dev: CUdeviceptr,
+        kin_dev: CUdeviceptr,
+        vin_dev: CUdeviceptr,
+    ) -> Result<CUdeviceptr, String> {
+        let dm = self.attn_dims()?;
+        if t_len == 0 || t_len > ATTN_F3S_TMAX {
+            return Err(format!(
+                "attn: T={t_len} — fwd3s 소형 전용 도메인(1..={ATTN_F3S_TMAX}) 위반, 거부"
+            ));
+        }
+        if layer >= dm.n_attn {
+            return Err(format!("attn layer={layer} >= n_attn={}", dm.n_attn));
+        }
+        if slot >= self.n_slots.max(1) {
+            return Err(format!("attn slot={slot} >= n_slots={}", self.n_slots));
+        }
+        // 위치축 한계(S9) — 커널 조기복귀 대신 여기서 명시적 거부.
+        let pos = self.slot_pos.get(slot).copied().unwrap_or(0);
+        if pos as usize + t_len > ATTN_SCORE_SCAP {
+            return Err(format!(
+                "attn: 위치 {} > fwd3s 공유메모리 한계 {ATTN_SCORE_SCAP} (S9)",
+                pos as usize + t_len
+            ));
+        }
+        // **pp[0]을 현재 위치로 기입한다.** prep/fwd3s는 발사 인자가 아니라
+        // 장치 pp[0]에서 pos를 읽는다(결함 4호). 호스트 경로는
+        // attn_chain_host가 attn_set_pos로 매 층 세팅하지만, 디바이스
+        // 경로는 세팅이 없어 pp[0]이 0에 머물렀다 — 0번 토큰은 우연히
+        // 맞고 2번째부터 KV 기록 위치가 밀려 어텐션이 틀어진다(원장 S10).
+        self.attn_set_pos(slot, pos)?;
+        self.ensure_attn_bufs(t_len)?;
+        // qg/kin/vin을 상주 스테이징으로 복사한다 — attn_upload이 하던
+        // h2d를 대신한다. 빠지면 이전 층의 값이 남는다(원장 S10).
+        // prep 커널이 읽는 **모듈 작업 버퍼**로 복사한다 — 상주 스테이징에
+        // 만 두면 prep는 이전 층의 값을 본다(원장 S10).
+        self.cc.d2d(self.dqg_a, qg_dev, t_len * dm.qg_dim() * 4)?;
+        self.cc.d2d(self.dkin_a, kin_dev, t_len * dm.kv_dim() * 4)?;
+        self.cc.d2d(self.dvin_a, vin_dev, t_len * dm.kv_dim() * 4)?;
+        self.attn_prep_launch(slot, layer, t_len, false, 0)?;
+        self.attn_fwd3s_launch(slot, layer, t_len)?;
+        Ok(self.doutv_a)
+    }
+
     /// 어텐션 체인 본체(pp 미개입 — 현장치값 사용): prep(디바이스 pos
     /// 판독) → fwd3s → qh·outv·KC/VC 신규 행 판독. T 도메인(1..=8)과
     /// 캐시 상한을 검사한다(pos0는 경계 판정용 판독값 — fwd3s 산출은

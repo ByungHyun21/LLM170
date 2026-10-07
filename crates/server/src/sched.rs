@@ -605,7 +605,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         let next = slots[i].next;
                         let greedy = !slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
                         let r: Result<Vec<u32>, String> = if greedy {
-                            e.step_tok(i, next).map(|t| vec![t])
+                            e.step_tok_device(i, next).map(|t| vec![t])
                         } else {
                             e.decode1(i, next).map(|l| vec![pick(&mut slots[i], &l)])
                         };

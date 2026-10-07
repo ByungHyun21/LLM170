@@ -249,6 +249,36 @@ impl Exl3CudaDecoder {
         Ok(())
     }
 
+    /// GDN 체인 디바이스 상주(S10): xn·qkv·z가 이미 디바이스에 있을 때
+    /// conv→l2perm→scan→gate를 발사하고 gated(디바이스)를 반환한다.
+    /// 반환 포인터는 self.dgate(임시 — 다음 호출이 덮어쓴다).
+    ///
+    /// [주의 1] xn을 `self.dgxn`으로 **복사**해야 한다. l2perm 커널은 xtb로
+    /// self.dgxn을 읽는데, 호스트 래퍼만 h2d로 채우고 디바이스 경로는
+    /// 건너뛰면 이전 층의 값이 남아 GDN이 엉뚱한 입력을 쓴다(원장 S10).
+    ///
+    /// [주의 2] qkv·z는 **모듈 자신의 작업 버퍼**(`self.dqkv`·`self.dzv`)로
+    /// 복사해야 한다. 체인이 그 버퍼를 직접 읽기 때문에, 상주 스테이징에
+    ///만 두면 모듈은 낡은 내용을 본다(원장 S10 — 32층에서 처음 드러남:
+    /// 8층은 어텐션 층이 없어 우연히 통과했다).
+    pub fn gdn_chain_dev_run(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        xn_dev: CUdeviceptr,
+        qkv_dev: CUdeviceptr,
+        z_dev: CUdeviceptr,
+    ) -> Result<CUdeviceptr, String> {
+        let dm = self.gdn_dims()?;
+        self.ensure_gdn_bufs(t_len)?;
+        self.cc.d2d(self.dgxn, xn_dev, t_len * dm.hidden * 4)?;
+        self.cc.d2d(self.dqkv, qkv_dev, t_len * dm.conv_ch() * 4)?;
+        self.cc.d2d(self.dzv, z_dev, t_len * dm.v_len() * 4)?;
+        self.gdn_chain_dev(slot, layer, t_len, false)?;
+        Ok(self.dgate)
+    }
+
     /// GDN 체인 디바이스 4발사(conv → l2perm → scan → gate) — 상태·링은
     /// 상주 버퍼(r/w). gather=true는 음성대조 계기(l2perm 방향 반전,
     /// 결함류: 방향 — 원장 17호. 정상 호출 금지). 그리드 계약(결함 5호):

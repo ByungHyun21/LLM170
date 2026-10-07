@@ -121,6 +121,29 @@ impl Exl3CudaDecoder {
         Ok(self.dxn)
     }
 
+    /// 잔차 x에 ab(디바이스)를 더하고 노름 xn을 디바이스에 남긴다(왕복 0).
+    /// 산술은 norm_resid_at과 동일 경로. 반환은 xn 포인터.
+    /// S10 디바이스 체인의 노름 단계 — 입력이 이미 디바이스일 때 쓴다.
+    pub fn norm_resid_dev(
+        &mut self,
+        w: usize,
+        x_dev: CUdeviceptr,
+        ab_dev: CUdeviceptr,
+        t_len: usize,
+    ) -> Result<CUdeviceptr, String> {
+        if self.dnw == 0 {
+            return Err("norm: 노름 가중 미등록(set_norm_weights)".into());
+        }
+        if w >= self.norm_w_rows {
+            return Err(format!("norm: w={w} >= rows={}", self.norm_w_rows));
+        }
+        if t_len == 0 {
+            return Err("norm: t_len=0".into());
+        }
+        self.ensure_norm_bufs(t_len)?;
+        self.norm_resid_at(w, x_dev, ab_dev, t_len)
+    }
+
     /// 별도 디바이스 잔차에 ab만 업로드 → 노름 산출 xn만 호스트로 판독.
     /// GEMV가 공유 dx를 덮어써도 x_dev는 영향을 받지 않는다(S5 호스트 스테이징).
     pub(crate) fn norm_resid_staged(

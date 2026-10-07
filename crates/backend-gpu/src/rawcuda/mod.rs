@@ -12,6 +12,9 @@
 //! - ctx:    CudaCtx 디바이스 컨텍스트(할당·복사·런치·동기화)
 //! - exl3_cuda:       모듈층 공유 글루(디코더 레지스트리·선형 상주 로드·
 //!   파서·fatbin 리졸버)
+//! - exl3_cuda_forward: 순차 forward(S5 호스트 스테이징 경로 — 회귀 기준)
+//! - exl3_cuda_device: 디바이스 상주 forward(S10 — 서버 기본 경로)
+//! - exl3_cuda_device_probe/_bench/_gemv_probe: S10 두 경로 대조 계기
 //! - gemv_cuda/gemm2_cuda/norm_cuda/gdn_cuda/attn_cuda/ew_argmax_cuda:
 //!   Exl3CudaDecoder 모듈별 임플 블록(G2-G7 분리 파일 —
 //!   머리에 용도·정합·속도 원장, plans/129-cuda C2)
@@ -31,6 +34,10 @@ pub mod ctx;
 pub mod ew_argmax_cuda;
 pub mod ew_argmax_cuda_probe;
 pub mod exl3_cuda;
+pub mod exl3_cuda_device;
+pub mod exl3_cuda_device_bench;
+pub mod exl3_cuda_device_probe;
+pub mod exl3_cuda_gemv_probe;
 pub mod exl3_cuda_forward;
 pub mod exl3_cuda_probe;
 pub mod ffi;

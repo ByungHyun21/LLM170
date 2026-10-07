@@ -30,6 +30,16 @@ impl Exl3CudaDecoder {
         self.argmax_host(&logits)
     }
 
+    /// 슬롯 토큰 1개 → 로짓 (디바이스 상주 경로, S10). 서버 기본 경로 —
+    /// 호스트 스테이징은 GEMV마다 왕복해 실사용 속도가 크게 낮다.
+    pub fn forward_tok_device(&mut self, slot: usize, tok: u32) -> Result<Vec<f32>, String> {
+        let row = self.embed_row_host(tok);
+        if row.len() != self.hidden {
+            return Err(format!("exl3-cuda: 임베딩 토큰 {tok} 범위 밖 또는 미적재"));
+        }
+        self.forward_device(slot, &row).map(|(logits, _)| logits)
+    }
+
     /// 슬롯 임베딩 행 1개 → (로짓, 최종 노름 이전 잔차) — plans/cuda-port.md S5.
     pub fn forward(
         &mut self,
@@ -197,6 +207,16 @@ impl Exl3CudaDecoder {
             let st_off = (slot * dims.n_gdn * dims.h_v * 128 * 128) as u64 * 4;
             self.zero_state(self.dring + ring_off, ring_bytes)?;
             self.zero_state(self.dgst + st_off, st_bytes)?;
+        }
+        // S10 잔차·분기 스트림 0화 — 워밍업이 16토큰을 전진시킨 뒤 이 함수가
+        // 불리지만, dres·dab_dev에 누적된 잔차가 남아 있으면 첫 요청이 그
+        // 잔차 위에서 시작한다. 호스트 경로는 스텝마다 x를 새로 만들므로
+        // 드러나지 않지만, 디바이스 상주는 그 누적값을 그대로 쓴다.
+        if self.dres != 0 {
+            self.zero_state(self.dres, self.hidden * 4)?;
+        }
+        if self.dab_dev != 0 {
+            self.zero_state(self.dab_dev, self.hidden * 4)?;
         }
         Ok(())
     }

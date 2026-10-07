@@ -85,6 +85,26 @@ fn main() -> ExitCode {
         }
     }
     let r = match args.get(1).map(String::as_str) {
+        // S10 디바이스 상주 vs 호스트 스테이징 종단 대조(신규 파일 위임).
+        Some("s10") => {
+            let dir = args.get(2).map(String::as_str).unwrap_or("");
+            let ntok: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
+            let lim: usize = args
+                .get(4)
+                .and_then(|s| s.parse().ok())
+                .map(|v: usize| if v == 0 { usize::MAX } else { v })
+                .unwrap_or(8);
+            return match s10_check(dir, ntok, lim) {
+                Ok(s) => {
+                    println!("{s}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("FAIL: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Some("smoke") => rawcuda::exl3_cuda_probe::cuda_smoke_check(),
         Some("gemv") => rawcuda::gemv_cuda_probe::cuda_gemv_check(),
         Some("gemv-neg") => rawcuda::gemv_cuda_probe::cuda_gemv_negative_check(),
@@ -197,6 +217,90 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+// ── S10 디바이스 상주 대조(plan:cuda-port.md) ──
+// 실모델 EXL3 디코더를 두 벌 로드해(VRAM 2배 — 27B는 24GB에 불가하므로
+// 작은 lim_layers를 쓴다) 같은 토큰열을 호스트 스테이징·디바이스 경로로
+// 각각 그리디 디코드하고 종단 토큰열을 비교한다. 1스텝 로짓 대조로 놓치는
+// 상태 오염(GDN 스캔·KV 누적)을 여러 스텝에 걸쳐 잡는다.
+fn s10_check(dir: &str, ntok: usize, lim: usize) -> Result<String, String> {
+    use rawcuda::exl3_cuda::Exl3CudaDecoder;
+    if dir.is_empty() {
+        return Err("사용법: cuda_probe s10 <exl3_dir> [ntok]".into());
+    }
+    // S10 인자 확장: s10 <dir> [ntok] [layers] — layers가 주어지면 그만큼
+    // 적재한다(0=전층). 2벌 로드이므로 VRAM 여유가 필요: 27B 전층 2벌은
+    // 24GB에 불가하므로 기본은 8층이다.
+    let mut host = Exl3CudaDecoder::load_slots(dir, lim, 256, 1)?;
+    let mut dev = Exl3CudaDecoder::load_slots(dir, lim, 256, 1)?;
+    // 결정론 프롬프트: 작은 정수 토큰열(어휘 앞쪽, 임베딩 범위 내).
+    let toks: Vec<u32> = (0..ntok).map(|i| 100 + i as u32 * 7).collect();
+    let line = rawcuda::exl3_cuda_device_probe::cuda_s10_stream_check(
+        &mut host, &mut dev, &toks, 6,
+    )?;
+    // 진단 계기 — 결함 시 규위 좁히기용(정상 시 전부 0.000e0이어야 한다).
+    let d_embed = rawcuda::exl3_cuda_device_probe::embed_resid_probe(
+        &mut host, &mut dev, toks[0],
+    )?;
+    let d_norm = rawcuda::exl3_cuda_device_probe::first_norm_probe(
+        &mut host, &mut dev, toks[0],
+    )?;
+    let d_mid = rawcuda::exl3_cuda_device_probe::mid_layer_probe(&mut host, &mut dev, toks[0])?;
+    let d_attn = rawcuda::exl3_cuda_device_probe::attn_input_probe(&mut host, &mut dev)?;
+    let d_step = rawcuda::exl3_cuda_device_probe::one_step_state_probe(
+        &mut host, &mut dev, toks[0],
+    )?;
+    let d_trace = rawcuda::exl3_cuda_device_probe::layer_trace_probe(
+        &mut host,
+        &mut dev,
+        toks[0],
+        lim.min(8),
+    )
+    .unwrap_or_else(|e| format!("S10 layer-trace: 실행 실패({e})"));
+    // layer_trace는 z를 제로 대입해 두 경로의 입력이 달라지는 계기라
+    // 판정 근거가 아니라 진단 전용이다 — 결함 규위가 앞 단계에서 좁혀지지
+    // 않을 때만 본다.
+    let probe1 = rawcuda::exl3_cuda_device_probe::one_step_state_probe(
+        &mut host, &mut dev, toks[0],
+    )?;
+    let probe2 = rawcuda::exl3_cuda_device_probe::mid_layer_probe(
+        &mut host, &mut dev, toks[0],
+    )?;
+    let probe3 = rawcuda::exl3_cuda_device_probe::attn_input_probe(&mut host, &mut dev)?;
+    // 격리: 동일 x에 대한 단일 GEMV 2회만 비교한다. 여기서 다르면 GEMV
+    // 체인 문제, 같으면 forward 배선 문제로 갈린다. x 폭은 키마다 다르므로
+    // 키별로 그 선형의 k에 맞춰 만든다(같은 **내용 패턴**을 폭만 맞춘다).
+    let mut keys: Vec<String> = Vec::new();
+    for il in 0..lim.min(8) {
+        let lp = format!("model.language_model.layers.{il}");
+        keys.push(format!("{lp}.linear_attn.in_proj_qkv"));
+        keys.push(format!("{lp}.mlp.gate_proj"));
+        keys.push(format!("{lp}.mlp.down_proj"));
+    }
+    let mut iso_rows: Vec<String> = Vec::new();
+    for key in &keys {
+        let k = match dev.lin_shape(key) {
+            Some((k, _, _)) => k,
+            None => continue,
+        };
+        let xg: Vec<f32> = (0..k).map(|i| ((i % 97) as f32) * 0.01).collect();
+        let (md, _) = rawcuda::exl3_cuda_gemv_probe::single_gemv_compare(
+            &mut host, &mut dev, key, &xg,
+        )?;
+        iso_rows.push(format!("{key}={md:.1e}"));
+    }
+    let iso = format!("S10 gemv-isolation: {}", iso_rows.join(" "));
+    // 속도 비교 — 같은 8층으로 호스트/디바이스 경로 스텝당 시간을 잰다.
+    // 위치축 한계(S9) 밖으로 나가지 않도록 소량만.
+    const BENCH_STEPS: usize = 6;
+    let h = rawcuda::exl3_cuda_device_bench::time_host_steps(&mut host, &toks, BENCH_STEPS)?;
+    let d = rawcuda::exl3_cuda_device_bench::time_device_steps(&mut dev, &toks, BENCH_STEPS)?;
+    let prof = rawcuda::exl3_cuda_device_bench::report(h, d, dev.device_name());
+    Ok(format!(
+    "{line}\n{iso}\n{d_embed}\n{d_norm}\n{d_mid}\n{d_attn}\n{d_step}\n{d_trace}\n\
+     {prof} (layers={lim})"
+))
 }
 
 // ── G8 Q4 모듈 서브커맨드(2026-10-04 — 독립 파일 q4_cuda_probe 위임) ──
