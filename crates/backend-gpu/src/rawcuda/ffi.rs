@@ -65,6 +65,11 @@ pub type CuMemcpyHtoDFn =
     unsafe extern "system" fn(dst: CUdeviceptr, src: *const c_void, bytes: usize) -> CUresult;
 pub type CuMemcpyDtoHFn =
     unsafe extern "system" fn(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult;
+/// cuMemcpyDtoD_v2 — 디바이스 내 복사. 호스트 왕복 없는 디바이스 체인의
+/// 필수 요소(plans/cuda-port.md S10): GEMV 입출력을 상주 버퍼 사이에
+/// 직접 옮긴다.
+pub type CuMemcpyDtoDFn =
+    unsafe extern "system" fn(dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> CUresult;
 pub type CuLaunchKernelFn = unsafe extern "system" fn(
     f: CUfunction,
     gx: c_uint,
@@ -99,6 +104,7 @@ pub(crate) struct Driver {
     pub mem_alloc: CuMemAllocFn,
     pub memcpy_htod: CuMemcpyHtoDFn,
     pub memcpy_dtoh: CuMemcpyDtoHFn,
+    pub memcpy_dtod: CuMemcpyDtoDFn,
     pub launch_kernel: CuLaunchKernelFn,
     pub stream_synchronize: CuStreamSynchronizeFn,
     pub mem_free: CuMemFreeFn,
@@ -160,6 +166,9 @@ impl Driver {
                 )),
                 memcpy_dtoh: std::mem::transmute::<*mut c_void, CuMemcpyDtoHFn>(sym!(
                     "cuMemcpyDtoH_v2"
+                )),
+                memcpy_dtod: std::mem::transmute::<*mut c_void, CuMemcpyDtoDFn>(sym!(
+                    "cuMemcpyDtoD_v2"
                 )),
                 launch_kernel: std::mem::transmute::<*mut c_void, CuLaunchKernelFn>(sym!(
                     "cuLaunchKernel"

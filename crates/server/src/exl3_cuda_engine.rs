@@ -52,27 +52,38 @@ impl Exl3CudaEngine {
         })
     }
 
-    /// 프리필 — S5 호스트 임베딩 경로(plans/cuda-port.md): 토큰을 순차 처리해
-    /// 마지막 로짓을 반환한다. 빈 프롬프트는 디코더 상태를 건드리지 않고 거부.
+    /// 1토큰 순차 디코드 — 반환 로짓(디바이스 상주 경로, S10).
+    pub fn decode1(&mut self, slot: usize, tok: u32) -> Result<Vec<f32>, String> {
+        self.dec.forward_tok_device(slot, tok)
+    }
+
+    /// 프리필 — 토큰을 순차 처리해 마지막 로짓을 반환한다. 디바이스 상주
+    /// 경로(S10)를 쓴다: 장문 프롬프트가 전부 이 경로를 타므로 호스트
+    /// 스테이징으로 두면 실사용 속도가 그대로다.
     pub fn prefill(&mut self, slot: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
         if tokens.is_empty() {
             return Err("빈 프리필".into());
         }
         let mut last = Vec::new();
         for &tok in tokens {
-            last = self.dec.forward_tok(slot, tok)?;
+            last = self.decode1(slot, tok)?;
         }
         Ok(last)
     }
 
-    /// 1토큰 순차 디코드 — 반환 로짓.
-    pub fn decode1(&mut self, slot: usize, tok: u32) -> Result<Vec<f32>, String> {
-        self.dec.forward_tok(slot, tok)
-    }
-
-    /// 1토큰 순차 디코드(greedy) — GPU argmax.
-    pub fn step_tok(&mut self, slot: usize, tok: u32) -> Result<u32, String> {
-        self.dec.step_tok(slot, tok)
+    /// 1토큰 순차 디코드(greedy) — 디바이스 상주 경로(S10). 서버 기본 디코드
+    /// 경로다: 토큰당 왕복이 임베딩 업로드·로짓 판독 2회뿐이다(호스트
+    /// 스테이징은 GEMV마다 d2h→h2d를 반복해 층당 ~8회).
+    ///
+    /// [S10 게이트] 두 경로의 종단 토큰열이 동일한 것을 프로브
+    /// (cuda_probe s10)가 실측 검증한다 — 산술이 아니라 값으로 증명한다.
+    pub fn step_tok_device(&mut self, slot: usize, tok: u32) -> Result<u32, String> {
+        // argmax_host가 1MB(로짓 벡터) 장치 버퍼를 cuMemAlloc하므로
+        // forward의 가드 밖에서 부르면 INVALID_CONTEXT로 죽는다. 슬롯
+        // 스레드에 current 컨텍스트가 전파되지 않기 때문이다(plans/cuda-port.md S5).
+        let _g = self.dec.cc.guard()?;
+        let logits = self.decode1(slot, tok)?;
+        self.dec.argmax_host(&logits)
     }
 
     /// 슬롯 제자리 리셋 — GDN 링/스캔 상태와 pos를 디코더에서 함께 초기화.

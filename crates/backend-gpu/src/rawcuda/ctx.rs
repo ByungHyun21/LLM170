@@ -226,6 +226,22 @@ impl CudaCtx {
         Ok(())
     }
 
+    /// 디바이스→디바이스 복사(동기). 호스트 왕복 없는 체인의 기본 이동 —
+    /// plans/cuda-port.md S10.
+    pub fn d2d(&self, dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> Result<(), String> {
+        // SAFETY: 두 포인터 모두 alloc이 돌려준 유효 할당, 범위는 호출자 계약.
+        unsafe {
+            let r = (self.drv.memcpy_dtod)(dst, src, bytes);
+            if r != CUDA_SUCCESS {
+                return Err(format!(
+                    "rawcuda: cuMemcpyDtoD({bytes}B): {}",
+                    ffi::err_text(r)
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// 커널 발사 — rawhip RawCtx::launch(name, gx, gy, block, args) 미러
     /// (gz/bz=1 고정, shared=0, extra=null). args 원소는 각 커널 인자값을
     /// 가리키는 포인터(cuLaunchKernel 규격 — 인자 주소 배열).
