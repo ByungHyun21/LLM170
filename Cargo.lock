@@ -501,6 +501,7 @@ dependencies = [
  "libc",
  "llm170-backend-gpu",
  "llm170-diag",
+ "llm170-exl3",
  "llm170-gguf",
  "memmap2",
 ]
