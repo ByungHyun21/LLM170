@@ -6,7 +6,7 @@ pub(super) use crate::rawhip::ck;
 pub(super) use crate::rawhip::env_on;
 pub(super) use crate::rawhip::kernels;
 pub(super) use crate::rawhip::{
-    CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4, CO_W32F, CO_W32M,
+    CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4, CO_W32F,
 };
 pub(super) use cubecl_hip_sys as hip;
 pub(super) use std::collections::HashMap;
@@ -339,12 +339,6 @@ impl RawCtx {
                             "gemm_xs_j128",
                             "gemm_q8_j128",
                         ],
-                    ),
-                    (
-                        CO_W32M,
-                        "LLM170_CO9_PATH",
-                        include_bytes!("../co/w32m.co"),
-                        &["gemm_q4k_j128m", "gemm_q5_1_j128m"],
                     ),
                     (
                         CO_W32F,

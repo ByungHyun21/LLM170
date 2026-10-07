@@ -137,11 +137,12 @@ pub fn grp_padded(off: &[usize], ne: usize, pad: usize) -> (Vec<usize>, usize) {
 /// (2b)는 q5_K·q8_0 도 포함하지만 그 판들은 xq 를 소비하므로 이 게이트와
 /// 다르다. 런치 판 선택 자체는 백엔드별(원장 114).
 pub fn ids2_takes(rows: usize, t: usize, ty: GgmlType) -> bool {
-    // plans/135 항목 15: Q5K 추가 — FN 2층의 Q5_K 전문가 스택이 그룹 타일
-    // 경로(스텝당 14ms)로 떨어지던 것을 dmmv direct-ids로 (q5k_gemm_dmmv_ids).
-    rows > 0
-        && (t == 1 || rows <= 64)
-        && matches!(ty, GgmlType::Q4K | GgmlType::Q5_1 | GgmlType::Q5K)
+    // 2026-10-07 plans/141: e255e832의 Q5K 승격을 원복한다 — q5k dmmv 경로가
+    // FN 2층의 디코드 MoE 출력을 크게 바꾸어(합 0.854→0.946) 게이트 기준선
+    // 스트림을 깨뜨렸다(수리 후 실측). 재승격 선행 조건: (a) q5k dmmv 커널의
+    // 정의/CPU 참조 대조, (b) 2층 디코드 MoE의 백엔드간 불일치 해소(vk 0.801 /
+    // hip 구경로 0.854 / dmmv 0.946 — moe_sc는 hip 구경로만 정확히 0).
+    rows > 0 && (t == 1 || rows <= 64) && matches!(ty, GgmlType::Q4K | GgmlType::Q5_1)
 }
 
 #[cfg(test)]
@@ -208,7 +209,7 @@ mod tests {
         assert!(!ids2_takes(65, 8, GgmlType::Q4K)); // rows>64 且 t>1
         assert!(ids2_takes(65, 1, GgmlType::Q4K)); // t=1 이면 rows 무관
         assert!(!ids2_takes(64, 8, GgmlType::Q8_0)); // 타입 미지원
-        assert!(ids2_takes(64, 8, GgmlType::Q5K)); // e255e832: Q5K 직접 ids dmmv 승격 (+31%)
+        assert!(!ids2_takes(64, 8, GgmlType::Q5K)); // plans/141: e255e832 승격 원복
         assert!(!ids2_takes(0, 1, GgmlType::Q4K)); // 빈 라우팅
     }
 }
