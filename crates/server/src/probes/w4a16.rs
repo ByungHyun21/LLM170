@@ -12,6 +12,7 @@ pub fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         "w4a16-ref" => Some(finish(reference(args))),
         "w4a16-gemv" => Some(finish(gemm_gate(args, 1))),
         "w4a16-gemm" => Some(finish(gemm_gate(args, 8))),
+        "w4a16-gpu" => Some(finish(gpu_run(args))),
         _ => None,
     }
 }
@@ -144,6 +145,7 @@ fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
     let mut rows_limit = 4usize;
     let mut t = default_t;
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut lin: Option<String> = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -165,31 +167,52 @@ fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--seed requires a number")?;
             }
+            "--lin" => {
+                lin = Some(it.next().ok_or("--lin requires a name")?.clone());
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
     }
     if t == 0 || t > 8 {
         return Err(format!("--t {t}: 1..=8"));
     }
-    let store = llm170_core::w4a16::W4a16Model::open(std::path::Path::new(&dir))
-        .map_err(|e| e.to_string())?;
     let g4 = llm170_backend_gpu::Gptq4::new()?;
-    // 형상 자동 열거 — distinct (n,k) → 첫 base.
+    // 형상 열거 — --lin이면 model.w()(순열 사본 포함) 단일, 아니면 store 전수.
     let mut shapes: std::collections::BTreeMap<(usize, usize), String> =
         std::collections::BTreeMap::new();
-    for (base, n, k) in store.lin_shapes() {
-        shapes.entry((n, k)).or_insert(base);
+    let mut lin_data: Option<(Vec<u8>, Vec<u8>)> = None;
+    let store = llm170_core::w4a16::W4a16Model::open(std::path::Path::new(&dir))
+        .map_err(|e| e.to_string())?;
+    if let Some(name) = &lin {
+        let model = llm170_core::qwen35::Model::load(std::path::Path::new(&dir))
+            .map_err(|e| e.to_string())?;
+        let w = model
+            .w(name)
+            .ok_or_else(|| format!("--lin {name}: 무게 없음"))?;
+        let s = w.aux.ok_or_else(|| format!("--lin {name}: split 아님"))?;
+        shapes.insert((w.n_out as usize, w.n_in as usize), name.clone());
+        lin_data = Some((w.data.to_vec(), s.to_vec()));
+    } else {
+        for (base, n, k) in store.lin_shapes() {
+            shapes.entry((n, k)).or_insert(base);
+        }
     }
     let mut lines = Vec::new();
     let mut all_ok = true;
     let n_shape = shapes.len();
     for ((n, k), base) in &shapes {
-        let qb = store
-            .tensor_slice(&format!("{base}.weight_packed"))
-            .ok_or_else(|| format!("{base}: weight_packed 슬라이스 부재"))?;
-        let sb = store
-            .tensor_slice(&format!("{base}.weight_scale"))
-            .ok_or_else(|| format!("{base}: weight_scale 슬라이스 부재"))?;
+        let (qb, sb) = if let Some((q, s)) = &lin_data {
+            (q.as_slice(), s.as_slice())
+        } else {
+            (
+                store
+                    .tensor_slice(&format!("{base}.weight_packed"))
+                    .ok_or_else(|| format!("{base}: weight_packed 슬라이스 부재"))?,
+                store
+                    .tensor_slice(&format!("{base}.weight_scale"))
+                    .ok_or_else(|| format!("{base}: weight_scale 슬라이스 부재"))?,
+            )
+        };
         let r = rows_limit.min(*n);
         let q: Vec<u32> = qb[..r * (k / 8) * 4]
             .as_chunks::<4>()
@@ -293,4 +316,166 @@ fn f32_to_f16(v: f32) -> u16 {
         (m, exp)
     };
     sign | ((e as u16) << 10) | (m as u16)
+}
+
+/// GPU 순차 디코드 — 64층 체인을 CUDA(호스트 스테이징)로 돌리고
+/// 임베딩 행·최종 head만 CPU 참조 경로(골든과 동일 계급).
+///   w4a16-gpu <dir> --prompt-tokens <ids> [--n-predict N] [--ctx N]
+fn gpu_run(args: &[String]) -> Result<String, String> {
+    use llm170_backend_gpu::{AttnDims, GdnDims, W4a16Dec};
+    let dir = arg_str(args, 0, "");
+    if dir.is_empty() {
+        return Err(
+            "w4a16-gpu <dir> --prompt-tokens <ids> [--n-predict N] [--ctx N] — 사용법: llm170 w4a16-gpu ../models/Qwen3.8-27B-W4A16-AutoRound --prompt-tokens 148678,65233,202419 --n-predict 8".into(),
+        );
+    }
+    let mut prompts: Vec<Vec<u32>> = Vec::new();
+    let mut n_predict = 8usize;
+    let mut ctx = 1024usize;
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--prompt-tokens" => {
+                let v = it.next().ok_or("--prompt-tokens requires ids")?;
+                let ids: Vec<u32> = v
+                    .split(',')
+                    .map(|t| t.trim().parse::<u32>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| format!("bad tokens: {e}"))?;
+                if ids.is_empty() {
+                    return Err("empty prompt".into());
+                }
+                prompts.push(ids);
+            }
+            "--n-predict" => {
+                n_predict = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--n-predict requires a number")?;
+            }
+            "--ctx" => {
+                ctx = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--ctx requires a number")?;
+            }
+            other => return Err(format!("unknown flag: {other}")),
+        }
+    }
+    if prompts.len() != 1 {
+        return Err("w4a16-gpu: 단일 프롬프트 전용(v1)".into());
+    }
+    let prompt = &prompts[0];
+    if prompt.len() + n_predict + 1 > ctx {
+        return Err(format!("ctx({ctx}) too small for prompt+n_predict"));
+    }
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(&dir))
+        .map_err(|e| e.to_string())?;
+    let hp = model.hp.clone();
+    let interval = hp.full_attn_interval.max(1);
+    let t0 = std::time::Instant::now();
+    let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
+    dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
+    // 1) 선형 상주 업로드.
+    let mut n_lin = 0usize;
+    for name in model.engine_names() {
+        if let Some(w) = model.w_raw(&name)
+            && w.ty == llm170_core::wtype::WType::W4a16G128Split
+        {
+            let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
+            dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;
+            n_lin += 1;
+        }
+    }
+    // 2) 노름 nw [2L+1][hidden].
+    let mut nw: Vec<f32> = Vec::new();
+    for il in 0..hp.n_layer {
+        nw.extend(model.f32_vec(&format!("blk.{il}.attn_norm.weight")).map_err(|e| e.to_string())?);
+        nw.extend(model.f32_vec(&format!("blk.{il}.post_attention_norm.weight")).map_err(|e| e.to_string())?);
+    }
+    nw.extend(model.f32_vec("output_norm.weight").map_err(|e| e.to_string())?);
+    dec.set_norm_weights(&nw, 2 * hp.n_layer + 1)?;
+    // 3) GDN 상수(층 순서 = il 오름차순, a 먼저 b 다음 — 커널 ab 색인).
+    let n_gdn = hp.n_layer - hp.n_layer / interval;
+    let gd = GdnDims {
+        n_gdn,
+        hidden: hp.n_embd,
+        h_k: hp.n_group,
+        h_v: hp.dt_rank,
+        d: hp.d_state,
+    };
+    let (mut cw, mut ab, mut alog, mut dtb, mut gnw): (
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+    ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for il in 0..hp.n_layer {
+        if (il + 1) % interval == 0 {
+            continue;
+        }
+        cw.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_conv1d.weight")).map_err(|e| e.to_string())?);
+        ab.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_alpha.weight")).map_err(|e| e.to_string())?);
+        ab.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_beta.weight")).map_err(|e| e.to_string())?);
+        alog.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_a")).map_err(|e| e.to_string())?);
+        dtb.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_dt.bias")).map_err(|e| e.to_string())?);
+        gnw.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_norm.weight")).map_err(|e| e.to_string())?);
+    }
+    dec.set_gdn(gd, &cw, &ab, &alog, &dtb, &gnw)?;
+    // 4) 어텐션 q/k 노름(+1 저장 규약 — f32_vec가 보정).
+    let n_attn = hp.n_layer / interval;
+    let ad = AttnDims {
+        n_attn,
+        q_heads: hp.n_head,
+        kv_heads: hp.n_kv,
+        d: hp.head_dim,
+        cap: ctx,
+    };
+    let (mut qnw, mut knw): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
+    for ai in 0..n_attn {
+        let il = ai * interval + interval - 1;
+        qnw.extend(model.f32_vec(&format!("blk.{il}.attn_q_norm.weight")).map_err(|e| e.to_string())?);
+        knw.extend(model.f32_vec(&format!("blk.{il}.attn_k_norm.weight")).map_err(|e| e.to_string())?);
+    }
+    dec.set_attn(ad, &qnw, &knw)?;
+    let upload_ms = t0.elapsed().as_secs_f64() * 1e3;
+    // 5) 프롬프트 순차 prefill + greedy 생성(head는 CPU 참조 경로).
+    let head = model
+        .w("output.weight")
+        .ok_or_else(|| "output.weight 부재".to_string())?;
+    let head_logits = |xn: &[f32]| -> Vec<f32> {
+        let mut lg = vec![0.0f32; head.n_out as usize];
+        llm170_core::matmul::matmul(xn, &head, &mut lg);
+        lg
+    };
+    let t1 = std::time::Instant::now();
+    let mut out: Vec<u32> = Vec::new();
+    let mut next = 0u32;
+    for (i, tok) in prompt.iter().enumerate() {
+        let row = model.embed_row(*tok).map_err(|e| e.to_string())?;
+        let xn = dec.forward(0, &row)?;
+        if i + 1 == prompt.len() {
+            next = llm170_core::matmul::greedy_from(&head_logits(&xn));
+        }
+    }
+    out.push(next);
+    for _ in 0..n_predict {
+        let row = model.embed_row(next).map_err(|e| e.to_string())?;
+        let xn = dec.forward(0, &row)?;
+        next = llm170_core::matmul::greedy_from(&head_logits(&xn));
+        out.push(next);
+    }
+    let gen_ms = t1.elapsed().as_secs_f64() * 1e3;
+    let csv = out
+        .iter()
+        .map(|t| t.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!(
+        "w4a16-gpu {dir} — GPU 체인(호스트 스테이징) · 선형 {n_lin}개 · {:.1}GB급\n  업로드 {upload_ms:.0}ms · 생성 {}토큰 {gen_ms:.0}ms ({:.1}ms/토큰)\n tokens: {csv}",
+        (n_lin as f64 * 44.6e-3).max(0.0) * 1000.0 / 1000.0,
+        out.len(),
+        gen_ms / out.len() as f64,
+    ))
 }
