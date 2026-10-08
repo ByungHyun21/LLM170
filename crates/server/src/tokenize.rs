@@ -224,17 +224,20 @@ impl Tokenizer {
     /// EXL3 디렉터리 — vocab.json(조각→id) + merges.txt(BPE 순위) +
     /// tokenizer_config.json(added_tokens_decoder 특수 토큰) + config.json
     /// (model_type → pre 스플리터). GGUF 경로와 동일 필드를 구성한다.
-    /// 파서는 llm170_exl3::json 재사용.
+    /// 파서는 llm170_core::json 재사용.
     fn from_hf_dir(dir: &Path) -> Result<Self, String> {
         // 토큰 조각표 — vocab.json(HF 벌크) 우선, 없으면 tokenizer.json.
         // (W4A16 HF 배포는 vocab.json/merges.txt 부재 실측 — tokenizer.json의
         // model.vocab + added_tokens 병합으로 대체.)
-        let tok_json: Option<llm170_exl3::Json> = if dir.join("vocab.json").is_file() {
+        let tok_json: Option<llm170_core::json::Json> = if dir.join("vocab.json").is_file() {
             None
         } else {
             let txt = std::fs::read_to_string(dir.join("tokenizer.json"))
                 .map_err(|e| format!("tokenizer.json: {e}"))?;
-            Some(llm170_exl3::Json::parse(&txt).map_err(|e| format!("tokenizer.json 파싱: {e}"))?)
+            Some(
+                llm170_core::json::Json::parse(&txt)
+                    .map_err(|e| format!("tokenizer.json 파싱: {e}"))?,
+            )
         };
         let mut max_id = 0usize;
         let mut pairs: Vec<(String, u32)> = Vec::new();
@@ -256,10 +259,10 @@ impl Tokenizer {
                 pairs.push((piece.clone(), id as u32));
             }
             // added_tokens(특수 토큰 — EOS 포함) 병합.
-            if let Some(llm170_exl3::Json::Arr(items)) = tj.get("added_tokens") {
+            if let Some(llm170_core::json::Json::Arr(items)) = tj.get("added_tokens") {
                 for it in items {
-                    let id = it.get("id").and_then(llm170_exl3::Json::as_f64);
-                    let content = it.get("content").and_then(llm170_exl3::Json::as_str);
+                    let id = it.get("id").and_then(llm170_core::json::Json::as_f64);
+                    let content = it.get("content").and_then(llm170_core::json::Json::as_str);
                     if let (Some(id), Some(c)) = (id, content) {
                         let id = id as i64;
                         if id >= 0 {
@@ -270,7 +273,7 @@ impl Tokenizer {
                 }
             }
         } else {
-            let vj = llm170_exl3::Json::parse(
+            let vj = llm170_core::json::Json::parse(
                 &std::fs::read_to_string(dir.join("vocab.json"))
                     .map_err(|e| format!("vocab.json: {e}"))?,
             )
@@ -309,7 +312,8 @@ impl Tokenizer {
                 *rank += 1;
             };
         if let Some(tj) = &tok_json {
-            if let Some(llm170_exl3::Json::Arr(ms)) = tj.get("model").and_then(|m| m.get("merges"))
+            if let Some(llm170_core::json::Json::Arr(ms)) =
+                tj.get("model").and_then(|m| m.get("merges"))
             {
                 for m in ms {
                     if let Some(s) = m.as_str()
@@ -339,7 +343,7 @@ impl Tokenizer {
         let mut special: Vec<(String, u32)> = Vec::new();
         let mut ignore_merges = false;
         if let Ok(tc) = std::fs::read_to_string(dir.join("tokenizer_config.json"))
-            && let Ok(tj) = llm170_exl3::Json::parse(&tc)
+            && let Ok(tj) = llm170_core::json::Json::parse(&tc)
             && let Some(tobj) = tj.as_object()
         {
             for (k, v) in tobj {
@@ -382,7 +386,7 @@ impl Tokenizer {
         // pre 스플리터 — config.json model_type(GGUF pre 매핑과 동일 계열).
         let mut pre = Pre::Other;
         if let Ok(cfg) = std::fs::read_to_string(dir.join("config.json"))
-            && let Ok(cj) = llm170_exl3::Json::parse(&cfg)
+            && let Ok(cj) = llm170_core::json::Json::parse(&cfg)
             && let Some(cobj) = cj.as_object()
             && let Some((_, mt)) = cobj.iter().find(|(k, _)| k == "model_type")
             && let Some(mt) = mt.as_str()

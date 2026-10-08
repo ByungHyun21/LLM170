@@ -204,15 +204,18 @@ fn host_mem_available() -> Option<u64> {
 /// `gpu`가 참이면 VRAM 가용을 조회해 산식에 포함한다(B17: 조회 실패=거부).
 /// `runtime`: 요청 런타임(Some("cuda")면 cuMemGetInfo 프로브, 그 외 hip).
 /// 진단용 기본 모델 경로(단일 소스 — probes.rs·가드 표가 공유,
-/// plans/129 A2/R1·A13). 2026-10-08 이 기기 실측 경로로 갱신(종전
-/// /home/yoon 체계는 부재 — 표 테스트의 "전부 실존" 계약이 깨졌다).
-pub const DEFAULT_FN_MODEL: &str = "/home/harsper/Desktop/workspace/models/Qwen3.8-Flash-Next-GGUF-UD-Q3_K_XL/UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
+/// plans/129 A2/R1·A13). **[2026-10-08 임시 대체]** 구 GGUF/EXL3 자산이
+/// 사용자 정리(GGUF·EXL3 탈락)로 삭제되어 W4A16 자산으로 임시 지정 —
+/// hip/vk/exl3 프로브 표면은 후속 배치(plans/w4a16-cuda.md §5 B1/B2)에서
+/// 삭제 예정이라 이 표도 함께 소멸한다.
+pub const DEFAULT_FN_MODEL: &str =
+    "/home/harsper/Desktop/workspace/models/Qwen3.8-Flash-Next-W4A16-FP8PLE";
 pub const DEFAULT_27_MODEL: &str =
-    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B-W4A16-AutoRound";
 pub const DEFAULT_Q35_MODEL: &str =
-    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B-W4A16-AutoRound";
 pub const DEFAULT_EXL3_MODEL: &str =
-    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B-exl3-5.00bpw";
+    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B-W4A16-AutoRound";
 
 /// 무인자 실행 시 모델을 적재하는 프로브(가드 우회 폐쇄 — plans/129 A13).
 /// (서브커맨드, 기본 경로) — --model/위치인자 부재 시 기본 경로로 가드한다.
@@ -605,20 +608,12 @@ mod tests {
         // CPU 프로브(mod-check) 위치인자 — gpu=false 폴백.
         let g = guard_target("mod-check", None, None, None, &s(&["/m/a.gguf"]));
         assert_eq!(g.map(|g| g.gpu), Some(false));
-        // W4A16 로더 프로브(§3.5) — 위치인자 폴백(gpu=false): 첫 인자가 dir.
+        // W4A16 로더 프로브(plans/w4a16-cuda.md §1) — 위치인자 폴백(gpu=false).
         let g = guard_target("w4a16-load", None, None, None, &s(&["/m/w4a16"]));
         assert_eq!(
             g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
             Some(("/m/w4a16".into(), false))
         );
-        let g = guard_target(
-            "w4a16-xcheck",
-            None,
-            None,
-            None,
-            &s(&["/m/w4a16", "/m/a.gguf"]),
-        );
-        assert_eq!(g.map(|g| g.gpu), Some(false));
         // 메타·행 판독 서브커맨드 → None
         assert!(guard_target("gguf-dump", None, None, None, &s(&[])).is_none());
         assert!(guard_target("tokenize", Some("/m/a.gguf"), None, None, &s(&[])).is_none());
