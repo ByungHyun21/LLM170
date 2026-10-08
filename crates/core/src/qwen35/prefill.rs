@@ -1,4 +1,4 @@
-//! Engine 프리필 — 청킹·비전 스플라이스·행 단주 프리필 (mod.rs에서 분리, plans/35 P5).
+//! Engine 프리필 — 청킹·비전 스플라이스·행 단주 프리필 (mod.rs에서 분리).
 
 use super::*;
 
@@ -88,7 +88,7 @@ impl Engine {
         if llm170_diag::flag::on("LLM170_T1_PREFILL")
             || (self.raw_decode.is_some() && llm170_diag::flag::ne0("LLM170_RAWHIP"))
         {
-            // plans/84 A: 단일 토큰 prefill 호출(청크 꼬리 t=1)도 배치 경로로 —
+            // 단일 토큰 prefill 호출(청크 꼬리 t=1)도 배치 경로로 —
             // decode 경로는 GEMM 패밀리가 달라 청크 불변성이 깨진다.
             // 핀(step_batch)이 large-t 패밀리로 통일하므로 t=1도 비트 일치.
             let use_batch = llm170_diag::flag::ne0("LLM170_RAWHIP")
@@ -106,7 +106,7 @@ impl Engine {
                     64
                 };
                 let n_chunks = cache.len().div_ceil(ch_sz).max(1);
-                // plans/92 P2: 청크 경계 4분해 계량 — 조립(CPU)·업로드·GPU·판독.
+                // 청크 경계 4분해 계량 — 조립(CPU)·업로드·GPU·판독.
                 let pfck = llm170_diag::dump::opts().key("pfck");
                 for (ci, ch) in cache.chunks(ch_sz).enumerate() {
                     let pf_t0 = std::time::Instant::now();

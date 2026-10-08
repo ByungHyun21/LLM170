@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = r#"
-llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일, plans/w4a16-cuda.md)
+llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
 
 주요 커맨드:
   llm170 infer --model <w4a16_dir> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
@@ -32,11 +32,11 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일, plans/
   llm170 help
 
 단일 트랙(2026-10-08 — 사용자 지시): CUDA W4A16만. 구 백엔드·포맷은
-명시 에러로 안내한다. CUDA 가속은 plans/w4a16-cuda.md §2(W2/W3)에서
+명시 에러로 안내한다. CUDA 가속은 W2/W3에서
 개발 중이며, 그 전까지 W4A16은 CPU 참조로 돈다.
 "#;
 
-/// 모델 적재 서브커맨드 공용 인자 (plans/78 R5) — main에서 1회 파싱해
+/// 모델 적재 서브커맨드 공용 인자 — main에서 1회 파싱해
 /// 사전 리소스 가드와 serve/infer/vl/bench가 같은 값을 본다(이중 파싱 제거).
 /// `--flag value`와 `--flag=value` 양형 지원. `rest`는 공용 플래그(값 포함)를
 /// 제외한 나머지 인자 — trio 서브커맨드의 개별 플래그 파싱에 그대로 쓴다.
@@ -45,11 +45,11 @@ pub(crate) struct ModelArgs {
     pub model: Option<String>,
     pub backend: Option<String>,
     pub gpu_runtime: Option<String>,
-    /// 외장 MTP(nextn) 모듈 경로 (plans/109 P15⑤) — "--mtp <path>".
+    /// 외장 MTP(nextn) 모듈 경로 — "--mtp <path>".
     pub mtp: Option<String>,
-    /// PLE 테이블 오프로드 모드(plans/111 W4c) — "--ple-table auto|ram|ssd".
+    /// PLE 테이블 오프로드 모드 — "--ple-table auto|ram|ssd".
     pub ple_table: Option<String>,
-    /// SSD 블록 캐시 예산 MiB(plans/111 W4c) — "--ple-cache <MiB>".
+    /// SSD 블록 캐시 예산 MiB — "--ple-cache <MiB>".
     pub ple_cache_mib: Option<usize>,
     pub rest: Vec<String>,
 }
@@ -127,7 +127,7 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
 
 fn main() -> ExitCode {
     let code = run_main();
-    // A5(plans/129): 폴백 누계 종료 출력 — 카운터는 프로세스 로컬이라
+    // A5: 폴백 누계 종료 출력 — 카운터는 프로세스 로컬이라
     // `llm170 diag fb`(신규 프로세스)는 향상 0건이다. 폴백이 일어난 바로 그
     // 프로세스(infer·bench·프로브 등)가 자기 누계를 stderr에 남긴다.
     // serve는 Ctrl-C로 즉사해 이 출력을 건너뜀 — serve 관측은 ONCE 로그가 담당.
@@ -139,7 +139,7 @@ fn main() -> ExitCode {
 }
 
 fn run_main() -> ExitCode {
-    // plans/87 §2 — 와치독(스텔 보고·옵션 FAIL 자결).
+    // 와치독(스텔 보고·옵션 FAIL 자결).
     if let Some(v) = std::env::var("LLM170_WATCHDOG")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -154,7 +154,7 @@ fn run_main() -> ExitCode {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    // 공용 인자 1회 파싱 (plans/78 R5) — 아래 가드와 trio 디스패치가 공유.
+    // 공용 인자 1회 파싱 — 아래 가드와 trio 디스패치가 공유.
     let ma = match parse_model_args(&args[1..]) {
         Ok(ma) => ma,
         Err(e) => {
@@ -163,11 +163,11 @@ fn run_main() -> ExitCode {
         }
     };
     // 사전 리소스 가드(2026-09-16): 이중 적재로 호스트가 먹통되는 사고 방지.
-    // 대상 판정은 resource::guard_target 순수함수(A2/R1 추출, plans/129) —
+    // 대상 판정은 resource::guard_target 순수함수(A2/R1 추출) —
     // 서브커맨드×인자 형태 계약은 표 테스트(guard_target_cases)가 고정하고
     // 무가드 적재 프로브 폐쇄(A13)도 같은 표가 담당한다.
     if !matches!(args.first().map(String::as_str), Some("tokenize")) {
-        // 가드 대상 판정은 resource::guard_target 순수함수(A2/R1 추출, plans/129) —
+        // 가드 대상 판정은 resource::guard_target 순수함수(A2/R1 추출) —
         // 표 테이블 테스트가 계약을 고정한다(무가드 프로브 폐쇄 A13 포함).
         if let Some(gt) = resource::guard_target(
             args.first().map(String::as_str).unwrap_or(""),
@@ -176,7 +176,7 @@ fn run_main() -> ExitCode {
             ma.gpu_runtime.as_deref(),
             &ma.rest,
         ) {
-            // B20(plans/cuda-models.md §4·§5): 전역 적재 락 획득 → **락 후
+            // B20: 전역 적재 락 획득 → **락 후
             // 재판정**(preflight) — 동시 기동 check-then-act 레이스 직렬화.
             // 해제는 적재 완료 지점(build_slots 반환 직후 등) — 여기서 실패
             // 시엔 즉시 반납한다.
@@ -276,7 +276,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let Some(model_path) = ma.model.clone().map(PathBuf::from) else {
         return usage_err("--model required");
     };
-    // 단일 트랙(2026-10-08, plans/w4a16-cuda.md §5): 수용 모델은 W4A16
+    // 단일 트랙(2026-10-08): 수용 모델은 W4A16
     // 디렉터리 단일 — 그 외 포맷은 스니핑 단계에서 명시 에러.
     let fmt = match engine::sniff_format(&model_path) {
         Ok(f) => f,
@@ -288,14 +288,12 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let _ = fmt; // W4A16 단일(현재)
     // W4A16은 CPU 전용(가속 커널 미구현 — W2) — GPU 백엔드 지정은 정직 거부.
     if backend != "cpu" {
-        eprintln!(
-            "error: W4A16은 아직 CPU 전용(가속 커널 미구현 — plans/w4a16-cuda.md W2): --backend cpu"
-        );
+        eprintln!("error: W4A16은 아직 CPU 전용(가속 커널 미구현 — W2): --backend cpu");
         return ExitCode::FAILURE;
     }
     // W4A16은 MTP 미매핑 — 스펙 디코드는 후속(§2 W4).
     if spec_k > 0 {
-        eprintln!("error: W4A16은 --spec 미지원(MTP 미매핑 — plans/w4a16-cuda.md §2)");
+        eprintln!("error: W4A16은 --spec 미지원(MTP 미매핑)");
         return ExitCode::FAILURE;
     }
     // 토크나이저 적재 (W4A16 디렉터리)
@@ -313,7 +311,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             }
         }
     }
-    // QA-12(plans/114): serve의 텍스트 엔드포인트(/v1/chat·completions·
+    // QA-12: serve의 텍스트 엔드포인트(/v1/chat·completions·
     // messages)는 빈 인코딩 ids=[] 잡을 엔진에 투입해 쓰레기 스트림(또는 엔진
     // Err)을 뿜었다 — 조용한 서락 대신 기동 치명 오류. (infer·vl은 ids 인터
     // 페이스라 빈 토크나이저로도 동작 — 이곳 serve에만 적용.)
@@ -321,7 +319,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         eprintln!("error: tokenizer load 실패(5회 재시도) — serve 텍스트 요청에 필수");
         return ExitCode::FAILURE;
     };
-    // A19(plans/129): load는 어느 파트에도 토크나이저가 없으면 Ok(empty)를
+    // A19: load는 어느 파트에도 토크나이저가 없으면 Ok(empty)를
     // 돌려준다 — Some(empty) 통과가 쓰레기 스트림을 뿜었다. 치명 오류로.
     if tok.is_empty() {
         eprintln!("error: 토크나이저 비음(어느 파트에도 없음) — serve 텍스트 요청에 필수");
@@ -347,7 +345,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
 }
 
 /// `llm170 tokenize --model <dir> [--no-special] (--text <s> | --file <f> | --stdin)`
-/// llama-tokenize 대응 출력 `[id, ...]` — plans/83 A 검증·디버깅용.
+/// llama-tokenize 대응 출력 `[id, ...]` — 검증·디버깅용.
 fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
     let Some(model) = ma.model.clone() else {
         eprintln!("error: --model required");
@@ -362,7 +360,7 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
         }
     };
     let no_special = ma.rest.iter().any(|a| a == "--no-special");
-    // A20(plans/129): 위치인자만 준 사용자에게 stdin 판독 무응답처럼 보였다
+    // A20: 위치인자만 준 사용자에게 stdin 판독 무응답처럼 보였다
     // (원장 기록 ⑧) — usage 에러로. --text/--file 값 부재(마지막 인자)도
     // 빈 문자열 조용 인코딩 대신 에러.
     let has_text = ma.rest.iter().any(|a| a == "--text");

@@ -1,4 +1,4 @@
-//! OAI/Anthropic 페이로드 계층 (R2, plans/129 — http.rs에서 순수 이동).
+//! OAI/Anthropic 페이로드 계층 (http.rs에서 순수 이동).
 //! JSON 파서군(j*)·메시지 렌더·샘플러·stop 유틸·요청 라우팅(handle)과
 //! OAI/Anthropic 방출 러너가 산다. 전송(resp/sse/read_request/serve)은
 //! http.rs — 이 층은 바이트 해석과 프로토콜 스키만 담는다.
@@ -147,7 +147,7 @@ fn jarr_u32(body: &str, key: &str) -> Option<Vec<u32>> {
 }
 
 /// 따옴표로 시작하는 JSON 문자열 1개 파싱 — (값, 소비 바이트 수).
-/// jstr·jarr_str 공용 (plans/123 P0-2·P0-3).
+/// jstr·jarr_str 공용.
 fn jparse_string(s: &str) -> Option<(String, usize)> {
     let b = s.as_bytes();
     if b.first() != Some(&b'"') {
@@ -199,7 +199,7 @@ fn jarr_str(body: &str, key: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// plans/123 P0-3: 요청 stop 파싱 — OpenAI "stop"(문자열|배열)과 Anthropic
+/// 요청 stop 파싱 — OpenAI "stop"(문자열|배열)과 Anthropic
 /// "stop_sequences"(배열) 통합. 반환: (stop 문자열 목록, stop 문자열 포함 여부).
 fn jstop(body: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -213,7 +213,7 @@ fn jstop(body: &str) -> Vec<String> {
     out
 }
 
-/// plans/123 P0-1: 유닉스 초.
+/// 유닉스 초.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -221,7 +221,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// plans/123 P0-1: OAI 응답 id — 프로세스 단조 카운터로 충돌 없는 유일값.
+/// OAI 응답 id — 프로세스 단조 카운터로 충돌 없는 유일값.
 fn oai_id() -> String {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -236,7 +236,7 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
-/// plans/123 P0-1/3/4: 응답 포맷 컨텍스트 — 엔드포인트별 조립에 필요한 최소값.
+/// 응답 포맷 컨텍스트 — 엔드포인트별 조립에 필요한 최소값.
 struct EmitFmt {
     chat: bool,
     model: String,
@@ -244,7 +244,7 @@ struct EmitFmt {
     include_stop: bool,
 }
 
-/// plans/123 P0-2: role 인지 멀티턴 렌더링 — system/user/assistant 턴별
+/// role 인지 멀티턴 렌더링 — system/user/assistant 턴별
 /// im_start 블록 + 마지막 generation prompt(마지막 턴이 assistant면 생략).
 /// 정합 제약: 단일 user 메시지(시스템 없음)는 종전 단일 턴 출력과 바이트 동일
 /// (verify 토큰 대면 표면 — 회귀 금지).
@@ -270,7 +270,7 @@ fn jmessages_render(body: &str) -> String {
         return raw;
     }
     let mut out = String::new();
-    // A14(plans/129): 최상위 system 필드 — Anthropic 표준은 messages 밖에 있다.
+    // A14: 최상위 system 필드 — Anthropic 표준은 messages 밖에 있다.
     if let Some(sys) = jstr(body, "system")
         && !sys.is_empty()
     {
@@ -394,7 +394,7 @@ pub(crate) fn handle(
                     ids,
                     n_predict,
                     stream_mode,
-                    // plans/123 P0-1: completions는 text_completion 포맷.
+                    // completions는 text_completion 포맷.
                     &EmitFmt {
                         chat: false,
                         model: jstr(&req.body, "model").unwrap_or_else(|| "local_llm".into()),
@@ -410,7 +410,7 @@ pub(crate) fn handle(
                     .unwrap_or(jnum(&req.body, "n_predict").unwrap_or(24.0))
                     .max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
-                // plans/123 P0-2: role 인지 멀티턴 렌더링(시스템 프롬프트 보존).
+                // role 인지 멀티턴 렌더링(시스템 프롬프트 보존).
                 let text = jmessages_render(&req.body);
                 let ids = crate::engine::greedy_encode(&text);
                 run_and_emit(
@@ -454,7 +454,7 @@ pub(crate) fn handle(
     }
 }
 
-/// 슬롯 잡 enqueue 공통 (plans/109 P5) — 채널 쌍 생성·SlotJob 조립·큐 송신.
+/// 슬롯 잡 enqueue 공통 — 채널 쌍 생성·SlotJob 조립·큐 송신.
 /// Err면 이미 503(queue full) 응답을 썼다. 반환: (최종 결과 수신기, 스트림
 /// 토큰 수신기 — 비스트림 모드는 진행 채널이 그대로 닫힌다).
 #[allow(clippy::type_complexity)]
@@ -592,7 +592,7 @@ fn run_and_emit(
             );
             return;
         }
-        // plans/123 P0-3: stop 문자열 응답 절단 — 토큰 순회하며 누적 텍스트에
+        // stop 문자열 응답 절단 — 토큰 순회하며 누적 텍스트에
         // 최초 등장 시 절단. 서버 측 절단은 과도 방안(엔진 조기 정지는 후속 항목).
         let mut det = crate::engine::Detok::new();
         let mut acc = String::new();
@@ -612,7 +612,7 @@ fn run_and_emit(
                 }
             }
         }
-        // plans/123 P0-1: OAI 표준 비스트림 응답(id/created/model/object/
+        // OAI 표준 비스트림 응답(id/created/model/object/
         // choices/usage) — 종전 소비자를 위한 tokens·text는 유지.
         let finish = if trunc {
             "stop"
@@ -655,7 +655,7 @@ fn run_and_emit(
     let (id, created) = (oai_id(), now_secs());
     let model_esc = crate::json::esc(&fmt.model);
     if fmt.chat {
-        // plans/123 P0-4: 첫 청크 — role delta(id/created/model 포함 표준 계약).
+        // 첫 청크 — role delta(id/created/model 포함 표준 계약).
         let frame = sse(
             stream,
             "message",
@@ -669,7 +669,7 @@ fn run_and_emit(
     }
     // 토큰 생성 즉시 SSE — 장문 요청이 완료까지 굳지 않게 (2026-09-01).
     let mut det = crate::engine::Detok::new();
-    // plans/123 P0-3: 스트림 stop 처리 — 누적 텍스트 기준 판정 + holdback으로
+    // 스트림 stop 처리 — 누적 텍스트 기준 판정 + holdback으로
     // stop 문자열 부분 유출 방지(마지막 max(stop)-1바이트는 미송신 보류).
     let mut acc = String::new();
     let mut emitted = 0usize;
@@ -704,7 +704,7 @@ fn run_and_emit(
             let piece = crate::json::esc(&acc[emitted..safe]);
             emitted = safe;
             let frame = emit_delta(stream, fmt, &id, created, &model_esc, &piece);
-            // plans/113(sglang P0-1): 쓰기 실패(클라 절단) 시 즉시 탈출 — 이 스코프를
+            // 쓰기 실패(클라 절단) 시 즉시 탈출 — 이 스코프를
             // 벗어나며 prx가 drop되고 다음 slot_emit부터 기존 cancelled 경로가
             // 슬롯을 회수한다(비스트림 QA-3 폴링과 동일 메커니즘).
             if frame.is_err() {
@@ -728,7 +728,7 @@ fn run_and_emit(
         "stop"
     };
     if fmt.chat {
-        // plans/123 P0-4: 종료 청크 — finish_reason 후 [DONE](기존 계약 유지).
+        // 종료 청크 — finish_reason 후 [DONE](기존 계약 유지).
         let _ = sse(
             stream,
             "message",
@@ -738,7 +738,7 @@ fn run_and_emit(
         );
     }
     let _ = sse(stream, "done", "[DONE]");
-    // plans/114 QA-2 연계 수리: SSE 완료 후 연결 종료. curl류 클라이언트는
+    // QA-2 연계 수리: SSE 완료 후 연결 종료. curl류 클라이언트는
     // [DONE]을 인지하지 못해 서버의 keep-alive 대기에 묶였고 — 무타임아웃
     // 시대엔 무한 대기, read_timeout(120s) 도입 후엔 요청마다 +120s 꼬리가
     // 붙었다(실측: 6s 생성 + 120s 꼬리 = 126.4s). 스트림은 완료 즉시 FIN.
@@ -746,7 +746,7 @@ fn run_and_emit(
 }
 
 /// JSON 배열 내 최상위 객체 조각들 추출 — 중괄호 균형(문자열 리터럴 내부
-/// { } 무시). jmessages_render·jcontent가 공유(A14, plans/129 — 원본은
+/// { } 무시). jmessages_render·jcontent가 공유(A14 — 원본은
 /// jmessages_render 인라인이었다).
 fn jblocks(arr: &str) -> Vec<&str> {
     let mut objs = Vec::new();
@@ -794,7 +794,7 @@ fn jblocks(arr: &str) -> Vec<&str> {
     objs
 }
 
-/// content 필드 추출(A14, plans/129) — Anthropic 표준은 블록 배열
+/// content 필드 추출(A14) — Anthropic 표준은 블록 배열
 /// ([{"type":"text","text":"..."}])이라 문자열 전용 jstr은 조용히 빈 값을
 /// 돌려줬다(빈 프롬프트 붕괴). text 블록을 연결하고 비-text 블록은 건너뛴다.
 fn jcontent(o: &str) -> Option<String> {
@@ -858,7 +858,7 @@ fn run_and_emit_anthropic(
     n_predict: usize,
     stream_mode: bool,
     sampler: Option<llm170_core::sampler::SamplerParams>,
-    // A14(plans/129): stop_sequences — jstop이 문자열·배열 모두 파싱.
+    // A14: stop_sequences — jstop이 문자열·배열 모두 파싱.
     stop_strs: Vec<String>,
 ) {
     // A14: ctx 사전 검증 — run_and_emit과 동일(엔진 Err→500보다 400이 정확).
@@ -1007,7 +1007,7 @@ fn run_and_emit_anthropic(
 
 #[cfg(test)]
 mod http_tests {
-    //! A3(plans/129): 핸드롤 JSON 파서군·경계 유틸·렌더의 유닛테스트 — 전부
+    //! A3: 핸드롤 JSON 파서군·경계 유틸·렌더의 유닛테스트 — 전부
     //! CPU 순수(무 GPU). 변형 JSON·UTF-8 절단·stop 오버랩·블록 content가
     //! 종전 무검증이었다.
 

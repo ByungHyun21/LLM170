@@ -1,9 +1,9 @@
-// ── EW(silu·mul) + argmax CUDA 포팅 (plans/124 G7, 2026-10-04) ──
+// ── EW(silu·mul) + argmax CUDA 포팅 (G7, 2026-10-04) ──
 // 산술은 구 rawhip 커널의 ew(L898-908)·ew_argmax
-// (L911-934)을 1:1 직이식한다(원본 그대로 베낌 — plans/124 §2).
+// (L911-934)을 1:1 직이식한다(원본 그대로 베낌).
 // 원본과의 차이는 1점(트랜센던트):
-// 1) 원본 ew는 __expf(수 ulp 근사 내장) — G5/G6 노선(plans/124 §6:
-//    hip은 참조 구현일 뿐 진실 아님)에 따라 silu의 exp를 자작 f64
+// 1) 원본 ew는 __expf(수 ulp 근사 내장) — G5/G6 노선(hip은 참조 구현일
+//    뿐 진실 아님)에 따라 silu의 exp를 자작 f64
 //    DAG 트윈(ew_exp_d — gdn_exp_d/attn_exp_d와 동일 DAG, G5 원장)으로
 //    정밀화한다. 공식 silu(v) = v/(1+exp(−v))의 CPU 참조는
 //    crates/core/src/ops.rs silu(L127-130). 빌드는 -fmad=false(FMA 수축
@@ -22,7 +22,7 @@
 // 원본 reduction 구조 그대로(1:1 계약). 오라클도 이 규칙을 미러
 // 한다(exact-match 계약, 아래 reduction 참조).
 //
-// [CMP 170HX(sm_80, GA100 70SM, HBM2e ~1.5TB/s) 설계 근거 — plans/124 §0]
+// [CMP 170HX(sm_80, GA100 70SM, HBM2e ~1.5TB/s) 설계 근거]
 // - ew: 그리드 (ceil(n/128),1) · 블록 128 — 원본 hip 발사(구 hip 호스트
 //   L786-796: launch3(grid,1,1,128))와 동일. 27B FFN n=17408(config.json
 //   intermediate_size 실측 2026-10-04) → 136블록 · 스레드당 원소 1개 ·
@@ -32,7 +32,7 @@
 //   GA100 f64 코어가 f32의 1/2배속이어도 병목은 판독). 136블록 ≪
 //   70SM의 소형 런치 — T=1 레이턴시 도미넌트, 점유 확산 무의미.
 //   개발기(RTX 4070 SUPER, sm_89)는 정합 호스트일 뿐 — 타이밍 판단
-//   근거 아님(plans/124 §0 계약).
+//   근거 아님(설계 계약).
 // - argmax: 단일 블록 1024스레드(원본 계약, 도메인 n≤1M). 로짓
 //   248320×4B ≈ 0.97MB를 1SM이 순차 스트리밍(스레드당 243원소) —
 //   수십 µs 계급의 레이턴시 연산. 70SM 다중 블록 확산+병합 환원이

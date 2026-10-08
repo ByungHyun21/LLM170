@@ -1,4 +1,4 @@
-//! alloc — GPU 메모리 할당 원장 (plans/86 §5 진단).
+//! alloc — GPU 메모리 할당 원장.
 //!
 //! `LLM170_DUMP=alloc` 으로 켠다: 백엔드의 모든 (해제 없는) 버퍼 할당을
 //! 사이트 태그별로 기록해 누적·타임라인을 찍는다. 대형 컨텍스트에서
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ON: AtomicBool = AtomicBool::new(false);
 
-/// plans/87 §1 — 버퍼 VA 로깅 게이트(LLM170_DUMP=vaddr). 켜면 할당마다
+/// 버퍼 VA 로깅 게이트(LLM170_DUMP=vaddr). 켜면 할당마다
 /// tsv 한 줄을 append 로 남겨 폴트 주소 매칭에 쓴다.
 static VADDR: AtomicBool = AtomicBool::new(false);
 
@@ -38,7 +38,7 @@ pub fn set_on(v: bool) {
     ON.store(v, Ordering::Relaxed);
 }
 
-/// VA 로깅 게이트(plans/87 §1).
+/// VA 로깅 게이트.
 pub fn set_vaddr(v: bool) {
     VADDR.store(v, Ordering::Relaxed);
 }
@@ -47,14 +47,14 @@ pub fn vaddr_on() -> bool {
     VADDR.load(Ordering::Relaxed)
 }
 
-/// 진행 심박(plans/87 §2) — 백엔드 디스패치마다 증가. 와치독이 감시한다.
+/// 진행 심박 — 백엔드 디스패치마다 증가. 와치독이 감시한다.
 pub static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 
 pub fn on() -> bool {
     ON.load(Ordering::Relaxed)
 }
 
-/// plans/87 §1 — VA 원장 항목(폴트 매처 데이터).
+/// VA 원장 항목(폴트 매처 데이터).
 pub struct VaEntry {
     pub site: &'static str,
     pub bytes: u64,
@@ -100,7 +100,7 @@ pub fn record_va(site: &'static str, bytes: usize, va: u64, va_end: u64) {
     );
 }
 
-/// plans/87 §4 — 풀 반납(frame_free) 기록: 사이트별 재사용 가능 재고.
+/// 풀 반납(frame_free) 기록: 사이트별 재사용 가능 재고.
 pub fn recycle(site: &'static str, bytes: usize) {
     if !on() {
         return;
@@ -140,7 +140,7 @@ pub fn report() {
             format_bytes(*rec)
         );
     }
-    // plans/87 §4 — 커널 카운터 대사: 미추적(RADV 내부+무태그) 분리.
+    // 커널 카운터 대사: 미추적(RADV 내부+무태그) 분리.
     let (g0, v0) = l.base_counters.unwrap_or((0, 0));
     let (g1, v1) = drm_counters();
     eprintln!(

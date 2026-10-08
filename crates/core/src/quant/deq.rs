@@ -274,7 +274,7 @@ pub(crate) fn grid4xxs(idx: usize) -> [f32; 4] {
 /// iq3_xxs 블록(98B/256원소): d(2) qs[64](그룹8당 grid 인덱스 2B) +
 /// scales_and_signs[32](ib32당 4B — 하위 28비트 = ksigns 인덱스 7비트×4,
 /// 상위 4비트 = 스케일). ggml dequantize_row_iq3_xxs(ggml-quants.c) 이식 —
-/// plans/cuda-models.md §3.3-1·P0-1(B2): 35B-A3B 46.6%·FN 33.5% 지배 타입.
+/// 35B-A3B 46.6%·FN 33.5% 지배 타입 (B2).
 fn deq_iq3_xxs(blk: &[u8], y: &mut [f32]) {
     let d = f16(blk, 0);
     let qs = &blk[2..66];
@@ -386,7 +386,7 @@ fn deq_iq3_s(blk: &[u8], y: &mut [f32]) {
 
 /// 한 행(k 원소, k 는 블록 크기의 배수)을 f32 로 펼친다.
 /// `data` 는 해당 텐서의 데이터 시작 바이트.
-/// A7(plans/129): 로드 시점 사전 검증용 — dequant_row 매치와 동일 지원 목록.
+/// A7: 로드 시점 사전 검증용 — dequant_row 매치와 동일 지원 목록.
 /// 매치 갱신 시 이 목록도 함께(deq 표 테스트가 드리프트를 잡는다).
 pub fn dequant_supported(ty: WType) -> bool {
     matches!(
@@ -528,7 +528,7 @@ pub fn dequant_row(ty: WType, data: &[u8], row: u64, k: u64, out: &mut [f32]) {
 mod b2_tests {
     use super::*;
 
-    /// B2/B3(plans/cuda-models.md): dequant_supported 표와 dequant_row 매치의
+    /// B2/B3: dequant_supported 표와 dequant_row 매치의
     /// 드리프트 방지 — 지원 표시 타입 전부에 대해 영 블록 바이트로 실제
     /// 디양자화를 수행해 패닉 없음을, 미지원 대표 타입은 unimplemented를
     /// 보인다(로더 사전검증이 이 표를 신뢰한다).

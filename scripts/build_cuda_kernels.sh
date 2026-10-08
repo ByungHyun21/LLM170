@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # rawcuda 커널 자산 일괄 재생성 (2026-10-08 단일 트랙 재편 — 구 개별
-# 스크립트 3종(bat+attn.sh+gdn.sh) 통합. plans/w4a16-cuda.md §5).
+# 스크립트 3종(bat+attn.sh+gdn.sh) 통합).
 # 규칙: assets/<name>.cu → assets/<name>.fatbin, sm_80+sm_89.
 # -fmad=false는 아텐션/GDN/EW 한정 계약(FMA 수축 제거 — core 미러와의
 # 비트동일, 각 .cu 헤더 [빌드 계약]). norm/smoke는 기본 fmad.

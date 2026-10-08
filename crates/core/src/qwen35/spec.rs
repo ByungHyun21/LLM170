@@ -1,4 +1,4 @@
-//! Engine 스펙/MTP 오케스트레이션 — mod.rs에서 분리(plans/35 P5).
+//! Engine 스펙/MTP 오케스트레이션 — mod.rs에서 분리.
 //! draft·검증·GPU 스펙 경로와 접두 캐시 플러시.
 
 use super::*;
@@ -262,7 +262,7 @@ impl Engine {
         // 체인 상태: (draft 토큰, 그 pair의 h_next) — j=0은 hook 저장분 사용
         let mut chain_tok: Option<u32> = None;
         let mut chain_h: Vec<f32> = Vec::new();
-        // QA-27(plans/112→fix/mtp-qa27): mtp_forward의 KV 기입 규약은
+        // QA-27: mtp_forward의 KV 기입 규약은
         // "슬롯 = pos" — 체인 j는 위치 base_pos+j 토큰(d_{j-1})을 먹이므로
         // pos는 base_pos+j. 종전 base_pos+j-1은 ① draft step-0/hook이 쓴 실제
         // 마지막 토큰 KV를 즉시 덮어쓰고 ② 체인 KV가 한 슬롯 앞(rope 한 위상
@@ -301,7 +301,7 @@ impl Engine {
         Ok((accepted, total))
     }
 
-    /// np×spec 병합 스펙 (plans/18) — 배치 원자 의미론:
+    /// np×spec 병합 스펙 — 배치 원자 의미론:
     /// verify 배치 = 시퀀스별 [carried ++ next ++ drafts]. 전 시퀀스 전체수용 시에만
     /// GDN 유지; 하나라도 부분수용이면 전체 restore + 수용 접두 carried로 재실행.
     /// 반환: [seq][accepted].
@@ -344,7 +344,7 @@ impl Engine {
         let mut t_state = std::time::Duration::ZERO;
         let t_cyc = std::time::Instant::now();
 
-        // ── 드래프트 체인 — plans/135 항목 4: 슬롯 배칭(승격, 2026-10-06 A/B).
+        // ── 드래프트 체인: 슬롯 배칭(승격, 2026-10-06 A/B).
         // j-단계마다 슬롯 전체를 한 배치로(mtp_draft_batch): head 가중 4→1회.
         // A/B(np4-spec2 reps): draft 75.4→68ms, kept 패턴 동일(수용 무손실),
         // 사이클 450→438ms. 미지원 백엔드(vk)는 Err → 기존 직렬 경로 폴백.
@@ -608,7 +608,7 @@ impl Engine {
             results.push(accepted);
         }
 
-        // ── 상태 갱신 — 선택적 복원(plans/80 §C): 부분수용 seq만 되돌리고
+        // ── 상태 갱신 — 선택적 복원: 부분수용 seq만 되돌리고
         // 전수용 seq는 verify가 이미 올바르게 진행한 상태를 유지한다.
         // 종전 전체 복원은 한 seq의 부분수용이 모든 seq의 carried를 자라게
         // 해 verify 배치를 12→59행까지 부풀렸다(6.78 t/s의 주원인).
@@ -648,7 +648,7 @@ impl Engine {
                         for j in 0..matched {
                             c.push(all_drafts[si][j]);
                         }
-                        // per-seq carried 상한(plans/134): 12행 초과 시 즉시
+                        // per-seq carried 상한: 12행 초과 시 즉시
                         // 커밋. 종전 4는 solo flush(raw_verify 전체 trunk 패스
                         // ~220ms)를 3라운드당 1회꼴로 유발 — [specT] state
                         // ~245ms 스파이크의 진범. carried는 다음 verify 배치의
@@ -749,7 +749,7 @@ impl Engine {
         k: usize,
     ) -> Result<(Vec<u32>, usize), ModelError> {
         let eos = crate::qwen35::EOS_EOT;
-        // plans/135 §22 MTP k3: np1 솔로 라운드 계측 — draft/verify/state 분해
+        // MTP k3 np1 솔로 라운드 계측 — draft/verify/state 분해
         let tm_on = llm170_diag::dump::opts().key("spec_time");
         let t0 = std::time::Instant::now();
         let rd = self
@@ -806,12 +806,12 @@ impl Engine {
         // 너무 잦으면 손해. tg128 2회 반복 A/B 로 4 = 15.4, 8 = 13.15 t/s 확정(재현
         // 가능) → 4 를 기본으로 한다 (비스펙 11.6 대비 +33%).
         // LLM170_SPEC_CAPX 로 재정의 가능(진단용).
-        // plans/116-6: 검증 t = 1+k+carried 를 g4 GEMV 한계(t≤4, acc[4]) 안에
+        // 검증 t = 1+k+carried 를 g4 GEMV 한계(t≤4, acc[4]) 안에
         // 유지 — k≤3이면 cap = 3-k(부분수용 carried가 t를 4 이상으로 못 키움).
         // k≥4는 종전 4(해당 모드는 large-t 타일 검증 유지). 종전 기본 4는 타일
         // 검증 시대의 최적값(원장: 4=13.7 > 0=6.7 t/s) — g4 체제에서는 t>4가
         // 언핀 타일(mm 패밀리)로 떨어져 역전된다.
-        // plans/135 §22 MTP k3: mm8 절반 판(t≤8)이 verify 커버 — 캡 7-k(k3=4)로
+        // MTP k3: mm8 절반 판(t≤8)이 verify 커버 — 캡 7-k(k3=4)로
         // carried 라이딩 허용(플러시 제거). 과거 3-k는 g4 t≤4 한계 시절 값.
         let cap_default = if k <= 3 { 7 - k } else { 4 };
         let cap_extra: usize = llm170_diag::flag::val("LLM170_SPEC_CAPX")

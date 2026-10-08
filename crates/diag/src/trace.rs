@@ -1,4 +1,4 @@
-//! trace — resolved 커널 이벤트 표현·시각 계산 (plans/82 §1, plans/109 P2).
+//! trace — resolved 커널 이벤트 표현·시각 계산.
 //!
 //! 백엔드(hipEvent/VK timestamp)가 시간을 계산해 완료한 이벤트(Ev)를
 //! 받는다. 캡처 스토어(capture_begin/push/take)·집계(summarize/gap_by_pred)는

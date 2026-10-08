@@ -376,7 +376,7 @@ pub fn tree64(v: &[f64; 64]) -> f64 {
     a[0]
 }
 
-// ─── W4A16(GPTQ4·g128·sym) 레인 미러 — plans/137 §3.5, plans/138 단계 1 ───
+// ─── W4A16(GPTQ4·g128·sym) 레인 미러 ───
 // AutoRound auto_gptq 규약: qrow 워드 j의 니블 j%8 = 원소 8·(j/8)+(j%8).
 // lsb-first **확정**(2026-10-08, w4a16-xcheck — 동일 기저 27B 원본 대조
 // corr(lsb) 0.991~0.994 vs corr(msb) ≈0.01, §3.6 종결).

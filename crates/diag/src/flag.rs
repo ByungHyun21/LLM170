@@ -1,11 +1,11 @@
-//! flag — 환경변수 캐시형 판독 (plans/82 §3).
+//! flag — 환경변수 캐시형 판독.
 //!
 //! 프로세스 기동 시 1회 스냅샷(VALUES) 후 불변 — 핫패스 판독의 잠금·조회
-//! 원자화. 등록 레지스트리(env_on)는 프로덕션 호출 0으로 plans/109 P1에서
+//! 원자화. 등록 레지스트리(env_on)는 프로덕션 호출 0으로 이미
 //! 삭제했다(구 백엔드는 자체 캐시 env_on 사용).
 use std::collections::HashMap;
 
-/// 값 맵 — 1회 스냅샷(plans/107 W2). 핫패스 판독 잠금·조회 원자화.
+/// 값 맵 — 1회 스냅샷. 핫패스 판독 잠금·조회 원자화.
 static VALUES: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(|| {
     std::env::vars_os()
         .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v.to_str()?.to_string())))
@@ -36,12 +36,12 @@ pub fn val(name: &str) -> Option<&str> {
 
 /// `존재 && 값 != "0"` — `var(name).is_ok_and(|v| v != "0")` 대응.
 /// 부재 시 false(ne0와 반대 — 옵트인 값 게이트: LLM170_FRAME35·
-/// LLM170_FRAME 등 "설정돼 있고 0이 아니면 ON" 관례). A6(plans/129).
+/// LLM170_FRAME 등 "설정돼 있고 0이 아니면 ON" 관례). A6.
 pub fn on_nonzero(name: &str) -> bool {
     VALUES.get(name).is_some_and(|v| v != "0")
 }
 
-/// 스냅샷↔라이브 동치 검사 (plans/108 P1) — 현재 환경의 LLM170_ 키 전수에
+/// 스냅샷↔라이브 동치 검사 — 현재 환경의 LLM170_ 키 전수에
 /// 대해 4개 의미론(on/eq1/ne0/val)을 라이브 getenv 판정과 독립 대조한다.
 /// 불일치 목록(빈 벡터 = 정상).
 /// 원장 104(ne0 부재키 결함)류 회귀를 게이트 전에 포착한다.

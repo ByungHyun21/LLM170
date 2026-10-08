@@ -1,4 +1,4 @@
-//! Full-attention층 스테이지 — layers.rs에서 이동(qwen4exp P1 패턴, plans/90 B4).
+//! Full-attention층 스테이지 — layers.rs에서 이동(qwen4exp P1 패턴, B4).
 
 use super::super::{ModelError, SeqState, span_block};
 use super::Ctx;
@@ -6,7 +6,7 @@ use crate::ops::{rms_norm, rope_head, sigmoid};
 use crate::qwen35::{mm_batch, mm_group};
 use llm170_diag::profile_span;
 
-/// qwen35 단일 헤드 어텐션 — 점수→exp_cr 소프트맥스→가중합→게이트(plans/90 B4 D2).
+/// qwen35 단일 헤드 어텐션 — 점수→exp_cr 소프트맥스→가중합→게이트(D2).
 /// 본체 t-루프와 GPU 실패 폴백 재계산이 공유 — 연산 순서·exp 선택(exp_cr) 불변.
 #[allow(clippy::too_many_arguments)]
 fn attn_head(

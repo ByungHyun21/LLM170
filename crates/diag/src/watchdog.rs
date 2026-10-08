@@ -1,4 +1,4 @@
-//! watchdog — 진행 스텔 감시 (plans/87 §2).
+//! watchdog — 진행 스텔 감시.
 //!
 //! `LLM170_WATCHDOG=<sec>`: 백엔드 디스패치마다 `alloc::HEARTBEAT`가
 //! 진동한다. 별도 스레드가 `<sec>` 이상 무진동이면 op 링의 마지막 태그와
@@ -29,7 +29,7 @@ pub fn on() -> bool {
     ON.load(Ordering::Relaxed)
 }
 
-/// 스텔 보고 횟수 — plans/114 QA-22: watchdog-selftest가 보고 여부를
+/// 스텔 보고 횟수 — QA-22: watchdog-selftest가 보고 여부를
 /// 판정 가능하게 하는 관측값(미기동 감지).
 pub fn reports() -> u64 {
     REPORTS.load(Ordering::Relaxed)

@@ -60,13 +60,13 @@ impl std::fmt::Display for ModelError {
 
 impl std::error::Error for ModelError {}
 
-/// 가중치 소스 — **W4A16 디렉터리 단일**(2026-10-08, plans/w4a16-cuda.md §5).
+/// 가중치 소스 — **W4A16 디렉터리 단일**(2026-10-08).
 /// 세부 접근은 `w4a16` 로더(mmap 슬라이스 + 순열 사본).
 pub struct Model {
     w4: Box<crate::w4a16::W4a16Model>,
     pub hp: Hparams,
     pub token_pieces: Vec<String>,
-    /// plans/113(llama-vllm P13): f32 norm 가중 디양자화 캐시 — 첫 호출 1회
+    /// f32 norm 가중 디양자화 캐시(llama-vllm P13 계열) — 첫 호출 1회
     /// 디양자화 후 재사용(수치 불변). 값 경로 매 포워드 층별 norm 재디양자 제거.
     f32_cache: std::cell::RefCell<std::collections::HashMap<String, Vec<f32>>>,
 }
@@ -135,7 +135,7 @@ impl Model {
         Ok(m)
     }
 
-    /// plans/40 페이지 반납은 구 mmap 소스 전용이었음 — 2026-10-08 단일 트랙으로
+    /// 페이지 반납은 구 mmap 소스 전용이었음 — 2026-10-08 단일 트랙으로
     /// 무동작(W4A16 소스는 전부 CPU 경로). 호출부 계약 유지를 위해 잔존.
     pub fn discard_weight_pages(&self, _keep: &[&str]) -> u64 {
         0
@@ -374,7 +374,7 @@ impl Engine {
     /// 시퀀스 상태 전체 초기화 (무상태 HTTP 서버용) — mmap은 유지.
     /// ctx는 기존 KV 용량에서 역산 (첫 kv_k 길이).
     ///
-    /// GPU 상주 상태(GDN S/conv 링)도 전 슬롯 영점화 — 2026-09-20 plans/84 A:
+    /// GPU 상주 상태(GDN S/conv 링)도 전 슬롯 영점화 — 2026-09-20:
     /// CPU SeqState만 교체하면 raw 프리필이 이전 대화의 더러운 초기 상태를
     /// 읽어 두 번째 동일 프리필부터 logits이 발산했다 (chunk-check 재현:
     /// 1회째 bits-identical, 2회째 max|Δ|≈14). reset_seq은 이미 raw_reset.
@@ -623,7 +623,7 @@ impl Engine {
         // MTP nextn KV 적립 — 프롬프트/배치 토큰 전체 (draft 어텐션 컨텍스트).
         // h_in = 본체 최종 hidden (output_norm 전). 로짓 없이 1층만.
         if !self.seqs[seq_ids[0]].mtp_h.is_empty() && self.mtp_wanted {
-            // plans/46: raw 백엔드는 GPU MTP 스텝을 사용 — CPU mtp_step은 토큰당 ~150ms로
+            // 구 raw 백엔드는 GPU MTP 스텝을 사용 — CPU mtp_step은 토큰당 ~150ms로
             // 프리필·검증을 30× 악화시켰다. GPU 경로는 argmax만 반환 → mtp_draft_tok 사용.
             let raw = self.raw_decode.clone();
             let n_e = self.model.hp.n_embd;
@@ -731,7 +731,7 @@ impl Engine {
             self.seqs[seq_ids[0]].pos += 1;
             return Ok(vec![logits]);
         }
-        // 구 np 배치 GPU 경로 — 각 seq 1토큰, GEMM 공유 (plans/15)
+        // 구 np 배치 GPU 경로 — 각 seq 1토큰, GEMM 공유
         if tokens.len() > 1
             && seq_ids.len() > 1
             && self.raw_decode.is_some()
@@ -739,7 +739,7 @@ impl Engine {
         {
             let rd = self.raw_decode.clone().unwrap();
             let n = self.model.hp.n_embd;
-            // plans/92 P6: token_embd 은 mmap 에서 행 단위 직판독(t=1 경로와 동일) —
+            // token_embd 은 mmap 에서 행 단위 직판독(t=1 경로와 동일) —
             // 종전 2.5GB to_vec 캐시를 첫 np 호출(계측 구간 내)에 만들어 agg 셀에
             // ~1s 를 삼키고 RAM 을 상주시켰다. wchk 는 mmap 뷰라 복사 불필요.
             let embd = self.model.wchk("token_embd.weight")?;
@@ -766,7 +766,7 @@ impl Engine {
         Ok(logits)
     }
 
-    /// np 배치 greedy 디코드 — 토큰만 회수 (logits 전사 회피, plans/74 N1).
+    /// np 배치 greedy 디코드 — 토큰만 회수 (logits 전사 회피).
     /// raw np 경로가 없으면 decode+CPU greedy 폴백. LLM170_NP_GREEDY=0 게이트.
     pub fn decode_np_greedy(
         &mut self,
@@ -780,7 +780,7 @@ impl Engine {
         {
             let rd = self.raw_decode.clone().unwrap();
             let n = self.model.hp.n_embd;
-            // plans/92 P6: mmap 직판독(decode_greedy 단일 경로와 동일) —
+            // mmap 직판독(decode_greedy 단일 경로와 동일) —
             // 2.5GB to_vec 캐시 빌드를 계측 구간에 삼키지 않는다.
             let embd = self.model.wchk("token_embd.weight")?;
             let poss: Vec<u32> = seq_ids.iter().map(|&s| self.seqs[s].pos).collect();
@@ -834,5 +834,5 @@ impl Engine {
 }
 
 /// greedy argmax — `matmul::greedy_from`과 동일 의미(동률 최저인덱스).
-/// 구현 중복 제거(plans/90 A1 D3): 단일 구현 재수출.
+/// 구현 중복 제거: 단일 구현 재수출.
 pub use crate::matmul::greedy_from as greedy;
