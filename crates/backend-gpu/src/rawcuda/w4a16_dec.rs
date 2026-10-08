@@ -1610,18 +1610,55 @@ impl W4a16Dec {
 
     // ── CUDA Graph(체인 캡처 — P1) ──
 
-    /// 그래프 모드 가능 여부 — **옵트인**(LLM170_GRAPH=1). 캡처 실패 후에는
-    /// 직접 경로 고정(매 토큰 재시도 방지). debug_layers는 캡처 중 d2h/sync를
-    /// 하므로 그래프 불가.
+    /// 그래프 모드 가능 여부 — **기본 ON**(LLM170_GRAPH=0으로 끔).
+    /// 캡처 실패(에러 반환) 후에는 직접 경로 고정(매 토큰 재시도 방지).
+    /// debug_layers는 캡처 중 d2h/sync를 하므로 그래프 불가.
     ///
-    /// [실측 2026-10-08, 27B·4090] 밀집 디코드에서는 **중립**이다:
-    /// 그래프 39.9 vs 직접 40.8 ms/토큰(n=24) — 호스트 enqueue 12ms가 이미
-    /// GPU 36ms 아래에 숨어 있어 붕괴할 대상이 없다. 그래프가 값을 하는 것은
-    /// **런치 바운드** 워크로드다: MoE 전문가별 소형 커널(35B-A3B: 256×40),
-    /// RAM/SSD 오프로드(소형 커널+복사 다발), 빠른 GPU의 다중 슬롯 디코드.
-    /// W4-1 착수 시 기본 ON 전환을 재검한다.
+    /// [실측 2026-10-08, 27B·4090] 밀집 디코드는 **중립**(그래프 39.9 vs
+    /// 직접 40.8 ms/토큰, n=24) — 손해가 없어 기본 ON으로 간다. 이득 상한은
+    /// 호스트 enqueue(12ms)이고, GPU가 CPU를 기다릴 때만 회수된다. 값 하는
+    /// 곳은 런치 바운드: MoE 전문가 소형 커널(35B-A3B 256×40)·오프로드·
+    /// 다중 슬롯 — W4-1에서 데이터 주도 디스패치와 함께 재검한다.
     fn graph_ok(&self) -> bool {
-        llm170_diag::flag::eq1("LLM170_GRAPH") && !self.debug_layers && !self.graph_failed
+        llm170_diag::flag::ne0("LLM170_GRAPH") && !self.debug_layers && !self.graph_failed
+    }
+
+    /// 캡처 전 버퍼 워밍업 — **불변식: 체인에서 지연 할당되는 모든 버퍼는
+    /// 여기서 선할당한다.** 캡처 중 `cuMemAlloc`은 금지 API라 드라이버가
+    /// instantiate에서 SIGSEGV로 죽는다(2026-10-08 실측 — gemv dx32/dy 누락이
+    /// 원인이었다). 체인에 새 버퍼를 추가하면 반드시 이 목록에도 추가할 것.
+    /// 현행 지연 할당원: chain(dres/dab_dev/dchain) · norm(dx/dab/dxn) ·
+    /// gdn 12종 · attn 5종 · gemv_dev(dx32/dy, 선형 전수 최대치) ·
+    /// head(head_w/head_out — upload_head 소관).
+    fn warm_for_capture(&mut self) -> Result<(), String> {
+        self.ensure_chain_bufs()?;
+        self.ensure_norm_bufs(1)?;
+        self.ensure_gdn_bufs(1)?;
+        self.ensure_attn_bufs(1)?;
+        let (mut mk, mut mn) = (0usize, 0usize);
+        for &(_, _, n, k) in self.lins.values() {
+            mk = mk.max(k);
+            mn = mn.max(n);
+        }
+        if mk > self.dx32_cap {
+            if self.dx32 != 0 {
+                self.cc.free(self.dx32)?;
+            }
+            self.dx32 = 0; // G1 관례: 실패 시 재시도 이중해제 방지.
+            self.dx32_cap = 0;
+            self.dx32 = self.cc.alloc(mk * 4)?;
+            self.dx32_cap = mk;
+        }
+        if mn > self.y_cap {
+            if self.dy != 0 {
+                self.cc.free(self.dy)?;
+            }
+            self.dy = 0;
+            self.y_cap = 0;
+            self.dy = self.cc.alloc(mn * 4)?;
+            self.y_cap = mn;
+        }
+        Ok(())
     }
 
     /// 그래프 준비(슬롯·head 모드별 1회) — 버퍼 워밍업 → 캡처 → 인스턴스화.
@@ -1637,32 +1674,7 @@ impl W4a16Dec {
             self.graph_handle = std::ptr::null_mut();
             self.graph_slot = usize::MAX;
         }
-        // 1) 버퍼 워밍업(alloc·zero_dev는 캡처 밖에서만 — 캡처 중 cuMemAlloc은
-        // 금지 API라 드라이버 내부 크래시(instantiate SIGSEGV)를 유발한다).
-        self.ensure_chain_bufs()?;
-        self.ensure_norm_bufs(1)?;
-        self.ensure_gdn_bufs(1)?;
-        self.ensure_attn_bufs(1)?;
-        // gemv_dev 캐시(dx32/dy)는 지연 할당 — 선형 전수 최대치로 워밍.
-        let (mut mk, mut mn) = (0usize, 0usize);
-        for &(_, _, n, k) in self.lins.values() {
-            mk = mk.max(k);
-            mn = mn.max(n);
-        }
-        if mk > self.dx32_cap {
-            if self.dx32 != 0 {
-                self.cc.free(self.dx32)?;
-            }
-            self.dx32 = self.cc.alloc(mk * 4)?;
-            self.dx32_cap = mk;
-        }
-        if mn > self.y_cap {
-            if self.dy != 0 {
-                self.cc.free(self.dy)?;
-            }
-            self.dy = self.cc.alloc(mn * 4)?;
-            self.y_cap = mn;
-        }
+        self.warm_for_capture()?;
         // 2) 실스트림·pinned 1회 준비.
         if self.pin_embed.is_null() {
             self.cc.create_stream()?;
