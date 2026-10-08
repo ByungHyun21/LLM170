@@ -222,7 +222,10 @@ extern "C" __global__ void w4a16_gemm_g128(
     const int o = o0 + g;
     const bool live = (o < n) && (t > 0) && (t <= G4_TMAX);
     __shared__ float sc[G4_ROWS][G4_SCMAX];
-    __shared__ float xs[G4_TMAX][G4_KC];
+    // x 스테이징 = 전치+패딩 레이아웃([il][12]): 레인당 float4 2회 판독
+    // (종전 8회 스칼라 — L1TEX 트래픽 ÷4). 12 = 8토큰 + 4패딩(16B 정렬·
+    // 뱅크 충돌 회피: 행 stride 48B).
+    __shared__ float xs[G4_KC][12];
     __shared__ double red[G4_ROWS][G4_LANES];
     float acc[G4_TMAX];
 #pragma unroll
@@ -243,7 +246,7 @@ extern "C" __global__ void w4a16_gemm_g128(
             const int ti = idx / G4_KC;
             const int il = idx - ti * G4_KC;
             const int gi = base + il;
-            xs[ti][il] = (ti < t && gi < k) ? x[(size_t)ti * k + gi] : 0.0f;
+            xs[il][ti] = (ti < t && gi < k) ? x[(size_t)ti * k + gi] : 0.0f;
         }
         __syncthreads();
         if (live) {
@@ -257,12 +260,17 @@ extern "C" __global__ void w4a16_gemm_g128(
                     const unsigned qw = __ldcs(&qrow[i >> 3]); // 가중치 1회 = t토큰 공유
                     const int v = (int)((qw >> (4 * li)) & 0xFu) - 8;
                     const float w = (float)v * sc[g][i >> 7];
-#pragma unroll
-                    for (int ti = 0; ti < G4_TMAX; ++ti) {
-                        if (ti < t) {
-                            acc[ti] += w * xs[ti][il];
-                        }
-                    }
+                    // 전치 패딩 레이아웃에서 float4 2회로 8토큰 판독(smem 트래픽 ÷4).
+                    const float4 xa = *reinterpret_cast<const float4*>(&xs[il][0]);
+                    const float4 xb = *reinterpret_cast<const float4*>(&xs[il][4]);
+                    if (t > 0) acc[0] += w * xa.x;
+                    if (t > 1) acc[1] += w * xa.y;
+                    if (t > 2) acc[2] += w * xa.z;
+                    if (t > 3) acc[3] += w * xa.w;
+                    if (t > 4) acc[4] += w * xb.x;
+                    if (t > 5) acc[5] += w * xb.y;
+                    if (t > 6) acc[6] += w * xb.z;
+                    if (t > 7) acc[7] += w * xb.w;
                 }
             }
         }
