@@ -30,7 +30,6 @@ pub(crate) fn arg_num<T: std::str::FromStr>(args: &[String], i: usize, d: T) -> 
 // 5. 종단 최종 상태가 버전 간 유일 불변량(형상이 다르면 중간값 비교 무의미).
 
 mod diag;
-mod exl3;
 mod misc;
 mod q4;
 mod w4a16;
@@ -43,7 +42,6 @@ pub use q4::run_check;
 pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     diag::try_run(cmd, args)
         .or_else(|| q4::try_run(cmd, args))
-        .or_else(|| exl3::try_run(cmd, args))
         .or_else(|| w4a16::try_run(cmd, args))
         .or_else(|| misc::try_run(cmd, args))
 }

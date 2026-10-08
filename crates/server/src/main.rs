@@ -1,13 +1,9 @@
 //! llm170 CLI.
 //!
-//! - gguf-dump: 모델 구조·양자화 믹스 덤프 (무게 미로딩)
 //! - infer: qwen35 CPU 참조 추론 (greedy). 토큰 id 입력 — 토크나이저는 후속 단계.
 
 mod bench;
 mod engine;
-mod exl3_cuda_engine;
-mod exl3_engine;
-mod exl3_hip_engine;
 mod http;
 mod infer;
 mod json;
@@ -33,55 +29,23 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = r#"
-llm170 — 순수 Rust 추론 엔진 (CPU·HIP·Vulkan·CUDA)
+llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일, plans/w4a16-cuda.md)
 
 주요 커맨드:
-  llm170 gguf-dump [--meta-only] [--limit N] <file.gguf>
-      GGUF 메타데이터·텐서 구성 덤프 (무게 미로딩)
-  llm170 infer --model <file.gguf|exl3_dir> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
-              [--n-predict N] [--ctx N] [--backend cpu|hip|vulkan|cuda] [--spec k]
+  llm170 infer --model <w4a16_dir> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
+              [--n-predict N] [--ctx N] [--backend cpu]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
-      --prompt-tokens 반복 = 병렬 시퀀스(np). CUDA는 EXL3 디렉터리 단일 슬롯 순차 디코드만 지원.
-  llm170 serve --model <file.gguf|exl3_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan|cuda] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
-      OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯(기본 1).
-  llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
-            [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
-      비전 인코딩 + LLM 스플라이스 추론.
-  llm170 bench --model <file.gguf> [--pp N] [--tg N] [--reps N] [--ctx N]
-              [--backend cpu|hip|vulkan] [--spec k]
-      llama-bench 규격 PP/TG 측정 (t/s).
-  llm170 check <model.gguf> [--quick] [--backend cpu|hip|vulkan]
-      텐서 스캔(NaN/Inf) + GPU↔CPU GEMM 상호검증 + 장문 청크 스모크.
-  llm170 w4a8-check <file> <tensor> [t] [rows]
-      W4A8 변형 ↔ f32 기준 상호검증.
-  llm170 dequant <file> <tensor> <row> <n>
-      디양자화 값 프로브.
-  llm170 perplexity --model <file.gguf> --prompt-tokens <ids> [--ctx N]
-      NLL·perplexity 산출 (품질 게이트, CPU 전용).
-  llm170 exl3-load [exl3_dir]
-      EXL3 모델 레지스트리 구축 + §7.1 완전성 검증 (mmap).
-  llm170 exl3-check [exl3_dir] [q8.gguf]
-      EXL3 트렐리스 디코드 ↔ GGUF Q8 대조 (K=3/4/5 corr 기준 0.97).
-  llm170 exl3-vk-check [exl3_dir] [tensor-key]
-      EXL3 vk 3커널(had_in/gemv/had_out)+FFN ew(silu·mul) ↔ CPU 미러 비트/FMA/허용치 검증 + 속도.
-  llm170 exl3-pp [exl3_dir] [token_ids] [n_predict]
-      EXL3 T-배치 프리필(하다마드/GEMM/GDN 청크) — 순차 대비 로짓·토큰 검증 + pp t/s (plans/121).
+  llm170 serve --model <w4a16_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu]
+      OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯.
   llm170 w4a16-load <dir>
       W4A16(compressed-tensors int4 sym g128) 로더 완전성 검증 — 트리플·커버리지.
-
-개발 프로브 (backend-gpu 검증·타이밍):
-  rawhip-check <file> <tensor>   HIP GEMV ↔ CPU 미러 to_bits 검증
-  gpu-raw-probe [iters]          원시 런치 오버헤드
-  dims <file> [tensor...]        텐서 차원 조회
-  mm-bench2 | mm-bench | mm-tile | launch-probe | bw-test | dp4a-test
-  tty-probe [file]               타입별 텐서 수·용량 집계
-  vk-check                       Vulkan 장치·coopmat·axpy 스모크
-  vk-gemv-check <file> <tensor> [t]   엔진 경로(quant+gemv3) GEMV 검증
-  vk-gemv8-check <file> <tensor> [t]  gemv8 패밀리 검증+타이밍
-  vk-frame-check <file> <tensor>       vk 프레임 코어(버퍼/EW/GEMM) CPU 대조
-  gdn-check | subsum-check       GDN/서브그룹 축소 커널 검증
-  qk-check | iq3s-probe          qk_rope/iq3_s 커널 검증
+  llm170 tokenize --model <dir> (--text <s> | --file <f> | --stdin)
+      토크나이저 인코딩 [id, ...] 출력.
   llm170 help
+
+방향 전환(2026-10-08 — 사용자 지시): EXL3·GGUF·HIP·Vulkan은 **탈락** —
+해당 모델/백엔드는 명시 에러로 안내한다. CUDA W4A16 서빙(가속 커널)은
+plans/w4a16-cuda.md §2(W2/W3)에서 개발 중이며, 그 전까지 W4A16은 CPU 참조로 돈다.
 "#;
 
 /// 모델 적재 서브커맨드 공용 인자 (plans/78 R5) — main에서 1회 파싱해
@@ -228,10 +192,7 @@ fn run_main() -> ExitCode {
     // 대상 판정은 resource::guard_target 순수함수(A2/R1 추출, plans/129) —
     // 서브커맨드×인자 형태 계약은 표 테스트(guard_target_cases)가 고정하고
     // 무가드 적재 프로브 폐쇄(A13)도 같은 표가 담당한다.
-    if !matches!(
-        args.first().map(String::as_str),
-        Some("gguf-dump") | Some("tokenize")
-    ) {
+    if !matches!(args.first().map(String::as_str), Some("tokenize")) {
         // 가드 대상 판정은 resource::guard_target 순수함수(A2/R1 추출, plans/129) —
         // 표 테이블 테스트가 계약을 고정한다(무가드 프로브 폐쇄 A13 포함).
         if let Some(gt) = resource::guard_target(
@@ -289,7 +250,6 @@ fn run_main() -> ExitCode {
         return code;
     }
     match args.first().map(String::as_str) {
-        Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
         Some("infer") => infer::cmd_infer(&ma.rest, &ma),
         Some("serve") => cmd_serve(&ma.rest, &ma),
         Some("vl") => vl::cmd_vl(&ma.rest, &ma),
@@ -298,8 +258,6 @@ fn run_main() -> ExitCode {
         Some("check") => probes::run_check(&args[1..]),
         Some("mod-check") => modcheck::cmd_mod_check(&args[1..]),
         Some("tokenize") => cmd_tokenize(&ma),
-        Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
-        Some("dequant") => cmd_dequant(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -349,8 +307,8 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let Some(model_path) = ma.model.clone().map(PathBuf::from) else {
         return usage_err("--model required");
     };
-    // P0-4(§10-1·B22): 포맷 스니핑을 최우선 — 무거운 tokenizer 적재 전에
-    // 미지원 포맷(W4A16 등)을 명시 에러로 돌려준다(정체불명 실패 차단).
+    // 방향 전환(2026-10-08, plans/w4a16-cuda.md §5): 수용 모델은 W4A16
+    // 디렉터리 단일 — EXL3·GGUF는 스니핑 단계에서 탈락 에러.
     let fmt = match engine::sniff_format(&model_path) {
         Ok(f) => f,
         Err(e) => {
@@ -358,27 +316,18 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // §3.5 A안: W4A16 디렉터리는 qwen35 경로로 직접 로드. 현재 CPU 전용
-    // (가속 커널 미구현) — GPU 백엔드 지정은 정직 계약으로 명시 거부(B21).
-    if fmt == engine::ModelFormat::W4A16 && backend != "cpu" {
+    let _ = fmt; // W4A16 단일(현재)
+    // W4A16은 CPU 전용(가속 커널 미구현 — W2) — GPU 백엔드 지정은 정직 거부.
+    if backend != "cpu" {
         eprintln!(
-            "error: W4A16 직접 로드는 아직 CPU 전용(가속 커널 미구현 — plans/w4a16-cuda.md W2): --backend cpu"
+            "error: W4A16은 아직 CPU 전용(가속 커널 미구현 — plans/w4a16-cuda.md W2): --backend cpu"
         );
         return ExitCode::FAILURE;
     }
-    // A12(plans/129): exl3-hip 단일 슬롯 — --slots>1이 슬롯 상태를 파괴했다.
-    // 진입 거부가 계약상 정확. vk·cuda는 슬롯별 상태라 다중 슬롯 지원(S8).
-    if fmt == engine::ModelFormat::Exl3 && gpu_runtime == "hip" && slots.unwrap_or(1) > 1 {
-        return usage_err("EXL3 hip 백엔드는 단일 슬롯만 지원 --slots 1");
-    }
-    // P0-3(plans/cuda-models.md §3.2·B9, 2026-10-08): EXL3 CUDA --spec 개방 —
-    // M4 임계 종결(mtp 프로브 ALL PASS) 후 mtp_cuda 배선 완료. 종전 거부 폐지.
+    // W4A16은 MTP 미매핑 — 스펙 디코드는 후속(§2 W4).
     if spec_k > 0 {
-        // GPU 스펙 경로 강제 (스레드 기동 전 단일 스레드 시점 env 설정).
-        // 안전성: 이 시점은 단일 스레드 (엔진/슬롯 스레드 기동 전).
-        unsafe { std::env::set_var("LLM170_SPEC_GPU", "1") };
-        let _ = crate::engine::SPEC_K.set(spec_k);
-        eprintln!("# spec: k={spec_k} (MTP 스펙 디코드)");
+        eprintln!("error: W4A16은 --spec 미지원(MTP 미매핑 — plans/w4a16-cuda.md §2)");
+        return ExitCode::FAILURE;
     }
     // 토크나이저 적재 (part1 메타 → 실패시 part2)
     let part2 = part2_path(&model_path);
@@ -418,30 +367,9 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         ple_table: ma.ple_table.clone(),
         ple_cache_mib: ma.ple_cache_mib,
     };
-    // 포맷 라우팅(사용자 계약 2026-10-05 계승): EXL3 디렉터리는
-    // --backend 런타임(hip|vulkan|cuda)으로 엔진을 고른다. cpu+EXL3은
-    // 명확한 에러(무음 Q4 로드 실패 방지).
-    if fmt == engine::ModelFormat::Exl3 && backend != "gpu" {
-        eprintln!("error: EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan|cuda");
-        return ExitCode::FAILURE;
-    }
-    let sel = if fmt == engine::ModelFormat::Exl3 {
-        if gpu_runtime == "vulkan" {
-            engine::BackendSel::Exl3
-        } else if gpu_runtime == "cuda" {
-            engine::BackendSel::Exl3Cuda
-        } else {
-            engine::BackendSel::Exl3Hip
-        }
-    } else if backend == "gpu" {
-        if gpu_runtime.is_empty() {
-            engine::BackendSel::Gpu
-        } else {
-            engine::BackendSel::GpuRuntime(gpu_runtime)
-        }
-    } else {
-        engine::BackendSel::Cpu
-    };
+    // 라우팅: W4A16 = qwen35 CPU 경로 단일(가속은 W2 커널 이후).
+    let _ = gpu_runtime;
+    let sel = engine::BackendSel::Cpu;
     match http::serve(&format!("127.0.0.1:{port}"), req, sel, slots, queue) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -518,185 +446,6 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
             .join(", ")
     );
     ExitCode::SUCCESS
-}
-
-fn cmd_gguf_dump(args: &[String]) -> ExitCode {
-    let mut meta_only = false;
-    let mut limit = None;
-    let mut path: Option<PathBuf> = None;
-
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--meta-only" => meta_only = true,
-            "--limit" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
-                Some(n) => limit = Some(n),
-                None => {
-                    eprintln!("--limit requires a number");
-                    return ExitCode::from(2);
-                }
-            },
-            other if !other.starts_with("--") => {
-                if path.is_some() {
-                    eprintln!("multiple input files given");
-                    return ExitCode::from(2);
-                }
-                path = Some(PathBuf::from(other));
-            }
-            other => {
-                eprintln!("unknown flag: {other}");
-                return ExitCode::from(2);
-            }
-        }
-    }
-
-    let Some(path) = path else {
-        eprintln!("gguf-dump: input file required\n\n{USAGE}");
-        return ExitCode::from(2);
-    };
-
-    llm170_diag::span::reset();
-    let f = {
-        llm170_diag::profile_span!("cli::gguf-dump::total");
-        let f = match llm170_gguf::GgufFile::open(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        llm170_gguf::write_dump(&f, limit, meta_only, &mut std::io::stdout()).ok();
-        f
-    };
-    drop(f);
-
-    if let Some(rep) = llm170_diag::span::report() {
-        eprint!("\n{rep}");
-    }
-    ExitCode::SUCCESS
-}
-
-/// llm170 dequant <file> <tensor> <row> <n> — 디양자화 값 프로브 (검증용)
-fn cmd_dequant(args: &[String]) -> ExitCode {
-    if args.len() != 4 {
-        eprintln!("usage: llm170 dequant <file> <tensor> <row> <n>");
-        return ExitCode::from(2);
-    }
-    let f = match llm170_gguf::GgufFile::open(std::path::Path::new(&args[0])) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let t = match f.find_tensor(&args[1]) {
-        Some(t) => t,
-        None => {
-            eprintln!("tensor not found: {}", args[1]);
-            return ExitCode::FAILURE;
-        }
-    };
-    let (row, n): (u64, usize) = match (args[2].parse(), args[3].parse()) {
-        (Ok(r), Ok(nn)) => (r, nn),
-        _ => {
-            eprintln!("error: <row>/<n> must be integers");
-            return ExitCode::FAILURE;
-        }
-    };
-    use std::os::unix::fs::FileExt;
-    let file = match std::fs::File::open(&args[0]) {
-        Ok(fl) => fl,
-        Err(e) => {
-            eprintln!("error: open {}: {e}", args[0]);
-            return ExitCode::FAILURE;
-        }
-    };
-    let k = t.ne[0];
-    let (blck, bsize) = t.ty.block_info();
-    let row_bytes = (k / blck * bsize) as usize;
-    let Some((start, _)) = t.file_range(f.data_offset) else {
-        eprintln!("error: tensor file range 없음");
-        return ExitCode::FAILURE;
-    };
-    let mut buf = vec![0u8; row_bytes];
-    if let Err(e) = file.read_exact_at(&mut buf, start + row * row_bytes as u64) {
-        eprintln!("error: read row {row}: {e}");
-        return ExitCode::FAILURE;
-    }
-    let mut out = vec![0.0f32; k as usize];
-    llm170_core::quant::dequant_row(t.ty, &buf, 0, k, &mut out);
-    // A21b(plans/129): n>k 슬라이스 패닉 — 클램프(k가 실제 상한).
-    let show = n.min(k as usize);
-    let vals: Vec<String> = out[..show].iter().map(|v| format!("{v:.6}")).collect();
-    println!("[{}] row {row}: {}", t.ty.name(), vals.join(", "));
-    ExitCode::SUCCESS
-}
-
-/// llm170 w4a8-check <file> <tensor> [t] [rows] — W4A8 변형 ↔ f32 기준 상호검증.
-fn cmd_w4a8_check(args: &[String]) -> ExitCode {
-    if args.len() < 2 {
-        eprintln!("usage: llm170 w4a8-check <file> <tensor> [t] [rows]");
-        return ExitCode::from(2);
-    }
-    let model = match llm170_core::qwen35::Model::load(std::path::Path::new(&args[0])) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let w = match model.w(&args[1]) {
-        Some(w) => w,
-        None => {
-            eprintln!("tensor not found: {}", args[1]);
-            return ExitCode::FAILURE;
-        }
-    };
-    let t: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
-    let rows: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(256);
-    let rows = rows.min(w.n_out as usize);
-    let n_in = w.n_in as usize;
-    let mut seed = 0x1234_5678u64;
-    let mut lcg = || {
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 1.0
-    };
-    let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
-    let wsub = llm170_core::matmul::Weight {
-        data: &w.data[..rows * (n_in / w.ty.blck_size() as usize) * w.ty.type_size() as usize],
-        aux: None,
-        ty: w.ty,
-        n_in: w.n_in,
-        n_out: rows as u64,
-    };
-    let mut couts = vec![vec![0.0f32; rows]; t];
-    llm170_core::matmul::matmul_batch(&xs, &wsub, &mut couts);
-    let mut wouts = vec![vec![0.0f32; rows]; t];
-    for (xi, wo) in xs.iter().zip(wouts.iter_mut()) {
-        llm170_core::matmul::matmul_w4a8(xi, &wsub, wo);
-    }
-    let (mut max_abs, mut max_mag) = (0.0f64, 0.0f64);
-    for ti in 0..t {
-        for o in 0..rows {
-            let (g, c) = (wouts[ti][o], couts[ti][o]);
-            max_abs = max_abs.max((g - c).abs() as f64);
-            max_mag = max_mag.max(c.abs() as f64);
-        }
-    }
-    let rel = max_abs / max_mag;
-    println!(
-        "[{}] {} t={t} rows={rows}: max_abs={max_abs:.3e} rel(vs max|y|)={rel:.3e}",
-        w.ty.name(),
-        args[1]
-    );
-    if rel > 2e-2 {
-        eprintln!("MISMATCH (rel > 2e-2)");
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
 }
 
 fn parse_ids(s: &str) -> Result<Vec<u32>, std::num::ParseIntError> {

@@ -254,7 +254,7 @@ pub fn guard_target(
     // 메타데이터/행 판독만 읽는 서브커맨드 — 무게 미적재. dequant는 무게
     // 텐서 1행(≤수백KB)만 판독하므로 적재 계정 대상이 아니다(B2 검증 워크플로
     // 가드 우회가 아니라 계약 — 모델 상주 불가 기기에서도 판독 가능해야 한다).
-    if matches!(sub, "gguf-dump" | "tokenize" | "dequant") {
+    if matches!(sub, "tokenize") {
         return None;
     }
     let mut path = model.map(std::path::PathBuf::from);
@@ -615,18 +615,7 @@ mod tests {
             Some(("/m/w4a16".into(), false))
         );
         // 메타·행 판독 서브커맨드 → None
-        assert!(guard_target("gguf-dump", None, None, None, &s(&[])).is_none());
         assert!(guard_target("tokenize", Some("/m/a.gguf"), None, None, &s(&[])).is_none());
-        assert!(
-            guard_target(
-                "dequant",
-                None,
-                None,
-                None,
-                &s(&["/m/a.gguf", "t", "0", "8"])
-            )
-            .is_none()
-        );
         // 무모델 로딩 창구 → None(로더/CLI 에러가 더 정확 — bench는 --model required)
         assert!(guard_target("bench", None, Some("gpu"), None, &s(&[])).is_none());
         assert!(guard_target("infer", None, None, None, &s(&[])).is_none());

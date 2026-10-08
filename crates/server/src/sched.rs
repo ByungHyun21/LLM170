@@ -292,7 +292,7 @@ impl Sched {
 
 pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slots: usize) {
     // plans/130 F5: EOS 하드코드 248044 → 모델 메타 파생(Q4=GGUF 메타,
-    // EXL3=tokenizer_config.json, Q35=아키텍처 상수 — Engine::eos).
+    // Q35=아키텍처 상수 — Engine::eos).
     let eos = eng.eos();
     // 기동 워밍업 — 첫 요청이 지연 초기화(raw_init, ctx 비례 수십 초)를
     // 뒤집어쓰지 않도록 여기서 소진하고 상태를 되돌린다. 준비 전에는 /health가
@@ -311,27 +311,6 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 .prefill(0, &warm)
                 .and_then(|_| e.decode1(0, 1u32).map(|_| ()))
                 .map_err(|e| e.to_string()),
-            Engine::Exl3(e) => e
-                .prefill(0, &warm)
-                .and_then(|l| {
-                    let t = llm170_core::qwen35::greedy(&l);
-                    e.decode1(0, t).map(|_| ())
-                })
-                .map_err(|e| e.to_string()),
-            Engine::Exl3Cuda(e) => e
-                .prefill(0, &warm)
-                .and_then(|l| {
-                    let t = llm170_core::qwen35::greedy(&l);
-                    e.decode1(0, t).map(|_| ())
-                })
-                .map_err(|e| e.to_string()),
-            Engine::Exl3Hip(e) => e
-                .prefill(&warm)
-                .and_then(|l| {
-                    let t = llm170_core::qwen35::greedy(&l);
-                    e.decode1(t).map(|_| ())
-                })
-                .map_err(|e| e.to_string()),
         };
         if let Err(err) = w {
             eprintln!("# warmup 실패(치명 아님): {err}");
@@ -339,17 +318,6 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         match &mut eng {
             Engine::Q35(e) => e.reset_states(),
             Engine::Q4(e) => e.reset_states(),
-            Engine::Exl3(e) => e.reset_states(),
-            Engine::Exl3Cuda(e) => {
-                if let Err(err) = e.reset_states() {
-                    eprintln!("# cuda 리셋 실패: {err}");
-                }
-            }
-            Engine::Exl3Hip(e) => {
-                if let Err(err) = e.reset_seq() {
-                    eprintln!("# hip 리셋 실패: {err}");
-                }
-            }
         }
     }
     crate::http::READY.store(true, std::sync::atomic::Ordering::Release);
@@ -595,207 +563,6 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         q4_plain_decode(e, &mut slots, &active);
                     }
                 }
-                Engine::Exl3Cuda(e) => {
-                    // cuda 경로(rawcuda 포팅, plans/124). greedy 슬롯이
-                    // 2개 이상이면 슬롯 간 배치로 한 번에 돈다(gemv_t —
-                    // 행별 T=1 순차와 비트동일, plans/cuda-port.md §1).
-                    // greedy 1개는 기존 step_tok_device 기본선(게이트
-                    // 무변화), 샘플링 슬롯은 로짓 판이 필요해 단슬롯.
-                    // P0-3(plans/cuda-models.md §3.2·B9): spec_k>0 그리디
-                    // 슬롯은 MTP 스펙 라운드(hip 분기 미러) — 실패 시
-                    // 단슬롯 폴백.
-                    let (spec_slots, rest): (Vec<usize>, Vec<usize>) =
-                        active.iter().copied().partition(|&i| {
-                            !sampling(&slots[i])
-                                && slots[i]
-                                    .job
-                                    .as_ref()
-                                    .map(|j| j.spec_k.clamp(0, 4))
-                                    .unwrap_or(0)
-                                    > 0
-                                && e.has_mtp()
-                        });
-                    for &i in &spec_slots {
-                        let k = slots[i]
-                            .job
-                            .as_ref()
-                            .map(|j| j.spec_k.clamp(0, 4))
-                            .unwrap_or(0);
-                        match e.spec_round(i, k) {
-                            Ok(toks) => {
-                                let cap = slots[i]
-                                    .job
-                                    .as_ref()
-                                    .map(|j| j.n_predict)
-                                    .unwrap_or(usize::MAX);
-                                for &t in &toks {
-                                    if slots[i].generated as usize >= cap {
-                                        break;
-                                    }
-                                    slot_emit(&mut slots[i], t);
-                                    if t == eos {
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                eprintln!("# cuda mtp spec 실패({err}) — 일반 디코드로");
-                                if let Ok(l) = e.decode1(i, slots[i].next) {
-                                    let t = llm170_core::qwen35::greedy(&l);
-                                    slot_emit(&mut slots[i], t);
-                                } else {
-                                    slot_fail(&mut slots[i], format!("cuda spec+decode1: {err}"));
-                                }
-                            }
-                        }
-                    }
-                    let active = rest;
-                    let (batch, solo): (Vec<usize>, Vec<usize>) =
-                        active.iter().copied().partition(|&i| !sampling(&slots[i]));
-                    // 단슬롯 1스텝 공용 — greedy는 step_tok_device(GPU
-                    // argmax), 샘플링은 decode1 로짓 판.
-                    let step_one = |e: &mut crate::exl3_cuda_engine::Exl3CudaEngine,
-                                    slots: &mut [Slot],
-                                    i: usize| {
-                        let next = slots[i].next;
-                        let greedy = !slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
-                        let r: Result<Vec<u32>, String> = if greedy {
-                            e.step_tok_device(i, next).map(|t| vec![t])
-                        } else {
-                            e.decode1(i, next).map(|l| vec![pick(&mut slots[i], &l)])
-                        };
-                        match r {
-                            Ok(toks) => {
-                                let cap = slots[i]
-                                    .job
-                                    .as_ref()
-                                    .map(|j| j.n_predict)
-                                    .unwrap_or(usize::MAX);
-                                for &t in &toks {
-                                    if slots[i].generated as usize >= cap {
-                                        break;
-                                    }
-                                    slot_emit(&mut slots[i], t);
-                                    if t == eos {
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                eprintln!("# cuda decode 실패(slot{i}): {err}");
-                                slot_fail(&mut slots[i], format!("cuda decode1: {err}"));
-                            }
-                        }
-                    };
-                    if batch.len() >= 2 {
-                        let items: Vec<(usize, u32)> =
-                            batch.iter().map(|&i| (i, slots[i].next)).collect();
-                        match e.step_batch(&items) {
-                            Ok(toks) => {
-                                for (k, &i) in batch.iter().enumerate() {
-                                    let cap = slots[i]
-                                        .job
-                                        .as_ref()
-                                        .map(|j| j.n_predict)
-                                        .unwrap_or(usize::MAX);
-                                    // [배치 소비 계약] decode_batch_slots는
-                                    // 전 슬롯 상태를 이미 1스텝 전진시켰다 —
-                                    // 한 슬롯의 cap/EOS 사정으로 청크의 다른
-                                    // 슬롯 방출을 건너뛰면(break) 그 슬롯들이
-                                    // 토큰 없이 상태만 전진해 어긋난다(과거
-                                    // 잠재 결함). 완료 판정(eos·stops·
-                                    // n_predict)은 아래 공통 finish_slot이
-                                    // 담당하므로 여기선 방출만 한다.
-                                    if slots[i].generated as usize >= cap {
-                                        continue;
-                                    }
-                                    slot_emit(&mut slots[i], toks[k]);
-                                }
-                            }
-                            Err(err) => {
-                                // 배치 거절(예: 한 슬롯의 문맥 초과)은 그
-                                // 슬롯만 실패시키도록 단슬롯 경로로 물러난다
-                                // — 나머지 슬롯이 연쇄 실패하지 않게.
-                                eprintln!("# cuda 슬롯 간 배치 실패({err}) — 단슬롯 폴백");
-                                for &i in &batch {
-                                    step_one(e, &mut slots, i);
-                                }
-                            }
-                        }
-                    } else {
-                        for &i in &batch {
-                            step_one(e, &mut slots, i);
-                        }
-                    }
-                    for &i in &solo {
-                        step_one(e, &mut slots, i);
-                    }
-                }
-                Engine::Exl3Hip(e) => {
-                    // hip 기본 경로(단일 슬롯 — plans/121 exl3-sched). greedy는
-                    // step_tok(GPU argmax, plans/130 A2), spec_k>0면 MTP 라운드
-                    // (D2 — 롤백 포함, k≤4). 샘플링 슬롯은 로짓 판.
-                    for &i in &active {
-                        let next = slots[i].next;
-                        let greedy = !slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
-                        let k = slots[i]
-                            .job
-                            .as_ref()
-                            .map(|j| j.spec_k)
-                            .unwrap_or(0)
-                            .clamp(0, 4);
-                        let r: Result<Vec<u32>, String> = if greedy && k > 0 {
-                            e.spec_round(k)
-                        } else if greedy {
-                            e.step_tok(next).map(|t| vec![t])
-                        } else {
-                            e.decode1(next).map(|l| vec![pick(&mut slots[i], &l)])
-                        };
-                        match r {
-                            Ok(toks) => {
-                                let cap = slots[i]
-                                    .job
-                                    .as_ref()
-                                    .map(|j| j.n_predict)
-                                    .unwrap_or(usize::MAX);
-                                for &t in &toks {
-                                    if slots[i].generated as usize >= cap {
-                                        break;
-                                    }
-                                    slot_emit(&mut slots[i], t);
-                                    if t == eos {
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                eprintln!("# hip decode 실패({err})");
-                                slot_fail(&mut slots[i], format!("hip decode1: {err}"));
-                            }
-                        }
-                    }
-                }
-                Engine::Exl3(e) => {
-                    // EXL3 (plans/121 A1) — 슬롯별 순차 디코드(tg 4.69 t/s).
-                    // np 배치·스펙 미보유 — greedy 최적, 샘플링 슬롯은 로짓 판.
-                    for &i in &active {
-                        let next = slots[i].next;
-                        let r = e.decode1(i, next).map(|l| {
-                            if slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy()) {
-                                pick(&mut slots[i], &l)
-                            } else {
-                                llm170_core::qwen35::greedy(&l)
-                            }
-                        });
-                        match r {
-                            Ok(t) => slot_emit(&mut slots[i], t),
-                            Err(err) => {
-                                eprintln!("# exl3 decode 실패({err})");
-                                slot_fail(&mut slots[i], format!("exl3 decode1: {err}"));
-                            }
-                        }
-                    }
-                }
             }
             dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
             // 완료 슬롯 정리 — 결과 전송·반환
@@ -918,31 +685,6 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                             // 단일스트림(측정 승리) 전용.
                             r
                         }
-                        Engine::Exl3Cuda(e) => e.prefill(i, &part).map(|l| {
-                            if samp {
-                                pick(&mut slots[i], &l)
-                            } else {
-                                llm170_core::qwen35::greedy(&l)
-                            }
-                        }),
-                        Engine::Exl3Hip(e) if i == 0 => e.prefill(&part).map(|l| {
-                            if samp {
-                                pick(&mut slots[i], &l)
-                            } else {
-                                llm170_core::qwen35::greedy(&l)
-                            }
-                        }),
-                        Engine::Exl3Hip(_) => Err("hip 단일 슬롯: 슬롯>0 미지원".to_string()),
-                        Engine::Exl3(e) => e
-                            .prefill(i, &part)
-                            .map(|l| {
-                                if samp {
-                                    pick(&mut slots[i], &l)
-                                } else {
-                                    llm170_core::qwen35::greedy(&l)
-                                }
-                            })
-                            .map_err(|e| e.to_string()),
                     };
                     (end, r)
                 };

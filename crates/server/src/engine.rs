@@ -4,39 +4,31 @@ use std::path::PathBuf;
 
 pub enum BackendSel {
     Cpu,
+    /// 후속(W2/W3): CUDA W4A16 가속 부착 경로에서 사용 예정 — 현 프런트
+    /// (serve/infer)는 Cpu 단일이라 아직 생성되지 않는다.
+    #[allow(dead_code)]
     Gpu,
     /// Gpu + 런타임 지정 ("hip"|"vulkan") — serve --gpu-runtime (2026-09-01:
     /// HIP가 폴트로 웨지된 경우 Vulkan 회피).
+    #[allow(dead_code)]
     GpuRuntime(String),
-    /// EXL3 직접 경로 (plans/121 A1) — --model은 EXL3 디렉터리,
-    /// --backend exl3로 지정. vk 배치 프리필+순차 디코드.
-    Exl3,
-    /// EXL3 hip 백엔드(plans/121 exl3-sched) — 단일 슬롯, 배치 프리필+순차 디코드.
-    Exl3Hip,
-    /// EXL3 cuda 백엔드(rawcuda 포팅, plans/124) — 단일 슬롯. S4 배선:
-    /// 라우팅·상주 적재까지, forward 체인은 디코더 G3+ 스텁 위임.
-    Exl3Cuda,
 }
-/// P0-4(§10-1·B22): 모델 경로 포맷 판정 — 디렉터리를 무조건 EXL3으로
-/// 단정하던 종전 라우팅의 정체불명 실패(tokenizer 실패·gate_proj 미등록
-/// 실측)를 명시 에러로 교체. 파일명 하드코딩 금지(내용 기반 판정).
+/// 모델 경로 포맷 판정 — 2026-10-08 방향 전환(plans/w4a16-cuda.md §5):
+/// 수용은 **W4A16 디렉터리 단일**. EXL3·GGUF는 탈락 — 명시 에러로 안내.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ModelFormat {
-    Gguf,
-    Exl3,
-    /// compressed-tensors(weight_packed 3조)·auto-gptq(qweight/qzeros)
-    /// 패킹의 W4A16 계열 — 로더 미구현(P2 §3.5 대기). 인식은 하되
-    /// 명시 에러로 안내한다.
+    /// compressed-tensors(weight_packed 3조)·auto-gptq(qweight/qzeros) 패킹.
     W4A16,
 }
 
-/// 포맷 스니핑: (a) .gguf 파일 → Gguf (b) 디렉터리 → index.json 우선,
-/// 없으면 첫 model*.safetensors 헤더에서 키 탐색(.trellis→Exl3,
-/// weight_packed/qweight→W4A16). 어느 쪽도 아니면 config.json
-/// architectures 유무로 안내 메시지를 갈라 Err.
+/// 포맷 스니핑 — 디렉터리 내 safetensors 내용 기반(index.json 우선, 없으면
+/// 첫 샤드 헤더 접두). GGUF 파일·EXL3 trellis 디렉터리는 탈락 에러.
 pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
     if path.is_file() {
-        return Ok(ModelFormat::Gguf);
+        return Err(format!(
+            "GGUF는 탈락(2026-10-08 — plans/w4a16-cuda.md §5): W4A16 디렉터리만 지원 — {}",
+            path.display()
+        ));
     }
     if !path.is_dir() {
         return Err(format!("모델 경로 없음: {}", path.display()));
@@ -78,19 +70,22 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
         ));
     };
     if hay.contains(".trellis") {
-        return Ok(ModelFormat::Exl3);
+        return Err(format!(
+            "EXL3는 탈락(2026-10-08 — plans/w4a16-cuda.md §5): W4A16 디렉터리만 지원 — {}",
+            path.display()
+        ));
     }
     if hay.contains("weight_packed") || hay.contains("qweight") {
         return Ok(ModelFormat::W4A16);
     }
     if path.join("config.json").is_file() {
         return Err(format!(
-            "미지원 포맷: HF config 배포(architectures) — {} (지원: GGUF 파일·EXL3 trellis 디렉터리)",
+            "미지원 포맷: HF config 배포(architectures) — {} (지원: W4A16 디렉터리)",
             path.display()
         ));
     }
     Err(format!(
-        "모델 디렉터리 포맷 인식 불가: {} (지원: GGUF 파일·EXL3 trellis 디렉터리)",
+        "모델 디렉터리 포맷 인식 불가: {} (지원: W4A16 디렉터리)",
         path.display()
     ))
 }
@@ -122,7 +117,7 @@ pub fn q4_gpu_wanted(backend: &BackendSel) -> bool {
         return false;
     }
     match backend {
-        BackendSel::Cpu | BackendSel::Exl3 | BackendSel::Exl3Hip | BackendSel::Exl3Cuda => false,
+        BackendSel::Cpu => false,
         BackendSel::Gpu => true,
         BackendSel::GpuRuntime(r) => {
             if r != "hip" && r != "vulkan" && r != "cuda" {
@@ -525,21 +520,14 @@ pub static SPEC_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 pub enum Engine {
     Q35(Box<llm170_core::qwen35::Engine>),
     Q4(Box<llm170_core::qwen4exp::layers::Engine4>),
-    /// EXL3 직접 경로 (plans/121 A1) — TrellisResident + 슬롯 SeqState.
-    Exl3(Box<crate::exl3_engine::Exl3Engine>),
-    Exl3Hip(Box<crate::exl3_hip_engine::Exl3HipEngine>),
-    Exl3Cuda(Box<crate::exl3_cuda_engine::Exl3CudaEngine>),
 }
 
 impl Engine {
     /// 정지 토큰(plans/130 F5 — 하드코드 248044 일반화): Q4는 GGUF 메타,
-    /// EXL3는 tokenizer_config.json 파생, Q35는 아키텍처 상수.
+    /// Q35는 아키텍처 상수.
     pub fn eos(&self) -> u32 {
         match self {
             Engine::Q4(e) => e.model.eos,
-            Engine::Exl3(e) => e.eos,
-            Engine::Exl3Hip(e) => e.eos,
-            Engine::Exl3Cuda(e) => e.eos,
             Engine::Q35(_) => llm170_core::qwen35::EOS_EOT,
         }
     }
@@ -574,29 +562,6 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         } else {
             "gguf"
         };
-    // EXL3 직접 경로 (plans/121 A1) — --model은 EXL3 디렉터리.
-    if matches!(backend, BackendSel::Exl3Hip) {
-        let dir = req.model.to_string_lossy().into_owned();
-        let eng = crate::exl3_hip_engine::Exl3HipEngine::load(&dir, 1, req.ctx)
-            .unwrap_or_else(|e| panic!("exl3-hip 엔진 로드 실패: {e}"));
-        banner(&req.model, "exl3", "hip", "full", "on", req.ctx, 1);
-        return Engine::Exl3Hip(Box::new(eng));
-    }
-    if matches!(backend, BackendSel::Exl3Cuda) {
-        // plans/cuda-port.md S8: 슬롯 수가 상태(링/스캔/KV) 할당량을 정한다.
-        let dir = req.model.to_string_lossy().into_owned();
-        let eng = crate::exl3_cuda_engine::Exl3CudaEngine::load(&dir, n_slots, req.ctx)
-            .unwrap_or_else(|e| panic!("exl3-cuda 엔진 로드 실패: {e}"));
-        banner(&req.model, "exl3", "cuda", "full", "on", req.ctx, n_slots);
-        return Engine::Exl3Cuda(Box::new(eng));
-    }
-    if matches!(backend, BackendSel::Exl3) {
-        let dir = req.model.to_string_lossy().into_owned();
-        let eng = crate::exl3_engine::Exl3Engine::load(&dir, n_slots, req.ctx)
-            .unwrap_or_else(|e| panic!("exl3 엔진 로드 실패: {e}"));
-        banner(&req.model, "exl3", "vulkan", "full", "on", req.ctx, n_slots);
-        return Engine::Exl3(Box::new(eng));
-    }
     // plans/111 W4c: PLE 테이블 오프로드 모드(서빙 옵션 → 백엔드 전역).
     // B8(plans/cuda-models.md §5): 구현은 rawhip 전역뿐 — CUDA 런타임은
     // 플래그가 조용히 무시되므로 명시 경고한다.
@@ -613,7 +578,12 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
     if let Some(mib) = req.ple_cache_mib {
         llm170_backend_gpu::set_ple_ssd_cache_mib(mib);
     }
-    let arch = open_with_retry(&req.model).and_then(|g| g.arch().map(|s| s.to_string()));
+    // 아키텍처 판별은 GGUF 파일 전용 — W4A16 디렉터리는 곧장 qwen35 경로.
+    let arch = if req.model.is_dir() {
+        None
+    } else {
+        open_with_retry(&req.model).and_then(|g| g.arch().map(|s| s.to_string()))
+    };
     if arch.as_deref() == Some("qwen4exp") {
         // qwen4exp GPU 경로 — plans/64 P1: 기본 CPU(정확성 기준); --backend gpu
         // 명시 시에만 상주 가속기 부착(attach_q4가 res_f16 원장 105 규칙 적용).
@@ -727,17 +697,6 @@ impl Engine {
         match self {
             Engine::Q35(e) => e.reset_seq(seq),
             Engine::Q4(e) => e.reset_seq(seq),
-            Engine::Exl3(e) => e.reset_seq(seq),
-            Engine::Exl3Hip(e) => {
-                if let Err(err) = e.reset_seq() {
-                    eprintln!("# hip 슬롯 리셋 오류: {err}");
-                }
-            }
-            Engine::Exl3Cuda(e) => {
-                if let Err(err) = e.reset_seq(seq) {
-                    eprintln!("# cuda 슬롯 리셋 오류(slot{seq}): {err}");
-                }
-            }
         }
     }
 }
