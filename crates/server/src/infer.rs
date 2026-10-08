@@ -11,7 +11,6 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let mut n_predict = 32usize;
     let mut ctx = 4096usize;
     let backend = ma.backend.clone().unwrap_or_else(|| "cpu".into());
-    let mut spec_k: Option<usize> = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -32,10 +31,6 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 Some(n) => ctx = n,
                 None => return usage_err("--ctx requires a number"),
             },
-            "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
-                Some(k) if (1..=8).contains(&k) => spec_k = Some(k),
-                _ => return usage_err("--spec requires k in 1..=8"),
-            },
             other => return usage_err(&format!("unknown flag: {other}")),
         }
     }
@@ -54,9 +49,6 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     // W4A16은 CPU 전용(가속 커널 미구현 — W2): GPU 백엔드 지정은 명시 거부.
     if backend != "cpu" {
         return usage_err("W4A16은 아직 CPU 전용(가속 커널 미구현 — W2): --backend cpu");
-    }
-    if spec_k.is_some() {
-        return usage_err("W4A16은 --spec 미지원(MTP 미매핑)");
     }
     let max_prompt = prompts.iter().map(|p| p.len()).max().unwrap();
     if max_prompt + n_predict + 8 >= ctx {
@@ -94,31 +86,15 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     finished[s] = true;
                 }
             }
-            // 생성 — 단일 루프(generate_q35): spec-multi/spec-single/batch.
-            let spec_k: usize = spec_k.unwrap_or(0);
+            // 생성 — 단일 루프(generate_q35).
             let mut st = crate::engine::GenState {
                 finished,
                 gen_toks: gen_tokens,
                 next,
                 pos: prompts.iter().map(|p| p.len() as u32).collect(),
             };
-            let (mode, stats) =
-                crate::engine::generate_q35(&mut eng, &mut st, n_predict, spec_k, eos, &mut InferSink)?;
+            crate::engine::generate_q35(&mut eng, &mut st, n_predict, eos, &mut InferSink)?;
             let gen_tokens = st.gen_toks;
-            match mode {
-                "spec-multi" => eprintln!(
-                    "# spec-multi(k={spec_k}, n={n}): {}사이클, 수용 {}토큰",
-                    stats.cycles, stats.accepted
-                ),
-                "spec" => eprintln!(
-                    "# spec(k={spec_k}): {}사이클, 수용 {}토큰, 타깃 forward {}회 — 수용률/forward {:.2}",
-                    stats.cycles,
-                    stats.accepted,
-                    stats.target_forwards,
-                    stats.accepted as f64 / stats.target_forwards.max(1) as f64
-                ),
-                _ => {}
-            }
             let dt = t_start.elapsed();
             eprintln!(
                 "# done: {} seqs, prompt max {}, gen per seq: {} (elapsed {dt:.1?})",

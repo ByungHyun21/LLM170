@@ -487,7 +487,6 @@ fn enqueue_job(
     let job = SlotJob {
         tokens: ids,
         n_predict,
-        spec_k: crate::engine::SPEC_K.get().copied().unwrap_or(0),
         sampler,
         stops,
         // QA-3: 비스트림도 progress 채널 부여 — 핸들러가 prx를 잡고 폴링
