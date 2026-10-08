@@ -134,6 +134,75 @@ impl Model {
         w4_weight(self, name)
     }
 
+    /// 엔진 접점 이름 전수(상주 로더/W3 배선용).
+    pub fn engine_names(&self) -> Vec<String> {
+        bind::engine_names(&self.cfg)
+    }
+
+    /// 임베딩 행 1개(tok) — W3 GPU 체인 입력(호스트 스테이징).
+    pub fn embed_row(&self, tok: u32) -> Result<Vec<f32>, ModelError> {
+        let Some(bind::Eng::Plain { name, .. }) = bind::eng("token_embd.weight") else {
+            return Err(ModelError::MissingTensor("token_embd.weight".into()));
+        };
+        self.w4
+            .plain_rows_f32(&name, tok as u64, tok as u64 + 1)
+            .map_err(|e| ModelError::W4a16(e.to_string()))
+    }
+
+    /// 원본(HF) 무게 — W3 GPU 체인용. GPU 커널은 순열을 내부에서
+    /// 처리하므로(l2perm scatter·gate p_inv) 순열 사본을 주면 이중 순열이
+    /// 된다. CPU 엔진은 순열 사본(w())을 쓰고, GPU는 이쪽을 쓴다.
+    pub fn w_raw(&self, name: &str) -> Option<Weight<'_>> {
+        w4_weight_raw(&self.w4, name)
+    }
+
+    /// 원본(HF) f32 벡터 — 순열·synth 보정 없이(1D/2D 모두).
+    pub fn raw_f32_vec(&self, name: &str) -> Result<Vec<f32>, ModelError> {
+        let hf = match bind::eng(name) {
+            Some(bind::Eng::Synth { name, .. }) | Some(bind::Eng::Plain { name, .. }) => name,
+            _ => return Err(ModelError::W4a16(format!("{name}: Synth/Plain 아님"))),
+        };
+        let e = self
+            .w4
+            .entry(&hf)
+            .ok_or_else(|| ModelError::MissingTensor(hf.clone()))?;
+        if e.shape.len() == 1 {
+            self.w4
+                .plain_vec_f32(&hf)
+                .map_err(|e| ModelError::W4a16(e.to_string()))
+        } else {
+            // 랭크 ≥2(conv1d는 [conv_ch,1,4]) — 행 원시 바이트 → f32.
+            let rows = *e.shape.first().unwrap_or(&0);
+            let raw = self
+                .w4
+                .raw_rows(&hf, 0, rows)
+                .map_err(|e| ModelError::W4a16(e.to_string()))?;
+            crate::w4a16::decode_f32(&raw, e.dtype, &hf)
+                .map_err(|e| ModelError::W4a16(e.to_string()))
+        }
+    }
+
+    /// Synth 원값(변환 없이) + 순열만 — W3 GPU 조립용.
+    /// (예: A_log — f32_vec는 CPU 계약(-exp)이라 커널이 -exp를 스스로
+    /// 산출하도록 원값이 필요하다.)
+    pub fn synth_raw(&self, name: &str) -> Result<Vec<f32>, ModelError> {
+        match bind::eng(name) {
+            Some(bind::Eng::Synth { name: hf, perm, .. }) => {
+                let raw = self
+                    .w4
+                    .plain_vec_f32(&hf)
+                    .map_err(|e| ModelError::W4a16(e.to_string()))?;
+                Ok(match perm {
+                    1 => bind::permute_heads_f32(&self.cfg, &raw),
+                    2 => bind::conv_rows_f32_permuted(&self.w4, &self.cfg, &hf)
+                        .map_err(|e| ModelError::W4a16(e.to_string()))?,
+                    _ => raw,
+                })
+            }
+            _ => Err(ModelError::W4a16(format!("{name}: Synth 아님"))),
+        }
+    }
+
     /// V축 순열 사본(지연 1회 구축 — 48 선형층 qkv-v/z/out + alpha/beta).
     fn perm_store(&self) -> &bind::PermStore {
         self.perm
@@ -196,6 +265,43 @@ impl Model {
 
     pub fn is_recr(&self, il: usize) -> bool {
         il % self.hp.full_attn_interval != self.hp.full_attn_interval - 1
+    }
+}
+
+/// 원본(HF) Weight 구성 — 순열 사본 비경유(W3 GPU 체인용).
+fn w4_weight_raw<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Weight<'a>> {
+    use crate::wtype::WType;
+    use bind::Eng;
+    match bind::eng(name)? {
+        Eng::Quant { base, .. } => {
+            let (n, k) = w4.lin_shape(&base)?;
+            Some(Weight {
+                data: w4.tensor_slice(&format!("{base}.weight_packed"))?,
+                aux: Some(w4.tensor_slice(&format!("{base}.weight_scale"))?),
+                ty: WType::W4a16G128Split,
+                n_in: k as u64,
+                n_out: n as u64,
+            })
+        }
+        Eng::Plain { name: hf, .. } => {
+            let e = w4.entry(&hf)?;
+            let ty = match e.dtype {
+                crate::st::StDtype::Bf16 => WType::Bf16,
+                crate::st::StDtype::F16 => WType::F16,
+                crate::st::StDtype::F32 => WType::F32,
+                _ => return None,
+            };
+            let n_out = *e.shape.first()?;
+            let n_in = e.shape[1..].iter().product::<u64>();
+            Some(Weight {
+                data: w4.tensor_slice(&hf)?,
+                aux: None,
+                ty,
+                n_in,
+                n_out,
+            })
+        }
+        Eng::Synth { .. } => None,
     }
 }
 

@@ -202,6 +202,43 @@ pub fn eng(name: &str) -> Option<Eng> {
     }
 }
 
+/// 엔진 접점 이름 전수(스테이지가 요구하는 이름) — 상주 로더/W3 배선용.
+/// 층 유형과 무관하게 전 접미사를 열거한다(비실재는 w()가 None으로 걸러냄).
+pub fn engine_names(cfg: &QwenCfg) -> Vec<String> {
+    let mut v = vec![
+        "token_embd.weight".to_string(),
+        "output_norm.weight".to_string(),
+        "output.weight".to_string(),
+    ];
+    for il in 0..cfg.layers {
+        for suf in [
+            "attn_norm.weight",
+            "post_attention_norm.weight",
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "attn_q_norm.weight",
+            "attn_k_norm.weight",
+            "attn_qkv.weight",
+            "attn_gate.weight",
+            "ssm_conv1d.weight",
+            "ssm_dt.bias",
+            "ssm_a",
+            "ssm_alpha.weight",
+            "ssm_beta.weight",
+            "ssm_norm.weight",
+            "ssm_out.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+        ] {
+            v.push(format!("blk.{il}.{suf}"));
+        }
+    }
+    v
+}
+
 /// 순열 사본 저장소 — 엔진 접점의 V축 텐서(HF→subhead-major).
 pub struct PermStore {
     /// quant base → (packed, scale) 순열 사본.

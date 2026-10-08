@@ -45,6 +45,11 @@ pub(crate) fn gdn_layer(
         });
     }
     let [qkv, z, b, a] = group;
+    if il == 0 && llm170_diag::dump::opts().key("debug_layers") {
+        eprintln!("  C0 xn[0..4]={:?}", &xs[0][..4]);
+        eprintln!("  C0 qkv[0..4]={:?}", &qkv[0][..4]);
+        eprintln!("  C0 z[0..4]={:?}", &z[0][..4]);
+    }
 
     let mut beta_all = vec![0.0f32; n_tok * dt_rank];
     let mut g_all = vec![0.0f32; n_tok * dt_rank];
@@ -168,6 +173,10 @@ pub(crate) fn gdn_layer(
         span_block!("cpu::gdn_out", {
             mm_batch(&gated, &wout, &mut out);
         });
+    }
+    if il == 0 && llm170_diag::dump::opts().key("debug_layers") {
+        eprintln!("  C0 gated[0..4]={:?}", &gated[0][..4]);
+        eprintln!("  C0 out[0..4]={:?}", &out[0][..4]);
     }
     Ok(out)
 }
