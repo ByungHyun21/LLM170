@@ -297,6 +297,11 @@ extern "C" __global__ void gdn_l2perm_gather(
 // 공유메모리는 동적 61,828B(최상단 주석 2항). 그리드 (h_v, 1), WG=128.
 #define GDN_CS 32
 #define GDN_TILE 16
+// V축 슬라이스 수 — 1 = 슬라이싱 없음(grid=h_v, 블록 128스레드).
+// [실측 2026-10-08] 4로 올리면 192블록이 되지만 블록당 32스레드가 되어 K축
+// 공통 작업(sk 적재·A/KQ)이 4배로 늘어 오히려 74.6µs(67µs 대비 열화) — 1 유지.
+#define GDN_VSLICE 1
+#define GDN_VW (128 / GDN_VSLICE)
 extern "C" __global__ void gdn_scan(
     const float* __restrict__ q,     // [T][k_len]
     const float* __restrict__ k,     // [T][k_len] L2
@@ -306,36 +311,46 @@ extern "C" __global__ void gdn_scan(
     float* __restrict__ outv,        // [T][h_v*128] o_lc
     int t_len, int h_k, int h_v, int d, int layer)
 {
+    // [2026-10-08 P3-b 후속 — V-슬라이싱] 종전 grid=h_v(27B 48블록) × 128스레드
+    // = 48 SM만 점유(스케줄러당 1워프, IPC 0.11 — 실측 gdn_scan 67µs×48=3.2ms).
+    // V축(128)을 GDN_VSLICE로 잘라 grid=h_v*VSLICE(192블록), 블록=GDN_VW스레드.
+    // V원소별 계산은 독립이라 **비트 안전**(K축·A/KQ는 슬라이스별 중복 — 계획서
+    // §4.4-3의 "A/KQ 중복 무시 가능" 판단 그대로).
     extern __shared__ char smem_raw[];
     __half* sk = (__half*)smem_raw;                    // [CS*128]
-    __half* sv = sk + GDN_CS * 128;                   // [CS*128]
-    __half* A = sv + GDN_CS * 128;                    // [CS*CS]
-    __half* KQ = A + GDN_CS * GDN_CS;                // [CS*CS]
-    __half* KS = KQ + GDN_CS * GDN_CS;               // [CS*128]
-    __half* QS = KS + GDN_CS * 128;                   // [CS*128]
-    float* dc = (float*)(QS + GDN_CS * 128);          // [CS*128] — 4B 정렬(오프셋 36864)
-    float* Stile = dc + GDN_CS * 128;                 // [TILE*128]
-    float* bp = Stile + GDN_TILE * 128;               // [CS]
+    __half* sv = sk + GDN_CS * 128;                   // [CS*GDN_VW]
+    __half* A = sv + GDN_CS * GDN_VW;                 // [CS*CS]
+    __half* KQ = A + GDN_CS * GDN_CS;                 // [CS*CS]
+    __half* KS = KQ + GDN_CS * GDN_CS;                // [CS*GDN_VW]
+    __half* QS = KS + GDN_CS * GDN_VW;                // [CS*GDN_VW]
+    float* dc = (float*)(QS + GDN_CS * GDN_VW);       // [CS*GDN_VW]
+    float* Stile = dc + GDN_CS * GDN_VW;              // [TILE*GDN_VW]
+    float* bp = Stile + GDN_TILE * GDN_VW;            // [CS]
     float* gcs = bp + GDN_CS;                         // [CS+1]
     float* wsm = gcs + (GDN_CS + 1);                  // [CS]
-    int h = blockIdx.x;
+    int h = blockIdx.x / GDN_VSLICE;
+    int vs = (blockIdx.x % GDN_VSLICE) * GDN_VW;
     int kh = h % h_k;
     int tid = threadIdx.x;
     int n_chunks = (t_len + GDN_CS - 1) / GDN_CS;
     // G5 정밀화: rsqrtf(≤2ulp 근사) 대신 IEEE sqrt+div — 호스트 미러와
     // 비트동일(양측 sqrt.rn·div.rn).
     float qscale = 1.0f / sqrtf((float)d);
-    long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    long st_h = (long)layer * h_v * d * d + (long)h * d * d + vs;
 
     for (int c = 0; c < n_chunks; c++) {
         int t0 = c * GDN_CS;
         int n = min(t_len - t0, GDN_CS);
 
-        for (int e = tid; e < GDN_CS * 128; e += 128) {
+        for (int e = tid; e < GDN_CS * 128; e += blockDim.x) {
             int t = e / 128, dv = e % 128;
             bool live = t < n;
             sk[e] = __float2half_rn(live ? k[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f);
-            sv[e] = __float2half_rn(live ? v[(t0 + t) * (h_v * d) + h * 128 + dv] : 0.0f);
+        }
+        for (int e = tid; e < GDN_CS * GDN_VW; e += blockDim.x) {
+            int t = e / GDN_VW, dvl = e % GDN_VW;
+            bool live = t < n;
+            sv[e] = __float2half_rn(live ? v[(t0 + t) * (h_v * d) + h * 128 + vs + dvl] : 0.0f);
         }
         if (tid < GDN_CS) {
             float acc = 0.0f;
@@ -365,7 +380,7 @@ extern "C" __global__ void gdn_scan(
         }
         __syncthreads();
 
-        for (int e = tid; e < GDN_CS * 128; e += 128) {
+        for (int e = tid; e < GDN_CS * GDN_VW; e += blockDim.x) {
             KS[e] = __float2half_rn(0.0f);
             QS[e] = __float2half_rn(0.0f);
         }
@@ -373,13 +388,19 @@ extern "C" __global__ void gdn_scan(
         for (int pass_ = 0; pass_ < 8; pass_++) {
             int s2b = pass_ * GDN_TILE;
             for (int s2p = 0; s2p < GDN_TILE; s2p++)
-                Stile[s2p * 128 + tid] = st[st_h + (long)(s2b + s2p) * d + tid];
+                Stile[s2p * GDN_VW + tid] = st[st_h + (long)(s2b + s2p) * d + tid];
             __syncthreads();
             for (int i = 0; i < GDN_CS; i++) {
+                // T<n 행 스킵 — KS/QS[i≥n]는 소비자(출력·상태 갱신)가 i<n만
+                // 읽으므로 계산·기록 모두 불필요(종전엔 32행 전부 계산 —
+                // T=1 디코드에서 32× 낭비). i<n 값의 산술 순서는 불변.
+                if (i >= n) {
+                    continue;
+                }
                 float ak = 0.0f, aq = 0.0f;
                 int qbase = (t0 + i) * (h_k * d) + kh * 128;
                 for (int s2p = 0; s2p < GDN_TILE; s2p++) {
-                    float s_el = Stile[s2p * 128 + tid];
+                    float s_el = Stile[s2p * GDN_VW + tid];
                     ak += __half2float(sk[i * 128 + s2b + s2p]) * s_el;
                     // T=1이면 i=1..31의 q 행은
                     // 할당되지 않는다. 프로브 T=32에서 숨었던 CUresult=700;
@@ -387,7 +408,7 @@ extern "C" __global__ void gdn_scan(
                     float qv = (i < n) ? q[qbase + s2b + s2p] : 0.0f;
                     aq += qv * s_el;
                 }
-                int ib = i * 128 + tid;
+                int ib = i * GDN_VW + tid;
                 KS[ib] = __float2half_rn(__half2float(KS[ib]) + ak);
                 QS[ib] = __float2half_rn(__half2float(QS[ib]) + aq * qscale);
             }
@@ -395,18 +416,18 @@ extern "C" __global__ void gdn_scan(
         }
 
         for (int i = 0; i < n; i++) {
-            float rhs = bp[i] * (__half2float(sv[i * 128 + tid]) - gdn_expf(gcs[i]) * __half2float(KS[i * 128 + tid]));
+            float rhs = bp[i] * (__half2float(sv[i * GDN_VW + tid]) - gdn_expf(gcs[i]) * __half2float(KS[i * GDN_VW + tid]));
             for (int j = 0; j < i; j++) {
                 float aij = __half2float(A[i * GDN_CS + j]);
-                if (aij != 0.0f) rhs -= aij * dc[j * 128 + tid];
+                if (aij != 0.0f) rhs -= aij * dc[j * GDN_VW + tid];
             }
-            dc[i * 128 + tid] = rhs;
-            float oi = gdn_expf(gcs[i]) * __half2float(QS[i * 128 + tid]);
+            dc[i * GDN_VW + tid] = rhs;
+            float oi = gdn_expf(gcs[i]) * __half2float(QS[i * GDN_VW + tid]);
             for (int p = 0; p <= i; p++) {
                 float w = __half2float(KQ[i * GDN_CS + p]);
-                if (w != 0.0f) oi += w * dc[p * 128 + tid];
+                if (w != 0.0f) oi += w * dc[p * GDN_VW + tid];
             }
-            outv[(t0 + i) * (h_v * d) + h * 128 + tid] = oi;
+            outv[(t0 + i) * (h_v * d) + h * 128 + vs + tid] = oi;
         }
         __syncthreads();
 
@@ -418,7 +439,7 @@ extern "C" __global__ void gdn_scan(
             for (int s2 = 0; s2 < 128; s2++) {
                 float acc = st[st_h + (long)s2 * d + tid] * gt_exp;
                 for (int j = 0; j < n; j++)
-                    acc += __half2float(sk[j * 128 + s2]) * wsm[j] * dc[j * 128 + tid];
+                    acc += __half2float(sk[j * 128 + s2]) * wsm[j] * dc[j * GDN_VW + tid];
                 st[st_h + (long)s2 * d + tid] = acc;
             }
             __syncthreads();

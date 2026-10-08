@@ -23,7 +23,10 @@ pub const ATTN_F3S_TMAX: usize = 8;
 /// 프리필 배치 상한 — 체인 버퍼·GEMM t 계약(attn fwd3s와 동일 상한).
 pub const CHAIN_TMAX: usize = 8;
 /// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
+/// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — GDN_VSLICE=1 기준).
 pub const GDN_SCAN_SMEM: u32 = 61_828;
+/// gdn_scan V-슬라이스 수(커널 GDN_VSLICE와 동일 계약 — 1=슬라이싱 없음).
+pub const GDN_VSLICE: usize = 1;
 
 /// GDN 체인 형상(서버가 config에서 유도해 명시 등록 — 추정 금지).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -900,8 +903,15 @@ impl W4a16Dec {
             (&mut dd) as *mut _ as *mut _,
             (&mut lay) as *mut _ as *mut _,
         ];
-        self.cc
-            .launch_shared(f, dm.h_v as u32, 1, 128, GDN_SCAN_SMEM, &mut as_)?;
+        // grid = h_v × VSLICE(블록 = GDN_VW = 128/VSLICE 스레드).
+        self.cc.launch_shared(
+            f,
+            (dm.h_v * GDN_VSLICE) as u32,
+            1,
+            (128 / GDN_VSLICE) as u32,
+            GDN_SCAN_SMEM,
+            &mut as_,
+        )?;
 
         let f = self.cc.function("gdn_gate")?;
         let (mut g0, mut g1, mut g2, mut g3) = (self.dgo, self.dzv, self.dnwg, self.dgate);
