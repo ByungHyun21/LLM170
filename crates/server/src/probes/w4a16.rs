@@ -332,6 +332,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     let mut n_predict = 8usize;
     let mut ctx = 1024usize;
+    let mut no_head = false;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -359,6 +360,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--ctx requires a number")?;
             }
+            "--no-head" => no_head = true,
             other => return Err(format!("unknown flag: {other}")),
         }
     }
@@ -489,25 +491,57 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         .w("output.weight")
         .ok_or_else(|| "output.weight 부재".to_string())?;
     let head_logits = |xn: &[f32]| -> Vec<f32> {
+        if no_head {
+            // head 비용 분리 계측 전용 — 체인 시간만 재기 위한 가짜 로짓.
+            return xn[..5120].to_vec();
+        }
         let mut lg = vec![0.0f32; head.n_out as usize];
         llm170_core::matmul::matmul(xn, &head, &mut lg);
         lg
     };
+    let staged = llm170_diag::flag::on("LLM170_STAGED");
+    // GPU head — bf16 output.weight를 상주 업로드(--no-head·스테이징은 CPU 참조).
+    let mut head_gpu = false;
+    if !no_head && !staged && head.ty == llm170_core::wtype::WType::Bf16 {
+        dec.upload_head(head.data, head.n_out as usize, head.n_in as usize)?;
+        head_gpu = true;
+    }
     let t1 = std::time::Instant::now();
     let mut out: Vec<u32> = Vec::new();
     let mut next = 0u32;
     for (i, tok) in prompt.iter().enumerate() {
         let row = model.embed_row(*tok).map_err(|e| e.to_string())?;
-        let xn = dec.forward(0, &row)?;
-        if i + 1 == prompt.len() {
-            next = llm170_core::matmul::greedy_from(&head_logits(&xn));
+        let last = i + 1 == prompt.len();
+        if head_gpu {
+            let lg = dec.forward_device_head(0, &row)?;
+            if last {
+                next = llm170_core::matmul::greedy_from(&lg);
+            }
+        } else {
+            let xn = if staged {
+                dec.forward(0, &row)?
+            } else {
+                dec.forward_device(0, &row)?
+            };
+            if last {
+                next = llm170_core::matmul::greedy_from(&head_logits(&xn));
+            }
         }
     }
     out.push(next);
     for _ in 0..n_predict {
         let row = model.embed_row(next).map_err(|e| e.to_string())?;
-        let xn = dec.forward(0, &row)?;
-        next = llm170_core::matmul::greedy_from(&head_logits(&xn));
+        if head_gpu {
+            let lg = dec.forward_device_head(0, &row)?;
+            next = llm170_core::matmul::greedy_from(&lg);
+        } else {
+            let xn = if staged {
+                dec.forward(0, &row)?
+            } else {
+                dec.forward_device(0, &row)?
+            };
+            next = llm170_core::matmul::greedy_from(&head_logits(&xn));
+        }
         out.push(next);
     }
     let gen_ms = t1.elapsed().as_secs_f64() * 1e3;
@@ -517,7 +551,17 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         .collect::<Vec<_>>()
         .join(",");
     Ok(format!(
-        "w4a16-gpu {dir} — GPU 체인(호스트 스테이징) · 선형 {n_lin}개 · {:.1}GB급\n  업로드 {upload_ms:.0}ms · 생성 {}토큰 {gen_ms:.0}ms ({:.1}ms/토큰)\n tokens: {csv}",
+        "w4a16-gpu {dir} — GPU 체인({}{}) · 선형 {n_lin}개 · {:.1}GB급\n  업로드 {upload_ms:.0}ms · 생성 {}토큰 {gen_ms:.0}ms ({:.1}ms/토큰)\n tokens: {csv}",
+        if staged {
+            "호스트 스테이징"
+        } else {
+            "디바이스 상주"
+        },
+        if head_gpu {
+            " + GPU head"
+        } else {
+            " + CPU head"
+        },
         (n_lin as f64 * 44.6e-3).max(0.0) * 1000.0 / 1000.0,
         out.len(),
         gen_ms / out.len() as f64,
