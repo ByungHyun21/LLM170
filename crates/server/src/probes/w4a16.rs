@@ -22,10 +22,12 @@ fn load(args: &[String]) -> Result<String, String> {
                 .into(),
         );
     }
-    let m = llm170_core::w4a16::W4a16Model::open(std::path::Path::new(&dir))
+    let store = llm170_core::w4a16::W4a16Model::open(std::path::Path::new(&dir))
         .map_err(|e| e.to_string())?;
-    let rep = m.validate().map_err(|e| e.to_string())?;
-    let c = &m.cfg;
+    let cfg = llm170_core::qwen35::bind::QwenCfg::load(std::path::Path::new(&dir))
+        .map_err(|e| e.to_string())?;
+    let rep = llm170_core::qwen35::bind::validate(&store, &cfg).map_err(|e| e.to_string())?;
+    let c = &cfg;
     let head = format!(
         "w4a16-load {dir}\n  hidden={} layers={} heads={}/{} head_dim={} ffn={} vocab={} interval={}\n  양자화=compressed-tensors pack-quantized int4 sym g{} (zp=8 상수) · 선형 {}개",
         c.hidden,
@@ -36,8 +38,8 @@ fn load(args: &[String]) -> Result<String, String> {
         c.ffn,
         c.vocab,
         c.full_interval,
-        c.group_size,
-        m.n_lins()
+        store.group(),
+        store.n_lins()
     );
     let body = rep.summary();
     if rep.ok() {

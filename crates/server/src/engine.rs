@@ -11,10 +11,11 @@ pub enum BackendSel {
 }
 /// 모델 경로 포맷 판정 — 2026-10-08 단일 트랙:
 /// 수용은 **W4A16 디렉터리 단일** — 그 외는 명시 에러로 안내.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ModelFormat {
     /// compressed-tensors(weight_packed 3조)·auto-gptq(qweight/qzeros) 패킹.
-    W4A16,
+    /// arch = config.json 아키텍처 식별자(로더 레지스트리 키).
+    W4A16 { arch: String },
 }
 
 /// 포맷 스니핑 — 디렉터리 내 safetensors 내용 기반(index.json 우선, 없으면
@@ -72,7 +73,21 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
         ));
     }
     if hay.contains("weight_packed") || hay.contains("qweight") {
-        return Ok(ModelFormat::W4A16);
+        // 아키텍처 레지스트리 게이트 — 로더 dispatch의 키.
+        let Some(arch) = llm170_core::qwen35::bind::dir_arch(path) else {
+            return Err(format!(
+                "아키텍처 판별 불가(config.json architectures/model_type 부재): {}",
+                path.display()
+            ));
+        };
+        if !llm170_core::qwen35::bind::arch_supported(&arch) {
+            return Err(format!(
+                "미지원 아키텍처: {arch} (지원: {:?}) — {}",
+                llm170_core::qwen35::bind::ARCHES,
+                path.display()
+            ));
+        }
+        return Ok(ModelFormat::W4A16 { arch });
     }
     if path.join("config.json").is_file() {
         return Err(format!(

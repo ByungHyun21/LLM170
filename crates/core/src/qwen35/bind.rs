@@ -1,0 +1,462 @@
+//! qwen35 아키텍처 바인딩 — HF 이름맵·synth·V헤드 순열·기대 커버리지.
+//! (2026-10-08 R4: `w4a16` 스토어에서 분리. 새 모델군은 이 모듈에 준하는
+//! 바인딩을 추가한다 — 스토어는 형식만, 바인딩이 아키텍처를 안다.)
+
+use crate::json::Json;
+use crate::w4a16::{R, Report, W4a16Error, W4a16Model, decode_f32};
+use std::collections::HashMap;
+use std::path::Path;
+
+/// 지원 아키텍처 식별자(config.json `architectures`/`model_type`).
+pub const ARCHES: &[&str] = &["Qwen3_5ForConditionalGeneration"];
+
+pub fn arch_supported(arch: &str) -> bool {
+    ARCHES.contains(&arch)
+}
+
+/// 디렉터리 config.json에서 아키텍처 식별자 추출(architectures[0] → model_type).
+pub fn dir_arch(dir: &Path) -> Option<String> {
+    let txt = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let v = Json::parse(&txt).ok()?;
+    if let Some(Json::Arr(items)) = v.get("architectures")
+        && let Some(Json::Str(s)) = items.first()
+    {
+        return Some(s.clone());
+    }
+    v.get("model_type").and_then(Json::as_str).map(String::from)
+}
+
+/// qwen3_5 계열 하이퍼파라미터(config.json 발췌).
+#[derive(Debug, Clone)]
+pub struct QwenCfg {
+    pub hidden: usize,
+    pub layers: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub ffn: usize,
+    pub vocab: usize,
+    /// full-attention 간격(4 → full il = {3,7,…,63}).
+    pub full_interval: usize,
+    /// GDN — state_size·key_heads·value_heads·conv 커널.
+    pub linear_key_head_dim: usize,
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+    pub linear_conv_kernel: usize,
+    pub partial_rotary_factor: f64,
+    pub rope_theta: f64,
+    pub rms_norm_eps: f64,
+}
+
+impl QwenCfg {
+    /// config.json 로드 + 아키텍처 게이트.
+    pub fn load(dir: &Path) -> R<Self> {
+        if let Some(arch) = dir_arch(dir)
+            && !arch_supported(&arch)
+        {
+            return Err(W4a16Error::Arch(format!("{arch} — 지원: {ARCHES:?}")));
+        }
+        let text = std::fs::read_to_string(dir.join("config.json"))
+            .map_err(|e| W4a16Error::Missing(format!("config.json: {e}")))?;
+        Self::parse(&text)
+    }
+
+    fn parse(text: &str) -> R<Self> {
+        let v =
+            Json::parse(text).map_err(|e| W4a16Error::BadTensor(format!("config.json: {e}")))?;
+        let tc = v.get("text_config").unwrap_or(&v);
+        let u = |k: &str| -> Option<usize> { tc.get(k).and_then(Json::as_f64).map(|x| x as usize) };
+        let bad = |k: &str| W4a16Error::BadTensor(format!("config.json: {k} 부재"));
+        // rope 파라미터는 text_config.rope_parameters에 중첩(실측) — 평면 키도 허용.
+        let rp = tc.get("rope_parameters").unwrap_or(tc);
+        let f = |k: &str| -> Option<f64> { rp.get(k).and_then(Json::as_f64) };
+        Ok(QwenCfg {
+            hidden: u("hidden_size").ok_or_else(|| bad("hidden_size"))?,
+            layers: u("num_hidden_layers").ok_or_else(|| bad("num_hidden_layers"))?,
+            heads: u("num_attention_heads").ok_or_else(|| bad("num_attention_heads"))?,
+            kv_heads: u("num_key_value_heads").ok_or_else(|| bad("num_key_value_heads"))?,
+            head_dim: u("head_dim").ok_or_else(|| bad("head_dim"))?,
+            ffn: u("intermediate_size").ok_or_else(|| bad("intermediate_size"))?,
+            vocab: u("vocab_size").ok_or_else(|| bad("vocab_size"))?,
+            full_interval: u("full_attention_interval").unwrap_or(4).max(1),
+            linear_key_head_dim: u("linear_key_head_dim")
+                .ok_or_else(|| bad("linear_key_head_dim"))?,
+            linear_num_key_heads: u("linear_num_key_heads")
+                .ok_or_else(|| bad("linear_num_key_heads"))?,
+            linear_num_value_heads: u("linear_num_value_heads")
+                .ok_or_else(|| bad("linear_num_value_heads"))?,
+            linear_conv_kernel: u("linear_conv_kernel_dim").unwrap_or(4),
+            partial_rotary_factor: f("partial_rotary_factor")
+                .or_else(|| tc.get("partial_rotary_factor").and_then(Json::as_f64))
+                .unwrap_or(0.25),
+            rope_theta: f("rope_theta")
+                .or_else(|| tc.get("rope_theta").and_then(Json::as_f64))
+                .unwrap_or(1e7),
+            rms_norm_eps: tc
+                .get("rms_norm_eps")
+                .and_then(Json::as_f64)
+                .unwrap_or(1e-6),
+        })
+    }
+}
+
+/// 엔진(블록) 텐서명 해석 — qwen35 스테이지가 요구하는 이름을 소스로 매핑.
+/// V헤드 순열은 **필수**다 — 엔진은 subhead-major 계약
+/// (V헤드 h ↔ K헤드 h % nk, gdn.rs `ik1 = iv1 % nek1` 미러)이라, HF 원본
+/// (group-major)을 그대로 주면 k/v 짝이 어긋난다(직접 로드 실측: 출력 붕괴).
+/// 따라서 v-축 텐서는 순열 사본(perm store)으로 subhead-major를 공급한다.
+pub enum Eng {
+    /// 양자화 선형 — 분리 버퍼 Weight(packed+scale). vperm 적용 축 명시.
+    Quant { base: String, vperm: PV },
+    /// BF16 플레인 — rows_perm=true면 행(V헤드) 순열(alpha/beta).
+    Plain { name: String, rows_perm: bool },
+    /// f32 합성 — perm: 0 없음(norm)·1 헤드 인덱스(dt_bias/A_log)·2 conv 채널.
+    Synth {
+        name: String,
+        plus1: bool,
+        neg_exp: bool,
+        perm: u8,
+    },
+}
+
+/// V축 순열 스펙 — 엔진(subhead-major) 계약.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PV {
+    /// 순열 없음.
+    None,
+    /// n축·vbase(=2·nk·hd) 이후 128행 블록(attn_qkv v부).
+    VPart,
+    /// n축 전 행 128블록(in_proj_z).
+    AllN,
+    /// k축 전 열 128블록(out_proj).
+    AllK,
+}
+
+/// `blk.{il}.*`·전역 이름 → 소스 해석. (스테이지 접점 전수가 지나는 단일 계약)
+pub fn eng(name: &str) -> Option<Eng> {
+    if name == "token_embd.weight" {
+        return Some(Eng::Plain {
+            name: "model.language_model.embed_tokens.weight".into(),
+            rows_perm: false,
+        });
+    }
+    if name == "output.weight" {
+        return Some(Eng::Plain {
+            name: "lm_head.weight".into(),
+            rows_perm: false,
+        });
+    }
+    if name == "output_norm.weight" {
+        return Some(Eng::Synth {
+            name: "model.language_model.norm.weight".into(),
+            plus1: true,
+            neg_exp: false,
+            perm: 0,
+        });
+    }
+    let rest = name.strip_prefix("blk.")?;
+    let (il, suf) = rest.split_once('.')?;
+    let l = format!("model.language_model.layers.{il}");
+    let q = |m: &str, vperm: PV| {
+        Some(Eng::Quant {
+            base: format!("{l}.{m}"),
+            vperm,
+        })
+    };
+    let sy = |m: &str, plus1: bool, neg_exp: bool, perm: u8| {
+        Some(Eng::Synth {
+            name: format!("{l}.{m}"),
+            plus1,
+            neg_exp,
+            perm,
+        })
+    };
+    match suf {
+        "attn_norm.weight" => sy("input_layernorm.weight", true, false, 0),
+        "post_attention_norm.weight" => sy("post_attention_layernorm.weight", true, false, 0),
+        "attn_q.weight" => q("self_attn.q_proj", PV::None),
+        "attn_k.weight" => q("self_attn.k_proj", PV::None),
+        "attn_v.weight" => q("self_attn.v_proj", PV::None),
+        "attn_output.weight" => q("self_attn.o_proj", PV::None),
+        "attn_q_norm.weight" => sy("self_attn.q_norm.weight", true, false, 0),
+        "attn_k_norm.weight" => sy("self_attn.k_norm.weight", true, false, 0),
+        "attn_qkv.weight" => q("linear_attn.in_proj_qkv", PV::VPart),
+        "attn_gate.weight" => q("linear_attn.in_proj_z", PV::AllN),
+        "ssm_conv1d.weight" => sy("linear_attn.conv1d.weight", false, false, 2),
+        "ssm_dt.bias" => sy("linear_attn.dt_bias", false, false, 1),
+        "ssm_a" => sy("linear_attn.A_log", false, true, 1),
+        "ssm_alpha.weight" => Some(Eng::Plain {
+            name: format!("{l}.linear_attn.in_proj_a.weight"),
+            rows_perm: true,
+        }),
+        "ssm_beta.weight" => Some(Eng::Plain {
+            name: format!("{l}.linear_attn.in_proj_b.weight"),
+            rows_perm: true,
+        }),
+        "ssm_norm.weight" => sy("linear_attn.norm.weight", false, false, 0),
+        "ssm_out.weight" => q("linear_attn.out_proj", PV::AllK),
+        "ffn_gate.weight" => q("mlp.gate_proj", PV::None),
+        "ffn_up.weight" => q("mlp.up_proj", PV::None),
+        "ffn_down.weight" => q("mlp.down_proj", PV::None),
+        _ => None,
+    }
+}
+
+/// 순열 사본 저장소 — 엔진 접점의 V축 텐서(HF→subhead-major).
+pub struct PermStore {
+    /// quant base → (packed, scale) 순열 사본.
+    q: HashMap<String, (Vec<u8>, Vec<u8>)>,
+    /// 플레인(HF 이름) → BF16 행 순열 사본(alpha/beta).
+    p: HashMap<String, Vec<u8>>,
+}
+
+impl PermStore {
+    /// 양자화 순열 사본 슬라이스 — PV::None이면 호출하지 않는다(원본 사용).
+    pub fn quant(&self, base: &str) -> Option<(&[u8], &[u8])> {
+        let s = self.q.get(base)?;
+        Some((&s.0, &s.1))
+    }
+
+    /// 플레인 행 순열 사본 슬라이스(alpha/beta).
+    pub fn plain(&self, name: &str) -> Option<&[u8]> {
+        self.p.get(name).map(|v| v.as_slice())
+    }
+}
+
+/// GDN V헤드 순열 — llama.cpp(subhead-major) ↔ HF(group-major):
+/// 블록 i ← 원본 블록 ratio·(i%nk) + i/nk (실측 확정 — beta 지문
+/// corr 1.000·ssm_out 블록 corr 0.999, 동일 규약 미러).
+fn vperm(cfg: &QwenCfg, i: usize) -> usize {
+    let nk = cfg.linear_num_key_heads;
+    let ratio = cfg.linear_num_value_heads / nk;
+    ratio * (i % nk) + i / nk
+}
+
+/// V헤드 순열 사본 구축 — 엔진(subhead-major) 계약 공급용(g128 전용).
+pub fn build_perm(store: &W4a16Model, cfg: &QwenCfg) -> PermStore {
+    assert_eq!(store.group(), 128, "순열 사본은 g128 계약");
+    let nk = cfg.linear_num_key_heads;
+    let vbase = 2 * nk * cfg.linear_key_head_dim;
+    let mut q = HashMap::new();
+    let mut p = HashMap::new();
+    let lp = "model.language_model.layers.";
+    for il in 0..cfg.layers {
+        if (il + 1).is_multiple_of(cfg.full_interval) {
+            continue; // full-attn 층은 V축 순열 없음(직접 대응 확인됨).
+        }
+        let l = format!("{lp}{il}.");
+        for (suf, pv) in [
+            ("linear_attn.in_proj_qkv", PV::VPart),
+            ("linear_attn.in_proj_z", PV::AllN),
+            ("linear_attn.out_proj", PV::AllK),
+        ] {
+            let base = format!("{l}{suf}");
+            let Some((n, k)) = store.lin_shape(&base) else {
+                continue;
+            };
+            let (Some(pk), Some(sc)) = (
+                store.tensor_slice(&format!("{base}.weight_packed")),
+                store.tensor_slice(&format!("{base}.weight_scale")),
+            ) else {
+                continue;
+            };
+            let (rb, sb) = (k / 2, k / 64);
+            let mut d = vec![0u8; n * rb];
+            let mut ds = vec![0u8; n * sb];
+            match pv {
+                PV::VPart | PV::AllN => {
+                    let nb0 = if pv == PV::VPart { vbase / 128 } else { 0 };
+                    let nblk = n / 128;
+                    d[..nb0 * 128 * rb].copy_from_slice(&pk[..nb0 * 128 * rb]);
+                    ds[..nb0 * 128 * sb].copy_from_slice(&sc[..nb0 * 128 * sb]);
+                    for b in 0..nblk - nb0 {
+                        let s = (nb0 + vperm(cfg, b)) * 128 * rb;
+                        let t = (nb0 + b) * 128 * rb;
+                        d[t..t + 128 * rb].copy_from_slice(&pk[s..s + 128 * rb]);
+                        let s2 = (nb0 + vperm(cfg, b)) * 128 * sb;
+                        let t2 = (nb0 + b) * 128 * sb;
+                        ds[t2..t2 + 128 * sb].copy_from_slice(&sc[s2..s2 + 128 * sb]);
+                    }
+                }
+                PV::AllK => {
+                    // 행 내 k-블록(128열) 순열 — 원본 행 사본 후 셔플.
+                    let nblk = k / 128;
+                    let mut scratch = vec![0u8; rb];
+                    for r in 0..n {
+                        scratch.copy_from_slice(&pk[r * rb..(r + 1) * rb]);
+                        for g in 0..nblk {
+                            let s = g * 64; // 128원소 = u32×16 = 64B
+                            let sg = vperm(cfg, g) * 64;
+                            d[r * rb + s..r * rb + s + 64].copy_from_slice(&scratch[sg..sg + 64]);
+                        }
+                        let srow = &mut ds[r * sb..(r + 1) * sb];
+                        let temp: Vec<u8> = sc[r * sb..(r + 1) * sb].to_vec();
+                        for g in 0..nblk {
+                            let sg = vperm(cfg, g) * 2;
+                            srow[g * 2..g * 2 + 2].copy_from_slice(&temp[sg..sg + 2]);
+                        }
+                    }
+                }
+                PV::None => {}
+            }
+            q.insert(base, (d, ds));
+        }
+        // alpha/beta — 행(V헤드) 순열(BF16 바이트).
+        for suf in [
+            "linear_attn.in_proj_a.weight",
+            "linear_attn.in_proj_b.weight",
+        ] {
+            let name = format!("{l}{suf}");
+            let Some(src) = store.tensor_slice(&name) else {
+                continue;
+            };
+            let rows = cfg.linear_num_value_heads;
+            let rb = src.len() / rows;
+            let mut out = vec![0u8; src.len()];
+            for i in 0..rows {
+                out[i * rb..(i + 1) * rb]
+                    .copy_from_slice(&src[vperm(cfg, i) * rb..(vperm(cfg, i) + 1) * rb]);
+            }
+            p.insert(name, out);
+        }
+    }
+    PermStore { q, p }
+}
+
+/// 헤드 인덱스 순열(1D — dt_bias·A_log).
+pub fn permute_heads_f32(cfg: &QwenCfg, v: &[f32]) -> Vec<f32> {
+    (0..v.len()).map(|i| v[vperm(cfg, i)]).collect()
+}
+
+/// conv 채널 행 순열 f32 — [ch][kk] 평탄, vbase 이후 128채널 블록 순열(g128).
+pub fn conv_rows_f32_permuted(store: &W4a16Model, cfg: &QwenCfg, name: &str) -> R<Vec<f32>> {
+    assert_eq!(store.group(), 128, "conv 순열은 g128 계약");
+    let e = store
+        .entry(name)
+        .ok_or_else(|| W4a16Error::Missing(name.into()))?;
+    let chk: u64 = e.shape[1..].iter().product();
+    let ch = e.shape[0];
+    let raw = store.raw_rows(name, 0, ch)?;
+    let v = decode_f32(&raw, e.dtype, name)?;
+    let kk = chk as usize;
+    let vbase = 2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+    let mut out = vec![0f32; v.len()];
+    out[..vbase * kk].copy_from_slice(&v[..vbase * kk]);
+    let nb = (ch as usize - vbase) / 128;
+    for b in 0..nb {
+        let s = (vbase + vperm(cfg, b) * 128) * kk;
+        let t = (vbase + b * 128) * kk;
+        out[t..t + 128 * kk].copy_from_slice(&v[s..s + 128 * kk]);
+    }
+    Ok(out)
+}
+
+/// 전수 검증 — weight_shape 값 대조(스토어) + 커버리지(기대 집합 전수).
+pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
+    let mut rep = Report {
+        triples: store.n_lins(),
+        ..Default::default()
+    };
+    rep.bad_shape_value = store.check_shape_values()?;
+    // 커버리지: 기대 양자화/플레인 집합 vs 실제.
+    let (exp_q, exp_p) = expected_names(cfg);
+    for base in &exp_q {
+        if store.lin_shape(base).is_none() {
+            rep.missing_quant.push(base.clone());
+        }
+    }
+    for name in &exp_p {
+        if store.entry(name).is_none() {
+            rep.missing_plain.push(name.clone());
+        }
+    }
+    // 분류: visual/mtp/텍스트 플레인/트리플 파트.
+    let triple_part = |n: &str| {
+        n.ends_with(".weight_packed")
+            || n.ends_with(".weight_scale")
+            || n.ends_with(".weight_shape")
+    };
+    for name in store.entries().keys() {
+        if name.starts_with("model.visual.") {
+            // visual은 무양자화 BF16/F32 — 텍스트 경로 무사용.
+            rep.visual += 1;
+            continue;
+        }
+        if name.starts_with("mtp.") {
+            rep.mtp += 1;
+            continue;
+        }
+        if triple_part(name) {
+            continue;
+        }
+        if exp_p.contains(name) {
+            rep.plain_text += 1;
+        } else {
+            // 기대 밖 텍스트 텐서 — 정체불명(텍스트 경로에 bias 부재 실측).
+            rep.unknown_text.push(name.clone());
+        }
+    }
+    Ok(rep)
+}
+
+/// 기대 텐서 집합 — (양자화 base, 플레인 이름). qwen3_5 실측 스키마의 전수.
+fn expected_names(cfg: &QwenCfg) -> (Vec<String>, Vec<String>) {
+    let (mut q, mut p) = (Vec::new(), Vec::new());
+    let lp = "model.language_model.layers.";
+    for il in 0..cfg.layers {
+        let full = (il + 1).is_multiple_of(cfg.full_interval);
+        let pre = format!("{lp}{il}.");
+        if full {
+            for m in [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ] {
+                q.push(format!("{pre}{m}"));
+            }
+            for m in [
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+                "self_attn.q_norm.weight",
+                "self_attn.k_norm.weight",
+            ] {
+                p.push(format!("{pre}{m}"));
+            }
+        } else {
+            for m in [
+                "linear_attn.in_proj_qkv",
+                "linear_attn.in_proj_z",
+                "linear_attn.out_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ] {
+                q.push(format!("{pre}{m}"));
+            }
+            for m in [
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+                "linear_attn.norm.weight",
+                "linear_attn.in_proj_a.weight",
+                "linear_attn.in_proj_b.weight",
+                "linear_attn.conv1d.weight",
+                "linear_attn.A_log",
+                "linear_attn.dt_bias",
+            ] {
+                p.push(format!("{pre}{m}"));
+            }
+        }
+    }
+    for g in [
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.norm.weight",
+        "lm_head.weight",
+    ] {
+        p.push(g.to_string());
+    }
+    (q, p)
+}
