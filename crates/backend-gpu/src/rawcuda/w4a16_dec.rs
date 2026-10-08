@@ -373,6 +373,8 @@ impl W4a16Dec {
         for off in (0..src.len()).step_by(CH) {
             let end = (off + CH).min(src.len());
             cc.h2d(dst + off as u64, &src[off..end])?;
+            // 업로드는 수 초~수십 초 — 와치독이 로드를 스텔로 오판하지 않게 심박.
+            llm170_diag::watchdog::bump();
         }
         Ok(())
     }
