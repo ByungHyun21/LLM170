@@ -405,6 +405,7 @@ pub fn dequant_supported(ty: GgmlType) -> bool {
             | GgmlType::Iq4Nl
             | GgmlType::Iq3S
             | GgmlType::Iq3Xxs
+            | GgmlType::W4a16G128
     )
 }
 
@@ -519,6 +520,25 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
+        // llm170 dialect(plans/cuda-models.md §3.5) — w4a16-to-gguf 산출:
+        // 블록 = [u32×16 packed][f16 scale] 66B, sym zp=8(소스 로더 계약과 동일).
+        GgmlType::W4a16G128 => {
+            for b in 0..blocks {
+                let off = base + b * bsize;
+                let scale = half_to_f32(u16::from_le_bytes([data[off + 64], data[off + 65]]));
+                for i in 0..128usize {
+                    let woff = off + 4 * (i / 8);
+                    let w = u32::from_le_bytes([
+                        data[woff],
+                        data[woff + 1],
+                        data[woff + 2],
+                        data[woff + 3],
+                    ]);
+                    let q = ((w >> (4 * (i % 8))) & 0xF) as i32;
+                    out[b * 128 + i] = (q - 8) as f32 * scale;
+                }
+            }
+        }
         // 107 W11: 로드 시점 타입 사전 검증 전까지 초기화 패닉 유지(허용 분류).
         other => unimplemented!("dequant for {other:?} — 모델 로드 시 타입 검증 필요"),
     }
@@ -549,6 +569,7 @@ mod b2_tests {
             GgmlType::Iq4Nl,
             GgmlType::Iq3S,
             GgmlType::Iq3Xxs,
+            GgmlType::W4a16G128,
         ] {
             assert!(dequant_supported(t), "{t:?} 지원 표시 필요");
             let (blck, bsize) = t.block_info();
