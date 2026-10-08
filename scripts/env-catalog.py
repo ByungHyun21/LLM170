@@ -35,7 +35,7 @@ def classify(name: str, curated: dict) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    a = ap.parse_args()
+    ap.parse_args()
     curated = {}
     cf = ROOT / "scripts" / "env-classify.json"
     if cf.exists():

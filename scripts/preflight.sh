@@ -24,7 +24,7 @@ else
     echo "FAIL:"; cargo clippy --workspace --all-targets -- -D warnings 2>&1 | grep -E "^(error|warning)" | sort | uniq -c | head -10; fail=1
 fi
 
-echo "== 3/4 cargo 경고 0 (debug+release check) =="
+echo "== 3/4 cargo 경고 0 (dev check — 릴리스는 빌드 게이트가 담당) =="
 w=$(cargo check --workspace --all-targets 2>&1 | grep -c "^warning" || true)
 if [[ "$w" -eq 0 ]]; then echo "OK"; else echo "FAIL — warning ${w}건"; fail=1; fi
 
