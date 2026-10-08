@@ -65,11 +65,39 @@ __device__ __forceinline__ float tree64(double* red) {
     return (float)red[0];
 }
 
+// ── 그룹·스케일 dtype 변형(W4-1: 35B-A3B = g32·BF16 스케일) ──
+// bf16 → f32: 상위 16비트 좌시프트(정확) — core quant::deq::bf16_to_f32 동일.
+__device__ __forceinline__ float b2f(unsigned short v) {
+    return __uint_as_float(((unsigned)v) << 16);
+}
+
+// 스케일 로드 — BF16이면 b2f, 아니면 h2f(기존 g128·f16 경로와 동일 값).
+template <bool BF16>
+__device__ __forceinline__ float ld_scale(const unsigned short* __restrict__ p, int i) {
+    return BF16 ? b2f(p[i]) : h2f(p[i]);
+}
+
+// 스케일 그룹 인덱스 — i = l + 64j (l = 레인, j = 64원소 스텝).
+// g128(SHIFT=7): (l+64j)>>7 = j>>1 (l<64라 레인 공통), g32(SHIFT=5):
+// (l>>5) + 2j. 일반식 (l>>SHIFT)+(j<<(6-SHIFT))는 SHIFT=7에서 시프트가
+// 음수라 분기한다.
+template <int SHIFT>
+__device__ __forceinline__ int sidx(int l, int j) {
+    if constexpr (SHIFT == 7) {
+        return j >> 1;
+    } else {
+        return (l >> SHIFT) + (j << (6 - SHIFT));
+    }
+}
+
 // 2행/블록 — x를 두 행이 공유(L1 x 트래픽 ÷2)하고 레인당 미결 로드가 2배.
 // 스케일은 행별(각 행의 srow), 산술 순서는 1행 커널과 동일(계약 불변).
-extern "C" __global__ void w4a16_gemv_g128(
+// SHIFT = 그룹 로그2(7 = g128, 5 = g32) — 산술 계약은 core
+// dot_row_w4a16_lane_group과 1:1.
+template <int SHIFT, bool BF16>
+__device__ __forceinline__ void gemv_body(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
-    const unsigned short* __restrict__ s,  // [n][k/128] f16 비트(스케일)
+    const unsigned short* __restrict__ s,  // [n][k/2^SHIFT] 스케일(f16/bf16 비트)
     const float* __restrict__ x,           // [k] f32 = h2f(f2h(활성))
     float* __restrict__ out,               // [n]
     int n,
@@ -83,9 +111,9 @@ extern "C" __global__ void w4a16_gemv_g128(
     __shared__ double red[G4_LANES];
     __shared__ float sc[G4_SCMAX];
     const int k8 = k >> 3;
-    const int kg = k >> 7;
+    const int kg = k >> SHIFT;
     for (int g = l; g < kg; g += G4_LANES) {
-        sc[g] = h2f(s[(size_t)o * kg + g]);
+        sc[g] = ld_scale<BF16>(s + (size_t)o * kg, g);
     }
     __syncthreads();
     const unsigned* qrow = q + (size_t)o * k8;
@@ -104,7 +132,7 @@ extern "C" __global__ void w4a16_gemv_g128(
             // evict-first — 한 번 읽는 가중치가 L2를 오염시키지 않게(스트리밍).
             unsigned qw = __ldcs(&qrow[i >> 3]);
             int v = (int)((qw >> (4 * li)) & 0xFu) - 8;
-            float w = (float)v * sc[jj >> 1];
+            float w = (float)v * sc[sidx<SHIFT>(l, jj)];
             acc += w * x[i];
         }
     }
@@ -112,7 +140,7 @@ extern "C" __global__ void w4a16_gemv_g128(
         const int i = l + (j << 6);
         unsigned qw = __ldcs(&qrow[i >> 3]);
         int v = (int)((qw >> (4 * li)) & 0xFu) - 8;
-        float w = (float)v * sc[j >> 1];
+        float w = (float)v * sc[sidx<SHIFT>(l, j)];
         acc += w * x[i];
     }
     red[l] = (double)acc;
@@ -133,6 +161,18 @@ extern "C" __global__ void w4a16_gemv_g128(
     }
 }
 
+// t=1 GEMV 래퍼 — g128·f16(27B) / g32·bf16(35B 전문가).
+extern "C" __global__ void w4a16_gemv_g128(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k) {
+    gemv_body<7, false>(q, s, x, out, n, k);
+}
+extern "C" __global__ void w4a16_gemv_g32_bf16(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k) {
+    gemv_body<5, true>(q, s, x, out, n, k);
+}
+
 // out[t][n] = x[t][k] · W4A16(g128, sym) — t≥2(프리필 배치) 전용.
 // [2026-10-08 P3-b 최종 — 채택 변형] 1라운드 진화(벤치 실측): 행=블록 43 →
 // smem(R=4) 51 → smem f16→f32 변환 63 → **R=8(512스레드) 72~77(채택)** →
@@ -146,9 +186,11 @@ extern "C" __global__ void w4a16_gemv_g128(
 #define G4_LANES 64
 #define G4_KC 256              // k-청크(64의 배수)
 
-extern "C" __global__ void w4a16_gemm_g128(
+// SHIFT = 그룹 로그2(7 = g128, 5 = g32), BF16 = 스케일 dtype.
+template <int SHIFT, bool BF16>
+__device__ __forceinline__ void gemm_body(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
-    const unsigned short* __restrict__ s,  // [n][k/128] f16 비트(스케일)
+    const unsigned short* __restrict__ s,  // [n][k/2^SHIFT] 스케일(f16/bf16 비트)
     const float* __restrict__ x,           // [t][k] f32 = h2f(f2h(활성))
     float* __restrict__ out,               // [t][n]
     int n,
@@ -172,10 +214,10 @@ extern "C" __global__ void w4a16_gemm_g128(
         acc[u] = 0.0f;
     }
     const int k8 = k >> 3;
-    const int kg = k >> 7;
+    const int kg = k >> SHIFT;
     if (live) {
         for (int gg = l; gg < kg; gg += G4_LANES) {
-            sc[g][gg] = h2f(s[(size_t)o * kg + gg]);
+            sc[g][gg] = ld_scale<BF16>(s + (size_t)o * kg, gg);
         }
     }
     const int li = l & 7;
@@ -198,7 +240,7 @@ extern "C" __global__ void w4a16_gemm_g128(
                     const int i = base + il;
                     const unsigned qw = __ldcs(&qrow[i >> 3]); // 가중치 1회 = t토큰 공유
                     const int v = (int)((qw >> (4 * li)) & 0xFu) - 8;
-                    const float w = (float)v * sc[g][i >> 7];
+                    const float w = (float)v * sc[g][i >> SHIFT];
                     // 전치 패딩 레이아웃에서 float4 2회로 8토큰 판독(smem 트래픽 ÷4).
                     const float4 xa = *reinterpret_cast<const float4*>(&xs[il][0]);
                     const float4 xb = *reinterpret_cast<const float4*>(&xs[il][4]);
@@ -237,4 +279,16 @@ extern "C" __global__ void w4a16_gemm_g128(
         }
         __syncthreads();
     }
+}
+
+// t≥2 GEMM 래퍼 — g128·f16(27B) / g32·bf16(35B 전문가).
+extern "C" __global__ void w4a16_gemm_g128(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k, int t) {
+    gemm_body<7, false>(q, s, x, out, n, k, t);
+}
+extern "C" __global__ void w4a16_gemm_g32_bf16(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k, int t) {
+    gemm_body<5, true>(q, s, x, out, n, k, t);
 }

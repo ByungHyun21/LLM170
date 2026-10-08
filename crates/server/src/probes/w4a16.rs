@@ -180,7 +180,7 @@ fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
     // 형상 열거 — --lin이면 model.w()(순열 사본 포함) 단일, 아니면 store 전수.
     let mut shapes: std::collections::BTreeMap<(usize, usize), String> =
         std::collections::BTreeMap::new();
-    let mut lin_data: Option<(Vec<u8>, Vec<u8>)> = None;
+    let mut lin_data: Option<(Vec<u8>, Vec<u8>, usize, bool)> = None;
     let store = llm170_core::w4a16::W4a16Model::open(std::path::Path::new(&dir))
         .map_err(|e| e.to_string())?;
     if let Some(name) = &lin {
@@ -191,7 +191,7 @@ fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
             .ok_or_else(|| format!("--lin {name}: 무게 없음"))?;
         let s = w.aux.ok_or_else(|| format!("--lin {name}: split 아님"))?;
         shapes.insert((w.n_out as usize, w.n_in as usize), name.clone());
-        lin_data = Some((w.data.to_vec(), s.to_vec()));
+        lin_data = Some((w.data.to_vec(), s.to_vec(), w.group, w.scale_bf16));
     } else {
         for (base, n, k) in store.lin_shapes() {
             shapes.entry((n, k)).or_insert(base);
@@ -201,7 +201,7 @@ fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
     let mut all_ok = true;
     let n_shape = shapes.len();
     for ((n, k), base) in &shapes {
-        let (qb, sb) = if let Some((q, s)) = &lin_data {
+        let (qb, sb) = if let Some((q, s, _, _)) = &lin_data {
             (q.as_slice(), s.as_slice())
         } else {
             (
@@ -213,6 +213,11 @@ fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
                     .ok_or_else(|| format!("{base}: weight_scale 슬라이스 부재"))?,
             )
         };
+        // 그룹·스케일 dtype — --lin이면 Weight 실측, 아니면 스토어 실측.
+        let (group, bf16) = match &lin_data {
+            Some((_, _, g, b)) => (*g, *b),
+            None => (store.group(), store.scale_is_bf16(base)),
+        };
         let r = rows_limit.min(*n);
         let q: Vec<u32> = qb[..r * (k / 8) * 4]
             .as_chunks::<4>()
@@ -220,30 +225,42 @@ fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
             .iter()
             .map(|c| u32::from_le_bytes(*c))
             .collect();
-        let s: Vec<u16> = sb[..r * (k / 128) * 2]
+        let s: Vec<u16> = sb[..r * (k / group) * 2]
             .as_chunks::<2>()
             .0
             .iter()
             .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        // 참조용 f32 스케일 — f16/bf16 디코드(둘 다 정확).
+        let sf32: Vec<f32> = s
+            .iter()
+            .map(|&h| {
+                if bf16 {
+                    llm170_core::quant::deq::bf16_to_f32(h)
+                } else {
+                    llm170_core::quant::half_to_f32(h)
+                }
+            })
             .collect();
         // x — 결정적(splitmix64) f16 비트. 스케일이 작은 모델이라 ±1 균일.
         let mut rnd = SplitMix64::new(seed ^ ((*n as u64) << 32) ^ *k as u64);
         let x: Vec<u16> = (0..t * k)
             .map(|_| llm170_backend_gpu::f32_to_f16(rnd.next_pm1()))
             .collect();
-        let got = g4.gemm(&x, t, &q, &s, r, *k)?;
-        let z8 = vec![8u32; k / 128];
+        let got = g4.gemm(&x, t, &q, &s, r, *k, group, bf16)?;
+        let z8 = vec![8u32; k / group];
         let mut mism = 0usize;
         let mut maxd = 0f64;
         for ti in 0..t {
             for o in 0..r {
                 let qrow = &q[o * (k / 8)..(o + 1) * (k / 8)];
-                let srow = &s[o * (k / 128)..(o + 1) * (k / 128)];
-                let want = llm170_core::quant::dot_row_w4a16_lane(
+                let srow = &sf32[o * (k / group)..(o + 1) * (k / group)];
+                let want = llm170_core::quant::dot_row_w4a16_lane_group(
                     qrow,
                     &z8,
                     srow,
                     &x[ti * k..(ti + 1) * k],
+                    group,
                 );
                 let g = got[ti * r + o];
                 if g.to_bits() != want.to_bits() {
@@ -255,7 +272,8 @@ fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
         let ok = mism == 0;
         all_ok &= ok;
         lines.push(format!(
-            "  n={n:<6} k={k:<6} rows={r} t={t}  {}",
+            "  n={n:<6} k={k:<6} g{group}{} rows={r} t={t}  {}",
+            if bf16 { "/bf16" } else { "/f16" },
             if ok {
                 "PASS(비트일치)".to_string()
             } else {
@@ -375,7 +393,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut n_lin = 0usize;
     for name in model.engine_names() {
         if let Some(w) = model.w_raw(&name)
-            && w.ty == llm170_core::wtype::WType::W4a16G128Split
+            && w.ty == llm170_core::wtype::WType::W4a16Split
         {
             let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
             dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;
