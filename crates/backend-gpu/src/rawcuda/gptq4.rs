@@ -129,7 +129,8 @@ impl Gptq4 {
         };
         let dq = self.cc.alloc(q.len() * 4)?;
         let ds = self.cc.alloc(s.len() * 2)?;
-        let dx = self.cc.alloc(x.len() * 2)?;
+        // t≥2 경로는 f32 x(4B/원소) 업로드 — 넉넉히 4배로 잡는다(t=1은 dx32 사용).
+        let dx = self.cc.alloc(x.len() * 4)?;
         let dout = self.cc.alloc(t * n * 4)?;
         // t=1은 행=블록 GEMV(x32 사전변환), t≥2는 구 GEMM 커널.
         let dx32 = if t == 1 { self.cc.alloc(k * 4)? } else { 0 };
@@ -163,7 +164,10 @@ impl Gptq4 {
                     .map(|c| f32::from_le_bytes(*c))
                     .collect::<Vec<f32>>());
             }
-            self.cc.h2d(dx, bytes_u16(x))?;
+            // P3-b: 커널이 f32 x를 받는다(cast_x32 계약) — 호스트 h2f로 동형.
+            let xf: Vec<f32> = x.iter().map(|&h| h2f(h)).collect();
+            let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
+            self.cc.h2d(dx, xb)?;
             let f = self.cc.function("w4a16_gemm_g128")?;
             let (mut p_q, mut p_s, mut p_x, mut p_out) = (dq, ds, dx, dout);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);

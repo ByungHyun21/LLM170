@@ -513,11 +513,24 @@ impl W4a16Dec {
             self.dy = self.cc.alloc(n * 4)?;
             self.y_cap = n;
         }
-        let xh: Vec<u16> = x.iter().map(|&v| f32_to_f16(v)).collect();
-        let xb = unsafe { std::slice::from_raw_parts(xh.as_ptr() as *const u8, xh.len() * 2) };
-        self.cc.h2d(self.dxh, xb)?;
+        // P3-b: 신 GEMM은 f32 x 계약 — 호스트에서 h2f(f2h(v)) 동형 변환.
+        if k > self.dx32_cap {
+            if self.dx32 != 0 {
+                self.cc.free(self.dx32)?;
+            }
+            self.dx32 = 0; // G1
+            self.dx32_cap = 0;
+            self.dx32 = self.cc.alloc(k * 4)?;
+            self.dx32_cap = k;
+        }
+        let xf: Vec<f32> = x
+            .iter()
+            .map(|&v| crate::rawcuda::gptq4::h2f(f32_to_f16(v)))
+            .collect();
+        let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
+        self.cc.h2d(self.dx32, xb)?;
         let f = self.cc.function("w4a16_gemm_g128")?;
-        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dxh, self.dy);
+        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx32, self.dy);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, 1i32);
         let mut args: [*mut std::ffi::c_void; 7] = [
             (&mut p_q) as *mut _ as *mut _,
@@ -1402,30 +1415,6 @@ impl W4a16Dec {
         Ok(self.dx32)
     }
 
-    /// 활성 f32 [n] → f16 비트 캐스트(t≥2 GEMM 입력 계약) — dxh 반환.
-    fn cast_f16(&mut self, x_dev: CUdeviceptr, n_elems: usize) -> Result<CUdeviceptr, String> {
-        if n_elems > self.xh_cap {
-            if self.dxh != 0 {
-                self.cc.free(self.dxh)?;
-            }
-            self.dxh = 0; // G1
-            self.xh_cap = 0;
-            self.dxh = self.cc.alloc(n_elems * 2)?;
-            self.xh_cap = n_elems;
-        }
-        let f = self.cc.function("w4a16_cast_f16")?;
-        let mut nn = n_elems as i32;
-        let (mut c0, mut c1) = (x_dev, self.dxh);
-        let mut ca: [*mut std::ffi::c_void; 3] = [
-            (&mut c0) as *mut _ as *mut _,
-            (&mut c1) as *mut _ as *mut _,
-            (&mut nn) as *mut _ as *mut _,
-        ];
-        self.cc
-            .launch(f, n_elems.div_ceil(256) as u32, 1, 256, &mut ca)?;
-        Ok(self.dxh)
-    }
-
     /// t≥2 GEMM 발사 — x f16 [t][k] → out [t][n] 직접 쓰기.
     fn gemm_launch(
         &mut self,
@@ -1932,14 +1921,14 @@ impl W4a16Dec {
                 .norm_resid_dev(2 * il, self.dres, ab, t)
                 .map_err(|e| format!("T{il} input norm: {e}"))?;
             let branch = if (il + 1) % 4 == 0 {
-                let xh = self.cast_f16(xn, t * h)?;
+                let xh = self.cast_x32(xn, t * h)?;
                 self.gemm_launch(&format!("blk.{il}.attn_q.weight"), xh, s0, t)?;
                 self.gemm_launch(&format!("blk.{il}.attn_k.weight"), xh, s1, t)?;
                 self.gemm_launch(&format!("blk.{il}.attn_v.weight"), xh, s1b, t)?;
                 self.attn_chain_dev_run(slot, il / 4, t, s0, s1, s1b)
                     .map_err(|e| format!("T{il} attn: {e}"))?
             } else {
-                let xh = self.cast_f16(xn, t * h)?;
+                let xh = self.cast_x32(xn, t * h)?;
                 self.gemm_launch(&format!("blk.{il}.attn_qkv.weight"), xh, s0, t)?;
                 self.gemm_launch(&format!("blk.{il}.attn_gate.weight"), xh, s1, t)?;
                 let g = self
@@ -1954,18 +1943,18 @@ impl W4a16Dec {
                 format!("blk.{il}.ssm_out.weight")
             };
             let (_, _, _, ko) = self.lin_spec(&lo)?;
-            let xh2 = self.cast_f16(branch, t * ko)?;
+            let xh2 = self.cast_x32(branch, t * ko)?;
             self.gemm_launch(&lo, xh2, dyt, t)?;
             let xn2 = self
                 .norm_resid_dev(2 * il + 1, self.dres, dyt, t)
                 .map_err(|e| format!("T{il} post norm: {e}"))?;
-            let xh3 = self.cast_f16(xn2, t * h)?;
+            let xh3 = self.cast_x32(xn2, t * h)?;
             self.gemm_launch(&format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
             self.gemm_launch(&format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
             self.ew_dev(s0, s1, s2, t * w2)?;
             let dn = format!("blk.{il}.ffn_down.weight");
             let (_, _, _, kd) = self.lin_spec(&dn)?;
-            let xh4 = self.cast_f16(s2, t * kd)?;
+            let xh4 = self.cast_x32(s2, t * kd)?;
             self.gemm_launch(&dn, xh4, s3, t)?;
             ab = s3;
         }

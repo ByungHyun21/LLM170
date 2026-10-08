@@ -498,9 +498,9 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             .w_raw(name)
             .map(|w| (w.n_out as usize, w.n_in as usize))
             .ok_or_else(|| format!("--bench-gemm {name}: 무게 없음"))?;
-        let xh: Vec<u16> = vec![0x3C00u16; bt * k]; // f16 1.0 — 수치 무의미
-        let xb = unsafe { std::slice::from_raw_parts(xh.as_ptr() as *const u8, xh.len() * 2) };
-        let dxh = dec.alloc_scratch(xh.len() * 2)?;
+        let xf: Vec<f32> = vec![1.0f32; bt * k]; // f32 1.0 — 수치 무의미
+        let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
+        let dxh = dec.alloc_scratch(xf.len() * 4)?;
         dec.h2d_scratch(dxh, xb)?;
         let dout = dec.alloc_scratch(bt * n * 4)?;
         // 워밍 1회.
