@@ -69,17 +69,22 @@ fn slot_fail(s: &mut Slot, msg: String) {
 }
 
 /// qwen35 로드 재시도 — 동일.
-pub(crate) fn load_q35_retry(p: &std::path::Path) -> llm170_core::qwen35::Model {
+/// GPU 엔진 로드(간헐 ENOPT 재시도 — 2026-09-01 실측 회복 패턴).
+pub(crate) fn load_gpu_retry(
+    p: &std::path::Path,
+    n_slots: usize,
+    ctx: usize,
+) -> crate::gpu_engine::GpuEngine {
     for i in 0..5 {
-        match llm170_core::qwen35::Model::load(p) {
-            Ok(m) => return m,
-            Err(e) => {
-                eprintln!("# qwen35 로드 재시도 {}/5: {e}", i + 1);
+        match crate::gpu_engine::GpuEngine::load(p, n_slots, ctx) {
+            Ok(e) => return e,
+            Err(err) => {
+                eprintln!("# gpu 엔진 로드 재시도 {}/5: {err}", i + 1);
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
     }
-    panic!("qwen35 로드 최종 실패: {}", p.display())
+    panic!("gpu 엔진 로드 최종 실패: {}", p.display())
 }
 
 /// 슬롯 로짓 → 토큰: 활성 샘플러면 sample, 아니면 greedy (동률 최저 인덱스).
@@ -91,7 +96,7 @@ fn pick(s: &mut Slot, logits: &[f32]) -> u32 {
 }
 
 /// Q35 np 디코드 — 샘플링 슬롯 포함시 logits 경로(decode), 아니면 GPU argmax 판.
-fn q35_decode(e: &mut llm170_core::qwen35::Engine, slots: &mut [Slot], seqs: &[usize]) {
+fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[usize]) {
     let toks: Vec<u32> = seqs.iter().map(|&i| slots[i].next).collect();
     if seqs
         .iter()
@@ -189,19 +194,18 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     {
         let warm: Vec<u32> = vec![1u32; 16];
         let w: Result<(), String> = match &mut eng {
-            Engine::Q35(e) => e
-                .prefill(0, &warm)
-                .and_then(|l| {
-                    let t = llm170_core::qwen35::greedy(&l);
-                    e.decode_greedy(0, t).map(|_| ())
-                })
-                .map_err(|e| e.to_string()),
+            Engine::Gpu(e) => e.prefill(0, &warm).and_then(|l| {
+                let t = llm170_core::qwen35::greedy(&l);
+                e.decode_greedy(0, t).map(|_| ())
+            }),
         };
         if let Err(err) = w {
             eprintln!("# warmup 실패(치명 아님): {err}");
         }
         match &mut eng {
-            Engine::Q35(e) => e.reset_states(),
+            Engine::Gpu(e) => {
+                let _ = e.reset_states();
+            }
         }
     }
     crate::http::READY.store(true, std::sync::atomic::Ordering::Release);
@@ -251,7 +255,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             decoded = true;
             let _dt = std::time::Instant::now();
             match &mut eng {
-                Engine::Q35(e) => q35_decode(e, &mut slots, &active),
+                Engine::Gpu(e) => q35_decode(e, &mut slots, &active),
             }
             dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
             // 완료 슬롯 정리 — 결과 전송·반환
@@ -288,16 +292,13 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     // prefill_greedy 대신 prefill. greedy는 종전 최적 경로.
                     let samp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
                     let r: Result<u32, String> = match &mut eng {
-                        Engine::Q35(e) => e
-                            .prefill(i, &part)
-                            .map(|l| {
-                                if samp {
-                                    pick(&mut slots[i], &l)
-                                } else {
-                                    llm170_core::qwen35::greedy(&l)
-                                }
-                            })
-                            .map_err(|e| e.to_string()),
+                        Engine::Gpu(e) => e.prefill(i, &part).map(|l| {
+                            if samp {
+                                pick(&mut slots[i], &l)
+                            } else {
+                                llm170_core::qwen35::greedy(&l)
+                            }
+                        }),
                     };
                     (end, r)
                 };

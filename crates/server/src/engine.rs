@@ -115,14 +115,15 @@ pub struct InferResult {
 }
 
 pub enum Engine {
-    Q35(Box<llm170_core::qwen35::Engine>),
+    /// W3-3: GPU 단일 경로 — W4A16 CUDA 체인(호스트 스테이징) + CPU head.
+    Gpu(Box<crate::gpu_engine::GpuEngine>),
 }
 
 impl Engine {
     /// 정지 토큰(F5 — 하드코드 248044 일반화): Q35는 아키텍처 상수.
     pub fn eos(&self) -> u32 {
         match self {
-            Engine::Q35(_) => llm170_core::qwen35::EOS_EOT,
+            Engine::Gpu(_) => llm170_core::qwen35::EOS_EOT,
         }
     }
 }
@@ -149,26 +150,27 @@ fn banner(
 }
 
 pub fn build_slots(req: InferRequest, _backend: BackendSel, n_slots: usize) -> Engine {
-    // W4A16 = qwen35 CPU 경로 단일(가속은 W2 커널 이후 — 그때 attach 재도입).
-    let m = load_q35_retry(&req.model);
-    let eng = llm170_core::qwen35::Engine::new(m, n_slots, req.ctx);
+    // W3-3: GPU 경로 단일 — 가중치 VRAM 상주(호스트 스테이징 체인).
+    let eng = load_gpu_retry(&req.model, n_slots, req.ctx);
     banner(
         &req.model,
         "w4a16",
-        "cpu",
+        "cuda",
         "none",
-        "off(cpu-backend)",
+        "cuda-resident",
         req.ctx,
         n_slots,
     );
-    Engine::Q35(Box::new(eng))
+    Engine::Gpu(Box::new(eng))
 }
 
 impl Engine {
     /// 슬롯 단위 리셋 위임.
     pub fn reset_seq(&mut self, seq: usize) {
         match self {
-            Engine::Q35(e) => e.reset_seq(seq),
+            Engine::Gpu(e) => {
+                let _ = e.reset_seq(seq);
+            }
         }
     }
 }
@@ -211,7 +213,7 @@ impl Detok {
     }
 }
 
-use crate::sched::load_q35_retry;
+use crate::sched::load_gpu_retry;
 /// 글로벌 토크나이저 (serve 시 1회 적재).
 pub use crate::sched::{SlotJob, slot_loop};
 

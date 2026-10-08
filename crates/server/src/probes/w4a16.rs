@@ -369,8 +369,8 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     if prompt.len() + n_predict + 1 > ctx {
         return Err(format!("ctx({ctx}) too small for prompt+n_predict"));
     }
-    let model = llm170_core::qwen35::Model::load(std::path::Path::new(&dir))
-        .map_err(|e| e.to_string())?;
+    let model =
+        llm170_core::qwen35::Model::load(std::path::Path::new(&dir)).map_err(|e| e.to_string())?;
     let hp = model.hp.clone();
     let interval = hp.full_attn_interval.max(1);
     let t0 = std::time::Instant::now();
@@ -390,10 +390,22 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     // 2) 노름 nw [2L+1][hidden].
     let mut nw: Vec<f32> = Vec::new();
     for il in 0..hp.n_layer {
-        nw.extend(model.f32_vec(&format!("blk.{il}.attn_norm.weight")).map_err(|e| e.to_string())?);
-        nw.extend(model.f32_vec(&format!("blk.{il}.post_attention_norm.weight")).map_err(|e| e.to_string())?);
+        nw.extend(
+            model
+                .f32_vec(&format!("blk.{il}.attn_norm.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+        nw.extend(
+            model
+                .f32_vec(&format!("blk.{il}.post_attention_norm.weight"))
+                .map_err(|e| e.to_string())?,
+        );
     }
-    nw.extend(model.f32_vec("output_norm.weight").map_err(|e| e.to_string())?);
+    nw.extend(
+        model
+            .f32_vec("output_norm.weight")
+            .map_err(|e| e.to_string())?,
+    );
     dec.set_norm_weights(&nw, 2 * hp.n_layer + 1)?;
     // 3) GDN 상수(층 순서 = il 오름차순, a 먼저 b 다음 — 커널 ab 색인).
     let n_gdn = hp.n_layer - hp.n_layer / interval;
@@ -415,12 +427,36 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         if (il + 1) % interval == 0 {
             continue;
         }
-        cw.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_conv1d.weight")).map_err(|e| e.to_string())?);
-        ab.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_alpha.weight")).map_err(|e| e.to_string())?);
-        ab.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_beta.weight")).map_err(|e| e.to_string())?);
-        alog.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_a")).map_err(|e| e.to_string())?);
-        dtb.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_dt.bias")).map_err(|e| e.to_string())?);
-        gnw.extend(model.raw_f32_vec(&format!("blk.{il}.ssm_norm.weight")).map_err(|e| e.to_string())?);
+        cw.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_conv1d.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+        ab.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_alpha.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+        ab.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_beta.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+        alog.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_a"))
+                .map_err(|e| e.to_string())?,
+        );
+        dtb.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_dt.bias"))
+                .map_err(|e| e.to_string())?,
+        );
+        gnw.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_norm.weight"))
+                .map_err(|e| e.to_string())?,
+        );
     }
     dec.set_gdn(gd, &cw, &ab, &alog, &dtb, &gnw)?;
     // 4) 어텐션 q/k 노름(+1 저장 규약 — f32_vec가 보정).
@@ -435,8 +471,16 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let (mut qnw, mut knw): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
     for ai in 0..n_attn {
         let il = ai * interval + interval - 1;
-        qnw.extend(model.f32_vec(&format!("blk.{il}.attn_q_norm.weight")).map_err(|e| e.to_string())?);
-        knw.extend(model.f32_vec(&format!("blk.{il}.attn_k_norm.weight")).map_err(|e| e.to_string())?);
+        qnw.extend(
+            model
+                .f32_vec(&format!("blk.{il}.attn_q_norm.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+        knw.extend(
+            model
+                .f32_vec(&format!("blk.{il}.attn_k_norm.weight"))
+                .map_err(|e| e.to_string())?,
+        );
     }
     dec.set_attn(ad, &qnw, &knw)?;
     let upload_ms = t0.elapsed().as_secs_f64() * 1e3;

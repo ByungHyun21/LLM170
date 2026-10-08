@@ -185,6 +185,12 @@ pub struct W4a16Dec {
     pub debug_layers: bool,
 }
 
+// SAFETY: CUDA 핸들(*mut c_void)은 Send가 아니지만, 이 디코더는 서버
+// 슬롯 스레드 1개가 소유·사용한다(공유 없음). 컨텍스트 current 전환은
+// 진입마다 cc.guard()가 수행한다 — 구 Exl3CudaDecoder의 동일 계약
+// (586758df^ exl3_cuda.rs L234 unsafe impl Send) 미러.
+unsafe impl Send for W4a16Dec {}
+
 impl W4a16Dec {
     /// 디코더 생성 — 5개 fatbin(체인 커널) 로드. 가중치는 upload_*로 공급.
     pub fn new(n_slots: usize, hidden: usize, n_layers: usize) -> Result<Self, String> {
@@ -237,7 +243,12 @@ impl W4a16Dec {
                     "src/rawcuda/assets/attn.fatbin",
                 ],
             )?,
-            &["attn_prep", "attn_prep_hostpos", "attn_fwd3s", "attn_pos_bump"],
+            &[
+                "attn_prep",
+                "attn_prep_hostpos",
+                "attn_fwd3s",
+                "attn_pos_bump",
+            ],
         )?;
         cc.load_fatbin(
             "ew",
@@ -380,9 +391,7 @@ impl W4a16Dec {
             self.y_cap = n;
         }
         let xh: Vec<u16> = x.iter().map(|&v| f32_to_f16(v)).collect();
-        let xb = unsafe {
-            std::slice::from_raw_parts(xh.as_ptr() as *const u8, xh.len() * 2)
-        };
+        let xb = unsafe { std::slice::from_raw_parts(xh.as_ptr() as *const u8, xh.len() * 2) };
         self.cc.h2d(self.dxh, xb)?;
         let f = self.cc.function("w4a16_gemm_g128")?;
         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dxh, self.dy);
@@ -541,7 +550,8 @@ impl W4a16Dec {
             (&mut a2) as *mut _ as *mut _,
             (&mut nn) as *mut _ as *mut _,
         ];
-        self.cc.launch(f, g.len().div_ceil(128) as u32, 1, 128, &mut args)?;
+        self.cc
+            .launch(f, g.len().div_ceil(128) as u32, 1, 128, &mut args)?;
         let mut yb = vec![0u8; g.len() * 4];
         self.cc.d2h(&mut yb, self.dew)?;
         self.cc.sync()?;
@@ -577,9 +587,8 @@ impl W4a16Dec {
         }
         (self.dcw, self.dab_c, self.dalog, self.ddtb, self.dnwg) = (0, 0, 0, 0, 0);
         (self.dring, self.dgst) = (0, 0);
-        let b = |v: &[f32]| unsafe {
-            std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-        };
+        let b =
+            |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         let dcw = self.cc.alloc(cw.len() * 4)?;
         Self::h2d_chunked(&self.cc, dcw, b(cw))?;
         let dab = self.cc.alloc(ab.len() * 4)?;
@@ -635,7 +644,9 @@ impl W4a16Dec {
     fn gdn_chain_dev(&mut self, slot: usize, layer: usize, t_len: usize) -> Result<(), String> {
         let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
         if layer >= dm.n_gdn || slot >= self.n_slots || t_len == 0 {
-            return Err(format!("GDN: 범위 위반 layer={layer} slot={slot} t={t_len}"));
+            return Err(format!(
+                "GDN: 범위 위반 layer={layer} slot={slot} t={t_len}"
+            ));
         }
         self.ensure_gdn_bufs(t_len)?;
         let ring_slot = slot * dm.n_gdn * 3 * dm.conv_ch();
@@ -773,9 +784,8 @@ impl W4a16Dec {
             return Err("GDN: 입력 형상 계약 위반".into());
         }
         self.ensure_gdn_bufs(t_len)?;
-        let b = |v: &[f32]| unsafe {
-            std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-        };
+        let b =
+            |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         self.cc.h2d(self.dgxn, b(xn))?;
         self.cc.h2d(self.dqkv, b(qkv))?;
         self.cc.h2d(self.dzv, b(z))?;
@@ -823,9 +833,8 @@ impl W4a16Dec {
             self.doutv_a,
         ) = (0, 0, 0, 0, 0);
         self.attn_t_cap = 0;
-        let b = |v: &[f32]| unsafe {
-            std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-        };
+        let b =
+            |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         let dq = self.cc.alloc(qnw.len() * 4)?;
         Self::h2d_chunked(&self.cc, dq, b(qnw))?;
         let dk = self.cc.alloc(knw.len() * 4)?;
@@ -929,8 +938,13 @@ impl W4a16Dec {
             (&mut kvh) as *mut _ as *mut _,
             (&mut cp) as *mut _ as *mut _,
         ];
-        self.cc
-            .launch(f, t_len as u32, (dm.q_heads + dm.kv_heads) as u32, 128, &mut args)
+        self.cc.launch(
+            f,
+            t_len as u32,
+            (dm.q_heads + dm.kv_heads) as u32,
+            128,
+            &mut args,
+        )
     }
 
     fn attn_fwd3s_launch(&mut self, slot: usize, layer: usize, t_len: usize) -> Result<(), String> {
@@ -995,9 +1009,8 @@ impl W4a16Dec {
             ));
         }
         self.ensure_attn_bufs(t_len)?;
-        let b = |v: &[f32]| unsafe {
-            std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-        };
+        let b =
+            |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         self.cc.h2d(self.dqg_a, b(qg))?;
         self.cc.h2d(self.dkin_a, b(kin))?;
         self.cc.h2d(self.dvin_a, b(vin))?;

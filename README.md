@@ -9,13 +9,15 @@ tensor cores, so every 4-bit format runs dequant → fp16 mma on the tensor
 cores anyway. The split packed/scale layout (4.125 bits/weight) keeps HBM2e
 pressure low and rides the mature GPTQ-style kernel line.
 
-Current state: the loader and CPU reference run W4A16 model directories
-end-to-end (compressed-tensors / AutoRound auto_gptq packing —
-`.weight_packed` · `.weight_scale` · `.weight_shape`). The serving path is
-CUDA-fixed; kernels (GEMV/GEMM → device-resident decoder) land in W2/W3 —
-until then `serve`/`infer` exit with a clear message. The CPU reference
-runner is the `w4a16-ref` probe (oracle for kernel/token judgment);
-per-module debug probes arrive with the kernels.
+Current state: `serve`/`infer` run the **CUDA chain** end-to-end on W4A16
+directories (compressed-tensors / AutoRound auto_gptq packing —
+`.weight_packed` · `.weight_scale` · `.weight_shape`): weights are
+VRAM-resident, the 64-layer chain runs on GPU (host-staged v1 — per-op
+round trips; ~275 ms/token on the dev 4090), and the token stream matches
+the CPU reference golden. The CPU reference runner is the `w4a16-ref`
+probe (oracle); module gates are `w4a16-gemv`/`w4a16-gemm` (bit judgment
+vs `dot_row_w4a16_lane`). Device-resident chaining (round-trip removal) is
+the next optimization step.
 
 Bit contract: CUDA kernel outputs must match the CPU reference
 (`crates/core/src/quant/lane.rs` — `dot_row_w4a16_lane`).
@@ -48,8 +50,12 @@ cargo build --release
 # Reference runner (CPU oracle — token judgment / debugging)
 cargo run --release -- w4a16-ref <w4a16_dir> --prompt-tokens 148678,65233,202419 --n-predict 16
 
-# HTTP server (OpenAI/Anthropic-compatible; CUDA path — W2/W3)
+# HTTP server (OpenAI/Anthropic-compatible; CUDA chain)
 cargo run --release -- serve --model <w4a16_dir> --port 8080 --slots 4   # --slots N: continuous batching (default 1)
+
+# GPU chain run (probe) / CPU oracle
+cargo run --release -- w4a16-gpu <w4a16_dir> --prompt-tokens 148678,65233,202419 --n-predict 8
+cargo run --release -- w4a16-ref <w4a16_dir> --prompt-tokens 148678,65233,202419 --n-predict 8
 
 # Loader completeness check / tokenizer
 cargo run --release -- w4a16-load <w4a16_dir>
