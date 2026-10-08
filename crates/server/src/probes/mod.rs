@@ -4,13 +4,9 @@
 //! exp-ab)는 2026-09-08 폐기.
 use std::process::ExitCode;
 
-/// 위치 인자 규약 헬퍼 (plans/109 P5) — `args[i] | default` 파싱이
-/// 디스패치 전체에 ~30번 손베껴져 있었다. 프로브 전용(경로/텐서명/수치).
+/// 위치 인자 규약 헬퍼 — `args[i] | default` 파싱.
 pub(crate) fn arg_str(args: &[String], i: usize, d: &str) -> String {
     args.get(i).cloned().unwrap_or_else(|| d.into())
-}
-pub(crate) fn arg_num<T: std::str::FromStr>(args: &[String], i: usize, d: T) -> T {
-    args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
 // ## 프로브 하네스 저작 원칙 (A10, plans/129 — 사고 4건+회귀루프 5건의 교훈)
@@ -30,20 +26,11 @@ pub(crate) fn arg_num<T: std::str::FromStr>(args: &[String], i: usize, d: T) -> 
 // 5. 종단 최종 상태가 버전 간 유일 불변량(형상이 다르면 중간값 비교 무의미).
 
 mod diag;
-mod misc;
-mod q4;
 mod w4a16;
 
-pub use q4::run_check;
-
 /// 프로브 커맨드이면 실행해 Some(코드) 반환, 아니면 None.
-/// R2③(플랜 129): 단일 match는 그룹 디스패치 체인으로 — arm 본문은 각
-/// 그룹 파일에 무변경 이동. special() 출력 특수 arm은 misc/q4가 편입.
 pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
-    diag::try_run(cmd, args)
-        .or_else(|| q4::try_run(cmd, args))
-        .or_else(|| w4a16::try_run(cmd, args))
-        .or_else(|| misc::try_run(cmd, args))
+    diag::try_run(cmd, args).or_else(|| w4a16::try_run(cmd, args))
 }
 
 /// Result<String, String> → ExitCode 공통 변환(구 run() 테일).

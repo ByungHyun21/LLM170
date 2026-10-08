@@ -10,8 +10,9 @@
 //!   fp·watchdog가 env를 읽는 유일한 곳이어야 한다).
 //! - `crates/server/src/main.rs` — 부트스트랩: LLM170_FRAME 기본값 set_var(스냅샷
 //!   이전에 env를 *써야* 한다)·watchdog 초 파싱·OOM adj. 1회 판독 비핫패스.
-//! - `crates/server/src/probes/`·`rawvk/checks/`·`rawhip/probes/` — 검증층
-//!   (3층 분리: 하네스는 프로덕션 계약 밖. A21e 후순위).
+//! - `crates/server/src/probes/` — 검증층(3층 분리: 하네스는 프로덕션 계약 밖).
+//! - `crates/backend-gpu/src/rawcuda/**` — fatbin 자산 경로 오버라이드 env
+//!   (`LLM170_CUDA_*_FATBIN_PATH` — 계산 경로 분기 아님, 로드 경로 전용).
 //! - gguf·server의 tests/·examples — 이 스캔은 src 트리만 본다.
 
 /// (루트, 허용 파일 접두사 목록) — 루트가 없으면 테스트 실패(이동 누락 방지).
@@ -19,8 +20,6 @@ const SCAN: &[(&str, &[&str])] = &[
     ("crates/core/src", &[]),
     ("crates/exl3/src", &[]),
     ("crates/server/src", &["main.rs", "probes/"]),
-    ("crates/backend-gpu/src/rawhip", &["probes/"]),
-    ("crates/backend-gpu/src/rawvk", &["checks/"]),
 ];
 
 fn repo_root() -> std::path::PathBuf {

@@ -7,13 +7,8 @@ edition.workspace = true
 llm170-core = { path = "../core" }
 llm170-gguf = { path = "../gguf" }
 llm170-exl3 = { path = "../exl3" }
-cubecl-hip-sys = { package = "hanzo-cubecl-hip-sys", version = "7.2" }
-bytemuck = "1"
-ash = "0.38.0"
-parking_lot = "0.12.5"
 llm170-diag = { path = "../diag" }
-half = "2.7.1"
-libc = "0.2"
+parking_lot = "0.12.5"
 
 [lints]
 workspace = true

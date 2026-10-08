@@ -141,22 +141,6 @@ pub fn q4_cuda_runtime(backend: &BackendSel) -> bool {
     matches!(backend, BackendSel::GpuRuntime(r) if r == "cuda")
 }
 
-/// qwen4exp GPU 요청 판정 — CLI 문자열판 (infer/bench).
-pub fn q4_gpu_wanted_str(backend: &str, runtime: &str) -> bool {
-    if q4_gpu_env_off() {
-        return false;
-    }
-    if backend != "gpu" {
-        return false;
-    }
-    if runtime != "hip" && runtime != "vulkan" && runtime != "cuda" {
-        eprintln!(
-            "# qwen4exp: --gpu-runtime {runtime}은 미지원(QSA 커널·용량) — HIP로 진행 (plans/64 §7)"
-        );
-    }
-    true
-}
-
 /// q4 모델에 외장 MTP 모듈 병합 (plans/109 P15⑤) — `--mtp` 우선, 없으면
 /// spec 의도(spec_k>0)일 때 모델 형제의 `mtp-*.gguf` 자동 탐지(Q8_0 우선).
 /// 성공/생략은 로그로만 — 실패(명시 지정인데 깨짐)는 Err.
@@ -209,45 +193,26 @@ pub fn apply_mtp(
     }
 }
 
-/// CLI 문자열판 vulkan 선택 (plans/84 B).
-pub fn q4_vk_runtime_str(runtime: &str) -> bool {
-    runtime == "vulkan"
-}
-
-/// CLI 문자열판 cuda 선택 (plans/cuda-port.md §1.3 S6).
-pub fn q4_cuda_runtime_str(runtime: &str) -> bool {
-    runtime == "cuda"
-}
-
-/// 백엔드 부착 실패 정책 — serve·vl은 경고 후 CPU 지속, bench·infer 검증은
-/// 오류 승격(조용한 CPU 폴백이 GPU 수치로 오인된 사고 이력 — 커밋 참조).
+/// 백엔드 부착 실패 정책 — serve는 경고 후 CPU 지속(조용한 CPU 폴백이 GPU
+/// 수치로 오인된 사고 이력 — 커밋 참조).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AttachPolicy {
     Warn,
+    /// 현 프런트는 Warn만 생성 — Strict는 검증 하네스 후속용으로 존치.
+    #[allow(dead_code)]
     Strict,
 }
 
-/// qwen35 GPU 부착 — 단일 경로 (plans/109 P3). 종전 serve/infer/bench/vl이
-/// 각자 베껴 쓰며 serve의 vk-q35 비결정 게이트를 우회했다.
-/// 1. LLM170_RAWHIP=0 → 부착 없음(CPU).
-/// 2. vulkan && !LLM170_VK_Q35_FORCE → hip 폴백(원장 87/90 비결정 레이스).
-/// 3. vulkan 잔여 → LLM170_VK_ACC=1이면 VkAcc, 아니면 VkDecoder.
-/// 4. 그 외 → rawhip 디코더. 실패는 정책(Warn=CPU 지속 / Strict=Err)대로.
+/// qwen35 GPU 부착 — rawhip·rawvk 탈락(2026-10-08, plans/w4a16-cuda.md §5):
+/// 잔존 GPU 부착은 CUDA 값경로뿐. 실패는 정책대로(Warn=CPU 지속 / Strict=Err).
 pub fn attach_q35(
-    mut eng: llm170_core::qwen35::Engine,
-    vulkan: bool,
+    eng: llm170_core::qwen35::Engine,
+    _vulkan: bool,
     cuda: bool,
     policy: AttachPolicy,
 ) -> Result<llm170_core::qwen35::Engine, String> {
-    // LLM170_RAWHIP=0 → 명시적 CPU.
-    if !llm170_diag::flag::ne0("LLM170_RAWHIP") {
-        // B21/P0-4(§10-3): 무음 CPU 금지 — env 게이트 적용 사실을 로그로.
-        eprintln!("# backend: cpu (env 게이트 LLM170_RAWHIP=0 — 명시적 CPU)");
-        return Ok(eng);
-    }
     if cuda {
         // plans/cuda-port.md §1.3 S6 — CUDA 값경로: Q4AccCuda(MatmulHost).
-        // qwen35 GGUF(Q4_K_M 등)의 값경로 판 — VkAcc와 동일 구조다.
         match llm170_backend_gpu::new_q4_acc_cuda() {
             Ok(acc) => {
                 eprintln!("# backend: gpu (qwen35 CUDA 값경로 — plans/cuda-port.md §1.3 S6)");
@@ -262,41 +227,7 @@ pub fn attach_q35(
             }
         }
     }
-    // 107(원장 87·90) → plans/135 §21-3 16차 종결: qwen35 vk 디코드 비결정의
-    // 근원 = gemv8_q5b 발사의 배리어 생략(gemv_stage 내부 skip이 q5b에선 경합).
-    // gemv.rs q5b bar=true 근원 수정 + alloc flush·DEVICE_ADDRESS 사양 정정으로
-    // 3연속 결정론 확인 — 봉인 해제. LLM170_VK_Q35_FORCE는 진단 강행용으로 유지
-    // (무해 — 봉인 조건은 이제 항상 거짓이므로 미동작).
-    if vulkan {
-        if llm170_diag::flag::on("LLM170_VK_ACC") {
-            match llm170_backend_gpu::rawvk::vkacc::VkAcc::new() {
-                Ok(acc) => {
-                    eprintln!("# backend: gpu (vulkan VkAcc)");
-                    return Ok(eng.with_acc(std::sync::Arc::new(acc)));
-                }
-                Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
-            }
-        } else if let Err(e) = llm170_backend_gpu::inject_rawvk(&mut eng) {
-            eprintln!("vk-decoder: {e}");
-        } else {
-            eprintln!("# backend: gpu (vulkan VkDecoder)");
-            return Ok(eng);
-        }
-        return Ok(eng);
-    }
-    match llm170_backend_gpu::inject_rawhip(&mut eng) {
-        Ok(()) => {
-            eprintln!("# backend: gpu (qwen35 rawhip decode)");
-            Ok(eng)
-        }
-        Err(e) => {
-            eprintln!("rawhip: {e}");
-            match policy {
-                AttachPolicy::Warn => Ok(eng),
-                AttachPolicy::Strict => Err(e),
-            }
-        }
-    }
+    Ok(eng)
 }
 
 /// qwen4exp GPU 부착 — 단일 경로 (plans/109 P3). vk·hip 가속기 실패는 정책대로.
@@ -345,36 +276,13 @@ pub fn attach_q4(
         };
     }
     if vk {
-        // plans/84 B — Vulkan 값경로: VkAcc(MatmulHost). 프레임 미구현 →
-        // Engine4는 값 경로로 동작(모든 GEMV를 호스트 스테이징).
-        return match llm170_backend_gpu::new_q4_acc_vk_with_sources(sources) {
-            Ok(acc) => {
-                eprintln!("# backend: gpu (qwen4exp Vulkan 값경로 — plans/84 B)");
-                Ok(eng.with_acc(acc))
-            }
-            Err(e) => {
-                eprintln!("error: qwen4exp Vulkan 가속기 생성 실패 — {e}");
-                match policy {
-                    AttachPolicy::Warn => Ok(eng),
-                    AttachPolicy::Strict => Err(e),
-                }
-            }
-        };
+        // rawvk 탈락(2026-10-08) — vk 부착 경로 없음: CPU 유지.
+        return Ok(eng);
     }
-    match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
-        Ok(acc) => {
-            eprintln!("# backend: gpu (qwen4exp rawhip)");
-            Ok(eng.with_acc(acc))
-        }
-        Err(e) => {
-            eprintln!("error: qwen4exp GPU 가속기 생성 실패 — {e}");
-            eprintln!("error: --backend cpu로 CPU 기준 경로를 쓸 것 (조용한 폴백 금지)");
-            match policy {
-                AttachPolicy::Warn => Ok(eng),
-                AttachPolicy::Strict => Err(e),
-            }
-        }
-    }
+    // rawhip 탈락(2026-10-08) — hip 부착 경로 없음: CPU 유지(무음 금지 로그).
+    let _ = sources;
+    eprintln!("# backend: cpu (hip 부착 탈락 — plans/w4a16-cuda.md §5)");
+    Ok(eng)
 }
 
 /// 생성 토큰 싱크 — 명령별 출력(JSONL text 포함/미포함·텍스트 누적) 차이를
@@ -562,21 +470,12 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         } else {
             "gguf"
         };
-    // plans/111 W4c: PLE 테이블 오프로드 모드(서빙 옵션 → 백엔드 전역).
-    // B8(plans/cuda-models.md §5): 구현은 rawhip 전역뿐 — CUDA 런타임은
-    // 플래그가 조용히 무시되므로 명시 경고한다.
-    if let Some(m) = req.ple_table.as_deref() {
-        if let Err(e) = llm170_backend_gpu::set_ple_table_mode_by_str(m) {
-            eprintln!("error: {e}");
-        }
-        if q4_cuda_runtime(&backend) {
-            eprintln!(
-                "# ple-table({m}): CUDA 경로 미구현 — 플래그 무시(B8, plans/cuda-models.md §4)"
-            );
-        }
-    }
-    if let Some(mib) = req.ple_cache_mib {
-        llm170_backend_gpu::set_ple_ssd_cache_mib(mib);
+    // PLE 플래그는 rawhip 전역 구현이었음 — hip 탈락(2026-10-08, §5)으로
+    // W4A16 경로에서는 무의미. 지정 시 정직 고지.
+    if req.ple_table.is_some() || req.ple_cache_mib.is_some() {
+        eprintln!(
+            "# ple-table/ple-cache: hip 탈락(2026-10-08) — 플래그 무시(plans/w4a16-cuda.md §5)"
+        );
     }
     // 아키텍처 판별은 GGUF 파일 전용 — W4A16 디렉터리는 곧장 qwen35 경로.
     let arch = if req.model.is_dir() {

@@ -20,7 +20,7 @@ if not exist "%NVCC%" (
   echo build_cuda: nvcc 없음: %NVCC% 1>&2
   exit /b 1
 )
-set SRCS=smoke exl3_gemv exl3_norm exl3_gemm2
+set SRCS=smoke exl3_norm
 rem exl3_gdn은 별도 블록: -fmad=false(FMA 수축 제거 — GDN 오라클과의
 rem 비트동일 미러 계약, assets/exl3_gdn.cu 헤더 4항·plans/124 §6).
 rem 나머지 소스(G2-G4)는 기본 fmad 유지 — f16팩 GEMV의 HFMA2 단일

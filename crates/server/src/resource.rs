@@ -212,8 +212,6 @@ pub const DEFAULT_FN_MODEL: &str =
     "/home/harsper/Desktop/workspace/models/Qwen3.8-Flash-Next-W4A16-FP8PLE";
 pub const DEFAULT_27_MODEL: &str =
     "/home/harsper/Desktop/workspace/models/Qwen3.8-27B-W4A16-AutoRound";
-pub const DEFAULT_Q35_MODEL: &str =
-    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B-W4A16-AutoRound";
 pub const DEFAULT_EXL3_MODEL: &str =
     "/home/harsper/Desktop/workspace/models/Qwen3.8-27B-W4A16-AutoRound";
 
@@ -353,13 +351,9 @@ pub fn preflight(model: &Path, gpu: bool, runtime: Option<&str>) -> Result<(), S
         return Ok(()); // 경로 오류는 로더의 에러가 더 정확하다 - 여기서는 통과
     }
     let vram = if gpu {
-        // B6: 런타임별 프로브 — cuda는 cuMemGetInfo(rawcuda ffi), 그 외는
-        // 기존 hip 프로브. 실패는 None → check의 B17 게이트가 거부한다.
-        let probe = if runtime == Some("cuda") {
-            llm170_backend_gpu::cuda_mem_free()
-        } else {
-            llm170_backend_gpu::gpu_mem_free()
-        };
+        // B6: CUDA 단일(hip·vulkan 탈락 2026-10-08) — cuMemGetInfo(rawcuda ffi).
+        // 실패는 None → check의 B17 게이트가 거부한다.
+        let probe = llm170_backend_gpu::cuda_mem_free();
         match probe {
             Some((free, _total)) => Some(free),
             None => {
