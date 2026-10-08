@@ -6,8 +6,9 @@
 //! `.weight_scale` F16[n, k/group] · `.weight_shape` I64[2]=(n,k). 행=출력(n),
 //! 열=입력(k). 대칭(sym)이라 zero-point 미저장 — zp=8 고정(4bit 중심).
 //! 니블 순서 lsb-first **확정**(2026-10-08 — lane.rs §3.6).
-//! group은 quantization_config에서 읽는다(g128/g32 공용 — 스케일 행 길이가
-//! 실효 그룹을 정한다).
+//! group은 quantization_config에서 읽는다 — **현행 g128 전용**(C3: 스토어·lane·
+//! 커널·bind 순열이 전부 g128 가정이라 g32는 check_quant가 명시 거부. g32 정식
+//! 지원은 W4-1에서 네 지점 동시 일반화).
 //!
 //! [계약] 헤더 인덱스(StArchive) + 행 단위 pread — 전체 적재 금지.
 //! 트리플 구조 정합은 open이, 기대 집합 대조는 바인딩의 validate가 판정한다.
@@ -24,6 +25,8 @@ pub enum W4a16Error {
     BadTensor(String),
     Quant(String),
     Arch(String),
+    /// config.json 시맨틱 위반(교차필드·정렬 계약) — BadTensor 남용 분리.
+    Config(String),
     St(crate::st::StError),
     Io(std::io::Error),
 }
@@ -35,6 +38,7 @@ impl std::fmt::Display for W4a16Error {
             W4a16Error::BadTensor(s) => write!(f, "w4a16 bad tensor: {s}"),
             W4a16Error::Quant(s) => write!(f, "w4a16 unsupported quant: {s}"),
             W4a16Error::Arch(s) => write!(f, "w4a16 unsupported arch: {s}"),
+            W4a16Error::Config(s) => write!(f, "w4a16 config: {s}"),
             W4a16Error::St(e) => write!(f, "w4a16 archive: {e}"),
             W4a16Error::Io(e) => write!(f, "w4a16 io: {e}"),
         }
@@ -61,7 +65,7 @@ pub type R<T> = Result<T, W4a16Error>;
 #[derive(Debug, Clone, Copy)]
 pub struct QuantSpec {
     pub bits: usize,
-    /// 그룹 크기 — g128(27B)·g32(35B 전문가) 공용. 스케일 형상이 실효값.
+    /// 그룹 크기 — 현행 128 고정(g32는 W4-1 — check_quant 게이트).
     pub group: usize,
 }
 
@@ -224,8 +228,9 @@ impl W4a16Model {
         })
     }
 
-    /// quantization_config 계약: compressed-tensors pack-quantized int4 sym.
-    /// group은 값 그대로 채택(g128/g32 공용 — 스케일 형상이 교차 검증).
+    /// quantization_config 계약: compressed-tensors pack-quantized int4 sym g128.
+    /// g32는 스토어·lane·커널·bind가 전부 g128 가정이라 명시 거부(패닉 예방 —
+    /// W4-1에서 일반화 예정).
     fn check_quant(text: &str) -> R<QuantSpec> {
         let v = Json::parse(text)
             .map_err(|e| W4a16Error::Quant(format!("quantization_config.json: {e}")))?;
@@ -251,9 +256,14 @@ impl W4a16Model {
         let bits = w.get("num_bits").and_then(Json::as_f64).unwrap_or(0.0) as usize;
         let group = w.get("group_size").and_then(Json::as_f64).unwrap_or(0.0) as usize;
         let sym = w.get("symmetric").and_then(Json::as_bool).unwrap_or(false);
-        if bits != 4 || !sym || group == 0 || !group.is_multiple_of(32) {
+        if bits != 4 || !sym {
             return Err(W4a16Error::Quant(format!(
-                "bits={bits} group={group} sym={sym} — int4 sym 전용(그룹 32배수)"
+                "bits={bits} sym={sym} — int4 sym 전용"
+            )));
+        }
+        if group != 128 {
+            return Err(W4a16Error::Quant(format!(
+                "group={group} — 현행 g128 전용(g32는 W4-1에서 스토어·lane·커널·bind 동시 일반화)"
             )));
         }
         Ok(QuantSpec { bits, group })
@@ -300,7 +310,7 @@ impl W4a16Model {
         v
     }
 
-    /// 그룹 크기(g128/g32) — 커널 계약의 입력.
+    /// 그룹 크기(현행 g128) — 커널 계약의 입력.
     pub fn group(&self) -> usize {
         self.quant.group
     }
@@ -469,4 +479,36 @@ pub fn load_pieces(dir: &Path) -> R<Vec<String>> {
         out[i as usize] = p;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qtext(bits: usize, sym: bool, group: usize) -> String {
+        format!(
+            r#"{{"quant_method":"compressed-tensors","config_groups":{{"group_0":{{"format":"pack-quantized","weights":{{"num_bits":{bits},"symmetric":{sym},"group_size":{group}}}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn quant_g128_accept() {
+        let q = W4a16Model::check_quant(&qtext(4, true, 128)).expect("g128 계약");
+        assert_eq!(q.group, 128);
+    }
+
+    #[test]
+    fn quant_g32_reject_until_w4() {
+        // C3: g32는 로드 중 패닉(커널/lane 가정)을 내므로 파싱 시점 명시 거부.
+        let e = W4a16Model::check_quant(&qtext(4, true, 32))
+            .expect_err("g32 거부")
+            .to_string();
+        assert!(e.contains("g128 전용"), "{e}");
+    }
+
+    #[test]
+    fn quant_bits_sym_reject() {
+        assert!(W4a16Model::check_quant(&qtext(8, true, 128)).is_err());
+        assert!(W4a16Model::check_quant(&qtext(4, false, 128)).is_err());
+    }
 }

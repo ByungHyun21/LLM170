@@ -70,7 +70,7 @@ impl QwenCfg {
         // rope 파라미터는 text_config.rope_parameters에 중첩(실측) — 평면 키도 허용.
         let rp = tc.get("rope_parameters").unwrap_or(tc);
         let f = |k: &str| -> Option<f64> { rp.get(k).and_then(Json::as_f64) };
-        Ok(QwenCfg {
+        let cfg = QwenCfg {
             hidden: u("hidden_size").ok_or_else(|| bad("hidden_size"))?,
             layers: u("num_hidden_layers").ok_or_else(|| bad("num_hidden_layers"))?,
             heads: u("num_attention_heads").ok_or_else(|| bad("num_attention_heads"))?,
@@ -96,8 +96,66 @@ impl QwenCfg {
                 .get("rms_norm_eps")
                 .and_then(Json::as_f64)
                 .unwrap_or(1e-6),
-        })
+        };
+        // 교차필드 계약(C4) — 위반은 로드 중 0나누기(attn)·언더플로(conv)·조용한
+        // GQA 오매핑이 된다. 파싱 시점에 명시 거부(게이트 B/C 계약 보호).
+        let pos = |v: usize, k: &str| -> R<()> {
+            if v == 0 {
+                Err(W4a16Error::Config(format!("config.json: {k}=0")))
+            } else {
+                Ok(())
+            }
+        };
+        pos(cfg.hidden, "hidden_size")?;
+        pos(cfg.layers, "num_hidden_layers")?;
+        pos(cfg.heads, "num_attention_heads")?;
+        pos(cfg.kv_heads, "num_key_value_heads")?;
+        pos(cfg.head_dim, "head_dim")?;
+        pos(cfg.ffn, "intermediate_size")?;
+        pos(cfg.vocab, "vocab_size")?;
+        pos(cfg.linear_key_head_dim, "linear_key_head_dim")?;
+        pos(cfg.linear_num_key_heads, "linear_num_key_heads")?;
+        pos(cfg.linear_num_value_heads, "linear_num_value_heads")?;
+        pos(cfg.linear_conv_kernel, "linear_conv_kernel_dim")?;
+        if !cfg.heads.is_multiple_of(cfg.kv_heads) {
+            return Err(W4a16Error::Config(format!(
+                "num_attention_heads={} % num_key_value_heads={} != 0",
+                cfg.heads, cfg.kv_heads
+            )));
+        }
+        if !cfg
+            .linear_num_value_heads
+            .is_multiple_of(cfg.linear_num_key_heads)
+        {
+            return Err(W4a16Error::Config(format!(
+                "linear_num_value_heads={} % linear_num_key_heads={} != 0 (vperm ratio)",
+                cfg.linear_num_value_heads, cfg.linear_num_key_heads
+            )));
+        }
+        Ok(cfg)
     }
+}
+
+/// 순열 사본 정렬 계약(C2) — build_perm/conv_rows_f32_permuted는 128행 블록
+/// 단위로만 순열하고 꼬리(n%128)를 0으로 방치한다(오류·패닉 없이 잘못된
+/// 가중치 = 조용한 오염). validate가 구축 전에 전수 검사한다.
+/// name 규약: `in_proj_z`는 전 행(base 0), 그 외(qkv·conv1d)는 vbase 이후.
+pub fn perm_align_check(cfg: &QwenCfg, items: &[(String, usize)]) -> R<()> {
+    let vbase = 2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+    for (name, v) in items {
+        let base = if name.ends_with("in_proj_z") {
+            0
+        } else {
+            vbase
+        };
+        if *v < base || !(*v - base).is_multiple_of(128) {
+            return Err(W4a16Error::Config(format!(
+                "{name}: 순열 정렬 위반 — n-base={} (128배수 아님, 순열 사본 0 방치)",
+                *v as i64 - base as i64
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 엔진(블록) 텐서명 해석 — qwen35 스테이지가 요구하는 이름을 소스로 매핑.
@@ -395,6 +453,29 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
         ..Default::default()
     };
     rep.bad_shape_value = store.check_shape_values()?;
+    // 순열 정렬 계약(C2) — 순열 사본 구축(build_perm) 전에 전수 거부.
+    {
+        let lp = "model.language_model.layers.";
+        let mut items: Vec<(String, usize)> = Vec::new();
+        for il in 0..cfg.layers {
+            if (il + 1).is_multiple_of(cfg.full_interval) {
+                continue; // full-attn 층은 V축 순열 없음.
+            }
+            let l = format!("{lp}{il}.");
+            for (suf, nm) in [
+                ("linear_attn.in_proj_qkv", "in_proj_qkv"),
+                ("linear_attn.in_proj_z", "in_proj_z"),
+            ] {
+                if let Some((n, _k)) = store.lin_shape(&format!("{l}{suf}")) {
+                    items.push((format!("{l}{nm}"), n));
+                }
+            }
+            if let Some(e) = store.entry(&format!("{l}linear_attn.conv1d.weight")) {
+                items.push((format!("{l}conv1d"), e.shape[0] as usize));
+            }
+        }
+        perm_align_check(cfg, &items)?;
+    }
     // 커버리지: 기대 양자화/플레인 집합 vs 실제.
     let (exp_q, exp_p) = expected_names(cfg);
     for base in &exp_q {
@@ -496,4 +577,92 @@ fn expected_names(cfg: &QwenCfg) -> (Vec<String>, Vec<String>) {
         p.push(g.to_string());
     }
     (q, p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_text(heads: usize, kv: usize, nk: usize, nv: usize, conv_k: usize) -> String {
+        format!(
+            r#"{{"hidden_size":5120,"num_hidden_layers":4,"num_attention_heads":{heads},"num_key_value_heads":{kv},"head_dim":128,"intermediate_size":17408,"vocab_size":248320,"linear_key_head_dim":128,"linear_num_key_heads":{nk},"linear_num_value_heads":{nv},"linear_conv_kernel_dim":{conv_k}}}"#
+        )
+    }
+
+    #[test]
+    fn cfg_accept_and_reject_cross_fields() {
+        assert!(QwenCfg::parse(&cfg_text(40, 8, 16, 64, 4)).is_ok());
+        // C4: 0 필드·GQA 불일치·vperm ratio 위반은 명시 거부.
+        let e = QwenCfg::parse(&cfg_text(40, 0, 16, 64, 4))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("num_key_value_heads=0"), "{e}");
+        let e = QwenCfg::parse(&cfg_text(41, 8, 16, 64, 4))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("num_key_value_heads"), "{e}");
+        let e = QwenCfg::parse(&cfg_text(40, 8, 16, 65, 4))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("vperm"), "{e}");
+        let e = QwenCfg::parse(&cfg_text(40, 8, 16, 64, 0))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("linear_conv_kernel_dim=0"), "{e}");
+    }
+
+    fn cfg_fixture() -> QwenCfg {
+        QwenCfg {
+            hidden: 5120,
+            layers: 4,
+            heads: 40,
+            kv_heads: 8,
+            head_dim: 128,
+            ffn: 17408,
+            vocab: 248320,
+            full_interval: 4,
+            linear_key_head_dim: 128,
+            linear_num_key_heads: 16,
+            linear_num_value_heads: 64,
+            linear_conv_kernel: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 1e7,
+            rms_norm_eps: 1e-6,
+        }
+    }
+
+    #[test]
+    fn perm_align_rules() {
+        let cfg = cfg_fixture();
+        let vbase = 2 * 16 * 128; // 4096
+        // 정렬 OK — qkv v부(6144)·z(5120)·conv(vbase+2560).
+        let ok = vec![
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_qkv".to_string(),
+                vbase + 6144,
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_z".to_string(),
+                5120,
+            ),
+            (
+                "model.language_model.layers.0.conv1d".to_string(),
+                vbase + 2560,
+            ),
+        ];
+        assert!(perm_align_check(&cfg, &ok).is_ok());
+        // C2: 128 꼬리행은 거부(순열 사본이 0으로 방치되는 오염).
+        let bad = vec![(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv".to_string(),
+            vbase + 6144 + 64,
+        )];
+        let e = perm_align_check(&cfg, &bad).unwrap_err().to_string();
+        assert!(e.contains("순열 정렬 위반"), "{e}");
+        // vbase 미만도 거부.
+        let bad2 = vec![(
+            "model.language_model.layers.0.conv1d".to_string(),
+            vbase - 128,
+        )];
+        assert!(perm_align_check(&cfg, &bad2).is_err());
+    }
 }
