@@ -407,9 +407,9 @@ fn w4_weight<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Weight<
         } => {
             let e = w4.entry(&hf)?;
             let ty = match e.dtype {
-                llm170_exl3::StDtype::Bf16 => GgmlType::Bf16,
-                llm170_exl3::StDtype::F16 => GgmlType::F16,
-                llm170_exl3::StDtype::F32 => GgmlType::F32,
+                crate::st::StDtype::Bf16 => GgmlType::Bf16,
+                crate::st::StDtype::F16 => GgmlType::F16,
+                crate::st::StDtype::F32 => GgmlType::F32,
                 _ => return None,
             };
             let data = if rows_perm {
