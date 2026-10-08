@@ -357,6 +357,155 @@ impl CudaCtx {
         Ok(())
     }
 
+    // ── CUDA Graph 캡처(체인 1 launch 붕괴 — P1) ──
+
+    /// 실스트림 생성(비차단) + 이 컨텍스트의 기본 스트림으로 교체.
+    /// 그래프 캡처는 레거시 기본 스트림(0)에서 불가(STREAM_CAPTURE_UNSUPPORTED).
+    /// 이후 모든 발사·비동기 복사가 이 스트림으로 나간다(파괴는 프로세스 수명).
+    pub fn create_stream(&mut self) -> Result<(), String> {
+        // SAFETY: 출력은 스택 로컬 — 생성 핸들은 필드 보관.
+        unsafe {
+            let mut s: CUstream = std::ptr::null_mut();
+            let r = (self.drv.stream_create)(&mut s, 1); // CU_STREAM_NON_BLOCKING
+            if r != CUDA_SUCCESS {
+                return Err(format!("rawcuda: cuStreamCreate: {}", ffi::err_text(r)));
+            }
+            self.stream = s;
+        }
+        Ok(())
+    }
+
+    /// pinned 호스트 할당 — 캡처 가능한 async 복사의 소스/목적지.
+    pub fn pinned_alloc(&self, bytes: usize) -> Result<*mut std::ffi::c_void, String> {
+        // SAFETY: 출력은 스택 로컬 — 해제는 pinned_free 계약.
+        unsafe {
+            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+            let r = (self.drv.mem_host_alloc)(&mut p, bytes, 0);
+            if r != CUDA_SUCCESS {
+                return Err(format!(
+                    "rawcuda: cuMemHostAlloc({bytes}B): {}",
+                    ffi::err_text(r)
+                ));
+            }
+            Ok(p)
+        }
+    }
+
+    /// pinned 해제. clippy allow — launch와 동일 판정(불투명 핸들: 유효성은
+    /// 발급 계약과 드라이버 CUresult 검증에 맡긴다).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn pinned_free(&self, p: *mut std::ffi::c_void) -> Result<(), String> {
+        // SAFETY: p는 pinned_alloc이 돌려준 유효 핸들(중복 해제 금지 계약).
+        unsafe {
+            let r = (self.drv.mem_free_host)(p);
+            if r != CUDA_SUCCESS {
+                return Err(format!("rawcuda: cuMemFreeHost: {}", ffi::err_text(r)));
+            }
+        }
+        Ok(())
+    }
+
+    /// 디바이스→호스트 비동기 복사(pinned dst — 캡처 노드로 기록 가능).
+    /// clippy allow — dst는 호출자가 보증하는 pinned 포인터(불투명 핸들 계약).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn d2h_async(&self, dst: *mut u8, src: CUdeviceptr, bytes: usize) -> Result<(), String> {
+        // SAFETY: dst는 pinned(호출자 계약), src는 유효 할당, 범위는 호출자 계약.
+        unsafe {
+            let r =
+                (self.drv.memcpy_dtoh_async)(dst as *mut std::ffi::c_void, src, bytes, self.stream);
+            if r != CUDA_SUCCESS {
+                return Err(format!(
+                    "rawcuda: cuMemcpyDtoHAsync({bytes}B): {}",
+                    ffi::err_text(r)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 그래프 캡처 개시(THREAD_LOCAL) — 이후 이 스트림의 발사가 그래프 노드로
+    /// 기록된다(실행 아님). 캡처 중 동기 복사·alloc·sync는 금지.
+    pub fn capture_begin(&self) -> Result<(), String> {
+        // SAFETY: stream은 create_stream이 설정한 유효 핸들.
+        unsafe {
+            let r = (self.drv.stream_begin_capture)(self.stream, 1);
+            if r != CUDA_SUCCESS {
+                return Err(format!(
+                    "rawcuda: cuStreamBeginCapture: {}",
+                    ffi::err_text(r)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 캡처 종료 → 그래프 핸들. 실패 시에도 캡처 상태는 해제된다.
+    pub fn capture_end(&self) -> Result<ffi::CUgraph, String> {
+        // SAFETY: 출력은 스택 로컬 — 그래프 핸들은 호출자 소유(graph_destroy).
+        unsafe {
+            let mut g: ffi::CUgraph = std::ptr::null_mut();
+            let r = (self.drv.stream_end_capture)(self.stream, &mut g);
+            if r != CUDA_SUCCESS {
+                return Err(format!("rawcuda: cuStreamEndCapture: {}", ffi::err_text(r)));
+            }
+            Ok(g)
+        }
+    }
+
+    /// 그래프 인스턴스화 — 실행 핸들(캡처 1회·replay N회).
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn graph_instantiate(&self, g: ffi::CUgraph) -> Result<ffi::CUgraphExec, String> {
+        // SAFETY: g는 capture_end가 돌려준 유효 그래프.
+        unsafe {
+            let mut e: ffi::CUgraphExec = std::ptr::null_mut();
+            let r = (self.drv.graph_instantiate)(&mut e, g, 0);
+            if r != CUDA_SUCCESS {
+                return Err(format!(
+                    "rawcuda: cuGraphInstantiateWithFlags: {}",
+                    ffi::err_text(r)
+                ));
+            }
+            Ok(e)
+        }
+    }
+
+    /// 그래프 실행 — 전 노드를 1회 launch로 제출.
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn graph_launch(&self, e: ffi::CUgraphExec) -> Result<(), String> {
+        // SAFETY: e는 graph_instantiate가 돌려준 유효 실행 핸들.
+        unsafe {
+            let r = (self.drv.graph_launch)(e, self.stream);
+            if r != CUDA_SUCCESS {
+                return Err(format!("rawcuda: cuGraphLaunch: {}", ffi::err_text(r)));
+            }
+        }
+        Ok(())
+    }
+
+    /// 그래프·실행 핸들 해제.
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn graph_destroy(&self, e: ffi::CUgraphExec, g: ffi::CUgraph) -> Result<(), String> {
+        // SAFETY: 두 핸들 모두 본 모듈이 발급한 유효 핸들(중복 해제 금지 계약).
+        unsafe {
+            if !e.is_null() {
+                let r = (self.drv.graph_exec_destroy)(e);
+                if r != CUDA_SUCCESS {
+                    return Err(format!("rawcuda: cuGraphExecDestroy: {}", ffi::err_text(r)));
+                }
+            }
+            if !g.is_null() {
+                let r = (self.drv.graph_destroy)(g);
+                if r != CUDA_SUCCESS {
+                    return Err(format!("rawcuda: cuGraphDestroy: {}", ffi::err_text(r)));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 기본 스트림 동기화.
     pub fn sync(&self) -> Result<(), String> {
         // SAFETY: stream 필드는 new()가 설정한 값(레거시 기본 스트림 0).
