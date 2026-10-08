@@ -289,6 +289,17 @@ impl W4a16Model {
         self.lins.len()
     }
 
+    /// 양자화 선형 전수 (HF base, n, k) — 프로브 형상 자동 열거용.
+    pub fn lin_shapes(&self) -> Vec<(String, usize, usize)> {
+        let mut v: Vec<(String, usize, usize)> = self
+            .lins
+            .iter()
+            .map(|(b, &(n, k))| (b.clone(), n, k))
+            .collect();
+        v.sort();
+        v
+    }
+
     /// 그룹 크기(g128/g32) — 커널 계약의 입력.
     pub fn group(&self) -> usize {
         self.quant.group

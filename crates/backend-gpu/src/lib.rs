@@ -6,6 +6,8 @@
 
 pub mod rawcuda;
 
+pub use rawcuda::gptq4::Gptq4;
+
 /// VRAM 프로브 — 가드 preflight가 사용(미측정 시 B17 거부).
 pub fn cuda_mem_free() -> Option<(u64, u64)> {
     rawcuda::ctx::cuda_mem_free()

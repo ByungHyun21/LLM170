@@ -125,7 +125,10 @@ pub fn guard_target(sub: &str, model: Option<&str>, rest: &[String]) -> Option<G
             .map(std::path::PathBuf::from)
     });
     // 서빙 경로는 CUDA 고정 → VRAM 계정. CPU 전용 프로브는 제외.
-    let gpu = !matches!(sub, "w4a16-load" | "w4a16-ref");
+    let gpu = !matches!(
+        sub,
+        "w4a16-load" | "w4a16-ref" | "w4a16-gemv" | "w4a16-gemm"
+    );
     path.map(|path| GuardTarget { path, gpu })
 }
 

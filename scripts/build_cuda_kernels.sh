@@ -27,6 +27,7 @@ build() { # name fmad_flag("" | "-fmad=false")
 
 build smoke
 build norm
-build gdn  -fmad=false
-build attn -fmad=false
-build ew   -fmad=false
+build gdn   -fmad=false
+build attn  -fmad=false
+build ew    -fmad=false
+build gptq4 -fmad=false
