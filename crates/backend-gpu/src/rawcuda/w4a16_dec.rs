@@ -1358,13 +1358,9 @@ impl W4a16Dec {
         Ok(())
     }
 
-    /// 디바이스 GEMV(t=1) — x_dev f32 → x32(h2f 왕복) → gptq4 행=블록 커널
-    /// → dy. 반환 포인터는 self.dy(다음 gemv가 덮는다 — 스트림 순서 계약).
-    fn gemv_dev(&mut self, name: &str, x_dev: CUdeviceptr) -> Result<CUdeviceptr, String> {
-        let (dq, ds, n, k) = self.lin_spec(name)?;
-        if k > 128 * 256 {
-            return Err(format!("gemv_dev({name}): k={k} > 32768(smem 계약)"));
-        }
+    /// 활성 f32 → x32(h2f 왕복) 캐스트 1회 — 같은 xn을 쓰는 GEMV들이 공유한다
+    /// (q/k/v·gate/up: 종전 gemv마다 캐스트 = 런치 2배). 반환은 self.dx32.
+    fn cast_x32(&mut self, x_dev: CUdeviceptr, k: usize) -> Result<CUdeviceptr, String> {
         if k > self.dx32_cap {
             if self.dx32 != 0 {
                 self.cc.free(self.dx32)?;
@@ -1373,15 +1369,6 @@ impl W4a16Dec {
             self.dx32_cap = 0;
             self.dx32 = self.cc.alloc(k * 4)?;
             self.dx32_cap = k;
-        }
-        if n > self.y_cap {
-            if self.dy != 0 {
-                self.cc.free(self.dy)?;
-            }
-            self.dy = 0; // G1
-            self.y_cap = 0;
-            self.dy = self.cc.alloc(n * 4)?;
-            self.y_cap = n;
         }
         let f = self.cc.function("w4a16_cast_x32")?;
         let mut nn = k as i32;
@@ -1392,8 +1379,19 @@ impl W4a16Dec {
             (&mut nn) as *mut _ as *mut _,
         ];
         self.cc.launch(f, k.div_ceil(256) as u32, 1, 256, &mut ca)?;
+        Ok(self.dx32)
+    }
+
+    /// GEMV 발사(공용) — x32 입력 → y_out 직접 쓰기(dy·d2d 경유 제거).
+    fn gemv_launch(
+        &mut self,
+        name: &str,
+        x32_dev: CUdeviceptr,
+        y_out: CUdeviceptr,
+    ) -> Result<(), String> {
+        let (dq, ds, n, k) = self.lin_spec(name)?;
         let f = self.cc.function("w4a16_gemv_g128")?;
-        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx32, self.dy);
+        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, x32_dev, y_out);
         let (mut p_n, mut p_k) = (n as i32, k as i32);
         let mut args: [*mut std::ffi::c_void; 6] = [
             (&mut p_q) as *mut _ as *mut _,
@@ -1403,16 +1401,31 @@ impl W4a16Dec {
             (&mut p_n) as *mut _ as *mut _,
             (&mut p_k) as *mut _ as *mut _,
         ];
-        self.cc.launch(f, n as u32, 1, 64, &mut args)?;
+        self.cc.launch(f, n as u32, 1, 64, &mut args)
+    }
+
+    /// GEMV(x32 입력) → self.dy — 반환 포인터는 다음 gemv가 덮는다(스트림 순서).
+    fn gemv_dev_x32(&mut self, name: &str, x32_dev: CUdeviceptr) -> Result<CUdeviceptr, String> {
+        let (_, _, n, k) = self.lin_spec(name)?;
+        if n > self.y_cap {
+            if self.dy != 0 {
+                self.cc.free(self.dy)?;
+            }
+            self.dy = 0; // G1
+            self.y_cap = 0;
+            self.dy = self.cc.alloc(n * 4)?;
+            self.y_cap = n;
+        }
+        self.gemv_launch(name, x32_dev, self.dy)?;
+        let _ = k;
         Ok(self.dy)
     }
 
-    /// GEMV → 상주 스테이징 복사(단일 대여 — 중첩 빌림 회피). 복사량은
-    /// 그 선형의 실제 출력폭 n(스테이징 공유 폭까지 복사하면 범위 초과).
-    fn gemv_stage(
+    /// GEMV(x32 입력) → dst 직접 쓰기 + 폭 검사(스테이징 공유 폭 계약).
+    fn gemv_stage_x32(
         &mut self,
         name: &str,
-        x_dev: CUdeviceptr,
+        x32_dev: CUdeviceptr,
         dst: CUdeviceptr,
         w: usize,
     ) -> Result<(), String> {
@@ -1420,8 +1433,7 @@ impl W4a16Dec {
         if n > w {
             return Err(format!("gemv_stage({name}): n={n} > 스테이징 {w}"));
         }
-        let p = self.gemv_dev(name, x_dev)?;
-        self.cc.d2d(dst, p, n * 4)
+        self.gemv_launch(name, x32_dev, dst)
     }
 
     /// 노름 1회(디바이스 x·ab) — xn은 self.dxn(다음 노름이 덮는다).
@@ -1540,19 +1552,23 @@ impl W4a16Dec {
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, 1)
                 .map_err(|e| format!("L{il} input norm: {e}"))?;
+            // xn은 q/k/v(또는 qkv/z)가 공유 — x32 캐스트 1회(런치·복사 절감).
+            let x32 = self
+                .cast_x32(xn, self.hidden)
+                .map_err(|e| format!("L{il} xn cast: {e}"))?;
             let branch = if (il + 1) % 4 == 0 {
-                self.gemv_stage(&format!("blk.{il}.attn_q.weight"), xn, s0, w0)
+                self.gemv_stage_x32(&format!("blk.{il}.attn_q.weight"), x32, s0, w0)
                     .map_err(|e| format!("L{il} q: {e}"))?;
-                self.gemv_stage(&format!("blk.{il}.attn_k.weight"), xn, s1, w1)
+                self.gemv_stage_x32(&format!("blk.{il}.attn_k.weight"), x32, s1, w1)
                     .map_err(|e| format!("L{il} k: {e}"))?;
-                self.gemv_stage(&format!("blk.{il}.attn_v.weight"), xn, s1b, w1)
+                self.gemv_stage_x32(&format!("blk.{il}.attn_v.weight"), x32, s1b, w1)
                     .map_err(|e| format!("L{il} v: {e}"))?;
                 self.attn_chain_dev_run(slot, il / 4, 1, s0, s1, s1b)
                     .map_err(|e| format!("L{il} attn: {e}"))?
             } else {
-                self.gemv_stage(&format!("blk.{il}.attn_qkv.weight"), xn, s0, w0)
+                self.gemv_stage_x32(&format!("blk.{il}.attn_qkv.weight"), x32, s0, w0)
                     .map_err(|e| format!("L{il} qkv: {e}"))?;
-                self.gemv_stage(&format!("blk.{il}.attn_gate.weight"), xn, s1, w1)
+                self.gemv_stage_x32(&format!("blk.{il}.attn_gate.weight"), x32, s1, w1)
                     .map_err(|e| format!("L{il} z: {e}"))?;
                 let g = self
                     .gdn_chain_dev_run(slot, gi, 1, xn, s0, s1)
@@ -1565,21 +1581,32 @@ impl W4a16Dec {
             } else {
                 format!("blk.{il}.ssm_out.weight")
             };
+            let (_, _, _, ko) = self.lin_spec(&lo)?;
+            let x32b = self
+                .cast_x32(branch, ko)
+                .map_err(|e| format!("L{il} branch cast: {e}"))?;
             let out = self
-                .gemv_dev(&lo, branch)
+                .gemv_dev_x32(&lo, x32b)
                 .map_err(|e| format!("L{il} {lo}: {e}"))?;
             let xn2 = self
                 .norm_resid_dev(2 * il + 1, self.dres, out, 1)
                 .map_err(|e| format!("L{il} post norm: {e}"))?;
-            self.gemv_stage(&format!("blk.{il}.ffn_gate.weight"), xn2, s0, w0)
+            let x32n = self
+                .cast_x32(xn2, self.hidden)
+                .map_err(|e| format!("L{il} xn2 cast: {e}"))?;
+            self.gemv_stage_x32(&format!("blk.{il}.ffn_gate.weight"), x32n, s0, w0)
                 .map_err(|e| format!("L{il} gate: {e}"))?;
-            self.gemv_stage(&format!("blk.{il}.ffn_up.weight"), xn2, s1, w1)
+            self.gemv_stage_x32(&format!("blk.{il}.ffn_up.weight"), x32n, s1, w1)
                 .map_err(|e| format!("L{il} up: {e}"))?;
             self.ew_dev(s0, s1, s2, w2)?;
-            let down = self
-                .gemv_dev(&format!("blk.{il}.ffn_down.weight"), s2)
+            let dn = format!("blk.{il}.ffn_down.weight");
+            let (_, _, _, kd) = self.lin_spec(&dn)?;
+            let x32d = self
+                .cast_x32(s2, kd)
+                .map_err(|e| format!("L{il} down cast: {e}"))?;
+            // down은 s3 직접 쓰기 — dy 경유 d2d 제거.
+            self.gemv_launch(&dn, x32d, s3)
                 .map_err(|e| format!("L{il} down: {e}"))?;
-            self.cc.d2d(s3, down, self.hidden * 4)?;
             ab = s3;
             if self.debug_layers {
                 let mut db = vec![0u8; self.hidden * 4];
