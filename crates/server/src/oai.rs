@@ -682,6 +682,11 @@ fn run_and_emit(
         .unwrap_or(0);
     let mut stopped = false;
     for t in prx {
+        // 정지 토큰은 텍스트로 방출하지 않는다(비스트림은 finish_slot이
+        // 트림하지만 스트림 델타는 여기서 걸러야 새어나가지 않는다).
+        if t == llm170_core::qwen35::EOS_EOT || t == STOP_EOT {
+            break;
+        }
         ntok += 1;
         acc.push_str(&det.push(t));
         if let Some((p, l)) = earliest_stop(&acc, &fmt.stop_strs) {
@@ -893,6 +898,9 @@ fn run_and_emit_anthropic(
         let mut sent = 0usize;
         let mut stopped = false;
         for t in prx {
+            if t == llm170_core::qwen35::EOS_EOT || t == STOP_EOT {
+                break; // 정지 토큰 미방출(스트림 델타)
+            }
             acc.push_str(&det.push(t));
             if let Some((sp, _)) = earliest_stop(&acc, &stop_strs) {
                 if sp > sent {
