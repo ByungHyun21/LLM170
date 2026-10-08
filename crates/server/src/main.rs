@@ -347,12 +347,26 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let Some(model_path) = ma.model.clone().map(PathBuf::from) else {
         return usage_err("--model required");
     };
-    // A12(plans/129): exl3-hip 엔진은 단일 슬롯 — --slots>1이 슬롯 생성 시점의
-    // 점유 슬롯 reset으로 교묘하게 상태를 파괴했다(엔진 코드는 대응하지만
-    // 진입에서 거부하는 게 계약상 정확). vk·cuda 엔진은 슬롯별 상태를
-    // 디코더가 보유하므로 다중 슬롯 지원(S8) — 제외.
-    if model_path.is_dir() && gpu_runtime == "hip" && slots.unwrap_or(1) > 1 {
-        return usage_err("EXL3 hip 백엔드는 단일 슬롯만 지원 — --slots 1");
+    // P0-4(§10-1·B22): 포맷 스니핑을 최우선 — 무거운 tokenizer 적재 전에
+    // 미지원 포맷(W4A16 등)을 명시 에러로 돌려준다(정체불명 실패 차단).
+    let fmt = match engine::sniff_format(&model_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if fmt == engine::ModelFormat::W4A16 {
+        eprintln!(
+            "error: 미지원 포맷(W4A16 — 로더·커널 P2 대기, plans/cuda-models.md §3.5): {}",
+            model_path.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    // A12(plans/129): exl3-hip 단일 슬롯 — --slots>1이 슬롯 상태를 파괴했다.
+    // 진입 거부가 계약상 정확. vk·cuda는 슬롯별 상태라 다중 슬롯 지원(S8).
+    if fmt == engine::ModelFormat::Exl3 && gpu_runtime == "hip" && slots.unwrap_or(1) > 1 {
+        return usage_err("EXL3 hip 백엔드는 단일 슬롯만 지원 --slots 1");
     }
     // P0-3(plans/cuda-models.md §3.2·B9, 2026-10-08): EXL3 CUDA --spec 개방 —
     // M4 임계 종결(mtp 프로브 ALL PASS) 후 mtp_cuda 배선 완료. 종전 거부 폐지.
@@ -401,16 +415,14 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         ple_table: ma.ple_table.clone(),
         ple_cache_mib: ma.ple_cache_mib,
     };
-    // 포맷 자동 판별(사용자 계약 2026-10-05): 모델 경로가 디렉터리(EXL3
-    // 아카이브)면 --backend 런타임(hip|vulkan)으로 EXL3 엔진을 고른다.
-    // cpu+디렉터리는 명확한 에러(무음 Q4 로드 실패 방지).
-    if model_path.is_dir() && backend != "gpu" {
+    // 포맷 라우팅(사용자 계약 2026-10-05 계승): EXL3 디렉터리는
+    // --backend 런타임(hip|vulkan|cuda)으로 엔진을 고른다. cpu+EXL3은
+    // 명확한 에러(무음 Q4 로드 실패 방지).
+    if fmt == engine::ModelFormat::Exl3 && backend != "gpu" {
         eprintln!("error: EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan|cuda");
         return ExitCode::FAILURE;
     }
-    // plans/cuda-port.md §1.3 S6 — GGUF+cuda(qwen4exp)는 Q4AccCuda 값경로로
-    // 진행한다(attach_q4 cuda 분기). 디렉터리(EXL3)는 위 라우팅 그대로.
-    let sel = if model_path.is_dir() {
+    let sel = if fmt == engine::ModelFormat::Exl3 {
         if gpu_runtime == "vulkan" {
             engine::BackendSel::Exl3
         } else if gpu_runtime == "cuda" {

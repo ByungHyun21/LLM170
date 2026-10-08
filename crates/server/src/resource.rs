@@ -288,7 +288,9 @@ pub fn guard_target(
     // B19: 나머지 위치인자 프로브(rawhip-check·vk-gemv-check 등)도 모델을
     // 적재한다 — 일반 폴백으로 가드. 라우트 추가·프로브 확장 시 무가드
     // 실적재 경로가 새로 생기는 것을 막는다. GPU 프로브 접두는 gpu=true.
-    if path.is_none() && let Some(p) = first_pos() {
+    if path.is_none()
+        && let Some(p) = first_pos()
+    {
         path = Some(p);
         if POSITIONAL_GPU_PROBES.iter().any(|pre| sub.starts_with(pre)) {
             gpu = true;
@@ -402,9 +404,7 @@ pub fn acquire_load_lock() -> Result<(), String> {
     return Ok(()); // 비유닉스: flock 부재 — 가드 판정만으로 동작
     #[cfg(unix)]
     {
-        let mut g = LOAD_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_some() {
             return Ok(()); // 이미 보유(같은 프로세스 재진입)
         }
@@ -428,10 +428,8 @@ pub fn acquire_load_lock() -> Result<(), String> {
                 break;
             }
             let holder = std::fs::read_to_string(&path).unwrap_or_default();
-            if reported % 40 == 0 {
-                eprintln!(
-                    "# rsrc-guard: 다른 llm170 적재 진행 중(보유 pid {holder}) — 대기(B20)"
-                );
+            if reported.is_multiple_of(40) {
+                eprintln!("# rsrc-guard: 다른 llm170 적재 진행 중(보유 pid {holder}) — 대기(B20)");
             }
             reported += 1;
             if std::time::Instant::now() >= deadline {
@@ -455,9 +453,7 @@ pub fn acquire_load_lock() -> Result<(), String> {
 /// 적재 락 해제 — 적재 완료 지점(build_slots 반환 직후 등)에서 호출.
 /// 프로세스 exit도 fd close로 해제된다(단명 CLI 경로).
 pub fn release_load_lock() {
-    let mut g = LOAD_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut g = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut f) = g.take() {
         let _ = f.set_len(0);
         use std::io::{Seek, Write};
@@ -526,7 +522,11 @@ mod tests {
         // 실존 스플릿(FN 3파트)으로 검증: part2 입력도 part1로 정규화.
         let fn_dir = "/home/yoon/models/qwen3.8-Flash-Next/UD-Q3_K_XL";
         let base = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q3_K_XL";
-        if std::path::Path::new(&format!("{fn_dir}/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf")).exists() {
+        if std::path::Path::new(&format!(
+            "{fn_dir}/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf"
+        ))
+        .exists()
+        {
             let p = split_part1(Path::new(&format!(
                 "{fn_dir}/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00003.gguf"
             )));
@@ -608,7 +608,16 @@ mod tests {
         // 메타·행 판독 서브커맨드 → None
         assert!(guard_target("gguf-dump", None, None, None, &s(&[])).is_none());
         assert!(guard_target("tokenize", Some("/m/a.gguf"), None, None, &s(&[])).is_none());
-        assert!(guard_target("dequant", None, None, None, &s(&["/m/a.gguf", "t", "0", "8"])).is_none());
+        assert!(
+            guard_target(
+                "dequant",
+                None,
+                None,
+                None,
+                &s(&["/m/a.gguf", "t", "0", "8"])
+            )
+            .is_none()
+        );
         // 무모델 로딩 창구 → None(로더/CLI 에러가 더 정확 — bench는 --model required)
         assert!(guard_target("bench", None, Some("gpu"), None, &s(&[])).is_none());
         assert!(guard_target("infer", None, None, None, &s(&[])).is_none());

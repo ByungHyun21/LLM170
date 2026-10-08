@@ -17,6 +17,83 @@ pub enum BackendSel {
     /// 라우팅·상주 적재까지, forward 체인은 디코더 G3+ 스텁 위임.
     Exl3Cuda,
 }
+/// P0-4(§10-1·B22): 모델 경로 포맷 판정 — 디렉터리를 무조건 EXL3으로
+/// 단정하던 종전 라우팅의 정체불명 실패(tokenizer 실패·gate_proj 미등록
+/// 실측)를 명시 에러로 교체. 파일명 하드코딩 금지(내용 기반 판정).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModelFormat {
+    Gguf,
+    Exl3,
+    /// compressed-tensors(weight_packed 3조)·auto-gptq(qweight/qzeros)
+    /// 패킹의 W4A16 계열 — 로더 미구현(P2 §3.5 대기). 인식은 하되
+    /// 명시 에러로 안내한다.
+    W4A16,
+}
+
+/// 포맷 스니핑: (a) .gguf 파일 → Gguf (b) 디렉터리 → index.json 우선,
+/// 없으면 첫 model*.safetensors 헤더에서 키 탐색(.trellis→Exl3,
+/// weight_packed/qweight→W4A16). 어느 쪽도 아니면 config.json
+/// architectures 유무로 안내 메시지를 갈라 Err.
+pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
+    if path.is_file() {
+        return Ok(ModelFormat::Gguf);
+    }
+    if !path.is_dir() {
+        return Err(format!("모델 경로 없음: {}", path.display()));
+    }
+    let index = path.join("model.safetensors.index.json");
+    let hay: Option<String> = if index.is_file() {
+        std::fs::read_to_string(&index).ok()
+    } else {
+        // index 없음: 첫 샤드 헤더(8바이트 길이 + JSON) 접두 판독.
+        let shard = std::fs::read_dir(path).ok().and_then(|rd| {
+            rd.flatten().map(|e| e.path()).find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("model") && n.ends_with(".safetensors"))
+            })
+        });
+        shard.and_then(|p| {
+            use std::io::Read;
+            let mut f = std::fs::File::open(p).ok()?;
+            let mut lenb = [0u8; 8];
+            f.read_exact(&mut lenb).ok()?;
+            let hlen = u64::from_le_bytes(lenb).min(1 << 20) as usize; // 접두 1MB
+            let mut buf = vec![0u8; hlen];
+            f.read_exact(&mut buf).ok()?;
+            String::from_utf8_lossy(&buf).into_owned().into()
+        })
+    };
+    let Some(hay) = hay else {
+        // safetensors 없는 디렉터리 — config.json(architectures) 유무로 안내.
+        if path.join("config.json").is_file() {
+            return Err(format!(
+                "미지원 포맷: HF config 배포(architectures) — {} (지원: GGUF 파일·EXL3 trellis 디렉터리)",
+                path.display()
+            ));
+        }
+        return Err(format!(
+            "모델 디렉터리 인식 불가(model*.safetensors/index.json 없음): {}",
+            path.display()
+        ));
+    };
+    if hay.contains(".trellis") {
+        return Ok(ModelFormat::Exl3);
+    }
+    if hay.contains("weight_packed") || hay.contains("qweight") {
+        return Ok(ModelFormat::W4A16);
+    }
+    if path.join("config.json").is_file() {
+        return Err(format!(
+            "미지원 포맷: HF config 배포(architectures) — {} (지원: GGUF 파일·EXL3 trellis 디렉터리)",
+            path.display()
+        ));
+    }
+    Err(format!(
+        "모델 디렉터리 포맷 인식 불가: {} (지원: GGUF 파일·EXL3 trellis 디렉터리)",
+        path.display()
+    ))
+}
 
 #[derive(Clone)]
 pub struct InferRequest {
@@ -169,6 +246,8 @@ pub fn attach_q35(
 ) -> Result<llm170_core::qwen35::Engine, String> {
     // LLM170_RAWHIP=0 → 명시적 CPU.
     if !llm170_diag::flag::ne0("LLM170_RAWHIP") {
+        // B21/P0-4(§10-3): 무음 CPU 금지 — env 게이트 적용 사실을 로그로.
+        eprintln!("# backend: cpu (env 게이트 LLM170_RAWHIP=0 — 명시적 CPU)");
         return Ok(eng);
     }
     if cuda {
@@ -245,6 +324,10 @@ pub fn attach_q4(
 ) -> Result<llm170_core::qwen4exp::layers::Engine4, String> {
     llm170_core::qwen4exp::frame::set_backend_res_f16(res_f16);
     if !want_gpu {
+        // B21/P0-4(§10-3): 무음 CPU 금지 — env 게이트가 GPU를 강제로 껐으면 로그로.
+        if q4_gpu_env_off() {
+            eprintln!("# backend: cpu (env 게이트 LLM170_Q4_CPU=1/LLM170_RAWHIP=0 — 명시적 CPU)");
+        }
         return Ok(eng);
     }
     if cuda {
@@ -462,13 +545,34 @@ impl Engine {
     }
 }
 
-/// n_slots 시퀀스로 엔진 구성 (연속 배칭 — 04).
+/// P0-4(§10-2): 기동 배너 1줄 고정 — 스왑 시 "무엇으로 도는지"를 로그만으로
+/// 판정한다(B1·B21의 라벨 문제를 계약으로 흡수). offload/attach는 각 엔진
+/// 조립 지점의 사실.
+fn banner(
+    model: &std::path::Path,
+    fmt: &str,
+    runtime: &str,
+    offload: &str,
+    attach: &str,
+    ctx: usize,
+    slots: usize,
+) {
+    let name = model
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_else(|| model.to_str().unwrap_or("?"));
+    eprintln!(
+        "# boot: model={name} format={fmt} runtime={runtime} offload={offload} ctx={ctx} slots={slots} attach={attach}"
+    );
+}
+
 pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> Engine {
     // EXL3 직접 경로 (plans/121 A1) — --model은 EXL3 디렉터리.
     if matches!(backend, BackendSel::Exl3Hip) {
         let dir = req.model.to_string_lossy().into_owned();
         let eng = crate::exl3_hip_engine::Exl3HipEngine::load(&dir, 1, req.ctx)
             .unwrap_or_else(|e| panic!("exl3-hip 엔진 로드 실패: {e}"));
+        banner(&req.model, "exl3", "hip", "full", "on", req.ctx, 1);
         return Engine::Exl3Hip(Box::new(eng));
     }
     if matches!(backend, BackendSel::Exl3Cuda) {
@@ -476,12 +580,14 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         let dir = req.model.to_string_lossy().into_owned();
         let eng = crate::exl3_cuda_engine::Exl3CudaEngine::load(&dir, n_slots, req.ctx)
             .unwrap_or_else(|e| panic!("exl3-cuda 엔진 로드 실패: {e}"));
+        banner(&req.model, "exl3", "cuda", "full", "on", req.ctx, n_slots);
         return Engine::Exl3Cuda(Box::new(eng));
     }
     if matches!(backend, BackendSel::Exl3) {
         let dir = req.model.to_string_lossy().into_owned();
         let eng = crate::exl3_engine::Exl3Engine::load(&dir, n_slots, req.ctx)
             .unwrap_or_else(|e| panic!("exl3 엔진 로드 실패: {e}"));
+        banner(&req.model, "exl3", "vulkan", "full", "on", req.ctx, n_slots);
         return Engine::Exl3(Box::new(eng));
     }
     // plans/111 W4c: PLE 테이블 오프로드 모드(서빙 옵션 → 백엔드 전역).
@@ -529,6 +635,33 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             AttachPolicy::Warn,
         )
         .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
+        // 배너(§10-2): attach는 acc 실재 여부, offload는 런타임별 실제.
+        let runtime = if q4_cuda_runtime(&backend) {
+            "cuda"
+        } else if q4_vk_runtime(&backend) {
+            "vulkan"
+        } else if q4_gpu_wanted(&backend) {
+            "hip"
+        } else {
+            "cpu"
+        };
+        let (attach, offload) = if eng.acc.is_some() {
+            (
+                "on",
+                match runtime {
+                    "cuda" => "partial(Q4K)", // B1: Q4K만 오프로드
+                    "cpu" => "none",
+                    _ => "full",
+                },
+            )
+        } else if runtime == "cpu" {
+            ("off(cpu-backend)", "none")
+        } else {
+            ("off(env-gate-or-create-failed)", "none")
+        };
+        banner(
+            &req.model, "gguf", runtime, offload, attach, req.ctx, n_slots,
+        );
         Engine::Q4(Box::new(eng))
     } else {
         let m = load_q35_retry(&req.model);
@@ -550,6 +683,33 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             eng = attach_q35(eng, vulkan, cuda, AttachPolicy::Warn)
                 .unwrap_or_else(|e| panic!("gpu attach: {e}"));
         }
+        // 배너(§10-2) — Q4와 동일 계약.
+        let runtime = if cuda {
+            "cuda"
+        } else if vulkan {
+            "vulkan"
+        } else if !matches!(&backend, BackendSel::Cpu) {
+            "hip"
+        } else {
+            "cpu"
+        };
+        let (attach, offload) = if eng.acc.is_some() || eng.raw_decode.is_some() {
+            (
+                "on",
+                match runtime {
+                    "cuda" => "partial(Q4K)",
+                    "cpu" => "none",
+                    _ => "full",
+                },
+            )
+        } else if runtime == "cpu" {
+            ("off(cpu-backend)", "none")
+        } else {
+            ("off(env-gate-or-create-failed)", "none")
+        };
+        banner(
+            &req.model, "gguf", runtime, offload, attach, req.ctx, n_slots,
+        );
         Engine::Q35(Box::new(eng))
     }
 }
