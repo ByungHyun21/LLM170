@@ -320,7 +320,7 @@ impl W4a16Dec {
                     "src/rawcuda/assets/head.fatbin",
                 ],
             )?,
-            &["head_bf16"],
+            &["head_bf16", "head_transpose"],
         )?;
         cc.load_fatbin(
             "ew",
@@ -1819,10 +1819,37 @@ impl W4a16Dec {
         self.head_out = 0;
         self.head_n = 0;
         self.head_k = 0;
-        let dw = self.cc.alloc(need)?;
-        if let Err(e) = Self::h2d_chunked(&self.cc, dw, &data[..need]) {
-            let _ = self.cc.free(dw);
+        // 전치 업로드: 원본 n-major를 임시 버퍼로 올린 뒤 head_transpose로
+        // [k][n] 상주 버퍼를 만든다(판독 응집 — 실측 근거는 assets/head.cu).
+        let dtmp = self.cc.alloc(need)?;
+        if let Err(e) = Self::h2d_chunked(&self.cc, dtmp, &data[..need]) {
+            let _ = self.cc.free(dtmp);
             return Err(e);
+        }
+        let dw = self.cc.alloc(need)?;
+        let tr = (|| -> Result<(), String> {
+            let f = self.cc.function("head_transpose")?;
+            let (mut p_in, mut p_out) = (dtmp, dw);
+            let (mut p_n, mut p_k) = (n as i32, k as i32);
+            let mut args: [*mut std::ffi::c_void; 4] = [
+                (&mut p_in) as *mut _ as *mut _,
+                (&mut p_out) as *mut _ as *mut _,
+                (&mut p_n) as *mut _ as *mut _,
+                (&mut p_k) as *mut _ as *mut _,
+            ];
+            self.cc.launch(
+                f,
+                k.div_ceil(32) as u32,
+                n.div_ceil(32) as u32,
+                1024,
+                &mut args,
+            )?;
+            self.cc.sync()
+        })();
+        let _ = self.cc.free(dtmp); // 전치 완료 — 임시 해제(피크 VRAM 절감).
+        if let Err(e) = tr {
+            let _ = self.cc.free(dw);
+            return Err(format!("head 전치: {e}"));
         }
         let dout = match self.cc.alloc(n * 4) {
             Ok(p) => p,
