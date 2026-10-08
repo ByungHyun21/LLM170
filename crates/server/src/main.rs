@@ -21,19 +21,21 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
 
 주요 커맨드:
   llm170 infer --model <w4a16_dir> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
-              [--n-predict N] [--ctx N] [--backend cpu]
+              [--n-predict N] [--ctx N]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
-  llm170 serve --model <w4a16_dir> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu]
+  llm170 serve --model <w4a16_dir> [--port N] [--ctx N] [--slots N] [--queue N]
       OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯.
   llm170 w4a16-load <dir>
       W4A16(compressed-tensors int4 sym g128) 로더 완전성 검증 — 트리플·커버리지.
+  llm170 w4a16-ref <dir> --prompt-tokens <ids> [--n-predict N] [--ctx N]
+      참조(CPU) greedy 토큰열 — 커널/서빙 판정 오라클·디버깅 전용.
   llm170 tokenize --model <dir> (--text <s> | --file <f> | --stdin)
       토크나이저 인코딩 [id, ...] 출력.
   llm170 help
 
-단일 트랙(2026-10-08 — 사용자 지시): CUDA W4A16만. 구 백엔드·포맷은
-명시 에러로 안내한다. CUDA 가속은 W2/W3에서
-개발 중이며, 그 전까지 W4A16은 CPU 참조로 돈다.
+단일 트랙(2026-10-08 — 사용자 지시): CUDA W4A16만. 기본 경로는 CUDA(가속
+커널 W2/W3 개발 중 — 착륙 전 기본 실행은 안내 에러). 경로는 CUDA 고정이며,
+참조(CPU) 실행은 프로브(w4a16-ref — 오라클·커널 판정 기준)로만 가능하다.
 "#;
 
 /// 모델 적재 서브커맨드 공용 인자 — main에서 1회 파싱해
@@ -43,8 +45,6 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
 /// probes/check는従来대로 원본 args를 받는다(자체 파싱 보존).
 pub(crate) struct ModelArgs {
     pub model: Option<String>,
-    /// "cpu" | "cuda" (미지정 = cpu).
-    pub backend: Option<String>,
     pub rest: Vec<String>,
 }
 
@@ -61,7 +61,6 @@ fn common_value(args: &[String], i: &mut usize, inline: &Option<String>) -> Stri
 pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
     let mut ma = ModelArgs {
         model: None,
-        backend: None,
         rest: Vec::new(),
     };
     let mut i = 0;
@@ -73,19 +72,16 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
         };
         match name {
             "--model" => ma.model = Some(common_value(args, &mut i, &inline)),
-            "--backend" => {
-                let v = common_value(args, &mut i, &inline);
-                // 단일 트랙(2026-10-08): cpu|cuda 2택. cuda는 W2 커널 전까지
-                // 프런트(infer/serve)가 명시 거부한다(W4A16 CPU 참조 전용).
-                match v.as_str() {
-                    "cpu" => ma.backend = Some("cpu".into()),
-                    "cuda" => ma.backend = Some("cuda".into()),
-                    _ => return Err(format!("--backend: cpu|cuda (got {v})")),
-                }
+            // --backend/--cpu 폐지(2026-10-08): 경로는 CUDA 고정.
+            // 참조·디버깅은 프로브(`w4a16-ref`)로만.
+            "--backend" | "--cpu" => {
+                return Err(format!(
+                    "{name} 폐지: 경로는 CUDA 고정 — 참조·디버깅은 w4a16-ref 프로브"
+                ));
             }
             // 단일 트랙에서 제거된 플래그 — 명시 안내(무음 무시 금지).
             "--gpu-runtime" | "--mtp" | "--ple-table" | "--ple-cache" => {
-                return Err(format!("{name} 미지원(단일 트랙 W4A16 — cpu|cuda)"));
+                return Err(format!("{name} 미지원(단일 트랙 W4A16)"));
             }
             _ => ma.rest.push(a.to_string()),
         }
@@ -141,7 +137,6 @@ fn run_main() -> ExitCode {
         if let Some(gt) = resource::guard_target(
             args.first().map(String::as_str).unwrap_or(""),
             ma.model.as_deref(),
-            ma.backend.as_deref(),
             &ma.rest,
         ) {
             // B20: 전역 적재 락 획득 → **락 후
@@ -206,13 +201,12 @@ fn run_main() -> ExitCode {
     }
 }
 
-/// llm170 serve --model <dir> [--port N] [--ctx N] [--slots N] [--backend cpu|cuda]
+/// llm170 serve --model <dir> [--port N] [--ctx N] [--slots N]
 fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
     let mut queue: Option<usize> = None;
     let mut slots: Option<usize> = None;
     let mut ctx = 4096usize;
-    let backend = ma.backend.clone().unwrap_or_else(|| "cpu".into());
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -248,9 +242,13 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         }
     };
     let _ = fmt; // W4A16 단일(현재)
-    // W4A16은 CPU 전용(가속 커널 미구현 — W2) — GPU 백엔드 지정은 정직 거부.
-    if backend != "cpu" {
-        eprintln!("error: W4A16은 아직 CPU 전용(가속 커널 미구현 — W2): --backend cpu");
+    // 경로는 CUDA 고정(가속 커널 미착륙 — W2/W3): W3에서 실행부가 들어오면
+    // 이 게이트를 제거한다. 참조·디버깅은 `w4a16-ref` 프로브.
+    const CUDA_READY: bool = false;
+    if !CUDA_READY {
+        eprintln!(
+            "error: W4A16 CUDA 경로는 W2/W3 개발 중(가속 커널 미착륙) — 참조·디버깅은 w4a16-ref 프로브"
+        );
         return ExitCode::FAILURE;
     }
     // 토크나이저 적재 (W4A16 디렉터리)

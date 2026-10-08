@@ -9,11 +9,13 @@ tensor cores, so every 4-bit format runs dequant → fp16 mma on the tensor
 cores anyway. The split packed/scale layout (4.125 bits/weight) keeps HBM2e
 pressure low and rides the mature GPTQ-style kernel line.
 
-Current state: the CPU reference path runs W4A16 model directories
+Current state: the loader and CPU reference run W4A16 model directories
 end-to-end (compressed-tensors / AutoRound auto_gptq packing —
-`.weight_packed` · `.weight_scale` · `.weight_shape`). CUDA kernels
-(GEMV/GEMM → device-resident decoder) are in development; until they land
-the front-ends accept `--backend cpu` only.
+`.weight_packed` · `.weight_scale` · `.weight_shape`). The serving path is
+CUDA-fixed; kernels (GEMV/GEMM → device-resident decoder) land in W2/W3 —
+until then `serve`/`infer` exit with a clear message. The CPU reference
+runner is the `w4a16-ref` probe (oracle for kernel/token judgment);
+per-module debug probes arrive with the kernels.
 
 Bit contract: CUDA kernel outputs must match the CPU reference
 (`crates/core/src/quant/lane.rs` — `dot_row_w4a16_lane`).
@@ -43,10 +45,10 @@ Requires Rust 1.99+ (edition 2024). No GPU toolchain needed to build.
 ```bash
 cargo build --release
 
-# Inference (W4A16 directory)
-cargo run --release -- infer --model <w4a16_dir> --prompt-tokens 148678,65233,202419 --n-predict 16 --backend cpu
+# Reference runner (CPU oracle — token judgment / debugging)
+cargo run --release -- w4a16-ref <w4a16_dir> --prompt-tokens 148678,65233,202419 --n-predict 16
 
-# HTTP server (OpenAI/Anthropic-compatible)
+# HTTP server (OpenAI/Anthropic-compatible; CUDA path — W2/W3)
 cargo run --release -- serve --model <w4a16_dir> --port 8080 --slots 4   # --slots N: continuous batching (default 1)
 
 # Loader completeness check / tokenizer

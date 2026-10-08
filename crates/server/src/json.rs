@@ -21,8 +21,3 @@ pub(crate) fn esc(s: &str) -> String {
     }
     out
 }
-
-/// 따옴표 포함 완전 JSON 필드 — infer.rs JSONL(`"text":…`)용.
-pub(crate) fn quoted(s: &str) -> String {
-    format!("\"{}\"", esc(s))
-}

@@ -92,52 +92,6 @@ pub struct InferRequest {
     pub ctx: usize,
 }
 
-/// 생성 토큰 싱크 — 명령별 출력(JSONL text 포함/미포함·텍스트 누적) 차이를
-/// 흡수한다. eng는 읽기 전용 재차용: 디코드 mutable 차용이 끝난 시점에만
-/// 호출된다.
-pub trait TokenSink {
-    fn on_token(&mut self, s: usize, pos: u32, t: u32, eng: &llm170_core::qwen35::Engine);
-}
-
-/// qwen35 greedy 생성 상태 — 호출부가 prefill 결과로 시딩한다.
-pub struct GenState {
-    pub finished: Vec<bool>,
-    pub gen_toks: Vec<Vec<u32>>,
-    pub next: Vec<u32>,
-    /// 시퀀스별 절대 위치(프롬프트 길이 기준) — 토큰마다 +1.
-    pub pos: Vec<u32>,
-}
-
-/// qwen35 생성 루프 — 배치 디코드(greedy).
-pub fn generate_q35(
-    eng: &mut llm170_core::qwen35::Engine,
-    st: &mut GenState,
-    n_predict: usize,
-    eos: u32,
-    sink: &mut dyn TokenSink,
-) -> Result<(), String> {
-    let n = st.next.len();
-    for _step in 0..n_predict {
-        let active: Vec<usize> = (0..n).filter(|&s| !st.finished[s]).collect();
-        if active.is_empty() {
-            break;
-        }
-        let toks: Vec<u32> = active.iter().map(|&s| st.next[s]).collect();
-        let logits = eng.decode(&active, &toks).map_err(|e| e.to_string())?;
-        for (i, &s) in active.iter().enumerate() {
-            let t = llm170_core::qwen35::greedy(&logits[i]);
-            st.next[s] = t;
-            st.pos[s] += 1;
-            sink.on_token(s, st.pos[s], t, eng);
-            st.gen_toks[s].push(t);
-            if t == eos {
-                st.finished[s] = true;
-            }
-        }
-    }
-    Ok(())
-}
-
 pub struct InferResult {
     pub tokens: Vec<u32>,
     /// QA-1: 엔진 확정 실패 사유 — None이면 정상 종료. 종전엔 에러 필드가
