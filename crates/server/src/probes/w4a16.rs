@@ -228,7 +228,9 @@ fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
             .collect();
         // x — 결정적(splitmix64) f16 비트. 스케일이 작은 모델이라 ±1 균일.
         let mut rnd = SplitMix64::new(seed ^ ((*n as u64) << 32) ^ *k as u64);
-        let x: Vec<u16> = (0..t * k).map(|_| f32_to_f16(rnd.next_pm1())).collect();
+        let x: Vec<u16> = (0..t * k)
+            .map(|_| llm170_backend_gpu::f32_to_f16(rnd.next_pm1()))
+            .collect();
         let got = g4.gemm(&x, t, &q, &s, r, *k)?;
         let z8 = vec![8u32; k / 128];
         let mut mism = 0usize;
@@ -293,29 +295,6 @@ impl SplitMix64 {
     fn next_pm1(&mut self) -> f32 {
         ((self.next() >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
     }
-}
-
-/// f32 → f16 비트 (정규수 round-to-nearest — 게이트 입력 전용).
-fn f32_to_f16(v: f32) -> u16 {
-    let b = v.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u16;
-    let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
-    let man = b & 0x7F_FFFF;
-    if exp <= 0 {
-        return sign;
-    }
-    if exp >= 31 {
-        return sign | 0x7C00;
-    }
-    let half_man = man >> 13;
-    let round = (man >> 12) & 1;
-    let m = half_man + round;
-    let (m, e) = if m & 0x400 != 0 {
-        (m & 0x3FF, exp + 1)
-    } else {
-        (m, exp)
-    };
-    sign | ((e as u16) << 10) | (m as u16)
 }
 
 /// GPU 순차 디코드 — 64층 체인을 CUDA(호스트 스테이징)로 돌리고
@@ -566,4 +545,59 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         out.len(),
         gen_ms / out.len() as f64,
     ))
+}
+
+#[cfg(test)]
+mod cast_contract {
+    //! G3 — f16 캐스트 트윈 전수 대조(CPU 전용, GPU 불필요).
+    //! 4중 수동 복사 중 호스트 3본(gptq4::h2f · w4a16_dec::f32_to_f16 ·
+    //! core deq)을 65,536 패턴으로 묶는다. 커널(.cu f2h/h2f)은 골든 게이트 소관.
+    use llm170_core::quant::half_to_f32;
+
+    /// h2f(backend-gpu) ≡ core half_to_f32 — u16 전 패턴.
+    #[test]
+    fn h2f_matches_core_all_patterns() {
+        for h in 0..=u16::MAX {
+            assert_eq!(
+                llm170_backend_gpu::h2f(h).to_bits(),
+                half_to_f32(h).to_bits(),
+                "h2f({h:#06x})"
+            );
+        }
+    }
+
+    /// f32_to_f16 왕복 항등 — f16 전 패턴(NaN 제외). core half_to_f32로
+    /// 올린 뒤 되돌리면 원 비트(서브노멀·±inf 포함).
+    #[test]
+    fn f32_to_f16_roundtrips_all_non_nan_patterns() {
+        for h in 0..=u16::MAX {
+            let exp = (h >> 10) & 0x1F;
+            let man = h & 0x3FF;
+            if exp == 0x1F && man != 0 {
+                continue; // NaN — 페이로드 정규화(0x200)라 항등 아님(별도 검사).
+            }
+            let v = half_to_f32(h);
+            assert_eq!(llm170_backend_gpu::f32_to_f16(v), h, "roundtrip {h:#06x}");
+        }
+    }
+
+    /// 경계·반올림(RN-even)·NaN 규약.
+    #[test]
+    fn f32_to_f16_edges() {
+        let f = llm170_backend_gpu::f32_to_f16;
+        assert_eq!(f(1.0), 0x3C00);
+        assert_eq!(f(-2.0), 0xC000);
+        assert_eq!(f(0.0), 0x0000);
+        assert_eq!(f(-0.0), 0x8000);
+        assert_eq!(f(65504.0), 0x7BFF); // f16 최대 정규수
+        assert_eq!(f(65520.0), 0x7C00); // 오버플로 타이 → +inf
+        assert_eq!(f(f32::INFINITY), 0x7C00);
+        assert_eq!(f(f32::NEG_INFINITY), 0xFC00);
+        assert_eq!(f(f32::NAN), 0x7E00); // qNaN 정규화
+        assert_eq!(f(1e-8), 0x0000); // e < -10 → 0
+        assert_eq!(f(5.960_464_5e-8), 0x0001); // 2^-24 = 최소 서브노멀
+        // RN-even 타이: 2049.0(2048+1, ulp=2의 반) → 짝수 가수 2048.
+        assert_eq!(f(2049.0), f(2048.0));
+        assert_eq!(f(2050.0), 0x6801); // 정확값(반올림 없음)
+    }
 }

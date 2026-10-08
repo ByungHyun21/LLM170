@@ -8,6 +8,33 @@
 use crate::rawcuda::ctx::CudaCtx;
 use std::ffi::c_void;
 
+/// f16 비트 → f32(정확 — 커널 h2f와 동일 값). t=1 GEMV의 x32 사전변환용.
+/// 계약 표면(pub): 서버 단위 테스트가 core `half_to_f32`와 전수 대조한다.
+pub fn h2f(h: u16) -> f32 {
+    let sign = ((h >> 15) as u32) << 31;
+    let e = ((h >> 10) & 0x1F) as u32;
+    let m = (h & 0x3FF) as u32;
+    let bits = if e == 0 {
+        if m == 0 {
+            sign
+        } else {
+            // 서브노멀 정규화.
+            let mut ee = 127 - 15 + 1;
+            let mut f = m;
+            while f & 0x400 == 0 {
+                f <<= 1;
+                ee -= 1;
+            }
+            sign | ((ee as u32) << 23) | ((f & 0x3FF) << 13)
+        }
+    } else if e == 0x1F {
+        sign | (0xFF << 23) | (m << 13)
+    } else {
+        sign | ((e + 112) << 23) | (m << 13)
+    };
+    f32::from_bits(bits)
+}
+
 /// 형상 계약 검사(순수 — GPU 불필요, 단위 테스트 대상).
 /// k ≤ 128*G4_SCMAX(32768)는 t=1 행=블록 GEMV의 smem `sc[G4_SCMAX]` 계약
 /// (assets/gptq4.cu) — 상한 초과는 smem 오버런(UB)이라 호스트에서 거부한다.
@@ -70,32 +97,6 @@ impl Gptq4 {
         Ok(Gptq4 { cc })
     }
 
-    /// f16 비트 → f32(정확 — 커널 h2f와 동일 값). t=1 GEMV의 x32 사전변환용.
-    fn h2f(h: u16) -> f32 {
-        let sign = ((h >> 15) as u32) << 31;
-        let e = ((h >> 10) & 0x1F) as u32;
-        let m = (h & 0x3FF) as u32;
-        let bits = if e == 0 {
-            if m == 0 {
-                sign
-            } else {
-                // 서브노멀 정규화.
-                let mut ee = 127 - 15 + 1;
-                let mut f = m;
-                while f & 0x400 == 0 {
-                    f <<= 1;
-                    ee -= 1;
-                }
-                sign | ((ee as u32) << 23) | ((f & 0x3FF) << 13)
-            }
-        } else if e == 0x1F {
-            sign | (0xFF << 23) | (m << 13)
-        } else {
-            sign | ((e + 112) << 23) | (m << 13)
-        };
-        f32::from_bits(bits)
-    }
-
     /// GEMV(t=1) — x f16 [k] → out f32 [n].
     pub fn gemv(
         &self,
@@ -136,7 +137,7 @@ impl Gptq4 {
             self.cc.h2d(dq, bytes_u32(q))?;
             self.cc.h2d(ds, bytes_u16(s))?;
             if t == 1 {
-                let xf: Vec<f32> = x.iter().map(|&h| Self::h2f(h)).collect();
+                let xf: Vec<f32> = x.iter().map(|&h| h2f(h)).collect();
                 let xb =
                     unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
                 self.cc.h2d(dx32, xb)?;
