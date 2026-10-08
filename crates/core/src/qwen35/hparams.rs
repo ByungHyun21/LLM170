@@ -1,4 +1,4 @@
-//! qwen35 하이퍼파라미터 — GGUF 메타에서 동적 로드.
+//! qwen35 하이퍼파라미터 — config.json 메타에서 동적 로드.
 
 #[derive(Debug, Clone)]
 pub struct Hparams {

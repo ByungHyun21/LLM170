@@ -1,5 +1,5 @@
-// ── EXL3 norm_resid CUDA 포팅 (plans/124 G3, 2026-10-04) ──
-// 산술은 rawhip/kernels/src_exl3.hip의 exl3_norm_resid 1:1 직이식(원본
+// ── norm_resid CUDA 포팅 (plans/124 G3, 2026-10-04) ──
+// 산술은 구 rawhip 커널의 norm_resid 1:1 직이식(원본
 // 그대로 베낌 — 부동소수 적산 순서·정밀 sqrt 계약 포함). 차이는 hip 판이
 // 5120으로 경직된 행 폭을 hidden 인자로 일반화한 것뿐(hidden=5120이면
 // 원본과 원소 순서까지 동일 — v0..v4 스트라이드 적재가 루프 좌결합으로
@@ -27,7 +27,7 @@
 // hidden 계약: 1024의 배수, 8192 이하(v[8] 레지스터 적재 상한).
 // 27B hidden=5120(nper=5) · 35B hidden=2048(nper=2). 256원소 q/k_norm
 // 행(결함 9호 패딩 쟁점)은 본 커널 범위 밖(G4+ MTP 단계).
-extern "C" __global__ void exl3_norm_resid(
+extern "C" __global__ void norm_resid(
     float* __restrict__ x,        // [T][hidden] r/w — 잔차 스트림(제자리 가산)
     const float* __restrict__ nw, // [rows][hidden] 노름 가중 배열
     const float* __restrict__ ab, // [T][hidden]

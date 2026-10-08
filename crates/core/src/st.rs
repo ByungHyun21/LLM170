@@ -1,9 +1,8 @@
 //! safetensors 아카이브 리더 — 헤더 파서 + 샤드 인덱스 + 직독.
-//! (구 llm170-exl3에서 core로 이관 — 2026-10-08 EXL3 탈락·W4A16 단일 트랙.
-//!  W4A16 로더·변환기가 쓰던 공용 자산이라 exl3 크레이트 삭제에 앞서 이동.)
+//! (2026-10-08 단일 트랙 재편에서 core로 이관 — W4A16 로더 공용 자산.)
 //!
 //! API 계약은 이관 전과 동일: entries()/entry()/read()/read_into()/
-//! shard_paths()/shard_data_base(). 오류는 `StError`(구 Exl3Error).
+//! shard_paths()/shard_data_base(). 오류는 `StError`.
 
 use crate::json::Json;
 use std::collections::HashMap;

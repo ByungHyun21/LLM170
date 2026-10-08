@@ -136,7 +136,7 @@ pub const KVALUES_IQ4NL: [i8; 16] = [
 ];
 
 /// iq4_nl kvalues u16 팩 테이블(256워드) — GPU ktab2 업로드용 단일 소스.
-/// (rawvk ensure_shared·VkDecoder, rawhip DecodeContext·프로브가 공유)
+/// (현행 참조 없음 — 구 백엔드 전용 잔존)
 pub fn ktab2_packed() -> Vec<u32> {
     (0..256u32)
         .map(|b| {

@@ -2,7 +2,7 @@
 //!
 //! 백엔드(hipEvent/VK timestamp)가 시간을 계산해 완료한 이벤트(Ev)를
 //! 받는다. 캡처 스토어(capture_begin/push/take)·집계(summarize/gap_by_pred)는
-//! 프로덕션 호출 0으로 삭제했다 — rawhip ktrace는 자체 스토어를 쓰고
+//! 프로덕션 호출 0으로 삭제했다 — 구 백엔드 ktrace는 자체 스토어를 쓰고
 //! 집계는 writer::table이 담당한다.
 
 /// resolved 이벤트 — 백엔드 어댑터가 채운 완성품.

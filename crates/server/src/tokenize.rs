@@ -45,17 +45,17 @@ pub struct Tokenizer {
 
 impl Tokenizer {
     pub fn load(path: &Path) -> Result<Self, String> {
-        // 모델 = W4A16 디렉터리(2026-10-08 단일 — GGUF 탈락, plans/w4a16-cuda.md §5).
+        // 모델 = W4A16 디렉터리(2026-10-08 단일 트랙 — plans/w4a16-cuda.md §5).
         if path.is_dir() {
             return Self::from_hf_dir(path);
         }
         Err(format!(
-            "토크나이저: 디렉터리 모델(W4A16)만 지원 — GGUF 탈락(2026-10-08): {}",
+            "토크나이저: 디렉터리 모델(W4A16)만 지원(2026-10-08): {}",
             path.display()
         ))
     }
 
-    /// 공통 꼬리 — 바이트 표·인덱스 조립(from_gguf·from_hf_dir 공유).
+    /// 공통 꼬리 — 바이트 표·인덱스 조립(from_hf_dir 공유).
     fn from_parts(
         vocab: &[String],
         bpe_ranks: HashMap<Vec<u8>, u32>,
@@ -113,9 +113,9 @@ impl Tokenizer {
         })
     }
 
-    /// EXL3 디렉터리 — vocab.json(조각→id) + merges.txt(BPE 순위) +
+    /// W4A16 디렉터리 — vocab.json(조각→id) + merges.txt(BPE 순위) +
     /// tokenizer_config.json(added_tokens_decoder 특수 토큰) + config.json
-    /// (model_type → pre 스플리터). GGUF 경로와 동일 필드를 구성한다.
+    /// (model_type → pre 스플리터).
     /// 파서는 llm170_core::json 재사용.
     fn from_hf_dir(dir: &Path) -> Result<Self, String> {
         // 토큰 조각표 — vocab.json(HF 벌크) 우선, 없으면 tokenizer.json.
@@ -189,8 +189,8 @@ impl Tokenizer {
             vocab[*id as usize] = piece.clone();
         }
 
-        // 병합 순위 — GGUF 관례 동일 키(첫 ' ' 분할, 선발 우선). # 헤더는
-        // 순위 소모 없이 스킵(convert_hf_to_gguf의 배열 순서와 정렬).
+        // 병합 순위 — 표준 키(첫 ' ' 분할, 선발 우선). # 헤더는
+        // 순위 소모 없이 스킵(HF 변환기 배열 순서와 정렬).
         // merges.txt 우선, tokenizer.json이면 model.merges(문자열 배열) 파생.
         let mut bpe_ranks: HashMap<Vec<u8>, u32> = HashMap::new();
         let mut rank = 0u32;
@@ -275,7 +275,7 @@ impl Tokenizer {
         }
         special.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
-        // pre 스플리터 — config.json model_type(GGUF pre 매핑과 동일 계열).
+        // pre 스플리터 — config.json model_type 계열.
         let mut pre = Pre::Other;
         if let Ok(cfg) = std::fs::read_to_string(dir.join("config.json"))
             && let Ok(cj) = llm170_core::json::Json::parse(&cfg)

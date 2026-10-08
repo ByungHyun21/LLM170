@@ -18,25 +18,22 @@ pub fn w4a8_enabled() -> bool {
 }
 
 /// W4A8 대상 타입 (정수 커널·미러 구현 완료분).
-pub fn w4a8_ty(ty: llm170_gguf::GgmlType) -> bool {
-    matches!(
-        ty,
-        |llm170_gguf::GgmlType::Iq4Xs| llm170_gguf::GgmlType::Iq3S
-            | llm170_gguf::GgmlType::Q3K
-            | llm170_gguf::GgmlType::Q4K
-            | llm170_gguf::GgmlType::Q5K
-            | llm170_gguf::GgmlType::Q8_0
-            | llm170_gguf::GgmlType::Q5_1
-            | llm170_gguf::GgmlType::Iq4Nl
-            | llm170_gguf::GgmlType::Q6K
-    )
+pub fn w4a8_ty(ty: crate::wtype::WType) -> bool {
+    matches!(ty, |crate::wtype::WType::Iq4Xs| crate::wtype::WType::Iq3S
+        | crate::wtype::WType::Q3K
+        | crate::wtype::WType::Q4K
+        | crate::wtype::WType::Q5K
+        | crate::wtype::WType::Q8_0
+        | crate::wtype::WType::Q5_1
+        | crate::wtype::WType::Iq4Nl
+        | crate::wtype::WType::Q6K)
 }
 
 pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
     profile_span!("cpu::matmul1");
     // W4A16 split(§3.5 A안 직접 로드) — 분리 버퍼 디양자화 + f32 내적.
-    // GGUF 계열과 동일하게 f32 레퍼런스(비트 격리 계약은 quant lane 소관).
-    if w.ty == llm170_gguf::GgmlType::W4a16G128Split {
+    // f32 레퍼런스(비트 격리 계약은 quant lane 소관).
+    if w.ty == crate::wtype::WType::W4a16G128Split {
         let scale = w
             .aux
             .expect("w4a16 split: aux(scale) 필수 계약 — Model::w 보장");
@@ -75,23 +72,17 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
         for (o, out_o) in out.iter_mut().enumerate() {
             let row = &w.data[o * row_bytes..];
             *out_o = match w.ty {
-                llm170_gguf::GgmlType::Q3K => crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, &y),
-                llm170_gguf::GgmlType::Iq3S => {
-                    crate::quant::dot_row_w4a8_iq3s_lane(row, w.n_in, &y)
-                }
-                llm170_gguf::GgmlType::Q4K => crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, &y),
-                llm170_gguf::GgmlType::Q5K => crate::quant::dot_row_w4a8_q5k_lane(row, w.n_in, &y),
-                llm170_gguf::GgmlType::Q8_0 => {
-                    crate::quant::dot_row_w4a8_q8_0_lane(row, w.n_in, &y)
-                }
-                llm170_gguf::GgmlType::Iq4Nl => {
+                crate::wtype::WType::Q3K => crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, &y),
+                crate::wtype::WType::Iq3S => crate::quant::dot_row_w4a8_iq3s_lane(row, w.n_in, &y),
+                crate::wtype::WType::Q4K => crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, &y),
+                crate::wtype::WType::Q5K => crate::quant::dot_row_w4a8_q5k_lane(row, w.n_in, &y),
+                crate::wtype::WType::Q8_0 => crate::quant::dot_row_w4a8_q8_0_lane(row, w.n_in, &y),
+                crate::wtype::WType::Iq4Nl => {
                     crate::quant::dot_row_w4a8_iq4nl_lane(row, w.n_in, &y)
                 }
-                llm170_gguf::GgmlType::Q6K => crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, &y),
-                llm170_gguf::GgmlType::Q5_1 => {
-                    crate::quant::dot_row_w4a8_q5_1_lane(row, w.n_in, &y)
-                }
-                llm170_gguf::GgmlType::Iq4Xs => {
+                crate::wtype::WType::Q6K => crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, &y),
+                crate::wtype::WType::Q5_1 => crate::quant::dot_row_w4a8_q5_1_lane(row, w.n_in, &y),
+                crate::wtype::WType::Iq4Xs => {
                     crate::quant::dot_row_w4a8_iq4xs_lane(row, w.n_in, &y)
                 }
                 // w4a8_ty 진입 게이트가 9타입 전부 위 팔로 커버 — 신규 타입
@@ -138,7 +129,7 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
 /// 스레드별 로컬 결과 [T][rows_per] → 조인 후 스캐터 (행 슬라이스 교차 차입 회피).
 pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
     // W4A16 split(§3.5 A안) — 행별 1회 디양자화 후 T토큰 내적(일반 경로 미러).
-    if w.ty == llm170_gguf::GgmlType::W4a16G128Split {
+    if w.ty == crate::wtype::WType::W4a16G128Split {
         let scale = w
             .aux
             .expect("w4a16 split: aux(scale) 필수 계약 — Model::w 보장");
@@ -198,31 +189,23 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
             for (o, out_o) in out.iter_mut().enumerate() {
                 let row = &w.data[o * row_bytes..];
                 *out_o = match w.ty {
-                    llm170_gguf::GgmlType::Q3K => {
-                        crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, y)
-                    }
-                    llm170_gguf::GgmlType::Iq3S => {
+                    crate::wtype::WType::Q3K => crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, y),
+                    crate::wtype::WType::Iq3S => {
                         crate::quant::dot_row_w4a8_iq3s_lane(row, w.n_in, y)
                     }
-                    llm170_gguf::GgmlType::Q4K => {
-                        crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, y)
-                    }
-                    llm170_gguf::GgmlType::Q5K => {
-                        crate::quant::dot_row_w4a8_q5k_lane(row, w.n_in, y)
-                    }
-                    llm170_gguf::GgmlType::Q8_0 => {
+                    crate::wtype::WType::Q4K => crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, y),
+                    crate::wtype::WType::Q5K => crate::quant::dot_row_w4a8_q5k_lane(row, w.n_in, y),
+                    crate::wtype::WType::Q8_0 => {
                         crate::quant::dot_row_w4a8_q8_0_lane(row, w.n_in, y)
                     }
-                    llm170_gguf::GgmlType::Iq4Nl => {
+                    crate::wtype::WType::Iq4Nl => {
                         crate::quant::dot_row_w4a8_iq4nl_lane(row, w.n_in, y)
                     }
-                    llm170_gguf::GgmlType::Q6K => {
-                        crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, y)
-                    }
-                    llm170_gguf::GgmlType::Q5_1 => {
+                    crate::wtype::WType::Q6K => crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, y),
+                    crate::wtype::WType::Q5_1 => {
                         crate::quant::dot_row_w4a8_q5_1_lane(row, w.n_in, y)
                     }
-                    llm170_gguf::GgmlType::Iq4Xs => {
+                    crate::wtype::WType::Iq4Xs => {
                         crate::quant::dot_row_w4a8_iq4xs_lane(row, w.n_in, y)
                     }
                     _ => unreachable!("w4a8_ty에 포함됐으나 lane 미구현: {:?}", w.ty),
@@ -282,7 +265,7 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
 }
 
 /// W4A16 split 행 디양자화 — data=packed[n][k/8 u32], scale=[n][k/128 u16],
-/// zp=8(sym 상수). cpu matmul 전용(레퍼런스 f32 — GGUF 계열 경로와 동일 계급).
+/// zp=8(sym 상수). cpu matmul 전용(레퍼런스 f32).
 fn dequant_row_w4a16_split(q: &[u8], s: &[u8], row: usize, k: usize, out: &mut [f32]) {
     let nb = k / 128;
     let qrow = &q[row * (k / 2)..];

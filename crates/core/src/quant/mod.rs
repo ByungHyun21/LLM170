@@ -8,11 +8,11 @@ pub mod lane;
 pub mod mm;
 pub mod q8;
 
+#[cfg(test)]
+#[cfg(test)]
+use crate::wtype::WType;
 pub use deq::*;
 pub use lane::*;
-#[cfg(test)]
-#[cfg(test)]
-use llm170_gguf::GgmlType;
 pub use mm::*;
 pub use q8::*;
 #[cfg(test)]
@@ -46,7 +46,7 @@ mod w4a8_tests {
         let y = quantize_row_q8_ref(&x);
         // 기준: f32 디퀀트 × q8 재구성 (측정 대상 산술만 남긴다)
         let mut wv = vec![0.0f32; n];
-        dequant_row(GgmlType::Q5_1, &bytes, 0, n as u64, &mut wv);
+        dequant_row(WType::Q5_1, &bytes, 0, n as u64, &mut wv);
         let mut want = 0.0f64;
         for i in 0..n {
             want += (wv[i] as f64) * (y[i / 32].d as f64) * (y[i / 32].qs[i % 32] as f64);
@@ -74,15 +74,15 @@ mod w4a8_tests {
         // 임의 x (f32) → q8 양자화 → 재구성 y_f 를 f32 기준으로 삼으면
         // 차이는 오직 (a) 블록별 정수그룹화 (b) q8 양자화 0 — 아니, f32 기준은
         // 원본 x와 y 재구성을 같이 쓴다: w_f32[i]·x[i] vs dot(q8(x)) — q8 오차 포함.
-        let cases: Vec<(GgmlType, usize)> = vec![
-            (GgmlType::Q4K, 144),
-            (GgmlType::Q5K, 176),
-            (GgmlType::Q6K, 210),
-            (GgmlType::Q3K, 110),
-            (GgmlType::Q8_0, 34),
-            (GgmlType::Iq4Xs, 136),
-            (GgmlType::Iq4Nl, 18),
-            (GgmlType::Iq3S, 110),
+        let cases: Vec<(WType, usize)> = vec![
+            (WType::Q4K, 144),
+            (WType::Q5K, 176),
+            (WType::Q6K, 210),
+            (WType::Q3K, 110),
+            (WType::Q8_0, 34),
+            (WType::Iq4Xs, 136),
+            (WType::Iq4Nl, 18),
+            (WType::Iq3S, 110),
         ];
         for (ty, bsize) in cases {
             let blck = ty.blck_size() as usize;
@@ -94,29 +94,29 @@ mod w4a8_tests {
             // d 필드가 극단적(0/ff)이면 값이 퇴화 — 스케일 바이트만 온화하게
             for blk in bytes.chunks_mut(bsize) {
                 match ty {
-                    GgmlType::Q4K | GgmlType::Q5K => {
+                    WType::Q4K | WType::Q5K => {
                         blk[0] = 0x30;
                         blk[1] = 0x10;
                         blk[2] = 0x28;
                         blk[3] = 0x10;
                     }
-                    GgmlType::Q6K => {
+                    WType::Q6K => {
                         blk[208] = 0x50;
                         blk[209] = 0x11;
                     }
-                    GgmlType::Q3K => {
+                    WType::Q3K => {
                         blk[108] = 0x40;
                         blk[109] = 0x11;
                     }
-                    GgmlType::Q8_0 => {
+                    WType::Q8_0 => {
                         blk[0] = 0x50;
                         blk[1] = 0x11;
                     }
-                    GgmlType::Iq4Xs | GgmlType::Iq4Nl => {
+                    WType::Iq4Xs | WType::Iq4Nl => {
                         blk[0] = 0x50;
                         blk[1] = 0x11;
                     }
-                    GgmlType::Iq3S => {
+                    WType::Iq3S => {
                         blk[0] = 0x50;
                         blk[1] = 0x11;
                     }

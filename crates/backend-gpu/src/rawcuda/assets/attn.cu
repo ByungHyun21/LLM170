@@ -1,18 +1,18 @@
-// ── EXL3 어텐션 CUDA 포팅 (plans/124 G6, 2026-10-04) ──
-// 산술은 rawhip/kernels/src_exl3.hip의 exl3_attn_prep(L607-687)·
-// exl3_attn_fwd3s(L799-853)·exl3_pos_bump(L1152-1155)을 1:1 직이식한다
+// ── 어텐션 CUDA 포팅 (plans/124 G6, 2026-10-04) ──
+// 산술은 구 rawhip 커널의 attn_prep(L607-687)·
+// attn_fwd3s(L799-853)·pos_bump(L1152-1155)을 1:1 직이식한다
 // (원본 그대로 베낌 — plans/124 §2. 트렐리스 비트 조작식은 이 파일에 없다).
 // 원본과의 차이는 5점(1-2 아래 · 3-4는 #include 직후 트랜센던트 블록):
 // 1) hip 판이 27B 폭(q헤드 24·KV헤드 4·kv 1024·KV cap 1024)으로 경직된 상수를
 //    런치 인자(q_heads/kv_heads/cap)로 일반화 — 27B 값(24/4/1024)을 넣으면
 //    원소 순서까지 원본과 동일. 목적은 35B-A3B 어텐션 형상 지원
-//    (q헤드 16·KV헤드 2 — D:/models/Qwen3.6-35B-A3B-exl3-4.00bpw/config.json
+//    (q헤드 16·KV헤드 2 — 실측 형상 config.json
 //    text_config num_attention_heads=16·num_key_value_heads=2 실측 2026-10-04).
 // 2) hip 시그니처의 pos0_ 파라미터(사실상 미사용 — 본체는 pp[0]만 판독)를
 //    CUDA에서는 아예 제거한다: 결함 4호(KV 인덱스는 pp[0] "디바이스" 판독 —
 //    파라미터 아님, 그래프/루프 설계에 필수)의 계약을 시그니처 수준에서
 //    강제한다. 호스트 pos 사본 경로는 음성대조 전용 쌍둥이
-//    exl3_attn_prep_hostpos(명시적 pos0_host 인자)로만 존재 — 프로덕션
+//    attn_prep_hostpos(명시적 pos0_host 인자)로만 존재 — 프로덕션
 //    경로에서 발사 금지(원장 17호 계기 원칙).
 // 3) 트랜센던트/수축(아래 블록 참조): 빌드 -fmad=false(FMA 수축 제거 —
 //    호스트 미러와 연산 DAG 비트동일), 초월함수는 자작 f64 미러
@@ -56,7 +56,7 @@
 // 편차가 f16 경계·소프트맥스 분모를 타고 남으므로(plans/124 §1 최tight),
 // 본 파일의 트랜센던트는 순수 f64 연산 DAG(IEEE mul/add/div/floor·비트
 // 재구성, FMA 수축 없음 — 빌드 -fmad=false)로 자작해 양측(본 .cu ↔
-// exl3_cuda_probe.rs 오라클 트윈)의 비트동일을 계약으로 삼는다(G5 실측
+// 구 프로브 오라클 트윈)의 비트동일을 계약으로 삼는다(G5 실측
 // 원장: libdevice expf는 3.1M 표본 중 30%에서 참값 ±1ulp). exp는 G5
 // gdn_exp_d와 동일 DAG(차수 7 테일러·비트 재구성 2^k). 도메인: exp |x|≤128,
 // sincos 0≤a≤2^20(rope ang = pos·theta ≤ cap·1 — 실사용 ≤1024),
@@ -142,12 +142,12 @@ __device__ __forceinline__ float attn_sinf(float a)
     return (float)s;
 }
 
-// ── prep 본체(src_exl3.hip L607-687 직이식, 폭 인자화 + 결함 4호) ──
+// ── prep 본체(구 rawhip 커널 L607-687 직이식, 폭 인자화 + 결함 4호) ──
 // q 디인터리브[rms+rope] → qh, k rms+rope → KC(디바이스 pos), v 복사 → VC.
 // 그리드 (T, q_heads+kv_heads): j<q_heads=q헤드, j≥q_heads=KV헤드
 // (m=j−q_heads). WG=128. KV 기록 인덱스 pos = pp[0](디바이스) + t —
 // 결함 4호: pp[0] 판독이 그래프/루프 설계의 핵심(pos_bump와 짝).
-extern "C" __global__ void exl3_attn_prep(
+extern "C" __global__ void attn_prep(
     const float* __restrict__ qg,    // [T][q_heads*512] q‖gate 인터리브
     const float* __restrict__ kin,   // [T][kv_heads*256]
     const float* __restrict__ vin,   // [T][kv_heads*256]
@@ -235,8 +235,8 @@ extern "C" __global__ void exl3_attn_prep(
 // 계산하는 판(prep와의 유일한 차이 — pos 원천). 장치 pp[0]이 pos_bump 등으로
 // 전진한 뒤 호스트 사본이 낡은 값이면 KV 기록 위치가 어긋나고, 그 이격이
 // fwd3s(디바이스 판독 경로) 종단 값에서 maxdiff>2e-7로 검출됨을 증명한다.
-// 프로덕션 경로에서 발사 금지 — exl3_cuda.rs 검증 전용 진입만 호출.
-extern "C" __global__ void exl3_attn_prep_hostpos(
+// 프로덕션 경로에서 발사 금지 — 구 디코더 검증 전용 진입만 호출.
+extern "C" __global__ void attn_prep_hostpos(
     const float* __restrict__ qg,
     const float* __restrict__ kin,
     const float* __restrict__ vin,
@@ -318,13 +318,13 @@ extern "C" __global__ void exl3_attn_prep_hostpos(
     }
 }
 
-// ── fwd3s 본체(src_exl3.hip L799-853 직이식, 폭 인자화 + 도메인 강제) ──
+// ── fwd3s 본체(구 rawhip 커널 L799-853 직이식, 폭 인자화 + 도메인 강제) ──
 // 3단 구조: (1) 스코어 q·kᵀ·scale(행당 1스레드 순차 d-누산) → sarr,
 // (2) 트리 max → 지수(트윈)·트리 sum(스레드 보폭 순차 + 트리 — 환원 순서
 // 미러 계약) → sarr 자리에 확률, (3) AV 순차 누산(스레드=dim 원소) →
 // 게이트 sigmoid 곱. WG당 (t,h). lim = pp[0](디바이스)+t+1 — 결함 4호.
-// 도메인: T≤8(EXL3_ATTN_TMAX) — 위반 시 전 블록 조기복귀(기록 없음).
-#define EXL3_ATTN_TMAX 8
+// 도메인: T≤8(ATTN_TMAX) — 위반 시 전 블록 조기복귀(기록 없음).
+#define ATTN_TMAX 8
 // ── [S12 2026-10-07] 위치축 청크.online 소프트맥스 — 공유메모리 6KB→2KB ──
 // 이전 구현은 sarr[1024]에 lim행 스코어를 전부 담아 두었다. 공유메모리 고정
 // 크기라 lim(=pp[0]+t+1)이 1024를 넘으면 sarr[row]가 블록 밖을 넘어가고
@@ -333,7 +333,7 @@ extern "C" __global__ void exl3_attn_prep_hostpos(
 // (plans/cuda-port.md S9가 규칙적으로 확인해 봉인한 한계).
 //
 // 해법은 알고리즘 새로 쓰기가 아니라 **hip 판의 청크 온라인 소프트맥스를
-// 그대로 이식**하는 것이었다(rawhip/kernels/src_exl3_attn.hip L202-276가
+// 그대로 이식**하는 것이었다(rawhip/kernels/구 rawhip 커널 L202-276가
 // plans/128 P0에서 이미 그 형태로 재작성돼 있다 — 청크 256행마다 running
 // max/l/acc를 갱신하므로 smem이 kvcap과 무관해진다).
 //
@@ -352,8 +352,8 @@ extern "C" __global__ void exl3_attn_prep_hostpos(
 // 달라져 값이 ulp 수준으로 움직인다. 수학적으로는 동등(온라인 소프트맥스
 // 정의 그대로)하며 f16 GEMM 누산(1.6e-2)보다 작다. 실사용 판정은 기존과
 // 동일하게 argmax 일치다.
-#define EXL3_ATTN_CHUNK 256
-extern "C" __global__ void exl3_attn_fwd3s(
+#define ATTN_CHUNK 256
+extern "C" __global__ void attn_fwd3s(
     const float* __restrict__ qh,    // [T][q_heads*256]
     const float* __restrict__ kc,    // [n_attn*cap][kv_heads*256]
     const float* __restrict__ vc,
@@ -362,9 +362,9 @@ extern "C" __global__ void exl3_attn_fwd3s(
     const unsigned* __restrict__ pp, // [1] pos0 — 디바이스 판독(결함 4호)
     int t_len, int layer, int q_heads, int kv_heads, int cap)
 {
-    if (t_len > EXL3_ATTN_TMAX) return;   // 도메인 강제: T≤8(깨끗한 거부)
+    if (t_len > ATTN_TMAX) return;   // 도메인 강제: T≤8(깨끗한 거부)
     __shared__ float qs[256];
-    __shared__ float sarr[EXL3_ATTN_CHUNK]; // 청크 스코어(온라인 — 전체 보관 아님)
+    __shared__ float sarr[ATTN_CHUNK]; // 청크 스코어(온라인 — 전체 보관 아님)
     __shared__ float reds[256];
     int t = blockIdx.x;
     int h = blockIdx.y;
@@ -383,8 +383,8 @@ extern "C" __global__ void exl3_attn_fwd3s(
     float m_run = -1e30f;
     float l_run = 0.0f;
     float acc = 0.0f;   // 스레드(dim=tid)별 AV 누산
-    for (int base = 0; base < lim; base += EXL3_ATTN_CHUNK) {
-        int nch = min(EXL3_ATTN_CHUNK, lim - base);
+    for (int base = 0; base < lim; base += ATTN_CHUNK) {
+        int nch = min(ATTN_CHUNK, lim - base);
         // 스코어: 행=base+tid(tid<nch), 256차원 직렬 내적(hip L232-239 동일)
         float p = -1e30f;
         if (tid < nch) {
@@ -433,10 +433,10 @@ extern "C" __global__ void exl3_attn_fwd3s(
 }
 // 마커 f3sc
 
-// exl3_pos_bump 직이식(src_exl3.hip L1152-1155) — pp[0] += 1. 캡처
+// pos_bump 직이식(구 rawhip 커널 L1152-1155) — pp[0] += 1. 캡처
 // 그래프 내 pos 전진(h2d 불가 대체 — 결함 16호 정신). 어텐션 행 루프가
 // 디바이스 체인으로 남는 결함 4호 계약의 짝.
-extern "C" __global__ void exl3_attn_pos_bump(unsigned* __restrict__ pp)
+extern "C" __global__ void attn_pos_bump(unsigned* __restrict__ pp)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) pp[0] += 1u;
 }

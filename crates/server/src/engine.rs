@@ -8,13 +8,9 @@ pub enum BackendSel {
     /// (serve/infer)는 Cpu 단일이라 아직 생성되지 않는다.
     #[allow(dead_code)]
     Gpu,
-    /// Gpu + 런타임 지정 ("hip"|"vulkan") — serve --gpu-runtime (2026-09-01:
-    /// HIP가 폴트로 웨지된 경우 Vulkan 회피).
-    #[allow(dead_code)]
-    GpuRuntime(String),
 }
-/// 모델 경로 포맷 판정 — 2026-10-08 방향 전환(plans/w4a16-cuda.md §5):
-/// 수용은 **W4A16 디렉터리 단일**. EXL3·GGUF는 탈락 — 명시 에러로 안내.
+/// 모델 경로 포맷 판정 — 2026-10-08 단일 트랙(plans/w4a16-cuda.md §5):
+/// 수용은 **W4A16 디렉터리 단일** — 그 외는 명시 에러로 안내.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ModelFormat {
     /// compressed-tensors(weight_packed 3조)·auto-gptq(qweight/qzeros) 패킹.
@@ -22,11 +18,11 @@ pub enum ModelFormat {
 }
 
 /// 포맷 스니핑 — 디렉터리 내 safetensors 내용 기반(index.json 우선, 없으면
-/// 첫 샤드 헤더 접두). GGUF 파일·EXL3 trellis 디렉터리는 탈락 에러.
+/// 첫 샤드 헤더 접두). 그 외 파일·디렉터리는 탈락 에러.
 pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
     if path.is_file() {
         return Err(format!(
-            "GGUF는 탈락(2026-10-08 — plans/w4a16-cuda.md §5): W4A16 디렉터리만 지원 — {}",
+            "파일 모델 미지원(2026-10-08 — plans/w4a16-cuda.md §5): W4A16 디렉터리만 지원 — {}",
             path.display()
         ));
     }
@@ -60,7 +56,7 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
         // safetensors 없는 디렉터리 — config.json(architectures) 유무로 안내.
         if path.join("config.json").is_file() {
             return Err(format!(
-                "미지원 포맷: HF config 배포(architectures) — {} (지원: GGUF 파일·EXL3 trellis 디렉터리)",
+                "미지원 포맷: HF config 배포(architectures) — {} (지원: W4A16 디렉터리)",
                 path.display()
             ));
         }
@@ -71,7 +67,7 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
     };
     if hay.contains(".trellis") {
         return Err(format!(
-            "EXL3는 탈락(2026-10-08 — plans/w4a16-cuda.md §5): W4A16 디렉터리만 지원 — {}",
+            "미지원 quant 스키마(.trellis — 2026-10-08): W4A16 디렉터리만 지원 — {}",
             path.display()
         ));
     }
@@ -94,7 +90,7 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
 pub struct InferRequest {
     pub model: PathBuf,
     pub ctx: usize,
-    /// PLE 테이블 오프로드 모드(plans/111 W4c) — hip 탈락(2026-10-08)으로
+    /// PLE 테이블 오프로드 모드(plans/111 W4c) — 백엔드 탈락(2026-10-08)으로
     /// W4A16 경로에서는 무시된다(build_slots가 고지).
     pub ple_table: Option<String>,
     /// SSD 블록 캐시 예산 MiB(plans/111 W4c) — 상동.
@@ -276,10 +272,10 @@ fn banner(
 }
 
 pub fn build_slots(req: InferRequest, _backend: BackendSel, n_slots: usize) -> Engine {
-    // PLE 플래그는 rawhip 전역 구현이었음 — hip 탈락(2026-10-08, §5)으로 무의미.
+    // PLE 플래그는 구 백엔드 전역 구현이었음 — 탈락(2026-10-08, §5)으로 무의미.
     if req.ple_table.is_some() || req.ple_cache_mib.is_some() {
         eprintln!(
-            "# ple-table/ple-cache: hip 탈락(2026-10-08) — 플래그 무시(plans/w4a16-cuda.md §5)"
+            "# ple-table/ple-cache: 백엔드 탈락(2026-10-08) — 플래그 무시(plans/w4a16-cuda.md §5)"
         );
     }
     if SPEC_K.get().copied().unwrap_or(0) > 0 {

@@ -1,6 +1,6 @@
 //! 기본 연산: norms, 활성화, RoPE — llama.cpp ggml-cpu 시맨틱스 대응.
 //!
-//! - rms_norm: f64 누적, scale = 1/sqrt(mean(x²)+eps), 감마는 GGUF 저장값(1+w) 그대로 곱.
+//! - rms_norm: f64 누적, scale = 1/sqrt(mean(x²)+eps), 감마는 (w+1) 보정 저장값 그대로 곱.
 //! - l2_norm: scale = 1/max(sqrt(Σx²), eps) (ops.cpp — eps 는 floor).
 //! - rope: 인접 페어 (2i, 2i+1), θ_p = base^(−p/n_pairs). IMROPE의 텍스트 전용 퇴화형
 //!   (모든 위치 성분이 동일하면 표준 RoPE와 동일 — ggml mrope_cache_init 참조).

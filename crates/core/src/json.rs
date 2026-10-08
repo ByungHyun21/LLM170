@@ -1,5 +1,5 @@
 //! safetensors 헤더·index.json·tokenizer/config용 최소 JSON 파서.
-//! (구 llm170-exl3에서 core로 이관 — 2026-10-08 EXL3 탈락·W4A16 단일 트랙.)
+//! (2026-10-08 단일 트랙 재편에서 core로 이관.)
 //!
 //! 표준 일반 JSON은 아님 — 헤더 스키마에 필요한 부분집합:
 //! 객체·배열·문자열·정수/실수·bool·null. 깊이/길이 상한으로

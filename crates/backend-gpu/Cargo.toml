@@ -4,10 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-llm170-core = { path = "../core" }
-llm170-gguf = { path = "../gguf" }
 llm170-diag = { path = "../diag" }
-parking_lot = "0.12.5"
 
 [lints]
 workspace = true

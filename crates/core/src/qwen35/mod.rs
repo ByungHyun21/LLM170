@@ -3,7 +3,7 @@
 //! 그래프 배선: `~/local_llm/llama.cpp/src/models/qwen35.cpp` (2026-08-30 판).
 //! 하이퍼파라미터(27B): n_embd 5120, FFN 17408(SwiGLU), vocab 248320,
 //! rms_eps 1e-6, ctx 262144. 64층 = 12×(3×GDN→FFN + 1×GatedAttn→FFN)
-//! (full_attention_interval=4 → full-attn il∈{3,7,…,63}), GGUF
+//! (full_attention_interval=4 → full-attn il∈{3,7,…,63}),
 //! block_count=65 (MTP blk.64, mtp_num_hidden_layers=1).
 //! - 잔차: h += attn(rms(h)); h += ffn(rms_post(h)) — FFN 분기는 **post**-attn norm
 //! - GDN층(interval≠3): qkv → depthwise conv+SiLU → L2 norm(q,k) → GDN → rms_norm·silu(z) → ssm_out
@@ -11,7 +11,7 @@
 //!   (스트라이드 2·head_dim) → per-head rms norm(q,k) [256] → RoPE half-split
 //!   (n_rot 64, base 1e7 — 텍스트 토큰에서 mrope 구간 [11,11,10]과 동치)
 //!   → GQA(24Q/4KV, scale 1/√256) → ⊙sigmoid(gate) → wo. KV f16 64 KiB/token(16층).
-//! - 하이퍼파라미터는 GGUF 메타에서 동적 로드 (소형 검증 모델 지원).
+//! - 하이퍼파라미터는 config.json 메타에서 동적 로드 (소형 검증 모델 지원).
 //! - f32 KV, f32 GDN 상태 (참조 정확도 우선).
 
 mod dispatch;
@@ -60,8 +60,8 @@ impl std::fmt::Display for ModelError {
 
 impl std::error::Error for ModelError {}
 
-/// 가중치 소스 — **W4A16 디렉터리 단일**(2026-10-08, plans/w4a16-cuda.md §5:
-/// GGUF 파서 탈락). 세부 접근은 `w4a16` 로더(mmap 슬라이스 + 순열 사본).
+/// 가중치 소스 — **W4A16 디렉터리 단일**(2026-10-08, plans/w4a16-cuda.md §5).
+/// 세부 접근은 `w4a16` 로더(mmap 슬라이스 + 순열 사본).
 pub struct Model {
     w4: Box<crate::w4a16::W4a16Model>,
     pub hp: Hparams,
@@ -135,7 +135,7 @@ impl Model {
         Ok(m)
     }
 
-    /// plans/40 페이지 반납은 GGUF mmap 전용이었음 — GGUF 탈락(2026-10-08)으로
+    /// plans/40 페이지 반납은 구 mmap 소스 전용이었음 — 2026-10-08 단일 트랙으로
     /// 무동작(W4A16 소스는 전부 CPU 경로). 호출부 계약 유지를 위해 잔존.
     pub fn discard_weight_pages(&self, _keep: &[&str]) -> u64 {
         0
@@ -162,7 +162,7 @@ impl Model {
         }
         let w4 = &self.w4;
         let v = match crate::w4a16::eng(name) {
-            // 정규화는 HF zero-centered(w−1 저장) — GGUF 규약 +1 보정.
+            // 정규화는 HF zero-centered(w−1 저장) — 로드 시 +1 보정.
             // ssm_a는 −exp(A_log), dt_bias/A_log·conv는 V헤드 순열 합성
             // (엔진 subhead-major 계약 — perm: 1 인덱스·2 채널).
             Some(crate::w4a16::Eng::Synth {
@@ -215,7 +215,7 @@ impl Model {
 /// f32_vec 전용 계약(호출부가 w()로 요구하지 않는다).
 fn w4_weight<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Weight<'a>> {
     use crate::w4a16::{Eng, PV};
-    use llm170_gguf::GgmlType;
+    use crate::wtype::WType;
     match crate::w4a16::eng(name)? {
         Eng::Quant { base, vperm } => {
             let (n, k) = w4.lin_shape(&base)?;
@@ -229,7 +229,7 @@ fn w4_weight<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Weight<
             Some(Weight {
                 data,
                 aux: Some(aux),
-                ty: GgmlType::W4a16G128Split,
+                ty: WType::W4a16G128Split,
                 n_in: k as u64,
                 n_out: n as u64,
             })
@@ -240,9 +240,9 @@ fn w4_weight<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Weight<
         } => {
             let e = w4.entry(&hf)?;
             let ty = match e.dtype {
-                crate::st::StDtype::Bf16 => GgmlType::Bf16,
-                crate::st::StDtype::F16 => GgmlType::F16,
-                crate::st::StDtype::F32 => GgmlType::F32,
+                crate::st::StDtype::Bf16 => WType::Bf16,
+                crate::st::StDtype::F16 => WType::F16,
+                crate::st::StDtype::F32 => WType::F32,
                 _ => return None,
             };
             let data = if rows_perm {
@@ -330,7 +330,7 @@ pub struct Engine {
     /// qwen35 디코드 프레임 (t=1) — LLM170_FRAME35=1 첫 디코드에서 생성.
     pub raw_decode: Option<std::sync::Arc<dyn crate::matmul::RawDecode>>,
     /// token_embd 원시 복사 캐시 (spec 토큰 행 디양자화용 — 매 스텝 to_vec 폭주 방지).
-    pub embd_cache: Option<(llm170_gguf::GgmlType, std::sync::Arc<Vec<u8>>)>,
+    pub embd_cache: Option<(crate::wtype::WType, std::sync::Arc<Vec<u8>>)>,
     pub frame: Option<Frame>,
     /// MTP 스펙 의도 — true일 때만 prefill/decode 훅 활성 (미사용 시
     /// 훅 비용으로 prefill 3배 저하 방지, 2026-09-04 계측).
@@ -363,7 +363,7 @@ impl Engine {
         }
     }
 
-    /// KV 용량에서 역산한 컨텍스트 길이 (rawhip 상수 테이블 크기 등).
+    /// KV 용량에서 역산한 컨텍스트 길이.
     pub fn ctx_len(&self) -> usize {
         let (n_kv, hd) = (self.model.hp.n_kv, self.model.hp.head_dim);
         self.seqs
@@ -731,7 +731,7 @@ impl Engine {
             self.seqs[seq_ids[0]].pos += 1;
             return Ok(vec![logits]);
         }
-        // np 배치 (rawhip) — 각 seq 1토큰, GEMM 공유 (plans/15)
+        // 구 np 배치 GPU 경로 — 각 seq 1토큰, GEMM 공유 (plans/15)
         if tokens.len() > 1
             && seq_ids.len() > 1
             && self.raw_decode.is_some()

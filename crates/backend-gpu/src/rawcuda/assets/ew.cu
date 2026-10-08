@@ -1,5 +1,5 @@
-// ── EXL3 ew(silu·mul) + argmax CUDA 포팅 (plans/124 G7, 2026-10-04) ──
-// 산술은 rawhip/kernels/src_exl3.hip의 exl3_ew(L898-908)·exl3_argmax
+// ── EW(silu·mul) + argmax CUDA 포팅 (plans/124 G7, 2026-10-04) ──
+// 산술은 구 rawhip 커널의 ew(L898-908)·ew_argmax
 // (L911-934)을 1:1 직이식한다(원본 그대로 베낌 — plans/124 §2).
 // 원본과의 차이는 1점(트랜센던트):
 // 1) 원본 ew는 __expf(수 ulp 근사 내장) — G5/G6 노선(plans/124 §6:
@@ -13,9 +13,9 @@
 //    argmax는 부동소수 환원이 아니라 정수 인덱스 선택(exp 미포함,
 //    fmad 무관)이라 차이 없다.
 //
-// 결함 8호(원장): exl3_argmax의 n은 "로짓 길이"(248320 — 어휘 폭),
+// 결함 8호(원장): ew_argmax의 n은 "로짓 길이"(248320 — 어휘 폭),
 // 행수가 아니다. 과잉 판독(행수>길이 창 밖)·과소 판독(길이>행수 미
-// 스캔)이 고전 버그 — 검증층 음성대조(exl3_cuda_probe.rs
+// 스캔)이 고전 버그 — 검증층 음성대조(구 프로브
 // cuda_argmax_negative_check)가 잘못된 n을 토큰 불일치로 잡는다.
 // 동일값 최대가 여러 개일 때 위너는 "가장 낮은 tid의 잔여 클래스
 // (i ≡ tid mod 1024) 내 첫 등장" — 전역 첫 등장과 다를 수 있으나
@@ -23,7 +23,7 @@
 // 한다(exact-match 계약, 아래 reduction 참조).
 //
 // [CMP 170HX(sm_80, GA100 70SM, HBM2e ~1.5TB/s) 설계 근거 — plans/124 §0]
-// - ew: 그리드 (ceil(n/128),1) · 블록 128 — 원본 hip 발사(exl3_hip.rs
+// - ew: 그리드 (ceil(n/128),1) · 블록 128 — 원본 hip 발사(구 hip 호스트
 //   L786-796: launch3(grid,1,1,128))와 동일. 27B FFN n=17408(config.json
 //   intermediate_size 실측 2026-10-04) → 136블록 · 스레드당 원소 1개 ·
 //   g/u/y 완전 coalesce 스트리밍(블록당 512B×3 런치) — 메모리 본드
@@ -46,7 +46,7 @@
 // ── 미러 트랜센던트(G7 — G5 gdn_exp_d·G6 attn_exp_d와 동일 DAG) ──
 // 계약: k = floor(x·invln2+½) → r = x−k·ln2(hi/lo 2분할) → 테일러
 // 차수 7 → 2^k 비트 재구성. 연산 순서·상수는 절대 변경 금지 — 호스트
-// Rust 트윈(exl3_cuda_probe.rs gdn_exp_d, G5)과 리터럴까지 동일해야
+// Rust 트윈(구 프로브 gdn_exp_d, G5)과 리터럴까지 동일해야
 // 비트동일(-fmad=false 빌드와 세트).
 __device__ __forceinline__ double ew_exp_d(double x)
 {
@@ -68,11 +68,11 @@ __device__ __forceinline__ float ew_expf(float x)
     return (float)ew_exp_d((double)x);
 }
 
-// ── ew 본체(src_exl3.hip L898-908 직이식, exp만 트윈 치환) ──
+// ── ew 본체(구 rawhip 커널 L898-908 직이식, exp만 트윈 치환) ──
 // y[j] = silu(g[j])·u[j] — T=1 디코드 FFN 게이트·업 곱. 원본식
 // (v / (1.0f + __expf(-v))) * u[j]에서 __expf만 ew_expf로 바꾼다
 // (f32 add/div/mul 순서 불변 — 비트동일 미러 계약).
-extern "C" __global__ void exl3_ew(
+extern "C" __global__ void ew(
     const float* __restrict__ g,
     const float* __restrict__ u,
     float* __restrict__ y,
@@ -85,12 +85,12 @@ extern "C" __global__ void exl3_ew(
     y[j] = (v / (1.0f + e)) * u[j];
 }
 
-// ── argmax 본체(src_exl3.hip L911-934 직이식) ──
+// ── argmax 본체(구 rawhip 커널 L911-934 직이식) ──
 // [n] 로짓에서 최대 인덱스 1개(단일 블록 리덕션, n≤1M). n은 로짓
 // 길이(248320) — 행수 아님(결함 8호). 리덕션: tid별 스트라이드 1024
 // 상향 스캔(초기 −1e30, "초과" 갱신 — 클래스 내 첫 등장 유지) →
 // 공유 트리(st=512..1, 동일값 낮은 tid 우선) → out[0].
-extern "C" __global__ void exl3_argmax(
+extern "C" __global__ void ew_argmax(
     const float* __restrict__ lg,
     unsigned* __restrict__ out,
     int n)

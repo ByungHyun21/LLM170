@@ -1,13 +1,13 @@
-// ── EXL3 GDN 체인 CUDA 포팅 (plans/124 G5, 2026-10-04) ──
-// 산술은 rawhip/kernels/src_exl3.hip의 exl3_gdn_conv(L330-365)·
-// exl3_gdn_gate(L368-393)·exl3_gdn_l2perm(L397-472)·exl3_gdn_scan
+// ── GDN 체인 CUDA 포팅 (plans/124 G5, 2026-10-04) ──
+// 산술은 구 rawhip 커널의 gdn_conv(L330-365)·
+// gdn_gate(L368-393)·gdn_l2perm(L397-472)·gdn_scan
 // (L484-608)을 1:1 직이식한다(원본 그대로 베낌 — plans/124 §2).
 // 원본과의 차이는 4점(1-3 아래, 4번은 #include 직후 트랜센던트 블록):
 // 1) hip 판이 27B 폭(10240/2048/6144/5120/96/48헤드)으로 경직된 상수를
 //    런치 인자(k_len/v_len/conv_ch/hidden/h_k/h_v)로 일반화 — 27B 값
 //    (hidden=5120, h_k=16, h_v=48)을 넣으면 원소 순서까지 원본과 동일.
 //    목적은 35B-A3B GDN 형상 지원(hidden=2048, h_k=16, h_v=32,
-//    conv_ch=8192 — D:/models/Qwen3.6-35B-A3B-exl3-4.00bpw/config.json
+//    conv_ch=8192 — 실측 형상 config.json
 //    text_config 실측 2026-10-04).
 // 2) scan 공유메모리 합계 61,828B(sk/sv/KS/QS 8KB×4 · A/KQ 2KB×2 ·
 //    dc 16KB · Stile 8KB · bp/gcs/wsm 388B)는 CUDA 정적 __shared__ 한계
@@ -26,7 +26,7 @@
 // k-주요 배치, lc(FLA)는 [G][h_k] 그룹-주요 — 전치 p_inv=(h%G)·h_k+h/G,
 // G=h_v/h_k(27B: G=3 → (h%3)·16+h/3 — 원본식과 동일). l2perm·gate 모두
 // scatter(쓰기측 인덱스에 p_inv) — CPU 미러가 gather라 방향 혼동 주의.
-// exl3_gdn_l2perm_gather는 원장 17호 음성대조 전용 쌍둥이(방향 반전
+// gdn_l2perm_gather는 원장 17호 음성대조 전용 쌍둥이(방향 반전
 // 결함 재현) — 프로덕션 경로에서 발사 금지.
 //
 // 그리드 계약(결함 5호): T>1 커널(l2perm/gate)은 t=blockIdx.y —
@@ -61,7 +61,7 @@
 // 실가중 픽스처에서 스캔 단계 7.6e-6 → 게이트 rms 증폭 ×289로 종단
 // 3.3e-4, 임계 2e-4 초과)를 유발한다. 본 파일의 트랜센던트는 순수 f64
 // 연산 DAG(IEEE mul/add/div/floor·비트 재구성만, FMA 수축 없음 — 빌드
-// -fmad=false)로 자작해 양측(본 .cu ↔ exl3_cuda_probe.rs 오라클 트윈)의
+// -fmad=false)로 자작해 양측(본 .cu ↔ 구 프로브 오라클 트윈)의
 // 비트동일을 계약으로 삼는다. 정확도는 f64 다항 근사(~1e-12 상대 —
 // f32 캐스트 기준 참값과 수 ulp)로 수학 동등·정밀도 상향. 도메인:
 // exp |x| ≤ 128(k 비트 재구성 상한), log y ≥ 2^-1022 정규수(softplus
@@ -113,10 +113,10 @@ __device__ __forceinline__ float gdn_logf(float y)
     return (float)gdn_log_d((double)y);
 }
 
-// exl3_gdn_conv — 채널별 3탭 링 순차 회전(src_exl3.hip L330-365 직이식,
+// gdn_conv — 채널별 3탭 링 순차 회전(구 rawhip 커널 L330-365 직이식,
 // 폭 인자화). 그리드 (conv_ch/128, 1), 블록 128. 링 [L][3][conv_ch]은
 // 커널이 r/w — T행 전체를 한 런치에서 순회(§3.3).
-extern "C" __global__ void exl3_gdn_conv(
+extern "C" __global__ void gdn_conv(
     const float* __restrict__ qkv,   // [T][conv_ch]
     const float* __restrict__ convw, // [L][conv_ch][4]
     float* __restrict__ ring,        // [L][3][conv_ch]
@@ -153,7 +153,7 @@ extern "C" __global__ void exl3_gdn_conv(
 }
 
 // l2perm 본체 — a/b 도트(xn·abuf) + q/k L2 + v·beta|g lc 순열
-// (src_exl3.hip L397-472 직이식, 폭 인자화). 그리드 (h_v, T), WG=128.
+// (구 rawhip 커널 L397-472 직이식, 폭 인자화). 그리드 (h_v, T), WG=128.
 // GATHER=true는 음성대조 전용 방향 반전(v 판독측에 p_inv — 결함류:
 // 방향). beta|g는 lc 순열로 scatter(bg[.. + p_inv]).
 template <bool GATHER>
@@ -251,7 +251,7 @@ __device__ __forceinline__ void gdn_l2perm_body(
 }
 
 // 프로덕션 l2perm — scatter(계약 방향).
-extern "C" __global__ void exl3_gdn_l2perm(
+extern "C" __global__ void gdn_l2perm(
     const float* __restrict__ q_in,
     const float* __restrict__ k_in,
     const float* __restrict__ v_in,
@@ -270,7 +270,7 @@ extern "C" __global__ void exl3_gdn_l2perm(
 }
 
 // 음성대조 전용 l2perm — gather(방향 결함 재현, 원장 17호 계기).
-extern "C" __global__ void exl3_gdn_l2perm_gather(
+extern "C" __global__ void gdn_l2perm_gather(
     const float* __restrict__ q_in,
     const float* __restrict__ k_in,
     const float* __restrict__ v_in,
@@ -288,16 +288,16 @@ extern "C" __global__ void exl3_gdn_l2perm_gather(
                           q_out, k_out, v_out, bg, t_len, layer, h_k, h_v, hidden);
 }
 
-// exl3_gdn_scan — FLA 청크 알고리즘(src_exl3.hip L484-608 직이식,
+// gdn_scan — FLA 청크 알고리즘(구 rawhip 커널 L484-608 직이식,
 // CS=32·TILE=16·8패스). A/KQ/KS/QS/sk/sv f16, dc f32 전진대입 소거
 // (d[i] = β·(v_i − e^{g_i}·KS_i) 먼저, 이후 j<i 감산 — 순서 계약),
 // o는 각 i의 소거 직후(필요한 dc[p≤i]는 전부 확정) 산출. 상태 P6
 // 갱신. q 입력(q2)은 l2perm에서 이미 L2 정규화됨 — 이 커널에서 중복
 // 스케일 금지(§3.3; qscale=1/√d는 어텐션 스케일이지 재정규화 아님).
 // 공유메모리는 동적 61,828B(최상단 주석 2항). 그리드 (h_v, 1), WG=128.
-#define EXL3_CS 32
-#define EXL3_TILE 16
-extern "C" __global__ void exl3_gdn_scan(
+#define GDN_CS 32
+#define GDN_TILE 16
+extern "C" __global__ void gdn_scan(
     const float* __restrict__ q,     // [T][k_len]
     const float* __restrict__ k,     // [T][k_len] L2
     const float* __restrict__ v,     // [T][h_v*128] lc
@@ -308,48 +308,48 @@ extern "C" __global__ void exl3_gdn_scan(
 {
     extern __shared__ char smem_raw[];
     __half* sk = (__half*)smem_raw;                    // [CS*128]
-    __half* sv = sk + EXL3_CS * 128;                   // [CS*128]
-    __half* A = sv + EXL3_CS * 128;                    // [CS*CS]
-    __half* KQ = A + EXL3_CS * EXL3_CS;                // [CS*CS]
-    __half* KS = KQ + EXL3_CS * EXL3_CS;               // [CS*128]
-    __half* QS = KS + EXL3_CS * 128;                   // [CS*128]
-    float* dc = (float*)(QS + EXL3_CS * 128);          // [CS*128] — 4B 정렬(오프셋 36864)
-    float* Stile = dc + EXL3_CS * 128;                 // [TILE*128]
-    float* bp = Stile + EXL3_TILE * 128;               // [CS]
-    float* gcs = bp + EXL3_CS;                         // [CS+1]
-    float* wsm = gcs + (EXL3_CS + 1);                  // [CS]
+    __half* sv = sk + GDN_CS * 128;                   // [CS*128]
+    __half* A = sv + GDN_CS * 128;                    // [CS*CS]
+    __half* KQ = A + GDN_CS * GDN_CS;                // [CS*CS]
+    __half* KS = KQ + GDN_CS * GDN_CS;               // [CS*128]
+    __half* QS = KS + GDN_CS * 128;                   // [CS*128]
+    float* dc = (float*)(QS + GDN_CS * 128);          // [CS*128] — 4B 정렬(오프셋 36864)
+    float* Stile = dc + GDN_CS * 128;                 // [TILE*128]
+    float* bp = Stile + GDN_TILE * 128;               // [CS]
+    float* gcs = bp + GDN_CS;                         // [CS+1]
+    float* wsm = gcs + (GDN_CS + 1);                  // [CS]
     int h = blockIdx.x;
     int kh = h % h_k;
     int tid = threadIdx.x;
-    int n_chunks = (t_len + EXL3_CS - 1) / EXL3_CS;
+    int n_chunks = (t_len + GDN_CS - 1) / GDN_CS;
     // G5 정밀화: rsqrtf(≤2ulp 근사) 대신 IEEE sqrt+div — 호스트 미러와
     // 비트동일(양측 sqrt.rn·div.rn).
     float qscale = 1.0f / sqrtf((float)d);
     long st_h = (long)layer * h_v * d * d + (long)h * d * d;
 
     for (int c = 0; c < n_chunks; c++) {
-        int t0 = c * EXL3_CS;
-        int n = min(t_len - t0, EXL3_CS);
+        int t0 = c * GDN_CS;
+        int n = min(t_len - t0, GDN_CS);
 
-        for (int e = tid; e < EXL3_CS * 128; e += 128) {
+        for (int e = tid; e < GDN_CS * 128; e += 128) {
             int t = e / 128, dv = e % 128;
             bool live = t < n;
             sk[e] = __float2half_rn(live ? k[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f);
             sv[e] = __float2half_rn(live ? v[(t0 + t) * (h_v * d) + h * 128 + dv] : 0.0f);
         }
-        if (tid < EXL3_CS) {
+        if (tid < GDN_CS) {
             float acc = 0.0f;
-            for (int t = 0; t < EXL3_CS; t++) {
+            for (int t = 0; t < GDN_CS; t++) {
                 acc += (t < n) ? bg[(t0 + t) * (2 * h_v) + h_v + h] : 0.0f;
                 gcs[t] = acc;
             }
-            gcs[EXL3_CS] = acc;
+            gcs[GDN_CS] = acc;
             bp[tid] = (tid < n) ? bg[(t0 + tid) * (2 * h_v) + h] : 0.0f;
         }
         __syncthreads();
 
-        for (int i = 0; i < EXL3_CS; i++) {
-            if (tid < EXL3_CS && i < n) {
+        for (int i = 0; i < GDN_CS; i++) {
+            if (tid < GDN_CS && i < n) {
                 int j = tid;
                 float dk = 0.0f, dq = 0.0f;
                 int qbase = (t0 + i) * (h_k * d) + kh * 128;
@@ -359,26 +359,26 @@ extern "C" __global__ void exl3_gdn_scan(
                     dq += q[qbase + s2] * kj;
                 }
                 float bi = bp[i];
-                A[i * EXL3_CS + j] = __float2half_rn((j < i) ? dk * bi * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
-                KQ[i * EXL3_CS + j] = __float2half_rn((j <= i) ? dq * qscale * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
+                A[i * GDN_CS + j] = __float2half_rn((j < i) ? dk * bi * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
+                KQ[i * GDN_CS + j] = __float2half_rn((j <= i) ? dq * qscale * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
             }
         }
         __syncthreads();
 
-        for (int e = tid; e < EXL3_CS * 128; e += 128) {
+        for (int e = tid; e < GDN_CS * 128; e += 128) {
             KS[e] = __float2half_rn(0.0f);
             QS[e] = __float2half_rn(0.0f);
         }
         __syncthreads();
         for (int pass_ = 0; pass_ < 8; pass_++) {
-            int s2b = pass_ * EXL3_TILE;
-            for (int s2p = 0; s2p < EXL3_TILE; s2p++)
+            int s2b = pass_ * GDN_TILE;
+            for (int s2p = 0; s2p < GDN_TILE; s2p++)
                 Stile[s2p * 128 + tid] = st[st_h + (long)(s2b + s2p) * d + tid];
             __syncthreads();
-            for (int i = 0; i < EXL3_CS; i++) {
+            for (int i = 0; i < GDN_CS; i++) {
                 float ak = 0.0f, aq = 0.0f;
                 int qbase = (t0 + i) * (h_k * d) + kh * 128;
-                for (int s2p = 0; s2p < EXL3_TILE; s2p++) {
+                for (int s2p = 0; s2p < GDN_TILE; s2p++) {
                     float s_el = Stile[s2p * 128 + tid];
                     ak += __half2float(sk[i * 128 + s2b + s2p]) * s_el;
                     // plans/cuda-port.md S5: T=1이면 i=1..31의 q 행은
@@ -397,13 +397,13 @@ extern "C" __global__ void exl3_gdn_scan(
         for (int i = 0; i < n; i++) {
             float rhs = bp[i] * (__half2float(sv[i * 128 + tid]) - gdn_expf(gcs[i]) * __half2float(KS[i * 128 + tid]));
             for (int j = 0; j < i; j++) {
-                float aij = __half2float(A[i * EXL3_CS + j]);
+                float aij = __half2float(A[i * GDN_CS + j]);
                 if (aij != 0.0f) rhs -= aij * dc[j * 128 + tid];
             }
             dc[i * 128 + tid] = rhs;
             float oi = gdn_expf(gcs[i]) * __half2float(QS[i * 128 + tid]);
             for (int p = 0; p <= i; p++) {
-                float w = __half2float(KQ[i * EXL3_CS + p]);
+                float w = __half2float(KQ[i * GDN_CS + p]);
                 if (w != 0.0f) oi += w * dc[p * 128 + tid];
             }
             outv[(t0 + i) * (h_v * d) + h * 128 + tid] = oi;
@@ -411,9 +411,9 @@ extern "C" __global__ void exl3_gdn_scan(
         __syncthreads();
 
         {
-            float gtot = gcs[EXL3_CS];
+            float gtot = gcs[GDN_CS];
             float gt_exp = gdn_expf(gtot);
-            if (tid < EXL3_CS) wsm[tid] = (tid < n) ? gdn_expf(gtot - gcs[tid]) : 0.0f;
+            if (tid < GDN_CS) wsm[tid] = (tid < n) ? gdn_expf(gtot - gcs[tid]) : 0.0f;
             __syncthreads();
             for (int s2 = 0; s2 < 128; s2++) {
                 float acc = st[st_h + (long)s2 * d + tid] * gt_exp;
@@ -426,9 +426,9 @@ extern "C" __global__ void exl3_gdn_scan(
     }
 }
 
-// exl3_gdn_gate — rms(o_lc)·nw·silu(z) → gated(HF), 역순열 포함
-// (src_exl3.hip L368-393 직이식, 폭 인자화). 그리드 (h_v, T), WG=128.
-extern "C" __global__ void exl3_gdn_gate(
+// gdn_gate — rms(o_lc)·nw·silu(z) → gated(HF), 역순열 포함
+// (구 rawhip 커널 L368-393 직이식, 폭 인자화). 그리드 (h_v, T), WG=128.
+extern "C" __global__ void gdn_gate(
     const float* __restrict__ o_lc,  // [T][h_v*128] lc
     const float* __restrict__ z,     // [T][h_v*128] HF
     const float* __restrict__ nw,    // [L][128]

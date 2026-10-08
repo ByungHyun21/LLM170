@@ -1,6 +1,6 @@
 //! 디양자화 블록 구현(형식별) + 디스패치.
 use crate::tables::{IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL};
-use llm170_gguf::GgmlType;
+use crate::wtype::WType;
 
 #[inline]
 pub fn f16(b: &[u8], off: usize) -> f32 {
@@ -388,50 +388,50 @@ fn deq_iq3_s(blk: &[u8], y: &mut [f32]) {
 /// `data` 는 해당 텐서의 데이터 시작 바이트.
 /// A7(plans/129): 로드 시점 사전 검증용 — dequant_row 매치와 동일 지원 목록.
 /// 매치 갱신 시 이 목록도 함께(deq 표 테스트가 드리프트를 잡는다).
-pub fn dequant_supported(ty: GgmlType) -> bool {
+pub fn dequant_supported(ty: WType) -> bool {
     matches!(
         ty,
-        GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::Bf16
-            | GgmlType::Q4K
-            | GgmlType::Q5K
-            | GgmlType::Q6K
-            | GgmlType::Q3K
-            | GgmlType::Q8_0
-            | GgmlType::Q5_1
-            | GgmlType::Q5_0
-            | GgmlType::Iq4Xs
-            | GgmlType::Iq4Nl
-            | GgmlType::Iq3S
-            | GgmlType::Iq3Xxs
+        WType::F32
+            | WType::F16
+            | WType::Bf16
+            | WType::Q4K
+            | WType::Q5K
+            | WType::Q6K
+            | WType::Q3K
+            | WType::Q8_0
+            | WType::Q5_1
+            | WType::Q5_0
+            | WType::Iq4Xs
+            | WType::Iq4Nl
+            | WType::Iq3S
+            | WType::Iq3Xxs
     )
 }
 
-pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32]) {
+pub fn dequant_row(ty: WType, data: &[u8], row: u64, k: u64, out: &mut [f32]) {
     let (blck, bsize) = ty.block_info();
     let blocks = (k / blck) as usize;
     let bsize = bsize as usize;
     debug_assert_eq!(out.len(), k as usize);
     let base = row as usize * blocks * bsize;
     match ty {
-        GgmlType::F32 => {
+        WType::F32 => {
             for j in 0..k as usize {
                 let o = base + j * 4;
                 out[j] = f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
             }
         }
-        GgmlType::F16 | GgmlType::Bf16 => {
+        WType::F16 | WType::Bf16 => {
             for j in 0..k as usize {
                 let h = u16::from_le_bytes([data[base + j * 2], data[base + j * 2 + 1]]);
-                out[j] = if ty == GgmlType::F16 {
+                out[j] = if ty == WType::F16 {
                     half_to_f32(h)
                 } else {
                     bf16_to_f32(h)
                 };
             }
         }
-        GgmlType::Q4K => {
+        WType::Q4K => {
             for b in 0..blocks {
                 deq_q4_k(
                     &data[base + b * bsize..][..bsize],
@@ -439,7 +439,7 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
-        GgmlType::Q5K => {
+        WType::Q5K => {
             for b in 0..blocks {
                 deq_q5_k(
                     &data[base + b * bsize..][..bsize],
@@ -447,7 +447,7 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
-        GgmlType::Q6K => {
+        WType::Q6K => {
             for b in 0..blocks {
                 deq_q6_k(
                     &data[base + b * bsize..][..bsize],
@@ -455,7 +455,7 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
-        GgmlType::Q3K => {
+        WType::Q3K => {
             for b in 0..blocks {
                 deq_q3_k(
                     &data[base + b * bsize..][..bsize],
@@ -463,7 +463,7 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
-        GgmlType::Q8_0 => {
+        WType::Q8_0 => {
             for b in 0..blocks {
                 deq_q8_0(
                     &data[base + b * bsize..][..bsize],
@@ -471,7 +471,7 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
-        GgmlType::Q5_1 => {
+        WType::Q5_1 => {
             for b in 0..blocks {
                 deq_q5_1(
                     &data[base + b * bsize..][..bsize],
@@ -479,7 +479,7 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
-        GgmlType::Q5_0 => {
+        WType::Q5_0 => {
             for b in 0..blocks {
                 deq_q5_0(
                     &data[base + b * bsize..][..bsize],
@@ -487,7 +487,7 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
-        GgmlType::Iq4Xs => {
+        WType::Iq4Xs => {
             for b in 0..blocks {
                 deq_iq4_xs(
                     &data[base + b * bsize..][..bsize],
@@ -495,7 +495,7 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
-        GgmlType::Iq4Nl => {
+        WType::Iq4Nl => {
             for b in 0..blocks {
                 deq_iq4_nl(
                     &data[base + b * bsize..][..bsize],
@@ -503,7 +503,7 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
-        GgmlType::Iq3S => {
+        WType::Iq3S => {
             for b in 0..blocks {
                 deq_iq3_s(
                     &data[base + b * bsize..][..bsize],
@@ -511,7 +511,7 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
-        GgmlType::Iq3Xxs => {
+        WType::Iq3Xxs => {
             for b in 0..blocks {
                 deq_iq3_xxs(
                     &data[base + b * bsize..][..bsize],
@@ -535,20 +535,20 @@ mod b2_tests {
     #[test]
     fn supported_types_all_survive_dequant_row() {
         for t in [
-            GgmlType::F32,
-            GgmlType::F16,
-            GgmlType::Bf16,
-            GgmlType::Q4K,
-            GgmlType::Q5K,
-            GgmlType::Q6K,
-            GgmlType::Q3K,
-            GgmlType::Q8_0,
-            GgmlType::Q5_1,
-            GgmlType::Q5_0,
-            GgmlType::Iq4Xs,
-            GgmlType::Iq4Nl,
-            GgmlType::Iq3S,
-            GgmlType::Iq3Xxs,
+            WType::F32,
+            WType::F16,
+            WType::Bf16,
+            WType::Q4K,
+            WType::Q5K,
+            WType::Q6K,
+            WType::Q3K,
+            WType::Q8_0,
+            WType::Q5_1,
+            WType::Q5_0,
+            WType::Iq4Xs,
+            WType::Iq4Nl,
+            WType::Iq3S,
+            WType::Iq3Xxs,
         ] {
             assert!(dequant_supported(t), "{t:?} 지원 표시 필요");
             let (blck, bsize) = t.block_info();
@@ -557,7 +557,7 @@ mod b2_tests {
             dequant_row(t, &data, 0, blck, &mut out); // 패닉 없으면 통과
             assert!(out.iter().all(|v| v.is_finite()), "{t:?} 비유한 출력");
         }
-        for t in [GgmlType::Iq2Xxs, GgmlType::Iq1S, GgmlType::Mxfp4] {
+        for t in [WType::Iq2Xxs, WType::Iq1S, WType::Mxfp4] {
             assert!(!dequant_supported(t), "{t:?} 미지원 표시 필요");
         }
     }
@@ -575,9 +575,9 @@ mod a7_tests {
     use super::*;
     #[test]
     fn supported_mirror_matches_dequant_arms() {
-        // 지원 목록 전부 지원 · 대표 미지원(잘못된 타입) 거부 — GgmlType 전순회가
+        // 지원 목록 전부 지원 · 대표 미지원(잘못된 타입) 거부 — WType 전순회가
         // 열거형 전체에 대해 드리프트를 잡는다.
-        for t in [GgmlType::F32, GgmlType::F16, GgmlType::Q4K, GgmlType::Q6K] {
+        for t in [WType::F32, WType::F16, WType::Q4K, WType::Q6K] {
             assert!(dequant_supported(t));
         }
     }

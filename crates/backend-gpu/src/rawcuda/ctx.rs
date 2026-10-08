@@ -1,5 +1,5 @@
 //! CudaCtx — CUDA 드라이버 컨텍스트 래퍼(디바이스·컨텍스트·모듈·런치·복사).
-//! rawhip ctx(RawCtx)의 최소 미러 — 스켈레톤 단계(plans/124 2026-10-04):
+//! 스켈레톤 단계(plans/124 2026-10-04):
 //! 단일 디바이스(ordinal 0)·프라이머리 컨텍스트·레거시 기본 스트림.
 //! 버퍼는 명시적 alloc/free(스모크 검증용) — 영속 아레나 규칙(ADR-0014)은
 //! 실 가중치 상주 단계에서 도입한다.
@@ -12,7 +12,7 @@ pub struct CudaCtx {
     pub device: ffi::CUdevice,
     pub device_name: String,
     ctx: ffi::CUcontext,
-    /// 레거시 기본 스트림(0) — rawhip stream 필드 대응. 후속 목표의
+    /// 레거시 기본 스트림(0). 후속 목표의
     /// 디바이스 체인(plans/124 §4.13: 드래프트 호스트 왕복 제거)에서
     /// cuStreamCreate 도입 시 교체.
     pub stream: CUstream,
@@ -21,8 +21,8 @@ pub struct CudaCtx {
 }
 
 /// 컨텍스트 스코프 가드 — 진입 시 현재 컨텍스트를 이 ctx로 전환,
-/// 이탈 시 이전 컨텍스트 복원(cuCtxGetCurrent 기반 — rawhip 단일 스레드
-/// 계약과 동일 환경에서 스코프 명시화).
+/// 이탈 시 이전 컨텍스트 복원(cuCtxGetCurrent 기반 — 단일 스레드 계약
+/// 환경에서 스코프 명시화).
 pub struct CtxGuard {
     drv: &'static ffi::Driver,
     prev: ffi::CUcontext,
@@ -242,7 +242,7 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// 커널 발사 — rawhip RawCtx::launch(name, gx, gy, block, args) 미러
+    /// 커널 발사 — launch(f, gx, gy, block, args)
     /// (gz/bz=1 고정, shared=0, extra=null). args 원소는 각 커널 인자값을
     /// 가리키는 포인터(cuLaunchKernel 규격 — 인자 주소 배열).
     /// clippy allow: f는 드라이버 불투명 핸들 — 해드 유효성은 본문 SAFETY 계약
@@ -258,7 +258,7 @@ impl CudaCtx {
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
         // SAFETY: f는 function()이 돌려준 유효 핸들, args 포인터들은
-        // 호출 시점까지 유효한 스택 로컬(호출자 계약 — rawhip launch와 동일).
+        // 호출 시점까지 유효한 스택 로컬(호출자 계약).
         unsafe {
             let r = (self.drv.launch_kernel)(
                 f,
@@ -281,7 +281,7 @@ impl CudaCtx {
     }
 
     /// 함수 속성: 동적 공유메모리 상한 opt-in(정적 48KB 초과 커널 —
-    /// G5 exl3_gdn_scan 61,828B). CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_
+    /// G5 gdn_scan 61,828B). CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_
     /// SIZE_BYTES=8(cuda.h 규약 — sm_80 164KB/SM 상한 내에서만 성공).
     /// clippy allow — launch와 동일 판정(불투명 핸들).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -354,7 +354,7 @@ impl CudaCtx {
 /// B6(plans/cuda-models.md §4): CUDA 런타임 VRAM 프로브 — 가드 preflight용.
 /// cuInit → 디바이스 0 프라이머리 컨텍스트 유지 → cuMemGetInfo_v2.
 /// 모듈 로드 없음(가드는 모델 적재 전 단계). 실패 시 None(호출부가 B17 정책
-/// 으로 거부 — hip gpu_mem_free와 동일한 Option 계약).
+/// 으로 거부 — Option 계약).
 pub fn cuda_mem_free() -> Option<(u64, u64)> {
     let drv = ffi::Driver::get().ok()?;
     // SAFETY: 출력은 스택 로컬 — 프로브 경로, 컨텍스트 유지는 프로세스 수명.

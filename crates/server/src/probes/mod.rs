@@ -1,7 +1,6 @@
-//! 원오프 GPU 프로브/체크 서브커맨드 — main.rs에서 이관(plans/35 P4).
-//! 본체는 backend-gpu(rawhip 프로브 fn, rawvk check fn)에 있고 여기는
-//! 인자 파싱+호출만. 결론난 A/B 하니스(batch-abtest·tree-test·q6k-abtest·
-//! exp-ab)는 2026-09-08 폐기.
+//! 원오프 프로브/체크 서브커맨드 — main.rs에서 이관(plans/35 P4).
+//! 현재 w4a16·diag 로컬 프로브만 — 인자 파싱 + 본체 호출. 결론난 A/B
+//! 하니스(batch-abtest·tree-test·q6k-abtest·exp-ab)는 2026-09-08 폐기.
 use std::process::ExitCode;
 
 /// 위치 인자 규약 헬퍼 — `args[i] | default` 파싱.

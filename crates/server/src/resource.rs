@@ -109,7 +109,7 @@ fn host_mem_available() -> Option<u64> {
 pub struct GuardTarget {
     pub path: std::path::PathBuf,
     pub gpu: bool,
-    /// 요청 런타임("cuda"|"hip"|"vulkan" — B6 프로브 선택용).
+    /// 요청 런타임("cuda" — B6 프로브 선택용).
     pub runtime: Option<String>,
 }
 
@@ -146,7 +146,7 @@ pub fn preflight(model: &Path, gpu: bool, runtime: Option<&str>) -> Result<(), S
         return Ok(()); // 경로 오류는 로더의 에러가 더 정확하다 - 여기서는 통과
     }
     let vram = if gpu {
-        // B6: CUDA 단일(hip·vulkan 탈락 2026-10-08) — cuMemGetInfo(rawcuda ffi).
+        // B6: CUDA 단일(2026-10-08 백엔드 탈락 반영) — cuMemGetInfo(rawcuda ffi).
         // 실패는 None → check의 B17 게이트가 거부한다.
         let probe = llm170_backend_gpu::cuda_mem_free();
         match probe {
