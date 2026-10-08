@@ -28,6 +28,7 @@ pub fn micro_check() -> Result<String, String> {
     let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 - 0.15).collect();
     let w = llm170_core::matmul::Weight {
         data: &bytes,
+        aux: None,
         ty: GgmlType::Q5_1,
         n_in: n as u64,
         n_out: 1,
@@ -598,6 +599,7 @@ pub fn check_tensor(
     let n_out = (w.n_out as usize).min(rows_max.max(1));
     let ws = llm170_core::matmul::Weight {
         data: &w.data[..n_out * row_bytes],
+        aux: None,
         ty: w.ty,
         n_in: w.n_in,
         n_out: n_out as u64,
@@ -735,6 +737,7 @@ pub fn moe_row_check(
     acc.frame_write_u32(hids, &ids)?;
     let ws = llm170_core::matmul::Weight {
         data: w.data,
+        aux: None,
         ty: w.ty,
         n_in: w.n_in,
         n_out: w.n_out,
@@ -807,6 +810,7 @@ pub fn mm_row_check(
     acc.frame_write(hx, &x)?;
     let ws = llm170_core::matmul::Weight {
         data: w.data,
+        aux: None,
         ty: w.ty,
         n_in: w.n_in,
         n_out: w.n_out,

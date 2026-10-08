@@ -52,25 +52,19 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     if prompts.is_empty() {
         return usage_err("at least one --prompt-tokens required");
     }
-    // P0-4(§10-1·B22): 디렉터리 포맷 스니핑 — W4A16은 명시 에러(정체불명
-    // "gate_proj 미등록" 실패 차단), EXL3만 디렉터리 서빙.
+    // P0-4(§10-1·B22) 스니핑 + §3.5 A안: W4A16 디렉터리도 같은 절차로 로드.
+    // EXL3만 별도 엔진(run_exl3_infer), GGUF/W4A16은 qwen35 경로.
+    let mut fmt = crate::engine::ModelFormat::Gguf;
     if model_path.is_dir() {
-        match crate::engine::sniff_format(&model_path) {
-            Ok(crate::engine::ModelFormat::Exl3) => {}
-            Ok(crate::engine::ModelFormat::W4A16) => {
-                return usage_err(&format!(
-                    "미지원 포맷(W4A16 — 로더·커널 P2 대기, plans/cuda-models.md §3.5): {}",
-                    model_path.display()
-                ));
-            }
-            Ok(crate::engine::ModelFormat::Gguf) => {} // 불가치(디렉터리)
+        fmt = match crate::engine::sniff_format(&model_path) {
+            Ok(f) => f,
             Err(e) => return usage_err(&e),
-        }
+        };
     }
     // EXL3 아카이브(디렉터리) — 포맷 자동 판별(사용자 계약 2026-10-05):
     // --backend는 런타임만 받고 모델 포맷은 경로로 결정. 단일 프롬프트만
     // 지원(엔진이 단일 슬롯) — 게이트(gate-exl3.sh)의 고정 토큰 러너.
-    if model_path.is_dir() {
+    if fmt == crate::engine::ModelFormat::Exl3 {
         if backend == "cpu" {
             return usage_err("EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan|cuda");
         }
@@ -78,6 +72,13 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             return usage_err("EXL3 infer는 단일 --prompt-tokens만 지원");
         }
         return run_exl3_infer(&model_path, &prompts[0], n_predict, ctx, &gpu_runtime);
+    }
+    // W4A16 직접 로드(§3.5 A안) — 아직 CPU 전용(가속 커널 미구현). 정직 계약:
+    // GPU 백엔드 지정은 명시 거부(B21 — 무음 CPU 금지).
+    if fmt == crate::engine::ModelFormat::W4A16 && backend != "cpu" {
+        return usage_err(
+            "W4A16 직접 로드는 아직 CPU 전용(가속 커널 미구현 — plans/cuda-models.md §3.5): --backend cpu",
+        );
     }
     // plans/cuda-port.md §1.3 S6 — GGUF+cuda는 Q4AccCuda 값경로로 진행한다
     // (attach_q4 cuda 분기). W4A16(safetensors)은 여전히 미지원 — S7.
@@ -95,12 +96,13 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     // 즉 S7의 실제 남은 일은 "매핑"이 아니라 (1) gemm_gptq4 CUDA 커널
     // 신규 작성+비트계약 확립, (2) compressed-tensors safetensors 로더,
     // (3) qwen35 계열 Engine 가속기 매핑이다 — 커널 프로젝트 규모.
-    if gpu_runtime == "cuda"
+    if fmt == crate::engine::ModelFormat::Gguf
+        && gpu_runtime == "cuda"
         && !model_path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
     {
-        return usage_err("CUDA+GGUF는 S6 값경로 지원 — W4A16(safetensors)은 S7 대기");
+        return usage_err("CUDA 값경로는 GGUF 파일 전용 — 디렉터리는 W4A16(§3.5)로");
     }
     let max_prompt = prompts.iter().map(|p| p.len()).max().unwrap();
     if max_prompt + n_predict + 8 >= ctx {
@@ -117,17 +119,19 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let mut arch: Option<String> = None;
-    for _ in 0..=wait_secs {
-        arch = llm170_gguf::GgufFile::open(&model_path)
-            .ok()
-            .and_then(|g| g.arch().map(|s| s.to_string()));
-        if arch.is_some() {
-            break;
+    if !model_path.is_dir() {
+        for _ in 0..=wait_secs {
+            arch = llm170_gguf::GgufFile::open(&model_path)
+                .ok()
+                .and_then(|g| g.arch().map(|s| s.to_string()));
+            if arch.is_some() {
+                break;
+            }
+            if wait_secs == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
-        if wait_secs == 0 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
     }
     if arch.as_deref() == Some("qwen4exp") {
         return run_q4_infer(

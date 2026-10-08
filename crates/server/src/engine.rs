@@ -567,6 +567,13 @@ fn banner(
 }
 
 pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> Engine {
+    // 배너 format 판정(§10-2): W4A16 디렉터리는 w4a16 — 그 외는 gguf/엔진별.
+    let fmt_str =
+        if req.model.is_dir() && matches!(sniff_format(&req.model), Ok(ModelFormat::W4A16)) {
+            "w4a16"
+        } else {
+            "gguf"
+        };
     // EXL3 직접 경로 (plans/121 A1) — --model은 EXL3 디렉터리.
     if matches!(backend, BackendSel::Exl3Hip) {
         let dir = req.model.to_string_lossy().into_owned();
@@ -660,7 +667,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             ("off(env-gate-or-create-failed)", "none")
         };
         banner(
-            &req.model, "gguf", runtime, offload, attach, req.ctx, n_slots,
+            &req.model, fmt_str, runtime, offload, attach, req.ctx, n_slots,
         );
         Engine::Q4(Box::new(eng))
     } else {
@@ -708,7 +715,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             ("off(env-gate-or-create-failed)", "none")
         };
         banner(
-            &req.model, "gguf", runtime, offload, attach, req.ctx, n_slots,
+            &req.model, fmt_str, runtime, offload, attach, req.ctx, n_slots,
         );
         Engine::Q35(Box::new(eng))
     }

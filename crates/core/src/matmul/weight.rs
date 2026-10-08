@@ -4,6 +4,10 @@ use llm170_gguf::GgmlType;
 #[derive(Clone, Copy)]
 pub struct Weight<'a> {
     pub data: &'a [u8],
+    /// W4A16 split 계열의 scale 버퍼(plans/cuda-models.md §3.5 A안 — 직접
+    /// 로드). 무압축·GGUF 계열은 None. `W4a16G128Split`은 aux가 필수 계약이며
+    /// Model::w가 보장한다(dequant_row 비경유 — cpu matmul 전용 arm).
+    pub aux: Option<&'a [u8]>,
     pub ty: GgmlType,
     pub n_in: u64,
     pub n_out: u64,

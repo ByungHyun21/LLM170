@@ -362,10 +362,11 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if fmt == engine::ModelFormat::W4A16 {
+    // §3.5 A안: W4A16 디렉터리는 qwen35 경로로 직접 로드. 현재 CPU 전용
+    // (가속 커널 미구현) — GPU 백엔드 지정은 정직 계약으로 명시 거부(B21).
+    if fmt == engine::ModelFormat::W4A16 && backend != "cpu" {
         eprintln!(
-            "error: 미지원 포맷(W4A16 — 로더·커널 P2 대기, plans/cuda-models.md §3.5): {}",
-            model_path.display()
+            "error: W4A16 직접 로드는 아직 CPU 전용(가속 커널 미구현 — plans/w4a16-cuda.md W2): --backend cpu"
         );
         return ExitCode::FAILURE;
     }
@@ -669,6 +670,7 @@ fn cmd_w4a8_check(args: &[String]) -> ExitCode {
     let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
     let wsub = llm170_core::matmul::Weight {
         data: &w.data[..rows * (n_in / w.ty.blck_size() as usize) * w.ty.type_size() as usize],
+        aux: None,
         ty: w.ty,
         n_in: w.n_in,
         n_out: rows as u64,
