@@ -2077,15 +2077,25 @@ impl W4a16Dec {
     fn moe_ffn_dev(&mut self, il: usize, xn: CUdeviceptr) -> Result<CUdeviceptr, String> {
         let _g = self.cc.guard()?;
         let n_exp = self.n_experts;
-        let top_k = self.top_k;
-        let h = self.hidden;
-        let n_ff = self.moe_ffn;
         if n_exp == 0 || self.moe_tab.len() < (il + 1) * n_exp * 3 {
             return Err("moe: 구성/전문가 테이블 미등록".into());
         }
         self.ensure_moe_bufs()?;
-        let [s0, s1, _s1b, s2, s3] = self.dchain;
-        // 1) 라우터 — bf16 GEMV(원시 xn) → 로짓 판독 → 호스트 선택.
+        let sel = self.moe_route(il, xn)?;
+        // 전문가 — 상주: 배치 GEMV(디바이스 테이블 간접) / 비상주: 스트리밍.
+        Self::zero_dev(&self.cc, self.dmo, self.hidden * 4)?;
+        if self.moe_resident {
+            self.moe_experts_batch(il, xn, &sel)?;
+        } else {
+            self.moe_experts_streaming(il, xn, &sel)?;
+        }
+        self.moe_shared(il, xn)?;
+        Ok(self.dmo)
+    }
+
+    /// 라우터 — bf16 GEMV(원시 xn) → 로짓 판독 → 호스트 top-k 선택.
+    fn moe_route(&mut self, il: usize, xn: CUdeviceptr) -> Result<Vec<(usize, f32)>, String> {
+        let n_exp = self.n_experts;
         self.plain_gemv_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt)?;
         let mut lb = vec![0u8; n_exp * 4];
         self.cc.d2h_async(lb.as_mut_ptr(), self.drt, n_exp * 4)?;
@@ -2096,53 +2106,77 @@ impl W4a16Dec {
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect();
-        let sel = moe_topk(&logits, top_k);
-        // 2) 전문가 — 상주: 배치 GEMV(디바이스 테이블 간접) / 비상주: 스트리밍.
-        Self::zero_dev(&self.cc, self.dmo, h * 4)?;
-        if self.moe_resident {
-            let ns = sel.len();
-            let idx: Vec<u32> = sel.iter().map(|&(e, _)| e as u32).collect();
-            let wts: Vec<f32> = sel.iter().map(|&(_, w)| w).collect();
-            // SAFETY: 호스트 Vec 슬라이스 — 호출 내 수명(동기 복사 완료).
-            let ib =
-                unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len() * 4) };
-            let wb =
-                unsafe { std::slice::from_raw_parts(wts.as_ptr() as *const u8, wts.len() * 4) };
-            // 캡처/체인과 같은 스트림 순서(레거시 h2d는 비블로킹 스트림과
-            // 순서 보장이 없다 — 실측 회귀 원인).
-            self.cc.h2d_async(self.moe_idx, ib)?;
-            self.cc.h2d_async(self.moe_wt, wb)?;
-            // gate/up 배치 → ew(제자리 = gate에 act) → down 배치 → 가중 누적.
-            let base = il * n_exp * 3;
-            self.gemv_experts_launch(base, ns, xn, 0, self.dexp_gate, n_ff, h)?;
-            self.gemv_experts_launch(base + 1, ns, xn, 0, self.dexp_up, n_ff, h)?;
-            self.ew_dev(self.dexp_gate, self.dexp_up, self.dexp_act, ns * n_ff)?;
-            self.gemv_experts_launch(base + 2, ns, self.dexp_act, n_ff, self.dexp_dn, h, n_ff)?;
-            self.moe_accum_dev(self.moe_wt, self.dexp_dn, self.dmo, ns, h)?;
-        } else {
-            for &(e, w) in &sel {
-                let base = (il * n_exp + e) * 3;
-                for (pi, out) in [(0usize, s0), (1usize, s1)] {
-                    let entry = self.moe_tab[base + pi];
-                    self.expert_gemv(entry, n_ff, h, xn, out)?;
-                }
-                self.ew_dev(s0, s1, s2, n_ff)?;
-                let entry = self.moe_tab[base + 2];
-                self.expert_gemv(entry, h, n_ff, s2, s3)?;
-                self.axpy_dev(w, s3, self.dmo, h)?;
+        Ok(moe_topk(&logits, self.top_k))
+    }
+
+    /// 전문가 배치(상주) — 슬롯 idx·가중 h2d + 테이블 간접 GEMV + 가중 누적.
+    fn moe_experts_batch(
+        &mut self,
+        il: usize,
+        xn: CUdeviceptr,
+        sel: &[(usize, f32)],
+    ) -> Result<(), String> {
+        let n_exp = self.n_experts;
+        let h = self.hidden;
+        let n_ff = self.moe_ffn;
+        let ns = sel.len();
+        let idx: Vec<u32> = sel.iter().map(|&(e, _)| e as u32).collect();
+        let wts: Vec<f32> = sel.iter().map(|&(_, w)| w).collect();
+        // SAFETY: 호스트 Vec 슬라이스 — 호출 내 수명(동기 복사 완료).
+        let ib = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len() * 4) };
+        let wb = unsafe { std::slice::from_raw_parts(wts.as_ptr() as *const u8, wts.len() * 4) };
+        // 캡처/체인과 같은 스트림 순서(레거시 h2d는 비블로킹 스트림과 순서
+        // 보장이 없다 — 실측 회귀 원인).
+        self.cc.h2d_async(self.moe_idx, ib)?;
+        self.cc.h2d_async(self.moe_wt, wb)?;
+        // gate/up 배치(x 공통) → ew → down 배치(x 슬롯별) → 가중 누적.
+        let base = il * n_exp * 3;
+        self.gemv_experts_launch(base, ns, xn, 0, self.dexp_gate, n_ff, h)?;
+        self.gemv_experts_launch(base + 1, ns, xn, 0, self.dexp_up, n_ff, h)?;
+        self.ew_dev(self.dexp_gate, self.dexp_up, self.dexp_act, ns * n_ff)?;
+        self.gemv_experts_launch(base + 2, ns, self.dexp_act, n_ff, self.dexp_dn, h, n_ff)?;
+        self.moe_accum_dev(self.moe_wt, self.dexp_dn, self.dmo, ns, h)
+    }
+
+    /// 전문가 스트리밍(비상주) — 스테이징 1쌍 재사용 h2d + 개별 GEMV.
+    fn moe_experts_streaming(
+        &mut self,
+        il: usize,
+        xn: CUdeviceptr,
+        sel: &[(usize, f32)],
+    ) -> Result<(), String> {
+        let n_exp = self.n_experts;
+        let h = self.hidden;
+        let n_ff = self.moe_ffn;
+        let [s0, s1, _s1b, s2, s3] = self.dchain;
+        for &(e, w) in sel {
+            let base = (il * n_exp + e) * 3;
+            for (pi, out) in [(0usize, s0), (1usize, s1)] {
+                let entry = self.moe_tab[base + pi];
+                self.expert_gemv(entry, n_ff, h, xn, out)?;
             }
+            self.ew_dev(s0, s1, s2, n_ff)?;
+            let entry = self.moe_tab[base + 2];
+            self.expert_gemv(entry, h, n_ff, s2, s3)?;
+            self.axpy_dev(w, s3, self.dmo, h)?;
         }
-        // 3) shared — sigmoid(sgate·xn)·down(silu(gate·xn)·up·xn).
-        if self.shared_ffn > 0 {
-            let sf = self.shared_ffn;
-            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_gate.weight"), xn, s0)?;
-            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_up.weight"), xn, s1)?;
-            self.ew_dev(s0, s1, s2, sf)?;
-            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3)?;
-            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_sgate.weight"), xn, self.drt)?;
-            self.shared_add_dev(self.drt, s3, self.dmo, h)?;
+        Ok(())
+    }
+
+    /// shared 전문가 — sigmoid(sgate·xn)·down(silu(gate·xn)·up·xn).
+    fn moe_shared(&mut self, il: usize, xn: CUdeviceptr) -> Result<(), String> {
+        if self.shared_ffn == 0 {
+            return Ok(());
         }
-        Ok(self.dmo)
+        let h = self.hidden;
+        let sf = self.shared_ffn;
+        let [s0, s1, _s1b, s2, s3] = self.dchain;
+        self.plain_gemv_launch(&format!("blk.{il}.moe_shared_gate.weight"), xn, s0)?;
+        self.plain_gemv_launch(&format!("blk.{il}.moe_shared_up.weight"), xn, s1)?;
+        self.ew_dev(s0, s1, s2, sf)?;
+        self.plain_gemv_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3)?;
+        self.plain_gemv_launch(&format!("blk.{il}.moe_shared_sgate.weight"), xn, self.drt)?;
+        self.shared_add_dev(self.drt, s3, self.dmo, h)
     }
 
     /// MoE 자가 점검 — 직접 GEMV vs 배치(간접) GEMV 비트 비교(층0·전문가0·
@@ -2948,6 +2982,25 @@ impl W4a16Dec {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    /// MoE 선택 시맨틱 — core stages/moe::select_topk 미러(변경 시 동시 갱신).
+    #[test]
+    fn moe_topk_mirrors_core_semantics() {
+        // 재정규화(합 1)·내림차순·exp 비율 유지.
+        let sel = moe_topk(&[2.0, 1.0, 0.5, -1.0], 2);
+        assert_eq!(sel.len(), 2);
+        assert_eq!(sel[0].0, 0);
+        assert_eq!(sel[1].0, 1);
+        assert!(sel[0].1 > sel[1].1);
+        let sum: f32 = sel.iter().map(|&(_, w)| w).sum();
+        assert!((sum - 1.0).abs() < 1e-6, "합={sum}");
+        let ratio = sel[0].1 / sel[1].1;
+        assert!((ratio - std::f32::consts::E).abs() < 1e-4, "비율={ratio}");
+        // 동률은 낮은 인덱스(결정적).
+        let tie = moe_topk(&[1.0, 1.0, 1.0], 2);
+        assert_eq!(tie[0].0, 0);
+        assert_eq!(tie[1].0, 1);
+    }
 
     /// G1 회귀 — 부분 alloc 실패 후 재시도가 이중해제/유실 없이 전량 재할당.
     /// (CUDA 불필요 — free/alloc을 모의 클로저로 주입.)
