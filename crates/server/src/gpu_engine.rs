@@ -24,124 +24,9 @@ impl GpuEngine {
     pub fn load(dir: &Path, n_slots: usize, ctx: usize) -> Result<Self, String> {
         let model = llm170_core::qwen35::Model::load(dir).map_err(|e| e.to_string())?;
         let hp = model.hp.clone();
-        let interval = hp.full_attn_interval.max(1);
-        if interval != 4 {
-            return Err(format!(
-                "디코더는 4층 주기(full_attention_interval) 전용 — interval={interval}"
-            ));
-        }
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
-        let moe = hp.n_experts > 0;
-        // 1) 선형 상주 — GPU 체인은 원본(HF) 무게(순열은 커널 내부 처리).
-        if moe {
-            upload_moe(&mut dec, &model)?;
-        } else {
-            for name in model.engine_names() {
-                if let Some(w) = model.w_raw(&name)
-                    && w.ty == llm170_core::wtype::WType::W4a16Split
-                {
-                    let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
-                    dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;
-                }
-            }
-        }
-        // 2) 노름 nw [2L+1][hidden] (+1 보정 — f32_vec).
-        let mut nw: Vec<f32> = Vec::new();
-        for il in 0..hp.n_layer {
-            nw.extend(
-                model
-                    .f32_vec(&format!("blk.{il}.attn_norm.weight"))
-                    .map_err(|e| e.to_string())?,
-            );
-            nw.extend(
-                model
-                    .f32_vec(&format!("blk.{il}.post_attention_norm.weight"))
-                    .map_err(|e| e.to_string())?,
-            );
-        }
-        nw.extend(
-            model
-                .f32_vec("output_norm.weight")
-                .map_err(|e| e.to_string())?,
-        );
-        dec.set_norm_weights(&nw, 2 * hp.n_layer + 1)?;
-        // 3) GDN 상수 — 원본(HF) 순서(a 먼저 b 다음 — 커널 ab 색인).
-        let n_gdn = hp.n_layer - hp.n_layer / interval;
-        let gd = GdnDims {
-            n_gdn,
-            hidden: hp.n_embd,
-            h_k: hp.n_group,
-            h_v: hp.dt_rank,
-            d: hp.d_state,
-        };
-        let (mut cw, mut ab, mut alog, mut dtb, mut gnw): (
-            Vec<f32>,
-            Vec<f32>,
-            Vec<f32>,
-            Vec<f32>,
-            Vec<f32>,
-        ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for il in 0..hp.n_layer {
-            if (il + 1) % interval == 0 {
-                continue;
-            }
-            cw.extend(
-                model
-                    .raw_f32_vec(&format!("blk.{il}.ssm_conv1d.weight"))
-                    .map_err(|e| e.to_string())?,
-            );
-            ab.extend(
-                model
-                    .raw_f32_vec(&format!("blk.{il}.ssm_alpha.weight"))
-                    .map_err(|e| e.to_string())?,
-            );
-            ab.extend(
-                model
-                    .raw_f32_vec(&format!("blk.{il}.ssm_beta.weight"))
-                    .map_err(|e| e.to_string())?,
-            );
-            alog.extend(
-                model
-                    .raw_f32_vec(&format!("blk.{il}.ssm_a"))
-                    .map_err(|e| e.to_string())?,
-            );
-            dtb.extend(
-                model
-                    .raw_f32_vec(&format!("blk.{il}.ssm_dt.bias"))
-                    .map_err(|e| e.to_string())?,
-            );
-            gnw.extend(
-                model
-                    .raw_f32_vec(&format!("blk.{il}.ssm_norm.weight"))
-                    .map_err(|e| e.to_string())?,
-            );
-        }
-        dec.set_gdn(gd, &cw, &ab, &alog, &dtb, &gnw)?;
-        // 4) 어텐션 q/k 노름(+1 — f32_vec 보정).
-        let n_attn = hp.n_layer / interval;
-        let ad = AttnDims {
-            n_attn,
-            q_heads: hp.n_head,
-            kv_heads: hp.n_kv,
-            d: hp.head_dim,
-            cap: ctx,
-        };
-        let (mut qnw, mut knw): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
-        for ai in 0..n_attn {
-            let il = ai * interval + interval - 1;
-            qnw.extend(
-                model
-                    .f32_vec(&format!("blk.{il}.attn_q_norm.weight"))
-                    .map_err(|e| e.to_string())?,
-            );
-            knw.extend(
-                model
-                    .f32_vec(&format!("blk.{il}.attn_k_norm.weight"))
-                    .map_err(|e| e.to_string())?,
-            );
-        }
-        dec.set_attn(ad, &qnw, &knw)?;
+        upload_model(&mut dec, &model, ctx)?;
         // 5) head — bf16 output.weight는 GPU 커널 경로(아니면 CPU 참조).
         let mut head_gpu = false;
         if let Some(w) = model.w("output.weight")
@@ -379,5 +264,132 @@ pub(crate) fn upload_moe(
             "호스트 스트리밍"
         }
     );
+    Ok(())
+}
+
+/// 모델 상주 업로드(1~4단계) — GpuEngine·w4a16-gpu 프로브 공용.
+/// head는 호출부 소관(프로브는 --no-head/스테이징 분기가 있다).
+pub(crate) fn upload_model(
+    dec: &mut llm170_backend_gpu::W4a16Dec,
+    model: &llm170_core::qwen35::Model,
+    ctx: usize,
+) -> Result<(), String> {
+    let hp = model.hp.clone();
+    let interval = hp.full_attn_interval.max(1);
+    if interval != 4 {
+        return Err(format!(
+            "디코더는 4층 주기(full_attention_interval) 전용 — interval={interval}"
+        ));
+    }
+    let moe = hp.n_experts > 0;
+    // 1) 선형 상주 — GPU 체인은 원본(HF) 무게(순열은 커널 내부 처리).
+    if moe {
+        upload_moe(dec, model)?;
+    } else {
+        for name in model.engine_names() {
+            if let Some(w) = model.w_raw(&name)
+                && w.ty == llm170_core::wtype::WType::W4a16Split
+            {
+                let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
+                dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;
+            }
+        }
+    }
+    // 2) 노름 nw [2L+1][hidden] (+1 보정 — f32_vec).
+    let mut nw: Vec<f32> = Vec::new();
+    for il in 0..hp.n_layer {
+        nw.extend(
+            model
+                .f32_vec(&format!("blk.{il}.attn_norm.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+        nw.extend(
+            model
+                .f32_vec(&format!("blk.{il}.post_attention_norm.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    nw.extend(
+        model
+            .f32_vec("output_norm.weight")
+            .map_err(|e| e.to_string())?,
+    );
+    dec.set_norm_weights(&nw, 2 * hp.n_layer + 1)?;
+    // 3) GDN 상수 — 원본(HF) 순서(a 먼저 b 다음 — 커널 ab 색인).
+    let n_gdn = hp.n_layer - hp.n_layer / interval;
+    let gd = GdnDims {
+        n_gdn,
+        hidden: hp.n_embd,
+        h_k: hp.n_group,
+        h_v: hp.dt_rank,
+        d: hp.d_state,
+    };
+    let (mut cw, mut ab, mut alog, mut dtb, mut gnw): (
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+    ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for il in 0..hp.n_layer {
+        if (il + 1) % interval == 0 {
+            continue;
+        }
+        cw.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_conv1d.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+        ab.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_alpha.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+        ab.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_beta.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+        alog.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_a"))
+                .map_err(|e| e.to_string())?,
+        );
+        dtb.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_dt.bias"))
+                .map_err(|e| e.to_string())?,
+        );
+        gnw.extend(
+            model
+                .raw_f32_vec(&format!("blk.{il}.ssm_norm.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    dec.set_gdn(gd, &cw, &ab, &alog, &dtb, &gnw)?;
+    // 4) 어텐션 q/k 노름(+1 — f32_vec 보정).
+    let n_attn = hp.n_layer / interval;
+    let ad = AttnDims {
+        n_attn,
+        q_heads: hp.n_head,
+        kv_heads: hp.n_kv,
+        d: hp.head_dim,
+        cap: ctx,
+    };
+    let (mut qnw, mut knw): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
+    for ai in 0..n_attn {
+        let il = ai * interval + interval - 1;
+        qnw.extend(
+            model
+                .f32_vec(&format!("blk.{il}.attn_q_norm.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+        knw.extend(
+            model
+                .f32_vec(&format!("blk.{il}.attn_k_norm.weight"))
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    dec.set_attn(ad, &qnw, &knw)?;
     Ok(())
 }

@@ -12,6 +12,28 @@ use crate::ops::silu;
 use crate::qwen35::ModelError;
 use crate::qwen35::{mm_batch, mm_group};
 
+/// 라우터 로짓 → softmax(전문가 전체) → top-k → 재정규화 — (전문가, 가중)
+/// 내림차순. 결정적(동률 = 낮은 인덱스). backend-gpu `moe_topk`(배치 경로)가
+/// 같은 시맨틱을 미러한다(크레이트 의존 방향 제약 — 변경 시 동시 갱신).
+pub(crate) fn select_topk(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let n = logits.len();
+    let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut p = vec![0.0f32; n];
+    let mut sum = 0.0f32;
+    for (e, pv) in p.iter_mut().enumerate() {
+        *pv = (logits[e] - mx).exp();
+        sum += *pv;
+    }
+    for pv in p.iter_mut() {
+        *pv /= sum;
+    }
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_unstable_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
+    idx.truncate(k);
+    let wsum: f32 = idx.iter().map(|&e| p[e]).sum();
+    idx.iter().map(|&e| (e, p[e] / wsum)).collect()
+}
+
 /// MoE FFN — out[t] = Σ_i w_i·E_i(x_t) + sigmoid(sgate·x_t)·S(x_t).
 /// out은 덮어쓴다(잔차 가산은 호출부 — dense FFN과 동일 계약).
 pub(crate) fn moe_ffn(
@@ -35,24 +57,9 @@ pub(crate) fn moe_ffn(
     let mut logits = vec![vec![0.0f32; n_exp]; n_tok];
     mm_batch(x, &gate_w, &mut logits);
 
-    // softmax(전문가 전체) → top-k → 재정규화 — 결정적(동률 = 낮은 인덱스).
     let mut sel: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n_tok);
     for l in logits.iter() {
-        let mx = l.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut p = vec![0.0f32; n_exp];
-        let mut sum = 0.0f32;
-        for (e, pv) in p.iter_mut().enumerate() {
-            *pv = (l[e] - mx).exp();
-            sum += *pv;
-        }
-        for pv in p.iter_mut() {
-            *pv /= sum;
-        }
-        let mut idx: Vec<usize> = (0..n_exp).collect();
-        idx.sort_unstable_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
-        idx.truncate(top_k);
-        let wsum: f32 = idx.iter().map(|&e| p[e]).sum();
-        sel.push(idx.iter().map(|&e| (e, p[e] / wsum)).collect());
+        sel.push(select_topk(l, top_k));
     }
 
     // 전문가 디스패치 — 선택된 전문가별 토큰 묶음.
@@ -128,4 +135,34 @@ pub(crate) fn moe_ffn(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_topk;
+
+    /// 시맨틱 고정 — softmax 전체 → top-k → 재정규화(합 1), 내림차순.
+    #[test]
+    fn select_topk_renormalizes_and_orders() {
+        let sel = select_topk(&[2.0, 1.0, 0.5, -1.0], 2);
+        assert_eq!(sel.len(), 2);
+        assert_eq!(sel[0].0, 0);
+        assert_eq!(sel[1].0, 1);
+        assert!(sel[0].1 > sel[1].1, "내림차순");
+        let sum: f32 = sel.iter().map(|&(_, w)| w).sum();
+        assert!((sum - 1.0).abs() < 1e-6, "재정규화 합={sum}");
+        // 원 softmax 값 비례: p0/p1 = exp(1) 비율 유지.
+        let ratio = sel[0].1 / sel[1].1;
+        assert!((ratio - std::f32::consts::E).abs() < 1e-4, "비율={ratio}");
+    }
+
+    /// 동률은 낮은 인덱스 우선(결정적) — backend-gpu moe_topk 미러 계약.
+    #[test]
+    fn select_topk_tie_breaks_low_index() {
+        let sel = select_topk(&[1.0, 1.0, 1.0], 2);
+        assert_eq!(sel[0].0, 0);
+        assert_eq!(sel[1].0, 1);
+        let sum: f32 = sel.iter().map(|&(_, w)| w).sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+    }
 }
