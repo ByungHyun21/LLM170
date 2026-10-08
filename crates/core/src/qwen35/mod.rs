@@ -31,10 +31,6 @@ use crate::quant::dequant_row;
 #[derive(Debug)]
 pub enum ModelError {
     MissingTensor(String),
-    UnsupportedLayout {
-        name: String,
-        why: &'static str,
-    },
     BadHparam(&'static str),
     /// W4A16 디렉터리 로더 오류(§3.5 A안 직접 로드).
     W4a16(String),
@@ -44,9 +40,6 @@ impl std::fmt::Display for ModelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ModelError::MissingTensor(n) => write!(f, "missing tensor: {n}"),
-            ModelError::UnsupportedLayout { name, why } => {
-                write!(f, "unsupported layout {name}: {why}")
-            }
             ModelError::BadHparam(w) => write!(f, "bad hyperparameter: {w}"),
             ModelError::W4a16(e) => write!(f, "w4a16: {e}"),
         }

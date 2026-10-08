@@ -38,7 +38,7 @@ Dev-machine ledger (RTX 4090): [benchmark/4090.md](benchmark/4090.md)
 
 ## Build & run
 
-Requires Rust 1.95+ (edition 2024). No GPU toolchain needed to build.
+Requires Rust 1.99+ (edition 2024). No GPU toolchain needed to build.
 
 ```bash
 cargo build --release
