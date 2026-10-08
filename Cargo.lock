@@ -445,7 +445,6 @@ version = "0.1.0"
 dependencies = [
  "llm170-core",
  "llm170-diag",
- "llm170-exl3",
  "llm170-gguf",
  "parking_lot",
 ]
@@ -457,7 +456,6 @@ dependencies = [
  "image",
  "libc",
  "llm170-diag",
- "llm170-exl3",
  "llm170-gguf",
  "memmap2",
 ]
@@ -465,16 +463,6 @@ dependencies = [
 [[package]]
 name = "llm170-diag"
 version = "0.1.0"
-
-[[package]]
-name = "llm170-exl3"
-version = "0.1.0"
-dependencies = [
- "half",
- "llm170-diag",
- "llm170-gguf",
- "memmap2",
-]
 
 [[package]]
 name = "llm170-gguf"

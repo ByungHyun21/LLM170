@@ -40,9 +40,6 @@ struct Slot {
     err_count: u32,
     /// QA-1: 연속 실패 상한(3) 도달 시 확정 실패 사유.
     failed: Option<String>,
-    /// plans/115 D2/P1-3: 이 잡 프리필의 시작 위치(0=신규, cp=접두 복원,
-    /// l=완전 재사용) — h행 세션·mtp_draft_prefill base_pos.
-    pf_base: usize,
 }
 
 impl Slot {
@@ -59,7 +56,6 @@ impl Slot {
             sampler: None,
             err_count: 0,
             failed: None,
-            pf_base: 0,
         }
     }
 }
@@ -72,20 +68,6 @@ fn slot_fail(s: &mut Slot, msg: String) {
         eprintln!("# slot 확정 실패(연속 {}회): {}", s.err_count, msg);
         s.failed = Some(msg);
     }
-}
-
-/// qwen4exp 로드 재시도 — transient ENOENT 회복 (최대 5회×1s).
-pub(crate) fn load_q4_retry(p: &std::path::Path) -> llm170_core::qwen4exp::Model4 {
-    for i in 0..5 {
-        match llm170_core::qwen4exp::Model4::load(p) {
-            Ok(m) => return m,
-            Err(e) => {
-                eprintln!("# qwen4exp 로드 재시도 {}/5: {e}", i + 1);
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-        }
-    }
-    panic!("qwen4exp 로드 최종 실패: {}", p.display())
 }
 
 /// qwen35 로드 재시도 — 동일.
@@ -102,101 +84,11 @@ pub(crate) fn load_q35_retry(p: &std::path::Path) -> llm170_core::qwen35::Model 
     panic!("qwen35 로드 최종 실패: {}", p.display())
 }
 
-/// GGUF 오픈 재시도 (최대 5회×1s) — transient ENOENT 회복.
-pub(crate) fn open_with_retry(p: &std::path::Path) -> Option<llm170_gguf::GgufFile> {
-    for i in 0..5 {
-        if let Ok(g) = llm170_gguf::GgufFile::open(p) {
-            return Some(g);
-        }
-        eprintln!("# gguf 오픈 재시도 {}/5: {}", i + 1, p.display());
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    None
-}
 /// 슬롯 로짓 → 토큰: 활성 샘플러면 sample, 아니면 greedy (동률 최저 인덱스).
 fn pick(s: &mut Slot, logits: &[f32]) -> u32 {
     match &mut s.sampler {
         Some(sm) if !sm.is_greedy() => sm.sample(logits),
         _ => llm170_core::qwen35::greedy(logits),
-    }
-}
-
-/// 슬롯 로짓 → 토큰 (top-k 후보 경로) — plans/115 A-2.
-fn pick_cands(s: &mut Slot, cands: &[(f32, u32)]) -> u32 {
-    match &mut s.sampler {
-        Some(sm) if !sm.is_greedy() => sm.sample_cands(cands),
-        _ => cands
-            .iter()
-            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|&(_, i)| i)
-            .unwrap_or(0),
-    }
-}
-
-/// Q4 배치/순차 디코드(종전 Q4 arm 본체 — P15⑤ 스펙 분기로부터 분리).
-fn q4_plain_decode(
-    e: &mut Box<llm170_core::qwen4exp::layers::Engine4>,
-    slots: &mut [Slot],
-    active: &[usize],
-) {
-    if active
-        .iter()
-        .any(|&i| slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy()))
-    {
-        let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
-        // plans/115 A-2: GPU top-k 후보 경로 — 미지원 백엔드는 전체 로짓 폴백
-        match e.decode_batch_topk(active, &toks) {
-            Ok(rows) => {
-                for (row, &i) in active.iter().enumerate() {
-                    let t = pick_cands(&mut slots[i], &rows[row]);
-                    slot_emit(&mut slots[i], t);
-                }
-            }
-            Err(err) => {
-                eprintln!("# batch 실패({err}) — 이번 회차 건너뜀");
-                for &i2 in active {
-                    slot_fail(&mut slots[i2], format!("decode_batch: {err}"));
-                }
-            }
-        }
-    } else if active.len() > 1 {
-        let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
-        match e.decode_batch_greedy(active, &toks) {
-            Ok(toks) => {
-                for (row, &i) in active.iter().enumerate() {
-                    slot_emit(&mut slots[i], toks[row]);
-                }
-            }
-            Err(err) => {
-                eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀");
-                for &i2 in active {
-                    slot_fail(&mut slots[i2], format!("decode_batch_greedy: {err}"));
-                }
-            }
-        }
-    } else {
-        for &i in active {
-            if slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy()) {
-                match e.decode1(i, slots[i].next) {
-                    Ok(l) => {
-                        let t = pick(&mut slots[i], &l);
-                        slot_emit(&mut slots[i], t);
-                    }
-                    Err(err) => {
-                        eprintln!("# decode1 실패({err})");
-                        slot_fail(&mut slots[i], format!("decode1: {err}"));
-                    }
-                }
-            } else {
-                match e.decode1_greedy(i, slots[i].next) {
-                    Ok(t) => slot_emit(&mut slots[i], t),
-                    Err(err) => {
-                        eprintln!("# decode1g 실패({err})");
-                        slot_fail(&mut slots[i], format!("decode1_greedy: {err}"));
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -307,17 +199,12 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     e.decode_greedy(0, t).map(|_| ())
                 })
                 .map_err(|e| e.to_string()),
-            Engine::Q4(e) => e
-                .prefill(0, &warm)
-                .and_then(|_| e.decode1(0, 1u32).map(|_| ()))
-                .map_err(|e| e.to_string()),
         };
         if let Err(err) = w {
             eprintln!("# warmup 실패(치명 아님): {err}");
         }
         match &mut eng {
             Engine::Q35(e) => e.reset_states(),
-            Engine::Q4(e) => e.reset_states(),
         }
     }
     crate::http::READY.store(true, std::sync::atomic::Ordering::Release);
@@ -443,126 +330,6 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         q35_decode(e, &mut slots, &active);
                     }
                 }
-                Engine::Q4(e) => {
-                    // plans/109 P15⑤: MTP 스펙 슬롯 우선 — mtp_spec_step으로
-                    // k토근 제안·검증(수용분 emit). 잔여 슬롯은 종전 배치 디코드.
-                    // CPU 참조 드래프트 — ④ GPU화 전까지 느리다(스펙 슬롯만).
-                    // plans/113(sglang P2-1): 스펙은 단독 활성 슬롯에서만 — 다중
-                    // 활성 시 검증 무게(전상태 스냅샷+수용분 재실행)가 배치 이득을
-                    // 상쇄해 순손실(serve MTP+np4 6.09 vs np4 27.03 t/s, 원장 128).
-                    // spec_k를 무시하고 전원 plain np 배치로.
-                    let spec_on = active.len() == 1;
-                    let spec_slots: Vec<usize> = if spec_on {
-                        active
-                            .iter()
-                            .copied()
-                            .filter(|&i| {
-                                slots[i].job.as_ref().is_some_and(|j| j.spec_k > 0)
-                                    && !sampling(&slots[i])
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    if !spec_slots.is_empty() {
-                        // plans/115 P12: --spec은 MTP 헤드 없이도 유효 — 서픽스 드래프터(비용 0).
-                        // plans/110 W5(실험, LLM170_SPEC_MULTI=1): 다중 스펙
-                        // 슬롯의 라운드 시작 decode1을 1회 np 배치로 병합. 잔여
-                        // 과제: 동일 프롬프트 2슬롯 스트림이 서로 갈라진다(np
-                        // 다중 슬롯 결정성 — 검증 전 기본 OFF).
-                        let kmin = spec_slots
-                            .iter()
-                            .map(|&i| slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8))
-                            .min()
-                            .unwrap_or(1);
-                        let mut done_multi = false;
-                        if e.model.has_mtp()
-                            && llm170_diag::flag::on("LLM170_SPEC_MULTI")
-                            && spec_slots.len() >= 2
-                            && kmin >= 2
-                        {
-                            let ns: Vec<u32> = spec_slots.iter().map(|&i| slots[i].next).collect();
-                            match e.mtp_spec_step_multi(&spec_slots, &ns, kmin) {
-                                Ok((accs, _fw)) => {
-                                    for (row, &i) in spec_slots.iter().enumerate() {
-                                        let cap = slots[i].job.as_ref().unwrap().n_predict;
-                                        for &t in &accs[row] {
-                                            if slots[i].generated as usize >= cap {
-                                                break;
-                                            }
-                                            slot_emit(&mut slots[i], t);
-                                            if t == eos {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    done_multi = true;
-                                }
-                                Err(err) => {
-                                    eprintln!("# mtp spec-multi 실패({err}) — 순차로");
-                                }
-                            }
-                        }
-                        if !done_multi {
-                            for &i in &spec_slots {
-                                let k = slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8);
-                                let next = slots[i].next;
-                                let cap = slots[i].job.as_ref().unwrap().n_predict;
-                                // 드래프터 체인(plans/115 P12+D2): 서픽스(비용 0)
-                                // 단독 — 제안 없으면 plain greedy. 콜드 MTP 폴백은
-                                // 드래프트 KV가 없어 기각 일변(검증 낭비)이라 삭제.
-                                let drafts = llm170_core::qwen4exp::layers::Engine4::suffix_drafts(
-                                    &slots[i].tokens,
-                                    k,
-                                );
-                                let round = if !drafts.is_empty() {
-                                    e.suffix_spec_step(i, next, &drafts)
-                                } else {
-                                    e.decode1_greedy(i, next).map(|t| (vec![t], 1))
-                                };
-                                match round {
-                                    Ok((acc, _fwd)) => {
-                                        SCHED.spec_rounds.fetch_add(1, Ordering::Relaxed);
-                                        SCHED
-                                            .spec_accepted
-                                            .fetch_add(acc.len() as u64, Ordering::Relaxed);
-                                        for &t in &acc {
-                                            if slots[i].generated as usize >= cap {
-                                                break;
-                                            }
-                                            slot_emit(&mut slots[i], t);
-                                            if t == eos {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Err(err) => {
-                                        eprintln!("# mtp spec 실패({err}) — 일반 디코드로");
-                                        if let Ok(l) = e.decode1(i, next) {
-                                            let t = llm170_core::qwen35::greedy(&l);
-                                            slot_emit(&mut slots[i], t);
-                                        } else {
-                                            slot_fail(
-                                                &mut slots[i],
-                                                format!("mtp_spec+decode1: {err}"),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        let plain: Vec<usize> = active
-                            .iter()
-                            .copied()
-                            .filter(|&i| !spec_slots.contains(&i))
-                            .collect();
-                        if !plain.is_empty() {
-                            q4_plain_decode(e, &mut slots, &plain);
-                        }
-                    } else {
-                        q4_plain_decode(e, &mut slots, &active);
-                    }
-                }
             }
             dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
             // 완료 슬롯 정리 — 결과 전송·반환
@@ -584,58 +351,6 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         && slots[i].prefilled < slots[i].job.as_ref().unwrap().tokens.len()
                 })
                 .min_by_key(|&i| slots[i].touch);
-            // 배치 프리필(plans/74 np4) — 대기 슬롯 N개의 같은 길이 청크를 한 forward 로
-            // 묶어 무게 패스를 공유한다(슬롯별이면 4회 읽던 것). plans/110 W8:
-            // 기본 ON(등가성은 prefill_multi 등가 테스트가 보증, 실패 시 아래
-            // 슬롯별 경로 폴백). (plans/115 env 정리: 킬스위치 폐기 — 항시.)
-            {
-                let pend: Vec<usize> = (0..n_slots)
-                    .filter(|&i| {
-                        slots[i].job.is_some()
-                            && slots[i].prefilled < slots[i].job.as_ref().unwrap().tokens.len()
-                    })
-                    .collect();
-                if pend.len() >= 2 {
-                    let per = (512usize / pend.len()).max(16);
-                    let parts: Vec<Vec<u32>> = pend
-                        .iter()
-                        .map(|&i| {
-                            let j = slots[i].job.as_ref().unwrap();
-                            let end = (slots[i].prefilled + per).min(j.tokens.len());
-                            j.tokens[slots[i].prefilled..end].to_vec()
-                        })
-                        .collect();
-                    let uniform = parts.iter().all(|p| p.len() == per) && parts.len() == pend.len();
-                    if uniform {
-                        let flat: Vec<u32> = parts.iter().flatten().copied().collect();
-                        if let Engine::Q4(e) = &mut eng {
-                            match e.prefill_multi(&pend, &flat, per) {
-                                Ok(toks) => {
-                                    for (k, &i) in pend.iter().enumerate() {
-                                        slots[i].prefilled += per;
-                                        // plans/115 P1-3: 청크 경계 체크포인트 캡처.
-                                        if let Engine::Q4(e) = &mut eng {
-                                            e.ckpt_capture(i, slots[i].prefilled);
-                                        }
-                                        let done = slots[i]
-                                            .job
-                                            .as_ref()
-                                            .is_some_and(|j| slots[i].prefilled == j.tokens.len());
-                                        if done {
-                                            slot_emit(&mut slots[i], toks[k]);
-                                        }
-                                        finish_slot(&mut slots[i], &mut eng, i, eos);
-                                    }
-                                    n_pf += 1;
-                                    // 이번 회차 프리필 소비 — 슬롯별 경로로 중복 계상 방지.
-                                    continue;
-                                }
-                                Err(err) => eprintln!("# batch-prefill 실패({err}) — 슬롯별 폴백"),
-                            }
-                        }
-                    }
-                }
-            }
             if let Some(i) = pf {
                 let _pft = std::time::Instant::now();
                 let chunk = 512usize;
@@ -647,14 +362,6 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         .min(slots[i].job.as_ref().unwrap().tokens.len());
                     let part: Vec<u32> =
                         slots[i].job.as_ref().unwrap().tokens[slots[i].prefilled..end].to_vec();
-                    // plans/115 D2: 잡 첫 청크 — h행 세션 리셋. last_res_hc_rows
-                    // 는 청크마다 extend라 리셋 없으면 잡을 넘어 무한 증가한다
-                    // (종전엔 드래프트 프리필 len 검사 파탄의 원인이기도 했다).
-                    if slots[i].prefilled == slots[i].pf_base
-                        && let Engine::Q4(e) = &mut eng
-                    {
-                        e.hrows_reset(i);
-                    }
                     // 샘플링 슬롯은 로짓 판(마지막 청크만 판정에 사용) — Q4도
                     // prefill_greedy 대신 prefill. greedy는 종전 최적 경로.
                     let samp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
@@ -669,22 +376,6 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                 }
                             })
                             .map_err(|e| e.to_string()),
-                        Engine::Q4(e) => {
-                            let r = if samp {
-                                e.prefill(i, &part)
-                                    .map(|l| pick(&mut slots[i], &l))
-                                    .map_err(|e| e.to_string())
-                            } else {
-                                e.prefill_greedy(i, &part).map_err(|e| e.to_string())
-                            };
-                            // plans/115 D2 측정(원장 141): serve에서 MTP 드래프트
-                            // 프리필 재생([pf_base..)×~4ms/토큰)은 수용 이득 0 —
-                            // 반복·패턴 수용은 서픽스 드래프터(P12, 비용 0)가
-                            // 전부 담당, 비반복엔 MTP도 1.0-1.22(원장 128)이라
-                            // 재생비용이 항상 우세한다. 재생 삭제 — MTP는 infer
-                            // 단일스트림(측정 승리) 전용.
-                            r
-                        }
                     };
                     (end, r)
                 };
@@ -704,10 +395,6 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 match logits {
                     Ok(t) => {
                         slots[i].prefilled = start;
-                        // plans/115 P1-3: 청크 경계 체크포인트 캡처.
-                        if let Engine::Q4(e) = &mut eng {
-                            e.ckpt_capture(i, start);
-                        }
                         if start == slots[i].job.as_ref().unwrap().tokens.len() {
                             slot_emit(&mut slots[i], t);
                         }
@@ -777,42 +464,10 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
             (i, if full { l } else { 0 })
         })
         .max_by_key(|&(_, l)| l);
-    let Some((mut i, mut reuse)) = pick else {
+    let Some((i, reuse)) = pick else {
         return;
     };
     if reuse == 0 {
-        // plans/115 P1-3: 부분 접두 재사용 — 캐시가 새 프롬프트의 **접두**이기만
-        // 하면(l < cached.len() 포함) 체크포인트(512 청크 경계)로 되감아 잔여를
-        // 재프리필한다. GDN 상태 = 체크포인트 CPU 클론(dirty 전사), QSA KV/idx
-        // 는 pos 인덱스 쓰기라 멱등 — 재프리필이 동일 행을 다시 쓴다.
-        if prefix_ok {
-            let mut best: Option<(usize, usize)> = None;
-            for i2 in 0..slots.len() {
-                if slots[i2].job.is_some() {
-                    continue;
-                }
-                let l = slots[i2]
-                    .cached
-                    .iter()
-                    .zip(j.tokens.iter())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                if l >= 512 && best.is_none_or(|(_, bl)| l > bl) {
-                    best = Some((i2, l));
-                }
-            }
-            if let Some((i2, l)) = best
-                && let Engine::Q4(e) = eng
-                && let Some(cp) = e.ckpt_restore_upto(i2, l)
-            {
-                SCHED.prefix_tokens.fetch_add(cp as u64, Ordering::Relaxed);
-                eprintln!(
-                    "# prefix-cache: slot{i2} partial reuse {l}토큰 (ckpt {cp}에서 재프리필)"
-                );
-                i = i2;
-                reuse = cp; // prefilled = cp — [cp..len) 재프리필(부분 접두 포함)
-            }
-        }
         if reuse == 0 {
             eng.reset_seq(i);
         }
@@ -841,7 +496,6 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         sampler: sampler_new,
         err_count: 0,
         failed: None,
-        pf_base: reuse,
     };
 }
 fn slot_emit(s: &mut Slot, t: u32) {
@@ -897,9 +551,8 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
             });
             // 접두 캐시 — 상태 유지 (프롬프트+생성 = 구워진 열).
             // 스펙 carried가 남으면 GDN이 뒤처짐 — 트렁크 재실행으로 커밋.
-            if let Engine::Q35(e) = eng {
-                let _ = e.flush_carried(i);
-            }
+            let Engine::Q35(e) = &mut *eng;
+            let _ = e.flush_carried(i);
             let mut full = j.tokens.clone();
             full.extend(toks);
             s.cached = full;
