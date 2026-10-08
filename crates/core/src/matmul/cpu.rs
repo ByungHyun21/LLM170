@@ -34,6 +34,38 @@ pub fn w4a8_ty(ty: llm170_gguf::GgmlType) -> bool {
 
 pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
     profile_span!("cpu::matmul1");
+    // W4A16 split(§3.5 A안 직접 로드) — 분리 버퍼 디양자화 + f32 내적.
+    // GGUF 계열과 동일하게 f32 레퍼런스(비트 격리 계약은 quant lane 소관).
+    if w.ty == llm170_gguf::GgmlType::W4a16G128Split {
+        let scale = w
+            .aux
+            .expect("w4a16 split: aux(scale) 필수 계약 — Model::w 보장");
+        let n_in = w.n_in as usize;
+        let nt = n_threads().max(1).min(out.len());
+        let rows_per = out.len().div_ceil(nt);
+        let mut chunks: Vec<&mut [f32]> = out.chunks_mut(rows_per).collect();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (lo, ch) in chunks.iter_mut().enumerate() {
+                let row0 = lo * rows_per;
+                handles.push(scope.spawn(move || {
+                    let mut scratch = vec![0.0f32; n_in];
+                    for (r, o) in ch.iter_mut().enumerate() {
+                        dequant_row_w4a16_split(w.data, scale, row0 + r, n_in, &mut scratch);
+                        let mut acc = 0.0f32;
+                        for i in 0..n_in {
+                            acc += x[i] * scratch[i];
+                        }
+                        *o = acc;
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+        return;
+    }
     // W4A8 디코드 전환 — 활성 시 전 경로 동일 비트
     if w4a8_enabled() && w4a8_ty(w.ty) && x.len() == w.n_in as usize {
         let y = crate::quant::quantize_row_q8_ref(x);
@@ -105,6 +137,53 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
 /// 행(o)별로 한 번 디양자화해 B 토큰과 내적 — prefill에서 디양자화 비용 상각.
 /// 스레드별 로컬 결과 [T][rows_per] → 조인 후 스캐터 (행 슬라이스 교차 차입 회피).
 pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
+    // W4A16 split(§3.5 A안) — 행별 1회 디양자화 후 T토큰 내적(일반 경로 미러).
+    if w.ty == llm170_gguf::GgmlType::W4a16G128Split {
+        let scale = w
+            .aux
+            .expect("w4a16 split: aux(scale) 필수 계약 — Model::w 보장");
+        profile_span!("cpu::matmulB");
+        let n_in = w.n_in as usize;
+        let n_out = w.n_out as usize;
+        let t = xs.len();
+        assert_eq!(outs.len(), t);
+        let nt = n_threads().max(1).min(n_out);
+        let rows_per = n_out.div_ceil(nt);
+        let mut locals: Vec<Vec<f32>> = vec![vec![0.0f32; t * rows_per]; nt];
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (g, local) in locals.iter_mut().enumerate() {
+                let row0 = g * rows_per;
+                handles.push(scope.spawn(move || {
+                    let mut scratch = vec![0.0f32; n_in];
+                    let rows = n_out.saturating_sub(row0).min(rows_per);
+                    for r in 0..rows {
+                        dequant_row_w4a16_split(w.data, scale, row0 + r, n_in, &mut scratch);
+                        for (ti, x) in xs.iter().enumerate() {
+                            let mut acc = 0.0f32;
+                            for i in 0..n_in {
+                                acc += x[i] * scratch[i];
+                            }
+                            local[ti * rows_per + r] = acc;
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+        for (g, local) in locals.iter().enumerate() {
+            let row0 = g * rows_per;
+            let rows = n_out.saturating_sub(row0).min(rows_per);
+            for ti in 0..t {
+                for r in 0..rows {
+                    outs[ti][row0 + r] = local[ti * rows_per + r];
+                }
+            }
+        }
+        return;
+    }
     // W4A8 (지원 타입) — 행별 레인 미러 정수 내적 (GPU 배치 경로와 동일 비트)
     if w4a8_enabled() && w4a8_ty(w.ty) {
         let y_all: Vec<_> = xs
@@ -198,6 +277,24 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
             for r in 0..rows {
                 outs[ti][row0 + r] = local[ti * rows_per + r];
             }
+        }
+    }
+}
+
+/// W4A16 split 행 디양자화 — data=packed[n][k/8 u32], scale=[n][k/128 u16],
+/// zp=8(sym 상수). cpu matmul 전용(레퍼런스 f32 — GGUF 계열 경로와 동일 계급).
+fn dequant_row_w4a16_split(q: &[u8], s: &[u8], row: usize, k: usize, out: &mut [f32]) {
+    let nb = k / 128;
+    let qrow = &q[row * (k / 2)..];
+    let srow = &s[row * (k / 64)..];
+    for b in 0..nb {
+        let sc = crate::quant::half_to_f32(u16::from_le_bytes([srow[2 * b], srow[2 * b + 1]]));
+        for i in 0..128usize {
+            let woff = 4 * (b * 16 + i / 8);
+            let w =
+                u32::from_le_bytes([qrow[woff], qrow[woff + 1], qrow[woff + 2], qrow[woff + 3]]);
+            let nib = ((w >> (4 * (i % 8))) & 0xF) as i32;
+            out[b * 128 + i] = (nib - 8) as f32 * sc;
         }
     }
 }

@@ -226,24 +226,68 @@ impl Tokenizer {
     /// (model_type → pre 스플리터). GGUF 경로와 동일 필드를 구성한다.
     /// 파서는 llm170_exl3::json 재사용.
     fn from_hf_dir(dir: &Path) -> Result<Self, String> {
-        let vj = llm170_exl3::Json::parse(
-            &std::fs::read_to_string(dir.join("vocab.json"))
-                .map_err(|e| format!("vocab.json: {e}"))?,
-        )
-        .map_err(|e| format!("vocab.json 파싱: {e}"))?;
-        let obj = vj.as_object().ok_or("vocab.json: 객체 아님")?;
+        // 토큰 조각표 — vocab.json(HF 벌크) 우선, 없으면 tokenizer.json.
+        // (W4A16 HF 배포는 vocab.json/merges.txt 부재 실측 — tokenizer.json의
+        // model.vocab + added_tokens 병합으로 대체.)
+        let tok_json: Option<llm170_exl3::Json> = if dir.join("vocab.json").is_file() {
+            None
+        } else {
+            let txt = std::fs::read_to_string(dir.join("tokenizer.json"))
+                .map_err(|e| format!("tokenizer.json: {e}"))?;
+            Some(llm170_exl3::Json::parse(&txt).map_err(|e| format!("tokenizer.json 파싱: {e}"))?)
+        };
         let mut max_id = 0usize;
-        let mut pairs: Vec<(String, u32)> = Vec::with_capacity(obj.len());
-        for (k, v) in obj {
-            let f = v
-                .as_f64()
-                .ok_or_else(|| format!("vocab.json: '{k}' id가 숫자 아님"))?;
-            let id = f as i64;
-            if id < 0 || f != id as f64 {
-                return Err(format!("vocab.json: '{k}' id가 정수 아님({f})"));
+        let mut pairs: Vec<(String, u32)> = Vec::new();
+        if let Some(tj) = &tok_json {
+            let vocab = tj
+                .get("model")
+                .and_then(|m| m.get("vocab"))
+                .and_then(|v| v.as_object())
+                .ok_or("tokenizer.json: model.vocab 부재")?;
+            for (piece, id) in vocab {
+                let f = id
+                    .as_f64()
+                    .ok_or_else(|| format!("tokenizer.json: '{piece}' id가 숫자 아님"))?;
+                let id = f as i64;
+                if id < 0 || f != id as f64 {
+                    return Err(format!("tokenizer.json: '{piece}' id가 정수 아님({f})"));
+                }
+                max_id = max_id.max(id as usize);
+                pairs.push((piece.clone(), id as u32));
             }
-            max_id = max_id.max(id as usize);
-            pairs.push((k.clone(), id as u32));
+            // added_tokens(특수 토큰 — EOS 포함) 병합.
+            if let Some(llm170_exl3::Json::Arr(items)) = tj.get("added_tokens") {
+                for it in items {
+                    let id = it.get("id").and_then(llm170_exl3::Json::as_f64);
+                    let content = it.get("content").and_then(llm170_exl3::Json::as_str);
+                    if let (Some(id), Some(c)) = (id, content) {
+                        let id = id as i64;
+                        if id >= 0 {
+                            max_id = max_id.max(id as usize);
+                            pairs.push((c.to_string(), id as u32));
+                        }
+                    }
+                }
+            }
+        } else {
+            let vj = llm170_exl3::Json::parse(
+                &std::fs::read_to_string(dir.join("vocab.json"))
+                    .map_err(|e| format!("vocab.json: {e}"))?,
+            )
+            .map_err(|e| format!("vocab.json 파싱: {e}"))?;
+            let obj = vj.as_object().ok_or("vocab.json: 객체 아님")?;
+            pairs.reserve(obj.len());
+            for (k, v) in obj {
+                let f = v
+                    .as_f64()
+                    .ok_or_else(|| format!("vocab.json: '{k}' id가 숫자 아님"))?;
+                let id = f as i64;
+                if id < 0 || f != id as f64 {
+                    return Err(format!("vocab.json: '{k}' id가 정수 아님({f})"));
+                }
+                max_id = max_id.max(id as usize);
+                pairs.push((k.clone(), id as u32));
+            }
         }
         let mut vocab = vec![String::new(); max_id + 1];
         for (piece, id) in &pairs {
@@ -252,25 +296,43 @@ impl Tokenizer {
 
         // 병합 순위 — GGUF 관례 동일 키(첫 ' ' 분할, 선발 우선). # 헤더는
         // 순위 소모 없이 스킵(convert_hf_to_gguf의 배열 순서와 정렬).
-        let merges_txt = std::fs::read_to_string(dir.join("merges.txt"))
-            .map_err(|e| format!("merges.txt: {e}"))?;
+        // merges.txt 우선, tokenizer.json이면 model.merges(문자열 배열) 파생.
         let mut bpe_ranks: HashMap<Vec<u8>, u32> = HashMap::new();
         let mut rank = 0u32;
-        for line in merges_txt.lines() {
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let b = line.as_bytes();
-            let Some(p) = b[1..].iter().position(|&c| c == b' ') else {
-                continue;
+        let push_merge =
+            |first: &[u8], second: &[u8], bpe_ranks: &mut HashMap<Vec<u8>, u32>, rank: &mut u32| {
+                let mut key = Vec::with_capacity(4 + first.len() + second.len());
+                key.extend_from_slice(&(first.len() as u32).to_le_bytes());
+                key.extend_from_slice(first);
+                key.extend_from_slice(second);
+                bpe_ranks.entry(key).or_insert(*rank);
+                *rank += 1;
             };
-            let (first, second) = (&b[..p + 1], &b[p + 2..]);
-            let mut key = Vec::with_capacity(4 + first.len() + second.len());
-            key.extend_from_slice(&(first.len() as u32).to_le_bytes());
-            key.extend_from_slice(first);
-            key.extend_from_slice(second);
-            bpe_ranks.entry(key).or_insert(rank);
-            rank += 1;
+        if let Some(tj) = &tok_json {
+            if let Some(llm170_exl3::Json::Arr(ms)) = tj.get("model").and_then(|m| m.get("merges"))
+            {
+                for m in ms {
+                    if let Some(s) = m.as_str()
+                        && let Some((a, b)) = s.split_once(' ')
+                    {
+                        push_merge(a.as_bytes(), b.as_bytes(), &mut bpe_ranks, &mut rank);
+                    }
+                }
+            }
+        } else {
+            let merges_txt = std::fs::read_to_string(dir.join("merges.txt"))
+                .map_err(|e| format!("merges.txt: {e}"))?;
+            for line in merges_txt.lines() {
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let b = line.as_bytes();
+                let Some(p) = b[1..].iter().position(|&c| c == b' ') else {
+                    continue;
+                };
+                let (first, second) = (&b[..p + 1], &b[p + 2..]);
+                push_merge(first, second, &mut bpe_ranks, &mut rank);
+            }
         }
 
         // 특수 토큰 — added_tokens_decoder {id: {content, special}}.

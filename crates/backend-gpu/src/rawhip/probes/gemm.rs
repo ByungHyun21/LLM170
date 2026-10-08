@@ -300,6 +300,7 @@ pub fn q4k_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result<
         .collect();
     let weight = llm170_core::matmul::Weight {
         data: &w,
+        aux: None,
         ty: llm170_gguf::GgmlType::Q4K,
         n_in: n_in as u64,
         n_out: n_out as u64,
@@ -352,6 +353,7 @@ pub fn q4k_micro() -> Result<String, String> {
         .collect();
     let weight = llm170_core::matmul::Weight {
         data: &w,
+        aux: None,
         ty: llm170_gguf::GgmlType::Q4K,
         n_in: n_in as u64,
         n_out: n_out as u64,

@@ -47,6 +47,12 @@ pub enum GgmlType {
     /// 블록 = [u32×16 packed(128니블)][f16 scale] = 66B, zp=8 상수.
     /// w4a16-to-gguf 변환 산출 전용 — 원본 GGUF 파일에는 나타나지 않는다.
     W4a16G128 = 100,
+    /// W4A16 g128 sym — **분리 버퍼 in-memory 표현**(§3.5 A안 직접 로드):
+    /// data=packed 행우선 [n][k/8 u32], aux=scale 행우선 [n][k/128 u16].
+    /// 파일에는 나타나지 않는다(from_u32 미등록) — dequant_row 비경유,
+    /// cpu matmul 전용 arm이 소비. block_info는 dialect와 동일한 총량
+    /// (66B/128)만 제공한다(오프셋 해석용 아님).
+    W4a16G128Split = 101,
 }
 
 impl GgmlType {
@@ -133,6 +139,7 @@ impl GgmlType {
             Q1_0 => "q1_0",
             Q2_0 => "q2_0",
             W4a16G128 => "w4a16_g128",
+            W4a16G128Split => "w4a16_g128_split",
         }
     }
 
@@ -177,6 +184,8 @@ impl GgmlType {
             Tq2_0 => (256, 66),
             // [u32×16 packed][f16 scale] — 셔플된 compressed-tensors g128.
             W4a16G128 => (128, 66),
+            // 분리 버퍼(총량만 동일 — 오프셋 해석은 matmul arm 전용).
+            W4a16G128Split => (128, 66),
         }
     }
 

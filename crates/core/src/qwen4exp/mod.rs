@@ -335,6 +335,7 @@ impl Model4 {
         let (start, end) = t.file_range(part.data_offset)?;
         Some(Weight {
             data: &part.mmap[start as usize..end as usize],
+            aux: None,
             ty: t.ty,
             n_in: t.ne[0],
             n_out: t.ne[1] * t.ne[2] * t.ne[3],
@@ -454,6 +455,7 @@ impl Model4 {
         let s = start as usize + e * per_expert_bytes;
         Ok(Weight {
             data: &part.mmap[s..s + per_expert_bytes],
+            aux: None,
             ty: t.ty,
             n_in: t.ne[0],
             n_out: t.ne[1],

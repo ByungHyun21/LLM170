@@ -43,6 +43,7 @@ impl F32Weight {
     fn w(&self) -> crate::matmul::Weight<'_> {
         crate::matmul::Weight {
             data: &self.data,
+            aux: None,
             ty: llm170_gguf::GgmlType::F32,
             n_in: self.n_in,
             n_out: self.n_out,
