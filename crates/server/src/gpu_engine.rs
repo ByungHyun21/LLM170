@@ -185,21 +185,52 @@ impl GpuEngine {
         Ok(lg)
     }
 
-    /// 시퀀스 prefill(토큰 순차 forward) → 마지막 로짓.
-    /// head는 마지막 토큰만 계산한다(중간 토큰은 체인만 — head 비용 상각).
+    /// 시퀀스 prefill → 마지막 로짓. t≤8 배치 청크(GEMM t≥2 경로)로 처리하고
+    /// head는 마지막 토큰만 계산한다(중간 토큰 상각).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
-        let mut last = None;
+        let h = self.model.hp.n_embd;
         let n = tokens.len();
-        for (i, tok) in tokens.iter().enumerate() {
-            let row = self.model.embed_row(*tok).map_err(|e| e.to_string())?;
-            if i + 1 == n {
-                last = Some(self.logits(seq, &row)?);
-            } else {
-                self.forward(seq, &row)?;
-            }
+        if n == 0 {
+            // A10: 빈 프롬프트는 조용한 제로 로짓 대신 명시 오류.
+            return Err("prefill: 빈 프롬프트 — 토큰 1개 이상 필요".into());
         }
-        // A10: 빈 프롬프트는 조용한 제로 로짓 대신 명시 오류(조용한 오염 금지 —
-        // infer.rs 거부 표면과 일치).
+        let mut last = None;
+        if self.staged {
+            // 구 스테이징 경로는 t=1 전용 — 한 토큰씩.
+            for (i, tok) in tokens.iter().enumerate() {
+                let row = self.model.embed_row(*tok).map_err(|e| e.to_string())?;
+                if i + 1 == n {
+                    let xn = self.dec.forward(seq, &row)?;
+                    last = Some(self.head_logits(&xn)?);
+                } else {
+                    self.dec.forward(seq, &row)?;
+                }
+            }
+            return last.ok_or_else(|| "prefill: 빈 프롬프트".to_string());
+        }
+        // 청크 크기 오버라이드(진단/폴백): LLM170_PREFILL_T=1이면 토큰 순차.
+        let tmax = llm170_diag::flag::val("LLM170_PREFILL_T")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, 8);
+        let mut i = 0usize;
+        while i < n {
+            let t = (n - i).min(tmax);
+            let mut rows = Vec::with_capacity(t * h);
+            for &tok in &tokens[i..i + t] {
+                rows.extend_from_slice(&self.model.embed_row(tok).map_err(|e| e.to_string())?);
+            }
+            let is_last = i + t == n;
+            if is_last && self.head_gpu {
+                last = Some(self.dec.forward_prefill(seq, &rows, t, true)?);
+            } else if is_last {
+                let xn = self.dec.forward_prefill(seq, &rows, t, false)?;
+                last = Some(self.head_logits(&xn)?);
+            } else {
+                self.dec.forward_prefill(seq, &rows, t, false)?;
+            }
+            i += t;
+        }
         last.ok_or_else(|| "prefill: 빈 프롬프트 — 토큰 1개 이상 필요".to_string())
     }
 

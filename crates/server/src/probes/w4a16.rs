@@ -312,6 +312,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut n_predict = 8usize;
     let mut ctx = 1024usize;
     let mut no_head = false;
+    let mut bench: Option<(String, usize, usize)> = None; // (lin, t, reps)
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -340,14 +341,27 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                     .ok_or("--ctx requires a number")?;
             }
             "--no-head" => no_head = true,
+            "--bench-gemm" => {
+                let name = it.next().ok_or("--bench-gemm requires a name")?.clone();
+                let t = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--bench-gemm requires t")?;
+                let reps = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--bench-gemm requires reps")?;
+                bench = Some((name, t, reps));
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
     }
-    if prompts.len() != 1 {
+    if bench.is_none() && prompts.len() != 1 {
         return Err("w4a16-gpu: 단일 프롬프트 전용(v1)".into());
     }
-    let prompt = &prompts[0];
-    if prompt.len() + n_predict + 1 > ctx {
+    let prompt: Vec<u32> = prompts.first().cloned().unwrap_or_default();
+    let prompt = &prompt;
+    if bench.is_none() && prompt.len() + n_predict + 1 > ctx {
         return Err(format!("ctx({ctx}) too small for prompt+n_predict"));
     }
     let model =
@@ -478,6 +492,34 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         llm170_core::matmul::matmul(xn, &head, &mut lg);
         lg
     };
+    // 마이크로벤치(진단): 지정 선형의 t≥2 GEMM 반복 시간·실효 GB/s.
+    if let Some((name, bt, reps)) = &bench {
+        let (n, k) = model
+            .w_raw(name)
+            .map(|w| (w.n_out as usize, w.n_in as usize))
+            .ok_or_else(|| format!("--bench-gemm {name}: 무게 없음"))?;
+        let xh: Vec<u16> = vec![0x3C00u16; bt * k]; // f16 1.0 — 수치 무의미
+        let xb = unsafe { std::slice::from_raw_parts(xh.as_ptr() as *const u8, xh.len() * 2) };
+        let dxh = dec.alloc_scratch(xh.len() * 2)?;
+        dec.h2d_scratch(dxh, xb)?;
+        let dout = dec.alloc_scratch(bt * n * 4)?;
+        // 워밍 1회.
+        dec.gemm_bench_launch(name, dxh, dout, *bt)?;
+        dec.sync_bench()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..*reps {
+            dec.gemm_bench_launch(name, dxh, dout, *bt)?;
+        }
+        dec.sync_bench()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / *reps as f64;
+        let wb = (n * k) as f64 / 2.0; // 4bit+scale ≈ 0.5625B/원소 근사
+        let gbs = wb * 1e-9 / (ms * 1e-3);
+        dec.free_scratch(dxh)?;
+        dec.free_scratch(dout)?;
+        return Ok(format!(
+            "bench-gemm {name} n={n} k={k} t={bt} reps={reps}: {ms:.2} ms/회 · 가중치 {gbs:.0} GB/s"
+        ));
+    }
     let staged = llm170_diag::flag::on("LLM170_STAGED");
     // GPU head — bf16 output.weight를 상주 업로드(--no-head·스테이징은 CPU 참조).
     let mut head_gpu = false;
@@ -488,23 +530,37 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let t1 = std::time::Instant::now();
     let mut out: Vec<u32> = Vec::new();
     let mut next = 0u32;
-    for (i, tok) in prompt.iter().enumerate() {
-        let row = model.embed_row(*tok).map_err(|e| e.to_string())?;
-        let last = i + 1 == prompt.len();
-        if head_gpu {
-            let lg = dec.forward_device_head(0, &row)?;
-            if last {
-                next = llm170_core::matmul::greedy_from(&lg);
+    // 프롬프트는 t≤8 배치 청크로 — 골든 판정이 배치 경로(GEMM t≥2)를 지난다.
+    {
+        let h = hp.n_embd;
+        let mut i = 0usize;
+        while i < prompt.len() {
+            let t = (prompt.len() - i).min(8);
+            let mut rows: Vec<f32> = Vec::with_capacity(t * h);
+            for &tok in &prompt[i..i + t] {
+                rows.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);
             }
-        } else {
-            let xn = if staged {
-                dec.forward(0, &row)?
+            let last = i + t == prompt.len();
+            if staged {
+                for u in 0..t {
+                    let row = &rows[u * h..(u + 1) * h];
+                    let xn = dec.forward(0, row)?;
+                    if last && u + 1 == t {
+                        next = llm170_core::matmul::greedy_from(&head_logits(&xn));
+                    }
+                }
+            } else if head_gpu {
+                let lg = dec.forward_prefill(0, &rows, t, last)?;
+                if last {
+                    next = llm170_core::matmul::greedy_from(&lg);
+                }
             } else {
-                dec.forward_device(0, &row)?
-            };
-            if last {
-                next = llm170_core::matmul::greedy_from(&head_logits(&xn));
+                let xn = dec.forward_prefill(0, &rows, t, false)?;
+                if last {
+                    next = llm170_core::matmul::greedy_from(&head_logits(&xn));
+                }
             }
+            i += t;
         }
     }
     out.push(next);

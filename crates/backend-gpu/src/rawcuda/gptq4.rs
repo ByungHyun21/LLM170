@@ -176,8 +176,8 @@ impl Gptq4 {
                 &mut p_k as *mut _ as *mut c_void,
                 &mut p_t as *mut _ as *mut c_void,
             ];
-            let gx = n.div_ceil(8) as u32;
-            self.cc.launch(f, gx, 1, 64, &mut args)?;
+            // 8행/블록 커널(2026-10-08 재작성 2) — grid = ceil(n/8), block 512.
+            self.cc.launch(f, n.div_ceil(8) as u32, 1, 512, &mut args)?;
             self.cc.sync()?;
             let mut ob = vec![0u8; t * n * 4];
             self.cc.d2h(&mut ob, dout)?;
