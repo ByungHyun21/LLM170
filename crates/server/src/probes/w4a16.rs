@@ -389,15 +389,19 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let t0 = std::time::Instant::now();
     let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
     dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
-    // 1) 선형 상주 업로드.
+    // 1) 선형 상주 업로드 — MoE(35B)는 플레인+전문가 테이블(GpuEngine 공용).
     let mut n_lin = 0usize;
-    for name in model.engine_names() {
-        if let Some(w) = model.w_raw(&name)
-            && w.ty == llm170_core::wtype::WType::W4a16Split
-        {
-            let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
-            dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;
-            n_lin += 1;
+    if hp.n_experts > 0 {
+        crate::gpu_engine::upload_moe(&mut dec, &model)?;
+    } else {
+        for name in model.engine_names() {
+            if let Some(w) = model.w_raw(&name)
+                && w.ty == llm170_core::wtype::WType::W4a16Split
+            {
+                let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
+                dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;
+                n_lin += 1;
+            }
         }
     }
     // 2) 노름 nw [2L+1][hidden].
@@ -553,7 +557,12 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         let h = hp.n_embd;
         let mut i = 0usize;
         while i < prompt.len() {
-            let t = (prompt.len() - i).min(8);
+            // MoE 체인은 t=1 경로(전문가별 GEMM 프리필은 후속).
+            let t = if hp.n_experts > 0 {
+                1
+            } else {
+                (prompt.len() - i).min(8)
+            };
             let mut rows: Vec<f32> = Vec::with_capacity(t * h);
             for &tok in &prompt[i..i + t] {
                 rows.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);

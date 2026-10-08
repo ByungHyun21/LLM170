@@ -344,6 +344,18 @@ pub fn engine_names(cfg: &QwenCfg) -> Vec<String> {
         ] {
             v.push(format!("blk.{il}.{suf}"));
         }
+        // MoE(35B-A3B) — 라우터·shared. 전문가는 이름맵 무경유(스토어 접근자).
+        if cfg.n_experts > 0 {
+            for suf in [
+                "moe_gate.weight",
+                "moe_shared_gate.weight",
+                "moe_shared_up.weight",
+                "moe_shared_down.weight",
+                "moe_shared_sgate.weight",
+            ] {
+                v.push(format!("blk.{il}.{suf}"));
+            }
+        }
     }
     v
 }

@@ -80,6 +80,28 @@ impl AttnDims {
 
 /// f32 → f16 비트(RN-even, 서브노멀·inf/nan 처리) — GEMV 활성 캐스팅 계약.
 /// 커널은 이 f16 비트를 dot_row_w4a16_lane과 동일 산술로 소비한다.
+/// MoE top-k 선택 — 라우터 로짓 → softmax(전문가 전체) → top-k → 재정규화.
+/// 시맨틱 단일 출처는 core `qwen35::stages::moe`(크레이트 의존 방향 제약으로
+/// 미러 — 변경 시 양쪽 동시 갱신). 반환 = (전문가, 가중) 내림차순.
+pub fn moe_topk(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let n = logits.len();
+    let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut p = vec![0.0f32; n];
+    let mut sum = 0.0f32;
+    for (i, l) in logits.iter().enumerate() {
+        p[i] = (l - mx).exp();
+        sum += p[i];
+    }
+    for v in p.iter_mut() {
+        *v /= sum;
+    }
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_unstable_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
+    idx.truncate(k);
+    let wsum: f32 = idx.iter().map(|&e| p[e]).sum();
+    idx.iter().map(|&e| (e, p[e] / wsum)).collect()
+}
+
 pub fn f32_to_f16(v: f32) -> u16 {
     let b = v.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
@@ -159,6 +181,35 @@ pub struct W4a16Dec {
     pub slot_pos: Vec<u32>,
     /// 선형 상주 — 이름 → (packed, scale, n, k).
     lins: HashMap<String, (CUdeviceptr, CUdeviceptr, usize, usize)>,
+    /// 플레인 bf16 상주 — 이름 → ([k][n] 전치 ptr, n, k). MoE 모델(35B)의
+    /// 비양자화 선형(GDN·어텐션·라우터·shared) — head_bf16 GEMV 재사용.
+    plains: HashMap<String, (CUdeviceptr, usize, usize)>,
+    /// 플레인 모드(체인 분기 — 전문가 외 전부 bf16인 모델).
+    plain_weights: bool,
+    /// MoE 구성 — n_experts=0이면 dense FFN.
+    n_experts: usize,
+    top_k: usize,
+    moe_ffn: usize,
+    shared_ffn: usize,
+    moe_group: usize,
+    moe_scale_bf16: bool,
+    /// 전문가 슬라이스 테이블 — (packed ptr/len, scale ptr/len), 인덱스
+    /// ((il·n_experts + e)·3 + proj) — proj 0/1/2 = gate/up/down.
+    /// 호스트 포인터는 서버 스토어 mmap 수명 계약(set_expert_table).
+    moe_tab: Vec<(u64, u64, u64, u64)>,
+    /// 전문가 상주 모드 — moe_tab이 VRAM 포인터(170HX 64GB 등).
+    moe_resident: bool,
+    /// MoE 스테이징 — 전문가 packed/scale(1쌍 재사용, 스트림 순서 안전).
+    dstg_q: CUdeviceptr,
+    dstg_s: CUdeviceptr,
+    dstg_cap: (usize, usize),
+    /// 라우터 로짓/ shared 게이트 스크래치(n_experts ≥ 1).
+    drt: CUdeviceptr,
+    drt_cap: usize,
+    /// MoE 출력(hidden) — 잔차 ab로 소비된다.
+    dmo: CUdeviceptr,
+    dmo_cap: usize,
+    moe_bufs_ok: bool,
     /// GEMV 스테이징 — x f16 [t][k], y f32 [t][n].
     dxh: CUdeviceptr,
     xh_cap: usize,
@@ -271,8 +322,12 @@ impl W4a16Dec {
             &[
                 "w4a16_gemm_g128",
                 "w4a16_gemv_g128",
+                "w4a16_gemm_g32_bf16",
+                "w4a16_gemv_g32_bf16",
                 "w4a16_cast_f16",
                 "w4a16_cast_x32",
+                "w4a16_axpy",
+                "w4a16_shared_add",
             ],
         )?;
         cc.load_fatbin(
@@ -348,6 +403,24 @@ impl W4a16Dec {
             n_slots: n_slots.max(1),
             slot_pos: vec![0; n_slots.max(1)],
             lins: HashMap::new(),
+            plains: HashMap::new(),
+            plain_weights: false,
+            n_experts: 0,
+            top_k: 0,
+            moe_ffn: 0,
+            shared_ffn: 0,
+            moe_group: 32,
+            moe_scale_bf16: true,
+            moe_tab: Vec::new(),
+            moe_resident: false,
+            dstg_q: 0,
+            dstg_s: 0,
+            dstg_cap: (0, 0),
+            drt: 0,
+            drt_cap: 0,
+            dmo: 0,
+            dmo_cap: 0,
+            moe_bufs_ok: false,
             dxh: 0,
             xh_cap: 0,
             dy: 0,
@@ -1385,8 +1458,16 @@ impl W4a16Dec {
         let h = self.hidden;
         let ad = self.attn.ok_or("attn: 형상 미등록")?;
         let gd = self.gdn.ok_or("GDN: 형상 미등록")?;
-        let (_, _, ff_gate, _) = self.lin_spec("blk.0.ffn_gate.weight")?;
-        let (_, _, ff_up, _) = self.lin_spec("blk.0.ffn_up.weight")?;
+        let (ff_gate, ff_up) = if self.plain_weights {
+            // 플레인(MoE) 모드 — dense FFN 없음. ew 스테이징 폭은 shared 폭.
+            let (_, g, _) = self.plain_spec("blk.0.moe_shared_gate.weight")?;
+            let (_, u, _) = self.plain_spec("blk.0.moe_shared_up.weight")?;
+            (g, u)
+        } else {
+            let (_, _, g, _) = self.lin_spec("blk.0.ffn_gate.weight")?;
+            let (_, _, u, _) = self.lin_spec("blk.0.ffn_up.weight")?;
+            (g, u)
+        };
         // 슬롯 0 = qg·qkv·gate/up, 슬롯 1 = kin/vin·z·up. ew가 gate·up을
         // 동시에 읽으므로 둘 다 FFN 폭 확보(구 S10 ensure_chain_bufs 계약).
         let w0 = ad.qg_dim().max(gd.conv_ch()).max(ff_gate);
@@ -1520,7 +1601,14 @@ impl W4a16Dec {
 
     /// GEMV(x32 입력) → self.dy — 반환 포인터는 다음 gemv가 덮는다(스트림 순서).
     fn gemv_dev_x32(&mut self, name: &str, x32_dev: CUdeviceptr) -> Result<CUdeviceptr, String> {
-        let (_, _, n, k) = self.lin_spec(name)?;
+        let (_, _, n, _) = self.lin_spec(name)?;
+        let dy = self.ensure_dy(n)?;
+        self.gemv_launch(name, x32_dev, dy)?;
+        Ok(dy)
+    }
+
+    /// dy 버퍼 보장(n f32).
+    fn ensure_dy(&mut self, n: usize) -> Result<CUdeviceptr, String> {
         if n > self.y_cap {
             if self.dy != 0 {
                 self.cc.free(self.dy)?;
@@ -1530,8 +1618,6 @@ impl W4a16Dec {
             self.dy = self.cc.alloc(n * 4)?;
             self.y_cap = n;
         }
-        self.gemv_launch(name, x32_dev, self.dy)?;
-        let _ = k;
         Ok(self.dy)
     }
 
@@ -1548,6 +1634,378 @@ impl W4a16Dec {
             return Err(format!("gemv_stage({name}): n={n} > 스테이징 {w}"));
         }
         self.gemv_launch(name, x32_dev, dst)
+    }
+
+    // ── 플레인 bf16(MoE 모델 — 35B) + MoE FFN ──
+
+    /// 플레인 bf16 [n][k] 상주 업로드 — [k][n] 전치(head_bf16 GEMV 계약).
+    pub fn upload_plain(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        n: usize,
+        k: usize,
+    ) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        let need = n * k * 2;
+        if n == 0 || k == 0 || data.len() < need {
+            return Err(format!(
+                "upload_plain({name}): 형상 계약 위반 n={n} k={k} bytes={} < {need}",
+                data.len()
+            ));
+        }
+        // 전치 업로드 — head와 동일(head_transpose 커널).
+        let dtmp = self.cc.alloc(need)?;
+        if let Err(e) = Self::h2d_chunked(&self.cc, dtmp, &data[..need]) {
+            let _ = self.cc.free(dtmp);
+            return Err(e);
+        }
+        let dw = self.cc.alloc(need)?;
+        let tr = (|| -> Result<(), String> {
+            let f = self.cc.function("head_transpose")?;
+            let (mut p_in, mut p_out) = (dtmp, dw);
+            let (mut p_n, mut p_k) = (n as i32, k as i32);
+            let mut args: [*mut std::ffi::c_void; 4] = [
+                (&mut p_in) as *mut _ as *mut _,
+                (&mut p_out) as *mut _ as *mut _,
+                (&mut p_n) as *mut _ as *mut _,
+                (&mut p_k) as *mut _ as *mut _,
+            ];
+            self.cc.launch(
+                f,
+                k.div_ceil(32) as u32,
+                n.div_ceil(32) as u32,
+                1024,
+                &mut args,
+            )?;
+            self.cc.sync()
+        })();
+        let _ = self.cc.free(dtmp);
+        if let Err(e) = tr {
+            let _ = self.cc.free(dw);
+            return Err(format!("upload_plain({name}) 전치: {e}"));
+        }
+        if let Some((old, _, _)) = self.plains.insert(name.to_string(), (dw, n, k)) {
+            let _ = self.cc.free(old);
+        }
+        Ok(())
+    }
+
+    /// 플레인 모드 전환(전문가 외 전부 bf16인 MoE 모델).
+    pub fn set_plain_mode(&mut self, on: bool) {
+        self.plain_weights = on;
+    }
+
+    /// MoE 모델 여부(프리필 t=1 강제 등).
+    pub fn is_moe(&self) -> bool {
+        self.n_experts > 0
+    }
+
+    /// MoE 구성 등록 — n_experts>0이면 체인은 플레인+MoE FFN 경로.
+    pub fn set_moe(
+        &mut self,
+        n_experts: usize,
+        top_k: usize,
+        moe_ffn: usize,
+        shared_ffn: usize,
+        group: usize,
+        scale_bf16: bool,
+    ) {
+        self.n_experts = n_experts;
+        self.top_k = top_k;
+        self.moe_ffn = moe_ffn;
+        self.shared_ffn = shared_ffn;
+        self.moe_group = group;
+        self.moe_scale_bf16 = scale_bf16;
+    }
+
+    /// 전문가 슬라이스 테이블 등록 — (packed ptr/len, scale ptr/len) × (il,e,proj).
+    /// 포인터는 서버 스토어 mmap 슬라이스 — 서버가 모델을 함께 보유하는 수명 계약.
+    pub fn set_expert_table(&mut self, tab: Vec<(u64, u64, u64, u64)>) {
+        self.moe_tab = tab;
+    }
+
+    fn plain_spec(&self, name: &str) -> Result<(CUdeviceptr, usize, usize), String> {
+        self.plains
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("상주 플레인 없음: {name}"))
+    }
+
+    /// bf16 GEMV(head_bf16 재사용 — k직렬 f32 행 내적, CPU 참조와 동일 순서).
+    /// x는 **원시 f32**(h2f 왕복 아님 — 플레인 경로 계약).
+    fn plain_gemv_launch(
+        &self,
+        name: &str,
+        x_dev: CUdeviceptr,
+        out_dev: CUdeviceptr,
+    ) -> Result<(), String> {
+        let (w, n, k) = self.plain_spec(name)?;
+        let f = self.cc.function("head_bf16")?;
+        let (mut p_w, mut p_x, mut p_o) = (w, x_dev, out_dev);
+        let (mut p_n, mut p_k) = (n as i32, k as i32);
+        let mut args: [*mut std::ffi::c_void; 5] = [
+            (&mut p_w) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_o) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+        ];
+        self.cc
+            .launch(f, n.div_ceil(4 * 256) as u32, 1, 256, &mut args)
+    }
+
+    /// 플레인 GEMV → 스테이징 dst 직접 쓰기 + 폭 검사.
+    fn plain_stage_x32(
+        &self,
+        name: &str,
+        x_dev: CUdeviceptr,
+        dst: CUdeviceptr,
+        w: usize,
+    ) -> Result<(), String> {
+        let (_, n, _) = self.plain_spec(name)?;
+        if n > w {
+            return Err(format!("plain_stage({name}): n={n} > 스테이징 {w}"));
+        }
+        self.plain_gemv_launch(name, x_dev, dst)
+    }
+
+    /// 플레인 GEMV → self.dy.
+    fn plain_gemv_dev(&mut self, name: &str, x_dev: CUdeviceptr) -> Result<CUdeviceptr, String> {
+        let (_, n, _) = self.plain_spec(name)?;
+        let dy = self.ensure_dy(n)?;
+        self.plain_gemv_launch(name, x_dev, dy)?;
+        Ok(dy)
+    }
+
+    /// 분리 GEMV 발사(이름 무경유 — MoE 전문가 스테이징).
+    fn gemv_launch_raw(
+        &self,
+        dq: CUdeviceptr,
+        ds: CUdeviceptr,
+        n: usize,
+        k: usize,
+        x_dev: CUdeviceptr,
+        y_out: CUdeviceptr,
+    ) -> Result<(), String> {
+        let sym = super::gptq4::kernel_sym(false, self.moe_group, self.moe_scale_bf16)?;
+        let f = self.cc.function(sym)?;
+        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, x_dev, y_out);
+        let (mut p_n, mut p_k) = (n as i32, k as i32);
+        let mut args: [*mut std::ffi::c_void; 6] = [
+            (&mut p_q) as *mut _ as *mut _,
+            (&mut p_s) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_y) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, n as u32, 1, 64, &mut args)
+    }
+
+    /// 전문가 상주 업로드 — 호스트 테이블(mmAP 슬라이스)을 VRAM 아레나
+    /// (proj별 packed/scale 6개)로 올리고 테이블을 VRAM 포인터로 교체한다.
+    /// 상주가 가능한 기기(170HX 64GB)에서 토큰당 PCIe 스트리밍을 제거한다.
+    pub fn upload_experts_resident(
+        &mut self,
+        host_tab: &[(u64, u64, u64, u64)],
+    ) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        if self.n_experts == 0 || host_tab.len() != self.n_layers * self.n_experts * 3 {
+            return Err("upload_experts_resident: 테이블 형상 위반".into());
+        }
+        let mut pk = [0usize; 3];
+        let mut sk = [0usize; 3];
+        for (i, e) in host_tab.iter().enumerate() {
+            pk[i % 3] += e.1 as usize;
+            sk[i % 3] += e.3 as usize;
+        }
+        let mut dpk = [0 as CUdeviceptr; 3];
+        let mut dsk = [0 as CUdeviceptr; 3];
+        let mut opk = [0usize; 3];
+        let mut osk = [0usize; 3];
+        let mut allocd = Vec::new();
+        let setup = (|| -> Result<(), String> {
+            for p in 0..3 {
+                dpk[p] = self.cc.alloc(pk[p])?;
+                allocd.push(dpk[p]);
+                dsk[p] = self.cc.alloc(sk[p])?;
+                allocd.push(dsk[p]);
+            }
+            Ok(())
+        })();
+        if let Err(e) = setup {
+            for p in allocd {
+                let _ = self.cc.free(p);
+            }
+            return Err(e);
+        }
+        let mut dev_tab = Vec::with_capacity(host_tab.len());
+        let r = (|| -> Result<(), String> {
+            for (i, e) in host_tab.iter().enumerate() {
+                let p = i % 3;
+                // SAFETY: 호스트 테이블 항목 — 서버 스토어 mmap 슬라이스
+                // (set_expert_table 수명 계약과 동일).
+                let qb = unsafe { std::slice::from_raw_parts(e.0 as *const u8, e.1 as usize) };
+                let sb = unsafe { std::slice::from_raw_parts(e.2 as *const u8, e.3 as usize) };
+                Self::h2d_chunked(&self.cc, dpk[p] + opk[p] as u64, qb)?;
+                Self::h2d_chunked(&self.cc, dsk[p] + osk[p] as u64, sb)?;
+                dev_tab.push((dpk[p] + opk[p] as u64, e.1, dsk[p] + osk[p] as u64, e.3));
+                opk[p] += e.1 as usize;
+                osk[p] += e.3 as usize;
+            }
+            Ok(())
+        })();
+        if let Err(err) = r {
+            for p in allocd {
+                let _ = self.cc.free(p);
+            }
+            return Err(err);
+        }
+        self.moe_tab = dev_tab;
+        self.moe_resident = true;
+        Ok(())
+    }
+
+    /// 전문가 GEMV 1건 — 상주면 직접, 아니면 스테이징 h2d 후 발사.
+    fn expert_gemv(
+        &mut self,
+        entry: (u64, u64, u64, u64),
+        n: usize,
+        k: usize,
+        x_dev: CUdeviceptr,
+        out_dev: CUdeviceptr,
+    ) -> Result<(), String> {
+        let (qp, ql, sp, sl) = entry;
+        if self.moe_resident {
+            return self.gemv_launch_raw(qp, sp, n, k, x_dev, out_dev);
+        }
+        // SAFETY: 서버 스토어 mmap 슬라이스 — set_expert_table 수명 계약.
+        let qb = unsafe { std::slice::from_raw_parts(qp as *const u8, ql as usize) };
+        let sb = unsafe { std::slice::from_raw_parts(sp as *const u8, sl as usize) };
+        Self::h2d_chunked(&self.cc, self.dstg_q, qb)?;
+        Self::h2d_chunked(&self.cc, self.dstg_s, sb)?;
+        self.gemv_launch_raw(self.dstg_q, self.dstg_s, n, k, x_dev, out_dev)
+    }
+
+    /// MoE 버퍼 보장(전문가 스테이징·라우터·출력).
+    fn ensure_moe_bufs(&mut self) -> Result<(), String> {
+        if self.moe_bufs_ok {
+            return Ok(());
+        }
+        let h = self.hidden;
+        let n_ff = self.moe_ffn;
+        let n_exp = self.n_experts;
+        if n_ff == 0 || n_exp == 0 || !self.moe_group.is_multiple_of(32) {
+            return Err("moe: 구성 미등록".into());
+        }
+        // 전문가 최대 행렬 = h×n_ff(gate/up) = h×n_ff(down) — 동일 크기.
+        let pk = h * n_ff / 2;
+        let sk = h * n_ff / self.moe_group * 2;
+        realloc_fields(
+            |p| self.cc.free(p),
+            |b| self.cc.alloc(b),
+            [
+                &mut self.dstg_q,
+                &mut self.dstg_s,
+                &mut self.drt,
+                &mut self.dmo,
+            ],
+            [pk, sk, n_exp * 4, h * 4],
+        )?;
+        self.dstg_cap = (pk, sk);
+        self.drt_cap = n_exp;
+        self.dmo_cap = h;
+        self.moe_bufs_ok = true;
+        Ok(())
+    }
+
+    /// 가중 누적 — y += w·x.
+    fn axpy_dev(&mut self, w: f32, x: CUdeviceptr, y: CUdeviceptr, n: usize) -> Result<(), String> {
+        let f = self.cc.function("w4a16_axpy")?;
+        let mut ww = w;
+        let (mut p_x, mut p_y) = (x, y);
+        let mut nn = n as i32;
+        let mut args: [*mut std::ffi::c_void; 4] = [
+            (&mut ww) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_y) as *mut _ as *mut _,
+            (&mut nn) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, n.div_ceil(256) as u32, 1, 256, &mut args)
+    }
+
+    /// shared 게이트 가산 — y += sigmoid(sg)·x.
+    fn shared_add_dev(
+        &mut self,
+        sg: CUdeviceptr,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
+        n: usize,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_shared_add")?;
+        let (mut p_sg, mut p_x, mut p_y) = (sg, x, y);
+        let mut nn = n as i32;
+        let mut args: [*mut std::ffi::c_void; 4] = [
+            (&mut p_sg) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_y) as *mut _ as *mut _,
+            (&mut nn) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, n.div_ceil(256) as u32, 1, 256, &mut args)
+    }
+
+    /// MoE FFN(35B-A3B) — 라우터(bf16 GEMV→호스트 top-k) + 전문가 스트리밍
+    /// GEMV + shared. 반환 = self.dmo(잔차 ab로 소비).
+    /// 시맨틱은 CPU 스테이지(core qwen35::stages::moe)와 동일: 라우터 전체
+    /// softmax → top-k → 재정규화, shared = sigmoid(sgate)·MLP.
+    fn moe_ffn_dev(&mut self, il: usize, xn: CUdeviceptr) -> Result<CUdeviceptr, String> {
+        let _g = self.cc.guard()?;
+        let n_exp = self.n_experts;
+        let top_k = self.top_k;
+        let h = self.hidden;
+        let n_ff = self.moe_ffn;
+        if n_exp == 0 || self.moe_tab.len() < (il + 1) * n_exp * 3 {
+            return Err("moe: 구성/전문가 테이블 미등록".into());
+        }
+        self.ensure_moe_bufs()?;
+        let [s0, s1, _s1b, s2, s3] = self.dchain;
+        // 1) 라우터 — bf16 GEMV(원시 xn) → 로짓 판독 → 호스트 선택.
+        self.plain_gemv_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt)?;
+        let mut lb = vec![0u8; n_exp * 4];
+        self.cc.d2h_async(lb.as_mut_ptr(), self.drt, n_exp * 4)?;
+        self.cc.sync()?;
+        let logits: Vec<f32> = lb
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let sel = moe_topk(&logits, top_k);
+        // 2) 전문가 스트리밍 GEMV — 스테이징 1쌍 재사용(스트림 순서 안전).
+        Self::zero_dev(&self.cc, self.dmo, h * 4)?;
+        for &(e, w) in &sel {
+            let base = (il * n_exp + e) * 3;
+            for (pi, out) in [(0usize, s0), (1usize, s1)] {
+                let entry = self.moe_tab[base + pi];
+                self.expert_gemv(entry, n_ff, h, xn, out)?;
+            }
+            self.ew_dev(s0, s1, s2, n_ff)?;
+            let entry = self.moe_tab[base + 2];
+            self.expert_gemv(entry, h, n_ff, s2, s3)?;
+            self.axpy_dev(w, s3, self.dmo, h)?;
+        }
+        // 3) shared — sigmoid(sgate·xn)·down(silu(gate·xn)·up·xn).
+        if self.shared_ffn > 0 {
+            let sf = self.shared_ffn;
+            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_gate.weight"), xn, s0)?;
+            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_up.weight"), xn, s1)?;
+            self.ew_dev(s0, s1, s2, sf)?;
+            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3)?;
+            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_sgate.weight"), xn, self.drt)?;
+            self.shared_add_dev(self.drt, s3, self.dmo, h)?;
+        }
+        Ok(self.dmo)
     }
 
     /// 노름 1회(디바이스 x·ab) — xn은 self.dxn(다음 노름이 덮는다).
@@ -1663,26 +2121,49 @@ impl W4a16Dec {
         let (w0, w1, w2) = (self.stg_w0, self.stg_w1, self.stg_w2);
         let mut ab = self.dab_dev;
         let mut gi = 0usize;
+        // 플레인 모드(MoE 모델) — GEMV는 bf16(head_bf16), x는 원시 f32
+        // (h2f 왕복 없음 — CPU 플레인 matmul 계약과 동일). FFN은 MoE.
+        let plain = self.plain_weights;
         for il in 0..self.n_layers {
             // 노름이 x32를 융합 기록(cast_x32 노드 제거) — q/k/v(또는 qkv/z) 공유.
-            let x32 = self.ensure_dx32(self.hidden)?;
+            let x32 = if plain {
+                0
+            } else {
+                self.ensure_dx32(self.hidden)?
+            };
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, 1, x32)
                 .map_err(|e| format!("L{il} input norm: {e}"))?;
             let branch = if (il + 1) % 4 == 0 {
-                self.gemv_stage_x32(&format!("blk.{il}.attn_q.weight"), x32, s0, w0)
-                    .map_err(|e| format!("L{il} q: {e}"))?;
-                self.gemv_stage_x32(&format!("blk.{il}.attn_k.weight"), x32, s1, w1)
-                    .map_err(|e| format!("L{il} k: {e}"))?;
-                self.gemv_stage_x32(&format!("blk.{il}.attn_v.weight"), x32, s1b, w1)
-                    .map_err(|e| format!("L{il} v: {e}"))?;
+                if plain {
+                    self.plain_stage_x32(&format!("blk.{il}.attn_q.weight"), xn, s0, w0)
+                        .map_err(|e| format!("L{il} q: {e}"))?;
+                    self.plain_stage_x32(&format!("blk.{il}.attn_k.weight"), xn, s1, w1)
+                        .map_err(|e| format!("L{il} k: {e}"))?;
+                    self.plain_stage_x32(&format!("blk.{il}.attn_v.weight"), xn, s1b, w1)
+                        .map_err(|e| format!("L{il} v: {e}"))?;
+                } else {
+                    self.gemv_stage_x32(&format!("blk.{il}.attn_q.weight"), x32, s0, w0)
+                        .map_err(|e| format!("L{il} q: {e}"))?;
+                    self.gemv_stage_x32(&format!("blk.{il}.attn_k.weight"), x32, s1, w1)
+                        .map_err(|e| format!("L{il} k: {e}"))?;
+                    self.gemv_stage_x32(&format!("blk.{il}.attn_v.weight"), x32, s1b, w1)
+                        .map_err(|e| format!("L{il} v: {e}"))?;
+                }
                 self.attn_chain_dev_run(slot, il / 4, 1, s0, s1, s1b)
                     .map_err(|e| format!("L{il} attn: {e}"))?
             } else {
-                self.gemv_stage_x32(&format!("blk.{il}.attn_qkv.weight"), x32, s0, w0)
-                    .map_err(|e| format!("L{il} qkv: {e}"))?;
-                self.gemv_stage_x32(&format!("blk.{il}.attn_gate.weight"), x32, s1, w1)
-                    .map_err(|e| format!("L{il} z: {e}"))?;
+                if plain {
+                    self.plain_stage_x32(&format!("blk.{il}.attn_qkv.weight"), xn, s0, w0)
+                        .map_err(|e| format!("L{il} qkv: {e}"))?;
+                    self.plain_stage_x32(&format!("blk.{il}.attn_gate.weight"), xn, s1, w1)
+                        .map_err(|e| format!("L{il} z: {e}"))?;
+                } else {
+                    self.gemv_stage_x32(&format!("blk.{il}.attn_qkv.weight"), x32, s0, w0)
+                        .map_err(|e| format!("L{il} qkv: {e}"))?;
+                    self.gemv_stage_x32(&format!("blk.{il}.attn_gate.weight"), x32, s1, w1)
+                        .map_err(|e| format!("L{il} z: {e}"))?;
+                }
                 let g = self
                     .gdn_chain_dev_run(slot, gi, 1, xn, s0, s1)
                     .map_err(|e| format!("L{il} gdn: {e}"))?;
@@ -1694,32 +2175,43 @@ impl W4a16Dec {
             } else {
                 format!("blk.{il}.ssm_out.weight")
             };
-            let (_, _, _, ko) = self.lin_spec(&lo)?;
-            let x32b = self
-                .cast_x32(branch, ko)
-                .map_err(|e| format!("L{il} branch cast: {e}"))?;
-            let out = self
-                .gemv_dev_x32(&lo, x32b)
-                .map_err(|e| format!("L{il} {lo}: {e}"))?;
+            let out = if plain {
+                self.plain_gemv_dev(&lo, branch)
+                    .map_err(|e| format!("L{il} {lo}: {e}"))?
+            } else {
+                let (_, _, _, ko) = self.lin_spec(&lo)?;
+                let x32b = self
+                    .cast_x32(branch, ko)
+                    .map_err(|e| format!("L{il} branch cast: {e}"))?;
+                self.gemv_dev_x32(&lo, x32b)
+                    .map_err(|e| format!("L{il} {lo}: {e}"))?
+            };
             let xn2 = self
                 .norm_resid_dev(2 * il + 1, self.dres, out, 1, x32)
                 .map_err(|e| format!("L{il} post norm: {e}"))?;
-            let x32n = x32; // 노름 융합 기록
-            let _ = xn2;
-            self.gemv_stage_x32(&format!("blk.{il}.ffn_gate.weight"), x32n, s0, w0)
-                .map_err(|e| format!("L{il} gate: {e}"))?;
-            self.gemv_stage_x32(&format!("blk.{il}.ffn_up.weight"), x32n, s1, w1)
-                .map_err(|e| format!("L{il} up: {e}"))?;
-            self.ew_dev(s0, s1, s2, w2)?;
-            let dn = format!("blk.{il}.ffn_down.weight");
-            let (_, _, _, kd) = self.lin_spec(&dn)?;
-            let x32d = self
-                .cast_x32(s2, kd)
-                .map_err(|e| format!("L{il} down cast: {e}"))?;
-            // down은 s3 직접 쓰기 — dy 경유 d2d 제거.
-            self.gemv_launch(&dn, x32d, s3)
-                .map_err(|e| format!("L{il} down: {e}"))?;
-            ab = s3;
+            if plain {
+                // MoE FFN(35B-A3B) — 잔차 ab = MoE 출력(dmo).
+                ab = self
+                    .moe_ffn_dev(il, xn2)
+                    .map_err(|e| format!("L{il} moe: {e}"))?;
+            } else {
+                let x32n = x32; // 노름 융합 기록
+                let _ = xn2;
+                self.gemv_stage_x32(&format!("blk.{il}.ffn_gate.weight"), x32n, s0, w0)
+                    .map_err(|e| format!("L{il} gate: {e}"))?;
+                self.gemv_stage_x32(&format!("blk.{il}.ffn_up.weight"), x32n, s1, w1)
+                    .map_err(|e| format!("L{il} up: {e}"))?;
+                self.ew_dev(s0, s1, s2, w2)?;
+                let dn = format!("blk.{il}.ffn_down.weight");
+                let (_, _, _, kd) = self.lin_spec(&dn)?;
+                let x32d = self
+                    .cast_x32(s2, kd)
+                    .map_err(|e| format!("L{il} down cast: {e}"))?;
+                // down은 s3 직접 쓰기 — dy 경유 d2d 제거.
+                self.gemv_launch(&dn, x32d, s3)
+                    .map_err(|e| format!("L{il} down: {e}"))?;
+                ab = s3;
+            }
             if self.debug_layers {
                 let mut db = vec![0u8; self.hidden * 4];
                 let mut abv = vec![0u8; self.hidden * 4];
@@ -1759,7 +2251,12 @@ impl W4a16Dec {
     /// 곳은 런치 바운드: MoE 전문가 소형 커널(35B-A3B 256×40)·오프로드·
     /// 다중 슬롯 — W4-1에서 데이터 주도 디스패치와 함께 재검한다.
     fn graph_ok(&self) -> bool {
-        llm170_diag::flag::ne0("LLM170_GRAPH") && !self.debug_layers && !self.graph_failed
+        llm170_diag::flag::ne0("LLM170_GRAPH")
+            && !self.debug_layers
+            && !self.graph_failed
+            // MoE는 라우터 로짓 판독(호스트 선택)+전문가 h2d가 있어 캡처 불가 —
+            // 데이터 주도 디스패치(전문가 테이블 상주) 도입 시 재검.
+            && self.n_experts == 0
     }
 
     /// 캡처 전 버퍼 워밍업 — **불변식: 체인에서 지연 할당되는 모든 버퍼는
