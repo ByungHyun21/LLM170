@@ -601,7 +601,58 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     // 행별 T=1 순차와 비트동일, plans/cuda-port.md §1).
                     // greedy 1개는 기존 step_tok_device 기본선(게이트
                     // 무변화), 샘플링 슬롯은 로짓 판이 필요해 단슬롯.
-                    // MTP는 디코더 G4+ 이후(spec_round가 명시 Err).
+                    // P0-3(plans/cuda-models.md §3.2·B9): spec_k>0 그리디
+                    // 슬롯은 MTP 스펙 라운드(hip 분기 미러) — 실패 시
+                    // 단슬롯 폴백.
+                    let (spec_slots, rest): (Vec<usize>, Vec<usize>) =
+                        active.iter().copied().partition(|&i| {
+                            !sampling(&slots[i])
+                                && slots[i]
+                                    .job
+                                    .as_ref()
+                                    .map(|j| j.spec_k.clamp(0, 4))
+                                    .unwrap_or(0)
+                                    > 0
+                                && e.has_mtp()
+                        });
+                    for &i in &spec_slots {
+                        let k = slots[i]
+                            .job
+                            .as_ref()
+                            .map(|j| j.spec_k.clamp(0, 4))
+                            .unwrap_or(0);
+                        match e.spec_round(i, k) {
+                            Ok(toks) => {
+                                let cap = slots[i]
+                                    .job
+                                    .as_ref()
+                                    .map(|j| j.n_predict)
+                                    .unwrap_or(usize::MAX);
+                                for &t in &toks {
+                                    if slots[i].generated as usize >= cap {
+                                        break;
+                                    }
+                                    slot_emit(&mut slots[i], t);
+                                    if t == eos {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("# cuda mtp spec 실패({err}) — 일반 디코드로");
+                                if let Ok(l) = e.decode1(i, slots[i].next) {
+                                    let t = llm170_core::qwen35::greedy(&l);
+                                    slot_emit(&mut slots[i], t);
+                                } else {
+                                    slot_fail(
+                                        &mut slots[i],
+                                        format!("cuda spec+decode1: {err}"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let active = rest;
                     let (batch, solo): (Vec<usize>, Vec<usize>) =
                         active.iter().copied().partition(|&i| !sampling(&slots[i]));
                     // 단슬롯 1스텝 공용 — greedy는 step_tok_device(GPU

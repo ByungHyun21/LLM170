@@ -15,7 +15,7 @@ export LLM170_CUDA_EXL3_FN_CONFIG=${LLM170_CUDA_EXL3_FN_CONFIG:-/tmp/ulw-cuda/fi
 fail=0
 
 if [ ! -x "$PROBE" ]; then
-  rustc --edition 2024 -O scripts/cuda_probe_shim.rs -o "$PROBE" || exit 1
+  rustc --edition 2024 --cfg cuda_probe_shim -O scripts/cuda_probe_shim.rs -o "$PROBE" || exit 1
 fi
 
 run() { # 긍정 프로브 — 영 exit가 PASS

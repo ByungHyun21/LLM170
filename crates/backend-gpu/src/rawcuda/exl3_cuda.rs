@@ -221,6 +221,12 @@ pub struct Exl3CudaDecoder {
     /// ew 작업 버퍼 원소 상한 · argmax 로짓 스테이징 상한(원소 수) — G7.
     pub(crate) ew_cap: usize,
     pub(crate) lg_cap: usize,
+    /// P0-3(plans/cuda-models.md §3.2) spec_round GDN 스냅샷 스크래치 —
+    /// 지연 할당·재사용(부분수용 롤백용, 슬롯 1개분).
+    pub(crate) snap_ring: CUdeviceptr,
+    pub(crate) snap_gst: CUdeviceptr,
+    pub(crate) snap_ring_cap: usize,
+    pub(crate) snap_gst_cap: usize,
 }
 
 // SAFETY: CudaCtx·CUdeviceptr 소유 — 단일 스레드 사용 계약(rawhip
@@ -623,7 +629,7 @@ impl StArchive {
 
     /// plans/cuda-port.md S5: 지정 형상·부동 dtype을 확인한 뒤 원시 텐서를
     /// f32로 확장한다. 프로브의 st_to_f32와 독립된 생산 경로(정수 오인 금지).
-    fn read_f32(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
+    pub(crate) fn read_f32(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
         let entry = self
             .entries
             .get(name)
@@ -1014,6 +1020,10 @@ impl Exl3CudaDecoder {
             attn_t_cap: 0,
             ew_cap: 0,
             lg_cap: 0,
+            snap_ring: 0,
+            snap_gst: 0,
+            snap_ring_cap: 0,
+            snap_gst_cap: 0,
         })
     }
 

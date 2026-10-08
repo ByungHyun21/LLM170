@@ -354,9 +354,8 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     if model_path.is_dir() && gpu_runtime == "hip" && slots.unwrap_or(1) > 1 {
         return usage_err("EXL3 hip 백엔드는 단일 슬롯만 지원 — --slots 1");
     }
-    if model_path.is_dir() && gpu_runtime == "cuda" && spec_k > 0 {
-        return usage_err("EXL3 CUDA 스펙 디코드는 미구현 — --spec 없이 실행");
-    }
+    // P0-3(plans/cuda-models.md §3.2·B9, 2026-10-08): EXL3 CUDA --spec 개방 —
+    // M4 임계 종결(mtp 프로브 ALL PASS) 후 mtp_cuda 배선 완료. 종전 거부 폐지.
     if spec_k > 0 {
         // GPU 스펙 경로 강제 (스레드 기동 전 단일 스레드 시점 env 설정).
         // 안전성: 이 시점은 단일 스레드 (엔진/슬롯 스레드 기동 전).
