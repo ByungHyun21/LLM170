@@ -292,3 +292,24 @@ extern "C" __global__ void w4a16_gemm_g32_bf16(
     const float* __restrict__ x, float* __restrict__ out, int n, int k, int t) {
     gemm_body<5, true>(q, s, x, out, n, k, t);
 }
+
+// ── MoE(W4-1, 35B-A3B) 보조 커널 ──
+// 가중 누적 — y[i] += w·x[i] (mul·add 분리 — CPU MoE 스테이지와 동일 산식).
+extern "C" __global__ void w4a16_axpy(float w, const float* __restrict__ x,
+                                      float* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] += w * x[i];
+    }
+}
+
+// shared 게이트 가산 — y[i] += sigmoid(sg[0])·x[i] (sigmoid = 1/(1+e^-v)).
+extern "C" __global__ void w4a16_shared_add(const float* __restrict__ sg,
+                                            const float* __restrict__ x,
+                                            float* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float s = 1.0f / (1.0f + expf(-sg[0]));
+        y[i] += s * x[i];
+    }
+}

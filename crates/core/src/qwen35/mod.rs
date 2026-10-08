@@ -153,6 +153,22 @@ impl Model {
             .map_err(|e| ModelError::W4a16(e.to_string()))
     }
 
+    /// MoE 전문가 트리플 슬라이스(W4-1) — 서버 GPU 전문가 테이블 구성용.
+    pub fn expert_slice(
+        &self,
+        il: usize,
+        e: usize,
+        proj: &str,
+    ) -> Option<(&[u8], &[u8], usize, usize)> {
+        self.w4.expert_slice(il, e, proj)
+    }
+
+    /// MoE 전문가 양자 파라미터 — (group, scale_bf16) 실측.
+    pub fn expert_quant(&self) -> (usize, bool) {
+        let base = crate::w4a16::W4a16Model::expert_base(0, 0, "gate_proj");
+        (self.w4.group(), self.w4.scale_is_bf16(&base))
+    }
+
     /// MoE 전문가 Weight(W4-1) — 스토어 트리플에서 직접 구성(30k 이름맵 무경유).
     pub fn expert_w(&self, il: usize, e: usize, proj: &str) -> Option<Weight<'_>> {
         let base = crate::w4a16::W4a16Model::expert_base(il, e, proj);

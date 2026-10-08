@@ -32,13 +32,18 @@ impl GpuEngine {
         }
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
+        let moe = hp.n_experts > 0;
         // 1) 선형 상주 — GPU 체인은 원본(HF) 무게(순열은 커널 내부 처리).
-        for name in model.engine_names() {
-            if let Some(w) = model.w_raw(&name)
-                && w.ty == llm170_core::wtype::WType::W4a16Split
-            {
-                let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
-                dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;
+        if moe {
+            upload_moe(&mut dec, &model)?;
+        } else {
+            for name in model.engine_names() {
+                if let Some(w) = model.w_raw(&name)
+                    && w.ty == llm170_core::wtype::WType::W4a16Split
+                {
+                    let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
+                    dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;
+                }
             }
         }
         // 2) 노름 nw [2L+1][hidden] (+1 보정 — f32_vec).
@@ -209,10 +214,15 @@ impl GpuEngine {
             return last.ok_or_else(|| "prefill: 빈 프롬프트".to_string());
         }
         // 청크 크기 오버라이드(진단/폴백): LLM170_PREFILL_T=1이면 토큰 순차.
-        let tmax = llm170_diag::flag::val("LLM170_PREFILL_T")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8)
-            .clamp(1, 8);
+        // MoE 체인은 t=1 경로만(전문가별 GEMM 프리필은 후속).
+        let tmax = if self.dec.is_moe() {
+            1
+        } else {
+            llm170_diag::flag::val("LLM170_PREFILL_T")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(8)
+                .clamp(1, 8)
+        };
         let mut i = 0usize;
         while i < n {
             let t = (n - i).min(tmax);
@@ -286,4 +296,81 @@ impl GpuEngine {
             .replace('Ġ', " ")
             .replace('Ċ', "\n")
     }
+}
+
+/// MoE(35B-A3B) 상주 배선 — 플레인 bf16 업로드 + 전문가 슬라이스 테이블.
+/// GpuEngine·w4a16-gpu 프로브 공용.
+///
+/// SAFETY(전문가 테이블): 항목은 모델 스토어의 mmap 슬라이스 주소다 —
+/// 호출자가 모델을 디코더와 함께 보유하는 수명 계약(디코더가 먼저 drop).
+pub(crate) fn upload_moe(
+    dec: &mut llm170_backend_gpu::W4a16Dec,
+    model: &llm170_core::qwen35::Model,
+) -> Result<(), String> {
+    let hp = model.hp.clone();
+    for name in model.engine_names() {
+        // token_embd(호스트 embed_row)·output(head 전용 업로드)는 체인이
+        // 선형으로 쓰지 않는다 — VRAM 절약(각 ~970MiB @35B).
+        if name == "token_embd.weight" || name == "output.weight" {
+            continue;
+        }
+        if let Some(w) = model.w_raw(&name)
+            && w.ty == llm170_core::wtype::WType::Bf16
+        {
+            dec.upload_plain(&name, w.data, w.n_out as usize, w.n_in as usize)?;
+        }
+    }
+    dec.set_plain_mode(true);
+    let (group, scale_bf16) = model.expert_quant();
+    dec.set_moe(
+        hp.n_experts,
+        hp.top_k,
+        hp.moe_ffn,
+        hp.shared_ffn,
+        group,
+        scale_bf16,
+    );
+    let mut tab: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(hp.n_layer * hp.n_experts * 3);
+    for il in 0..hp.n_layer {
+        for e in 0..hp.n_experts {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                let (q, s, _, _) = model
+                    .expert_slice(il, e, proj)
+                    .ok_or_else(|| format!("전문가 슬라이스 부재: L{il} e{e} {proj}"))?;
+                tab.push((
+                    q.as_ptr() as u64,
+                    q.len() as u64,
+                    s.as_ptr() as u64,
+                    s.len() as u64,
+                ));
+            }
+        }
+    }
+    // 상주 가능(170HX 64GB 등)이면 전문가 전량 VRAM — 토큰당 PCIe 스트리밍 제거.
+    // 판정: 전문가 바이트 + 1GiB 여유. 불가면 스트리밍 테이블(호스트 mmap).
+    let expert_bytes: u64 = tab.iter().map(|e| e.1 + e.3).sum();
+    let free = llm170_backend_gpu::cuda_mem_free()
+        .map(|(f, _)| f)
+        .unwrap_or(0);
+    let resident = match llm170_diag::flag::val("LLM170_MOE_RESIDENT") {
+        Some("0") => false,
+        Some("1") => true,
+        _ => free > expert_bytes + (1 << 30),
+    };
+    eprintln!(
+        "[moe] 전문가 {:.2}GiB · 여유 {:.2}GiB → {}",
+        expert_bytes as f64 / (1u64 << 30) as f64,
+        free as f64 / (1u64 << 30) as f64,
+        if resident {
+            "전량 상주"
+        } else {
+            "호스트 스트리밍"
+        }
+    );
+    if resident {
+        dec.upload_experts_resident(&tab)?;
+    } else {
+        dec.set_expert_table(tab);
+    }
+    Ok(())
 }
