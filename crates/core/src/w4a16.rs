@@ -29,9 +29,6 @@ use std::path::Path;
 
 /// 그룹 크기 계약(quantization_config 실측 — g128).
 pub const GROUP: usize = 128;
-/// 대칭 4bit 중심 zero-point(미저장 — 상수 공급).
-pub const ZP_SYM: u32 = 8;
-
 #[derive(Debug)]
 pub enum W4a16Error {
     Missing(String),
@@ -756,36 +753,6 @@ impl W4a16Model {
         Ok(raw)
     }
 
-    /// 양자화 행 범위 → packed u32(행당 k/8 워드).
-    pub fn packed_rows_u32(&self, base: &str, lo: u64, hi: u64) -> R<Vec<u32>> {
-        let (_, k) = *self
-            .lins
-            .get(base)
-            .ok_or_else(|| W4a16Error::Missing(format!("{base}.weight_packed")))?;
-        let raw = self.read_raw(&format!("{base}.weight_packed"), (k / 8) * 4, lo, hi)?;
-        Ok(raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| u32::from_le_bytes(*c))
-            .collect())
-    }
-
-    /// 양자화 행 범위 → scale u16(행당 k/128 그룹).
-    pub fn scale_rows_u16(&self, base: &str, lo: u64, hi: u64) -> R<Vec<u16>> {
-        let (_, k) = *self
-            .lins
-            .get(base)
-            .ok_or_else(|| W4a16Error::Missing(format!("{base}.weight_scale")))?;
-        let raw = self.read_raw(&format!("{base}.weight_scale"), (k / GROUP) * 2, lo, hi)?;
-        Ok(raw
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_le_bytes(*c))
-            .collect())
-    }
-
     /// 플레인 행 범위 → f32(2D 텐서, F32/BF16/F16).
     pub fn plain_rows_f32(&self, name: &str, lo: u64, hi: u64) -> R<Vec<f32>> {
         let e = self
@@ -823,25 +790,6 @@ impl W4a16Model {
                 )));
             }
         })
-    }
-
-    /// 행 1개 W4A16 내적 — 활성 x는 f16 비트(u16, lane 미러 계약).
-    /// zp=8 상수 공급(sym), scale은 F16 그룹값.
-    pub fn dot_row_f16x(&self, base: &str, row: u64, x: &[u16]) -> R<f32> {
-        let (_, k) = *self
-            .lins
-            .get(base)
-            .ok_or_else(|| W4a16Error::Missing(base.into()))?;
-        if x.len() != k {
-            return Err(W4a16Error::BadTensor(format!(
-                "{base}: x.len={} != k={k}",
-                x.len()
-            )));
-        }
-        let q = self.packed_rows_u32(base, row, row + 1)?;
-        let s = self.scale_rows_u16(base, row, row + 1)?;
-        let z = vec![ZP_SYM; k / GROUP];
-        Ok(crate::quant::dot_row_w4a16_lane(&q, &z, &s, x))
     }
 
     /// GDN V헤드 순열 — llama.cpp(subhead-major) ↔ HF(group-major):

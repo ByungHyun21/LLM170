@@ -2,6 +2,7 @@
 name = "llm170-backend-gpu"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 llm170-diag = { path = "../diag" }

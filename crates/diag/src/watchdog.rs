@@ -1,7 +1,6 @@
 //! watchdog — 진행 스텔 감시.
 //!
-//! `LLM170_WATCHDOG=<sec>`: 백엔드 디스패치마다 `alloc::HEARTBEAT`가
-//! 진동한다. 별도 스레드가 `<sec>` 이상 무진동이면 op 링의 마지막 태그와
+//! `LLM170_WATCHDOG=<sec>`: 백엔드 디스패치마다 `bump()`가 진동한다. 별도 스레드가 `<sec>` 이상 무진동이면 op 링의 마지막 태그와
 //! 최근 기록을 덤프한다. `LLM170_WATCHDOG_FAIL=1`이면 SIGKILL 로 자결 —
 //! 벤치 스크립트가 무한 대기하지 않게 한다.
 //!
@@ -13,7 +12,13 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::alloc::HEARTBEAT;
+/// 진행 심박 — 커널/스텝 진행 지점에서 `bump()`로 증가, 와치독이 감시.
+static HEARTBEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 심박 1회 — 디스패치/스텝 진행 지점에서 호출한다.
+pub fn bump() {
+    HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Clone)]
 pub struct OpMark {

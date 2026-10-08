@@ -1,40 +1,16 @@
-//! dump — `LLM170_DUMP` 통합 진단 덤프 프론트엔드.
+//! dump — `LLM170_DUMP` 통합 진단 키 프론트엔드.
 //!
-//! 콤마 키 목록 하나로 산재한 덤프 플래그를 대체한다:
-//!
-//! ```text
-//! LLM170_DUMP="checksum,rows:L1.gdn_ar;L2.moe_sc,row0full,bufhash,moe"
-//! ```
-//!
-//! (`rows:` 태그 구분은 `;` — 키 구분 `,` 와 충돌 회피)
-//! - `checksum`  — 프레임 체크섬 라인(`[npck]`, 구 LLM170_NP_CHECKSUM)
-//! - `rows:<tags>` — 지정 태그의 행별 비트 표본(`[nprd]`, 구 LLM170_NP_ROWS)
-//! - `row0full` — 태그 버퍼 첫 행 전체 헥스(`[npr0]`, 구 LLM170_NP_ROW0FULL)
-//! - `bufhash`  — 버퍼 FNV 해시(`[npbh]`, 구 LLM170_NP_BUFHASH)
-//! - `moe`      — MoE 그룹 GEMM 입력 해시·덤프
-//!
-//! 107 W2: 위 이름없는 진단 키도 전부 이 공간으로 통합 — `dump::key(k)`
-//! 로 판정(구 개별 env → 소문자 키: frame_time, q4_trace, ck_all,
-//! mtp_stage, ms_dump, np_time, stage_skip, mix_check,
-//! qsa_selcheck, lsum, ... 92개 판독점 흡수).
-//! 1회 파싱(LazyLock) — 런치패스 비용은 원자 판독 1회.
+//! 콤마 키 목록 하나로 진단 스위치를 판정한다:
+//! `LLM170_DUMP="debug_layers,top2,srv_time,wall_time,..."`.
+//! 개별 필드 없는 키는 `dump::key(k)`로 조회(자유 확장).
+//! 1회 파싱(LazyLock) — 판독 비용은 원자 조회 1회.
 
 /// 파싱된 덤프 옵션 — 정적 싱글턴.
 #[derive(Debug, Default)]
 pub struct DumpOpts {
-    pub checksum: bool,
-    pub rows: Vec<String>,
-    pub row0full: bool,
-    pub bufhash: bool,
-    pub moe: bool,
-    /// top2 — greedy 스텝 상위2 토큰·마진 덤프(근접타이 실증용, 107 W1).
+    /// top2 — greedy 스텝 상위2 토큰·마진 덤프(근접타이 실증용).
     pub top2: bool,
-    /// alloc — GPU 버퍼 할당 원장.
-    pub alloc: bool,
-    /// vaddr — 할당 tsv(VA 범위) 증분 기록.
-    pub vaddr: bool,
-    /// 통합 진단 키 집합 — LLM170_DUMP CSV 멤버 전체(개별 필드 없는
-    /// 확장용. 107 W2: 개별 진단 env를 이 키 공간으로 흡수).
+    /// 통합 진단 키 집합 — LLM170_DUMP CSV 멤버 전체.
     keys: std::collections::HashSet<String>,
 }
 
@@ -42,22 +18,6 @@ impl DumpOpts {
     /// 통합 진단 키 조회 — `LLM170_DUMP=key,...` 멤버 판정.
     pub fn key(&self, k: &str) -> bool {
         self.keys.contains(k)
-    }
-
-    /// 값 인자 키 조회 — `LLM170_DUMP=key:arg` 멤버의 arg 반환(A6).
-    /// 값이 필요한 진단(디렉터리·파일 접두·모드 선택: `키:값` 예
-    /// `ms_dump:/tmp/d`)용. 부재 시 None. 인자 없이 `key` 단독이면
-    /// None(값이 필수인 소비자는 단독 키를 무시한다).
-    pub fn key_arg(&self, k: &str) -> Option<&str> {
-        let pfx = format!("{k}:");
-        self.keys
-            .iter()
-            .find_map(|s| Some(s.strip_prefix(&pfx)?.trim()))
-    }
-
-    /// 태그가 rows 지정에 포함되는지.
-    pub fn row_on(&self, tag: &str) -> bool {
-        self.rows.iter().any(|x| x == tag)
     }
 }
 
@@ -68,32 +28,13 @@ static OPTS: std::sync::LazyLock<DumpOpts> = std::sync::LazyLock::new(|| {
     };
     for key in v.split(',') {
         let key = key.trim();
-        // 모든 멤버를 통합 키 집합에 기록 — dump::key(k) 판정용.
-        if !key.is_empty() && !key.starts_with("rows:") {
-            o.keys.insert(key.to_string());
+        if key.is_empty() {
+            continue;
         }
-        if let Some(tags) = key.strip_prefix("rows:") {
-            o.rows = tags
-                .split(';')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect();
-        } else if key == "row0full" {
-            o.row0full = true;
-        } else if key == "bufhash" {
-            o.bufhash = true;
-        } else if key == "moe" {
-            o.moe = true;
-        } else if key == "checksum" {
-            o.checksum = true;
-        } else if key == "top2" {
+        if key == "top2" {
             o.top2 = true;
-        } else if key == "alloc" {
-            o.alloc = true;
-        } else if key == "vaddr" {
-            o.alloc = true;
-            o.vaddr = true;
         }
+        o.keys.insert(key.to_string());
     }
     o
 });
@@ -109,12 +50,9 @@ mod tests {
 
     #[test]
     fn default_off() {
-        // LLM170_DUMP 미설정 환경에서는 전부 꺼져야 한다
-        // (테스트 프로세스가 이 값을 설정하지 않는 한)
+        // LLM170_DUMP 미설정 환경에서는 top2가 꺼져야 한다.
         if std::env::var_os("LLM170_DUMP").is_none() {
-            let o = opts();
-            assert!(!o.checksum && !o.row0full && !o.bufhash && !o.moe);
-            assert!(o.rows.is_empty());
+            assert!(!opts().top2);
         }
     }
 }

@@ -2,6 +2,7 @@
 name = "llm170-server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "llm170"
