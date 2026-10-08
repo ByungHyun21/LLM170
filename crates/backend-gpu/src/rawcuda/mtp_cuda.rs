@@ -900,7 +900,7 @@ impl Exl3CudaMtp {
         };
         let qnw = norm256("mtp.layers.0.self_attn.q_norm.weight")?;
         let knw = norm256("mtp.layers.0.self_attn.k_norm.weight")?;
-        Ok(Self::new(dec, dims, &norms5, &qnw, &knw)?)
+        Self::new(dec, dims, &norms5, &qnw, &knw)
     }
 
     /// h_in 호스트 업로드 스테이징 버퍼(verify 배치 h0 주입용).
