@@ -523,6 +523,80 @@ impl CudaCtx {
 }
 
 /// B6: CUDA 런타임 VRAM 프로브 — 가드 preflight용.
+/// 다중 GPU VRAM 샘플러 — 기동 시 장치별 primary context를 **1회** retain하고
+/// 이후 `cuMemGetInfo`만 반복한다(스크랩마다 retain 금지: refcount 무한 증가 +
+/// 호출 스레드 current ctx 오염 — 모니터링 샘플러 스레드 전용 계약).
+///
+/// 값 의미론: free/total은 **기기 전체** 값 — 이 프로세스 귀속이 아니다
+/// (공유 기기에서는 타 프로세스 포함; 독점 배포 가정).
+pub struct VramSampler {
+    drv: &'static ffi::Driver,
+    ctxs: Vec<ffi::CUcontext>,
+}
+
+// SAFETY: 컨텍스트 핸들은 Send가 아니지만, 이 샘플러는 **단일 스레드**
+// (모니터링 샘플러 스레드)가 소유·사용한다 — retain한 컨텍스트는 프로세스
+// 수명 유지되고, sample()은 current 전환 후 mem_get_info만 한다.
+unsafe impl Send for VramSampler {}
+
+impl VramSampler {
+    /// 전체 CUDA 장치 열거 + primary context retain. 실패 장치는 건너뛴다.
+    pub fn new() -> Option<Self> {
+        let drv = ffi::Driver::get().ok()?;
+        // SAFETY: 프로브 경로 — 장치 열거·컨텍스트 유지(프로세스 수명).
+        unsafe {
+            if (drv.init)(0) != CUDA_SUCCESS {
+                return None;
+            }
+            let mut n: i32 = 0;
+            if (drv.device_get_count)(&mut n) != CUDA_SUCCESS || n <= 0 {
+                return None;
+            }
+            let mut ctxs = Vec::new();
+            for i in 0..n {
+                let mut dev: ffi::CUdevice = 0;
+                if (drv.device_get)(&mut dev, i) != CUDA_SUCCESS {
+                    continue;
+                }
+                let mut ctx: ffi::CUcontext = std::ptr::null_mut();
+                if (drv.device_primary_ctx_retain)(&mut ctx, dev) != CUDA_SUCCESS {
+                    continue;
+                }
+                ctxs.push(ctx);
+            }
+            if ctxs.is_empty() {
+                return None;
+            }
+            Some(VramSampler { drv, ctxs })
+        }
+    }
+
+    pub fn device_count(&self) -> usize {
+        self.ctxs.len()
+    }
+
+    /// 장치별 (free, total) — 실패 장치는 None(게시 측이 0 유지).
+    pub fn sample(&self) -> Vec<Option<(u64, u64)>> {
+        let mut out = Vec::with_capacity(self.ctxs.len());
+        // SAFETY: retain한 컨텍스트로 current 전환 후 mem_get_info.
+        unsafe {
+            for &ctx in &self.ctxs {
+                if (self.drv.ctx_set_current)(ctx) != CUDA_SUCCESS {
+                    out.push(None);
+                    continue;
+                }
+                let (mut f, mut t) = (0usize, 0usize);
+                if (self.drv.mem_get_info)(&mut f, &mut t) != CUDA_SUCCESS {
+                    out.push(None);
+                    continue;
+                }
+                out.push(Some((f as u64, t as u64)));
+            }
+        }
+        out
+    }
+}
+
 /// cuInit → 디바이스 0 프라이머리 컨텍스트 유지 → cuMemGetInfo_v2.
 /// 모듈 로드 없음(가드는 모델 적재 전 단계). 실패 시 None(호출부가 B17 정책
 /// 으로 거부 — Option 계약).

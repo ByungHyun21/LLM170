@@ -147,6 +147,11 @@ pub static SCHED: Sched = Sched {
     ms_prefill: AtomicU64::new(0),
     spec_rounds: AtomicU64::new(0),
     spec_accepted: AtomicU64::new(0),
+    slots_active: AtomicU64::new(0),
+    prompt_tokens: AtomicU64::new(0),
+    gen_tokens: AtomicU64::new(0),
+    requests: AtomicU64::new(0),
+    requests_failed: AtomicU64::new(0),
 };
 pub struct Sched {
     pub jobs: AtomicU64,
@@ -159,6 +164,17 @@ pub struct Sched {
     /// 스펙 라운드 수/수용 토큰 수 계측(수용률 = acc/rounds).
     pub spec_rounds: AtomicU64,
     pub spec_accepted: AtomicU64,
+    // ── 모니터링(2026-10-09) — "최신 누적값"만(히스토리 없음) ──
+    /// 활성 작업 슬롯 수(게이지 — slot_loop가 게시).
+    pub slots_active: AtomicU64,
+    /// 프롬프트 토큰 누적(완료 잡 기준).
+    pub prompt_tokens: AtomicU64,
+    /// 생성 토큰 누적(방출 기준).
+    pub gen_tokens: AtomicU64,
+    /// 배정된 요청 누적.
+    pub requests: AtomicU64,
+    /// 확정 실패 요청 누적.
+    pub requests_failed: AtomicU64,
 }
 impl Sched {
     pub fn summary(&self) -> String {
@@ -216,6 +232,8 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     let npw = llm170_diag::dump::opts().key("wall_time");
     let t0w = std::time::Instant::now();
     let mut last_wt = std::time::Instant::now();
+    // 모니터링 게시 스로틀(≤1Hz — 최신값만, 핫패스 할당 최소화).
+    let mut last_pub = std::time::Instant::now();
     loop {
         // S3: 진행 심박 — 엔진이 멈추면(디코드/프리필 교착) 와치독이 보고한다.
         llm170_diag::watchdog::bump();
@@ -240,6 +258,10 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             };
             // 107 W7: 배정 단일 구현으로 위임(접두 캐시 로직 동일).
             assign_slot(&mut slots, &mut eng, j, tick);
+        }
+        if last_pub.elapsed() >= std::time::Duration::from_millis(900) {
+            last_pub = std::time::Instant::now();
+            publish_slot_views(&slots);
         }
         tick += 1;
         let _it0 = std::time::Instant::now();
@@ -350,8 +372,12 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 );
             }
         }
-        // 유휴 시 차단 수신 — 종료(송신자 전 소멸) 시 루프 탈출
+        // 유휴 시 차단 수신 — 종료(송신자 전 소멸) 시 루프 탈출.
+        // 차단 전 게시(유휴 상태가 마지막 뷰로 굳지 않게 — 실측 결함).
         let busy = slots.iter().any(|s| s.job.is_some());
+        if !busy {
+            publish_slot_views(&slots);
+        }
         if !busy {
             match rx.recv() {
                 Ok(j) => {
@@ -365,10 +391,34 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     eprintln!("{}", SCHED.summary());
 }
 
+/// 모니터링 게시 — 슬롯 뷰 + 활성 수(최신값 덮어쓰기, 히스토리 없음).
+fn publish_slot_views(slots: &[Slot]) {
+    let views: Vec<crate::metrics::SlotView> = slots
+        .iter()
+        .enumerate()
+        .map(|(i, s)| crate::metrics::SlotView {
+            id: i,
+            is_processing: s.job.is_some(),
+            n_prompt_tokens: s.job.as_ref().map(|j| j.tokens.len()).unwrap_or(0),
+            n_prompt_processed: s.prefilled,
+            n_cache: s.cached.len(),
+            n_decoded: s.generated as usize,
+            err_count: s.err_count,
+        })
+        .collect();
+    SCHED.slots_active.store(
+        views.iter().filter(|v| v.is_processing).count() as u64,
+        Ordering::Relaxed,
+    );
+    crate::metrics::publish_slots(views);
+}
+
 /// 슬롯 배정 단일 구현 (107 W7: drain/유휴 이중 복제 통합).
 /// 접두 캐시 최장 일치 슬롯 선택(전 슬롯 대상 — 종전 유휴 경로는
 /// slot0 고정이었음), 재사용 시 reset 생략, 샘플러 시딩 포함.
 fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
+    // 모니터링 — 배정 단일 지점(두 수신 경로 공통).
+    SCHED.requests.fetch_add(1, Ordering::Relaxed);
     SCHED
         .queue_wait_us
         .fetch_add(j.queued.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -449,6 +499,7 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
         && s.job.is_some()
     {
         if let Some(j) = s.job.take() {
+            SCHED.requests_failed.fetch_add(1, Ordering::Relaxed);
             let _ = j.out.send(InferResult {
                 tokens: Vec::new(),
                 error: Some(err),
@@ -472,6 +523,12 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
                 toks.pop();
             }
             toks.truncate(j.n_predict);
+            SCHED
+                .prompt_tokens
+                .fetch_add(j.tokens.len() as u64, Ordering::Relaxed);
+            SCHED
+                .gen_tokens
+                .fetch_add(toks.len() as u64, Ordering::Relaxed);
             let _ = j.out.send(InferResult {
                 tokens: toks.clone(),
                 error: None,
