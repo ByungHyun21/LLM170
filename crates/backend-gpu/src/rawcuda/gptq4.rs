@@ -8,6 +8,35 @@
 use crate::rawcuda::ctx::CudaCtx;
 use std::ffi::c_void;
 
+/// 형상 계약 검사(순수 — GPU 불필요, 단위 테스트 대상).
+/// k ≤ 128*G4_SCMAX(32768)는 t=1 행=블록 GEMV의 smem `sc[G4_SCMAX]` 계약
+/// (assets/gptq4.cu) — 상한 초과는 smem 오버런(UB)이라 호스트에서 거부한다.
+pub fn check_shapes(
+    t: usize,
+    qlen: usize,
+    slen: usize,
+    xlen: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), String> {
+    if !k.is_multiple_of(128)
+        || t == 0
+        || qlen != n * (k / 8)
+        || slen != n * (k / 128)
+        || xlen != t * k
+    {
+        return Err(format!(
+            "gptq4: 형상 계약 위반 q={qlen} s={slen} x={xlen} n={n} k={k} t={t}"
+        ));
+    }
+    if t == 1 && k > 128 * 256 {
+        return Err(format!(
+            "gptq4: t=1 GEMV k 상한 위반 — k={k} > 32768(smem sc 계약)"
+        ));
+    }
+    Ok(())
+}
+
 pub struct Gptq4 {
     cc: CudaCtx,
 }
@@ -90,19 +119,7 @@ impl Gptq4 {
         k: usize,
     ) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
-        if !k.is_multiple_of(128)
-            || t == 0
-            || q.len() != n * (k / 8)
-            || s.len() != n * (k / 128)
-            || x.len() != t * k
-        {
-            return Err(format!(
-                "gptq4: 형상 계약 위반 q={} s={} x={} n={n} k={k} t={t}",
-                q.len(),
-                s.len(),
-                x.len()
-            ));
-        }
+        check_shapes(t, q.len(), s.len(), x.len(), n, k)?;
         let bytes_u32 = |v: &[u32]| unsafe {
             std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v))
         };
@@ -178,5 +195,34 @@ impl Gptq4 {
             let _ = self.cc.free(dx32);
         }
         r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_shapes;
+
+    #[test]
+    fn shapes_accept_g128_contract() {
+        // n=8, k=5120: q=8*640, s=8*40, x=5120 (t=1).
+        assert!(check_shapes(1, 8 * 640, 8 * 40, 5120, 8, 5120).is_ok());
+        // t=8 배치도 같은 계약.
+        assert!(check_shapes(8, 8 * 640, 8 * 40, 8 * 5120, 8, 5120).is_ok());
+    }
+
+    #[test]
+    fn shapes_reject_bad_rank_and_misalignment() {
+        assert!(check_shapes(1, 8 * 640, 8 * 40, 5120, 8, 5121).is_err()); // k % 128
+        assert!(check_shapes(0, 8 * 640, 8 * 40, 0, 8, 5120).is_err()); // t=0
+        assert!(check_shapes(1, 7 * 640, 8 * 40, 5120, 8, 5120).is_err()); // q 크기
+    }
+
+    #[test]
+    fn shapes_reject_k_over_smem_for_gemv_only() {
+        // A5: t=1은 smem 상한(32768), t≥2는 구 GEMM 커널이라 상한 없음.
+        // k=32768(=128*256) 경계 통과, k=32896(한 그룹 초과)은 t=1만 거부.
+        assert!(check_shapes(1, 8 * 4096, 8 * 256, 32768, 8, 32768).is_ok());
+        assert!(check_shapes(1, 8 * 4112, 8 * 257, 32896, 8, 32896).is_err());
+        assert!(check_shapes(2, 8 * 4112, 8 * 257, 2 * 32896, 8, 32896).is_ok());
     }
 }
