@@ -330,6 +330,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut n_predict = 8usize;
     let mut ctx = 1024usize;
     let mut no_head = false;
+    let mut moe_check = false;
     let mut bench: Option<(String, usize, usize)> = None; // (lin, t, reps)
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -359,6 +360,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                     .ok_or("--ctx requires a number")?;
             }
             "--no-head" => no_head = true,
+            "--moe-check" => moe_check = true,
             "--bench-gemm" => {
                 let name = it.next().ok_or("--bench-gemm requires a name")?.clone();
                 let t = it
@@ -500,6 +502,9 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         );
     }
     dec.set_attn(ad, &qnw, &knw)?;
+    if moe_check {
+        return dec.moe_selfcheck();
+    }
     let upload_ms = t0.elapsed().as_secs_f64() * 1e3;
     // 5) 프롬프트 순차 prefill + greedy 생성(head는 CPU 참조 경로).
     let head = model
@@ -612,8 +617,21 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         .map(|t| t.to_string())
         .collect::<Vec<_>>()
         .join(",");
+    // MoE는 플레인(비양자화) 업로드 실측 — dense는 split 선형 수 기반 추정.
+    let plain_gb = if hp.n_experts > 0 {
+        model
+            .engine_names()
+            .iter()
+            .filter(|n| n.as_str() != "token_embd.weight" && n.as_str() != "output.weight")
+            .filter_map(|n| model.w_raw(n))
+            .filter(|w| w.ty == llm170_core::wtype::WType::Bf16)
+            .map(|w| w.data.len() as f64 * 1e-9)
+            .sum::<f64>()
+    } else {
+        n_lin as f64 * 44.6e-3
+    };
     Ok(format!(
-        "w4a16-gpu {dir} — GPU 체인({}{}) · 선형 {n_lin}개 · {:.1}GB급\n  업로드 {upload_ms:.0}ms · 생성 {}토큰 {gen_ms:.0}ms ({:.1}ms/토큰)\n tokens: {csv}",
+        "w4a16-gpu {dir} — GPU 체인({}{}) · {}\n  업로드 {upload_ms:.0}ms · 생성 {}토큰 {gen_ms:.0}ms ({:.1}ms/토큰)\n tokens: {csv}",
         if staged {
             "호스트 스테이징"
         } else {
@@ -624,7 +642,11 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         } else {
             " + CPU head"
         },
-        (n_lin as f64 * 44.6e-3).max(0.0) * 1000.0 / 1000.0,
+        if hp.n_experts > 0 {
+            format!("MoE 플레인 {plain_gb:.1}GB + 전문가 스트리밍/상주")
+        } else {
+            format!("선형 {n_lin}개 · {plain_gb:.1}GB급")
+        },
         out.len(),
         gen_ms / out.len() as f64,
     ))

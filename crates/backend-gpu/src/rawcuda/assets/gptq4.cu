@@ -95,16 +95,15 @@ __device__ __forceinline__ int sidx(int l, int j) {
 // SHIFT = 그룹 로그2(7 = g128, 5 = g32) — 산술 계약은 core
 // dot_row_w4a16_lane_group과 1:1.
 template <int SHIFT, bool BF16>
-__device__ __forceinline__ void gemv_body(
+__device__ __forceinline__ void gemv_row_body(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
     const unsigned short* __restrict__ s,  // [n][k/2^SHIFT] 스케일(f16/bf16 비트)
     const float* __restrict__ x,           // [k] f32 = h2f(f2h(활성))
-    float* __restrict__ out,               // [n]
-    int n,
+    float* __restrict__ out,               // [해당 행 1개]
+    int o,
     int k)
 {
-    const int o = blockIdx.x;
-    if (o >= n) {
+    if (o < 0) {
         return;
     }
     const int l = threadIdx.x;
@@ -159,6 +158,38 @@ __device__ __forceinline__ void gemv_body(
             out[o] = (float)r;
         }
     }
+}
+
+template <int SHIFT, bool BF16>
+__device__ __forceinline__ void gemv_body(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k)
+{
+    const int o = blockIdx.x;
+    if (o >= n) {
+        return;
+    }
+    gemv_row_body<SHIFT, BF16>(q, s, x, out, o, k);
+}
+
+// 전문가 배치 GEMV — 전문가 포인터 테이블(tab, (q,s) 쌍) + 슬롯 인덱스.
+// 테이블 레이아웃 = (il, e, proj) 순서 — 커널 항목 = base + idx[sl]·3
+// (같은 층·proj의 전문가). xstride: 게이트/업은 0(x 공통 브로드캐스트),
+// 다운은 k(슬롯별 활성 — x = [nslots][k]). grid = n × nslots(블록 = (행,슬롯)),
+// out = [nslots][n]. 상주 전용(스트리밍은 호스트 h2d 경로).
+extern "C" __global__ void w4a16_gemv_experts_g32_bf16(
+    const unsigned long long* __restrict__ tab, int base,
+    const int* __restrict__ idx, int nslots,
+    const float* __restrict__ x, int xstride, float* __restrict__ out, int n, int k)
+{
+    const int sl = blockIdx.x / n;
+    if (sl >= nslots) {
+        return;
+    }
+    const int o = blockIdx.x - sl * n;
+    const unsigned long long* e = tab + (size_t)(base + idx[sl] * 3) * 2;
+    gemv_row_body<5, true>((const unsigned*)e[0], (const unsigned short*)e[1],
+                           x + (size_t)sl * xstride, out + (size_t)sl * n, o, k);
 }
 
 // t=1 GEMV 래퍼 — g128·f16(27B) / g32·bf16(35B 전문가).
@@ -294,12 +325,63 @@ extern "C" __global__ void w4a16_gemm_g32_bf16(
 }
 
 // ── MoE(W4-1, 35B-A3B) 보조 커널 ──
+// 플레인 bf16 GEMV — 행=블록(64레인), 레인 l = i=l,l+64,… f32 누산 → tree64.
+// split 커널과 동일한 레인·환원 구조(플레인 경로 판정은 토큰 수준 — 골든).
+// w는 [n][k] 행 우선(업로드 원본 그대로 — 전치 없음).
+extern "C" __global__ void w4a16_gemv_bf16(
+    const unsigned short* __restrict__ w,  // [n][k] bf16
+    const float* __restrict__ x,           // [k] f32
+    float* __restrict__ out,               // [n]
+    int n, int k)
+{
+    const int o = blockIdx.x;
+    if (o >= n) {
+        return;
+    }
+    const int l = threadIdx.x;
+    __shared__ double red[G4_LANES];
+    const unsigned short* wrow = w + (size_t)o * k;
+    float acc = 0.0f;
+    for (int i = l; i < k; i += G4_LANES) {
+        acc += b2f(wrow[i]) * x[i];
+    }
+    red[l] = (double)acc;
+    __syncthreads();
+    if (l < 32) {
+        double r = red[l] + red[l + 32];
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(r, off);
+            if (l < off) {
+                r += oth;
+            }
+        }
+        if (l == 0) {
+            out[o] = (float)r;
+        }
+    }
+}
+
 // 가중 누적 — y[i] += w·x[i] (mul·add 분리 — CPU MoE 스테이지와 동일 산식).
 extern "C" __global__ void w4a16_axpy(float w, const float* __restrict__ x,
                                       float* __restrict__ y, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         y[i] += w * x[i];
+    }
+}
+
+// 전문가 가중 누적 — y[i] += Σ_s w[s]·d[s][i] (선택 순서 가산 — CPU 미러).
+extern "C" __global__ void w4a16_moe_accum(const float* __restrict__ w,
+                                           const float* __restrict__ d,
+                                           float* __restrict__ y, int nslots, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float acc = y[i];
+        for (int s = 0; s < nslots; ++s) {
+            acc += w[s] * d[(size_t)s * n + i];
+        }
+        y[i] = acc;
     }
 }
 
