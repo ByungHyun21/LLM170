@@ -22,6 +22,9 @@ pub type CUcontext = *mut c_void;
 pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 pub type CUstream = *mut c_void;
+/// CUgraph/CUgraphExec — 그래프 캡처 핸들(불투명).
+pub type CUgraph = *mut c_void;
+pub type CUgraphExec = *mut c_void;
 
 /// CUresult — 드라이버 API 반환 코드(0 = CUDA_SUCCESS).
 pub type CUresult = c_uint;
@@ -84,6 +87,33 @@ pub type CuMemcpyDtoDAsyncFn = unsafe extern "system" fn(
     bytes: usize,
     stream: CUstream,
 ) -> CUresult;
+/// cuStreamCreate — 실스트림 생성(그래프 캡처 전제 — 레거시 0은 캡처 불가).
+pub type CuStreamCreateFn =
+    unsafe extern "system" fn(ph_stream: *mut CUstream, flags: c_uint) -> CUresult;
+/// cuMemHostAlloc — pinned 호스트 메모리(캡처 가능한 async 복사 소스/목적).
+pub type CuMemHostAllocFn =
+    unsafe extern "system" fn(pp: *mut *mut c_void, bytes: usize, flags: c_uint) -> CUresult;
+pub type CuMemFreeHostFn = unsafe extern "system" fn(p: *mut c_void) -> CUresult;
+/// cuMemcpyDtoHAsync_v2 — 캡처 가능한 비동기 판독(pinned 목적지).
+pub type CuMemcpyDtoHAsyncFn = unsafe extern "system" fn(
+    dst: *mut c_void,
+    src: CUdeviceptr,
+    bytes: usize,
+    stream: CUstream,
+) -> CUresult;
+/// cuStreamBeginCapture — 모드: 0=GLOBAL, 1=THREAD_LOCAL, 2=RELAXED.
+pub type CuStreamBeginCaptureFn =
+    unsafe extern "system" fn(stream: CUstream, mode: c_uint) -> CUresult;
+pub type CuStreamEndCaptureFn =
+    unsafe extern "system" fn(stream: CUstream, ph_graph: *mut CUgraph) -> CUresult;
+/// cuGraphInstantiateWithFlags — 실행 핸들 생성(flags=0).
+pub type CuGraphInstantiateWithFlagsFn =
+    unsafe extern "system" fn(ph_exec: *mut CUgraphExec, graph: CUgraph, flags: u64) -> CUresult;
+pub type CuGraphLaunchFn =
+    unsafe extern "system" fn(exec: CUgraphExec, stream: CUstream) -> CUresult;
+pub type CuGraphExecDestroyFn = unsafe extern "system" fn(exec: CUgraphExec) -> CUresult;
+pub type CuGraphDestroyFn = unsafe extern "system" fn(graph: CUgraph) -> CUresult;
+
 pub type CuLaunchKernelFn = unsafe extern "system" fn(
     f: CUfunction,
     gx: c_uint,
@@ -127,6 +157,16 @@ pub(crate) struct Driver {
     pub memcpy_dtod_async: CuMemcpyDtoDAsyncFn,
     pub launch_kernel: CuLaunchKernelFn,
     pub stream_synchronize: CuStreamSynchronizeFn,
+    pub stream_create: CuStreamCreateFn,
+    pub mem_host_alloc: CuMemHostAllocFn,
+    pub mem_free_host: CuMemFreeHostFn,
+    pub memcpy_dtoh_async: CuMemcpyDtoHAsyncFn,
+    pub stream_begin_capture: CuStreamBeginCaptureFn,
+    pub stream_end_capture: CuStreamEndCaptureFn,
+    pub graph_instantiate: CuGraphInstantiateWithFlagsFn,
+    pub graph_launch: CuGraphLaunchFn,
+    pub graph_exec_destroy: CuGraphExecDestroyFn,
+    pub graph_destroy: CuGraphDestroyFn,
     pub mem_free: CuMemFreeFn,
 
     /// cuMemGetInfo_v2 — 가드 VRAM 프로브(B6).
@@ -202,6 +242,36 @@ impl Driver {
                 stream_synchronize: std::mem::transmute::<*mut c_void, CuStreamSynchronizeFn>(
                     sym!("cuStreamSynchronize"),
                 ),
+                stream_create: std::mem::transmute::<*mut c_void, CuStreamCreateFn>(sym!(
+                    "cuStreamCreate"
+                )),
+                mem_host_alloc: std::mem::transmute::<*mut c_void, CuMemHostAllocFn>(sym!(
+                    "cuMemHostAlloc"
+                )),
+                mem_free_host: std::mem::transmute::<*mut c_void, CuMemFreeHostFn>(sym!(
+                    "cuMemFreeHost"
+                )),
+                memcpy_dtoh_async: std::mem::transmute::<*mut c_void, CuMemcpyDtoHAsyncFn>(sym!(
+                    "cuMemcpyDtoHAsync_v2"
+                )),
+                stream_begin_capture: std::mem::transmute::<*mut c_void, CuStreamBeginCaptureFn>(
+                    sym!("cuStreamBeginCapture"),
+                ),
+                stream_end_capture: std::mem::transmute::<*mut c_void, CuStreamEndCaptureFn>(sym!(
+                    "cuStreamEndCapture"
+                )),
+                graph_instantiate: std::mem::transmute::<*mut c_void, CuGraphInstantiateWithFlagsFn>(
+                    sym!("cuGraphInstantiateWithFlags"),
+                ),
+                graph_launch: std::mem::transmute::<*mut c_void, CuGraphLaunchFn>(sym!(
+                    "cuGraphLaunch"
+                )),
+                graph_exec_destroy: std::mem::transmute::<*mut c_void, CuGraphExecDestroyFn>(sym!(
+                    "cuGraphExecDestroy"
+                )),
+                graph_destroy: std::mem::transmute::<*mut c_void, CuGraphDestroyFn>(sym!(
+                    "cuGraphDestroy"
+                )),
                 mem_free: std::mem::transmute::<*mut c_void, CuMemFreeFn>(sym!("cuMemFree_v2")),
                 func_set_attribute: std::mem::transmute::<*mut c_void, CuFuncSetAttributeFn>(sym!(
                     "cuFuncSetAttribute"

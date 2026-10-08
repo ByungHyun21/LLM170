@@ -15,7 +15,7 @@
 //! 전 슬롯 공유 — 커널 layer 인덱스를 오염시키지 않는다.
 
 use crate::rawcuda::ctx::CudaCtx;
-use crate::rawcuda::ffi::CUdeviceptr;
+use crate::rawcuda::ffi::{self, CUdeviceptr};
 use std::collections::HashMap;
 
 /// fwd3s T 상한(assets/attn.cu ATTN_TMAX와 동일 값).
@@ -222,6 +222,21 @@ pub struct W4a16Dec {
     head_n: usize,
     head_k: usize,
     head_out: CUdeviceptr,
+    // ── CUDA Graph(체인 캡처 — 토큰당 1 launch) ──
+    graph_exec: ffi::CUgraphExec,
+    graph_handle: ffi::CUgraph,
+    /// 캡처된 슬롯(usize::MAX = 없음).
+    graph_slot: usize,
+    /// 캡처에 head 포함 여부(모드 전환 시 재캡처).
+    graph_head: bool,
+    /// 캡처 실패 후 직접 경로 고정(매 토큰 재시도 방지).
+    graph_failed: bool,
+    /// 캡처 중 임베딩 복사 소스를 pinned로 고정(캡처는 pageable async 불가).
+    capture_pinned_src: bool,
+    pin_embed: *mut std::ffi::c_void,
+    pin_pos: *mut std::ffi::c_void,
+    pin_out: *mut std::ffi::c_void,
+    pin_out_len: usize,
     /// 층별 잔차 합 덤프(CPU LLM170_DUMP=debug_layers와 대조용).
     pub debug_layers: bool,
 }
@@ -385,6 +400,16 @@ impl W4a16Dec {
             head_n: 0,
             head_k: 0,
             head_out: 0,
+            graph_exec: std::ptr::null_mut(),
+            graph_handle: std::ptr::null_mut(),
+            graph_slot: usize::MAX,
+            graph_head: false,
+            graph_failed: false,
+            capture_pinned_src: false,
+            pin_embed: std::ptr::null_mut(),
+            pin_pos: std::ptr::null_mut(),
+            pin_out: std::ptr::null_mut(),
+            pin_out_len: 0,
             debug_layers: false,
         })
     }
@@ -993,6 +1018,11 @@ impl W4a16Dec {
         if self.dpp == 0 || slot >= self.n_slots {
             return Err("attn: pp 미할당/슬롯 범위".into());
         }
+        if self.capture_pinned_src {
+            // 캡처 중: dpp 갱신은 replay 전 1회(그래프 밖·같은 스트림)로 옮긴다 —
+            // 캡처 중 스택 임시를 소스로 잡으면 replay에서 무효 주소가 된다.
+            return Ok(());
+        }
         // 비동기 — 층마다 동기 H2D를 걸면 스트림이 매번 배수된다(층당 8ms 실측).
         self.cc
             .h2d_async(self.dpp + (slot as u64) * 4, &pos.to_le_bytes())
@@ -1494,8 +1524,13 @@ impl W4a16Dec {
             return Err("forward_device: 디코더 상수 미등록".into());
         }
         self.ensure_chain_bufs()?;
-        let row =
-            unsafe { std::slice::from_raw_parts(embed_row.as_ptr() as *const u8, self.hidden * 4) };
+        let row = if self.capture_pinned_src {
+            // 캡처 중: pageable async 복사는 캡처 불가 — pinned 버퍼를 소스로
+            // 기록하고 replay가 실행 직전에 내용을 채운다.
+            unsafe { std::slice::from_raw_parts(self.pin_embed as *const u8, self.hidden * 4) }
+        } else {
+            unsafe { std::slice::from_raw_parts(embed_row.as_ptr() as *const u8, self.hidden * 4) }
+        };
         self.cc.h2d_async(self.dres, row)?;
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let (w0, w1, w2) = (self.stg_w0, self.stg_w1, self.stg_w2);
@@ -1573,11 +1608,171 @@ impl W4a16Dec {
         Ok(xn_final)
     }
 
+    // ── CUDA Graph(체인 캡처 — P1) ──
+
+    /// 그래프 모드 가능 여부 — **옵트인**(LLM170_GRAPH=1). 캡처 실패 후에는
+    /// 직접 경로 고정(매 토큰 재시도 방지). debug_layers는 캡처 중 d2h/sync를
+    /// 하므로 그래프 불가.
+    ///
+    /// [실측 2026-10-08, 27B·4090] 밀집 디코드에서는 **중립**이다:
+    /// 그래프 39.9 vs 직접 40.8 ms/토큰(n=24) — 호스트 enqueue 12ms가 이미
+    /// GPU 36ms 아래에 숨어 있어 붕괴할 대상이 없다. 그래프가 값을 하는 것은
+    /// **런치 바운드** 워크로드다: MoE 전문가별 소형 커널(35B-A3B: 256×40),
+    /// RAM/SSD 오프로드(소형 커널+복사 다발), 빠른 GPU의 다중 슬롯 디코드.
+    /// W4-1 착수 시 기본 ON 전환을 재검한다.
+    fn graph_ok(&self) -> bool {
+        llm170_diag::flag::eq1("LLM170_GRAPH") && !self.debug_layers && !self.graph_failed
+    }
+
+    /// 그래프 준비(슬롯·head 모드별 1회) — 버퍼 워밍업 → 캡처 → 인스턴스화.
+    /// 캡처 중 금지 API(동기 복사·alloc)를 배제하기 위해 ensure_*를 선행한다.
+    fn ensure_graph(&mut self, slot: usize, head: bool) -> Result<(), String> {
+        if !self.graph_exec.is_null() && self.graph_slot == slot && self.graph_head == head {
+            return Ok(());
+        }
+        if !self.graph_exec.is_null() {
+            // 슬롯/모드 전환 — 이전 그래프 폐기 후 재캡처.
+            self.cc.graph_destroy(self.graph_exec, self.graph_handle)?;
+            self.graph_exec = std::ptr::null_mut();
+            self.graph_handle = std::ptr::null_mut();
+            self.graph_slot = usize::MAX;
+        }
+        // 1) 버퍼 워밍업(alloc·zero_dev는 캡처 밖에서만 — 캡처 중 cuMemAlloc은
+        // 금지 API라 드라이버 내부 크래시(instantiate SIGSEGV)를 유발한다).
+        self.ensure_chain_bufs()?;
+        self.ensure_norm_bufs(1)?;
+        self.ensure_gdn_bufs(1)?;
+        self.ensure_attn_bufs(1)?;
+        // gemv_dev 캐시(dx32/dy)는 지연 할당 — 선형 전수 최대치로 워밍.
+        let (mut mk, mut mn) = (0usize, 0usize);
+        for &(_, _, n, k) in self.lins.values() {
+            mk = mk.max(k);
+            mn = mn.max(n);
+        }
+        if mk > self.dx32_cap {
+            if self.dx32 != 0 {
+                self.cc.free(self.dx32)?;
+            }
+            self.dx32 = self.cc.alloc(mk * 4)?;
+            self.dx32_cap = mk;
+        }
+        if mn > self.y_cap {
+            if self.dy != 0 {
+                self.cc.free(self.dy)?;
+            }
+            self.dy = self.cc.alloc(mn * 4)?;
+            self.y_cap = mn;
+        }
+        // 2) 실스트림·pinned 1회 준비.
+        if self.pin_embed.is_null() {
+            self.cc.create_stream()?;
+            self.pin_embed = self.cc.pinned_alloc(self.hidden * 4)?;
+            self.pin_pos = self.cc.pinned_alloc(self.n_slots * 4)?;
+        }
+        let out_len = if head {
+            self.head_n * 4
+        } else {
+            self.hidden * 4
+        };
+        if self.pin_out.is_null() || self.pin_out_len < out_len {
+            if !self.pin_out.is_null() {
+                let _ = self.cc.pinned_free(self.pin_out);
+            }
+            self.pin_out = self.cc.pinned_alloc(out_len)?;
+            self.pin_out_len = out_len;
+        }
+        // 3) 캡처(실행 없음 — 기록만).
+        self.cc.capture_begin()?;
+        self.capture_pinned_src = true;
+        let cap = (|| -> Result<(), String> {
+            let row = vec![0f32; self.hidden]; // 내용 무의미(캡처는 실행 아님).
+            let xn = self.chain_device(slot, &row)?;
+            if head {
+                let f = self.cc.function("head_bf16")?;
+                let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn, self.head_out);
+                let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
+                let mut args: [*mut std::ffi::c_void; 5] = [
+                    (&mut p_w) as *mut _ as *mut _,
+                    (&mut p_x) as *mut _ as *mut _,
+                    (&mut p_o) as *mut _ as *mut _,
+                    (&mut p_n) as *mut _ as *mut _,
+                    (&mut p_k) as *mut _ as *mut _,
+                ];
+                self.cc
+                    .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
+                self.cc
+                    .d2h_async(self.pin_out as *mut u8, self.head_out, self.head_n * 4)?;
+            } else {
+                self.cc
+                    .d2h_async(self.pin_out as *mut u8, xn, self.hidden * 4)?;
+            }
+            Ok(())
+        })();
+        self.capture_pinned_src = false;
+        if let Err(e) = cap {
+            let _ = self.cc.capture_end(); // 캡처 상태 정리(그래프 폐기).
+            return Err(format!("캡처 본문: {e}"));
+        }
+        let g = self.cc.capture_end()?;
+        let e = self.cc.graph_instantiate(g)?;
+        self.graph_handle = g;
+        self.graph_exec = e;
+        self.graph_slot = slot;
+        self.graph_head = head;
+        Ok(())
+    }
+
+    /// 그래프 replay — pinned 입력 기입 → dpp 1회 갱신 → launch 1회 → sync →
+    /// pinned 출력 회수. 반환: head 모드면 로짓, 아니면 xn.
+    fn graph_replay(&mut self, slot: usize, embed_row: &[f32]) -> Result<Vec<f32>, String> {
+        let pos = self.slot_pos[slot];
+        // SAFETY: pinned 버퍼는 hidden*4/n_slots*4 크기 계약(ensure_graph 할당).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                embed_row.as_ptr() as *const u8,
+                self.pin_embed as *mut u8,
+                self.hidden * 4,
+            );
+            std::ptr::copy_nonoverlapping(
+                pos.to_le_bytes().as_ptr(),
+                (self.pin_pos as *mut u8).add(slot * 4),
+                4,
+            );
+        }
+        // dpp 갱신은 그래프 밖·같은 스트림(그래프보다 먼저 실행 — 순서 보장).
+        let posb =
+            unsafe { std::slice::from_raw_parts(self.pin_pos as *const u8, self.n_slots * 4) };
+        self.cc
+            .h2d_async(self.dpp + (slot as u64) * 4, &posb[slot * 4..slot * 4 + 4])?;
+        self.cc.graph_launch(self.graph_exec)?;
+        self.cc.sync()?;
+        let out =
+            unsafe { std::slice::from_raw_parts(self.pin_out as *const f32, self.pin_out_len / 4) };
+        let v = out.to_vec();
+        self.slot_pos[slot] = pos + 1;
+        Ok(v)
+    }
+
     /// 1토큰 forward(디바이스 체인) — 최종 xn까지 판독(CPU head용).
     /// guard는 래퍼 전체를 덮는다 — 체인 이후의 d2h/h2d도 같은 스레드
     /// 컨텍스트가 필요하다(CtxGuard는 드랍 시 이전 컨텍스트로 복원).
     pub fn forward_device(&mut self, slot: usize, embed_row: &[f32]) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
+        if self.graph_ok() {
+            match self
+                .ensure_graph(slot, false)
+                .and_then(|()| self.graph_replay(slot, embed_row))
+            {
+                Ok(xn) => {
+                    llm170_diag::fp::fp_record("gpu.xn", &xn);
+                    return Ok(xn);
+                }
+                Err(e) => {
+                    eprintln!("[graph] xn 경로 실패 — 직접 경로 폴백: {e}");
+                    self.graph_failed = true;
+                }
+            }
+        }
         let pos = self.slot_pos[slot];
         let xn_final = self.chain_device(slot, embed_row)?;
         let mut ob = vec![0u8; self.hidden * 4];
@@ -1641,6 +1836,21 @@ impl W4a16Dec {
             return Err("forward_device_head: head 미등록 — upload_head 선행".into());
         }
         let _g = self.cc.guard()?;
+        if self.graph_ok() {
+            match self
+                .ensure_graph(slot, true)
+                .and_then(|()| self.graph_replay(slot, embed_row))
+            {
+                Ok(lg) => {
+                    llm170_diag::fp::fp_record("gpu.logits", &lg);
+                    return Ok(lg);
+                }
+                Err(e) => {
+                    eprintln!("[graph] head 경로 실패 — 직접 경로 폴백: {e}");
+                    self.graph_failed = true;
+                }
+            }
+        }
         let pos = self.slot_pos[slot];
         let xn = self.chain_device(slot, embed_row)?;
         let f = self.cc.function("head_bf16")?;
