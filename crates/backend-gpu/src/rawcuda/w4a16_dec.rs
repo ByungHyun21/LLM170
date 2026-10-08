@@ -188,6 +188,8 @@ pub struct W4a16Dec {
     plain_weights: bool,
     /// 상주 가중치 바이트 합(모니터링 — 업로드 시 누적, 재업로드 없음 계약).
     weights_bytes: u64,
+    /// 전문가 테이블 바이트 합(불변 — 1Hz 집계의 O(92k) 반복 제거).
+    experts_bytes: u64,
     /// MoE 구성 — n_experts=0이면 dense FFN.
     n_experts: usize,
     top_k: usize,
@@ -423,6 +425,7 @@ impl W4a16Dec {
             plains: HashMap::new(),
             plain_weights: false,
             weights_bytes: 0,
+            experts_bytes: 0,
             n_experts: 0,
             top_k: 0,
             moe_ffn: 0,
@@ -1729,7 +1732,7 @@ impl W4a16Dec {
                     * 4
             })
             .unwrap_or(0);
-        let experts: u64 = self.moe_tab.iter().map(|e| e.1 + e.3).sum();
+        let experts = self.experts_bytes;
         let (w_gpu, w_cpu) = if self.n_experts > 0 && !self.moe_resident {
             (self.weights_bytes, experts)
         } else {
@@ -1742,7 +1745,7 @@ impl W4a16Dec {
     /// 상주 모드 = 상주 가중치 − 미선택 전문가(전문가 크기 균일 — 평균이 정확).
     /// 스트리밍 모드 = 상주 가중치(전문가는 별도 CPU 오프로드로 집계).
     pub fn active_weight_bytes(&self) -> u64 {
-        let experts: u64 = self.moe_tab.iter().map(|e| e.1 + e.3).sum();
+        let experts = self.experts_bytes;
         if self.n_experts > 0 && self.moe_resident {
             let unsel = experts / self.n_experts as u64 * (self.n_experts - self.top_k) as u64;
             self.weights_bytes.saturating_sub(unsel)
@@ -1793,6 +1796,7 @@ impl W4a16Dec {
     /// 전문가 슬라이스 테이블 등록 — (packed ptr/len, scale ptr/len) × (il,e,proj).
     /// 포인터는 서버 스토어 mmap 슬라이스 — 서버가 모델을 함께 보유하는 수명 계약.
     pub fn set_expert_table(&mut self, tab: Vec<(u64, u64, u64, u64)>) {
+        self.experts_bytes = tab.iter().map(|e| e.1 + e.3).sum();
         self.moe_tab = tab;
     }
 
@@ -1957,7 +1961,8 @@ impl W4a16Dec {
         }
         self.moe_dev_tab = dtab;
         self.moe_tab = dev_tab;
-        self.weights_bytes += host_tab.iter().map(|e| e.1 + e.3).sum::<u64>();
+        self.experts_bytes = host_tab.iter().map(|e| e.1 + e.3).sum();
+        self.weights_bytes += self.experts_bytes;
         self.moe_resident = true;
         Ok(())
     }
