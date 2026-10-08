@@ -6,7 +6,7 @@
 
 pub mod rawcuda;
 
-pub use rawcuda::ctx::VramSampler;
+pub use rawcuda::ctx::{DeviceCaps, VramSampler};
 pub use rawcuda::gptq4::Gptq4;
 pub use rawcuda::gptq4::h2f;
 pub use rawcuda::w4a16_dec::{AttnDims, GdnDims, W4a16Dec, f32_to_f16};

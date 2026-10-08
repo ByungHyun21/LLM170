@@ -120,6 +120,34 @@ pub enum Engine {
 }
 
 impl Engine {
+    /// 메모리 분류(모니터링) — (가중치, KV, CPU 오프로드, PLE 오프로드).
+    pub fn mem_stats(&self) -> (u64, u64, u64, u64) {
+        match self {
+            Engine::Gpu(e) => e.mem_stats(),
+        }
+    }
+
+    /// 토큰당 활성 가중치 바이트(실효 대역폭 계산용).
+    pub fn active_weight_bytes(&self) -> u64 {
+        match self {
+            Engine::Gpu(e) => e.active_weight_bytes(),
+        }
+    }
+
+    /// MoE 배치 모드 — "none" | "resident" | "streaming".
+    pub fn moe_mode(&self) -> &'static str {
+        match self {
+            Engine::Gpu(e) => e.moe_mode(),
+        }
+    }
+
+    /// 복사 계측 — [h2d, d2h, d2d] × (바이트, ns, 호출).
+    pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
+        match self {
+            Engine::Gpu(e) => e.copy_stats(),
+        }
+    }
+
     /// 정지 토큰(F5 — 하드코드 248044 일반화): Q35는 아키텍처 상수.
     pub fn eos(&self) -> u32 {
         match self {

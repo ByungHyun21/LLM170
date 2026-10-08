@@ -186,6 +186,8 @@ pub struct W4a16Dec {
     plains: HashMap<String, (CUdeviceptr, usize, usize)>,
     /// 플레인 모드(체인 분기 — 전문가 외 전부 bf16인 모델).
     plain_weights: bool,
+    /// 상주 가중치 바이트 합(모니터링 — 업로드 시 누적, 재업로드 없음 계약).
+    weights_bytes: u64,
     /// MoE 구성 — n_experts=0이면 dense FFN.
     n_experts: usize,
     top_k: usize,
@@ -420,6 +422,7 @@ impl W4a16Dec {
             lins: HashMap::new(),
             plains: HashMap::new(),
             plain_weights: false,
+            weights_bytes: 0,
             n_experts: 0,
             top_k: 0,
             moe_ffn: 0,
@@ -591,6 +594,7 @@ impl W4a16Dec {
             let _ = self.cc.free(ds);
             return Err(e);
         }
+        self.weights_bytes += (q.len() + s.len()) as u64;
         if let Some((oq, os, _, _)) = self.lins.insert(name.to_string(), (dq, ds, n, k)) {
             let _ = self.cc.free(oq);
             let _ = self.cc.free(os);
@@ -1696,6 +1700,7 @@ impl W4a16Dec {
             let _ = self.cc.free(dw);
             return Err(e);
         }
+        self.weights_bytes += need as u64;
         if let Some((old, _, _)) = self.plains.insert(name.to_string(), (dw, n, k)) {
             let _ = self.cc.free(old);
         }
@@ -1705,6 +1710,61 @@ impl W4a16Dec {
     /// 플레인 모드 전환(전문가 외 전부 bf16인 MoE 모델).
     pub fn set_plain_mode(&mut self, on: bool) {
         self.plain_weights = on;
+    }
+
+    /// 메모리 분류(모니터링) — 모델이 시스템을 어떻게 쓰는지.
+    /// 반환: (VRAM 가중치, VRAM KV, CPU 오프로드 가중치, CPU PLE).
+    /// - 가중치: 업로드 누적(weights_bytes — 로드 후 불변). 스트리밍 모드에서
+    ///   전문가는 VRAM에 없고 호스트(mmAP 페이지 캐시)에서 토큰별로 올린다.
+    /// - KV: 어텐션 캐시 2벌(K+V) f32 — 전량 VRAM(현행 KV 오프로드 없음).
+    /// - PLE: 미구현(W4-2) — 항상 0.
+    pub fn mem_stats(&self) -> (u64, u64, u64, u64) {
+        let kv = self
+            .attn
+            .map(|d| {
+                2 * (self.n_slots as u64)
+                    * (d.n_attn as u64)
+                    * (d.cap as u64)
+                    * (d.kv_dim() as u64)
+                    * 4
+            })
+            .unwrap_or(0);
+        let experts: u64 = self.moe_tab.iter().map(|e| e.1 + e.3).sum();
+        let (w_gpu, w_cpu) = if self.n_experts > 0 && !self.moe_resident {
+            (self.weights_bytes, experts)
+        } else {
+            (self.weights_bytes, 0)
+        };
+        (w_gpu, kv, w_cpu, 0)
+    }
+
+    /// 토큰당 활성 가중치 바이트(모니터링 — 실효 대역폭 계산용).
+    /// 상주 모드 = 상주 가중치 − 미선택 전문가(전문가 크기 균일 — 평균이 정확).
+    /// 스트리밍 모드 = 상주 가중치(전문가는 별도 CPU 오프로드로 집계).
+    pub fn active_weight_bytes(&self) -> u64 {
+        let experts: u64 = self.moe_tab.iter().map(|e| e.1 + e.3).sum();
+        if self.n_experts > 0 && self.moe_resident {
+            let unsel = experts / self.n_experts as u64 * (self.n_experts - self.top_k) as u64;
+            self.weights_bytes.saturating_sub(unsel)
+        } else {
+            self.weights_bytes
+        }
+    }
+
+    /// 복사 계측(모니터링) — [h2d, d2h, d2d] × (바이트, ns, 호출).
+    pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
+        self.cc.copy_stats()
+    }
+
+    /// MoE 배치 모드 문자열(모니터링) — "none" | "resident" | "streaming".
+    pub fn moe_mode(&self) -> &'static str {
+        if self.n_experts == 0 {
+            "none"
+        } else if self.moe_resident {
+            "resident"
+        } else {
+            "streaming"
+        }
     }
 
     /// MoE 모델 여부(프리필 t=1 강제 등).
@@ -1897,6 +1957,7 @@ impl W4a16Dec {
         }
         self.moe_dev_tab = dtab;
         self.moe_tab = dev_tab;
+        self.weights_bytes += host_tab.iter().map(|e| e.1 + e.3).sum::<u64>();
         self.moe_resident = true;
         Ok(())
     }
@@ -2919,6 +2980,7 @@ impl W4a16Dec {
         self.head_out = dout;
         self.head_n = n;
         self.head_k = k;
+        self.weights_bytes += (need + n * 4) as u64;
         Ok(())
     }
 

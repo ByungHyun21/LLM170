@@ -44,6 +44,26 @@ impl GpuEngine {
         })
     }
 
+    /// 메모리 분류(모니터링) — (상주 가중치, KV, CPU 오프로드, PLE 오프로드).
+    pub fn mem_stats(&self) -> (u64, u64, u64, u64) {
+        self.dec.mem_stats()
+    }
+
+    /// 토큰당 활성 가중치 바이트(실효 대역폭 계산용).
+    pub fn active_weight_bytes(&self) -> u64 {
+        self.dec.active_weight_bytes()
+    }
+
+    /// MoE 배치 모드 — "none" | "resident" | "streaming".
+    pub fn moe_mode(&self) -> &'static str {
+        self.dec.moe_mode()
+    }
+
+    /// 복사 계측 — [h2d, d2h, d2d] × (바이트, ns, 호출).
+    pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
+        self.dec.copy_stats()
+    }
+
     /// 1토큰 체인(로짓 없이 상태만 진행) — prefill 중간 토큰용.
     fn forward(&mut self, slot: usize, row: &[f32]) -> Result<Vec<f32>, String> {
         if self.staged {

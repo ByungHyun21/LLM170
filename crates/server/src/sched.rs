@@ -204,6 +204,8 @@ impl Sched {
 pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slots: usize) {
     // EOS 하드코드 248044 → 모델 메타 파생(Engine::eos).
     let eos = eng.eos();
+    // 모니터링 — 복사 계측 기준(가중치 적재분을 load로 분리, 이후는 runtime).
+    let copy_base = eng.copy_stats();
     // 기동 워밍업 — 첫 요청이 지연 초기화(raw_init, ctx 비례 수십 초)를
     // 뒤집어쓰지 않도록 여기서 소진하고 상태를 되돌린다. 준비 전에는 /health가
     // 503이라 클라이언트가 계측을 시작하지 않는다.
@@ -262,6 +264,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         if last_pub.elapsed() >= std::time::Duration::from_millis(900) {
             last_pub = std::time::Instant::now();
             publish_slot_views(&slots);
+            publish_stats(&eng, copy_base);
         }
         tick += 1;
         let _it0 = std::time::Instant::now();
@@ -377,6 +380,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         let busy = slots.iter().any(|s| s.job.is_some());
         if !busy {
             publish_slot_views(&slots);
+            publish_stats(&eng, copy_base);
         }
         if !busy {
             match rx.recv() {
@@ -389,6 +393,31 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         }
     }
     eprintln!("{}", SCHED.summary());
+}
+
+/// 모니터링 — 메모리 분류 + 복사 계측 게시(최신값만).
+fn publish_stats(eng: &Engine, base: [(u64, u64, u64); 3]) {
+    let (weights_gpu, kv_gpu, offload_cpu, ple_cpu) = eng.mem_stats();
+    crate::metrics::publish_memory(crate::metrics::MemView {
+        weights_gpu,
+        kv_gpu,
+        offload_cpu,
+        ple_cpu,
+        active_per_token: eng.active_weight_bytes(),
+        moe_mode: eng.moe_mode().to_string(),
+    });
+    let now = eng.copy_stats();
+    let sub = |i: usize| -> (u64, u64, u64) {
+        (
+            now[i].0.saturating_sub(base[i].0),
+            now[i].1.saturating_sub(base[i].1),
+            now[i].2.saturating_sub(base[i].2),
+        )
+    };
+    crate::metrics::publish_io(crate::metrics::IoView {
+        runtime: [sub(0), sub(1), sub(2)],
+        load: base,
+    });
 }
 
 /// 모니터링 게시 — 슬롯 뷰 + 활성 수(최신값 덮어쓰기, 히스토리 없음).

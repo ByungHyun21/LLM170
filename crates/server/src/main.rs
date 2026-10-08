@@ -290,6 +290,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             .unwrap_or_default(),
         ctx,
         n_slots: slots.unwrap_or(1),
+        model_bytes: dir_bytes(&model_path),
     });
     // 라우팅: W4A16 = qwen35 CPU 경로 단일(가속은 W2 커널 이후).
     let sel = engine::BackendSel::Cpu;
@@ -300,6 +301,18 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// 디렉터리 파일 크기 합(모니터링 표시용 — 실패는 0).
+fn dir_bytes(p: &std::path::Path) -> u64 {
+    std::fs::read_dir(p)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// `llm170 tokenize --model <dir> [--no-special] (--text <s> | --file <f> | --stdin)`
