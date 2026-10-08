@@ -1,5 +1,5 @@
 //! 디양자화 블록 구현(형식별) + 디스패치.
-use crate::tables::{IQ3S_GRID, KVALUES_IQ4NL};
+use crate::tables::{IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL};
 use llm170_gguf::GgmlType;
 
 #[inline]
@@ -260,6 +260,62 @@ pub(crate) fn grid4(idx: usize) -> [f32; 4] {
     ]
 }
 
+#[inline]
+pub(crate) fn grid4xxs(idx: usize) -> [f32; 4] {
+    let w = IQ3XXS_GRID[idx];
+    [
+        (w & 0xFF) as f32,
+        ((w >> 8) & 0xFF) as f32,
+        ((w >> 16) & 0xFF) as f32,
+        ((w >> 24) & 0xFF) as f32,
+    ]
+}
+
+/// iq3_xxs 블록(98B/256원소): d(2) qs[64](그룹8당 grid 인덱스 2B) +
+/// scales_and_signs[32](ib32당 4B — 하위 28비트 = ksigns 인덱스 7비트×4,
+/// 상위 4비트 = 스케일). ggml dequantize_row_iq3_xxs(ggml-quants.c) 이식 —
+/// plans/cuda-models.md §3.3-1·P0-1(B2): 35B-A3B 46.6%·FN 33.5% 지배 타입.
+fn deq_iq3_xxs(blk: &[u8], y: &mut [f32]) {
+    let d = f16(blk, 0);
+    let qs = &blk[2..66];
+    let sas = &blk[66..98];
+    let mut yi = 0;
+    let mut qi = 0;
+    for ib32 in 0..8 {
+        let aux32 = u32::from_le_bytes([
+            sas[4 * ib32],
+            sas[4 * ib32 + 1],
+            sas[4 * ib32 + 2],
+            sas[4 * ib32 + 3],
+        ]);
+        // 원문 산술열: db = (d * (0.5 + scale)) * 0.5 — f32 결합 순서 보존.
+        let db = d * (0.5f32 + (aux32 >> 28) as f32) * 0.5f32;
+        for l in 0..4 {
+            let signs = KSIGNS_IQ2XS[((aux32 >> (7 * l)) & 127) as usize];
+            let g1 = grid4xxs(qs[qi + 2 * l] as usize);
+            let g2 = grid4xxs(qs[qi + 2 * l + 1] as usize);
+            for j in 0..4 {
+                y[yi + j] = db
+                    * g1[j]
+                    * if signs & KMASK_IQ2XS[j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                y[yi + 4 + j] = db
+                    * g2[j]
+                    * if signs & KMASK_IQ2XS[4 + j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+            }
+            yi += 8;
+        }
+        qi += 8;
+    }
+}
+
 /// iq3_s 블록: d(2) qs(64) qh(8) signs(32) scales(4) — d가 맨 앞 (ggml-common.h 구조체)
 fn deq_iq3_s(blk: &[u8], y: &mut [f32]) {
     let d = f16(blk, 0);
@@ -348,6 +404,7 @@ pub fn dequant_supported(ty: GgmlType) -> bool {
             | GgmlType::Iq4Xs
             | GgmlType::Iq4Nl
             | GgmlType::Iq3S
+            | GgmlType::Iq3Xxs
     )
 }
 
@@ -454,8 +511,55 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
+        GgmlType::Iq3Xxs => {
+            for b in 0..blocks {
+                deq_iq3_xxs(
+                    &data[base + b * bsize..][..bsize],
+                    &mut out[b * 256..b * 256 + 256],
+                );
+            }
+        }
         // 107 W11: 로드 시점 타입 사전 검증 전까지 초기화 패닉 유지(허용 분류).
         other => unimplemented!("dequant for {other:?} — 모델 로드 시 타입 검증 필요"),
+    }
+}
+
+#[cfg(test)]
+mod b2_tests {
+    use super::*;
+
+    /// B2/B3(plans/cuda-models.md): dequant_supported 표와 dequant_row 매치의
+    /// 드리프트 방지 — 지원 표시 타입 전부에 대해 영 블록 바이트로 실제
+    /// 디양자화를 수행해 패닉 없음을, 미지원 대표 타입은 unimplemented를
+    /// 보인다(로더 사전검증이 이 표를 신뢰한다).
+    #[test]
+    fn supported_types_all_survive_dequant_row() {
+        for t in [
+            GgmlType::F32,
+            GgmlType::F16,
+            GgmlType::Bf16,
+            GgmlType::Q4K,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+            GgmlType::Q3K,
+            GgmlType::Q8_0,
+            GgmlType::Q5_1,
+            GgmlType::Q5_0,
+            GgmlType::Iq4Xs,
+            GgmlType::Iq4Nl,
+            GgmlType::Iq3S,
+            GgmlType::Iq3Xxs,
+        ] {
+            assert!(dequant_supported(t), "{t:?} 지원 표시 필요");
+            let (blck, bsize) = t.block_info();
+            let data = vec![0u8; bsize as usize];
+            let mut out = vec![0.0f32; blck as usize];
+            dequant_row(t, &data, 0, blck, &mut out); // 패닉 없으면 통과
+            assert!(out.iter().all(|v| v.is_finite()), "{t:?} 비유한 출력");
+        }
+        for t in [GgmlType::Iq2Xxs, GgmlType::Iq1S, GgmlType::Mxfp4] {
+            assert!(!dequant_supported(t), "{t:?} 미지원 표시 필요");
+        }
     }
 }
 

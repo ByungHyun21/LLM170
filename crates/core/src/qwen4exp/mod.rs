@@ -32,6 +32,9 @@ pub enum Q4Error {
     MissingTensor(String),
     BadMeta(&'static str),
     Io(String),
+    /// B3(plans/cuda-models.md §5): dequant_row 미지원 타입 텐서 목록 —
+    /// 런타임 첫 역양자화 패닉 대신 로드 시점 거부.
+    UnsupportedTensor(String),
 }
 
 impl std::fmt::Display for Q4Error {
@@ -40,6 +43,7 @@ impl std::fmt::Display for Q4Error {
             Q4Error::MissingTensor(n) => write!(f, "missing tensor: {n}"),
             Q4Error::BadMeta(w) => write!(f, "bad metadata: {w}"),
             Q4Error::Io(e) => write!(f, "io: {e}"),
+            Q4Error::UnsupportedTensor(ts) => write!(f, "unsupported tensor type: {ts}"),
         }
     }
 }
@@ -200,6 +204,18 @@ impl Model4 {
             .unwrap_or(0);
         let hp = Hparams4 { vocab, ..hp };
         let eos = hp.ple_eos;
+        // B3(plans/cuda-models.md §4·§5): 전 텐서 타입 사전검증 — 모든 무게가
+        // 결국 dequant_row를 지나므로 미지원 타입은 로드에서 거부한다
+        // (런타임 unimplemented! 패닉 — IQ3_XXS 실측 — 의 차단). parts 이동 전 판정.
+        let bad: Vec<String> = parts
+            .iter()
+            .flat_map(|p| p.tensors.iter())
+            .filter(|t| !crate::quant::dequant_supported(t.ty))
+            .map(|t| format!("{}({})", t.name, t.ty.name()))
+            .collect();
+        if !bad.is_empty() {
+            return Err(Q4Error::UnsupportedTensor(bad.join(", ")).into());
+        }
         let m = Model4 {
             hp,
             parts,
@@ -390,6 +406,16 @@ impl Model4 {
             tensors: g.tensors.clone(),
             mmap,
         });
+        // B3 동일 계약: MTP 모듈 텐서도 dequant_row 대상 — 미지원 타입 거부.
+        let bad: Vec<String> = g
+            .tensors
+            .iter()
+            .filter(|t| !crate::quant::dequant_supported(t.ty))
+            .map(|t| format!("{}({})", t.name, t.ty.name()))
+            .collect();
+        if !bad.is_empty() {
+            return Err(Q4Error::UnsupportedTensor(bad.join(", ")).into());
+        }
         self.mtp_nextn = true;
         Ok(())
     }
