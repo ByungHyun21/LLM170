@@ -112,14 +112,9 @@ pub struct GuardTarget {
 }
 
 /// 가드 대상 판정 — main() 인라인의 순수함수(A2/R1).
-/// 입력: 서브커맨드, --model, 백엔드, 런타임, 위치인자. None = 가드 스킵
+/// 입력: 서브커맨드, --model, 위치인자. None = 가드 스킵
 /// (메타 서브커맨드 또는 경로 부재 — 로더 에러가 더 정확).
-pub fn guard_target(
-    sub: &str,
-    model: Option<&str>,
-    backend: Option<&str>,
-    rest: &[String],
-) -> Option<GuardTarget> {
+pub fn guard_target(sub: &str, model: Option<&str>, rest: &[String]) -> Option<GuardTarget> {
     // 토크나이저 파일만 판독 — 무게 미적재.
     if matches!(sub, "tokenize") {
         return None;
@@ -129,7 +124,8 @@ pub fn guard_target(
             .find(|a| !a.starts_with("--"))
             .map(std::path::PathBuf::from)
     });
-    let gpu = backend == Some("cuda");
+    // 서빙 경로는 CUDA 고정 → VRAM 계정. CPU 전용 프로브는 제외.
+    let gpu = !matches!(sub, "w4a16-load" | "w4a16-ref");
     path.map(|path| GuardTarget { path, gpu })
 }
 
@@ -301,24 +297,26 @@ mod tests {
     fn guard_target_cases() {
         use super::guard_target;
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        // serve/infer류: --model + 백엔드 → (경로, gpu)
-        let g = guard_target("serve", Some("/m/w4a16"), Some("cuda"), &s(&[]));
+        // serve/infer류: --model (CUDA 고정 → gpu=true)
+        let g = guard_target("serve", Some("/m/w4a16"), &s(&[]));
         assert_eq!(
             g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
             Some(("/m/w4a16".into(), true))
         );
-        let g = guard_target("infer", Some("/m/w4a16"), Some("cpu"), &s(&[]));
-        assert_eq!(g.map(|g| g.gpu), Some(false));
-        // W4A16 로더 프로브 — 위치인자 폴백(gpu=false).
-        let g = guard_target("w4a16-load", None, None, &s(&["/m/w4a16"]));
+        let g = guard_target("infer", Some("/m/w4a16"), &s(&[]));
+        assert_eq!(g.map(|g| g.gpu), Some(true));
+        // CPU 전용 프로브 — 위치인자 폴백(gpu=false).
+        let g = guard_target("w4a16-load", None, &s(&["/m/w4a16"]));
         assert_eq!(
             g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
             Some(("/m/w4a16".into(), false))
         );
+        let g = guard_target("w4a16-ref", None, &s(&["/m/w4a16"]));
+        assert_eq!(g.map(|g| g.gpu), Some(false));
         // 메타 서브커맨드 → None
-        assert!(guard_target("tokenize", Some("/m/w4a16"), None, &s(&[])).is_none());
+        assert!(guard_target("tokenize", Some("/m/w4a16"), &s(&[])).is_none());
         // 무모델 로딩 창구 → None(로더/CLI 에러가 더 정확)
-        assert!(guard_target("infer", None, None, &s(&[])).is_none());
-        assert!(guard_target("serve", None, None, &s(&[])).is_none());
+        assert!(guard_target("infer", None, &s(&[])).is_none());
+        assert!(guard_target("serve", None, &s(&[])).is_none());
     }
 }
