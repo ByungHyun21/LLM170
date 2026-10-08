@@ -230,28 +230,41 @@ pub mod ar_pool {
         cv: Condvar,
     }
     static QUEUE: OnceLock<Queue> = OnceLock::new();
+    static SPAWNED: std::sync::Once = std::sync::Once::new();
+    static SPAWNED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+    /// 큐 확보 + 워커 스폰(1회). **set-then-spawn 계약**: 워커는 큐 값이
+    /// OnceLock에 저장된 뒤에만 스폰한다 — 초기화 진행 중 스폰하면 워커의
+    /// 큐 조회가 None을 보고 조용히 종료한다(C1, 2026-10-08 분석).
     fn queue() -> &'static Queue {
-        QUEUE.get_or_init(|| {
+        let q = QUEUE.get_or_init(|| Queue {
+            jobs: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+        });
+        SPAWNED.call_once(|| {
             let n = std::thread::available_parallelism()
                 .map(|v| v.get())
                 .unwrap_or(8)
                 .min(64);
             for _ in 0..n {
                 let worker = std::thread::Builder::new().name("gdn-ar-pool".into());
-                if worker.spawn(worker_loop).is_err() {
-                    break; // 잔여 워커로 진행 — 전멸 시에만 교착 가능
+                match worker.spawn(move || worker_loop(q)) {
+                    Ok(_) => {
+                        SPAWNED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(_) => break, // 잔여 워커로 진행(run_par가 전멸을 폴백 처리)
                 }
             }
-            Queue {
-                jobs: Mutex::new(VecDeque::new()),
-                cv: Condvar::new(),
-            }
-        })
+        });
+        q
     }
 
-    fn worker_loop() {
-        let Some(q) = QUEUE.get() else { return };
+    /// 스폰된 워커 수(회귀 테스트·진단용 — set-then-spawn 계약 확인).
+    pub fn spawned_workers() -> usize {
+        SPAWNED_N.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn worker_loop(q: &'static Queue) {
         loop {
             let job = {
                 let mut g = q.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -271,6 +284,13 @@ pub mod ar_pool {
     /// 호출자 스레드에서 재개한다(thread::scope + join().unwrap() 의미 보존).
     pub fn run_par(n_jobs: usize, make: impl Fn(usize) -> Job) {
         let q = queue();
+        if spawned_workers() == 0 {
+            // 워커 전멸(스폰 실패) — 호출 스레드 순차 실행(완료 카운터 교착 방지).
+            for i in 0..n_jobs {
+                (make(i))();
+            }
+            return;
+        }
         let done = Arc::new((Mutex::new(0usize), Condvar::new()));
         let panic_payload: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>> =
             Arc::new(Mutex::new(None));
@@ -533,5 +553,61 @@ mod tests {
             "출력 불일치: max_diff={max_diff}"
         );
         assert!(max_state_diff < 5e-2, "상태 불일치: {max_state_diff}");
+    }
+
+    /// C1 회귀 — set-then-spawn: 워커가 초기화 경쟁으로 조용히 죽으면
+    /// run_par가 완료 카운터에서 교착한다. 워치독으로 hang 대신 실패시킨다.
+    #[test]
+    fn ar_pool_spawns_workers_and_completes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let done = Arc::new(AtomicUsize::new(0));
+        let d = Arc::clone(&done);
+        let h = std::thread::spawn(move || {
+            ar_pool::run_par(64, move |i| {
+                let d = Arc::clone(&d);
+                Box::new(move || {
+                    d.fetch_add(i + 1, Ordering::Relaxed);
+                })
+            });
+        });
+        let t0 = std::time::Instant::now();
+        while !h.is_finished() {
+            assert!(
+                t0.elapsed().as_secs() < 30,
+                "ar_pool 교착 — 워커 전멸 의심(C1 회귀)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        h.join().unwrap();
+        assert_eq!(done.load(Ordering::Relaxed), 64 * 65 / 2);
+        assert!(
+            ar_pool::spawned_workers() >= 1,
+            "워커 0 — set-then-spawn 결함"
+        );
+    }
+
+    /// 동시 run_par 스트레스 — 큐 초기화·분배가 다중 호출에서도 완결.
+    #[test]
+    fn ar_pool_concurrent_run_par() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut hs = Vec::new();
+        for _ in 0..4 {
+            hs.push(std::thread::spawn(|| {
+                let done = Arc::new(AtomicUsize::new(0));
+                let d = Arc::clone(&done);
+                ar_pool::run_par(16, move |_| {
+                    let d = Arc::clone(&d);
+                    Box::new(move || {
+                        d.fetch_add(1, Ordering::Relaxed);
+                    })
+                });
+                assert_eq!(done.load(Ordering::Relaxed), 16);
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
     }
 }
