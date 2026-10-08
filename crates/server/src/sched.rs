@@ -217,6 +217,8 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     let t0w = std::time::Instant::now();
     let mut last_wt = std::time::Instant::now();
     loop {
+        // S3: 진행 심박 — 엔진이 멈추면(디코드/프리필 교착) 와치독이 보고한다.
+        llm170_diag::watchdog::bump();
         if npw {
             let now = std::time::Instant::now();
             let dt = last_wt.elapsed().as_secs_f64();
@@ -254,6 +256,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         if !active.is_empty() {
             decoded = true;
             let _dt = std::time::Instant::now();
+            llm170_diag::watchdog::bump();
             match &mut eng {
                 Engine::Gpu(e) => q35_decode(e, &mut slots, &active),
             }
@@ -279,6 +282,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 .min_by_key(|&i| slots[i].touch);
             if let Some(i) = pf {
                 let _pft = std::time::Instant::now();
+                llm170_diag::watchdog::bump();
                 let chunk = 512usize;
                 // Q4(FN)는 prefill_greedy — 청크마다 어휘 152k
                 // 로짓 pageable D2H(슬로패스 수십 ms) 대신 GPU argmax 8B 회수.

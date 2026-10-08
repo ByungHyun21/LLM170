@@ -105,18 +105,78 @@ pub(crate) struct HttpReq {
 /// +16.8GB 점유(2026-09-30 실측) 후 read_exact 영구 블록. 프롬프트 JSON 여유.
 const MAX_BODY: usize = 64 << 20;
 
-pub(crate) fn read_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
-    // QA-2: 읽기 타임아웃 — 헤더/바디 미완 송신(절단·slow-loris) 영구 블록 방지.
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
-    // EOF(keep-alive 연결이 끊긴 경우) — 종전엔 빈 요청으로 파싱돼 404 응답을
-    // 무한히 재전송하는 스핀이 됐다(닫힌 소켓 read 는 즉시 0 반환): 유휴 서버가
-    // 코어 하나를 태우고 system time 이 2/3 를 차지했다(2026-09-17 실측).
-    if line.is_empty() {
-        return Err("eof".into());
+/// 라인 상한 — 요청 라인·헤더 라인 각각 8KB(S2). `read_line`은 무상한이라
+/// `\n` 미송신 클라가 타임아웃(120s)까지 버퍼를 키울 수 있었다.
+const MAX_LINE: usize = 8 * 1024;
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HEADER_LINES: usize = 128;
+
+/// 라인 리더 오류 — TooLong은 상태코드 응답(431/414) 대상.
+#[derive(Debug)]
+enum LineErr {
+    Io(std::io::Error),
+    TooLong,
+}
+
+/// `\n`까지 최대 max 바이트 라인 1개 — EOF면 None(S2).
+fn read_line_bounded<R: BufRead>(r: &mut R, max: usize) -> Result<Option<Vec<u8>>, LineErr> {
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let (nl, used) = {
+            let avail = r.fill_buf().map_err(LineErr::Io)?;
+            if avail.is_empty() {
+                return if out.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(out))
+                };
+            }
+            let used = match avail.iter().position(|&b| b == b'\n') {
+                Some(i) => i + 1,
+                None => avail.len(),
+            };
+            out.extend_from_slice(&avail[..used]);
+            (avail[used - 1] == b'\n', used)
+        };
+        r.consume(used);
+        if out.len() > max {
+            return Err(LineErr::TooLong);
+        }
+        if nl {
+            return Ok(Some(out));
+        }
     }
+}
+
+/// 요청 파싱 오류 — 상태 응답이 필요한 경우와 연결 종료를 구분(S2 테스트 표면).
+#[derive(Debug)]
+enum ReqErr {
+    /// (상태코드, 사유문구, 내부 메시지) — 호출부가 응답을 송신.
+    Status(u16, &'static str, String),
+    /// 응답 없이 연결 종료(EOF 등).
+    Plain(String),
+}
+
+/// 요청 1개 파싱 본체 — BufReader 인자(유닛테스트: Cursor 주입).
+/// 리더를 밖에서 유지하면 파이프라인 잔여 바이트가 보존된다(소비는 정확히
+/// 요청 1개분 — 프로덕션 keep-alive 재사용은 P2 항목).
+fn read_request_from<R: Read>(reader: &mut BufReader<R>) -> Result<HttpReq, ReqErr> {
+    let req_line = match read_line_bounded(reader, MAX_LINE) {
+        Ok(Some(v)) => v,
+        // EOF(keep-alive 연결이 끊긴 경우) — 종전엔 빈 요청으로 파싱돼 404 응답을
+        // 무한히 재전송하는 스핀이 됐다(닫힌 소켓 read 는 즉시 0 반환): 유휴 서버가
+        // 코어 하나를 태우고 system time 이 2/3 를 차지했다(2026-09-17 실측).
+        Ok(None) => return Err(ReqErr::Plain("eof".into())),
+        Err(LineErr::TooLong) => {
+            return Err(ReqErr::Status(
+                414,
+                "URI Too Long",
+                "request line too long".into(),
+            ));
+        }
+        Err(LineErr::Io(e)) => return Err(ReqErr::Plain(e.to_string())),
+    };
+    let line = String::from_utf8_lossy(&req_line).into_owned();
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("/").to_string();
@@ -129,19 +189,30 @@ pub(crate) fn read_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
     let mut bad_cl = false;
     let mut chunked = false;
     loop {
-        let mut h = String::new();
-        reader.read_line(&mut h).map_err(|e| e.to_string())?;
+        let h = match read_line_bounded(reader, MAX_LINE) {
+            Ok(Some(v)) => v,
+            Ok(None) => break, // 헤더 중 EOF — 아래 빈 헤더 취급(바디 0).
+            Err(LineErr::TooLong) => {
+                return Err(ReqErr::Status(
+                    431,
+                    "Request Header Fields Too Large",
+                    "header line too long".into(),
+                ));
+            }
+            Err(LineErr::Io(e)) => return Err(ReqErr::Plain(e.to_string())),
+        };
         hdr_lines += 1;
         hdr_bytes += h.len();
+        let h = String::from_utf8_lossy(&h).into_owned();
         if h.trim().is_empty() {
             break;
         }
-        if hdr_lines > 128 || hdr_bytes > 64 * 1024 {
-            let _ = write!(
-                reader.get_mut(),
-                "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            );
-            return Err("header too large".into());
+        if hdr_lines > MAX_HEADER_LINES || hdr_bytes > MAX_HEADER_BYTES {
+            return Err(ReqErr::Status(
+                431,
+                "Request Header Fields Too Large",
+                "header too large".into(),
+            ));
         }
         let hl = h.to_ascii_lowercase();
         if let Some(v) = hl.strip_prefix("content-length:") {
@@ -155,37 +226,55 @@ pub(crate) fn read_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
         }
     }
     if bad_cl {
-        let _ = write!(
-            reader.get_mut(),
-            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        return Err("malformed content-length".into());
+        return Err(ReqErr::Status(
+            400,
+            "Bad Request",
+            "malformed content-length".into(),
+        ));
     }
     if chunked {
-        let _ = write!(
-            reader.get_mut(),
-            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        return Err("chunked transfer-encoding unsupported".into());
+        return Err(ReqErr::Status(
+            400,
+            "Bad Request",
+            "chunked transfer-encoding unsupported".into(),
+        ));
     }
     if len > MAX_BODY {
         // QA-2: 413 응답 후 절단 — 상한 초과 본문은 읽지도 않는다.
-        // (stream은 reader로 이동됐으므로 get_mut 재차용)
-        let _ = write!(
-            reader.get_mut(),
-            "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        return Err(format!("content-length {len} exceeds limit {MAX_BODY}"));
+        return Err(ReqErr::Status(
+            413,
+            "Payload Too Large",
+            format!("content-length {len} exceeds limit {MAX_BODY}"),
+        ));
     }
     let mut body = vec![0u8; len];
     if len > 0 {
-        reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+        reader
+            .read_exact(&mut body)
+            .map_err(|e| ReqErr::Plain(e.to_string()))?;
     }
     Ok(HttpReq {
         method,
         path,
         body: String::from_utf8_lossy(&body).into_owned(),
     })
+}
+
+pub(crate) fn read_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
+    // QA-2: 읽기 타임아웃 — 헤더/바디 미완 송신(절단·slow-loris) 영구 블록 방지.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
+    let mut reader = BufReader::new(stream);
+    match read_request_from(&mut reader) {
+        Ok(r) => Ok(r),
+        Err(ReqErr::Status(code, reason, msg)) => {
+            let _ = write!(
+                reader.get_mut(),
+                "HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            Err(msg)
+        }
+        Err(ReqErr::Plain(m)) => Err(m),
+    }
 }
 
 pub(crate) fn resp(stream: &mut TcpStream, code: u16, ct: &str, body: &str) {
@@ -217,4 +306,101 @@ pub(crate) fn resp_sse_open(stream: &mut TcpStream) {
 pub(crate) fn sse(stream: &mut TcpStream, event: &str, data: &str) -> std::io::Result<()> {
     write!(stream, "event: {event}\ndata: {data}\n\n")?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod req_tests {
+    //! S2: 요청 파싱 매트릭스 — 431/414/400/413/EOF/파이프라인 소비.
+    //! `read_request_from`이 impl Read를 받으므로 Cursor로 전수 검증한다.
+
+    use super::*;
+    use std::io::{BufReader, Cursor};
+
+    fn parse(bytes: &[u8]) -> Result<HttpReq, ReqErr> {
+        let mut r = BufReader::new(Cursor::new(bytes.to_vec()));
+        read_request_from(&mut r)
+    }
+
+    #[test]
+    fn get_and_post_ok() {
+        let r = parse(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n").expect("GET");
+        assert_eq!((r.method.as_str(), r.path.as_str()), ("GET", "/health"));
+        assert!(r.body.is_empty());
+
+        let body = "{\"prompt\":\"hi\"}";
+        let req = format!(
+            "POST /v1/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let r = parse(req.as_bytes()).expect("POST");
+        assert_eq!(r.body, body);
+    }
+
+    #[test]
+    fn long_lines_are_bounded() {
+        // 요청 라인 8KB 초과(개행 없음) → 414.
+        let mut line = b"GET /".to_vec();
+        line.extend(std::iter::repeat_n(b'a', MAX_LINE + 16));
+        match parse(&line) {
+            Err(ReqErr::Status(414, _, _)) => {}
+            other => panic!("414 기대: {:?}", other.err().map(|e| format!("{e:?}"))),
+        }
+        // 헤더 라인 8KB 초과 → 431.
+        let mut req = b"GET / HTTP/1.1\r\nX-Big: ".to_vec();
+        req.extend(std::iter::repeat_n(b'b', MAX_LINE + 16));
+        req.extend_from_slice(b"\r\n\r\n");
+        match parse(&req) {
+            Err(ReqErr::Status(431, _, _)) => {}
+            _ => panic!("431 기대(헤더 라인)"),
+        }
+        // 헤더 라인 수 128 초과 → 431.
+        let mut req = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..(MAX_HEADER_LINES + 4) {
+            req.extend_from_slice(format!("X-{i}: 1\r\n").as_bytes());
+        }
+        req.extend_from_slice(b"\r\n");
+        match parse(&req) {
+            Err(ReqErr::Status(431, _, _)) => {}
+            _ => panic!("431 기대(헤더 수)"),
+        }
+    }
+
+    #[test]
+    fn cl_and_te_guards() {
+        // 변형 CL → 400.
+        match parse(b"POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n") {
+            Err(ReqErr::Status(400, _, _)) => {}
+            _ => panic!("400 기대(CL)"),
+        }
+        // chunked → 400(명시 미지원).
+        match parse(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n") {
+            Err(ReqErr::Status(400, _, _)) => {}
+            _ => panic!("400 기대(chunked)"),
+        }
+        // 상한 초과 CL → 413.
+        let req = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY + 1
+        );
+        match parse(req.as_bytes()) {
+            Err(ReqErr::Status(413, _, _)) => {}
+            _ => panic!("413 기대"),
+        }
+    }
+
+    #[test]
+    fn eof_and_pipeline_consumption() {
+        // 빈 입력 → EOF(응답 없음).
+        match parse(b"") {
+            Err(ReqErr::Plain(m)) => assert_eq!(m, "eof"),
+            _ => panic!("eof 기대"),
+        }
+        // 파이프라인: 리더를 유지하면 두 번째 요청이 그대로 남아 있다.
+        let two = b"GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n";
+        let mut r = BufReader::new(Cursor::new(two.to_vec()));
+        let a = read_request_from(&mut r).expect("1st");
+        let b = read_request_from(&mut r).expect("2nd");
+        assert_eq!(a.path, "/a");
+        assert_eq!(b.path, "/b");
+    }
 }

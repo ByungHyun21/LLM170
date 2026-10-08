@@ -83,63 +83,103 @@ fn take_escape(rest: &str) -> (String, &str) {
     }
 }
 
-fn jstr(body: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\":");
-    let i = body.find(&pat)? + pat.len();
-    let b = body[i..].trim_start();
-    if !b.starts_with('"') {
-        return None;
-    }
-    let mut out = String::new();
-    let mut rest = &b[1..];
-    loop {
-        match rest.chars().next() {
-            None => break,
-            Some('\\') => {
-                let (s, tail) = take_escape(&rest[1..]);
-                out.push_str(&s);
-                rest = tail;
+/// 값 1개(문자열/숫자/리터럴/배열/객체)의 끝 오프셋 — 문자열·깊이 추적.
+fn value_end(body: &str, start: usize) -> Option<usize> {
+    let b = body.as_bytes();
+    match b.get(start)? {
+        b'"' => jparse_string(&body[start..]).map(|(_, used)| start + used),
+        &open @ (b'[' | b'{') => {
+            let close = if open == b'[' { b']' } else { b'}' };
+            let mut depth = 0usize;
+            let mut i = start;
+            while i < b.len() {
+                match b[i] {
+                    b'"' => {
+                        i += jparse_string(&body[i..])?.1;
+                        continue;
+                    }
+                    c if c == open => depth += 1,
+                    c if c == close => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
             }
-            Some('"') => break,
-            Some(c) => {
-                let n = c.len_utf8();
-                out.push(c);
-                rest = &rest[n..];
+            None
+        }
+        _ => {
+            // 숫자·true/false/null — 구분자 전까지.
+            let mut i = start;
+            while i < b.len() && !matches!(b[i], b',' | b'}' | b']' | b' ' | b'\n' | b'\t' | b'\r')
+            {
+                i += 1;
             }
+            Some(i)
         }
     }
-    Some(out)
+}
+
+/// 최상위 객체에서 `key` 직계 멤버의 **값 슬라이스**(S1).
+/// 종전 `find("\"key\":")`는 중첩 객체(예: messages 내 content 문자열)의
+/// 같은 키를 먼저 잡아 샘플러·stop·model을 오염시킬 수 있었다 — 스캔은
+/// 문자열·이스케이프·중첩 깊이를 추적해 직계 멤버만 본다.
+fn jmember<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let b = body.as_bytes();
+    let mut i = body.find('{')? + 1;
+    loop {
+        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b',') {
+            i += 1;
+        }
+        if i >= b.len() || b[i] != b'"' {
+            return None; // '}' 또는 비정상 — 종료(호출부 기본값).
+        }
+        let (k, used) = jparse_string(&body[i..])?;
+        i += used;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || b[i] != b':' {
+            return None;
+        }
+        i += 1;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let vend = value_end(body, i)?;
+        if k == key {
+            return Some(&body[i..vend]);
+        }
+        i = vend;
+    }
+}
+
+fn jstr(body: &str, key: &str) -> Option<String> {
+    let (s, _) = jparse_string(jmember(body, key)?)?;
+    Some(s)
 }
 
 fn jnum(body: &str, key: &str) -> Option<f64> {
-    let pat = format!("\"{key}\":");
-    let i = body.find(&pat)? + pat.len();
-    let b = body[i..].trim_start();
-    let end = b
+    let v = jmember(body, key)?;
+    let end = v
         .find(|c: char| {
             !(c.is_ascii_digit() || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E')
         })
-        .unwrap_or(b.len());
-    b[..end].parse().ok()
+        .unwrap_or(v.len());
+    v[..end].parse().ok()
 }
 
 fn jbool(body: &str, key: &str) -> bool {
-    let pat = format!("\"{key}\":");
-    body.find(&pat)
-        .map(|i| body[i + pat.len()..].trim_start().starts_with("true"))
-        .unwrap_or(false)
+    jmember(body, key).is_some_and(|v| v.starts_with("true"))
 }
 
 fn jarr_u32(body: &str, key: &str) -> Option<Vec<u32>> {
-    let pat = format!("\"{key}\":");
-    let i = body.find(&pat)? + pat.len();
-    let b = body[i..].trim_start();
-    if !b.starts_with('[') {
-        return None;
-    }
-    let end = b.find(']')?;
+    let inner = jmember(body, key)?.strip_prefix('[')?.strip_suffix(']')?;
     Some(
-        b[1..end]
+        inner
             .split(',')
             .filter_map(|t| t.trim().parse().ok())
             .collect(),
@@ -147,53 +187,51 @@ fn jarr_u32(body: &str, key: &str) -> Option<Vec<u32>> {
 }
 
 /// 따옴표로 시작하는 JSON 문자열 1개 파싱 — (값, 소비 바이트 수).
-/// jstr·jarr_str 공용.
+/// jstr·jarr_str·jmember 공용. 이스케이프는 take_escape 재사용
+/// (`\uXXXX`·서로게이트 페어를 jstr과 동일 규약으로 디코딩).
 fn jparse_string(s: &str) -> Option<(String, usize)> {
-    let b = s.as_bytes();
-    if b.first() != Some(&b'"') {
+    if s.as_bytes().first() != Some(&b'"') {
         return None;
     }
     let mut out = String::new();
-    let mut esc = false;
-    for (n, c) in s[1..].char_indices() {
-        if esc {
-            out.push(match c {
-                'n' => '\n',
-                't' => '\t',
-                'r' => '\r',
-                other => other,
-            });
-            esc = false;
-        } else if c == '\\' {
-            esc = true;
-        } else if c == '"' {
-            return Some((out, n + 2));
+    let mut i = 1usize;
+    loop {
+        let c = s[i..].chars().next()?;
+        if c == '"' {
+            return Some((out, i + 1));
+        }
+        if c == '\\' {
+            let (dec, tail) = take_escape(&s[i + 1..]);
+            out.push_str(&dec);
+            i += 1 + (s[i + 1..].len() - tail.len());
         } else {
             out.push(c);
+            i += c.len_utf8();
         }
     }
-    None
 }
 
 /// 문자열 배열 필드 파싱 (예: "stop": ["a", "b"]) — 최소 파서.
+/// 원소는 jparse_string로 소비 — 문자열 안의 `]`에서 절단하지 않는다(S1).
 fn jarr_str(body: &str, key: &str) -> Option<Vec<String>> {
-    let pat = format!("\"{key}\":");
-    let i = body.find(&pat)? + pat.len();
-    let b = body[i..].trim_start();
-    if !b.starts_with('[') {
-        return None;
-    }
-    let end = b.find(']')?;
+    let inner = jmember(body, key)?.strip_prefix('[')?.strip_suffix(']')?;
     let mut out = Vec::new();
-    let mut seg = &b[1..end];
-    while let Some(q) = seg.find('"') {
-        seg = &seg[q..];
+    let mut seg = inner;
+    loop {
+        seg = seg.trim_start();
+        if seg.is_empty() {
+            break;
+        }
         match jparse_string(seg) {
             Some((v, used)) => {
                 out.push(v);
                 seg = &seg[used..];
             }
             None => break,
+        }
+        seg = seg.trim_start();
+        if let Some(rest) = seg.strip_prefix(',') {
+            seg = rest;
         }
     }
     Some(out)
@@ -1049,6 +1087,51 @@ mod http_tests {
         assert_eq!(jstr(r#"{"a":"x\ny"}"#, "a").as_deref(), Some("x\ny"));
         // 형식이 깨진 이스케이프는 원문 보존(무손실) — 조용히 지우지 않는다
         assert_eq!(jstr(r#"{"a":"\uZZZZ"}"#, "a").as_deref(), Some("\\uZZZZ"));
+    }
+
+    /// S1: 중첩 객체/문자열 안의 같은 키가 최상위 값을 오염시키지 않는다.
+    #[test]
+    fn jmember_ignores_nested_keys() {
+        let b = r#"{"messages":[{"role":"user","content":"say \"temperature\": 9"}],"temperature":0.5}"#;
+        assert_eq!(jnum(b, "temperature"), Some(0.5));
+        let b2 = r#"{"tools":[{"parameters":{"top_p":0.1}}],"top_p":0.9}"#;
+        assert_eq!(jnum(b2, "top_p"), Some(0.9));
+        let b3 = r#"{"messages":[{"content":"\"stream\": true"}],"stream":false}"#;
+        assert!(!jbool(b3, "stream"));
+        let b4 = r#"{"messages":[{"content":"\"model\": \"evil\""}],"model":"real"}"#;
+        assert_eq!(jstr(b4, "model").as_deref(), Some("real"));
+        let b5 = r#"{"messages":[{"content":"\"stop\": [\"WRONG\"]"}],"stop":["END"]}"#;
+        assert_eq!(jarr_str(b5, "stop"), Some(vec!["END".to_string()]));
+    }
+
+    /// S1: stop 배열 원소 안의 `]`가 절단을 만들지 않는다(종전 find(']')).
+    #[test]
+    fn jarr_str_keeps_brackets_in_strings() {
+        assert_eq!(
+            jarr_str(r#"{"stop":["a]b","c"]}"#, "stop"),
+            Some(vec!["a]b".to_string(), "c".to_string()])
+        );
+        assert_eq!(
+            jarr_str(r#"{"stop_sequences":["x","y"]}"#, "stop_sequences"),
+            Some(vec!["x".to_string(), "y".to_string()])
+        );
+        assert_eq!(jarr_str(r#"{"stop":"z"}"#, "stop"), None);
+        assert_eq!(jstop(r#"{"stop":["a]b"]}"#), vec!["a]b".to_string()]);
+    }
+
+    /// 값 슬라이스 경계 — 중첩 배열/객체 끝·이스케이프 따옴표.
+    #[test]
+    fn jmember_value_bounds() {
+        let b = r#"{"a":[1,[2,3],{"x":"}"}],"b":7}"#;
+        assert_eq!(jmember(b, "a"), Some(r#"[1,[2,3],{"x":"}"}]"#));
+        assert_eq!(jnum(b, "b"), Some(7.0));
+        assert_eq!(
+            jarr_u32(r#"{"prompt":[1,2,3]}"#, "prompt"),
+            Some(vec![1, 2, 3])
+        );
+        let c = r#"{"s":"a\"}b","t":1}"#;
+        assert_eq!(jstr(c, "s").as_deref(), Some("a\"}b"));
+        assert_eq!(jnum(c, "t"), Some(1.0));
     }
 
     #[test]
