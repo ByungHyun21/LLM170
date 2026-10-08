@@ -361,7 +361,7 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
     };
     let no_special = ma.rest.iter().any(|a| a == "--no-special");
     // A20: 위치인자만 준 사용자에게 stdin 판독 무응답처럼 보였다
-    // (원장 기록 ⑧) — usage 에러로. --text/--file 값 부재(마지막 인자)도
+    // usage 에러로. --text/--file 값 부재(마지막 인자)도
     // 빈 문자열 조용 인코딩 대신 에러.
     let has_text = ma.rest.iter().any(|a| a == "--text");
     let has_file = ma.rest.iter().any(|a| a == "--file");

@@ -4,7 +4,7 @@
 // 원본과의 차이는 1점(트랜센던트):
 // 1) 원본 ew는 __expf(수 ulp 근사 내장) — G5/G6 노선(hip은 참조 구현일
 //    뿐 진실 아님)에 따라 silu의 exp를 자작 f64
-//    DAG 트윈(ew_exp_d — gdn_exp_d/attn_exp_d와 동일 DAG, G5 원장)으로
+//    DAG 트윈(ew_exp_d — gdn_exp_d/attn_exp_d와 동일 DAG)으로
 //    정밀화한다. 공식 silu(v) = v/(1+exp(−v))의 CPU 참조는
 //    crates/core/src/ops.rs silu(L127-130). 빌드는 -fmad=false(FMA 수축
 //    제거 — 호스트 미러와 비트동일, build_cuda.bat 별도 블록). 도메인
@@ -13,7 +13,7 @@
 //    argmax는 부동소수 환원이 아니라 정수 인덱스 선택(exp 미포함,
 //    fmad 무관)이라 차이 없다.
 //
-// 결함 8호(원장): ew_argmax의 n은 "로짓 길이"(248320 — 어휘 폭),
+// 결함 8호: ew_argmax의 n은 "로짓 길이"(248320 — 어휘 폭),
 // 행수가 아니다. 과잉 판독(행수>길이 창 밖)·과소 판독(길이>행수 미
 // 스캔)이 고전 버그 — 검증층 음성대조(구 프로브
 // cuda_argmax_negative_check)가 잘못된 n을 토큰 불일치로 잡는다.
