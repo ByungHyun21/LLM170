@@ -183,21 +183,15 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         prompt,
         mtp: ma.mtp.clone(),
     };
-    // P0-4(B22): 디렉터리 스니핑 — W4A16 명시 에러(bench 경로 계약 동일).
-    if cfg.model_path.is_dir()
-        && crate::engine::sniff_format(&cfg.model_path) == Ok(crate::engine::ModelFormat::W4A16)
-    {
+    // 방향(2026-10-08): 디렉터리 = W4A16 — bench 미구현(가속 커널 이후).
+    if cfg.model_path.is_dir() {
         eprintln!(
-            "error: 미지원 포맷(W4A16 — P2 대기, plans/cuda-models.md §3.5): {}",
+            "error: W4A16 bench 미구현(가속 커널 이후 — plans/w4a16-cuda.md §2): {}",
             cfg.model_path.display()
         );
         return ExitCode::FAILURE;
     }
-    let res_lines = if cfg.model_path.is_dir() {
-        // EXL3 아카이브 디렉터리(plans/125-4) — GGUF 아키텍처 판별이 아닌
-        // 디렉터리 여부로 판정. arch 변수는 GGUF 파일에만 유효하다.
-        bench_exl3(&cfg)
-    } else if arch.as_deref() == Some("qwen4exp") {
+    let res_lines = if arch.as_deref() == Some("qwen4exp") {
         bench_q4(&cfg)
     } else {
         bench_q35(&cfg)
@@ -212,127 +206,6 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     median_summary(&mut lines);
     print_table(&lines, &cfg);
     ExitCode::SUCCESS
-}
-
-/// EXL3(아카이브 디렉터리) 측정 — plans/125-4: bench가 GGUF 아키텍처 판별에
-/// 묶여 EXL3 dir을 거부하던 결함 수리. 프로토콜은 bench_q4와 동일(워밍업 1회 +
-/// reps, pp=prefill, tg=순차 greedy decode1 — serve 단일슬롯 경로와 동일).
-/// 백엔드: 포맷 자동 판별(2026-10-05) — dir→EXL3 엔진, 런타임은 gpu_runtime
-/// (hip→Exl3Hip, vulkan→Exl3(vk)). 힙 수치 측정은 ROCm10 런타임으로.
-fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
-    let dir = cfg
-        .model_path
-        .to_str()
-        .ok_or("exl3: 모델 경로가 utf8가 아님")?
-        .to_string();
-    enum Exl3 {
-        Vk(Box<crate::exl3_engine::Exl3Engine>),
-        Hip(Box<crate::exl3_hip_engine::Exl3HipEngine>),
-    }
-    impl Exl3 {
-        fn prefill(&mut self, toks: &[u32]) -> Result<Vec<f32>, String> {
-            match self {
-                Exl3::Vk(e) => e.prefill(0, toks),
-                Exl3::Hip(e) => e.prefill(toks),
-            }
-        }
-        fn decode1(&mut self, tok: u32) -> Result<Vec<f32>, String> {
-            match self {
-                Exl3::Vk(e) => e.decode1(0, tok),
-                Exl3::Hip(e) => e.decode1(tok),
-            }
-        }
-        fn step_tok(&mut self, tok: u32) -> Result<u32, String> {
-            match self {
-                Exl3::Vk(e) => e.decode1(0, tok).map(|l| llm170_core::qwen35::greedy(&l)),
-                Exl3::Hip(e) => e.step_tok(tok),
-            }
-        }
-        fn spec_round(&mut self, k: usize) -> Result<Vec<u32>, String> {
-            match self {
-                Exl3::Vk(_) => Err("--spec은 hip 런타임만 지원(EXL3)".into()),
-                Exl3::Hip(e) => e.spec_round(k),
-            }
-        }
-        fn reset(&mut self) {
-            match self {
-                Exl3::Vk(e) => e.reset_states(),
-                Exl3::Hip(e) => {
-                    if let Err(err) = e.reset_seq() {
-                        eprintln!("# hip reset_seq 실패: {err}");
-                    }
-                }
-            }
-        }
-    }
-    if cfg.backend == "cpu" {
-        // 포맷 자동 판별 계약(2026-10-05): dir→EXL3는 GPU 런타임 필요.
-        return Err("EXL3(디렉터리)는 GPU 런타임 필요 — --backend hip|vulkan".into());
-    }
-    let mut eng = if cfg.gpu_runtime == "vulkan" {
-        Exl3::Vk(Box::new(crate::exl3_engine::Exl3Engine::load(
-            &dir, 1, cfg.ctx,
-        )?))
-    } else {
-        Exl3::Hip(Box::new(crate::exl3_hip_engine::Exl3HipEngine::load(
-            &dir, 1, cfg.ctx,
-        )?))
-    };
-
-    // B20: 엔진 적재 완료 — 전역 적재 락 해제.
-    crate::resource::release_load_lock();
-    // 워밍업 1회 — 측정 형상과 동일(plans/79, llama-bench 정합).
-    {
-        let l = eng.prefill(&cfg.prompt)?;
-        let t = llm170_core::qwen35::greedy(&l);
-        let _ = eng.decode1(t)?;
-    }
-    eng.reset();
-    let mut lines = Vec::new();
-    for r in 0..cfg.reps {
-        eng.reset();
-        let t0 = std::time::Instant::now();
-        let l = eng.prefill(&cfg.prompt)?;
-        let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
-        lines.push(format!(
-            "pp{} gpu | rep{r} | {pp_ms:8.1} ms | {:7.2} t/s",
-            cfg.pp,
-            cfg.pp as f64 / (pp_ms / 1e3)
-        ));
-        let mut next = llm170_core::qwen35::greedy(&l);
-        let t1 = std::time::Instant::now();
-        let mut n_gen = 0usize;
-        // 스펙 경로(plans/130 D2): hip + --spec k — MTP 라운드(롤백 포함).
-        if cfg.spec_k > 0 {
-            let (mut n_round, mut n_emit) = (0usize, 0usize);
-            while n_gen < cfg.tg {
-                let toks = eng.spec_round(cfg.spec_k)?;
-                if let Some(&t) = toks.last() {
-                    next = t;
-                }
-                n_gen += toks.len();
-                n_round += 1;
-                n_emit += toks.len();
-            }
-            eprintln!(
-                "  [spec] 라운드 {n_round} · 배출 {n_emit} ({:.2}/라운드, 드래프트 k={})",
-                n_emit as f64 / n_round as f64,
-                cfg.spec_k
-            );
-        } else {
-            while n_gen < cfg.tg {
-                next = eng.step_tok(next)?; // serve greedy 경로와 동일(plans/130 A2)
-                n_gen += 1;
-            }
-        }
-        let tg_ms = t1.elapsed().as_secs_f64() * 1e3;
-        lines.push(format!(
-            "tg{} gpu | rep{r} | {tg_ms:8.1} ms | {:7.2} t/s (steps {n_gen}, gen {n_gen})",
-            cfg.tg,
-            n_gen as f64 / (tg_ms / 1e3)
-        ));
-    }
-    Ok(lines)
 }
 
 /// qwen4exp 측정 — Engine4 prefill/decode1 greedy + np 배치.
