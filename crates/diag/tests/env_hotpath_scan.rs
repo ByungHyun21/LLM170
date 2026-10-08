@@ -13,7 +13,7 @@
 //! - `crates/server/src/probes/` — 검증층(3층 분리: 하네스는 프로덕션 계약 밖).
 //! - `crates/backend-gpu/src/rawcuda/**` — fatbin 자산 경로 오버라이드 env
 //!   (`LLM170_CUDA_*_FATBIN_PATH` — 계산 경로 분기 아님, 로드 경로 전용).
-//! - gguf·server의 tests/·examples — 이 스캔은 src 트리만 본다.
+//! - server의 tests/·examples — 이 스캔은 src 트리만 본다.
 
 /// (루트, 허용 파일 접두사 목록) — 루트가 없으면 테스트 실패(이동 누락 방지).
 const SCAN: &[(&str, &[&str])] = &[

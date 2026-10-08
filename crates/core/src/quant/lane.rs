@@ -7,8 +7,8 @@ use super::q8::*;
 #[allow(unused_imports)]
 use super::q8::{y_el, y_f};
 use crate::tables::{IQ3S_GRID, KVALUES_IQ4NL};
-use llm170_gguf::GgmlType;
-pub fn dot_row_w4a8(ty: GgmlType, data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+use crate::wtype::WType;
+pub fn dot_row_w4a8(ty: WType, data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
     let (blck, bsize) = ty.block_info();
     let blocks = (k / blck) as usize;
     let bsize = bsize as usize;
@@ -17,15 +17,15 @@ pub fn dot_row_w4a8(ty: GgmlType, data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
         let wb = &data[b * bsize..b * bsize + bsize];
         let yb = &y[b * (blck as usize / 32)..b * (blck as usize / 32) + blck as usize / 32];
         let v = match ty {
-            GgmlType::Q4K => dot_q4k_q8(wb, yb),
-            GgmlType::Q5K => dot_q5k_q8(wb, yb),
-            GgmlType::Q6K => dot_q6k_q8(wb, yb),
-            GgmlType::Q3K => dot_q3k_q8(wb, yb),
-            GgmlType::Q8_0 => dot_q8k_q8(wb, yb),
-            GgmlType::Q5_1 => dot_q5_1_q8(wb, yb),
-            GgmlType::Iq4Xs => dot_iq4xs_q8(wb, yb),
-            GgmlType::Iq4Nl => dot_iq4nl_q8(wb, yb),
-            GgmlType::Iq3S => dot_iq3s_q8(wb, yb),
+            WType::Q4K => dot_q4k_q8(wb, yb),
+            WType::Q5K => dot_q5k_q8(wb, yb),
+            WType::Q6K => dot_q6k_q8(wb, yb),
+            WType::Q3K => dot_q3k_q8(wb, yb),
+            WType::Q8_0 => dot_q8k_q8(wb, yb),
+            WType::Q5_1 => dot_q5_1_q8(wb, yb),
+            WType::Iq4Xs => dot_iq4xs_q8(wb, yb),
+            WType::Iq4Nl => dot_iq4nl_q8(wb, yb),
+            WType::Iq3S => dot_iq3s_q8(wb, yb),
             _ => {
                 // 미지원: f32 디양자화 × y 재구성 (정확도 기준과 동일 원소 재구성)
                 let n = blck as usize;
@@ -378,7 +378,7 @@ pub fn tree64(v: &[f64; 64]) -> f64 {
 
 // ─── W4A16(GPTQ4·g128·sym) 레인 미러 — plans/137 §3.5, plans/138 단계 1 ───
 // AutoRound auto_gptq 규약: qrow 워드 j의 니블 j%8 = 원소 8·(j/8)+(j%8).
-// lsb-first **확정**(2026-10-08, w4a16-xcheck — 동일 기저 27B GGUF 대조
+// lsb-first **확정**(2026-10-08, w4a16-xcheck — 동일 기저 27B 원본 대조
 // corr(lsb) 0.991~0.994 vs corr(msb) ≈0.01, §3.6 종결).
 // zrow = 로더가 행별 언팩한 zp(그룹당 1개, sym 전형 8), srow = 그룹 f16 스케일.
 // GPU gemm_gptq4(64레인)와 동일 연산열: 레인 l = 원소 l, l+64, … f32 누산 →

@@ -245,7 +245,7 @@ impl Engine {
         last_token: u32,
         k: usize,
     ) -> Result<(Vec<u32>, usize), ModelError> {
-        // GPU 검증 경로 (rawhip): draft 체인(CPU MTP층 + GPU head) → 1배치 검증.
+        // 구 GPU 검증 경로(백엔드 탈락): draft 체인(CPU MTP층 + GPU head) → 1배치 검증.
         if self.raw_decode.is_some()
             && !self.seqs[seq].mtp_h.is_empty()
             && llm170_diag::flag::ne0("LLM170_RAWHIP")

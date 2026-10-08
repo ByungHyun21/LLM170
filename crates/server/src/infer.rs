@@ -46,8 +46,8 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     if prompts.is_empty() {
         return usage_err("at least one --prompt-tokens required");
     }
-    // 방향(2026-10-08, plans/w4a16-cuda.md §5): 모델은 W4A16 디렉터리 단일 —
-    // EXL3/GGUF는 스니핑이 탈락 에러로 안내.
+    // 단일 트랙(2026-10-08, plans/w4a16-cuda.md §5): 모델은 W4A16 디렉터리 단일 —
+    // 그 외는 스니핑이 명시 에러로 안내.
     if let Err(e) = crate::engine::sniff_format(&model_path) {
         return usage_err(&e);
     }

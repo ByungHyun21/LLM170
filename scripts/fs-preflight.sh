@@ -5,12 +5,12 @@
 # 반복 재발(stat은 성공, open은 ENOENT 플래핑). fsck로 복구했으나 재발 방지를
 # 위해 모든 무거운 작업 전 이 검사를 통과해야 한다.
 #
-# 사용법: scripts/fs-preflight.sh <모델파일> [--strict]
+# 사용법: scripts/fs-preflight.sh <경로(파일|디렉터리)> [--strict]
 #   일반: 5회 연속 open 성공 → 통과
 #   strict: 10회 + 0.2s 간격 — 플래핑 탐지
 # 종료코드: 0=통과, 1=불안정(작업 중단 권장), 2=완전 차단
 set -u
-MODEL="${1:?사용법: fs-preflight.sh <모델파일> [--strict]}"
+MODEL="${1:?사용법: fs-preflight.sh <경로> [--strict]}"
 MODE="${2:-}"
 
 N=5; GAP=0.2

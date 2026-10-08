@@ -31,9 +31,9 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일, plans/
       토크나이저 인코딩 [id, ...] 출력.
   llm170 help
 
-방향 전환(2026-10-08 — 사용자 지시): EXL3·GGUF·HIP·Vulkan은 **탈락** —
-해당 모델/백엔드는 명시 에러로 안내한다. CUDA W4A16 서빙(가속 커널)은
-plans/w4a16-cuda.md §2(W2/W3)에서 개발 중이며, 그 전까지 W4A16은 CPU 참조로 돈다.
+단일 트랙(2026-10-08 — 사용자 지시): CUDA W4A16만. 구 백엔드·포맷은
+명시 에러로 안내한다. CUDA 가속은 plans/w4a16-cuda.md §2(W2/W3)에서
+개발 중이며, 그 전까지 W4A16은 CPU 참조로 돈다.
 "#;
 
 /// 모델 적재 서브커맨드 공용 인자 (plans/78 R5) — main에서 1회 파싱해
@@ -85,37 +85,23 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
             "--model" => ma.model = Some(common_value(args, &mut i, &inline)),
             "--backend" => {
                 let v = common_value(args, &mut i, &inline);
-                // 통합 백엔드 1택(사용자 지시 2026-09-30): cpu|hip|vulkan|cuda.
-                // 파싱층에서 (backend, runtime) 쌍으로 정규화 — 엔진 코드는 무변경.
+                // 단일 트랙(2026-10-08): cpu|cuda 2택. cuda는 W2 커널 전까지
+                // 프런트(infer/serve)가 명시 거부한다(W4A16 CPU 참조 전용).
                 match v.as_str() {
                     "cpu" => {
                         ma.backend = Some("cpu".into());
                         ma.gpu_runtime = None;
                     }
-                    "hip" | "vulkan" => {
-                        ma.backend = Some("gpu".into());
-                        ma.gpu_runtime = Some(v.clone());
-                    }
                     "cuda" => {
                         ma.backend = Some("gpu".into());
                         ma.gpu_runtime = Some("cuda".into());
                     }
-                    // EXL3 백엔드값 폐지(사용자 지시 2026-10-05): --backend는
-                    // 런타임만(cpu|hip|vulkan|cuda). EXL3는 --model이 디렉터리면
-                    // 포맷 자동 판별로 라우팅된다.
-                    "exl3" | "exl3-hip" => {
-                        return Err("--backend exl3* 폐지: EXL3는 --model <EXL3 디렉터리>로 자동 판별 — --backend hip|vulkan|cpu".into());
-                    }
-                    // 하위호준 별칭 — 종전 2층(--backend gpu --gpu-runtime X) 폐지.
-                    "gpu" => {
-                        return Err("--backend gpu 폐지: --backend hip|vulkan|cpu 로 지정".into());
-                    }
-                    _ => return Err(format!("--backend: cpu|hip|vulkan|cuda (got {v})")),
+                    _ => return Err(format!("--backend: cpu|cuda (got {v})")),
                 }
             }
             "--gpu-runtime" => {
-                // 통합 폐지(2026-09-30): --backend hip|vulkan 이 단일 선택지다.
-                return Err("--gpu-runtime 폐지: --backend hip|vulkan 사용".into());
+                // --gpu-runtime 폐지(2026-09-30): --backend 단일 선택지.
+                return Err("--gpu-runtime 폐지: --backend 사용".into());
             }
             "--mtp" => ma.mtp = Some(common_value(args, &mut i, &inline)),
             "--ple-table" => {
@@ -205,7 +191,7 @@ fn run_main() -> ExitCode {
             }
         }
     }
-    // cubecl 커널 컴파일 오류 등 log 패싯 메시지 노출 — stderr 간이 로거.
+    // 런타임 log 패싯 메시지 노출 — stderr 간이 로거.
     struct EL;
     impl log::Log for EL {
         fn enabled(&self, _: &log::Metadata) -> bool {
@@ -252,7 +238,7 @@ fn run_main() -> ExitCode {
     }
 }
 
-/// llm170 serve --model <file> [--port N] [--ctx N] [--slots N] [--backend cpu|hip|vulkan] [--spec k]
+/// llm170 serve --model <dir> [--port N] [--ctx N] [--slots N] [--backend cpu|cuda] [--spec k]
 fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
     let mut queue: Option<usize> = None;
@@ -290,8 +276,8 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let Some(model_path) = ma.model.clone().map(PathBuf::from) else {
         return usage_err("--model required");
     };
-    // 방향 전환(2026-10-08, plans/w4a16-cuda.md §5): 수용 모델은 W4A16
-    // 디렉터리 단일 — EXL3·GGUF는 스니핑 단계에서 탈락 에러.
+    // 단일 트랙(2026-10-08, plans/w4a16-cuda.md §5): 수용 모델은 W4A16
+    // 디렉터리 단일 — 그 외 포맷은 스니핑 단계에서 명시 에러.
     let fmt = match engine::sniff_format(&model_path) {
         Ok(f) => f,
         Err(e) => {
@@ -360,7 +346,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     }
 }
 
-/// `llm170 tokenize --model <gguf> [--no-special] (--text <s> | --file <f> | --stdin)`
+/// `llm170 tokenize --model <dir> [--no-special] (--text <s> | --file <f> | --stdin)`
 /// llama-tokenize 대응 출력 `[id, ...]` — plans/83 A 검증·디버깅용.
 fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
     let Some(model) = ma.model.clone() else {

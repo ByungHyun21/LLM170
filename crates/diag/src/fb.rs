@@ -3,10 +3,10 @@
 //! GPU→CPU/경로 폴백이 조용히 발산 원인을 가리는 일을 막는다. eprintln
 //! 로그는 ONCE라 반복 폴백이 보이지 않는다; 카운터는 전수를 센다.
 //!
-//! A5 이전엔 core/qwen4exp/frame/fb.rs가 원장이었으나 EXL3(vk)·vl 등
-//! core 밖 폴백이 등재 불가했다 — 원장을 diag 공유층으로 옮기고 qwen4exp는
-//! 타입화 진입점(Id→이름)만 위임한다. 이름 공간은 dump.rs 92키와 동일
-//! 방식(단일 고정 표)으로 여기가 단일 진실 공급원이다.
+//! [2026-10-08 단일 트랙] 등록 표는 비어 있다 — 구 GPU 경로·구 아키텍처
+//! 삭제로 발화 지점이 전부 사라졌다. W2/W3(W4A16 CUDA
+//! 디코더)에서 폴백 지점이 생기면 여기에 이름을 등록한다. 이름 공간은
+//! dump.rs 키와 동일 방식(단일 고정 표)으로 여기가 단일 진실 공급원이다.
 //!
 //! 관측 경로 2개:
 //! - `llm170 diag fb` — 독립 프로세스(원장·0건 확인용).
@@ -17,24 +17,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// 등록 카운터 이름 — 여기 없는 이름 incr은 프로그래밍 에러(경고 로그).
-const NAMES: [&str; 13] = [
-    // qwen4exp frame (plans/107 W8 — core/qwen4exp/frame/fb.rs가 위임)
-    "emb-q8g",
-    "ple-ggpu",
-    "qsa-devsel",
-    "qsa-devsel-mt",
-    "qsa-idxpool",
-    "qsa-attn",
-    "frame-create",
-    "frame-create-np",
-    "mtp-draft",
-    "mtp-spec",
-    // EXL3 vk (plans/129 A5 — 체크 하네스 hadcpu 우회·프로덕션 krate 폴백)
-    "exl3-hadcpu",
-    "exl3-krate-preah",
-    // vl vit GPU→CPU (A21d 국소 카운터 → A5 원장 통합)
-    "vl-vit",
-];
+const NAMES: [&str; 0] = [];
 
 static COUNTS: [AtomicUsize; NAMES.len()] = [const { AtomicUsize::new(0) }; NAMES.len()];
 
@@ -78,18 +61,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn incr_bumps_named_counter() {
-        let before = count("exl3-krate-preah");
-        let v1 = incr("exl3-krate-preah");
-        incr("exl3-krate-preah");
-        assert_eq!(v1, before + 1);
-        assert_eq!(count("exl3-krate-preah"), before + 2);
-        assert!(report().contains("exl3-krate-preah"));
+    fn unknown_name_warns_and_stays_zero() {
+        assert_eq!(incr("no-such-counter"), 0);
+        assert_eq!(count("no-such-counter"), 0);
     }
 
     #[test]
-    fn unknown_name_does_not_panic() {
-        assert_eq!(incr("no-such-counter"), 0);
-        assert_eq!(count("no-such-counter"), 0);
+    fn empty_registry_reports_nothing() {
+        assert!(report().is_empty());
     }
 }

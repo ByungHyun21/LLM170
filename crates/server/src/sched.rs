@@ -183,8 +183,7 @@ impl Sched {
 }
 
 pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slots: usize) {
-    // plans/130 F5: EOS 하드코드 248044 → 모델 메타 파생(Q4=GGUF 메타,
-    // Q35=아키텍처 상수 — Engine::eos).
+    // plans/130 F5: EOS 하드코드 248044 → 모델 메타 파생(Engine::eos).
     let eos = eng.eos();
     // 기동 워밍업 — 첫 요청이 지연 초기화(raw_init, ctx 비례 수십 초)를
     // 뒤집어쓰지 않도록 여기서 소진하고 상태를 되돌린다. 준비 전에는 /health가

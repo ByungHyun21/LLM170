@@ -2,10 +2,9 @@
 //! (plans/124 2026-10-04).
 //!
 //! 계약: 새 크레이트 금지 → cuda-sys 등 도입 없이 시그니처를 손작성한다.
-//! 링크 방침: 정적 extern 링크(`#[link(name = "cuda")]`)는 AMD 전용 기기의
-//! 기본 빌드를 깨뜨린다(libcuda.so 없음 — 기본 빌드 녹색 계약). rawhip의
-//! cubecl-hip-sys(의존 libc+regex, 링크 의존 없음)와 동일 정책으로 런타임
-//! 해석만 한다(Windows: LoadLibraryA, unix: dlopen — libc은 기존 의존).
+//! 링크 방침: 정적 extern 링크(`#[link(name = "cuda")]`)는 CUDA 런타임이
+//! 없는 기기에서 기본 빌드를 깨뜨린다 — 런타임 해석만 한다
+//! (Windows: LoadLibraryA, unix: dlopen — libc은 기존 의존).
 //! 시그니처는 CUDA 13.4 nvcuda.dll 수출표와 대조 확인(2026-10-04 dumpbin).
 //! 계 alloc/memcpy/free는 _v2 심볼에 바인딩 — CUDA 13.4에서 평명(非_v2)
 //! 수출은 프라이머리 유지 컨텍스트를 인식하지 못해 CUresult=201로 실패함을

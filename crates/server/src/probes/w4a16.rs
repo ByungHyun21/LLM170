@@ -1,8 +1,8 @@
 //! W4A16 로더 프로브 — `w4a16-load` (plans/w4a16-cuda.md §1).
 //!
 //! 로더 완전성 검증 — 트리플 구조·weight_shape 값·커버리지(기대 텐서 전수)
-//! 판정. 무게는 헤더 + 행 단위 pread만. (구 w4a16-xcheck/to-gguf는 GGUF 탈락
-//! 2026-10-08로 제거 — 비트순서 확정·변환 검증은 이력에 기록.)
+//! 판정. 무게는 헤더 + 행 단위 pread만. (구 대조·변환 프로브는 2026-10-08
+//! 제거 — 비트순서 확정 검증은 이력에 기록.)
 
 use super::{arg_str, finish};
 use std::process::ExitCode;

@@ -6,7 +6,7 @@
 //!   F16[n, k/128] · `.weight_shape` I64[2]=(n,k). 행=출력(n), 열=입력(k).
 //! - 대칭(sym)이라 zero-point 미저장 → zp=8 고정(4bit 중심 — lane 미러 계약).
 //! - 니블 순서 lsb-first **확정**(2026-10-08, w4a16-xcheck — 동일 기저
-//!   27B GGUF 대조 corr(lsb) 0.991~0.994 vs corr(msb) ≈0.01; lane.rs §3.6).
+//!   27B 원본 대조 corr(lsb) 0.991~0.994 vs corr(msb) ≈0.01; lane.rs §3.6).
 //! - 비양자화: BF16 — embed_tokens·lm_head·norm·conv1d·A_log·dt_bias·
 //!   in_proj_a/b, mtp 15종, visual 333종(텍스트 서빙 무사용 — 커버리지에서만 집계).
 //! - 텐서명 `model.language_model.layers.{il}.*`(HF 원본), 전역은
@@ -175,7 +175,7 @@ pub struct W4a16Model {
 }
 
 /// 엔진(블록) 텐서명 해석 — qwen35 스테이지가 요구하는 이름을 소스로 매핑.
-/// **[정정]** V헤드 순열은 **필수**다 — 엔진은 GGUF subhead-major 계약
+/// **[정정]** V헤드 순열은 **필수**다 — 엔진은 subhead-major 계약
 /// (V헤드 h ↔ K헤드 h % nk, gdn.rs `ik1 = iv1 % nek1` 미러)이라, HF 원본
 /// (group-major)을 그대로 주면 k/v 짝이 어긋난다(직접 로드 실측: 출력 붕괴).
 /// 따라서 v-축 텐서는 순열 사본(perm store)으로 subhead-major를 공급한다.
@@ -355,7 +355,7 @@ impl W4a16Model {
         let mut mmaps = Vec::new();
         for p in ar.shard_paths() {
             let f = std::fs::File::open(p)?;
-            // SAFETY: 읽기 전용 매핑 — 수정하지 않는다(qwen35 GGUF mmap 동일 계약).
+            // SAFETY: 읽기 전용 매핑 — 수정하지 않는다(qwen35 mmap 동일 계약).
             mmaps.push(unsafe { memmap2::Mmap::map(&f)? });
         }
         Ok(W4a16Model {
@@ -468,7 +468,7 @@ impl W4a16Model {
     }
 
     /// V헤드 순열 사본 구축 — 엔진(subhead-major) 계약 공급용.
-    /// 규약은 exl3 convert.rs의 vperm 미러(F→3·(i%16)+i/16 실측 확정).
+    /// 규약은 vperm 미러(F→3·(i%16)+i/16 실측 확정).
     fn build_perm(&self) -> PermStore {
         let c = &self.cfg;
         let nk = c.linear_num_key_heads;
@@ -845,8 +845,8 @@ impl W4a16Model {
     }
 
     /// GDN V헤드 순열 — llama.cpp(subhead-major) ↔ HF(group-major):
-    /// gguf 블록 i ← 원본 블록 ratio·(i%nk) + i/nk (exl3 convert.rs 실측 확정
-    /// — beta 지문 corr 1.000·ssm_out 블록 corr 0.999, 동일 규약 미러).
+    /// 블록 i ← 원본 블록 ratio·(i%nk) + i/nk (실측 확정 — beta 지문
+    /// corr 1.000·ssm_out 블록 corr 0.999, 동일 규약 미러).
     fn vperm(&self, i: usize) -> usize {
         let nk = self.cfg.linear_num_key_heads;
         let ratio = self.cfg.linear_num_value_heads / nk;
@@ -907,7 +907,7 @@ fn decode_f32(raw: &[u8], dt: StDtype, name: &str) -> R<Vec<f32>> {
     })
 }
 
-/// 토큰 조각표(id 순) — vocab.json(exl3 규약) 우선, 없으면 tokenizer.json
+/// 토큰 조각표(id 순) — vocab.json(디렉터리 규약) 우선, 없으면 tokenizer.json
 /// (model.vocab + added_tokens 병합 — W4A16 HF 배포는 vocab.json 부재 실측,
 /// 특수 토큰 33종은 added_tokens에만 있다). Model 로드 공용.
 pub fn load_pieces(dir: &Path) -> R<Vec<String>> {
