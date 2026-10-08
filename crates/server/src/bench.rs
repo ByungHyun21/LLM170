@@ -268,6 +268,9 @@ fn bench_exl3(cfg: &BenchCfg) -> Result<Vec<String>, String> {
             &dir, 1, cfg.ctx,
         )?))
     };
+
+    // B20: 엔진 적재 완료 — 전역 적재 락 해제.
+    crate::resource::release_load_lock();
     // 워밍업 1회 — 측정 형상과 동일(plans/79, llama-bench 정합).
     {
         let l = eng.prefill(&cfg.prompt)?;
@@ -366,6 +369,9 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         false,
         crate::engine::AttachPolicy::Strict,
     )?;
+
+    // B20: 적재(엔진 조립+부착) 완료 — 전역 적재 락 해제.
+    crate::resource::release_load_lock();
     let eos = eng.model.eos;
     // QA-16: --spec 계약 — 스펙 의도면 측정도 스펙 경로로. 종전엔 MTP 가중치만
     // 적재하고 tg 루프는 순수 decode1_greedy(스펙 아님)였다.
@@ -627,9 +633,13 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         eng = crate::engine::attach_q35(
             eng,
             gpu_runtime == "vulkan",
+            crate::engine::q4_cuda_runtime_str(gpu_runtime),
             crate::engine::AttachPolicy::Strict,
         )?;
     }
+
+    // B20: 적재(엔진 조립+부착) 완료 — 전역 적재 락 해제.
+    crate::resource::release_load_lock();
     let has_mtp = eng.has_mtp();
     let spec_desc = if *spec_k > 0 && has_mtp {
         format!(" spec{spec_k}")

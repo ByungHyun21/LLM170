@@ -229,10 +229,14 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         eng = crate::engine::attach_q35(
             eng,
             gpu_runtime == "vulkan",
+            crate::engine::q4_cuda_runtime_str(&gpu_runtime),
             crate::engine::AttachPolicy::Warn,
         )
         .unwrap_or_else(|e| panic!("gpu attach: {e}"));
     }
+
+    // B20: 적재(엔진 조립+부착) 완료 — 전역 적재 락 해제.
+    crate::resource::release_load_lock();
     let eos = llm170_core::qwen35::EOS_EOT;
     let t1 = std::time::Instant::now();
     let mut last_logits = Vec::with_capacity(n_img);

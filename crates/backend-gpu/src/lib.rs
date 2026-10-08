@@ -36,6 +36,12 @@ pub fn new_q4_acc_vk_with_sources(
     Ok(std::sync::Arc::new(acc))
 }
 pub use rawhip::probes::gpu_mem_free;
+
+/// B6(plans/cuda-models.md §4): CUDA 런타임 VRAM 프로브 — 가드 preflight가
+/// 런타임 cuda일 때 hip gpu_mem_free 대신 사용.
+pub fn cuda_mem_free() -> Option<(u64, u64)> {
+    rawcuda::ctx::cuda_mem_free()
+}
 pub use rawhip::{bw_test, dp4a_test, qk_check, raw_probe};
 pub use rawvk::decoder::inject as inject_rawvk;
 

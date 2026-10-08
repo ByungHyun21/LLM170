@@ -97,6 +97,9 @@ fn perplexity_cpu(model_path: &str, prompt: &[u32]) -> ExitCode {
     };
     let mut eng = llm170_core::qwen35::Engine::new(model, 1, 4096);
 
+    // B20: 모델 적재 완료 — 전역 적재 락 해제.
+    crate::resource::release_load_lock();
+
     let n = prompt.len();
     let init = &prompt[..n - 1];
     let logits = match eng.prefill(0, init) {

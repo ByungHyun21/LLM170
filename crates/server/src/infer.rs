@@ -144,9 +144,17 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             // QA-17: backend 문자열 반영 — 종전 --backend cpu가 무시돼 GPU
             // 부착 결과를 cpu로 취급했다(vl 패턴과 동일 계약).
             if backend != "cpu" {
-                eng = crate::engine::attach_q35(eng, gpu_runtime == "vulkan", policy)
-                    .map_err(|e| format!("GPU 백엔드 주입 실패(REQUIRE_GPU): {e}"))?;
+                eng = crate::engine::attach_q35(
+                    eng,
+                    gpu_runtime == "vulkan",
+                    crate::engine::q4_cuda_runtime_str(&gpu_runtime),
+                    policy,
+                )
+                .map_err(|e| format!("GPU 백엔드 주입 실패(REQUIRE_GPU): {e}"))?;
             }
+
+            // B20: 적재(엔진 조립+부착) 완료 — 전역 적재 락 해제.
+            crate::resource::release_load_lock();
             let eos = llm170_core::qwen35::EOS_EOT;
             // prefill (시퀀스별 — GDN chunked 경로)
             let mut last_logits = Vec::with_capacity(n);
@@ -259,6 +267,9 @@ fn run_q4_infer(
                 false,
                 crate::engine::AttachPolicy::Strict,
             )?;
+
+            // B20: 적재(엔진 조립+부착) 완료 — 전역 적재 락 해제.
+            crate::resource::release_load_lock();
             let eos = eng.model.eos;
             let mut finished = vec![false; n];
             let mut next: Vec<u32> = Vec::with_capacity(n);
@@ -471,6 +482,9 @@ fn run_exl3_infer(
         eprintln!("error: EXL3 GPU 런타임 미지원: {gpu_runtime} (hip|vulkan|cuda 필요)");
         return ExitCode::FAILURE;
     };
+
+    // B20: 엔진 적재 완료 — 전역 적재 락 해제(EXL3 경로).
+    crate::resource::release_load_lock();
     let mut lg = match eng.prefill(prompt) {
         Ok(l) => l,
         Err(e) => {

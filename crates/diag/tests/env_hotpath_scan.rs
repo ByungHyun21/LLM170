@@ -99,3 +99,33 @@ fn production_sources_have_no_direct_env_reads() {
         bad.join("\n")
     );
 }
+
+/// B18(plans/cuda-models.md §5): 가드 우회 env 재도입 방지 — 폐지된
+/// `LLM170_NO_RSRC_GUARD`가 프로덕션 소스에 다시 등장하면 실패한다
+/// (bfb30654 폐지. 동결 사고 2026-09-16 재발 경로 차단 — resource.rs는
+/// env를 읽지 않는다는 계약과 세트).
+#[test]
+fn guard_killswitch_env_stays_banned() {
+    fn walk(d: &std::path::Path, bad: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, bad);
+            } else if let Ok(s) = std::fs::read_to_string(&p)
+                && s.contains("LLM170_NO_RSRC_GUARD")
+            {
+                bad.push(p.display().to_string());
+            }
+        }
+    }
+    let root = repo_root();
+    let mut bad = Vec::new();
+    for dir in ["crates/core/src", "crates/exl3/src", "crates/server/src"] {
+        walk(&root.join(dir), &mut bad);
+    }
+    assert!(
+        bad.is_empty(),
+        "가드 우회 env 재도입 감지: {bad:?} — 폐지 계약 위반(B18)"
+    );
+}
