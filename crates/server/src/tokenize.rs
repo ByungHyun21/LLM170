@@ -208,10 +208,20 @@ impl Tokenizer {
                 tj.get("model").and_then(|m| m.get("merges"))
             {
                 for m in ms {
-                    if let Some(s) = m.as_str()
-                        && let Some((a, b)) = s.split_once(' ')
-                    {
-                        push_merge(a.as_bytes(), b.as_bytes(), &mut bpe_ranks, &mut rank);
+                    // 두 형식: ["a","b"] 배열쌍(HF 최신 — 실측) · "a b" 문자열.
+                    match m {
+                        llm170_core::json::Json::Arr(pair) if pair.len() == 2 => {
+                            if let (Some(a), Some(b)) = (pair[0].as_str(), pair[1].as_str()) {
+                                push_merge(a.as_bytes(), b.as_bytes(), &mut bpe_ranks, &mut rank);
+                            }
+                        }
+                        _ => {
+                            if let Some(s) = m.as_str()
+                                && let Some((a, b)) = s.split_once(' ')
+                            {
+                                push_merge(a.as_bytes(), b.as_bytes(), &mut bpe_ranks, &mut rank);
+                            }
+                        }
                     }
                 }
             }
@@ -273,7 +283,45 @@ impl Tokenizer {
                 }
             }
         }
+        // 폴백: tokenizer_config의 added_tokens_decoder가 비어 있으면
+        // tokenizer.json added_tokens에서 수집(HF 최신 배포 — 실측:
+        // W4A16 AutoRound는 decoder 부재·added_tokens 33종에 special 플래그).
+        let mut special_user: Vec<(String, u32)> = Vec::new();
+        {
+            let mut seen: std::collections::HashSet<u32> =
+                special.iter().map(|(_, id)| *id).collect();
+            if let Some(tj) = &tok_json
+                && let Some(llm170_core::json::Json::Arr(items)) = tj.get("added_tokens")
+            {
+                for it in items {
+                    let Some(id) = it
+                        .get("id")
+                        .and_then(llm170_core::json::Json::as_f64)
+                        .map(|x| x as u32)
+                    else {
+                        continue;
+                    };
+                    let Some(content) = it.get("content").and_then(llm170_core::json::Json::as_str)
+                    else {
+                        continue;
+                    };
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    let is_special = it
+                        .get("special")
+                        .and_then(llm170_core::json::Json::as_bool)
+                        .unwrap_or(false);
+                    if is_special {
+                        special.push((content.to_string(), id));
+                    } else {
+                        special_user.push((content.to_string(), id));
+                    }
+                }
+            }
+        }
         special.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        special_user.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
         // pre 스플리터 — config.json model_type 계열.
         let mut pre = Pre::Other;
@@ -290,7 +338,7 @@ impl Tokenizer {
             };
         }
 
-        Self::from_parts(&vocab, bpe_ranks, special, Vec::new(), pre, ignore_merges)
+        Self::from_parts(&vocab, bpe_ranks, special, special_user, pre, ignore_merges)
     }
     /// 토큰 조각의 원 바이트열 (바이트 수준 BPE 역매핑).
     /// 어휘 비었는지(A19) — part1/part2 어느 쪽에도 토크나이저가
