@@ -243,7 +243,6 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
     let mut queue: Option<usize> = None;
     let mut slots: Option<usize> = None;
-    let mut spec_k = 0usize;
     let mut ctx = 4096usize;
     let backend = ma.backend.clone().unwrap_or_else(|| "cpu".into());
     let gpu_runtime = ma.gpu_runtime.clone().unwrap_or_default();
@@ -266,10 +265,6 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 Some(q) => queue = Some(q.max(1)),
                 None => return usage_err("--queue requires a number"),
             },
-            "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
-                Some(k) => spec_k = k.min(8),
-                None => return usage_err("--spec requires k in 1..=8"),
-            },
             other => return usage_err(&format!("unknown flag: {other}")),
         }
     }
@@ -289,11 +284,6 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     // W4A16은 CPU 전용(가속 커널 미구현 — W2) — GPU 백엔드 지정은 정직 거부.
     if backend != "cpu" {
         eprintln!("error: W4A16은 아직 CPU 전용(가속 커널 미구현 — W2): --backend cpu");
-        return ExitCode::FAILURE;
-    }
-    // W4A16은 MTP 미매핑 — 스펙 디코드는 후속(§2 W4).
-    if spec_k > 0 {
-        eprintln!("error: W4A16은 --spec 미지원(MTP 미매핑)");
         return ExitCode::FAILURE;
     }
     // 토크나이저 적재 (W4A16 디렉터리)

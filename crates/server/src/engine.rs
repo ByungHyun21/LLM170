@@ -113,99 +113,15 @@ pub struct GenState {
     pub pos: Vec<u32>,
 }
 
-/// 스펙 통계 — 요약 eprintln은 호출부 담당.
-#[derive(Default)]
-pub struct SpecStats {
-    pub cycles: usize,
-    pub accepted: usize,
-    pub target_forwards: usize,
-}
-
-/// qwen35 생성 루프 단일 구현 — 종전 infer/vl이 3모드
-/// (spec-multi / spec-single / batch)를 각자 손베껴 썼다. 모드 선택:
-/// spec_k>0 && has_mtp && LLM170_SPEC_GPU → n>1: "spec-multi", n==1:
-/// "spec", 아니면 "batch". --spec 무시 안내(eos·MTP 부재)도 여기서.
+/// qwen35 생성 루프 — 배치 디코드(greedy).
 pub fn generate_q35(
     eng: &mut llm170_core::qwen35::Engine,
     st: &mut GenState,
     n_predict: usize,
-    spec_k: usize,
     eos: u32,
     sink: &mut dyn TokenSink,
-) -> Result<(&'static str, SpecStats), String> {
+) -> Result<(), String> {
     let n = st.next.len();
-    let mut stats = SpecStats::default();
-    let spec_on = spec_k > 0 && eng.has_mtp() && llm170_diag::flag::on("LLM170_SPEC_GPU");
-    if spec_k > 0 && !eng.has_mtp() {
-        eprintln!("# --spec 무시: MTP(nextn) 텐서 없음");
-    }
-    if spec_on && n > 1 {
-        // np×spec 병합
-        let mut min_gen = st.gen_toks.iter().map(|g| g.len()).min().unwrap_or(0);
-        while min_gen <= n_predict {
-            let active: Vec<usize> = (0..n).filter(|&s| !st.finished[s]).collect();
-            if active.is_empty() {
-                break;
-            }
-            let nexts: Vec<u32> = active.iter().map(|&s| st.next[s]).collect();
-            let acc = eng
-                .spec_step_multi(&active, &nexts, spec_k)
-                .map_err(|e| e.to_string())?;
-            stats.cycles += 1;
-            let mut any = false;
-            for (i, &s) in active.iter().enumerate() {
-                for &t in &acc[i] {
-                    if st.gen_toks[s].len() > n_predict {
-                        break;
-                    }
-                    st.pos[s] += 1;
-                    sink.on_token(s, st.pos[s], t, eng);
-                    st.gen_toks[s].push(t);
-                    st.next[s] = t;
-                    stats.accepted += 1;
-                    if t == eos {
-                        st.finished[s] = true;
-                    }
-                    any = true;
-                }
-            }
-            if !any {
-                break;
-            }
-            min_gen = usize::MAX;
-            for (s, g) in st.gen_toks.iter().enumerate() {
-                if !st.finished[s] {
-                    min_gen = min_gen.min(g.len());
-                }
-            }
-        }
-        return Ok(("spec-multi", stats));
-    }
-    if spec_on {
-        let s = 0usize;
-        while st.gen_toks[s].len() <= n_predict && !st.finished[s] {
-            let (acc_toks, tf) = eng
-                .spec_step(s, st.next[s], spec_k)
-                .map_err(|e| e.to_string())?;
-            stats.cycles += 1;
-            stats.target_forwards += tf;
-            for &t in &acc_toks {
-                if st.gen_toks[s].len() > n_predict {
-                    break;
-                }
-                st.pos[s] += 1;
-                sink.on_token(s, st.pos[s], t, eng);
-                st.gen_toks[s].push(t);
-                st.next[s] = t;
-                stats.accepted += 1;
-                if t == eos {
-                    st.finished[s] = true;
-                }
-            }
-        }
-        return Ok(("spec", stats));
-    }
-    // 배치 디코드 — 활성 시퀀스 묶어 1스텝 (np 상호검증 대상 경로)
     for _step in 0..n_predict {
         let active: Vec<usize> = (0..n).filter(|&s| !st.finished[s]).collect();
         if active.is_empty() {
@@ -224,7 +140,7 @@ pub fn generate_q35(
             }
         }
     }
-    Ok(("batch", stats))
+    Ok(())
 }
 
 pub struct InferResult {
@@ -233,9 +149,6 @@ pub struct InferResult {
     /// 없어 실패 통보 경로 자체가 없었다(슬롯 스피너 + 클라이언트 영구 대기).
     pub error: Option<String>,
 }
-
-/// serve --spec k 전역 (기본 0).
-pub static SPEC_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 pub enum Engine {
     Q35(Box<llm170_core::qwen35::Engine>),
@@ -275,9 +188,6 @@ pub fn build_slots(req: InferRequest, _backend: BackendSel, n_slots: usize) -> E
     // PLE 플래그는 구 백엔드 전역 구현이었음 — 탈락(2026-10-08, §5)으로 무의미.
     if req.ple_table.is_some() || req.ple_cache_mib.is_some() {
         eprintln!("# ple-table/ple-cache: 백엔드 탈락(2026-10-08) — 플래그 무시");
-    }
-    if SPEC_K.get().copied().unwrap_or(0) > 0 {
-        eprintln!("# spec: W4A16은 MTP 미매핑 — 무시");
     }
     // W4A16 = qwen35 CPU 경로 단일(가속은 W2 커널 이후 — 그때 attach 재도입).
     let m = load_q35_retry(&req.model);

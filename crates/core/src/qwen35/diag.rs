@@ -47,20 +47,9 @@ pub(super) fn g0_gdn(
     eprintln!("  G0dbg exp_cr(g) xor={xce:016x}");
 }
 
-/// A3: 어텐션 층 norm 직후 q 판(word0·첫 6개 q8).
+/// A3: 어텐션 층 norm 직후 q 판 표본.
 pub(super) fn a3_normed(xs0: &[f32]) {
     eprintln!("  A3dbg normed[0..6]={:?}", &xs0[0..6]);
-    if let Some(qb) = crate::quant::quantize_row_q8_ref(xs0).first() {
-        let mut word = 0u32;
-        for (i, b) in qb.qs.iter().take(4).enumerate() {
-            word |= (*b as u8 as u32) << (8 * i);
-        }
-        eprintln!(
-            "  A3dbg cpu q word0={word:#010x} d={:e} q[0..6]={:?}",
-            qb.d,
-            qb.qs.iter().take(6).collect::<Vec<_>>()
-        );
-    }
 }
 
 /// A3: CPU 어텐션 직전 캐시·게이트 표본.

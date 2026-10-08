@@ -10,8 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct SlotJob {
     pub tokens: Vec<u32>,
     pub n_predict: usize,
-    /// MTP 스펙 k (0=off) — serve --spec.
-    pub spec_k: usize,
     /// 샘플링 파라미터 (기본 greedy — None이면 GPU argmax 경로 유지).
     pub sampler: Option<llm170_core::sampler::SamplerParams>,
     /// 조기 종료 토큰 (EOS + 채팅 템플릿 종결자).
@@ -252,83 +250,8 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         if !active.is_empty() {
             decoded = true;
             let _dt = std::time::Instant::now();
-            // 샘플링 활성 슬롯 — logits 경로 필요 (GPU argmax 판은 토큰만 회수).
-            // greedy 기본은 종전 최적 경로 유지 (게이트 무변화).
-            let sampling = |s: &Slot| s.sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
             match &mut eng {
-                Engine::Q35(e) => {
-                    // 스펙 슬롯 분리 — spec_step 경로. 샘플링 슬롯은
-                    // 스펙 제외(스펙 검증은 greedy 판정 전제) — 일반 디코드로.
-                    let spec_slots: Vec<usize> = active
-                        .iter()
-                        .copied()
-                        .filter(|&i| {
-                            slots[i].job.as_ref().is_some_and(|j| j.spec_k > 0)
-                                && !sampling(&slots[i])
-                        })
-                        .collect();
-                    if !spec_slots.is_empty() && e.has_mtp() && e.raw_decode.is_some() {
-                        // np×spec 병합: 스펙 슬롯 2개 이상이면 한 배치로 검증.
-                        // 슬롯별 순차 spec_step은 배치 이득을 전부 잃는다 (2026-09-12 측정:
-                        // 서버 np4 spec 12.1 vs 비스펙 22.6 t/s agg).
-                        let kmin = spec_slots
-                            .iter()
-                            .map(|&i| slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8))
-                            .min()
-                            .unwrap_or(1);
-                        let mut done_spec: Vec<usize> = Vec::new();
-                        if spec_slots.len() > 1 {
-                            let ns: Vec<u32> = spec_slots.iter().map(|&i| slots[i].next).collect();
-                            if let Ok(accs) = e.spec_step_multi(&spec_slots, &ns, kmin) {
-                                for (row, &i) in spec_slots.iter().enumerate() {
-                                    let cap = slots[i].job.as_ref().unwrap().n_predict;
-                                    for &t in &accs[row] {
-                                        if slots[i].generated as usize >= cap {
-                                            break;
-                                        }
-                                        slot_emit(&mut slots[i], t);
-                                        if t == eos {
-                                            break;
-                                        }
-                                    }
-                                }
-                                done_spec = spec_slots.clone();
-                            }
-                        }
-                        for &i in spec_slots.iter().filter(|&i| !done_spec.contains(i)) {
-                            let k = slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8);
-                            let next = slots[i].next;
-                            let cap = slots[i].job.as_ref().unwrap().n_predict;
-                            match e.spec_step(i, next, k) {
-                                Ok((acc, _tf)) => {
-                                    for &t in &acc {
-                                        if slots[i].generated as usize >= cap {
-                                            break;
-                                        }
-                                        slot_emit(&mut slots[i], t);
-                                        if t == eos {
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    eprintln!("# spec 실패({err})");
-                                    slot_fail(&mut slots[i], format!("spec_step: {err}"));
-                                }
-                            }
-                        }
-                        let plain: Vec<usize> = active
-                            .iter()
-                            .copied()
-                            .filter(|&i| !spec_slots.contains(&i))
-                            .collect();
-                        if !plain.is_empty() {
-                            q35_decode(e, &mut slots, &plain);
-                        }
-                    } else {
-                        q35_decode(e, &mut slots, &active);
-                    }
-                }
+                Engine::Q35(e) => q35_decode(e, &mut slots, &active),
             }
             dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
             // 완료 슬롯 정리 — 결과 전송·반환
@@ -549,9 +472,6 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
                 error: None,
             });
             // 접두 캐시 — 상태 유지 (프롬프트+생성 = 구워진 열).
-            // 스펙 carried가 남으면 GDN이 뒤처짐 — 트렁크 재실행으로 커밋.
-            let Engine::Q35(e) = &mut *eng;
-            let _ = e.flush_carried(i);
             let mut full = j.tokens.clone();
             full.extend(toks);
             s.cached = full;
