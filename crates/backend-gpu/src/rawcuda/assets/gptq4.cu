@@ -104,6 +104,22 @@ extern "C" __global__ void w4a16_cast_x32(const float* __restrict__ in,
 //   w = (nib-8) as f32 * sc[g];  acc += w * x[i];   (mul·add 분리, 레인 l은
 //   i=l,l+64,… 오름차순 → f64 tree64). k ≤ 128*G4_SCMAX 계약.
 #define G4_SCMAX 256
+
+// f64 tree64 — core lane.rs와 동일 순서(전 호출부 공용).
+__device__ __forceinline__ float tree64(double* red) {
+    for (int i = 0; i < 32; ++i) {
+        red[i] += red[i + 32];
+    }
+    for (int off = 16; off >= 1; off >>= 1) {
+        for (int i = 0; i < off; ++i) {
+            red[i] += red[i + off];
+        }
+    }
+    return (float)red[0];
+}
+
+// 2행/블록 — x를 두 행이 공유(L1 x 트래픽 ÷2)하고 레인당 미결 로드가 2배.
+// 스케일은 행별(각 행의 srow), 산술 순서는 1행 커널과 동일(계약 불변).
 extern "C" __global__ void w4a16_gemv_g128(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
     const unsigned short* __restrict__ s,  // [n][k/128] f16 비트(스케일)
@@ -127,14 +143,15 @@ extern "C" __global__ void w4a16_gemv_g128(
     __syncthreads();
     const unsigned* qrow = q + (size_t)o * k8;
     // 스케일 그룹은 i>>7 = (l + 64j)>>7 = j>>1 — 전 레인 공통(유니폼 로드).
-    // 8이터레이션 언롤로 미결 q·x 로드를 8개까지 겹친다(지연 은닉).
+    // 16이터레이션 언롤 — 미결 q·x 로드를 16개까지 겹친다(지연 은닉, 실측 8→16
+    // = 27.9→27.2ms). 2행/블록 변형은 역효과(34.8ms — 레지스터·L1 압박).
     const int jn = k >> 6;
     const int li = l & 7;
     float acc = 0.0f;
     int j = 0;
-    for (; j + 8 <= jn; j += 8) {
+    for (; j + 16 <= jn; j += 16) {
 #pragma unroll
-        for (int u = 0; u < 8; ++u) {
+        for (int u = 0; u < 16; ++u) {
             const int jj = j + u;
             const int i = l + (jj << 6);
             // evict-first — 한 번 읽는 가중치가 L2를 오염시키지 않게(스트리밍).
@@ -154,16 +171,7 @@ extern "C" __global__ void w4a16_gemv_g128(
     red[l] = (double)acc;
     __syncthreads();
     if (l == 0) {
-        // tree64 — core lane.rs와 동일 순서.
-        for (int i = 0; i < 32; ++i) {
-            red[i] += red[i + 32];
-        }
-        for (int off = 16; off >= 1; off >>= 1) {
-            for (int i = 0; i < off; ++i) {
-                red[i] += red[i + off];
-            }
-        }
-        out[o] = (float)red[0];
+        out[o] = tree64(red);
     }
 }
 
