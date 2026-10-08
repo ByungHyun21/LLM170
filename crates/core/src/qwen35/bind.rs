@@ -8,7 +8,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// 지원 아키텍처 식별자(config.json `architectures`/`model_type`).
-pub const ARCHES: &[&str] = &["Qwen3_5ForConditionalGeneration"];
+pub const ARCHES: &[&str] = &[
+    "Qwen3_5ForConditionalGeneration",
+    // W4-1: 35B-A3B MoE(g32) — dense와 같은 qwen3_5 계열, FFN만 MoE.
+    "Qwen3_5MoeForConditionalGeneration",
+];
 
 pub fn arch_supported(arch: &str) -> bool {
     ARCHES.contains(&arch)
@@ -46,6 +50,11 @@ pub struct QwenCfg {
     pub partial_rotary_factor: f64,
     pub rope_theta: f64,
     pub rms_norm_eps: f64,
+    // ── MoE(0이면 dense FFN) ──
+    pub n_experts: usize,
+    pub top_k: usize,
+    pub moe_ffn: usize,
+    pub shared_ffn: usize,
 }
 
 impl QwenCfg {
@@ -76,7 +85,11 @@ impl QwenCfg {
             heads: u("num_attention_heads").ok_or_else(|| bad("num_attention_heads"))?,
             kv_heads: u("num_key_value_heads").ok_or_else(|| bad("num_key_value_heads"))?,
             head_dim: u("head_dim").ok_or_else(|| bad("head_dim"))?,
-            ffn: u("intermediate_size").ok_or_else(|| bad("intermediate_size"))?,
+            // MoE는 dense intermediate_size가 없다 — moe_intermediate_size로
+            // 대체(엔진 ffn 필드는 dense 전용, MoE 경로는 moe_ffn을 쓴다).
+            ffn: u("intermediate_size")
+                .or_else(|| u("moe_intermediate_size"))
+                .ok_or_else(|| bad("intermediate_size"))?,
             vocab: u("vocab_size").ok_or_else(|| bad("vocab_size"))?,
             full_interval: u("full_attention_interval").unwrap_or(4).max(1),
             linear_key_head_dim: u("linear_key_head_dim")
@@ -96,6 +109,10 @@ impl QwenCfg {
                 .get("rms_norm_eps")
                 .and_then(Json::as_f64)
                 .unwrap_or(1e-6),
+            n_experts: u("num_experts").unwrap_or(0),
+            top_k: u("num_experts_per_tok").unwrap_or(0),
+            moe_ffn: u("moe_intermediate_size").unwrap_or(0),
+            shared_ffn: u("shared_expert_intermediate_size").unwrap_or(0),
         };
         // 교차필드 계약(C4) — 위반은 로드 중 0나누기(attn)·언더플로(conv)·조용한
         // GQA 오매핑이 된다. 파싱 시점에 명시 거부(게이트 B/C 계약 보호).
@@ -130,6 +147,18 @@ impl QwenCfg {
             return Err(W4a16Error::Config(format!(
                 "linear_num_value_heads={} % linear_num_key_heads={} != 0 (vperm ratio)",
                 cfg.linear_num_value_heads, cfg.linear_num_key_heads
+            )));
+        }
+        // MoE 교차필드 — n_experts>0이면 top_k/FFN 폭 전부 양수·상한 내.
+        if cfg.n_experts > 0
+            && (cfg.top_k == 0
+                || cfg.top_k > cfg.n_experts
+                || cfg.moe_ffn == 0
+                || cfg.shared_ffn == 0)
+        {
+            return Err(W4a16Error::Config(format!(
+                "MoE 구성 위반 — experts={} top_k={} moe_ffn={} shared_ffn={}",
+                cfg.n_experts, cfg.top_k, cfg.moe_ffn, cfg.shared_ffn
             )));
         }
         Ok(cfg)
@@ -256,6 +285,28 @@ pub fn eng(name: &str) -> Option<Eng> {
         "ffn_gate.weight" => q("mlp.gate_proj", PV::None),
         "ffn_up.weight" => q("mlp.up_proj", PV::None),
         "ffn_down.weight" => q("mlp.down_proj", PV::None),
+        // MoE(35B) — 라우터·shared_expert는 플레인. 전문가는 스토어 접근자
+        // (Model::expert_slice)로 인덱스 접근 — 이름맵에 30,720개를 넣지 않는다.
+        "moe_gate.weight" => Some(Eng::Plain {
+            name: format!("{l}.mlp.gate.weight"),
+            rows_perm: false,
+        }),
+        "moe_shared_gate.weight" => Some(Eng::Plain {
+            name: format!("{l}.mlp.shared_expert.gate_proj.weight"),
+            rows_perm: false,
+        }),
+        "moe_shared_up.weight" => Some(Eng::Plain {
+            name: format!("{l}.mlp.shared_expert.up_proj.weight"),
+            rows_perm: false,
+        }),
+        "moe_shared_down.weight" => Some(Eng::Plain {
+            name: format!("{l}.mlp.shared_expert.down_proj.weight"),
+            rows_perm: false,
+        }),
+        "moe_shared_sgate.weight" => Some(Eng::Plain {
+            name: format!("{l}.mlp.shared_expert_gate.weight"),
+            rows_perm: false,
+        }),
         _ => None,
     }
 }
@@ -453,6 +504,33 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
         ..Default::default()
     };
     rep.bad_shape_value = store.check_shape_values()?;
+    // MoE 전문가 트리플 구조(W4-1) — 층당 n_experts×3, 형상 계약 포함.
+    // 이름맵·커버리지에 30,720개를 싣지 않고 여기서 구조로 검증한다.
+    if cfg.n_experts > 0 {
+        let lp = "model.language_model.layers.";
+        for il in 0..cfg.layers {
+            for e in 0..cfg.n_experts {
+                for (proj, n, k) in [
+                    ("gate_proj", cfg.moe_ffn, cfg.hidden),
+                    ("up_proj", cfg.moe_ffn, cfg.hidden),
+                    ("down_proj", cfg.hidden, cfg.moe_ffn),
+                ] {
+                    let base = format!("{lp}{il}.mlp.experts.{e}.{proj}");
+                    match store.lin_shape(&base) {
+                        Some((nn, kk)) if nn == n && kk == k => {}
+                        Some((nn, kk)) => {
+                            return Err(W4a16Error::Config(format!(
+                                "{base}: 형상 ({nn},{kk}) != ({n},{k})"
+                            )));
+                        }
+                        None => {
+                            return Err(W4a16Error::Config(format!("{base}: 전문가 트리플 부재")));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // 순열 정렬 계약(C2) — 순열 사본 구축(build_perm) 전에 전수 거부.
     {
         let lp = "model.language_model.layers.";
@@ -521,19 +599,68 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
 fn expected_names(cfg: &QwenCfg) -> (Vec<String>, Vec<String>) {
     let (mut q, mut p) = (Vec::new(), Vec::new());
     let lp = "model.language_model.layers.";
+    // MoE(35B): dense mlp.{gate,up,down}_proj 부재 — 라우터·shared_expert가
+    // 플레인으로, 전문가 트리플은 validate의 구조 검사(층당 experts×3)가 맡는다.
+    let ffn_q: &[&str] = if cfg.n_experts > 0 {
+        &[]
+    } else {
+        &["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"]
+    };
+    let ffn_p: &[&str] = if cfg.n_experts > 0 {
+        &[
+            "mlp.gate.weight",
+            "mlp.shared_expert.gate_proj.weight",
+            "mlp.shared_expert.up_proj.weight",
+            "mlp.shared_expert.down_proj.weight",
+            "mlp.shared_expert_gate.weight",
+        ]
+    } else {
+        &[]
+    };
+    // MoE는 어텐션 투영도 BF16 플레인(실측 — 전문가만 양자화).
+    let attn_q: &[&str] = if cfg.n_experts > 0 {
+        &[]
+    } else {
+        &[
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+        ]
+    };
+    let attn_qg: &[&str] = if cfg.n_experts > 0 {
+        &[]
+    } else {
+        &[
+            "linear_attn.in_proj_qkv",
+            "linear_attn.in_proj_z",
+            "linear_attn.out_proj",
+        ]
+    };
+    let attn_p: &[&str] = if cfg.n_experts > 0 {
+        &[
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+        ]
+    } else {
+        &[]
+    };
+    let attn_pg: &[&str] = if cfg.n_experts > 0 {
+        &[
+            "linear_attn.in_proj_qkv.weight",
+            "linear_attn.in_proj_z.weight",
+            "linear_attn.out_proj.weight",
+        ]
+    } else {
+        &[]
+    };
     for il in 0..cfg.layers {
         let full = (il + 1).is_multiple_of(cfg.full_interval);
         let pre = format!("{lp}{il}.");
         if full {
-            for m in [
-                "self_attn.q_proj",
-                "self_attn.k_proj",
-                "self_attn.v_proj",
-                "self_attn.o_proj",
-                "mlp.gate_proj",
-                "mlp.up_proj",
-                "mlp.down_proj",
-            ] {
+            for m in attn_q.iter().chain(ffn_q) {
                 q.push(format!("{pre}{m}"));
             }
             for m in [
@@ -541,18 +668,15 @@ fn expected_names(cfg: &QwenCfg) -> (Vec<String>, Vec<String>) {
                 "post_attention_layernorm.weight",
                 "self_attn.q_norm.weight",
                 "self_attn.k_norm.weight",
-            ] {
+            ]
+            .into_iter()
+            .chain(attn_p.iter().copied())
+            .chain(ffn_p.iter().copied())
+            {
                 p.push(format!("{pre}{m}"));
             }
         } else {
-            for m in [
-                "linear_attn.in_proj_qkv",
-                "linear_attn.in_proj_z",
-                "linear_attn.out_proj",
-                "mlp.gate_proj",
-                "mlp.up_proj",
-                "mlp.down_proj",
-            ] {
+            for m in attn_qg.iter().chain(ffn_q) {
                 q.push(format!("{pre}{m}"));
             }
             for m in [
@@ -564,7 +688,11 @@ fn expected_names(cfg: &QwenCfg) -> (Vec<String>, Vec<String>) {
                 "linear_attn.conv1d.weight",
                 "linear_attn.A_log",
                 "linear_attn.dt_bias",
-            ] {
+            ]
+            .into_iter()
+            .chain(attn_pg.iter().copied())
+            .chain(ffn_p.iter().copied())
+            {
                 p.push(format!("{pre}{m}"));
             }
         }
@@ -628,6 +756,10 @@ mod tests {
             partial_rotary_factor: 0.25,
             rope_theta: 1e7,
             rms_norm_eps: 1e-6,
+            n_experts: 0,
+            top_k: 0,
+            moe_ffn: 0,
+            shared_ffn: 0,
         }
     }
 

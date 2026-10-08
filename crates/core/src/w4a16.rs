@@ -150,8 +150,20 @@ pub struct W4a16Model {
 impl W4a16Model {
     /// 디렉터리 열기 — quantization_config 검증 + 트리플 구조 검사 + mmap.
     pub fn open(dir: &Path) -> R<Self> {
-        let q_txt = std::fs::read_to_string(dir.join("quantization_config.json"))
-            .map_err(|e| W4a16Error::Missing(format!("quantization_config.json: {e}")))?;
+        // E1: 양자화 설정 탐색 체인 — 사이드카 2종 → config.json 내장.
+        // (35B 실측: quantization_config.json·quant_config.json 모두 부재,
+        //  config.json["quantization_config"]에만 내장 — GPTQModel 탐색 순서 미러.)
+        let q_txt = match ["quantization_config.json", "quant_config.json"]
+            .iter()
+            .find_map(|f| std::fs::read_to_string(dir.join(f)).ok())
+        {
+            Some(t) => t,
+            None => {
+                let cfg = std::fs::read_to_string(dir.join("config.json"))
+                    .map_err(|e| W4a16Error::Missing(format!("config.json: {e}")))?;
+                extract_embedded_quant(&cfg)?
+            }
+        };
         let quant = Self::check_quant(&q_txt)?;
         let ar = StArchive::open(dir)?;
 
@@ -174,7 +186,9 @@ impl W4a16Model {
                     pk.dtype
                 )));
             }
-            if sc.dtype != StDtype::F16 {
+            // E2: 스케일은 F16(27B) 또는 BF16(35B 전문가 — 실측) 수용.
+            // 소비자(디퀀트·커널)는 scale_dtype 플래그로 분기한다.
+            if sc.dtype != StDtype::F16 && sc.dtype != StDtype::Bf16 {
                 return Err(W4a16Error::BadTensor(format!(
                     "{base}: scale {:?}",
                     sc.dtype
@@ -261,12 +275,28 @@ impl W4a16Model {
                 "bits={bits} sym={sym} — int4 sym 전용"
             )));
         }
-        if group != 128 {
+        // E3: g128(27B)·g32(35B MoE) 수용 — 소비자 일반화는 W4-1 진행 중.
+        if group != 128 && group != 32 {
             return Err(W4a16Error::Quant(format!(
-                "group={group} — 현행 g128 전용(g32는 W4-1에서 스토어·lane·커널·bind 동시 일반화)"
+                "group={group} — g128/g32만 지원"
             )));
         }
         Ok(QuantSpec { bits, group })
+    }
+
+    /// MoE 전문가 트리플 슬라이스(W4-1) — (packed, scale, n, k).
+    /// 인덱스 기반 접근자: 이름맵에 30,720개를 넣지 않는다(로더 계약).
+    pub fn expert_slice(
+        &self,
+        layer: usize,
+        e: usize,
+        proj: &str,
+    ) -> Option<(&[u8], &[u8], usize, usize)> {
+        let base = format!("model.language_model.layers.{layer}.mlp.experts.{e}.{proj}");
+        let (n, k) = *self.lins.get(&base)?;
+        let q = self.tensor_slice(&format!("{base}.weight_packed"))?;
+        let s = self.tensor_slice(&format!("{base}.weight_scale"))?;
+        Some((q, s, n, k))
     }
 
     /// 헤더 엔트리 조회(서빙 경로 — Weight 슬라이스 형상 판독).
@@ -481,6 +511,47 @@ pub fn load_pieces(dir: &Path) -> R<Vec<String>> {
     Ok(out)
 }
 
+/// config.json 본문에서 `"quantization_config": {...}` 값을 원문 슬라이스로
+/// 추출한다(E1 — 사이드카 부재 모델). 문자열 리터럴 내부의 중괄호는 무시.
+fn extract_embedded_quant(cfg: &str) -> R<String> {
+    let key = "\"quantization_config\"";
+    let i = cfg
+        .find(key)
+        .ok_or_else(|| W4a16Error::Quant("quantization_config 부재(사이드카·내장 모두)".into()))?;
+    let rest = &cfg[i + key.len()..];
+    let start = rest
+        .find('{')
+        .ok_or_else(|| W4a16Error::Quant("quantization_config 값이 객체 아님".into()))?;
+    let b = rest.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut j = start;
+    while j < b.len() {
+        let c = b[j];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else if c == b'"' {
+            in_str = true;
+        } else if c == b'{' {
+            depth += 1;
+        } else if c == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Ok(rest[start..=j].to_string());
+            }
+        }
+        j += 1;
+    }
+    Err(W4a16Error::Quant("quantization_config 객체 미종결".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,12 +569,14 @@ mod tests {
     }
 
     #[test]
-    fn quant_g32_reject_until_w4() {
-        // C3: g32는 로드 중 패닉(커널/lane 가정)을 내므로 파싱 시점 명시 거부.
-        let e = W4a16Model::check_quant(&qtext(4, true, 32))
-            .expect_err("g32 거부")
+    fn quant_g32_accept_other_groups_reject() {
+        // W4-1(2026-10-08): g32(35B MoE) 수용 — g128/g32 외 그룹은 명시 거부.
+        let q = W4a16Model::check_quant(&qtext(4, true, 32)).expect("g32 계약");
+        assert_eq!(q.group, 32);
+        let e = W4a16Model::check_quant(&qtext(4, true, 64))
+            .expect_err("g64 거부")
             .to_string();
-        assert!(e.contains("g128 전용"), "{e}");
+        assert!(e.contains("g128/g32"), "{e}");
     }
 
     #[test]
