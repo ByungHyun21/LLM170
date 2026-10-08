@@ -606,12 +606,27 @@ impl W4a16Dec {
         Ok(())
     }
 
+    /// dx32(x32 버퍼) 용량 보장 — 융합 노름·cast_x32 공용.
+    fn ensure_dx32(&mut self, n: usize) -> Result<CUdeviceptr, String> {
+        if n > self.dx32_cap {
+            if self.dx32 != 0 {
+                self.cc.free(self.dx32)?;
+            }
+            self.dx32 = 0; // G1
+            self.dx32_cap = 0;
+            self.dx32 = self.cc.alloc(n * 4)?;
+            self.dx32_cap = n;
+        }
+        Ok(self.dx32)
+    }
+
     fn norm_resid_at(
         &mut self,
         w: usize,
         x_dev: CUdeviceptr,
         ab_dev: CUdeviceptr,
         t_len: usize,
+        xn32: CUdeviceptr,
     ) -> Result<CUdeviceptr, String> {
         if self.dnw == 0 {
             return Err("norm: 노름 가중 미등록".into());
@@ -623,12 +638,13 @@ impl W4a16Dec {
         let mut tl = t_len as i32;
         let mut wo = (w * self.hidden) as i32;
         let mut hd = self.hidden as i32;
-        let (mut a0, mut a1, mut a2, mut a3) = (x_dev, self.dnw, ab_dev, self.dxn);
-        let mut args: [*mut std::ffi::c_void; 7] = [
+        let (mut a0, mut a1, mut a2, mut a3, mut a4) = (x_dev, self.dnw, ab_dev, self.dxn, xn32);
+        let mut args: [*mut std::ffi::c_void; 8] = [
             (&mut a0) as *mut _ as *mut _,
             (&mut a1) as *mut _ as *mut _,
             (&mut a2) as *mut _ as *mut _,
             (&mut a3) as *mut _ as *mut _,
+            (&mut a4) as *mut _ as *mut _,
             (&mut tl) as *mut _ as *mut _,
             (&mut wo) as *mut _ as *mut _,
             (&mut hd) as *mut _ as *mut _,
@@ -650,7 +666,7 @@ impl W4a16Dec {
         self.ensure_norm_bufs(1)?;
         let abb = unsafe { std::slice::from_raw_parts(ab.as_ptr() as *const u8, ab.len() * 4) };
         self.cc.h2d(self.dab, abb)?;
-        let xn = self.norm_resid_at(w, x_dev, self.dab, 1)?;
+        let xn = self.norm_resid_at(w, x_dev, self.dab, 1, 0)?;
         let mut bytes = vec![0u8; self.hidden * 4];
         self.cc.d2h(&mut bytes, xn)?;
         self.cc.sync()?;
@@ -1541,9 +1557,10 @@ impl W4a16Dec {
         x_dev: CUdeviceptr,
         ab_dev: CUdeviceptr,
         t_len: usize,
+        xn32: CUdeviceptr,
     ) -> Result<CUdeviceptr, String> {
         self.ensure_norm_bufs(t_len)?;
-        self.norm_resid_at(w, x_dev, ab_dev, t_len)
+        self.norm_resid_at(w, x_dev, ab_dev, t_len, xn32)
     }
 
     /// GDN 체인 디바이스 상주 — xn·qkv·z(디바이스) → dgate.
@@ -1647,13 +1664,11 @@ impl W4a16Dec {
         let mut ab = self.dab_dev;
         let mut gi = 0usize;
         for il in 0..self.n_layers {
+            // 노름이 x32를 융합 기록(cast_x32 노드 제거) — q/k/v(또는 qkv/z) 공유.
+            let x32 = self.ensure_dx32(self.hidden)?;
             let xn = self
-                .norm_resid_dev(2 * il, self.dres, ab, 1)
+                .norm_resid_dev(2 * il, self.dres, ab, 1, x32)
                 .map_err(|e| format!("L{il} input norm: {e}"))?;
-            // xn은 q/k/v(또는 qkv/z)가 공유 — x32 캐스트 1회(런치·복사 절감).
-            let x32 = self
-                .cast_x32(xn, self.hidden)
-                .map_err(|e| format!("L{il} xn cast: {e}"))?;
             let branch = if (il + 1) % 4 == 0 {
                 self.gemv_stage_x32(&format!("blk.{il}.attn_q.weight"), x32, s0, w0)
                     .map_err(|e| format!("L{il} q: {e}"))?;
@@ -1687,11 +1702,10 @@ impl W4a16Dec {
                 .gemv_dev_x32(&lo, x32b)
                 .map_err(|e| format!("L{il} {lo}: {e}"))?;
             let xn2 = self
-                .norm_resid_dev(2 * il + 1, self.dres, out, 1)
+                .norm_resid_dev(2 * il + 1, self.dres, out, 1, x32)
                 .map_err(|e| format!("L{il} post norm: {e}"))?;
-            let x32n = self
-                .cast_x32(xn2, self.hidden)
-                .map_err(|e| format!("L{il} xn2 cast: {e}"))?;
+            let x32n = x32; // 노름 융합 기록
+            let _ = xn2;
             self.gemv_stage_x32(&format!("blk.{il}.ffn_gate.weight"), x32n, s0, w0)
                 .map_err(|e| format!("L{il} gate: {e}"))?;
             self.gemv_stage_x32(&format!("blk.{il}.ffn_up.weight"), x32n, s1, w1)
@@ -1728,7 +1742,7 @@ impl W4a16Dec {
             }
         }
         let xn_final = self
-            .norm_resid_dev(2 * self.n_layers, self.dres, ab, 1)
+            .norm_resid_dev(2 * self.n_layers, self.dres, ab, 1, 0)
             .map_err(|e| format!("final norm: {e}"))?;
         Ok(xn_final)
     }
@@ -1927,11 +1941,11 @@ impl W4a16Dec {
         let mut ab = self.dab_dev;
         let mut gi = 0usize;
         for il in 0..self.n_layers {
+            let xh = self.ensure_dx32(t * h)?;
             let xn = self
-                .norm_resid_dev(2 * il, self.dres, ab, t)
+                .norm_resid_dev(2 * il, self.dres, ab, t, xh)
                 .map_err(|e| format!("T{il} input norm: {e}"))?;
             let branch = if (il + 1) % 4 == 0 {
-                let xh = self.cast_x32(xn, t * h)?;
                 self.gemm_launch(&format!("blk.{il}.attn_q.weight"), xh, s0, t)?;
                 self.gemm_launch(&format!("blk.{il}.attn_k.weight"), xh, s1, t)?;
                 self.gemm_launch(&format!("blk.{il}.attn_v.weight"), xh, s1b, t)?;
@@ -1956,9 +1970,10 @@ impl W4a16Dec {
             let xh2 = self.cast_x32(branch, t * ko)?;
             self.gemm_launch(&lo, xh2, dyt, t)?;
             let xn2 = self
-                .norm_resid_dev(2 * il + 1, self.dres, dyt, t)
+                .norm_resid_dev(2 * il + 1, self.dres, dyt, t, xh)
                 .map_err(|e| format!("T{il} post norm: {e}"))?;
-            let xh3 = self.cast_x32(xn2, t * h)?;
+            let xh3 = xh; // 노름 융합 기록
+            let _ = xn2;
             self.gemm_launch(&format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
             self.gemm_launch(&format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
             self.ew_dev(s0, s1, s2, t * w2)?;
@@ -1971,7 +1986,7 @@ impl W4a16Dec {
         // 마지막 행만 최종 노름(+head) — 중간 행 로짓은 불필요(상각).
         let last = (t - 1) as u64 * (h as u64) * 4;
         let xn_last = self
-            .norm_resid_dev(2 * self.n_layers, self.dres + last, ab + last, 1)
+            .norm_resid_dev(2 * self.n_layers, self.dres + last, ab + last, 1, 0)
             .map_err(|e| format!("T final norm: {e}"))?;
         let mut ob = vec![0u8; if head { self.head_n * 4 } else { h * 4 }];
         if head {

@@ -1,3 +1,5 @@
+#include "cast_common.cuh"
+
 // ── norm_resid CUDA 포팅 (G3, 2026-10-04) ──
 // 산술은 구 rawhip 커널의 norm_resid 1:1 직이식(원본
 // 그대로 베낌 — 부동소수 적산 순서·정밀 sqrt 계약 포함). 차이는 hip 판이
@@ -32,6 +34,9 @@ extern "C" __global__ void norm_resid(
     const float* __restrict__ nw, // [rows][hidden] 노름 가중 배열
     const float* __restrict__ ab, // [T][hidden]
     float* __restrict__ xn,       // [T][hidden]
+    float* __restrict__ xn32,     // [T][hidden] h2f(f2h(xn)) — 융합 캐스트.
+                                  // 0이면 생략(cast_x32 커널과 비트 동일 계약:
+                                  // 노드 −2/층 → 그래프 노드·런치 절감).
     int t_len, int w_off, int hidden)
 {
     __shared__ float red[1024];
@@ -57,7 +62,11 @@ extern "C" __global__ void norm_resid(
     float inv = 1.0f / sqrtf(red[0] / (float)hidden + 1e-6f);
     for (int j = 0; j < nper; j++) {
         int e = base + (j << 10) + tid;
-        xn[e] = v[j] * inv * nw[w_off + (j << 10) + tid];
+        float y = v[j] * inv * nw[w_off + (j << 10) + tid];
+        xn[e] = y;
+        if (xn32 != (float*)0) {
+            xn32[e] = h2f(f2h(y)); // cast_x32 커널과 동일 산식(비트 동일)
+        }
         x[e] = v[j];
     }
 }
