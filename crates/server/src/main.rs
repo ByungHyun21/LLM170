@@ -3,6 +3,7 @@
 //! - infer: qwen35 CPU 참조 추론 (greedy). 토큰 id 입력 — 토크나이저는 후속 단계.
 
 mod engine;
+mod gpu_engine;
 mod http;
 mod infer;
 mod json;
@@ -242,15 +243,6 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         }
     };
     let _ = fmt; // W4A16 단일(현재)
-    // 경로는 CUDA 고정(가속 커널 미착륙 — W2/W3): W3에서 실행부가 들어오면
-    // 이 게이트를 제거한다. 참조·디버깅은 `w4a16-ref` 프로브.
-    const CUDA_READY: bool = false;
-    if !CUDA_READY {
-        eprintln!(
-            "error: W4A16 CUDA 경로는 W2/W3 개발 중(가속 커널 미착륙) — 참조·디버깅은 w4a16-ref 프로브"
-        );
-        return ExitCode::FAILURE;
-    }
     // 토크나이저 적재 (W4A16 디렉터리)
     // 간헐 ENOPT(transient ENOENT) 재시도 — 2026-09-01 실측 회복 패턴.
     let mut tok = None;
