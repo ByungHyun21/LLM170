@@ -10,12 +10,13 @@
 //! - 필요량  = 모델 전체 바이트 x 1.10 (KV/활성/업로드 스테이징 여유)
 //! - 가용량  = VRAM 가용 + 0.85 x 호스트 가용(MemAvailable)
 //!   (호스트 15%는 프로세스 자체/페이지캐시 변동을 위한 상한)
-//! - 측정 불능(비리눅스/프로브 실패)인 항목은 거부하지 않고 경고만 낸다
-//!   - 가드가 오탐으로 정상 실행을 막는 일이 없어야 하기 때문.
-//!
-//! 킬스위치 폐지(2026-10-03, 사용자 지시): MemAvailable 기반 계정이 회수
-//! 가능 캐시를 이미 반영하므로 오탐 근원이 아니며, 우회 env는 실질 무장
-//! 해제(시스템 동결 사고 재발 위험) — 가드는 상시 동작.
+//! - **gpu 적재에서 VRAM 미측정이면 거부**(B17, 2026-10-08 사용자 승인 —
+//!   '오탐 차단 우선'을 '안전 우선'으로 변경. 탈출구 없음). CPU 적재의
+//!   호스트 미측정(비리눅스 등)은 기존대로 경고 후 판정.
+//! - 킬스위치 폐지(2026-10-03, 사용자 지시) 유지 — 가드는 상시 동작.
+//! - B20(plans/cuda-models.md §4·§5, 2026-10-08): 전역 적재 락(flock) —
+//!   동시 기동 check-then-act 레이스 직렬화. 락 획득 **후** 판정(재판정),
+//!   적재 완료 지점에서 해제(장기 상주 락 아님).
 
 use std::path::Path;
 
@@ -23,12 +24,22 @@ const REQ_SLACK: f64 = 1.10;
 const HOST_USABLE: f64 = 0.85;
 
 /// 순수 판정 함수 - 단위테스트 대상.
+/// B17: gpu 적재(gpu_load=true)에서 VRAM 미측정(vram_free=None)은 즉시 거부 —
+/// "측정 불능→통과"가 사실상 가드 해제였다(CUDA 기기 "VRAM unknown" 실측 2회).
 pub fn check(
     model_bytes: u64,
     vram_free: Option<u64>,
     host_avail: Option<u64>,
+    gpu_load: bool,
 ) -> Result<(), String> {
     let gib = |b: u64| format!("{:.1} GiB", b as f64 / (1u64 << 30) as f64);
+    if gpu_load && vram_free.is_none() {
+        return Err(format!(
+            "VRAM 측정 불능 — gpu 적재는 VRAM 조회가 필수다(B17, 안전 우선 정책). \
+             model ~{} (with slack). 런타임/드라이버 상태 확인 후 재시도",
+            gib((model_bytes as f64 * REQ_SLACK) as u64),
+        ));
+    }
     let required = (model_bytes as f64 * REQ_SLACK) as u64;
     let mut capacity = 0u64;
     let mut known = false;
@@ -41,7 +52,8 @@ pub fn check(
         known = true;
     }
     if !known {
-        // 측정 불능 - 오탐 방지 위해 통과 (호출부에서 경고).
+        // 측정 불능(CPU 적재·비리눅스) - 오탐 방지 위해 통과 (호출부에서 경고).
+        // gpu 적재는 위 B17 게이트에서 이미 거부됐다.
         return Ok(());
     }
     if required > capacity {
@@ -57,11 +69,46 @@ pub fn check(
     Ok(())
 }
 
+/// B7(plans/cuda-models.md §5): 스플릿 GGUF 파트 경로 정규화 — `-NNNNN-of-MMMMM.gguf`
+/// 어떤 파트로 지정해도 파트1 기준 경로로(Model4::load가 파트를 전개하는 기준).
+/// 종전 model_bytes의 rfind("-00001-of-")는 part2/3 입력을 단일 파일로 과소
+/// 계상했다. 파트1이 없으면 원본 경로 그대로.
+fn split_part1(p: &Path) -> std::path::PathBuf {
+    let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+        return p.to_path_buf();
+    };
+    let b = name.as_bytes();
+    let digits5 = |s: &[u8]| s.len() == 5 && s.iter().all(u8::is_ascii_digit);
+    // 뒤쪽 `-MMMMM-of-NNNNN.gguf` 접미 확인(첫 `-of-`가 아니다 — 모델명에
+    // `-of-`가 포함될 수 있다).
+    if let Some(of) = name.rfind("-of-")
+        && b.len() >= of + 9 + 5
+        && b[of + 4..of + 9].starts_with(&b[of + 4..])
+        && digits5(&b[of + 4..of + 9])
+        && b[of + 9..].starts_with(b".gguf")
+        && of >= 6
+        && b[of - 6] == b'-'
+        && digits5(&b[of - 5..of])
+    {
+        let mut n2 = String::with_capacity(name.len());
+        n2.push_str(&name[..of - 6]);
+        n2.push_str("-00001");
+        n2.push_str(&name[of..]);
+        let p1 = p.with_file_name(n2);
+        if p1.exists() {
+            return p1;
+        }
+    }
+    p.to_path_buf()
+}
+
 /// 스플릿 GGUF 전체 파트 크기 합 - `-00001-of-00004.gguf` 패턴(Model4::load와 동일 규약).
 /// EXL3 디렉터리 경로는 재귀 합산 + 런타임 스크래치 가산(2026-10-03:
 /// 디렉터리 metadata≈0으로 통과하던 구멍 — gsnap/배치 스크래치 할당이
 /// 시스템 동결로 폭발한 사고의 근본 가드 결함).
 fn model_bytes(p: &Path) -> u64 {
+    // B7: 파트 정규화 후 회계 — part2/3 직접 지정도 전체 파트 합산.
+    let p = &split_part1(p);
     // EXL3 디렉터리: 샤드 전체 합 + GPU 스크래치(yb×3 1.5GB + xtb/ah 1.3GB
     // + gframe 0.53GB + aframe 0.27GB + fframe/gsnap 0.18GB ≈ 3.7GB → 4GB 가산).
     if p.is_dir() {
@@ -112,6 +159,7 @@ fn model_bytes(p: &Path) -> u64 {
 /// GGUF 파트들에서 PLE 테이블(per_layer_token_embd) 바이트 합 — mmap 스트리밍
 /// 되어 상주 불요한 테이블의 가드 차감용. GGUF 헤더 파싱 실패 시 0.
 fn ple_stream_bytes(p: &Path) -> u64 {
+    let p = &split_part1(p);
     let name = match p.file_name().and_then(|s| s.to_str()) {
         Some(n) => n.to_string(),
         None => return 0,
@@ -153,14 +201,18 @@ fn host_mem_available() -> Option<u64> {
 }
 
 /// 적재 시작 전 가드 - 서브커맨드 진입부에서 호출.
-/// `gpu`가 참이면 VRAM 가용을 조회해 산식에 포함한다.
+/// `gpu`가 참이면 VRAM 가용을 조회해 산식에 포함한다(B17: 조회 실패=거부).
+/// `runtime`: 요청 런타임(Some("cuda")면 cuMemGetInfo 프로브, 그 외 hip).
 /// 진단용 기본 모델 경로(단일 소스 — probes.rs·가드 표가 공유,
-/// plans/129 A2/R1·A13).
-pub const DEFAULT_FN_MODEL: &str =
-    "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
-pub const DEFAULT_27_MODEL: &str = "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf";
-pub const DEFAULT_Q35_MODEL: &str = "/home/yoon/models/qwen3.8-27b/q35work.gguf";
-pub const DEFAULT_EXL3_MODEL: &str = "/home/yoon/models/Qwen3.8-27B-exl3-4.00bpw";
+/// plans/129 A2/R1·A13). 2026-10-08 이 기기 실측 경로로 갱신(종전
+/// /home/yoon 체계는 부재 — 표 테스트의 "전부 실존" 계약이 깨졌다).
+pub const DEFAULT_FN_MODEL: &str = "/home/harsper/Desktop/workspace/models/Qwen3.8-Flash-Next-GGUF-UD-Q3_K_XL/UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
+pub const DEFAULT_27_MODEL: &str =
+    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_M.gguf";
+pub const DEFAULT_Q35_MODEL: &str =
+    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_M.gguf";
+pub const DEFAULT_EXL3_MODEL: &str =
+    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B-exl3-5.00bpw";
 
 /// 무인자 실행 시 모델을 적재하는 프로브(가드 우회 폐쇄 — plans/129 A13).
 /// (서브커맨드, 기본 경로) — --model/위치인자 부재 시 기본 경로로 가드한다.
@@ -173,10 +225,16 @@ pub const PROBE_DEFAULT_MODELS: &[(&str, &str)] = &[
     ("vk-frame-check", DEFAULT_FN_MODEL),
 ];
 
+/// B19: 위치인자로 모델을 적재하는 GPU 프로브 접두 — 일반 위치인자 폴백에서
+/// gpu=true(가드가 VRAM까지 계정). CPU 프로브(mod-check 등)는 폴백 gpu=false.
+const POSITIONAL_GPU_PROBES: &[&str] = &["vk-", "hip", "exl3-", "cuda", "mmq-", "tile-", "rawhip"];
+
 /// 가드 대상(plans/129 A2/R1) — 판정 결과.
 pub struct GuardTarget {
     pub path: std::path::PathBuf,
     pub gpu: bool,
+    /// 요청 런타임("cuda"|"hip"|"vulkan" — B6 프로브 선택용).
+    pub runtime: Option<String>,
 }
 
 /// 가드 대상 판정 — main() 인라인에서 추출한 순수함수(plans/129 A2/R1).
@@ -190,8 +248,10 @@ pub fn guard_target(
     gpu_runtime: Option<&str>,
     rest: &[String],
 ) -> Option<GuardTarget> {
-    // 메타데이터만 읽는 서브커맨드 — 무게 미적재.
-    if matches!(sub, "gguf-dump" | "tokenize") {
+    // 메타데이터/행 판독만 읽는 서브커맨드 — 무게 미적재. dequant는 무게
+    // 텐서 1행(≤수백KB)만 판독하므로 적재 계정 대상이 아니다(B2 검증 워크플로
+    // 가드 우회가 아니라 계약 — 모델 상주 불가 기기에서도 판독 가능해야 한다).
+    if matches!(sub, "gguf-dump" | "tokenize" | "dequant") {
         return None;
     }
     let mut path = model.map(std::path::PathBuf::from);
@@ -225,12 +285,25 @@ pub fn guard_target(
         path = Some(std::path::PathBuf::from(*def));
         gpu = true;
     }
-    path.map(|path| GuardTarget { path, gpu })
+    // B19: 나머지 위치인자 프로브(rawhip-check·vk-gemv-check 등)도 모델을
+    // 적재한다 — 일반 폴백으로 가드. 라우트 추가·프로브 확장 시 무가드
+    // 실적재 경로가 새로 생기는 것을 막는다. GPU 프로브 접두는 gpu=true.
+    if path.is_none() && let Some(p) = first_pos() {
+        path = Some(p);
+        if POSITIONAL_GPU_PROBES.iter().any(|pre| sub.starts_with(pre)) {
+            gpu = true;
+        }
+    }
+    path.map(|path| GuardTarget {
+        path,
+        gpu,
+        runtime: gpu_runtime.map(String::from),
+    })
 }
 
 /// PLE 테이블(per_layer_token_embd) SSD 스테이징 차감 — 상주 계정에서 제외.
 /// ple-ssd 모드(8GiB+ 테이블은 auto 정책상 SSD 행선)에선 테이블이 RAM/VRAM
-/// 비상주(pread 요구 시 판독)이므로 model_bytes에 포함하면 과대계상 — 버퍼드
+/// 비상주(pread 요청 시 판독)이므로 model_bytes에 포함하면 과대계상 — 버퍼드
 /// PLE(plans/135 long-ctx)가 페이지캐시를 쓰며 MemAvailable이 오르내리는
 /// 지금은 가드 오탐의 직접 원인. 메타데이터만 저비용 판독(GGUF 헤더+텐서 표).
 fn ple_ssd_deduction(model: &Path) -> u64 {
@@ -269,16 +342,26 @@ fn ple_ssd_deduction(model: &Path) -> u64 {
     0
 }
 
-pub fn preflight(model: &Path, gpu: bool) -> Result<(), String> {
+pub fn preflight(model: &Path, gpu: bool, runtime: Option<&str>) -> Result<(), String> {
     let bytes = model_bytes(model).saturating_sub(ple_ssd_deduction(model));
     if bytes == 0 {
         return Ok(()); // 경로 오류는 로더의 에러가 더 정확하다 - 여기서는 통과
     }
     let vram = if gpu {
-        match llm170_backend_gpu::gpu_mem_free() {
+        // B6: 런타임별 프로브 — cuda는 cuMemGetInfo(rawcuda ffi), 그 외는
+        // 기존 hip 프로브. 실패는 None → check의 B17 게이트가 거부한다.
+        let probe = if runtime == Some("cuda") {
+            llm170_backend_gpu::cuda_mem_free()
+        } else {
+            llm170_backend_gpu::gpu_mem_free()
+        };
+        match probe {
             Some((free, _total)) => Some(free),
             None => {
-                eprintln!("# rsrc-guard: VRAM 조회 실패 - VRAM 항목 없이 판정한다");
+                eprintln!(
+                    "# rsrc-guard: VRAM 조회 실패(runtime={}) — gpu 적재는 거부된다(B17)",
+                    runtime.unwrap_or("default")
+                );
                 None
             }
         }
@@ -289,7 +372,99 @@ pub fn preflight(model: &Path, gpu: bool) -> Result<(), String> {
     if host.is_none() {
         eprintln!("# rsrc-guard: MemAvailable 조회 불가 - 호스트 항목 없이 판정한다");
     }
-    check(bytes, vram, host)
+    check(bytes, vram, host, gpu)
+}
+
+// ── B20: 전역 적재 락(flock) ──────────────────────────────────────────────
+// 동시 기동 레이스: 가드는 기동 시점 1회 판정이라 두 프로세스가 동시에 뜨면
+// 양쪽 다 통과한 뒤 둘 다 적재한다(2026-09-16 동결 사고 계급). 전역 락으로
+// 적재 창구를 직렬화하고, 락 획득 후 재판정한다(main이 acquire → preflight
+// 순서로 호출). 해제는 적재 완료 지점(build_slots/각 로더 반환 후) — 장기
+// 상주 락이 아니다. 모델 무관: 다른 모델끼리도 동시 적재 금지(사고 보고).
+
+// std 외 크레이트 금지 계약(rawcuda loader 관례) — libc는 std가 이미 링크.
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+    fn getuid() -> u32;
+}
+#[cfg(unix)]
+const LOCK_EX: i32 = 2;
+#[cfg(unix)]
+const LOCK_NB: i32 = 4;
+
+static LOAD_LOCK: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// 적재 락 획득 — 배타(flock). 선점 중이면 보유자 pid를 보고하며 최대 600초
+/// 대기(대형 적재 창구), 초과 시 거부. 같은 프로세스 재획득은 no-op.
+pub fn acquire_load_lock() -> Result<(), String> {
+    #[cfg(not(unix))]
+    return Ok(()); // 비유닉스: flock 부재 — 가드 판정만으로 동작
+    #[cfg(unix)]
+    {
+        let mut g = LOAD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if g.is_some() {
+            return Ok(()); // 이미 보유(같은 프로세스 재진입)
+        }
+        // SAFETY: getuid는 부작용 없는 조회.
+        let uid = unsafe { getuid() };
+        let path = format!("/tmp/llm170-load-{uid}.lock");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("적재 락 파일 열기 실패({path}): {e}"))?;
+        use std::os::unix::io::AsRawFd;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let mut reported = 0u32;
+        loop {
+            // SAFETY: f의 raw fd에 저수준 잠금 — fd 소유는 f가 유지한다.
+            let r = unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) };
+            if r == 0 {
+                break;
+            }
+            let holder = std::fs::read_to_string(&path).unwrap_or_default();
+            if reported % 40 == 0 {
+                eprintln!(
+                    "# rsrc-guard: 다른 llm170 적재 진행 중(보유 pid {holder}) — 대기(B20)"
+                );
+            }
+            reported += 1;
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "적재 락 대기 시간 초과(600s) — 보유 pid {holder}. 동시 기동 금지(B20)"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        // 보유자 기록(해제 시 지운다 — stale pid 최소화).
+        let _ = f.set_len(0);
+        use std::io::{Seek, Write};
+        let mut f = f;
+        let _ = f.seek(std::io::SeekFrom::Start(0));
+        let _ = write!(f, "{}", std::process::id());
+        *g = Some(f);
+        Ok(())
+    }
+}
+
+/// 적재 락 해제 — 적재 완료 지점(build_slots 반환 직후 등)에서 호출.
+/// 프로세스 exit도 fd close로 해제된다(단명 CLI 경로).
+pub fn release_load_lock() {
+    let mut g = LOAD_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(mut f) = g.take() {
+        let _ = f.set_len(0);
+        use std::io::{Seek, Write};
+        let _ = f.seek(std::io::SeekFrom::Start(0));
+        let _ = write!(f, "0");
+        // drop(f) — flock 해제(fd close)
+    }
 }
 
 #[cfg(test)]
@@ -305,7 +480,8 @@ mod tests {
             check(
                 103_700 * (1 << 20),
                 Some(95 * GIB + 768 * (1 << 20)),
-                Some(26 * GIB)
+                Some(26 * GIB),
+                true,
             )
             .is_ok()
         );
@@ -314,30 +490,61 @@ mod tests {
     #[test]
     fn refuses_double_resident() {
         // 다른 서버가 상주해 VRAM~=0, 호스트~=5GiB 남은 이중 적재 사고 조건.
-        assert!(check(103_700 * (1 << 20), Some(GIB), Some(5 * GIB)).is_err());
+        assert!(check(103_700 * (1 << 20), Some(GIB), Some(5 * GIB), true).is_err());
     }
 
     #[test]
     fn passes_27b_alongside_resident() {
-        assert!(check(17 * GIB, Some(80 * GIB), Some(22 * GIB)).is_ok());
+        assert!(check(17 * GIB, Some(80 * GIB), Some(22 * GIB), true).is_ok());
     }
 
     #[test]
-    fn unknown_measurements_pass_with_warning() {
-        assert!(check(103_700 * (1 << 20), None, None).is_ok());
+    fn cpu_unknown_measurements_pass_with_warning() {
+        // CPU 적재: 측정 불능 통과 유지(오탐 방지 — 비리눅스 등).
+        assert!(check(103_700 * (1 << 20), None, None, false).is_ok());
         // 호스트 불능 + VRAM 만으로 모델×슬랙을 못 덮으면 거부 — 가드의 목적
         // (이중 적재 동결 방지)상 이것이 옳다(2026-09-16: 통과 기대는 산식과
         // 모순되어 수정).
-        assert!(check(103_700 * (1 << 20), Some(90 * GIB), None).is_err());
+        assert!(check(103_700 * (1 << 20), Some(90 * GIB), None, true).is_err());
     }
 
-    /// guard_target 판정 표(plans/129 A2/R1) — 서브커맨드×인자 형태 계약을
-    /// 고정한다. 무가드 적재 프로브 폐쇄(A13)·exl3 상대경로 우회 폐쇄 포함.
+    #[test]
+    fn b17_gpu_load_requires_vram_measurement() {
+        // B17 승인 정책(2026-10-08): gpu 적재에서 VRAM 미측정 = 거부.
+        // 호스트가 넉넉해도(CUDA 기기 "VRAM unknown" 사고 재현 조건) 거부.
+        assert!(check(17 * GIB, None, Some(200 * GIB), true).is_err());
+        assert!(check(17 * GIB, None, None, true).is_err());
+        // 측정되면 통과(용량 충분).
+        assert!(check(17 * GIB, Some(20 * GIB), Some(30 * GIB), true).is_ok());
+    }
+
+    #[test]
+    fn b7_split_part1_normalization() {
+        // part2/3 경로 → 파트1 유도. 존재하지 않는 파트면 원본 유지.
+        let p2 = Path::new("/nonexistent/model-00002-of-00003.gguf");
+        assert_eq!(split_part1(p2), p2); // 파트1 부재 — 원본
+        // 실존 스플릿(FN 3파트)으로 검증: part2 입력도 part1로 정규화.
+        let fn_dir = "/home/yoon/models/qwen3.8-Flash-Next/UD-Q3_K_XL";
+        let base = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q3_K_XL";
+        if std::path::Path::new(&format!("{fn_dir}/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf")).exists() {
+            let p = split_part1(Path::new(&format!(
+                "{fn_dir}/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00003.gguf"
+            )));
+            assert!(p.to_string_lossy().contains("-00001-of-00003"));
+        }
+        // 단일 파일·비-GGUF 접미는 무변환.
+        assert_eq!(split_part1(Path::new("/m/a.gguf")), Path::new("/m/a.gguf"));
+        let _ = base;
+    }
+
+    /// guard_target 판정 표(plans/129 A2/R1 + B19 확대) — 서브커맨드×인자 형태
+    /// 계약을 고정한다. 무가드 적재 프로브 폐쇄(A13)·exl3 상대경로 우회 폐쇄·
+    /// 위치인자 프로브 일반 폴백(B19) 포함.
     #[test]
     fn guard_target_cases() {
         use super::{DEFAULT_27_MODEL, DEFAULT_EXL3_MODEL, PROBE_DEFAULT_MODELS, guard_target};
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        // serve/infer류: --model + 백엔드 → (경로, gpu)
+        // serve/infer류: --model + 백엔드 → (경로, gpu, 런타임)
         let g = guard_target(
             "serve",
             Some("/m/a.gguf"),
@@ -346,8 +553,8 @@ mod tests {
             &s(&[]),
         );
         assert_eq!(
-            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
-            Some(("/m/a.gguf".into(), true))
+            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu, g.runtime)),
+            Some(("/m/a.gguf".into(), true, Some("hip".into())))
         );
         // cpu 백엔드 → gpu=false
         let g = guard_target("infer", Some("/m/a.gguf"), Some("cpu"), None, &s(&[]));
@@ -387,10 +594,28 @@ mod tests {
             g.map(|g| g.path.to_str().unwrap().to_string()),
             Some(super::DEFAULT_FN_MODEL.to_string())
         );
-        // 메타데이터 서브커맨드·경로 부재 → None
+        // B19: 위치인자 GPU 프로브 일반 폴백 — rawhip-check/vk-gemv-check 무가드 폐쇄.
+        let g = guard_target("rawhip-check", None, None, None, &s(&["/m/27b.gguf"]));
+        assert_eq!(
+            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
+            Some(("/m/27b.gguf".into(), true))
+        );
+        let g = guard_target("vk-gemv-check", None, None, None, &s(&["/m/27b.gguf"]));
+        assert_eq!(g.map(|g| g.gpu), Some(true));
+        // CPU 프로브(mod-check) 위치인자 — gpu=false 폴백.
+        let g = guard_target("mod-check", None, None, None, &s(&["/m/a.gguf"]));
+        assert_eq!(g.map(|g| g.gpu), Some(false));
+        // 메타·행 판독 서브커맨드 → None
         assert!(guard_target("gguf-dump", None, None, None, &s(&[])).is_none());
         assert!(guard_target("tokenize", Some("/m/a.gguf"), None, None, &s(&[])).is_none());
+        assert!(guard_target("dequant", None, None, None, &s(&["/m/a.gguf", "t", "0", "8"])).is_none());
+        // 무모델 로딩 창구 → None(로더/CLI 에러가 더 정확 — bench는 --model required)
         assert!(guard_target("bench", None, Some("gpu"), None, &s(&[])).is_none());
+        assert!(guard_target("infer", None, None, None, &s(&[])).is_none());
+        assert!(guard_target("serve", None, None, None, &s(&[])).is_none());
+        // perplexity --model → 가드(전 모델 적재)
+        let g = guard_target("perplexity", Some("/m/a.gguf"), Some("cpu"), None, &s(&[]));
+        assert_eq!(g.map(|g| g.gpu), Some(false));
         // 표 무결성: 기본 경로 전부 실존(부서진 기본 경로 = 무가드보다 못한 오탐)
         for (_, def) in PROBE_DEFAULT_MODELS {
             assert!(std::path::Path::new(def).exists(), "기본 경로 부재: {def}");

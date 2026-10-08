@@ -350,3 +350,33 @@ impl CudaCtx {
         Ok(())
     }
 }
+
+/// B6(plans/cuda-models.md §4): CUDA 런타임 VRAM 프로브 — 가드 preflight용.
+/// cuInit → 디바이스 0 프라이머리 컨텍스트 유지 → cuMemGetInfo_v2.
+/// 모듈 로드 없음(가드는 모델 적재 전 단계). 실패 시 None(호출부가 B17 정책
+/// 으로 거부 — hip gpu_mem_free와 동일한 Option 계약).
+pub fn cuda_mem_free() -> Option<(u64, u64)> {
+    let drv = ffi::Driver::get().ok()?;
+    // SAFETY: 출력은 스택 로컬 — 프로브 경로, 컨텍스트 유지는 프로세스 수명.
+    unsafe {
+        if (drv.init)(0) != CUDA_SUCCESS {
+            return None;
+        }
+        let mut dev: ffi::CUdevice = 0;
+        if (drv.device_get)(&mut dev, 0) != CUDA_SUCCESS {
+            return None;
+        }
+        let mut ctx: ffi::CUcontext = std::ptr::null_mut();
+        if (drv.device_primary_ctx_retain)(&mut ctx, dev) != CUDA_SUCCESS {
+            return None;
+        }
+        if (drv.ctx_set_current)(ctx) != CUDA_SUCCESS {
+            return None;
+        }
+        let (mut free, mut total) = (0usize, 0usize);
+        if (drv.mem_get_info)(&mut free, &mut total) != CUDA_SUCCESS {
+            return None;
+        }
+        Some((free as u64, total as u64))
+    }
+}

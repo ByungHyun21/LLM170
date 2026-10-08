@@ -164,11 +164,29 @@ pub enum AttachPolicy {
 pub fn attach_q35(
     mut eng: llm170_core::qwen35::Engine,
     vulkan: bool,
+    cuda: bool,
     policy: AttachPolicy,
 ) -> Result<llm170_core::qwen35::Engine, String> {
     // LLM170_RAWHIP=0 → 명시적 CPU.
     if !llm170_diag::flag::ne0("LLM170_RAWHIP") {
         return Ok(eng);
+    }
+    if cuda {
+        // plans/cuda-port.md §1.3 S6 — CUDA 값경로: Q4AccCuda(MatmulHost).
+        // qwen35 GGUF(Q4_K_M 등)의 값경로 판 — VkAcc와 동일 구조다.
+        match llm170_backend_gpu::new_q4_acc_cuda() {
+            Ok(acc) => {
+                eprintln!("# backend: gpu (qwen35 CUDA 값경로 — plans/cuda-port.md §1.3 S6)");
+                return Ok(eng.with_acc(acc));
+            }
+            Err(e) => {
+                eprintln!("q4acc-cuda: {e}");
+                match policy {
+                    AttachPolicy::Warn => return Ok(eng),
+                    AttachPolicy::Strict => return Err(e),
+                }
+            }
+        }
     }
     // 107(원장 87·90) → plans/135 §21-3 16차 종결: qwen35 vk 디코드 비결정의
     // 근원 = gemv8_q5b 발사의 배리어 생략(gemv_stage 내부 skip이 q5b에선 경합).
@@ -467,10 +485,17 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         return Engine::Exl3(Box::new(eng));
     }
     // plans/111 W4c: PLE 테이블 오프로드 모드(서빙 옵션 → 백엔드 전역).
-    if let Some(m) = req.ple_table.as_deref()
-        && let Err(e) = llm170_backend_gpu::set_ple_table_mode_by_str(m)
-    {
-        eprintln!("error: {e}");
+    // B8(plans/cuda-models.md §5): 구현은 rawhip 전역뿐 — CUDA 런타임은
+    // 플래그가 조용히 무시되므로 명시 경고한다.
+    if let Some(m) = req.ple_table.as_deref() {
+        if let Err(e) = llm170_backend_gpu::set_ple_table_mode_by_str(m) {
+            eprintln!("error: {e}");
+        }
+        if q4_cuda_runtime(&backend) {
+            eprintln!(
+                "# ple-table({m}): CUDA 경로 미구현 — 플래그 무시(B8, plans/cuda-models.md §4)"
+            );
+        }
     }
     if let Some(mib) = req.ple_cache_mib {
         llm170_backend_gpu::set_ple_ssd_cache_mib(mib);
@@ -520,8 +545,9 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         // QA-17: --backend cpu는 부착 생략 — 종전 무조건 부착으로 라벨과
         // 실제 백엔드가 어긋났다(q4 판 q4_gpu_wanted와 대칭 계약).
         let vulkan = matches!(&backend, BackendSel::GpuRuntime(r) if r == "vulkan");
+        let cuda = matches!(&backend, BackendSel::GpuRuntime(r) if r == "cuda");
         if !matches!(&backend, BackendSel::Cpu) {
-            eng = attach_q35(eng, vulkan, AttachPolicy::Warn)
+            eng = attach_q35(eng, vulkan, cuda, AttachPolicy::Warn)
                 .unwrap_or_else(|e| panic!("gpu attach: {e}"));
         }
         Engine::Q35(Box::new(eng))

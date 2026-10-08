@@ -238,10 +238,20 @@ fn run_main() -> ExitCode {
             ma.backend.as_deref(),
             ma.gpu_runtime.as_deref(),
             &ma.rest,
-        ) && let Err(e) = resource::preflight(&gt.path, gt.gpu)
-        {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
+        ) {
+            // B20(plans/cuda-models.md §4·§5): 전역 적재 락 획득 → **락 후
+            // 재판정**(preflight) — 동시 기동 check-then-act 레이스 직렬화.
+            // 해제는 적재 완료 지점(build_slots 반환 직후 등) — 여기서 실패
+            // 시엔 즉시 반납한다.
+            if let Err(e) = resource::acquire_load_lock() {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+            if let Err(e) = resource::preflight(&gt.path, gt.gpu, gt.runtime.as_deref()) {
+                resource::release_load_lock();
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     }
     // cubecl 커널 컴파일 오류 등 log 패싯 메시지 노출 — stderr 간이 로거.

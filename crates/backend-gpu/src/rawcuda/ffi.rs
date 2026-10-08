@@ -90,6 +90,11 @@ pub type CuMemFreeFn = unsafe extern "system" fn(dptr: CUdeviceptr) -> CUresult;
 pub type CuFuncSetAttributeFn =
     unsafe extern "system" fn(f: CUfunction, attrib: c_uint, value: c_int) -> CUresult;
 
+/// cuMemGetInfo_v2 — 가용/전체 디바이스 메모리(바이트). B6(plans/cuda-models.md
+/// §4): 리소스 가드의 CUDA 런타임 VRAM 조회용(현재 컨텍스트 기준).
+pub type CuMemGetInfoFn =
+    unsafe extern "system" fn(free: *mut usize, total: *mut usize) -> CUresult;
+
 /// 해석 완료된 드라이버 함수표 — 전부 순수 함수 포인터(Send+Sync 자동).
 pub(crate) struct Driver {
     pub init: CuInitFn,
@@ -108,6 +113,9 @@ pub(crate) struct Driver {
     pub launch_kernel: CuLaunchKernelFn,
     pub stream_synchronize: CuStreamSynchronizeFn,
     pub mem_free: CuMemFreeFn,
+
+    /// cuMemGetInfo_v2 — 가드 VRAM 프로브(B6).
+    pub mem_get_info: CuMemGetInfoFn,
     pub func_set_attribute: CuFuncSetAttributeFn,
 }
 
@@ -179,6 +187,10 @@ impl Driver {
                 mem_free: std::mem::transmute::<*mut c_void, CuMemFreeFn>(sym!("cuMemFree_v2")),
                 func_set_attribute: std::mem::transmute::<*mut c_void, CuFuncSetAttributeFn>(sym!(
                     "cuFuncSetAttribute"
+                )),
+
+                mem_get_info: std::mem::transmute::<*mut c_void, CuMemGetInfoFn>(sym!(
+                    "cuMemGetInfo_v2"
                 )),
             })
         }

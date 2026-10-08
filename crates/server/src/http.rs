@@ -61,6 +61,8 @@ pub fn serve(
     };
     let (tx, rx) = std::sync::mpsc::sync_channel::<SlotJob>(qcap);
     let eng = crate::engine::build_slots(req.clone(), backend, slots);
+    // B20: 적재 완료 — 전역 적재 락 해제(다음 기동의 재판정이 이 상주분을 본다).
+    crate::resource::release_load_lock();
     // QA-11: 엔진 스레드 패닉 포착 — 종전엔 스레드가 죽어도 큐가 살아
     // try_send 성공 → 요청이 영구 행업, 원인은 stderr 1회뿐이었다.
     std::thread::spawn(move || {
