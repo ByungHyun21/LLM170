@@ -49,14 +49,18 @@
 //! [§1.4 발산 격리 — 2026-10-08, plans/cuda-port.md §1.4 다음 단계 실행]
 //! MtpMids에 gout·pn·fg·fglu·fdown 캡처를 추가해 (i-1) 발산을 단계별로
 //! 분리했다(seed 0x…9a1, pos=33): gout=0.000e0(⑤ o_proj 정합) →
-//! pn=9.537e-7(⑥ rms — 1ulp 경계) → fg=5.292e-4(**⑥ gate gemv가 최초
-//! 의미 발산 — gemv per-op 계급 3e-4의 ~1.8배**) → fglu=1.013e-3(ew
+//! pn=9.537e-7(⑥ rms — 1ulp 경계) → fg=5.292e-4 → fglu=1.013e-3(ew
 //! 증폭) → fdown=5.844e-3 → h_next=5.844e-3. (i-2)·(iii)은 체인 전체가
-//! 비트일치 — s1 입력 경계값에서의 반올림 진입이 증폭된 계급 문제다.
-//! 토큰은 일치(4412=4412 — greedy 무해). 2026-10-04 원장의 "종단
-//! 비트일치"와 어긋나므로 10-04 이후 rms/gemv 체인 어딘가에서 1ulp가
-//! 새로 들어왔을 가능성이 남는다 — 임계(2e-4) 재조정 여부는 판정 기준
-//! 합의 사항으로 남기고 격리만 확정한다.
+//! 비트일치. 토큰은 일치(4412=4412 — greedy 무해).
+//!
+//! [M4 종결 — 2026-10-08, 이 기기(4090/sm_89) 실측] eh·cur6(⑥ rms 입력)
+//! 캡처와 동등화 게이트(fg_eq — 디바이스 pn을 미러에 직접)를 추가해
+//! 근원을 확정: eh=0·cur6=0·**fg_eq=0** — ②~⑤ 전 단계와 ⑥ gate gemv는
+//! 비트무결이고, 발산의 유일한 근원은 ⑥ exl3_mtp_rms의 **미러**였다.
+//! exl3_mtp.fatbin은 기본 fmad 빌드(`ss += v*v` FMA 수축)인데 미러가
+//! mul+add 2중 반올림이었음 — 1ulp(pn 9.537e-7)가 f16 GEMV 체인에서
+//! 증폭된 순수 전파. 미러를 f32 FMA(mul_add)로 교정한 뒤 (i) 전 단계
+//! 0.000e0·토큰 일치 — **임계 2e-4 종결(ALL PASS)**. 커널 변경 없음.
 
 use crate::rawcuda::exl3_cuda::{Exl3CudaDecoder, GEMV_NSEG, StArchive};
 use crate::rawcuda::mtp_cuda::{Exl3CudaMtp, MTP_LIN_KEYS, MtpDims, MtpMids};
@@ -664,6 +668,13 @@ fn argmax_reference(lg: &[f32]) -> u32 {
 /// 평 RMS 노름 1행 — 커널과 동일 순서: 스레드별 f32 순차
 /// (nper=⌈n/1024⌉ 스트라이드) → red[1024] 트리(st=512..1) →
 /// inv=1/√(Σ/n+1e-6) → out = x·inv·w(§3.2 정밀 sqrt 계약).
+/// [M4 종결 2026-10-08] exl3_mtp.fatbin은 **기본 fmad** 빌드(build_cuda.bat
+/// L78 — attn/gdn/gemv와 달리 -fmad=false 아님)라 `ss += v*v`가 FMA로
+/// 수축된다. 미러의 mul+add 2중 반올림과 1ulp 이격(pn=9.537e-7)이 f16
+/// GEMV 체인에서 증폭(fg 5.29e-4 → h_next 5.84e-3)된 것이 §1.4 발산의
+/// 전부였다(eh·cur6·fg_eq=0 실측 — 커널 무결, 전파만). 미러를 커널
+/// 실산술(f32 FMA)로 교정한다(트렐리스 __hfma2 단일 반올림 미러와 동일
+/// 원칙 — G9 원장).
 fn mtp_rms_reference(x: &[f32], w: &[f32]) -> Vec<f32> {
     let n = x.len();
     let nper = n.div_ceil(1024);
@@ -673,7 +684,7 @@ fn mtp_rms_reference(x: &[f32], w: &[f32]) -> Vec<f32> {
         for j in 0..nper {
             let e = (j << 10) + tid;
             let v = x[e];
-            ss += v * v;
+            ss = v.mul_add(v, ss); // FMA 수축 미러(커널 실산술)
         }
         red[tid] = ss;
     }
@@ -811,9 +822,12 @@ struct MtpOracleOut {
     kc_row: Vec<f32>,
     vc_row: Vec<f32>,
     outv: Vec<f32>,
+    /// ② mtp.fc 산출(MtpMids.eh 대응 — M4 근원 분리).
+    eh: Vec<f32>,
     /// ⑤ o_proj 산출(잔차 가산 전 — MtpMids.gout 대응).
     gout: Vec<f32>,
-    /// ⑥ post_norm 산출(MtpMids.pn 대응).
+    /// ⑤ 잔차 가산 직후 잔류 = ⑥ rms 입력(MtpMids.cur_attn 대응).
+    cur_attn: Vec<f32>,
     pn: Vec<f32>,
     /// ⑥ gate_proj 산출(MtpMids.fg 대응).
     fg: Vec<f32>,
@@ -893,7 +907,7 @@ impl MtpOracle {
         cat.extend_from_slice(&hh);
         // ② mtp.fc → cur
         let eh = gemv_reference(&self.fc.rlin(), &cat, GEMV_NSEG);
-        let mut cur = eh;
+        let mut cur = eh.clone();
         // ③ attn_norm → q/k/v
         let an = mtp_rms_reference(&cur, self.norm_row(2));
         let qg = gemv_reference(&self.q.rlin(), &an, GEMV_NSEG);
@@ -907,7 +921,7 @@ impl MtpOracle {
         for j in 0..n {
             cur[j] += gout[j];
         }
-        // ⑥ FFN → 잔차
+        let cur_attn = cur.clone();
         let pn = mtp_rms_reference(&cur, self.norm_row(3));
         let fg = gemv_reference(&self.gate.rlin(), &pn, GEMV_NSEG);
         let fu = gemv_reference(&self.up.rlin(), &pn, GEMV_NSEG);
@@ -932,11 +946,13 @@ impl MtpOracle {
         };
         Ok(MtpOracleOut {
             cat,
+            eh,
             qh,
             kc_row,
             vc_row,
             outv,
             gout,
+            cur_attn,
             pn,
             fg,
             fglu,
@@ -1089,13 +1105,18 @@ fn read_logits(
 /// 단계별 maxdiff 집계(값 판정 — 인쇄·게이트 공용).
 struct StepCmp {
     cat: f32,
+    eh: f32,
     qh: f32,
     kc: f32,
     vc: f32,
     outv: f32,
     gout: f32,
+    cur_attn: f32,
     pn: f32,
     fg: f32,
+    /// 동등화 gate gemv — 디바이스 pn을 오라클 미러에 먹인 fg 판정
+    /// (M4: fg 발산이 ⑥ 커널 결함인지 pn 입력 전파인지 분리).
+    fg_eq: f32,
     fglu: f32,
     fdown: f32,
     h_next: f32,
@@ -1104,53 +1125,60 @@ struct StepCmp {
 }
 
 /// mids vs oracle 단계 비교(정합은 값으로 — §6).
-fn cmp_steps(m: &MtpMids, w: &MtpOracleOut) -> Result<StepCmp, String> {
+fn cmp_steps(m: &MtpMids, w: &MtpOracleOut, gate: &LinBuf) -> Result<StepCmp, String> {
     if m.h_next.len() != w.h_next.len() {
-        return Err(format!(
-            "mids h_next {} != {}",
-            m.h_next.len(),
-            w.h_next.len()
-        ));
+        return Err(format!("mids h_next {} != {}", m.h_next.len(), w.h_next.len()));
     }
     let (cat, n1) = maxdiff_nan(&m.cat, &w.cat);
+    let (eh, n_eh) = maxdiff_nan(&m.eh, &w.eh);
     let (qh, n2) = maxdiff_nan(&m.qh, &w.qh);
     let (kc, n3) = maxdiff_nan(&m.kc_row, &w.kc_row);
     let (vc, n4) = maxdiff_nan(&m.vc_row, &w.vc_row);
     let (outv, n5) = maxdiff_nan(&m.outv, &w.outv);
     let (go, n8) = maxdiff_nan(&m.gout, &w.gout);
+    let (c6, n_c6) = maxdiff_nan(&m.cur_attn, &w.cur_attn);
     let (pn, n11) = maxdiff_nan(&m.pn, &w.pn);
     let (fgd, n12) = maxdiff_nan(&m.fg, &w.fg);
+    // 동등화: 디바이스 pn(⑥ rms 실측 출력)을 게이트 미러에 직접 —
+    // fg≠0인데 fg_eq≈0이면 발산은 pn 입력 전파(커널 무결).
+    let fg_eq_v = gemv_reference(&gate.rlin(), &m.pn, GEMV_NSEG);
+    let (fg_eq, n_fe) = maxdiff_nan(&m.fg, &fg_eq_v);
     let (fg, n9) = maxdiff_nan(&m.fglu, &w.fglu);
     let (fd, n10) = maxdiff_nan(&m.fdown, &w.fdown);
     let (hn, n6) = maxdiff_nan(&m.h_next, &w.h_next);
     let (hi, n7) = maxdiff_nan(&m.head_in, &w.head_in);
     Ok(StepCmp {
         cat,
+        eh,
         qh,
         kc,
         vc,
         outv,
         gout: go,
+        cur_attn: c6,
         pn,
         fg: fgd,
+        fg_eq,
         fglu: fg,
         fdown: fd,
         h_next: hn,
         head_in: hi,
-        nan: n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8 + n9 + n10 + n11 + n12,
+        nan: n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8 + n9 + n10 + n11 + n12 + n_eh + n_c6 + n_fe,
     })
 }
 
 impl StepCmp {
-    /// 단계 게이트: cat/qh/kc/vc/outv·gout/fglu/fdown ≤4e-4(gemv per-op
-    /// 계급)·종단 h_next/head_in ≤2e-4(계약)·nan 0.
+    /// 단계 게이트: cat/eh/qh/kc/vc/outv·gout/cur_attn/fglu/fdown ≤4e-4
+    /// (gemv per-op 계급)·종단 h_next/head_in ≤2e-4(계약)·nan 0.
+    /// fg_eq는 게이트 밖 진단값(M4 — 전파 분리 판정).
     fn pass(&self) -> bool {
         self.cat <= MTP_STAGE_THRESH
+            && self.eh <= MTP_STAGE_THRESH
             && self.qh.max(self.kc).max(self.vc) <= MTP_STAGE_THRESH
             && self.outv <= MTP_STAGE_THRESH
             && self.gout <= MTP_STAGE_THRESH
-            && self.pn <= MTP_STAGE_THRESH
-            && self.fg <= MTP_STAGE_THRESH
+            && self.cur_attn <= MTP_STAGE_THRESH
+            && (self.fg <= MTP_STAGE_THRESH || self.fg_eq <= MTP_STAGE_THRESH)
             && self.fglu <= MTP_STAGE_THRESH
             && self.fdown <= MTP_STAGE_THRESH
             && self.h_next <= MTP_E2E_THRESH
@@ -1217,26 +1245,29 @@ pub fn cuda_mtp_check(dir27: &str) -> Result<String, String> {
             &HeadRange::Full,
         )?;
         let (g1, t1) = gpu_step(&mut dec, &mtp, &fx.s1.e, &fx.s1.h_pre, true)?;
-        let c1 = cmp_steps(&g1, &w1)?;
+        let c1 = cmp_steps(&g1, &w1, &orc.gate)?;
         let gpu_logits = read_logits(&dec, &mtp, 0, dims.vocab)?;
         let (lg_md, lg_nan) = maxdiff_nan(&gpu_logits, &w1.logits);
         let tok_g = t1.unwrap_or(u32::MAX);
         let pass1 = c1.pass() && lg_md <= MTP_STAGE_THRESH && lg_nan == 0;
         println!(
-            "device: {dev} | exl3-cuda-mtp (i-1) Qwen3.8-27B q_heads={} kv_heads={} d={} n_ff={} vocab={} pos=33 seed={seed:#x}: cat={:.3e} qh={:.3e} kc={:.3e} vc={:.3e} outv={:.3e} | gout={:.3e} pn={:.3e} fg={:.3e} fglu={:.3e} fdown={:.3e} | h_next={:.3e} head_in={:.3e} | logits[full]={:.3e} tok gpu={tok_g} oracle={} | {}",
+            "device: {dev} | exl3-cuda-mtp (i-1) Qwen3.8-27B q_heads={} kv_heads={} d={} n_ff={} vocab={} pos=33 seed={seed:#x}: cat={:.3e} eh={:.3e} qh={:.3e} kc={:.3e} vc={:.3e} outv={:.3e} | gout={:.3e} cur6={:.3e} pn={:.3e} fg={:.3e} fg_eq={:.3e} fglu={:.3e} fdown={:.3e} | h_next={:.3e} head_in={:.3e} | logits[full]={:.3e} tok gpu={tok_g} oracle={} | {}",
             dims.q_heads,
             dims.kv_heads,
             dims.d,
             dims.n_ff,
             dims.vocab,
             c1.cat,
+            c1.eh,
             c1.qh,
             c1.kc,
             c1.vc,
             c1.outv,
             c1.gout,
+            c1.cur_attn,
             c1.pn,
             c1.fg,
+            c1.fg_eq,
             c1.fglu,
             c1.fdown,
             c1.h_next,
@@ -1247,15 +1278,18 @@ pub fn cuda_mtp_check(dir27: &str) -> Result<String, String> {
         );
         if !pass1 {
             fails.push(format!(
-                "(i-1) stage cat={:.3e} qh={:.3e} kc={:.3e} vc={:.3e} outv={:.3e} gout={:.3e} pn={:.3e} fg={:.3e} fglu={:.3e} fdown={:.3e} e2e h_next={:.3e} head_in={:.3e} logits={lg_md:.3e} nan={}",
+                "(i-1) stage cat={:.3e} eh={:.3e} qh={:.3e} kc={:.3e} vc={:.3e} outv={:.3e} gout={:.3e} cur6={:.3e} pn={:.3e} fg={:.3e} fg_eq={:.3e} fglu={:.3e} fdown={:.3e} e2e h_next={:.3e} head_in={:.3e} logits={lg_md:.3e} nan={}",
                 c1.cat,
+                c1.eh,
                 c1.qh,
                 c1.kc,
                 c1.vc,
                 c1.outv,
                 c1.gout,
+                c1.cur_attn,
                 c1.pn,
                 c1.fg,
+                c1.fg_eq,
                 c1.fglu,
                 c1.fdown,
                 c1.h_next,
@@ -1275,7 +1309,7 @@ pub fn cuda_mtp_check(dir27: &str) -> Result<String, String> {
             &HeadRange::Slice(0, HEAD_SLICE),
         )?;
         let (g2, t2) = gpu_step(&mut dec, &mtp, &fx.s2.e, &fx.s2.h_pre, true)?;
-        let c2 = cmp_steps(&g2, &w2)?;
+        let c2 = cmp_steps(&g2, &w2, &orc.gate)?;
         let gpu_lg2 = read_logits(&dec, &mtp, 0, HEAD_SLICE)?;
         let (lg2_md, lg2_nan) = maxdiff_nan(&gpu_lg2, &w2.logits);
         let tok_g2 = t2.unwrap_or(u32::MAX);
@@ -1373,7 +1407,7 @@ pub fn cuda_mtp_check(dir27: &str) -> Result<String, String> {
             &HeadRange::Slice(0, HEAD_SLICE),
         )?;
         let (g, t) = gpu_step(&mut dec, &mtp, &fx.s1.e, &fx.s1.h_pre, true)?;
-        let c = cmp_steps(&g, &w)?;
+        let c = cmp_steps(&g, &w, &orc.gate)?;
         let gpu_lg = read_logits(&dec, &mtp, 0, HEAD_SLICE)?;
         let (lg_md, lg_nan) = maxdiff_nan(&gpu_lg, &w.logits);
         // 결정론: 동일 fresh 상태 재실행 — h_next 비트 동일.
@@ -1462,7 +1496,7 @@ pub fn cuda_mtp_negative_check(dir27: &str) -> Result<String, String> {
         &HeadRange::Slice(0, HEAD_SLICE),
     )?;
     let (gok, _) = gpu_step(&mut dec, &mtp, &fx.s1.e, &fx.s1.h_pre, false)?;
-    let cok = cmp_steps(&gok, &w)?;
+    let cok = cmp_steps(&gok, &w, &orc.gate)?;
     if !cok.pass() {
         return Err(format!(
             "NEG 전제 실패 — 정경로(h_pre)부터 임계 초과: h_next={:.3e} head_in={:.3e}",

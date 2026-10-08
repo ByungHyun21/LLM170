@@ -602,3 +602,54 @@ impl Exl3CudaDecoder {
         })
     }
 }
+
+// ── P0-3(plans/cuda-models.md §3.2): 스펙 검증 롤백용 GDN 슬롯 스냅샷 ──
+
+impl Exl3CudaDecoder {
+    /// 슬롯 GDN 상태(conv 링 + scan 상태)를 사적 스크래치로 D2D 복사.
+    /// 검증 배치 직전 1회 — 부분수용 시 gdn_restore_slot로 되돌린다.
+    /// KV 캐시는 위치 색인 쓰기라 재실행이 같은 칸을 덮어 자가치유한다
+    /// (qwen4exp frame/verify.rs 롤백 계약과 동일).
+    pub fn gdn_snapshot_slot(&mut self, slot: usize) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        let gd = self.gdn_dims()?;
+        let ring = gd.n_gdn * 3 * gd.conv_ch();
+        let gst = gd.n_gdn * gd.h_v * gd.d * gd.d;
+        if self.snap_ring == 0 || self.snap_ring_cap < ring {
+            if self.snap_ring != 0 {
+                self.cc.free(self.snap_ring)?;
+            }
+            self.snap_ring = self.cc.alloc(ring * 4)?;
+            self.snap_ring_cap = ring;
+        }
+        if self.snap_gst == 0 || self.snap_gst_cap < gst {
+            if self.snap_gst != 0 {
+                self.cc.free(self.snap_gst)?;
+            }
+            self.snap_gst = self.cc.alloc(gst * 4)?;
+            self.snap_gst_cap = gst;
+        }
+        let src = self.dring + (slot * ring) as u64 * 4;
+        // SAFETY: 할당 경계 내 슬롯 슬라이스 — 크기는 형상에서 산출.
+        self.cc.d2d(self.snap_ring, src, ring * 4)?;
+        let src = self.dgst + (slot * gst) as u64 * 4;
+        self.cc.d2d(self.snap_gst, src, gst * 4)?;
+        Ok(())
+    }
+
+    /// 스냅샷 복원(부분수용 롤백) — 스냅샷 후 상태로 되돌린다.
+    pub fn gdn_restore_slot(&mut self, slot: usize) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        let gd = self.gdn_dims()?;
+        let ring = gd.n_gdn * 3 * gd.conv_ch();
+        let gst = gd.n_gdn * gd.h_v * gd.d * gd.d;
+        if self.snap_ring == 0 || self.snap_gst == 0 {
+            return Err("gdn_restore: 스냅샷 없음".into());
+        }
+        let dst = self.dring + (slot * ring) as u64 * 4;
+        self.cc.d2d(dst, self.snap_ring, ring * 4)?;
+        let dst = self.dgst + (slot * gst) as u64 * 4;
+        self.cc.d2d(dst, self.snap_gst, gst * 4)?;
+        Ok(())
+    }
+}

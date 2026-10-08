@@ -69,6 +69,10 @@ pub mod ple_cuda;
 pub mod ple_cuda_probe;
 pub mod q4_cuda;
 pub mod q4_cuda_probe;
+// q4acc_cuda는 Accelerator 어댑터로 크레이트 의존(llm170_core·parking_lot)
+// 을 갖는다 — rawcuda 단독 컴파일 계약(cuda_probe_shim, std 전용)에서는
+// 제외한다. 셔임 빌드는 `rustc --cfg cuda_probe_shim`(verify_cuda.sh).
+#[cfg(not(cuda_probe_shim))]
 pub mod q4acc_cuda;
 
 pub mod ds4_attn_cuda;

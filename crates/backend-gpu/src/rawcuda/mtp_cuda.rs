@@ -702,6 +702,15 @@ impl Exl3CudaMtp {
         // ② mtp.fc [2n → n] → cur
         let lfc = self.lin_key(dec, MTP_LIN_FC)?;
         self.lin_dev(cc, &lfc, self.dcat, self.dcur)?;
+        // axpy가 덮으므로 ② 직후 체인 중간 판독. M4 근원 분리: fc gemv 정합).
+        let eh_cap = if mids.is_some() {
+            let mut buf = vec![0u8; n * 4];
+            cc.d2h(&mut buf, self.dcur)?;
+            // SAFETY: d2h 동기 완료 — buf는 n개 f32 LE.
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, n) }.to_vec()
+        } else {
+            Vec::new()
+        };
         // ③ attn_norm → q/k/v
         self.rms_dev(cc, self.dcur, MTP_NORM_ATTN, self.dnrm)?;
         let lq = self.lin_key(dec, MTP_LIN_Q)?;
@@ -717,6 +726,16 @@ impl Exl3CudaMtp {
         let lo = self.lin_key(dec, MTP_LIN_O)?;
         self.lin_dev(cc, &lo, self.doutv, self.dgout)?;
         self.axpy_dev(cc, self.dcur, self.dgout, n)?;
+        // cur_attn 캡처(⑤ 잔차 가산 직후 = ⑥ rms 입력 — M4: pn 발산의
+        // 근원이 fc gemv(eh)인지 ⑥ rms 커널인지 분리하는 판독).
+        let cur6_cap = if mids.is_some() {
+            let mut buf = vec![0u8; n * 4];
+            cc.d2h(&mut buf, self.dcur)?;
+            // SAFETY: d2h 동기 완료 — buf는 n개 f32 LE.
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, n) }.to_vec()
+        } else {
+            Vec::new()
+        };
         // ⑥ FFN: post_norm → gate/up → silu·mul → down → 잔차 가산
         self.rms_dev(cc, self.dcur, MTP_NORM_POST, self.dnrm)?;
         // pn 캡처는 mids 경로 한정 체인 중간 판독 — ⑦ rms가 dnrm을
@@ -746,7 +765,7 @@ impl Exl3CudaMtp {
             token = Some(dec.argmax_dev(self.dlogits, dm.vocab)?);
         }
         if let Some(m) = mids {
-            self.read_mids(&dec.cc, m, pn_cap)?;
+            self.read_mids(&dec.cc, m, pn_cap, eh_cap, cur6_cap)?;
         }
         Ok(token)
     }
@@ -754,7 +773,14 @@ impl Exl3CudaMtp {
     /// 중간 산출 판독(검증층 — mtp_step_g mids 경로의 실체.
     /// cur는 스테이지별로 변형되므로 지정 시점 값을 순차 판독한다).
     /// pn_cap은 ⑥ rms 시점 체인 중간 판독값(⑦이 dnrm을 덮기 전).
-    fn read_mids(&self, cc: &CudaCtx, m: &mut MtpMids, pn_cap: Vec<f32>) -> Result<(), String> {
+    fn read_mids(
+        &self,
+        cc: &CudaCtx,
+        m: &mut MtpMids,
+        pn_cap: Vec<f32>,
+        eh_cap: Vec<f32>,
+        cur6_cap: Vec<f32>,
+    ) -> Result<(), String> {
         let dm = self.dims;
         let n = dm.hidden;
         let take = |v: &mut Vec<f32>, elems: usize, src: CUdeviceptr| -> Result<(), String> {
@@ -783,8 +809,9 @@ impl Exl3CudaMtp {
         // gout·fglu·fdown은 스텝 내 전용 버퍼(dgout·dfglu·dfdown)라
         // axpy가 덮지 않는다 — 다음 스텝 체인이 덮을 때까지 유효.
         // pn은 체인 중간 판독값(인자), fg는 dfg(ew까지 생존).
+        m.eh = eh_cap;
+        m.cur_attn = cur6_cap;
         m.pn = pn_cap;
-        take(&mut m.gout, n, self.dgout)?;
         take(&mut m.fg, dm.n_ff, self.dfg)?;
         take(&mut m.fglu, n, self.dfglu)?;
         take(&mut m.fdown, n, self.dfdown)?;
@@ -828,6 +855,62 @@ impl Exl3CudaMtp {
         // 재주입한다. 메인 부착 단계에서 d2d 도입 예정).
         self.mtp_step_g(dec, e, self.dh, true, None)?
             .ok_or_else(|| "mtp: head 미실행".to_string())
+    }
+}
+
+// ── 프로덕션 적재(서버 엔진용 — 검증층 프로브와 무관한 생산 경로) ──
+
+impl Exl3CudaMtp {
+    /// EXL3 아카이브 디렉터리에서 MTP 상주 상태 조립 — config.json 형상 +
+    /// 노름 7종(BF16 w−1 → +1 규약) + 선형 9종(사전 등록된 dec.lin 대여).
+    /// mtp.* 텐서가 없는 아카이브는 Err(35B-A3B 계열 — 실측 2026-10-04).
+    /// P0-3(plans/cuda-models.md §3.2-1): M4 임계 종결(2026-10-08 ALL PASS)
+    /// 후 서버 --spec 개방용 배선.
+    pub fn from_dir(dec: &mut Exl3CudaDecoder, dir: &str) -> Result<Self, String> {
+        let cfg = std::fs::read_to_string(format!("{dir}/config.json"))
+            .map_err(|e| format!("mtp from_dir: config.json: {e}"))?;
+        let dims = MtpDims::from_config(&cfg)?;
+        let ar = crate::rawcuda::exl3_cuda::StArchive::open(std::path::Path::new(dir))?;
+        // 노름 5행(enorm·hnorm·attn·post·shared) — load_plain_tensors와
+        // 동일 규약(BF16 w−1 저장 → 등록값 +1).
+        let mut norms5 = Vec::with_capacity(MTP_NORM_ROWS * dims.hidden);
+        for name in [
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.post_attention_layernorm.weight",
+            "mtp.norm.weight",
+        ] {
+            let mut w = ar.read_f32(name, &[dims.hidden])?;
+            if ar.dtype_of(name) == Some(2) {
+                for v in &mut w {
+                    *v += 1.0;
+                }
+            }
+            norms5.extend_from_slice(&w);
+        }
+        let norm256 = |name: &str| -> Result<Vec<f32>, String> {
+            let mut w = ar.read_f32(name, &[256])?;
+            if ar.dtype_of(name) == Some(2) {
+                for v in &mut w {
+                    *v += 1.0;
+                }
+            }
+            Ok(w)
+        };
+        let qnw = norm256("mtp.layers.0.self_attn.q_norm.weight")?;
+        let knw = norm256("mtp.layers.0.self_attn.k_norm.weight")?;
+        Ok(Self::new(dec, dims, &norms5, &qnw, &knw)?)
+    }
+
+    /// h_in 호스트 업로드 스테이징 버퍼(verify 배치 h0 주입용).
+    pub fn dh_buf(&self) -> CUdeviceptr {
+        self.dh
+    }
+
+    /// h_in 디바이스 버퍼(체인 캐리 dcur — 직전 h_next가 상주한다).
+    pub fn dcur(&self) -> CUdeviceptr {
+        self.dcur
     }
 }
 

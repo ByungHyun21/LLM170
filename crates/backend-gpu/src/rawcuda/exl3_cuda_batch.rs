@@ -163,6 +163,165 @@ impl Exl3CudaDecoder {
         Ok((logits, hidden))
     }
 
+    /// P0-3(plans/cuda-models.md §3.2): 스펙 검증 배치 — T행 forward +
+    /// 행별 argmax + MTP KV 적립(행 r의 MTP 입력 h = 행 r-1의 pre-final-norm
+    /// 잔차; h0는 배치 직전 커밋 잔사, None이면 행 0을 건너뛴다 — 첫 프리필
+    /// 청크의 "위치 0의 h_{-1}은 없음" 계약, qwen4exp P15④와 동일).
+    /// 반환: (행별 argmax[t], 마지막 행 잔차 h_new, 마지막 행 로짓).
+    /// 타깃 경로 산술은 forward_batch_device와 동일(MTP는 자체 KV에만 쓴다).
+    pub fn verify_batch_with_mtp(
+        &mut self,
+        slot: usize,
+        embed_rows: &[f32],
+        mtp: &crate::rawcuda::mtp_cuda::Exl3CudaMtp,
+        h0: Option<&[f32]>,
+    ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>), String> {
+        let (h, n_slots) = (self.hidden, self.n_slots.max(1));
+        if h == 0 || embed_rows.is_empty() || !embed_rows.len().is_multiple_of(h) {
+            return Err(format!(
+                "exl3-cuda: 검증 임베딩 {} — [t][hidden] 계약 위반",
+                embed_rows.len()
+            ));
+        }
+        let t = embed_rows.len() / h;
+        if slot >= n_slots {
+            return Err(format!("exl3-cuda: slot={slot} >= n_slots={n_slots}"));
+        }
+        let tmax = crate::rawcuda::attn_cuda::ATTN_F3S_TMAX;
+        if t > tmax {
+            return Err(format!("exl3-cuda: 검증 T={t} > fwd3s 상한 {tmax}"));
+        }
+        let pos = self.slot_pos[slot];
+        let cap = self.attn_dims()?.cap;
+        if pos as usize + t > cap {
+            return Err(format!(
+                "context overflow: slot{slot} pos={pos}+T={t} > kvcap={cap}"
+            ));
+        }
+        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.is_none() {
+            return Err("exl3-cuda: 디코더 상수 미등록 — load_slots 필요".into());
+        }
+        let _g = self.cc.guard()?;
+        self.ensure_chain_probe_bufs_pub()?;
+        self.prewarm_chain_bufs()?;
+        self.ensure_batch_bufs()?;
+        // SAFETY: f32 [t][hidden] 바이트 뷰.
+        let eb = unsafe {
+            std::slice::from_raw_parts(embed_rows.as_ptr() as *const u8, embed_rows.len() * 4)
+        };
+        self.cc.h2d(self.dres, eb)?;
+
+        let mut ab = self.dab_dev;
+        let mut gi = 0usize;
+        for il in 0..self.loaded_layers.min(self.n_layers) {
+            let lp = format!("model.language_model.layers.{il}");
+            let xn = self.norm_resid_dev(2 * il, self.dres, ab, t)?;
+            let branch = if il % 4 == 3 {
+                self.ensure_stage(4, self.attn_dims()?.q_dim(), t)?;
+                let att = format!("{lp}.self_attn");
+                self.bstage(&format!("{att}.q_proj"), xn, 0, t)?;
+                self.bstage(&format!("{att}.k_proj"), xn, 1, t)?;
+                self.bstage(&format!("{att}.v_proj"), xn, 2, t)?;
+                let c0 = self.bchain(0)?;
+                let c1 = self.bchain(1)?;
+                let c2 = self.bchain(2)?;
+                self.ensure_attn_bufs_pub(t)?;
+                let out = self.attn_chain_dev_run(slot, il / 4, t, c0, c1, c2)?;
+                let odst = self.bchain(4)?;
+                self.cc.d2d(odst, out, t * self.attn_dims()?.q_dim() * 4)?;
+                odst
+            } else {
+                let att = format!("{lp}.linear_attn");
+                self.ensure_stage(4, self.gdn_dims()?.v_len(), t)?;
+                self.bstage(&format!("{att}.in_proj_qkv"), xn, 0, t)?;
+                self.bstage(&format!("{att}.in_proj_z"), xn, 1, t)?;
+                let c0 = self.bchain(0)?;
+                let c1 = self.bchain(1)?;
+                self.ensure_gdn_bufs_pub(t)?;
+                let g = self
+                    .gdn_chain_dev_run(slot, gi, t, xn, c0, c1)
+                    .map_err(|e| format!("L{il} gdn(T={t}): {e}"))?;
+                let gd = self.bchain(4)?;
+                self.cc.d2d(gd, g, t * self.gdn_dims()?.v_len() * 4)?;
+                gi += 1;
+                gd
+            };
+            let lo = if il % 4 == 3 {
+                format!("{lp}.self_attn.o_proj")
+            } else {
+                format!("{lp}.linear_attn.out_proj")
+            };
+            let bstride = if il % 4 == 3 {
+                self.attn_dims()?.q_dim()
+            } else {
+                self.gdn_dims()?.v_len()
+            };
+            let out = self.bgemv(&lo, branch, bstride, t)?;
+            let xn2 = self.norm_resid_dev(2 * il + 1, self.dres, out, t)?;
+            let mlp = format!("{lp}.mlp");
+            self.bstage(&format!("{mlp}.gate_proj"), xn2, 0, t)?;
+            self.bstage(&format!("{mlp}.up_proj"), xn2, 1, t)?;
+            let (c0, c1) = (self.bchain(0)?, self.bchain(1)?);
+            self.ew_batch(c0, c1, t)?;
+            let act = self.bchain(3)?;
+            ab = self.bgemv_down(&format!("{mlp}.down_proj"), act, t)?;
+        }
+
+        // ── MTP KV 적립(레이어 루프 후, 최종 노름 전 — dres가 전 행의
+        // pre-final-norm 잔차다). 행 r의 h 입력 = dres[r-1](r=0은 h0).
+        // with_head=false — 드래프트 헤드 없이 KV·상태만 전진.
+        for r in 0..t {
+            let h_dev = if r == 0 {
+                match h0 {
+                    Some(hv) => {
+                        if hv.len() != h {
+                            return Err(format!("mtp h0 {} != hidden {h}", hv.len()));
+                        }
+                        // SAFETY: f32 슬라이스 바이트 뷰(호출 내 유효).
+                        let hb = unsafe {
+                            std::slice::from_raw_parts(hv.as_ptr() as *const u8, hv.len() * 4)
+                        };
+                        self.cc.h2d(mtp.dh_buf(), hb)?;
+                        mtp.dh_buf()
+                    }
+                    None => continue, // 청크 행 0 — h_{-1} 부재(첫 프리필)
+                }
+            } else {
+                self.dres + ((r - 1) * h) as u64 * 4
+            };
+            let e_row = &embed_rows[r * h..(r + 1) * h];
+            mtp.mtp_step_g(self, e_row, h_dev, false, None)?;
+            mtp.mtp_pos_bump(&self.cc)?;
+        }
+
+        let xn_final = self.norm_resid_dev(2 * self.n_layers, self.dres, ab, t)?;
+        let n_head = self.lin_copy("lm_head").map(|l| l.n)?;
+        let hd_src = self.bchain(3)?;
+        self.cc.d2d(hd_src, xn_final, t * self.hidden * 4)?;
+        let logits_ptr = self.gemm2_dev("lm_head", hd_src, t)?;
+        let mut ams = Vec::with_capacity(t);
+        for r in 0..t {
+            let tok = self.argmax_dev(logits_ptr + (r * n_head) as u64 * 4, n_head)?;
+            ams.push(tok);
+        }
+        let mut lb = vec![0u8; n_head * 4];
+        self.cc
+            .d2h(&mut lb, logits_ptr + ((t - 1) * n_head) as u64 * 4)?;
+        self.cc.sync()?;
+        // SAFETY: d2h 동기 완료 — lb는 n_head개 f32 LE(마지막 행 로짓).
+        let logits_last =
+            unsafe { std::slice::from_raw_parts(lb.as_ptr() as *const f32, n_head) }.to_vec();
+        self.slot_pos[slot] = pos + t as u32;
+        self.attn_set_pos(slot, pos + t as u32)?;
+        let mut hb = vec![0u8; self.hidden * 4];
+        self.cc.d2h(&mut hb, self.dres + ((t - 1) * self.hidden) as u64 * 4)?;
+        self.cc.sync()?;
+        // SAFETY: d2h 동기 완료 — hb는 hidden개 f32 LE.
+        let hnew =
+            unsafe { std::slice::from_raw_parts(hb.as_ptr() as *const f32, self.hidden) }.to_vec();
+        Ok((ams, hnew, logits_last))
+    }
+
     /// 배치 GEMM → 스테이징 슬롯 s. [T][k] 입력을 받아 [T][n]을 쓴다.
     pub(crate) fn bstage(
         &mut self,
