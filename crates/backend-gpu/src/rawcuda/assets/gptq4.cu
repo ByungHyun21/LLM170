@@ -180,7 +180,8 @@ __device__ __forceinline__ void gemv_body(
 extern "C" __global__ void w4a16_gemv_experts_g32_bf16(
     const unsigned long long* __restrict__ tab, int base,
     const int* __restrict__ idx, int nslots,
-    const float* __restrict__ x, int xstride, float* __restrict__ out, int n, int k)
+    const float* __restrict__ x, int xstride, int sp,
+    float* __restrict__ out, int n, int k)
 {
     const int sl = blockIdx.x / n;
     if (sl >= nslots) {
@@ -188,8 +189,10 @@ extern "C" __global__ void w4a16_gemv_experts_g32_bf16(
     }
     const int o = blockIdx.x - sl * n;
     const unsigned long long* e = tab + (size_t)(base + idx[sl] * 3) * 2;
+    // sp = 토큰당 슬롯 수(프리필 = top_k, 디코드 = 1) — x는 토큰 단위 공유.
+    const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
     gemv_row_body<5, true>((const unsigned*)e[0], (const unsigned short*)e[1],
-                           x + (size_t)sl * xstride, out + (size_t)sl * n, o, k);
+                           x + xoff, out + (size_t)sl * n, o, k);
 }
 
 // t=1 GEMV 래퍼 — g128·f16(27B) / g32·bf16(35B 전문가).
@@ -362,6 +365,56 @@ extern "C" __global__ void w4a16_gemv_bf16(
     }
 }
 
+// 플레인 bf16 GEMM(t≤8) — 행=블록(64레인), **가중치 1회 판독 × t토큰 재사용**
+// (t=1 경로와 같은 레인·환원 순서 — 판정은 토큰 수준, 골든). x는 원시 f32
+// [t][k](전치 없음), out [t][n]. 프리필 청크(t≤8)의 dense 경로.
+extern "C" __global__ void w4a16_gemm_bf16(
+    const unsigned short* __restrict__ w,  // [n][k] bf16
+    const float* __restrict__ x,           // [t][k] f32
+    float* __restrict__ out,               // [t][n]
+    int n, int k, int t)
+{
+    const int o = blockIdx.x;
+    if (o >= n) {
+        return;
+    }
+    const int l = threadIdx.x;
+    __shared__ double red[G4_LANES];
+    const unsigned short* wrow = w + (size_t)o * k;
+    float acc[G4_TMAX];
+#pragma unroll
+    for (int u = 0; u < G4_TMAX; ++u) {
+        acc[u] = 0.0f;
+    }
+    for (int i = l; i < k; i += G4_LANES) {
+        const float wv = b2f(wrow[i]);
+#pragma unroll
+        for (int u = 0; u < G4_TMAX; ++u) {
+            if (u < t) {
+                acc[u] += wv * x[(size_t)u * k + i];
+            }
+        }
+    }
+    for (int u = 0; u < t; ++u) {
+        red[l] = (double)acc[u];
+        __syncthreads();
+        if (l < 32) {
+            double r = red[l] + red[l + 32];
+#pragma unroll
+            for (int off = 16; off >= 1; off >>= 1) {
+                const double oth = shfl_down_f64(r, off);
+                if (l < off) {
+                    r += oth;
+                }
+            }
+            if (l == 0) {
+                out[(size_t)u * n + o] = (float)r;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // 가중 누적 — y[i] += w·x[i] (mul·add 분리 — CPU MoE 스테이지와 동일 산식).
 extern "C" __global__ void w4a16_axpy(float w, const float* __restrict__ x,
                                       float* __restrict__ y, int n) {
@@ -374,14 +427,19 @@ extern "C" __global__ void w4a16_axpy(float w, const float* __restrict__ x,
 // 전문가 가중 누적 — y[i] += Σ_s w[s]·d[s][i] (선택 순서 가산 — CPU 미러).
 extern "C" __global__ void w4a16_moe_accum(const float* __restrict__ w,
                                            const float* __restrict__ d,
-                                           float* __restrict__ y, int nslots, int n) {
+                                           float* __restrict__ y, int sp, int nslots,
+                                           int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        float acc = y[i];
-        for (int s = 0; s < nslots; ++s) {
-            acc += w[s] * d[(size_t)s * n + i];
+        const int spt = (sp > 0) ? sp : nslots;
+        for (int ti = 0; ti < nslots; ti += spt) {
+            float acc = 0.0f;
+            const int end = (ti + spt < nslots) ? ti + spt : nslots;
+            for (int s = ti; s < end; ++s) {
+                acc += w[s] * d[(size_t)s * n + i];
+            }
+            y[(size_t)(ti / spt) * n + i] = acc;
         }
-        y[i] = acc;
     }
 }
 
@@ -389,9 +447,10 @@ extern "C" __global__ void w4a16_moe_accum(const float* __restrict__ w,
 extern "C" __global__ void w4a16_shared_add(const float* __restrict__ sg,
                                             const float* __restrict__ x,
                                             float* __restrict__ y, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int ti = blockIdx.x;
+    const int i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i < n) {
-        const float s = 1.0f / (1.0f + expf(-sg[0]));
-        y[i] += s * x[i];
+        const float s = 1.0f / (1.0f + expf(-sg[ti]));
+        y[(size_t)ti * n + i] += s * x[(size_t)ti * n + i];
     }
 }

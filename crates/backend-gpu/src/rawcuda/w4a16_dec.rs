@@ -347,6 +347,7 @@ impl W4a16Dec {
                 "w4a16_gemv_experts_g32_bf16",
                 "w4a16_moe_accum",
                 "w4a16_gemv_bf16",
+                "w4a16_gemm_bf16",
             ],
         )?;
         cc.load_fatbin(
@@ -1591,12 +1592,19 @@ impl W4a16Dec {
     }
 
     /// 배치 출력 스크래치 보장([t][max_n]).
+    /// 플레인 모드(MoE)는 lins가 비어 있다 — plains·전문가 폭까지 포함해야
+    /// dyt가 NULL로 남지 않는다(실측: ssm_out GEMM이 NULL에 쓰러 크래시).
     fn ensure_dyt(&mut self, t: usize) -> Result<CUdeviceptr, String> {
         let (mut mn, mut mk) = (0usize, 0usize);
         for &(_, _, n, k) in self.lins.values() {
             mn = mn.max(n);
             mk = mk.max(k);
         }
+        for &(_, n, k) in self.plains.values() {
+            mn = mn.max(n);
+            mk = mk.max(k);
+        }
+        mn = mn.max(self.hidden).max(self.n_experts);
         let need = t * mn;
         if need > self.dyt_cap {
             if self.dyt != 0 {
@@ -1775,6 +1783,11 @@ impl W4a16Dec {
         self.n_experts > 0
     }
 
+    /// 전문가 전량 상주 여부 — MoE 배치 프리필(t>1)의 전제.
+    pub fn moe_experts_resident(&self) -> bool {
+        self.moe_resident
+    }
+
     /// MoE 구성 등록 — n_experts>0이면 체인은 플레인+MoE FFN 경로.
     pub fn set_moe(
         &mut self,
@@ -1825,6 +1838,30 @@ impl W4a16Dec {
             (&mut p_o) as *mut _ as *mut _,
             (&mut p_n) as *mut _ as *mut _,
             (&mut p_k) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, n as u32, 1, 64, &mut args)
+    }
+
+    /// 플레인 bf16 GEMM(t≤8) — x는 원시 f32 [t][k](h2f 왕복 없음),
+    /// 가중치 1회 판독 × t토큰 재사용(프리필 청크의 dense 경로).
+    fn plain_gemm_launch(
+        &self,
+        name: &str,
+        x_dev: CUdeviceptr,
+        y_out: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let (w, n, k) = self.plain_spec(name)?;
+        let f = self.cc.function("w4a16_gemm_bf16")?;
+        let (mut p_w, mut p_x, mut p_o) = (w, x_dev, y_out);
+        let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+        let mut args: [*mut std::ffi::c_void; 6] = [
+            (&mut p_w) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_o) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+            (&mut p_t) as *mut _ as *mut _,
         ];
         self.cc.launch(f, n as u32, 1, 64, &mut args)
     }
@@ -1999,6 +2036,8 @@ impl W4a16Dec {
         if n_ff == 0 || n_exp == 0 || !self.moe_group.is_multiple_of(32) {
             return Err("moe: 구성 미등록".into());
         }
+        // 프리필 t≤CHAIN_TMAX까지 수용 — 슬롯 = TMAX×top_k, 라우터 = TMAX×n_exp.
+        let tmax = CHAIN_TMAX;
         // 전문가 최대 행렬 = h×n_ff(gate/up) = h×n_ff(down) — 동일 크기.
         let pk = h * n_ff / 2;
         let sk = h * n_ff / self.moe_group * 2;
@@ -2011,13 +2050,13 @@ impl W4a16Dec {
                 &mut self.drt,
                 &mut self.dmo,
             ],
-            [pk, sk, n_exp * 4, h * 4],
+            [pk, sk, tmax * n_exp * 4, tmax * h * 4],
         )?;
         self.dstg_cap = (pk, sk);
-        self.drt_cap = n_exp;
-        self.dmo_cap = h;
-        // 배치 전문가 출력([top_k][n_ff]·[top_k][h]) + 슬롯 idx/가중(상주 전용).
-        let tk = self.top_k.max(1);
+        self.drt_cap = tmax * n_exp;
+        self.dmo_cap = tmax * h;
+        // 배치 전문가 출력([TMAX×top_k][n_ff]·[TMAX×top_k][h]) + 슬롯 idx/가중.
+        let tk = tmax * self.top_k.max(1);
         if self.dexp_cap < tk {
             for p in [self.dexp_gate, self.dexp_up, self.dexp_act, self.dexp_dn] {
                 if p != 0 {
@@ -2049,13 +2088,16 @@ impl W4a16Dec {
     }
 
     /// 배치 전문가 GEMV(상주) — tab 간접 참조, grid = n × nslots.
-    /// xstride = 0(x 공통) 또는 k(슬롯별 활성 [nslots][k]).
+    /// xstride = 0(x 공통) 또는 k(슬롯/토큰별 활성), sp = 토큰당 슬롯 수
+    /// (프리필 = top_k → x는 토큰 단위 [t][k], 디코드 = 1 → 슬롯별 [nslots][k]).
+    #[allow(clippy::too_many_arguments)]
     fn gemv_experts_launch(
         &self,
         base: usize,
         nslots: usize,
         x_dev: CUdeviceptr,
         xstride: usize,
+        sp: usize,
         out_dev: CUdeviceptr,
         n: usize,
         k: usize,
@@ -2063,15 +2105,22 @@ impl W4a16Dec {
         let f = self.cc.function("w4a16_gemv_experts_g32_bf16")?;
         let (mut p_t, mut p_b, mut p_i, mut p_ns) =
             (self.moe_dev_tab, base as i32, self.moe_idx, nslots as i32);
-        let (mut p_x, mut p_xs, mut p_o, mut p_n, mut p_k) =
-            (x_dev, xstride as i32, out_dev, n as i32, k as i32);
-        let mut args: [*mut std::ffi::c_void; 9] = [
+        let (mut p_x, mut p_xs, mut p_sp, mut p_o, mut p_n, mut p_k) = (
+            x_dev,
+            xstride as i32,
+            sp as i32,
+            out_dev,
+            n as i32,
+            k as i32,
+        );
+        let mut args: [*mut std::ffi::c_void; 10] = [
             (&mut p_t) as *mut _ as *mut _,
             (&mut p_b) as *mut _ as *mut _,
             (&mut p_i) as *mut _ as *mut _,
             (&mut p_ns) as *mut _ as *mut _,
             (&mut p_x) as *mut _ as *mut _,
             (&mut p_xs) as *mut _ as *mut _,
+            (&mut p_sp) as *mut _ as *mut _,
             (&mut p_o) as *mut _ as *mut _,
             (&mut p_n) as *mut _ as *mut _,
             (&mut p_k) as *mut _ as *mut _,
@@ -2079,22 +2128,24 @@ impl W4a16Dec {
         self.cc.launch(f, (n * nslots) as u32, 1, 64, &mut args)
     }
 
-    /// 선택 순서 가중 누적 — y += Σ_s w[s]·d[s][i].
+    /// 선택 순서 가중 누적 — y[ti] = Σ_{s∈ti} w[s]·d[s][i] (sp = 토큰당 슬롯).
     fn moe_accum_dev(
         &mut self,
         w_dev: CUdeviceptr,
         d_dev: CUdeviceptr,
         y_dev: CUdeviceptr,
+        sp: usize,
         nslots: usize,
         n: usize,
     ) -> Result<(), String> {
         let f = self.cc.function("w4a16_moe_accum")?;
         let (mut p_w, mut p_d, mut p_y) = (w_dev, d_dev, y_dev);
-        let (mut p_ns, mut nn) = (nslots as i32, n as i32);
-        let mut args: [*mut std::ffi::c_void; 5] = [
+        let (mut p_sp, mut p_ns, mut nn) = (sp as i32, nslots as i32, n as i32);
+        let mut args: [*mut std::ffi::c_void; 6] = [
             (&mut p_w) as *mut _ as *mut _,
             (&mut p_d) as *mut _ as *mut _,
             (&mut p_y) as *mut _ as *mut _,
+            (&mut p_sp) as *mut _ as *mut _,
             (&mut p_ns) as *mut _ as *mut _,
             (&mut nn) as *mut _ as *mut _,
         ];
@@ -2116,13 +2167,14 @@ impl W4a16Dec {
         self.cc.launch(f, n.div_ceil(256) as u32, 1, 256, &mut args)
     }
 
-    /// shared 게이트 가산 — y += sigmoid(sg)·x.
+    /// shared 게이트 가산 — y[t][i] += sigmoid(sg[t])·x[t][i] (grid = t).
     fn shared_add_dev(
         &mut self,
         sg: CUdeviceptr,
         x: CUdeviceptr,
         y: CUdeviceptr,
         n: usize,
+        t: usize,
     ) -> Result<(), String> {
         let f = self.cc.function("w4a16_shared_add")?;
         let (mut p_sg, mut p_x, mut p_y) = (sg, x, y);
@@ -2133,7 +2185,8 @@ impl W4a16Dec {
             (&mut p_y) as *mut _ as *mut _,
             (&mut nn) as *mut _ as *mut _,
         ];
-        self.cc.launch(f, n.div_ceil(256) as u32, 1, 256, &mut args)
+        self.cc
+            .launch(f, t.max(1) as u32, n.div_ceil(256) as u32, 256, &mut args)
     }
 
     /// MoE FFN(35B-A3B) — 라우터(bf16 GEMV→호스트 top-k) + 전문가 스트리밍
@@ -2197,11 +2250,11 @@ impl W4a16Dec {
         self.cc.h2d_async(self.moe_wt, wb)?;
         // gate/up 배치(x 공통) → ew → down 배치(x 슬롯별) → 가중 누적.
         let base = il * n_exp * 3;
-        self.gemv_experts_launch(base, ns, xn, 0, self.dexp_gate, n_ff, h)?;
-        self.gemv_experts_launch(base + 1, ns, xn, 0, self.dexp_up, n_ff, h)?;
+        self.gemv_experts_launch(base, ns, xn, 0, ns, self.dexp_gate, n_ff, h)?;
+        self.gemv_experts_launch(base + 1, ns, xn, 0, ns, self.dexp_up, n_ff, h)?;
         self.ew_dev(self.dexp_gate, self.dexp_up, self.dexp_act, ns * n_ff)?;
-        self.gemv_experts_launch(base + 2, ns, self.dexp_act, n_ff, self.dexp_dn, h, n_ff)?;
-        self.moe_accum_dev(self.moe_wt, self.dexp_dn, self.dmo, ns, h)
+        self.gemv_experts_launch(base + 2, ns, self.dexp_act, n_ff, 1, self.dexp_dn, h, n_ff)?;
+        self.moe_accum_dev(self.moe_wt, self.dexp_dn, self.dmo, ns, ns, h)
     }
 
     /// 전문가 스트리밍(비상주) — 스테이징 1쌍 재사용 h2d + 개별 GEMV.
@@ -2242,7 +2295,87 @@ impl W4a16Dec {
         self.ew_dev(s0, s1, s2, sf)?;
         self.plain_gemv_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3)?;
         self.plain_gemv_launch(&format!("blk.{il}.moe_shared_sgate.weight"), xn, self.drt)?;
-        self.shared_add_dev(self.drt, s3, self.dmo, h)
+        self.shared_add_dev(self.drt, s3, self.dmo, h, 1)
+    }
+
+    /// MoE FFN 배치(t≤8) — 라우터 플레인 GEMM → 호스트 선택(t×top_k 슬롯,
+    /// 토큰 우선) → 전문가 배치 GEMV(gate/up x=토큰 단위 sp=top_k, down x=슬롯
+    /// 단위 sp=1) → 토큰별 누적 → shared. **상주 모드 전용**(스트리밍 프리필은
+    /// 미구현 — 호출부가 t=1로 떨어뜨린다).
+    fn moe_ffn_dev_t(
+        &mut self,
+        il: usize,
+        xn: CUdeviceptr,
+        t: usize,
+    ) -> Result<CUdeviceptr, String> {
+        let _g = self.cc.guard()?;
+        let n_exp = self.n_experts;
+        let h = self.hidden;
+        let n_ff = self.moe_ffn;
+        let tk = self.top_k;
+        if n_exp == 0 || self.moe_tab.len() < (il + 1) * n_exp * 3 {
+            return Err("moe: 구성/전문가 테이블 미등록".into());
+        }
+        if !self.moe_resident {
+            return Err("moe t>1: 상주 모드 전용(스트리밍 프리필 미구현)".into());
+        }
+        self.ensure_moe_bufs()?;
+        // 1) 라우터 [t][n_exp] — 플레인 GEMM → 호스트 선택(슬롯 = 토큰 우선).
+        self.plain_gemm_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt, t)?;
+        let mut lb = vec![0u8; t * n_exp * 4];
+        self.cc
+            .d2h_async(lb.as_mut_ptr(), self.drt, t * n_exp * 4)?;
+        self.cc.sync()?;
+        let logits: Vec<f32> = lb
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let mut sel: Vec<(usize, f32)> = Vec::with_capacity(t * tk);
+        for ti in 0..t {
+            for (e, w) in moe_topk(&logits[ti * n_exp..(ti + 1) * n_exp], tk) {
+                sel.push((e, w));
+            }
+        }
+        // 2) 전문가 배치.
+        let ns = sel.len();
+        let idx: Vec<u32> = sel.iter().map(|&(e, _)| e as u32).collect();
+        let wts: Vec<f32> = sel.iter().map(|&(_, w)| w).collect();
+        // SAFETY: 호스트 Vec 슬라이스 — 호출 내 수명(동기 복사 완료).
+        let ib = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len() * 4) };
+        let wb = unsafe { std::slice::from_raw_parts(wts.as_ptr() as *const u8, wts.len() * 4) };
+        self.cc.h2d_async(self.moe_idx, ib)?;
+        self.cc.h2d_async(self.moe_wt, wb)?;
+        let base = il * n_exp * 3;
+        self.gemv_experts_launch(base, ns, xn, h, tk, self.dexp_gate, n_ff, h)?;
+        self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.dexp_up, n_ff, h)?;
+        self.ew_dev(self.dexp_gate, self.dexp_up, self.dexp_act, ns * n_ff)?;
+        self.gemv_experts_launch(base + 2, ns, self.dexp_act, n_ff, 1, self.dexp_dn, h, n_ff)?;
+        self.moe_accum_dev(self.moe_wt, self.dexp_dn, self.dmo, tk, ns, h)?;
+        self.moe_shared_t(il, xn, t)?;
+        Ok(self.dmo)
+    }
+
+    /// shared 전문가 배치(t≤8) — 플레인 GEMM ×3 + 토큰별 게이트 가산.
+    fn moe_shared_t(&mut self, il: usize, xn: CUdeviceptr, t: usize) -> Result<(), String> {
+        if self.shared_ffn == 0 {
+            return Ok(());
+        }
+        let h = self.hidden;
+        let sf = self.shared_ffn;
+        let [s0, s1, _s1b, s2, s3] = self.dchain;
+        self.plain_gemm_launch(&format!("blk.{il}.moe_shared_gate.weight"), xn, s0, t)?;
+        self.plain_gemm_launch(&format!("blk.{il}.moe_shared_up.weight"), xn, s1, t)?;
+        self.ew_dev(s0, s1, s2, t * sf)?;
+        self.plain_gemm_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3, t)?;
+        self.plain_gemm_launch(
+            &format!("blk.{il}.moe_shared_sgate.weight"),
+            xn,
+            self.drt,
+            t,
+        )?;
+        self.shared_add_dev(self.drt, s3, self.dmo, h, t)
     }
 
     /// MoE 자가 점검 — 직접 GEMV vs 배치(간접) GEMV 비트 비교(층0·전문가0·
@@ -2275,7 +2408,7 @@ impl W4a16Dec {
             let idx = [0u32];
             let ib = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, 4) };
             self.cc.h2d(self.moe_idx, ib)?;
-            self.gemv_experts_launch(0, 1, dx, 0, db, n, k)?;
+            self.gemv_experts_launch(0, 1, dx, 0, 1, db, n, k)?;
             self.cc.sync()?;
             let mut a = vec![0u8; n * 4];
             let mut b = vec![0u8; n * 4];
@@ -2745,21 +2878,34 @@ impl W4a16Dec {
         let (w2, h) = (self.stg_w2, self.hidden);
         let mut ab = self.dab_dev;
         let mut gi = 0usize;
+        // 플레인(MoE) 모드 — bf16 GEMM(x 원시 f32), FFN은 MoE 배치(t≤8).
+        let plain = self.plain_weights;
         for il in 0..self.n_layers {
-            let xh = self.ensure_dx32(t * h)?;
+            let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, t, xh)
                 .map_err(|e| format!("T{il} input norm: {e}"))?;
             let branch = if (il + 1) % 4 == 0 {
-                self.gemm_launch(&format!("blk.{il}.attn_q.weight"), xh, s0, t)?;
-                self.gemm_launch(&format!("blk.{il}.attn_k.weight"), xh, s1, t)?;
-                self.gemm_launch(&format!("blk.{il}.attn_v.weight"), xh, s1b, t)?;
+                if plain {
+                    self.plain_gemm_launch(&format!("blk.{il}.attn_q.weight"), xn, s0, t)?;
+                    self.plain_gemm_launch(&format!("blk.{il}.attn_k.weight"), xn, s1, t)?;
+                    self.plain_gemm_launch(&format!("blk.{il}.attn_v.weight"), xn, s1b, t)?;
+                } else {
+                    self.gemm_launch(&format!("blk.{il}.attn_q.weight"), xh, s0, t)?;
+                    self.gemm_launch(&format!("blk.{il}.attn_k.weight"), xh, s1, t)?;
+                    self.gemm_launch(&format!("blk.{il}.attn_v.weight"), xh, s1b, t)?;
+                }
                 self.attn_chain_dev_run(slot, il / 4, t, s0, s1, s1b)
                     .map_err(|e| format!("T{il} attn: {e}"))?
             } else {
-                let xh = self.cast_x32(xn, t * h)?;
-                self.gemm_launch(&format!("blk.{il}.attn_qkv.weight"), xh, s0, t)?;
-                self.gemm_launch(&format!("blk.{il}.attn_gate.weight"), xh, s1, t)?;
+                if plain {
+                    self.plain_gemm_launch(&format!("blk.{il}.attn_qkv.weight"), xn, s0, t)?;
+                    self.plain_gemm_launch(&format!("blk.{il}.attn_gate.weight"), xn, s1, t)?;
+                } else {
+                    let xh = self.cast_x32(xn, t * h)?;
+                    self.gemm_launch(&format!("blk.{il}.attn_qkv.weight"), xh, s0, t)?;
+                    self.gemm_launch(&format!("blk.{il}.attn_gate.weight"), xh, s1, t)?;
+                }
                 let g = self
                     .gdn_chain_dev_run(slot, gi, t, xn, s0, s1)
                     .map_err(|e| format!("T{il} gdn: {e}"))?;
@@ -2771,22 +2917,32 @@ impl W4a16Dec {
             } else {
                 format!("blk.{il}.ssm_out.weight")
             };
-            let (_, _, _, ko) = self.lin_spec(&lo)?;
-            let xh2 = self.cast_x32(branch, t * ko)?;
-            self.gemm_launch(&lo, xh2, dyt, t)?;
+            if plain {
+                self.plain_gemm_launch(&lo, branch, dyt, t)?;
+            } else {
+                let (_, _, _, ko) = self.lin_spec(&lo)?;
+                let xh2 = self.cast_x32(branch, t * ko)?;
+                self.gemm_launch(&lo, xh2, dyt, t)?;
+            }
             let xn2 = self
                 .norm_resid_dev(2 * il + 1, self.dres, dyt, t, xh)
                 .map_err(|e| format!("T{il} post norm: {e}"))?;
-            let xh3 = xh; // 노름 융합 기록
-            let _ = xn2;
-            self.gemm_launch(&format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
-            self.gemm_launch(&format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
-            self.ew_dev(s0, s1, s2, t * w2)?;
-            let dn = format!("blk.{il}.ffn_down.weight");
-            let (_, _, _, kd) = self.lin_spec(&dn)?;
-            let xh4 = self.cast_x32(s2, t * kd)?;
-            self.gemm_launch(&dn, xh4, s3, t)?;
-            ab = s3;
+            if plain {
+                ab = self
+                    .moe_ffn_dev_t(il, xn2, t)
+                    .map_err(|e| format!("T{il} moe: {e}"))?;
+            } else {
+                let xh3 = xh; // 노름 융합 기록
+                let _ = xn2;
+                self.gemm_launch(&format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
+                self.gemm_launch(&format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
+                self.ew_dev(s0, s1, s2, t * w2)?;
+                let dn = format!("blk.{il}.ffn_down.weight");
+                let (_, _, _, kd) = self.lin_spec(&dn)?;
+                let xh4 = self.cast_x32(s2, t * kd)?;
+                self.gemm_launch(&dn, xh4, s3, t)?;
+                ab = s3;
+            }
         }
         // 마지막 행만 최종 노름(+head) — 중간 행 로짓은 불필요(상각).
         let last = (t - 1) as u64 * (h as u64) * 4;
