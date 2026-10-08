@@ -7,6 +7,8 @@
 # .cu가 진실이며 fatbin은 nvcc 출력으로만 갱신한다(손편집 금지).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# A1: 클린 환경에서 mktemp 접두 디렉터리 부재로 즉시 실패하던 결함.
+mkdir -p /tmp/opencode
 NVCC=${NVCC:-nvcc}
 command -v "$NVCC" >/dev/null || { echo "nvcc 없음: $NVCC" >&2; exit 1; }
 A=crates/backend-gpu/src/rawcuda/assets

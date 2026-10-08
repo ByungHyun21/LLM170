@@ -109,6 +109,31 @@ pub fn f32_to_f16(v: f32) -> u16 {
     sign | (h as u16)
 }
 
+/// ensure_* 버퍼 교체 계약(G1) — 기존 전량 해제 → 전 필드 0화 → 재할당.
+/// alloc이 중간에 실패하면 필드는 0 또는 그때까지의 성공분을 유지한다:
+/// 재시도는 성공분만 회수하고(이중해제 없음) 처음부터 다시 할당한다.
+/// cap류는 호출부가 0으로 내린 뒤 성공 시에만 갱신할 것.
+/// free/alloc을 클로저로 받는 이유: CUDA 없이 모의 주입 단위 테스트(회귀).
+fn realloc_fields<const N: usize>(
+    mut free: impl FnMut(CUdeviceptr) -> Result<(), String>,
+    mut alloc: impl FnMut(usize) -> Result<CUdeviceptr, String>,
+    mut fields: [&mut CUdeviceptr; N],
+    sizes: [usize; N],
+) -> Result<(), String> {
+    for f in fields.iter() {
+        if **f != 0 {
+            free(**f)?;
+        }
+    }
+    for f in fields.iter_mut() {
+        **f = 0;
+    }
+    for (f, sz) in fields.into_iter().zip(sizes) {
+        *f = alloc(sz)?;
+    }
+    Ok(())
+}
+
 fn asset_bytes(env: &str, rel: &[&str]) -> Result<Vec<u8>, String> {
     if let Some(p) = llm170_diag::flag::val(env) {
         return std::fs::read(p).map_err(|e| format!("{env}({p}) 읽기 실패: {e}"));
@@ -403,10 +428,25 @@ impl W4a16Dec {
                 s.len()
             ));
         }
+        // G2: alloc 전량 성공 → h2d 성공 시에만 상주 등록. 어느 단계든 실패하면
+        // 성공분을 회수한다(부분 업로드 유실 금지 — 재시도가 처음부터).
         let dq = self.cc.alloc(q.len())?;
-        Self::h2d_chunked(&self.cc, dq, q)?;
-        let ds = self.cc.alloc(s.len())?;
-        Self::h2d_chunked(&self.cc, ds, s)?;
+        let ds = match self.cc.alloc(s.len()) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.cc.free(dq);
+                return Err(e);
+            }
+        };
+        let r = (|| {
+            Self::h2d_chunked(&self.cc, dq, q)?;
+            Self::h2d_chunked(&self.cc, ds, s)
+        })();
+        if let Err(e) = r {
+            let _ = self.cc.free(dq);
+            let _ = self.cc.free(ds);
+            return Err(e);
+        }
         if let Some((oq, os, _, _)) = self.lins.insert(name.to_string(), (dq, ds, n, k)) {
             let _ = self.cc.free(oq);
             let _ = self.cc.free(os);
@@ -427,6 +467,8 @@ impl W4a16Dec {
             if self.dxh != 0 {
                 self.cc.free(self.dxh)?;
             }
+            self.dxh = 0; // G1: alloc 실패 시 재시도 이중해제 방지.
+            self.xh_cap = 0;
             self.dxh = self.cc.alloc(k * 2)?;
             self.xh_cap = k;
         }
@@ -434,6 +476,8 @@ impl W4a16Dec {
             if self.dy != 0 {
                 self.cc.free(self.dy)?;
             }
+            self.dy = 0; // G1
+            self.y_cap = 0;
             self.dy = self.cc.alloc(n * 4)?;
             self.y_cap = n;
         }
@@ -484,9 +528,14 @@ impl W4a16Dec {
         if self.dnw != 0 {
             self.cc.free(self.dnw)?;
         }
+        self.dnw = 0; // G1: 실패 시 재시도가 0을 해제하지 않게.
+        self.norm_w_rows = 0;
         let b = unsafe { std::slice::from_raw_parts(nw.as_ptr() as *const u8, nw.len() * 4) };
         let d = self.cc.alloc(nw.len() * 4)?;
-        Self::h2d_chunked(&self.cc, d, b)?;
+        if let Err(e) = Self::h2d_chunked(&self.cc, d, b) {
+            let _ = self.cc.free(d); // G1: 부분 업로드 실패 시 유실 방지.
+            return Err(e);
+        }
         self.dnw = d;
         self.norm_w_rows = rows;
         Ok(())
@@ -495,14 +544,13 @@ impl W4a16Dec {
     fn ensure_norm_bufs(&mut self, t_len: usize) -> Result<(), String> {
         let need = t_len * self.hidden;
         if need > self.norm_cap {
-            for q in [self.dx, self.dab, self.dxn] {
-                if q != 0 {
-                    self.cc.free(q)?;
-                }
-            }
-            self.dx = self.cc.alloc(need * 4)?;
-            self.dab = self.cc.alloc(need * 4)?;
-            self.dxn = self.cc.alloc(need * 4)?;
+            self.norm_cap = 0; // G1: 실패 시 재진입 보장(성공 뒤에만 갱신).
+            realloc_fields(
+                |p| self.cc.free(p),
+                |n| self.cc.alloc(n),
+                [&mut self.dx, &mut self.dab, &mut self.dxn],
+                [need * 4, need * 4, need * 4],
+            )?;
             self.norm_cap = need;
         }
         Ok(())
@@ -566,14 +614,13 @@ impl W4a16Dec {
 
     fn ensure_ew_bufs(&mut self, n: usize) -> Result<(), String> {
         if n > self.ew_cap {
-            for q in [self.dewg, self.dewu, self.dew] {
-                if q != 0 {
-                    self.cc.free(q)?;
-                }
-            }
-            self.dewg = self.cc.alloc(n * 4)?;
-            self.dewu = self.cc.alloc(n * 4)?;
-            self.dew = self.cc.alloc(n * 4)?;
+            self.ew_cap = 0; // G1
+            realloc_fields(
+                |p| self.cc.free(p),
+                |b| self.cc.alloc(b),
+                [&mut self.dewg, &mut self.dewu, &mut self.dew],
+                [n * 4, n * 4, n * 4],
+            )?;
             self.ew_cap = n;
         }
         Ok(())
@@ -664,26 +711,39 @@ impl W4a16Dec {
         }
         let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
         let (hd, cch, kl, vl) = (dm.hidden, dm.conv_ch(), dm.k_len(), dm.v_len());
-        for q in [
-            self.dqkv, self.dzv, self.dgxn, self.dgq, self.dgk, self.dgv, self.dq2, self.dk2,
-            self.dv2, self.dbg, self.dgo, self.dgate,
-        ] {
-            if q != 0 {
-                self.cc.free(q)?;
-            }
-        }
-        self.dqkv = self.cc.alloc(t_len * cch * 4)?;
-        self.dzv = self.cc.alloc(t_len * vl * 4)?;
-        self.dgxn = self.cc.alloc(t_len * hd * 4)?;
-        self.dgq = self.cc.alloc(t_len * kl * 4)?;
-        self.dgk = self.cc.alloc(t_len * kl * 4)?;
-        self.dgv = self.cc.alloc(t_len * vl * 4)?;
-        self.dq2 = self.cc.alloc(t_len * kl * 4)?;
-        self.dk2 = self.cc.alloc(t_len * kl * 4)?;
-        self.dv2 = self.cc.alloc(t_len * vl * 4)?;
-        self.dbg = self.cc.alloc(t_len * dm.bg_len() * 4)?;
-        self.dgo = self.cc.alloc(t_len * vl * 4)?;
-        self.dgate = self.cc.alloc(t_len * vl * 4)?;
+        self.gdn_t_cap = 0; // G1: 실패 시 재진입 보장.
+        realloc_fields(
+            |p| self.cc.free(p),
+            |b| self.cc.alloc(b),
+            [
+                &mut self.dqkv,
+                &mut self.dzv,
+                &mut self.dgxn,
+                &mut self.dgq,
+                &mut self.dgk,
+                &mut self.dgv,
+                &mut self.dq2,
+                &mut self.dk2,
+                &mut self.dv2,
+                &mut self.dbg,
+                &mut self.dgo,
+                &mut self.dgate,
+            ],
+            [
+                t_len * cch * 4,
+                t_len * vl * 4,
+                t_len * hd * 4,
+                t_len * kl * 4,
+                t_len * kl * 4,
+                t_len * vl * 4,
+                t_len * kl * 4,
+                t_len * kl * 4,
+                t_len * vl * 4,
+                t_len * dm.bg_len() * 4,
+                t_len * vl * 4,
+                t_len * vl * 4,
+            ],
+        )?;
         self.gdn_t_cap = t_len;
         Ok(())
     }
@@ -906,22 +966,25 @@ impl W4a16Dec {
             return Ok(());
         }
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
-        for q in [
-            self.dqg_a,
-            self.dkin_a,
-            self.dvin_a,
-            self.dqh_a,
-            self.doutv_a,
-        ] {
-            if q != 0 {
-                self.cc.free(q)?;
-            }
-        }
-        self.dqg_a = self.cc.alloc(t_len * dm.qg_dim() * 4)?;
-        self.dkin_a = self.cc.alloc(t_len * dm.kv_dim() * 4)?;
-        self.dvin_a = self.cc.alloc(t_len * dm.kv_dim() * 4)?;
-        self.dqh_a = self.cc.alloc(t_len * dm.q_dim() * 4)?;
-        self.doutv_a = self.cc.alloc(t_len * dm.q_dim() * 4)?;
+        self.attn_t_cap = 0; // G1: 실패 시 재진입 보장.
+        realloc_fields(
+            |p| self.cc.free(p),
+            |b| self.cc.alloc(b),
+            [
+                &mut self.dqg_a,
+                &mut self.dkin_a,
+                &mut self.dvin_a,
+                &mut self.dqh_a,
+                &mut self.doutv_a,
+            ],
+            [
+                t_len * dm.qg_dim() * 4,
+                t_len * dm.kv_dim() * 4,
+                t_len * dm.kv_dim() * 4,
+                t_len * dm.q_dim() * 4,
+                t_len * dm.q_dim() * 4,
+            ],
+        )?;
         self.attn_t_cap = t_len;
         Ok(())
     }
@@ -1250,29 +1313,14 @@ impl W4a16Dec {
         // 동시에 읽으므로 둘 다 FFN 폭 확보(구 S10 ensure_chain_bufs 계약).
         let w0 = ad.qg_dim().max(gd.conv_ch()).max(ff_gate);
         let w1 = ad.kv_dim().max(gd.v_len()).max(ff_up);
-        for p in [
-            self.dres,
-            self.dab_dev,
-            self.dchain[0],
-            self.dchain[1],
-            self.dchain[2],
-            self.dchain[3],
-            self.dchain[4],
-        ] {
-            if p != 0 {
-                self.cc.free(p)?;
-            }
-        }
-        self.dres = self.cc.alloc(h * 4)?;
-        self.dab_dev = self.cc.alloc(h * 4)?;
+        let [c0, c1, c2, c3, c4] = &mut self.dchain;
+        realloc_fields(
+            |p| self.cc.free(p),
+            |b| self.cc.alloc(b),
+            [&mut self.dres, &mut self.dab_dev, c0, c1, c2, c3, c4],
+            [h * 4, h * 4, w0 * 4, w1 * 4, w1 * 4, ff_up * 4, h * 4],
+        )?;
         Self::zero_dev(&self.cc, self.dab_dev, h * 4)?;
-        self.dchain = [
-            self.cc.alloc(w0 * 4)?,
-            self.cc.alloc(w1 * 4)?,
-            self.cc.alloc(w1 * 4)?,
-            self.cc.alloc(ff_up * 4)?,
-            self.cc.alloc(h * 4)?,
-        ];
         self.stg_w0 = w0;
         self.stg_w1 = w1;
         self.stg_w2 = ff_up;
@@ -1291,6 +1339,8 @@ impl W4a16Dec {
             if self.dx32 != 0 {
                 self.cc.free(self.dx32)?;
             }
+            self.dx32 = 0; // G1
+            self.dx32_cap = 0;
             self.dx32 = self.cc.alloc(k * 4)?;
             self.dx32_cap = k;
         }
@@ -1298,6 +1348,8 @@ impl W4a16Dec {
             if self.dy != 0 {
                 self.cc.free(self.dy)?;
             }
+            self.dy = 0; // G1
+            self.y_cap = 0;
             self.dy = self.cc.alloc(n * 4)?;
             self.y_cap = n;
         }
@@ -1533,7 +1585,12 @@ impl W4a16Dec {
         self.cc.sync()?;
         self.slot_pos[slot] = pos + 1;
         self.attn_set_pos(slot, pos + 1)?;
-        Ok(unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, self.hidden) }.to_vec())
+        let xn =
+            unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, self.hidden) }.to_vec();
+        // S5: 지문 파이프라인 부활 — LLM170_FP_FILE 시 스테이지 해시 기록
+        // (`diag diff`로 실행 2개의 최초 발산 스테이지 추적).
+        llm170_diag::fp::fp_record("gpu.xn", &xn);
+        Ok(xn)
     }
 
     /// bf16 head(output.weight) 상주 업로드 — head_bf16 GEMV.
@@ -1551,9 +1608,24 @@ impl W4a16Dec {
                 self.cc.free(p)?;
             }
         }
-        self.head_w = self.cc.alloc(need)?;
-        Self::h2d_chunked(&self.cc, self.head_w, &data[..need])?;
-        self.head_out = self.cc.alloc(n * 4)?;
+        self.head_w = 0; // G1: 부분 상태(head_n=0)로 소비되지 않게 마지막에 대입.
+        self.head_out = 0;
+        self.head_n = 0;
+        self.head_k = 0;
+        let dw = self.cc.alloc(need)?;
+        if let Err(e) = Self::h2d_chunked(&self.cc, dw, &data[..need]) {
+            let _ = self.cc.free(dw);
+            return Err(e);
+        }
+        let dout = match self.cc.alloc(n * 4) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.cc.free(dw);
+                return Err(e);
+            }
+        };
+        self.head_w = dw;
+        self.head_out = dout;
         self.head_n = n;
         self.head_k = k;
         Ok(())
@@ -1588,11 +1660,59 @@ impl W4a16Dec {
         self.cc.sync()?;
         self.slot_pos[slot] = pos + 1;
         self.attn_set_pos(slot, pos + 1)?;
-        Ok(ob
+        let lg: Vec<f32> = ob
             .as_chunks::<4>()
             .0
             .iter()
             .map(|c| f32::from_le_bytes(*c))
-            .collect())
+            .collect();
+        llm170_diag::fp::fp_record("gpu.logits", &lg);
+        Ok(lg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// G1 회귀 — 부분 alloc 실패 후 재시도가 이중해제/유실 없이 전량 재할당.
+    /// (CUDA 불필요 — free/alloc을 모의 클로저로 주입.)
+    #[test]
+    fn realloc_fields_partial_failure_retry_safe() {
+        let mut f: [CUdeviceptr; 3] = [0x11, 0x22, 0x33];
+        let live = RefCell::new(vec![0x11u64, 0x22, 0x33]);
+        let frees = RefCell::new(Vec::<u64>::new());
+        let next = Cell::new(0x100u64);
+        let fail_next = Cell::new(1usize); // 두 번째 alloc에서 실패 주입
+        let free = |p: CUdeviceptr| -> Result<(), String> {
+            let mut l = live.borrow_mut();
+            assert!(l.contains(&p), "이중해제 {p:#x}");
+            l.retain(|&v| v != p);
+            frees.borrow_mut().push(p);
+            Ok(())
+        };
+        let alloc = |_sz: usize| -> Result<CUdeviceptr, String> {
+            if fail_next.get() == 0 {
+                return Err("inject".into());
+            }
+            fail_next.set(fail_next.get() - 1);
+            let v = next.get() + 1;
+            next.set(v);
+            live.borrow_mut().push(v);
+            Ok(v)
+        };
+        let [a, b, c] = &mut f;
+        let r = realloc_fields(free, alloc, [a, b, c], [1, 1, 1]);
+        assert!(r.is_err(), "주입 실패가 전파되어야 한다");
+        assert_eq!(*frees.borrow(), vec![0x11, 0x22, 0x33]);
+        assert_eq!(f, [0x101, 0, 0], "성공분 유지·실패분 0");
+        // 재시도 — 성공분만 회수(이중해제 없음), 전량 재할당.
+        fail_next.set(usize::MAX);
+        let [a, b, c] = &mut f;
+        realloc_fields(free, alloc, [a, b, c], [1, 1, 1]).expect("재시도");
+        assert_eq!(*frees.borrow(), vec![0x11, 0x22, 0x33, 0x101]);
+        assert_eq!(f, [0x102, 0x103, 0x104]);
+        assert_eq!(live.borrow().len(), 3);
     }
 }

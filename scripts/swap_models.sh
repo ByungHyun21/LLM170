@@ -6,14 +6,18 @@
 #   1. A(27B): 참조(CPU) greedy 토큰열 골든 접두 일치 — 오라클.
 #   2. B(27B): GPU 체인(w4a16-gpu) 토큰열 골든 접두 일치.
 #   3. C(27B): serve HTTP 종단 — 배너 runtime=cuda + 골든 접두.
-#   4. D(35B-A3B INT4 g32): 로더 명시 거부(quantization_config 부재 — W4).
+#   4. D(35B-A3B INT4 g32): 로더 명시 거부 — 양자화 설정이 config.json 내장
+#      (사이드카 quantization_config.json 부재). W4-1에서 내장 폴백 예정.
 #   5. E(FN FP8PLE): 자원 가드 명시 거부(120GiB > 호스트).
 # 사용법: scripts/swap_models.sh
 set -u
 cd "$(dirname "$0")/.."
 BIN=./target/release/llm170
 GOLDEN="156037,16072,154029,209495,30"
-PORT=18210
+# A2: 동시 실행 충돌 방지 — 실행별 런 디렉터리·포트(고정 18210/고정 파일명 해소).
+mkdir -p /tmp/opencode
+RUN=$(mktemp -d /tmp/opencode/w4a16-smoke.XXXXXX)
+PORT=$((18210 + ($$ % 400)))
 
 M_27B=../models/Qwen3.8-27B-W4A16-AutoRound
 M_35B=../models/Qwen3.6-35B-A3B-INT4-W4A16
@@ -25,44 +29,48 @@ note() { echo "[w4a16] $*"; }
 # ── 1. A(27B) 참조 토큰 ──
 note "[1/5] A(27B) 참조 실행 — w4a16-ref"
 timeout 900 "$BIN" w4a16-ref "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
-  > /tmp/w4a16_a.out 2> /tmp/w4a16_a.log
-A=$(grep -m1 '^tokens:' /tmp/w4a16_a.out | sed 's/^tokens: //')
+  > "$RUN/a.out" 2> "$RUN/a.log"
+A=$(grep -m1 '^tokens:' "$RUN/a.out" | sed 's/^tokens: //')
 case "$A" in
   "$GOLDEN"*) note "참조 토큰 OK: $(echo "$A" | head -c 60)";;
-  "") echo "[w4a16] FAIL: 참조 실행 실패 — /tmp/w4a16_a.log"; fail=1;;
+  "") echo "[w4a16] FAIL: 참조 실행 실패 — ${RUN}/a.log"; fail=1;;
   *) echo "[w4a16] FAIL: 골든 접두 불일치: $(echo "$A" | head -c 60)"; fail=1;;
 esac
 
 # ── 2. B(27B) GPU 체인 ──
 note "[2/5] B(27B) GPU 체인 — w4a16-gpu"
 timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
-  > /tmp/w4a16_b.out 2> /tmp/w4a16_b.log
-B=$(grep -m1 '^ tokens:' /tmp/w4a16_b.out | sed 's/^ tokens: //')
+  > "$RUN/b.out" 2> "$RUN/b.log"
+B=$(grep -m1 '^ tokens:' "$RUN/b.out" | sed 's/^ tokens: //')
 case "$B" in
   "$GOLDEN"*) note "GPU 토큰 OK: $(echo "$B" | head -c 60)";;
-  "") echo "[w4a16] FAIL: GPU 체인 실패 — /tmp/w4a16_b.log"; fail=1;;
+  "") echo "[w4a16] FAIL: GPU 체인 실패 — ${RUN}/b.log"; fail=1;;
   *) echo "[w4a16] FAIL: GPU 골든 불일치: $(echo "$B" | head -c 60)"; fail=1;;
 esac
 
 # ── 3. C(27B) serve HTTP 종단 ──
 note "[3/5] C(27B) serve HTTP — runtime=cuda + 골든 접두"
-: > /tmp/w4a16_c.log
-( for i in $(seq 1 100); do
-    sleep 3
-    grep -m1 "listening" /tmp/w4a16_c.log >/dev/null 2>&1 && break
-  done
-  curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
-    -d '{"prompt":[148678,65233,202419],"max_tokens":8,"temperature":0}' > /tmp/w4a16_c.json
-  pkill -9 -x llm170 ) &
-timeout 900 "$BIN" serve --model "$M_27B" --ctx 1024 --slots 1 --port "$PORT" > /tmp/w4a16_c.log 2>&1
-wait
-if grep -q "runtime=cuda" /tmp/w4a16_c.log; then note "배너 OK(runtime=cuda)"; else
-  echo "[w4a16] FAIL: 배너 runtime!=cuda — /tmp/w4a16_c.log"; fail=1
+: > "$RUN/c.log"
+"$BIN" serve --model "$M_27B" --ctx 1024 --slots 1 --port "$PORT" > "$RUN/c.log" 2>&1 &
+SERVE_PID=$!
+# A2: 기기 전체 pkill 금지 — 이 실행의 서버 PID만 종료(개발 서버 보호).
+trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
+for i in $(seq 1 100); do
+  sleep 3
+  grep -m1 "listening" "$RUN/c.log" >/dev/null 2>&1 && break
+done
+curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
+  -d '{"prompt":[148678,65233,202419],"max_tokens":8,"temperature":0}' > "$RUN/c.json"
+kill "$SERVE_PID" 2>/dev/null
+wait "$SERVE_PID" 2>/dev/null
+trap - EXIT
+if grep -q "runtime=cuda" "$RUN/c.log"; then note "배너 OK(runtime=cuda)"; else
+  echo "[w4a16] FAIL: 배너 runtime!=cuda — $${RUN}/c.log"; fail=1
 fi
 C=$(python3 -c "
 import json
 try:
-    d=json.load(open('/tmp/w4a16_c.json'))
+    d=json.load(open('"$RUN/c.json"'))
     t=d.get('tokens') or (d['choices'][0].get('tokens') if 'choices' in d else None)
     print(','.join(map(str,t)) if t else 'ERR')
 except Exception:
@@ -75,22 +83,22 @@ esac
 
 # ── 4. D(35B INT4 g32) 명시 거부 ──
 note "[4/5] D(35B INT4 g32) 로더 명시 거부 판정"
-if timeout 60 "$BIN" w4a16-load "$M_35B" > /tmp/w4a16_d.log 2>&1; then
-  echo "[w4a16] FAIL: 거부되어야 할 g32 자산이 통과 — /tmp/w4a16_d.log"; fail=1
-elif grep -q "w4a16" /tmp/w4a16_d.log; then
-  note "명시 거부 OK: $(head -1 /tmp/w4a16_d.log)"
+if timeout 60 "$BIN" w4a16-load "$M_35B" > "$RUN/d.log" 2>&1; then
+  echo "[w4a16] FAIL: 거부되어야 할 g32 자산이 통과 — $${RUN}/d.log"; fail=1
+elif grep -q "w4a16" "$RUN/d.log"; then
+  note "명시 거부 OK: $(head -1 "$RUN/d.log")"
 else
-  echo "[w4a16] FAIL: 원인 불명 거부 — /tmp/w4a16_d.log"; fail=1
+  echo "[w4a16] FAIL: 원인 불명 거부 — $${RUN}/d.log"; fail=1
 fi
 
 # ── 5. E(FN FP8PLE) 자원 가드 명시 거부 ──
 note "[5/5] E(FN FP8PLE) 자원 가드 명시 거부 판정"
-if timeout 60 "$BIN" w4a16-load "$M_FN" > /tmp/w4a16_e.log 2>&1; then
-  echo "[w4a16] FAIL: 가드가 통과시킴(120GiB) — /tmp/w4a16_e.log"; fail=1
-elif grep -qE "insufficient resources|rsrc-guard" /tmp/w4a16_e.log; then
-  note "가드 거부 OK: $(head -1 /tmp/w4a16_e.log)"
+if timeout 60 "$BIN" w4a16-load "$M_FN" > "$RUN/e.log" 2>&1; then
+  echo "[w4a16] FAIL: 가드가 통과시킴(120GiB) — $${RUN}/e.log"; fail=1
+elif grep -qE "insufficient resources|rsrc-guard" "$RUN/e.log"; then
+  note "가드 거부 OK: $(head -1 "$RUN/e.log")"
 else
-  echo "[w4a16] FAIL: 가드 외 사유 — /tmp/w4a16_e.log"; fail=1
+  echo "[w4a16] FAIL: 가드 외 사유 — $${RUN}/e.log"; fail=1
 fi
 
 if [ $fail -eq 0 ]; then
