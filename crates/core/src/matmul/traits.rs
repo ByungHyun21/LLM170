@@ -31,7 +31,7 @@ pub trait GraphCapture: Send + Sync {
 
 /// 양자화 matmul 계열과 동기 프리미티브.
 ///
-/// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
+/// `Accelerator` 분해의 일부. 스테이지 코드는 필요한
 /// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
 pub trait MatmulHost: Send + Sync {
     /// MoE 전문가 배치 down — K전문가 1런치. 미구현은 Err (호출부 폴백).
@@ -113,7 +113,7 @@ pub trait MatmulHost: Send + Sync {
 
 /// 값 경로 elementwise/GDN/셰이프 op.
 ///
-/// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
+/// `Accelerator` 분해의 일부. 스테이지 코드는 필요한
 /// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
 pub trait EwOps: Send + Sync {
     /// rms_norm 오프로드 — 미구현 백엔드는 Err (호출부 CPU 폴백).
@@ -226,7 +226,7 @@ pub trait EwOps: Send + Sync {
         Err("gdn_chunk: 미지원".into())
     }
 
-    /// plans/72: 디코드(t=1) shared expert 융합 — gate+up+silu(1런치),
+    /// 디코드(t=1) shared expert 융합 — gate+up+silu(1런치),
     /// down+sigmoid·axpy(1런치). 기존 8런치를 대체.
     fn shexp_gu(
         &self,
@@ -251,12 +251,12 @@ pub trait EwOps: Send + Sync {
         Err("shexp_da: 이 가속기는 미지원".into())
     }
 
-    /// plans/97 — pos==0 상태의 GPU zero-fill(gdn+conv). 실패 시 CPU 업로드 폴백.
+    /// pos==0 상태의 GPU zero-fill(gdn+conv). 실패 시 CPU 업로드 폴백.
     fn frame_zero_states(&self, _gdn: &[u64], _conv: &[u64]) -> Result<(), String> {
         Err("frame_zero_states: 미지원".into())
     }
 
-    /// plans/97 — token_embd(Q8_0) gather + hc 방송 GPU 오프로드.
+    /// token_embd(Q8_0) gather + hc 방송 GPU 오프로드.
     #[allow(clippy::too_many_arguments)]
     fn emb_q8_gather_dev(
         &self,
@@ -270,7 +270,7 @@ pub trait EwOps: Send + Sync {
         Err("emb_q8_gather_dev: 미지원".into())
     }
 
-    /// plans/111 4차 W-P — ssd 블록 캐시 선예열: 다음 스텝에 필요한 PLE 행의
+    /// ssd 블록 캐시 선예열: 다음 스텝에 필요한 PLE 행의
     /// 4KB 블록을 백그라운드에서 pread 적재(프리페치 워커가 호출). no-op 구현이
     /// 기본(ram 모드·CPU·vk).
     fn ple_ssd_warm(&self, _rows: &[u32]) {}
@@ -281,7 +281,7 @@ pub trait EwOps: Send + Sync {
         false
     }
 
-    /// plans/93 — PLE 임베딩 gather GPU 오프로드(IQ4_NL).
+    /// PLE 임베딩 gather GPU 오프로드(IQ4_NL).
     fn ple_gather_dev(
         &self,
         _table_key: usize,
@@ -293,7 +293,7 @@ pub trait EwOps: Send + Sync {
         Err("ple_gather_dev: 미지원".into())
     }
 
-    /// plans/73: PLE 수학의 디바이스판(디코드 t=1) — gate/conv/잔차 3커널.
+    /// PLE 수학의 디바이스판(디코드 t=1) — gate/conv/잔차 3커널.
     /// key/value 투영은 호출부가 frame_mm_group으로 수행한 뒤 이 메서드에
     /// 디바이스 버퍼를 넘긴다. ring은 (seq)별 상주 상태(워터마크 규약).
     #[allow(clippy::too_many_arguments)]
@@ -310,7 +310,7 @@ pub trait EwOps: Send + Sync {
         _conv_out: u64,
         _gate_out: u64,
         _seq: usize,
-        // plans/93 P2: pos 기반 워터마크(역방향 감지). t>1 프리필 디바이스화의
+        // pos 기반 워터마크(역방향 감지). t>1 프리필 디바이스화의
         // 핵심 — t 기반 판정은 프리필(512)→디코드(1) 전환을 롤백으로 오판했다.
         _pos0: usize,
         _t: usize,
@@ -325,7 +325,7 @@ pub trait EwOps: Send + Sync {
         Err("ple_math_dev: 이 가속기는 미지원".into())
     }
 
-    /// plans/93 P2 — 디바이스 링 상태 판독(GPU 유휴 시점 호출 전제).
+    /// 디바이스 링 상태 판독(GPU 유휴 시점 호출 전제).
     /// 프리필 디바이스화 후 엔진 CPU 상태(seq_st.ple_conv) 재동기용.
     fn ple_ring_sync(&self, _seq: usize, _ring_out: &mut [f32]) -> Result<(), String> {
         Err("ple_ring_sync: 이 가속기는 미지원".into())
@@ -334,7 +334,7 @@ pub trait EwOps: Send + Sync {
 
 /// QSA(인덱서·선택·KV 상주) 어텐션 계열.
 ///
-/// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
+/// `Accelerator` 분해의 일부. 스테이지 코드는 필요한
 /// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
 pub trait QsaOps: Send + Sync {
     /// QSA 마스크드 밀집 GQA (GPU 전용 — 기본 미지원).
@@ -355,7 +355,7 @@ pub trait QsaOps: Send + Sync {
         Err("qsa_attention: 이 가속기는 미지원".into())
     }
 
-    /// plans/67 3단계: QSA KV 캐시 **디바이스 상주화** — (full_idx, seq) 풀에
+    /// QSA KV 캐시 **디바이스 상주화** — (full_idx, seq) 풀에
     /// k/v 행(mm_group 출력 버퍼, 이미 norm·rope 완료)을 D2D append하고 풀
     /// 핸들을 반환한다. 어텐션이 이 풀을 직접 읽으면 매 층 매 스텝의 캐시
     /// 재업로드(8k 문맥 32MB)가 사라진다. 미지원이면 Err(호출부가 업로드 경로로).
@@ -374,7 +374,7 @@ pub trait QsaOps: Send + Sync {
         Err("qsa_kv_dev: 이 가속기는 미지원".into())
     }
 
-    /// 진단: 상주 풀 내용이 호스트 캐시와 비트一致하는지 검증(plans/67 3단계 디버그).
+    /// 진단: 상주 풀 내용이 호스트 캐시와 비트一致하는지 검증.
     fn qsa_kv_check(
         &self,
         _full_idx: usize,
@@ -405,7 +405,7 @@ pub trait QsaOps: Send + Sync {
         Err("qsa_attention_dev_res: 이 가속기는 미지원".into())
     }
 
-    /// plans/73 SELCHECK 진단: qsa_sel_dev가 만든 디바이스 선택 목록을 호스트로
+    /// SELCHECK 진단: qsa_sel_dev가 만든 디바이스 선택 목록을 호스트로
     /// 읽어 돌려준다(검증 전용 — 프로덕션 경로는 부르지 않는다).
     fn qsa_sel_readback(
         &self,
@@ -416,7 +416,7 @@ pub trait QsaOps: Send + Sync {
         Err("qsa_sel_readback: 이 가속기는 미지원".into())
     }
 
-    /// plans/73: QSA 인덱서 선택의 **디바이스판** (디코드 t=1). iq/ik가 프레임
+    /// QSA 인덱서 선택의 **디바이스판** (디코드 t=1). iq/ik가 프레임
     /// 버퍼(디바이스)에 있을 때 호스트 왕복 없이 (1) ik를 idx 풀에 적립,
     /// (2) iq norm+rope, (3) 블록키 증분 갱신, (4) 점수·top-k·선택목록 전개까지
     /// 커널로 수행한다. 반환 = (sel_idx 디바이스 핸들, sel_off 핸들, 목록 길이).
@@ -442,7 +442,7 @@ pub trait QsaOps: Send + Sync {
         Err("qsa_sel_dev: 이 가속기는 미지원".into())
     }
 
-    /// plans/89 재개: QSA 선택의 **프리필 다중 토큰 디바이스판** — iq/ik가
+    /// QSA 선택의 **프리필 다중 토큰 디바이스판** — iq/ik가
     /// 프레임 버퍼에 있을 때 (적립+블록키) → q_rope → 토큰별 점수 → 토큰별
     /// 비토닉 top-k → 평탄 목록+sel_off까지 전부 커널. 호스트 d2h 4회
     /// (배치 플러시)와 CPU 점수/정렬을 소거. 반환은 qsa_sel_dev 동일.
@@ -468,7 +468,7 @@ pub trait QsaOps: Send + Sync {
         Err("qsa_sel_dev_mt: 이 가속기는 미지원".into())
     }
 
-    /// plans/73: 프리필(t>1)이 호스트 선택 후 **디바이스 idx 풀만** 갱신 — ik 청크
+    /// 프리필(t>1)이 호스트 선택 후 **디바이스 idx 풀만** 갱신 — ik 청크
     /// h2d 적립 + 완성 블록의 블록키 재계산. 이후 디코드의 qsa_sel_dev가
     /// 풀을 이어 쓴다.
     #[allow(clippy::too_many_arguments)]
@@ -510,7 +510,7 @@ pub trait QsaOps: Send + Sync {
         Err("qsa_idx_append_dev 미지원".into())
     }
 
-    /// plans/73: 디바이스 풀 → 호스트 캐시 재구축(디코드가 호스트 갱신을 건너뛴
+    /// 디바이스 풀 → 호스트 캐시 재구축(디코드가 호스트 갱신을 건너뛴
     /// 뒤 프리필/폴백 진입 시 1회). kv_k/kv_v는 [pos*kv_row], idx_k는
     /// [pos*idx_dim], bk는 [(pos/r)*idx_dim]까지 채운다.
     #[allow(clippy::too_many_arguments)]
@@ -530,10 +530,10 @@ pub trait QsaOps: Send + Sync {
         Err("qsa_host_rebuild: 이 가속기는 미지원".into())
     }
 
-    /// plans/73: sel 목록이 **디바이스 버퍼**에 이미 있는 상주 캐시판 어텐션 —
+    /// sel 목록이 **디바이스 버퍼**에 이미 있는 상주 캐시판 어텐션 —
     /// 업로드 없이 qsa_attention_dev_res와 동일 커널(t=1 분할 우선).
     #[allow(clippy::too_many_arguments)]
-    /// plans/115 D(원장 151): 항등 선택 목록 디바이스 생성 — 반환은
+    /// 항등 선택 목록 디바이스 생성 — 반환은
     /// (sel_idx핸들, sel_off핸들, 총길이). 미구현 백엔드는 Err(호스트 경로).
     fn qsa_identity_sel(
         &self,
@@ -562,7 +562,7 @@ pub trait QsaOps: Send + Sync {
     }
 
     /// QSA 선택-목록 GQA의 **디바이스 q판** — q가 이미 디바이스 버퍼(wq의
-    /// frame_mm_group 출력)에 있을 때 h2d 없이 어텐션을 돈다(plans/67 1단계).
+    /// frame_mm_group 출력)에 있을 때 h2d 없이 어텐션을 돈다.
     /// k/v는 기존처럼 캐시 업로드 경로(kv_sync)를 쓴다. 출력은 out 버퍼에.
     #[allow(clippy::too_many_arguments)]
     fn qsa_attention_dev(
@@ -605,11 +605,11 @@ pub trait QsaOps: Send + Sync {
 
 /// 프레임 버퍼·프레임 op·프레임 GEMM — 상태는 FrameState 승계.
 ///
-/// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
+/// `Accelerator` 분해의 일부. 스테이지 코드는 필요한
 /// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
 pub trait FrameHost: Send + Sync + EwOps {
     /// 프레임 경로 완전성 — false면 엔진이 프레임 진입을 건너뛴다(값경로).
-    /// 부분 구현 백엔드(plans/84 B vk)가 완성 전 기본 경로를 깨지 않게 한다.
+    /// 부분 구현 백엔드가 완성 전 기본 경로를 깨지 않게 한다.
     fn frame_capable(&self) -> bool {
         true
     }
@@ -634,7 +634,7 @@ pub trait FrameHost: Send + Sync + EwOps {
     }
 
     /// np 행별 conv — qkv/out은 [t][ch] 연속, states는 행(시퀀스)별 상태
-    /// 핸들. gdn_conv(t=1) 산술 그대로 1런치 (plans/74 N2). 미구현은 Err.
+    /// 핸들. gdn_conv(t=1) 산술 그대로 1런치 (N2). 미구현은 Err.
     fn frame_gdn_conv_np(
         &self,
         _qkv: u64,
@@ -648,7 +648,7 @@ pub trait FrameHost: Send + Sync + EwOps {
     }
 
     /// np 행별 AR — q/k/v/beta_ge/out은 [t][·] 연속, states는 행별 상태
-    /// 핸들. gdn_ar_w_swap(t=1) 산술 그대로 1런치 (plans/74 N2). 미구현은 Err.
+    /// 핸들. gdn_ar_w_swap(t=1) 산술 그대로 1런치 (N2). 미구현은 Err.
     #[allow(clippy::too_many_arguments)]
     fn frame_gdn_ar_np(
         &self,
@@ -665,14 +665,14 @@ pub trait FrameHost: Send + Sync + EwOps {
         Err("frame_gdn_ar_np: 미지원".into())
     }
 
-    /// plans/73(np): 프레임 버퍼 행 뷰 — base+off_elems 위치를 frames 테이블에
+    /// 프레임 버퍼 행 뷰 — base+off_elems 위치를 frames 테이블에
     /// 등록해 새 핸들을 반환한다. np 배치 디코드가 per-seq 상태 op(conv/AR/
     /// QSA 선택·rope·어텐션)에 행 슬라이스를 그대로 넘기기 위해서다.
     /// 기존 메서드·커널은 무변경(핸들 = 포인터이므로 그대로 소비된다).
     fn frame_slice(&self, _h: u64, _off_elems: usize, _len: usize) -> Result<u64, String> {
         Err("frame_slice: 이 가속기는 미지원".into())
     }
-    /// plans/116 U2: shared expert t행 배치 — x/h/s/mout는 [t][·] 연속.
+    /// shared expert t행 배치 — x/h/s/mout는 [t][·] 연속.
     /// 행별 산술 동일(비트 불변). 기본은 행별 슬라이스 폴백(현행 동작).
     fn shexp_gu_t(
         &self,
@@ -692,7 +692,7 @@ pub trait FrameHost: Send + Sync + EwOps {
         Ok(())
     }
 
-    /// plans/116 U2 — shexp_gu_t의 down+sigmoid·axpy 짝. s는 [t] 스칼라열.
+    /// shexp_gu_t의 down+sigmoid·axpy 짝. s는 [t] 스칼라열.
     fn shexp_da_t(
         &self,
         h: u64,
@@ -712,7 +712,7 @@ pub trait FrameHost: Send + Sync + EwOps {
         Ok(())
     }
 
-    /// plans/67 2a: 프레임 버퍼의 q/k에 **RMS norm + rope**를 디바이스에서 적용
+    /// 프레임 버퍼의 q/k에 **RMS norm + rope**를 디바이스에서 적용
     /// (in-place). q는 [t][n_head*2*hd] (gate 절반은 그대로), k는 [t][n_kv*hd].
     /// `cs`는 cos/sin 로프 테이블(모델 상수)로 호출부가 넘긴다.
     #[allow(clippy::too_many_arguments)]
@@ -753,7 +753,7 @@ pub trait FrameHost: Send + Sync + EwOps {
     }
     /// 프레임 버퍼 → 호스트 판독 (동기 — forward 종료 1회가 설계상 목표).
     /// 진단 판독 전 전체 동기 — buf_hash 계측이 커스텀 스트림 파이프라인의
-    /// 미완결 쓰기를 읽는 경합을 없앤다(plans/84 E.2 mout 역설 교정).
+    /// 미완결 쓰기를 읽는 경합을 없앤다(mout 역설 교정).
     fn frame_sync(&self) {}
     fn frame_read(&self, _h: u64, _out: &mut [f32]) -> Result<(), String> {
         Err("frame_read: 미지원".into())
@@ -772,7 +772,7 @@ pub trait FrameHost: Send + Sync + EwOps {
     ) -> Result<(), String> {
         Err("frame_mm_group: 미지원".into())
     }
-    /// plans/104 — 격리 quant 버퍼 판(공유전문가 병렬 체인). 미지원 백엔드는
+    /// 격리 quant 버퍼 판(공유전문가 병렬 체인). 미지원 백엔드는
     /// 일반 그룹으로 폴백(산술 동일).
     fn frame_mm_group_sep(
         &self,
@@ -788,7 +788,7 @@ pub trait FrameHost: Send + Sync + EwOps {
         Err("frame_op: 미지원".into())
     }
 
-    /// plans/110 W2 — 스펙 검증 배치 핀: true인 동안 t=2..8 GEMV를 행별
+    /// 스펙 검증 배치 핀: true인 동안 t=2..8 GEMV를 행별
     /// t=1 커널 디스패치로 실행한다(mt 변형은 t=1 커널과 축소 순서가 달라
     /// 검증 배치 == 순차 decode1 비트 동일이 깨진다). 기본 no-op(미구현
     /// 백엔드는 배치 산술 그대로).
@@ -811,7 +811,7 @@ pub trait FrameHost: Send + Sync + EwOps {
     }
 }
 
-/// GPU 가속기 합성 트레이트 — capability 서브트레이트의 합집합(plans/75 P1).
+/// GPU 가속기 합성 트레이트 — capability 서브트레이트의 합집합.
 ///
 /// 호출부(`&dyn Accelerator`)는 종전 시그니처 그대로다. 구현체는 서브트레이트만
 /// 구현하면 되므로(블랭킷) 백엔드가 필요한 capability 만 갖출 수 있다.
@@ -1031,7 +1031,7 @@ pub enum FrameOp {
 /// 프레임 상태 연산 — 상주 상태(kv/gdn/conv/blk)를 갱신하는 가속기 전용
 /// 메서드. 값 경로 Accelerator 메서드와 대응하되 입출력이 전부 핸들.
 pub trait FrameState {
-    /// plans/115 P1-3 — 상태 버퍼 D2D 복사 묶음(같은 크기 dst←src). 접두
+    /// 상태 버퍼 D2D 복사 묶음(같은 크기 dst←src). 접두
     /// 체크포인트 캡처/복원용 — 호스트 왕복(D2H+클론 ≈110ms) 대신 스트림
     /// 순서 복사(수 ms). 실패 시 호출부는 캡처를 생략한다(재사용 불가뿐).
     fn frame_copy_states(&self, _pairs: &[(u64, u64, usize)]) -> Result<(), String> {
@@ -1043,34 +1043,34 @@ pub trait FrameState {
     /// 가중합/split3)이 이 값을 쓴다.
     fn frame_begin(&self, _t: usize) {}
 
-    /// plans/115 P5: np 디코드 스텝 시작 — frame_begin에 np 경로 표식을
+    /// np 디코드 스텝 시작 — frame_begin에 np 경로 표식을
     /// 얹는다(백엔드의 GEMM 패밀리 핀·MoE 경로 분기용). 기본은 위임.
     fn frame_begin_np(&self, t: usize) {
         self.frame_begin(t);
     }
 
-    /// plans/115 P5: np 스텝 종료 — 표식 해제. frame_begin_np과 쌍으로
+    /// np 스텝 종료 — 표식 해제. frame_begin_np과 쌍으로
     /// 호출된다(가드 Drop 포함). 기본 no-op.
     fn frame_end_np(&self) {}
 
-    /// plans/115 D: 프리필 섹션 GPU 벽 계측 — 메인 스트림에 이벤트 마킹.
+    /// 프리필 섹션 GPU 벽 계측 — 메인 스트림에 이벤트 마킹.
     /// 태그: 0=청크시작 1=gdn 2=qsa 3=moe 4=head. 기본 no-op.
     fn frame_ev_mark(&self, _tag: u8) {}
 
-    /// plans/115 D: 마킹 보고 — 연속 마크 간 GPU 경과를 태그별 적립해 출력.
+    /// 마킹 보고 — 연속 마크 간 GPU 경과를 태그별 적립해 출력.
     /// 청크 종료(큐 드레인 후)에 호출. 기본 no-op.
     fn frame_ev_report(&self) {}
 
-    /// plans/115 D(원장 152): 프리필 그래프 캡처 — 층 루프의 런치열을 그래프로
+    /// 프리필 그래프 캡처 — 층 루프의 런치열을 그래프로
     /// 묶어 dispatch 고정비(≈114µs×4,400) 제거(Strata layer.cpp 준거).
     /// begin=true 시작, false 종료+인스턴스화+발행. 기본 no-op(미구현 백엔드는
     /// 종전 런치 경로). 캡처 중 sync/d2h_wait/이벤트는 백엔드가 건너뛴다.
-    /// plans/115 D: MoE가 그래프 캡처 호환(전 투영이 디바이스 테이블 경로)인가.
+    /// MoE가 그래프 캡처 호환(전 투영이 디바이스 테이블 경로)인가.
     /// 폴백(호스트 오프셋 판독) 도달 이력이 있으면 false.
     fn moe_graph_capable(&self) -> bool {
         true
     }
-    /// plans/115 U3: GDN split3+L2×2+scale 융합 — 4런치→1. 기본 no-op(폴백).
+    /// GDN split3+L2×2+scale 융합 — 4런치→1. 기본 no-op(폴백).
     #[allow(clippy::too_many_arguments)]
     fn gdn_split_l2_scale(
         &self,
@@ -1088,7 +1088,7 @@ pub trait FrameState {
     ) -> Result<(), String> {
         Err("gdn_split_l2_scale: 미지원".into())
     }
-    /// plans/115 A-2: 샘플링 top-k 후보 — GPU에서 워프별 top-1 후보 목록.
+    /// 샘플링 top-k 후보 — GPU에서 워프별 top-1 후보 목록.
     /// 반환 (val, idx) 쌍 (블록×워프 수, 일반 512). CPU가 최종 병합.
     fn frame_topk_cands(
         &self,
@@ -1169,7 +1169,7 @@ pub trait FrameState {
         Err("frame_moe_scatter: 미지원".into())
     }
 
-    /// plans/105(원장 80) — mxsel 생산 직후 1회 팩 정량(블록당 10워드
+    /// mxsel 생산 직후 1회 팩 정량(블록당 10워드
     /// [qs8][d][Σ]). 등록된 x는 llmmq가 팩 버퍼로 소비.
     /// 기본 Err: 팩을 소비하는 경로에서 미구현 백엔드가 조용히 Ok를
     /// 반환하면 llmmq가 스테일 버퍼를 읽는 무결 오염이 된다(107 P0-3,

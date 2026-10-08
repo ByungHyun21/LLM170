@@ -1,10 +1,10 @@
-//! 샘플러 — temperature/top_k/top_p/min_p/repeat_penalty/seed (plans/83 B).
+//! 샘플러 — temperature/top_k/top_p/min_p/repeat_penalty/seed.
 //!
 //! 기본값은 전부 off → `is_greedy()`가 참이면 `sample()`은 CPU greedy와
 //! 동일 의미(argmax, 동률 최저 인덱스)로 폴백한다 — 기존 게이트 무변화.
 //! RNG는 자작 splitmix64 (외부 rand 크레이트 금지 규칙).
 //!
-//! 적용 순서 (llama.cpp chain 준수 — plans/114 QA-30 정정):
+//! 적용 순서 (llama.cpp chain 준수 — QA-30 정정):
 //!   repeat_penalty → top_k → temperature → softmax → top_p → min_p → 난수 추출
 //! (temperature는 필터 후·softmax 전 — 종전 top_k 이전 적용은 nucleus
 //! 멤버십을 달리 만들었다)
@@ -114,7 +114,7 @@ impl Sampler {
     }
 
     /// logits → 토큰. greedy시 argmax (동률 최저 인덱스 — `greedy_from` 동일 의미).
-    /// plans/115 A-2: GPU top-k 후보에서 샘플링 — (val, idx) 쌍 입력.
+    /// GPU top-k 후보에서 샘플링 — (val, idx) 쌍 입력.
     /// 전체 로짓이 아닌 상위 후보만으로 페널티·top_k·softmax·top_p·min_p 수행.
     /// 페널티는 값 감소 방향만 작동하므로 후보 집합이 사전 top-K의 상위집합이
     /// 안전하다(누락 토큰은 페널티 후에도 상위권 진입 불가).

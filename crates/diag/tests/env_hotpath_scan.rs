@@ -1,4 +1,4 @@
-//! env 직접 판독 금지 계약의 정적 검사 (A6, plans/129).
+//! env 직접 판독 금지 계약의 정적 검사 (A6).
 //!
 //! 프로덕션 핫패스는 diag 스냅샷(flag::on/eq1/ne0/on_nonzero/val) 또는
 //! dump::opts()/key_arg()로만 env를 읽는다(원장 89·104). 이 테스트는
@@ -98,7 +98,7 @@ fn production_sources_have_no_direct_env_reads() {
     );
 }
 
-/// B18(plans/cuda-models.md §5): 가드 우회 env 재도입 방지 — 폐지된
+/// B18: 가드 우회 env 재도입 방지 — 폐지된
 /// `LLM170_NO_RSRC_GUARD`가 프로덕션 소스에 다시 등장하면 실패한다
 /// (bfb30654 폐지. 동결 사고 2026-09-16 재발 경로 차단 — resource.rs는
 /// env를 읽지 않는다는 계약과 세트).

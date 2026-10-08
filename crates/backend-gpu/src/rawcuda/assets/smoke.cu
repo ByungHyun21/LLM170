@@ -1,4 +1,4 @@
-// llm170 rawcuda 스모크 커널 (plans/124 2026-10-04).
+// llm170 rawcuda 스모크 커널 (2026-10-04).
 // 계약 소스는 이 .cu — 빌드 자산(smoke.fatbin)은 scripts/build_cuda.bat가
 // nvcc -fatbin 으로 같은 디렉터리에 생성·커밋한다(rawhip co/*.co 미러:
 // 소스와 자산을 함께 커밋, 커널 산술 변경은 이 파일부터).

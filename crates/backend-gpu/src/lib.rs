@@ -1,5 +1,4 @@
-//! GPU 백엔드 — **rawcuda 단일** (2026-10-08: 단일 트랙 CUDA W4A16,
-//! plans/w4a16-cuda.md §5).
+//! GPU 백엔드 — **rawcuda 단일** (2026-10-08: 단일 트랙 CUDA W4A16).
 //!
 //! `rawcuda`: CUDA 드라이버 API 수동 바인딩(ffi) + 컨텍스트(ctx) + 커널 자산
 //! (assets/*.cu, fatbin). 커널 산술 계약은 core 미러(`dot_row_w4a16_lane` 등)가

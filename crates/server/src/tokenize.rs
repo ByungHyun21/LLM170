@@ -1,4 +1,4 @@
-//! BPE 토크나이저 — llama.cpp `llama-vocab.cpp`·`unicode.cpp` 미러 (plans/83 A).
+//! BPE 토크나이저 — llama.cpp `llama-vocab.cpp`·`unicode.cpp` 미러.
 //!
 //! 대상 pre: `qwen35`·`qwen2` (양대 게이트 모델). GPT-2 바이트 수준 BPE 전체 경로:
 //! 특수 토큰 최장 분할 → pre-tokenizer 분할(qwen35/qwen2 커스텀 스플리터) →
@@ -45,7 +45,7 @@ pub struct Tokenizer {
 
 impl Tokenizer {
     pub fn load(path: &Path) -> Result<Self, String> {
-        // 모델 = W4A16 디렉터리(2026-10-08 단일 트랙 — plans/w4a16-cuda.md §5).
+        // 모델 = W4A16 디렉터리(2026-10-08 단일 트랙).
         if path.is_dir() {
             return Self::from_hf_dir(path);
         }
@@ -293,7 +293,7 @@ impl Tokenizer {
         Self::from_parts(&vocab, bpe_ranks, special, Vec::new(), pre, ignore_merges)
     }
     /// 토큰 조각의 원 바이트열 (바이트 수준 BPE 역매핑).
-    /// 어휘 비었는지(A19, plans/129) — part1/part2 어느 쪽에도 토크나이저가
+    /// 어휘 비었는지(A19) — part1/part2 어느 쪽에도 토크나이저가
     /// 없으면 load가 Ok(empty)를 돌려주므로 serve 텍스트 요청에 치명 여부를
     /// 호출자가 판정해야 한다.
     pub fn is_empty(&self) -> bool {

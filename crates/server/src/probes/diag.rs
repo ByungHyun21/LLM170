@@ -1,10 +1,10 @@
-//! diag 진단 하위커맨드(diff·chunk-check·va-lookup·fb·envcheck·ckdiff…) + 그 로컬 하네스 (plans/129 R2③ — probes/ 분리, arm 본문 무변경 이동).
+//! diag 진단 하위커맨드(diff·chunk-check·va-lookup·fb·envcheck·ckdiff…) + 그 로컬 하네스 (probes/ 분리, arm 본문 무변경 이동).
 use std::process::ExitCode;
 
 pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     let r: Result<String, String> = match cmd {
         "diag" => {
-            // plans/82: 지문 비교 — `llm170 diag diff <A> <B>`
+            // 지문 비교 — `llm170 diag diff <A> <B>`
             if args.first().map(String::as_str) == Some("diff") {
                 let (pa, pb) = match (args.get(1), args.get(2)) {
                     (Some(a), Some(b)) => (a, b),
@@ -21,7 +21,7 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     Err(e) => Err(e),
                 }
             }
-            // plans/87 §1 — tsv 원장에서 폴트 주소 매칭.
+            // tsv 원장에서 폴트 주소 매칭.
             else if args.first().map(String::as_str) == Some("va-lookup") {
                 let Some(tsv) = args.get(1).cloned() else {
                     eprintln!("error: va-lookup <tsv> <addr-hex>");
@@ -33,11 +33,11 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                 };
                 return Some(cmd_va_lookup(&tsv, &addr));
             }
-            // plans/87 §2 — 와치독 자가 시험(진동 정지 후 스폰).
+            // 와치독 자가 시험(진동 정지 후 스폰).
             else if args.first().map(String::as_str) == Some("watchdog-selftest") {
                 return Some(cmd_watchdog_selftest());
             }
-            // plans/107 W8 — 폴백 카운터 관측. A5(plans/129)부터 diag 공유 원장
+            // 폴백 카운터 관측. A5부터 diag 공유 원장
             // (실측 프로세스 종료 [fb] 출력과 같은 소스).
             else if args.first().map(String::as_str) == Some("fb") {
                 let r = llm170_diag::fb::report();
@@ -47,7 +47,7 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     Ok(r)
                 }
             }
-            // plans/108 P1 — env 스냅샷↔라이브 동치 검사.
+            // env 스냅샷↔라이브 동치 검사.
             else if args.first().map(String::as_str) == Some("envcheck") {
                 let bad = llm170_diag::flag::env_check();
                 if bad.is_empty() {
@@ -60,7 +60,7 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     ))
                 }
             }
-            // plans/87 §5 — [npck] 로그 크로스 diff.
+            // [npck] 로그 크로스 diff.
             else if args.first().map(String::as_str) == Some("ckdiff") {
                 let Some(a) = args.get(1).cloned() else {
                     eprintln!("error: ckdiff <A.log> <B.log> [rel]");
@@ -86,7 +86,7 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
 
 fn cmd_va_lookup(tsv: &str, addr: &str) -> ExitCode {
     // BDA는 canonical 부호확장(0xffff8001..), RADV 폴트는 48비트 절단형
-    // (0x8001..) — 하위 48비트로 정규화해 비교한다(실측, plans/87 §1).
+    // (0x8001..) — 하위 48비트로 정규화해 비교한다(실측).
     const M: u64 = 0x0000_ffff_ffff_ffff;
     let Ok(a) = u64::from_str_radix(addr.trim_start_matches("0x"), 16) else {
         eprintln!("error: 주소 파싱 실패: {addr}");
@@ -167,7 +167,7 @@ fn cmd_va_lookup(tsv: &str, addr: &str) -> ExitCode {
     }
 }
 
-/// plans/87 §2 — 진동을 멈추고 와치독 보고를 기다린다(FAIL 모드면 137).
+/// 진동을 멈추고 와치독 보고를 기다린다(FAIL 모드면 137).
 fn cmd_watchdog_selftest() -> ExitCode {
     // QA-22: 자가시험은 실패 가능해야 한다 — 종전엔 와치독 미기동·미보고
     // 어느 쪽이든 SUCCESS 고정(자가시험 실패 불가 구조)이었다.
@@ -196,7 +196,7 @@ fn cmd_watchdog_selftest() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// plans/87 §5 — [npck] 체크섬 로그 교차 diff: (tag, t, 등장순) 정렬 맞춤,
+/// [npck] 체크섬 로그 교차 diff: (tag, t, 등장순) 정렬 맞춤,
 /// 첫 상이 태그 + 상위 상이 표. 무상이 exit 0.
 fn cmd_ckdiff(a_path: &str, b_path: &str, rel_lim: f64) -> ExitCode {
     let parse = |p: &str| -> Result<Vec<(String, usize, f64)>, String> {

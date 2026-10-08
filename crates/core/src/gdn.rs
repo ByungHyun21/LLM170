@@ -214,7 +214,7 @@ fn gdn_chunk_head(
     }
 }
 
-// ── GDN AR 헤드 병렬 풀 (plans/120 A1) ──
+// ── GDN AR 헤드 병렬 풀 ──
 // 구 직접 디코드 계측(2026-09): gdn:delta 79.6ms/토큰, 그중 상당분이 토큰당
 // 48층 × 48헤드 = 2304회 thread::scope OS 스폰이었다. 상수 풀로 스폰 비용
 // 제거. 잡이 'static이어야 하므로 호출자 소유 버퍼는 원시 포인터로 캡처하고
@@ -317,7 +317,7 @@ pub mod ar_pool {
 #[derive(Clone, Copy)]
 struct SendPtr(usize);
 
-/// 단일 (seq, v-head) AR 스텝. 비트동일 보존 전제(plans/120 A1):
+/// 단일 (seq, v-head) AR 스텝. 비트동일 보존 전제:
 /// · sk/o 순회를 행(kdim) 우량으로 전환하되 kdim 누적 순서와 항 표현식
 ///   `(s·q)·scale`·`(s·k)` 을 원문과 동일하게 유지한다(열 우량 그대로면
 ///   스트라이드 d 접근으로 캐시·벡터화 모두 실패).
@@ -366,12 +366,12 @@ fn gdn_ar_head(
 }
 
 // (행별 도트 풀 병렬 헬퍼 2종은 제거 — 잡당 고정비 ~3µs가 3584-길이 도트를
-// 못 이겨 스칼라 대비 무차. 2026-10-02 실험, plans/120 A1 기록.)
+// 못 이겨 스칼라 대비 무차. 2026-10-02 실험 기록.)
 
 /// 배치 디코드: 토큰 1개 × n_seqs. (build_delta_net_autoregressive / fused one_chunk)
 /// 레이아웃: q/k `[B][H_k][d]`, v `[B][H_v][d]`, beta/g `[B][H_v]`,
 /// states `[B][H_v][d*d]`, out `[B][H_v][d]`. (seq, v-head) 쌍별 병렬
-/// (ar_pool 상수 풀 — plans/120 A1, 스폰 2304회/토큰 제거).
+/// (ar_pool 상수 풀 — 스폰 2304회/토큰 제거).
 pub fn gdn_ar_batch(
     q: &[f32],
     k: &[f32],

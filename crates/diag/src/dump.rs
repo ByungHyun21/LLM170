@@ -1,4 +1,4 @@
-//! dump — `LLM170_DUMP` 통합 진단 덤프 프론트엔드 (plans/83 C4).
+//! dump — `LLM170_DUMP` 통합 진단 덤프 프론트엔드.
 //!
 //! 콤마 키 목록 하나로 산재한 덤프 플래그를 대체한다:
 //!
@@ -29,9 +29,9 @@ pub struct DumpOpts {
     pub moe: bool,
     /// top2 — greedy 스텝 상위2 토큰·마진 덤프(근접타이 실증용, 107 W1).
     pub top2: bool,
-    /// alloc — GPU 버퍼 할당 원장(plans/86 §5).
+    /// alloc — GPU 버퍼 할당 원장.
     pub alloc: bool,
-    /// vaddr — 할당 tsv(VA 범위) 증분 기록(plans/87 §1).
+    /// vaddr — 할당 tsv(VA 범위) 증분 기록.
     pub vaddr: bool,
     /// 통합 진단 키 집합 — LLM170_DUMP CSV 멤버 전체(개별 필드 없는
     /// 확장용. 107 W2: 개별 진단 env를 이 키 공간으로 흡수).
@@ -44,7 +44,7 @@ impl DumpOpts {
         self.keys.contains(k)
     }
 
-    /// 값 인자 키 조회 — `LLM170_DUMP=key:arg` 멤버의 arg 반환(A6, plans/129).
+    /// 값 인자 키 조회 — `LLM170_DUMP=key:arg` 멤버의 arg 반환(A6).
     /// 값이 필요한 진단(디렉터리·파일 접두·모드 선택: `키:값` 예
     /// `ms_dump:/tmp/d`)용. 부재 시 None. 인자 없이 `key` 단독이면
     /// None(값이 필수인 소비자는 단독 키를 무시한다).

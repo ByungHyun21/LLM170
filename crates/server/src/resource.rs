@@ -14,7 +14,7 @@
 //!   '오탐 차단 우선'을 '안전 우선'으로 변경. 탈출구 없음). CPU 적재의
 //!   호스트 미측정(비리눅스 등)은 기존대로 경고 후 판정.
 //! - 킬스위치 폐지(2026-10-03, 사용자 지시) 유지 — 가드는 상시 동작.
-//! - B20(plans/cuda-models.md §4·§5, 2026-10-08): 전역 적재 락(flock) —
+//! - B20(2026-10-08): 전역 적재 락(flock) —
 //!   동시 기동 check-then-act 레이스 직렬화. 락 획득 **후** 판정(재판정),
 //!   적재 완료 지점에서 해제(장기 상주 락 아님).
 
@@ -104,7 +104,7 @@ fn host_mem_available() -> Option<u64> {
     None
 }
 
-/// 가드 대상(plans/129 A2/R1) — 판정 결과. 판정 계약은 guard_target_cases
+/// 가드 대상(A2/R1) — 판정 결과. 판정 계약은 guard_target_cases
 /// 표 테스트가 고정한다(`gpu`=VRAM 계정 여부, B17: 조회 실패=거부).
 pub struct GuardTarget {
     pub path: std::path::PathBuf,
@@ -113,7 +113,7 @@ pub struct GuardTarget {
     pub runtime: Option<String>,
 }
 
-/// 가드 대상 판정 — main() 인라인의 순수함수(plans/129 A2/R1).
+/// 가드 대상 판정 — main() 인라인의 순수함수(A2/R1).
 /// 입력: 서브커맨드, --model, 백엔드, 런타임, 위치인자. None = 가드 스킵
 /// (메타 서브커맨드 또는 경로 부재 — 로더 에러가 더 정확).
 pub fn guard_target(

@@ -2,7 +2,7 @@
 //!
 //! W4A16 단일 트랙의 실사용 타입: `F32`·`F16`·`Bf16`(플레인)·`W4a16G128Split`
 //! (int4 g128 분리 버퍼). 나머지 변이는 구 타입 사전 잔존(대응 역양자화
-//! 스택 정리 시 함께 소멸 예정 — plans/w4a16-cuda.md §5).
+//! 스택 정리 시 함께 소멸 예정).
 
 /// 가중치 타입. (`quantized()`: 양자화 저장 여부)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -43,7 +43,7 @@ pub enum WType {
     Nvfp4 = 40,
     Q1_0 = 41,
     Q2_0 = 42,
-    /// llm170 확장 타입(plans/w4a16-cuda.md §1): W4A16 g128 sym —
+    /// llm170 확장 타입: W4A16 g128 sym —
     /// **분리 버퍼 in-memory 표현**(직접 로드): data=packed 행우선 [n][k/8 u32],
     /// aux=scale 행우선 [n][k/128 u16]. 파일에는 나타나지 않는다 — dequant_row
     /// 비경유, cpu matmul 전용 arm이 소비. block_info는 총량(66B/128)만 제공한다.

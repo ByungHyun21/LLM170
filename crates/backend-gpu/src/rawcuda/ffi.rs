@@ -1,5 +1,5 @@
 //! CUDA 드라이버 API 수동 바인딩 — nvcuda.dll / libcuda.so.1 런타임 해석
-//! (plans/124 2026-10-04).
+//! (2026-10-04).
 //!
 //! 계약: 새 크레이트 금지 → cuda-sys 등 도입 없이 시그니처를 손작성한다.
 //! 링크 방침: 정적 extern 링크(`#[link(name = "cuda")]`)는 CUDA 런타임이
@@ -65,7 +65,7 @@ pub type CuMemcpyHtoDFn =
 pub type CuMemcpyDtoHFn =
     unsafe extern "system" fn(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult;
 /// cuMemcpyDtoD_v2 — 디바이스 내 복사. 호스트 왕복 없는 디바이스 체인의
-/// 필수 요소(plans/cuda-port.md S10): GEMV 입출력을 상주 버퍼 사이에
+/// 필수 요소: GEMV 입출력을 상주 버퍼 사이에
 /// 직접 옮긴다.
 pub type CuMemcpyDtoDFn =
     unsafe extern "system" fn(dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> CUresult;
@@ -89,8 +89,8 @@ pub type CuMemFreeFn = unsafe extern "system" fn(dptr: CUdeviceptr) -> CUresult;
 pub type CuFuncSetAttributeFn =
     unsafe extern "system" fn(f: CUfunction, attrib: c_uint, value: c_int) -> CUresult;
 
-/// cuMemGetInfo_v2 — 가용/전체 디바이스 메모리(바이트). B6(plans/cuda-models.md
-/// §4): 리소스 가드의 CUDA 런타임 VRAM 조회용(현재 컨텍스트 기준).
+/// cuMemGetInfo_v2 — 가용/전체 디바이스 메모리(바이트). B6:
+/// 리소스 가드의 CUDA 런타임 VRAM 조회용(현재 컨텍스트 기준).
 pub type CuMemGetInfoFn =
     unsafe extern "system" fn(free: *mut usize, total: *mut usize) -> CUresult;
 
@@ -237,7 +237,7 @@ mod loader {
         }
     }
 
-    // unix 수동 dl 바인딩 — std 외 크레이트 금지 계약(plans/124)으로 libc 크레이트를
+    // unix 수동 dl 바인딩 — std 외 크레이트 금지 계약으로 libc 크레이트를
     // 쓰지 않는다. glibc 2.34+는 dlopen/dlsym이 libc 내장(구분 libdl 폐지)이고
     // std 타깃은 libc에 링크되므로 extern "C" 선언만으로 해석된다(2026-10-07
     // 리눅스 포팅). RTLD_NOW=2는 glibc·musl 공통값.

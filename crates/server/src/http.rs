@@ -121,7 +121,7 @@ pub(crate) fn read_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("/").to_string();
     let mut len = 0usize;
-    // A18(plans/129): 헤더 라인 상한·개수 상한 — 무상한 push로 악성/고장
+    // A18: 헤더 라인 상한·개수 상한 — 무상한 push로 악성/고장
     // 클라가 수십 GB를 소비한 사고 재발 방지. 변형 CL·chunked는 즉시 400
     // (len=0로 조용히 빈 바디 처리하던 종전 동작은 오해 백롭).
     let mut hdr_lines = 0usize;
@@ -212,7 +212,7 @@ pub(crate) fn resp_sse_open(stream: &mut TcpStream) {
     );
 }
 
-/// plans/113(sglang P0-1): 쓰기 오류를 반환한다 — 종전 `let _ =`가 절단된
+/// 쓰기 오류를 반환한다 — 종전 `let _ =`가 절단된
 /// 클라이언트로의 쓰기 실패를 삼켜, 잔여 n_predict를 GPU가 끝까지 계산했다.
 pub(crate) fn sse(stream: &mut TcpStream, event: &str, data: &str) -> std::io::Result<()> {
     write!(stream, "event: {event}\ndata: {data}\n\n")?;

@@ -1,5 +1,5 @@
 //! W4A16 safetensors 로더 — compressed-tensors pack-quantized(int4 sym g128).
-//! (plans/cuda-models.md §3.5 W4A16 계열, 2026-10-08 — "3계열 모두 로드" 목표)
+//! (2026-10-08 — "3계열 모두 로드" 목표)
 //!
 //! [실측 스키마 — ../models/Qwen3.8-27B-W4A16-AutoRound]
 //! - 양자화 선형 1개 = 3조: `.weight_packed` I32[n, k/8] · `.weight_scale`

@@ -1,4 +1,4 @@
-//! 원오프 프로브/체크 서브커맨드 — main.rs에서 이관(plans/35 P4).
+//! 원오프 프로브/체크 서브커맨드 — main.rs에서 이관.
 //! 현재 w4a16·diag 로컬 프로브만 — 인자 파싱 + 본체 호출. 결론난 A/B
 //! 하니스(batch-abtest·tree-test·q6k-abtest·exp-ab)는 2026-09-08 폐기.
 use std::process::ExitCode;
@@ -8,7 +8,7 @@ pub(crate) fn arg_str(args: &[String], i: usize, d: &str) -> String {
     args.get(i).cloned().unwrap_or_else(|| d.into())
 }
 
-// ## 프로브 하네스 저작 원칙 (A10, plans/129 — 사고 4건+회귀루프 5건의 교훈)
+// ## 프로브 하네스 저작 원칙 (A10 — 사고 4건+회귀루프 5건의 교훈)
 //
 // 검증 하네스 자체가 결함을 만든 클래스: ① 선행 단계의 공유 버퍼 오염
 // (dah 행0 — "WMMA 행0 오염" 3일 오답의 진범) ② 하네스의 이중 상태 진입

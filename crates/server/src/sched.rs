@@ -1,4 +1,4 @@
-//! 슬롯 스케줄러 (R2, plans/129 — engine.rs에서 순수 이동).
+//! 슬롯 스케줄러 (engine.rs에서 순수 이동).
 //! 연속 배칭: 디코드 우선·잔여 예산 프리필 청크(llama.cpp 규칙 1:1).
 //! 슬롯 = 엔진 시퀀스 id. Engine 열거는 engine.rs(파사드) — 이 층은
 //! 배정(slot_loop·assign_slot)과 슬롯 상태만 담는다.
@@ -32,7 +32,7 @@ struct Slot {
     touch: u64,
     /// 클라이언트 절단 — progress 채널 송신 실패로 감지 (SSE flush 실패).
     cancelled: bool,
-    /// 접두 캐시 — 상태가 구워진 전체 토큰열 (요청 간 유지, plans/24).
+    /// 접두 캐시 — 상태가 구워진 전체 토큰열 (요청 간 유지).
     cached: Vec<u32>,
     /// 슬롯별 샘플러 (요청에서 생성, 토큰마다 상태 갱신).
     sampler: Option<llm170_core::sampler::Sampler>,
@@ -153,7 +153,7 @@ pub struct Sched {
     pub ms_decode: AtomicU64,
     pub chunks_prefill: AtomicU64,
     pub ms_prefill: AtomicU64,
-    /// plans/115 D2 계측 — 스펙 라운드 수/수용 토큰 수(수용률 = acc/rounds).
+    /// 스펙 라운드 수/수용 토큰 수 계측(수용률 = acc/rounds).
     pub spec_rounds: AtomicU64,
     pub spec_accepted: AtomicU64,
 }
@@ -183,7 +183,7 @@ impl Sched {
 }
 
 pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slots: usize) {
-    // plans/130 F5: EOS 하드코드 248044 → 모델 메타 파생(Engine::eos).
+    // EOS 하드코드 248044 → 모델 메타 파생(Engine::eos).
     let eos = eng.eos();
     // 기동 워밍업 — 첫 요청이 지연 초기화(raw_init, ctx 비례 수십 초)를
     // 뒤집어쓰지 않도록 여기서 소진하고 상태를 되돌린다. 준비 전에는 /health가
@@ -257,7 +257,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             let sampling = |s: &Slot| s.sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
             match &mut eng {
                 Engine::Q35(e) => {
-                    // 스펙 슬롯 분리 — spec_step 경로 (plans/21). 샘플링 슬롯은
+                    // 스펙 슬롯 분리 — spec_step 경로. 샘플링 슬롯은
                     // 스펙 제외(스펙 검증은 greedy 판정 전제) — 일반 디코드로.
                     let spec_slots: Vec<usize> = active
                         .iter()
@@ -268,7 +268,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         })
                         .collect();
                     if !spec_slots.is_empty() && e.has_mtp() && e.raw_decode.is_some() {
-                        // np×spec 병합 (plans/18): 스펙 슬롯 2개 이상이면 한 배치로 검증.
+                        // np×spec 병합: 스펙 슬롯 2개 이상이면 한 배치로 검증.
                         // 슬롯별 순차 spec_step은 배치 이득을 전부 잃는다 (2026-09-12 측정:
                         // 서버 np4 spec 12.1 vs 비스펙 22.6 t/s agg).
                         let kmin = spec_slots
@@ -353,7 +353,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             if let Some(i) = pf {
                 let _pft = std::time::Instant::now();
                 let chunk = 512usize;
-                // plans/74: Q4(FN)는 prefill_greedy — 청크마다 어휘 152k
+                // Q4(FN)는 prefill_greedy — 청크마다 어휘 152k
                 // 로짓 pageable D2H(슬로패스 수십 ms) 대신 GPU argmax 8B 회수.
                 // Q35(27B)는 종전 전사 경로(원시 프리필 내부 d2h).
                 let (start, logits) = {
@@ -445,7 +445,7 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         .queue_wait_us
         .fetch_add(j.queued.elapsed().as_micros() as u64, Ordering::Relaxed);
     SCHED.jobs.fetch_add(1, Ordering::Relaxed);
-    let prefix_ok = true; // plans/115 env 정리: NO_PREFIX 폐기 — 접두 캐시 항시
+    let prefix_ok = true; // NO_PREFIX 폐기 — 접두 캐시 항시
     let pick = (0..slots.len())
         .filter(|&i| slots[i].job.is_none())
         .map(|i| {

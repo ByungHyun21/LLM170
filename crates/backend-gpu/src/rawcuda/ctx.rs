@@ -1,5 +1,5 @@
 //! CudaCtx — CUDA 드라이버 컨텍스트 래퍼(디바이스·컨텍스트·모듈·런치·복사).
-//! 스켈레톤 단계(plans/124 2026-10-04):
+//! 스켈레톤 단계(2026-10-04):
 //! 단일 디바이스(ordinal 0)·프라이머리 컨텍스트·레거시 기본 스트림.
 //! 버퍼는 명시적 alloc/free(스모크 검증용) — 영속 아레나 규칙(ADR-0014)은
 //! 실 가중치 상주 단계에서 도입한다.
@@ -13,7 +13,7 @@ pub struct CudaCtx {
     pub device_name: String,
     ctx: ffi::CUcontext,
     /// 레거시 기본 스트림(0). 후속 목표의
-    /// 디바이스 체인(plans/124 §4.13: 드래프트 호스트 왕복 제거)에서
+    /// 디바이스 체인(드래프트 호스트 왕복 제거)에서
     /// cuStreamCreate 도입 시 교체.
     pub stream: CUstream,
     modules: HashMap<&'static str, ffi::CUmodule>,
@@ -226,8 +226,7 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// 디바이스→디바이스 복사(동기). 호스트 왕복 없는 체인의 기본 이동 —
-    /// plans/cuda-port.md S10.
+    /// 디바이스→디바이스 복사(동기). 호스트 왕복 없는 체인의 기본 이동.
     pub fn d2d(&self, dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> Result<(), String> {
         // SAFETY: 두 포인터 모두 alloc이 돌려준 유효 할당, 범위는 호출자 계약.
         unsafe {
@@ -351,7 +350,7 @@ impl CudaCtx {
     }
 }
 
-/// B6(plans/cuda-models.md §4): CUDA 런타임 VRAM 프로브 — 가드 preflight용.
+/// B6: CUDA 런타임 VRAM 프로브 — 가드 preflight용.
 /// cuInit → 디바이스 0 프라이머리 컨텍스트 유지 → cuMemGetInfo_v2.
 /// 모듈 로드 없음(가드는 모델 적재 전 단계). 실패 시 None(호출부가 B17 정책
 /// 으로 거부 — Option 계약).

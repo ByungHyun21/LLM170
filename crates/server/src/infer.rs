@@ -1,4 +1,4 @@
-//! infer — qwen35/qwen4exp greedy 추론 CLI (main.rs에서 이관, plans/35 P7).
+//! infer — qwen35/qwen4exp greedy 추론 CLI (main.rs에서 이관).
 //! JSONL {"seq","pos","token","text"} 스트림 출력.
 
 use std::path::PathBuf;
@@ -46,19 +46,17 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     if prompts.is_empty() {
         return usage_err("at least one --prompt-tokens required");
     }
-    // 단일 트랙(2026-10-08, plans/w4a16-cuda.md §5): 모델은 W4A16 디렉터리 단일 —
+    // 단일 트랙(2026-10-08): 모델은 W4A16 디렉터리 단일 —
     // 그 외는 스니핑이 명시 에러로 안내.
     if let Err(e) = crate::engine::sniff_format(&model_path) {
         return usage_err(&e);
     }
     // W4A16은 CPU 전용(가속 커널 미구현 — W2): GPU 백엔드 지정은 명시 거부.
     if backend != "cpu" {
-        return usage_err(
-            "W4A16은 아직 CPU 전용(가속 커널 미구현 — plans/w4a16-cuda.md W2): --backend cpu",
-        );
+        return usage_err("W4A16은 아직 CPU 전용(가속 커널 미구현 — W2): --backend cpu");
     }
     if spec_k.is_some() {
-        return usage_err("W4A16은 --spec 미지원(MTP 미매핑 — plans/w4a16-cuda.md §2)");
+        return usage_err("W4A16은 --spec 미지원(MTP 미매핑)");
     }
     let max_prompt = prompts.iter().map(|p| p.len()).max().unwrap();
     if max_prompt + n_predict + 8 >= ctx {

@@ -1,5 +1,5 @@
 //! qwen35 mm_group 디스패치 — 가속기 없으면 CPU 개별 배치 (matmul/에서 이관,
-//! plans/109 P8 — qwen35 전용 ModelError 반환이라 소속을 qwen35로).
+//! qwen35 전용 ModelError 반환이라 소속을 qwen35로).
 /// matmul_group 디스패치 — 가속기 없으면 CPU 개별 배치.
 use crate::matmul::cpu::{matmul, matmul_batch};
 use crate::matmul::traits::*;

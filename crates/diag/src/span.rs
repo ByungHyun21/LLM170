@@ -1,4 +1,4 @@
-//! span — 이름 기반 구간 누적 프로파일러 (crates/profiler에서 이식, plans/83 C1).
+//! span — 이름 기반 구간 누적 프로파일러.
 //!
 //! debug 빌드 또는 `profile` feature에서만 계측, release 기본은 zero-cost.
 //! 사용 규칙: `profile_span!`은 **스코프당 1개**. 같은 함수에서 순차 구간을 잴

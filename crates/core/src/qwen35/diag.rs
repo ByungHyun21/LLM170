@@ -1,4 +1,4 @@
-//! qwen35 진단 잔재 격리 (plans/90 B4 — qwen4exp/frame/diag.rs 패턴).
+//! qwen35 진단 잔재 격리 (B4 — qwen4exp/frame/diag.rs 패턴).
 //! G0(GDN)/A3(어텐션) 계측 덤프 — 본체(layers.rs)와 분리해 조사 코드가
 //! 값 경로를 오염하지 않게 한다. 전부 LLM170_DEBUG_LAYERS 게이트.
 

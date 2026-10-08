@@ -1,4 +1,4 @@
-//! GDN층 스테이지 — layers.rs에서 이동(qwen4exp P1 패턴, plans/90 B4).
+//! GDN층 스테이지 — layers.rs에서 이동(qwen4exp P1 패턴, B4).
 //! 수치 경로 불변 — 시그니처만 Ctx/seqs 분리.
 
 use super::super::{ModelError, SeqState, span_block};

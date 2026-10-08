@@ -9,7 +9,7 @@ pub enum BackendSel {
     #[allow(dead_code)]
     Gpu,
 }
-/// 모델 경로 포맷 판정 — 2026-10-08 단일 트랙(plans/w4a16-cuda.md §5):
+/// 모델 경로 포맷 판정 — 2026-10-08 단일 트랙:
 /// 수용은 **W4A16 디렉터리 단일** — 그 외는 명시 에러로 안내.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ModelFormat {
@@ -22,7 +22,7 @@ pub enum ModelFormat {
 pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
     if path.is_file() {
         return Err(format!(
-            "파일 모델 미지원(2026-10-08 — plans/w4a16-cuda.md §5): W4A16 디렉터리만 지원 — {}",
+            "파일 모델 미지원(2026-10-08): W4A16 디렉터리만 지원 — {}",
             path.display()
         ));
     }
@@ -90,10 +90,10 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
 pub struct InferRequest {
     pub model: PathBuf,
     pub ctx: usize,
-    /// PLE 테이블 오프로드 모드(plans/111 W4c) — 백엔드 탈락(2026-10-08)으로
+    /// PLE 테이블 오프로드 모드 — 백엔드 탈락(2026-10-08)으로
     /// W4A16 경로에서는 무시된다(build_slots가 고지).
     pub ple_table: Option<String>,
-    /// SSD 블록 캐시 예산 MiB(plans/111 W4c) — 상동.
+    /// SSD 블록 캐시 예산 MiB — 상동.
     pub ple_cache_mib: Option<usize>,
 }
 
@@ -121,7 +121,7 @@ pub struct SpecStats {
     pub target_forwards: usize,
 }
 
-/// qwen35 생성 루프 단일 구현 (plans/109 P4) — 종전 infer/vl이 3모드
+/// qwen35 생성 루프 단일 구현 — 종전 infer/vl이 3모드
 /// (spec-multi / spec-single / batch)를 각자 손베껴 썼다. 모드 선택:
 /// spec_k>0 && has_mtp && LLM170_SPEC_GPU → n>1: "spec-multi", n==1:
 /// "spec", 아니면 "batch". --spec 무시 안내(eos·MTP 부재)도 여기서.
@@ -140,7 +140,7 @@ pub fn generate_q35(
         eprintln!("# --spec 무시: MTP(nextn) 텐서 없음");
     }
     if spec_on && n > 1 {
-        // np×spec 병합 (plans/18)
+        // np×spec 병합
         let mut min_gen = st.gen_toks.iter().map(|g| g.len()).min().unwrap_or(0);
         while min_gen <= n_predict {
             let active: Vec<usize> = (0..n).filter(|&s| !st.finished[s]).collect();
@@ -242,7 +242,7 @@ pub enum Engine {
 }
 
 impl Engine {
-    /// 정지 토큰(plans/130 F5 — 하드코드 248044 일반화): Q35는 아키텍처 상수.
+    /// 정지 토큰(F5 — 하드코드 248044 일반화): Q35는 아키텍처 상수.
     pub fn eos(&self) -> u32 {
         match self {
             Engine::Q35(_) => llm170_core::qwen35::EOS_EOT,
@@ -274,12 +274,10 @@ fn banner(
 pub fn build_slots(req: InferRequest, _backend: BackendSel, n_slots: usize) -> Engine {
     // PLE 플래그는 구 백엔드 전역 구현이었음 — 탈락(2026-10-08, §5)으로 무의미.
     if req.ple_table.is_some() || req.ple_cache_mib.is_some() {
-        eprintln!(
-            "# ple-table/ple-cache: 백엔드 탈락(2026-10-08) — 플래그 무시(plans/w4a16-cuda.md §5)"
-        );
+        eprintln!("# ple-table/ple-cache: 백엔드 탈락(2026-10-08) — 플래그 무시");
     }
     if SPEC_K.get().copied().unwrap_or(0) > 0 {
-        eprintln!("# spec: W4A16은 MTP 미매핑 — 무시(plans/w4a16-cuda.md §2)");
+        eprintln!("# spec: W4A16은 MTP 미매핑 — 무시");
     }
     // W4A16 = qwen35 CPU 경로 단일(가속은 W2 커널 이후 — 그때 attach 재도입).
     let m = load_q35_retry(&req.model);

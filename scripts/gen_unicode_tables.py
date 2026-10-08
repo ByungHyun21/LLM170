@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Transpile llama.cpp unicode-data.cpp tables into Rust (crates/server/src/unicode_data.rs).
 
-Source: source/llama.cpp/src/unicode-data.cpp (llama-tokenizer port, plans/83 A).
+Source: source/llama.cpp/src/unicode-data.cpp (llama-tokenizer port).
 Regenerate: python3 scripts/gen_unicode_tables.py
 """
 

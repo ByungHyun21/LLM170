@@ -71,7 +71,7 @@ pub const IQ3S_GRID: [u32; 512] = [
 
 /// iq3_xxs 그리드 — ggml-common.h `iq3xxs_grid` 256×u32 (하위 4바이트 =
 /// 크기 4..62 양의 값 4바이트, 부호는 ksigns가 담당).
-/// plans/cuda-models.md §3.3-1·P0-1(B2): FN/35B 전문가 스택 지배 타입.
+/// FN/35B 전문가 스택 지배 타입 (B2).
 #[rustfmt::skip]
 pub const IQ3XXS_GRID: [u32; 256] = [
     0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,

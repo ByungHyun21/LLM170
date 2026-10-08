@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# W10 프리플라이트 — 커밋 전 로컬 검증 단일 진실 공급원 (plans/107)
+# W10 프리플라이트 — 커밋 전 로컬 검증 단일 진실 공급원
 #
 # 검증: (1) rustfmt, (2) clippy -D warnings, (3) cargo 경고 0,
 #       (4) env 스냅샷↔라이브 동치(108 P1).
-# [2026-10-08] 단일 트랙 재편(plans/w4a16-cuda.md §5) — spv·charhash
+# [2026-10-08] 단일 트랙 재편 — spv·charhash
 # 스텝 제거. W4A16 커널(W2) 도입 시 그 게이트는 새 스크립트로 붙인다.
 # 사용: scripts/preflight.sh
 set -uo pipefail

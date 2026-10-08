@@ -133,7 +133,7 @@ pub trait RawDecode: Send + Sync {
         Err("mtp_prefill_batch: 미지원(백엔드)".into())
     }
 
-    /// MTP 드래프트 스텝 슬롯 배칭 (plans/135 항목 4): 슬롯 t행을 한 번에 —
+    /// MTP 드래프트 스텝 슬롯 배칭: 슬롯 t행을 한 번에 —
     /// eh_proj·qkv·FFN·head 가중을 t행 상각(head 0.95GB를 4→1회),
     /// rope/KV/flash만 슬롯별 런치(테이블·pos 상이). 초안 토큰은 제안이라
     /// 산술 변화는 수용률에만 영향. 기본 Err(백엔드 미지원).
@@ -175,7 +175,7 @@ pub trait RawDecode: Send + Sync {
     fn gdn_restore(&self) -> Result<(), String> {
         Err("gdn_restore: 미지원".into())
     }
-    /// 선택적 per-seq 복원 — 부분수용 시 해당 seq만 되돌린다(plans/80 §C).
+    /// 선택적 per-seq 복원 — 부분수용 시 해당 seq만 되돌린다.
     fn gdn_restore_seq(&self, _seq: usize, _n_seqs: usize) -> Result<(), String> {
         Err("gdn_restore_seq: 미지원".into())
     }
