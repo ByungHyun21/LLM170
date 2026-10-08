@@ -1,9 +1,5 @@
-/// W4A8 정수 GEMV 경로 활성 (LLM170_W4A8=1) — iq4_xs·q3_K 디코드
-/// matmul을 레인 f64 미러 정수 내적으로 전환. GPU frame/value 경로와
-/// 동일 비트 (그룹핑 무관 설계). 프리필(t>1)은 무관.
-/// out[o] = Σ_i x[i]·W[o,i] (단일 토큰). 스레드별 행 슬라이스 소유.
-/// 원시 HIP 디코드 (LLM170_RAWHIP=1) — 백엔드가 상주 DecodeState로
-/// 토큰 1스텝 전체를 수행. 엔진은 임베딩 dequant·pos만 제공.
+//! CPU matmul — 스레드 수 · 단행/배치 내적 + W4A16 split arm(분리 버퍼 디양자화).
+
 pub fn n_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -12,22 +8,6 @@ pub fn n_threads() -> usize {
 }
 use super::weight::Weight;
 use llm170_diag::profile_span;
-pub fn w4a8_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| llm170_diag::flag::on("LLM170_W4A8"))
-}
-
-/// W4A8 대상 타입 (정수 커널·미러 구현 완료분).
-pub fn w4a8_ty(ty: crate::wtype::WType) -> bool {
-    matches!(ty, |crate::wtype::WType::Iq4Xs| crate::wtype::WType::Iq3S
-        | crate::wtype::WType::Q3K
-        | crate::wtype::WType::Q4K
-        | crate::wtype::WType::Q5K
-        | crate::wtype::WType::Q8_0
-        | crate::wtype::WType::Q5_1
-        | crate::wtype::WType::Iq4Nl
-        | crate::wtype::WType::Q6K)
-}
 
 pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
     profile_span!("cpu::matmul1");
@@ -61,35 +41,6 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
                 h.join().unwrap();
             }
         });
-        return;
-    }
-    // W4A8 디코드 전환 — 활성 시 전 경로 동일 비트
-    if w4a8_enabled() && w4a8_ty(w.ty) && x.len() == w.n_in as usize {
-        let y = crate::quant::quantize_row_q8_ref(x);
-        let blck = w.ty.blck_size() as usize;
-        let bsize = w.ty.type_size() as usize;
-        let row_bytes = (w.n_in as usize / blck) * bsize;
-        for (o, out_o) in out.iter_mut().enumerate() {
-            let row = &w.data[o * row_bytes..];
-            *out_o = match w.ty {
-                crate::wtype::WType::Q3K => crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, &y),
-                crate::wtype::WType::Iq3S => crate::quant::dot_row_w4a8_iq3s_lane(row, w.n_in, &y),
-                crate::wtype::WType::Q4K => crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, &y),
-                crate::wtype::WType::Q5K => crate::quant::dot_row_w4a8_q5k_lane(row, w.n_in, &y),
-                crate::wtype::WType::Q8_0 => crate::quant::dot_row_w4a8_q8_0_lane(row, w.n_in, &y),
-                crate::wtype::WType::Iq4Nl => {
-                    crate::quant::dot_row_w4a8_iq4nl_lane(row, w.n_in, &y)
-                }
-                crate::wtype::WType::Q6K => crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, &y),
-                crate::wtype::WType::Q5_1 => crate::quant::dot_row_w4a8_q5_1_lane(row, w.n_in, &y),
-                crate::wtype::WType::Iq4Xs => {
-                    crate::quant::dot_row_w4a8_iq4xs_lane(row, w.n_in, &y)
-                }
-                // w4a8_ty 진입 게이트가 9타입 전부 위 팔로 커버 — 신규 타입
-                // 추가 시 여기서 즉시 패닉(무결 오염 방지 계약).
-                _ => unreachable!("w4a8_ty에 포함됐으나 lane 미구현: {:?}", w.ty),
-            };
-        }
         return;
     }
     let n_in = w.n_in as usize;
@@ -175,46 +126,6 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
         }
         return;
     }
-    // W4A8 (지원 타입) — 행별 레인 미러 정수 내적 (GPU 배치 경로와 동일 비트)
-    if w4a8_enabled() && w4a8_ty(w.ty) {
-        let y_all: Vec<_> = xs
-            .iter()
-            .map(|r| crate::quant::quantize_row_q8_ref(r))
-            .collect();
-        let blck = w.ty.blck_size() as usize;
-        let bsize = w.ty.type_size() as usize;
-        let row_bytes = (w.n_in as usize / blck) * bsize;
-        for (ti, out) in outs.iter_mut().enumerate() {
-            let y = &y_all[ti];
-            for (o, out_o) in out.iter_mut().enumerate() {
-                let row = &w.data[o * row_bytes..];
-                *out_o = match w.ty {
-                    crate::wtype::WType::Q3K => crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, y),
-                    crate::wtype::WType::Iq3S => {
-                        crate::quant::dot_row_w4a8_iq3s_lane(row, w.n_in, y)
-                    }
-                    crate::wtype::WType::Q4K => crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, y),
-                    crate::wtype::WType::Q5K => crate::quant::dot_row_w4a8_q5k_lane(row, w.n_in, y),
-                    crate::wtype::WType::Q8_0 => {
-                        crate::quant::dot_row_w4a8_q8_0_lane(row, w.n_in, y)
-                    }
-                    crate::wtype::WType::Iq4Nl => {
-                        crate::quant::dot_row_w4a8_iq4nl_lane(row, w.n_in, y)
-                    }
-                    crate::wtype::WType::Q6K => crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, y),
-                    crate::wtype::WType::Q5_1 => {
-                        crate::quant::dot_row_w4a8_q5_1_lane(row, w.n_in, y)
-                    }
-                    crate::wtype::WType::Iq4Xs => {
-                        crate::quant::dot_row_w4a8_iq4xs_lane(row, w.n_in, y)
-                    }
-                    _ => unreachable!("w4a8_ty에 포함됐으나 lane 미구현: {:?}", w.ty),
-                };
-            }
-        }
-        return;
-    }
-
     profile_span!("cpu::matmulB");
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
@@ -280,35 +191,6 @@ fn dequant_row_w4a16_split(q: &[u8], s: &[u8], row: usize, k: usize, out: &mut [
             out[b * 128 + i] = (nib - 8) as f32 * sc;
         }
     }
-}
-
-/// W4A8 변형 단일 벡터 matmul — x를 q8로 양자화해 타입별 정수 내적.
-/// 성능 경로: 기준(f32) 대비 활성 양자화 오차 허용 전제.
-pub fn matmul_w4a8(x: &[f32], w: &Weight, out: &mut [f32]) {
-    profile_span!("cpu::matmul_w4a8");
-    use crate::quant::{dot_row_w4a8, quantize_row_q8_ref};
-    let n_in = w.n_in as usize;
-    let y = quantize_row_q8_ref(x);
-    let nt = n_threads().max(1).min(out.len());
-    let rows_per = out.len().div_ceil(nt);
-    let mut chunks: Vec<&mut [f32]> = out.chunks_mut(rows_per).collect();
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (lo, ch) in chunks.iter_mut().enumerate() {
-            let row0 = lo * rows_per;
-            let y = &y;
-            handles.push(scope.spawn(move || {
-                for (r, o) in ch.iter_mut().enumerate() {
-                    let row = row0 + r;
-                    let base = row * (n_in / w.ty.blck_size() as usize) * w.ty.type_size() as usize;
-                    *o = dot_row_w4a8(w.ty, &w.data[base..], w.n_in, y);
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-    });
 }
 
 /// logits → argmax (greedy와 동일 의미, 트레이트 기본구현용).

@@ -11,5 +11,3 @@ pub mod sampler;
 pub mod st;
 pub mod w4a16;
 pub mod wtype;
-pub use tables::{IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL, ktab2_packed};
-mod tables;
