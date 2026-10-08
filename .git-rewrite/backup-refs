@@ -1,7 +1,0 @@
-f223f31c2fc7e4f40c050f540e1da6a99369fc87 commit	refs/heads/backup/pre-en-rewrite
-03077195cc6b578867f84f33eee4a64c4fa544dc commit	refs/heads/main
-72814ea090b32adea11155fb6cc0b7d0587c243f commit	refs/original/refs/heads/main
-285afaaa54ad340757c049f6ba5b7a53daaedbe4 commit	refs/remotes/origin/HEAD
-285afaaa54ad340757c049f6ba5b7a53daaedbe4 commit	refs/remotes/origin/main
-b2f47225c284b0c6891bd4f8a3e079ed11ab26e2 commit	refs/stash
-a984bd14bcb71efd67b1557d11dcfdcc820b50e6 commit	refs/tags/archive/exl3-cuda-20261007

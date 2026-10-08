@@ -1,6 +1,0 @@
-tree ac57dd98eb58b8e2950f6365951fea39ea6da8c9
-parent 7e6dea49f5be6a71e5c3a90ca2054bd330165647
-author ByungHyun21 <ByungHyun21@users.noreply.github.com> 1790572871 +0900
-committer ByungHyun21 <ByungHyun21@users.noreply.github.com> 1790572871 +0900
-
-diag(105): z=1 A-shared direct-drain neutral (+-1%) — no reuse exists at 1.06 chunks/expert; q4k mmq at its practical ceiling, remaining gap is the q4_K dequant hardware class (ledger 74)
