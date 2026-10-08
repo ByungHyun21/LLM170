@@ -528,9 +528,11 @@ impl W4a16Dec {
             (&mut p_k) as *mut _ as *mut _,
             (&mut p_t) as *mut _ as *mut _,
         ];
-        self.cc.launch(f, n.div_ceil(8) as u32, 1, 64, &mut args)?;
+        // 스테이징 폴백(t=1)도 신 GEMM 커널 계약(8행/블록·512스레드)으로 —
+        // 구 계약(grid n/8·block 64)은 재작성 후 1/8행만 계산하는 결함이었다.
+        self.cc.launch(f, n.div_ceil(8) as u32, 1, 512, &mut args)?;
         let mut ob = vec![0u8; n * 4];
-        self.cc.d2h(&mut ob, self.dy)?;
+        self.cc.d2h_async(ob.as_mut_ptr(), self.dy, n * 4)?; // 커스텀 스트림 대비
         self.cc.sync()?;
         Ok(ob
             .as_chunks::<4>()

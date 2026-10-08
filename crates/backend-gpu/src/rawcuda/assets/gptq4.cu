@@ -176,18 +176,17 @@ extern "C" __global__ void w4a16_gemv_g128(
 }
 
 // out[t][n] = x[t][k] · W4A16(g128, sym) — t≥2(프리필 배치) 전용.
-// [2026-10-08 재작성 5 — P3-b 레지스터 블로킹] bench-gemm 진화: 행=블록 43 →
-// smem(R=4) 51 → smem f32 63 → R=8 77 → f32 직접 52 → smem+언롤 63 GB/s
-// (t=1 GEMV는 ~740GB/s). 병목 분해: x smem 판독 4B/(행·원소·토큰)과 ALU가 지배.
-// 여기서는 **레인당 G4_RL행을 레지스터 누산**해 x를 레지스터로 1회 로드 후
-// 재사용한다(x smem 트래픽 ÷G4_RL). 스레드 256(4그룹×64레인)으로 점유 확보.
+// [2026-10-08 P3-b 실측 진화 — 최선 채택] 행=블록 f16 x = 43GB/s → smem(R=4)
+// 51 → smem f32 변환 63 → **R=8(512스레드)+smem f16→f32+KC256+q4 언롤 4 = 77**
+// → 레지스터 블로킹 RL=2(256스레드) 61(기각) → f32 직접 판독 52(기각).
+// 병목: x smem 판독 4B/(행·원소·토큰)·ALU·가중치 스트림(추정 합 ~62ms/chunk
+// vs 실측 178ms — 잔여는 지연/점유 미규명). 남은 정공법: cp.async 더블버퍼
+// (스테이징-누산 겹침) 또는 스레드당 다출력+레지스터 재사용 심화.
 // 산술 계약 불변(행·토큰별 레인 l은 i=l,l+64,… 오름차순 f32 누산 → tree64).
 #define G4_TMAX 8
-#define G4_GROUPS 4                 // 행 그룹(=64레인 묶음) 수
-#define G4_RL 2                     // 레인당 출력 행(레지스터 블로킹)
+#define G4_ROWS 8
 #define G4_LANES 64
-#define G4_KC 256                   // k-청크(64의 배수)
-#define G4_ROWSB (G4_GROUPS * G4_RL) // 블록당 행
+#define G4_KC 256              // k-청크(64의 배수)
 
 extern "C" __global__ void w4a16_gemm_g128(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
@@ -198,36 +197,29 @@ extern "C" __global__ void w4a16_gemm_g128(
     int k,
     int t)
 {
-    const int o0 = blockIdx.x * G4_ROWSB;
+    const int o0 = blockIdx.x * G4_ROWS;
     const int g = threadIdx.x >> 6;
     const int l = threadIdx.x & (G4_LANES - 1);
-    const int orow = o0 + g * G4_RL;
-    __shared__ float sc[G4_ROWSB][G4_SCMAX];
-    __shared__ float xs[G4_TMAX][G4_KC]; // f32 1회 변환 저장
-    __shared__ double red[G4_ROWSB][G4_LANES];
-    float acc[G4_RL][G4_TMAX];
+    const int o = o0 + g;
+    const bool live = (o < n) && (t > 0) && (t <= G4_TMAX);
+    __shared__ float sc[G4_ROWS][G4_SCMAX];
+    __shared__ float xs[G4_TMAX][G4_KC]; // f32 1회 변환 저장(루프 내 h2f 제거)
+    __shared__ double red[G4_ROWS][G4_LANES];
+    float acc[G4_TMAX];
 #pragma unroll
-    for (int r = 0; r < G4_RL; ++r) {
-#pragma unroll
-        for (int u = 0; u < G4_TMAX; ++u) {
-            acc[r][u] = 0.0f;
-        }
+    for (int u = 0; u < G4_TMAX; ++u) {
+        acc[u] = 0.0f;
     }
     const int k8 = k >> 3;
     const int kg = k >> 7;
-#pragma unroll
-    for (int r = 0; r < G4_RL; ++r) {
-        const int o = orow + r;
-        if (o < n && t > 0 && t <= G4_TMAX) {
-            for (int gg = l; gg < kg; gg += G4_LANES) {
-                sc[g * G4_RL + r][gg] = h2f(s[(size_t)o * kg + gg]);
-            }
+    if (live) {
+        for (int gg = l; gg < kg; gg += G4_LANES) {
+            sc[g][gg] = h2f(s[(size_t)o * kg + gg]);
         }
     }
     const int li = l & 7;
-    const bool t_ok = (t > 0) && (t <= G4_TMAX);
     for (int base = 0; base < k; base += G4_KC) {
-        __syncthreads(); // 이전 청크 xs 소비 완료 대기
+        __syncthreads(); // 이전 청크 소비 완료 대기
         for (int idx = threadIdx.x; idx < G4_TMAX * G4_KC; idx += blockDim.x) {
             const int ti = idx / G4_KC;
             const int il = idx - ti * G4_KC;
@@ -235,51 +227,35 @@ extern "C" __global__ void w4a16_gemm_g128(
             xs[ti][il] = (ti < t && gi < k) ? h2f(x[(size_t)ti * k + gi]) : 0.0f;
         }
         __syncthreads();
-        if (t_ok) {
+        if (live) {
+            const unsigned* qrow = q + (size_t)o * k8;
             const int nch = min(G4_KC, k - base);
 #pragma unroll
             for (int q4 = 0; q4 < G4_KC / G4_LANES; ++q4) {
                 const int il = l + (q4 << 6);
                 if (il < nch) {
                     const int i = base + il;
-                    // x를 레지스터로 1회 로드 — G4_RL행이 재사용(트래픽 ÷RL).
-                    float xv[G4_TMAX];
+                    const unsigned qw = __ldcs(&qrow[i >> 3]); // 가중치 1회 = t토큰 공유
+                    const int v = (int)((qw >> (4 * li)) & 0xFu) - 8;
+                    const float w = (float)v * sc[g][i >> 7];
 #pragma unroll
                     for (int ti = 0; ti < G4_TMAX; ++ti) {
-                        xv[ti] = xs[ti][il];
-                    }
-#pragma unroll
-                    for (int r = 0; r < G4_RL; ++r) {
-                        const int o = orow + r;
-                        if (o < n) {
-                            const unsigned qw = __ldcs(&q[(size_t)o * k8 + (i >> 3)]);
-                            const int v = (int)((qw >> (4 * li)) & 0xFu) - 8;
-                            const float w = (float)v * sc[g * G4_RL + r][i >> 7];
-#pragma unroll
-                            for (int ti = 0; ti < G4_TMAX; ++ti) {
-                                if (ti < t) {
-                                    acc[r][ti] += w * xv[ti];
-                                }
-                            }
+                        if (ti < t) {
+                            acc[ti] += w * xs[ti][il];
                         }
                     }
                 }
             }
         }
     }
-    // 행별 토큰별 64레인 트리(순서는 t=1 GEMV와 동일).
-#pragma unroll
-    for (int r = 0; r < G4_RL; ++r) {
-        const int o = orow + r;
-        for (int ti = 0; ti < t; ++ti) {
-            if (t_ok) {
-                red[g * G4_RL + r][l] = (double)acc[r][ti];
-            }
-            __syncthreads();
-            if (o < n && t_ok && l == 0) {
-                out[(size_t)ti * n + o] = tree64(red[g * G4_RL + r]);
-            }
-            __syncthreads();
+    for (int ti = 0; ti < G4_TMAX; ++ti) {
+        if (ti < t) {
+            red[g][l] = (double)acc[ti];
         }
+        __syncthreads();
+        if (live && l == 0) {
+            out[(size_t)ti * n + o] = tree64(red[g]);
+        }
+        __syncthreads();
     }
 }
