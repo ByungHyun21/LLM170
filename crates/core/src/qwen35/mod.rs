@@ -156,20 +156,22 @@ impl Model {
         for name in ["token_embd.weight", "output.weight", "output_norm.weight"] {
             m.w(name).ok_or(ModelError::MissingTensor(name.into()))?;
         }
-        // A7(plans/129): dequant_row 미지원 타입이 런타임 첫 역양자화에서
-        // unimplemented!로 죽던 것을 로드에서 거부(embd/output만 dequant_row 경로).
-        for name in ["token_embd.weight", "output.weight"] {
-            let t = m
-                .gguf
-                .find_tensor(name)
-                .ok_or(ModelError::MissingTensor(name.into()))?;
-            if !crate::quant::deq::dequant_supported(t.ty) {
-                return Err(ModelError::UnsupportedLayout {
-                    name: name.into(),
-                    why: "dequant_row 미지원 양자 타입",
-                }
-                .into());
+        // A7(plans/129) → B3(plans/cuda-models.md §4·§5) 확장: 전 텐서 타입
+        // 사전검증 — 모든 무게가 결국 dequant_row를 지나므로(embd/output만이
+        // 아니다) 미지원 타입은 로드에서 거부한다(런타임 unimplemented! 패닉 차단).
+        let bad: Vec<String> = m
+            .gguf
+            .tensors
+            .iter()
+            .filter(|t| !crate::quant::deq::dequant_supported(t.ty))
+            .map(|t| format!("{}({})", t.name, t.ty.name()))
+            .collect();
+        if !bad.is_empty() {
+            return Err(ModelError::UnsupportedLayout {
+                name: bad.join(", "),
+                why: "dequant_row 미지원 양자 타입",
             }
+            .into());
         }
         Ok(m)
     }
