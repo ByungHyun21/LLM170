@@ -92,16 +92,38 @@ fn model_bytes(p: &Path) -> u64 {
     p.metadata().map(|m| m.len()).unwrap_or(0)
 }
 
-/// 호스트 가용 메모리 (/proc/meminfo MemAvailable).
-fn host_mem_available() -> Option<u64> {
+/// /proc/meminfo 한 줄(kB) 파싱 — MemTotal/MemAvailable 공용.
+fn meminfo_kb(key: &str) -> Option<u64> {
     let s = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+        if let Some(rest) = line.strip_prefix(key) {
             let kb: u64 = rest.trim().trim_end_matches(" kB").parse().ok()?;
             return Some(kb * 1024);
         }
     }
     None
+}
+
+/// 호스트 전체 메모리 (/proc/meminfo MemTotal) — 모니터링용.
+pub fn host_mem_total() -> Option<u64> {
+    meminfo_kb("MemTotal:")
+}
+
+/// 프로세스 RSS (/proc/self/status VmRSS) — 모니터링용.
+pub fn process_rss() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.trim().trim_end_matches(" kB").parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// 호스트 가용 메모리 (/proc/meminfo MemAvailable).
+pub(crate) fn host_mem_available() -> Option<u64> {
+    meminfo_kb("MemAvailable:")
 }
 
 /// 가드 대상(A2/R1) — 판정 결과. 판정 계약은 guard_target_cases

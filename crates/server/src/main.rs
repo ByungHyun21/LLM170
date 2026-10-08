@@ -7,6 +7,7 @@ mod gpu_engine;
 mod http;
 mod infer;
 mod json;
+mod metrics;
 mod oai;
 mod probes;
 mod resource;
@@ -277,6 +278,19 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         model: model_path.clone(),
         ctx,
     };
+    // 모니터링 — 정적 정보 등록 + 샘플러 스레드(1Hz; 무시 가능 비용,
+    // 최신 스냅샷만 유지 — 시계열 누적은 외부 폴러 몫).
+    metrics::init(metrics::Info {
+        instance: llm170_diag::flag::val("LLM170_INSTANCE")
+            .map(str::to_string)
+            .unwrap_or_default(),
+        model: model_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        ctx,
+        n_slots: slots.unwrap_or(1),
+    });
     // 라우팅: W4A16 = qwen35 CPU 경로 단일(가속은 W2 커널 이후).
     let sel = engine::BackendSel::Cpu;
     match http::serve(&format!("127.0.0.1:{port}"), req, sel, slots, queue) {

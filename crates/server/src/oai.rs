@@ -387,6 +387,20 @@ pub(crate) fn handle(
                 "application/json",
                 "{\"object\":\"list\",\"data\":[{\"id\":\"llm170\",\"object\":\"model\",\"owned_by\":\"local\"}]}",
             ),
+            // 모니터링 — 최신 스냅샷 1장(시계열 누적은 외부 폴러 몫).
+            // /stats = JSON(주 타깃), /metrics = Prometheus 텍스트(표준 호환).
+            ("GET", "/stats") => resp(
+                &mut stream,
+                200,
+                "application/json",
+                &crate::metrics::json(),
+            ),
+            ("GET", "/metrics") => resp(
+                &mut stream,
+                200,
+                "text/plain; version=0.0.4",
+                &crate::metrics::prometheus(),
+            ),
             ("POST", "/tokenize") => {
                 let Some(content) = jstr(&req.body, "content") else {
                     resp(
