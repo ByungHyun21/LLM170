@@ -331,6 +331,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut ctx = 1024usize;
     let mut no_head = false;
     let mut moe_check = false;
+    let mut h2d_mb = 0usize;
     let mut bench: Option<(String, usize, usize)> = None; // (lin, t, reps)
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -361,6 +362,13 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             }
             "--no-head" => no_head = true,
             "--moe-check" => moe_check = true,
+            "--h2d-bench" => {
+                let mb = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--h2d-bench requires MB")?;
+                h2d_mb = mb;
+            }
             "--bench-gemm" => {
                 let name = it.next().ok_or("--bench-gemm requires a name")?.clone();
                 let t = it
@@ -502,6 +510,33 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         );
     }
     dec.set_attn(ad, &qnw, &knw)?;
+    if h2d_mb > 0 {
+        // h2d 대역폭 실측 — (a) 핀드 소스, (b) 페이지러블 소스(드라이버 스테이징).
+        let bytes = h2d_mb << 20;
+        let src = vec![0x5Au8; bytes];
+        let dst = dec.alloc_scratch(bytes)?;
+        let pinned = dec.alloc_pinned_scratch(bytes)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), pinned as *mut u8, bytes);
+        }
+        let t = std::time::Instant::now();
+        dec.h2d_scratch(dst, &src)?;
+        dec.sync_bench()?;
+        let pageable_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
+        // SAFETY: 핀드 버퍼 슬라이스(할당 크기).
+        let ps = unsafe { std::slice::from_raw_parts(pinned as *const u8, bytes) };
+        dec.h2d_scratch(dst, ps)?;
+        dec.sync_bench()?;
+        let pinned_ms = t.elapsed().as_secs_f64() * 1e3;
+        dec.free_pinned_scratch(pinned)?;
+        dec.free_scratch(dst)?;
+        return Ok(format!(
+            "h2d-bench {h2d_mb}MiB: 페이지러블 {pageable_ms:.0}ms ({:.1}GB/s) · 핀드 {pinned_ms:.0}ms ({:.1}GB/s)",
+            bytes as f64 * 1e-9 / (pageable_ms * 1e-3),
+            bytes as f64 * 1e-9 / (pinned_ms * 1e-3).max(1e-9)
+        ));
+    }
     if moe_check {
         return dec.moe_selfcheck();
     }

@@ -308,6 +308,7 @@ pub(crate) fn upload_moe(
     model: &llm170_core::qwen35::Model,
 ) -> Result<(), String> {
     let hp = model.hp.clone();
+    let t0 = std::time::Instant::now();
     for name in model.engine_names() {
         // token_embd(호스트 embed_row)·output(head 전용 업로드)는 체인이
         // 선형으로 쓰지 않는다 — VRAM 절약(각 ~970MiB @35B).
@@ -320,6 +321,8 @@ pub(crate) fn upload_moe(
             dec.upload_plain(&name, w.data, w.n_out as usize, w.n_in as usize)?;
         }
     }
+    let plain_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t1 = std::time::Instant::now();
     dec.set_plain_mode(true);
     let (group, scale_bf16) = model.expert_quant();
     dec.set_moe(
@@ -357,8 +360,17 @@ pub(crate) fn upload_moe(
         Some("1") => true,
         _ => free > expert_bytes + (1 << 30),
     };
+    let tab_ms = t1.elapsed().as_secs_f64() * 1e3;
+    let t2 = std::time::Instant::now();
+    if resident {
+        dec.upload_experts_resident(&tab)?;
+    } else {
+        dec.set_expert_table(tab);
+    }
     eprintln!(
-        "[moe] 전문가 {:.2}GiB · 여유 {:.2}GiB → {}",
+        "[moe] 플레인 {plain_ms:.0}ms · 테이블 {tab_ms:.0}ms · 전문가 {:.0}ms ({:.1}GB/s) — 전문가 {:.2}GiB · 여유 {:.2}GiB → {}",
+        t2.elapsed().as_secs_f64() * 1e3,
+        (expert_bytes as f64 * 1e-9) / t2.elapsed().as_secs_f64().max(1e-9),
         expert_bytes as f64 / (1u64 << 30) as f64,
         free as f64 / (1u64 << 30) as f64,
         if resident {
@@ -367,10 +379,5 @@ pub(crate) fn upload_moe(
             "호스트 스트리밍"
         }
     );
-    if resident {
-        dec.upload_experts_resident(&tab)?;
-    } else {
-        dec.set_expert_table(tab);
-    }
     Ok(())
 }
