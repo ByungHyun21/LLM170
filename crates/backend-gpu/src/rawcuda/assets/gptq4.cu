@@ -105,6 +105,14 @@ extern "C" __global__ void w4a16_cast_x32(const float* __restrict__ in,
 //   i=l,l+64,… 오름차순 → f64 tree64). k ≤ 128*G4_SCMAX 계약.
 #define G4_SCMAX 256
 
+// double 셔플(__shfl_down_sync는 32bit) — 트리 병렬화용.
+__device__ __forceinline__ double shfl_down_f64(double v, int off) {
+    unsigned lo = __double2loint(v), hi = __double2hiint(v);
+    lo = __shfl_down_sync(0xffffffffu, lo, off);
+    hi = __shfl_down_sync(0xffffffffu, hi, off);
+    return __hiloint2double(hi, lo);
+}
+
 // f64 tree64 — core lane.rs와 동일 순서(전 호출부 공용).
 __device__ __forceinline__ float tree64(double* red) {
     for (int i = 0; i < 32; ++i) {
@@ -170,8 +178,19 @@ extern "C" __global__ void w4a16_gemv_g128(
     }
     red[l] = (double)acc;
     __syncthreads();
-    if (l == 0) {
-        out[o] = tree64(red);
+    // 트리 병렬화(계약 순서 유지 — 1단 a[i]+=a[i+32] 후 셔플로 off 16..1).
+    if (l < 32) {
+        double r = red[l] + red[l + 32];
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(r, off);
+            if (l < off) {
+                r += oth;
+            }
+        }
+        if (l == 0) {
+            out[o] = (float)r;
+        }
     }
 }
 
@@ -248,13 +267,26 @@ extern "C" __global__ void w4a16_gemm_g128(
             }
         }
     }
+    // 토큰별 트리 — 계약 순서(1단 a[i]+=a[i+32] 후 off 16,8,4,2,1)를 병렬화:
+    // 워프 셔플로 각 단을 병렬 가산(각 가산은 독립 — 비트 동일), 배리어는
+    // red 기록용 1회/토큰만.
     for (int ti = 0; ti < G4_TMAX; ++ti) {
         if (ti < t) {
             red[g][l] = (double)acc[ti];
         }
         __syncthreads();
-        if (live && l == 0) {
-            out[(size_t)ti * n + o] = tree64(red[g]);
+        if (live && l < 32) {
+            double r = red[g][l] + red[g][l + 32];
+#pragma unroll
+            for (int off = 16; off >= 1; off >>= 1) {
+                const double oth = shfl_down_f64(r, off);
+                if (l < off) {
+                    r += oth;
+                }
+            }
+            if (l == 0) {
+                out[(size_t)ti * n + o] = (float)r;
+            }
         }
         __syncthreads();
     }
