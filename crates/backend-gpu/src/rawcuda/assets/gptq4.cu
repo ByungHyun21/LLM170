@@ -137,7 +137,8 @@ extern "C" __global__ void w4a16_gemv_g128(
         for (int u = 0; u < 8; ++u) {
             const int jj = j + u;
             const int i = l + (jj << 6);
-            unsigned qw = qrow[i >> 3];
+            // evict-first — 한 번 읽는 가중치가 L2를 오염시키지 않게(스트리밍).
+            unsigned qw = __ldcs(&qrow[i >> 3]);
             int v = (int)((qw >> (4 * li)) & 0xFu) - 8;
             float w = (float)v * sc[jj >> 1];
             acc += w * x[i];
@@ -145,7 +146,7 @@ extern "C" __global__ void w4a16_gemv_g128(
     }
     for (; j < jn; ++j) {
         const int i = l + (j << 6);
-        unsigned qw = qrow[i >> 3];
+        unsigned qw = __ldcs(&qrow[i >> 3]);
         int v = (int)((qw >> (4 * li)) & 0xFu) - 8;
         float w = (float)v * sc[j >> 1];
         acc += w * x[i];
