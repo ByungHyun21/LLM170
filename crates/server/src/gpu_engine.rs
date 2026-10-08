@@ -1,9 +1,10 @@
-//! GPU 서빙 엔진 — W4A16 CUDA 체인(호스트 스테이징 v1) + CPU head.
+//! GPU 서빙 엔진 — W4A16 CUDA 디바이스 체인 + GPU head.
 //!
-//! W3-3: serve/infer의 단일 경로. 가중치는 VRAM 상주(12.4GB급), 활성은
-//! 연산별 왕복(f16 캐스트 → GEMV → 판독), 최종 head는 CPU 참조 경로
-//! (bf16 디퀀트 f32 내적 — 골든과 동일 계급). 성능 최적화(디바이스
-//! 체인·head 커널)는 후속 — 판정 기준은 토큰열이다.
+//! W3-3 착륙 후 성능 캠페인(2026-10-08): 활성은 디바이스 상주(왕복은
+//! 토큰당 임베딩 업로드 + 로짓 판독뿐), head는 head_bf16 커널(bf16
+//! →f32 시프트 + k 직렬 f32 내적 — CPU 참조와 동일 순서).
+//! LLM170_STAGED=1이면 구 스테이징 경로(호스트 왕복)로 폴백한다.
+//! 판정 기준은 토큰열(골든)이다.
 
 use llm170_backend_gpu::{AttnDims, GdnDims, W4a16Dec};
 use std::path::Path;
@@ -12,6 +13,10 @@ pub struct GpuEngine {
     model: llm170_core::qwen35::Model,
     dec: W4a16Dec,
     n_slots: usize,
+    /// 스테이징 폴백(LLM170_STAGED=1 — 비교/디버그 전용).
+    staged: bool,
+    /// GPU head 상주 여부(bf16 output.weight 업로드 성공).
+    head_gpu: bool,
 }
 
 impl GpuEngine {
@@ -20,6 +25,11 @@ impl GpuEngine {
         let model = llm170_core::qwen35::Model::load(dir).map_err(|e| e.to_string())?;
         let hp = model.hp.clone();
         let interval = hp.full_attn_interval.max(1);
+        if interval != 4 {
+            return Err(format!(
+                "디코더는 4층 주기(full_attention_interval) 전용 — interval={interval}"
+            ));
+        }
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
         // 1) 선형 상주 — GPU 체인은 원본(HF) 무게(순열은 커널 내부 처리).
@@ -127,11 +137,40 @@ impl GpuEngine {
             );
         }
         dec.set_attn(ad, &qnw, &knw)?;
+        // 5) head — bf16 output.weight는 GPU 커널 경로(아니면 CPU 참조).
+        let mut head_gpu = false;
+        if let Some(w) = model.w("output.weight")
+            && w.ty == llm170_core::wtype::WType::Bf16
+        {
+            dec.upload_head(w.data, w.n_out as usize, w.n_in as usize)?;
+            head_gpu = true;
+        }
         Ok(GpuEngine {
             model,
             dec,
             n_slots: n_slots.max(1),
+            staged: llm170_diag::flag::on("LLM170_STAGED"),
+            head_gpu,
         })
+    }
+
+    /// 1토큰 체인(로짓 없이 상태만 진행) — prefill 중간 토큰용.
+    fn forward(&mut self, slot: usize, row: &[f32]) -> Result<Vec<f32>, String> {
+        if self.staged {
+            self.dec.forward(slot, row)
+        } else {
+            self.dec.forward_device(slot, row)
+        }
+    }
+
+    /// 1토큰 다음 로짓 — GPU head 상주 시 로짓만 회수(xn 판독 생략),
+    /// 아니면 디바이스/스테이징 체인 + CPU 참조 head.
+    fn logits(&mut self, slot: usize, row: &[f32]) -> Result<Vec<f32>, String> {
+        if self.head_gpu && !self.staged {
+            return self.dec.forward_device_head(slot, row);
+        }
+        let xn = self.forward(slot, row)?;
+        Ok(self.head_logits(&xn))
     }
 
     /// head 로짓 — CPU 참조 경로(bf16 디퀀트 f32 내적, 골든과 동일 계급).
@@ -143,12 +182,17 @@ impl GpuEngine {
     }
 
     /// 시퀀스 prefill(토큰 순차 forward) → 마지막 로짓.
+    /// head는 마지막 토큰만 계산한다(중간 토큰은 체인만 — head 비용 상각).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
         let mut last = None;
-        for tok in tokens {
+        let n = tokens.len();
+        for (i, tok) in tokens.iter().enumerate() {
             let row = self.model.embed_row(*tok).map_err(|e| e.to_string())?;
-            let xn = self.dec.forward(seq, &row)?;
-            last = Some(self.head_logits(&xn));
+            if i + 1 == n {
+                last = Some(self.logits(seq, &row)?);
+            } else {
+                self.forward(seq, &row)?;
+            }
         }
         Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]))
     }
@@ -158,8 +202,7 @@ impl GpuEngine {
         let mut out = Vec::with_capacity(seq_ids.len());
         for (s, tok) in seq_ids.iter().zip(tokens.iter()) {
             let row = self.model.embed_row(*tok).map_err(|e| e.to_string())?;
-            let xn = self.dec.forward(*s, &row)?;
-            out.push(self.head_logits(&xn));
+            out.push(self.logits(*s, &row)?);
         }
         Ok(out)
     }

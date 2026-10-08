@@ -181,6 +181,22 @@ pub struct W4a16Dec {
     dqh_a: CUdeviceptr,
     doutv_a: CUdeviceptr,
     attn_t_cap: usize,
+    // ── 디바이스 체인(S10 — 연산별 왕복 제거) ──
+    dres: CUdeviceptr,
+    dab_dev: CUdeviceptr,
+    dchain: [CUdeviceptr; 5],
+    stg_w0: usize,
+    stg_w1: usize,
+    stg_w2: usize,
+    chain_bufs_ok: bool,
+    /// t=1 GEMV 입력 x32(h2f 왕복 f32) 버퍼.
+    dx32: CUdeviceptr,
+    dx32_cap: usize,
+    // ── GPU head(output.weight bf16) ──
+    head_w: CUdeviceptr,
+    head_n: usize,
+    head_k: usize,
+    head_out: CUdeviceptr,
     /// 층별 잔차 합 덤프(CPU LLM170_DUMP=debug_layers와 대조용).
     pub debug_layers: bool,
 }
@@ -204,7 +220,12 @@ impl W4a16Dec {
                     "src/rawcuda/assets/gptq4.fatbin",
                 ],
             )?,
-            &["w4a16_gemm_g128"],
+            &[
+                "w4a16_gemm_g128",
+                "w4a16_gemv_g128",
+                "w4a16_cast_f16",
+                "w4a16_cast_x32",
+            ],
         )?;
         cc.load_fatbin(
             "norm",
@@ -249,6 +270,17 @@ impl W4a16Dec {
                 "attn_fwd3s",
                 "attn_pos_bump",
             ],
+        )?;
+        cc.load_fatbin(
+            "head",
+            &asset_bytes(
+                "LLM170_CUDA_HEAD_FATBIN_PATH",
+                &[
+                    "crates/backend-gpu/src/rawcuda/assets/head.fatbin",
+                    "src/rawcuda/assets/head.fatbin",
+                ],
+            )?,
+            &["head_bf16"],
         )?;
         cc.load_fatbin(
             "ew",
@@ -315,6 +347,19 @@ impl W4a16Dec {
             dqh_a: 0,
             doutv_a: 0,
             attn_t_cap: 0,
+            dres: 0,
+            dab_dev: 0,
+            dchain: [0; 5],
+            stg_w0: 0,
+            stg_w1: 0,
+            stg_w2: 0,
+            chain_bufs_ok: false,
+            dx32: 0,
+            dx32_cap: 0,
+            head_w: 0,
+            head_n: 0,
+            head_k: 0,
+            head_out: 0,
             debug_layers: false,
         })
     }
@@ -883,8 +928,9 @@ impl W4a16Dec {
         if self.dpp == 0 || slot >= self.n_slots {
             return Err("attn: pp 미할당/슬롯 범위".into());
         }
+        // 비동기 — 층마다 동기 H2D를 걸면 스트림이 매번 배수된다(층당 8ms 실측).
         self.cc
-            .h2d(self.dpp + (slot as u64) * 4, &pos.to_le_bytes())
+            .h2d_async(self.dpp + (slot as u64) * 4, &pos.to_le_bytes())
     }
 
     fn attn_pp_ptr(&self, slot: usize) -> CUdeviceptr {
@@ -1177,5 +1223,374 @@ impl W4a16Dec {
             Self::zero_dev(&self.cc, self.dgst + st_off, st_bytes)?;
         }
         Ok(())
+    }
+
+    // ── 디바이스 체인(S10 — 왕복 제거) ──
+
+    fn lin_spec(&self, name: &str) -> Result<(CUdeviceptr, CUdeviceptr, usize, usize), String> {
+        self.lins
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("상주 선형 없음: {name}"))
+    }
+
+    /// 체인 작업 버퍼 보장(1회 — 폭은 선형 형상에서 산출).
+    fn ensure_chain_bufs(&mut self) -> Result<(), String> {
+        if self.chain_bufs_ok {
+            return Ok(());
+        }
+        let h = self.hidden;
+        let ad = self.attn.ok_or("attn: 형상 미등록")?;
+        let gd = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let (_, _, ff_gate, _) = self.lin_spec("blk.0.ffn_gate.weight")?;
+        let (_, _, ff_up, _) = self.lin_spec("blk.0.ffn_up.weight")?;
+        // 슬롯 0 = qg·qkv·gate/up, 슬롯 1 = kin/vin·z·up. ew가 gate·up을
+        // 동시에 읽으므로 둘 다 FFN 폭 확보(구 S10 ensure_chain_bufs 계약).
+        let w0 = ad.qg_dim().max(gd.conv_ch()).max(ff_gate);
+        let w1 = ad.kv_dim().max(gd.v_len()).max(ff_up);
+        for p in [
+            self.dres,
+            self.dab_dev,
+            self.dchain[0],
+            self.dchain[1],
+            self.dchain[2],
+            self.dchain[3],
+            self.dchain[4],
+        ] {
+            if p != 0 {
+                self.cc.free(p)?;
+            }
+        }
+        self.dres = self.cc.alloc(h * 4)?;
+        self.dab_dev = self.cc.alloc(h * 4)?;
+        Self::zero_dev(&self.cc, self.dab_dev, h * 4)?;
+        self.dchain = [
+            self.cc.alloc(w0 * 4)?,
+            self.cc.alloc(w1 * 4)?,
+            self.cc.alloc(w1 * 4)?,
+            self.cc.alloc(ff_up * 4)?,
+            self.cc.alloc(h * 4)?,
+        ];
+        self.stg_w0 = w0;
+        self.stg_w1 = w1;
+        self.stg_w2 = ff_up;
+        self.chain_bufs_ok = true;
+        Ok(())
+    }
+
+    /// 디바이스 GEMV(t=1) — x_dev f32 → x32(h2f 왕복) → gptq4 행=블록 커널
+    /// → dy. 반환 포인터는 self.dy(다음 gemv가 덮는다 — 스트림 순서 계약).
+    fn gemv_dev(&mut self, name: &str, x_dev: CUdeviceptr) -> Result<CUdeviceptr, String> {
+        let (dq, ds, n, k) = self.lin_spec(name)?;
+        if k > 128 * 256 {
+            return Err(format!("gemv_dev({name}): k={k} > 32768(smem 계약)"));
+        }
+        if k > self.dx32_cap {
+            if self.dx32 != 0 {
+                self.cc.free(self.dx32)?;
+            }
+            self.dx32 = self.cc.alloc(k * 4)?;
+            self.dx32_cap = k;
+        }
+        if n > self.y_cap {
+            if self.dy != 0 {
+                self.cc.free(self.dy)?;
+            }
+            self.dy = self.cc.alloc(n * 4)?;
+            self.y_cap = n;
+        }
+        let f = self.cc.function("w4a16_cast_x32")?;
+        let mut nn = k as i32;
+        let (mut c0, mut c1) = (x_dev, self.dx32);
+        let mut ca: [*mut std::ffi::c_void; 3] = [
+            (&mut c0) as *mut _ as *mut _,
+            (&mut c1) as *mut _ as *mut _,
+            (&mut nn) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, k.div_ceil(256) as u32, 1, 256, &mut ca)?;
+        let f = self.cc.function("w4a16_gemv_g128")?;
+        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx32, self.dy);
+        let (mut p_n, mut p_k) = (n as i32, k as i32);
+        let mut args: [*mut std::ffi::c_void; 6] = [
+            (&mut p_q) as *mut _ as *mut _,
+            (&mut p_s) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_y) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, n as u32, 1, 64, &mut args)?;
+        Ok(self.dy)
+    }
+
+    /// GEMV → 상주 스테이징 복사(단일 대여 — 중첩 빌림 회피). 복사량은
+    /// 그 선형의 실제 출력폭 n(스테이징 공유 폭까지 복사하면 범위 초과).
+    fn gemv_stage(
+        &mut self,
+        name: &str,
+        x_dev: CUdeviceptr,
+        dst: CUdeviceptr,
+        w: usize,
+    ) -> Result<(), String> {
+        let (_, _, n, _) = self.lin_spec(name)?;
+        if n > w {
+            return Err(format!("gemv_stage({name}): n={n} > 스테이징 {w}"));
+        }
+        let p = self.gemv_dev(name, x_dev)?;
+        self.cc.d2d(dst, p, n * 4)
+    }
+
+    /// 노름 1회(디바이스 x·ab) — xn은 self.dxn(다음 노름이 덮는다).
+    fn norm_resid_dev(
+        &mut self,
+        w: usize,
+        x_dev: CUdeviceptr,
+        ab_dev: CUdeviceptr,
+        t_len: usize,
+    ) -> Result<CUdeviceptr, String> {
+        self.ensure_norm_bufs(t_len)?;
+        self.norm_resid_at(w, x_dev, ab_dev, t_len)
+    }
+
+    /// GDN 체인 디바이스 상주 — xn·qkv·z(디바이스) → dgate.
+    fn gdn_chain_dev_run(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        xn_dev: CUdeviceptr,
+        qkv_dev: CUdeviceptr,
+        z_dev: CUdeviceptr,
+    ) -> Result<CUdeviceptr, String> {
+        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        self.ensure_gdn_bufs(t_len)?;
+        self.cc.d2d(self.dgxn, xn_dev, t_len * dm.hidden * 4)?;
+        self.cc.d2d(self.dqkv, qkv_dev, t_len * dm.conv_ch() * 4)?;
+        self.cc.d2d(self.dzv, z_dev, t_len * dm.v_len() * 4)?;
+        self.gdn_chain_dev(slot, layer, t_len)?;
+        Ok(self.dgate)
+    }
+
+    /// 어텐션 체인 디바이스 상주 — qg·kin·vin(디바이스) → doutv.
+    fn attn_chain_dev_run(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        qg_dev: CUdeviceptr,
+        kin_dev: CUdeviceptr,
+        vin_dev: CUdeviceptr,
+    ) -> Result<CUdeviceptr, String> {
+        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        if t_len == 0 || t_len > ATTN_F3S_TMAX || layer >= dm.n_attn || slot >= self.n_slots {
+            return Err("attn dev: 도메인/범위 위반".into());
+        }
+        let pos = self.slot_pos[slot];
+        if pos as usize + t_len > dm.cap {
+            return Err(format!("attn dev: pos{pos}+T{t_len} > cap{}", dm.cap));
+        }
+        self.attn_set_pos(slot, pos)?;
+        self.ensure_attn_bufs(t_len)?;
+        self.cc.d2d(self.dqg_a, qg_dev, t_len * dm.qg_dim() * 4)?;
+        self.cc.d2d(self.dkin_a, kin_dev, t_len * dm.kv_dim() * 4)?;
+        self.cc.d2d(self.dvin_a, vin_dev, t_len * dm.kv_dim() * 4)?;
+        self.attn_prep_launch(slot, layer, t_len)?;
+        self.attn_fwd3s_launch(slot, layer, t_len)?;
+        Ok(self.doutv_a)
+    }
+
+    /// ew(silu·mul) 디바이스 발사 — g·u → y.
+    fn ew_dev(
+        &mut self,
+        g_dev: CUdeviceptr,
+        u_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        n: usize,
+    ) -> Result<(), String> {
+        if n == 0 {
+            return Err("ew: n=0".into());
+        }
+        let f = self.cc.function("ew")?;
+        let mut nn = n as i32;
+        let (mut a0, mut a1, mut a2) = (g_dev, u_dev, y_dev);
+        let mut args: [*mut std::ffi::c_void; 4] = [
+            (&mut a0) as *mut _ as *mut _,
+            (&mut a1) as *mut _ as *mut _,
+            (&mut a2) as *mut _ as *mut _,
+            (&mut nn) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, n.div_ceil(128) as u32, 1, 128, &mut args)
+    }
+
+    /// 1토큰 forward(디바이스 체인) — 왕복은 임베딩 업로드 1회 + 최종 xn
+    /// 판독 1회뿐. 산술은 스테이징 경로와 같은 커널·같은 순서(층 4주기).
+    fn chain_device(&mut self, slot: usize, embed_row: &[f32]) -> Result<CUdeviceptr, String> {
+        let _g = self.cc.guard()?;
+        if embed_row.len() != self.hidden || slot >= self.n_slots {
+            return Err("forward_device: 임베딩 폭/슬롯 계약 위반".into());
+        }
+        let pos = self.slot_pos[slot];
+        let cap = self.attn.ok_or("attn: 형상 미등록")?.cap;
+        if pos as usize >= cap {
+            return Err(format!(
+                "context overflow: slot{slot} pos={pos} >= kvcap={cap}"
+            ));
+        }
+        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.is_none() {
+            return Err("forward_device: 디코더 상수 미등록".into());
+        }
+        self.ensure_chain_bufs()?;
+        let row =
+            unsafe { std::slice::from_raw_parts(embed_row.as_ptr() as *const u8, self.hidden * 4) };
+        self.cc.h2d_async(self.dres, row)?;
+        let [s0, s1, s1b, s2, s3] = self.dchain;
+        let (w0, w1, w2) = (self.stg_w0, self.stg_w1, self.stg_w2);
+        let mut ab = self.dab_dev;
+        let mut gi = 0usize;
+        for il in 0..self.n_layers {
+            let xn = self
+                .norm_resid_dev(2 * il, self.dres, ab, 1)
+                .map_err(|e| format!("L{il} input norm: {e}"))?;
+            let branch = if (il + 1) % 4 == 0 {
+                self.gemv_stage(&format!("blk.{il}.attn_q.weight"), xn, s0, w0)
+                    .map_err(|e| format!("L{il} q: {e}"))?;
+                self.gemv_stage(&format!("blk.{il}.attn_k.weight"), xn, s1, w1)
+                    .map_err(|e| format!("L{il} k: {e}"))?;
+                self.gemv_stage(&format!("blk.{il}.attn_v.weight"), xn, s1b, w1)
+                    .map_err(|e| format!("L{il} v: {e}"))?;
+                self.attn_chain_dev_run(slot, il / 4, 1, s0, s1, s1b)
+                    .map_err(|e| format!("L{il} attn: {e}"))?
+            } else {
+                self.gemv_stage(&format!("blk.{il}.attn_qkv.weight"), xn, s0, w0)
+                    .map_err(|e| format!("L{il} qkv: {e}"))?;
+                self.gemv_stage(&format!("blk.{il}.attn_gate.weight"), xn, s1, w1)
+                    .map_err(|e| format!("L{il} z: {e}"))?;
+                let g = self
+                    .gdn_chain_dev_run(slot, gi, 1, xn, s0, s1)
+                    .map_err(|e| format!("L{il} gdn: {e}"))?;
+                gi += 1;
+                g
+            };
+            let lo = if (il + 1) % 4 == 0 {
+                format!("blk.{il}.attn_output.weight")
+            } else {
+                format!("blk.{il}.ssm_out.weight")
+            };
+            let out = self
+                .gemv_dev(&lo, branch)
+                .map_err(|e| format!("L{il} {lo}: {e}"))?;
+            let xn2 = self
+                .norm_resid_dev(2 * il + 1, self.dres, out, 1)
+                .map_err(|e| format!("L{il} post norm: {e}"))?;
+            self.gemv_stage(&format!("blk.{il}.ffn_gate.weight"), xn2, s0, w0)
+                .map_err(|e| format!("L{il} gate: {e}"))?;
+            self.gemv_stage(&format!("blk.{il}.ffn_up.weight"), xn2, s1, w1)
+                .map_err(|e| format!("L{il} up: {e}"))?;
+            self.ew_dev(s0, s1, s2, w2)?;
+            let down = self
+                .gemv_dev(&format!("blk.{il}.ffn_down.weight"), s2)
+                .map_err(|e| format!("L{il} down: {e}"))?;
+            self.cc.d2d(s3, down, self.hidden * 4)?;
+            ab = s3;
+            if self.debug_layers {
+                let mut db = vec![0u8; self.hidden * 4];
+                let mut abv = vec![0u8; self.hidden * 4];
+                self.cc.d2h(&mut db, self.dres)?;
+                self.cc.d2h(&mut abv, ab)?;
+                self.cc.sync()?;
+                let d: f64 = db
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c) as f64)
+                    .sum();
+                let a: f64 = abv
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c) as f64)
+                    .sum();
+                eprintln!("  G{il:>2} recr={} sum={:.6}", (il + 1) % 4 != 0, d + a);
+            }
+        }
+        let xn_final = self
+            .norm_resid_dev(2 * self.n_layers, self.dres, ab, 1)
+            .map_err(|e| format!("final norm: {e}"))?;
+        Ok(xn_final)
+    }
+
+    /// 1토큰 forward(디바이스 체인) — 최종 xn까지 판독(CPU head용).
+    /// guard는 래퍼 전체를 덮는다 — 체인 이후의 d2h/h2d도 같은 스레드
+    /// 컨텍스트가 필요하다(CtxGuard는 드랍 시 이전 컨텍스트로 복원).
+    pub fn forward_device(&mut self, slot: usize, embed_row: &[f32]) -> Result<Vec<f32>, String> {
+        let _g = self.cc.guard()?;
+        let pos = self.slot_pos[slot];
+        let xn_final = self.chain_device(slot, embed_row)?;
+        let mut ob = vec![0u8; self.hidden * 4];
+        self.cc.d2h(&mut ob, xn_final)?;
+        self.cc.sync()?;
+        self.slot_pos[slot] = pos + 1;
+        self.attn_set_pos(slot, pos + 1)?;
+        Ok(unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, self.hidden) }.to_vec())
+    }
+
+    /// bf16 head(output.weight) 상주 업로드 — head_bf16 GEMV.
+    pub fn upload_head(&mut self, data: &[u8], n: usize, k: usize) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        let need = n * k * 2;
+        if n == 0 || k == 0 || data.len() < need {
+            return Err(format!(
+                "upload_head: 형상 계약 위반 n={n} k={k} bytes={} < {need}",
+                data.len()
+            ));
+        }
+        for p in [self.head_w, self.head_out] {
+            if p != 0 {
+                self.cc.free(p)?;
+            }
+        }
+        self.head_w = self.cc.alloc(need)?;
+        Self::h2d_chunked(&self.cc, self.head_w, &data[..need])?;
+        self.head_out = self.cc.alloc(n * 4)?;
+        self.head_n = n;
+        self.head_k = k;
+        Ok(())
+    }
+
+    /// 1토큰 forward + GPU head — xn 판독 없이 로짓만 회수(왕복 1회).
+    pub fn forward_device_head(
+        &mut self,
+        slot: usize,
+        embed_row: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        if self.head_w == 0 {
+            return Err("forward_device_head: head 미등록 — upload_head 선행".into());
+        }
+        let _g = self.cc.guard()?;
+        let pos = self.slot_pos[slot];
+        let xn = self.chain_device(slot, embed_row)?;
+        let f = self.cc.function("head_bf16")?;
+        let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn, self.head_out);
+        let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
+        let mut args: [*mut std::ffi::c_void; 5] = [
+            (&mut p_w) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_o) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+        ];
+        self.cc
+            .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
+        let mut ob = vec![0u8; self.head_n * 4];
+        self.cc.d2h(&mut ob, self.head_out)?;
+        self.cc.sync()?;
+        self.slot_pos[slot] = pos + 1;
+        self.attn_set_pos(slot, pos + 1)?;
+        Ok(ob
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
     }
 }

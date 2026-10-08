@@ -210,6 +210,26 @@ impl CudaCtx {
         Ok(())
     }
 
+    /// 호스트→디바이스 복사(비동기 — 기본 스트림 순서 계약). 페이지러블
+    /// 소스는 드라이버가 반환 전 스테이징하므로 호출 내 수명이면 충분하다.
+    /// 목적지가 커널 입력이면 같은 스트림 순서로 보이고, 관측 전에는 동기
+    /// d2h/스트림 동기화가 온다.
+    pub fn h2d_async(&self, dst: CUdeviceptr, src: &[u8]) -> Result<(), String> {
+        // SAFETY: dst는 alloc이 돌려준 유효 할당, src는 호출 내 수명(스테이징 계약).
+        unsafe {
+            let r =
+                (self.drv.memcpy_htod_async)(dst, src.as_ptr() as *const _, src.len(), self.stream);
+            if r != CUDA_SUCCESS {
+                return Err(format!(
+                    "rawcuda: cuMemcpyHtoDAsync({}B): {}",
+                    src.len(),
+                    ffi::err_text(r)
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// 디바이스→호스트 복사(동기).
     pub fn d2h(&self, dst: &mut [u8], src: CUdeviceptr) -> Result<(), String> {
         // SAFETY: src는 유효 할당, dst는 호출자 소유 버퍼(길이 일치 계약).
@@ -226,14 +246,17 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// 디바이스→디바이스 복사(동기). 호스트 왕복 없는 체인의 기본 이동.
+    /// 디바이스→디바이스 복사(비동기 — 기본 스트림 순서 계약). 동기
+    /// DtoD는 호출마다 스트림을 배수해 디바이스 체인(토큰당 수백 회)에서
+    /// GP 유휴를 만든다(2026-10-08 실측). 목적지를 관측하는 쪽은 항상
+    /// 같은 스트림의 커널 또는 동기 d2h이므로 순서만 보장되면 된다.
     pub fn d2d(&self, dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> Result<(), String> {
         // SAFETY: 두 포인터 모두 alloc이 돌려준 유효 할당, 범위는 호출자 계약.
         unsafe {
-            let r = (self.drv.memcpy_dtod)(dst, src, bytes);
+            let r = (self.drv.memcpy_dtod_async)(dst, src, bytes, self.stream);
             if r != CUDA_SUCCESS {
                 return Err(format!(
-                    "rawcuda: cuMemcpyDtoD({bytes}B): {}",
+                    "rawcuda: cuMemcpyDtoDAsync({bytes}B): {}",
                     ffi::err_text(r)
                 ));
             }

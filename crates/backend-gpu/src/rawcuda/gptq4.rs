@@ -33,8 +33,38 @@ impl Gptq4 {
 
     pub fn new() -> Result<Self, String> {
         let mut cc = CudaCtx::new()?;
-        cc.load_fatbin("gptq4", &Self::fatbin_bytes()?, &["w4a16_gemm_g128"])?;
+        cc.load_fatbin(
+            "gptq4",
+            &Self::fatbin_bytes()?,
+            &["w4a16_gemm_g128", "w4a16_gemv_g128"],
+        )?;
         Ok(Gptq4 { cc })
+    }
+
+    /// f16 비트 → f32(정확 — 커널 h2f와 동일 값). t=1 GEMV의 x32 사전변환용.
+    fn h2f(h: u16) -> f32 {
+        let sign = ((h >> 15) as u32) << 31;
+        let e = ((h >> 10) & 0x1F) as u32;
+        let m = (h & 0x3FF) as u32;
+        let bits = if e == 0 {
+            if m == 0 {
+                sign
+            } else {
+                // 서브노멀 정규화.
+                let mut ee = 127 - 15 + 1;
+                let mut f = m;
+                while f & 0x400 == 0 {
+                    f <<= 1;
+                    ee -= 1;
+                }
+                sign | ((ee as u32) << 23) | ((f & 0x3FF) << 13)
+            }
+        } else if e == 0x1F {
+            sign | (0xFF << 23) | (m << 13)
+        } else {
+            sign | ((e + 112) << 23) | (m << 13)
+        };
+        f32::from_bits(bits)
     }
 
     /// GEMV(t=1) — x f16 [k] → out f32 [n].
@@ -83,9 +113,38 @@ impl Gptq4 {
         let ds = self.cc.alloc(s.len() * 2)?;
         let dx = self.cc.alloc(x.len() * 2)?;
         let dout = self.cc.alloc(t * n * 4)?;
+        // t=1은 행=블록 GEMV(x32 사전변환), t≥2는 구 GEMM 커널.
+        let dx32 = if t == 1 { self.cc.alloc(k * 4)? } else { 0 };
         let r = (|| {
             self.cc.h2d(dq, bytes_u32(q))?;
             self.cc.h2d(ds, bytes_u16(s))?;
+            if t == 1 {
+                let xf: Vec<f32> = x.iter().map(|&h| Self::h2f(h)).collect();
+                let xb =
+                    unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
+                self.cc.h2d(dx32, xb)?;
+                let f = self.cc.function("w4a16_gemv_g128")?;
+                let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx32, dout);
+                let (mut p_n, mut p_k) = (n as i32, k as i32);
+                let mut args: [*mut c_void; 6] = [
+                    &mut p_q as *mut _ as *mut c_void,
+                    &mut p_s as *mut _ as *mut c_void,
+                    &mut p_x as *mut _ as *mut c_void,
+                    &mut p_y as *mut _ as *mut c_void,
+                    &mut p_n as *mut _ as *mut c_void,
+                    &mut p_k as *mut _ as *mut c_void,
+                ];
+                self.cc.launch(f, n as u32, 1, 64, &mut args)?;
+                self.cc.sync()?;
+                let mut ob = vec![0u8; n * 4];
+                self.cc.d2h(&mut ob, dout)?;
+                return Ok(ob
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect::<Vec<f32>>());
+            }
             self.cc.h2d(dx, bytes_u16(x))?;
             let f = self.cc.function("w4a16_gemm_g128")?;
             let (mut p_q, mut p_s, mut p_x, mut p_out) = (dq, ds, dx, dout);
@@ -115,6 +174,9 @@ impl Gptq4 {
         let _ = self.cc.free(ds);
         let _ = self.cc.free(dx);
         let _ = self.cc.free(dout);
+        if dx32 != 0 {
+            let _ = self.cc.free(dx32);
+        }
         r
     }
 }

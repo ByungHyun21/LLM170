@@ -67,8 +67,23 @@ pub type CuMemcpyDtoHFn =
 /// cuMemcpyDtoD_v2 — 디바이스 내 복사. 호스트 왕복 없는 디바이스 체인의
 /// 필수 요소: GEMV 입출력을 상주 버퍼 사이에
 /// 직접 옮긴다.
-pub type CuMemcpyDtoDFn =
-    unsafe extern "system" fn(dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> CUresult;
+/// cuMemcpyHtoDAsync_v2 — 4바이트 위치 갱신 등 상습 소형 업로드용.
+/// 동기 HtoD는 호출마다 스트림 배수(체인에서 층당 8ms 실측).
+pub type CuMemcpyHtoDAsyncFn = unsafe extern "system" fn(
+    dst: CUdeviceptr,
+    src: *const c_void,
+    bytes: usize,
+    stream: CUstream,
+) -> CUresult;
+/// cuMemcpyDtoDAsync_v2 — 디바이스 체인 핫패스용. 동기 DtoD는 호출마다
+/// 스트림을 배수해 체인(토큰당 수백 회 복사)에서 GP가 놀게 된다
+/// (2026-10-08 실측: 체인 189ms/토큰 → 비동기 전환으로 왕복 제거).
+pub type CuMemcpyDtoDAsyncFn = unsafe extern "system" fn(
+    dst: CUdeviceptr,
+    src: CUdeviceptr,
+    bytes: usize,
+    stream: CUstream,
+) -> CUresult;
 pub type CuLaunchKernelFn = unsafe extern "system" fn(
     f: CUfunction,
     gx: c_uint,
@@ -107,8 +122,9 @@ pub(crate) struct Driver {
     pub module_get_function: CuModuleGetFunctionFn,
     pub mem_alloc: CuMemAllocFn,
     pub memcpy_htod: CuMemcpyHtoDFn,
+    pub memcpy_htod_async: CuMemcpyHtoDAsyncFn,
     pub memcpy_dtoh: CuMemcpyDtoHFn,
-    pub memcpy_dtod: CuMemcpyDtoDFn,
+    pub memcpy_dtod_async: CuMemcpyDtoDAsyncFn,
     pub launch_kernel: CuLaunchKernelFn,
     pub stream_synchronize: CuStreamSynchronizeFn,
     pub mem_free: CuMemFreeFn,
@@ -171,11 +187,14 @@ impl Driver {
                 memcpy_htod: std::mem::transmute::<*mut c_void, CuMemcpyHtoDFn>(sym!(
                     "cuMemcpyHtoD_v2"
                 )),
+                memcpy_htod_async: std::mem::transmute::<*mut c_void, CuMemcpyHtoDAsyncFn>(sym!(
+                    "cuMemcpyHtoDAsync_v2"
+                )),
                 memcpy_dtoh: std::mem::transmute::<*mut c_void, CuMemcpyDtoHFn>(sym!(
                     "cuMemcpyDtoH_v2"
                 )),
-                memcpy_dtod: std::mem::transmute::<*mut c_void, CuMemcpyDtoDFn>(sym!(
-                    "cuMemcpyDtoD_v2"
+                memcpy_dtod_async: std::mem::transmute::<*mut c_void, CuMemcpyDtoDAsyncFn>(sym!(
+                    "cuMemcpyDtoDAsync_v2"
                 )),
                 launch_kernel: std::mem::transmute::<*mut c_void, CuLaunchKernelFn>(sym!(
                     "cuLaunchKernel"
