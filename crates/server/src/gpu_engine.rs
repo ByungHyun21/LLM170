@@ -170,15 +170,19 @@ impl GpuEngine {
             return self.dec.forward_device_head(slot, row);
         }
         let xn = self.forward(slot, row)?;
-        Ok(self.head_logits(&xn))
+        self.head_logits(&xn)
     }
 
     /// head 로짓 — CPU 참조 경로(bf16 디퀀트 f32 내적, 골든과 동일 계급).
-    fn head_logits(&self, xn: &[f32]) -> Vec<f32> {
-        let head = self.model.w("output.weight").expect("output.weight 계약");
+    /// A9: 로더가 보증하더라도 패닉 대신 Result — 서버 오류 응답으로 유도.
+    fn head_logits(&self, xn: &[f32]) -> Result<Vec<f32>, String> {
+        let head = self
+            .model
+            .w("output.weight")
+            .ok_or_else(|| "output.weight 부재 — head 계약 위반".to_string())?;
         let mut lg = vec![0.0f32; head.n_out as usize];
         llm170_core::matmul::matmul(xn, &head, &mut lg);
-        lg
+        Ok(lg)
     }
 
     /// 시퀀스 prefill(토큰 순차 forward) → 마지막 로짓.
@@ -194,7 +198,9 @@ impl GpuEngine {
                 self.forward(seq, &row)?;
             }
         }
-        Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]))
+        // A10: 빈 프롬프트는 조용한 제로 로짓 대신 명시 오류(조용한 오염 금지 —
+        // infer.rs 거부 표면과 일치).
+        last.ok_or_else(|| "prefill: 빈 프롬프트 — 토큰 1개 이상 필요".to_string())
     }
 
     /// 배치 디코드 — seq별 1토큰 forward → 로짓.
