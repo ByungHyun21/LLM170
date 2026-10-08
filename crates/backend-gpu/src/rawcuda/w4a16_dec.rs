@@ -199,6 +199,18 @@ pub struct W4a16Dec {
     moe_tab: Vec<(u64, u64, u64, u64)>,
     /// 전문가 상주 모드 — moe_tab이 VRAM 포인터(170HX 64GB 등).
     moe_resident: bool,
+    /// 전문가 디바이스 포인터 테이블(상주 — 배치 GEMV 간접 참조, (q,s) 쌍).
+    moe_dev_tab: CUdeviceptr,
+    /// 선택 슬롯 인덱스·가중(호스트 → 디바이스, [top_k]).
+    moe_idx: CUdeviceptr,
+    moe_wt: CUdeviceptr,
+    /// 배치 전문가 출력([top_k][n_ff] · [top_k][hidden]) — act는 ew 전용
+    /// 별도 버퍼(ew 커널 __restrict__ 계약 — 제자리 호출 금지).
+    dexp_gate: CUdeviceptr,
+    dexp_up: CUdeviceptr,
+    dexp_act: CUdeviceptr,
+    dexp_dn: CUdeviceptr,
+    dexp_cap: usize,
     /// MoE 스테이징 — 전문가 packed/scale(1쌍 재사용, 스트림 순서 안전).
     dstg_q: CUdeviceptr,
     dstg_s: CUdeviceptr,
@@ -328,6 +340,9 @@ impl W4a16Dec {
                 "w4a16_cast_x32",
                 "w4a16_axpy",
                 "w4a16_shared_add",
+                "w4a16_gemv_experts_g32_bf16",
+                "w4a16_moe_accum",
+                "w4a16_gemv_bf16",
             ],
         )?;
         cc.load_fatbin(
@@ -413,6 +428,14 @@ impl W4a16Dec {
             moe_scale_bf16: true,
             moe_tab: Vec::new(),
             moe_resident: false,
+            moe_dev_tab: 0,
+            moe_idx: 0,
+            moe_wt: 0,
+            dexp_gate: 0,
+            dexp_up: 0,
+            dexp_act: 0,
+            dexp_dn: 0,
+            dexp_cap: 0,
             dstg_q: 0,
             dstg_s: 0,
             dstg_cap: (0, 0),
@@ -1654,36 +1677,11 @@ impl W4a16Dec {
                 data.len()
             ));
         }
-        // 전치 업로드 — head와 동일(head_transpose 커널).
-        let dtmp = self.cc.alloc(need)?;
-        if let Err(e) = Self::h2d_chunked(&self.cc, dtmp, &data[..need]) {
-            let _ = self.cc.free(dtmp);
-            return Err(e);
-        }
+        // [n][k] 원본 그대로 — w4a16_gemv_bf16(행=블록) 계약(전치 없음).
         let dw = self.cc.alloc(need)?;
-        let tr = (|| -> Result<(), String> {
-            let f = self.cc.function("head_transpose")?;
-            let (mut p_in, mut p_out) = (dtmp, dw);
-            let (mut p_n, mut p_k) = (n as i32, k as i32);
-            let mut args: [*mut std::ffi::c_void; 4] = [
-                (&mut p_in) as *mut _ as *mut _,
-                (&mut p_out) as *mut _ as *mut _,
-                (&mut p_n) as *mut _ as *mut _,
-                (&mut p_k) as *mut _ as *mut _,
-            ];
-            self.cc.launch(
-                f,
-                k.div_ceil(32) as u32,
-                n.div_ceil(32) as u32,
-                1024,
-                &mut args,
-            )?;
-            self.cc.sync()
-        })();
-        let _ = self.cc.free(dtmp);
-        if let Err(e) = tr {
+        if let Err(e) = Self::h2d_chunked(&self.cc, dw, &data[..need]) {
             let _ = self.cc.free(dw);
-            return Err(format!("upload_plain({name}) 전치: {e}"));
+            return Err(e);
         }
         if let Some((old, _, _)) = self.plains.insert(name.to_string(), (dw, n, k)) {
             let _ = self.cc.free(old);
@@ -1732,8 +1730,8 @@ impl W4a16Dec {
             .ok_or_else(|| format!("상주 플레인 없음: {name}"))
     }
 
-    /// bf16 GEMV(head_bf16 재사용 — k직렬 f32 행 내적, CPU 참조와 동일 순서).
-    /// x는 **원시 f32**(h2f 왕복 아님 — 플레인 경로 계약).
+    /// bf16 GEMV — 행=블록(w4a16_gemv_bf16), x는 **원시 f32**(h2f 왕복 없음).
+    /// 플레인 경로 판정은 토큰 수준(골든) — split 경로의 레인/환원 구조 미러.
     fn plain_gemv_launch(
         &self,
         name: &str,
@@ -1741,7 +1739,7 @@ impl W4a16Dec {
         out_dev: CUdeviceptr,
     ) -> Result<(), String> {
         let (w, n, k) = self.plain_spec(name)?;
-        let f = self.cc.function("head_bf16")?;
+        let f = self.cc.function("w4a16_gemv_bf16")?;
         let (mut p_w, mut p_x, mut p_o) = (w, x_dev, out_dev);
         let (mut p_n, mut p_k) = (n as i32, k as i32);
         let mut args: [*mut std::ffi::c_void; 5] = [
@@ -1751,8 +1749,7 @@ impl W4a16Dec {
             (&mut p_n) as *mut _ as *mut _,
             (&mut p_k) as *mut _ as *mut _,
         ];
-        self.cc
-            .launch(f, n.div_ceil(4 * 256) as u32, 1, 256, &mut args)
+        self.cc.launch(f, n as u32, 1, 64, &mut args)
     }
 
     /// 플레인 GEMV → 스테이징 dst 직접 쓰기 + 폭 검사.
@@ -1862,6 +1859,23 @@ impl W4a16Dec {
             }
             return Err(err);
         }
+        // 디바이스 포인터 테이블 — (q,s) 쌍 평탄 배열(커널 간접 참조).
+        let mut flat: Vec<u64> = Vec::with_capacity(dev_tab.len() * 2);
+        for e in &dev_tab {
+            flat.push(e.0);
+            flat.push(e.2);
+        }
+        let fb = unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 8) };
+        if self.moe_dev_tab != 0 {
+            let _ = self.cc.free(self.moe_dev_tab);
+            self.moe_dev_tab = 0;
+        }
+        let dtab = self.cc.alloc(flat.len() * 8)?;
+        if let Err(e) = Self::h2d_chunked(&self.cc, dtab, fb) {
+            let _ = self.cc.free(dtab);
+            return Err(e);
+        }
+        self.moe_dev_tab = dtab;
         self.moe_tab = dev_tab;
         self.moe_resident = true;
         Ok(())
@@ -1916,8 +1930,89 @@ impl W4a16Dec {
         self.dstg_cap = (pk, sk);
         self.drt_cap = n_exp;
         self.dmo_cap = h;
+        // 배치 전문가 출력([top_k][n_ff]·[top_k][h]) + 슬롯 idx/가중(상주 전용).
+        let tk = self.top_k.max(1);
+        if self.dexp_cap < tk {
+            for p in [self.dexp_gate, self.dexp_up, self.dexp_act, self.dexp_dn] {
+                if p != 0 {
+                    self.cc.free(p)?;
+                }
+            }
+            self.dexp_gate = 0;
+            self.dexp_up = 0;
+            self.dexp_act = 0;
+            self.dexp_dn = 0;
+            self.dexp_cap = 0;
+            self.dexp_gate = self.cc.alloc(tk * n_ff * 4)?;
+            self.dexp_up = self.cc.alloc(tk * n_ff * 4)?;
+            self.dexp_act = self.cc.alloc(tk * n_ff * 4)?;
+            self.dexp_dn = self.cc.alloc(tk * h * 4)?;
+            self.dexp_cap = tk;
+        }
+        for p in [self.moe_idx, self.moe_wt] {
+            if p != 0 {
+                self.cc.free(p)?;
+            }
+        }
+        self.moe_idx = 0;
+        self.moe_wt = 0;
+        self.moe_idx = self.cc.alloc(tk * 4)?;
+        self.moe_wt = self.cc.alloc(tk * 4)?;
         self.moe_bufs_ok = true;
         Ok(())
+    }
+
+    /// 배치 전문가 GEMV(상주) — tab 간접 참조, grid = n × nslots.
+    /// xstride = 0(x 공통) 또는 k(슬롯별 활성 [nslots][k]).
+    fn gemv_experts_launch(
+        &self,
+        base: usize,
+        nslots: usize,
+        x_dev: CUdeviceptr,
+        xstride: usize,
+        out_dev: CUdeviceptr,
+        n: usize,
+        k: usize,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_gemv_experts_g32_bf16")?;
+        let (mut p_t, mut p_b, mut p_i, mut p_ns) =
+            (self.moe_dev_tab, base as i32, self.moe_idx, nslots as i32);
+        let (mut p_x, mut p_xs, mut p_o, mut p_n, mut p_k) =
+            (x_dev, xstride as i32, out_dev, n as i32, k as i32);
+        let mut args: [*mut std::ffi::c_void; 9] = [
+            (&mut p_t) as *mut _ as *mut _,
+            (&mut p_b) as *mut _ as *mut _,
+            (&mut p_i) as *mut _ as *mut _,
+            (&mut p_ns) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_xs) as *mut _ as *mut _,
+            (&mut p_o) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, (n * nslots) as u32, 1, 64, &mut args)
+    }
+
+    /// 선택 순서 가중 누적 — y += Σ_s w[s]·d[s][i].
+    fn moe_accum_dev(
+        &mut self,
+        w_dev: CUdeviceptr,
+        d_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        nslots: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_moe_accum")?;
+        let (mut p_w, mut p_d, mut p_y) = (w_dev, d_dev, y_dev);
+        let (mut p_ns, mut nn) = (nslots as i32, n as i32);
+        let mut args: [*mut std::ffi::c_void; 5] = [
+            (&mut p_w) as *mut _ as *mut _,
+            (&mut p_d) as *mut _ as *mut _,
+            (&mut p_y) as *mut _ as *mut _,
+            (&mut p_ns) as *mut _ as *mut _,
+            (&mut nn) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, n.div_ceil(256) as u32, 1, 256, &mut args)
     }
 
     /// 가중 누적 — y += w·x.
@@ -1982,18 +2077,40 @@ impl W4a16Dec {
             .map(|c| f32::from_le_bytes(*c))
             .collect();
         let sel = moe_topk(&logits, top_k);
-        // 2) 전문가 스트리밍 GEMV — 스테이징 1쌍 재사용(스트림 순서 안전).
+        // 2) 전문가 — 상주: 배치 GEMV(디바이스 테이블 간접) / 비상주: 스트리밍.
         Self::zero_dev(&self.cc, self.dmo, h * 4)?;
-        for &(e, w) in &sel {
-            let base = (il * n_exp + e) * 3;
-            for (pi, out) in [(0usize, s0), (1usize, s1)] {
-                let entry = self.moe_tab[base + pi];
-                self.expert_gemv(entry, n_ff, h, xn, out)?;
+        if self.moe_resident {
+            let ns = sel.len();
+            let idx: Vec<u32> = sel.iter().map(|&(e, _)| e as u32).collect();
+            let wts: Vec<f32> = sel.iter().map(|&(_, w)| w).collect();
+            // SAFETY: 호스트 Vec 슬라이스 — 호출 내 수명(동기 복사 완료).
+            let ib =
+                unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len() * 4) };
+            let wb =
+                unsafe { std::slice::from_raw_parts(wts.as_ptr() as *const u8, wts.len() * 4) };
+            // 캡처/체인과 같은 스트림 순서(레거시 h2d는 비블로킹 스트림과
+            // 순서 보장이 없다 — 실측 회귀 원인).
+            self.cc.h2d_async(self.moe_idx, ib)?;
+            self.cc.h2d_async(self.moe_wt, wb)?;
+            // gate/up 배치 → ew(제자리 = gate에 act) → down 배치 → 가중 누적.
+            let base = il * n_exp * 3;
+            self.gemv_experts_launch(base, ns, xn, 0, self.dexp_gate, n_ff, h)?;
+            self.gemv_experts_launch(base + 1, ns, xn, 0, self.dexp_up, n_ff, h)?;
+            self.ew_dev(self.dexp_gate, self.dexp_up, self.dexp_act, ns * n_ff)?;
+            self.gemv_experts_launch(base + 2, ns, self.dexp_act, n_ff, self.dexp_dn, h, n_ff)?;
+            self.moe_accum_dev(self.moe_wt, self.dexp_dn, self.dmo, ns, h)?;
+        } else {
+            for &(e, w) in &sel {
+                let base = (il * n_exp + e) * 3;
+                for (pi, out) in [(0usize, s0), (1usize, s1)] {
+                    let entry = self.moe_tab[base + pi];
+                    self.expert_gemv(entry, n_ff, h, xn, out)?;
+                }
+                self.ew_dev(s0, s1, s2, n_ff)?;
+                let entry = self.moe_tab[base + 2];
+                self.expert_gemv(entry, h, n_ff, s2, s3)?;
+                self.axpy_dev(w, s3, self.dmo, h)?;
             }
-            self.ew_dev(s0, s1, s2, n_ff)?;
-            let entry = self.moe_tab[base + 2];
-            self.expert_gemv(entry, h, n_ff, s2, s3)?;
-            self.axpy_dev(w, s3, self.dmo, h)?;
         }
         // 3) shared — sigmoid(sgate·xn)·down(silu(gate·xn)·up·xn).
         if self.shared_ffn > 0 {
@@ -2006,6 +2123,77 @@ impl W4a16Dec {
             self.shared_add_dev(self.drt, s3, self.dmo, h)?;
         }
         Ok(self.dmo)
+    }
+
+    /// MoE 자가 점검 — 직접 GEMV vs 배치(간접) GEMV 비트 비교(층0·전문가0·
+    /// gate_proj). 상주 기기 브링업·회귀 판정용.
+    pub fn moe_selfcheck(&mut self) -> Result<String, String> {
+        if !self.moe_resident || self.n_experts == 0 {
+            return Err("moe_selfcheck: 상주 MoE 구성 필요".into());
+        }
+        let _g = self.cc.guard()?;
+        self.ensure_moe_bufs()?;
+        let k = self.hidden;
+        let n = self.moe_ffn;
+        if self.moe_tab.is_empty() {
+            return Err("moe_selfcheck: 테이블 부재".into());
+        }
+        // x — 결정적(splitmix64 계열 상수) ±0.5.
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 2048.0 - 0.5)
+            .collect();
+        let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        let dx = self.cc.alloc(k * 4)?;
+        let da = self.cc.alloc(n * 4)?;
+        let db = self.cc.alloc(n * 4)?;
+        let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
+            self.cc.h2d(dx, xb)?;
+            // 직접 — moe_tab[0] = (층0, 전문가0, gate_proj).
+            let e0 = self.moe_tab[0];
+            self.gemv_launch_raw(e0.0, e0.2, n, k, dx, da)?;
+            // 배치 — idx=[0], base=0, nslots=1.
+            let idx = [0u32];
+            let ib = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, 4) };
+            self.cc.h2d(self.moe_idx, ib)?;
+            self.gemv_experts_launch(0, 1, dx, 0, db, n, k)?;
+            self.cc.sync()?;
+            let mut a = vec![0u8; n * 4];
+            let mut b = vec![0u8; n * 4];
+            self.cc.d2h(&mut a, da)?;
+            self.cc.d2h(&mut b, db)?;
+            let fa: Vec<f32> = a
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            let fb: Vec<f32> = b
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            Ok((fa, fb))
+        })();
+        let _ = self.cc.free(dx);
+        let _ = self.cc.free(da);
+        let _ = self.cc.free(db);
+        let (fa, fb) = r?;
+        let mism = fa
+            .iter()
+            .zip(fb.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let maxd = fa
+            .iter()
+            .zip(fb.iter())
+            .map(|(a, b)| (a - b).abs() as f64)
+            .fold(0.0f64, f64::max);
+        Ok(format!(
+            "moe-selfcheck: 직접 vs 배치 n={n} k={k} — 불일치 {mism}/{n} maxdiff={maxd:.3e} (head A={:?} B={:?})",
+            &fa[..3],
+            &fb[..3]
+        ))
     }
 
     /// 노름 1회(디바이스 x·ab) — xn은 self.dxn(다음 노름이 덮는다).

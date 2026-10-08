@@ -8,7 +8,8 @@
 #   3. C(27B): serve HTTP 종단 — 배너 runtime=cuda + 골든 접두.
 #   4. D(35B-A3B INT4 g32): 참조(CPU) MoE 오라클 — W4-1(2026-10-08) g32/bf16
 #      전문가 + 라우터 top-8·shared 게이트. 골든 접두 일치 + 로드 완전성.
-#   5. E(FN FP8PLE): 자원 가드 명시 거부(120GiB > 호스트).
+#   5. D2(35B) GPU 체인(MoE) — w4a16-gpu 골든 접두(플레인 bf16 + 전문가 상주).
+#   6. E(FN FP8PLE): 자원 가드 명시 거부(120GiB > 호스트).
 # 사용법: scripts/swap_models.sh
 set -u
 cd "$(dirname "$0")/.."
@@ -29,7 +30,7 @@ fail=0
 note() { echo "[w4a16] $*"; }
 
 # ── 1. A(27B) 참조 토큰 ──
-note "[1/5] A(27B) 참조 실행 — w4a16-ref"
+note "[1/6] A(27B) 참조 실행 — w4a16-ref"
 timeout 900 "$BIN" w4a16-ref "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/a.out" 2> "$RUN/a.log"
 A=$(grep -m1 '^tokens:' "$RUN/a.out" | sed 's/^tokens: //')
@@ -40,7 +41,7 @@ case "$A" in
 esac
 
 # ── 2. B(27B) GPU 체인 ──
-note "[2/5] B(27B) GPU 체인 — w4a16-gpu"
+note "[2/6] B(27B) GPU 체인 — w4a16-gpu"
 timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/b.out" 2> "$RUN/b.log"
 B=$(grep -m1 '^ tokens:' "$RUN/b.out" | sed 's/^ tokens: //')
@@ -51,7 +52,7 @@ case "$B" in
 esac
 
 # ── 3. C(27B) serve HTTP 종단 ──
-note "[3/5] C(27B) serve HTTP — runtime=cuda + 골든 접두"
+note "[3/6] C(27B) serve HTTP — runtime=cuda + 골든 접두"
 : > "$RUN/c.log"
 "$BIN" serve --model "$M_27B" --ctx 1024 --slots 1 --port "$PORT" > "$RUN/c.log" 2>&1 &
 SERVE_PID=$!
@@ -84,7 +85,7 @@ case "$C" in
 esac
 
 # ── 4. D(35B INT4 g32) 참조 오라클(W4-1 MoE) ──
-note "[4/5] D(35B INT4 g32) 참조 실행 — w4a16-ref (MoE g32/bf16)"
+note "[4/6] D(35B INT4 g32) 참조 실행 — w4a16-ref (MoE g32/bf16)"
 timeout 2400 "$BIN" w4a16-ref "$M_35B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/d.out" 2> "$RUN/d.log"
 D=$(grep -m1 '^tokens:' "$RUN/d.out" | sed 's/^tokens: //')
@@ -94,8 +95,19 @@ case "$D" in
   *) echo "[w4a16] FAIL: 35B 골든 불일치: $(echo "$D" | head -c 60)"; fail=1;;
 esac
 
-# ── 5. E(FN FP8PLE) 자원 가드 명시 거부 ──
-note "[5/5] E(FN FP8PLE) 자원 가드 명시 거부 판정"
+# ── 5. D2(35B INT4 g32) GPU 체인(MoE) ──
+note "[5/6] D2(35B) GPU 체인 — w4a16-gpu (MoE)"
+timeout 1800 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
+  > "$RUN/d2.out" 2> "$RUN/d2.log"
+D2=$(grep -m1 '^ tokens:' "$RUN/d2.out" | sed 's/^ tokens: //')
+case "$D2" in
+  "$GOLDEN35"*) note "35B GPU 토큰 OK: $(echo "$D2" | head -c 60)";;
+  "") echo "[w4a16] FAIL: 35B GPU 실패 — ${RUN}/d2.log"; fail=1;;
+  *) echo "[w4a16] FAIL: 35B GPU 골든 불일치: $(echo "$D2" | head -c 60)"; fail=1;;
+esac
+
+# ── 6. E(FN FP8PLE) 자원 가드 명시 거부 ──
+note "[6/6] E(FN FP8PLE) 자원 가드 명시 거부 판정"
 if timeout 60 "$BIN" w4a16-load "$M_FN" > "$RUN/e.log" 2>&1; then
   echo "[w4a16] FAIL: 가드가 통과시킴(120GiB) — ${RUN}/e.log"; fail=1
 elif grep -qE "insufficient resources|rsrc-guard" "$RUN/e.log"; then
@@ -105,7 +117,7 @@ else
 fi
 
 if [ $fail -eq 0 ]; then
-  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve / 35B MoE 참조 골든 / E 가드 거부)"
+  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve / 35B MoE 참조+GPU 골든 / E 가드 거부)"
 else
   echo "[w4a16] smoke: FAILURES PRESENT"
 fi
