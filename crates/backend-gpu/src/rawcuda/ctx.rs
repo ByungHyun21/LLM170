@@ -18,6 +18,12 @@ pub struct CudaCtx {
     pub stream: CUstream,
     modules: HashMap<&'static str, ffi::CUmodule>,
     fns: HashMap<&'static str, CUfunction>,
+    /// 복사 계측(모니터링) — 방향별 (바이트, ns, 호출). "최신 누적값"만.
+    /// ns는 API 호출 구간(동기 복사는 전송 시간 포함, 비동기는 스테이징/큐잉
+    /// 시간) — 유효 대역폭은 폴러가 벽시계 차분으로 계산한다.
+    copy_h2d: std::cell::Cell<(u64, u64, u64)>,
+    copy_d2h: std::cell::Cell<(u64, u64, u64)>,
+    copy_d2d: std::cell::Cell<(u64, u64, u64)>,
 }
 
 /// 컨텍스트 스코프 가드 — 진입 시 현재 컨텍스트를 이 ctx로 전환,
@@ -99,6 +105,9 @@ impl CudaCtx {
                 stream: std::ptr::null_mut(),
                 modules: HashMap::new(),
                 fns: HashMap::new(),
+                copy_h2d: std::cell::Cell::new((0, 0, 0)),
+                copy_d2h: std::cell::Cell::new((0, 0, 0)),
+                copy_d2d: std::cell::Cell::new((0, 0, 0)),
             })
         }
     }
@@ -196,6 +205,7 @@ impl CudaCtx {
 
     /// 호스트→디바이스 복사(동기).
     pub fn h2d(&self, dst: CUdeviceptr, src: &[u8]) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
         // SAFETY: dst는 alloc이 돌려준 유효 할당, src는 호출자 소유(호출 내 수명).
         unsafe {
             let r = (self.drv.memcpy_htod)(dst, src.as_ptr() as *const _, src.len());
@@ -207,6 +217,7 @@ impl CudaCtx {
                 ));
             }
         }
+        Self::bump(&self.copy_h2d, src.len(), t0.elapsed().as_nanos() as u64);
         Ok(())
     }
 
@@ -215,6 +226,7 @@ impl CudaCtx {
     /// 목적지가 커널 입력이면 같은 스트림 순서로 보이고, 관측 전에는 동기
     /// d2h/스트림 동기화가 온다.
     pub fn h2d_async(&self, dst: CUdeviceptr, src: &[u8]) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
         // SAFETY: dst는 alloc이 돌려준 유효 할당, src는 호출 내 수명(스테이징 계약).
         unsafe {
             let r =
@@ -227,11 +239,13 @@ impl CudaCtx {
                 ));
             }
         }
+        Self::bump(&self.copy_h2d, src.len(), t0.elapsed().as_nanos() as u64);
         Ok(())
     }
 
     /// 디바이스→호스트 복사(동기).
     pub fn d2h(&self, dst: &mut [u8], src: CUdeviceptr) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
         // SAFETY: src는 유효 할당, dst는 호출자 소유 버퍼(길이 일치 계약).
         unsafe {
             let r = (self.drv.memcpy_dtoh)(dst.as_mut_ptr() as *mut _, src, dst.len());
@@ -243,6 +257,7 @@ impl CudaCtx {
                 ));
             }
         }
+        Self::bump(&self.copy_d2h, dst.len(), t0.elapsed().as_nanos() as u64);
         Ok(())
     }
 
@@ -251,6 +266,7 @@ impl CudaCtx {
     /// GP 유휴를 만든다(2026-10-08 실측). 목적지를 관측하는 쪽은 항상
     /// 같은 스트림의 커널 또는 동기 d2h이므로 순서만 보장되면 된다.
     pub fn d2d(&self, dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
         // SAFETY: 두 포인터 모두 alloc이 돌려준 유효 할당, 범위는 호출자 계약.
         unsafe {
             let r = (self.drv.memcpy_dtod_async)(dst, src, bytes, self.stream);
@@ -261,6 +277,7 @@ impl CudaCtx {
                 ));
             }
         }
+        Self::bump(&self.copy_d2d, bytes, t0.elapsed().as_nanos() as u64);
         Ok(())
     }
 
@@ -409,6 +426,7 @@ impl CudaCtx {
     /// clippy allow — dst는 호출자가 보증하는 pinned 포인터(불투명 핸들 계약).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn d2h_async(&self, dst: *mut u8, src: CUdeviceptr, bytes: usize) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
         // SAFETY: dst는 pinned(호출자 계약), src는 유효 할당, 범위는 호출자 계약.
         unsafe {
             let r =
@@ -420,6 +438,7 @@ impl CudaCtx {
                 ));
             }
         }
+        Self::bump(&self.copy_d2h, bytes, t0.elapsed().as_nanos() as u64);
         Ok(())
     }
 
@@ -523,6 +542,23 @@ impl CudaCtx {
 }
 
 /// B6: CUDA 런타임 VRAM 프로브 — 가드 preflight용.
+impl CudaCtx {
+    /// 복사 계측 접근자 — [h2d, d2h, d2d] × (바이트, ns, 호출).
+    pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
+        [
+            self.copy_h2d.get(),
+            self.copy_d2h.get(),
+            self.copy_d2d.get(),
+        ]
+    }
+
+    /// 계측 누적(내부).
+    fn bump(c: &std::cell::Cell<(u64, u64, u64)>, bytes: usize, ns: u64) {
+        let (b, t, n) = c.get();
+        c.set((b + bytes as u64, t + ns, n + 1));
+    }
+}
+
 /// 다중 GPU VRAM 샘플러 — 기동 시 장치별 primary context를 **1회** retain하고
 /// 이후 `cuMemGetInfo`만 반복한다(스크랩마다 retain 금지: refcount 무한 증가 +
 /// 호출 스레드 current ctx 오염 — 모니터링 샘플러 스레드 전용 계약).
@@ -532,6 +568,28 @@ impl CudaCtx {
 pub struct VramSampler {
     drv: &'static ffi::Driver,
     ctxs: Vec<ffi::CUcontext>,
+    caps: Vec<DeviceCaps>,
+    names: Vec<String>,
+}
+
+/// 장치 능력(정적) — 모니터링. CMP 170HX처럼 대역폭/연산 비대칭 카드 판독용.
+#[derive(Clone, Copy, Default)]
+pub struct DeviceCaps {
+    pub sm_count: u32,
+    /// SM 최대 클럭(kHz).
+    pub sm_clock_khz: u32,
+    /// 메모리 클럭(kHz — 실제 클럭, DDR 배수는 peak_bw에서).
+    pub mem_clock_khz: u32,
+    pub bus_width_bits: u32,
+}
+
+impl DeviceCaps {
+    /// 이론 피크 대역폭(bytes/s) — DDR: 2 × 메모리클럭 × 버스폭 / 8.
+    /// 검증: A100/HBM2e 1215MHz×5120bit → 1.55TB/s · 4090 GDDR6X
+    /// 10501MHz×384bit → 1008GB/s — 두 실스펙과 일치하는 공식.
+    pub fn peak_bw_bytes(&self) -> u64 {
+        2 * self.mem_clock_khz as u64 * 1000 * self.bus_width_bits as u64 / 8
+    }
 }
 
 // SAFETY: 컨텍스트 핸들은 Send가 아니지만, 이 샘플러는 **단일 스레드**
@@ -553,6 +611,8 @@ impl VramSampler {
                 return None;
             }
             let mut ctxs = Vec::new();
+            let mut caps = Vec::new();
+            let mut names = Vec::new();
             for i in 0..n {
                 let mut dev: ffi::CUdevice = 0;
                 if (drv.device_get)(&mut dev, i) != CUDA_SUCCESS {
@@ -562,17 +622,61 @@ impl VramSampler {
                 if (drv.device_primary_ctx_retain)(&mut ctx, dev) != CUDA_SUCCESS {
                     continue;
                 }
+                // 장치 능력(정적) — 실패 속성은 0 유지.
+                let attr = |a: std::os::raw::c_int| -> u32 {
+                    let mut v: std::os::raw::c_int = 0;
+                    if (drv.device_get_attribute)(&mut v, a, dev) == CUDA_SUCCESS {
+                        v.max(0) as u32
+                    } else {
+                        0
+                    }
+                };
+                caps.push(DeviceCaps {
+                    sm_count: attr(ffi::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT),
+                    sm_clock_khz: attr(ffi::CU_DEVICE_ATTRIBUTE_CLOCK_RATE),
+                    mem_clock_khz: attr(ffi::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE),
+                    bus_width_bits: attr(ffi::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH),
+                });
+                let mut nbuf = [0i8; 128];
+                let nm = if (drv.device_get_name)(nbuf.as_mut_ptr(), nbuf.len() as i32, dev)
+                    == CUDA_SUCCESS
+                {
+                    let bytes: Vec<u8> = nbuf
+                        .iter()
+                        .take_while(|&&c| c != 0)
+                        .map(|&c| c as u8)
+                        .collect();
+                    String::from_utf8_lossy(&bytes).into_owned()
+                } else {
+                    String::new()
+                };
+                names.push(nm);
                 ctxs.push(ctx);
             }
             if ctxs.is_empty() {
                 return None;
             }
-            Some(VramSampler { drv, ctxs })
+            Some(VramSampler {
+                drv,
+                ctxs,
+                caps,
+                names,
+            })
         }
     }
 
     pub fn device_count(&self) -> usize {
         self.ctxs.len()
+    }
+
+    /// 장치 능력(정적) — 대역폭 피크·SM.
+    pub fn caps(&self) -> &[DeviceCaps] {
+        &self.caps
+    }
+
+    /// 장치 이름.
+    pub fn names(&self) -> &[String] {
+        &self.names
     }
 
     /// 장치별 (free, total) — 실패 장치는 None(게시 측이 0 유지).

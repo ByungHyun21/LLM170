@@ -38,13 +38,48 @@ pub struct Info {
     pub model: String,
     pub ctx: usize,
     pub n_slots: usize,
+    /// 모델 파일 총합(디스크 — 분류의 기준점).
+    pub model_bytes: u64,
+}
+
+/// 메모리 분류 뷰 — slot_loop가 저빈도 게시(모델이 시스템을 쓰는 방식).
+#[derive(Clone, Default)]
+pub struct MemView {
+    /// VRAM 상주 가중치(비전문가 + 상주 전문가).
+    pub weights_gpu: u64,
+    /// VRAM KV 캐시(현행 전량 — CPU 오프로드 없음).
+    pub kv_gpu: u64,
+    /// CPU 오프로드 가중치(스트리밍 전문가 — 호스트에서 토큰별 업로드).
+    pub offload_cpu: u64,
+    /// CPU PLE 오프로드(미구현 W4-2 — 0).
+    pub ple_cpu: u64,
+    /// 토큰당 활성 가중치 바이트(실효 대역폭 = 이 값 × tg tok/s).
+    pub active_per_token: u64,
+    /// MoE 배치: "none" | "resident" | "streaming".
+    pub moe_mode: String,
+}
+
+/// 복사(io) 뷰 — 런타임/적재 분리. 각 항목 = [h2d, d2h, d2d] × (바이트, ns, 호출).
+#[derive(Clone, Copy, Default)]
+pub struct IoView {
+    /// 서빙 구간 누적(토큰당 스트리밍·로짓 판독 등 — 병목 판독용).
+    pub runtime: [(u64, u64, u64); 3],
+    /// 적재 구간(가중치 업로드 — 1회).
+    pub load: [(u64, u64, u64); 3],
 }
 
 struct Shared {
     info: Info,
     started: std::time::Instant,
+    /// 기동 직후(엔진 적재 전) 프리 VRAM — gpu_used = before − now.
+    free_before: Vec<AtomicU64>,
     gpu_free: Vec<AtomicU64>,
     gpu_total: Vec<AtomicU64>,
+    /// 장치 능력·이름(정적 — 대역폭 피크·SM).
+    caps: Vec<llm170_backend_gpu::DeviceCaps>,
+    names: Vec<String>,
+    mem: Mutex<MemView>,
+    io: Mutex<IoView>,
     host_avail: AtomicU64,
     host_total: AtomicU64,
     rss: AtomicU64,
@@ -58,11 +93,32 @@ static SNAP: OnceLock<Shared> = OnceLock::new();
 pub fn init(info: Info) {
     let sampler = llm170_backend_gpu::VramSampler::new();
     let n = sampler.as_ref().map(|s| s.device_count()).unwrap_or(0);
+    // 엔진 적재 **전** 프리 VRAM 기록(적재 후 델타 = 이 프로세스 VRAM).
+    let before: Vec<u64> = sampler
+        .as_ref()
+        .map(|s| {
+            s.sample()
+                .into_iter()
+                .map(|v| v.map(|(f, _)| f).unwrap_or(0))
+                .collect()
+        })
+        .unwrap_or_default();
     let shared = Shared {
         info,
         started: std::time::Instant::now(),
-        gpu_free: (0..n).map(|_| AtomicU64::new(0)).collect(),
+        free_before: before.iter().map(|&f| AtomicU64::new(f)).collect(),
+        gpu_free: before.iter().map(|&f| AtomicU64::new(f)).collect(),
         gpu_total: (0..n).map(|_| AtomicU64::new(0)).collect(),
+        caps: sampler
+            .as_ref()
+            .map(|s| s.caps().to_vec())
+            .unwrap_or_default(),
+        names: sampler
+            .as_ref()
+            .map(|s| s.names().to_vec())
+            .unwrap_or_default(),
+        mem: Mutex::new(MemView::default()),
+        io: Mutex::new(IoView::default()),
         host_avail: AtomicU64::new(0),
         host_total: AtomicU64::new(0),
         rss: AtomicU64::new(0),
@@ -107,6 +163,24 @@ fn sampler_loop(sampler: Option<llm170_backend_gpu::VramSampler>) {
     }
 }
 
+/// 메모리 분류 게시(slot_loop — 최신값 덮어쓰기).
+pub fn publish_memory(v: MemView) {
+    if let Some(s) = SNAP.get()
+        && let Ok(mut g) = s.mem.lock()
+    {
+        *g = v;
+    }
+}
+
+/// 복사(io) 게시(slot_loop — 최신값 덮어쓰기).
+pub fn publish_io(v: IoView) {
+    if let Some(s) = SNAP.get()
+        && let Ok(mut g) = s.io.lock()
+    {
+        *g = v;
+    }
+}
+
 /// 슬롯 뷰 게시(slot_loop — 최신값 덮어쓰기).
 pub fn publish_slots(v: Vec<SlotView>) {
     if let Some(s) = SNAP.get()
@@ -144,20 +218,48 @@ fn esc(s: &str) -> String {
     o
 }
 
-/// JSON 스냅샷 — 외부 폴러용(수 KB).
+/// JSON 스냅샷 — 외부 폴러용(수 KB). 메모리는 **모델 중심 분류**:
+/// 각 컴포넌트가 gpu/cpu 어디에 얼마나 있는지(현행 KV·PLE는 gpu 전량/미구현).
 pub fn json() -> String {
     let Some(s) = SNAP.get() else {
         return "{\"error\":\"metrics uninitialized\"}".to_string();
     };
+    let dev_used = |i: usize| -> u64 {
+        let before = s
+            .free_before
+            .get(i)
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        before.saturating_sub(s.gpu_free[i].load(Ordering::Relaxed))
+    };
     let gpus: Vec<String> = (0..s.gpu_free.len())
         .map(|i| {
+            let caps = s.caps.get(i).copied().unwrap_or_default();
             format!(
-                "{{\"idx\":{i},\"mem_free\":{},\"mem_total\":{}}}",
+                "{{\"idx\":{i},\"name\":\"{}\",\"mem_free\":{},\"mem_total\":{},\"used\":{},\
+\"sm_count\":{},\"sm_clock_khz\":{},\"mem_clock_khz\":{},\"bus_width_bits\":{},\
+\"peak_bw_bytes_s\":{}}}",
+                esc(s.names.get(i).map(String::as_str).unwrap_or("")),
                 s.gpu_free[i].load(Ordering::Relaxed),
-                s.gpu_total[i].load(Ordering::Relaxed)
+                s.gpu_total[i].load(Ordering::Relaxed),
+                dev_used(i),
+                caps.sm_count,
+                caps.sm_clock_khz,
+                caps.mem_clock_khz,
+                caps.bus_width_bits,
+                caps.peak_bw_bytes()
             )
         })
         .collect();
+    let gpu_total: u64 = (0..s.gpu_total.len())
+        .map(|i| s.gpu_total[i].load(Ordering::Relaxed))
+        .sum();
+    let gpu_used: u64 = (0..s.gpu_free.len()).map(dev_used).sum();
+    let mem = s.mem.lock().map(|m| m.clone()).unwrap_or_default();
+    let io = s.io.lock().map(|v| *v).unwrap_or_default();
+    let workspace = gpu_used
+        .saturating_sub(mem.weights_gpu)
+        .saturating_sub(mem.kv_gpu);
     let sc = &crate::sched::SCHED;
     let jobs = sc.jobs.load(Ordering::Relaxed);
     let qw = sc.queue_wait_us.load(Ordering::Relaxed);
@@ -186,23 +288,34 @@ pub fn json() -> String {
         })
         .unwrap_or_default();
     format!(
-        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\
-\"gpus\":[{}],\
-\"host\":{{\"mem_available\":{},\"mem_total\":{},\"rss\":{}}},\
-\"serving\":{{\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\
-\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\
-\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\
-\"requests\":{},\"requests_failed\":{}}},\
-\"slot_detail\":[{}]}}",
+        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"cpu\":0}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\"}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{}}},\"slot_detail\":[{}]}}",
         esc(&s.info.instance),
         esc(&s.info.model),
         s.info.ctx,
         s.info.n_slots,
         s.started.elapsed().as_secs_f64(),
-        gpus.join(","),
-        s.host_avail.load(Ordering::Relaxed),
-        s.host_total.load(Ordering::Relaxed),
+        s.info.model_bytes,
+        mem.weights_gpu,
+        mem.offload_cpu,
+        mem.kv_gpu,
+        mem.ple_cpu,
+        mem.active_per_token,
         s.rss.load(Ordering::Relaxed),
+        esc(&mem.moe_mode),
+        gpus.join(","),
+        io.runtime[0].0,
+        io.runtime[0].1 / 1_000_000,
+        io.runtime[0].2,
+        io.runtime[1].0,
+        io.runtime[1].1 / 1_000_000,
+        io.runtime[1].2,
+        io.runtime[2].0,
+        io.runtime[2].1 / 1_000_000,
+        io.runtime[2].2,
+        io.load[0].0,
+        io.load[0].1 / 1_000_000,
+        io.load[1].0,
+        io.load[2].0,
         jobs,
         if jobs > 0 {
             qw as f64 / jobs as f64 / 1e3

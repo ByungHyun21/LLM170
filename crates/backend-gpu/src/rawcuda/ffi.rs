@@ -49,8 +49,16 @@ pub fn err_text(r: CUresult) -> String {
 pub type CuInitFn = unsafe extern "system" fn(flags: c_uint) -> CUresult;
 pub type CuDeviceGetCountFn = unsafe extern "system" fn(count: *mut c_int) -> CUresult;
 pub type CuDeviceGetFn = unsafe extern "system" fn(dev: *mut CUdevice, ordinal: c_int) -> CUresult;
+
+// CUdevice_attribute — 모니터링(장치 능력)용 부분집합.
+pub const CU_DEVICE_ATTRIBUTE_CLOCK_RATE: c_int = 13; // SM 최대 클럭(kHz)
+pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
+pub const CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE: c_int = 36; // kHz
+pub const CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH: c_int = 37; // bits
 pub type CuDeviceGetNameFn =
     unsafe extern "system" fn(name: *mut c_char, len: c_int, dev: CUdevice) -> CUresult;
+pub type CuDeviceGetAttributeFn =
+    unsafe extern "system" fn(pi: *mut c_int, attrib: c_int, dev: CUdevice) -> CUresult;
 pub type CuDevicePrimaryCtxRetainFn =
     unsafe extern "system" fn(ctx: *mut CUcontext, dev: CUdevice) -> CUresult;
 pub type CuCtxSetCurrentFn = unsafe extern "system" fn(ctx: CUcontext) -> CUresult;
@@ -145,6 +153,7 @@ pub(crate) struct Driver {
     pub device_get_count: CuDeviceGetCountFn,
     pub device_get: CuDeviceGetFn,
     pub device_get_name: CuDeviceGetNameFn,
+    pub device_get_attribute: CuDeviceGetAttributeFn,
     pub device_primary_ctx_retain: CuDevicePrimaryCtxRetainFn,
     pub ctx_set_current: CuCtxSetCurrentFn,
     pub ctx_get_current: CuCtxGetCurrentFn,
@@ -204,6 +213,9 @@ impl Driver {
                     "cuDeviceGetCount"
                 )),
                 device_get: std::mem::transmute::<*mut c_void, CuDeviceGetFn>(sym!("cuDeviceGet")),
+                device_get_attribute: std::mem::transmute::<*mut c_void, CuDeviceGetAttributeFn>(
+                    sym!("cuDeviceGetAttribute"),
+                ),
                 device_get_name: std::mem::transmute::<*mut c_void, CuDeviceGetNameFn>(sym!(
                     "cuDeviceGetName"
                 )),
