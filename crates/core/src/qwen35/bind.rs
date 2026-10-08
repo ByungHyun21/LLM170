@@ -378,9 +378,11 @@ fn vperm(cfg: &QwenCfg, i: usize) -> usize {
     ratio * (i % nk) + i / nk
 }
 
-/// V헤드 순열 사본 구축 — 엔진(subhead-major) 계약 공급용(g128 전용).
+/// V헤드 순열 사본 구축 — 엔진(subhead-major) 계약 공급용.
+/// 128블록 = 헤드차원(linear_key_head_dim) 단위라 그룹 무관 — 스케일 행/블록
+/// 바이트만 group으로 환산한다(g128 27B · g32 35B).
 pub fn build_perm(store: &W4a16Model, cfg: &QwenCfg) -> PermStore {
-    assert_eq!(store.group(), 128, "순열 사본은 g128 계약");
+    let group = store.group();
     let nk = cfg.linear_num_key_heads;
     let vbase = 2 * nk * cfg.linear_key_head_dim;
     let mut q = HashMap::new();
@@ -406,7 +408,7 @@ pub fn build_perm(store: &W4a16Model, cfg: &QwenCfg) -> PermStore {
             ) else {
                 continue;
             };
-            let (rb, sb) = (k / 2, k / 64);
+            let (rb, sb) = (k / 2, k * 2 / group);
             let mut d = vec![0u8; n * rb];
             let mut ds = vec![0u8; n * sb];
             match pv {
@@ -435,11 +437,13 @@ pub fn build_perm(store: &W4a16Model, cfg: &QwenCfg) -> PermStore {
                             let sg = vperm(cfg, g) * 64;
                             d[r * rb + s..r * rb + s + 64].copy_from_slice(&scratch[sg..sg + 64]);
                         }
+                        // 스케일 블록 = 128열 = 128/group개 스케일(×2B).
+                        let sblk = 128 * 2 / group;
                         let srow = &mut ds[r * sb..(r + 1) * sb];
                         let temp: Vec<u8> = sc[r * sb..(r + 1) * sb].to_vec();
                         for g in 0..nblk {
-                            let sg = vperm(cfg, g) * 2;
-                            srow[g * 2..g * 2 + 2].copy_from_slice(&temp[sg..sg + 2]);
+                            let sg = vperm(cfg, g) * sblk;
+                            srow[g * sblk..(g + 1) * sblk].copy_from_slice(&temp[sg..sg + sblk]);
                         }
                     }
                 }
@@ -474,9 +478,9 @@ pub fn permute_heads_f32(cfg: &QwenCfg, v: &[f32]) -> Vec<f32> {
     (0..v.len()).map(|i| v[vperm(cfg, i)]).collect()
 }
 
-/// conv 채널 행 순열 f32 — [ch][kk] 평탄, vbase 이후 128채널 블록 순열(g128).
+/// conv 채널 행 순열 f32 — [ch][kk] 평탄, vbase 이후 128채널(헤드차원) 블록
+/// 순열 — 그룹 무관(스케일 무접촉).
 pub fn conv_rows_f32_permuted(store: &W4a16Model, cfg: &QwenCfg, name: &str) -> R<Vec<f32>> {
-    assert_eq!(store.group(), 128, "conv 순열은 g128 계약");
     let e = store
         .entry(name)
         .ok_or_else(|| W4a16Error::Missing(name.into()))?;

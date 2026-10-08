@@ -40,14 +40,45 @@ pub fn dot_row_w4a16_lane_parts(qrow: &[u32], zrow: &[u32], srow: &[u16], x: &[u
     assert!(k.is_multiple_of(128), "w4a16: k는 g128 그룹정렬 필요");
     assert_eq!(qrow.len(), k / 8, "w4a16: qrow 길이");
     assert_eq!(srow.len(), k / 128, "w4a16: srow 길이");
+    lane_parts_scale(qrow, zrow, x, 128, |g| f16b(srow[g]))
+}
+
+/// 일반화 계약(W4-1) — 그룹 크기 + 스케일 접근자 공용 **단일 구현**.
+/// 산술은 g128·f16 경로와 완전 동일(레인 l = i=l,l+64,… f32 누산, mul·add
+/// 분리 → f64 tree64). g32(35B 전문가)는 그룹 = i/32, 스케일은 BF16 디코드값.
+pub fn dot_row_w4a16_lane_group(
+    qrow: &[u32],
+    zrow: &[u32],
+    srow_f32: &[f32],
+    x: &[u16],
+    group: usize,
+) -> f32 {
+    tree64(&lane_parts_scale(qrow, zrow, x, group, |g| srow_f32[g])) as f32
+}
+
+/// 레인 부분합 — 그룹·스케일 접근자 일반형(내부 단일 구현).
+fn lane_parts_scale<F: Fn(usize) -> f32>(
+    qrow: &[u32],
+    zrow: &[u32],
+    x: &[u16],
+    group: usize,
+    scale: F,
+) -> [f64; 64] {
+    let k = x.len();
+    assert!(
+        group >= 32 && group.is_multiple_of(32) && k.is_multiple_of(group),
+        "w4a16: k는 group(32배수) 정렬 필요 — group={group} k={k}"
+    );
+    assert_eq!(qrow.len(), k / 8, "w4a16: qrow 길이");
+    assert_eq!(zrow.len(), k / group, "w4a16: zrow 길이");
     let mut lane = [0.0f64; 64];
     for l in 0..64usize {
         let mut acc = 0.0f32;
         let mut i = l;
         while i < k {
-            let g = i >> 7;
+            let g = i / group;
             let q = ((qrow[i >> 3] >> (4 * (i & 7))) & 0xF) as i32;
-            let w = (q - zrow[g] as i32) as f32 * f16b(srow[g]);
+            let w = (q - zrow[g] as i32) as f32 * scale(g);
             acc += w * f16b(x[i]);
             i += 64;
         }
@@ -133,6 +164,47 @@ mod w4a16_tests {
         assert_eq!(f16b(0x3C00), 1.0);
         assert_eq!(f16b(0x3800), 0.5);
         assert_eq!(f16b(0xC000), -2.0);
+    }
+
+    #[test]
+    fn w4a16_lane_g32_bf16_scale() {
+        // W4-1: g32 + BF16 스케일(35B 전문가 실측) — 일반화 경로 검증.
+        let k = 256usize; // g32 × 8그룹
+        let mut seed = 0x1234_5678u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let qrow: Vec<u32> = (0..k / 8).map(|_| rnd() as u32).collect();
+        let zrow: Vec<u32> = (0..k / 32).map(|_| (rnd() % 16) as u32).collect();
+        // BF16 스케일 비트(상위 16bit) — bf16→f32는 정확 확장.
+        let srow: Vec<f32> = (0..k / 32)
+            .map(|_| {
+                let v = 0.25f32 + (rnd() % 100) as f32 / 400.0;
+                crate::quant::deq::bf16_to_f32((v.to_bits() >> 16) as u16)
+            })
+            .collect();
+        let x: Vec<u16> = (0..k)
+            .map(|_| to_f16((rnd() % 2000) as f32 / 1000.0 - 1.0))
+            .collect();
+        let got = dot_row_w4a16_lane_group(&qrow, &zrow, &srow, &x, 32);
+        // 스칼라 미러(같은 산술 순서 — 레인 누산 후 tree64).
+        let mut lanes = [0.0f64; 64];
+        for l in 0..64usize {
+            let mut acc = 0.0f32;
+            let mut i = l;
+            while i < k {
+                let g = i / 32;
+                let q = ((qrow[i >> 3] >> (4 * (i & 7))) & 0xF) as i32;
+                let w = (q - zrow[g] as i32) as f32 * srow[g];
+                acc += w * f16b(x[i]);
+                i += 64;
+            }
+            lanes[l] = acc as f64;
+        }
+        assert_eq!(got.to_bits(), (tree64(&lanes) as f32).to_bits());
     }
 
     #[test]

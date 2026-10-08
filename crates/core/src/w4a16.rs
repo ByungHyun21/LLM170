@@ -284,6 +284,17 @@ impl W4a16Model {
         Ok(QuantSpec { bits, group })
     }
 
+    /// 전문가 텐서 베이스 이름(HF 규약) — 이름맵 무경유 접근자와 동일.
+    pub fn expert_base(layer: usize, e: usize, proj: &str) -> String {
+        format!("model.language_model.layers.{layer}.mlp.experts.{e}.{proj}")
+    }
+
+    /// 스케일 dtype이 BF16인가(35B 전문가 실측) — Weight 구성용.
+    pub fn scale_is_bf16(&self, base: &str) -> bool {
+        self.entry(&format!("{base}.weight_scale"))
+            .is_some_and(|e| e.dtype == crate::st::StDtype::Bf16)
+    }
+
     /// MoE 전문가 트리플 슬라이스(W4-1) — (packed, scale, n, k).
     /// 인덱스 기반 접근자: 이름맵에 30,720개를 넣지 않는다(로더 계약).
     pub fn expert_slice(
@@ -292,7 +303,7 @@ impl W4a16Model {
         e: usize,
         proj: &str,
     ) -> Option<(&[u8], &[u8], usize, usize)> {
-        let base = format!("model.language_model.layers.{layer}.mlp.experts.{e}.{proj}");
+        let base = Self::expert_base(layer, e, proj);
         let (n, k) = *self.lins.get(&base)?;
         let q = self.tensor_slice(&format!("{base}.weight_packed"))?;
         let s = self.tensor_slice(&format!("{base}.weight_scale"))?;

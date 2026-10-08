@@ -5,12 +5,16 @@ use crate::wtype::WType;
 pub struct Weight<'a> {
     pub data: &'a [u8],
     /// W4A16 split 계열의 scale 버퍼(직접
-    /// 로드). 무압축(F32/F16/Bf16)은 None. `W4a16G128Split`은 aux가 필수 계약이며
+    /// 로드). 무압축(F32/F16/Bf16)은 None. `W4a16Split`은 aux가 필수 계약이며
     /// Model::w가 보장한다(dequant_row 비경유 — cpu matmul 전용 arm).
     pub aux: Option<&'a [u8]>,
     pub ty: WType,
     pub n_in: u64,
     pub n_out: u64,
+    /// W4a16Split 그룹 크기(g128/g32) — 플레인은 0.
+    pub group: usize,
+    /// W4a16Split 스케일 dtype(35B 전문가 = BF16) — 플레인은 false.
+    pub scale_bf16: bool,
 }
 
 impl<'a> Weight<'a> {

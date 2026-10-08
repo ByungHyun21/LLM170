@@ -35,7 +35,7 @@ impl GpuEngine {
         // 1) 선형 상주 — GPU 체인은 원본(HF) 무게(순열은 커널 내부 처리).
         for name in model.engine_names() {
             if let Some(w) = model.w_raw(&name)
-                && w.ty == llm170_core::wtype::WType::W4a16G128Split
+                && w.ty == llm170_core::wtype::WType::W4a16Split
             {
                 let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
                 dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;

@@ -18,6 +18,11 @@ pub struct Hparams {
     pub d_state: usize,
     pub conv_k: usize,
     pub vocab: usize,
+    /// MoE(W4-1, 35B-A3B) — n_experts=0이면 dense FFN(27B).
+    pub n_experts: usize,
+    pub top_k: usize,
+    pub moe_ffn: usize,
+    pub shared_ffn: usize,
 }
 
 impl Hparams {

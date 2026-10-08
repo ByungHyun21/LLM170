@@ -89,6 +89,6 @@ mod tests {
     #[should_panic(expected = "지원 밖 타입")]
     fn split_type_is_not_dequant_row() {
         let mut out = [0.0f32; 128];
-        dequant_row(WType::W4a16G128Split, &[0u8; 66], 0, 128, &mut out);
+        dequant_row(WType::W4a16Split, &[0u8; 66], 0, 128, &mut out);
     }
 }

@@ -107,6 +107,10 @@ impl Model {
             d_state,
             conv_k: c.linear_conv_kernel,
             vocab: c.vocab,
+            n_experts: c.n_experts,
+            top_k: c.top_k,
+            moe_ffn: c.moe_ffn,
+            shared_ffn: c.shared_ffn,
         };
         if !d_inner.is_multiple_of(hp.dt_rank) || d_inner / hp.dt_rank != d_state {
             return Err(ModelError::BadHparam("d_inner/dt_rank != d_state").into());
@@ -147,6 +151,21 @@ impl Model {
         self.w4
             .plain_rows_f32(&name, tok as u64, tok as u64 + 1)
             .map_err(|e| ModelError::W4a16(e.to_string()))
+    }
+
+    /// MoE 전문가 Weight(W4-1) — 스토어 트리플에서 직접 구성(30k 이름맵 무경유).
+    pub fn expert_w(&self, il: usize, e: usize, proj: &str) -> Option<Weight<'_>> {
+        let base = crate::w4a16::W4a16Model::expert_base(il, e, proj);
+        let (data, scale, n, k) = self.w4.expert_slice(il, e, proj)?;
+        Some(Weight {
+            data,
+            aux: Some(scale),
+            ty: crate::wtype::WType::W4a16Split,
+            n_in: k as u64,
+            n_out: n as u64,
+            group: self.w4.group(),
+            scale_bf16: self.w4.scale_is_bf16(&base),
+        })
     }
 
     /// 원본(HF) 무게 — W3 GPU 체인용. GPU 커널은 순열을 내부에서
@@ -287,6 +306,8 @@ fn plain_weight<'a>(w4: &'a crate::w4a16::W4a16Model, hf: &str) -> Option<Weight
         ty,
         n_in,
         n_out,
+        group: 0,
+        scale_bf16: false,
     })
 }
 
@@ -303,9 +324,11 @@ fn w4_weight_raw<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Wei
             Some(Weight {
                 data: w4.tensor_slice(&format!("{base}.weight_packed"))?,
                 aux: Some(w4.tensor_slice(&format!("{base}.weight_scale"))?),
-                ty: WType::W4a16G128Split,
+                ty: WType::W4a16Split,
                 n_in: k as u64,
                 n_out: n as u64,
+                group: w4.group(),
+                scale_bf16: w4.scale_is_bf16(&base),
             })
         }
         Eng::Plain { name: hf, .. } => plain_weight(w4, &hf),
@@ -336,9 +359,11 @@ fn w4_weight<'a>(m: &'a Model, name: &str) -> Option<Weight<'a>> {
             Some(Weight {
                 data,
                 aux: Some(aux),
-                ty: WType::W4a16G128Split,
+                ty: WType::W4a16Split,
                 n_in: k as u64,
                 n_out: n as u64,
+                group: w4.group(),
+                scale_bf16: w4.scale_is_bf16(&base),
             })
         }
         Eng::Plain {
@@ -365,6 +390,8 @@ fn w4_weight<'a>(m: &'a Model, name: &str) -> Option<Weight<'a>> {
                 ty,
                 n_in,
                 n_out,
+                group: 0,
+                scale_bf16: false,
             })
         }
         Eng::Synth { .. } => None,
@@ -530,6 +557,35 @@ impl Engine {
             let post_w = self
                 .model
                 .f32_vec(&format!("blk.{il}.post_attention_norm.weight"))?;
+            if hp.n_experts > 0 {
+                // MoE FFN(W4-1, 35B-A3B) — dense와 동일 계약: normed 계산 후
+                // 잔차(ffn_residual) 가산은 여기서.
+                let mut normed: Vec<Vec<f32>> = vec![vec![0.0f32; n_embd]; n_tok];
+                for (i, x) in xs.iter().enumerate() {
+                    normed[i] = rms_norm(x, &post_w, hp.eps);
+                }
+                let mut ffn_out = vec![vec![0.0f32; n_embd]; n_tok];
+                span_block!("cpu::moe", {
+                    stages::moe_ffn(&ctx, il, &normed, &mut ffn_out)?;
+                });
+                for t in 0..n_tok {
+                    for i in 0..n_embd {
+                        xs[t][i] = ffn_residual[t][i] + ffn_out[t][i];
+                    }
+                }
+                if llm170_diag::dump::opts().key("debug_layers") {
+                    let m = xs[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let nan = xs[0].iter().any(|v| v.is_nan());
+                    let v4: Vec<String> = xs[0][..4].iter().map(|v| format!("{v:.5}")).collect();
+                    let sum: f64 = xs[0].iter().map(|&v| v as f64).sum();
+                    eprintln!(
+                        "layer {il:>2} recr={} moe max|x|={m:.4} nan={nan} head={} sum={sum:.6}",
+                        self.model.is_recr(il),
+                        v4.join(","),
+                    );
+                }
+                continue;
+            }
             let gate_w = self.model.wchk(&format!("blk.{il}.ffn_gate.weight"))?;
             let up_w = self.model.wchk(&format!("blk.{il}.ffn_up.weight"))?;
             let down_w = self.model.wchk(&format!("blk.{il}.ffn_down.weight"))?;

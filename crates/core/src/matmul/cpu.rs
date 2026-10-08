@@ -13,7 +13,7 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
     profile_span!("cpu::matmul1");
     // W4A16 split(§3.5 A안 직접 로드) — 분리 버퍼 디양자화 + f32 내적.
     // f32 레퍼런스(비트 격리 계약은 quant lane 소관).
-    if w.ty == crate::wtype::WType::W4a16G128Split {
+    if w.ty == crate::wtype::WType::W4a16Split {
         let scale = w
             .aux
             .expect("w4a16 split: aux(scale) 필수 계약 — Model::w 보장");
@@ -28,7 +28,15 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
                 handles.push(scope.spawn(move || {
                     let mut scratch = vec![0.0f32; n_in];
                     for (r, o) in ch.iter_mut().enumerate() {
-                        dequant_row_w4a16_split(w.data, scale, row0 + r, n_in, &mut scratch);
+                        dequant_row_w4a16_split(
+                            w.data,
+                            scale,
+                            row0 + r,
+                            n_in,
+                            w.group,
+                            w.scale_bf16,
+                            &mut scratch,
+                        );
                         let mut acc = 0.0f32;
                         for i in 0..n_in {
                             acc += x[i] * scratch[i];
@@ -80,7 +88,7 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
 /// 스레드별 로컬 결과 [T][rows_per] → 조인 후 스캐터 (행 슬라이스 교차 차입 회피).
 pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
     // W4A16 split(§3.5 A안) — 행별 1회 디양자화 후 T토큰 내적(일반 경로 미러).
-    if w.ty == crate::wtype::WType::W4a16G128Split {
+    if w.ty == crate::wtype::WType::W4a16Split {
         let scale = w
             .aux
             .expect("w4a16 split: aux(scale) 필수 계약 — Model::w 보장");
@@ -100,7 +108,15 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
                     let mut scratch = vec![0.0f32; n_in];
                     let rows = n_out.saturating_sub(row0).min(rows_per);
                     for r in 0..rows {
-                        dequant_row_w4a16_split(w.data, scale, row0 + r, n_in, &mut scratch);
+                        dequant_row_w4a16_split(
+                            w.data,
+                            scale,
+                            row0 + r,
+                            n_in,
+                            w.group,
+                            w.scale_bf16,
+                            &mut scratch,
+                        );
                         for (ti, x) in xs.iter().enumerate() {
                             let mut acc = 0.0f32;
                             for i in 0..n_in {
@@ -175,20 +191,34 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
     }
 }
 
-/// W4A16 split 행 디양자화 — data=packed[n][k/8 u32], scale=[n][k/128 u16],
-/// zp=8(sym 상수). cpu matmul 전용(레퍼런스 f32).
-fn dequant_row_w4a16_split(q: &[u8], s: &[u8], row: usize, k: usize, out: &mut [f32]) {
-    let nb = k / 128;
+/// W4A16 split 행 디양자화 — data=packed[n][k/8 u32], scale=[n][k/group],
+/// zp=8(sym 상수). 그룹·스케일 dtype 일반화(W4-1: g128/f16 27B · g32/bf16 35B).
+/// cpu matmul 전용(레퍼런스 f32 — 비트 계약은 lane 소관).
+fn dequant_row_w4a16_split(
+    q: &[u8],
+    s: &[u8],
+    row: usize,
+    k: usize,
+    group: usize,
+    scale_bf16: bool,
+    out: &mut [f32],
+) {
+    let nb = k / group;
     let qrow = &q[row * (k / 2)..];
-    let srow = &s[row * (k / 64)..];
+    let srow = &s[row * (k * 2 / group)..];
     for b in 0..nb {
-        let sc = crate::quant::half_to_f32(u16::from_le_bytes([srow[2 * b], srow[2 * b + 1]]));
-        for i in 0..128usize {
-            let woff = 4 * (b * 16 + i / 8);
+        let bits = u16::from_le_bytes([srow[2 * b], srow[2 * b + 1]]);
+        let sc = if scale_bf16 {
+            crate::quant::deq::bf16_to_f32(bits)
+        } else {
+            crate::quant::half_to_f32(bits)
+        };
+        for i in 0..group {
+            let woff = 4 * (b * (group / 8) + i / 8);
             let w =
                 u32::from_le_bytes([qrow[woff], qrow[woff + 1], qrow[woff + 2], qrow[woff + 3]]);
             let nib = ((w >> (4 * (i % 8))) & 0xF) as i32;
-            out[b * 128 + i] = (nib - 8) as f32 * sc;
+            out[b * group + i] = (nib - 8) as f32 * sc;
         }
     }
 }
