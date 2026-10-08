@@ -13,6 +13,7 @@
 //! - 하이퍼파라미터는 config.json 메타에서 동적 로드 (소형 검증 모델 지원).
 //! - f32 KV, f32 GDN 상태 (참조 정확도 우선).
 
+pub mod bind;
 mod diag;
 mod dispatch;
 use dispatch::{mm, mm_batch, mm_group};
@@ -52,6 +53,10 @@ impl std::error::Error for ModelError {}
 /// 세부 접근은 `w4a16` 로더(mmap 슬라이스 + 순열 사본).
 pub struct Model {
     w4: Box<crate::w4a16::W4a16Model>,
+    /// qwen3_5 아키텍처 바인딩 설정(config.json).
+    cfg: bind::QwenCfg,
+    /// V축 순열 사본(지연 1회 구축).
+    perm: std::sync::OnceLock<bind::PermStore>,
     pub hp: Hparams,
     pub token_pieces: Vec<String>,
     /// f32 norm 가중 디양자화 캐시(llama-vllm P13 계열) — 첫 호출 1회
@@ -75,15 +80,14 @@ impl Model {
         profile_span!("model::load_w4a16");
         let w4 =
             crate::w4a16::W4a16Model::open(dir).map_err(|e| ModelError::W4a16(e.to_string()))?;
-        let rep = w4
-            .validate()
-            .map_err(|e| ModelError::W4a16(e.to_string()))?;
+        let cfg = bind::QwenCfg::load(dir).map_err(|e| ModelError::W4a16(e.to_string()))?;
+        let rep = bind::validate(&w4, &cfg).map_err(|e| ModelError::W4a16(e.to_string()))?;
         if !rep.ok() {
             return Err(
                 ModelError::W4a16(format!("커버리지 검증 실패:\n{}", rep.summary())).into(),
             );
         }
-        let c = &w4.cfg;
+        let c = &cfg;
         let d_state = c.linear_key_head_dim;
         let d_inner = c.linear_num_value_heads * c.linear_key_head_dim;
         let hp = Hparams {
@@ -111,6 +115,8 @@ impl Model {
             crate::w4a16::load_pieces(dir).map_err(|e| ModelError::W4a16(e.to_string()))?;
         let m = Model {
             w4: Box::new(w4),
+            cfg,
+            perm: std::sync::OnceLock::new(),
             hp,
             token_pieces,
             f32_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -123,9 +129,15 @@ impl Model {
         Ok(m)
     }
 
-    /// 무게 뷰 — W4A16 이름맵(§3.5)으로 슬라이스/분리버퍼 구성.
+    /// 무게 뷰 — W4A16 이름맵으로 슬라이스/분리버퍼 구성.
     pub fn w(&self, name: &str) -> Option<Weight<'_>> {
-        w4_weight(&self.w4, name)
+        w4_weight(self, name)
+    }
+
+    /// V축 순열 사본(지연 1회 구축 — 48 선형층 qkv-v/z/out + alpha/beta).
+    fn perm_store(&self) -> &bind::PermStore {
+        self.perm
+            .get_or_init(|| bind::build_perm(&self.w4, &self.cfg))
     }
 
     pub fn wchk(&self, name: &str) -> Result<Weight<'_>, ModelError> {
@@ -138,25 +150,25 @@ impl Model {
             return Ok(v.clone());
         }
         let w4 = &self.w4;
-        let v = match crate::w4a16::eng(name) {
+        let v = match bind::eng(name) {
             // 정규화는 HF zero-centered(w−1 저장) — 로드 시 +1 보정.
             // ssm_a는 −exp(A_log), dt_bias/A_log·conv는 V헤드 순열 합성
             // (엔진 subhead-major 계약 — perm: 1 인덱스·2 채널).
-            Some(crate::w4a16::Eng::Synth {
+            Some(bind::Eng::Synth {
                 name: hf,
                 plus1,
                 neg_exp,
                 perm,
             }) => {
                 let mut v = if perm == 2 {
-                    w4.conv_rows_f32_permuted(&hf)
+                    bind::conv_rows_f32_permuted(w4, &self.cfg, &hf)
                         .map_err(|e| ModelError::W4a16(e.to_string()))?
                 } else {
                     let raw = w4
                         .plain_vec_f32(&hf)
                         .map_err(|e| ModelError::W4a16(e.to_string()))?;
                     if perm == 1 {
-                        w4.permute_heads_f32(&raw)
+                        bind::permute_heads_f32(&self.cfg, &raw)
                     } else {
                         raw
                     }
@@ -187,13 +199,14 @@ impl Model {
     }
 }
 
-/// W4A16 소스의 Weight 구성(§3.5 A안) — Quant는 분리 버퍼(packed+scale),
-/// Plain은 원시 슬라이스(ty는 dtype에서). Synth(norm류)는 None —
+/// W4A16 소스의 Weight 구성 — Quant는 분리 버퍼(packed+scale), Plain은
+/// 원시 슬라이스(ty는 dtype에서). Synth(norm류)는 None —
 /// f32_vec 전용 계약(호출부가 w()로 요구하지 않는다).
-fn w4_weight<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Weight<'a>> {
-    use crate::w4a16::{Eng, PV};
+fn w4_weight<'a>(m: &'a Model, name: &str) -> Option<Weight<'a>> {
     use crate::wtype::WType;
-    match crate::w4a16::eng(name)? {
+    use bind::{Eng, PV};
+    let w4 = &m.w4;
+    match bind::eng(name)? {
         Eng::Quant { base, vperm } => {
             let (n, k) = w4.lin_shape(&base)?;
             let (data, aux) = match vperm {
@@ -201,7 +214,7 @@ fn w4_weight<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Weight<
                     w4.tensor_slice(&format!("{base}.weight_packed"))?,
                     w4.tensor_slice(&format!("{base}.weight_scale"))?,
                 ),
-                _ => w4.perm_quant(&base, vperm)?,
+                _ => m.perm_store().quant(&base)?,
             };
             Some(Weight {
                 data,
@@ -223,7 +236,7 @@ fn w4_weight<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Weight<
                 _ => return None,
             };
             let data = if rows_perm {
-                w4.perm_plain(&hf)?
+                m.perm_store().plain(&hf)?
             } else {
                 w4.tensor_slice(&hf)?
             };
