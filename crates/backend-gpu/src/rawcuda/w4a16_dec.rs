@@ -20,6 +20,8 @@ use std::collections::HashMap;
 
 /// fwd3s T 상한(assets/attn.cu ATTN_TMAX와 동일 값).
 pub const ATTN_F3S_TMAX: usize = 8;
+/// 프리필 배치 상한 — 체인 버퍼·GEMM t 계약(attn fwd3s와 동일 상한).
+pub const CHAIN_TMAX: usize = 8;
 /// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
 pub const GDN_SCAN_SMEM: u32 = 61_828;
 
@@ -217,6 +219,9 @@ pub struct W4a16Dec {
     /// t=1 GEMV 입력 x32(h2f 왕복 f32) 버퍼.
     dx32: CUdeviceptr,
     dx32_cap: usize,
+    /// t≥2 GEMM 출력 스크래치([t][max_n] f32).
+    dyt: CUdeviceptr,
+    dyt_cap: usize,
     // ── GPU head(output.weight bf16) ──
     head_w: CUdeviceptr,
     head_n: usize,
@@ -396,6 +401,8 @@ impl W4a16Dec {
             chain_bufs_ok: false,
             dx32: 0,
             dx32_cap: 0,
+            dyt: 0,
+            dyt_cap: 0,
             head_w: 0,
             head_n: 0,
             head_k: 0,
@@ -1343,14 +1350,25 @@ impl W4a16Dec {
         // 동시에 읽으므로 둘 다 FFN 폭 확보(구 S10 ensure_chain_bufs 계약).
         let w0 = ad.qg_dim().max(gd.conv_ch()).max(ff_gate);
         let w1 = ad.kv_dim().max(gd.v_len()).max(ff_up);
+        // 배치 프리필(t≤CHAIN_TMAX)까지 수용 — 버퍼는 t배 폭으로 잡는다
+        // (t=1 경로는 오프셋 0만 사용하므로 동작 불변).
+        let tb = CHAIN_TMAX;
         let [c0, c1, c2, c3, c4] = &mut self.dchain;
         realloc_fields(
             |p| self.cc.free(p),
             |b| self.cc.alloc(b),
             [&mut self.dres, &mut self.dab_dev, c0, c1, c2, c3, c4],
-            [h * 4, h * 4, w0 * 4, w1 * 4, w1 * 4, ff_up * 4, h * 4],
+            [
+                tb * h * 4,
+                tb * h * 4,
+                tb * w0 * 4,
+                tb * w1 * 4,
+                tb * w1 * 4,
+                tb * ff_up * 4,
+                tb * h * 4,
+            ],
         )?;
-        Self::zero_dev(&self.cc, self.dab_dev, h * 4)?;
+        Self::zero_dev(&self.cc, self.dab_dev, tb * h * 4)?;
         self.stg_w0 = w0;
         self.stg_w1 = w1;
         self.stg_w2 = ff_up;
@@ -1380,6 +1398,85 @@ impl W4a16Dec {
         ];
         self.cc.launch(f, k.div_ceil(256) as u32, 1, 256, &mut ca)?;
         Ok(self.dx32)
+    }
+
+    /// 활성 f32 [n] → f16 비트 캐스트(t≥2 GEMM 입력 계약) — dxh 반환.
+    fn cast_f16(&mut self, x_dev: CUdeviceptr, n_elems: usize) -> Result<CUdeviceptr, String> {
+        if n_elems > self.xh_cap {
+            if self.dxh != 0 {
+                self.cc.free(self.dxh)?;
+            }
+            self.dxh = 0; // G1
+            self.xh_cap = 0;
+            self.dxh = self.cc.alloc(n_elems * 2)?;
+            self.xh_cap = n_elems;
+        }
+        let f = self.cc.function("w4a16_cast_f16")?;
+        let mut nn = n_elems as i32;
+        let (mut c0, mut c1) = (x_dev, self.dxh);
+        let mut ca: [*mut std::ffi::c_void; 3] = [
+            (&mut c0) as *mut _ as *mut _,
+            (&mut c1) as *mut _ as *mut _,
+            (&mut nn) as *mut _ as *mut _,
+        ];
+        self.cc
+            .launch(f, n_elems.div_ceil(256) as u32, 1, 256, &mut ca)?;
+        Ok(self.dxh)
+    }
+
+    /// t≥2 GEMM 발사 — x f16 [t][k] → out [t][n] 직접 쓰기.
+    fn gemm_launch(
+        &mut self,
+        name: &str,
+        xh_dev: CUdeviceptr,
+        y_out: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let (dq, ds, n, k) = self.lin_spec(name)?;
+        let f = self.cc.function("w4a16_gemm_g128")?;
+        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, xh_dev, y_out);
+        let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+        let mut args: [*mut std::ffi::c_void; 7] = [
+            (&mut p_q) as *mut _ as *mut _,
+            (&mut p_s) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_y) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+            (&mut p_t) as *mut _ as *mut _,
+        ];
+        // 8행/블록 커널(512스레드 = 8그룹×64레인) — grid = ceil(n/8).
+        self.cc.launch(f, n.div_ceil(8) as u32, 1, 512, &mut args)
+    }
+
+    /// 배치 출력 스크래치 보장([t][max_n]).
+    fn ensure_dyt(&mut self, t: usize) -> Result<CUdeviceptr, String> {
+        let (mut mn, mut mk) = (0usize, 0usize);
+        for &(_, _, n, k) in self.lins.values() {
+            mn = mn.max(n);
+            mk = mk.max(k);
+        }
+        let need = t * mn;
+        if need > self.dyt_cap {
+            if self.dyt != 0 {
+                self.cc.free(self.dyt)?;
+            }
+            self.dyt = 0; // G1
+            self.dyt_cap = 0;
+            self.dyt = self.cc.alloc(need * 4)?;
+            self.dyt_cap = need;
+        }
+        // 배치 캐스트 입력(xh: t×k f16)도 함께 보장.
+        if t * mk > self.xh_cap {
+            if self.dxh != 0 {
+                self.cc.free(self.dxh)?;
+            }
+            self.dxh = 0;
+            self.xh_cap = 0;
+            self.dxh = self.cc.alloc(t * mk * 2)?;
+            self.xh_cap = t * mk;
+        }
+        Ok(self.dyt)
     }
 
     /// GEMV 발사(공용) — x32 입력 → y_out 직접 쓰기(dy·d2d 경유 제거).
@@ -1792,6 +1889,174 @@ impl W4a16Dec {
         Ok(v)
     }
 
+    /// 배치 체인(t∈2..=8) — 프리필 청크. GEMM(t≥2) 경로 + 배치 버퍼.
+    /// 반환: 마지막 행의 xn(또는 head면 로짓). t≥2 GEMM은 w4a16-gemm
+    /// 게이트가 비트 판정(행별 64레인·tree64 동일) — t=1 경로와 계약 동일.
+    fn chain_device_t(
+        &mut self,
+        slot: usize,
+        rows: &[f32],
+        t: usize,
+        head: bool,
+    ) -> Result<Vec<f32>, String> {
+        let _g = self.cc.guard()?;
+        if !(2..=CHAIN_TMAX).contains(&t) || rows.len() != t * self.hidden || slot >= self.n_slots {
+            return Err(format!(
+                "chain_device_t: t={t} rows={} 계약 위반",
+                rows.len()
+            ));
+        }
+        let pos = self.slot_pos[slot];
+        let cap = self.attn.ok_or("attn: 형상 미등록")?.cap;
+        if pos as usize + t > cap {
+            return Err(format!("context overflow: pos{pos}+T{t} > kvcap{cap}"));
+        }
+        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.is_none() {
+            return Err("chain_device_t: 디코더 상수 미등록".into());
+        }
+        self.ensure_chain_bufs()?;
+        self.ensure_norm_bufs(t)?;
+        self.ensure_gdn_bufs(t)?;
+        self.ensure_attn_bufs(t)?;
+        let dyt = self.ensure_dyt(t)?;
+        let rb = unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, rows.len() * 4) };
+        self.cc.h2d_async(self.dres, rb)?;
+        let [s0, s1, s1b, s2, s3] = self.dchain;
+        let (w2, h) = (self.stg_w2, self.hidden);
+        let mut ab = self.dab_dev;
+        let mut gi = 0usize;
+        for il in 0..self.n_layers {
+            let xn = self
+                .norm_resid_dev(2 * il, self.dres, ab, t)
+                .map_err(|e| format!("T{il} input norm: {e}"))?;
+            let branch = if (il + 1) % 4 == 0 {
+                let xh = self.cast_f16(xn, t * h)?;
+                self.gemm_launch(&format!("blk.{il}.attn_q.weight"), xh, s0, t)?;
+                self.gemm_launch(&format!("blk.{il}.attn_k.weight"), xh, s1, t)?;
+                self.gemm_launch(&format!("blk.{il}.attn_v.weight"), xh, s1b, t)?;
+                self.attn_chain_dev_run(slot, il / 4, t, s0, s1, s1b)
+                    .map_err(|e| format!("T{il} attn: {e}"))?
+            } else {
+                let xh = self.cast_f16(xn, t * h)?;
+                self.gemm_launch(&format!("blk.{il}.attn_qkv.weight"), xh, s0, t)?;
+                self.gemm_launch(&format!("blk.{il}.attn_gate.weight"), xh, s1, t)?;
+                let g = self
+                    .gdn_chain_dev_run(slot, gi, t, xn, s0, s1)
+                    .map_err(|e| format!("T{il} gdn: {e}"))?;
+                gi += 1;
+                g
+            };
+            let lo = if (il + 1) % 4 == 0 {
+                format!("blk.{il}.attn_output.weight")
+            } else {
+                format!("blk.{il}.ssm_out.weight")
+            };
+            let (_, _, _, ko) = self.lin_spec(&lo)?;
+            let xh2 = self.cast_f16(branch, t * ko)?;
+            self.gemm_launch(&lo, xh2, dyt, t)?;
+            let xn2 = self
+                .norm_resid_dev(2 * il + 1, self.dres, dyt, t)
+                .map_err(|e| format!("T{il} post norm: {e}"))?;
+            let xh3 = self.cast_f16(xn2, t * h)?;
+            self.gemm_launch(&format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
+            self.gemm_launch(&format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
+            self.ew_dev(s0, s1, s2, t * w2)?;
+            let dn = format!("blk.{il}.ffn_down.weight");
+            let (_, _, _, kd) = self.lin_spec(&dn)?;
+            let xh4 = self.cast_f16(s2, t * kd)?;
+            self.gemm_launch(&dn, xh4, s3, t)?;
+            ab = s3;
+        }
+        // 마지막 행만 최종 노름(+head) — 중간 행 로짓은 불필요(상각).
+        let last = (t - 1) as u64 * (h as u64) * 4;
+        let xn_last = self
+            .norm_resid_dev(2 * self.n_layers, self.dres + last, ab + last, 1)
+            .map_err(|e| format!("T final norm: {e}"))?;
+        let mut ob = vec![0u8; if head { self.head_n * 4 } else { h * 4 }];
+        if head {
+            if self.head_w == 0 {
+                return Err("chain_device_t: head 미등록".into());
+            }
+            let f = self.cc.function("head_bf16")?;
+            let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn_last, self.head_out);
+            let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
+            let mut args: [*mut std::ffi::c_void; 5] = [
+                (&mut p_w) as *mut _ as *mut _,
+                (&mut p_x) as *mut _ as *mut _,
+                (&mut p_o) as *mut _ as *mut _,
+                (&mut p_n) as *mut _ as *mut _,
+                (&mut p_k) as *mut _ as *mut _,
+            ];
+            self.cc
+                .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
+            // 동기 d2h 금지 — 그래프 캡처가 만든 커스텀(비차단) 스트림과
+            // 경합한다(실측: serve 배치 프리필 쓰레기 토큰). 스트림 순서 복사.
+            self.cc
+                .d2h_async(ob.as_mut_ptr(), self.head_out, self.head_n * 4)?;
+        } else {
+            self.cc.d2h_async(ob.as_mut_ptr(), xn_last, h * 4)?;
+        }
+        self.cc.sync()?;
+        let pos_after = pos + t as u32;
+        self.slot_pos[slot] = pos_after;
+        self.attn_set_pos(slot, pos_after)?;
+        let v: Vec<f32> = ob
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        if head {
+            llm170_diag::fp::fp_record("gpu.logits", &v);
+        } else {
+            llm170_diag::fp::fp_record("gpu.xn", &v);
+        }
+        Ok(v)
+    }
+
+    /// 마이크로벤치 표면(진단 전용) — 스크래치 alloc/h2d/free + GEMM 발사/sync.
+    pub fn alloc_scratch(&self, bytes: usize) -> Result<CUdeviceptr, String> {
+        self.cc.alloc(bytes)
+    }
+    pub fn free_scratch(&self, p: CUdeviceptr) -> Result<(), String> {
+        self.cc.free(p)
+    }
+    pub fn h2d_scratch(&self, dst: CUdeviceptr, src: &[u8]) -> Result<(), String> {
+        self.cc.h2d(dst, src)
+    }
+    pub fn sync_bench(&self) -> Result<(), String> {
+        self.cc.sync()
+    }
+    /// 지정 선형의 t≥2 GEMM 1회 발사(벤치 전용 — y는 스크래치).
+    pub fn gemm_bench_launch(
+        &mut self,
+        name: &str,
+        xh: CUdeviceptr,
+        y: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        self.gemm_launch(name, xh, y, t)
+    }
+
+    /// 프리필 청크 진입(공개) — t=1은 기존 경로(그래프 포함), t≥2는 배치 체인.
+    pub fn forward_prefill(
+        &mut self,
+        slot: usize,
+        rows: &[f32],
+        t: usize,
+        head: bool,
+    ) -> Result<Vec<f32>, String> {
+        if t == 1 {
+            let row = &rows[..self.hidden];
+            return if head {
+                self.forward_device_head(slot, row)
+            } else {
+                self.forward_device(slot, row)
+            };
+        }
+        self.chain_device_t(slot, rows, t, head)
+    }
+
     /// 1토큰 forward(디바이스 체인) — 최종 xn까지 판독(CPU head용).
     /// guard는 래퍼 전체를 덮는다 — 체인 이후의 d2h/h2d도 같은 스레드
     /// 컨텍스트가 필요하다(CtxGuard는 드랍 시 이전 컨텍스트로 복원).
@@ -1815,7 +2080,8 @@ impl W4a16Dec {
         let pos = self.slot_pos[slot];
         let xn_final = self.chain_device(slot, embed_row)?;
         let mut ob = vec![0u8; self.hidden * 4];
-        self.cc.d2h(&mut ob, xn_final)?;
+        self.cc
+            .d2h_async(ob.as_mut_ptr(), xn_final, self.hidden * 4)?;
         self.cc.sync()?;
         self.slot_pos[slot] = pos + 1;
         self.attn_set_pos(slot, pos + 1)?;
@@ -1932,7 +2198,8 @@ impl W4a16Dec {
         self.cc
             .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
         let mut ob = vec![0u8; self.head_n * 4];
-        self.cc.d2h(&mut ob, self.head_out)?;
+        self.cc
+            .d2h_async(ob.as_mut_ptr(), self.head_out, self.head_n * 4)?;
         self.cc.sync()?;
         self.slot_pos[slot] = pos + 1;
         self.attn_set_pos(slot, pos + 1)?;
