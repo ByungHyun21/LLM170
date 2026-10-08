@@ -27,8 +27,6 @@ pub use frame::Frame;
 
 use hparams::Hparams;
 use llm170_diag::profile_span;
-use llm170_gguf::GgufFile;
-use memmap2::Mmap;
 
 use crate::matmul::Weight;
 use crate::ops::{rms_norm, silu};
@@ -62,19 +60,14 @@ impl std::fmt::Display for ModelError {
 
 impl std::error::Error for ModelError {}
 
-/// 가중치 소스 — GGUF 파일(mmap) 또는 W4A16 디렉터리(§3.5 A안 직접 로드).
-pub enum WSrc {
-    Gguf { gguf: GgufFile, mmap: Mmap },
-    W4a16(Box<crate::w4a16::W4a16Model>),
-}
-
+/// 가중치 소스 — **W4A16 디렉터리 단일**(2026-10-08, plans/w4a16-cuda.md §5:
+/// GGUF 파서 탈락). 세부 접근은 `w4a16` 로더(mmap 슬라이스 + 순열 사본).
 pub struct Model {
-    pub src: WSrc,
+    w4: Box<crate::w4a16::W4a16Model>,
     pub hp: Hparams,
     pub token_pieces: Vec<String>,
     /// plans/113(llama-vllm P13): f32 norm 가중 디양자화 캐시 — 첫 호출 1회
-    /// 디양자화 후 재사용(수치 불변, qwen4exp f32_vec4와 동일 기법). 값 경로
-    /// 매 포워드 층별 norm 재디양자(48+16층 × 2 × 스텝) 제거.
+    /// 디양자화 후 재사용(수치 불변). 값 경로 매 포워드 층별 norm 재디양자 제거.
     f32_cache: std::cell::RefCell<std::collections::HashMap<String, Vec<f32>>>,
 }
 
@@ -87,114 +80,10 @@ macro_rules! span_block {
 pub(crate) use span_block;
 
 impl Model {
-    pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
-        // 디렉터리 = W4A16 직접 로드(§3.5 A안 — 서버 스니핑이 라우팅한다).
-        // EXL3 디렉터리는 exl3 백엔드가 별도 처리하므로 여기 오지 않는다.
-        if path.is_dir() {
-            return Self::load_w4a16(path);
-        }
-        profile_span!("model::load");
-        let gguf = GgufFile::open(path)?;
-        let file = std::fs::File::open(path)?;
-        // SAFETY: 읽기 전용 무게 매핑 — 수정하지 않는다
-        let mmap = unsafe { Mmap::map(&file)? };
-
-        let u = |k: &str| gguf.arch_kv_u64(k);
-        let n_embd =
-            u("embedding_length").ok_or(ModelError::BadHparam("embedding_length"))? as usize;
-        let block_count = u("block_count").unwrap_or(64) as usize;
-        let head_count =
-            u("attention.head_count").ok_or(ModelError::BadHparam("head_count"))? as usize;
-        let head_dim =
-            u("attention.key_length").ok_or(ModelError::BadHparam("key_length"))? as usize;
-        let d_state = u("ssm.state_size").ok_or(ModelError::BadHparam("ssm.state_size"))? as usize;
-        let n_group =
-            u("ssm.group_count").ok_or(ModelError::BadHparam("ssm.group_count"))? as usize;
-        let dt_rank =
-            u("ssm.time_step_rank").ok_or(ModelError::BadHparam("ssm.time_step_rank"))? as usize;
-        let d_inner = u("ssm.inner_size").ok_or(ModelError::BadHparam("ssm.inner_size"))? as usize;
-
-        let hp = Hparams {
-            n_layer: block_count.min(64), // block_count=65 → 64본체 + MTP(그래프 외)
-            n_embd,
-            n_ff: u("feed_forward_length").ok_or(ModelError::BadHparam("feed_forward_length"))?
-                as usize,
-            n_head: head_count,
-            n_kv: u("attention.head_count_kv").unwrap_or(head_count as u64) as usize,
-            head_dim,
-            n_rot: u("rope.dimension_count").unwrap_or(head_dim as u64) as usize,
-            rope_base: gguf
-                .arch_kv("rope.freq_base")
-                .and_then(llm170_gguf::Value::as_f64)
-                .unwrap_or(1e7) as f32,
-            eps: gguf
-                .arch_kv("attention.layer_norm_rms_epsilon")
-                .and_then(llm170_gguf::Value::as_f64)
-                .unwrap_or(1e-6) as f32,
-            full_attn_interval: u("full_attention_interval").unwrap_or(4).max(1) as usize,
-            d_inner,
-            n_group,
-            dt_rank,
-            d_state,
-            conv_k: u("ssm.conv_kernel").unwrap_or(4) as usize,
-            vocab: 0, // 아래에서 embd 텐서로 확정
-        };
-
-        // 정합성: d_inner = dt_rank × head_v_dim, head_v_dim == d_state (delta-net-base assert)
-        if !d_inner.is_multiple_of(dt_rank) || d_inner / dt_rank != d_state {
-            return Err(ModelError::BadHparam("d_inner/dt_rank != d_state").into());
-        }
-        if !hp.n_head.is_multiple_of(hp.n_kv) {
-            return Err(ModelError::BadHparam("n_head % n_kv != 0").into());
-        }
-
-        let mut token_pieces = Vec::new();
-        if let Some((_, toks)) = gguf.kv("tokenizer.ggml.tokens").and_then(|v| v.as_array()) {
-            for t in toks {
-                token_pieces.push(t.as_str().unwrap_or("").to_string());
-            }
-        }
-
-        let vocab = gguf
-            .find_tensor("token_embd.weight")
-            .map(|t| t.ne[1])
-            .unwrap_or(0) as usize;
-        let hp = Hparams { vocab, ..hp };
-
-        let m = Model {
-            src: WSrc::Gguf { gguf, mmap },
-            hp,
-            token_pieces,
-            f32_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
-        for name in ["token_embd.weight", "output.weight", "output_norm.weight"] {
-            m.w(name).ok_or(ModelError::MissingTensor(name.into()))?;
-        }
-        // A7(plans/129) → B3(plans/cuda-models.md §4·§5) 확장: 전 텐서 타입
-        // 사전검증 — 모든 무게가 결국 dequant_row를 지나므로(embd/output만이
-        // 아니다) 미지원 타입은 로드에서 거부한다(런타임 unimplemented! 패닉 차단).
-        if let WSrc::Gguf { gguf, .. } = &m.src {
-            let bad: Vec<String> = gguf
-                .tensors
-                .iter()
-                .filter(|t| !crate::quant::deq::dequant_supported(t.ty))
-                .map(|t| format!("{}({})", t.name, t.ty.name()))
-                .collect();
-            if !bad.is_empty() {
-                return Err(ModelError::UnsupportedLayout {
-                    name: bad.join(", "),
-                    why: "dequant_row 미지원 양자 타입",
-                }
-                .into());
-            }
-        }
-        Ok(m)
-    }
-
-    /// W4A16 디렉터리 직접 로드(§3.5 A안) — config.json에서 하이퍼파라미터,
+    /// W4A16 디렉터리 로드(§3.5 직접 로드) — config.json에서 하이퍼파라미터,
     /// tokenizer.json/vocab.json에서 조각표. 소스 검증은 W4A16 로더의
     /// validate()가 전수(트리플·커버리지). MTP는 미매핑(스펙 별도 과제).
-    pub fn load_w4a16(dir: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(dir: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         profile_span!("model::load_w4a16");
         let w4 =
             crate::w4a16::W4a16Model::open(dir).map_err(|e| ModelError::W4a16(e.to_string()))?;
@@ -233,7 +122,7 @@ impl Model {
         let token_pieces =
             crate::w4a16::load_pieces(dir).map_err(|e| ModelError::W4a16(e.to_string()))?;
         let m = Model {
-            src: WSrc::W4a16(Box::new(w4)),
+            w4: Box::new(w4),
             hp,
             token_pieces,
             f32_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -246,73 +135,20 @@ impl Model {
         Ok(m)
     }
 
-    /// plans/40: 가중 텐서의 mmap 페이지를 커널에 반납 (MADV_DONTNEED).
-    /// GPU 상주 엔진 업로드 후 호출 — 파일 지원 클린 페이지라 즉시 회수되고,
-    /// 이후 재접근 시 디스크에서 다시 읽힘. keep에 포함된 이름·4MiB 미만은 유지.
-    pub fn discard_weight_pages(&self, keep: &[&str]) -> u64 {
-        let WSrc::Gguf { gguf, mmap } = &self.src else {
-            return 0; // W4A16 소스는 전부 CPU 경로 — 페이지 반납 무의미.
-        };
-        let mut total = 0u64;
-        for t in &gguf.tensors {
-            let name = t.name.as_str();
-            let Some((start, end)) = t.file_range(gguf.data_offset) else {
-                continue;
-            };
-            let len = (end - start) as usize;
-            if len < (4 << 20) || keep.contains(&name) {
-                continue;
-            }
-            // madvise는 페이지 정렬 필수 — 시작을 내림, 길이 보정
-            const PG: usize = 4096;
-            let s_pg = (start as usize) & !(PG - 1);
-            let e_pg = ((start as usize + len + PG - 1) & !(PG - 1)).min(mmap.len());
-            if e_pg <= s_pg {
-                continue;
-            }
-            let rc = unsafe {
-                libc::madvise(
-                    mmap.as_ptr().add(s_pg) as *mut libc::c_void,
-                    e_pg - s_pg,
-                    libc::MADV_DONTNEED,
-                )
-            };
-            if rc == 0 {
-                total += len as u64;
-            } else {
-                eprintln!(
-                    "[madvise] {name}: rc={rc} err={}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-        total
+    /// plans/40 페이지 반납은 GGUF mmap 전용이었음 — GGUF 탈락(2026-10-08)으로
+    /// 무동작(W4A16 소스는 전부 CPU 경로). 호출부 계약 유지를 위해 잔존.
+    pub fn discard_weight_pages(&self, _keep: &[&str]) -> u64 {
+        0
     }
 
-    /// 무게 뷰 — 소스별. W4A16은 이름맵(§3.5 A안)으로 슬라이스/분리버퍼 구성.
+    /// 무게 뷰 — W4A16 이름맵(§3.5)으로 슬라이스/분리버퍼 구성.
     pub fn w(&self, name: &str) -> Option<Weight<'_>> {
-        match &self.src {
-            WSrc::Gguf { gguf, mmap } => {
-                let t = gguf.find_tensor(name)?;
-                let (start, end) = t.file_range(gguf.data_offset)?;
-                Some(Weight {
-                    data: &mmap[start as usize..end as usize],
-                    aux: None,
-                    ty: t.ty,
-                    n_in: t.ne[0],
-                    n_out: t.ne[1] * t.ne[2] * t.ne[3],
-                })
-            }
-            WSrc::W4a16(w4) => w4_weight(w4, name),
-        }
+        w4_weight(&self.w4, name)
     }
 
-    /// 텐서 실재 판정(소스 무관) — MTP 탑재 여부 등.
+    /// 텐서 실재 판정 — MTP 탑재 여부 등.
     pub fn has_tensor(&self, name: &str) -> bool {
-        match &self.src {
-            WSrc::Gguf { gguf, .. } => gguf.find_tensor(name).is_some(),
-            WSrc::W4a16(_) => crate::w4a16::eng(name).is_some(),
-        }
+        crate::w4a16::eng(name).is_some()
     }
 
     pub fn wchk(&self, name: &str) -> Result<Weight<'_>, ModelError> {
@@ -324,46 +160,44 @@ impl Model {
         if let Some(v) = self.f32_cache.borrow().get(name) {
             return Ok(v.clone());
         }
-        let v = match &self.src {
-            WSrc::Gguf { .. } => self.wchk(name)?.dequant_f32_vec(),
-            WSrc::W4a16(w4) => match crate::w4a16::eng(name) {
-                // 정규화는 HF zero-centered(w−1 저장) — GGUF 규약 +1 보정.
-                // ssm_a는 −exp(A_log), dt_bias/A_log·conv는 V헤드 순열 합성
-                // (엔진 subhead-major 계약 — perm: 1 인덱스·2 채널).
-                Some(crate::w4a16::Eng::Synth {
-                    name: hf,
-                    plus1,
-                    neg_exp,
-                    perm,
-                }) => {
-                    let mut v = if perm == 2 {
-                        w4.conv_rows_f32_permuted(&hf)
-                            .map_err(|e| ModelError::W4a16(e.to_string()))?
+        let w4 = &self.w4;
+        let v = match crate::w4a16::eng(name) {
+            // 정규화는 HF zero-centered(w−1 저장) — GGUF 규약 +1 보정.
+            // ssm_a는 −exp(A_log), dt_bias/A_log·conv는 V헤드 순열 합성
+            // (엔진 subhead-major 계약 — perm: 1 인덱스·2 채널).
+            Some(crate::w4a16::Eng::Synth {
+                name: hf,
+                plus1,
+                neg_exp,
+                perm,
+            }) => {
+                let mut v = if perm == 2 {
+                    w4.conv_rows_f32_permuted(&hf)
+                        .map_err(|e| ModelError::W4a16(e.to_string()))?
+                } else {
+                    let raw = w4
+                        .plain_vec_f32(&hf)
+                        .map_err(|e| ModelError::W4a16(e.to_string()))?;
+                    if perm == 1 {
+                        w4.permute_heads_f32(&raw)
                     } else {
-                        let raw = w4
-                            .plain_vec_f32(&hf)
-                            .map_err(|e| ModelError::W4a16(e.to_string()))?;
-                        if perm == 1 {
-                            w4.permute_heads_f32(&raw)
-                        } else {
-                            raw
-                        }
-                    };
-                    if plus1 {
-                        for x in &mut v {
-                            *x += 1.0;
-                        }
+                        raw
                     }
-                    if neg_exp {
-                        for x in &mut v {
-                            *x = -x.exp();
-                        }
+                };
+                if plus1 {
+                    for x in &mut v {
+                        *x += 1.0;
                     }
-                    v
                 }
-                // 플레인 2D(BF16) — Weight 경유 디양자화(행 순열 포함).
-                _ => self.wchk(name)?.dequant_f32_vec(),
-            },
+                if neg_exp {
+                    for x in &mut v {
+                        *x = -x.exp();
+                    }
+                }
+                v
+            }
+            // 플레인 2D(BF16) — Weight 경유 디양자화(행 순열 포함).
+            _ => self.wchk(name)?.dequant_f32_vec(),
         };
         self.f32_cache
             .borrow_mut()

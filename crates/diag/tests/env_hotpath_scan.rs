@@ -18,7 +18,6 @@
 /// (루트, 허용 파일 접두사 목록) — 루트가 없으면 테스트 실패(이동 누락 방지).
 const SCAN: &[(&str, &[&str])] = &[
     ("crates/core/src", &[]),
-    ("crates/exl3/src", &[]),
     ("crates/server/src", &["main.rs", "probes/"]),
 ];
 
@@ -120,7 +119,7 @@ fn guard_killswitch_env_stays_banned() {
     }
     let root = repo_root();
     let mut bad = Vec::new();
-    for dir in ["crates/core/src", "crates/exl3/src", "crates/server/src"] {
+    for dir in ["crates/core/src", "crates/server/src"] {
         walk(&root.join(dir), &mut bad);
     }
     assert!(

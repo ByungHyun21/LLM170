@@ -7,7 +7,6 @@
 //! 디코딩(`piece_bytes`)은 기존 c2b 역표를 그대로 사용.
 
 use crate::unicode_data as udata;
-use llm170_gguf::GgufFile;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 
@@ -44,123 +43,16 @@ pub struct Tokenizer {
     greedy_index: HashMap<Vec<u8>, u32>,
 }
 
-/// 토큰 KV 존재 판정 (part1/part2 선택용).
-fn has_tokens(g: &GgufFile) -> bool {
-    g.kv("tokenizer.ggml.tokens")
-        .and_then(llm170_gguf::Value::as_array)
-        .map(|(_, v)| !v.is_empty())
-        .unwrap_or(false)
-}
-
 impl Tokenizer {
-    /// 빈 토크나이저 (로드 최종 실패시 — 토큰 id 모드만 동작).
-    pub fn empty() -> Self {
-        Tokenizer {
-            vocab: Vec::new(),
-            text_to_id: HashMap::new(),
-            bpe_ranks: HashMap::new(),
-            special: Vec::new(),
-            special_user: Vec::new(),
-            pre: Pre::Other,
-            ignore_merges: false,
-            c2b: HashMap::new(),
-            b2c: HashMap::new(),
-            greedy_index: HashMap::new(),
-        }
-    }
-
-    pub fn load(path: &Path, part2: Option<&Path>) -> Result<Self, String> {
-        // EXL3 디렉터리 (plans/121 A1) — vocab.json/merges.txt/tokenizer_config.json.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        // 모델 = W4A16 디렉터리(2026-10-08 단일 — GGUF 탈락, plans/w4a16-cuda.md §5).
         if path.is_dir() {
             return Self::from_hf_dir(path);
         }
-        let g = GgufFile::open(path).map_err(|e| e.to_string())?;
-        if has_tokens(&g) {
-            return Self::from_gguf(&g);
-        }
-        // part1(메타 전용)에 토크나이저가 없음 — part2 시도
-        if let Some(g2) = part2
-            .map(GgufFile::open)
-            .transpose()
-            .map_err(|e| e.to_string())?
-            && has_tokens(&g2)
-        {
-            return Self::from_gguf(&g2);
-        }
-        Ok(Tokenizer::empty())
-    }
-
-    fn from_gguf(g: &GgufFile) -> Result<Self, String> {
-        let toks = g
-            .kv("tokenizer.ggml.tokens")
-            .and_then(llm170_gguf::Value::as_array)
-            .map(|(_, v)| v.to_vec())
-            .unwrap_or_default();
-        let mut vocab = Vec::with_capacity(toks.len());
-        for t in &toks {
-            vocab.push(t.as_str().unwrap_or("").to_string());
-        }
-
-        // pre 타입
-        let pre_str = g
-            .kv("tokenizer.ggml.pre")
-            .and_then(llm170_gguf::Value::as_str)
-            .unwrap_or("");
-        let pre = match pre_str {
-            "qwen35" => Pre::Qwen35,
-            "qwen2" => Pre::Qwen2,
-            _ => Pre::Other,
-        };
-        let ignore_merges = g
-            .kv("tokenizer.ggml.ignore_merges")
-            .and_then(llm170_gguf::Value::as_u64)
-            .map(|v| v != 0)
-            .unwrap_or(false);
-
-        // 병합 랭크 — llama.cpp: 위치 1부터 첫 ' ' 분할, 중복 emplace(선발 우선)
-        let mut bpe_ranks = HashMap::new();
-        if let Some(merges) = g
-            .kv("tokenizer.ggml.merges")
-            .and_then(llm170_gguf::Value::as_array)
-            .map(|(_, v)| v.to_vec())
-        {
-            for (i, m) in merges.iter().enumerate() {
-                let w = m.as_str().unwrap_or("");
-                let b = w.as_bytes();
-                let (first, second) = match b[1..].iter().position(|&c| c == b' ') {
-                    Some(p) => (&b[..p + 1], &b[p + 2..]),
-                    None => continue, // 스페이스 없음 — llama.cpp의 ("","") 등재는 미사용
-                };
-                let mut key = Vec::with_capacity(4 + first.len() + second.len());
-                key.extend_from_slice(&(first.len() as u32).to_le_bytes());
-                key.extend_from_slice(first);
-                key.extend_from_slice(second);
-                bpe_ranks.entry(key).or_insert(i as u32);
-            }
-        }
-
-        // 특수 토큰: token_type ∈ {UNKNOWN=2, CONTROL=3, USER_DEFINED=4}
-        let mut special: Vec<(String, u32)> = Vec::new();
-        let mut special_user: Vec<(String, u32)> = Vec::new();
-        if let Some(types) = g
-            .kv("tokenizer.ggml.token_type")
-            .and_then(llm170_gguf::Value::as_array)
-            .map(|(_, v)| v.to_vec())
-        {
-            for (i, t) in types.iter().take(vocab.len()).enumerate() {
-                let ty = t.as_u64().unwrap_or(1) as i32;
-                if ty == 4 {
-                    special_user.push((vocab[i].clone(), i as u32));
-                } else if matches!(ty, 2 | 3) {
-                    special.push((vocab[i].clone(), i as u32));
-                }
-            }
-        }
-        // 파티션 순서 = 본문 길이 내림차순 (llama.cpp cache_special_tokens 정렬)
-        special.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
-        special_user.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
-
-        Self::from_parts(&vocab, bpe_ranks, special, special_user, pre, ignore_merges)
+        Err(format!(
+            "토크나이저: 디렉터리 모델(W4A16)만 지원 — GGUF 탈락(2026-10-08): {}",
+            path.display()
+        ))
     }
 
     /// 공통 꼬리 — 바이트 표·인덱스 조립(from_gguf·from_hf_dir 공유).

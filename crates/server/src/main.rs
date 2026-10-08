@@ -13,14 +13,6 @@ mod sched;
 mod tokenize;
 mod unicode_data;
 
-/// 4분할 모델의 part2 경로 유도 — part1 메타(토크나이저) 실패 시 대안.
-/// serve·tokenize가 같은 규칙을 썼다(plans/109 P5 단일화).
-fn part2_path(model: &std::path::Path) -> Option<std::path::PathBuf> {
-    let stem = model.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    stem.contains("-00001-of-")
-        .then(|| model.with_file_name(stem.replace("-00001-of-", "-00002-of-")))
-}
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -320,12 +312,11 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         eprintln!("error: W4A16은 --spec 미지원(MTP 미매핑 — plans/w4a16-cuda.md §2)");
         return ExitCode::FAILURE;
     }
-    // 토크나이저 적재 (part1 메타 → 실패시 part2)
-    let part2 = part2_path(&model_path);
+    // 토크나이저 적재 (W4A16 디렉터리)
     // 간헐 ENOPT(transient ENOENT) 재시도 — 2026-09-01 실측 회복 패턴.
     let mut tok = None;
     for i in 0..5 {
-        match tokenize::Tokenizer::load(&model_path, part2.as_deref()) {
+        match tokenize::Tokenizer::load(&model_path) {
             Ok(t) => {
                 tok = Some(t);
                 break;
@@ -354,7 +345,6 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let req = engine::InferRequest {
         model: model_path.clone(),
         ctx,
-        mtp: ma.mtp.clone().map(PathBuf::from),
         ple_table: ma.ple_table.clone(),
         ple_cache_mib: ma.ple_cache_mib,
     };
@@ -378,9 +368,7 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
         return ExitCode::from(2);
     };
     let model_path = PathBuf::from(model);
-    // part1 메타 → 실패시 part2 (serve와 동일 규칙)
-    let part2 = part2_path(&model_path);
-    let tok = match tokenize::Tokenizer::load(&model_path, part2.as_deref()) {
+    let tok = match tokenize::Tokenizer::load(&model_path) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("error: tokenizer load: {e}");

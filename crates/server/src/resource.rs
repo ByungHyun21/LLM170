@@ -69,48 +69,9 @@ pub fn check(
     Ok(())
 }
 
-/// B7(plans/cuda-models.md §5): 스플릿 GGUF 파트 경로 정규화 — `-NNNNN-of-MMMMM.gguf`
-/// 어떤 파트로 지정해도 파트1 기준 경로로(Model4::load가 파트를 전개하는 기준).
-/// 종전 model_bytes의 rfind("-00001-of-")는 part2/3 입력을 단일 파일로 과소
-/// 계상했다. 파트1이 없으면 원본 경로 그대로.
-fn split_part1(p: &Path) -> std::path::PathBuf {
-    let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
-        return p.to_path_buf();
-    };
-    let b = name.as_bytes();
-    let digits5 = |s: &[u8]| s.len() == 5 && s.iter().all(u8::is_ascii_digit);
-    // 뒤쪽 `-MMMMM-of-NNNNN.gguf` 접미 확인(첫 `-of-`가 아니다 — 모델명에
-    // `-of-`가 포함될 수 있다).
-    if let Some(of) = name.rfind("-of-")
-        && b.len() >= of + 9 + 5
-        && b[of + 4..of + 9].starts_with(&b[of + 4..])
-        && digits5(&b[of + 4..of + 9])
-        && b[of + 9..].starts_with(b".gguf")
-        && of >= 6
-        && b[of - 6] == b'-'
-        && digits5(&b[of - 5..of])
-    {
-        let mut n2 = String::with_capacity(name.len());
-        n2.push_str(&name[..of - 6]);
-        n2.push_str("-00001");
-        n2.push_str(&name[of..]);
-        let p1 = p.with_file_name(n2);
-        if p1.exists() {
-            return p1;
-        }
-    }
-    p.to_path_buf()
-}
-
-/// 스플릿 GGUF 전체 파트 크기 합 - `-00001-of-00004.gguf` 패턴(Model4::load와 동일 규약).
-/// EXL3 디렉터리 경로는 재귀 합산 + 런타임 스크래치 가산(2026-10-03:
-/// 디렉터리 metadata≈0으로 통과하던 구멍 — gsnap/배치 스크래치 할당이
-/// 시스템 동결로 폭발한 사고의 근본 가드 결함).
+/// 모델 회계 — W4A16 디렉터리(전 샤드 재귀 합산 + 런타임 스크래치 가산).
+/// (2026-10-03 사고: 디렉터리 metadata≈0 통과로 시스템 동결 — 근본 가드 결함.)
 fn model_bytes(p: &Path) -> u64 {
-    // B7: 파트 정규화 후 회계 — part2/3 직접 지정도 전체 파트 합산.
-    let p = &split_part1(p);
-    // EXL3 디렉터리: 샤드 전체 합 + GPU 스크래치(yb×3 1.5GB + xtb/ah 1.3GB
-    // + gframe 0.53GB + aframe 0.27GB + fframe/gsnap 0.18GB ≈ 3.7GB → 4GB 가산).
     if p.is_dir() {
         let mut total = 0u64;
         fn walk(d: &Path, acc: &mut u64) {
@@ -128,64 +89,7 @@ fn model_bytes(p: &Path) -> u64 {
         walk(p, &mut total);
         return total.saturating_add(4u64 << 30);
     }
-    let name = match p.file_name().and_then(|s| s.to_str()) {
-        Some(n) => n.to_string(),
-        None => return 0,
-    };
-    let mut total = p.metadata().map(|m| m.len()).unwrap_or(0);
-    // 부분 파일이면 같은 접두의 모든 파트를 합산한다.
-    if let Some(idx) = name.rfind("-00001-of-") {
-        let dir = p.parent().map(Path::new).unwrap_or_else(|| Path::new("."));
-        let prefix = &name[..idx];
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                let n = e.file_name();
-                let Some(n) = n.to_str() else { continue };
-                if n.starts_with(prefix) && n.ends_with(".gguf") && n != name {
-                    total += e.metadata().map(|m| m.len()).unwrap_or(0);
-                }
-            }
-        }
-    }
-    // PLE 테이블(per_layer_token_embd) 스트리밍 제외 — 4-split qwen4exp GGUF의
-    // PLE 테이블(26.8GiB)은 mmap+ssd pread로 스트리밍(ple_table auto/ssd,
-    // plans/111 W4c·§21-4)되어 상주 불요. ram 모드(28.8GB pin)는 30GB 체제에서
-    // 선택 불가 — 상수 차감이 무해. 파일을 못 읽으면 0(보수적으로 과대 가드).
-    // (2026-10-07: host 19.5GB에서 FN 기동 거부 — max-ctx 실사용 장벽 수리.)
-    total = total.saturating_sub(ple_stream_bytes(p));
-    total
-}
-
-/// GGUF 파트들에서 PLE 테이블(per_layer_token_embd) 바이트 합 — mmap 스트리밍
-/// 되어 상주 불요한 테이블의 가드 차감용. GGUF 헤더 파싱 실패 시 0.
-fn ple_stream_bytes(p: &Path) -> u64 {
-    let p = &split_part1(p);
-    let name = match p.file_name().and_then(|s| s.to_str()) {
-        Some(n) => n.to_string(),
-        None => return 0,
-    };
-    let Some(idx) = name.find("-of-") else {
-        return 0;
-    };
-    let dir = p.parent().map(Path::new).unwrap_or_else(|| Path::new("."));
-    let prefix = &name[..idx];
-    let mut total = 0u64;
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let n = e.file_name();
-            let Some(n) = n.to_str() else { continue };
-            if !n.starts_with(prefix) || !n.ends_with(".gguf") {
-                continue;
-            }
-            if let Ok(g) = llm170_gguf::GgufFile::open(&dir.join(n))
-                && let Some(t) = g.find_tensor("per_layer_token_embd.weight")
-                && let Some(nb) = t.nbytes()
-            {
-                total += nb;
-            }
-        }
-    }
-    total
+    p.metadata().map(|m| m.len()).unwrap_or(0)
 }
 
 /// 호스트 가용 메모리 (/proc/meminfo MemAvailable).
@@ -200,37 +104,8 @@ fn host_mem_available() -> Option<u64> {
     None
 }
 
-/// 적재 시작 전 가드 - 서브커맨드 진입부에서 호출.
-/// `gpu`가 참이면 VRAM 가용을 조회해 산식에 포함한다(B17: 조회 실패=거부).
-/// `runtime`: 요청 런타임(Some("cuda")면 cuMemGetInfo 프로브, 그 외 hip).
-/// 진단용 기본 모델 경로(단일 소스 — probes.rs·가드 표가 공유,
-/// plans/129 A2/R1·A13). **[2026-10-08 임시 대체]** 구 GGUF/EXL3 자산이
-/// 사용자 정리(GGUF·EXL3 탈락)로 삭제되어 W4A16 자산으로 임시 지정 —
-/// hip/vk/exl3 프로브 표면은 후속 배치(plans/w4a16-cuda.md §5 B1/B2)에서
-/// 삭제 예정이라 이 표도 함께 소멸한다.
-pub const DEFAULT_FN_MODEL: &str =
-    "/home/harsper/Desktop/workspace/models/Qwen3.8-Flash-Next-W4A16-FP8PLE";
-pub const DEFAULT_27_MODEL: &str =
-    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B-W4A16-AutoRound";
-pub const DEFAULT_EXL3_MODEL: &str =
-    "/home/harsper/Desktop/workspace/models/Qwen3.8-27B-W4A16-AutoRound";
-
-/// 무인자 실행 시 모델을 적재하는 프로브(가드 우회 폐쇄 — plans/129 A13).
-/// (서브커맨드, 기본 경로) — --model/위치인자 부재 시 기본 경로로 가드한다.
-pub const PROBE_DEFAULT_MODELS: &[(&str, &str)] = &[
-    ("mmq-row-check", DEFAULT_27_MODEL),
-    ("hip-dmmv-check", DEFAULT_27_MODEL),
-    ("tile-row-check", DEFAULT_27_MODEL),
-    ("hip-moe-dmmv-check", DEFAULT_FN_MODEL),
-    ("mtp-load-check", DEFAULT_FN_MODEL),
-    ("vk-frame-check", DEFAULT_FN_MODEL),
-];
-
-/// B19: 위치인자로 모델을 적재하는 GPU 프로브 접두 — 일반 위치인자 폴백에서
-/// gpu=true(가드가 VRAM까지 계정). CPU 프로브(mod-check 등)는 폴백 gpu=false.
-const POSITIONAL_GPU_PROBES: &[&str] = &["vk-", "hip", "exl3-", "cuda", "mmq-", "tile-", "rawhip"];
-
-/// 가드 대상(plans/129 A2/R1) — 판정 결과.
+/// 가드 대상(plans/129 A2/R1) — 판정 결과. 판정 계약은 guard_target_cases
+/// 표 테스트가 고정한다(`gpu`=VRAM 계정 여부, B17: 조회 실패=거부).
 pub struct GuardTarget {
     pub path: std::path::PathBuf,
     pub gpu: bool,
@@ -238,10 +113,9 @@ pub struct GuardTarget {
     pub runtime: Option<String>,
 }
 
-/// 가드 대상 판정 — main() 인라인에서 추출한 순수함수(plans/129 A2/R1).
-/// 입력: 서브커맨드, --model 값, 정규화 백엔드(hip|vulkan→"gpu"), 런타임,
-/// 위치인자. None = 가드 스킵(메타데이터 서브커맨드 또는 경로 부재 — 로더
-/// 에러가 더 정확). 계약은 테이블 테스트(guard_target_cases)가 고정한다.
+/// 가드 대상 판정 — main() 인라인의 순수함수(plans/129 A2/R1).
+/// 입력: 서브커맨드, --model, 백엔드, 런타임, 위치인자. None = 가드 스킵
+/// (메타 서브커맨드 또는 경로 부재 — 로더 에러가 더 정확).
 pub fn guard_target(
     sub: &str,
     model: Option<&str>,
@@ -249,54 +123,16 @@ pub fn guard_target(
     gpu_runtime: Option<&str>,
     rest: &[String],
 ) -> Option<GuardTarget> {
-    // 메타데이터/행 판독만 읽는 서브커맨드 — 무게 미적재. dequant는 무게
-    // 텐서 1행(≤수백KB)만 판독하므로 적재 계정 대상이 아니다(B2 검증 워크플로
-    // 가드 우회가 아니라 계약 — 모델 상주 불가 기기에서도 판독 가능해야 한다).
+    // 토크나이저 파일만 판독 — 무게 미적재.
     if matches!(sub, "tokenize") {
         return None;
     }
-    let mut path = model.map(std::path::PathBuf::from);
-    let mut gpu = backend == Some("gpu") || gpu_runtime.is_some();
-    let first_pos = || {
+    let path = model.map(std::path::PathBuf::from).or_else(|| {
         rest.iter()
             .find(|a| !a.starts_with("--"))
             .map(std::path::PathBuf::from)
-    };
-    if sub == "check" {
-        gpu = true; // run_check의 백엔드 기본값이 gpu다.
-        if path.is_none() {
-            path = first_pos();
-        }
-    } else if sub == "w4a8-check" && path.is_none() {
-        path = first_pos(); // args[0] 필수 — 로더 적재.
-    }
-    // exl3-* 프로브도 모델을 적재한다 — 첫 비플래그 인자(A13: 상대경로 우회를
-    // 닫기 위해 과거 슬래시 조건 폐지, 2026-10-04 사고 재발 방지). 무인자면
-    // EXL3 기본 아카이브로 가드(안전 방향 — 오탐은 가드 에러가 안내).
-    if sub.starts_with("exl3-") {
-        gpu = true;
-        if path.is_none() {
-            path = first_pos().or_else(|| Some(DEFAULT_EXL3_MODEL.into()));
-        }
-    }
-    // A13: 기본 경로로 적재하는 무인자 프로브 — 경로표로 가드.
-    if path.is_none()
-        && let Some((_, def)) = PROBE_DEFAULT_MODELS.iter().find(|(c, _)| *c == sub)
-    {
-        path = Some(std::path::PathBuf::from(*def));
-        gpu = true;
-    }
-    // B19: 나머지 위치인자 프로브(rawhip-check·vk-gemv-check 등)도 모델을
-    // 적재한다 — 일반 폴백으로 가드. 라우트 추가·프로브 확장 시 무가드
-    // 실적재 경로가 새로 생기는 것을 막는다. GPU 프로브 접두는 gpu=true.
-    if path.is_none()
-        && let Some(p) = first_pos()
-    {
-        path = Some(p);
-        if POSITIONAL_GPU_PROBES.iter().any(|pre| sub.starts_with(pre)) {
-            gpu = true;
-        }
-    }
+    });
+    let gpu = backend == Some("gpu") || gpu_runtime.is_some();
     path.map(|path| GuardTarget {
         path,
         gpu,
@@ -304,49 +140,8 @@ pub fn guard_target(
     })
 }
 
-/// PLE 테이블(per_layer_token_embd) SSD 스테이징 차감 — 상주 계정에서 제외.
-/// ple-ssd 모드(8GiB+ 테이블은 auto 정책상 SSD 행선)에선 테이블이 RAM/VRAM
-/// 비상주(pread 요청 시 판독)이므로 model_bytes에 포함하면 과대계상 — 버퍼드
-/// PLE(plans/135 long-ctx)가 페이지캐시를 쓰며 MemAvailable이 오르내리는
-/// 지금은 가드 오탐의 직접 원인. 메타데이터만 저비용 판독(GGUF 헤더+텐서 표).
-fn ple_ssd_deduction(model: &Path) -> u64 {
-    const TENSOR: &str = "per_layer_token_embd.weight";
-    const SSD_MIN: u64 = 8u64 << 30; // 8GiB+ 테이블만 SSD 행선으로 간주
-    let dir = model
-        .parent()
-        .map(Path::new)
-        .unwrap_or_else(|| Path::new("."));
-    let name = model.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    let mut shards: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(idx) = name.rfind("-00001-of-") {
-        let prefix = &name[..idx];
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                let n = e.file_name();
-                let Some(n) = n.to_str() else { continue };
-                if n.starts_with(prefix) && n.ends_with(".gguf") {
-                    shards.push(dir.join(n));
-                }
-            }
-            shards.sort();
-        }
-    } else {
-        shards.push(model.to_path_buf());
-    }
-    for sh in &shards {
-        let Ok(f) = llm170_gguf::GgufFile::open(sh) else {
-            continue;
-        };
-        if let Some(sz) = f.find_tensor(TENSOR).and_then(|t| t.nbytes()) {
-            // 스플릿 텐서는 단일 샤드에 온전히 존재 (GGUF v3 배치 규약).
-            return if sz >= SSD_MIN { sz } else { 0 };
-        }
-    }
-    0
-}
-
 pub fn preflight(model: &Path, gpu: bool, runtime: Option<&str>) -> Result<(), String> {
-    let bytes = model_bytes(model).saturating_sub(ple_ssd_deduction(model));
+    let bytes = model_bytes(model);
     if bytes == 0 {
         return Ok(()); // 경로 오류는 로더의 에러가 더 정확하다 - 여기서는 통과
     }
@@ -511,115 +306,35 @@ mod tests {
         assert!(check(17 * GIB, Some(20 * GIB), Some(30 * GIB), true).is_ok());
     }
 
-    #[test]
-    fn b7_split_part1_normalization() {
-        // part2/3 경로 → 파트1 유도. 존재하지 않는 파트면 원본 유지.
-        let p2 = Path::new("/nonexistent/model-00002-of-00003.gguf");
-        assert_eq!(split_part1(p2), p2); // 파트1 부재 — 원본
-        // 실존 스플릿(FN 3파트)으로 검증: part2 입력도 part1로 정규화.
-        let fn_dir = "/home/yoon/models/qwen3.8-Flash-Next/UD-Q3_K_XL";
-        let base = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q3_K_XL";
-        if std::path::Path::new(&format!(
-            "{fn_dir}/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf"
-        ))
-        .exists()
-        {
-            let p = split_part1(Path::new(&format!(
-                "{fn_dir}/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00003.gguf"
-            )));
-            assert!(p.to_string_lossy().contains("-00001-of-00003"));
-        }
-        // 단일 파일·비-GGUF 접미는 무변환.
-        assert_eq!(split_part1(Path::new("/m/a.gguf")), Path::new("/m/a.gguf"));
-        let _ = base;
-    }
-
-    /// guard_target 판정 표(plans/129 A2/R1 + B19 확대) — 서브커맨드×인자 형태
-    /// 계약을 고정한다. 무가드 적재 프로브 폐쇄(A13)·exl3 상대경로 우회 폐쇄·
-    /// 위치인자 프로브 일반 폴백(B19) 포함.
+    /// guard_target 판정 표 — 서브커맨드×인자 형태 계약(B19 확대 유지).
     #[test]
     fn guard_target_cases() {
-        use super::{DEFAULT_27_MODEL, DEFAULT_EXL3_MODEL, PROBE_DEFAULT_MODELS, guard_target};
+        use super::guard_target;
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         // serve/infer류: --model + 백엔드 → (경로, gpu, 런타임)
         let g = guard_target(
             "serve",
-            Some("/m/a.gguf"),
+            Some("/m/w4a16"),
             Some("gpu"),
-            Some("hip"),
+            Some("cuda"),
             &s(&[]),
         );
         assert_eq!(
             g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu, g.runtime)),
-            Some(("/m/a.gguf".into(), true, Some("hip".into())))
+            Some(("/m/w4a16".into(), true, Some("cuda".into())))
         );
-        // cpu 백엔드 → gpu=false
-        let g = guard_target("infer", Some("/m/a.gguf"), Some("cpu"), None, &s(&[]));
+        let g = guard_target("infer", Some("/m/w4a16"), Some("cpu"), None, &s(&[]));
         assert_eq!(g.map(|g| g.gpu), Some(false));
-        // check: 첫 위치인자 + gpu 강제
-        let g = guard_target("check", None, None, None, &s(&["/m/a.gguf", "--quick"]));
-        assert_eq!(
-            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
-            Some(("/m/a.gguf".into(), true))
-        );
-        // w4a8-check: 위치인자 (gpu 강제 없음)
-        let g = guard_target("w4a8-check", None, None, None, &s(&["/m/a.gguf"]));
-        assert_eq!(
-            g.map(|g| g.path.to_str().unwrap().to_string()),
-            Some("/m/a.gguf".to_string())
-        );
-        // exl3 프로브: 상대경로(무슬래시)도 우회 없이 가드(A13)
-        let g = guard_target("exl3-hip-decode", None, None, None, &s(&["relmodel"]));
-        assert_eq!(
-            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
-            Some(("relmodel".into(), true))
-        );
-        // exl3 무인자: 기본 EXL3 아카이브로 가드
-        let g = guard_target("exl3-hip-attn", None, None, None, &s(&[]));
-        assert_eq!(
-            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
-            Some((DEFAULT_EXL3_MODEL.to_string(), true))
-        );
-        // 무인자 적재 프로브: 기본 경로표(A13)
-        let g = guard_target("mmq-row-check", None, None, None, &s(&[]));
-        assert_eq!(
-            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
-            Some((DEFAULT_27_MODEL.to_string(), true))
-        );
-        let g = guard_target("vk-frame-check", None, None, None, &s(&[]));
-        assert_eq!(
-            g.map(|g| g.path.to_str().unwrap().to_string()),
-            Some(super::DEFAULT_FN_MODEL.to_string())
-        );
-        // B19: 위치인자 GPU 프로브 일반 폴백 — rawhip-check/vk-gemv-check 무가드 폐쇄.
-        let g = guard_target("rawhip-check", None, None, None, &s(&["/m/27b.gguf"]));
-        assert_eq!(
-            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
-            Some(("/m/27b.gguf".into(), true))
-        );
-        let g = guard_target("vk-gemv-check", None, None, None, &s(&["/m/27b.gguf"]));
-        assert_eq!(g.map(|g| g.gpu), Some(true));
-        // CPU 프로브(mod-check) 위치인자 — gpu=false 폴백.
-        let g = guard_target("mod-check", None, None, None, &s(&["/m/a.gguf"]));
-        assert_eq!(g.map(|g| g.gpu), Some(false));
-        // W4A16 로더 프로브(plans/w4a16-cuda.md §1) — 위치인자 폴백(gpu=false).
+        // W4A16 로더 프로브 — 위치인자 폴백(gpu=false).
         let g = guard_target("w4a16-load", None, None, None, &s(&["/m/w4a16"]));
         assert_eq!(
             g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
             Some(("/m/w4a16".into(), false))
         );
-        // 메타·행 판독 서브커맨드 → None
-        assert!(guard_target("tokenize", Some("/m/a.gguf"), None, None, &s(&[])).is_none());
-        // 무모델 로딩 창구 → None(로더/CLI 에러가 더 정확 — bench는 --model required)
-        assert!(guard_target("bench", None, Some("gpu"), None, &s(&[])).is_none());
+        // 메타 서브커맨드 → None
+        assert!(guard_target("tokenize", Some("/m/w4a16"), None, None, &s(&[])).is_none());
+        // 무모델 로딩 창구 → None(로더/CLI 에러가 더 정확)
         assert!(guard_target("infer", None, None, None, &s(&[])).is_none());
         assert!(guard_target("serve", None, None, None, &s(&[])).is_none());
-        // perplexity --model → 가드(전 모델 적재)
-        let g = guard_target("perplexity", Some("/m/a.gguf"), Some("cpu"), None, &s(&[]));
-        assert_eq!(g.map(|g| g.gpu), Some(false));
-        // 표 무결성: 기본 경로 전부 실존(부서진 기본 경로 = 무가드보다 못한 오탐)
-        for (_, def) in PROBE_DEFAULT_MODELS {
-            assert!(std::path::Path::new(def).exists(), "기본 경로 부재: {def}");
-        }
     }
 }

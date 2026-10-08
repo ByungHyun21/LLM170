@@ -94,195 +94,11 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
 pub struct InferRequest {
     pub model: PathBuf,
     pub ctx: usize,
-    /// 외장 MTP 모듈 경로(plans/109 P15⑤) — None이면 --spec>0 시 자동 탐지.
-    pub mtp: Option<PathBuf>,
-    /// PLE 테이블 오프로드 모드(plans/111 W4c) — None=auto.
+    /// PLE 테이블 오프로드 모드(plans/111 W4c) — hip 탈락(2026-10-08)으로
+    /// W4A16 경로에서는 무시된다(build_slots가 고지).
     pub ple_table: Option<String>,
-    /// SSD 블록 캐시 예산 MiB(plans/111 W4c) — None=기본 1024.
+    /// SSD 블록 캐시 예산 MiB(plans/111 W4c) — 상동.
     pub ple_cache_mib: Option<usize>,
-}
-
-/// qwen4exp GPU 경로 요청 여부 (plans/64 P1).
-/// GPU = `--backend gpu` 명시 시에만 (기본은 CPU golden 경로).
-/// `LLM170_Q4_CPU=1` / `LLM170_RAWHIP=0`이면 항상 CPU.
-pub fn q4_gpu_env_off() -> bool {
-    if llm170_diag::flag::on("LLM170_Q4_CPU") {
-        return true;
-    }
-    llm170_diag::flag::val("LLM170_RAWHIP") == Some("0")
-}
-
-pub fn q4_gpu_wanted(backend: &BackendSel) -> bool {
-    if q4_gpu_env_off() {
-        return false;
-    }
-    match backend {
-        BackendSel::Cpu => false,
-        BackendSel::Gpu => true,
-        BackendSel::GpuRuntime(r) => {
-            if r != "hip" && r != "vulkan" && r != "cuda" {
-                eprintln!(
-                    "# qwen4exp: --gpu-runtime {r}은 미지원(QSA 커널·용량) — HIP로 진행 (plans/64 §7)"
-                );
-            }
-            true
-        }
-    }
-}
-
-/// qwen4exp의 vulkan 런타임 선택 여부 (plans/84 B — 값경로 VkAcc).
-pub fn q4_vk_runtime(backend: &BackendSel) -> bool {
-    matches!(backend, BackendSel::GpuRuntime(r) if r == "vulkan")
-}
-
-/// qwen4exp의 cuda 런타임 선택 여부 (plans/cuda-port.md §1.3 S6 — 값경로
-/// Q4AccCuda).
-pub fn q4_cuda_runtime(backend: &BackendSel) -> bool {
-    matches!(backend, BackendSel::GpuRuntime(r) if r == "cuda")
-}
-
-/// q4 모델에 외장 MTP 모듈 병합 (plans/109 P15⑤) — `--mtp` 우선, 없으면
-/// spec 의도(spec_k>0)일 때 모델 형제의 `mtp-*.gguf` 자동 탐지(Q8_0 우선).
-/// 성공/생략은 로그로만 — 실패(명시 지정인데 깨짐)는 Err.
-pub fn apply_mtp(
-    m: &mut llm170_core::qwen4exp::Model4,
-    model_path: &std::path::Path,
-    mtp_arg: Option<&std::path::Path>,
-    spec_k: usize,
-) -> Result<(), String> {
-    let pick: Option<std::path::PathBuf> = match mtp_arg {
-        Some(p) => Some(p.to_path_buf()),
-        None if spec_k > 0 => {
-            let dir = model_path.parent().unwrap_or(std::path::Path::new("."));
-            let mut hits: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("mtp-") && n.ends_with(".gguf"))
-                })
-                .collect();
-            hits.sort(); // Q4_K_M < Q8_0 — Q8 우선은 아래에서.
-            hits.sort_by_key(|p| {
-                // Q8_0 우선(드래프트 품질) — ⑥ 측정 전 임시 기본.
-                !p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.contains("Q8"))
-            });
-            hits.into_iter().next()
-        }
-        None => None,
-    };
-    match pick {
-        Some(p) => {
-            m.load_mtp(&p).map_err(|e| e.to_string())?;
-            eprintln!("# mtp: 외장 nextn 모듈 병합 — {}", p.display());
-            Ok(())
-        }
-        None if spec_k > 0 => {
-            eprintln!(
-                "# mtp: --spec {} 지정이나 mtp-*.gguf 미발견 — 스펙 없이 진행",
-                spec_k
-            );
-            Ok(())
-        }
-        None => Ok(()),
-    }
-}
-
-/// 백엔드 부착 실패 정책 — serve는 경고 후 CPU 지속(조용한 CPU 폴백이 GPU
-/// 수치로 오인된 사고 이력 — 커밋 참조).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AttachPolicy {
-    Warn,
-    /// 현 프런트는 Warn만 생성 — Strict는 검증 하네스 후속용으로 존치.
-    #[allow(dead_code)]
-    Strict,
-}
-
-/// qwen35 GPU 부착 — rawhip·rawvk 탈락(2026-10-08, plans/w4a16-cuda.md §5):
-/// 잔존 GPU 부착은 CUDA 값경로뿐. 실패는 정책대로(Warn=CPU 지속 / Strict=Err).
-pub fn attach_q35(
-    eng: llm170_core::qwen35::Engine,
-    _vulkan: bool,
-    cuda: bool,
-    policy: AttachPolicy,
-) -> Result<llm170_core::qwen35::Engine, String> {
-    if cuda {
-        // plans/cuda-port.md §1.3 S6 — CUDA 값경로: Q4AccCuda(MatmulHost).
-        match llm170_backend_gpu::new_q4_acc_cuda() {
-            Ok(acc) => {
-                eprintln!("# backend: gpu (qwen35 CUDA 값경로 — plans/cuda-port.md §1.3 S6)");
-                return Ok(eng.with_acc(acc));
-            }
-            Err(e) => {
-                eprintln!("q4acc-cuda: {e}");
-                match policy {
-                    AttachPolicy::Warn => return Ok(eng),
-                    AttachPolicy::Strict => return Err(e),
-                }
-            }
-        }
-    }
-    Ok(eng)
-}
-
-/// qwen4exp GPU 부착 — 단일 경로 (plans/109 P3). vk·hip 가속기 실패는 정책대로.
-///
-/// res_hc f16 버스(res_f16)는 호출부가 명시한다 — 현재 원장 상태:
-/// - serve(build_slots): `want_gpu && !vk` (원장 105 — hip f16 버스 승격,
-///   serve 슬롯 경로에서 +4.3% 웜·토큰 불변 실측).
-/// - infer/bench: `false` — charhash 스테이지 해시·FN 토큰 골든이 f32 버스로
-///   캡처됐다(2026-09-29 실측: infer에서 f16 설정 시 골든 발산·토큰 열화).
-///   통일은 산술 클래스 변경(규칙 10: 승인+재캡처 필요) — 별도 승인 전까지
-///   호출부 현행 값을 유지한다(B1 잔여, 의도된 발산으로 문서화).
-pub fn attach_q4(
-    eng: llm170_core::qwen4exp::layers::Engine4,
-    sources: Vec<(usize, usize, PathBuf)>,
-    want_gpu: bool,
-    vk: bool,
-    cuda: bool,
-    res_f16: bool,
-    policy: AttachPolicy,
-) -> Result<llm170_core::qwen4exp::layers::Engine4, String> {
-    llm170_core::qwen4exp::frame::set_backend_res_f16(res_f16);
-    if !want_gpu {
-        // B21/P0-4(§10-3): 무음 CPU 금지 — env 게이트가 GPU를 강제로 껐으면 로그로.
-        if q4_gpu_env_off() {
-            eprintln!("# backend: cpu (env 게이트 LLM170_Q4_CPU=1/LLM170_RAWHIP=0 — 명시적 CPU)");
-        }
-        return Ok(eng);
-    }
-    if cuda {
-        // plans/cuda-port.md §1.3 S6 — CUDA 값경로: Q4AccCuda(MatmulHost).
-        // 프레임 미구현 → Engine4는 값 경로로 동작(모든 GEMV를 호스트
-        // 스테이징). sources는 미소비 — Q4AccCuda는 Weight 식별 등록판이라
-        // 텐서 사전 적재가 없다(첫 matmul에서 디바이스 적재).
-        return match llm170_backend_gpu::new_q4_acc_cuda() {
-            Ok(acc) => {
-                eprintln!("# backend: gpu (qwen4exp CUDA 값경로 — plans/cuda-port.md §1.3 S6)");
-                Ok(eng.with_acc(acc))
-            }
-            Err(e) => {
-                eprintln!("error: qwen4exp CUDA 가속기 생성 실패 — {e}");
-                match policy {
-                    AttachPolicy::Warn => Ok(eng),
-                    AttachPolicy::Strict => Err(e),
-                }
-            }
-        };
-    }
-    if vk {
-        // rawvk 탈락(2026-10-08) — vk 부착 경로 없음: CPU 유지.
-        return Ok(eng);
-    }
-    // rawhip 탈락(2026-10-08) — hip 부착 경로 없음: CPU 유지(무음 금지 로그).
-    let _ = sources;
-    eprintln!("# backend: cpu (hip 부착 탈락 — plans/w4a16-cuda.md §5)");
-    Ok(eng)
 }
 
 /// 생성 토큰 싱크 — 명령별 출력(JSONL text 포함/미포함·텍스트 누적) 차이를
@@ -427,15 +243,12 @@ pub static SPEC_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 pub enum Engine {
     Q35(Box<llm170_core::qwen35::Engine>),
-    Q4(Box<llm170_core::qwen4exp::layers::Engine4>),
 }
 
 impl Engine {
-    /// 정지 토큰(plans/130 F5 — 하드코드 248044 일반화): Q4는 GGUF 메타,
-    /// Q35는 아키텍처 상수.
+    /// 정지 토큰(plans/130 F5 — 하드코드 248044 일반화): Q35는 아키텍처 상수.
     pub fn eos(&self) -> u32 {
         match self {
-            Engine::Q4(e) => e.model.eos,
             Engine::Q35(_) => llm170_core::qwen35::EOS_EOT,
         }
     }
@@ -462,132 +275,29 @@ fn banner(
     );
 }
 
-pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> Engine {
-    // 배너 format 판정(§10-2): W4A16 디렉터리는 w4a16 — 그 외는 gguf/엔진별.
-    let fmt_str =
-        if req.model.is_dir() && matches!(sniff_format(&req.model), Ok(ModelFormat::W4A16)) {
-            "w4a16"
-        } else {
-            "gguf"
-        };
-    // PLE 플래그는 rawhip 전역 구현이었음 — hip 탈락(2026-10-08, §5)으로
-    // W4A16 경로에서는 무의미. 지정 시 정직 고지.
+pub fn build_slots(req: InferRequest, _backend: BackendSel, n_slots: usize) -> Engine {
+    // PLE 플래그는 rawhip 전역 구현이었음 — hip 탈락(2026-10-08, §5)으로 무의미.
     if req.ple_table.is_some() || req.ple_cache_mib.is_some() {
         eprintln!(
             "# ple-table/ple-cache: hip 탈락(2026-10-08) — 플래그 무시(plans/w4a16-cuda.md §5)"
         );
     }
-    // 아키텍처 판별은 GGUF 파일 전용 — W4A16 디렉터리는 곧장 qwen35 경로.
-    let arch = if req.model.is_dir() {
-        None
-    } else {
-        open_with_retry(&req.model).and_then(|g| g.arch().map(|s| s.to_string()))
-    };
-    if arch.as_deref() == Some("qwen4exp") {
-        // qwen4exp GPU 경로 — plans/64 P1: 기본 CPU(정확성 기준); --backend gpu
-        // 명시 시에만 상주 가속기 부착(attach_q4가 res_f16 원장 105 규칙 적용).
-        let mut m = load_q4_retry(&req.model);
-        if let Err(e) = apply_mtp(
-            &mut m,
-            &req.model,
-            req.mtp.as_deref(),
-            SPEC_K.get().copied().unwrap_or(0),
-        ) {
-            eprintln!("error: {e}");
-        }
-        let sources = m.part_sources();
-        let eng = llm170_core::qwen4exp::layers::Engine4::new(m, n_slots, req.ctx);
-        let eng = attach_q4(
-            eng,
-            sources,
-            q4_gpu_wanted(&backend),
-            q4_vk_runtime(&backend),
-            q4_cuda_runtime(&backend),
-            // plans/115: f16 버스 기본 박탈(원장 105 승격 회수) — serve hip에서
-            // 토큰 전수 파괴 실측(2026-09-30): [760,6511]→가비지 vs f32 버스로는
-            // infer 골든과 완전 일치. B1 잔여(infer f16 골든 발산)와 동일 결함.
-            // 산술 클래스는 f32(골든 캡처본)로 통일.
-            false,
-            AttachPolicy::Warn,
-        )
-        .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
-        // 배너(§10-2): attach는 acc 실재 여부, offload는 런타임별 실제.
-        let runtime = if q4_cuda_runtime(&backend) {
-            "cuda"
-        } else if q4_vk_runtime(&backend) {
-            "vulkan"
-        } else if q4_gpu_wanted(&backend) {
-            "hip"
-        } else {
-            "cpu"
-        };
-        let (attach, offload) = if eng.acc.is_some() {
-            (
-                "on",
-                match runtime {
-                    "cuda" => "partial(Q4K)", // B1: Q4K만 오프로드
-                    "cpu" => "none",
-                    _ => "full",
-                },
-            )
-        } else if runtime == "cpu" {
-            ("off(cpu-backend)", "none")
-        } else {
-            ("off(env-gate-or-create-failed)", "none")
-        };
-        banner(
-            &req.model, fmt_str, runtime, offload, attach, req.ctx, n_slots,
-        );
-        Engine::Q4(Box::new(eng))
-    } else {
-        let m = load_q35_retry(&req.model);
-        let eng = llm170_core::qwen35::Engine::new(m, n_slots, req.ctx);
-        // serve --spec — 스펙 의도일 때만 MTP prefill 훅 활성 (plans/22).
-        let mut eng = if SPEC_K.get().copied().unwrap_or(0) > 0 {
-            let mut e = eng;
-            e.mtp_wanted = true;
-            e
-        } else {
-            eng
-        };
-        // plans/29: --gpu-runtime vulkan 실제 반영.
-        // QA-17: --backend cpu는 부착 생략 — 종전 무조건 부착으로 라벨과
-        // 실제 백엔드가 어긋났다(q4 판 q4_gpu_wanted와 대칭 계약).
-        let vulkan = matches!(&backend, BackendSel::GpuRuntime(r) if r == "vulkan");
-        let cuda = matches!(&backend, BackendSel::GpuRuntime(r) if r == "cuda");
-        if !matches!(&backend, BackendSel::Cpu) {
-            eng = attach_q35(eng, vulkan, cuda, AttachPolicy::Warn)
-                .unwrap_or_else(|e| panic!("gpu attach: {e}"));
-        }
-        // 배너(§10-2) — Q4와 동일 계약.
-        let runtime = if cuda {
-            "cuda"
-        } else if vulkan {
-            "vulkan"
-        } else if !matches!(&backend, BackendSel::Cpu) {
-            "hip"
-        } else {
-            "cpu"
-        };
-        let (attach, offload) = if eng.acc.is_some() || eng.raw_decode.is_some() {
-            (
-                "on",
-                match runtime {
-                    "cuda" => "partial(Q4K)",
-                    "cpu" => "none",
-                    _ => "full",
-                },
-            )
-        } else if runtime == "cpu" {
-            ("off(cpu-backend)", "none")
-        } else {
-            ("off(env-gate-or-create-failed)", "none")
-        };
-        banner(
-            &req.model, fmt_str, runtime, offload, attach, req.ctx, n_slots,
-        );
-        Engine::Q35(Box::new(eng))
+    if SPEC_K.get().copied().unwrap_or(0) > 0 {
+        eprintln!("# spec: W4A16은 MTP 미매핑 — 무시(plans/w4a16-cuda.md §2)");
     }
+    // W4A16 = qwen35 CPU 경로 단일(가속은 W2 커널 이후 — 그때 attach 재도입).
+    let m = load_q35_retry(&req.model);
+    let eng = llm170_core::qwen35::Engine::new(m, n_slots, req.ctx);
+    banner(
+        &req.model,
+        "w4a16",
+        "cpu",
+        "none",
+        "off(cpu-backend)",
+        req.ctx,
+        n_slots,
+    );
+    Engine::Q35(Box::new(eng))
 }
 
 impl Engine {
@@ -595,7 +305,6 @@ impl Engine {
     pub fn reset_seq(&mut self, seq: usize) {
         match self {
             Engine::Q35(e) => e.reset_seq(seq),
-            Engine::Q4(e) => e.reset_seq(seq),
         }
     }
 }
@@ -638,9 +347,9 @@ impl Detok {
     }
 }
 
+use crate::sched::load_q35_retry;
 /// 글로벌 토크나이저 (serve 시 1회 적재).
 pub use crate::sched::{SlotJob, slot_loop};
-use crate::sched::{load_q4_retry, load_q35_retry, open_with_retry};
 
 pub static TOKENIZER: std::sync::OnceLock<crate::tokenize::Tokenizer> = std::sync::OnceLock::new();
 
