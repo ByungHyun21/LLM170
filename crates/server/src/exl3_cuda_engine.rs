@@ -259,8 +259,7 @@ impl Exl3CudaEngine {
         self.dec.gdn_snapshot_slot(slot)?;
         let (ams, hnew, _lg0) = {
             let mtp = &self.mtps[slot];
-            self.dec
-                .verify_batch_with_mtp(slot, &rows, mtp, Some(&h))?
+            self.dec.verify_batch_with_mtp(slot, &rows, mtp, Some(&h))?
         };
         if llm170_diag::dump::opts().key("spec_accept") {
             eprintln!(

@@ -183,6 +183,16 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         prompt,
         mtp: ma.mtp.clone(),
     };
+    // P0-4(B22): 디렉터리 스니핑 — W4A16 명시 에러(bench 경로 계약 동일).
+    if cfg.model_path.is_dir()
+        && crate::engine::sniff_format(&cfg.model_path) == Ok(crate::engine::ModelFormat::W4A16)
+    {
+        eprintln!(
+            "error: 미지원 포맷(W4A16 — P2 대기, plans/cuda-models.md §3.5): {}",
+            cfg.model_path.display()
+        );
+        return ExitCode::FAILURE;
+    }
     let res_lines = if cfg.model_path.is_dir() {
         // EXL3 아카이브 디렉터리(plans/125-4) — GGUF 아키텍처 판별이 아닌
         // 디렉터리 여부로 판정. arch 변수는 GGUF 파일에만 유효하다.

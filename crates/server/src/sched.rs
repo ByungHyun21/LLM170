@@ -644,10 +644,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                     let t = llm170_core::qwen35::greedy(&l);
                                     slot_emit(&mut slots[i], t);
                                 } else {
-                                    slot_fail(
-                                        &mut slots[i],
-                                        format!("cuda spec+decode1: {err}"),
-                                    );
+                                    slot_fail(&mut slots[i], format!("cuda spec+decode1: {err}"));
                                 }
                             }
                         }

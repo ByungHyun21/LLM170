@@ -52,6 +52,21 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     if prompts.is_empty() {
         return usage_err("at least one --prompt-tokens required");
     }
+    // P0-4(§10-1·B22): 디렉터리 포맷 스니핑 — W4A16은 명시 에러(정체불명
+    // "gate_proj 미등록" 실패 차단), EXL3만 디렉터리 서빙.
+    if model_path.is_dir() {
+        match crate::engine::sniff_format(&model_path) {
+            Ok(crate::engine::ModelFormat::Exl3) => {}
+            Ok(crate::engine::ModelFormat::W4A16) => {
+                return usage_err(&format!(
+                    "미지원 포맷(W4A16 — 로더·커널 P2 대기, plans/cuda-models.md §3.5): {}",
+                    model_path.display()
+                ));
+            }
+            Ok(crate::engine::ModelFormat::Gguf) => {} // 불가치(디렉터리)
+            Err(e) => return usage_err(&e),
+        }
+    }
     // EXL3 아카이브(디렉터리) — 포맷 자동 판별(사용자 계약 2026-10-05):
     // --backend는 런타임만 받고 모델 포맷은 경로로 결정. 단일 프롬프트만
     // 지원(엔진이 단일 슬롯) — 게이트(gate-exl3.sh)의 고정 토큰 러너.
