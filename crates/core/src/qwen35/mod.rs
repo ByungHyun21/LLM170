@@ -21,7 +21,6 @@ pub(crate) mod frame;
 pub const EOS_EOT: u32 = 248044;
 pub mod hparams;
 pub mod prefill;
-pub mod rawinject;
 pub mod spec;
 pub mod stages;
 pub use frame::Frame;

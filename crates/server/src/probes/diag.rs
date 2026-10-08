@@ -21,10 +21,6 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     Err(e) => Err(e),
                 }
             }
-            // plans/83 C3: 청크 불변성 자동 검증 — `llm170 diag chunk-check <model> <prompt> [sizes...]`
-            else if args.first().map(String::as_str) == Some("chunk-check") {
-                return Some(cmd_chunk_check(&args[1..]));
-            }
             // plans/87 §1 — tsv 원장에서 폴트 주소 매칭.
             else if args.first().map(String::as_str) == Some("va-lookup") {
                 let Some(tsv) = args.get(1).cloned() else {
@@ -36,10 +32,6 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     return Some(ExitCode::FAILURE);
                 };
                 return Some(cmd_va_lookup(&tsv, &addr));
-            }
-            // plans/87 §1 — 의도적 디스크립터-오프셋 OOB 폴트 유발.
-            else if args.first().map(String::as_str) == Some("vk-fault-probe") {
-                return Some(cmd_vk_fault_probe());
             }
             // plans/87 §2 — 와치독 자가 시험(진동 정지 후 스폰).
             else if args.first().map(String::as_str) == Some("watchdog-selftest") {
@@ -84,7 +76,7 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     .unwrap_or(0.02);
                 return Some(cmd_ckdiff(&a, &b, rel));
             } else {
-                Err("diag: 하위커맨드 diff | chunk-check | va-lookup | vk-fault-probe | watchdog-selftest | ckdiff | fb | envcheck".into())
+                Err("diag: 하위커맨드 diff | va-lookup | watchdog-selftest | ckdiff | fb | envcheck".into())
             }
         }
         _ => return None,
@@ -92,218 +84,6 @@ pub(super) fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     Some(super::finish(r))
 }
 
-/// `llm170 diag chunk-check <model> <prompt> [sizes...] [--backend cpu]`
-/// 청크 불변성 자동 검증 (plans/83 C3, docs/chunk-invariance.md 계약).
-///
-/// 프롬프트를 단일 호출(기준)과 각 청크 크기로 프리필해 최종 logits를 비교:
-/// - bits 동일 → PASS
-/// - argmax 동일 && max|Δ| < 1e-3 → PASS(near-tie, GPU 행 수 의존 잔여 축)
-/// - 그 외 → FAIL
-///
-/// prompt: "1,2,3" 형태면 토큰 id, 아니면 텍스트(BPE 인코딩 — plans/83 A).
-fn cmd_chunk_check(args: &[String]) -> ExitCode {
-    let usage = "사용법: llm170 diag chunk-check <model> <prompt> [sizes...] [--backend cpu]";
-    let Some(model) = args.first() else {
-        eprintln!("{usage}");
-        return ExitCode::FAILURE;
-    };
-    let Some(prompt) = args.get(1) else {
-        eprintln!("{usage}");
-        return ExitCode::FAILURE;
-    };
-    let backend_cpu = args
-        .iter()
-        .any(|a| a == "--backend" && args.iter().any(|b| b == "cpu"))
-        || args.iter().any(|a| a == "--backend=cpu");
-    let sizes: Vec<usize> = args[2..]
-        .iter()
-        .filter_map(|a| a.parse::<usize>().ok())
-        .filter(|&s| s > 0)
-        .collect();
-    let sizes = if sizes.is_empty() {
-        vec![16, 63, 64, 512]
-    } else {
-        sizes
-    };
-
-    // 프롬프트 파싱 — 숫자/콤마 전용이면 토큰 id, 아니면 텍스트
-    let ids: Vec<u32> = if prompt
-        .bytes()
-        .all(|b| b.is_ascii_digit() || b == b',' || b == b' ')
-        && prompt.contains(',')
-    {
-        prompt
-            .split(',')
-            .filter_map(|t| t.trim().parse().ok())
-            .collect()
-    } else {
-        let p = std::path::PathBuf::from(model);
-        let stem = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let part2 = if stem.contains("-00001-of-") {
-            Some(p.with_file_name(stem.replace("-00001-of-", "-00002-of-")))
-        } else {
-            None
-        };
-        match crate::tokenize::Tokenizer::load(&p, part2.as_deref()) {
-            Ok(t) => t.encode(prompt),
-            Err(e) => {
-                eprintln!("error: tokenizer: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-    };
-    if ids.is_empty() {
-        eprintln!("error: 빈 프롬프트");
-        return ExitCode::FAILURE;
-    }
-    eprintln!(
-        "# chunk-check: {}토큰, sizes={:?}, backend={}",
-        ids.len(),
-        sizes,
-        if backend_cpu { "cpu" } else { "gpu" }
-    );
-
-    let path = std::path::PathBuf::from(model);
-    let arch = llm170_gguf::GgufFile::open(&path)
-        .ok()
-        .and_then(|g| g.arch().map(|s| s.to_string()));
-    let ctx = ids.len() * 2 + 64;
-    let (ref_l, runs): (Vec<f32>, Vec<(usize, Vec<f32>)>) = match arch.as_deref() {
-        Some("qwen4exp") => {
-            let res = llm170_core::qwen4exp::Model4::load(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|m| {
-                    let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, 1, ctx);
-                    if !backend_cpu && !crate::engine::q4_gpu_env_off() {
-                        let sources = eng.model.part_sources();
-                        // plans/88 — 런타임 존중: LLM170_GPU_RUNTIME=vulkan 이면 vk
-                        // 프레임 경로의 청크 펜스를 잴 수 있다(종전 hip 고정이라
-                        // vk 변경의 펜스 검증이 불가했다).
-                        let vk = std::env::var("LLM170_GPU_RUNTIME")
-                            .map(|v| v == "vulkan")
-                            .unwrap_or(false);
-                        let r = if vk {
-                            llm170_backend_gpu::new_q4_acc_vk_with_sources(sources)
-                        } else {
-                            llm170_backend_gpu::new_q4_acc_with_sources(sources)
-                        };
-                        match r {
-                            Ok(acc) => {
-                                eng = eng.with_acc(acc);
-                            }
-                            Err(e) => {
-                                return Err(format!(
-                                    "GPU 가속기 생성 실패 — {e} (--backend cpu 로 회피)"
-                                ));
-                            }
-                        }
-                    }
-                    // 기준: 단일 청크(프롬프트 전체) — 청크 크기는 env 스냅샷이
-                    // 아니라 하네스 오버라이드 API로(A6: set_var는 스냅샷 이후 무효).
-                    llm170_core::qwen4exp::layers::set_q4_chunk(ids.len().max(1));
-                    let r = eng.prefill(0, &ids).map_err(|e| e.to_string())?;
-                    eng.reset_seq(0);
-                    let mut runs = Vec::new();
-                    for &sz in &sizes {
-                        llm170_core::qwen4exp::layers::set_q4_chunk(sz);
-                        let l = eng.prefill(0, &ids).map_err(|e| e.to_string())?;
-                        eng.reset_states();
-                        runs.push((sz, l));
-                    }
-                    Ok((r, runs))
-                });
-            match res {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-        _ => {
-            // qwen35 (및 기본) — 호출부 청킹
-            let res = llm170_core::qwen35::Model::load(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|m| {
-                    let cc_seq: usize = std::env::var("LLM170_CC_SEQ")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    let mut eng = llm170_core::qwen35::Engine::new(m, (cc_seq + 1).max(1), ctx);
-                    if !backend_cpu
-                        && std::env::var("LLM170_RAWHIP")
-                            .map(|v| v != "0")
-                            .unwrap_or(true)
-                    {
-                        let _ = llm170_backend_gpu::inject_rawhip(&mut eng);
-                    }
-                    let r = eng.prefill(0, &ids).map_err(|e| e.to_string())?;
-                    eng.reset_seq(cc_seq);
-                    let mut runs = Vec::new();
-                    for &sz in &sizes {
-                        let mut last = None;
-                        for ch in ids.chunks(sz) {
-                            last = Some(eng.prefill(cc_seq, ch).map_err(|e| e.to_string())?);
-                        }
-                        eng.reset_states();
-                        runs.push((sz, last.expect("청크 1개 이상")));
-                    }
-                    Ok((r, runs))
-                });
-            match res {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-    };
-
-    let ref_tok = llm170_core::qwen35::greedy(&ref_l);
-    println!("reference: {} logits, argmax={ref_tok}", ref_l.len());
-    let mut all_pass = true;
-    for (sz, l) in &runs {
-        // QA-19: NaN 불감 수리 — fold(0.0, f32::max)는 NaN을 무시(반대편
-        // 반환)해 diff 전체가 NaN이어도 maxd=0 → "PASS bits-identical".
-        let bad_nan = l.iter().any(|v| v.is_nan()) || ref_l.iter().any(|v| v.is_nan());
-        let maxd = l
-            .iter()
-            .zip(ref_l.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        let tok = llm170_core::qwen35::greedy(l);
-        let (verdict, why) = if bad_nan {
-            all_pass = false;
-            ("FAIL", "NaN in logits".to_string())
-        } else if l.len() != ref_l.len() {
-            // QA-19: 길이 불일치 — 종전엔 교집합 zip만 비교해 짧은 logits가 통과.
-            all_pass = false;
-            ("FAIL", format!("len {} != ref {}", l.len(), ref_l.len()))
-        } else if maxd == 0.0 {
-            ("PASS", "bits-identical".to_string())
-        } else if tok == ref_tok && maxd < 1e-3 {
-            (
-                "PASS",
-                format!(
-                    "near-tie max|Δ|={maxd:.3e} (행 수 의존 잔여축 — plans/archive/chunk-invariance.md)"
-                ),
-            )
-        } else {
-            all_pass = false;
-            ("FAIL", format!("max|Δ|={maxd:.3e} argmax {tok}≠{ref_tok}"))
-        };
-        println!("  chunk {sz:5}: {verdict} — {why}");
-    }
-    if all_pass {
-        ExitCode::SUCCESS
-    } else {
-        println!("chunk-check: FAIL — 청크 불변성 위반 (plans/archive/chunk-invariance.md)");
-        ExitCode::FAILURE
-    }
-}
-
-/// plans/87 §1 — tsv 원장(site, bytes, va, va_end, seq)에서 폴트 주소 매칭.
 fn cmd_va_lookup(tsv: &str, addr: &str) -> ExitCode {
     // BDA는 canonical 부호확장(0xffff8001..), RADV 폴트는 48비트 절단형
     // (0x8001..) — 하위 48비트로 정규화해 비교한다(실측, plans/87 §1).
@@ -384,20 +164,6 @@ fn cmd_va_lookup(tsv: &str, addr: &str) -> ExitCode {
         }
     } else {
         ExitCode::SUCCESS
-    }
-}
-
-/// plans/87 §1 — 의도적 GPUVM 폴트(디스크립터 오프셋 OOB) 유발.
-fn cmd_vk_fault_probe() -> ExitCode {
-    match llm170_backend_gpu::rawvk::checks::fault_probe() {
-        Ok(msg) => {
-            println!("# fault-probe: {msg}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
     }
 }
 

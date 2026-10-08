@@ -1,51 +1,14 @@
-//! GPU 백엔드 — 순수 Rust 원시 HIP 실행기 (2026-09-03 cubecl 제거).
+//! GPU 백엔드 — **rawcuda 단일** (2026-10-08 방향 전환: hip/vulkan 탈락,
+//! plans/w4a16-cuda.md §5 · CUDA W4A16 트랙).
 //!
-//! `rawhip`: hipRTC로 임베디드 HIP C++를 컴파일해 hipModuleLaunchKernel로 실행.
-//! 커널 산술은 core 미러(dot_row_w4a8_*_lane)와 토큰당 동일 연산열 — to_bits 검증 게이트.
-//! 비트계약: raw-HIP greedy 스트림 ≡ CPU W4A8 참조 엔진 (12+64토큰 교차검증).
+//! `rawcuda`: CUDA 드라이버 API 수동 바인딩(ffi) + fatbin 모듈 + GEMV/GEMM
+//! 커널 호스트. 커널 산술 계약은 core 미러(dot_row_w4a16_lane 등)가 판정 기준.
 
-pub mod common;
 pub mod rawcuda;
-pub mod rawhip;
-pub mod rawvk;
 
 pub use rawcuda::q4acc_cuda::new_q4_acc_cuda;
-pub use rawhip::decode::{RawDecoder, inject as inject_rawhip};
-pub use rawhip::q4acc::new_acc_with_sources as new_q4_acc_with_sources;
 
-/// ple-table 서빙 옵션 주입(서버 `--ple-table ram|ssd|auto` → engine build_slots).
-pub fn set_ple_table_mode_by_str(m: &str) -> Result<(), String> {
-    match m {
-        "auto" | "ram" | "ssd" => {
-            crate::rawhip::q4acc::set_ple_table_mode(match m {
-                "ram" => 1,
-                "ssd" => 2,
-                _ => 0,
-            });
-            Ok(())
-        }
-        _ => Err(format!("--ple-table: auto|ram|ssd (got {m})")),
-    }
-}
-/// plans/86 §6 — 파트 소스 지정판: 대형 가중 업로드가 mmap 폴트(20-180 MB/s)
-/// 대신 pread 스테이징(~1.2 GB/s)을 쓴다(hip staged_upload 미러).
-pub fn new_q4_acc_vk_with_sources(
-    parts: Vec<(usize, usize, std::path::PathBuf)>,
-) -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> {
-    let acc = rawvk::vkacc::VkAcc::new_with_sources(parts)?;
-    Ok(std::sync::Arc::new(acc))
-}
-pub use rawhip::probes::gpu_mem_free;
-
-/// B6(plans/cuda-models.md §4): CUDA 런타임 VRAM 프로브 — 가드 preflight가
-/// 런타임 cuda일 때 hip gpu_mem_free 대신 사용.
+/// B6: CUDA 런타임 VRAM 프로브 — 가드 preflight가 사용(미측정 시 B17 거부).
 pub fn cuda_mem_free() -> Option<(u64, u64)> {
     rawcuda::ctx::cuda_mem_free()
-}
-pub use rawhip::{bw_test, dp4a_test, qk_check, raw_probe};
-pub use rawvk::decoder::inject as inject_rawvk;
-
-/// ple-cache 서빙 옵션 주입(`--ple-cache <MiB>` → 바이트).
-pub fn set_ple_ssd_cache_mib(mib: usize) {
-    crate::rawhip::q4acc::set_ple_ssd_cache_bytes(mib.saturating_mul(1 << 20));
 }

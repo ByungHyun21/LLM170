@@ -2,20 +2,16 @@
 //!
 //! - infer: qwen35 CPU 참조 추론 (greedy). 토큰 id 입력 — 토크나이저는 후속 단계.
 
-mod bench;
 mod engine;
 mod http;
 mod infer;
 mod json;
-mod modcheck;
 mod oai;
-mod perplexity;
 mod probes;
 mod resource;
 mod sched;
 mod tokenize;
 mod unicode_data;
-mod vl;
 
 /// 4분할 모델의 part2 경로 유도 — part1 메타(토크나이저) 실패 시 대안.
 /// serve·tokenize가 같은 규칙을 썼다(plans/109 P5 단일화).
@@ -252,11 +248,6 @@ fn run_main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("infer") => infer::cmd_infer(&ma.rest, &ma),
         Some("serve") => cmd_serve(&ma.rest, &ma),
-        Some("vl") => vl::cmd_vl(&ma.rest, &ma),
-        Some("bench") => bench::cmd_bench(&ma.rest, &ma),
-        Some("perplexity") => perplexity::cmd_perplexity(&ma.rest, &ma),
-        Some("check") => probes::run_check(&args[1..]),
-        Some("mod-check") => modcheck::cmd_mod_check(&args[1..]),
         Some("tokenize") => cmd_tokenize(&ma),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{USAGE}");
@@ -446,15 +437,6 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
             .join(", ")
     );
     ExitCode::SUCCESS
-}
-
-fn parse_ids(s: &str) -> Result<Vec<u32>, std::num::ParseIntError> {
-    s.split(',').map(|t| t.trim().parse::<u32>()).collect()
-}
-
-/// &str → Option<Vec<u32>> (vl 플래그 파싱용).
-fn parse_ids_ref(s: &str) -> Option<Vec<u32>> {
-    parse_ids(s).ok()
 }
 
 fn usage_err(msg: &str) -> ExitCode {
