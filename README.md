@@ -12,12 +12,12 @@ pressure low and rides the mature GPTQ-style kernel line.
 Current state: `serve`/`infer` run the **CUDA chain** end-to-end on W4A16
 directories (compressed-tensors / AutoRound auto_gptq packing —
 `.weight_packed` · `.weight_scale` · `.weight_shape`): weights are
-VRAM-resident, the 64-layer chain runs on GPU (host-staged v1 — per-op
-round trips; ~275 ms/token on the dev 4090), and the token stream matches
-the CPU reference golden. The CPU reference runner is the `w4a16-ref`
-probe (oracle); module gates are `w4a16-gemv`/`w4a16-gemm` (bit judgment
-vs `dot_row_w4a16_lane`). Device-resident chaining (round-trip removal) is
-the next optimization step.
+VRAM-resident, the 64-layer chain runs device-resident (activations stay on
+GPU — the only per-token round trips are the embedding upload and the logits
+read), and the chain is captured as a CUDA graph (one launch per token;
+`LLM170_GRAPH=0` falls back to direct launches). The token stream matches
+the golden set; module gates are `w4a16-gemv`/`w4a16-gemm` (bit judgment
+vs `dot_row_w4a16_lane`).
 
 Bit contract: CUDA kernel outputs must match the CPU reference
 (`crates/core/src/quant/lane.rs` — `dot_row_w4a16_lane`).
@@ -32,13 +32,12 @@ Dev-machine ledger (RTX 4090): [benchmark/4090.md](benchmark/4090.md)
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
 | CUDA (170HX, sm_80) | — | — | — | — |
-| CPU reference | — | — | — | — |
 
-| mode | CUDA (170HX) | CPU reference |
-|---|---|---|
-| tg single | — | — |
-| np4 greedy | — | — |
-| serve | — | — |
+| mode | CUDA (170HX) |
+|---|---|
+| tg single | — |
+| np4 greedy | — |
+| serve | — |
 
 ## Build & run
 
