@@ -23,10 +23,10 @@ pub fn tree64(v: &[f64; 64]) -> f64 {
     a[0]
 }
 
-/// f16 비트(u16) → f32 (IEEE half: 상위 16비트 시프트, 정확 변환).
+/// f16 비트(u16) → f32 (IEEE half, 정확 변환 — deq::half_to_f32 공유).
 #[inline]
 fn f16b(v: u16) -> f32 {
-    f32::from_bits((v as u32) << 16)
+    super::deq::half_to_f32(v)
 }
 
 /// W4A16 행 내적 미러 — 활성 x는 f16 비트(u16) 슬라이스(res_hc f16 버스 계약).
@@ -124,6 +124,15 @@ mod w4a16_tests {
             rel < 1e-6,
             "w4a16 미러 불일치: got={got} want={want} rel={rel}"
         );
+    }
+
+    #[test]
+    fn f16b_is_ieee_half() {
+        // 회귀 가드: bf16식 비트 시프트로 퇴화하지 않는다(2026-10-08 정정 —
+        // 스케일은 실측 f16, 예: 0x3800=0.5).
+        assert_eq!(f16b(0x3C00), 1.0);
+        assert_eq!(f16b(0x3800), 0.5);
+        assert_eq!(f16b(0xC000), -2.0);
     }
 
     #[test]

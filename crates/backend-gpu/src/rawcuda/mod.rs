@@ -9,3 +9,4 @@
 
 pub mod ctx;
 pub mod ffi;
+pub mod gptq4;
