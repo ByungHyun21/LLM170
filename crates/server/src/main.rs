@@ -43,14 +43,8 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
 /// probes/check는従来대로 원본 args를 받는다(자체 파싱 보존).
 pub(crate) struct ModelArgs {
     pub model: Option<String>,
+    /// "cpu" | "cuda" (미지정 = cpu).
     pub backend: Option<String>,
-    pub gpu_runtime: Option<String>,
-    /// 외장 MTP(nextn) 모듈 경로 — "--mtp <path>".
-    pub mtp: Option<String>,
-    /// PLE 테이블 오프로드 모드 — "--ple-table auto|ram|ssd".
-    pub ple_table: Option<String>,
-    /// SSD 블록 캐시 예산 MiB — "--ple-cache <MiB>".
-    pub ple_cache_mib: Option<usize>,
     pub rest: Vec<String>,
 }
 
@@ -68,10 +62,6 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
     let mut ma = ModelArgs {
         model: None,
         backend: None,
-        gpu_runtime: None,
-        mtp: None,
-        ple_table: None,
-        ple_cache_mib: None,
         rest: Vec::new(),
     };
     let mut i = 0;
@@ -88,35 +78,14 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
                 // 단일 트랙(2026-10-08): cpu|cuda 2택. cuda는 W2 커널 전까지
                 // 프런트(infer/serve)가 명시 거부한다(W4A16 CPU 참조 전용).
                 match v.as_str() {
-                    "cpu" => {
-                        ma.backend = Some("cpu".into());
-                        ma.gpu_runtime = None;
-                    }
-                    "cuda" => {
-                        ma.backend = Some("gpu".into());
-                        ma.gpu_runtime = Some("cuda".into());
-                    }
+                    "cpu" => ma.backend = Some("cpu".into()),
+                    "cuda" => ma.backend = Some("cuda".into()),
                     _ => return Err(format!("--backend: cpu|cuda (got {v})")),
                 }
             }
-            "--gpu-runtime" => {
-                // --gpu-runtime 폐지(2026-09-30): --backend 단일 선택지.
-                return Err("--gpu-runtime 폐지: --backend 사용".into());
-            }
-            "--mtp" => ma.mtp = Some(common_value(args, &mut i, &inline)),
-            "--ple-table" => {
-                let v = common_value(args, &mut i, &inline);
-                if v != "auto" && v != "ram" && v != "ssd" {
-                    return Err(format!("--ple-table: auto|ram|ssd (got {v})"));
-                }
-                ma.ple_table = Some(v);
-            }
-            "--ple-cache" => {
-                let v = common_value(args, &mut i, &inline);
-                match v.parse::<usize>() {
-                    Ok(n) if n >= 16 => ma.ple_cache_mib = Some(n),
-                    _ => return Err(format!("--ple-cache: MiB ≥ 16 (got {v})")),
-                }
+            // 단일 트랙에서 제거된 플래그 — 명시 안내(무음 무시 금지).
+            "--gpu-runtime" | "--mtp" | "--ple-table" | "--ple-cache" => {
+                return Err(format!("{name} 미지원(단일 트랙 W4A16 — cpu|cuda)"));
             }
             _ => ma.rest.push(a.to_string()),
         }
@@ -173,7 +142,6 @@ fn run_main() -> ExitCode {
             args.first().map(String::as_str).unwrap_or(""),
             ma.model.as_deref(),
             ma.backend.as_deref(),
-            ma.gpu_runtime.as_deref(),
             &ma.rest,
         ) {
             // B20: 전역 적재 락 획득 → **락 후
@@ -184,7 +152,7 @@ fn run_main() -> ExitCode {
                 eprintln!("error: {e}");
                 return ExitCode::FAILURE;
             }
-            if let Err(e) = resource::preflight(&gt.path, gt.gpu, gt.runtime.as_deref()) {
+            if let Err(e) = resource::preflight(&gt.path, gt.gpu) {
                 resource::release_load_lock();
                 eprintln!("error: {e}");
                 return ExitCode::FAILURE;
@@ -238,14 +206,13 @@ fn run_main() -> ExitCode {
     }
 }
 
-/// llm170 serve --model <dir> [--port N] [--ctx N] [--slots N] [--backend cpu|cuda] [--spec k]
+/// llm170 serve --model <dir> [--port N] [--ctx N] [--slots N] [--backend cpu|cuda]
 fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
     let mut queue: Option<usize> = None;
     let mut slots: Option<usize> = None;
     let mut ctx = 4096usize;
     let backend = ma.backend.clone().unwrap_or_else(|| "cpu".into());
-    let gpu_runtime = ma.gpu_runtime.clone().unwrap_or_default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -319,11 +286,8 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let req = engine::InferRequest {
         model: model_path.clone(),
         ctx,
-        ple_table: ma.ple_table.clone(),
-        ple_cache_mib: ma.ple_cache_mib,
     };
     // 라우팅: W4A16 = qwen35 CPU 경로 단일(가속은 W2 커널 이후).
-    let _ = gpu_runtime;
     let sel = engine::BackendSel::Cpu;
     match http::serve(&format!("127.0.0.1:{port}"), req, sel, slots, queue) {
         Ok(()) => ExitCode::SUCCESS,

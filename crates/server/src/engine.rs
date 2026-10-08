@@ -90,11 +90,6 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
 pub struct InferRequest {
     pub model: PathBuf,
     pub ctx: usize,
-    /// PLE 테이블 오프로드 모드 — 백엔드 탈락(2026-10-08)으로
-    /// W4A16 경로에서는 무시된다(build_slots가 고지).
-    pub ple_table: Option<String>,
-    /// SSD 블록 캐시 예산 MiB — 상동.
-    pub ple_cache_mib: Option<usize>,
 }
 
 /// 생성 토큰 싱크 — 명령별 출력(JSONL text 포함/미포함·텍스트 누적) 차이를
@@ -185,10 +180,6 @@ fn banner(
 }
 
 pub fn build_slots(req: InferRequest, _backend: BackendSel, n_slots: usize) -> Engine {
-    // PLE 플래그는 구 백엔드 전역 구현이었음 — 탈락(2026-10-08, §5)으로 무의미.
-    if req.ple_table.is_some() || req.ple_cache_mib.is_some() {
-        eprintln!("# ple-table/ple-cache: 백엔드 탈락(2026-10-08) — 플래그 무시");
-    }
     // W4A16 = qwen35 CPU 경로 단일(가속은 W2 커널 이후 — 그때 attach 재도입).
     let m = load_q35_retry(&req.model);
     let eng = llm170_core::qwen35::Engine::new(m, n_slots, req.ctx);
