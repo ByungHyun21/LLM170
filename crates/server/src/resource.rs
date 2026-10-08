@@ -605,6 +605,20 @@ mod tests {
         // CPU 프로브(mod-check) 위치인자 — gpu=false 폴백.
         let g = guard_target("mod-check", None, None, None, &s(&["/m/a.gguf"]));
         assert_eq!(g.map(|g| g.gpu), Some(false));
+        // W4A16 로더 프로브(§3.5) — 위치인자 폴백(gpu=false): 첫 인자가 dir.
+        let g = guard_target("w4a16-load", None, None, None, &s(&["/m/w4a16"]));
+        assert_eq!(
+            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
+            Some(("/m/w4a16".into(), false))
+        );
+        let g = guard_target(
+            "w4a16-xcheck",
+            None,
+            None,
+            None,
+            &s(&["/m/w4a16", "/m/a.gguf"]),
+        );
+        assert_eq!(g.map(|g| g.gpu), Some(false));
         // 메타·행 판독 서브커맨드 → None
         assert!(guard_target("gguf-dump", None, None, None, &s(&[])).is_none());
         assert!(guard_target("tokenize", Some("/m/a.gguf"), None, None, &s(&[])).is_none());

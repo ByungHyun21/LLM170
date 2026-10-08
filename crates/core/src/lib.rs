@@ -11,5 +11,6 @@ pub mod quant;
 pub mod qwen35;
 pub mod qwen4exp;
 pub mod sampler;
+pub mod w4a16;
 pub use tables::{IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL, ktab2_packed};
 mod tables;

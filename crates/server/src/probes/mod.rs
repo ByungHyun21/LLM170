@@ -33,6 +33,7 @@ mod diag;
 mod exl3;
 mod misc;
 mod q4;
+mod w4a16;
 
 pub use q4::run_check;
 
@@ -43,6 +44,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     diag::try_run(cmd, args)
         .or_else(|| q4::try_run(cmd, args))
         .or_else(|| exl3::try_run(cmd, args))
+        .or_else(|| w4a16::try_run(cmd, args))
         .or_else(|| misc::try_run(cmd, args))
 }
 

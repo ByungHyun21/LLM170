@@ -66,6 +66,10 @@ llm170 — 순수 Rust 추론 엔진 (CPU·HIP·Vulkan·CUDA)
       EXL3 vk 3커널(had_in/gemv/had_out)+FFN ew(silu·mul) ↔ CPU 미러 비트/FMA/허용치 검증 + 속도.
   llm170 exl3-pp [exl3_dir] [token_ids] [n_predict]
       EXL3 T-배치 프리필(하다마드/GEMM/GDN 청크) — 순차 대비 로짓·토큰 검증 + pp t/s (plans/121).
+  llm170 w4a16-load <dir>
+      W4A16(compressed-tensors int4 sym g128) 로더 완전성 검증 — 트리플·커버리지.
+  llm170 w4a16-xcheck <w4a16_dir> <gguf> [il] [row]
+      니블 순서 확정 — 동일 기저 GGUF 행 대조 상관(lsb vs msb).
 
 개발 프로브 (backend-gpu 검증·타이밍):
   rawhip-check <file> <tensor>   HIP GEMV ↔ CPU 미러 to_bits 검증

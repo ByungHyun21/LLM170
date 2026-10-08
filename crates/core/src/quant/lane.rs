@@ -377,8 +377,9 @@ pub fn tree64(v: &[f64; 64]) -> f64 {
 }
 
 // ─── W4A16(GPTQ4·g128·sym) 레인 미러 — plans/137 §3.5, plans/138 단계 1 ───
-// AutoRound auto_gptq 규약: qrow 워드 j의 니블 j%8 = 원소 8·(j/8)+(j%8) (lsb-first —
-// 비트 순서는 로더 프로브로 확정 예정 §3.6, 미러는 lsb-first 고정).
+// AutoRound auto_gptq 규약: qrow 워드 j의 니블 j%8 = 원소 8·(j/8)+(j%8).
+// lsb-first **확정**(2026-10-08, w4a16-xcheck — 동일 기저 27B GGUF 대조
+// corr(lsb) 0.991~0.994 vs corr(msb) ≈0.01, §3.6 종결).
 // zrow = 로더가 행별 언팩한 zp(그룹당 1개, sym 전형 8), srow = 그룹 f16 스케일.
 // GPU gemm_gptq4(64레인)와 동일 연산열: 레인 l = 원소 l, l+64, … f32 누산 →
 // f64 레인 배열 → tree64(기존 레인 계약 준수).
