@@ -6,8 +6,8 @@
 #   1. A(27B): 참조(CPU) greedy 토큰열 골든 접두 일치 — 오라클.
 #   2. B(27B): GPU 체인(w4a16-gpu) 토큰열 골든 접두 일치.
 #   3. C(27B): serve HTTP 종단 — 배너 runtime=cuda + 골든 접두.
-#   4. D(35B-A3B INT4 g32): 로더 명시 거부 — 양자화 설정이 config.json 내장
-#      (사이드카 quantization_config.json 부재). W4-1에서 내장 폴백 예정.
+#   4. D(35B-A3B INT4 g32): 로더 완전성 — W4-1(2026-10-08) g32 수용 + 내장
+#      quant 설정 폴백. 전문가 30,720 트리플 + MoE 구조 검증을 통과해야 한다.
 #   5. E(FN FP8PLE): 자원 가드 명시 거부(120GiB > 호스트).
 # 사용법: scripts/swap_models.sh
 set -u
@@ -65,7 +65,7 @@ kill "$SERVE_PID" 2>/dev/null
 wait "$SERVE_PID" 2>/dev/null
 trap - EXIT
 if grep -q "runtime=cuda" "$RUN/c.log"; then note "배너 OK(runtime=cuda)"; else
-  echo "[w4a16] FAIL: 배너 runtime!=cuda — $${RUN}/c.log"; fail=1
+  echo "[w4a16] FAIL: 배너 runtime!=cuda — ${RUN}/c.log"; fail=1
 fi
 C=$(python3 -c "
 import json
@@ -81,28 +81,27 @@ case "$C" in
   *) echo "[w4a16] FAIL: serve 응답 불일치: $(echo "$C" | head -c 60)"; fail=1;;
 esac
 
-# ── 4. D(35B INT4 g32) 명시 거부 ──
-note "[4/5] D(35B INT4 g32) 로더 명시 거부 판정"
-if timeout 60 "$BIN" w4a16-load "$M_35B" > "$RUN/d.log" 2>&1; then
-  echo "[w4a16] FAIL: 거부되어야 할 g32 자산이 통과 — $${RUN}/d.log"; fail=1
-elif grep -q "w4a16" "$RUN/d.log"; then
-  note "명시 거부 OK: $(head -1 "$RUN/d.log")"
+# ── 4. D(35B INT4 g32) 로더 완전성(W4-1) ──
+note "[4/5] D(35B INT4 g32) 로더 완전성 판정"
+if timeout 300 "$BIN" w4a16-load "$M_35B" > "$RUN/d.log" 2>&1 \
+  && grep -q "완전성 검증 통과" "$RUN/d.log"; then
+  note "g32 로드 OK: $(grep -m1 '선형' "$RUN/d.log")"
 else
-  echo "[w4a16] FAIL: 원인 불명 거부 — $${RUN}/d.log"; fail=1
+  echo "[w4a16] FAIL: g32 로드 실패 — ${RUN}/d.log"; fail=1
 fi
 
 # ── 5. E(FN FP8PLE) 자원 가드 명시 거부 ──
 note "[5/5] E(FN FP8PLE) 자원 가드 명시 거부 판정"
 if timeout 60 "$BIN" w4a16-load "$M_FN" > "$RUN/e.log" 2>&1; then
-  echo "[w4a16] FAIL: 가드가 통과시킴(120GiB) — $${RUN}/e.log"; fail=1
+  echo "[w4a16] FAIL: 가드가 통과시킴(120GiB) — ${RUN}/e.log"; fail=1
 elif grep -qE "insufficient resources|rsrc-guard" "$RUN/e.log"; then
   note "가드 거부 OK: $(head -1 "$RUN/e.log")"
 else
-  echo "[w4a16] FAIL: 가드 외 사유 — $${RUN}/e.log"; fail=1
+  echo "[w4a16] FAIL: 가드 외 사유 — ${RUN}/e.log"; fail=1
 fi
 
 if [ $fail -eq 0 ]; then
-  echo "[w4a16] smoke: ALL PASS (참조·GPU·serve 토큰 / D·E 명시 거부)"
+  echo "[w4a16] smoke: ALL PASS (참조·GPU·serve 토큰 / D g32 로드 완전성·E 가드 거부)"
 else
   echo "[w4a16] smoke: FAILURES PRESENT"
 fi

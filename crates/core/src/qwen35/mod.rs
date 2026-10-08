@@ -269,12 +269,37 @@ impl Model {
 }
 
 /// 원본(HF) Weight 구성 — 순열 사본 비경유(W3 GPU 체인용).
+/// 플레인(무양자) Weight — MoE(35B) 어텐션 투영이 BF16인 케이스의 공용 경로.
+fn plain_weight<'a>(w4: &'a crate::w4a16::W4a16Model, hf: &str) -> Option<Weight<'a>> {
+    use crate::wtype::WType;
+    let e = w4.entry(hf)?;
+    let ty = match e.dtype {
+        crate::st::StDtype::Bf16 => WType::Bf16,
+        crate::st::StDtype::F16 => WType::F16,
+        crate::st::StDtype::F32 => WType::F32,
+        _ => return None,
+    };
+    let n_out = *e.shape.first()?;
+    let n_in = e.shape[1..].iter().product::<u64>();
+    Some(Weight {
+        data: w4.tensor_slice(hf)?,
+        aux: None,
+        ty,
+        n_in,
+        n_out,
+    })
+}
+
 fn w4_weight_raw<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Weight<'a>> {
     use crate::wtype::WType;
     use bind::Eng;
     match bind::eng(name)? {
         Eng::Quant { base, .. } => {
-            let (n, k) = w4.lin_shape(&base)?;
+            // MoE(35B) 폴백: 트리플이 없고 같은 베이스의 플레인(BF16)이 있으면
+            // 그쪽을 쓴다 — 스토어 내용이 진실(아치 분기 없이 동일 엔진 이름).
+            let Some((n, k)) = w4.lin_shape(&base) else {
+                return plain_weight(w4, &format!("{base}.weight"));
+            };
             Some(Weight {
                 data: w4.tensor_slice(&format!("{base}.weight_packed"))?,
                 aux: Some(w4.tensor_slice(&format!("{base}.weight_scale"))?),
@@ -283,24 +308,7 @@ fn w4_weight_raw<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Wei
                 n_out: n as u64,
             })
         }
-        Eng::Plain { name: hf, .. } => {
-            let e = w4.entry(&hf)?;
-            let ty = match e.dtype {
-                crate::st::StDtype::Bf16 => WType::Bf16,
-                crate::st::StDtype::F16 => WType::F16,
-                crate::st::StDtype::F32 => WType::F32,
-                _ => return None,
-            };
-            let n_out = *e.shape.first()?;
-            let n_in = e.shape[1..].iter().product::<u64>();
-            Some(Weight {
-                data: w4.tensor_slice(&hf)?,
-                aux: None,
-                ty,
-                n_in,
-                n_out,
-            })
-        }
+        Eng::Plain { name: hf, .. } => plain_weight(w4, &hf),
         Eng::Synth { .. } => None,
     }
 }
@@ -314,7 +322,10 @@ fn w4_weight<'a>(m: &'a Model, name: &str) -> Option<Weight<'a>> {
     let w4 = &m.w4;
     match bind::eng(name)? {
         Eng::Quant { base, vperm } => {
-            let (n, k) = w4.lin_shape(&base)?;
+            // MoE(35B) 폴백(위 raw 경로와 동일 계약).
+            let Some((n, k)) = w4.lin_shape(&base) else {
+                return plain_weight(w4, &format!("{base}.weight"));
+            };
             let (data, aux) = match vperm {
                 PV::None => (
                     w4.tensor_slice(&format!("{base}.weight_packed"))?,
