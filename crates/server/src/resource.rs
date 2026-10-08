@@ -109,8 +109,6 @@ fn host_mem_available() -> Option<u64> {
 pub struct GuardTarget {
     pub path: std::path::PathBuf,
     pub gpu: bool,
-    /// 요청 런타임("cuda" — B6 프로브 선택용).
-    pub runtime: Option<String>,
 }
 
 /// 가드 대상 판정 — main() 인라인의 순수함수(A2/R1).
@@ -120,7 +118,6 @@ pub fn guard_target(
     sub: &str,
     model: Option<&str>,
     backend: Option<&str>,
-    gpu_runtime: Option<&str>,
     rest: &[String],
 ) -> Option<GuardTarget> {
     // 토크나이저 파일만 판독 — 무게 미적재.
@@ -132,15 +129,11 @@ pub fn guard_target(
             .find(|a| !a.starts_with("--"))
             .map(std::path::PathBuf::from)
     });
-    let gpu = backend == Some("gpu") || gpu_runtime.is_some();
-    path.map(|path| GuardTarget {
-        path,
-        gpu,
-        runtime: gpu_runtime.map(String::from),
-    })
+    let gpu = backend == Some("cuda");
+    path.map(|path| GuardTarget { path, gpu })
 }
 
-pub fn preflight(model: &Path, gpu: bool, runtime: Option<&str>) -> Result<(), String> {
+pub fn preflight(model: &Path, gpu: bool) -> Result<(), String> {
     let bytes = model_bytes(model);
     if bytes == 0 {
         return Ok(()); // 경로 오류는 로더의 에러가 더 정확하다 - 여기서는 통과
@@ -152,10 +145,7 @@ pub fn preflight(model: &Path, gpu: bool, runtime: Option<&str>) -> Result<(), S
         match probe {
             Some((free, _total)) => Some(free),
             None => {
-                eprintln!(
-                    "# rsrc-guard: VRAM 조회 실패(runtime={}) — gpu 적재는 거부된다(B17)",
-                    runtime.unwrap_or("default")
-                );
+                eprintln!("# rsrc-guard: VRAM 조회 실패 — gpu 적재는 거부된다(B17)");
                 None
             }
         }
@@ -311,30 +301,24 @@ mod tests {
     fn guard_target_cases() {
         use super::guard_target;
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        // serve/infer류: --model + 백엔드 → (경로, gpu, 런타임)
-        let g = guard_target(
-            "serve",
-            Some("/m/w4a16"),
-            Some("gpu"),
-            Some("cuda"),
-            &s(&[]),
-        );
+        // serve/infer류: --model + 백엔드 → (경로, gpu)
+        let g = guard_target("serve", Some("/m/w4a16"), Some("cuda"), &s(&[]));
         assert_eq!(
-            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu, g.runtime)),
-            Some(("/m/w4a16".into(), true, Some("cuda".into())))
+            g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
+            Some(("/m/w4a16".into(), true))
         );
-        let g = guard_target("infer", Some("/m/w4a16"), Some("cpu"), None, &s(&[]));
+        let g = guard_target("infer", Some("/m/w4a16"), Some("cpu"), &s(&[]));
         assert_eq!(g.map(|g| g.gpu), Some(false));
         // W4A16 로더 프로브 — 위치인자 폴백(gpu=false).
-        let g = guard_target("w4a16-load", None, None, None, &s(&["/m/w4a16"]));
+        let g = guard_target("w4a16-load", None, None, &s(&["/m/w4a16"]));
         assert_eq!(
             g.map(|g| (g.path.to_str().unwrap().to_string(), g.gpu)),
             Some(("/m/w4a16".into(), false))
         );
         // 메타 서브커맨드 → None
-        assert!(guard_target("tokenize", Some("/m/w4a16"), None, None, &s(&[])).is_none());
+        assert!(guard_target("tokenize", Some("/m/w4a16"), None, &s(&[])).is_none());
         // 무모델 로딩 창구 → None(로더/CLI 에러가 더 정확)
-        assert!(guard_target("infer", None, None, None, &s(&[])).is_none());
-        assert!(guard_target("serve", None, None, None, &s(&[])).is_none());
+        assert!(guard_target("infer", None, None, &s(&[])).is_none());
+        assert!(guard_target("serve", None, None, &s(&[])).is_none());
     }
 }
