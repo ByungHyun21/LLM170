@@ -378,6 +378,52 @@ fn vperm(cfg: &QwenCfg, i: usize) -> usize {
     ratio * (i % nk) + i / nk
 }
 
+/// 플레인 가중 행/열 128블록 순열(그룹 무관) — 원시 바이트 사본.
+/// 35B처럼 GDN 투영이 비양자화(BF16)인 모델용 — 양자화 경로와 동일 규약.
+fn plain_perm(store: &W4a16Model, cfg: &QwenCfg, name: &str, pv: PV) -> Option<Vec<u8>> {
+    let e = store.entry(name)?;
+    let es = match e.dtype {
+        crate::st::StDtype::Bf16 | crate::st::StDtype::F16 => 2usize,
+        crate::st::StDtype::F32 => 4,
+        _ => return None,
+    };
+    let n = *e.shape.first()? as usize;
+    let k: usize = e.shape[1..].iter().product::<u64>() as usize;
+    let src = store.tensor_slice(name)?;
+    let rb = k * es;
+    if src.len() != n * rb || !n.is_multiple_of(128) || !k.is_multiple_of(128) {
+        return None;
+    }
+    let mut d = vec![0u8; src.len()];
+    match pv {
+        PV::VPart | PV::AllN => {
+            let vbase = 2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+            let nb0 = if pv == PV::VPart { vbase / 128 } else { 0 };
+            let nblk = n / 128;
+            d[..nb0 * 128 * rb].copy_from_slice(&src[..nb0 * 128 * rb]);
+            for b in 0..nblk - nb0 {
+                let s = (nb0 + vperm(cfg, b)) * 128 * rb;
+                let t = (nb0 + b) * 128 * rb;
+                d[t..t + 128 * rb].copy_from_slice(&src[s..s + 128 * rb]);
+            }
+        }
+        PV::AllK => {
+            let nblk = k / 128;
+            let blk = 128 * es;
+            for r in 0..n {
+                let row = &src[r * rb..(r + 1) * rb];
+                let dst = &mut d[r * rb..(r + 1) * rb];
+                for g in 0..nblk {
+                    let s = vperm(cfg, g) * blk;
+                    dst[g * blk..(g + 1) * blk].copy_from_slice(&row[s..s + blk]);
+                }
+            }
+        }
+        PV::None => {}
+    }
+    Some(d)
+}
+
 /// V헤드 순열 사본 구축 — 엔진(subhead-major) 계약 공급용.
 /// 128블록 = 헤드차원(linear_key_head_dim) 단위라 그룹 무관 — 스케일 행/블록
 /// 바이트만 group으로 환산한다(g128 27B · g32 35B).
@@ -400,6 +446,11 @@ pub fn build_perm(store: &W4a16Model, cfg: &QwenCfg) -> PermStore {
         ] {
             let base = format!("{l}{suf}");
             let Some((n, k)) = store.lin_shape(&base) else {
+                // 비양자화(35B — 전문가 외 전부 BF16) — 플레인 순열 사본.
+                let name = format!("{base}.weight");
+                if let Some(out) = plain_perm(store, cfg, &name, pv) {
+                    p.insert(name, out);
+                }
                 continue;
             };
             let (Some(pk), Some(sc)) = (

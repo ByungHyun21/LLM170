@@ -345,9 +345,34 @@ fn w4_weight<'a>(m: &'a Model, name: &str) -> Option<Weight<'a>> {
     let w4 = &m.w4;
     match bind::eng(name)? {
         Eng::Quant { base, vperm } => {
-            // MoE(35B) 폴백(위 raw 경로와 동일 계약).
+            // MoE(35B) 폴백 — 같은 베이스의 플레인(BF16). V축 순열은 양자화
+            // 경로와 동일 규약으로 적용한다(엔진 subhead-major 계약).
             let Some((n, k)) = w4.lin_shape(&base) else {
-                return plain_weight(w4, &format!("{base}.weight"));
+                let hf = format!("{base}.weight");
+                return match vperm {
+                    PV::None => plain_weight(w4, &hf),
+                    _ => {
+                        let e = w4.entry(&hf)?;
+                        let ty = match e.dtype {
+                            crate::st::StDtype::Bf16 => WType::Bf16,
+                            crate::st::StDtype::F16 => WType::F16,
+                            crate::st::StDtype::F32 => WType::F32,
+                            _ => return None,
+                        };
+                        let data = m.perm_store().plain(&hf)?;
+                        let n_out = *e.shape.first()?;
+                        let n_in = e.shape[1..].iter().product::<u64>();
+                        Some(Weight {
+                            data,
+                            aux: None,
+                            ty,
+                            n_in,
+                            n_out,
+                            group: 0,
+                            scale_bf16: false,
+                        })
+                    }
+                };
             };
             let (data, aux) = match vperm {
                 PV::None => (
