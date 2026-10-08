@@ -26,8 +26,8 @@
 // k-주요 배치, lc(FLA)는 [G][h_k] 그룹-주요 — 전치 p_inv=(h%G)·h_k+h/G,
 // G=h_v/h_k(27B: G=3 → (h%3)·16+h/3 — 원본식과 동일). l2perm·gate 모두
 // scatter(쓰기측 인덱스에 p_inv) — CPU 미러가 gather라 방향 혼동 주의.
-// gdn_l2perm_gather는 원장 17호 음성대조 전용 쌍둥이(방향 반전
-// 결함 재현) — 프로덕션 경로에서 발사 금지.
+// gdn_l2perm_gather는 음성대조 전용 쌍둥이(방향 반전
+// 결함 재현, 17호 계기) — 프로덕션 경로에서 발사 금지.
 //
 // 그리드 계약(결함 5호): T>1 커널(l2perm/gate)은 t=blockIdx.y —
 // grid (h_v, T). gy=1로 두면 행 1+가 미실행된다(과거 사고).
@@ -240,7 +240,7 @@ __device__ __forceinline__ void gdn_l2perm_body(
         k_out[t * (h_k * 128) + kh * 128 + tid] = kv * ki;
     }
     if (GATHER) {
-        // 음성대조: gather 방향(원장 — CPU 미러와 같은 쪽).
+        // 음성대조: gather 방향(CPU 미러와 같은 쪽).
         v_out[t * (h_v * 128) + h * 128 + tid] =
             v_in[t * (h_v * 128) + p_inv * 128 + tid];
     } else {
@@ -269,7 +269,7 @@ extern "C" __global__ void gdn_l2perm(
                            q_out, k_out, v_out, bg, t_len, layer, h_k, h_v, hidden);
 }
 
-// 음성대조 전용 l2perm — gather(방향 결함 재현, 원장 17호 계기).
+// 음성대조 전용 l2perm — gather(방향 결함 재현, 17호 계기).
 extern "C" __global__ void gdn_l2perm_gather(
     const float* __restrict__ q_in,
     const float* __restrict__ k_in,

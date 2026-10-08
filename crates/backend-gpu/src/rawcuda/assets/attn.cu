@@ -13,10 +13,10 @@
 //    파라미터 아님, 그래프/루프 설계에 필수)의 계약을 시그니처 수준에서
 //    강제한다. 호스트 pos 사본 경로는 음성대조 전용 쌍둥이
 //    attn_prep_hostpos(명시적 pos0_host 인자)로만 존재 — 프로덕션
-//    경로에서 발사 금지(원장 17호 계기 원칙).
+//    경로에서 발사 금지(17호 계기 원칙).
 // 3) 트랜센던트/수축(아래 블록 참조): 빌드 -fmad=false(FMA 수축 제거 —
 //    호스트 미러와 연산 DAG 비트동일), 초월함수는 자작 f64 미러
-//    (gdn_exp_d/gdn_log_d와 동일 노선 — G5 원장), rope theta는 exp(ln(1e7)·e)
+//    (gdn_exp_d/gdn_log_d와 동일 노선), rope theta는 exp(ln(1e7)·e)
 //    f64 재구성, rsqrtf(≤2ulp 근사)는 IEEE sqrt+div로 대체. 전부
 //    (hip은 참조 구현일 뿐 진실 아님)에 근거한 정밀화 — 수학 동등·정밀도
 //    상향, 값 변화는 ulp 수준. 어텐션은 계약 최대tightness maxdiff ≤2e-7
@@ -57,7 +57,7 @@
 // 본 파일의 트랜센던트는 순수 f64 연산 DAG(IEEE mul/add/div/floor·비트
 // 재구성, FMA 수축 없음 — 빌드 -fmad=false)로 자작해 양측(본 .cu ↔
 // 구 프로브 오라클 트윈)의 비트동일을 계약으로 삼는다(G5 실측
-// 원장: libdevice expf는 3.1M 표본 중 30%에서 참값 ±1ulp). exp는 G5
+// 실측: libdevice expf는 3.1M 표본 중 30%에서 참값 ±1ulp). exp는 G5
 // gdn_exp_d와 동일 DAG(차수 7 테일러·비트 재구성 2^k). 도메인: exp |x|≤128,
 // sincos 0≤a≤2^20(rope ang = pos·theta ≤ cap·1 — 실사용 ≤1024),
 // theta |e|≤ln(1e7). 연산 순서·상수는 절대 변경 금지(비트동일 계약 —
@@ -230,7 +230,7 @@ extern "C" __global__ void attn_prep(
 }
 // 마커 pr1c
 
-// ── 음성대조 전용 쌍둥이(결함 4호 재현 — 원장 17호) ──
+// ── 음성대조 전용 쌍둥이(결함 4호 재현) ──
 // pp[0] 디바이스 판독 대신 "호스트 파라미터 사본" pos0_host로 KV 인덱스를
 // 계산하는 판(prep와의 유일한 차이 — pos 원천). 장치 pp[0]이 pos_bump 등으로
 // 전진한 뒤 호스트 사본이 낡은 값이면 KV 기록 위치가 어긋나고, 그 이격이

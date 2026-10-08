@@ -327,7 +327,7 @@ pub fn greedy_from(logits: &[f32]) -> u32 {
         }
     }
     if top2 {
-        // 107 W1: 근접타이 마진 원장 — 두 변형의 아그맥스 뒤집힘이 합법
+        // 107 W1: 근접타이 마진 계측 — 두 변형의 아그맥스 뒤집힘이 합법
         // 타이인지(마진 < 엡실론) 판정하는 1회 측정용 계측.
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

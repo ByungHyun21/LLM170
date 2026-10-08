@@ -1,7 +1,7 @@
 //! D1 — qwen35/qwen4exp GDN층 공유 norm_gated 코어.
 //! z-게이트 활성화(silu↔sigmoid)만 파라미터화 — 양쪽 레이어의 나머지
 //! 오케스트레이션(상태 유형·GPU 훅·시퀀스 레이아웃)은 구조적으로 달라
-//! 그대로 둔다(원장 90 D8/D9 판정 준거 — 중복 없는 간접화 회피).
+//! 그대로 둔다(D8/D9 판정 준거 — 중복 없는 간접화 회피).
 
 use crate::ops::{rms_norm, sigmoid, silu};
 

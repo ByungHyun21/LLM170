@@ -24,7 +24,7 @@ pub fn eq1(name: &str) -> bool {
 
 /// `!= "0"` 기본 ON — `var(name).map(|v| v != "0").unwrap_or(true)` 대응.
 /// 키 부재 = 기본 ON(true). is_some_and는 부재 시 false를 돌려 기본
-/// ON 게이트 전체를 뒤집는 결함이었다(107 회귀, 원장 104).
+/// ON 게이트 전체를 뒤집는 결함이었다(107 회귀).
 pub fn ne0(name: &str) -> bool {
     VALUES.get(name).is_none_or(|v| v != "0")
 }
@@ -44,7 +44,7 @@ pub fn on_nonzero(name: &str) -> bool {
 /// 스냅샷↔라이브 동치 검사 — 현재 환경의 LLM170_ 키 전수에
 /// 대해 4개 의미론(on/eq1/ne0/val)을 라이브 getenv 판정과 독립 대조한다.
 /// 불일치 목록(빈 벡터 = 정상).
-/// 원장 104(ne0 부재키 결함)류 회귀를 게이트 전에 포착한다.
+/// ne0 부재키 결함류 회귀를 게이트 전에 포착한다.
 pub fn env_check() -> Vec<String> {
     let mut bad = Vec::new();
     for (ko, vo) in std::env::vars_os() {
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn absent_key_contracts() {
-        // 원장 104: 부재키 의미론 — ne0는 true(기본 ON), on/eq1는 false,
+        // 부재키 의미론 — ne0는 true(기본 ON), on/eq1는 false,
         // val은 None. is_some_and로 되돌리면 이 테스트가 즉시 잡는다
         // (108 P1 결함주입 검증 완료).
         const K: &str = "_LLM170_ABSENT_PROBE_";

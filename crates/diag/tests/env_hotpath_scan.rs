@@ -1,7 +1,7 @@
 //! env 직접 판독 금지 계약의 정적 검사 (A6).
 //!
 //! 프로덕션 핫패스는 diag 스냅샷(flag::on/eq1/ne0/on_nonzero/val) 또는
-//! dump::opts()/key_arg()로만 env를 읽는다(원장 89·104). 이 테스트는
+//! dump::opts()/key_arg()로만 env를 읽는다. 이 테스트는
 //! 프로덕션 소스 트리를 스캔해 `std::env::var(_os)` 직접 호출을 찾으면
 //! 실패한다 — 새 코드가 계약을 위반하면 컴파일은 되도 cargo test가 잡는다.
 //!
