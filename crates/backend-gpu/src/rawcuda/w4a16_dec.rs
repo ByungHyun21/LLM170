@@ -525,14 +525,27 @@ impl W4a16Dec {
     }
 
     pub(crate) fn h2d_chunked(cc: &CudaCtx, dst: CUdeviceptr, src: &[u8]) -> Result<(), String> {
-        const CH: usize = 4 << 20;
-        for off in (0..src.len()).step_by(CH) {
-            let end = (off + CH).min(src.len());
-            cc.h2d(dst + off as u64, &src[off..end])?;
+        const CH: usize = 8 << 20;
+        // 페이지러블 비동기(드라이버 스테이징 — 호출 내 스테이징 완료 계약) +
+        // 8청크(64MiB)마다 sync로 스테이징 큐 상한.
+        //
+        // [실측 2026-10-09, 4090·Gen4 x16] 수동 핀드 링 경로(CPU→핀드 복사 +
+        // 핑퐁 DMA)는 ~5GB/s — CPU의 핀드(비캐시) 기록이 병목이었다. 드라이버
+        // 스테이징은 9.3GB/s(h2d-bench), 핀드 DMA는 13.8GB/s지만 그 앞단 복사가
+        // 더 느리다. 합계 20GB급 업로드가 4.4s → ~2.2s.
+        const INFLIGHT: usize = 64 << 20; // 스테이징 큐 상한(바이트 기준)
+        let mut pending = 0usize;
+        for (i, chunk) in src.chunks(CH).enumerate() {
+            cc.h2d_async(dst + (i * CH) as u64, chunk)?;
+            pending += chunk.len();
+            if pending >= INFLIGHT {
+                cc.sync()?;
+                pending = 0;
+            }
             // 업로드는 수 초~수십 초 — 와치독이 로드를 스텔로 오판하지 않게 심박.
             llm170_diag::watchdog::bump();
         }
-        Ok(())
+        cc.sync()
     }
 
     fn zero_dev(cc: &CudaCtx, ptr: CUdeviceptr, len: usize) -> Result<(), String> {
@@ -1838,18 +1851,25 @@ impl W4a16Dec {
             return Err(e);
         }
         let mut dev_tab = Vec::with_capacity(host_tab.len());
+        // 1) 디바이스 테이블(아레나 오프셋) — 복사 없이 주소만 계산.
+        for (i, e) in host_tab.iter().enumerate() {
+            let p = i % 3;
+            dev_tab.push((dpk[p] + opk[p] as u64, e.1, dsk[p] + osk[p] as u64, e.3));
+            opk[p] += e.1 as usize;
+            osk[p] += e.3 as usize;
+        }
+        let (mut opk2, mut osk2) = ([0usize; 3], [0usize; 3]);
+        // 2) 전송 — h2d_chunked(페이지러블 비동기 + 드라이버 스테이징).
+        // SAFETY: 항목은 서버 스토어 mmap 슬라이스(set_expert_table 수명 계약).
         let r = (|| -> Result<(), String> {
             for (i, e) in host_tab.iter().enumerate() {
                 let p = i % 3;
-                // SAFETY: 호스트 테이블 항목 — 서버 스토어 mmap 슬라이스
-                // (set_expert_table 수명 계약과 동일).
                 let qb = unsafe { std::slice::from_raw_parts(e.0 as *const u8, e.1 as usize) };
                 let sb = unsafe { std::slice::from_raw_parts(e.2 as *const u8, e.3 as usize) };
-                Self::h2d_chunked(&self.cc, dpk[p] + opk[p] as u64, qb)?;
-                Self::h2d_chunked(&self.cc, dsk[p] + osk[p] as u64, sb)?;
-                dev_tab.push((dpk[p] + opk[p] as u64, e.1, dsk[p] + osk[p] as u64, e.3));
-                opk[p] += e.1 as usize;
-                osk[p] += e.3 as usize;
+                Self::h2d_chunked(&self.cc, dpk[p] + opk2[p] as u64, qb)?;
+                Self::h2d_chunked(&self.cc, dsk[p] + osk2[p] as u64, sb)?;
+                opk2[p] += e.1 as usize;
+                osk2[p] += e.3 as usize;
             }
             Ok(())
         })();
@@ -2716,6 +2736,15 @@ impl W4a16Dec {
     }
 
     /// 마이크로벤치 표면(진단 전용) — 스크래치 alloc/h2d/free + GEMM 발사/sync.
+    /// 핀드 스크래치 할당(벤치·진단) — h2d_bench 계약.
+    pub fn alloc_pinned_scratch(&self, bytes: usize) -> Result<*mut std::ffi::c_void, String> {
+        self.cc.pinned_alloc(bytes)
+    }
+
+    pub fn free_pinned_scratch(&self, p: *mut std::ffi::c_void) -> Result<(), String> {
+        self.cc.pinned_free(p)
+    }
+
     pub fn alloc_scratch(&self, bytes: usize) -> Result<CUdeviceptr, String> {
         self.cc.alloc(bytes)
     }
