@@ -314,7 +314,8 @@ impl Exl3CudaDecoder {
         self.slot_pos[slot] = pos + t as u32;
         self.attn_set_pos(slot, pos + t as u32)?;
         let mut hb = vec![0u8; self.hidden * 4];
-        self.cc.d2h(&mut hb, self.dres + ((t - 1) * self.hidden) as u64 * 4)?;
+        self.cc
+            .d2h(&mut hb, self.dres + ((t - 1) * self.hidden) as u64 * 4)?;
         self.cc.sync()?;
         // SAFETY: d2h 동기 완료 — hb는 hidden개 f32 LE.
         let hnew =

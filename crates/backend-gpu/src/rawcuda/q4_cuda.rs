@@ -12,6 +12,11 @@
 //! 소유한다. Exl3CudaDecoder와 동시 상주는 검증층에서 금지(한 프로세스
 //! 모델 1개).
 //!
+//! [슬롯 스레드 계약] 공개 진입(등록·gemv·gemm·dequant)은 cc.guard()로
+//! 현재 컨텍스트를 전환한다 — 로드 스레드의 current는 다른 스레드로
+//! 전파되지 않아, 가드 없이 alloc/h2d하면 CUresult=201(INVALID_CONTEXT)로
+//! 죽는다(exl3_cuda_forward S5 계약의 미러 — serve 슬롯 스레드 실측 2026-10-08).
+//!
 //! [독립 컴파일 계약] 이 파일은 scripts/cuda_probe_shim.rs가 rustc로 단독
 //! 컴파일한다(전체 워크스페이스는 Windows에서 llm170-core mmap 결함으로
 //! 불가 — G1 원장). 따라서 std 외 크레이트 의존 금지. exl3_cuda.rs의
@@ -144,6 +149,9 @@ impl Q4Cuda {
                 expect
             ));
         }
+        // S5 계약: 슬롯 스레드에는 로드 스레드의 current 컨텍스트가 없다 —
+        // 가드 없이 alloc하면 CUresult=201(INVALID_CONTEXT, 2026-10-08 실측).
+        let _g = self.cc.guard()?;
         let w = self.cc.alloc(expect)?;
         Self::h2d_chunked(&self.cc, w, bytes)?;
         if let Some(old) = self.lins.insert(key.to_string(), Q4Lin { n_in, n_out, w }) {
@@ -230,6 +238,8 @@ impl Q4Cuda {
                 "q4 gemv: n_out={n_out} — grid-y 상한 65535 초과(블록 분할 필요)"
             ));
         }
+        // S5 슬롯 스레드 컨텍스트 가드(헤더 계약).
+        let _g = self.cc.guard()?;
         let xq = self.quant_rows(x, n_in, 1)?;
         let f = self.cc.function("q4_gemv_q4k")?;
         let w = self.lins[key].w;
@@ -274,6 +284,8 @@ impl Q4Cuda {
                 "q4 gemm: t={t} — (0, 65535] 도메인 계약(그리드 y 상한)"
             ));
         }
+        // S5 슬롯 스레드 컨텍스트 가드(헤더 계약).
+        let _g = self.cc.guard()?;
         let xq = self.quant_rows(rows, n_in, t)?;
         let f = self.cc.function("q4_gemm_q4k_m")?;
         let w = self.lins[key].w;
@@ -315,6 +327,8 @@ impl Q4Cuda {
                 "q4 dequant: n_rows={n_rows} — (0, {n_out}] 도메인 계약 위반"
             ));
         }
+        // S5 슬롯 스레드 컨텍스트 가드(헤더 계약).
+        let _g = self.cc.guard()?;
         let nsuper = n_in / Q4K_BLCK;
         let f = self.cc.function("q4_dequant_q4k")?;
         let w = self.lins[key].w;

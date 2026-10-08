@@ -1127,7 +1127,11 @@ struct StepCmp {
 /// mids vs oracle 단계 비교(정합은 값으로 — §6).
 fn cmp_steps(m: &MtpMids, w: &MtpOracleOut, gate: &LinBuf) -> Result<StepCmp, String> {
     if m.h_next.len() != w.h_next.len() {
-        return Err(format!("mids h_next {} != {}", m.h_next.len(), w.h_next.len()));
+        return Err(format!(
+            "mids h_next {} != {}",
+            m.h_next.len(),
+            w.h_next.len()
+        ));
     }
     let (cat, n1) = maxdiff_nan(&m.cat, &w.cat);
     let (eh, n_eh) = maxdiff_nan(&m.eh, &w.eh);
