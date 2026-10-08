@@ -176,12 +176,12 @@ extern "C" __global__ void w4a16_gemv_g128(
 }
 
 // out[t][n] = x[t][k] · W4A16(g128, sym) — t≥2(프리필 배치) 전용.
-// [2026-10-08 P3-b 실측 진화 — 최선 채택] 행=블록 f16 x = 43GB/s → smem(R=4)
-// 51 → smem f32 변환 63 → **R=8(512스레드)+smem f16→f32+KC256+q4 언롤 4 = 77**
-// → 레지스터 블로킹 RL=2(256스레드) 61(기각) → f32 직접 판독 52(기각).
-// 병목: x smem 판독 4B/(행·원소·토큰)·ALU·가중치 스트림(추정 합 ~62ms/chunk
-// vs 실측 178ms — 잔여는 지연/점유 미규명). 남은 정공법: cp.async 더블버퍼
-// (스테이징-누산 겹침) 또는 스레드당 다출력+레지스터 재사용 심화.
+// [2026-10-08 P3-b 최종 — 채택 변형] 1라운드 진화(벤치 실측): 행=블록 43 →
+// smem(R=4) 51 → smem f16→f32 변환 63 → **R=8(512스레드) 72~77(채택)** →
+// 레지스터 블로킹 RL=2 61(기각) → f32 직접 52(기각) → cp.async 2단 62(기각:
+// 스테이징 지연은 병목 아님). ncu는 권한(ERR_NVGPUCTRPERM)으로 카운터 불가 —
+// 잔여 지연 요인은 미규명(모델: warp-jj ~30사이클 × 2.78M ≈ 380µs vs 실측 620).
+// 채택본: R=8 + x f32(cast_x32 공유 — 변환·h2f 없음) + smem 스테이징 + 언롤.
 // 산술 계약 불변(행·토큰별 레인 l은 i=l,l+64,… 오름차순 f32 누산 → tree64).
 #define G4_TMAX 8
 #define G4_ROWS 8
@@ -191,7 +191,7 @@ extern "C" __global__ void w4a16_gemv_g128(
 extern "C" __global__ void w4a16_gemm_g128(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
     const unsigned short* __restrict__ s,  // [n][k/128] f16 비트(스케일)
-    const unsigned short* __restrict__ x,  // [t][k] f16 비트(활성)
+    const float* __restrict__ x,           // [t][k] f32 = h2f(f2h(활성))
     float* __restrict__ out,               // [t][n]
     int n,
     int k,
@@ -203,7 +203,7 @@ extern "C" __global__ void w4a16_gemm_g128(
     const int o = o0 + g;
     const bool live = (o < n) && (t > 0) && (t <= G4_TMAX);
     __shared__ float sc[G4_ROWS][G4_SCMAX];
-    __shared__ float xs[G4_TMAX][G4_KC]; // f32 1회 변환 저장(루프 내 h2f 제거)
+    __shared__ float xs[G4_TMAX][G4_KC];
     __shared__ double red[G4_ROWS][G4_LANES];
     float acc[G4_TMAX];
 #pragma unroll
@@ -224,7 +224,7 @@ extern "C" __global__ void w4a16_gemm_g128(
             const int ti = idx / G4_KC;
             const int il = idx - ti * G4_KC;
             const int gi = base + il;
-            xs[ti][il] = (ti < t && gi < k) ? h2f(x[(size_t)ti * k + gi]) : 0.0f;
+            xs[ti][il] = (ti < t && gi < k) ? x[(size_t)ti * k + gi] : 0.0f;
         }
         __syncthreads();
         if (live) {
