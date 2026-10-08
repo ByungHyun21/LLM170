@@ -68,7 +68,7 @@ impl From<std::io::Error> for W4a16Error {
 
 pub type R<T> = Result<T, W4a16Error>;
 
-/// 아키텍처 메타(config.json 발췌 — 로더 검증용 최소 집합).
+/// 아키텍처 메타(config.json 발췌 — 로더·변환기 공용).
 #[derive(Debug, Clone)]
 pub struct W4a16Config {
     pub hidden: usize,
@@ -82,6 +82,14 @@ pub struct W4a16Config {
     pub full_interval: usize,
     pub group_size: usize,
     pub bits: usize,
+    /// GDN — state_size·key_heads·value_heads·conv 커널(변환기 KV용).
+    pub linear_key_head_dim: usize,
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+    pub linear_conv_kernel: usize,
+    pub partial_rotary_factor: f64,
+    pub rope_theta: f64,
+    pub rms_norm_eps: f64,
 }
 
 /// 전수 검증 리포트 — ok()가 커버리지·정합 판정.
@@ -154,6 +162,8 @@ fn bf16_to_f32(bits: u16) -> f32 {
 pub struct W4a16Model {
     ar: StArchive,
     pub cfg: W4a16Config,
+    /// 원본 디렉터리(vocab.json·generation_config.json — 변환기용).
+    pub dir: std::path::PathBuf,
     /// `model.language_model.layers.{il}.mlp.gate_proj` → (n, k).
     lins: HashMap<String, (usize, usize)>,
 }
@@ -225,7 +235,12 @@ impl W4a16Model {
         if lins.is_empty() {
             return Err(W4a16Error::Quant("weight_packed 0건 — W4A16 아님".into()));
         }
-        Ok(W4a16Model { ar, cfg, lins })
+        Ok(W4a16Model {
+            ar,
+            cfg,
+            dir: dir.to_path_buf(),
+            lins,
+        })
     }
 
     fn parse_config(text: &str) -> R<W4a16Config> {
@@ -234,6 +249,9 @@ impl W4a16Model {
         let tc = v.get("text_config").unwrap_or(&v);
         let u = |k: &str| -> Option<usize> { tc.get(k).and_then(Json::as_f64).map(|x| x as usize) };
         let bad = |k: &str| W4a16Error::BadTensor(format!("config.json: {k} 부재"));
+        // rope 파라미터는 text_config.rope_parameters에 중첩(실측) — 평면 키도 허용.
+        let rp = tc.get("rope_parameters").unwrap_or(tc);
+        let f = |k: &str| -> Option<f64> { rp.get(k).and_then(Json::as_f64) };
         Ok(W4a16Config {
             hidden: u("hidden_size").ok_or_else(|| bad("hidden_size"))?,
             layers: u("num_hidden_layers").ok_or_else(|| bad("num_hidden_layers"))?,
@@ -245,6 +263,23 @@ impl W4a16Model {
             full_interval: u("full_attention_interval").unwrap_or(4).max(1),
             group_size: GROUP,
             bits: 4,
+            linear_key_head_dim: u("linear_key_head_dim")
+                .ok_or_else(|| bad("linear_key_head_dim"))?,
+            linear_num_key_heads: u("linear_num_key_heads")
+                .ok_or_else(|| bad("linear_num_key_heads"))?,
+            linear_num_value_heads: u("linear_num_value_heads")
+                .ok_or_else(|| bad("linear_num_value_heads"))?,
+            linear_conv_kernel: u("linear_conv_kernel_dim").unwrap_or(4),
+            partial_rotary_factor: f("partial_rotary_factor")
+                .or_else(|| tc.get("partial_rotary_factor").and_then(Json::as_f64))
+                .unwrap_or(0.25),
+            rope_theta: f("rope_theta")
+                .or_else(|| tc.get("rope_theta").and_then(Json::as_f64))
+                .unwrap_or(1e7),
+            rms_norm_eps: tc
+                .get("rms_norm_eps")
+                .and_then(Json::as_f64)
+                .unwrap_or(1e-6),
         })
     }
 
@@ -528,4 +563,608 @@ impl W4a16Model {
         let z = vec![ZP_SYM; k / GROUP];
         Ok(crate::quant::dot_row_w4a16_lane(&q, &z, &s, x))
     }
+
+    /// GDN V헤드 순열 — llama.cpp(subhead-major) ↔ HF(group-major):
+    /// gguf 블록 i ← 원본 블록 ratio·(i%nk) + i/nk (exl3 convert.rs 실측 확정
+    /// — beta 지문 corr 1.000·ssm_out 블록 corr 0.999, 동일 규약 미러).
+    fn vperm(&self, i: usize) -> usize {
+        let nk = self.cfg.linear_num_key_heads;
+        let ratio = self.cfg.linear_num_value_heads / nk;
+        ratio * (i % nk) + i / nk
+    }
+
+    /// 플레인 임의 행 범위 원시 바이트 — 행 = shape[0], 나머지 축이 한 행.
+    pub fn raw_rows(&self, name: &str, lo: u64, hi: u64) -> R<Vec<u8>> {
+        let e = self
+            .ar
+            .entry(name)
+            .ok_or_else(|| W4a16Error::Missing(name.into()))?;
+        let row_bytes: u64 = e.shape[1..].iter().product::<u64>() * e.dtype.nbytes();
+        self.read_raw(name, row_bytes as usize, lo, hi)
+    }
+
+    /// 1D 플레인 → f32(F32/BF16/F16).
+    pub fn plain_vec_f32(&self, name: &str) -> R<Vec<f32>> {
+        let e = self
+            .ar
+            .entry(name)
+            .ok_or_else(|| W4a16Error::Missing(name.into()))?;
+        if e.shape.len() != 1 {
+            return Err(W4a16Error::BadTensor(format!("{name}: 1D 아님")));
+        }
+        let nb = e.dtype.nbytes() as usize;
+        let raw = self.read_raw(name, nb, 0, e.shape[0])?;
+        decode_f32(&raw, e.dtype, name)
+    }
+}
+
+/// 원시 바이트 → f32(F32/BF16/F16).
+fn decode_f32(raw: &[u8], dt: StDtype, name: &str) -> R<Vec<f32>> {
+    Ok(match dt {
+        StDtype::F32 => raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect(),
+        StDtype::Bf16 => raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| bf16_to_f32(u16::from_le_bytes(*c)))
+            .collect(),
+        StDtype::F16 => raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f16_to_f32(u16::from_le_bytes(*c)))
+            .collect(),
+        other => {
+            return Err(W4a16Error::BadTensor(format!(
+                "{name}: f32 변환 불가 dtype {other:?}"
+            )));
+        }
+    })
+}
+
+/// 변환 통계 — w4a16-to-gguf.
+pub struct ConvertStats {
+    pub tensors: usize,
+    pub bytes: u64,
+    pub elapsed_s: f64,
+}
+
+/// 변환 플랜 — exl3 convert.rs의 qwen35 계약 미러(HF→GGUF). W4A16은 원본
+/// HF 레이아웃이므로 EXL3의 norm w−1 보정은 없다(무보정 F32).
+enum WPlan {
+    /// 양자화 선형 → W4A16G128(66B 블록). n_base/k_base: V순열 시작 축
+    /// (usize::MAX=무순열) — 순열은 128(=1헤드) 단위.
+    Quant {
+        base: String,
+        n: usize,
+        k: usize,
+        n_base: usize,
+        k_base: usize,
+    },
+    /// 2D BF16 직접(embed/lm_head — 행우선 그대로, ne만 [cols, rows]).
+    Bf16Direct { name: String, rows: u64, cols: u64 },
+    /// 2D BF16 행 V순열(alpha/beta).
+    Bf16Rows { name: String, rows: u64, cols: u64 },
+    /// conv1d — 채널행 V순열(vbase 채널 이후 128채널 블록).
+    Bf16Ch {
+        name: String,
+        ch: u64,
+        kk: u64,
+        vbase: usize,
+    },
+    /// 1D F32 — plus1=HF zero-centered norm(Qwen3.5 계열: HF는 w−1 저장,
+    /// GGUF는 w 저장 — llama.cpp convert의 +1 규약, exl3 NormPlus1 실측).
+    F32Direct { name: String, n: usize, plus1: bool },
+    /// 1D F32 V순열(dt_bias).
+    F32V { name: String, n: usize },
+    /// ssm_a = −exp(A_log[V순열]).
+    SsmA { name: String, n: usize },
+}
+
+impl W4a16Model {
+    /// W4A16 디렉터리 → llm170 dialect GGUF(`w4a16-to-gguf`).
+    /// 매핑은 exl3 convert.rs의 qwen35 계약 미러 — V헤드 순열·ssm_a −exp,
+    /// MTP 15종은 미기입(스펙 디코드는 별도 과제). 양자화 선형만 dialect
+    /// 타입, 플레인은 BF16/F32 원본 비트 보존.
+    pub fn to_gguf(&self, out_path: &Path) -> R<ConvertStats> {
+        use llm170_exl3::gguf_out::{GgufWriter, Kv};
+        let t0 = std::time::Instant::now();
+        let c = &self.cfg;
+        let h = c.hidden as u64;
+        let v = c.vocab as u64;
+        let nv = c.linear_num_value_heads;
+        let nk = c.linear_num_key_heads;
+        let hd = c.linear_key_head_dim;
+        let ahd = c.head_dim;
+        let qkv = (2 * nk + nv) * hd;
+
+        // ── KV ──
+        let mut w = GgufWriter::new();
+        w.kv("general.architecture", Kv::Str("qwen35".into()));
+        w.kv("qwen35.embedding_length", Kv::U32(c.hidden as u32));
+        w.kv("qwen35.block_count", Kv::U32(c.layers as u32));
+        w.kv("qwen35.attention.head_count", Kv::U32(c.heads as u32));
+        w.kv("qwen35.attention.head_count_kv", Kv::U32(c.kv_heads as u32));
+        w.kv("qwen35.attention.key_length", Kv::U32(c.head_dim as u32));
+        w.kv("qwen35.ssm.state_size", Kv::U32(hd as u32));
+        w.kv("qwen35.ssm.group_count", Kv::U32(nk as u32));
+        w.kv("qwen35.ssm.time_step_rank", Kv::U32(nv as u32));
+        w.kv("qwen35.ssm.inner_size", Kv::U32((nv * hd) as u32));
+        w.kv("qwen35.feed_forward_length", Kv::U32(c.ffn as u32));
+        w.kv(
+            "qwen35.rope.dimension_count",
+            Kv::U32((c.head_dim as f64 * c.partial_rotary_factor) as u32),
+        );
+        w.kv("qwen35.rope.freq_base", Kv::F64(c.rope_theta));
+        w.kv(
+            "qwen35.attention.layer_norm_rms_epsilon",
+            Kv::F32(c.rms_norm_eps as f32),
+        );
+        w.kv(
+            "qwen35.full_attention_interval",
+            Kv::U32(c.full_interval as u32),
+        );
+        w.kv(
+            "qwen35.ssm.conv_kernel",
+            Kv::U32(c.linear_conv_kernel as u32),
+        );
+        w.kv("qwen35.context_length", Kv::U64(262144));
+        let pieces = load_pieces(&self.dir)?;
+        w.kv("tokenizer.ggml.tokens", Kv::StrArray(pieces));
+        if let Some(e) = eos_of(&self.dir) {
+            w.kv("tokenizer.ggml.eos_token_id", Kv::U32(e));
+        }
+
+        // ── 플랜 ──
+        let mut plans: Vec<(String, WPlan)> = Vec::new();
+        plans.push((
+            "token_embd.weight".into(),
+            WPlan::Bf16Direct {
+                name: "model.language_model.embed_tokens.weight".into(),
+                rows: v,
+                cols: h,
+            },
+        ));
+        plans.push((
+            "output_norm.weight".into(),
+            WPlan::F32Direct {
+                name: "model.language_model.norm.weight".into(),
+                n: c.hidden,
+                plus1: true,
+            },
+        ));
+        plans.push((
+            "output.weight".into(),
+            WPlan::Bf16Direct {
+                name: "lm_head.weight".into(),
+                rows: v,
+                cols: h,
+            },
+        ));
+        let vbase = 2 * nk * hd;
+        for il in 0..c.layers {
+            let l = format!("model.language_model.layers.{il}");
+            let g = format!("blk.{il}");
+            plans.push((
+                format!("{g}.attn_norm.weight"),
+                WPlan::F32Direct {
+                    name: format!("{l}.input_layernorm.weight"),
+                    n: c.hidden,
+                    plus1: true,
+                },
+            ));
+            let full = (il + 1).is_multiple_of(c.full_interval);
+            if full {
+                for (gn, sn, n_out) in [
+                    ("attn_q", "self_attn.q_proj", c.heads * ahd * 2),
+                    ("attn_k", "self_attn.k_proj", c.kv_heads * ahd),
+                    ("attn_v", "self_attn.v_proj", c.kv_heads * ahd),
+                ] {
+                    plans.push((
+                        format!("{g}.{gn}.weight"),
+                        WPlan::Quant {
+                            base: format!("{l}.{sn}"),
+                            n: n_out,
+                            k: c.hidden,
+                            n_base: usize::MAX,
+                            k_base: usize::MAX,
+                        },
+                    ));
+                }
+                plans.push((
+                    format!("{g}.attn_q_norm.weight"),
+                    WPlan::F32Direct {
+                        name: format!("{l}.self_attn.q_norm.weight"),
+                        n: ahd,
+                        plus1: true,
+                    },
+                ));
+                plans.push((
+                    format!("{g}.attn_k_norm.weight"),
+                    WPlan::F32Direct {
+                        name: format!("{l}.self_attn.k_norm.weight"),
+                        n: ahd,
+                        plus1: true,
+                    },
+                ));
+                plans.push((
+                    format!("{g}.attn_output.weight"),
+                    WPlan::Quant {
+                        base: format!("{l}.self_attn.o_proj"),
+                        n: c.hidden,
+                        k: c.heads * ahd,
+                        n_base: usize::MAX,
+                        k_base: usize::MAX,
+                    },
+                ));
+            } else {
+                plans.push((
+                    format!("{g}.attn_qkv.weight"),
+                    WPlan::Quant {
+                        base: format!("{l}.linear_attn.in_proj_qkv"),
+                        n: qkv,
+                        k: c.hidden,
+                        n_base: vbase,
+                        k_base: usize::MAX,
+                    },
+                ));
+                plans.push((
+                    format!("{g}.attn_gate.weight"),
+                    WPlan::Quant {
+                        base: format!("{l}.linear_attn.in_proj_z"),
+                        n: nv * hd,
+                        k: c.hidden,
+                        n_base: 0,
+                        k_base: usize::MAX,
+                    },
+                ));
+                plans.push((
+                    format!("{g}.ssm_conv1d.weight"),
+                    WPlan::Bf16Ch {
+                        name: format!("{l}.linear_attn.conv1d.weight"),
+                        ch: qkv as u64,
+                        kk: c.linear_conv_kernel as u64,
+                        vbase,
+                    },
+                ));
+                plans.push((
+                    format!("{g}.ssm_dt.bias"),
+                    WPlan::F32V {
+                        name: format!("{l}.linear_attn.dt_bias"),
+                        n: nv,
+                    },
+                ));
+                plans.push((
+                    format!("{g}.ssm_a"),
+                    WPlan::SsmA {
+                        name: format!("{l}.linear_attn.A_log"),
+                        n: nv,
+                    },
+                ));
+                plans.push((
+                    format!("{g}.ssm_alpha.weight"),
+                    WPlan::Bf16Rows {
+                        name: format!("{l}.linear_attn.in_proj_a.weight"),
+                        rows: nv as u64,
+                        cols: h,
+                    },
+                ));
+                plans.push((
+                    format!("{g}.ssm_beta.weight"),
+                    WPlan::Bf16Rows {
+                        name: format!("{l}.linear_attn.in_proj_b.weight"),
+                        rows: nv as u64,
+                        cols: h,
+                    },
+                ));
+                plans.push((
+                    format!("{g}.ssm_norm.weight"),
+                    WPlan::F32Direct {
+                        name: format!("{l}.linear_attn.norm.weight"),
+                        n: hd,
+                        plus1: false,
+                    },
+                ));
+                plans.push((
+                    format!("{g}.ssm_out.weight"),
+                    WPlan::Quant {
+                        base: format!("{l}.linear_attn.out_proj"),
+                        n: c.hidden,
+                        k: nv * hd,
+                        n_base: usize::MAX,
+                        k_base: 0,
+                    },
+                ));
+            }
+            plans.push((
+                format!("{g}.post_attention_norm.weight"),
+                WPlan::F32Direct {
+                    name: format!("{l}.post_attention_layernorm.weight"),
+                    n: c.hidden,
+                    plus1: true,
+                },
+            ));
+            for (gn, sn) in [("ffn_gate", "mlp.gate_proj"), ("ffn_up", "mlp.up_proj")] {
+                plans.push((
+                    format!("{g}.{gn}.weight"),
+                    WPlan::Quant {
+                        base: format!("{l}.{sn}"),
+                        n: c.ffn,
+                        k: c.hidden,
+                        n_base: usize::MAX,
+                        k_base: usize::MAX,
+                    },
+                ));
+            }
+            plans.push((
+                format!("{g}.ffn_down.weight"),
+                WPlan::Quant {
+                    base: format!("{l}.mlp.down_proj"),
+                    n: c.hidden,
+                    k: c.ffn,
+                    n_base: usize::MAX,
+                    k_base: usize::MAX,
+                },
+            ));
+        }
+
+        // ── 등록(플랜 순서 = 데이터 순서) ──
+        let mut total = 0u64;
+        for (name, p) in &plans {
+            let len = match p {
+                WPlan::Quant { n, k, .. } => (n * (k / 2 + k / GROUP * 2)) as u64,
+                WPlan::Bf16Direct { rows, cols, .. } | WPlan::Bf16Rows { rows, cols, .. } => {
+                    rows * cols * 2
+                }
+                WPlan::Bf16Ch { ch, kk, .. } => ch * kk * 2,
+                WPlan::F32Direct { n, .. } | WPlan::F32V { n, .. } | WPlan::SsmA { n, .. } => {
+                    (*n * 4) as u64
+                }
+            };
+            match p {
+                WPlan::Quant { n, k, .. } => {
+                    w.tensor_raw(name, &[*k as u64, *n as u64], 100, len);
+                }
+                WPlan::Bf16Direct { rows, cols, .. } | WPlan::Bf16Rows { rows, cols, .. } => {
+                    w.tensor_bf16(name, &[*cols, *rows]);
+                }
+                WPlan::Bf16Ch { ch, kk, .. } => {
+                    w.tensor_bf16(name, &[*kk, *ch]);
+                }
+                WPlan::F32Direct { n, .. } | WPlan::F32V { n, .. } | WPlan::SsmA { n, .. } => {
+                    w.tensor_f32(name, &[*n as u64]);
+                }
+            }
+            total += len;
+        }
+
+        // ── 기입 ──
+        let file = std::fs::File::create(out_path)?;
+        let mut bw = std::io::BufWriter::with_capacity(16 << 20, file);
+        let mut written = 0u64;
+        let plans_ref = &plans;
+        w.write(&mut bw, |name, _off, len, out| {
+            let (_, plan) = plans_ref.iter().find(|(n, _)| n == name).expect("플랜");
+            let buf = self.materialize(plan)?;
+            if buf.len() as u64 != len {
+                return Err(llm170_exl3::Exl3Error::BadTensor(format!(
+                    "{name}: {} != {len} 바이트",
+                    buf.len()
+                )));
+            }
+            std::io::Write::write_all(out, &buf)?;
+            written += len;
+            if written / (1 << 30) != (written - len) / (1 << 30) {
+                eprintln!(
+                    "  [w4a16-conv] {:.1}/{:.1} GB",
+                    written as f64 / 1e9,
+                    total as f64 / 1e9
+                );
+            }
+            Ok(())
+        })?;
+        std::io::Write::flush(&mut bw)?;
+        Ok(ConvertStats {
+            tensors: plans.len(),
+            bytes: total,
+            elapsed_s: t0.elapsed().as_secs_f64(),
+        })
+    }
+
+    /// 플랜 → 바이트(변환기 본체).
+    fn materialize(&self, p: &WPlan) -> Result<Vec<u8>, llm170_exl3::Exl3Error> {
+        let err = |e: W4a16Error| llm170_exl3::Exl3Error::BadTensor(e.to_string());
+        match p {
+            WPlan::Quant {
+                base,
+                n,
+                k,
+                n_base,
+                k_base,
+            } => self
+                .quant_bytes(base, *n, *k, *n_base, *k_base)
+                .map_err(err),
+            WPlan::Bf16Direct { name, rows, .. } => self.raw_rows(name, 0, *rows).map_err(err),
+            WPlan::Bf16Rows { name, rows, cols } => {
+                let raw = self.raw_rows(name, 0, *rows).map_err(err)?;
+                let rb = (*cols * 2) as usize;
+                let mut out = vec![0u8; raw.len()];
+                for i in 0..*rows as usize {
+                    out[i * rb..(i + 1) * rb]
+                        .copy_from_slice(&raw[self.vperm(i) * rb..(self.vperm(i) + 1) * rb]);
+                }
+                Ok(out)
+            }
+            WPlan::Bf16Ch {
+                name,
+                ch,
+                kk,
+                vbase,
+            } => {
+                let raw = self.raw_rows(name, 0, *ch).map_err(err)?;
+                let rb = (*kk * 2) as usize;
+                let mut out = vec![0u8; raw.len()];
+                for r in 0..*vbase {
+                    out[r * rb..(r + 1) * rb].copy_from_slice(&raw[r * rb..(r + 1) * rb]);
+                }
+                let nb = (*ch as usize - *vbase) / GROUP;
+                for blk in 0..nb {
+                    let src = *vbase + self.vperm(blk) * GROUP;
+                    let dst = *vbase + blk * GROUP;
+                    out[dst * rb..(dst + GROUP) * rb]
+                        .copy_from_slice(&raw[src * rb..(src + GROUP) * rb]);
+                }
+                Ok(out)
+            }
+            WPlan::F32Direct { name, plus1, .. } => {
+                let v = self.plain_vec_f32(name).map_err(err)?;
+                let mut out = Vec::with_capacity(v.len() * 4);
+                for x in &v {
+                    out.extend_from_slice(&(if *plus1 { x + 1.0 } else { *x }).to_le_bytes());
+                }
+                Ok(out)
+            }
+            WPlan::F32V { name, n } => {
+                let v = self.plain_vec_f32(name).map_err(err)?;
+                let mut out = Vec::with_capacity(*n * 4);
+                for i in 0..*n {
+                    out.extend_from_slice(&v[self.vperm(i)].to_le_bytes());
+                }
+                Ok(out)
+            }
+            WPlan::SsmA { name, n } => {
+                let v = self.plain_vec_f32(name).map_err(err)?;
+                let mut out = Vec::with_capacity(*n * 4);
+                for i in 0..*n {
+                    out.extend_from_slice(&(-v[self.vperm(i)].exp()).to_le_bytes());
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// 양자화 선형 → W4A16G128 인터리브 블록(행 V순열·열 V순열).
+    fn quant_bytes(
+        &self,
+        base: &str,
+        n: usize,
+        k: usize,
+        n_base: usize,
+        k_base: usize,
+    ) -> R<Vec<u8>> {
+        let packed = self.packed_rows_u32(base, 0, n as u64)?;
+        let scales = self.scale_rows_u16(base, 0, n as u64)?;
+        let nblk = k / GROUP;
+        let wprow = k / 8;
+        let span_n = if n_base == usize::MAX {
+            0
+        } else {
+            (n - n_base) / GROUP
+        };
+        let span_k = if k_base == usize::MAX {
+            0
+        } else {
+            (k - k_base) / GROUP
+        };
+        let row_map = |no: usize| -> usize {
+            if span_n == 0 || no < n_base {
+                return no;
+            }
+            let off = no - n_base;
+            if off / GROUP >= span_n {
+                return no;
+            }
+            n_base + self.vperm(off / GROUP) * GROUP + off % GROUP
+        };
+        let col_map = |g: usize| -> usize {
+            if span_k == 0 {
+                return g;
+            }
+            let off = g * GROUP;
+            if off < k_base {
+                return g;
+            }
+            let ob = (off - k_base) / GROUP;
+            if ob >= span_k {
+                return g;
+            }
+            (k_base + self.vperm(ob) * GROUP) / GROUP
+        };
+        let row_bytes = k / 2 + nblk * 2;
+        let mut out = vec![0u8; n * row_bytes];
+        for no in 0..n {
+            let sn = row_map(no);
+            let dst_row = no * row_bytes;
+            for g in 0..nblk {
+                let sg = col_map(g);
+                let dst = dst_row + g * 66;
+                for wi in 0..16 {
+                    let word = packed[sn * wprow + sg * 16 + wi];
+                    out[dst + wi * 4..dst + wi * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                }
+                out[dst + 64..dst + 66].copy_from_slice(&scales[sn * nblk + sg].to_le_bytes());
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// 토큰 조각표(id 순) — vocab.json(exl3 규약) 우선, 없으면 tokenizer.json
+/// (model.vocab + added_tokens 병합 — W4A16 HF 배포는 vocab.json 부재 실측,
+/// 특수 토큰 33종은 added_tokens에만 있다).
+fn load_pieces(dir: &Path) -> R<Vec<String>> {
+    if dir.join("vocab.json").is_file() {
+        return llm170_exl3::convert::load_token_pieces(dir).map_err(W4a16Error::Exl3);
+    }
+    let txt = std::fs::read_to_string(dir.join("tokenizer.json"))
+        .map_err(|e| W4a16Error::Missing(format!("tokenizer.json: {e}")))?;
+    let v = Json::parse(&txt).map_err(|e| W4a16Error::BadTensor(format!("tokenizer.json: {e}")))?;
+    let mut map: HashMap<u32, String> = HashMap::new();
+    let vocab = v
+        .get("model")
+        .and_then(|m| m.get("vocab"))
+        .and_then(Json::as_object)
+        .ok_or_else(|| W4a16Error::BadTensor("tokenizer.json: model.vocab 부재".into()))?;
+    for (piece, id) in vocab {
+        if let Some(n) = id.as_f64() {
+            map.insert(n as u32, piece.clone());
+        }
+    }
+    if let Some(llm170_exl3::Json::Arr(items)) = v.get("added_tokens") {
+        for it in items {
+            let id = it.get("id").and_then(Json::as_f64).map(|x| x as u32);
+            let content = it.get("content").and_then(Json::as_str).map(String::from);
+            if let (Some(i), Some(c)) = (id, content) {
+                map.insert(i, c);
+            }
+        }
+    }
+    let max = map.keys().copied().max().unwrap_or(0);
+    let mut out = vec![String::new(); max as usize + 1];
+    for (i, p) in map {
+        out[i as usize] = p;
+    }
+    Ok(out)
+}
+
+/// eos — generation_config.json 우선(tokenizer_config.json 폴백).
+fn eos_of(dir: &Path) -> Option<u32> {
+    for f in ["generation_config.json", "tokenizer_config.json"] {
+        if let Ok(t) = std::fs::read_to_string(dir.join(f))
+            && let Ok(j) = Json::parse(&t)
+        {
+            if let Some(e) = j.get("eos_token_id").and_then(Json::as_f64) {
+                return Some(e as u32);
+            }
+            if let Some(e) = j.get("eos_token").and_then(Json::as_f64) {
+                return Some(e as u32);
+            }
+        }
+    }
+    None
 }

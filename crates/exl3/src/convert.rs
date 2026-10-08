@@ -646,8 +646,8 @@ fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
     f32::from_bits(((hi as u32) << 24) | ((lo as u32) << 16))
 }
 
-/// vocab.json {"piece": id} → id 순 토큰 조각표.
-fn load_token_pieces(dir: &Path) -> Result<Vec<String>> {
+/// vocab.json {"piece": id} → id 순 토큰 조각표. (W4A16 변환기 공용 — pub)
+pub fn load_token_pieces(dir: &Path) -> Result<Vec<String>> {
     let raw = std::fs::read_to_string(dir.join("vocab.json"))?;
     let v = Json::parse(&raw)?;
     let obj = v

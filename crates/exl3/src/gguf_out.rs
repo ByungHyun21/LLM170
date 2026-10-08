@@ -66,6 +66,26 @@ impl GgufWriter {
         offset
     }
 
+    /// 임의 원소 크기 텐서 등록 — 비원소 정렬 타입(W4A16G128=66B/128 등
+    /// llm170 dialect)용. len은 호출자 계약(바이트).
+    pub fn tensor_raw(&mut self, name: &str, ne: &[u64], ty: u32, len: u64) -> u64 {
+        let offset = align_up(self.data_len, ALIGN);
+        self.tensors.push(TensorOut {
+            name: name.to_string(),
+            ne: ne.to_vec(),
+            ty,
+            len,
+            offset,
+        });
+        self.data_len = offset + len;
+        offset
+    }
+
+    /// BF16 텐서 등록(ty=30).
+    pub fn tensor_bf16(&mut self, name: &str, ne: &[u64]) -> u64 {
+        self.tensor_ty(name, ne, 30, 2)
+    }
+
     pub fn tensor_f32(&mut self, name: &str, ne: &[u64]) -> u64 {
         self.tensor_ty(name, ne, 0, 4)
     }

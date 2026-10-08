@@ -43,6 +43,10 @@ pub enum GgmlType {
     Nvfp4 = 40,
     Q1_0 = 41,
     Q2_0 = 42,
+    /// llm170 dialect(비GGML — plans/cuda-models.md §3.5): W4A16 g128 sym.
+    /// 블록 = [u32×16 packed(128니블)][f16 scale] = 66B, zp=8 상수.
+    /// w4a16-to-gguf 변환 산출 전용 — 원본 GGUF 파일에는 나타나지 않는다.
+    W4a16G128 = 100,
 }
 
 impl GgmlType {
@@ -84,6 +88,7 @@ impl GgmlType {
             40 => Nvfp4,
             41 => Q1_0,
             42 => Q2_0,
+            100 => W4a16G128, // llm170 dialect(§3.5)
             _ => return None,
         })
     }
@@ -127,6 +132,7 @@ impl GgmlType {
             Nvfp4 => "nvfp4",
             Q1_0 => "q1_0",
             Q2_0 => "q2_0",
+            W4a16G128 => "w4a16_g128",
         }
     }
 
@@ -169,6 +175,8 @@ impl GgmlType {
             Iq4Xs => (256, 136),
             Tq1_0 => (256, 54),
             Tq2_0 => (256, 66),
+            // [u32×16 packed][f16 scale] — 셔플된 compressed-tensors g128.
+            W4a16G128 => (128, 66),
         }
     }
 

@@ -17,8 +17,29 @@ pub fn try_run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     match cmd {
         "w4a16-load" => Some(finish(load(args))),
         "w4a16-xcheck" => Some(finish(xcheck(args))),
+        "w4a16-to-gguf" => Some(finish(to_gguf(args))),
         _ => None,
     }
+}
+
+/// W4A16 → llm170 dialect GGUF(W4A16G128) — qwen35 엔진 직행 변환.
+fn to_gguf(args: &[String]) -> Result<String, String> {
+    let dir = arg_str(args, 0, "");
+    let out = arg_str(args, 1, "");
+    if dir.is_empty() || out.is_empty() {
+        return Err("w4a16-to-gguf <w4a16_dir> <out.gguf>".into());
+    }
+    let m = llm170_core::w4a16::W4a16Model::open(std::path::Path::new(&dir))
+        .map_err(|e| e.to_string())?;
+    let st = m
+        .to_gguf(std::path::Path::new(&out))
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "w4a16-to-gguf: {}개 텐서 {:.1} GB — {:.0}초 → {out} (MTP 15종 미기입)",
+        st.tensors,
+        st.bytes as f64 / 1e9,
+        st.elapsed_s
+    ))
 }
 
 fn load(args: &[String]) -> Result<String, String> {
