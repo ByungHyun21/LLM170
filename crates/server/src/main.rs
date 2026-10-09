@@ -168,7 +168,6 @@ fn run_main() -> ExitCode {
         fn flush(&self) {}
     }
     let _ = log::set_logger(&EL);
-    log::set_max_level(log::LevelFilter::Error);
     // OOM 킬러 지정 희생자 (실측 2026-09-01): 초대형 mmap(total-vm 150GB+)이
     // badness 최상위로 뽑혀 런·세션이 함께 죽는다. 스스로 adj=1000을 걸어
     // 런만 희생되게 한다 (무권한으로는 보호 불가 — 우선순위 이동만 가능).
@@ -183,6 +182,24 @@ fn run_main() -> ExitCode {
         // SAFETY: main 스레드 초기화 경로 — 다른 스레드 시작 전
         unsafe { std::env::set_var("LLM170_FRAME", "1") };
     }
+    // [H 2026-10-09] 로그 레벨 개방 — 기본 Error(종전 고정값 동일),
+    // LLM170_LOG=off|error|warn|info|debug|trace로 상향(진단 로그 확인 수단).
+    // 주의: flag 스냅샷을 FRAME 기본값 set_var 이후로 미룬다 — 여기서 처음
+    // flag를 읽으면 스냅샷이 FRAME 기본값을 못 보고 envcheck가 불일치한다.
+    let level = match llm170_diag::flag::val("LLM170_LOG").map(str::to_ascii_lowercase) {
+        Some(ref v) if v == "off" => log::LevelFilter::Off,
+        Some(ref v) if v == "warn" => log::LevelFilter::Warn,
+        Some(ref v) if v == "info" => log::LevelFilter::Info,
+        Some(ref v) if v == "debug" => log::LevelFilter::Debug,
+        Some(ref v) if v == "trace" => log::LevelFilter::Trace,
+        Some(ref v) if v == "error" => log::LevelFilter::Error,
+        Some(v) => {
+            eprintln!("warning: LLM170_LOG={v} 미지 레벨 — error 유지");
+            log::LevelFilter::Error
+        }
+        None => log::LevelFilter::Error,
+    };
+    log::set_max_level(level);
     if let Some(cmd) = args.first().map(String::as_str)
         && let Some(code) = probes::run(cmd, &args[1..])
     {
