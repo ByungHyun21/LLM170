@@ -8,13 +8,22 @@ use crate::rawcuda::ffi::{self, CUDA_SUCCESS, CUdeviceptr, CUfunction, CUstream}
 use std::collections::HashMap;
 
 /// 진단 타이머 범주(P8) — 커널 심볼명 분류.
-pub const PROF_CATS: [&str; 9] = [
-    "misc", "norm", "gemv", "gemm", "gdn", "attn", "ew", "head", "moe",
+pub const PROF_CATS: [&str; 13] = [
+    "misc", "norm", "gemv", "gemm", "gdn", "attn", "ew", "head", "moe", "scan", "l2perm", "conv",
+    "gate",
 ];
 
 /// 심볼명 → 범주 인덱스(순서 주의: moe를 gemv보다 먼저 검사).
 pub fn prof_cat(name: &str) -> usize {
-    if name.contains("moe") {
+    if name.contains("scan") {
+        9
+    } else if name.contains("l2perm") {
+        10
+    } else if name.contains("conv") {
+        11
+    } else if name.contains("gate") {
+        12
+    } else if name.contains("moe") {
         8
     } else if name.contains("norm") {
         1
