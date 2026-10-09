@@ -333,6 +333,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut ctx = 1024usize;
     let mut no_head = false;
     let mut moe_check = false;
+    let mut plain_check = false;
     let mut h2d_mb = 0usize;
     let mut bench: Option<(String, usize, usize)> = None; // (lin, t, reps)
     let mut it = args.iter().skip(1);
@@ -364,6 +365,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             }
             "--no-head" => no_head = true,
             "--moe-check" => moe_check = true,
+            "--plain-gemm-check" => plain_check = true,
             "--h2d-bench" => {
                 let mb = it
                     .next()
@@ -440,6 +442,9 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             bytes as f64 * 1e-9 / (pinned_ms * 1e-3).max(1e-9)
         ));
     }
+    if plain_check {
+        return dec.plain_gemm_selfcheck();
+    }
     if moe_check {
         return dec.moe_selfcheck();
     }
@@ -501,11 +506,13 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         let mut i = 0usize;
         while i < prompt.len() {
             // [2026-10-09 개방 결함] MoE 배치 프리필 t≥8 NaN — MoE는 t=1 고정.
-            let t = if hp.n_experts > 0 {
+            // LLM170_MOE_DBG(진단)에서만 배치를 허용해 추적한다.
+            let cap = if hp.n_experts > 0 && !llm170_diag::flag::ne0("LLM170_MOE_DBG") {
                 1
             } else {
-                (prompt.len() - i).min(8)
+                8
             };
+            let t = (prompt.len() - i).min(cap);
             let mut rows: Vec<f32> = Vec::with_capacity(t * h);
             for &tok in &prompt[i..i + t] {
                 rows.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);
