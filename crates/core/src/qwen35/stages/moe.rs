@@ -10,6 +10,7 @@
 use super::Ctx;
 use crate::ops::silu;
 use crate::qwen35::ModelError;
+use crate::qwen35::dispatch::mm_group_ref;
 use crate::qwen35::{mm_batch, mm_group};
 
 /// 라우터 로짓 → softmax(전문가 전체) → top-k → 재정규화 — (전문가, 가중)
@@ -74,7 +75,8 @@ pub(crate) fn moe_ffn(
         if toks.is_empty() {
             continue;
         }
-        let xs: Vec<Vec<f32>> = toks.iter().map(|&(t, _)| x[t].clone()).collect();
+        // [P12 E3] 참조 수집 — 종전 행 clone(프리필 1024토큰에서 층당 수십 MB).
+        let xs: Vec<&[f32]> = toks.iter().map(|&(t, _)| x[t].as_slice()).collect();
         let gw = m
             .expert_w(il, e, "gate_proj")
             .ok_or_else(|| ModelError::MissingTensor(format!("blk.{il}.expert{e}.gate_proj")))?;
@@ -85,7 +87,7 @@ pub(crate) fn moe_ffn(
             vec![vec![0.0f32; n_ff]; toks.len()],
             vec![vec![0.0f32; n_ff]; toks.len()],
         ];
-        mm_group(&xs, &[gw, uw], &mut outs);
+        mm_group_ref(&xs, &[gw, uw], &mut outs);
         let [mut g, u] = outs;
         for (gi, ui) in g.iter_mut().zip(u.iter()) {
             for i in 0..n_ff {
@@ -96,7 +98,7 @@ pub(crate) fn moe_ffn(
             .expert_w(il, e, "down_proj")
             .ok_or_else(|| ModelError::MissingTensor(format!("blk.{il}.expert{e}.down_proj")))?;
         let mut d = vec![vec![0.0f32; n_embd]; toks.len()];
-        mm_batch(&g, &dw, &mut d);
+        mm_batch(&g, &dw, &mut d); // g는 소유 행(게이트 활성) — 래퍼가 참조 수집.
         for (ti, &(t, w)) in toks.iter().enumerate() {
             for i in 0..n_embd {
                 moe_out[t][i] += w * d[ti][i];
