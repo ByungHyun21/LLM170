@@ -304,6 +304,23 @@ impl CudaCtx {
         Ok(())
     }
 
+    /// 디바이스 영역 0 채움(비동기 — 기본 스트림 순서 계약).
+    /// [2026-10-09 H] 종전 zero_dev의 동기 h2d 4MiB 청크 루프 대체 —
+    /// cuMemsetD8Async 1콜(스트림 순서라 후속 커널·판독과 정합).
+    pub fn memset0_async(&self, dst: CUdeviceptr, bytes: usize) -> Result<(), String> {
+        // SAFETY: dst는 alloc이 돌려준 유효 할당, 범위는 호출자 계약.
+        unsafe {
+            let r = (self.drv.memset_d8_async)(dst, 0, bytes, self.stream);
+            if r != CUDA_SUCCESS {
+                return Err(format!(
+                    "rawcuda: cuMemsetD8Async({bytes}B): {}",
+                    ffi::err_text(r)
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// 디바이스→호스트 복사(동기).
     pub fn d2h(&self, dst: &mut [u8], src: CUdeviceptr) -> Result<(), String> {
         let t0 = std::time::Instant::now();

@@ -11,7 +11,7 @@
 //! 실측 확인(평명 cuMemAlloc=201 vs cuMemAlloc_v2=0, 동일 유효 컨텍스트).
 //! CUDA 11+ 헤더에서 cuMemAlloc 등은 _v2의 매크로 별칭 — _v2가 정규 경로.
 
-use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void};
 use std::sync::OnceLock;
 
 /// CUdevice — 디바이스 서수 식별자.
@@ -31,7 +31,9 @@ pub type CUevent = *mut c_void;
 pub type CUresult = c_uint;
 pub const CUDA_SUCCESS: CUresult = 0;
 
-/// 확실한 코드만 명명 — 그 외는 숫자로 보고(오표기 위험 차단).
+/// 확실한 코드만 명명 — 그 외는 드라이버 표준 문구로 보고(오표기 위험 차단).
+/// [2026-10-09 H] 미지 코드는 cuGetErrorString 원문을 덧붙인다(드라이버
+/// 미로드 시에는 종전처럼 숫자만).
 pub fn err_text(r: CUresult) -> String {
     match r {
         CUDA_SUCCESS => "성공".into(),
@@ -42,7 +44,19 @@ pub fn err_text(r: CUresult) -> String {
         100 => "CUDA 디바이스 없음(CUDA_ERROR_NO_DEVICE)".into(),
         101 => "잘못된 디바이스 서수(CUDA_ERROR_INVALID_DEVICE)".into(),
         400 => "잘못된 핸들(CUDA_ERROR_INVALID_HANDLE)".into(),
-        _ => format!("CUresult={r}"),
+        _ => {
+            if let Ok(drv) = Driver::get() {
+                let mut p: *const c_char = std::ptr::null();
+                // SAFETY: 함수표는 로드 완료(Driver 계약) — p는 아웃 포인터.
+                let rc = unsafe { (drv.get_error_string)(r, &mut p) };
+                if rc == CUDA_SUCCESS && !p.is_null() {
+                    // SAFETY: 드라이버가 NUL 종료 정적 문자열 반환(프로세스 수명).
+                    let s = unsafe { std::ffi::CStr::from_ptr(p) };
+                    return format!("{} (CUresult={r})", s.to_string_lossy());
+                }
+            }
+            format!("CUresult={r}")
+        }
     }
 }
 
@@ -158,6 +172,19 @@ pub type CuEventDestroyFn = unsafe extern "system" fn(ev: CUevent) -> CUresult;
 pub type CuMemGetInfoFn =
     unsafe extern "system" fn(free: *mut usize, total: *mut usize) -> CUresult;
 
+/// cuGetErrorString — CUresult → 드라이버 표준 문구(H: err_text 확대).
+pub type CuGetErrorStringFn =
+    unsafe extern "system" fn(r: CUresult, p_str: *mut *const c_char) -> CUresult;
+
+/// cuMemsetD8Async — 디바이스 0 채움(H: zero_dev의 동기 h2d 청크 대체).
+/// 스트림 인자를 받는 async 계열이라 평명 심볼이 정규(_v2 분기 없음).
+pub type CuMemsetD8AsyncFn = unsafe extern "system" fn(
+    dst: CUdeviceptr,
+    uc: c_uchar,
+    n: usize,
+    stream: CUstream,
+) -> CUresult;
+
 /// 해석 완료된 드라이버 함수표 — 전부 순수 함수 포인터(Send+Sync 자동).
 pub(crate) struct Driver {
     pub init: CuInitFn,
@@ -192,6 +219,11 @@ pub(crate) struct Driver {
     /// cuMemGetInfo_v2 — 가드 VRAM 프로브(B6).
     pub mem_get_info: CuMemGetInfoFn,
     pub func_set_attribute: CuFuncSetAttributeFn,
+
+    /// 미지 오류 코드 문구(H) — err_text 폴백.
+    pub get_error_string: CuGetErrorStringFn,
+    /// 디바이스 0 채움(H) — zero_dev 경로.
+    pub memset_d8_async: CuMemsetD8AsyncFn,
 
     /// 진단 타이머(P8) — 이벤트 4종.
     pub event_create: CuEventCreateFn,
@@ -320,6 +352,12 @@ impl Driver {
 
                 mem_get_info: std::mem::transmute::<*mut c_void, CuMemGetInfoFn>(sym!(
                     "cuMemGetInfo_v2"
+                )),
+                get_error_string: std::mem::transmute::<*mut c_void, CuGetErrorStringFn>(sym!(
+                    "cuGetErrorString"
+                )),
+                memset_d8_async: std::mem::transmute::<*mut c_void, CuMemsetD8AsyncFn>(sym!(
+                    "cuMemsetD8Async"
                 )),
             })
         }

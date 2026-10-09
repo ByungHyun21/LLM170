@@ -614,11 +614,10 @@ impl W4a16Dec {
     }
 
     fn zero_dev(cc: &CudaCtx, ptr: CUdeviceptr, len: usize) -> Result<(), String> {
-        let zero = vec![0u8; (4 << 20).min(len)];
-        for off in (0..len).step_by(zero.len()) {
-            cc.h2d(ptr + off as u64, &zero[..zero.len().min(len - off)])?;
-        }
-        Ok(())
+        // [2026-10-09 H] 동기 h2d 4MiB 청크 루프 → cuMemsetD8Async 1콜.
+        // (종전에는 청크마다 스테이징·호출 — 게다가 캡처 경로에서 금지되는
+        // 동기 복사였다.) 스트림 순서라 후속 커널·판독과 정합.
+        cc.memset0_async(ptr, len)
     }
 
     /// 선형 상주 업로드 — packed u32 [n][k/8] · scale f16 [n][k/128].
@@ -4498,5 +4497,66 @@ mod tests {
         assert_eq!(*frees.borrow(), vec![0x11, 0x22, 0x33, 0x101]);
         assert_eq!(f, [0x102, 0x103, 0x104]);
         assert_eq!(live.borrow().len(), 3);
+    }
+}
+
+/// H(2026-10-09): .cu가 진실 — 호스트 미러 상수를 정적으로 대조한다
+/// (미러 불일치 = smem 오버런·버퍼 계약 위반이라 변경 시 사전 차단).
+#[cfg(test)]
+mod mirror_contract {
+    use super::{ATTN_F3S_TMAX, CHAIN_TMAX, GDN_SCAN_SMEM, GDN_VSLICE};
+
+    /// `#define NAME 값` 파싱 — 값은 정수 리터럴만 다룬다(대상 목록 한정).
+    fn define(src: &str, name: &str) -> u64 {
+        for line in src.lines() {
+            if let Some(rest) = line.trim().strip_prefix("#define ") {
+                let mut it = rest.split_whitespace();
+                if it.next() == Some(name) {
+                    return it
+                        .next()
+                        .expect("define 값 누락")
+                        .parse()
+                        .expect("정수 define 아님");
+                }
+            }
+        }
+        panic!(".cu define 없음: {name}");
+    }
+
+    #[test]
+    fn attn_tmax_mirror() {
+        let tmax = define(include_str!("assets/attn.cu"), "ATTN_TMAX") as usize;
+        assert_eq!(tmax, ATTN_F3S_TMAX, "attn.cu ATTN_TMAX ↔ ATTN_F3S_TMAX");
+        assert_eq!(tmax, CHAIN_TMAX, "attn.cu ATTN_TMAX ↔ CHAIN_TMAX");
+    }
+
+    #[test]
+    fn gdn_scan_layout_mirror() {
+        let cu = include_str!("assets/gdn.cu");
+        let cs = define(cu, "GDN_CS") as usize;
+        let tile = define(cu, "GDN_TILE") as usize;
+        let vslice = define(cu, "GDN_VSLICE") as usize;
+        assert_eq!(vslice, GDN_VSLICE, "gdn.cu GDN_VSLICE ↔ GDN_VSLICE");
+        let vw = 128 / vslice;
+        // gdn_scan 레이아웃(sk/sv/A/KQ/KS/QS/dc/Stile/bp/gcs/wsm) 바이트 합 —
+        // gdn.cu 상단 주석 2항(61,828B)과 동일 산식.
+        let total = cs * 128 * 2
+            + cs * vw * 2
+            + cs * cs * 2
+            + cs * cs * 2
+            + cs * vw * 2
+            + cs * vw * 2
+            + cs * vw * 4
+            + tile * vw * 4
+            + cs * 4
+            + (cs + 1) * 4
+            + cs * 4;
+        assert_eq!(total as u32, GDN_SCAN_SMEM, "gdn_scan 동적 smem 합");
+    }
+
+    #[test]
+    fn g4_scmax_mirror() {
+        let scmax = define(include_str!("assets/gptq4.cu"), "G4_SCMAX") as usize;
+        assert_eq!(scmax, crate::rawcuda::gptq4::G4_SCMAX, "gptq4.cu G4_SCMAX");
     }
 }

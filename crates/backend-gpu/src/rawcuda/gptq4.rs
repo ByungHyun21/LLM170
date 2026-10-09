@@ -35,8 +35,12 @@ pub fn h2f(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// GEMV smem 스케일 배열 크기 — assets/gptq4.cu `#define G4_SCMAX` 미러.
+/// 정적 대조: w4a16_dec::mirror_contract 테스트(H, 2026-10-09).
+pub const G4_SCMAX: usize = 256;
+
 /// 형상 계약 검사(순수 — GPU 불필요, 단위 테스트 대상).
-/// k ≤ 128*G4_SCMAX(32768)는 t=1 행=블록 GEMV의 smem `sc[G4_SCMAX]` 계약
+/// k ≤ group*G4_SCMAX(32768)는 t=1 행=블록 GEMV의 smem `sc[G4_SCMAX]` 계약
 /// (assets/gptq4.cu) — 상한 초과는 smem 오버런(UB)이라 호스트에서 거부한다.
 pub fn check_shapes(
     t: usize,
@@ -58,10 +62,10 @@ pub fn check_shapes(
             "gptq4: 형상 계약 위반 q={qlen} s={slen} x={xlen} n={n} k={k} t={t} group={group}"
         ));
     }
-    if t == 1 && k > group * 256 {
+    if t == 1 && k > group * G4_SCMAX {
         return Err(format!(
             "gptq4: t=1 GEMV k 상한 위반 — k={k} > {}(smem sc 계약, g{group})",
-            group * 256
+            group * G4_SCMAX
         ));
     }
     Ok(())
