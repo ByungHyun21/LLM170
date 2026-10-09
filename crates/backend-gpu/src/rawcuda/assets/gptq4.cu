@@ -570,8 +570,10 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
                                            // (동일 값 — cast_x32와 같은 반올림).
     float* __restrict__ out, int n, int k, int t)
 {
-    __shared__ unsigned short xs[MMA_M][MMA_KC + 8];
-    __shared__ unsigned short ws[MMA_N][MMA_KC + 8];
+    // [지연 은닉] 더블 버퍼 — ncu: Compute 27%·점유 35%·No Eligible 77%(지연
+    // 바운드). 스테이징(k+1)과 mma(k)를 겹친다(버퍼 2×27.6KB = 55KB < 100KB).
+    __shared__ unsigned short xs[2][MMA_M][MMA_KC + 8];
+    __shared__ unsigned short ws[2][MMA_N][MMA_KC + 8];
     const int tid = threadIdx.x;
     const int m0 = blockIdx.x * MMA_M;
     const int n0 = blockIdx.y * MMA_N;
@@ -588,74 +590,120 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
     for (int i = 0; i < 8; ++i) {
         ((float*)c)[i] = 0.0f;
     }
-    for (int k0 = 0; k0 < k; k0 += MMA_KC) {
-        __syncthreads();
-        // xs: M32×64 f32→f16(float4 로드 → __float2half_rn)
-        for (int e = tid; e < MMA_M * MMA_KC / 4; e += 256) {
-            const int r = e >> 4;
-            const int c4 = e & 15;
-            const int gi = k0 + c4 * 4;
-            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            if (m0 + r < t && gi + 3 < k) {
-                v = *reinterpret_cast<const float4*>(&x[(size_t)(m0 + r) * k + gi]);
-            } else if (m0 + r < t) {
-                float t4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                for (int j = 0; j < 4; ++j) {
-                    if (gi + j < k) {
-                        t4[j] = x[(size_t)(m0 + r) * k + gi + j];
+    int cur = 0;
+    int k0 = 0;
+    // 초기 스테이징(청크 0).
+    for (int e = tid; e < MMA_M * MMA_KC / 4; e += 256) {
+        const int r = e >> 4;
+        const int c4 = e & 15;
+        const int gi = c4 * 4;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (m0 + r < t && gi + 3 < k) {
+            v = *reinterpret_cast<const float4*>(&x[(size_t)(m0 + r) * k + gi]);
+        } else if (m0 + r < t) {
+            float t4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int j = 0; j < 4; ++j) {
+                if (gi + j < k) {
+                    t4[j] = x[(size_t)(m0 + r) * k + gi + j];
+                }
+            }
+            v = make_float4(t4[0], t4[1], t4[2], t4[3]);
+        }
+        xs[0][r][c4 * 4 + 0] = __half_as_ushort(__float2half_rn(v.x));
+        xs[0][r][c4 * 4 + 1] = __half_as_ushort(__float2half_rn(v.y));
+        xs[0][r][c4 * 4 + 2] = __half_as_ushort(__float2half_rn(v.z));
+        xs[0][r][c4 * 4 + 3] = __half_as_ushort(__float2half_rn(v.w));
+    }
+    for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
+        const int r = e >> 3;
+        const int c8 = e & 7;
+        const int gi = c8 * 8;
+        const bool live = (n0 + r < n) && (gi + 7 < k);
+        unsigned short scb = 0;
+        if (n0 + r < n) {
+            scb = s[(size_t)(n0 + r) * kg + (gi >> 7)];
+        }
+        const float scf = __half2float(*reinterpret_cast<const __half*>(&scb));
+        const unsigned qw = live ? q[(size_t)(n0 + r) * k8 + (gi >> 3)] : 0u;
+        if (live) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
+                ws[0][r][c8 * 8 + j] = __half_as_ushort(__float2half_rn((float)nib * scf));
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                ws[0][r][c8 * 8 + j] = 0;
+            }
+        }
+    }
+    for (; k0 < k; k0 += MMA_KC, cur ^= 1) {
+        __syncthreads(); // 이전 compute 완료(버퍼 재사용) + 스테이징 가시화
+        // 다음 청크 스테이징(다른 버퍼) — mma와 겹친다.
+        const int kn = k0 + MMA_KC;
+        if (kn < k) {
+            for (int e = tid; e < MMA_M * MMA_KC / 4; e += 256) {
+                const int r = e >> 4;
+                const int c4 = e & 15;
+                const int gi = kn + c4 * 4;
+                float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                if (m0 + r < t && gi + 3 < k) {
+                    v = *reinterpret_cast<const float4*>(&x[(size_t)(m0 + r) * k + gi]);
+                } else if (m0 + r < t) {
+                    float t4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    for (int j = 0; j < 4; ++j) {
+                        if (gi + j < k) {
+                            t4[j] = x[(size_t)(m0 + r) * k + gi + j];
+                        }
+                    }
+                    v = make_float4(t4[0], t4[1], t4[2], t4[3]);
+                }
+                xs[cur ^ 1][r][c4 * 4 + 0] = __half_as_ushort(__float2half_rn(v.x));
+                xs[cur ^ 1][r][c4 * 4 + 1] = __half_as_ushort(__float2half_rn(v.y));
+                xs[cur ^ 1][r][c4 * 4 + 2] = __half_as_ushort(__float2half_rn(v.z));
+                xs[cur ^ 1][r][c4 * 4 + 3] = __half_as_ushort(__float2half_rn(v.w));
+            }
+            for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
+                const int r = e >> 3;
+                const int c8 = e & 7;
+                const int gi = kn + c8 * 8;
+                const bool live = (n0 + r < n) && (gi + 7 < k);
+                unsigned short scb = 0;
+                if (n0 + r < n) {
+                    scb = s[(size_t)(n0 + r) * kg + (gi >> 7)];
+                }
+                const float scf = __half2float(*reinterpret_cast<const __half*>(&scb));
+                const unsigned qw = live ? q[(size_t)(n0 + r) * k8 + (gi >> 3)] : 0u;
+                if (live) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
+                        ws[cur ^ 1][r][c8 * 8 + j] =
+                            __half_as_ushort(__float2half_rn((float)nib * scf));
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        ws[cur ^ 1][r][c8 * 8 + j] = 0;
                     }
                 }
-                v = make_float4(t4[0], t4[1], t4[2], t4[3]);
-            }
-            xs[r][c4 * 4 + 0] = __half_as_ushort(__float2half_rn(v.x));
-            xs[r][c4 * 4 + 1] = __half_as_ushort(__float2half_rn(v.y));
-            xs[r][c4 * 4 + 2] = __half_as_ushort(__float2half_rn(v.z));
-            xs[r][c4 * 4 + 3] = __half_as_ushort(__float2half_rn(v.w));
-        }
-        // ws: 디퀀트(M64×64, 스레드당 8원소 = u32 1개)
-        for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
-            const int r = e >> 3;
-            const int c8 = e & 7;
-            const int gi = k0 + c8 * 8;
-            const bool live = (n0 + r < n) && (gi + 7 < k);
-            unsigned short scb = 0;
-            if (n0 + r < n) {
-                scb = s[(size_t)(n0 + r) * kg + (gi >> 7)];
-            }
-            const float scf = __half2float(*reinterpret_cast<const __half*>(&scb));
-            const unsigned qw = live ? q[(size_t)(n0 + r) * k8 + (gi >> 3)] : 0u;
-            // 디퀀트 = f32 (nib−8)·scale → f16 저장.
-            // 마법 상수(1024+n) 트릭은 두 이유로 기각: ① |1032·scale|>65504면
-            // f16 inf→NaN, ② 스케일이 크면 (1024+n)·s − 1032·s의 f16 소거로
-            // 정밀도 파괴(실측 NaN·maxabs 2e10). marlin 원전도 소스케일 전제.
-            if (live) {
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
-                    ws[r][c8 * 8 + j] = __half_as_ushort(__float2half_rn((float)nib * scf));
-                }
-            } else {
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    ws[r][c8 * 8 + j] = 0;
-                }
             }
         }
-        __syncthreads();
 #pragma unroll
         for (int ks = 0; ks < MMA_KC / 16; ++ks) {
             const int kb = ks * 16;
             // 프래그먼트 = 스모크 검증 방식(명시 판독). ldmatrix는 전치/분배
             // 불일치로 계통 오차(실측 maxabs 3e10) — 정확성 우선으로 되돌림.
-            const unsigned a0 = pk2bf(&xs[mt + g][kb + 2 * tt]);
-            const unsigned a1 = pk2bf(&xs[mt + g + 8][kb + 2 * tt]);
-            const unsigned a2 = pk2bf(&xs[mt + g][kb + 2 * tt + 8]);
-            const unsigned a3 = pk2bf(&xs[mt + g + 8][kb + 2 * tt + 8]);
+            const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
+            const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
+            const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
+            const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt) {
                 const int nb = ntw + nt * 8;
-                const unsigned b0 = pk2bf(&ws[nb + g][kb + 2 * tt]);
-                const unsigned b1 = pk2bf(&ws[nb + g][kb + 2 * tt + 8]);
+                const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
+                const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
                 asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
