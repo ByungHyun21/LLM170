@@ -75,6 +75,15 @@ impl GpuEngine {
 
     /// 1토큰 다음 로짓 — GPU head 상주 시 로짓만 회수(xn 판독 생략),
     /// 아니면 디바이스/스테이징 체인 + CPU 참조 head.
+    /// [P3] greedy 토큰 — GPU 경로는 디바이스 argmax(로짓 d2h 1MB → 4B).
+    fn token_greedy(&mut self, slot: usize, row: &[f32]) -> Result<u32, String> {
+        if self.head_gpu && !self.staged {
+            return self.dec.forward_device_argmax(slot, row);
+        }
+        let lg = self.logits(slot, row)?;
+        Ok(llm170_core::matmul::greedy_from(&lg))
+    }
+
     fn logits(&mut self, slot: usize, row: &[f32]) -> Result<Vec<f32>, String> {
         if self.head_gpu && !self.staged {
             return self.dec.forward_device_head(slot, row);
@@ -166,17 +175,18 @@ impl GpuEngine {
         seq_ids: &[usize],
         tokens: &[u32],
     ) -> Result<Vec<u32>, String> {
-        let lg = self.decode(seq_ids, tokens)?;
-        Ok(lg
-            .iter()
-            .map(|l| llm170_core::matmul::greedy_from(l))
-            .collect())
+        let mut out = Vec::with_capacity(seq_ids.len());
+        for (s, tok) in seq_ids.iter().zip(tokens.iter()) {
+            let row = self.model.embed_row(*tok).map_err(|e| e.to_string())?;
+            out.push(self.token_greedy(*s, &row)?);
+        }
+        Ok(out)
     }
 
     /// 단일 greedy 디코드.
     pub fn decode_greedy(&mut self, seq: usize, token: u32) -> Result<u32, String> {
-        let lg = self.decode(&[seq], &[token])?;
-        Ok(llm170_core::matmul::greedy_from(&lg[0]))
+        let row = self.model.embed_row(token).map_err(|e| e.to_string())?;
+        self.token_greedy(seq, &row)
     }
 
     /// 슬롯 상태 리셋(GDN 링/스캔 + pp + pos).

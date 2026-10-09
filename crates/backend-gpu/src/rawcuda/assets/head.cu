@@ -81,3 +81,53 @@ extern "C" __global__ void head_bf16(const unsigned short* __restrict__ wt, // [
         out[r] = acc;
     }
 }
+
+// [P3] 로짓 argmax — min-index-on-tie(CPU greedy_from 계약 미러: 엄격 비교
+// v > best → 동률은 최저 인덱스, NaN은 비교 false로 순위 제외). 1블록 1024
+// 스레드, float4 판독 + 공유 트리 리덕션(결정적). out[0] = u32 인덱스 —
+// 그래프 캡처 가능(커널 1 + 4B d2h).
+extern "C" __global__ void w4a16_argmax_min(
+    const float* __restrict__ lg, int n, unsigned* __restrict__ out)
+{
+    __shared__ float bv[1024];
+    __shared__ unsigned bi[1024];
+    const int tid = threadIdx.x;
+    float v = -INFINITY;
+    unsigned ix = 0u;
+    const int n4 = n >> 2;
+    const float4* l4 = reinterpret_cast<const float4*>(lg);
+    for (int i = tid; i < n4; i += 1024) {
+        const float4 q = l4[i];
+        const float w[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (w[j] > v) {
+                v = w[j];
+                ix = (unsigned)(4 * i + j);
+            }
+        }
+    }
+    for (int i = 4 * n4 + tid; i < n; i += 1024) {
+        if (lg[i] > v) {
+            v = lg[i];
+            ix = (unsigned)i;
+        }
+    }
+    bv[tid] = v;
+    bi[tid] = ix;
+    __syncthreads();
+    for (int st = 512; st > 0; st >>= 1) {
+        if (tid < st) {
+            const float ov = bv[tid + st];
+            const unsigned oi = bi[tid + st];
+            if (ov > bv[tid] || (ov == bv[tid] && oi < bi[tid])) {
+                bv[tid] = ov;
+                bi[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[0] = bi[0];
+    }
+}

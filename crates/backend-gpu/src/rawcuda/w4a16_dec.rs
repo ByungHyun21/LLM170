@@ -323,6 +323,8 @@ pub struct W4a16Dec {
     head_n: usize,
     head_k: usize,
     head_out: CUdeviceptr,
+    /// [P3] argmax 결과(u32 1개) — 그래프 4B readback 대상.
+    argmax_out: CUdeviceptr,
     // ── CUDA Graph(체인 캡처 — 토큰당 1 launch) ──
     graph_exec: ffi::CUgraphExec,
     graph_handle: ffi::CUgraph,
@@ -330,6 +332,8 @@ pub struct W4a16Dec {
     graph_slot: usize,
     /// 캡처에 head 포함 여부(모드 전환 시 재캡처).
     graph_head: bool,
+    /// [P3] 캡처에 argmax 포함 여부(head 대신 4B d2h) — 세 번째 모드.
+    graph_argmax: bool,
     /// 캡처 실패 후 직접 경로 고정(매 토큰 재시도 방지).
     graph_failed: bool,
     /// 캡처 중 임베딩 복사 소스를 pinned로 고정(캡처는 pageable async 불가).
@@ -443,7 +447,7 @@ impl W4a16Dec {
                     "src/rawcuda/assets/head.fatbin",
                 ],
             )?,
-            &["head_bf16", "head_transpose"],
+            &["head_bf16", "head_transpose", "w4a16_argmax_min"],
         )?;
         cc.load_fatbin(
             "ew",
@@ -562,10 +566,12 @@ impl W4a16Dec {
             head_n: 0,
             head_k: 0,
             head_out: 0,
+            argmax_out: 0,
             graph_exec: std::ptr::null_mut(),
             graph_handle: std::ptr::null_mut(),
             graph_slot: usize::MAX,
             graph_head: false,
+            graph_argmax: false,
             graph_failed: false,
             capture_pinned_src: false,
             pin_embed: std::ptr::null_mut(),
@@ -3456,8 +3462,12 @@ impl W4a16Dec {
 
     /// 그래프 준비(슬롯·head 모드별 1회) — 버퍼 워밍업 → 캡처 → 인스턴스화.
     /// 캡처 중 금지 API(동기 복사·alloc)를 배제하기 위해 ensure_*를 선행한다.
-    fn ensure_graph(&mut self, slot: usize, head: bool) -> Result<(), String> {
-        if !self.graph_exec.is_null() && self.graph_slot == slot && self.graph_head == head {
+    fn ensure_graph(&mut self, slot: usize, head: bool, argmax: bool) -> Result<(), String> {
+        if !self.graph_exec.is_null()
+            && self.graph_slot == slot
+            && self.graph_head == head
+            && self.graph_argmax == argmax
+        {
             return Ok(());
         }
         if !self.graph_exec.is_null() {
@@ -3505,8 +3515,23 @@ impl W4a16Dec {
                 ];
                 self.cc
                     .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
-                self.cc
-                    .d2h_async(self.pin_out as *mut u8, self.head_out, self.head_n * 4)?;
+                if argmax {
+                    // [P3] argmax 커널 + 4B d2h — 로짓 전량 readback 제거.
+                    let fa = self.cc.function("w4a16_argmax_min")?;
+                    let (mut p_l, mut p_n, mut p_o) =
+                        (self.head_out, self.head_n as i32, self.argmax_out);
+                    let mut aa: [*mut std::ffi::c_void; 3] = [
+                        (&mut p_l) as *mut _ as *mut _,
+                        (&mut p_n) as *mut _ as *mut _,
+                        (&mut p_o) as *mut _ as *mut _,
+                    ];
+                    self.cc.launch(fa, 1, 1, 1024, &mut aa)?;
+                    self.cc
+                        .d2h_async(self.pin_out as *mut u8, self.argmax_out, 4)?;
+                } else {
+                    self.cc
+                        .d2h_async(self.pin_out as *mut u8, self.head_out, self.head_n * 4)?;
+                }
             } else {
                 self.cc
                     .d2h_async(self.pin_out as *mut u8, xn, self.hidden * 4)?;
@@ -3524,9 +3549,10 @@ impl W4a16Dec {
         self.graph_exec = e;
         self.graph_slot = slot;
         self.graph_head = head;
+        self.graph_argmax = argmax;
         // 캡처 성공 1회 로그 — 경로 가시화(MoE 상주 = P1 개방분 포함).
         eprintln!(
-            "[graph] captured slot={slot} head={head} moe_resident={}",
+            "[graph] captured slot={slot} head={head} argmax={argmax} moe_resident={}",
             self.moe_resident
         );
         Ok(())
@@ -3561,6 +3587,83 @@ impl W4a16Dec {
         let v = out.to_vec();
         self.slot_pos[slot] = pos + 1;
         Ok(v)
+    }
+
+    /// [P3] 그래프 replay(argmax 모드) — 4B 인덱스 회수. graph_replay와 동일
+    /// 계약(입력 pinned 기입 → dpp 1회 → launch 1회 → sync).
+    fn graph_replay_argmax(&mut self, slot: usize, embed_row: &[f32]) -> Result<u32, String> {
+        let pos = self.slot_pos[slot];
+        // SAFETY: pinned 버퍼는 hidden*4/n_slots*4 크기 계약(ensure_graph 할당).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                embed_row.as_ptr() as *const u8,
+                self.pin_embed as *mut u8,
+                self.hidden * 4,
+            );
+            std::ptr::copy_nonoverlapping(
+                pos.to_le_bytes().as_ptr(),
+                (self.pin_pos as *mut u8).add(slot * 4),
+                4,
+            );
+        }
+        let posb =
+            unsafe { std::slice::from_raw_parts(self.pin_pos as *const u8, self.n_slots * 4) };
+        self.cc
+            .h2d_async(self.dpp + (slot as u64) * 4, &posb[slot * 4..slot * 4 + 4])?;
+        self.cc.graph_launch(self.graph_exec)?;
+        self.cc.sync()?;
+        let ob = unsafe { std::slice::from_raw_parts(self.pin_out as *const u8, 4) };
+        self.slot_pos[slot] = pos + 1;
+        Ok(u32::from_le_bytes([ob[0], ob[1], ob[2], ob[3]]))
+    }
+
+    /// [P3] 디코드 argmax — head 로짓을 디바이스에서 argmax(그래프 = 4B d2h).
+    /// 반환 = 토큰 인덱스(min-index-on-tie = CPU greedy_from 계약 미러).
+    pub fn forward_device_argmax(&mut self, slot: usize, embed_row: &[f32]) -> Result<u32, String> {
+        if self.head_w == 0 || self.argmax_out == 0 {
+            return Err("forward_device_argmax: head/argmax 미등록 — upload_head 선행".into());
+        }
+        let _g = self.cc.guard()?;
+        if self.graph_ok() {
+            match self
+                .ensure_graph(slot, true, true)
+                .and_then(|()| self.graph_replay_argmax(slot, embed_row))
+            {
+                Ok(t) => return Ok(t),
+                Err(e) => {
+                    eprintln!("[graph] argmax 경로 실패 — 직접 경로 폴백: {e}");
+                    self.graph_failed = true;
+                }
+            }
+        }
+        let pos = self.slot_pos[slot];
+        let xn = self.chain_device(slot, embed_row)?;
+        let f = self.cc.function("head_bf16")?;
+        let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn, self.head_out);
+        let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
+        let mut args: [*mut std::ffi::c_void; 5] = [
+            (&mut p_w) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_o) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+        ];
+        self.cc
+            .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
+        let fa = self.cc.function("w4a16_argmax_min")?;
+        let (mut p_l, mut p_nn, mut p_a) = (self.head_out, self.head_n as i32, self.argmax_out);
+        let mut aa: [*mut std::ffi::c_void; 3] = [
+            (&mut p_l) as *mut _ as *mut _,
+            (&mut p_nn) as *mut _ as *mut _,
+            (&mut p_a) as *mut _ as *mut _,
+        ];
+        self.cc.launch(fa, 1, 1, 1024, &mut aa)?;
+        let mut ob = [0u8; 4];
+        self.cc.d2h_async(ob.as_mut_ptr(), self.argmax_out, 4)?;
+        self.cc.sync()?;
+        self.slot_pos[slot] = pos + 1;
+        self.attn_set_pos(slot, pos + 1)?;
+        Ok(u32::from_le_bytes(ob))
     }
 
     /// 배치 체인(t∈2..=8) — 프리필 청크. GEMM(t≥2) 경로 + 배치 버퍼.
@@ -4122,7 +4225,7 @@ impl W4a16Dec {
         let _g = self.cc.guard()?;
         if self.graph_ok() {
             match self
-                .ensure_graph(slot, false)
+                .ensure_graph(slot, false, false)
                 .and_then(|()| self.graph_replay(slot, embed_row))
             {
                 Ok(xn) => {
@@ -4202,7 +4305,12 @@ impl W4a16Dec {
             let _ = self.cc.free(dw);
             return Err(format!("head 전치: {e}"));
         }
-        let dout = match self.cc.alloc(n * 4) {
+        let dout = match self.cc.alloc(n * 4).and_then(|p| {
+            self.cc.alloc(4).map(|a| {
+                self.argmax_out = a;
+                p
+            })
+        }) {
             Ok(p) => p,
             Err(e) => {
                 let _ = self.cc.free(dw);
@@ -4229,7 +4337,7 @@ impl W4a16Dec {
         let _g = self.cc.guard()?;
         if self.graph_ok() {
             match self
-                .ensure_graph(slot, true)
+                .ensure_graph(slot, true, false)
                 .and_then(|()| self.graph_replay(slot, embed_row))
             {
                 Ok(lg) => {
