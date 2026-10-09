@@ -64,6 +64,15 @@
 // Rust 트윈과 리터럴까지 동일해야 한다).
 __device__ __forceinline__ double attn_exp_d(double x)
 {
+    // [2026-10-09 P8-attn-3 결함 수정] 도메인 가드 — k 기반 2^k 재구성은
+    // k ≥ -1022(즉 x ≥ -708.5)에서만 유효. KV 분할 병합이 빈 분할에 -1e30을
+    // 넣어 NaN이 됐다(S=4/8 실측: 토큰 0 반복). gdn_exp_d와 동일 의미론.
+    if (x < -708.5) {
+        return 0.0;
+    }
+    if (x > 709.78) {
+        return __longlong_as_double(0x7ff0000000000000LL); // +inf
+    }
     // k = floor(x·invln2 + ½)(양수 음수 공용 반올림) → r = x − k·ln2(hi/lo)
     // → 테일러 차수 7 → 2^k 비트 재구성. gdn_exp_d(G5)와 동일 DAG.
     const double invln2 = 1.4426950408889634;
@@ -388,9 +397,8 @@ extern "C" __global__ void attn_fwd3s(
     for (int base = 0; base < lim; base += ATTN_CHUNK) {
         int nch = min(ATTN_CHUNK, lim - base);
         // 스코어: 행=base+tid(tid<nch), 256차원 직렬 내적(hip L232-239 동일)
-        // [2026-10-09 P8-attn] float4 판독 — 워프당 로드 명령 4배 감소(스코어가
-        // attn의 ~73%, 4k 실측: 워프당 32개 라인 비코얼레스). 가산 순서는 d
-        // 오름차순 그대로(비트 동일 — p += q*d 순차, FMA 체인 유지).
+        // [2026-10-09 P8-attn] float4 판독 — 워프당 32개 라인 비코얼레스 로드
+        // (스코어가 attn의 ~73%). 가산 순서는 d 오름차순 그대로(비트 동일).
         float p = -1e30f;
         if (tid < nch) {
             int row = base + tid;
@@ -449,6 +457,145 @@ extern "C" __global__ void attn_fwd3s(
     float g = qg[(long)t * (q_heads * 512) + (long)h * 512 + 256 + tid];
     outv[qrow + tid] = (acc / l_run) * (1.0f / (1.0f + attn_expf(-g)));
 }
+// [2026-10-09 P8-attn-3] KV 분할 attention — 4k ctx 실측: 스코어/AV가 24블록
+// (q_heads)만 써 SM의 81% 유휴 + K/V 로드 지연 노출. lim>256에서 KV를
+// ATTN_SPLITS(8)로 나눠 블록 = q_heads×S(27B 192블록)로 병렬화하고, 병합은
+// 분할 인덱스 오름차순 고정 순서(결정적). lim≤256은 종전 단일 경로 유지 —
+// 골든 구간 비트 동일 계약 보존.
+#define ATTN_SPLITS_C 8
+
+// 부분합: 분할 s의 KV 구간 [lo, hi)에 대해 온라인 소프트맥스(m·l·acc256).
+// 산술은 단일 커널과 동일(청크 내 순차·d 오름차순) — 분할 간 병합만 다르다.
+extern "C" __global__ void attn_fwd3s_part(
+    const float* __restrict__ qh,
+    const float* __restrict__ kc,
+    const float* __restrict__ vc,
+    float* __restrict__ part,   // [T][q_heads][S][258]: m, l, acc[256]
+    const unsigned* __restrict__ pp,
+    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits)
+{
+    int t = blockIdx.x;
+    int hs = blockIdx.y;
+    int h = hs / splits;
+    int s = hs - h * splits;
+    int tid = threadIdx.x;
+    int gq = q_heads / kv_heads;
+    int kh = h / gq;
+    float scale = 0.0625f;
+    int lim = (int)pp[0] + t + 1;
+    long kv_dim = (long)kv_heads * 256;
+    long qrow = (long)t * (q_heads * 256) + (long)h * 256;
+    __shared__ float qs[256];
+    __shared__ float sarr[ATTN_CHUNK];
+    __shared__ float reds[256];
+    qs[tid] = qh[qrow + tid];
+    __syncthreads();
+    // 분할 구간 — 256 정렬(청크 경계)로 자른다.
+    int chunk_rows = (lim + splits - 1) / splits;
+    chunk_rows = ((chunk_rows + ATTN_CHUNK - 1) / ATTN_CHUNK) * ATTN_CHUNK;
+    int lo = s * chunk_rows;
+    int hi = min(lim, lo + chunk_rows);
+    if (lo >= lim) {
+        lo = lim;
+        hi = lim;
+    }
+    float m_run = -1e30f;
+    float l_run = 0.0f;
+    float acc = 0.0f;
+    for (int base = lo; base < hi; base += ATTN_CHUNK) {
+        int nch = min(ATTN_CHUNK, hi - base);
+        float p = -1e30f;
+        if (tid < nch) {
+            int row = base + tid;
+            const float* krow = kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256;
+            const float4* k4 = reinterpret_cast<const float4*>(krow);
+            const float4* q4 = reinterpret_cast<const float4*>(qs);
+            float p0 = 0.0f;
+#pragma unroll 8
+            for (int d4 = 0; d4 < 64; d4++) {
+                const float4 kv = k4[d4];
+                const float4 qv = q4[d4];
+                p0 += qv.x * kv.x;
+                p0 += qv.y * kv.y;
+                p0 += qv.z * kv.z;
+                p0 += qv.w * kv.w;
+            }
+            p = p0 * scale;
+        }
+        sarr[tid] = p;
+        __syncthreads();
+        reds[tid] = (tid < nch) ? sarr[tid] : -1e30f;
+        __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (tid < st) reds[tid] = fmaxf(reds[tid], reds[tid + st]);
+            __syncthreads();
+        }
+        float m_new = fmaxf(m_run, reds[0]);
+        float corr = (m_run <= -1e29f) ? 0.0f : attn_expf(m_run - m_new);
+        __syncthreads();
+        float e = 0.0f;
+        if (tid < nch) {
+            e = attn_expf(sarr[tid] - m_new);
+            sarr[tid] = e;
+        }
+        reds[tid] = e;
+        __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (tid < st) reds[tid] += reds[tid + st];
+            __syncthreads();
+        }
+        acc *= corr;
+#pragma unroll 8
+        for (int i = 0; i < nch; i++) {
+            int row = base + i;
+            acc += sarr[i] * vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid];
+        }
+        l_run = l_run * corr + reds[0];
+        m_run = m_new;
+        __syncthreads();
+    }
+    float* out = part + (((long)t * q_heads + h) * splits + s) * 258;
+    if (tid == 0) {
+        out[0] = m_run;
+        out[1] = l_run;
+    }
+    out[2 + tid] = acc;
+}
+
+// 병합: 분할 s=0..S-1 오름차순 고정 — 결정적. m=최대, l·acc를 exp(m_s−m)로
+// 스케일해 합산(수학적으로 단일 경로와 동일, 반올림만 상이 — lim>256 완화 등급).
+extern "C" __global__ void attn_fwd3s_merge(
+    const float* __restrict__ part,
+    const float* __restrict__ qg,
+    float* __restrict__ outv,
+    int t_len, int q_heads, int splits)
+{
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    const float* pb = part + ((long)t * q_heads + h) * splits * 258;
+    __shared__ float ms[ATTN_SPLITS_C];
+    if (tid < splits) {
+        ms[tid] = pb[tid * 258];
+    }
+    __syncthreads();
+    float m = -1e30f;
+    for (int s = 0; s < splits; s++) {
+        m = fmaxf(m, ms[s]);
+    }
+    float l = 0.0f;
+    float acc = 0.0f;
+    for (int s = 0; s < splits; s++) {
+        const float* ps = pb + s * 258;
+        float w = attn_expf(ps[0] - m);
+        l += ps[1] * w;
+        acc += ps[2 + tid] * w;
+    }
+    float g = qg[(long)t * (q_heads * 512) + (long)h * 512 + 256 + tid];
+    outv[(long)t * (q_heads * 256) + (long)h * 256 + tid] =
+        (acc / l) * (1.0f / (1.0f + attn_expf(-g)));
+}
+
 // 마커 f3sc
 
 // pos_bump 직이식(구 rawhip 커널 L1152-1155) — pp[0] += 1. 캡처
