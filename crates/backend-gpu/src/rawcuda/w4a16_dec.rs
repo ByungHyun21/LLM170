@@ -364,6 +364,7 @@ impl W4a16Dec {
                 "w4a16_gemv_bf16",
                 "w4a16_gemm_bf16",
                 "w4a16_gemm_bf16_t",
+                "w4a16_gemm_bf16_mma",
             ],
         )?;
         cc.load_fatbin(
@@ -1927,6 +1928,36 @@ impl W4a16Dec {
         t: usize,
     ) -> Result<(), String> {
         let (w, n, k) = self.plain_spec(name)?;
+        // [T2] mma 경로(LLM170_TC=1, 기본 OFF) — bf16 mma GEMM(계약 완화 승인
+        // 후 첫 본체). t≥16에서만(타일 M32 — 부분 타일은 가드로 동작하나 이득이
+        // 작음). 토큰 수준 판정(플레인 계약).
+        if t >= 16 && llm170_diag::flag::ne0("LLM170_TC") {
+            {
+                static ONCE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[TC] mma GEMM 경로 진입: {name} n={n} k={k} t={t}");
+                }
+            }
+            let f = self.cc.function("w4a16_gemm_bf16_mma")?;
+            let (mut p_w, mut p_x, mut p_o) = (w, x_dev, y_out);
+            let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+            let mut args: [*mut std::ffi::c_void; 6] = [
+                (&mut p_w) as *mut _ as *mut _,
+                (&mut p_x) as *mut _ as *mut _,
+                (&mut p_o) as *mut _ as *mut _,
+                (&mut p_n) as *mut _ as *mut _,
+                (&mut p_k) as *mut _ as *mut _,
+                (&mut p_t) as *mut _ as *mut _,
+            ];
+            return self.cc.launch(
+                f,
+                t.div_ceil(32) as u32,
+                n.div_ceil(64) as u32,
+                256,
+                &mut args,
+            );
+        }
         // t>8은 v3(8행/블록 + 행별 smem + k청크) — v1은 t≤8 전용.
         let v3 = t > 8;
         let f = self.cc.function(if v3 {
@@ -3351,6 +3382,17 @@ impl W4a16Dec {
         self.cc.free(dx)?;
         self.cc.free(dy)?;
         Ok((ms, wb))
+    }
+
+    /// 플레인 GEMM 단발 발사(벤치·진단 — T2 mma 비교용).
+    pub fn plain_bench_launch(
+        &self,
+        name: &str,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        self.plain_gemm_launch(name, x, y, t)
     }
 
     /// GEMV 단발 발사(벤치·진단 — import 없이 이름·x·y만).

@@ -399,6 +399,156 @@ extern "C" __global__ void w4a16_gemv_bf16(
     }
 }
 
+// ── T2(2026-10-09): 플레인 bf16 mma GEMM — 계약 완화 승인 후 첫 본체 ──
+// A=x(bf16 반올림, 스테이징에서 f32→bf16 RNE), B=w bf16(스토어 원본 [n][k]),
+// f32 누적. 프래그먼트 규약은 --mma-smoke에서 검증(비트동일 0.00e0):
+//   A: a0={A[g][2t],A[g][2t+1]} a1={A[g+8][2t..]} a2={A[g][2t+8..]} a3={A[g+8][2t+8..]}
+//   B(col-major, B[k][n]=w[n][k]): b0={w[g][2t],w[g][2t+1]} b1={w[g][2t+8],w[g][2t+9]}
+//   C: c0=C[g][2t] c1=C[g][2t+1] c2=C[g+8][2t] c3=C[g+8][2t+1]  (g=lane>>2, t=lane&3)
+// 타일: 블록 256스레드(8워프) = M32 × N64, k청크 64(스테이징 12KB) → 워프당
+// m16×n16(2× n8 mma). 워프 w: m타일 w/4, n타일 (w%4)*16.
+#define MMA_M 32
+#define MMA_N 64
+#define MMA_KC 64
+
+__device__ __forceinline__ unsigned short f2bf16(float v) {
+    // RNE — __floats2bfloat162_rn과 동일 비트(스모크에서 대조 검증).
+    unsigned u = __float_as_uint(v);
+    return (unsigned short)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
+
+__device__ __forceinline__ unsigned pk2bf(const unsigned short* p) {
+    return (unsigned)p[0] | ((unsigned)p[1] << 16);
+}
+
+// ldmatrix — 프래그먼트 smem 재판독(8× 중복)을 1명령으로. A는 x4(비전치),
+// B는 x2.trans([n][k]→[k][n] 전치 = col-major 프래그먼트).
+__device__ __forceinline__ void ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2,
+                                       unsigned& r3, const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(a));
+}
+
+__device__ __forceinline__ void ldm_x2t(unsigned& r0, unsigned& r1, const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r0), "=r"(r1)
+                 : "r"(a));
+}
+
+extern "C" __global__ void w4a16_gemm_bf16_mma(
+    const unsigned short* __restrict__ w,  // [n][k] bf16
+    const float* __restrict__ x,           // [t][k] f32
+    float* __restrict__ out,               // [t][n]
+    int n, int k, int t)
+{
+    // [뱅크 충돌] 행 stride를 128B(전 뱅크 주기)로 두면 프래그먼트 로드가
+    // 8-way 충돌(실측: 패딩 없음 0.056ms = v3와 동일). +8 bf16(16B) 패딩으로
+    // 행마다 4뱅크씩 이동 → conflict-free.
+    __shared__ unsigned short xs[MMA_M][MMA_KC + 8];
+    __shared__ unsigned short ws[MMA_N][MMA_KC + 8];
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.x * MMA_M;
+    const int n0 = blockIdx.y * MMA_N;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int g = lane >> 2;
+    const int tt = lane & 3;
+    const int mt = (warp >> 2) * 16;      // 워프 m 오프셋(0/16)
+    const int ntw = (warp & 3) * 16;      // 워프 n 오프셋(0/16/32/48)
+    float c[2][4];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        ((float*)c)[i] = 0.0f;
+    }
+    for (int k0 = 0; k0 < k; k0 += MMA_KC) {
+        __syncthreads();
+        // xs 스테이징: M32×KC64 f32→bf16 (float4 벡터화)
+        for (int e = tid; e < MMA_M * MMA_KC / 4; e += 256) {
+            const int r = e >> 4;          // 64/4 = 16 float4 per row
+            const int c4 = e & 15;
+            const int gi = k0 + c4 * 4;
+            const float4 v = (m0 + r < t)
+                ? *reinterpret_cast<const float4*>(&x[(size_t)(m0 + r) * k + gi])
+                : make_float4(0.f, 0.f, 0.f, 0.f);
+            if (gi + 3 < k) {
+                xs[r][c4 * 4] = f2bf16(v.x);
+                xs[r][c4 * 4 + 1] = f2bf16(v.y);
+                xs[r][c4 * 4 + 2] = f2bf16(v.z);
+                xs[r][c4 * 4 + 3] = f2bf16(v.w);
+            } else {
+                xs[r][c4 * 4] = (gi < k) ? f2bf16(v.x) : (unsigned short)0;
+                xs[r][c4 * 4 + 1] = (gi + 1 < k) ? f2bf16(v.y) : (unsigned short)0;
+                xs[r][c4 * 4 + 2] = (gi + 2 < k) ? f2bf16(v.z) : (unsigned short)0;
+                xs[r][c4 * 4 + 3] = (gi + 3 < k) ? f2bf16(v.w) : (unsigned short)0;
+            }
+        }
+        // ws 스테이징: N64×KC64 bf16 (uint4 벡터화)
+        for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
+            const int r = e >> 3;          // 64/8 = 8 uint4 per row
+            const int c8 = e & 7;
+            const int gi = k0 + c8 * 8;
+            unsigned short* dst = &ws[r][c8 * 8];
+            if (n0 + r < n && gi + 7 < k) {
+                const uint4 v = *reinterpret_cast<const uint4*>(&w[(size_t)(n0 + r) * k + gi]);
+                *reinterpret_cast<uint4*>(dst) = v;
+            } else {
+                for (int j = 0; j < 8; ++j) {
+                    dst[j] = (n0 + r < n && gi + j < k)
+                        ? w[(size_t)(n0 + r) * k + gi + j]
+                        : (unsigned short)0;
+                }
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int ks = 0; ks < MMA_KC / 16; ++ks) {
+            const int kb = ks * 16;
+            // A: ldmatrix.x4 — 레인 0-15이 행 0-15(열 kb), 16-31이 행 0-15(열 kb+8).
+            const int row = (lane & 15);
+            const int colblk = (lane & 16) ? 8 : 0;
+            unsigned a0, a1, a2, a3;
+            ldm_x4(a0, a1, a2, a3, &xs[mt + row][kb + colblk]);
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const int nb = ntw + nt * 8;
+                // B: ldmatrix.x2.trans — 레인 0-7이 n행(열 kb), 8-15가 n행(열 kb+8).
+                unsigned b0, b1;
+                ldm_x2t(b0, b1, &ws[nb + (lane & 7)][kb + ((lane & 8) ? 8 : 0)]);
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3])
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+        }
+    }
+    // 에필로그 — 프래그먼트 규약 그대로 기록(범위 가드).
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+        const int col = n0 + ntw + nt * 8 + 2 * tt;
+        const int r0 = m0 + mt + g;
+        if (r0 < t) {
+            if (col < n) {
+                out[(size_t)r0 * n + col] = c[nt][0];
+            }
+            if (col + 1 < n) {
+                out[(size_t)r0 * n + col + 1] = c[nt][1];
+            }
+        }
+        if (r0 + 8 < t) {
+            if (col < n) {
+                out[(size_t)(r0 + 8) * n + col] = c[nt][2];
+            }
+            if (col + 1 < n) {
+                out[(size_t)(r0 + 8) * n + col + 1] = c[nt][3];
+            }
+        }
+    }
+}
+
 #define G4_TMAX 8              // 플레인 v1 GEMM 전용 토큰 상한
 
 // 플레인 bf16 GEMM(t≤8) — 행=블록(64레인), **가중치 1회 판독 × t토큰 재사용**

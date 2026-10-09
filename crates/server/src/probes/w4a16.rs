@@ -336,6 +336,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut plain_check = false;
     let mut mma_smoke = false;
     let mut bench_gemv: Option<(String, usize)> = None;
+    let mut bench_plain: Option<(String, usize, usize)> = None;
     let mut h2d_mb = 0usize;
     let mut bench: Option<(String, usize, usize)> = None; // (lin, t, reps)
     let mut it = args.iter().skip(1);
@@ -375,6 +376,18 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--h2d-bench requires MB")?;
                 h2d_mb = mb;
+            }
+            "--bench-plain" => {
+                let name = it.next().ok_or("--bench-plain requires a name")?.clone();
+                let t = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--bench-plain requires t")?;
+                let reps = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--bench-plain requires reps")?;
+                bench_plain = Some((name, t, reps));
             }
             "--bench-gemv" => {
                 let name = it.next().ok_or("--bench-gemv requires a name")?.clone();
@@ -483,6 +496,33 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         llm170_core::matmul::matmul(xn, &head, &mut lg);
         lg
     };
+    // 마이크로벤치(진단): 플레인 GEMM(t) 반복 — v1/v3 vs mma(LLM170_TC).
+    if let Some((name, bt, reps)) = &bench_plain {
+        let (n, k) = model
+            .w_raw(name)
+            .map(|w| (w.n_out as usize, w.n_in as usize))
+            .ok_or_else(|| format!("--bench-plain {name}: 무게 없음"))?;
+        let xf: Vec<f32> = vec![1.0f32; bt * k];
+        let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
+        let dx = dec.alloc_scratch(xf.len() * 4)?;
+        dec.h2d_scratch(dx, xb)?;
+        let dy = dec.alloc_scratch(bt * n * 4)?;
+        dec.plain_bench_launch(name, dx, dy, *bt)?;
+        dec.sync_bench()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..*reps {
+            dec.plain_bench_launch(name, dx, dy, *bt)?;
+        }
+        dec.sync_bench()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / *reps as f64;
+        let flop = 2.0 * (n as f64) * (k as f64) * (*bt as f64);
+        dec.free_scratch(dx)?;
+        dec.free_scratch(dy)?;
+        return Ok(format!(
+            "bench-plain {name} n={n} k={k} t={bt}: {ms:.3} ms/회 · {:.2} TF",
+            flop * 1e-9 / (ms * 1e-3)
+        ));
+    }
     // 마이크로벤치(진단): 지정 선형의 t=1 GEMV 반복 — 실효 가중치 대역.
     if let Some((name, reps)) = &bench_gemv
         && name == "ALL"
