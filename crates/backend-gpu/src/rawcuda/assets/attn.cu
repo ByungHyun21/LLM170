@@ -11,9 +11,7 @@
 // 2) hip 시그니처의 pos0_ 파라미터(사실상 미사용 — 본체는 pp[0]만 판독)를
 //    CUDA에서는 아예 제거한다: 결함 4호(KV 인덱스는 pp[0] "디바이스" 판독 —
 //    파라미터 아님, 그래프/루프 설계에 필수)의 계약을 시그니처 수준에서
-//    강제한다. 호스트 pos 사본 경로는 음성대조 전용 쌍둥이
-//    attn_prep_hostpos(명시적 pos0_host 인자)로만 존재 — 프로덕션
-//    경로에서 발사 금지(17호 계기 원칙).
+//    강제한다. 호스트 pos 사본 경로는 제거됐다(H 정리 — 2026-10-09).
 // 3) 트랜센던트/수축(아래 블록 참조): 빌드 -fmad=false(FMA 수축 제거 —
 //    호스트 미러와 연산 DAG 비트동일), 초월함수는 자작 f64 미러
 //    (gdn_exp_d/gdn_log_d와 동일 노선), rope theta는 exp(ln(1e7)·e)
@@ -360,94 +358,6 @@ extern "C" __global__ void attn_prep_q(
         if (tid == 0) {
             vsc[sr] = vs;
         }
-    }
-}
-
-// ── 음성대조 전용 쌍둥이(결함 4호 재현) ──
-// pp[0] 디바이스 판독 대신 "호스트 파라미터 사본" pos0_host로 KV 인덱스를
-// 계산하는 판(prep와의 유일한 차이 — pos 원천). 장치 pp[0]이 pos_bump 등으로
-// 전진한 뒤 호스트 사본이 낡은 값이면 KV 기록 위치가 어긋나고, 그 이격이
-// fwd3s(디바이스 판독 경로) 종단 값에서 maxdiff>2e-7로 검출됨을 증명한다.
-// 프로덕션 경로에서 발사 금지 — 구 디코더 검증 전용 진입만 호출.
-extern "C" __global__ void attn_prep_hostpos(
-    const float* __restrict__ qg,
-    const float* __restrict__ kin,
-    const float* __restrict__ vin,
-    const float* __restrict__ qnw,
-    const float* __restrict__ knw,
-    float* __restrict__ qh,
-    float* __restrict__ kc,
-    float* __restrict__ vc,
-    const unsigned* __restrict__ pp, // 판독하지 않는다(계약 위반 재현)
-    int t_len, int layer, int q_heads, int kv_heads, int cap, int pos0_host)
-{
-    __shared__ float red[128];
-    __shared__ float hd[256];
-    int t = blockIdx.x;
-    int j = blockIdx.y;
-    int tid = threadIdx.x;
-    (void)pp;
-    int pos = pos0_host + t;        // 결함 재현: 호스트 사본 — pp[0] 무시
-    long kv_dim = (long)kv_heads * 256;
-
-    if (j < q_heads) {
-        int src = t * (q_heads * 512) + j * 512;
-        hd[tid] = qg[src + tid];
-        hd[tid + 128] = qg[src + 128 + tid];
-        __syncthreads();
-        float ss = hd[tid] * hd[tid] + hd[tid + 128] * hd[tid + 128];
-        red[tid] = ss;
-        __syncthreads();
-        for (int s = 64; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            __syncthreads();
-        }
-        float inv = 1.0f / sqrtf(red[0] / 256.0f + 1e-6f);
-        hd[tid] = hd[tid] * inv * qnw[layer * 256 + tid];
-        hd[tid + 128] = hd[tid + 128] * inv * qnw[layer * 256 + 128 + tid];
-        __syncthreads();
-        if (tid < 32) {
-            float theta = attn_theta(tid);
-            float ang = (float)pos * theta;
-            float c = attn_cosf(ang), s2 = attn_sinf(ang);
-            float x0 = hd[tid], x1 = hd[tid + 32];
-            hd[tid] = x0 * c - x1 * s2;
-            hd[tid + 32] = x0 * s2 + x1 * c;
-        }
-        __syncthreads();
-        qh[(long)t * (q_heads * 256) + (long)j * 256 + tid] = hd[tid];
-        qh[(long)t * (q_heads * 256) + (long)j * 256 + 128 + tid] = hd[tid + 128];
-    } else {
-        int m = j - q_heads;
-        int src = t * (int)kv_dim + m * 256;
-        hd[tid] = kin[src + tid];
-        hd[tid + 128] = kin[src + 128 + tid];
-        __syncthreads();
-        float ss = hd[tid] * hd[tid] + hd[tid + 128] * hd[tid + 128];
-        red[tid] = ss;
-        __syncthreads();
-        for (int s = 64; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            __syncthreads();
-        }
-        float inv = 1.0f / sqrtf(red[0] / 256.0f + 1e-6f);
-        hd[tid] = hd[tid] * inv * knw[layer * 256 + tid];
-        hd[tid + 128] = hd[tid + 128] * inv * knw[layer * 256 + 128 + tid];
-        __syncthreads();
-        if (tid < 32) {
-            float theta = attn_theta(tid);
-            float ang = (float)pos * theta;
-            float c = attn_cosf(ang), s2 = attn_sinf(ang);
-            float x0 = hd[tid], x1 = hd[tid + 32];
-            hd[tid] = x0 * c - x1 * s2;
-            hd[tid + 32] = x0 * s2 + x1 * c;
-        }
-        __syncthreads();
-        long dst = ((long)layer * cap + pos) * kv_dim + (long)m * 256;
-        kc[dst + tid] = hd[tid];
-        kc[dst + 128 + tid] = hd[tid + 128];
-        vc[dst + tid] = vin[src + tid];
-        vc[dst + 128 + tid] = vin[src + 128 + tid];
     }
 }
 

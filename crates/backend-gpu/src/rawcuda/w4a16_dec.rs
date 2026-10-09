@@ -372,7 +372,6 @@ impl W4a16Dec {
                 "w4a16_gemv_g128",
                 "w4a16_gemm_g32_bf16",
                 "w4a16_gemv_g32_bf16",
-                "w4a16_cast_f16",
                 "w4a16_cast_x32",
                 "w4a16_axpy",
                 "w4a16_shared_add",
@@ -412,7 +411,6 @@ impl W4a16Dec {
             &[
                 "gdn_conv",
                 "gdn_l2perm",
-                "gdn_l2perm_gather",
                 "gdn_scan",
                 "gdn1_part",
                 "gdn1_comb",
@@ -431,7 +429,6 @@ impl W4a16Dec {
             )?,
             &[
                 "attn_prep",
-                "attn_prep_hostpos",
                 "attn_fwd3s",
                 "attn_fwd3s_part",
                 "attn_fwd3s_part_q",
