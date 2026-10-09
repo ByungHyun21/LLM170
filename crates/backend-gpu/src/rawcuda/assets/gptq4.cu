@@ -433,9 +433,12 @@ __device__ __forceinline__ void ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2,
                  : "r"(a));
 }
 
-__device__ __forceinline__ void ldm_x2t(unsigned& r0, unsigned& r1, const void* p) {
+__device__ __forceinline__ void ldm_x2(unsigned& r0, unsigned& r1, const void* p) {
+    // [버그 수정] B는 비전치 — ldmatrix 분배(스레드 i = 행 i/4, 열 2(i%4),+1)가
+    // b0={w[g][2t],w[g][2t+1]}와 정확히 일치한다. .trans를 쓰면 전치돼
+    // 값이 계통적으로 틀린다(실측 maxabs 3e10·불량 100%).
     const unsigned a = (unsigned)__cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)
                  : "r"(a));
 }
@@ -518,7 +521,7 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
                 const int nb = ntw + nt * 8;
                 // B: ldmatrix.x2.trans — 레인 0-7이 n행(열 kb), 8-15가 n행(열 kb+8).
                 unsigned b0, b1;
-                ldm_x2t(b0, b1, &ws[nb + (lane & 7)][kb + ((lane & 8) ? 8 : 0)]);
+                ldm_x2(b0, b1, &ws[nb + (lane & 7)][kb + ((lane & 8) ? 8 : 0)]);
                 asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -561,7 +564,10 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
 extern "C" __global__ void w4a16_gemm_g128_mma(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
     const unsigned short* __restrict__ s,  // [n][k/128] f16 스케일
-    const unsigned short* __restrict__ xh, // [t][k] f16 (cast_x32 동일 값)
+    const float* __restrict__ x,           // [t][k] f32 = h2f(f2h(활성)) —
+                                           // split 경로 계약(cast_x32 산출).
+                                           // 커널이 __float2half_rn로 f16화
+                                           // (동일 값 — cast_x32와 같은 반올림).
     float* __restrict__ out, int n, int k, int t)
 {
     __shared__ unsigned short xs[MMA_M][MMA_KC + 8];
@@ -584,21 +590,27 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
     }
     for (int k0 = 0; k0 < k; k0 += MMA_KC) {
         __syncthreads();
-        // xs: M32×64 f16 직접(uint4 = 8 f16)
-        for (int e = tid; e < MMA_M * MMA_KC / 8; e += 256) {
-            const int r = e >> 3;
-            const int c8 = e & 7;
-            unsigned short* dst = &xs[r][c8 * 8];
-            if (m0 + r < t && k0 + c8 * 8 + 7 < k) {
-                *reinterpret_cast<uint4*>(dst) =
-                    *reinterpret_cast<const uint4*>(&xh[(size_t)(m0 + r) * k + k0 + c8 * 8]);
-            } else {
-                for (int j = 0; j < 8; ++j) {
-                    dst[j] = (m0 + r < t && k0 + c8 * 8 + j < k)
-                        ? xh[(size_t)(m0 + r) * k + k0 + c8 * 8 + j]
-                        : (unsigned short)0;
+        // xs: M32×64 f32→f16(float4 로드 → __float2half_rn)
+        for (int e = tid; e < MMA_M * MMA_KC / 4; e += 256) {
+            const int r = e >> 4;
+            const int c4 = e & 15;
+            const int gi = k0 + c4 * 4;
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (m0 + r < t && gi + 3 < k) {
+                v = *reinterpret_cast<const float4*>(&x[(size_t)(m0 + r) * k + gi]);
+            } else if (m0 + r < t) {
+                float t4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (int j = 0; j < 4; ++j) {
+                    if (gi + j < k) {
+                        t4[j] = x[(size_t)(m0 + r) * k + gi + j];
+                    }
                 }
+                v = make_float4(t4[0], t4[1], t4[2], t4[3]);
             }
+            xs[r][c4 * 4 + 0] = __half_as_ushort(__float2half_rn(v.x));
+            xs[r][c4 * 4 + 1] = __half_as_ushort(__float2half_rn(v.y));
+            xs[r][c4 * 4 + 2] = __half_as_ushort(__float2half_rn(v.z));
+            xs[r][c4 * 4 + 3] = __half_as_ushort(__float2half_rn(v.w));
         }
         // ws: 디퀀트(M64×64, 스레드당 8원소 = u32 1개)
         for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
@@ -611,40 +623,39 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
                 scb = s[(size_t)(n0 + r) * kg + (gi >> 7)];
             }
             const float scf = __half2float(*reinterpret_cast<const __half*>(&scb));
-            const unsigned s2 = (unsigned)scb | ((unsigned)scb << 16);
-            const __half2 ch = __float2half2_rn(-1032.0f * scf);
             const unsigned qw = live ? q[(size_t)(n0 + r) * k8 + (gi >> 3)] : 0u;
-            const unsigned lo = (qw & 0x0F0F0F0Fu) | 0x64006400u;
-            const unsigned hi = ((qw >> 4) & 0x0F0F0F0Fu) | 0x64006400u;
-            const unsigned p01 = __byte_perm(lo, hi, 0x5410);
-            const unsigned p23 = __byte_perm(lo, hi, 0x7632);
-            const __half2 w0 = __hfma2(*reinterpret_cast<const __half2*>(&p01),
-                                       *reinterpret_cast<const __half2*>(&s2), ch);
-            const __half2 w1 = __hfma2(*reinterpret_cast<const __half2*>(&p23),
-                                       *reinterpret_cast<const __half2*>(&s2), ch);
+            // 디퀀트 = f32 (nib−8)·scale → f16 저장.
+            // 마법 상수(1024+n) 트릭은 두 이유로 기각: ① |1032·scale|>65504면
+            // f16 inf→NaN, ② 스케일이 크면 (1024+n)·s − 1032·s의 f16 소거로
+            // 정밀도 파괴(실측 NaN·maxabs 2e10). marlin 원전도 소스케일 전제.
             if (live) {
-                *reinterpret_cast<unsigned*>(&ws[r][c8 * 8]) = *reinterpret_cast<const unsigned*>(&w0);
-                *reinterpret_cast<unsigned*>(&ws[r][c8 * 8 + 2]) = *reinterpret_cast<const unsigned*>(&w1);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
+                    ws[r][c8 * 8 + j] = __half_as_ushort(__float2half_rn((float)nib * scf));
+                }
             } else {
-                ws[r][c8 * 8] = 0;
-                ws[r][c8 * 8 + 1] = 0;
-                ws[r][c8 * 8 + 2] = 0;
-                ws[r][c8 * 8 + 3] = 0;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    ws[r][c8 * 8 + j] = 0;
+                }
             }
         }
         __syncthreads();
 #pragma unroll
         for (int ks = 0; ks < MMA_KC / 16; ++ks) {
             const int kb = ks * 16;
-            const int row = (lane & 15);
-            const int colblk = (lane & 16) ? 8 : 0;
-            unsigned a0, a1, a2, a3;
-            ldm_x4(a0, a1, a2, a3, &xs[mt + row][kb + colblk]);
+            // 프래그먼트 = 스모크 검증 방식(명시 판독). ldmatrix는 전치/분배
+            // 불일치로 계통 오차(실측 maxabs 3e10) — 정확성 우선으로 되돌림.
+            const unsigned a0 = pk2bf(&xs[mt + g][kb + 2 * tt]);
+            const unsigned a1 = pk2bf(&xs[mt + g + 8][kb + 2 * tt]);
+            const unsigned a2 = pk2bf(&xs[mt + g][kb + 2 * tt + 8]);
+            const unsigned a3 = pk2bf(&xs[mt + g + 8][kb + 2 * tt + 8]);
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt) {
                 const int nb = ntw + nt * 8;
-                unsigned b0, b1;
-                ldm_x2t(b0, b1, &ws[nb + (lane & 7)][kb + ((lane & 8) ? 8 : 0)]);
+                const unsigned b0 = pk2bf(&ws[nb + g][kb + 2 * tt]);
+                const unsigned b1 = pk2bf(&ws[nb + g][kb + 2 * tt + 8]);
                 asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"

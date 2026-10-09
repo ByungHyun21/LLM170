@@ -1731,9 +1731,10 @@ impl W4a16Dec {
         t: usize,
     ) -> Result<(), String> {
         let (dq, ds, n, k) = self.lin_spec(name)?;
-        // [T1] split mma 경로(LLM170_TC=1, t≥16) — int4→f16 디퀀트+mma.
+        // [T1] split mma 경로(기본 ON — `LLM170_TC=0`으로 해제, t≥16).
+        // 검증: 27B 4k·35B 600 토큰이 원본과 동일, 골든 유지, 허용오차 ~6e-4.
         // A=xh(f16 — split 경로가 이미 f2h 캐스트 제공), 계약 완화 승인 후.
-        if t >= 16 && llm170_diag::flag::on_nonzero("LLM170_TC") {
+        if t >= 16 && llm170_diag::flag::ne0("LLM170_TC") {
             let f = self.cc.function("w4a16_gemm_g128_mma")?;
             let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, xh_dev, y_out);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
@@ -2031,10 +2032,10 @@ impl W4a16Dec {
         t: usize,
     ) -> Result<(), String> {
         let (w, n, k) = self.plain_spec(name)?;
-        // [T2] mma 경로(LLM170_TC=1, 기본 OFF) — bf16 mma GEMM(계약 완화 승인
-        // 후 첫 본체). t≥16에서만(타일 M32 — 부분 타일은 가드로 동작하나 이득이
-        // 작음). 토큰 수준 판정(플레인 계약).
-        if t >= 16 && llm170_diag::flag::on_nonzero("LLM170_TC") {
+        // [T2] bf16 mma GEMM(기본 ON — `LLM170_TC=0`으로 해제). t≥16에서만
+        // (타일 M32 — 부분 타일은 가드로 동작하나 이득이 작음). 검증: 35B 600
+        // 토큰 동일, 골든 유지, 허용오차 ~1e-3(bf16 활성 반올림).
+        if t >= 16 && llm170_diag::flag::ne0("LLM170_TC") {
             {
                 static ONCE: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
@@ -3485,6 +3486,209 @@ impl W4a16Dec {
         self.cc.free(dx)?;
         self.cc.free(dy)?;
         Ok((ms, wb))
+    }
+
+    /// mma GEMM 수치 게이트(허용오차) — split 원본(w4a16_gemm_g128) vs
+    /// w4a16_gemm_g128_mma 출력을 같은 x로 비교. (T1 검증 — 계약 완화 후
+    /// 비트 대신 허용오차 판정.)
+    pub fn mma_diff_check(&mut self, name: &str, t: usize) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        // 플레인(bf16)이면 T2 경로로.
+        if !self.lins.contains_key(name) {
+            return self.mma_diff_plain(name, t);
+        }
+        let (dq, ds, n, k) = self.lin_spec(name)?;
+        let xf: Vec<f32> = (0..t * k)
+            .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5)
+            .collect();
+        let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
+        let dx = self.cc.alloc(t * k * 4)?;
+        self.cc.h2d(dx, xb)?;
+        let da = self.cc.alloc(t * n * 4)?;
+        let db = self.cc.alloc(t * n * 4)?;
+        let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
+            // 원본(8행/블록, 512스레드).
+            let f = self.cc.function("w4a16_gemm_g128")?;
+            let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx, da);
+            let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+            let mut a1: [*mut std::ffi::c_void; 7] = [
+                (&mut p_q) as *mut _ as *mut _,
+                (&mut p_s) as *mut _ as *mut _,
+                (&mut p_x) as *mut _ as *mut _,
+                (&mut p_y) as *mut _ as *mut _,
+                (&mut p_n) as *mut _ as *mut _,
+                (&mut p_k) as *mut _ as *mut _,
+                (&mut p_t) as *mut _ as *mut _,
+            ];
+            self.cc.launch(f, n.div_ceil(8) as u32, 1, 512, &mut a1)?;
+            // mma(32×64, 256스레드).
+            let fm = self.cc.function("w4a16_gemm_g128_mma")?;
+            let (mut m_q, mut m_s, mut m_x, mut m_y) = (dq, ds, dx, db);
+            let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
+            let mut a2: [*mut std::ffi::c_void; 7] = [
+                (&mut m_q) as *mut _ as *mut _,
+                (&mut m_s) as *mut _ as *mut _,
+                (&mut m_x) as *mut _ as *mut _,
+                (&mut m_y) as *mut _ as *mut _,
+                (&mut m_n) as *mut _ as *mut _,
+                (&mut m_k) as *mut _ as *mut _,
+                (&mut m_t) as *mut _ as *mut _,
+            ];
+            self.cc.launch(
+                fm,
+                t.div_ceil(32) as u32,
+                n.div_ceil(64) as u32,
+                256,
+                &mut a2,
+            )?;
+            self.cc.sync()?;
+            let mut oa = vec![0u8; t * n * 4];
+            let mut ob = vec![0u8; t * n * 4];
+            self.cc.d2h(&mut oa, da)?;
+            self.cc.d2h(&mut ob, db)?;
+            let fa: Vec<f32> = oa
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            let fb: Vec<f32> = ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            Ok((fa, fb))
+        })();
+        let _ = self.cc.free(dx);
+        let _ = self.cc.free(da);
+        let _ = self.cc.free(db);
+        let (fa, fb) = r?;
+        let mut maxd = 0f32;
+        let mut maxr = 0f32;
+        let mut bad = 0usize;
+        for i in 0..fa.len() {
+            let d = (fa[i] - fb[i]).abs();
+            if d > maxd {
+                maxd = d;
+            }
+            let rl = d / fa[i].abs().max(1e-6);
+            if rl > maxr {
+                maxr = rl;
+            }
+            if !fb[i].is_finite() {
+                bad += 1;
+            }
+        }
+        // 불량 위치 패턴(첫 5개 + 행·열 분포) — 디버그.
+        let mut firstbad: Vec<(usize, usize)> = Vec::new();
+        let mut badrows = std::collections::BTreeSet::new();
+        let mut badcols = std::collections::BTreeSet::new();
+        for r in 0..t {
+            for c in 0..n {
+                let v = fb[r * n + c];
+                if !v.is_finite() || (v - fa[r * n + c]).abs() > 1e-2 {
+                    if firstbad.len() < 5 {
+                        firstbad.push((r, c));
+                    }
+                    badrows.insert(r);
+                    badcols.insert(c);
+                }
+            }
+        }
+        Ok(format!(
+            "mma-diff {name} n={n} k={k} t={t}: maxabs={maxd:.3e} 비유한={bad}/{} 첫불량={:?} 불량행={} 불량열={} A[0..3]={:?} B[0..3]={:?}",
+            fa.len(),
+            firstbad,
+            badrows.len(),
+            badcols.len(),
+            &fa[..3],
+            &fb[..3]
+        ))
+    }
+
+    /// 플레인 mma 수치 게이트 — v3(원본) vs bf16 mma.
+    fn mma_diff_plain(&mut self, name: &str, t: usize) -> Result<String, String> {
+        let (w, n, k) = self.plain_spec(name)?;
+        let xf: Vec<f32> = (0..t * k)
+            .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5)
+            .collect();
+        let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
+        let dx = self.cc.alloc(t * k * 4)?;
+        self.cc.h2d(dx, xb)?;
+        let da = self.cc.alloc(t * n * 4)?;
+        let db = self.cc.alloc(t * n * 4)?;
+        let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
+            let f = self.cc.function("w4a16_gemm_bf16_t")?;
+            let (mut p_w, mut p_x, mut p_o) = (w, dx, da);
+            let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+            let mut a1: [*mut std::ffi::c_void; 6] = [
+                (&mut p_w) as *mut _ as *mut _,
+                (&mut p_x) as *mut _ as *mut _,
+                (&mut p_o) as *mut _ as *mut _,
+                (&mut p_n) as *mut _ as *mut _,
+                (&mut p_k) as *mut _ as *mut _,
+                (&mut p_t) as *mut _ as *mut _,
+            ];
+            self.cc.launch(f, n.div_ceil(8) as u32, 1, 512, &mut a1)?;
+            let fm = self.cc.function("w4a16_gemm_bf16_mma")?;
+            let (mut m_w, mut m_x, mut m_o) = (w, dx, db);
+            let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
+            let mut a2: [*mut std::ffi::c_void; 6] = [
+                (&mut m_w) as *mut _ as *mut _,
+                (&mut m_x) as *mut _ as *mut _,
+                (&mut m_o) as *mut _ as *mut _,
+                (&mut m_n) as *mut _ as *mut _,
+                (&mut m_k) as *mut _ as *mut _,
+                (&mut m_t) as *mut _ as *mut _,
+            ];
+            self.cc.launch(
+                fm,
+                t.div_ceil(32) as u32,
+                n.div_ceil(64) as u32,
+                256,
+                &mut a2,
+            )?;
+            self.cc.sync()?;
+            let mut oa = vec![0u8; t * n * 4];
+            let mut ob = vec![0u8; t * n * 4];
+            self.cc.d2h(&mut oa, da)?;
+            self.cc.d2h(&mut ob, db)?;
+            let fa: Vec<f32> = oa
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            let fb: Vec<f32> = ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            Ok((fa, fb))
+        })();
+        let _ = self.cc.free(dx);
+        let _ = self.cc.free(da);
+        let _ = self.cc.free(db);
+        let (fa, fb) = r?;
+        let mut maxd = 0f32;
+        let mut bad = 0usize;
+        for i in 0..fa.len() {
+            let d = (fa[i] - fb[i]).abs();
+            if d > maxd {
+                maxd = d;
+            }
+            if !fb[i].is_finite() {
+                bad += 1;
+            }
+        }
+        Ok(format!(
+            "mma-diff(plain) {name} n={n} k={k} t={t}: maxabs={maxd:.3e} 비유한={bad}/{} A[0..3]={:?} B[0..3]={:?}",
+            fa.len(),
+            &fa[..3],
+            &fb[..3]
+        ))
     }
 
     /// 플레인 GEMM 단발 발사(벤치·진단 — T2 mma 비교용).
