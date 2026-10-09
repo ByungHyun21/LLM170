@@ -28,9 +28,18 @@ pub(crate) fn select_topk(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     for pv in p.iter_mut() {
         *pv /= sum;
     }
+    let kk = k.min(n);
+    if kk == 0 {
+        return Vec::new();
+    }
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_unstable_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
-    idx.truncate(k);
+    // P12 E4(2026-10-09): 전량 정렬 O(n log n) → nth 선택 O(n) + 상위 k만 정렬.
+    // 비교자가 (p 내림차순, 인덱스 오름차순) 전순서라 nth 분할의 앞 k집합은
+    // 전량 정렬 상위 k와 동일(동률 규칙 보존) — 이후 합·나눗셈 순서 불변(비트동일).
+    let mut ord = |&a: &usize, &b: &usize| p[b].total_cmp(&p[a]).then(a.cmp(&b));
+    idx.select_nth_unstable_by(kk - 1, &mut ord);
+    idx.truncate(kk);
+    idx.sort_unstable_by(&mut ord);
     let wsum: f32 = idx.iter().map(|&e| p[e]).sum();
     idx.iter().map(|&e| (e, p[e] / wsum)).collect()
 }
