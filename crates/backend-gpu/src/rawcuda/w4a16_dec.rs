@@ -3238,6 +3238,59 @@ impl W4a16Dec {
         self.cc.sync()
     }
     /// 지정 선형의 t≥2 GEMM 1회 발사(벤치 전용 — y는 스크래치).
+    /// 진단 타이머 리포트(P8) — LLM170_TIME=1일 때 범주별 ms·비중.
+    pub fn prof_report(&mut self, label: &str) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        self.cc.prof_report(label)
+    }
+
+    /// GEMV 전 선형 1회 순회(벤치) — 실사용과 동일한 DRAM 스트림(13.9GB ≫ L2).
+    /// 반환: (ms/회, 가중치 바이트 합). x는 k별 1.0 f32(수치 무의미).
+    pub fn gemv_walk_bench(&mut self, reps: usize) -> Result<(f64, u64), String> {
+        let _g = self.cc.guard()?;
+        let mut mk = 0usize;
+        let mut mn = 0usize;
+        let mut wb = 0u64;
+        for &(_, _, n, k) in self.lins.values() {
+            mk = mk.max(k);
+            mn = mn.max(n);
+            wb += (n * k / 2) as u64;
+        }
+        let xf: Vec<f32> = vec![1.0f32; mk];
+        let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
+        let dx = self.cc.alloc(xf.len() * 4)?;
+        self.cc.h2d(dx, xb)?;
+        let dy = self.cc.alloc(mn * 4)?;
+        let names: Vec<String> = self.lins.keys().cloned().collect();
+        let walk = |me: &mut Self| -> Result<(), String> {
+            for name in &names {
+                me.gemv_launch(name, dx, dy)?;
+            }
+            Ok(())
+        };
+        walk(self)?;
+        self.cc.sync()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            walk(self)?;
+        }
+        self.cc.sync()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        self.cc.free(dx)?;
+        self.cc.free(dy)?;
+        Ok((ms, wb))
+    }
+
+    /// GEMV 단발 발사(벤치·진단 — import 없이 이름·x·y만).
+    pub fn gemv_bench_launch(
+        &mut self,
+        name: &str,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
+    ) -> Result<(), String> {
+        self.gemv_launch(name, x, y)
+    }
+
     pub fn gemm_bench_launch(
         &mut self,
         name: &str,
