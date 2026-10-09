@@ -26,8 +26,7 @@
 // k-주요 배치, lc(FLA)는 [G][h_k] 그룹-주요 — 전치 p_inv=(h%G)·h_k+h/G,
 // G=h_v/h_k(27B: G=3 → (h%3)·16+h/3 — 원본식과 동일). l2perm·gate 모두
 // scatter(쓰기측 인덱스에 p_inv) — CPU 미러가 gather라 방향 혼동 주의.
-// gdn_l2perm_gather는 음성대조 전용 쌍둥이(방향 반전
-// 결함 재현, 17호 계기) — 프로덕션 경로에서 발사 금지.
+// (음성대조 gather 쌍둥이는 H 정리에서 제거 — 2026-10-09.)
 //
 // 그리드 계약(결함 5호): T>1 커널(l2perm/gate)은 t=blockIdx.y —
 // grid (h_v, T). gy=1로 두면 행 1+가 미실행된다(과거 사고).
@@ -168,9 +167,7 @@ extern "C" __global__ void gdn_conv(
 
 // l2perm 본체 — a/b 도트(xn·abuf) + q/k L2 + v·beta|g lc 순열
 // (구 rawhip 커널 L397-472 직이식, 폭 인자화). 그리드 (h_v, T), WG=128.
-// GATHER=true는 음성대조 전용 방향 반전(v 판독측에 p_inv — 결함류:
-// 방향). beta|g는 lc 순열로 scatter(bg[.. + p_inv]).
-template <bool GATHER>
+// v는 scatter, beta|g는 lc 순열 scatter(bg[.. + p_inv]).
 __device__ __forceinline__ void gdn_l2perm_body(
     const float* __restrict__ q_in,   // [T][k_len]
     const float* __restrict__ k_in,   // [T][k_len]
@@ -253,18 +250,12 @@ __device__ __forceinline__ void gdn_l2perm_body(
         __syncthreads();
         k_out[t * (h_k * 128) + kh * 128 + tid] = kv * ki;
     }
-    if (GATHER) {
-        // 음성대조: gather 방향(CPU 미러와 같은 쪽).
-        v_out[t * (h_v * 128) + h * 128 + tid] =
-            v_in[t * (h_v * 128) + p_inv * 128 + tid];
-    } else {
-        // 프로덕션: scatter 방향(계약).
-        v_out[t * (h_v * 128) + p_inv * 128 + tid] =
-            v_in[t * (h_v * 128) + h * 128 + tid];
-    }
+    // scatter 방향(계약): 쓰기측 인덱스에 p_inv.
+    v_out[t * (h_v * 128) + p_inv * 128 + tid] =
+        v_in[t * (h_v * 128) + h * 128 + tid];
 }
 
-// 프로덕션 l2perm — scatter(계약 방향).
+// l2perm — scatter(계약 방향).
 extern "C" __global__ void gdn_l2perm(
     const float* __restrict__ q_in,
     const float* __restrict__ k_in,
@@ -279,27 +270,8 @@ extern "C" __global__ void gdn_l2perm(
     float* __restrict__ bg,
     int t_len, int layer, int h_k, int h_v, int hidden)
 {
-    gdn_l2perm_body<false>(q_in, k_in, v_in, xn, abuf, alog, dtb,
-                           q_out, k_out, v_out, bg, t_len, layer, h_k, h_v, hidden);
-}
-
-// 음성대조 전용 l2perm — gather(방향 결함 재현, 17호 계기).
-extern "C" __global__ void gdn_l2perm_gather(
-    const float* __restrict__ q_in,
-    const float* __restrict__ k_in,
-    const float* __restrict__ v_in,
-    const float* __restrict__ xn,
-    const float* __restrict__ abuf,
-    const float* __restrict__ alog,
-    const float* __restrict__ dtb,
-    float* __restrict__ q_out,
-    float* __restrict__ k_out,
-    float* __restrict__ v_out,
-    float* __restrict__ bg,
-    int t_len, int layer, int h_k, int h_v, int hidden)
-{
-    gdn_l2perm_body<true>(q_in, k_in, v_in, xn, abuf, alog, dtb,
-                          q_out, k_out, v_out, bg, t_len, layer, h_k, h_v, hidden);
+    gdn_l2perm_body(q_in, k_in, v_in, xn, abuf, alog, dtb,
+                    q_out, k_out, v_out, bg, t_len, layer, h_k, h_v, hidden);
 }
 
 // gdn_scan — FLA 청크 알고리즘(구 rawhip 커널 L484-608 직이식,

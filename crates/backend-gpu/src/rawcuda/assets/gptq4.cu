@@ -15,15 +15,6 @@
 
 #include "cast_common.cuh"
 
-// 활성 f32 [n] → f16 비트 [n] (GEMV 입력 스테이징 계약).
-extern "C" __global__ void w4a16_cast_f16(const float* __restrict__ in,
-                                          unsigned short* __restrict__ out, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = f2h(in[i]);
-    }
-}
-
 // 활성 f32 [n] → h2f(f2h(v)) f32 [n] — t=1 GEMV 입력의 사전 변환.
 // 계약: 커널 안에서 h2f(xt[i])하던 값을 밖에서 한 번 계산해 두는 것과 동일
 // (f2h→h2f 왕복이 비트를 보존). 반드시 f2h/h2f와 동형 수정.
