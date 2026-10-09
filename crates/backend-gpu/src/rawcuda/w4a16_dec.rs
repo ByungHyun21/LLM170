@@ -68,6 +68,10 @@ pub struct AttnDims {
     pub kv_heads: usize,
     pub d: usize,
     pub cap: usize,
+    /// [A11] full attention 간격(모델 config `full_attention_interval`) —
+    /// 종전 4 하드코딩. 체인 분기 `(il+1) % interval == 0`과 `il/interval`이
+    /// 이 값을 쓴다(신규 비율 모델 대응).
+    pub interval: usize,
 }
 
 impl AttnDims {
@@ -1446,7 +1450,7 @@ impl W4a16Dec {
     ) -> Result<Vec<f32>, String> {
         let mut ab = vec![0.0f32; self.hidden];
         let mut gi = 0usize;
-        let interval = 4usize;
+        let interval = self.attn.map(|a| a.interval).unwrap_or(4);
         for il in 0..self.n_layers {
             let xn = self
                 .norm_resid_staged(2 * il, dres, &ab)
@@ -2846,7 +2850,8 @@ impl W4a16Dec {
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, 1, x32)
                 .map_err(|e| format!("L{il} input norm: {e}"))?;
-            let branch = if (il + 1) % 4 == 0 {
+            let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
+            let branch = if (il + 1) % interval == 0 {
                 if plain {
                     self.plain_stage_x32(&format!("blk.{il}.attn_q.weight"), xn, s0, w0)
                         .map_err(|e| format!("L{il} q: {e}"))?;
@@ -2862,7 +2867,7 @@ impl W4a16Dec {
                     self.gemv_stage_x32(&format!("blk.{il}.attn_v.weight"), x32, s1b, w1)
                         .map_err(|e| format!("L{il} v: {e}"))?;
                 }
-                self.attn_chain_dev_run(slot, il / 4, 1, s0, s1, s1b)
+                self.attn_chain_dev_run(slot, il / interval, 1, s0, s1, s1b)
                     .map_err(|e| format!("L{il} attn: {e}"))?
             } else {
                 if plain {
@@ -2882,7 +2887,7 @@ impl W4a16Dec {
                 gi += 1;
                 g
             };
-            let lo = if (il + 1) % 4 == 0 {
+            let lo = if (il + 1) % interval == 0 {
                 format!("blk.{il}.attn_output.weight")
             } else {
                 format!("blk.{il}.ssm_out.weight")
@@ -3172,7 +3177,8 @@ impl W4a16Dec {
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, t, xh)
                 .map_err(|e| format!("T{il} input norm: {e}"))?;
-            let branch = if (il + 1) % 4 == 0 {
+            let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
+            let branch = if (il + 1) % interval == 0 {
                 if plain {
                     self.plain_gemm_launch(&format!("blk.{il}.attn_q.weight"), xn, s0, t)?;
                     self.plain_gemm_launch(&format!("blk.{il}.attn_k.weight"), xn, s1, t)?;
@@ -3182,7 +3188,7 @@ impl W4a16Dec {
                     self.gemm_launch(&format!("blk.{il}.attn_k.weight"), xh, s1, t)?;
                     self.gemm_launch(&format!("blk.{il}.attn_v.weight"), xh, s1b, t)?;
                 }
-                self.attn_chain_dev_run(slot, il / 4, t, s0, s1, s1b)
+                self.attn_chain_dev_run(slot, il / interval, t, s0, s1, s1b)
                     .map_err(|e| format!("T{il} attn: {e}"))?
             } else {
                 if plain {
@@ -3202,7 +3208,7 @@ impl W4a16Dec {
                 gi += 1;
                 g
             };
-            let lo = if (il + 1) % 4 == 0 {
+            let lo = if (il + 1) % interval == 0 {
                 format!("blk.{il}.attn_output.weight")
             } else {
                 format!("blk.{il}.ssm_out.weight")

@@ -235,11 +235,74 @@ fn read_request_from<R: Read>(reader: &mut BufReader<R>) -> Result<HttpReq, ReqE
         ));
     }
     if chunked {
-        return Err(ReqErr::Status(
-            400,
-            "Bad Request",
-            "chunked transfer-encoding unsupported".into(),
-        ));
+        // [A13] chunked 지원(2026-10-09 사용자 결정) — 크기줄(hex)[;ext] CRLF +
+        // 데이터 CRLF 반복, 크기 0에서 종료(트레일러 헤더 소비). 본문 상한은
+        // Content-Length 경로와 동일(MAX_BODY) — 초과 시 413(읽지 않고 거부).
+        let mut body: Vec<u8> = Vec::new();
+        loop {
+            let szline = match read_line_bounded(reader, MAX_LINE) {
+                Ok(Some(v)) => v,
+                Ok(None) => return Err(ReqErr::Plain("chunked: EOF".into())),
+                Err(LineErr::TooLong) => {
+                    return Err(ReqErr::Status(
+                        400,
+                        "Bad Request",
+                        "chunk size too long".into(),
+                    ));
+                }
+                Err(LineErr::Io(e)) => return Err(ReqErr::Plain(e.to_string())),
+            };
+            let sztxt = String::from_utf8_lossy(&szline);
+            let tok = sztxt.trim().split(';').next().unwrap_or("").trim();
+            let n = match usize::from_str_radix(tok, 16) {
+                Ok(n) => n,
+                Err(_) => {
+                    return Err(ReqErr::Status(
+                        400,
+                        "Bad Request",
+                        "malformed chunk size".into(),
+                    ));
+                }
+            };
+            if n == 0 {
+                // 트레일러: 빈 줄까지 소비(있으면).
+                loop {
+                    match read_line_bounded(reader, MAX_LINE) {
+                        Ok(Some(v)) if !v.iter().all(u8::is_ascii_whitespace) => continue,
+                        _ => break,
+                    }
+                }
+                break;
+            }
+            if body.len() + n > MAX_BODY {
+                return Err(ReqErr::Status(
+                    413,
+                    "Payload Too Large",
+                    format!("chunked body exceeds limit {MAX_BODY}"),
+                ));
+            }
+            let mut chunk = vec![0u8; n];
+            reader
+                .read_exact(&mut chunk)
+                .map_err(|e| ReqErr::Plain(e.to_string()))?;
+            body.extend_from_slice(&chunk);
+            let mut crlf = [0u8; 2];
+            reader
+                .read_exact(&mut crlf)
+                .map_err(|e| ReqErr::Plain(e.to_string()))?;
+            if &crlf != b"\r\n" {
+                return Err(ReqErr::Status(
+                    400,
+                    "Bad Request",
+                    "malformed chunk terminator".into(),
+                ));
+            }
+        }
+        return Ok(HttpReq {
+            method,
+            path,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        });
     }
     if len > MAX_BODY {
         // QA-2: 413 응답 후 절단 — 상한 초과 본문은 읽지도 않는다.
@@ -348,6 +411,25 @@ mod req_tests {
     }
 
     #[test]
+    fn chunked_body_ok() {
+        // [A13] chunked 요청 — 조각 2개 + 종료(0) + 트레일러.
+        let body = "{\"prompt\":\"hi\"}";
+        let (a, b) = body.split_at(5);
+        let req = format!(
+            "POST /v1/completions HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\nX-T: 1\r\n\r\n",
+            a.len(),
+            b.len()
+        );
+        let r = parse(req.as_bytes()).expect("chunked");
+        assert_eq!(r.body, body);
+        // 잘못된 크기줄 → 400.
+        match parse(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n") {
+            Err(ReqErr::Status(400, _, _)) => {}
+            _ => panic!("400 기대(chunk size)"),
+        }
+    }
+
+    #[test]
     fn long_lines_are_bounded() {
         // 요청 라인 8KB 초과(개행 없음) → 414.
         let mut line = b"GET /".to_vec();
@@ -383,10 +465,11 @@ mod req_tests {
             Err(ReqErr::Status(400, _, _)) => {}
             _ => panic!("400 기대(CL)"),
         }
-        // chunked → 400(명시 미지원).
-        match parse(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n") {
-            Err(ReqErr::Status(400, _, _)) => {}
-            _ => panic!("400 기대(chunked)"),
+        // chunked는 A13으로 지원 — 정상 종료(0)까지 오면 빈 본문 수용,
+        // 미완(EOF)은 Plain 오류(400 아님).
+        match parse(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n") {
+            Ok(r) => assert!(r.body.is_empty()),
+            Err(e) => panic!("chunked 수용 기대: {e:?}"),
         }
         // 상한 초과 CL → 413.
         let req = format!(
