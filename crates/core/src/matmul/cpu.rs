@@ -103,9 +103,11 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
     let nt = n_threads().max(1).min(n_out.max(1));
     let rows_per = n_out.div_ceil(nt).max(1);
     let nch = n_out.div_ceil(rows_per);
-    let mut locals: Vec<Vec<f32>> = vec![vec![0.0f32; t * rows_per]; nch];
-    let locals_base = locals.as_mut_ptr() as usize;
+    // 평탄 버퍼(계약: 잡 g는 자기 몫 [g*lstride, (g+1)*lstride)만 접근).
+    // Vec<Vec>의 as_mut_ptr은 헤더 배열이라 f32 데이터 포인터가 아니다(실측 오염).
     let lstride = t * rows_per;
+    let mut locals: Vec<f32> = vec![0.0f32; nch * lstride];
+    let locals_base = locals.as_mut_ptr() as usize;
     let (dp, dl) = (w.data.as_ptr() as usize, w.data.len());
     let (ty, n_in_w) = (w.ty, w.n_in);
     let xp: Vec<usize> = xs.iter().map(|v| v.as_ptr() as usize).collect();
@@ -149,12 +151,12 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
             }
         })
     });
-    for (g, local) in locals.iter().enumerate() {
+    for g in 0..nch {
         let row0 = g * rows_per;
         let rows = n_out.saturating_sub(row0).min(rows_per);
         for ti in 0..t {
             for r in 0..rows {
-                outs[ti][row0 + r] = local[ti * rows_per + r];
+                outs[ti][row0 + r] = locals[g * lstride + ti * rows_per + r];
             }
         }
     }
