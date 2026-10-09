@@ -4028,6 +4028,48 @@ impl W4a16Dec {
         ))
     }
 
+    /// [진단] ew 커널 독립 벤치 — 순수 커널 처리량(파이프라인 무관).
+    pub fn bench_ew(&mut self) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        let n = 245_760usize;
+        let dg = self.cc.alloc(n * 4)?;
+        let du = self.cc.alloc(n * 4)?;
+        let dy = self.cc.alloc(n * 4)?;
+        let v: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.1 - 0.3).collect();
+        let b = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 4) };
+        self.cc.h2d(dg, b)?;
+        self.cc.h2d(du, b)?;
+        let f = self.cc.function("ew")?;
+        let (mut a0, mut a1, mut a2) = (dg, du, dy);
+        let mut nn = n as i32;
+        let mut args: [*mut std::ffi::c_void; 4] = [
+            (&mut a0) as *mut _ as *mut _,
+            (&mut a1) as *mut _ as *mut _,
+            (&mut a2) as *mut _ as *mut _,
+            (&mut nn) as *mut _ as *mut _,
+        ];
+        for _ in 0..10 {
+            self.cc
+                .launch(f, n.div_ceil(128) as u32, 1, 128, &mut args)?;
+        }
+        self.cc.sync()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            self.cc
+                .launch(f, n.div_ceil(128) as u32, 1, 128, &mut args)?;
+        }
+        self.cc.sync()?;
+        let el = t0.elapsed().as_secs_f64() / 100.0;
+        let _ = self.cc.free(dg);
+        let _ = self.cc.free(du);
+        let _ = self.cc.free(dy);
+        Ok(format!(
+            "ew bench n={n}: {:.3}ms/launch · {:.1} GB/s (12B/elem)",
+            el * 1000.0,
+            (n as f64 * 12.0) / el / 1e9
+        ))
+    }
+
     /// MoE top-k 게이트 — 호스트 moe_topk vs 디바이스 w4a16_moe_topk_t.
     pub fn moe_topk_check(&mut self, t: usize, n: usize, k: usize) -> Result<String, String> {
         let _g = self.cc.guard()?;

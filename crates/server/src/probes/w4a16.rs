@@ -334,6 +334,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut no_head = false;
     let mut moe_check = false;
     let mut plain_check = false;
+    let mut bench_ew = false;
     let mut mma_smoke = false;
     let mut bench_gemv: Option<(String, usize)> = None;
     let mut bench_plain: Option<(String, usize, usize)> = None;
@@ -371,6 +372,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             "--no-head" => no_head = true,
             "--moe-check" => moe_check = true,
             "--plain-gemm-check" => plain_check = true,
+            "--bench-ew" => bench_ew = true,
             "--mma-smoke" => mma_smoke = true,
             "--h2d-bench" => {
                 let mb = it
@@ -488,6 +490,9 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             bytes as f64 * 1e-9 / (pageable_ms * 1e-3),
             bytes as f64 * 1e-9 / (pinned_ms * 1e-3).max(1e-9)
         ));
+    }
+    if bench_ew {
+        return dec.bench_ew();
     }
     if plain_check {
         return dec.plain_gemm_selfcheck();
