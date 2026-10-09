@@ -216,11 +216,10 @@ impl Detok {
 
     /// 토큰 1개 투입 → 지금까지 완결된 텍스트 방출.
     pub fn push(&mut self, tok: u32) -> String {
-        let pb = TOKENIZER
-            .get()
-            .map(|t| t.piece_bytes(tok))
-            .unwrap_or_default();
-        self.buf.extend_from_slice(&pb);
+        // [2026-10-09 D4] out-param 변형 — 토큰당 중간 Vec 할당 제거.
+        if let Some(t) = TOKENIZER.get() {
+            t.piece_bytes_into(tok, &mut self.buf);
+        }
         let mut v = 0usize;
         let b = &self.buf;
         while v < b.len() {

@@ -348,19 +348,23 @@ impl Tokenizer {
         self.vocab.is_empty()
     }
 
-    pub fn piece_bytes(&self, tok: u32) -> Vec<u8> {
-        self.vocab
-            .get(tok as usize)
-            .map(|p| {
-                p.chars()
-                    .flat_map(|c| match self.c2b.get(&c) {
-                        Some(&b) => vec![b],
-                        None => c.to_string().into_bytes(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// [2026-10-09 D4] 문자당 Vec 할당 없이 out에 append — 종전 flat_map(vec![b])
+    /// 체인이 문자마다 힙 할당이었다(토큰마다).
+    pub fn piece_bytes_into(&self, tok: u32, out: &mut Vec<u8>) {
+        let Some(p) = self.vocab.get(tok as usize) else {
+            return;
+        };
+        for c in p.chars() {
+            match self.c2b.get(&c) {
+                Some(&b) => out.push(b),
+                None => {
+                    let mut tmp = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+                }
+            }
+        }
     }
+
 
     /// 텍스트 → 토큰 (특수 토큰 해석 포함 — llama-server 채팅 경로와 동일).
     pub fn encode(&self, text: &str) -> Vec<u32> {
