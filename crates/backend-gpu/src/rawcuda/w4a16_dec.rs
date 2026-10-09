@@ -2507,7 +2507,7 @@ impl W4a16Dec {
         for i in 0..cref.len() {
             maxd = maxd.max((out[i] - cref[i]).abs());
         }
-        if !(maxd <= 1e-4) {
+        if !maxd.is_finite() || maxd > 1e-4 {
             return Err(format!(
                 "mma_smoke: 최대 오차 {maxd:.3e} > 1e-4 — 프래그먼트/누적 불일치"
             ));
