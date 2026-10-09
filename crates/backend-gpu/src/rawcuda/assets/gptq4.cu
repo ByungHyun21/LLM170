@@ -113,27 +113,41 @@ __device__ __forceinline__ void gemv_row_body(
     // 16이터레이션 언롤 — 미결 q·x 로드를 16개까지 겹친다(지연 은닉, 실측 8→16
     // = 27.9→27.2ms). 2행/블록 변형은 역효과(34.8ms — 레지스터·L1 압박).
     const int jn = k >> 6;
-    const int li = l & 7;
+    const int sh = 4 * (l & 7);
     float acc = 0.0f;
     int j = 0;
+    // [T3/A2 슬림화 2026-10-09] 가중 스칼라 FMA 3-op — (nib−8)·sc를
+    // fmaf(nib, sc, −8·sc)로(상수항은 sc당 1회 상각), 누산은 fmaf.
+    // 종전 I2F+IADD+FMUL+FMUL+FADD(5) → I2F+FFMA+FFMA(3). 비트동일 아님
+    // (승인된 완화 — 골든·허용오차 게이트가 판정, 비트 게이트는 진단용).
+    // 포인터 진행형 — i 재계산(LEA/IADD 사슬 ~6/가중치)을 상수 증분으로 대체.
+    // q: i>>3 = (l>>3) + jj·8 → +8u32/iter, x: +64f/iter.
+    const unsigned* qp = qrow + (l >> 3);
+    const float* xp = x + l;
     for (; j + 16 <= jn; j += 16) {
 #pragma unroll
         for (int u = 0; u < 16; ++u) {
             const int jj = j + u;
-            const int i = l + (jj << 6);
             // evict-first — 한 번 읽는 가중치가 L2를 오염시키지 않게(스트리밍).
-            unsigned qw = __ldcs(&qrow[i >> 3]);
-            int v = (int)((qw >> (4 * li)) & 0xFu) - 8;
-            float w = (float)v * sc[sidx<SHIFT>(l, jj)];
-            acc += w * x[i];
+            const unsigned qw = __ldcs(qp);
+            const float xv = *xp;
+            const int nib = (int)((qw >> sh) & 0xFu);
+            const float scv = sc[sidx<SHIFT>(l, jj)];
+            const float w = fmaf((float)nib, scv, -8.0f * scv);
+            acc = fmaf(w, xv, acc);
+            qp += 8;
+            xp += 64;
         }
     }
     for (; j < jn; ++j) {
-        const int i = l + (j << 6);
-        unsigned qw = __ldcs(&qrow[i >> 3]);
-        int v = (int)((qw >> (4 * li)) & 0xFu) - 8;
-        float w = (float)v * sc[sidx<SHIFT>(l, j)];
-        acc += w * x[i];
+        const unsigned qw = __ldcs(qp);
+        const float xv = *xp;
+        const int nib = (int)((qw >> sh) & 0xFu);
+        const float scv = sc[sidx<SHIFT>(l, j)];
+        const float w = fmaf((float)nib, scv, -8.0f * scv);
+        acc = fmaf(w, xv, acc);
+        qp += 8;
+        xp += 64;
     }
     red[l] = (double)acc;
     __syncthreads();
