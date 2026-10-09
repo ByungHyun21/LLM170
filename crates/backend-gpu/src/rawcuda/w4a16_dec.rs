@@ -274,6 +274,9 @@ pub struct W4a16Dec {
     dv2: CUdeviceptr,
     dbg: CUdeviceptr,
     dgo: CUdeviceptr,
+    /// [P9] t=1 GDN 분할 부분합([h_v][4][2][128] f32)과 dc([h_v][128]).
+    dgpart: CUdeviceptr,
+    dgdc: CUdeviceptr,
     dgate: CUdeviceptr,
     gdn_t_cap: usize,
     // ── attn ──
@@ -392,6 +395,9 @@ impl W4a16Dec {
                 "gdn_l2perm",
                 "gdn_l2perm_gather",
                 "gdn_scan",
+                "gdn1_part",
+                "gdn1_comb",
+                "gdn1_upd",
                 "gdn_gate",
             ],
         )?;
@@ -503,6 +509,8 @@ impl W4a16Dec {
             dv2: 0,
             dbg: 0,
             dgo: 0,
+            dgpart: 0,
+            dgdc: 0,
             dgate: 0,
             gdn_t_cap: 0,
             attn: None,
@@ -931,6 +939,8 @@ impl W4a16Dec {
                 &mut self.dbg,
                 &mut self.dgo,
                 &mut self.dgate,
+                &mut self.dgpart,
+                &mut self.dgdc,
             ],
             [
                 t_len * cch * 4,
@@ -945,6 +955,8 @@ impl W4a16Dec {
                 t_len * dm.bg_len() * 4,
                 t_len * vl * 4,
                 t_len * vl * 4,
+                dm.h_v * 8 * 256 * 4,
+                dm.h_v * 128 * 4,
             ],
         )?;
         self.gdn_t_cap = t_len;
@@ -1033,38 +1045,105 @@ impl W4a16Dec {
         self.cc
             .launch(f, dm.h_v as u32, t_len as u32, 128, &mut al)?;
 
-        let f = self.cc.function("gdn_scan")?;
-        self.cc.set_dynamic_smem(f, GDN_SCAN_SMEM)?;
-        let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5) = (
-            self.dq2,
-            self.dk2,
-            self.dv2,
-            self.dbg,
-            self.dgst + (st_slot as u64) * 4,
-            self.dgo,
-        );
-        let mut as_: [*mut std::ffi::c_void; 11] = [
-            (&mut s0) as *mut _ as *mut _,
-            (&mut s1) as *mut _ as *mut _,
-            (&mut s2) as *mut _ as *mut _,
-            (&mut s3) as *mut _ as *mut _,
-            (&mut s4) as *mut _ as *mut _,
-            (&mut s5) as *mut _ as *mut _,
-            (&mut tl) as *mut _ as *mut _,
-            (&mut hk) as *mut _ as *mut _,
-            (&mut hv) as *mut _ as *mut _,
-            (&mut dd) as *mut _ as *mut _,
-            (&mut lay) as *mut _ as *mut _,
-        ];
-        // grid = h_v × VSLICE(블록 = GDN_VW = 128/VSLICE 스레드).
-        self.cc.launch_shared(
-            f,
-            (dm.h_v * GDN_VSLICE) as u32,
-            1,
-            (128 / GDN_VSLICE) as u32,
-            GDN_SCAN_SMEM,
-            &mut as_,
-        )?;
+        // [P9] t=1 전용 — i축 분할 3커널(grid h_v×4 = 192블록). ncu 실측
+        // gdn_scan 점유 8.3%(지연 바운드) → 분할로 병렬도 확보. t>1은 종전.
+        let mut skip_scan = false;
+        if t_len == 1 {
+            let fp = self.cc.function("gdn1_part")?;
+            let (mut p0, mut p1, mut p2, mut p3) = (
+                self.dq2,
+                self.dk2,
+                self.dgst + (st_slot as u64) * 4,
+                self.dgpart,
+            );
+            let mut ap: [*mut std::ffi::c_void; 8] = [
+                (&mut p0) as *mut _ as *mut _,
+                (&mut p1) as *mut _ as *mut _,
+                (&mut p2) as *mut _ as *mut _,
+                (&mut p3) as *mut _ as *mut _,
+                (&mut hk) as *mut _ as *mut _,
+                (&mut hv) as *mut _ as *mut _,
+                (&mut dd) as *mut _ as *mut _,
+                (&mut lay) as *mut _ as *mut _,
+            ];
+            self.cc.launch(fp, dm.h_v as u32, 8, 128, &mut ap)?;
+            let fc = self.cc.function("gdn1_comb")?;
+            let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6) = (
+                self.dq2,
+                self.dk2,
+                self.dv2,
+                self.dbg,
+                self.dgpart,
+                self.dgdc,
+                self.dgo,
+            );
+            let mut acomb: [*mut std::ffi::c_void; 10] = [
+                (&mut c0) as *mut _ as *mut _,
+                (&mut c1) as *mut _ as *mut _,
+                (&mut c2) as *mut _ as *mut _,
+                (&mut c3) as *mut _ as *mut _,
+                (&mut c4) as *mut _ as *mut _,
+                (&mut c5) as *mut _ as *mut _,
+                (&mut c6) as *mut _ as *mut _,
+                (&mut hk) as *mut _ as *mut _,
+                (&mut hv) as *mut _ as *mut _,
+                (&mut dd) as *mut _ as *mut _,
+            ];
+            self.cc.launch(fc, dm.h_v as u32, 1, 128, &mut acomb)?;
+            let fu = self.cc.function("gdn1_upd")?;
+            let (mut u0, mut u1, mut u2, mut u3) = (
+                self.dk2,
+                self.dbg,
+                self.dgdc,
+                self.dgst + (st_slot as u64) * 4,
+            );
+            let mut aup: [*mut std::ffi::c_void; 8] = [
+                (&mut u0) as *mut _ as *mut _,
+                (&mut u1) as *mut _ as *mut _,
+                (&mut u2) as *mut _ as *mut _,
+                (&mut u3) as *mut _ as *mut _,
+                (&mut hk) as *mut _ as *mut _,
+                (&mut hv) as *mut _ as *mut _,
+                (&mut dd) as *mut _ as *mut _,
+                (&mut lay) as *mut _ as *mut _,
+            ];
+            self.cc.launch(fu, dm.h_v as u32, 8, 128, &mut aup)?;
+            skip_scan = true;
+        }
+        if !skip_scan {
+            let f = self.cc.function("gdn_scan")?;
+            self.cc.set_dynamic_smem(f, GDN_SCAN_SMEM)?;
+            let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5) = (
+                self.dq2,
+                self.dk2,
+                self.dv2,
+                self.dbg,
+                self.dgst + (st_slot as u64) * 4,
+                self.dgo,
+            );
+            let mut as_: [*mut std::ffi::c_void; 11] = [
+                (&mut s0) as *mut _ as *mut _,
+                (&mut s1) as *mut _ as *mut _,
+                (&mut s2) as *mut _ as *mut _,
+                (&mut s3) as *mut _ as *mut _,
+                (&mut s4) as *mut _ as *mut _,
+                (&mut s5) as *mut _ as *mut _,
+                (&mut tl) as *mut _ as *mut _,
+                (&mut hk) as *mut _ as *mut _,
+                (&mut hv) as *mut _ as *mut _,
+                (&mut dd) as *mut _ as *mut _,
+                (&mut lay) as *mut _ as *mut _,
+            ];
+            // grid = h_v × VSLICE(블록 = GDN_VW = 128/VSLICE 스레드).
+            self.cc.launch_shared(
+                f,
+                (dm.h_v * GDN_VSLICE) as u32,
+                1,
+                (128 / GDN_VSLICE) as u32,
+                GDN_SCAN_SMEM,
+                &mut as_,
+            )?;
+        }
 
         let f = self.cc.function("gdn_gate")?;
         let (mut g0, mut g1, mut g2, mut g3) = (self.dgo, self.dzv, self.dnwg, self.dgate);
