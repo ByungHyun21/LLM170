@@ -219,6 +219,10 @@ pub struct W4a16Dec {
     /// 선택 슬롯 인덱스·가중(호스트 → 디바이스, [top_k]).
     moe_idx: CUdeviceptr,
     moe_wt: CUdeviceptr,
+    /// [P11] 전문가-우선 슬롯 정렬(프리필 그룹 GEMV) — gslot[n_exp×gmax]+cnt.
+    moe_gslot: CUdeviceptr,
+    moe_gcnt: CUdeviceptr,
+    moe_gmax: usize,
     /// 배치 전문가 출력([top_k][n_ff] · [top_k][hidden]) — act는 ew 전용
     /// 별도 버퍼(ew 커널 __restrict__ 계약 — 제자리 호출 금지).
     dexp_gate: CUdeviceptr,
@@ -367,6 +371,8 @@ impl W4a16Dec {
                 "w4a16_axpy",
                 "w4a16_shared_add",
                 "w4a16_gemv_experts_g32_bf16",
+                "w4a16_gemv_experts_g32_bf16_perm",
+                "w4a16_moe_align",
                 "w4a16_moe_accum",
                 "w4a16_moe_topk",
                 "w4a16_moe_topk_t",
@@ -472,6 +478,9 @@ impl W4a16Dec {
             moe_dev_tab: 0,
             moe_idx: 0,
             moe_wt: 0,
+            moe_gslot: 0,
+            moe_gcnt: 0,
+            moe_gmax: 0,
             dexp_gate: 0,
             dexp_up: 0,
             dexp_act: 0,
@@ -2454,6 +2463,22 @@ impl W4a16Dec {
         self.dmo_cap = tmax * h;
         // 배치 전문가 출력([TMAX×top_k][n_ff]·[TMAX×top_k][h]) + 슬롯 idx/가중.
         let tk = tmax * self.top_k.max(1);
+        // [P11] 전문가-우선 정렬 버퍼 — gslot[n_exp][tk] + cnt[n_exp].
+        if self.moe_gslot == 0 || self.moe_gmax < tk {
+            self.graph_invalidate();
+            self.cc.sync()?;
+            for p in [self.moe_gslot, self.moe_gcnt] {
+                if p != 0 {
+                    self.cc.free(p)?;
+                }
+            }
+            self.moe_gslot = 0;
+            self.moe_gcnt = 0;
+            self.moe_gmax = 0;
+            self.moe_gslot = self.cc.alloc(n_exp * tk * 4)?;
+            self.moe_gcnt = self.cc.alloc(n_exp * 4)?;
+            self.moe_gmax = tk;
+        }
         if self.dexp_cap < tk {
             for p in [self.dexp_gate, self.dexp_up, self.dexp_act, self.dexp_dn] {
                 if p != 0 {
@@ -2514,6 +2539,61 @@ impl W4a16Dec {
             (&mut p_t) as *mut _ as *mut _,
             (&mut p_b) as *mut _ as *mut _,
             (&mut p_i) as *mut _ as *mut _,
+            (&mut p_ns) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_xs) as *mut _ as *mut _,
+            (&mut p_sp) as *mut _ as *mut _,
+            (&mut p_o) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, (n * nslots) as u32, 1, 64, &mut args)
+    }
+
+    /// [P11] 전문가-우선 슬롯 순열 발사(프리필 전용) — w4a16_moe_align.
+    /// n_exp ≤ 1024 계약(초과 시 호출부가 종전 경로로 폴백).
+    fn moe_align_launch(&self, nslots: usize) -> Result<(), String> {
+        let f = self.cc.function("w4a16_moe_align")?;
+        let (mut p_i, mut p_ns) = (self.moe_idx, nslots as i32);
+        let (mut p_g, mut p_c, mut p_ne) = (self.moe_gslot, self.moe_gcnt, self.n_experts as i32);
+        let mut args: [*mut std::ffi::c_void; 5] = [
+            (&mut p_i) as *mut _ as *mut _,
+            (&mut p_ns) as *mut _ as *mut _,
+            (&mut p_g) as *mut _ as *mut _,
+            (&mut p_c) as *mut _ as *mut _,
+            (&mut p_ne) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, 1, 1, 256, &mut args)
+    }
+
+    /// [P11] 순열 전문가 GEMV 발사 — grid (슬롯 × n), 슬롯 순서만 전문가-우선.
+    fn gemv_experts_perm_launch(
+        &self,
+        base: usize,
+        nslots: usize,
+        x_dev: CUdeviceptr,
+        xstride: usize,
+        sp: usize,
+        out_dev: CUdeviceptr,
+        n: usize,
+        k: usize,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_gemv_experts_g32_bf16_perm")?;
+        let (mut p_t, mut p_b) = (self.moe_dev_tab, base as i32);
+        let (mut p_i, mut p_p, mut p_ns) = (self.moe_idx, self.moe_gslot, nslots as i32);
+        let (mut p_x, mut p_xs, mut p_sp, mut p_o, mut p_n, mut p_k) = (
+            x_dev,
+            xstride as i32,
+            sp as i32,
+            out_dev,
+            n as i32,
+            k as i32,
+        );
+        let mut args: [*mut std::ffi::c_void; 11] = [
+            (&mut p_t) as *mut _ as *mut _,
+            (&mut p_b) as *mut _ as *mut _,
+            (&mut p_i) as *mut _ as *mut _,
+            (&mut p_p) as *mut _ as *mut _,
             (&mut p_ns) as *mut _ as *mut _,
             (&mut p_x) as *mut _ as *mut _,
             (&mut p_xs) as *mut _ as *mut _,
@@ -2764,8 +2844,17 @@ impl W4a16Dec {
         }
         // (P11) idx/wt는 이미 디바이스에 있다(topk_t) — h2d 없음.
         let base = il * n_exp * 3;
-        self.gemv_experts_launch(base, ns, xn, h, tk, self.dexp_gate, n_ff, h)?;
-        self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.dexp_up, n_ff, h)?;
+        // [P11] 프리필(t>1)은 전문가-우선 정렬 + 그룹 GEMV — 같은 전문가의
+        // 슬롯을 연속 처리해 가중치 행을 L2 재사용(슬롯별 산술 동일 = 비트 동일).
+        let group = t > 1 && n_exp <= 1024;
+        if group {
+            self.moe_align_launch(ns)?;
+            self.gemv_experts_perm_launch(base, ns, xn, h, tk, self.dexp_gate, n_ff, h)?;
+            self.gemv_experts_perm_launch(base + 1, ns, xn, h, tk, self.dexp_up, n_ff, h)?;
+        } else {
+            self.gemv_experts_launch(base, ns, xn, h, tk, self.dexp_gate, n_ff, h)?;
+            self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.dexp_up, n_ff, h)?;
+        }
         self.ew_dev(self.dexp_gate, self.dexp_up, self.dexp_act, ns * n_ff)?;
         if llm170_diag::flag::ne0("LLM170_MOE_DBG") {
             let mut vb = vec![0u8; ns * n_ff * 4];
@@ -2783,7 +2872,20 @@ impl W4a16Dec {
                 .collect();
             eprintln!("[t-dbg] act nan-slots={bad:?} ns={ns}");
         }
-        self.gemv_experts_launch(base + 2, ns, self.dexp_act, n_ff, 1, self.dexp_dn, h, n_ff)?;
+        if group {
+            self.gemv_experts_perm_launch(
+                base + 2,
+                ns,
+                self.dexp_act,
+                n_ff,
+                1,
+                self.dexp_dn,
+                h,
+                n_ff,
+            )?;
+        } else {
+            self.gemv_experts_launch(base + 2, ns, self.dexp_act, n_ff, 1, self.dexp_dn, h, n_ff)?;
+        }
         self.moe_accum_dev(self.moe_wt, self.dexp_dn, self.dmo, tk, ns, h)?;
         self.moe_shared_t(il, xn, t)?;
         Ok(self.dmo)
