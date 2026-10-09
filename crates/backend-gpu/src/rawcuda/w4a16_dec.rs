@@ -26,6 +26,12 @@ pub const ATTN_F3S_TMAX: usize = 512;
 // 트래픽이 청크에 상각, MoE 전문가 재사용 ~4→16). mma GEMM(TC ON·t≥16)은
 // t 무제한, FFMA 폴백만 32 상한(chain_device_t 가드).
 pub const CHAIN_TMAX: usize = 512;
+/// [B1/B3 2026-10-10] mma GEMM 타일 미러(assets/gptq4.cu MMA_M/MMA_N —
+/// T1/T2, GRP_M/GRP_N — 그룹(MoE). 정적검사: gemm_mma_mirror 테스트).
+pub const GEMM_MMA_M: usize = 32;
+pub const GEMM_MMA_N: usize = 64;
+pub const GEMM_GRP_M: usize = 64;
+pub const GEMM_GRP_N: usize = 32;
 /// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
 /// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — A5-4: qs 스테이징 +
 /// V-타일(GDN_NSPLIT) + Stile 더블 버퍼 기준).
@@ -2039,8 +2045,8 @@ impl W4a16Dec {
             ];
             return self.cc.launch(
                 f,
-                t.div_ceil(32) as u32,
-                n.div_ceil(32) as u32,
+                t.div_ceil(GEMM_MMA_M) as u32,
+                n.div_ceil(GEMM_MMA_N) as u32,
                 256,
                 &mut args,
             );
@@ -2439,8 +2445,8 @@ impl W4a16Dec {
             ];
             return self.cc.launch(
                 f,
-                t.div_ceil(32) as u32,
-                n.div_ceil(32) as u32,
+                t.div_ceil(GEMM_MMA_M) as u32,
+                n.div_ceil(GEMM_MMA_N) as u32,
                 256,
                 &mut args,
             );
@@ -2875,7 +2881,7 @@ impl W4a16Dec {
         self.cc.launch(
             f,
             self.n_experts as u32,
-            n.div_ceil(32) as u32,
+            n.div_ceil(GEMM_GRP_N) as u32,
             256,
             &mut args,
         )
@@ -4803,8 +4809,8 @@ impl W4a16Dec {
             ];
             self.cc.launch(
                 fm,
-                t.div_ceil(32) as u32,
-                n.div_ceil(32) as u32,
+                t.div_ceil(GEMM_MMA_M) as u32,
+                n.div_ceil(GEMM_MMA_N) as u32,
                 256,
                 &mut a2,
             )?;
@@ -5021,8 +5027,8 @@ impl W4a16Dec {
             ];
             self.cc.launch(
                 fm,
-                t.div_ceil(32) as u32,
-                n.div_ceil(32) as u32,
+                t.div_ceil(GEMM_MMA_M) as u32,
+                n.div_ceil(GEMM_MMA_N) as u32,
                 256,
                 &mut a2,
             )?;
@@ -5350,7 +5356,10 @@ mod tests {
 /// (미러 불일치 = smem 오버런·버퍼 계약 위반이라 변경 시 사전 차단).
 #[cfg(test)]
 mod mirror_contract {
-    use super::{ATTN_F3S_TMAX, CHAIN_TMAX, GDN_CS, GDN_NGRP, GDN_NSPLIT, GDN_SCAN_SMEM, GEMV_TR};
+    use super::{
+        ATTN_F3S_TMAX, CHAIN_TMAX, GDN_CS, GDN_NGRP, GDN_NSPLIT, GDN_SCAN_SMEM, GEMM_GRP_M,
+        GEMM_GRP_N, GEMM_MMA_M, GEMM_MMA_N, GEMV_TR,
+    };
 
     /// `#define NAME 값` 파싱 — 값은 정수 리터럴만 다룬다(대상 목록 한정).
     fn define(src: &str, name: &str) -> u64 {
@@ -5374,6 +5383,32 @@ mod mirror_contract {
         let tmax = define(include_str!("assets/attn.cu"), "ATTN_TMAX") as usize;
         assert_eq!(tmax, ATTN_F3S_TMAX, "attn.cu ATTN_TMAX ↔ ATTN_F3S_TMAX");
         assert_eq!(tmax, CHAIN_TMAX, "attn.cu ATTN_TMAX ↔ CHAIN_TMAX");
+    }
+
+    #[test]
+    fn gemm_mma_mirror() {
+        // [B1/B3] gptq4.cu 타일 정의 ↔ 호스트 미러(런치 grid 오배치 방지).
+        let cu = include_str!("assets/gptq4.cu");
+        assert_eq!(
+            define(cu, "MMA_M") as usize,
+            GEMM_MMA_M,
+            "gptq4.cu MMA_M ↔ GEMM_MMA_M"
+        );
+        assert_eq!(
+            define(cu, "MMA_N") as usize,
+            GEMM_MMA_N,
+            "gptq4.cu MMA_N ↔ GEMM_MMA_N"
+        );
+        assert_eq!(
+            define(cu, "GRP_M") as usize,
+            GEMM_GRP_M,
+            "gptq4.cu GRP_M ↔ GEMM_GRP_M"
+        );
+        assert_eq!(
+            define(cu, "GRP_N") as usize,
+            GEMM_GRP_N,
+            "gptq4.cu GRP_N ↔ GEMM_GRP_N"
+        );
     }
 
     #[test]
