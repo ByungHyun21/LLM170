@@ -91,10 +91,17 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
     });
 }
 
-/// 배치: outs[t][o] = Σ_i xs[t][i]·W[o,i].
+/// 배치(소유 행) — 참조 변형으로 위임(호환 래퍼).
+pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
+    let refs: Vec<&[f32]> = xs.iter().map(|v| v.as_slice()).collect();
+    matmul_batch_ref(&refs, w, outs);
+}
+
+/// 배치(참조 행): outs[t][o] = Σ_i xs[t][i]·W[o,i].
 /// 행(o)별로 한 번 디양자화해 B 토큰과 내적 — prefill에서 디양자화 비용 상각.
 /// 스레드별 로컬 결과 [T][rows_per] → 조인 후 스캐터 (행 슬라이스 교차 차입 회피).
-pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
+/// [P12 E3] 참조 입력 — 호출부의 토큰 행 clone(프리필에서 층당 수십 MB) 제거.
+pub fn matmul_batch_ref(xs: &[&[f32]], w: &Weight, outs: &mut [Vec<f32>]) {
     profile_span!("cpu::matmulB");
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
