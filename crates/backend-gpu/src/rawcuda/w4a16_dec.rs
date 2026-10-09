@@ -19,12 +19,13 @@ use crate::rawcuda::ffi::{self, CUdeviceptr};
 use std::collections::HashMap;
 
 /// fwd3s T 상한(assets/attn.cu ATTN_TMAX와 동일 값).
-// 커널 ATTN_TMAX와 동기(2026-10-09: 8→32→128 — P10 프리필 청크 확대).
-pub const ATTN_F3S_TMAX: usize = 128;
+// 커널 ATTN_TMAX와 동기(2026-10-09: 8→32→128→512 — 프리필 청크 확대).
+pub const ATTN_F3S_TMAX: usize = 512;
 /// 프리필 배치 상한 — 체인 버퍼·GEMM t 계약(attn fwd3s와 동일 상한).
-// 프리필 청크 상한 — 2026-10-09: 8→32→128(P10 — 가중치 재사용 ↑). mma GEMM
-// (TC ON·t≥16)은 t 무제한, FFMA 폴백만 32 상한(chain_device_t 가드).
-pub const CHAIN_TMAX: usize = 128;
+// 프리필 청크 상한 — 2026-10-09: 8→32→128→512(가중치 재사용 ↑ — 밀집·전문가
+// 트래픽이 청크에 상각, MoE 전문가 재사용 ~4→16). mma GEMM(TC ON·t≥16)은
+// t 무제한, FFMA 폴백만 32 상한(chain_device_t 가드).
+pub const CHAIN_TMAX: usize = 512;
 /// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
 /// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — GDN_VSLICE=1 기준).
 pub const GDN_SCAN_SMEM: u32 = 61_828;

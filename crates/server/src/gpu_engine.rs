@@ -135,8 +135,8 @@ impl GpuEngine {
         } else {
             llm170_diag::flag::val("LLM170_PREFILL_T")
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(128) // [P10] 기본 128(32→128: 27B pp 1.5~1.6×)
-                .clamp(1, 128)
+                .unwrap_or(512) // 청크 확대(가중치 상각 — 128→512)
+                .clamp(1, 512)
         };
         let mut i = 0usize;
         while i < n {
