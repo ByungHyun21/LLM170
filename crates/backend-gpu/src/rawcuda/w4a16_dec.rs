@@ -2428,6 +2428,66 @@ impl W4a16Dec {
         self.shared_add_dev(self.drt, s3, self.dmo, h, t)
     }
 
+    /// 플레인 GEMM 자가 점검 — 배치 GEMM(t=8) vs 토큰별 GEMV 비트 비교
+    /// (판정 계약: 플레인 경로는 토큰 수준이나 같은 레인/환원 순서라 동일해야
+    /// 한다 — 다르면 t 처리 결함).
+    pub fn plain_gemm_selfcheck(&mut self) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        let (name, n, k) = self
+            .plains
+            .iter()
+            .find(|(nm, (_, n, _))| nm.contains("attn_qkv") && *n <= 8192)
+            .map(|(nm, &(_, n, k))| (nm.clone(), n, k))
+            .ok_or("plain_gemm_selfcheck: 플레인 qkv 가중 없음")?;
+        let t = 8usize;
+        let x: Vec<f32> = (0..t * k)
+            .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 2048.0 - 0.5)
+            .collect();
+        let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
+        let dx = self.cc.alloc(t * k * 4)?;
+        let da = self.cc.alloc(t * n * 4)?;
+        let db = self.cc.alloc(t * n * 4)?;
+        let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
+            self.cc.h2d(dx, xb)?;
+            // A: 배치 GEMM(v1, t=8)
+            self.plain_gemm_launch(&name, dx, da, t)?;
+            // B: 토큰별 GEMV(t=1) ×8 → 이어붙임
+            let mut bl = Vec::with_capacity(t * n);
+            for ti in 0..t {
+                self.plain_gemv_launch(&name, dx + (ti * k * 4) as u64, db)?;
+                self.cc.sync()?;
+                let mut vb = vec![0u8; n * 4];
+                self.cc.d2h(&mut vb, db)?;
+                bl.extend(vb.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)));
+            }
+            self.cc.sync()?;
+            let mut ob = vec![0u8; t * n * 4];
+            self.cc.d2h(&mut ob, da)?;
+            let a: Vec<f32> = ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            Ok((a, bl))
+        })();
+        let _ = self.cc.free(dx);
+        let _ = self.cc.free(da);
+        let _ = self.cc.free(db);
+        let (a, b) = r?;
+        let mism = a
+            .iter()
+            .zip(b.iter())
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        let nan_a = a.iter().filter(|v| v.is_nan()).count();
+        let nan_b = b.iter().filter(|v| v.is_nan()).count();
+        Ok(format!(
+            "plain-gemm-selfcheck {name}: n={n} k={k} t={t} — 불일치 {mism}/{} nan A={nan_a} B={nan_b}",
+            a.len()
+        ))
+    }
+
     /// MoE 자가 점검 — 직접 GEMV vs 배치(간접) GEMV 비트 비교(층0·전문가0·
     /// gate_proj). 상주 기기 브링업·회귀 판정용.
     pub fn moe_selfcheck(&mut self) -> Result<String, String> {
