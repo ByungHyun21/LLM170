@@ -459,7 +459,7 @@ impl W4a16Dec {
                     "src/rawcuda/assets/ew.fatbin",
                 ],
             )?,
-            &["ew", "ew_argmax"],
+            &["ew"],
         )?;
         Ok(W4a16Dec {
             cc,
