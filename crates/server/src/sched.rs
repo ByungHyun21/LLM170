@@ -1,9 +1,22 @@
 //! 슬롯 스케줄러 (engine.rs에서 순수 이동).
 //! 연속 배칭: 디코드 우선·잔여 예산 프리필 청크(llama.cpp 규칙 1:1).
+//! [B5 2026-10-09] 청크 가변화(예산−디코드)·라운드로빈·경합 long 캡.
 //! 슬롯 = 엔진 시퀀스 id. Engine 열거는 engine.rs(파사드) — 이 층은
 //! 배정(slot_loop·assign_slot)과 슬롯 상태만 담는다.
 use crate::engine::{Engine, InferResult};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// [B5 2026-10-09] 프리필 청크 정책 — llama.cpp "잔여 예산" 규칙의 명시화.
+/// 틱 예산에서 활성 디코드(슬롯당 1토큰)를 차감한 몫과 엔진 상한의 min.
+/// 경합(대기 프리필 복수)에서 긴 프롬프트는 청크를 절반으로 낮춰 라운드로빈
+/// 지연을 균등화하고, 청크 상한이 커져도(엔진 확대 전제) 예산이 상한을 지킨다.
+const PF_BUDGET_TOKENS: usize = 1024;
+/// 엔진 프리필 상한 미러(CHAIN_TMAX=512).
+const PF_CHUNK_MAX: usize = 512;
+/// 청크 최소.
+const PF_CHUNK_MIN: usize = 64;
+/// 이 길이 초과 프롬프트는 경합 시 절반 청크(라운드로빈 최대 대기 ↓).
+const PF_LONG_PROMPT: usize = 2048;
 
 /// 슬롯 스케줄러 (04) — llama.cpp 규칙 1:1: 디코드 우선, 잔여 예산만
 /// 프리필 청크. 슬롯 = 엔진 시퀀스 id. 요청 종료 → 슬롯 반환(reset_seq).
@@ -308,7 +321,21 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             if let Some(i) = pf {
                 let _pft = std::time::Instant::now();
                 llm170_diag::watchdog::bump();
-                let chunk = 512usize;
+                // [B5] 가변 청크 — 잔여 예산(디코드 차감) + 경합 시 long 캡.
+                let left = slots[i].job.as_ref().unwrap().tokens.len() - slots[i].prefilled;
+                let backlog = slots
+                    .iter()
+                    .filter(|s| {
+                        s.job.is_some() && s.prefilled < s.job.as_ref().unwrap().tokens.len()
+                    })
+                    .count();
+                let mut chunk = PF_BUDGET_TOKENS
+                    .saturating_sub(active.len())
+                    .clamp(PF_CHUNK_MIN, PF_CHUNK_MAX);
+                if backlog > 1 && left > PF_LONG_PROMPT {
+                    chunk = chunk.min(PF_CHUNK_MAX / 2);
+                }
+                let chunk = chunk.min(left);
                 // Q4(FN)는 prefill_greedy — 청크마다 어휘 152k
                 // 로짓 pageable D2H(슬로패스 수십 ms) 대신 GPU argmax 8B 회수.
                 // Q35(27B)는 종전 전사 경로(원시 프리필 내부 d2h).
@@ -331,6 +358,10 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     };
                     (end, r)
                 };
+                // [B5] 라운드로빈 — 방금 전진한 슬롯을 최신으로 갱신, 다음
+                // 청크는 더 오래 기다린(pending) 슬롯이 받는다. 종전엔 touch가
+                // 배정 시점에만 갱신돼 한 슬롯이 전량 프리필을 독점했다.
+                slots[i].touch = tick;
                 if npw {
                     eprintln!(
                         "[wall] prefill slot{i} {start}tok done @{}s",
