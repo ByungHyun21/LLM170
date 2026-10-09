@@ -260,6 +260,9 @@ pub struct W4a16Dec {
     /// 의존하지 않게 한다. Vec 버퍼 주소는 불변이므로 moe_tab이 이 안을
     /// 가리켜도 안전(용량 추가 변경 금지 — 구축 후 불변).
     host_stage: Vec<u8>,
+    /// [P7-fix 2026-10-10] host_stage 선두에서 cuMemHostRegister에 성공한
+    /// 바이트 수(0 = 미등록). 등록 구간 소스는 h2d DMA가 직행한다.
+    host_stage_reg: usize,
     /// 라우터 로짓/ shared 게이트 스크래치(n_experts ≥ 1).
     drt: CUdeviceptr,
     drt_cap: usize,
@@ -536,6 +539,7 @@ impl W4a16Dec {
             dstg_s: 0,
             dstg_cap: (0, 0),
             host_stage: Vec::new(),
+            host_stage_reg: 0,
             drt: 0,
             drt_cap: 0,
             dmo: 0,
@@ -1979,6 +1983,9 @@ impl W4a16Dec {
 
     /// 활성 f32 → x32(h2f 왕복) 캐스트 1회 — 같은 xn을 쓰는 GEMV들이 공유한다
     /// (q/k/v·gate/up: 종전 gemv마다 캐스트 = 런치 2배). 반환은 self.dx32.
+    /// [A3 판정 2026-10-10] GEMV 로드에 h2f를 인라인해 이 노드를 없애는 안은
+    /// 기각 — 디코드 GEMV +1op/가중치(+15%, ~+2.4ms/토큰) > 런치 절감
+    /// (단일 소비자 2회/층 ~0.4ms).
     fn cast_x32(&mut self, x_dev: CUdeviceptr, k: usize) -> Result<CUdeviceptr, String> {
         if k > self.dx32_cap {
             // [P10] 재할당 전 무효화+동기 — 프리필 cast_x32(t×k) 성장이
@@ -2279,6 +2286,15 @@ impl W4a16Dec {
     /// 전문가 슬라이스 테이블 등록 — (packed ptr/len, scale ptr/len) × (il,e,proj).
     /// 포인터는 서버 스토어 mmap 슬라이스 — 서버가 모델을 함께 보유하는 수명 계약.
     pub fn set_expert_table(&mut self, mut tab: Vec<(u64, u64, u64, u64)>) {
+        // [P7-fix] 기존 스테이징이 등록돼 있으면 해제(버퍼 해제 전 필수).
+        if self.host_stage_reg > 0 {
+            // SAFETY: 등록 성공 상태(host_stage_reg>0)의 host_stage 선두 주소다.
+            let _ = unsafe {
+                self.cc
+                    .host_unregister(self.host_stage.as_ptr() as *mut std::ffi::c_void)
+            };
+            self.host_stage_reg = 0;
+        }
         // [C2 2026-10-09] 호스트 RAM 스테이징(사용자 결정) — 스트리밍 셋을
         // 로드 시 1회 호스트 RAM으로 복사한다(SSD mmap·페이지캐시 경로 의존
         // 제거). 탈출구 LLM170_MOE_HOST_STAGE=0, 할당 실패 시 mmap 유지.
@@ -2311,6 +2327,47 @@ impl W4a16Dec {
                     total as f64 / (1u64 << 30) as f64
                 );
                 self.host_stage = buf;
+                // [P7-fix 2026-10-10] 핀드 DMA — 등록 가능한 선두 구간만
+                // cuMemHostRegister(RLIMIT_MEMLOCK 한도). 등록 구간 소스 복사는
+                // DMA 직행(실측 13.8GB/s), 나머지는 드라이버 스테이징 유지.
+                // 예산 LLM170_MOE_PIN_MB(0=끔, 기본 4096).
+                let budget_mb = llm170_diag::flag::val("LLM170_MOE_PIN_MB")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(4096);
+                let budget = budget_mb << 20;
+                if budget > 0 && !self.host_stage.is_empty() {
+                    // memlock 한도가 작은 환경 대비 1/4씩 축소 재시도(하한 4MiB).
+                    let mut bytes = self.host_stage.len().min(budget);
+                    loop {
+                        // SAFETY: host_stage는 구축 후 불변 Vec(boxed slice)라
+                        // 해제 전까지 포인터 수명이 유지된다(해제는 상단 unregister).
+                        match unsafe {
+                            self.cc.host_register(
+                                self.host_stage.as_ptr() as *mut std::ffi::c_void,
+                                bytes,
+                            )
+                        } {
+                            Ok(()) => {
+                                self.host_stage_reg = bytes;
+                                eprintln!(
+                                    "# moe: 스테이징 핀드 등록 {:.2}/{}GiB — 구간 DMA 직행(P7-fix)",
+                                    bytes as f64 / (1u64 << 30) as f64,
+                                    self.host_stage.len() >> 30
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                if bytes <= (4 << 20) {
+                                    eprintln!(
+                                        "# moe: 핀드 등록 실패({e}) — 드라이버 스테이징 유지(P7-fix)"
+                                    );
+                                    break;
+                                }
+                                bytes = (bytes / 4).max(4 << 20);
+                            }
+                        }
+                    }
+                }
             } else {
                 eprintln!("# moe: 호스트 스테이징 {total}B 할당 실패 — mmap 스트리밍 유지");
             }
@@ -2437,6 +2494,8 @@ impl W4a16Dec {
 
     /// [A9 2026-10-10] 배치 t행 GEMV(split g128) — 가중 판독 1회를 t행 공유,
     /// 행별 산술은 GEMV와 비트동일. x는 cast_x32 산출 f32.
+    /// [T3 실측 2026-10-10] T1 mma t<16 강제 배치 시험은 열세(27B 13.2 vs
+    /// 본 커널 21.1 tok/s/사용자 — mma 스테이징 실효 판독 < 380GB/s; gptq4.cu T1).
     fn gemv_t_launch(
         &mut self,
         name: &str,

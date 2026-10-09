@@ -306,6 +306,38 @@ impl CudaCtx {
         Ok(())
     }
 
+    /// 기존 호스트 버퍼 pin(핀드 DMA 소스, P7-fix) — flags=0.
+    /// 실패(주로 RLIMIT_MEMLOCK 초과)는 호출부가 폴백 판단.
+    ///
+    /// # Safety
+    /// `p`는 `bytes` 범위가 유효한 호스트 포인터여야 하고, 해제 전에
+    /// [`Self::host_unregister`]로 등록을 풀어야 한다.
+    pub unsafe fn host_register(
+        &self,
+        p: *mut std::ffi::c_void,
+        bytes: usize,
+    ) -> Result<(), String> {
+        // SAFETY: 호출자가 p/bytes 유효성을 보증한다(위 Safety 계약).
+        let r = unsafe { (self.drv.host_register)(p, bytes, 0) };
+        if r != CUDA_SUCCESS {
+            return Err(ffi::err_text(r));
+        }
+        Ok(())
+    }
+
+    /// pin 해제 — 등록 포인터 해제 **전** 호출.
+    ///
+    /// # Safety
+    /// `p`는 [`Self::host_register`]에 성공한 포인터여야 한다.
+    pub unsafe fn host_unregister(&self, p: *mut std::ffi::c_void) -> Result<(), String> {
+        // SAFETY: 호출자가 host_register 성공 포인터임을 보증한다.
+        let r = unsafe { (self.drv.host_unregister)(p) };
+        if r != CUDA_SUCCESS {
+            return Err(ffi::err_text(r));
+        }
+        Ok(())
+    }
+
     /// 디바이스 영역 0 채움(비동기 — 기본 스트림 순서 계약).
     /// [2026-10-09 H] 종전 zero_dev의 동기 h2d 4MiB 청크 루프 대체 —
     /// cuMemsetD8Async 1콜(스트림 순서라 후속 커널·판독과 정합).
