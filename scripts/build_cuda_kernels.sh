@@ -5,6 +5,10 @@
 # -fmad=false는 아텐션/GDN/EW/GPTQ4/HEAD 한정 계약(FMA 수축 제거 — core
 # 미러와의 비트동일, 각 .cu 헤더 [빌드 계약]). norm/smoke는 기본 fmad.
 # .cu가 진실이며 fatbin은 nvcc 출력으로만 갱신한다(손편집 금지).
+# [경고 2026-10-10] 이 스크립트의 출력을 grep 등으로 가리지 마라 — nvcc
+# 문법 오류(launch_bounds 배치 실측)가 실패로 전파되지 않고 **스테일
+# fatbin**이 남아 측정·골든이 오염된다(set -e는 여기서만 보장). .cu 변경
+# 후에는 원출력 확인 + 골든 재판정이 필수.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # A1: 클린 환경에서 mktemp 접두 디렉터리 부재로 즉시 실패하던 결함.
