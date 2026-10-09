@@ -641,8 +641,8 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             } else {
                 llm170_diag::flag::val("LLM170_PREFILL_T")
                     .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(128) // [P10] 기본 128
-                    .clamp(1, 128)
+                    .unwrap_or(512) // 청크 확대
+                    .clamp(1, 512)
             };
             let t = (prompt.len() - i).min(cap);
             let mut rows: Vec<f32> = Vec::with_capacity(t * h);
