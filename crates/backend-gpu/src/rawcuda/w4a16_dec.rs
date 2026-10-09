@@ -3073,7 +3073,7 @@ impl W4a16Dec {
         }
         let ns = t * tk;
         // 2) 전문가 배치.
-        if llm170_diag::flag::ne0("LLM170_MOE_DBG") {
+        if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
             // xn(정규화 출력) 행별 NaN — 업스트림 vs 전문가 GEMV 판별.
             let mut vb = vec![0u8; t * h * 4];
             self.cc.d2h_async(vb.as_mut_ptr(), xn, t * h * 4)?;
@@ -3104,7 +3104,7 @@ impl W4a16Dec {
             self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.dexp_up, n_ff, h)?;
         }
         self.ew_dev(self.dexp_gate, self.dexp_up, self.dexp_act, ns * n_ff)?;
-        if llm170_diag::flag::ne0("LLM170_MOE_DBG") {
+        if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
             let mut vb = vec![0u8; ns * n_ff * 4];
             self.cc
                 .d2h_async(vb.as_mut_ptr(), self.dexp_act, ns * n_ff * 4)?;
