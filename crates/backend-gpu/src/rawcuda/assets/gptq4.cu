@@ -933,6 +933,96 @@ extern "C" __global__ void w4a16_moe_topk(const float* __restrict__ lg,
     }
 }
 
+// [P11] 프리필용 배치 라우터 top-k — 워프당 1토큰(t 토큰 동시). 종전엔
+// 층·청크마다 d2h(32KB)+sync+호스트 전체 정렬(512×32)로 프리필의 ~10%.
+// 시맨틱은 호스트 moe_topk 미러: softmax(전문가 전체) → k라운드 선택
+// (p 내림차순, 동률 낮은 idx) → 재정규화. 플레인 경로 — 토큰 골든 판정.
+// 워프 환원 순서는 호스트와 다르다(계약 완화 승인 — 허용오차/토큰 판정).
+#define MOE_TK_WARPS 8
+
+extern "C" __global__ void w4a16_moe_topk_t(
+    const float* __restrict__ lg,   // [t][n_exp]
+    unsigned* __restrict__ idx,     // [t][k]
+    float* __restrict__ wt,         // [t][k]
+    int t, int n, int k)
+{
+    const int w = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int ti = blockIdx.x * MOE_TK_WARPS + w;
+    if (ti >= t || n > 1024) {
+        return;
+    }
+    const float* l = lg + (size_t)ti * n;
+    // softmax(최대 빼기) — 워프 환원.
+    float mx = -INFINITY;
+    for (int i = lane; i < n; i += 32) {
+        mx = fmaxf(mx, l[i]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+    }
+    // p를 레지스터에 보관(라운드마다 재계산 금지) — 레인당 n/32 ≤ 32개.
+    float pv[32];
+    unsigned pidx[32];
+    int cnt = 0;
+    float sum = 0.0f;
+    for (int i = lane; i < n; i += 32) {
+        pv[cnt] = expf(l[i] - mx);
+        pidx[cnt] = (unsigned)i;
+        sum += pv[cnt];
+        ++cnt;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    }
+    unsigned used = 0u;
+    float wsum = 0.0f;
+    for (int r = 0; r < k; ++r) {
+        float bv = -INFINITY;
+        unsigned bi = 0xffffffffu;
+        for (int j = 0; j < cnt; ++j) {
+            if (used & (1u << j)) {
+                continue;
+            }
+            if (pv[j] > bv || (pv[j] == bv && pidx[j] < bi)) {
+                bv = pv[j];
+                bi = pidx[j];
+            }
+        }
+        // 워프 환원 — (v, i) 쌍, 동률 낮은 idx.
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+            const unsigned oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        // 승자 마킹(승자를 소유한 레인이 표시).
+        for (int j = 0; j < cnt; ++j) {
+            if (pidx[j] == bi) {
+                used |= (1u << j);
+            }
+        }
+        if (lane == 0) {
+            idx[(size_t)ti * k + r] = bi;
+            wt[(size_t)ti * k + r] = bv; // 원시 p — 재정규화에서 나눈다.
+        }
+        wsum += bv;
+    }
+    // 재정규화 — 호스트 moe_topk의 (p/sum)/(Σtop-k p/sum) = raw/Σraw와 동일
+    // (sum이 분자·분모에서 상쇄). 여기서 sum을 또 나누면 가중치가 1/sum배 작아진다.
+    // [레이스 수정] 위 루프의 기록(레인 0)과 아래 판독(전 레인) 사이에
+    // __syncwarp 필요 — 없으면 실행마다 토큰이 달라진다(실측).
+    __syncwarp();
+    for (int r = lane; r < k; r += 32) {
+        wt[(size_t)ti * k + r] = wt[(size_t)ti * k + r] / wsum;
+    }
+}
+
 // shared 게이트 가산 — y[i] += sigmoid(sg[0])·x[i] (sigmoid = 1/(1+e^-v)).
 extern "C" __global__ void w4a16_shared_add(const float* __restrict__ sg,
                                             const float* __restrict__ x,
