@@ -252,3 +252,21 @@ pub fn greedy_from(logits: &[f32]) -> u32 {
     }
     best as u32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::greedy_from;
+
+    /// greedy 아그맥스 계약(2026-10-09): 엄격 비교 → 동률은 최저 인덱스,
+    /// NaN은 순위 제외(비교 false), 전부 NaN이면 0 — 실수 경로는 finiteness
+    /// 필터가 선행한다는 전제(서버 GPU argmax도 같은 의미론을 미러).
+    #[test]
+    fn greedy_first_max_nan_contract() {
+        assert_eq!(greedy_from(&[1.0, 3.0, 2.0]), 1);
+        assert_eq!(greedy_from(&[3.0, 3.0, 1.0]), 0);
+        assert_eq!(greedy_from(&[1.0, 3.0, 3.0]), 1);
+        assert_eq!(greedy_from(&[f32::NAN, 2.0, 1.0]), 1);
+        assert_eq!(greedy_from(&[f32::NEG_INFINITY, 0.0, f32::NAN]), 1);
+        assert_eq!(greedy_from(&[f32::NAN, f32::NAN]), 0);
+    }
+}

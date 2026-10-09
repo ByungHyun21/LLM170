@@ -864,4 +864,38 @@ mod tests {
         )];
         assert!(perm_align_check(&cfg, &bad2).is_err());
     }
+
+    /// V헤드 순열 계약(2026-10-09): 전단사 + 그룹→서브헤드 인터리브.
+    /// 27B(16→48)·35B(16→32)·기타 ratio 실형상과 ratio=1 항등을 고정한다.
+    #[test]
+    fn vperm_bijection_and_interleave() {
+        let mk = |nk: usize, nv: usize| {
+            let mut c = cfg_fixture();
+            c.linear_num_key_heads = nk;
+            c.linear_num_value_heads = nv;
+            c
+        };
+        for (nk, nv) in [(16usize, 48usize), (16, 32), (8, 16), (16, 16)] {
+            let c = mk(nk, nv);
+            let mut img: Vec<usize> = (0..nv).map(|i| vperm(&c, i)).collect();
+            img.sort_unstable();
+            assert_eq!(img, (0..nv).collect::<Vec<_>>(), "nk={nk} nv={nv}");
+        }
+        // ratio=1(헤드 수 동일)이면 항등 — 순열 무의미.
+        let c1 = mk(16, 16);
+        assert!((0..16).all(|i| vperm(&c1, i) == i));
+        // 27B: 그룹 메이저 0·16·32(모두 k%nk=0) → 서브헤드 메이저 0·1·2.
+        let c27 = mk(16, 48);
+        assert_eq!(
+            (vperm(&c27, 0), vperm(&c27, 16), vperm(&c27, 32)),
+            (0, 1, 2)
+        );
+        // permute_heads_f32 = vperm 라벨 순열(로더가 쓰는 실제 경로).
+        let v: Vec<f32> = (0..48).map(|i| i as f32).collect();
+        let out = permute_heads_f32(&c27, &v);
+        assert_eq!(out.len(), 48);
+        for i in 0..48 {
+            assert_eq!(out[i], vperm(&c27, i) as f32);
+        }
+    }
 }
