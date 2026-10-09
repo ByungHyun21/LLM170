@@ -124,10 +124,9 @@ impl GpuEngine {
         let tmax = if self.dec.is_moe() && !self.dec.moe_experts_resident() {
             1
         } else {
-            let def = if self.dec.is_moe() { 32 } else { 8 };
             llm170_diag::flag::val("LLM170_PREFILL_T")
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(def)
+                .unwrap_or(32)
                 .clamp(1, 32)
         };
         let mut i = 0usize;

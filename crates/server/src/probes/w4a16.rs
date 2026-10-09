@@ -508,10 +508,8 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             // [2026-10-09] MoE 상주는 32(gdn_exp_d 도메인 수정 후), 스트리밍은 1.
             let cap = if hp.n_experts > 0 && !dec.moe_experts_resident() {
                 1
-            } else if hp.n_experts > 0 {
-                32
             } else {
-                8
+                32
             };
             let t = (prompt.len() - i).min(cap);
             let mut rows: Vec<f32> = Vec::with_capacity(t * h);
