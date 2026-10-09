@@ -19,9 +19,12 @@ use crate::rawcuda::ffi::{self, CUdeviceptr};
 use std::collections::HashMap;
 
 /// fwd3s T 상한(assets/attn.cu ATTN_TMAX와 동일 값).
-pub const ATTN_F3S_TMAX: usize = 8;
+pub // 커널 ATTN_TMAX와 동기(2026-10-09: 8→32 — 프리필 청크 확대).
+const ATTN_F3S_TMAX: usize = 32;
 /// 프리필 배치 상한 — 체인 버퍼·GEMM t 계약(attn fwd3s와 동일 상한).
-pub const CHAIN_TMAX: usize = 8;
+// 프리필 청크 상한 — 2026-10-09: 8→32(가중치 재사용 ↑). 플레인(MoE) 경로는
+// 배치 GEMM v2가 전 t를 커버, dense(split GEMM) 경로는 여전히 t≤8(체인 가드).
+pub const CHAIN_TMAX: usize = 32;
 /// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
 /// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — GDN_VSLICE=1 기준).
 pub const GDN_SCAN_SMEM: u32 = 61_828;
@@ -348,6 +351,7 @@ impl W4a16Dec {
                 "w4a16_moe_accum",
                 "w4a16_gemv_bf16",
                 "w4a16_gemm_bf16",
+                "w4a16_gemm_bf16_t",
             ],
         )?;
         cc.load_fatbin(
@@ -1852,7 +1856,13 @@ impl W4a16Dec {
         t: usize,
     ) -> Result<(), String> {
         let (w, n, k) = self.plain_spec(name)?;
-        let f = self.cc.function("w4a16_gemm_bf16")?;
+        // t>8은 v3(8행/블록 + 행별 smem + k청크) — v1은 t≤8 전용.
+        let v3 = t > 8;
+        let f = self.cc.function(if v3 {
+            "w4a16_gemm_bf16_t"
+        } else {
+            "w4a16_gemm_bf16"
+        })?;
         let (mut p_w, mut p_x, mut p_o) = (w, x_dev, y_out);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
         let mut args: [*mut std::ffi::c_void; 6] = [
@@ -1863,7 +1873,11 @@ impl W4a16Dec {
             (&mut p_k) as *mut _ as *mut _,
             (&mut p_t) as *mut _ as *mut _,
         ];
-        self.cc.launch(f, n as u32, 1, 64, &mut args)
+        if v3 {
+            self.cc.launch(f, n.div_ceil(8) as u32, 1, 512, &mut args)
+        } else {
+            self.cc.launch(f, n as u32, 1, 64, &mut args)
+        }
     }
 
     /// 플레인 GEMV → 스테이징 dst 직접 쓰기 + 폭 검사.
@@ -2340,6 +2354,22 @@ impl W4a16Dec {
         }
         // 2) 전문가 배치.
         let ns = sel.len();
+        if llm170_diag::flag::ne0("LLM170_MOE_DBG") {
+            // xn(정규화 출력) 행별 NaN — 업스트림 vs 전문가 GEMV 판별.
+            let mut vb = vec![0u8; t * h * 4];
+            self.cc.d2h_async(vb.as_mut_ptr(), xn, t * h * 4)?;
+            self.cc.sync()?;
+            let v: Vec<f32> = vb
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            let rows: Vec<usize> = (0..t)
+                .filter(|&r| v[r * h..(r + 1) * h].iter().any(|x| x.is_nan()))
+                .collect();
+            eprintln!("[t-dbg] xn nan-rows={rows:?} t={t}");
+        }
         let idx: Vec<u32> = sel.iter().map(|&(e, _)| e as u32).collect();
         let wts: Vec<f32> = sel.iter().map(|&(_, w)| w).collect();
         // SAFETY: 호스트 Vec 슬라이스 — 호출 내 수명(동기 복사 완료).
@@ -2351,6 +2381,26 @@ impl W4a16Dec {
         self.gemv_experts_launch(base, ns, xn, h, tk, self.dexp_gate, n_ff, h)?;
         self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.dexp_up, n_ff, h)?;
         self.ew_dev(self.dexp_gate, self.dexp_up, self.dexp_act, ns * n_ff)?;
+        if llm170_diag::flag::ne0("LLM170_MOE_DBG") {
+            let mut vb = vec![0u8; ns * n_ff * 4];
+            self.cc
+                .d2h_async(vb.as_mut_ptr(), self.dexp_act, ns * n_ff * 4)?;
+            self.cc.sync()?;
+            let v: Vec<f32> = vb
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            let bad: Vec<usize> = (0..ns)
+                .filter(|&s| v[s * n_ff..(s + 1) * n_ff].iter().any(|x| x.is_nan()))
+                .collect();
+            eprintln!(
+                "[t-dbg] act nan-slots={bad:?} idx={:?} w={:?}",
+                &idx[..ns.min(16)],
+                &wts[..ns.min(4)]
+            );
+        }
         self.gemv_experts_launch(base + 2, ns, self.dexp_act, n_ff, 1, self.dexp_dn, h, n_ff)?;
         self.moe_accum_dev(self.moe_wt, self.dexp_dn, self.dmo, tk, ns, h)?;
         self.moe_shared_t(il, xn, t)?;
@@ -2878,8 +2928,12 @@ impl W4a16Dec {
         let (w2, h) = (self.stg_w2, self.hidden);
         let mut ab = self.dab_dev;
         let mut gi = 0usize;
-        // 플레인(MoE) 모드 — bf16 GEMM(x 원시 f32), FFN은 MoE 배치(t≤8).
+        // 플레인(MoE) 모드 — bf16 GEMM(x 원시 f32), FFN은 MoE 배치.
         let plain = self.plain_weights;
+        // dense(split GEMM) 경로는 t≤8 계약 — 초과는 조용한 무기록 대신 거부.
+        if !plain && t > 8 {
+            return Err(format!("chain_device_t: dense 경로 t={t} > 8(가드)"));
+        }
         for il in 0..self.n_layers {
             let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };
             let xn = self

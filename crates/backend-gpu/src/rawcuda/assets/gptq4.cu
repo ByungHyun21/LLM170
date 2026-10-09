@@ -415,6 +415,72 @@ extern "C" __global__ void w4a16_gemm_bf16(
     }
 }
 
+// 플레인 bf16 GEMM v3(t≤32) — **8행/블록(512스레드) + 행별 smem 가중치 + k청크**.
+// [v2(1행/블록)는 x를 행마다 재판독해 L2 트래픽이 n×t×k×4(실측 8GB/층) —
+// v3는 8그룹이 같은 x를 L1 공유(÷8)하고 가중치도 청크 단위 smem 재사용.]
+// 산술 순서는 v1/v2와 동일(레인 l = i=l,l+64,… f32 누산 → tree64 — 토큰 독립).
+#define G4_TMAX2 32
+#define G4_ROWS_B 8
+#define G4_KC_B 128
+extern "C" __global__ void w4a16_gemm_bf16_t(
+    const unsigned short* __restrict__ w,  // [n][k] bf16
+    const float* __restrict__ x,           // [t][k] f32
+    float* __restrict__ out,               // [t][n]
+    int n, int k, int t)
+{
+    const int g = threadIdx.x >> 6;
+    const int l = threadIdx.x & (G4_LANES - 1);
+    const int o = blockIdx.x * G4_ROWS_B + g;
+    const bool live = o < n;
+    __shared__ double red[G4_ROWS_B][G4_LANES];
+    __shared__ unsigned short ws[G4_ROWS_B][G4_KC_B];
+    float acc[G4_TMAX2];
+#pragma unroll
+    for (int u = 0; u < G4_TMAX2; ++u) {
+        acc[u] = 0.0f;
+    }
+    for (int base = 0; base < k; base += G4_KC_B) {
+        const int nch = min(G4_KC_B, k - base);
+        for (int idx = threadIdx.x; idx < G4_ROWS_B * G4_KC_B; idx += blockDim.x) {
+            const int r = idx / G4_KC_B;
+            const int i = idx - r * G4_KC_B;
+            const int ro = blockIdx.x * G4_ROWS_B + r;
+            ws[r][i] = (ro < n && i < nch) ? w[(size_t)ro * k + base + i] : (unsigned short)0;
+        }
+        __syncthreads();
+        const unsigned short* wsrow = ws[g];
+        const float* xp = x + base + l;
+        for (int i = l; i < nch; i += G4_LANES, xp += G4_LANES) {
+            const float wv = live ? b2f(wsrow[i]) : 0.0f;
+#pragma unroll
+            for (int u = 0; u < G4_TMAX2; ++u) {
+                if (u < t) {
+                    acc[u] += wv * xp[(size_t)u * k];
+                }
+            }
+        }
+        __syncthreads(); // 다음 청크 스테이징 전 소비 완료
+    }
+    for (int u = 0; u < t; ++u) {
+        red[g][l] = (double)acc[u];
+        __syncthreads();
+        if (live && l < 32) {
+            double r = red[g][l] + red[g][l + 32];
+#pragma unroll
+            for (int off = 16; off >= 1; off >>= 1) {
+                const double oth = shfl_down_f64(r, off);
+                if (l < off) {
+                    r += oth;
+                }
+            }
+            if (l == 0) {
+                out[(size_t)u * n + o] = (float)r;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // 가중 누적 — y[i] += w·x[i] (mul·add 분리 — CPU MoE 스테이지와 동일 산식).
 extern "C" __global__ void w4a16_axpy(float w, const float* __restrict__ x,
                                       float* __restrict__ y, int n) {
