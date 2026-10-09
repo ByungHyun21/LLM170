@@ -285,6 +285,11 @@ pub struct W4a16Dec {
     dknw_a: CUdeviceptr,
     dkc: CUdeviceptr,
     dvc: CUdeviceptr,
+    /// [P13] int8 KV 스케일(K/V 각각 [n_attn*cap][kv_heads] f32) — KVQ 전용.
+    dksc: CUdeviceptr,
+    dvsc: CUdeviceptr,
+    /// [P13] KV 양자화(int8) — set_attn에서 env(LLM170_KVQ)로 확정.
+    kvq: bool,
     dpp: CUdeviceptr,
     dqg_a: CUdeviceptr,
     dkin_a: CUdeviceptr,
@@ -417,6 +422,8 @@ impl W4a16Dec {
                 "attn_prep_hostpos",
                 "attn_fwd3s",
                 "attn_fwd3s_part",
+                "attn_fwd3s_part_q",
+                "attn_prep_q",
                 "attn_fwd3s_merge",
                 "attn_pos_bump",
             ],
@@ -520,6 +527,9 @@ impl W4a16Dec {
             dknw_a: 0,
             dkc: 0,
             dvc: 0,
+            dksc: 0,
+            dvsc: 0,
+            kvq: false,
             dpp: 0,
             dqg_a: 0,
             dkin_a: 0,
@@ -1206,11 +1216,17 @@ impl W4a16Dec {
         }
         let slots = self.n_slots;
         let kv_elems = slots * n * dims.cap * dims.kv_dim();
+        // [P13] KV 양자화 — 옵트인(LLM170_KVQ). int8 4× 절감, 스케일은
+        // 행×헤드 f32 1개(무시 가능). 미설정 = 종전 f32 경로 그대로.
+        let kvq = llm170_diag::flag::on_nonzero("LLM170_KVQ");
+        let kv_scales = slots * n * dims.cap * dims.kv_heads;
         for q in [
             self.dqnw_a,
             self.dknw_a,
             self.dkc,
             self.dvc,
+            self.dksc,
+            self.dvsc,
             self.dpp,
             self.dqg_a,
             self.dkin_a,
@@ -1223,6 +1239,8 @@ impl W4a16Dec {
             }
         }
         (self.dqnw_a, self.dknw_a, self.dkc, self.dvc, self.dpp) = (0, 0, 0, 0, 0);
+        (self.dksc, self.dvsc) = (0, 0);
+        self.kvq = kvq;
         (
             self.dqg_a,
             self.dkin_a,
@@ -1237,10 +1255,27 @@ impl W4a16Dec {
         Self::h2d_chunked(&self.cc, dq, b(qnw))?;
         let dk = self.cc.alloc(knw.len() * 4)?;
         Self::h2d_chunked(&self.cc, dk, b(knw))?;
-        let dkc = self.cc.alloc(kv_elems * 4)?;
-        Self::zero_dev(&self.cc, dkc, kv_elems * 4)?;
-        let dvc = self.cc.alloc(kv_elems * 4)?;
-        Self::zero_dev(&self.cc, dvc, kv_elems * 4)?;
+        let (dkc, dvc) = if kvq {
+            // [P13] int8 KV + 스케일 2벌. 기록은 attn_prep_q, 판독은
+            // attn_fwd3s_part_q(병합은 f32 part 그대로).
+            let kc = self.cc.alloc(kv_elems)?;
+            Self::zero_dev(&self.cc, kc, kv_elems)?;
+            let vc = self.cc.alloc(kv_elems)?;
+            Self::zero_dev(&self.cc, vc, kv_elems)?;
+            let ks = self.cc.alloc(kv_scales * 4)?;
+            Self::zero_dev(&self.cc, ks, kv_scales * 4)?;
+            let vs = self.cc.alloc(kv_scales * 4)?;
+            Self::zero_dev(&self.cc, vs, kv_scales * 4)?;
+            self.dksc = ks;
+            self.dvsc = vs;
+            (kc, vc)
+        } else {
+            let kc = self.cc.alloc(kv_elems * 4)?;
+            Self::zero_dev(&self.cc, kc, kv_elems * 4)?;
+            let vc = self.cc.alloc(kv_elems * 4)?;
+            Self::zero_dev(&self.cc, vc, kv_elems * 4)?;
+            (kc, vc)
+        };
         let dpp = self.cc.alloc(slots * 4)?;
         Self::zero_dev(&self.cc, dpp, slots * 4)?;
         self.dqnw_a = dq;
@@ -1301,24 +1336,97 @@ impl W4a16Dec {
     }
 
     fn attn_kv_ptr(&self, slot: usize) -> CUdeviceptr {
+        let b = if self.kvq { 1 } else { 4 }; // [P13] int8=1바이트
         match self.attn {
-            Some(dm) => self.dkc + (dm.kv_slot_elems(slot) as u64) * 4,
+            Some(dm) => self.dkc + (dm.kv_slot_elems(slot) as u64) * b,
             None => self.dkc,
         }
     }
 
     fn attn_vc_ptr(&self, slot: usize) -> CUdeviceptr {
+        let b = if self.kvq { 1 } else { 4 };
         match self.attn {
-            Some(dm) => self.dvc + (dm.kv_slot_elems(slot) as u64) * 4,
+            Some(dm) => self.dvc + (dm.kv_slot_elems(slot) as u64) * b,
             None => self.dvc,
+        }
+    }
+
+    /// [P13] KV 스케일 포인터(슬롯 기저) — KVQ 전용(f32).
+    fn attn_ksc_ptr(&self, slot: usize) -> CUdeviceptr {
+        match self.attn {
+            Some(dm) => self.dksc + (slot * dm.n_attn * dm.cap * dm.kv_heads) as u64 * 4,
+            None => self.dksc,
+        }
+    }
+
+    fn attn_vsc_ptr(&self, slot: usize) -> CUdeviceptr {
+        match self.attn {
+            Some(dm) => self.dvsc + (slot * dm.n_attn * dm.cap * dm.kv_heads) as u64 * 4,
+            None => self.dvsc,
         }
     }
 
     fn attn_prep_launch(&mut self, slot: usize, layer: usize, t_len: usize) -> Result<(), String> {
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        let (mut tl, mut lay) = (t_len as i32, layer as i32);
+        if self.kvq {
+            // [P13] int8 기록 — ksc/vsc 추가 인자.
+            let f = self.cc.function("attn_prep_q")?;
+            let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
+            #[allow(clippy::type_complexity)]
+            let (
+                mut a0,
+                mut a1,
+                mut a2,
+                mut a3,
+                mut a4,
+                mut a5,
+                mut a6,
+                mut a7,
+                mut a8,
+                mut a9,
+                mut aa,
+            ) = (
+                self.dqg_a,
+                self.dkin_a,
+                self.dvin_a,
+                self.dqnw_a,
+                self.dknw_a,
+                self.dqh_a,
+                self.attn_kv_ptr(slot),
+                self.attn_vc_ptr(slot),
+                self.attn_ksc_ptr(slot),
+                self.attn_vsc_ptr(slot),
+                self.attn_pp_ptr(slot),
+            );
+            let mut args: [*mut std::ffi::c_void; 16] = [
+                (&mut a0) as *mut _ as *mut _,
+                (&mut a1) as *mut _ as *mut _,
+                (&mut a2) as *mut _ as *mut _,
+                (&mut a3) as *mut _ as *mut _,
+                (&mut a4) as *mut _ as *mut _,
+                (&mut a5) as *mut _ as *mut _,
+                (&mut a6) as *mut _ as *mut _,
+                (&mut a7) as *mut _ as *mut _,
+                (&mut a8) as *mut _ as *mut _,
+                (&mut a9) as *mut _ as *mut _,
+                (&mut aa) as *mut _ as *mut _,
+                (&mut tl) as *mut _ as *mut _,
+                (&mut lay) as *mut _ as *mut _,
+                (&mut qh) as *mut _ as *mut _,
+                (&mut kvh) as *mut _ as *mut _,
+                (&mut cp) as *mut _ as *mut _,
+            ];
+            return self.cc.launch(
+                f,
+                t_len as u32,
+                (dm.q_heads + dm.kv_heads) as u32,
+                128,
+                &mut args,
+            );
+        }
         let kv = self.attn_kv_ptr(slot);
         let f = self.cc.function("attn_prep")?;
-        let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
         let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) = (
             self.dqg_a,
@@ -1369,37 +1477,74 @@ impl W4a16Dec {
         // 무관) — 호스트는 항상 분할 경로를 쓴다. dattn_part 부재 시만 단일.
         let _ = pos;
         if self.dattn_part != 0 {
-            let fp = self.cc.function("attn_fwd3s_part")?;
             let (mut tl, mut lay) = (t_len as i32, layer as i32);
             let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
             let mut sp = ATTN_SPLITS as i32;
-            let (mut f0, mut f1, mut f2, mut f3) = (
-                self.dqh_a,
-                self.attn_kv_ptr(slot),
-                self.attn_vc_ptr(slot),
-                self.dattn_part,
-            );
-            let mut f4 = self.attn_pp_ptr(slot);
-            let mut pa: [*mut std::ffi::c_void; 11] = [
-                (&mut f0) as *mut _ as *mut _,
-                (&mut f1) as *mut _ as *mut _,
-                (&mut f2) as *mut _ as *mut _,
-                (&mut f3) as *mut _ as *mut _,
-                (&mut f4) as *mut _ as *mut _,
-                (&mut tl) as *mut _ as *mut _,
-                (&mut lay) as *mut _ as *mut _,
-                (&mut qh) as *mut _ as *mut _,
-                (&mut kvh) as *mut _ as *mut _,
-                (&mut cp) as *mut _ as *mut _,
-                (&mut sp) as *mut _ as *mut _,
-            ];
-            self.cc.launch(
-                fp,
-                t_len as u32,
-                (dm.q_heads * ATTN_SPLITS) as u32,
-                256,
-                &mut pa,
-            )?;
+            if self.kvq {
+                // [P13] int8 KV 판독 — ksc/vsc 추가 인자.
+                let fp = self.cc.function("attn_fwd3s_part_q")?;
+                #[allow(clippy::type_complexity)]
+                let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
+                    self.dqh_a,
+                    self.attn_kv_ptr(slot),
+                    self.attn_vc_ptr(slot),
+                    self.attn_ksc_ptr(slot),
+                    self.attn_vsc_ptr(slot),
+                    self.dattn_part,
+                );
+                let mut f6 = self.attn_pp_ptr(slot);
+                let mut pa: [*mut std::ffi::c_void; 13] = [
+                    (&mut f0) as *mut _ as *mut _,
+                    (&mut f1) as *mut _ as *mut _,
+                    (&mut f2) as *mut _ as *mut _,
+                    (&mut f3) as *mut _ as *mut _,
+                    (&mut f4) as *mut _ as *mut _,
+                    (&mut f5) as *mut _ as *mut _,
+                    (&mut f6) as *mut _ as *mut _,
+                    (&mut tl) as *mut _ as *mut _,
+                    (&mut lay) as *mut _ as *mut _,
+                    (&mut qh) as *mut _ as *mut _,
+                    (&mut kvh) as *mut _ as *mut _,
+                    (&mut cp) as *mut _ as *mut _,
+                    (&mut sp) as *mut _ as *mut _,
+                ];
+                self.cc.launch(
+                    fp,
+                    t_len as u32,
+                    (dm.q_heads * ATTN_SPLITS) as u32,
+                    256,
+                    &mut pa,
+                )?;
+            } else {
+                let fp = self.cc.function("attn_fwd3s_part")?;
+                let (mut f0, mut f1, mut f2, mut f3) = (
+                    self.dqh_a,
+                    self.attn_kv_ptr(slot),
+                    self.attn_vc_ptr(slot),
+                    self.dattn_part,
+                );
+                let mut f4 = self.attn_pp_ptr(slot);
+                let mut pa: [*mut std::ffi::c_void; 11] = [
+                    (&mut f0) as *mut _ as *mut _,
+                    (&mut f1) as *mut _ as *mut _,
+                    (&mut f2) as *mut _ as *mut _,
+                    (&mut f3) as *mut _ as *mut _,
+                    (&mut f4) as *mut _ as *mut _,
+                    (&mut tl) as *mut _ as *mut _,
+                    (&mut lay) as *mut _ as *mut _,
+                    (&mut qh) as *mut _ as *mut _,
+                    (&mut kvh) as *mut _ as *mut _,
+                    (&mut cp) as *mut _ as *mut _,
+                    (&mut sp) as *mut _ as *mut _,
+                ];
+                self.cc.launch(
+                    fp,
+                    t_len as u32,
+                    (dm.q_heads * ATTN_SPLITS) as u32,
+                    256,
+                    &mut pa,
+                )?;
+            }
             let fm = self.cc.function("attn_fwd3s_merge")?;
             let (mut mp, mut mg, mut mo) = (self.dattn_part, self.dqg_a, self.doutv_a);
             let (mut tl2, mut qh2) = (t_len as i32, dm.q_heads as i32);
@@ -1908,17 +2053,18 @@ impl W4a16Dec {
     /// 반환: (VRAM 가중치, VRAM KV, CPU 오프로드 가중치, CPU PLE).
     /// - 가중치: 업로드 누적(weights_bytes — 로드 후 불변). 스트리밍 모드에서
     ///   전문가는 VRAM에 없고 호스트(mmAP 페이지 캐시)에서 토큰별로 올린다.
-    /// - KV: 어텐션 캐시 2벌(K+V) f32 — 전량 VRAM(현행 KV 오프로드 없음).
+    /// - KV: 어텐션 캐시 2벌(K+V) — 기본 f32, [P13] KVQ 시 int8+스케일.
     /// - PLE: 미구현(W4-2) — 항상 0.
     pub fn mem_stats(&self) -> (u64, u64, u64, u64) {
         let kv = self
             .attn
             .map(|d| {
-                2 * (self.n_slots as u64)
-                    * (d.n_attn as u64)
-                    * (d.cap as u64)
-                    * (d.kv_dim() as u64)
-                    * 4
+                let rows = (self.n_slots as u64) * (d.n_attn as u64) * (d.cap as u64);
+                if self.kvq {
+                    rows * (d.kv_dim() as u64) * 2 + rows * (d.kv_heads as u64) * 4 * 2
+                } else {
+                    2 * rows * (d.kv_dim() as u64) * 4
+                }
             })
             .unwrap_or(0);
         let experts = self.experts_bytes;
