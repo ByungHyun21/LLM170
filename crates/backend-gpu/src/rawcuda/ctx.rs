@@ -155,7 +155,9 @@ impl CudaCtx {
             Ok(CudaCtx {
                 drv,
                 prof: Prof {
-                    on: llm170_diag::flag::ne0("LLM170_TIME"),
+                    // [2026-10-10 수정] 옵트인(=1) — ne0(부재 시 ON)였던 동안
+                    // serve는 prof_report 미호출로 cuEvent를 발사마다 누수했다.
+                    on: llm170_diag::flag::on_nonzero("LLM170_TIME"),
                     capturing: std::cell::Cell::new(false),
                     evs: std::cell::RefCell::new(Vec::new()),
                     cats: std::cell::RefCell::new(Vec::new()),
