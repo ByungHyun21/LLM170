@@ -245,6 +245,11 @@ pub struct W4a16Dec {
     dstg_q: CUdeviceptr,
     dstg_s: CUdeviceptr,
     dstg_cap: (usize, usize),
+    /// [C2 2026-10-09] 호스트 RAM 스테이징 — 스트리밍 전문가의 mmap 슬라이스
+    /// 1회 복사본(set_expert_table). 스트리밍 업로드가 SSD/페이지캐시 경로에
+    /// 의존하지 않게 한다. Vec 버퍼 주소는 불변이므로 moe_tab이 이 안을
+    /// 가리켜도 안전(용량 추가 변경 금지 — 구축 후 불변).
+    host_stage: Vec<u8>,
     /// 라우터 로짓/ shared 게이트 스크래치(n_experts ≥ 1).
     drt: CUdeviceptr,
     drt_cap: usize,
@@ -499,6 +504,7 @@ impl W4a16Dec {
             dstg_q: 0,
             dstg_s: 0,
             dstg_cap: (0, 0),
+            host_stage: Vec::new(),
             drt: 0,
             drt_cap: 0,
             dmo: 0,
@@ -2179,7 +2185,43 @@ impl W4a16Dec {
 
     /// 전문가 슬라이스 테이블 등록 — (packed ptr/len, scale ptr/len) × (il,e,proj).
     /// 포인터는 서버 스토어 mmap 슬라이스 — 서버가 모델을 함께 보유하는 수명 계약.
-    pub fn set_expert_table(&mut self, tab: Vec<(u64, u64, u64, u64)>) {
+    pub fn set_expert_table(&mut self, mut tab: Vec<(u64, u64, u64, u64)>) {
+        // [C2 2026-10-09] 호스트 RAM 스테이징(사용자 결정) — 스트리밍 셋을
+        // 로드 시 1회 호스트 RAM으로 복사한다(SSD mmap·페이지캐시 경로 의존
+        // 제거). 탈출구 LLM170_MOE_HOST_STAGE=0, 할당 실패 시 mmap 유지.
+        if llm170_diag::flag::ne0("LLM170_MOE_HOST_STAGE") {
+            let total: u64 = tab.iter().map(|e| e.1 + e.3).sum();
+            let mut buf: Vec<u8> = Vec::new();
+            if total > 0 && usize::try_from(total).is_ok_and(|n| buf.try_reserve_exact(n).is_ok()) {
+                let mut offs: Vec<(usize, usize)> = Vec::with_capacity(tab.len());
+                for &(qp, ql, sp, sl) in &tab {
+                    let qo = buf.len();
+                    // SAFETY: tab 항목은 set_expert_table 수명 계약(mmap 슬라이스)
+                    // — 호출 내 유효, len은 계약 검증 완료분.
+                    buf.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(qp as *const u8, ql as usize)
+                    });
+                    let so = buf.len();
+                    // SAFETY: 상동(scale 슬라이스).
+                    buf.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(sp as *const u8, sl as usize)
+                    });
+                    offs.push((qo, so));
+                }
+                let base = buf.as_ptr() as u64;
+                for (e, &(qo, so)) in tab.iter_mut().zip(offs.iter()) {
+                    e.0 = base + qo as u64;
+                    e.2 = base + so as u64;
+                }
+                eprintln!(
+                    "[moe] 호스트 RAM 스테이징 {:.2}GiB — 업로드 mmap 의존 제거(C2)",
+                    total as f64 / (1u64 << 30) as f64
+                );
+                self.host_stage = buf;
+            } else {
+                eprintln!("# moe: 호스트 스테이징 {total}B 할당 실패 — mmap 스트리밍 유지");
+            }
+        }
         self.experts_bytes = tab.iter().map(|e| e.1 + e.3).sum();
         self.moe_tab = tab;
     }
@@ -2417,27 +2459,6 @@ impl W4a16Dec {
         Ok(())
     }
 
-    /// 전문가 GEMV 1건 — 상주면 직접, 아니면 스테이징 h2d 후 발사.
-    fn expert_gemv(
-        &mut self,
-        entry: (u64, u64, u64, u64),
-        n: usize,
-        k: usize,
-        x_dev: CUdeviceptr,
-        out_dev: CUdeviceptr,
-    ) -> Result<(), String> {
-        let (qp, ql, sp, sl) = entry;
-        if self.moe_resident {
-            return self.gemv_launch_raw(qp, sp, n, k, x_dev, out_dev);
-        }
-        // SAFETY: 서버 스토어 mmap 슬라이스 — set_expert_table 수명 계약.
-        let qb = unsafe { std::slice::from_raw_parts(qp as *const u8, ql as usize) };
-        let sb = unsafe { std::slice::from_raw_parts(sp as *const u8, sl as usize) };
-        Self::h2d_chunked(&self.cc, self.dstg_q, qb)?;
-        Self::h2d_chunked(&self.cc, self.dstg_s, sb)?;
-        self.gemv_launch_raw(self.dstg_q, self.dstg_s, n, k, x_dev, out_dev)
-    }
-
     /// MoE 버퍼 보장(전문가 스테이징·라우터·출력).
     fn ensure_moe_bufs(&mut self) -> Result<(), String> {
         if self.moe_bufs_ok {
@@ -2452,8 +2473,12 @@ impl W4a16Dec {
         // 프리필 t≤CHAIN_TMAX까지 수용 — 슬롯 = TMAX×top_k, 라우터 = TMAX×n_exp.
         let tmax = CHAIN_TMAX;
         // 전문가 최대 행렬 = h×n_ff(gate/up) = h×n_ff(down) — 동일 크기.
-        let pk = h * n_ff / 2;
-        let sk = h * n_ff / self.moe_group * 2;
+        // [P7 2026-10-09] 층 단위 배치 스테이징 — top_k×3 proj 슬라이스.
+        // proj 방향과 무관하게 동일 크기(gate/up [n_ff,h] · down [h,n_ff]):
+        // q = h·n_ff/2, s = h·n_ff/g·2. 슬라이스별 업로드 후 sync 1회.
+        let np = self.top_k.max(1) * 3;
+        let pk = h * n_ff / 2 * np;
+        let sk = h * n_ff / self.moe_group * 2 * np;
         self.graph_invalidate(); // [P10]
         self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
         realloc_fields(
@@ -2771,15 +2796,45 @@ impl W4a16Dec {
         let h = self.hidden;
         let n_ff = self.moe_ffn;
         let [s0, s1, _s1b, s2, s3] = self.dchain;
-        for &(e, w) in sel {
+        if sel.is_empty() {
+            return Ok(());
+        }
+        // [P7 2026-10-09] 층 단위 배치 스테이징 — (top_k×3) q/s 슬라이스를
+        // async 복사로 전부 올린 뒤 sync 1회(종전 proj마다 h2d_chunked —
+        // proj당 sync 2회 × 3 × top_k = 층당 수십 sync). 소스는 호스트
+        // 스테이징(C2)·mmap — 둘 다 호출 내 수명이면 충분(드라이버 스테이징).
+        let qsz = h * n_ff / 2;
+        let ssz = h * n_ff / self.moe_group * 2;
+        debug_assert!(
+            self.dstg_cap.0 >= qsz * sel.len() * 3 && self.dstg_cap.1 >= ssz * sel.len() * 3
+        );
+        for (j, &(e, _)) in sel.iter().enumerate() {
             let base = (il * n_exp + e) * 3;
-            for (pi, out) in [(0usize, s0), (1usize, s1)] {
-                let entry = self.moe_tab[base + pi];
-                self.expert_gemv(entry, n_ff, h, xn, out)?;
+            for p in 0..3 {
+                let (qp, ql, sp, sl) = self.moe_tab[base + p];
+                let qd = self.dstg_q + ((j * 3 + p) * qsz) as u64;
+                let sd = self.dstg_s + ((j * 3 + p) * ssz) as u64;
+                // SAFETY: tab 항목은 set_expert_table 수명 계약(mmap/호스트
+                // 스테이징), ql/sl은 위 qsz/ssz 형상 계약을 따른다.
+                let qb = unsafe { std::slice::from_raw_parts(qp as *const u8, ql as usize) };
+                let sb = unsafe { std::slice::from_raw_parts(sp as *const u8, sl as usize) };
+                self.cc.h2d_async(qd, qb)?;
+                self.cc.h2d_async(sd, sb)?;
             }
+        }
+        self.cc.sync()?;
+        for (j, &(_e, w)) in sel.iter().enumerate() {
+            let q0 = self.dstg_q + ((j * 3) * qsz) as u64;
+            let p0 = self.dstg_s + ((j * 3) * ssz) as u64;
+            let q1 = q0 + qsz as u64;
+            let p1 = p0 + ssz as u64;
+            let q2 = q0 + (2 * qsz) as u64;
+            let p2 = p0 + (2 * ssz) as u64;
+            // proj 순서 = 테이블 조립 순서(gate, up, down) — 스테이징과 일치.
+            self.gemv_launch_raw(q0, p0, n_ff, h, xn, s0)?;
+            self.gemv_launch_raw(q1, p1, n_ff, h, xn, s1)?;
             self.ew_dev(s0, s1, s2, n_ff)?;
-            let entry = self.moe_tab[base + 2];
-            self.expert_gemv(entry, h, n_ff, s2, s3)?;
+            self.gemv_launch_raw(q2, p2, h, n_ff, s2, s3)?;
             self.axpy_dev(w, s3, self.dmo, h)?;
         }
         Ok(())
