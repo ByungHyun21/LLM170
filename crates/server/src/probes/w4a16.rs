@@ -334,6 +334,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut no_head = false;
     let mut moe_check = false;
     let mut plain_check = false;
+    let mut mma_smoke = false;
     let mut h2d_mb = 0usize;
     let mut bench: Option<(String, usize, usize)> = None; // (lin, t, reps)
     let mut it = args.iter().skip(1);
@@ -366,6 +367,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             "--no-head" => no_head = true,
             "--moe-check" => moe_check = true,
             "--plain-gemm-check" => plain_check = true,
+            "--mma-smoke" => mma_smoke = true,
             "--h2d-bench" => {
                 let mb = it
                     .next()
@@ -444,6 +446,9 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     }
     if plain_check {
         return dec.plain_gemm_selfcheck();
+    }
+    if mma_smoke {
+        return dec.mma_smoke();
     }
     if moe_check {
         return dec.moe_selfcheck();
