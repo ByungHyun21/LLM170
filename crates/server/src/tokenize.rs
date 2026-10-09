@@ -365,7 +365,6 @@ impl Tokenizer {
         }
     }
 
-
     /// 텍스트 → 토큰 (특수 토큰 해석 포함 — llama-server 채팅 경로와 동일).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         self.encode_opts(text, true)
