@@ -16,6 +16,36 @@ const F_LETTER: u16 = 0x0004;
 const F_ACCENT: u16 = 0x0010;
 const F_WHITESPACE: u16 = 0x0100;
 
+/// [D5 2026-10-09] 자작 곱셈 해시 — 짧은 바이트 키(토큰 조각·병합 키)에서
+/// SipHash는 과하다(로컬 단일 사용자 서버 — DoS 저항 불필요).
+/// splitmix64 계열 상수 곱 + 회전, 8바이트 청크 + 꼬리.
+#[derive(Default)]
+struct MulHasher(u64);
+
+impl std::hash::Hasher for MulHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0 ^ 0x9E37_79B9_7F4A_7C15;
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for c in chunks {
+            let v = u64::from_le_bytes(*c);
+            h = (h ^ v).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            h = h.rotate_left(27);
+        }
+        let mut tail = 0u64;
+        for (i, &b) in rest.iter().enumerate() {
+            tail |= (b as u64) << (8 * i);
+        }
+        h = (h ^ tail).wrapping_mul(0x94D0_49BB_1331_11EB);
+        self.0 = h ^ (h >> 31);
+    }
+}
+
+/// 빠른 해시 맵(바이트·문자 키 전용 맵들).
+type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<MulHasher>>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pre {
     Qwen35,
@@ -26,21 +56,52 @@ enum Pre {
 pub struct Tokenizer {
     vocab: Vec<String>,
     /// 토큰 원문 바이트 → id (llama.cpp text_to_token — 바이트 정확 매칭)
-    text_to_id: HashMap<Box<[u8]>, u32>,
+    text_to_id: FastMap<Box<[u8]>, u32>,
     /// 병합 키 = len_le32 ++ left ++ right → 랭크 (llama.cpp find_bpe_rank)
-    bpe_ranks: HashMap<Vec<u8>, u32>,
-    /// 특수 토큰 (본문 바이트 길이 내림차순) — 파티션용. CONTROL/USER_DEFINED/UNKNOWN
+    bpe_ranks: FastMap<Vec<u8>, u32>,
+    /// 특수 토큰 — parse_special=true 파티션용(special ∪ special_user,
+    /// 본문 바이트 길이 내림차순 **로드 시 1회 정렬** — D5).
     special: Vec<(String, u32)>,
-    /// USER_DEFINED 특수 토큰 — parse_special=false에서도 분할 (llama.cpp 규칙)
+    /// USER_DEFINED 특수 토큰 — parse_special=false에서도 분할 (llama.cpp 규칙).
     special_user: Vec<(String, u32)>,
     pre: Pre,
     ignore_merges: bool,
     /// GPT-2 bytes_to_unicode 역표 (조각 문자 → 원바이트) — 디코딩용.
-    c2b: HashMap<char, u8>,
+    c2b: FastMap<char, u8>,
     /// 원바이트 → 조각 문자 — 인코딩용.
-    b2c: HashMap<u8, char>,
+    b2c: FastMap<u8, char>,
     /// 탐욕 폴백용 바이트열 → id (기존 index와 동일 규칙).
-    greedy_index: HashMap<Vec<u8>, u32>,
+    greedy_index: FastMap<Vec<u8>, u32>,
+    /// [D5] 완전 일치 텍스트 캐시 — 동일 요청 재인코딩 제거(유계 FIFO).
+    encode_cache: std::sync::Mutex<EncodeCache>,
+}
+
+/// [D5 2026-10-09] 동일 텍스트 재인코딩 캐시 — 재시도·중복 요청에서 BPE
+/// 재계산 제거. **완전 일치만** — 접두 재개는 BPE 병합이 조각 경계를 넘을 수
+/// 있어 시임 안전이 보장되지 않는다(필요 시 조각 단위 캐시 + 시임 검증).
+struct EncodeCache {
+    map: HashMap<String, std::sync::Arc<[u32]>>,
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl EncodeCache {
+    fn get(&self, text: &str) -> Option<Vec<u32>> {
+        self.map.get(text).map(|a| a.to_vec())
+    }
+    fn put(&mut self, text: &str, ids: &[u32]) {
+        // 짧은 텍스트는 비용 대비 이득 없음(해시·복사 > BPE).
+        if text.len() < 32 || self.map.contains_key(text) {
+            return;
+        }
+        if self.order.len() >= self.cap
+            && let Some(old) = self.order.pop_front()
+        {
+            self.map.remove(&old);
+        }
+        self.order.push_back(text.to_string());
+        self.map.insert(text.to_string(), ids.into());
+    }
 }
 
 impl Tokenizer {
@@ -58,15 +119,21 @@ impl Tokenizer {
     /// 공통 꼬리 — 바이트 표·인덱스 조립(from_hf_dir 공유).
     fn from_parts(
         vocab: &[String],
-        bpe_ranks: HashMap<Vec<u8>, u32>,
-        special: Vec<(String, u32)>,
-        special_user: Vec<(String, u32)>,
+        bpe_ranks: FastMap<Vec<u8>, u32>,
+        special_ctl: Vec<(String, u32)>,
+        mut special_user: Vec<(String, u32)>,
         pre: Pre,
         ignore_merges: bool,
     ) -> Result<Self, String> {
+        // [D5] 파티션용 통합 목록을 로드 시 1회 정렬 — 종전엔 encode 호출마다
+        // chain+collect+sort를 했다. special_ctl(CONTROL/UNKNOWN계) ∪ user.
+        let mut special = special_ctl;
+        special.extend(special_user.iter().cloned());
+        special.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        special_user.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
         // GPT-2 bytes_to_unicode 정/역표 (기존 구현과 동일)
-        let mut c2b: HashMap<char, u8> = HashMap::new();
-        let mut b2c: HashMap<u8, char> = HashMap::new();
+        let mut c2b: FastMap<char, u8> = FastMap::default();
+        let mut b2c: FastMap<u8, char> = FastMap::default();
         {
             let mut n = 0u32;
             for b in 0u32..256 {
@@ -83,8 +150,8 @@ impl Tokenizer {
             }
         }
 
-        let mut text_to_id: HashMap<Box<[u8]>, u32> = HashMap::new();
-        let mut greedy_index: HashMap<Vec<u8>, u32> = HashMap::new();
+        let mut text_to_id: FastMap<Box<[u8]>, u32> = FastMap::default();
+        let mut greedy_index: FastMap<Vec<u8>, u32> = FastMap::default();
         for (i, t) in vocab.iter().enumerate() {
             let bytes: Vec<u8> = t
                 .chars()
@@ -110,6 +177,11 @@ impl Tokenizer {
             c2b,
             b2c,
             greedy_index,
+            encode_cache: std::sync::Mutex::new(EncodeCache {
+                map: HashMap::new(),
+                order: std::collections::VecDeque::new(),
+                cap: 64,
+            }),
         })
     }
 
@@ -192,10 +264,10 @@ impl Tokenizer {
         // 병합 순위 — 표준 키(첫 ' ' 분할, 선발 우선). # 헤더는
         // 순위 소모 없이 스킵(HF 변환기 배열 순서와 정렬).
         // merges.txt 우선, tokenizer.json이면 model.merges(문자열 배열) 파생.
-        let mut bpe_ranks: HashMap<Vec<u8>, u32> = HashMap::new();
+        let mut bpe_ranks: FastMap<Vec<u8>, u32> = FastMap::default();
         let mut rank = 0u32;
         let push_merge =
-            |first: &[u8], second: &[u8], bpe_ranks: &mut HashMap<Vec<u8>, u32>, rank: &mut u32| {
+            |first: &[u8], second: &[u8], bpe_ranks: &mut FastMap<Vec<u8>, u32>, rank: &mut u32| {
                 let mut key = Vec::with_capacity(4 + first.len() + second.len());
                 key.extend_from_slice(&(first.len() as u32).to_le_bytes());
                 key.extend_from_slice(first);
@@ -366,8 +438,18 @@ impl Tokenizer {
     }
 
     /// 텍스트 → 토큰 (특수 토큰 해석 포함 — llama-server 채팅 경로와 동일).
+    /// [D5] 완전 일치 재인코딩 캐시 경유(값은 비캐시 경로와 동일).
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        self.encode_opts(text, true)
+        if let Ok(c) = self.encode_cache.lock()
+            && let Some(ids) = c.get(text)
+        {
+            return ids;
+        }
+        let ids = self.encode_opts(text, true);
+        if let Ok(mut c) = self.encode_cache.lock() {
+            c.put(text, &ids);
+        }
+        ids
     }
 
     /// 특수 토큰 미해석 판 (llama-tokenize 기본값과 동일 — 검증용).
@@ -423,18 +505,14 @@ impl Tokenizer {
 
     fn partition_special<'a>(&self, text: &'a str, parse_special: bool) -> Vec<Frag<'a>> {
         let mut frags = vec![Frag::Text(text)];
-        // USER_DEFINED는 항상 분할 — parse_special=false에서도 (llama.cpp 규칙).
-        // 분할 순서: 길이 내림차순 우선 — 전체 목록을 통합 정렬한다.
-        let all: Vec<&(String, u32)> = if parse_special {
-            self.special
-                .iter()
-                .chain(self.special_user.iter())
-                .collect()
+        // [D5] 정렬은 로드 시 1회 — 종전엔 호출마다 chain+collect+sort였다.
+        // special = 통합(parse=true), special_user = USER_DEFINED(항상 분할,
+        // llama.cpp 규칙) — 양쪽 모두 길이 내림차순.
+        let ordered: &[(String, u32)] = if parse_special {
+            &self.special
         } else {
-            self.special_user.iter().collect()
+            &self.special_user
         };
-        let mut ordered: Vec<&(String, u32)> = all;
-        ordered.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
         for (stext, sid) in ordered {
             if stext.is_empty() {
                 continue;
@@ -744,4 +822,58 @@ fn split_pre(cpts: &[u32], accent: bool) -> Vec<(usize, usize)> {
         add(&mut segs, &mut prev_end, pos);
     }
     segs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 최소 토크나이저 — 조각 a/b/c + 병합 (a,b). Pre::Other(탐욕 경로).
+    fn tiny() -> Tokenizer {
+        let vocab: Vec<String> = ["a", "b", "c", "ab"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut ranks: FastMap<Vec<u8>, u32> = FastMap::default();
+        // 키 = len_le32 ++ left ++ right.
+        let mut key = vec![1u8, 0, 0, 0];
+        key.push(b'a');
+        key.push(b'b');
+        ranks.insert(key, 0);
+        Tokenizer::from_parts(&vocab, ranks, Vec::new(), Vec::new(), Pre::Other, false).unwrap()
+    }
+
+    #[test]
+    fn encode_cache_is_used_and_consistent() {
+        let t = tiny();
+        let text = "abcabcabcabcabcabcabcabcabcabcabcabc"; // 36바이트 ≥ 32(캐시 대상)
+        let uncached = t.encode_opts(text, true);
+        let first = t.encode(text);
+        assert_eq!(first, uncached, "캐시 미스 결과 = 비캐시");
+        assert!(
+            t.encode_cache.lock().unwrap().map.contains_key(text),
+            "첫 encode 후 캐시 등록"
+        );
+        let second = t.encode(text); // 캐시 히트 경로
+        assert_eq!(second, uncached, "캐시 히트 결과 = 비캐시");
+    }
+
+    #[test]
+    fn special_lists_pre_sorted() {
+        // 로드 시 정렬 계약 — partition 결과의 토큰 순서가 길이 우선과 일치.
+        let mut ranks: FastMap<Vec<u8>, u32> = FastMap::default();
+        ranks.insert(vec![0u8, 0, 0, 0], 0);
+        let vocab: Vec<String> = ["x"].iter().map(|s| s.to_string()).collect();
+        let special = vec![("A".to_string(), 1u32), ("LONG".to_string(), 2u32)];
+        let t =
+            Tokenizer::from_parts(&vocab, ranks, special, Vec::new(), Pre::Qwen2, false).unwrap();
+        assert_eq!(
+            t.special
+                .iter()
+                .map(|(s, _)| s.as_str())
+                .collect::<Vec<_>>(),
+            vec!["LONG", "A"],
+            "길이 내림차순 1회 정렬"
+        );
+    }
 }
