@@ -2246,8 +2246,10 @@ impl W4a16Dec {
                 &mut args,
             );
         }
-        // t>8은 v3(8행/블록 + 행별 smem + k청크) — v1은 t≤8 전용.
-        let v3 = t > 8;
+        // [B2] v3(8행/블록 + 행별 smem + k청크) 상시 — t=1은 GEMV 경로라
+        // 여기 오지 않으므로(t≥2) 실질 임계치 = t≥2. v1(t≤8 전용)은 x 재판독이
+        // 있어 v3 대비 열위, 산술 순서는 동일 명시(plain_gemm_selfcheck 게이트).
+        let v3 = t > 1;
         let f = self.cc.function(if v3 {
             "w4a16_gemm_bf16_t"
         } else {
