@@ -172,6 +172,12 @@ pub type CuEventDestroyFn = unsafe extern "system" fn(ev: CUevent) -> CUresult;
 pub type CuMemGetInfoFn =
     unsafe extern "system" fn(free: *mut usize, total: *mut usize) -> CUresult;
 
+/// cuMemHostRegister_v2 — 기존 호스트 버퍼 pin(핀드 DMA 소스, P7).
+pub type CuMemHostRegisterFn =
+    unsafe extern "system" fn(p: *mut c_void, bytes: usize, flags: c_uint) -> CUresult;
+/// cuMemHostUnregister — pin 해제(버퍼 해제 전 필수).
+pub type CuMemHostUnregisterFn = unsafe extern "system" fn(p: *mut c_void) -> CUresult;
+
 /// cuGetErrorString — CUresult → 드라이버 표준 문구(H: err_text 확대).
 pub type CuGetErrorStringFn =
     unsafe extern "system" fn(r: CUresult, p_str: *mut *const c_char) -> CUresult;
@@ -222,6 +228,9 @@ pub(crate) struct Driver {
 
     /// 미지 오류 코드 문구(H) — err_text 폴백.
     pub get_error_string: CuGetErrorStringFn,
+    /// 호스트 핀드 등록/해제(P7-fix).
+    pub host_register: CuMemHostRegisterFn,
+    pub host_unregister: CuMemHostUnregisterFn,
     /// 디바이스 0 채움(H) — zero_dev 경로.
     pub memset_d8_async: CuMemsetD8AsyncFn,
 
@@ -355,6 +364,12 @@ impl Driver {
                 )),
                 get_error_string: std::mem::transmute::<*mut c_void, CuGetErrorStringFn>(sym!(
                     "cuGetErrorString"
+                )),
+                host_register: std::mem::transmute::<*mut c_void, CuMemHostRegisterFn>(sym!(
+                    "cuMemHostRegister_v2"
+                )),
+                host_unregister: std::mem::transmute::<*mut c_void, CuMemHostUnregisterFn>(sym!(
+                    "cuMemHostUnregister"
                 )),
                 memset_d8_async: std::mem::transmute::<*mut c_void, CuMemsetD8AsyncFn>(sym!(
                     "cuMemsetD8Async"

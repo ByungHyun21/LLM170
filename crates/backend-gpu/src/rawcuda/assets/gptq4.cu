@@ -814,6 +814,10 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
 
 // ── T1(2026-10-09): split(g128·f16) mma GEMM — int4 디퀀트→f16→mma ──
 // ncu: split GEMM은 L1/명령 바운드(DRAM 3.7%·compute 46%) → mma 여지 큼.
+// [T3 실측 2026-10-10] t<16 강제(배치 디코드 시험): 실효 가중 판독 ~300GB/s
+// (27B pp512 656ms ≈ m타일 16패스 × 12.16GB) — 디코드 t-GEMV(380GB/s)에
+// 열세라 배치는 t-GEMV 유지. 이 스테이징(스칼라 디퀀트+STS)이 프리필 지배
+// 비용 — 디퀀트 벡터화(PRMT/half2)로 판독률 역전 시 양쪽 재론.
 // A=xh(f16 — split 경로가 이미 f2h 캐스트 제공, 계약과 동일 값), B=디퀀트 f16.
 // 디퀀트는 marlin식 마법 상수: f16(1024+n) = 0x6400|n (n<16이 mantissa 하위
 // 비트에 정확히 더해짐) → w=(n−8)·s = (1024+n)·s − 1032·s = hfma2 1회.
