@@ -2431,6 +2431,92 @@ impl W4a16Dec {
     /// 플레인 GEMM 자가 점검 — 배치 GEMM(t=8) vs 토큰별 GEMV 비트 비교
     /// (판정 계약: 플레인 경로는 토큰 수준이나 같은 레인/환원 순서라 동일해야
     /// 한다 — 다르면 t 처리 결함).
+    /// [2026-10-09] 텐서코어 도구·수치 스모크 — bf16 mma.m16n8k16 → f32 누적을
+    /// CPU 참조(bf16 RN 반올림 입력 + f32 k순 합)와 대조. 차이는 누적 순서뿐
+    /// (허용오차 1e-4). 1b(플레인 mma GEMM) 착륙 전 도구·프래그먼트 검증.
+    pub fn mma_smoke(&mut self) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        self.cc.load_fatbin(
+            "smoke",
+            &asset_bytes(
+                "LLM170_CUDA_SMOKE_FATBIN_PATH",
+                &[
+                    "crates/backend-gpu/src/rawcuda/assets/smoke.fatbin",
+                    "src/rawcuda/assets/smoke.fatbin",
+                ],
+            )?,
+            &["llm170_mma_smoke", "llm170_smoke_add"],
+        )?;
+        // 결정적 준난수 ∈ [-1, 1) — 곱·합 ≤ 16이라 f32 누적순서 오차 ~1e-6.
+        let mk = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 53) as f32 / 1024.0 - 1.0
+                })
+                .collect()
+        };
+        let (a, b) = (mk(16 * 16), mk(16 * 8));
+        // bf16 RN(짝수) — 커널 __floats2bfloat162_rn과 동일 규약.
+        let bf = |x: f32| -> f32 {
+            let u = x.to_bits();
+            f32::from_bits((u.wrapping_add(0x7FFF + ((u >> 16) & 1))) & 0xFFFF_0000)
+        };
+        let ra: Vec<f32> = a.iter().map(|&x| bf(x)).collect();
+        let rb: Vec<f32> = b.iter().map(|&x| bf(x)).collect();
+        let mut cref = vec![0f32; 16 * 8];
+        for m in 0..16 {
+            for n2 in 0..8 {
+                let mut acc = 0f32;
+                for k in 0..16 {
+                    acc += ra[m * 16 + k] * rb[k * 8 + n2];
+                }
+                cref[m * 8 + n2] = acc;
+            }
+        }
+        let da = self.cc.alloc(a.len() * 4)?;
+        let db = self.cc.alloc(b.len() * 4)?;
+        let dc = self.cc.alloc(cref.len() * 4)?;
+        let r = (|| -> Result<Vec<f32>, String> {
+            let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) };
+            let bb = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u8, b.len() * 4) };
+            self.cc.h2d(da, ab)?;
+            self.cc.h2d(db, bb)?;
+            let f = self.cc.function("llm170_mma_smoke")?;
+            let (mut pa, mut pb, mut pc) = (da, db, dc);
+            let mut ca: [*mut std::ffi::c_void; 3] = [
+                (&mut pa) as *mut _ as *mut _,
+                (&mut pb) as *mut _ as *mut _,
+                (&mut pc) as *mut _ as *mut _,
+            ];
+            self.cc.launch(f, 1, 1, 32, &mut ca)?;
+            self.cc.sync()?;
+            let mut ob = vec![0u8; cref.len() * 4];
+            self.cc.d2h(&mut ob, dc)?;
+            Ok(ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect())
+        })();
+        let _ = self.cc.free(da);
+        let _ = self.cc.free(db);
+        let _ = self.cc.free(dc);
+        let out = r?;
+        let mut maxd = 0f32;
+        for i in 0..cref.len() {
+            maxd = maxd.max((out[i] - cref[i]).abs());
+        }
+        if !(maxd <= 1e-4) {
+            return Err(format!(
+                "mma_smoke: 최대 오차 {maxd:.3e} > 1e-4 — 프래그먼트/누적 불일치"
+            ));
+        }
+        Ok(format!(
+            "mma_smoke OK — bf16 m16n8k16 f32누적(16×16 × 16×8) 최대오차 {maxd:.2e}"
+        ))
+    }
+
     pub fn plain_gemm_selfcheck(&mut self) -> Result<String, String> {
         let _g = self.cc.guard()?;
         let (name, n, k) = self
