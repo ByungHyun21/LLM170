@@ -364,6 +364,7 @@ impl W4a16Dec {
                 "w4a16_gemv_experts_g32_bf16",
                 "w4a16_moe_accum",
                 "w4a16_moe_topk",
+                "w4a16_moe_topk_t",
                 "w4a16_gemv_bf16",
                 "w4a16_gemm_bf16",
                 "w4a16_gemm_bf16_t",
@@ -2526,7 +2527,7 @@ impl W4a16Dec {
         self.shared_add_dev(self.drt, s3, self.dmo, h, 1)
     }
 
-    /// MoE FFN 배치(t≤8) — 라우터 플레인 GEMM → 호스트 선택(t×top_k 슬롯,
+    /// MoE FFN 배치(t≤8) — 라우터 플레인 GEMM → 디바이스 top-k(t×top_k 슬롯,
     /// 토큰 우선) → 전문가 배치 GEMV(gate/up x=토큰 단위 sp=top_k, down x=슬롯
     /// 단위 sp=1) → 토큰별 누적 → shared. **상주 모드 전용**(스트리밍 프리필은
     /// 미구현 — 호출부가 t=1로 떨어뜨린다).
@@ -2548,26 +2549,27 @@ impl W4a16Dec {
             return Err("moe t>1: 상주 모드 전용(스트리밍 프리필 미구현)".into());
         }
         self.ensure_moe_bufs()?;
-        // 1) 라우터 [t][n_exp] — 플레인 GEMM → 호스트 선택(슬롯 = 토큰 우선).
+        // 1) 라우터 [t][n_exp] — 플레인 GEMM → **디바이스 top-k**(P11).
+        // 종전: d2h(32KB)+sync+호스트 전체 정렬(512×t)이 층·청크마다 — 프리필의
+        // ~10%. 시맨틱은 moe_topk 미러(softmax→k라운드→재정규화).
+        // 실측(2026-10-09): 35B 512토큰 프리필 1294→1088ms.
         self.plain_gemm_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt, t)?;
-        let mut lb = vec![0u8; t * n_exp * 4];
-        self.cc
-            .d2h_async(lb.as_mut_ptr(), self.drt, t * n_exp * 4)?;
-        self.cc.sync()?;
-        let logits: Vec<f32> = lb
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect();
-        let mut sel: Vec<(usize, f32)> = Vec::with_capacity(t * tk);
-        for ti in 0..t {
-            for (e, w) in moe_topk(&logits[ti * n_exp..(ti + 1) * n_exp], tk) {
-                sel.push((e, w));
-            }
+        {
+            let f = self.cc.function("w4a16_moe_topk_t")?;
+            let (mut p_lg, mut p_ix, mut p_wt) = (self.drt, self.moe_idx, self.moe_wt);
+            let (mut p_t, mut p_n, mut p_k) = (t as i32, n_exp as i32, tk as i32);
+            let mut a: [*mut std::ffi::c_void; 6] = [
+                (&mut p_lg) as *mut _ as *mut _,
+                (&mut p_ix) as *mut _ as *mut _,
+                (&mut p_wt) as *mut _ as *mut _,
+                (&mut p_t) as *mut _ as *mut _,
+                (&mut p_n) as *mut _ as *mut _,
+                (&mut p_k) as *mut _ as *mut _,
+            ];
+            self.cc.launch(f, t.div_ceil(8) as u32, 1, 256, &mut a)?;
         }
+        let ns = t * tk;
         // 2) 전문가 배치.
-        let ns = sel.len();
         if llm170_diag::flag::ne0("LLM170_MOE_DBG") {
             // xn(정규화 출력) 행별 NaN — 업스트림 vs 전문가 GEMV 판별.
             let mut vb = vec![0u8; t * h * 4];
@@ -2584,13 +2586,7 @@ impl W4a16Dec {
                 .collect();
             eprintln!("[t-dbg] xn nan-rows={rows:?} t={t}");
         }
-        let idx: Vec<u32> = sel.iter().map(|&(e, _)| e as u32).collect();
-        let wts: Vec<f32> = sel.iter().map(|&(_, w)| w).collect();
-        // SAFETY: 호스트 Vec 슬라이스 — 호출 내 수명(동기 복사 완료).
-        let ib = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len() * 4) };
-        let wb = unsafe { std::slice::from_raw_parts(wts.as_ptr() as *const u8, wts.len() * 4) };
-        self.cc.h2d_async(self.moe_idx, ib)?;
-        self.cc.h2d_async(self.moe_wt, wb)?;
+        // (P11) idx/wt는 이미 디바이스에 있다(topk_t) — h2d 없음.
         let base = il * n_exp * 3;
         self.gemv_experts_launch(base, ns, xn, h, tk, self.dexp_gate, n_ff, h)?;
         self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.dexp_up, n_ff, h)?;
@@ -2609,11 +2605,7 @@ impl W4a16Dec {
             let bad: Vec<usize> = (0..ns)
                 .filter(|&s| v[s * n_ff..(s + 1) * n_ff].iter().any(|x| x.is_nan()))
                 .collect();
-            eprintln!(
-                "[t-dbg] act nan-slots={bad:?} idx={:?} w={:?}",
-                &idx[..ns.min(16)],
-                &wts[..ns.min(4)]
-            );
+            eprintln!("[t-dbg] act nan-slots={bad:?} ns={ns}");
         }
         self.gemv_experts_launch(base + 2, ns, self.dexp_act, n_ff, 1, self.dexp_dn, h, n_ff)?;
         self.moe_accum_dev(self.moe_wt, self.dexp_dn, self.dmo, tk, ns, h)?;
@@ -3604,6 +3596,74 @@ impl W4a16Dec {
             badcols.len(),
             &fa[..3],
             &fb[..3]
+        ))
+    }
+
+    /// MoE top-k 게이트 — 호스트 moe_topk vs 디바이스 w4a16_moe_topk_t.
+    pub fn moe_topk_check(&mut self, t: usize, n: usize, k: usize) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        let lg: Vec<f32> = (0..t * n)
+            .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 2048.0 - 0.5)
+            .collect();
+        let lb = unsafe { std::slice::from_raw_parts(lg.as_ptr() as *const u8, lg.len() * 4) };
+        let dl = self.cc.alloc(t * n * 4)?;
+        let di = self.cc.alloc(t * k * 4)?;
+        let dw = self.cc.alloc(t * k * 4)?;
+        self.cc.h2d(dl, lb)?;
+        let f = self.cc.function("w4a16_moe_topk_t")?;
+        let (mut p_lg, mut p_ix, mut p_wt) = (dl, di, dw);
+        let (mut p_t, mut p_n, mut p_k) = (t as i32, n as i32, k as i32);
+        let mut a: [*mut std::ffi::c_void; 6] = [
+            (&mut p_lg) as *mut _ as *mut _,
+            (&mut p_ix) as *mut _ as *mut _,
+            (&mut p_wt) as *mut _ as *mut _,
+            (&mut p_t) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, t.div_ceil(8) as u32, 1, 256, &mut a)?;
+        self.cc.sync()?;
+        let mut ib = vec![0u8; t * k * 4];
+        let mut wb = vec![0u8; t * k * 4];
+        self.cc.d2h(&mut ib, di)?;
+        self.cc.d2h(&mut wb, dw)?;
+        let gi: Vec<u32> = ib
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        let gw: Vec<f32> = wb
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let _ = self.cc.free(dl);
+        let _ = self.cc.free(di);
+        let _ = self.cc.free(dw);
+        let mut idx_bad = 0usize;
+        let mut wmax = 0f32;
+        for ti in 0..t {
+            let host = moe_topk(&lg[ti * n..(ti + 1) * n], k);
+            for (r, (e, w)) in host.iter().enumerate() {
+                if gi[ti * k + r] as usize != *e {
+                    idx_bad += 1;
+                }
+                let d = (gw[ti * k + r] - w).abs();
+                if d > wmax {
+                    wmax = d;
+                }
+            }
+        }
+        Ok(format!(
+            "moe-topk-check t={t} n={n} k={k}: idx 불일치 {idx_bad}/{} · |Δw|max={wmax:.3e} · dev[0..4]={:?} host[0..4]={:?}",
+            t * k,
+            &gi[..4],
+            &moe_topk(&lg[..n], k)
+                .iter()
+                .map(|&(e, _)| e as u32)
+                .collect::<Vec<_>>()[..4]
         ))
     }
 

@@ -338,6 +338,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut bench_gemv: Option<(String, usize)> = None;
     let mut bench_plain: Option<(String, usize, usize)> = None;
     let mut mma_diff: Option<(String, usize)> = None;
+    let mut moe_topk_check: Option<(usize, usize, usize)> = None;
     let mut h2d_mb = 0usize;
     let mut bench: Option<(String, usize, usize)> = None; // (lin, t, reps)
     let mut it = args.iter().skip(1);
@@ -377,6 +378,12 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--h2d-bench requires MB")?;
                 h2d_mb = mb;
+            }
+            "--moe-topk-check" => {
+                let t = it.next().and_then(|v| v.parse().ok()).unwrap_or(32);
+                let n = it.next().and_then(|v| v.parse().ok()).unwrap_or(512);
+                let k = it.next().and_then(|v| v.parse().ok()).unwrap_or(8);
+                moe_topk_check = Some((t, n, k));
             }
             "--mma-diff" => {
                 let name = it.next().ok_or("--mma-diff requires a name")?.clone();
@@ -505,6 +512,9 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         llm170_core::matmul::matmul(xn, &head, &mut lg);
         lg
     };
+    if let Some((t, n, k)) = &moe_topk_check {
+        return dec.moe_topk_check(*t, *n, *k);
+    }
     if let Some((name, t)) = &mma_diff {
         return dec.mma_diff_check(name, *t);
     }
