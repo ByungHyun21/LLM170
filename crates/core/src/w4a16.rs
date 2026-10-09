@@ -613,4 +613,22 @@ mod tests {
         assert!(W4a16Model::check_quant(&qtext(8, true, 128)).is_err());
         assert!(W4a16Model::check_quant(&qtext(4, false, 128)).is_err());
     }
+
+    /// H(2026-10-09) 경화 — 조각표 중복 id 충돌·스파스는 거부, 조밀은 통과.
+    #[test]
+    fn load_pieces_rejects_dup_and_sparse() {
+        let dir = std::env::temp_dir().join(format!("llm170_pieces_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 중복 id(다른 조각) — 거부.
+        std::fs::write(dir.join("vocab.json"), r#"{"a":0,"b":0}"#).unwrap();
+        assert!(load_pieces(&dir).is_err(), "중복 id 거부");
+        // 스파스(id 0,2 — 1 결측) — 거부.
+        std::fs::write(dir.join("vocab.json"), r#"{"a":0,"c":2}"#).unwrap();
+        assert!(load_pieces(&dir).is_err(), "스파스 거부");
+        // 조밀 — 통과·id 순.
+        std::fs::write(dir.join("vocab.json"), r#"{"a":0,"b":1}"#).unwrap();
+        let p = load_pieces(&dir).unwrap();
+        assert_eq!(p, vec!["a".to_string(), "b".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

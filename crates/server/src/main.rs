@@ -403,5 +403,3 @@ fn usage_err(msg: &str) -> ExitCode {
     eprintln!("error: {msg}\n\n{USAGE}");
     ExitCode::from(2)
 }
-// 마커 gpx
-// 마커 ehi

@@ -395,3 +395,46 @@ impl StArchive {
         Ok(buf)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_file(tag: &str, hdr: &str, data: usize) -> PathBuf {
+        let mut bytes = (hdr.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(hdr.as_bytes());
+        bytes.extend(std::iter::repeat_n(0u8, data));
+        let p = std::env::temp_dir().join(format!(
+            "llm170_st_{}_{tag}.safetensors",
+            std::process::id()
+        ));
+        std::fs::write(&p, &bytes).unwrap();
+        p
+    }
+
+    /// H(2026-10-09) 경화 — 반전 data_offsets(감산 언더플로)는 열기에서 거부.
+    #[test]
+    fn rejects_inverted_offsets() {
+        let p = tmp_file(
+            "inv",
+            r#"{"a":{"dtype":"F32","shape":[4],"data_offsets":[16,8]}}"#,
+            32,
+        );
+        let r = StArchive::open(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(matches!(r, Err(StError::BadHeader(_))), "반전 offsets 거부");
+    }
+
+    /// H 경화 — 선언 바이트 ≠ numel×nbytes는 거부(조용 처리 금지).
+    #[test]
+    fn rejects_size_mismatch() {
+        let p = tmp_file(
+            "sz",
+            r#"{"a":{"dtype":"F32","shape":[4],"data_offsets":[0,8]}}"#,
+            32,
+        );
+        let r = StArchive::open(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(matches!(r, Err(StError::BadHeader(_))), "크기 불일치 거부");
+    }
+}
