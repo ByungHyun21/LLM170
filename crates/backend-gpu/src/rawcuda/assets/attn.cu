@@ -490,15 +490,26 @@ extern "C" __global__ void attn_fwd3s_part(
     __shared__ float reds[256];
     qs[tid] = qh[qrow + tid];
     __syncthreads();
+    // [2026-10-09 P8-attn-3b] 분할 수는 커널 내부에서 결정한다 — 그래프 캡처가
+    // 특정 pos에서 고정되므로 호스트 분기(pos 기준)로는 긴 컨텍스트에 도달하지
+    // 못한다(실측: serve 그래프 경로가 단일 경로로 캡처돼 분할 이득 0).
+    // lim ≤ 256(골든 구간)은 eff=1 → s=0만 활성, 나머지는 빈 부분합(0) →
+    // 병합이 단일 커널과 비트 동일(×1.0·+0.0은 정확).
+    const int eff = (lim <= 256) ? 1 : splits;
+    float* out = part + (((long)t * q_heads + h) * splits + s) * 258;
+    if (s >= eff) {
+        if (tid == 0) {
+            out[0] = -1e30f;
+            out[1] = 0.0f;
+        }
+        out[2 + tid] = 0.0f;
+        return;
+    }
     // 분할 구간 — 256 정렬(청크 경계)로 자른다.
-    int chunk_rows = (lim + splits - 1) / splits;
+    int chunk_rows = (lim + eff - 1) / eff;
     chunk_rows = ((chunk_rows + ATTN_CHUNK - 1) / ATTN_CHUNK) * ATTN_CHUNK;
     int lo = s * chunk_rows;
     int hi = min(lim, lo + chunk_rows);
-    if (lo >= lim) {
-        lo = lim;
-        hi = lim;
-    }
     float m_run = -1e30f;
     float l_run = 0.0f;
     float acc = 0.0f;
@@ -554,7 +565,6 @@ extern "C" __global__ void attn_fwd3s_part(
         m_run = m_new;
         __syncthreads();
     }
-    float* out = part + (((long)t * q_heads + h) * splits + s) * 258;
     if (tid == 0) {
         out[0] = m_run;
         out[1] = l_run;
@@ -587,6 +597,9 @@ extern "C" __global__ void attn_fwd3s_merge(
     float acc = 0.0f;
     for (int s = 0; s < splits; s++) {
         const float* ps = pb + s * 258;
+        if (ps[1] <= 0.0f) {
+            continue; // 빈 분할(0 기여 — 결정적)
+        }
         float w = attn_expf(ps[0] - m);
         l += ps[1] * w;
         acc += ps[2 + tid] * w;

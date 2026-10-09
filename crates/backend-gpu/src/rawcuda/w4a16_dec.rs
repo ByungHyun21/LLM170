@@ -1279,7 +1279,10 @@ impl W4a16Dec {
         // pos+t_len > 256이면 분할(블록 q_heads×S). ≤256은 종전 단일 경로(골든
         // 구간 비트 동일 — 단문/3토큰 프롬프트는 항상 이쪽).
         let pos = self.slot_pos[slot] as usize;
-        if pos + t_len > 256 && self.dattn_part != 0 {
+        // [2026-10-09 P8-attn-3b] 분할 수는 커널이 lim으로 결정한다(그래프 캡처
+        // 무관) — 호스트는 항상 분할 경로를 쓴다. dattn_part 부재 시만 단일.
+        let _ = pos;
+        if self.dattn_part != 0 {
             let fp = self.cc.function("attn_fwd3s_part")?;
             let (mut tl, mut lay) = (t_len as i32, layer as i32);
             let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
