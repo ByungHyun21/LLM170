@@ -83,10 +83,26 @@ __device__ __forceinline__ int sidx(int l, int j) {
     }
 }
 
+// [T3-2] 쌍 배치(128폭 청크) 스케일 인덱스 — i = 2l + 128j (2l < 128).
+// g128: (i)>>7 = j, g32: (i)>>5 = (l>>4) + 4j.
+template <int SHIFT>
+__device__ __forceinline__ int sidx2(int l, int j) {
+    if constexpr (SHIFT == 7) {
+        return j;
+    } else {
+        return (l >> 4) + (j << 2);
+    }
+}
+
 // 2행/블록 — x를 두 행이 공유(L1 x 트래픽 ÷2)하고 레인당 미결 로드가 2배.
 // 스케일은 행별(각 행의 srow), 산술 순서는 1행 커널과 동일(계약 불변).
 // SHIFT = 그룹 로그2(7 = g128, 5 = g32) — 산술 계약은 core
 // dot_row_w4a16_lane_group과 1:1.
+//
+// [T3-2 2026-10-09] 니블 2개/레인 + float2 x: 128폭 청크에서 레인 l이
+// k = 2l, 2l+1(연속)을 담당 — q 워드는 4레인 공유(바이트 1개 = 니블 쌍),
+// x는 float2(8B) 로드 1회. 로드/주소 연산 ÷2. 누산 묶음이 바뀌므로
+// 비트동일 아님(승인 완화 — 골든 판정). k는 128 배수 계약(전 모델 형상 충족).
 template <int SHIFT, bool BF16>
 __device__ __forceinline__ void gemv_row_body(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
@@ -112,41 +128,43 @@ __device__ __forceinline__ void gemv_row_body(
     // 스케일 그룹은 i>>7 = (l + 64j)>>7 = j>>1 — 전 레인 공통(유니폼 로드).
     // 16이터레이션 언롤 — 미결 q·x 로드를 16개까지 겹친다(지연 은닉, 실측 8→16
     // = 27.9→27.2ms). 2행/블록 변형은 역효과(34.8ms — 레지스터·L1 압박).
-    const int jn = k >> 6;
-    const int sh = 4 * (l & 7);
+    // [T3-1/2 2026-10-09] FMA 3-op(가중=fmaf(nib,sc,−8sc), 누산=fmaf) +
+    // 포인터 진행 + 니블 쌍/float2 — 레인당 2가중/이터, 128폭 청크.
+    // 종전 대비: 가중당 I2F+FFMA+FFMA(3), LDG ÷2, 주소 증분 상수.
+    // 비트동일 아님(승인 완화 — 골든·허용오차 게이트가 판정, 비트 게이트 진단용).
+    const int jn = k >> 7;
+    const int sh = 8 * (l & 3);
     float acc = 0.0f;
     int j = 0;
-    // [T3/A2 슬림화 2026-10-09] 가중 스칼라 FMA 3-op — (nib−8)·sc를
-    // fmaf(nib, sc, −8·sc)로(상수항은 sc당 1회 상각), 누산은 fmaf.
-    // 종전 I2F+IADD+FMUL+FMUL+FADD(5) → I2F+FFMA+FFMA(3). 비트동일 아님
-    // (승인된 완화 — 골든·허용오차 게이트가 판정, 비트 게이트는 진단용).
-    // 포인터 진행형 — i 재계산(LEA/IADD 사슬 ~6/가중치)을 상수 증분으로 대체.
-    // q: i>>3 = (l>>3) + jj·8 → +8u32/iter, x: +64f/iter.
-    const unsigned* qp = qrow + (l >> 3);
-    const float* xp = x + l;
-    for (; j + 16 <= jn; j += 16) {
+    const unsigned* qp = qrow + (l >> 2);
+    const float2* xp = reinterpret_cast<const float2*>(x) + l;
+    for (; j + 8 <= jn; j += 8) {
 #pragma unroll
-        for (int u = 0; u < 16; ++u) {
+        for (int u = 0; u < 8; ++u) {
             const int jj = j + u;
             // evict-first — 한 번 읽는 가중치가 L2를 오염시키지 않게(스트리밍).
             const unsigned qw = __ldcs(qp);
-            const float xv = *xp;
-            const int nib = (int)((qw >> sh) & 0xFu);
-            const float scv = sc[sidx<SHIFT>(l, jj)];
-            const float w = fmaf((float)nib, scv, -8.0f * scv);
-            acc = fmaf(w, xv, acc);
-            qp += 8;
+            const float2 xv = *xp;
+            const unsigned byte = (qw >> sh) & 0xFFu;
+            const float scv = sc[sidx2<SHIFT>(l, jj)];
+            const float w0 = fmaf((float)(byte & 0xFu), scv, -8.0f * scv);
+            const float w1 = fmaf((float)(byte >> 4), scv, -8.0f * scv);
+            acc = fmaf(w0, xv.x, acc);
+            acc = fmaf(w1, xv.y, acc);
+            qp += 16;
             xp += 64;
         }
     }
     for (; j < jn; ++j) {
         const unsigned qw = __ldcs(qp);
-        const float xv = *xp;
-        const int nib = (int)((qw >> sh) & 0xFu);
-        const float scv = sc[sidx<SHIFT>(l, j)];
-        const float w = fmaf((float)nib, scv, -8.0f * scv);
-        acc = fmaf(w, xv, acc);
-        qp += 8;
+        const float2 xv = *xp;
+        const unsigned byte = (qw >> sh) & 0xFFu;
+        const float scv = sc[sidx2<SHIFT>(l, j)];
+        const float w0 = fmaf((float)(byte & 0xFu), scv, -8.0f * scv);
+        const float w1 = fmaf((float)(byte >> 4), scv, -8.0f * scv);
+        acc = fmaf(w0, xv.x, acc);
+        acc = fmaf(w1, xv.y, acc);
+        qp += 16;
         xp += 64;
     }
     red[l] = (double)acc;
