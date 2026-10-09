@@ -456,10 +456,10 @@ extern "C" __global__ void attn_prep_hostpos(
 // (2) 트리 max → 지수(트윈)·트리 sum(스레드 보폭 순차 + 트리 — 환원 순서
 // 미러 계약) → sarr 자리에 확률, (3) AV 순차 누산(스레드=dim 원소) →
 // 게이트 sigmoid 곱. WG당 (t,h). lim = pp[0](디바이스)+t+1 — 결함 4호.
-// 도메인: T≤32(ATTN_TMAX) — 위반 시 전 블록 조기복귀(기록 없음).
+// 도메인: T≤128(ATTN_TMAX) — 위반 시 전 블록 조기복귀(기록 없음).
 // [2026-10-09] 8→32: 블록=토큰 구조라 smem이 T와 무관(가드일 뿐) —
 // 프리필 청크 확대(가중치 재사용 ↑)용.
-#define ATTN_TMAX 32
+#define ATTN_TMAX 128
 // ── [S12 2026-10-07] 위치축 청크.online 소프트맥스 — 공유메모리 6KB→2KB ──
 // 이전 구현은 sarr[1024]에 lim행 스코어를 전부 담아 두었다. 공유메모리 고정
 // 크기라 lim(=pp[0]+t+1)이 1024를 넘으면 sarr[row]가 블록 밖을 넘어가고
@@ -497,7 +497,7 @@ extern "C" __global__ void attn_fwd3s(
     const unsigned* __restrict__ pp, // [1] pos0 — 디바이스 판독(결함 4호)
     int t_len, int layer, int q_heads, int kv_heads, int cap)
 {
-    if (t_len > ATTN_TMAX) return;   // 도메인 강제: T≤8(깨끗한 거부)
+    if (t_len > ATTN_TMAX) return;   // 도메인 강제: T≤128(깨끗한 거부)
     __shared__ float qs[256];
     __shared__ float sarr[ATTN_CHUNK]; // 청크 스코어(온라인 — 전체 보관 아님)
     __shared__ float reds[256];

@@ -629,11 +629,15 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         let h = hp.n_embd;
         let mut i = 0usize;
         while i < prompt.len() {
-            // [2026-10-09] MoE 상주는 32(gdn_exp_d 도메인 수정 후), 스트리밍은 1.
+            // [2026-10-09] MoE 상주는 32(기본), 스트리밍은 1. [P10] 상한 128 —
+            // LLM170_PREFILL_T로 실측 오버라이드(엔진 prefill과 동일 규칙).
             let cap = if hp.n_experts > 0 && !dec.moe_experts_resident() {
                 1
             } else {
-                32
+                llm170_diag::flag::val("LLM170_PREFILL_T")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(128) // [P10] 기본 128
+                    .clamp(1, 128)
             };
             let t = (prompt.len() - i).min(cap);
             let mut rows: Vec<f32> = Vec::with_capacity(t * h);
