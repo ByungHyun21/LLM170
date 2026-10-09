@@ -461,6 +461,100 @@ extern "C" __global__ void gdn_scan(
     }
 }
 
+// ── [P9] t=1 전용 GDN — i축(상태 행) 분할 3커널 ──
+// ncu 실측: gdn_scan은 점유 8.3%·compute 8.3% = 지연 바운드(48블록×4워프,
+// 상태 64KB/블록). t=1이면 A(하삼각)·cumsum·청크 기구가 전부 자명하므로
+// i축(128)을 split(4)으로 나눠 grid를 h_v×4(192블록)로 늘린다.
+// 수식(t=1, g=bg[h_v+h], β=bg[h], e=exp(g), wsm[0]=1, gt_exp=e):
+//   KS[d]=Σ_i half(k[i])·st[i][d]   QS[d]=Σ_i q[i]·st[i][d]
+//   dc[d]=β·(half(v[d]) − e·KS[d])
+//   out[d]=e·QS[d]·qscale + KQ00·dc[d]   (KQ00 = Σ q·half(k) · qscale)
+//   st[i][d] = st[i][d]·e + half(k[i])·dc[d]
+// 산술 순서는 i 오름차순 유지(부분합은 분할 순서로 결합) — half 라운딩
+// 지점(KS/QS 8패스 half 누적)은 계약 완화로 f32 단일 누적으로 단순화.
+#define GDN1_SPLIT 8
+
+extern "C" __global__ void gdn1_part(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ st, float* __restrict__ part,
+    int h_k, int h_v, int d, int layer)
+{
+    const int h = blockIdx.x;
+    const int s = blockIdx.y;
+    const int tid = threadIdx.x; // = d 인덱스
+    const int kh = h % h_k;
+    const int ch = 128 / GDN1_SPLIT;
+    const int i0 = s * ch;
+    const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    float ks = 0.0f, qs = 0.0f;
+    for (int ii = 0; ii < ch; ++ii) {
+        const int i = i0 + ii;
+        const float stv = st[st_h + (long)i * d + tid];
+        ks += __half2float(__float2half_rn(k[kh * 128 + i])) * stv;
+        qs += q[kh * 128 + i] * stv;
+    }
+    float* p = part + ((long)h * GDN1_SPLIT + s) * 256;
+    p[tid] = ks;
+    p[128 + tid] = qs;
+}
+
+extern "C" __global__ void gdn1_comb(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ bg,
+    const float* __restrict__ part, float* __restrict__ dc,
+    float* __restrict__ outv, int h_k, int h_v, int d)
+{
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int kh = h % h_k;
+    float ks = 0.0f, qs = 0.0f;
+    for (int s = 0; s < GDN1_SPLIT; ++s) {
+        const float* p = part + ((long)h * GDN1_SPLIT + s) * 256;
+        ks += p[tid];
+        qs += p[128 + tid];
+    }
+    __shared__ float red[128];
+    red[tid] = q[kh * 128 + tid] * __half2float(__float2half_rn(k[kh * 128 + tid]));
+    __syncthreads();
+    for (int stp = 64; stp > 0; stp >>= 1) {
+        if (tid < stp) {
+            red[tid] += red[tid + stp];
+        }
+        __syncthreads();
+    }
+    const float qscale = 1.0f / sqrtf((float)d);
+    const float kq00 = red[0] * qscale;
+    const float g = bg[h_v + h];
+    const float beta = bg[h];
+    const float e = gdn_expf(g);
+    const float sv = __half2float(__float2half_rn(v[h * 128 + tid]));
+    const float rhs = beta * (sv - e * ks);
+    dc[h * 128 + tid] = rhs;
+    outv[h * 128 + tid] = e * qs * qscale + kq00 * rhs;
+}
+
+extern "C" __global__ void gdn1_upd(
+    const float* __restrict__ k, const float* __restrict__ bg,
+    const float* __restrict__ dc, float* __restrict__ st,
+    int h_k, int h_v, int d, int layer)
+{
+    const int h = blockIdx.x;
+    const int s = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int kh = h % h_k;
+    const int ch = 128 / GDN1_SPLIT;
+    const int i0 = s * ch;
+    const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    const float e = gdn_expf(bg[h_v + h]);
+    const float dcv = dc[h * 128 + tid];
+    for (int ii = 0; ii < ch; ++ii) {
+        const int i = i0 + ii;
+        const float kv = __half2float(__float2half_rn(k[kh * 128 + i]));
+        float* p = &st[st_h + (long)i * d + tid];
+        *p = *p * e + kv * dcv;
+    }
+}
+
 // gdn_gate — rms(o_lc)·nw·silu(z) → gated(HF), 역순열 포함
 // (구 rawhip 커널 L368-393 직이식, 폭 인자화). 그리드 (h_v, T), WG=128.
 extern "C" __global__ void gdn_gate(
