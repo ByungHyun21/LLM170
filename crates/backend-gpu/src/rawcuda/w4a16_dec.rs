@@ -2216,10 +2216,13 @@ impl W4a16Dec {
         self.ensure_moe_bufs()?;
         let sel = self.moe_route(il, xn)?;
         // 전문가 — 상주: 배치 GEMV(디바이스 테이블 간접) / 비상주: 스트리밍.
-        Self::zero_dev(&self.cc, self.dmo, self.hidden * 4)?;
+        // [2026-10-09 P2] zero_dev는 동기 h2d — 스트리밍(axpy 누적)에만 필요.
+        // 상주 경로는 moe_accum이 전 행을 덮어쓰므로(y[행]=acc) 제로 불필요:
+        // 층당 동기 1개(35B 36회/토큰) 제거. 값은 골든으로 판정.
         if self.moe_resident {
             self.moe_experts_batch(il, xn, &sel)?;
         } else {
+            Self::zero_dev(&self.cc, self.dmo, self.hidden * 4)?;
             self.moe_experts_streaming(il, xn, &sel)?;
         }
         self.moe_shared(il, xn)?;
