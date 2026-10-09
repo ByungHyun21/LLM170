@@ -541,8 +541,8 @@ pub(crate) fn handle(
 }
 
 /// 슬롯 잡 enqueue 공통 — 채널 쌍 생성·SlotJob 조립·큐 송신.
-/// Err면 이미 503(queue full) 응답을 썼다. 반환: (최종 결과 수신기, 스트림
-/// 토큰 수신기 — 비스트림 모드는 진행 채널이 그대로 닫힌다).
+/// Err면 이미 응답을 썼다(큐 포화 429 / 엔진 사망 503). 반환: (최종 결과
+/// 수신기, 스트림 토큰 수신기 — 비스트림 모드는 진행 채널이 그대로 닫힌다).
 #[allow(clippy::type_complexity)]
 fn enqueue_job(
     stream: &mut TcpStream,
@@ -582,14 +582,24 @@ fn enqueue_job(
         out: otx,
         queued: std::time::Instant::now(),
     };
-    if tx.try_send(job).is_err() {
-        resp(
-            stream,
-            503,
-            "application/json",
-            "{\"error\":\"queue full\"}",
-        );
-        return Err(());
+    // [D 2026-10-10] 어드미션 하드게이트 — 큐 포화는 429(재시도 가능)로 구분.
+    // 종전엔 사망/포화가 같은 503 "queue full"이라 클라이언트가 재시도 여부를
+    // 판단할 수 없었다(Retry-After 부재).
+    match tx.try_send(job) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            crate::http::resp_429(stream, "{\"error\":\"queue full — admission gate\"}");
+            return Err(());
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            resp(
+                stream,
+                503,
+                "application/json",
+                "{\"error\":\"engine channel closed\"}",
+            );
+            return Err(());
+        }
     }
     Ok((orx, prx))
 }
@@ -824,6 +834,25 @@ fn run_and_emit(
         let _ = emit_delta(stream, fmt, &id, created, &model_esc, &piece);
     }
     let final_res = orx.recv(); // 최종 결과 수령 (종료 정리)
+    // [D 2026-10-10] 엔진 확정 실패의 스트림 직렬화 — 종전엔 실패해도 정상
+    // finish("stop")+[DONE]으로 뭉개 클라이언트가 잘린 응답을 성공으로 오인했다.
+    let err: Option<String> = match &final_res {
+        Ok(r) => r.error.clone(),
+        Err(_) => Some("engine result channel closed".into()),
+    };
+    if let Some(e) = err {
+        let _ = sse(
+            stream,
+            "message",
+            &format!(
+                "{{\"error\":{{\"message\":\"{}\",\"type\":\"engine_error\"}}}}",
+                crate::json::esc(&e)
+            ),
+        );
+        let _ = sse(stream, "done", "[DONE]");
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        return;
+    }
     let n_gen = final_res.as_ref().map(|r| r.tokens.len()).unwrap_or(ntok);
     let finish = if trunc {
         "stop"
@@ -1077,7 +1106,25 @@ fn run_and_emit_anthropic(
                 ),
             );
         }
-        let _ = orx.recv();
+        let final_res = orx.recv();
+        // [D 2026-10-10] 확정 실패 — Anthropic error 이벤트 직렬화
+        // (정상 message_delta/message_stop 위장 금지).
+        let err: Option<String> = match &final_res {
+            Ok(r) => r.error.clone(),
+            Err(_) => Some("engine result channel closed".into()),
+        };
+        if let Some(e) = err {
+            let _ = sse(
+                stream,
+                "error",
+                &format!(
+                    "{{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":\"{}\"}}}}",
+                    crate::json::esc(&e)
+                ),
+            );
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            return;
+        }
         // [H 2026-10-09] max_tokens 방출 — 종전엔 length 정지도 end_turn으로
         // 뭉갰다(Anthropic 규약 위반).
         let reason = if stopped {

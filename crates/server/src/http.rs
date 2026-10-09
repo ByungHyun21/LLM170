@@ -398,6 +398,20 @@ pub(crate) fn resp_sse_open(stream: &mut TcpStream) {
     );
 }
 
+/// [D 2026-10-10] 어드미션 게이트 응답 — 429 Too Many Requests + Retry-After.
+/// 큐 포화(하드게이트) 전용 — 로딩/엔진 사망은 503(호출부 판단).
+pub(crate) fn resp_429(stream: &mut TcpStream, body: &str) {
+    let _ = stream.write_all(admission_429(body).as_bytes());
+}
+
+/// 429 응답 조립 — 순수 함수(전송 계약 테스트 표면).
+pub(crate) fn admission_429(body: &str) -> String {
+    format!(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 /// 쓰기 오류를 반환한다 — 종전 `let _ =`가 절단된
 /// 클라이언트로의 쓰기 실패를 삼켜, 잔여 n_predict를 GPU가 끝까지 계산했다.
 /// [2026-10-09 P5] 프레임을 문자열로 조립해 단일 write_all — 종전 write!는
@@ -421,7 +435,6 @@ mod req_tests {
 
     use super::*;
     use std::io::{BufReader, Cursor};
-
     fn parse(bytes: &[u8]) -> Result<HttpReq, ReqErr> {
         let mut r = BufReader::new(Cursor::new(bytes.to_vec()));
         read_request_from(&mut r)
@@ -528,5 +541,19 @@ mod req_tests {
         let b = read_request_from(&mut r).expect("2nd");
         assert_eq!(a.path, "/a");
         assert_eq!(b.path, "/b");
+    }
+
+    /// [D] 어드미션 게이트 429 — 상태줄·Retry-After·Content-Length 계약.
+    #[test]
+    fn admission_429_contract() {
+        let body = "{\"error\":\"queue full — admission gate\"}";
+        let r = admission_429(body);
+        assert!(r.starts_with("HTTP/1.1 429 Too Many Requests\r\n"), "{r}");
+        assert!(r.contains("\r\nRetry-After: 1\r\n"), "{r}");
+        assert!(
+            r.contains(&format!("\r\nContent-Length: {}\r\n", body.len())),
+            "{r}"
+        );
+        assert!(r.ends_with(&format!("\r\n\r\n{body}")), "{r}");
     }
 }
