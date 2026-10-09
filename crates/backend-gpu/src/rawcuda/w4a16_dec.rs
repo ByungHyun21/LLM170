@@ -1011,7 +1011,17 @@ impl W4a16Dec {
         Ok(())
     }
 
-    fn gdn_chain_dev(&mut self, slot: usize, layer: usize, t_len: usize) -> Result<(), String> {
+    /// GDN 체인 디바이스 — [A3 2026-10-09] 입력(xn·qkv·z)을 스테이징 버퍼로
+    /// d2d 복사하지 않고 **커널 인자로 직접 소비**한다(호출자 버퍼가 곧 입력).
+    fn gdn_chain_dev(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        xn_dev: CUdeviceptr,
+        qkv_dev: CUdeviceptr,
+        z_dev: CUdeviceptr,
+    ) -> Result<(), String> {
         let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
         if layer >= dm.n_gdn || slot >= self.n_slots || t_len == 0 {
             return Err(format!(
@@ -1032,7 +1042,7 @@ impl W4a16Dec {
 
         let f = self.cc.function("gdn_conv")?;
         let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5) = (
-            self.dqkv,
+            qkv_dev,
             self.dcw,
             self.dring + (ring_slot as u64) * 4,
             self.dgq,
@@ -1069,7 +1079,7 @@ impl W4a16Dec {
             mut l9,
             mut l10,
         ) = (
-            self.dgq, self.dgk, self.dgv, self.dgxn, self.dab_c, self.dalog, self.ddtb, self.dq2,
+            self.dgq, self.dgk, self.dgv, xn_dev, self.dab_c, self.dalog, self.ddtb, self.dq2,
             self.dk2, self.dv2, self.dbg,
         );
         let mut al: [*mut std::ffi::c_void; 16] = [
@@ -1194,7 +1204,7 @@ impl W4a16Dec {
         }
 
         let f = self.cc.function("gdn_gate")?;
-        let (mut g0, mut g1, mut g2, mut g3) = (self.dgo, self.dzv, self.dnwg, self.dgate);
+        let (mut g0, mut g1, mut g2, mut g3) = (self.dgo, z_dev, self.dnwg, self.dgate);
         let mut ag: [*mut std::ffi::c_void; 8] = [
             (&mut g0) as *mut _ as *mut _,
             (&mut g1) as *mut _ as *mut _,
@@ -1233,7 +1243,8 @@ impl W4a16Dec {
         self.cc.h2d(self.dgxn, b(xn))?;
         self.cc.h2d(self.dqkv, b(qkv))?;
         self.cc.h2d(self.dzv, b(z))?;
-        self.gdn_chain_dev(slot, layer, t_len)?;
+        let (gxn, gqkv, gzv) = (self.dgxn, self.dqkv, self.dzv);
+        self.gdn_chain_dev(slot, layer, t_len, gxn, gqkv, gzv)?;
         let mut ob = vec![0u8; t_len * dm.v_len() * 4];
         self.cc.d2h(&mut ob, self.dgate)?;
         self.cc.sync()?;
@@ -1404,7 +1415,17 @@ impl W4a16Dec {
         }
     }
 
-    fn attn_prep_launch(&mut self, slot: usize, layer: usize, t_len: usize) -> Result<(), String> {
+    /// 어텐션 prep — [A3 2026-10-09] qg·kin·vin은 커널 인자 직접 소비
+    /// (스테이징 d2d 제거). 출력은 dqh_a(정규화 q)·KV 캐시.
+    fn attn_prep_launch(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        qg_dev: CUdeviceptr,
+        kin_dev: CUdeviceptr,
+        vin_dev: CUdeviceptr,
+    ) -> Result<(), String> {
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         if self.kvq {
@@ -1425,9 +1446,9 @@ impl W4a16Dec {
                 mut a9,
                 mut aa,
             ) = (
-                self.dqg_a,
-                self.dkin_a,
-                self.dvin_a,
+                qg_dev,
+                kin_dev,
+                vin_dev,
                 self.dqnw_a,
                 self.dknw_a,
                 self.dqh_a,
@@ -1467,9 +1488,9 @@ impl W4a16Dec {
         let f = self.cc.function("attn_prep")?;
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
         let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) = (
-            self.dqg_a,
-            self.dkin_a,
-            self.dvin_a,
+            qg_dev,
+            kin_dev,
+            vin_dev,
             self.dqnw_a,
             self.dknw_a,
             self.dqh_a,
@@ -1502,7 +1523,14 @@ impl W4a16Dec {
         )
     }
 
-    fn attn_fwd3s_launch(&mut self, slot: usize, layer: usize, t_len: usize) -> Result<(), String> {
+    /// fwd3s — [A3 2026-10-09] gate(qg)는 커널 인자 직접 소비(스테이징 제거).
+    fn attn_fwd3s_launch(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        qg_dev: CUdeviceptr,
+    ) -> Result<(), String> {
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
         if t_len == 0 || t_len > ATTN_F3S_TMAX {
             return Err(format!("attn fwd3s: T={t_len} — 소형 전용 도메인 위반"));
@@ -1584,7 +1612,7 @@ impl W4a16Dec {
                 )?;
             }
             let fm = self.cc.function("attn_fwd3s_merge")?;
-            let (mut mp, mut mg, mut mo) = (self.dattn_part, self.dqg_a, self.doutv_a);
+            let (mut mp, mut mg, mut mo) = (self.dattn_part, qg_dev, self.doutv_a);
             let (mut tl2, mut qh2) = (t_len as i32, dm.q_heads as i32);
             let mut ma: [*mut std::ffi::c_void; 6] = [
                 (&mut mp) as *mut _ as *mut _,
@@ -1605,7 +1633,7 @@ impl W4a16Dec {
             self.dqh_a,
             self.attn_kv_ptr(slot),
             self.attn_vc_ptr(slot),
-            self.dqg_a,
+            qg_dev,
             self.doutv_a,
             self.attn_pp_ptr(slot),
         );
@@ -1661,8 +1689,9 @@ impl W4a16Dec {
         self.cc.h2d(self.dkin_a, b(kin))?;
         self.cc.h2d(self.dvin_a, b(vin))?;
         self.attn_set_pos(slot, pos0)?;
-        self.attn_prep_launch(slot, layer, t_len)?;
-        self.attn_fwd3s_launch(slot, layer, t_len)?;
+        let (aqg, akin, avin) = (self.dqg_a, self.dkin_a, self.dvin_a);
+        self.attn_prep_launch(slot, layer, t_len, aqg, akin, avin)?;
+        self.attn_fwd3s_launch(slot, layer, t_len, aqg)?;
         let mut buf = vec![0u8; t_len * dm.q_dim() * 4];
         self.cc.d2h(&mut buf, self.doutv_a)?;
         self.cc.sync()?;
@@ -3217,12 +3246,9 @@ impl W4a16Dec {
         qkv_dev: CUdeviceptr,
         z_dev: CUdeviceptr,
     ) -> Result<CUdeviceptr, String> {
-        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
-        self.ensure_gdn_bufs(t_len)?;
-        self.cc.d2d(self.dgxn, xn_dev, t_len * dm.hidden * 4)?;
-        self.cc.d2d(self.dqkv, qkv_dev, t_len * dm.conv_ch() * 4)?;
-        self.cc.d2d(self.dzv, z_dev, t_len * dm.v_len() * 4)?;
-        self.gdn_chain_dev(slot, layer, t_len)?;
+        // [A3] 스테이징 d2d 3회/층 제거 — 호출자 버퍼를 커널 인자로 직접 소비.
+        // (gdn_chain_dev가 형상·범위 검증·버퍼 보장을 겸한다.)
+        self.gdn_chain_dev(slot, layer, t_len, xn_dev, qkv_dev, z_dev)?;
         Ok(self.dgate)
     }
 
@@ -3246,11 +3272,9 @@ impl W4a16Dec {
         }
         self.attn_set_pos(slot, pos)?;
         self.ensure_attn_bufs(t_len)?;
-        self.cc.d2d(self.dqg_a, qg_dev, t_len * dm.qg_dim() * 4)?;
-        self.cc.d2d(self.dkin_a, kin_dev, t_len * dm.kv_dim() * 4)?;
-        self.cc.d2d(self.dvin_a, vin_dev, t_len * dm.kv_dim() * 4)?;
-        self.attn_prep_launch(slot, layer, t_len)?;
-        self.attn_fwd3s_launch(slot, layer, t_len)?;
+        // [A3] 스테이징 d2d 3회/층 제거 — 호출자 버퍼를 커널 인자로 직접 소비.
+        self.attn_prep_launch(slot, layer, t_len, qg_dev, kin_dev, vin_dev)?;
+        self.attn_fwd3s_launch(slot, layer, t_len, qg_dev)?;
         Ok(self.doutv_a)
     }
 
