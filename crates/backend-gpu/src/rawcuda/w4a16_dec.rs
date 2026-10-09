@@ -349,6 +349,7 @@ impl W4a16Dec {
                 "w4a16_shared_add",
                 "w4a16_gemv_experts_g32_bf16",
                 "w4a16_moe_accum",
+                "w4a16_moe_topk",
                 "w4a16_gemv_bf16",
                 "w4a16_gemm_bf16",
                 "w4a16_gemm_bf16_t",
@@ -2214,19 +2215,36 @@ impl W4a16Dec {
             return Err("moe: 구성/전문가 테이블 미등록".into());
         }
         self.ensure_moe_bufs()?;
-        let sel = self.moe_route(il, xn)?;
-        // 전문가 — 상주: 배치 GEMV(디바이스 테이블 간접) / 비상주: 스트리밍.
-        // [2026-10-09 P2] zero_dev는 동기 h2d — 스트리밍(axpy 누적)에만 필요.
-        // 상주 경로는 moe_accum이 전 행을 덮어쓰므로(y[행]=acc) 제로 불필요:
-        // 층당 동기 1개(35B 36회/토큰) 제거. 값은 골든으로 판정.
+        // [2026-10-09 P1] 상주는 라우터를 디바이스에서 마무리(top-k 디바이스) —
+        // d2h+sync+호스트 moe_topk+h2d 왕복(층당 1회) 제거, 그래프 캡처 가능화.
+        // 스트리밍은 전문가 파일 스테이징에 호스트 선택이 필요해 종전 경로 유지
+        // (zero_dev도 axpy 누적 전용 — 상주는 moe_accum이 전 행 덮어씀, P2).
         if self.moe_resident {
-            self.moe_experts_batch(il, xn, &sel)?;
+            self.moe_route_dev(il, xn)?;
+            self.moe_experts_batch(il, xn, self.top_k)?;
         } else {
+            let sel = self.moe_route(il, xn)?;
             Self::zero_dev(&self.cc, self.dmo, self.hidden * 4)?;
             self.moe_experts_streaming(il, xn, &sel)?;
         }
         self.moe_shared(il, xn)?;
         Ok(self.dmo)
+    }
+
+    /// 라우터 디바이스 상주(P1) — gate GEMV → w4a16_moe_topk(idx/wt 디바이스).
+    fn moe_route_dev(&mut self, il: usize, xn: CUdeviceptr) -> Result<(), String> {
+        self.plain_gemv_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt)?;
+        let f = self.cc.function("w4a16_moe_topk")?;
+        let (mut p_lg, mut p_ix, mut p_wt) = (self.drt, self.moe_idx, self.moe_wt);
+        let (mut nn, mut kk) = (self.n_experts as i32, self.top_k as i32);
+        let mut args: [*mut std::ffi::c_void; 5] = [
+            (&mut p_lg) as *mut _ as *mut _,
+            (&mut p_ix) as *mut _ as *mut _,
+            (&mut p_wt) as *mut _ as *mut _,
+            (&mut nn) as *mut _ as *mut _,
+            (&mut kk) as *mut _ as *mut _,
+        ];
+        self.cc.launch(f, 1, 1, 32, &mut args)
     }
 
     /// 라우터 — bf16 GEMV(원시 xn) → 로짓 판독 → 호스트 top-k 선택.
@@ -2245,26 +2263,19 @@ impl W4a16Dec {
         Ok(moe_topk(&logits, self.top_k))
     }
 
-    /// 전문가 배치(상주) — 슬롯 idx·가중 h2d + 테이블 간접 GEMV + 가중 누적.
+    /// 전문가 배치(상주) — 테이블 간접 GEMV + 가중 누적.
+    /// [P1] idx/wt는 호출자가 디바이스에 기록한다(moe_route_dev) — 종전
+    /// h2d 2회(층당) 제거. gDN 경로(moe_ffn_dev_t)는 호스트 선택이 남아
+    /// 이 함수 앞에서 moe_idx/moe_wt를 h2d로 채운 뒤 ns를 넘긴다.
     fn moe_experts_batch(
         &mut self,
         il: usize,
         xn: CUdeviceptr,
-        sel: &[(usize, f32)],
+        ns: usize,
     ) -> Result<(), String> {
         let n_exp = self.n_experts;
         let h = self.hidden;
         let n_ff = self.moe_ffn;
-        let ns = sel.len();
-        let idx: Vec<u32> = sel.iter().map(|&(e, _)| e as u32).collect();
-        let wts: Vec<f32> = sel.iter().map(|&(_, w)| w).collect();
-        // SAFETY: 호스트 Vec 슬라이스 — 호출 내 수명(동기 복사 완료).
-        let ib = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len() * 4) };
-        let wb = unsafe { std::slice::from_raw_parts(wts.as_ptr() as *const u8, wts.len() * 4) };
-        // 캡처/체인과 같은 스트림 순서(레거시 h2d는 비블로킹 스트림과 순서
-        // 보장이 없다 — 실측 회귀 원인).
-        self.cc.h2d_async(self.moe_idx, ib)?;
-        self.cc.h2d_async(self.moe_wt, wb)?;
         // gate/up 배치(x 공통) → ew → down 배치(x 슬롯별) → 가중 누적.
         let base = il * n_exp * 3;
         self.gemv_experts_launch(base, ns, xn, 0, ns, self.dexp_gate, n_ff, h)?;
@@ -2894,9 +2905,12 @@ impl W4a16Dec {
         llm170_diag::flag::ne0("LLM170_GRAPH")
             && !self.debug_layers
             && !self.graph_failed
-            // MoE는 라우터 로짓 판독(호스트 선택)+전문가 h2d가 있어 캡처 불가 —
-            // 데이터 주도 디스패치(전문가 테이블 상주) 도입 시 재검.
-            && self.n_experts == 0
+            // [2026-10-09 P1] MoE 상주 경로는 캡처 가능해졌다: 라우터 top-k가
+            // 디바이스(w4a16_moe_topk — 호스트 왕복 0), 전문가 디스패치가
+            // 데이터 주도(디바이스 idx 포인터 테이블 — 포인터는 고정), h2d/sync
+            // 없음(P1·P2). 스트리밍은 전문가 파일 스테이징(h2d_chunked sync)이라
+            // 여전히 불가. 미검증 경로는 직접 경로 폴백(graph_failed)이 덮는다.
+            && (self.n_experts == 0 || self.moe_resident)
     }
 
     /// 캡처 전 버퍼 워밍업 — **불변식: 체인에서 지연 할당되는 모든 버퍼는
@@ -2908,6 +2922,10 @@ impl W4a16Dec {
     /// head(head_w/head_out — upload_head 소관).
     fn warm_for_capture(&mut self) -> Result<(), String> {
         self.ensure_chain_bufs()?;
+        if self.n_experts > 0 {
+            // P1: MoE 상주 체인의 지연 할당원(drt/dexp_*/dmo/moe_idx/moe_wt).
+            self.ensure_moe_bufs()?;
+        }
         self.ensure_norm_bufs(1)?;
         self.ensure_gdn_bufs(1)?;
         self.ensure_attn_bufs(1)?;
@@ -3007,6 +3025,11 @@ impl W4a16Dec {
         self.graph_exec = e;
         self.graph_slot = slot;
         self.graph_head = head;
+        // 캡처 성공 1회 로그 — 경로 가시화(MoE 상주 = P1 개방분 포함).
+        eprintln!(
+            "[graph] captured slot={slot} head={head} moe_resident={}",
+            self.moe_resident
+        );
         Ok(())
     }
 
@@ -3105,7 +3128,10 @@ impl W4a16Dec {
                     self.plain_gemm_launch(&format!("blk.{il}.attn_qkv.weight"), xn, s0, t)?;
                     self.plain_gemm_launch(&format!("blk.{il}.attn_gate.weight"), xn, s1, t)?;
                 } else {
-                    let xh = self.cast_x32(xn, t * h)?;
+                    // [2026-10-09 P6] xh(=self.dx32)는 norm_resid_dev가 이미
+                    // h2f(f2h(xn)) 융합 기록(norm.cu xn32 — cast_x32와 비트 동일
+                    // 계약, 실측 근거 주석 포함). 종전 cast_x32 재계산은 중복
+                    // 런치였다. 값 불변(골든 검증).
                     self.gemm_launch(&format!("blk.{il}.attn_qkv.weight"), xh, s0, t)?;
                     self.gemm_launch(&format!("blk.{il}.attn_gate.weight"), xh, s1, t)?;
                 }

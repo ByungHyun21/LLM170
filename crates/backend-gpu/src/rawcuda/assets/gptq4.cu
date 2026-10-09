@@ -545,6 +545,55 @@ extern "C" __global__ void w4a16_moe_accum(const float* __restrict__ w,
     }
 }
 
+// [2026-10-09 P1] MoE 라우터 top-k — 호스트 moe_topk 미러:
+// softmax(f32, max-빼기) → k라운드 최대 선택(p 내림차순, 동률 낮은 idx) →
+// 재정규화. 단일 스레드 순차(결정적·캡처 안전 — 호스트 왕복 제거). n ≤ 1024.
+// exp는 CUDA expf — 호스트 libm exp와 ulp 차이 허용(플레인 경로 — 토큰 골든
+// 판정). idx/wt는 디바이스에 남아 배치 GEMV·moe_accum이 직접 소비한다.
+extern "C" __global__ void w4a16_moe_topk(const float* __restrict__ lg,
+                                          unsigned* __restrict__ idx,
+                                          float* __restrict__ wt, int n, int k) {
+    __shared__ float p[1024];
+    __shared__ unsigned char used[1024];
+    if (threadIdx.x != 0) {
+        return;
+    }
+    float mx = -INFINITY;
+    for (int i = 0; i < n; i++) {
+        mx = fmaxf(mx, lg[i]);
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        p[i] = expf(lg[i] - mx);
+        sum += p[i];
+    }
+    for (int i = 0; i < n; i++) {
+        p[i] /= sum;
+        used[i] = 0;
+    }
+    float wsum = 0.0f;
+    for (int r = 0; r < k; r++) {
+        int bi = 0;
+        float bv = -INFINITY;
+        for (int i = 0; i < n; i++) {
+            if (used[i]) {
+                continue;
+            }
+            if (p[i] > bv) {
+                bv = p[i];
+                bi = i;
+            }
+        }
+        used[bi] = 1;
+        idx[r] = (unsigned)bi;
+        wt[r] = bv;
+        wsum += bv;
+    }
+    for (int r = 0; r < k; r++) {
+        wt[r] /= wsum;
+    }
+}
+
 // shared 게이트 가산 — y[i] += sigmoid(sg[0])·x[i] (sigmoid = 1/(1+e^-v)).
 extern "C" __global__ void w4a16_shared_add(const float* __restrict__ sg,
                                             const float* __restrict__ x,
