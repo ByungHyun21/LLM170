@@ -357,4 +357,32 @@ mod tests {
         let l = logits(&[0.0, 20.0, 0.0]);
         assert_eq!(s.sample(&l), 1);
     }
+
+    /// min_p(2026-10-09 갭): 최대확률 대비 비율 미달 꼬리 제거 — 시드 무관
+    /// 단일 후보가 되는 두 경계(비 1:4.5e-5, 비 0.905)를 고정.
+    #[test]
+    fn min_p_filters_tail_deterministically() {
+        for seed in [0u64, 1, 7] {
+            let mut s = Sampler::new(SamplerParams {
+                temperature: 1.0,
+                min_p: 0.5,
+                seed,
+                ..Default::default()
+            });
+            assert!(!s.is_greedy());
+            for _ in 0..16 {
+                assert_eq!(s.sample(&logits(&[10.0, 0.0])), 0);
+            }
+        }
+        // 근접 분포(p0=0.524, p1=0.475 → 비 0.905) — 임계 0.95가 2등을 자른다.
+        let mut s = Sampler::new(SamplerParams {
+            temperature: 1.0,
+            min_p: 0.95,
+            seed: 3,
+            ..Default::default()
+        });
+        for _ in 0..16 {
+            assert_eq!(s.sample(&logits(&[1.0, 0.9])), 0);
+        }
+    }
 }
