@@ -377,9 +377,13 @@ extern "C" __global__ void gdn_scan(
         }
         __syncthreads();
 
-        for (int i = 0; i < GDN_CS; i++) {
-            if (tid < GDN_CS && i < n) {
-                int j = tid;
+        // [A5] A/KQ — (i,j) 2D 매핑(전 스레드). 종전 i직렬·tid<32만 활성
+        // (128스레드 중 96 유휴) — 셀당 128차 내적은 s2 오름차순 그대로라
+        // **셀 값은 비트동일**(골든 판정). i≥n 셀은 소비자(dc/o 루프)가 읽지
+        // 않지만 종전의 스테일 값 대신 0 기록(불변 — aij!=0 가드와 무관).
+        for (int e = tid; e < GDN_CS * GDN_CS; e += blockDim.x) {
+            int i = e / GDN_CS, j = e % GDN_CS;
+            if (i < n) {
                 float dk = 0.0f, dq = 0.0f;
                 int qbase = (t0 + i) * (h_k * d) + kh * 128;
                 for (int s2 = 0; s2 < 128; s2++) {
@@ -390,6 +394,9 @@ extern "C" __global__ void gdn_scan(
                 float bi = bp[i];
                 A[i * GDN_CS + j] = __float2half_rn((j < i) ? dk * bi * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
                 KQ[i * GDN_CS + j] = __float2half_rn((j <= i) ? dq * qscale * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
+            } else {
+                A[i * GDN_CS + j] = __float2half_rn(0.0f);
+                KQ[i * GDN_CS + j] = __float2half_rn(0.0f);
             }
         }
         __syncthreads();
