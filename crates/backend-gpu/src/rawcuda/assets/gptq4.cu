@@ -323,12 +323,16 @@ __device__ __forceinline__ void gemm_body(
     // 토큰별 트리 — 계약 순서(1단 a[i]+=a[i+32] 후 off 16,8,4,2,1)를 병렬화:
     // 워프 셔플로 각 단을 병렬 가산(각 가산은 독립 — 비트 동일), 배리어는
     // red 기록용 1회/토큰만.
+    // [2026-10-09 결함 수정] 종전엔 ti≥t 행도 트리·기록을 수행했다 — 출력
+    // 스크래치(ensure_dyt)가 t행만 할당되므로 t<32에서 버퍼 밖에 유한값을
+    // 기록하는 무증상 잠복 결함(값이 유한해 크래시·오염이 드러나지 않음).
+    // 유효 토큰(ti<t)만 트리·기록한다 — 산술 계약 무변.
     for (int ti = 0; ti < G4_GTMAX; ++ti) {
         if (ti < t) {
             red[g][l] = (double)acc[ti];
         }
         __syncthreads();
-        if (live && l < 32) {
+        if (ti < t && live && l < 32) {
             double r = red[g][l] + red[g][l + 32];
 #pragma unroll
             for (int off = 16; off >= 1; off >>= 1) {
