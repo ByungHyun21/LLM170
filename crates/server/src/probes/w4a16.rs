@@ -500,8 +500,8 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         let h = hp.n_embd;
         let mut i = 0usize;
         while i < prompt.len() {
-            // MoE 프리필 배치(t≤8)는 전문가 상주 전제 — 스트리밍은 t=1 폴백.
-            let t = if hp.n_experts > 0 && !dec.moe_experts_resident() {
+            // [2026-10-09 개방 결함] MoE 배치 프리필 t≥8 NaN — MoE는 t=1 고정.
+            let t = if hp.n_experts > 0 {
                 1
             } else {
                 (prompt.len() - i).min(8)
