@@ -665,11 +665,15 @@ extern "C" __global__ void w4a16_gemv_bf16_t(
 //   A: a0={A[g][2t],A[g][2t+1]} a1={A[g+8][2t..]} a2={A[g][2t+8..]} a3={A[g+8][2t+8..]}
 //   B(col-major, B[k][n]=w[n][k]): b0={w[g][2t],w[g][2t+1]} b1={w[g][2t+8],w[g][2t+9]}
 //   C: c0=C[g][2t] c1=C[g][2t+1] c2=C[g+8][2t] c3=C[g+8][2t+1]  (g=lane>>2, t=lane&3)
-// 타일: 블록 256스레드(8워프) = M32 × N64, k청크 64(스테이징 12KB) → 워프당
+// 타일: 블록 256스레드(8워프) = M32 × N64, k청크 32(스테이징 ~6KB) → 워프당
 // m16×n16(2× n8 mma). 워프 w: m타일 w/4, n타일 (w%4)*16.
+// [B1/B3 2026-10-10] ncu 이중 병목(L2 86% x 재판독 ÷2·ALU 57.7 디퀀트)·KC32
+// 실측: ffn_up t512 1.58→1.35ms. 그룹(MoE) = GRP_M64×GRP_N32(슬롯행 재사용).
 #define MMA_M 32
-#define MMA_N 32
-#define MMA_KC 64   // 128은 smem 증가로 블록 감소(0.18 vs 0.13ms 실측)
+#define MMA_N 64
+#define GRP_M 64
+#define GRP_N 32
+#define MMA_KC 32   // [B1/B3 실험] 64→32: smem 절반 → 점유 2배(지연 노출 완화)
 
 __device__ __forceinline__ unsigned short f2bf16(float v) {
     // RNE — __floats2bfloat162_rn과 동일 비트(스모크에서 대조 검증).
@@ -701,7 +705,7 @@ __device__ __forceinline__ void ldm_x2(unsigned& r0, unsigned& r1, const void* p
                  : "r"(a));
 }
 
-extern "C" __global__ void w4a16_gemm_bf16_mma(
+extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
     const unsigned short* __restrict__ w,  // [n][k] bf16
     const float* __restrict__ x,           // [t][k] f32
     float* __restrict__ out,               // [t][n]
@@ -719,8 +723,8 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
     const int warp = tid >> 5;
     const int g = lane >> 2;
     const int tt = lane & 3;
-    const int mt = (warp >> 2) * 16;      // 워프 m 오프셋(0/16)
-    const int ntw = (warp & 3) * 8;      // [병렬도] T1과 동일(16×8)
+    const int mt = (warp >> 2) * 16;      // [B1/B3] 2 m워프 × 16 = M32
+    const int ntw = (warp & 3) * 16;      // 4 n워프 × 16 = N64(워프 16×16)
     float c[2][4];
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -775,7 +779,7 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
             unsigned a0, a1, a2, a3;
             ldm_x4(a0, a1, a2, a3, &xs[mt + row][kb + colblk]);
 #pragma unroll
-            for (int nt = 0; nt < 1; ++nt) {
+            for (int nt = 0; nt < 2; ++nt) {
                 const int nb = ntw + nt * 8;
                 // B: ldmatrix.x2.trans — 레인 0-7이 n행(열 kb), 8-15가 n행(열 kb+8).
                 unsigned b0, b1;
@@ -790,7 +794,7 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
     }
     // 에필로그 — 프래그먼트 규약 그대로 기록(범위 가드).
 #pragma unroll
-    for (int nt = 0; nt < 1; ++nt) {
+    for (int nt = 0; nt < 2; ++nt) {
         const int col = n0 + ntw + nt * 8 + 2 * tt;
         const int r0 = m0 + mt + g;
         if (r0 < t) {
@@ -822,8 +826,8 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
 // 디퀀트는 marlin식 마법 상수: f16(1024+n) = 0x6400|n (n<16이 mantissa 하위
 // 비트에 정확히 더해짐) → w=(n−8)·s = (1024+n)·s − 1032·s = hfma2 1회.
 // 니블 순서는 __byte_perm으로 (e0,e1),(e2,e3) 정렬(8원소/u32당 ~8 op).
-// 타일·ldmatrix는 T2와 동일(M32×N64, k청크 64).
-extern "C" __global__ void w4a16_gemm_g128_mma(
+// 타일·ldmatrix는 T2와 동일(M32×N64, k청크 32 — B1/B3).
+extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_g128_mma(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
     const unsigned short* __restrict__ s,  // [n][k/128] f16 스케일
     const float* __restrict__ x,           // [t][k] f32 = h2f(f2h(활성)) —
@@ -843,11 +847,10 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
     const int warp = tid >> 5;
     const int g = lane >> 2;
     const int tt = lane & 3;
-    // [병렬도] 워프 타일 16×8(N=32, 8워프 = 2m×4n) — ncu: 스케줄러당 활성
-    // 워프 4.24(No Eligible 76%)로 지연 노출. 블록 32×32로 grid 272→544.
-    // 가중치 트래픽은 타일과 무관(각 블록이 자기 행만 읽음) — x 재판독만 2배.
+    // [B1/B3 2026-10-10] 워프 타일 16×16(M32×N64, 8워프 = 2m×4n) — ncu:
+    // ALU 57.7%(디퀀트)·L2 86%(x f32 재판독) 이중 병목. N64로 x 재판독 절반.
     const int mt = (warp >> 2) * 16;
-    const int ntw = (warp & 3) * 8;
+    const int ntw = (warp & 3) * 16;
     const int k8 = k >> 3;
     const int kg = k >> 7;
     float c[2][4];
@@ -965,7 +968,7 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
             const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
             const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
 #pragma unroll
-            for (int nt = 0; nt < 1; ++nt) {
+            for (int nt = 0; nt < 2; ++nt) {
                 const int nb = ntw + nt * 8;
                 const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
                 const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
@@ -978,7 +981,7 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
         }
     }
 #pragma unroll
-    for (int nt = 0; nt < 1; ++nt) {
+    for (int nt = 0; nt < 2; ++nt) {
         const int col = n0 + ntw + nt * 8 + 2 * tt;
         const int r0 = m0 + mt + g;
         if (r0 < t) {
@@ -1001,7 +1004,8 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
 }
 
 // ── [P11] 그룹 mma GEMM(g32·bf16 스케일) — MoE 프리필 전문가 묶음 ──
-// 블록 = (전문가, n타일). M = 그 전문가의 슬롯 수(가변 — m타일 루프),
+// 블록 = (전문가, n타일). 타일 GRP_M64×GRP_N32(워프 4m×2n 16×16, B1/B3 —
+// 슬롯행 64 재사용으로 W 디퀀트 절반). M = 그 전문가의 슬롯 수(가변 — m타일 루프),
 // A = 슬롯→토큰 매핑으로 모은 x 행(f16 스테이징), B = g32 디퀀트(f16).
 // 프래그먼트·타일 계약은 T1과 동일(명시 판독 — ldmatrix 전치 불일치 회피).
 // 판정은 토큰 골든(계약 완화 — 허용오차 등급).
@@ -1017,7 +1021,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     if (cnt == 0) {
         return;
     }
-    const int n0 = blockIdx.y * MMA_N;
+    const int n0 = blockIdx.y * GRP_N;
     const unsigned long long* wp = tab + (size_t)(base + e * 3) * 2;
     const unsigned* q = (const unsigned*)wp[0];
     const unsigned short* s = (const unsigned short*)wp[1];
@@ -1027,15 +1031,15 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     const int warp = tid >> 5;
     const int g = lane >> 2;
     const int tt = lane & 3;
-    const int mt = (warp >> 2) * 16;
-    const int ntw = (warp & 3) * 8;
+    const int mt = (warp >> 1) * 16; // [B1/B3] 4 m워프 × 16 = M64
+    const int ntw = (warp & 1) * 16; // 2 n워프 × 16 = N32(워프 16×16)
     const int k8 = k >> 3;
     const int kg = k >> 5; // g32
-    __shared__ unsigned short xs[MMA_M][MMA_KC + 8];
-    __shared__ unsigned short ws[MMA_N][MMA_KC + 8];
-    const unsigned mtiles = (cnt + MMA_M - 1) / MMA_M;
+    __shared__ unsigned short xs[GRP_M][MMA_KC + 8];
+    __shared__ unsigned short ws[GRP_N][MMA_KC + 8];
+    const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
     for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
-        const unsigned rbase = mtile * MMA_M;
+        const unsigned rbase = mtile * GRP_M;
         float c[2][4];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -1044,7 +1048,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
         for (int k0 = 0; k0 < k; k0 += MMA_KC) {
             __syncthreads(); // 이전 mma 완료(버퍼 재사용) + 스테이징 가시화
             // A 스테이징 — 슬롯 r의 x 행(슬롯→토큰: sl/sp·xstride), f16.
-            for (int ee = tid; ee < MMA_M * MMA_KC / 4; ee += 256) {
+            for (int ee = tid; ee < GRP_M * MMA_KC / 4; ee += 256) {
                 const int r = ee / (MMA_KC / 4);
                 const int c4 = ee % (MMA_KC / 4);
                 const int gi = k0 + c4 * 4;
@@ -1071,7 +1075,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
                 xs[r][c4 * 4 + 3] = __half_as_ushort(__float2half_rn(v.w));
             }
             // B 스테이징 — g32 디퀀트(스케일 bf16 → f32은 비트 상위 시프트).
-            for (int ee = tid; ee < MMA_N * MMA_KC / 8; ee += 256) {
+            for (int ee = tid; ee < GRP_N * MMA_KC / 8; ee += 256) {
                 const int r = ee / (MMA_KC / 8);
                 const int c8 = ee % (MMA_KC / 8);
                 const int gi = k0 + c8 * 8;
@@ -1105,7 +1109,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
                 const unsigned a2 = pk2bf(&xs[mt + g][kb + 2 * tt + 8]);
                 const unsigned a3 = pk2bf(&xs[mt + g + 8][kb + 2 * tt + 8]);
 #pragma unroll
-                for (int nt = 0; nt < 1; ++nt) {
+                for (int nt = 0; nt < 2; ++nt) {
                     const int nb = ntw + nt * 8;
                     const unsigned b0 = pk2bf(&ws[nb + g][kb + 2 * tt]);
                     const unsigned b1 = pk2bf(&ws[nb + g][kb + 2 * tt + 8]);
@@ -1119,7 +1123,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
         }
         // 에필로그 — 원본 슬롯 행으로 기록(범위 가드).
 #pragma unroll
-        for (int nt = 0; nt < 1; ++nt) {
+        for (int nt = 0; nt < 2; ++nt) {
             const int col = n0 + ntw + nt * 8 + 2 * tt;
             const int r0 = mt + g;
             if (rbase + r0 < cnt) {
