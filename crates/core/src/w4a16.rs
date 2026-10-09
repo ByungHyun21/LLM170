@@ -14,6 +14,9 @@
 //! 트리플 구조 정합은 open이, 기대 집합 대조는 바인딩의 validate가 판정한다.
 
 use crate::json::Json;
+// [2026-10-09 H] f16/bf16 디코더는 quant::deq 단일 출처(inf/NaN 구분 포함) —
+// 로더 로컬 복제본은 e==31에서 inf를 NaN으로 뭉개는 불일치가 있었다.
+use crate::quant::deq::{bf16_to_f32, half_to_f32 as f16_to_f32};
 use crate::st::{StArchive, StDtype};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -111,28 +114,6 @@ impl Report {
         }
         s
     }
-}
-
-/// f16(Half) → f32 — core는 half 크레이트에 의존하지 않는다.
-#[inline]
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) as u32) << 31;
-    let e = ((bits >> 10) & 0x1F) as u32;
-    let m = (bits & 0x3FF) as u32;
-    if e == 0 {
-        // 비정규: m/1024·2^-14.
-        return ((m as f32) * (2.0f64).powi(-24) as f32).copysign(f32::from_bits(sign));
-    }
-    if e == 31 {
-        return f32::NAN;
-    }
-    f32::from_bits(sign | ((e - 15 + 127) << 23) | (m << 13))
-}
-
-/// bf16 → f32 (비트 확장, 정확).
-#[inline]
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
 }
 
 /// W4A16 스토어 — 헤더 인덱스 + 양자화 선형 사전 + 샤드 mmap.
@@ -471,7 +452,35 @@ pub(crate) fn decode_f32(raw: &[u8], dt: StDtype, name: &str) -> R<Vec<f32>> {
 /// 토큰 조각표(id 순) — vocab.json(디렉터리 규약) 우선, 없으면 tokenizer.json
 /// (model.vocab + added_tokens 병합 — W4A16 HF 배포는 vocab.json 부재 실측).
 /// 아키텍처 무관 — 로더/바인딩 공용.
+/// vocab id 해석 — 0..=u32::MAX 정수만(잘림 금지, H 2026-10-09).
+fn vocab_id(v: &Json, src: &str) -> R<u32> {
+    let n = v
+        .as_f64()
+        .ok_or_else(|| W4a16Error::BadTensor(format!("{src}: id 숫자 아님")))?;
+    if !(0.0..=u32::MAX as f64).contains(&n) || n.fract() != 0.0 {
+        return Err(W4a16Error::BadTensor(format!(
+            "{src}: id 범위/정수 위반 {n}"
+        )));
+    }
+    Ok(n as u32)
+}
+
+/// 조각표 삽입 — id 충돌은 내용 동일할 때만 허용(조용한 중복 금지).
+fn piece_put(map: &mut HashMap<u32, String>, id: u32, piece: &str, src: &str) -> R<()> {
+    if let Some(prev) = map.get(&id) {
+        if prev != piece {
+            return Err(W4a16Error::BadTensor(format!(
+                "{src}: id {id} 충돌 — {prev:?} vs {piece:?}"
+            )));
+        }
+        return Ok(());
+    }
+    map.insert(id, piece.to_string());
+    Ok(())
+}
+
 pub fn load_pieces(dir: &Path) -> R<Vec<String>> {
+    let mut map: HashMap<u32, String> = HashMap::new();
     if dir.join("vocab.json").is_file() {
         // vocab.json {"piece": id} — id 순 조각표(HF 벌크 배포 규약).
         let raw = std::fs::read_to_string(dir.join("vocab.json"))
@@ -480,46 +489,55 @@ pub fn load_pieces(dir: &Path) -> R<Vec<String>> {
         let obj = v
             .as_object()
             .ok_or_else(|| W4a16Error::BadTensor("vocab.json: 객체 아님".into()))?;
-        let mut pairs: Vec<(u32, String)> = obj
-            .iter()
-            .filter_map(|(piece, id)| {
-                id.as_f64()
-                    .filter(|n| *n >= 0.0 && n.fract() == 0.0)
-                    .map(|n| (n as u32, piece.clone()))
-            })
-            .collect();
-        pairs.sort_by_key(|(id, _)| *id);
-        return Ok(pairs.into_iter().map(|(_, p)| p).collect());
-    }
-    let txt = std::fs::read_to_string(dir.join("tokenizer.json"))
-        .map_err(|e| W4a16Error::Missing(format!("tokenizer.json: {e}")))?;
-    let v = Json::parse(&txt).map_err(|e| W4a16Error::BadTensor(format!("tokenizer.json: {e}")))?;
-    let mut map: HashMap<u32, String> = HashMap::new();
-    let vocab = v
-        .get("model")
-        .and_then(|m| m.get("vocab"))
-        .and_then(Json::as_object)
-        .ok_or_else(|| W4a16Error::BadTensor("tokenizer.json: model.vocab 부재".into()))?;
-    for (piece, id) in vocab {
-        if let Some(n) = id.as_f64() {
-            map.insert(n as u32, piece.clone());
+        for (piece, id) in obj {
+            let id = vocab_id(id, "vocab.json")?;
+            piece_put(&mut map, id, piece, "vocab.json")?;
         }
-    }
-    if let Some(Json::Arr(items)) = v.get("added_tokens") {
-        for it in items {
-            let id = it.get("id").and_then(Json::as_f64).map(|x| x as u32);
-            let content = it.get("content").and_then(Json::as_str).map(String::from);
-            if let (Some(i), Some(c)) = (id, content) {
-                map.insert(i, c);
+    } else {
+        let txt = std::fs::read_to_string(dir.join("tokenizer.json"))
+            .map_err(|e| W4a16Error::Missing(format!("tokenizer.json: {e}")))?;
+        let v =
+            Json::parse(&txt).map_err(|e| W4a16Error::BadTensor(format!("tokenizer.json: {e}")))?;
+        let vocab = v
+            .get("model")
+            .and_then(|m| m.get("vocab"))
+            .and_then(Json::as_object)
+            .ok_or_else(|| W4a16Error::BadTensor("tokenizer.json: model.vocab 부재".into()))?;
+        for (piece, id) in vocab {
+            let id = vocab_id(id, "tokenizer.json model.vocab")?;
+            piece_put(&mut map, id, piece, "tokenizer.json model.vocab")?;
+        }
+        if let Some(Json::Arr(items)) = v.get("added_tokens") {
+            for it in items {
+                let id = vocab_id(
+                    it.get("id")
+                        .ok_or_else(|| W4a16Error::BadTensor("added_tokens: id 부재".into()))?,
+                    "added_tokens",
+                )?;
+                let content = it
+                    .get("content")
+                    .and_then(Json::as_str)
+                    .ok_or_else(|| W4a16Error::BadTensor("added_tokens: content 부재".into()))?;
+                piece_put(&mut map, id, content, "added_tokens")?;
             }
         }
     }
-    let max = map.keys().copied().max().unwrap_or(0);
-    let mut out = vec![String::new(); max as usize + 1];
+    // 조밀성(스파스 금지) — 결측 id는 종전엔 빈 조각으로 조용히 남았다.
+    let max = map
+        .keys()
+        .copied()
+        .max()
+        .ok_or_else(|| W4a16Error::BadTensor("조각표 비었음".into()))?;
+    let mut slots: Vec<Option<String>> = vec![None; max as usize + 1];
     for (i, p) in map {
-        out[i as usize] = p;
+        slots[i as usize] = Some(p);
     }
-    Ok(out)
+    if let Some(i) = slots.iter().position(Option::is_none) {
+        return Err(W4a16Error::BadTensor(format!(
+            "조각표 스파스 — id {i} 누락"
+        )));
+    }
+    Ok(slots.into_iter().map(Option::unwrap).collect())
 }
 
 /// config.json 본문에서 `"quantization_config": {...}` 값을 원문 슬라이스로

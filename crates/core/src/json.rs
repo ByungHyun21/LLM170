@@ -206,6 +206,17 @@ impl<'a> P<'a> {
             .ok_or_else(|| format!("bad number at {s}"))
     }
 
+    /// `at`부터 4자리 16진수(\\u 이스케이프 뒤) — 범위 밖이면 오류.
+    fn hex4(&self, at: usize) -> Result<u32, String> {
+        if at + 4 > self.b.len() {
+            return Err("bad \\u escape".into());
+        }
+        std::str::from_utf8(&self.b[at..at + 4])
+            .ok()
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
+            .ok_or_else(|| "bad \\u escape".to_string())
+    }
+
     fn string(&mut self) -> Result<String, String> {
         if self.b.get(self.i) != Some(&b'"') {
             return Err(format!("expected string at {}", self.i));
@@ -231,15 +242,29 @@ impl<'a> P<'a> {
                         Some(b'b') => out.push('\u{8}'),
                         Some(b'f') => out.push('\u{c}'),
                         Some(b'u') => {
-                            if self.i + 4 >= self.b.len() {
-                                return Err("bad \\u escape".into());
-                            }
-                            let h = std::str::from_utf8(&self.b[self.i + 1..self.i + 5])
-                                .ok()
-                                .and_then(|h| u32::from_str_radix(h, 16).ok())
-                                .ok_or("bad \\u escape")?;
-                            out.push(char::from_u32(h).ok_or("bad \\u codepoint")?);
-                            self.i += 4;
+                            // H(2026-10-09): 유효 서로게이트 쌍(\uD800-\uDBFF
+                            // + \uDC00-\uDFFF)을 수용 — 종전엔 전부 거부. 단독
+                            // 서로게이트는 종전처럼 거부(유효성 규칙 동일).
+                            let h = self.hex4(self.i + 1)?;
+                            let (cp, span) = if (0xD800..=0xDBFF).contains(&h) {
+                                if self.b.get(self.i + 5) != Some(&b'\\')
+                                    || self.b.get(self.i + 6) != Some(&b'u')
+                                {
+                                    return Err("unpaired high surrogate".into());
+                                }
+                                let l = self.hex4(self.i + 7)?;
+                                if !(0xDC00..=0xDFFF).contains(&l) {
+                                    return Err("unpaired high surrogate".into());
+                                }
+                                // 소비 폭 = 첫 escape(4hex) + 두 번째(2+4) — 공통 +1 별도.
+                                (0x10000 + ((h - 0xD800) << 10) + (l - 0xDC00), 10)
+                            } else if (0xDC00..=0xDFFF).contains(&h) {
+                                return Err("unpaired low surrogate".into());
+                            } else {
+                                (h, 4)
+                            };
+                            out.push(char::from_u32(cp).ok_or("bad \\u codepoint")?);
+                            self.i += span;
                         }
                         _ => return Err("bad escape".into()),
                     }
@@ -301,5 +326,17 @@ mod tests {
         assert_eq!(Json::parse(r#""a\"b""#).unwrap(), Json::Str("a\"b".into()));
         assert!(Json::parse("{").is_err());
         assert!(Json::parse("[1,]").is_err());
+    }
+
+    #[test]
+    fn surrogate_pairs_accepted_unpaired_rejected() {
+        // 😀 U+1F600 = \uD83D\uDE00 — 유효 쌍 수용(H 하드닝).
+        assert_eq!(
+            Json::parse(r#""\uD83D\uDE00""#).unwrap(),
+            Json::Str("😀".into())
+        );
+        assert!(Json::parse(r#""\uD83D""#).is_err(), "단독 상위");
+        assert!(Json::parse(r#""\uDE00""#).is_err(), "단독 하위");
+        assert!(Json::parse(r#""\uD83D\u0041""#).is_err(), "쌍 불일치");
     }
 }

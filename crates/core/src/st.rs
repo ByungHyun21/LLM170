@@ -150,7 +150,12 @@ impl StArchive {
                 let file = file
                     .as_str()
                     .ok_or_else(|| StError::BadHeader("weight_map value not a string".into()))?;
-                entries.insert(name.clone(), file.to_string());
+                // H(2026-10-09): 중복 이름은 종전 마지막 우선(조용) — 거부.
+                if entries.insert(name.clone(), file.to_string()).is_some() {
+                    return Err(StError::BadHeader(format!(
+                        "index.json: weight_map 중복 이름 {name}"
+                    )));
+                }
                 if !shard_names.iter().any(|s| s == file) {
                     shard_names.push(file.to_string());
                 }
@@ -196,6 +201,23 @@ impl StArchive {
                     e.shard = si;
                     out.insert(name, e);
                 }
+            }
+        }
+        if idx_path.exists() {
+            // H(2026-10-09): weight_map이 지정했는데 샤드 헤더에 없는 텐서는
+            // 종전 조용히 누락 — 로드 시점에 즉시 거부(원인 추적 가능하게).
+            let mut missing: Vec<&str> = entries
+                .keys()
+                .filter(|n| !out.contains_key(*n))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                missing.sort_unstable();
+                return Err(StError::BadHeader(format!(
+                    "index.json: 샤드 헤더에 없는 텐서 {}건 {:?}",
+                    missing.len(),
+                    &missing[..missing.len().min(4)]
+                )));
             }
         }
         Ok(Self {
@@ -254,6 +276,14 @@ impl StArchive {
             let Some(expect) = numel.checked_mul(dtype.nbytes()) else {
                 return Err(StError::BadHeader(format!("{name}: numel overflow")));
             };
+            // H(2026-10-09): 반전 offsets는 u64 감산 언더플로(디버그 패닉) —
+            // 여기서 즉시 거부.
+            if offs[1] < offs[0] {
+                return Err(StError::BadHeader(format!(
+                    "{name}: data_offsets 반전 {}..{}",
+                    offs[0], offs[1]
+                )));
+            }
             let nbytes = offs[1] - offs[0];
             if nbytes != expect {
                 return Err(StError::BadHeader(format!(

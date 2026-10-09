@@ -31,6 +31,8 @@ pub fn sq_sum(x: &[f32]) -> f64 {
 }
 
 pub fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    // H(2026-10-09): 종전 zip은 짧은 쪽에서 조용히 절단 — 계약 위반은 즉시.
+    assert_eq!(x.len(), w.len(), "rms_norm: x/w 길이 불일치");
     let sum = sq_sum(x);
     let scale = 1.0 / ((sum / x.len() as f64 + eps as f64).sqrt() as f32);
     x.iter().zip(w).map(|(&v, &g)| v * scale * g).collect()
