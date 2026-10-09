@@ -674,8 +674,9 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     for _ in 0..n_predict {
         let row = model.embed_row(next).map_err(|e| e.to_string())?;
         if head_gpu {
-            let lg = dec.forward_device_head(0, &row)?;
-            next = llm170_core::matmul::greedy_from(&lg);
+            // [P3] 디코드는 디바이스 argmax(4B d2h) — 토큰 스트림은 종전
+            // 로짓+CPU greedy_from과 동일해야 한다(골든이 동등성 판정).
+            next = dec.forward_device_argmax(0, &row)?;
         } else {
             let xn = if staged {
                 dec.forward(0, &row)?
