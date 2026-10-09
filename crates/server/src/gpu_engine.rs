@@ -170,11 +170,26 @@ impl GpuEngine {
     }
 
     /// 배치 greedy — 토큰만 회수.
+    /// [A9 2026-10-10] t∈2..=BATCH_DEC_MAX이면 단일 체인 배치 경로(가중
+    /// 상각)를 시도, 전제 미충족·실패 시 슬롯별 직렬로 폴백(로그 1회성).
     pub fn decode_np_greedy(
         &mut self,
         seq_ids: &[usize],
         tokens: &[u32],
     ) -> Result<Vec<u32>, String> {
+        if (2..=llm170_backend_gpu::BATCH_DEC_MAX).contains(&seq_ids.len()) {
+            let h = self.model.hp.n_embd;
+            let mut rows = Vec::with_capacity(seq_ids.len() * h);
+            for tok in tokens {
+                rows.extend_from_slice(&self.model.embed_row(*tok).map_err(|e| e.to_string())?);
+            }
+            match self.dec.forward_device_argmax_batch(seq_ids, &rows) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    eprintln!("# np-batch 폴백(직렬): {e}");
+                }
+            }
+        }
         let mut out = Vec::with_capacity(seq_ids.len());
         for (s, tok) in seq_ids.iter().zip(tokens.iter()) {
             let row = self.model.embed_row(*tok).map_err(|e| e.to_string())?;

@@ -82,6 +82,58 @@ extern "C" __global__ void head_bf16(const unsigned short* __restrict__ wt, // [
     }
 }
 
+// [A9 2026-10-10] 배치 디코드 head — t행을 한 블록이 함께 처리(가중치 판독
+// t회 공유, x·누산은 행별). 행별 산술 순서는 t=1 head_bf16과 동일(i 오름차순,
+// mul·add 분리) → **행 값 비트동일**. t≤8(호스트 가드 — 디코드 배치 상한).
+#define HEAD_TMAX 8
+extern "C" __global__ void head_bf16_t(const unsigned short* __restrict__ wt, // [k][n]
+                                       const float* __restrict__ x,           // [t][k]
+                                       float* __restrict__ out,              // [t][n]
+                                       int n, int k, int t)
+{
+    const int r0 = (blockIdx.x * blockDim.x + threadIdx.x) * HEAD_OUTS;
+    if (r0 >= n || t <= 0 || t > HEAD_TMAX) {
+        return;
+    }
+    if (r0 + HEAD_OUTS <= n && (n & (HEAD_OUTS - 1)) == 0) {
+        float a[HEAD_TMAX][HEAD_OUTS];
+        for (int r = 0; r < t; ++r) {
+#pragma unroll
+            for (int u = 0; u < HEAD_OUTS; ++u) {
+                a[r][u] = 0.0f;
+            }
+        }
+        for (int i = 0; i < k; ++i) {
+            const uint4 v = *reinterpret_cast<const uint4*>(wt + (size_t)i * n + r0);
+            const unsigned short* p = reinterpret_cast<const unsigned short*>(&v);
+            for (int r = 0; r < t; ++r) {
+                const float xv = x[(size_t)r * k + i];
+#pragma unroll
+                for (int u = 0; u < HEAD_OUTS; ++u) {
+                    a[r][u] += xv * b2f(p[u]);
+                }
+            }
+        }
+        for (int r = 0; r < t; ++r) {
+#pragma unroll
+            for (int u = 0; u < HEAD_OUTS; ++u) {
+                out[(size_t)r * n + r0 + u] = a[r][u];
+            }
+        }
+        return;
+    }
+    // 꼬리 — 스칼라, 행별 순서 동일.
+    for (int r = r0; r < n; ++r) {
+        for (int rr = 0; rr < t; ++rr) {
+            float acc = 0.0f;
+            for (int i = 0; i < k; ++i) {
+                acc += x[(size_t)rr * k + i] * b2f(wt[(size_t)i * n + r]);
+            }
+            out[(size_t)rr * n + r] = acc;
+        }
+    }
+}
+
 // [P3] 로짓 argmax — min-index-on-tie(CPU greedy_from 계약 미러: 엄격 비교
 // v > best → 동률은 최저 인덱스, NaN은 비교 false로 순위 제외). 1블록 1024
 // 스레드, float4 판독 + 공유 트리 리덕션(결정적). out[0] = u32 인덱스 —
@@ -129,5 +181,58 @@ extern "C" __global__ void w4a16_argmax_min(
     }
     if (tid == 0) {
         out[0] = bi[0];
+    }
+}
+
+// [A9 2026-10-10] 배치 argmax — 행당 1블록(grid=t), out[row]=인덱스.
+// 행별 알고리즘·동률 규칙은 w4a16_argmax_min과 동일(비트동일).
+extern "C" __global__ void w4a16_argmax_min_t(
+    const float* __restrict__ lg, int n, int t, unsigned* __restrict__ out)
+{
+    __shared__ float bv[1024];
+    __shared__ unsigned bi[1024];
+    const int row = blockIdx.x;
+    if (row >= t) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const float* lr = lg + (size_t)row * n;
+    float v = -INFINITY;
+    unsigned ix = 0u;
+    const int n4 = n >> 2;
+    const float4* l4 = reinterpret_cast<const float4*>(lr);
+    for (int i = tid; i < n4; i += 1024) {
+        const float4 q = l4[i];
+        const float w[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (w[j] > v) {
+                v = w[j];
+                ix = (unsigned)(4 * i + j);
+            }
+        }
+    }
+    for (int i = 4 * n4 + tid; i < n; i += 1024) {
+        if (lr[i] > v) {
+            v = lr[i];
+            ix = (unsigned)i;
+        }
+    }
+    bv[tid] = v;
+    bi[tid] = ix;
+    __syncthreads();
+    for (int st = 512; st > 0; st >>= 1) {
+        if (tid < st) {
+            const float ov = bv[tid + st];
+            const unsigned oi = bi[tid + st];
+            if (ov > bv[tid] || (ov == bv[tid] && oi < bi[tid])) {
+                bv[tid] = ov;
+                bi[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[row] = bi[0];
     }
 }
