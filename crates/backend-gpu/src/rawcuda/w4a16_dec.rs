@@ -27,10 +27,14 @@ pub const ATTN_F3S_TMAX: usize = 512;
 // t 무제한, FFMA 폴백만 32 상한(chain_device_t 가드).
 pub const CHAIN_TMAX: usize = 512;
 /// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
-/// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — GDN_VSLICE=1 기준).
-pub const GDN_SCAN_SMEM: u32 = 61_828;
+/// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — GDN_VSLICE=1, Stile 더블
+/// 버퍼(A5-2) 기준).
+pub const GDN_SCAN_SMEM: u32 = 70_020;
 /// gdn_scan V-슬라이스 수(커널 GDN_VSLICE와 동일 계약 — 1=슬라이싱 없음).
 pub const GDN_VSLICE: usize = 1;
+/// [A5 2026-10-10] gdn_scan 워크그룹 수(커널 GDN_NGRP와 동일 계약) —
+/// 블록 = GDN_NGRP×(128/GDN_VSLICE)스레드. 누적 순서 보존(비트동일) 분배.
+pub const GDN_NGRP: usize = 4;
 
 /// GDN 체인 형상(서버가 config에서 유도해 명시 등록 — 추정 금지).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1192,12 +1196,12 @@ impl W4a16Dec {
                 (&mut dd) as *mut _ as *mut _,
                 (&mut lay) as *mut _ as *mut _,
             ];
-            // grid = h_v × VSLICE(블록 = GDN_VW = 128/VSLICE 스레드).
+            // grid = h_v × VSLICE(블록 = GDN_NGRP×GDN_VW = 512스레드 — A5).
             self.cc.launch_shared(
                 f,
                 (dm.h_v * GDN_VSLICE) as u32,
                 1,
-                (128 / GDN_VSLICE) as u32,
+                (GDN_NGRP * (128 / GDN_VSLICE)) as u32,
                 GDN_SCAN_SMEM,
                 &mut as_,
             )?;
@@ -4598,7 +4602,7 @@ mod tests {
 /// (미러 불일치 = smem 오버런·버퍼 계약 위반이라 변경 시 사전 차단).
 #[cfg(test)]
 mod mirror_contract {
-    use super::{ATTN_F3S_TMAX, CHAIN_TMAX, GDN_SCAN_SMEM, GDN_VSLICE};
+    use super::{ATTN_F3S_TMAX, CHAIN_TMAX, GDN_NGRP, GDN_SCAN_SMEM, GDN_VSLICE};
 
     /// `#define NAME 값` 파싱 — 값은 정수 리터럴만 다룬다(대상 목록 한정).
     fn define(src: &str, name: &str) -> u64 {
@@ -4631,9 +4635,14 @@ mod mirror_contract {
         let tile = define(cu, "GDN_TILE") as usize;
         let vslice = define(cu, "GDN_VSLICE") as usize;
         assert_eq!(vslice, GDN_VSLICE, "gdn.cu GDN_VSLICE ↔ GDN_VSLICE");
+        assert_eq!(
+            define(cu, "GDN_NGRP") as usize,
+            GDN_NGRP,
+            "gdn.cu GDN_NGRP ↔ GDN_NGRP"
+        );
         let vw = 128 / vslice;
-        // gdn_scan 레이아웃(sk/sv/A/KQ/KS/QS/dc/Stile/bp/gcs/wsm) 바이트 합 —
-        // gdn.cu 상단 주석 2항(61,828B)과 동일 산식.
+        // gdn_scan 레이아웃(sk/sv/A/KQ/KS/QS/dc/Stile×2/bp/gcs/wsm) 바이트 합 —
+        // gdn.cu 상단 주석 2항(70,020B)과 동일 산식(A5-2 더블 버퍼 반영).
         let total = cs * 128 * 2
             + cs * vw * 2
             + cs * cs * 2
@@ -4641,7 +4650,7 @@ mod mirror_contract {
             + cs * vw * 2
             + cs * vw * 2
             + cs * vw * 4
-            + tile * vw * 4
+            + 2 * tile * vw * 4
             + cs * 4
             + (cs + 1) * 4
             + cs * 4;
