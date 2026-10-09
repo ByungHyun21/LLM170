@@ -3612,6 +3612,10 @@ impl W4a16Dec {
             self.hidden * 4
         };
         if self.pin_out.is_null() || self.pin_out_len < out_len {
+            // [A8 잠복 수정 2026-10-10] 핀드 출력 재할당 = 기존 exec들의 d2h
+            // 목적지 해제 — 캐시된 그래프 전량 폐기(모드 교대에서 해제 주소
+            // 기록 UAF, 할당자 재사용으로 잠복했던 실측 결함).
+            self.graph_invalidate();
             if !self.pin_out.is_null() {
                 let _ = self.cc.pinned_free(self.pin_out);
             }
