@@ -198,6 +198,65 @@ extern "C" __global__ void w4a16_gemv_experts_g32_bf16(
 }
 
 // t=1 GEMV 래퍼 — g128·f16(27B) / g32·bf16(35B 전문가).
+// [P11] 전문가-우선 슬롯 순열 — 같은 전문가의 슬롯을 연속 배치. 목적:
+// 전문가 GEMV 블록의 실행 순서를 전문가 단위로 묶어 같은 가중치 행을 L2에서
+// 재사용(토큰-우선 순서는 매 슬롯이 전문가 집합 전체를 재판독 — t=128 프리필
+// gemv 47%의 원인). 1블록·스레드 병렬: 카운트(원자) → 접두합(스레드 0) →
+// 스캐터(커서 원자). 슬롯 내부 순서는 비결정이나 **슬롯별 산술이 독립**이라
+// 결과는 순서 무관(비트 동일). n_exp ≤ 1024 계약(호스트 가드).
+extern "C" __global__ void w4a16_moe_align(
+    const int* __restrict__ idx, int nslots,
+    unsigned* __restrict__ gslot, unsigned* __restrict__ gcnt, int n_exp)
+{
+    __shared__ unsigned cnt[1024];
+    __shared__ unsigned off[1024];
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    for (int i = tid; i < n_exp; i += nt) {
+        cnt[i] = 0;
+    }
+    __syncthreads();
+    for (int j = tid; j < nslots; j += nt) {
+        atomicAdd(&cnt[idx[j]], 1u);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        unsigned acc = 0;
+        for (int i = 0; i < n_exp; ++i) {
+            off[i] = acc;
+            acc += cnt[i];
+            gcnt[i] = cnt[i];
+        }
+    }
+    __syncthreads();
+    for (int j = tid; j < nslots; j += nt) {
+        const unsigned e = (unsigned)idx[j];
+        const unsigned p = atomicAdd(&off[e], 1u);
+        gslot[p] = (unsigned)j;
+    }
+}
+
+// [P11] 순열 전문가 GEMV — 블록 구조는 w4a16_gemv_experts_g32_bf16과 동일
+// (grid = 슬롯 × n), 슬롯 순서만 perm(전문가-우선)으로 치환. 슬롯별 산술
+// 완전 동일(비트 동일) — 순서는 L2 재사용만 바꾼다.
+extern "C" __global__ void w4a16_gemv_experts_g32_bf16_perm(
+    const unsigned long long* __restrict__ tab, int base,
+    const int* __restrict__ idx, const unsigned* __restrict__ perm, int nslots,
+    const float* __restrict__ x, int xstride, int sp,
+    float* __restrict__ out, int n, int k)
+{
+    const int sl = blockIdx.x / n;
+    if (sl >= nslots) {
+        return;
+    }
+    const int o = blockIdx.x - sl * n;
+    const unsigned p = perm[sl];
+    const unsigned long long* e = tab + (size_t)(base + idx[p] * 3) * 2;
+    const size_t xoff = (size_t)(p / (sp > 0 ? sp : 1)) * (size_t)xstride;
+    gemv_row_body<5, true>((const unsigned*)e[0], (const unsigned short*)e[1],
+                           x + xoff, out + (size_t)p * n, o, k);
+}
+
 extern "C" __global__ void w4a16_gemv_g128(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x, float* __restrict__ out, int n, int k) {
