@@ -451,6 +451,16 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
     SCHED
         .queue_wait_us
         .fetch_add(j.queued.elapsed().as_micros() as u64, Ordering::Relaxed);
+    // [H 2026-10-09] 빈 프롬프트 최후 가드 — 표면(oai 400·CLI)이 막지만
+    // 스케줄러 직접 진입은 0번 토큰에서 조용히 디코드하게 된다.
+    if j.tokens.is_empty() {
+        SCHED.requests_failed.fetch_add(1, Ordering::Relaxed);
+        let _ = j.out.send(InferResult {
+            tokens: Vec::new(),
+            error: Some("empty prompt".into()),
+        });
+        return;
+    }
     SCHED.jobs.fetch_add(1, Ordering::Relaxed);
     let prefix_ok = true; // NO_PREFIX 폐기 — 접두 캐시 항시
     let pick = (0..slots.len())

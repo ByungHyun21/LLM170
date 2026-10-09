@@ -266,6 +266,13 @@ fn oai_id() -> String {
     format!("cmpl-{}-{n}", std::process::id())
 }
 
+/// Anthropic 메시지 id — 별도 카운터(OAI id와 네임스페이스 분리).
+fn anthropic_msg_id() -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("msg_llm170-{n}")
+}
+
 /// 문자 경계로 내림 보정 (UTF-8 안전 절단) — 스트림 holdback 계산용.
 fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     while i > 0 && !s.is_char_boundary(i) {
@@ -335,6 +342,22 @@ fn jmessages_render(body: &str) -> String {
     out
 }
 
+/// messages 배열에 내용 있는 메시지가 하나라도 있는가(H 2026-10-09).
+/// 종전엔 빈 messages가 렌더 후 assistant 접두만 남아 200으로 진행됐다 —
+/// completions의 빈 prompt 400과 표면 불일치(빈 프롬프트 붕괴).
+fn has_message_content(body: &str) -> bool {
+    let Some(mpos) = body.find("\"messages\"") else {
+        return false;
+    };
+    let seg = &body[mpos..];
+    let Some(ob) = seg.find('[') else {
+        return false;
+    };
+    jblocks(&seg[ob..])
+        .iter()
+        .any(|o| jcontent(o).is_some_and(|c| !c.is_empty()))
+}
+
 /// 요청 본문에서 샘플링 파라미터 추출 — 미지정시 None (greedy, 종전 동작).
 /// OpenAI 파라미터 명칭: temperature·top_k·top_p·min_p·repeat_penalty·seed.
 fn parse_sampler(body: &str) -> Option<llm170_core::sampler::SamplerParams> {
@@ -360,43 +383,38 @@ fn parse_sampler(body: &str) -> Option<llm170_core::sampler::SamplerParams> {
 const STOP_EOT: u32 = 248046;
 
 pub(crate) fn handle(
-    mut stream: TcpStream,
+    stream: TcpStream,
     tx: std::sync::mpsc::SyncSender<SlotJob>,
 ) -> Result<(), String> {
+    // [H 2026-10-09] 연결당 BufReader 1개 — 요청마다 재생성하면 선행 판독분
+    // (파이프라인 잔여 바이트)이 리더와 함께 폐기돼 keep-alive 파이프라이닝이
+    // 조용히 깨졌다.
+    let mut reader = std::io::BufReader::new(stream);
     loop {
-        let req = match read_request(&mut stream) {
+        let req = match read_request(&mut reader) {
             Ok(r) => r,
             Err(_) => return Ok(()), // 연결 종료
         };
+        let stream = reader.get_mut();
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/health") => {
                 if READY.load(Ordering::Acquire) {
-                    resp(&mut stream, 200, "application/json", "{\"status\":\"ok\"}")
+                    resp(stream, 200, "application/json", "{\"status\":\"ok\"}")
                 } else {
-                    resp(
-                        &mut stream,
-                        503,
-                        "application/json",
-                        "{\"status\":\"loading\"}",
-                    )
+                    resp(stream, 503, "application/json", "{\"status\":\"loading\"}")
                 }
             }
             ("GET", "/v1/models") => resp(
-                &mut stream,
+                stream,
                 200,
                 "application/json",
                 "{\"object\":\"list\",\"data\":[{\"id\":\"llm170\",\"object\":\"model\",\"owned_by\":\"local\"}]}",
             ),
             // 모니터링 — 최신 스냅샷 1장(시계열 누적은 외부 폴러 몫).
             // /stats = JSON(주 타깃), /metrics = Prometheus 텍스트(표준 호환).
-            ("GET", "/stats") => resp(
-                &mut stream,
-                200,
-                "application/json",
-                &crate::metrics::json(),
-            ),
+            ("GET", "/stats") => resp(stream, 200, "application/json", &crate::metrics::json()),
             ("GET", "/metrics") => resp(
-                &mut stream,
+                stream,
                 200,
                 "text/plain; version=0.0.4",
                 &crate::metrics::prometheus(),
@@ -404,7 +422,7 @@ pub(crate) fn handle(
             ("POST", "/tokenize") => {
                 let Some(content) = jstr(&req.body, "content") else {
                     resp(
-                        &mut stream,
+                        stream,
                         400,
                         "application/json",
                         "{\"error\":\"content required\"}",
@@ -414,7 +432,7 @@ pub(crate) fn handle(
                 let toks = crate::engine::greedy_encode(&content);
                 let ids: Vec<String> = toks.iter().map(|t| t.to_string()).collect();
                 resp(
-                    &mut stream,
+                    stream,
                     200,
                     "application/json",
                     &format!("{{\"tokens\":[{}]}}", ids.join(",")),
@@ -432,7 +450,7 @@ pub(crate) fn handle(
                     (_, Some(t)) => crate::engine::greedy_encode(&t),
                     _ => {
                         resp(
-                            &mut stream,
+                            stream,
                             400,
                             "application/json",
                             "{\"error\":\"prompt required\"}",
@@ -441,7 +459,7 @@ pub(crate) fn handle(
                     }
                 };
                 run_and_emit(
-                    &mut stream,
+                    stream,
                     tx.clone(),
                     ids,
                     n_predict,
@@ -462,11 +480,22 @@ pub(crate) fn handle(
                     .unwrap_or(jnum(&req.body, "n_predict").unwrap_or(24.0))
                     .max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
+                // [H 2026-10-09] 빈 messages 거부 — 렌더가 assistant 접두만
+                // 남겨 빈 디코드로 200이 나가던 표면 불일치.
+                if !has_message_content(&req.body) {
+                    resp(
+                        stream,
+                        400,
+                        "application/json",
+                        "{\"error\":\"messages required\"}",
+                    );
+                    continue;
+                }
                 // role 인지 멀티턴 렌더링(시스템 프롬프트 보존).
                 let text = jmessages_render(&req.body);
                 let ids = crate::engine::greedy_encode(&text);
                 run_and_emit(
-                    &mut stream,
+                    stream,
                     tx.clone(),
                     ids,
                     n_predict,
@@ -484,10 +513,20 @@ pub(crate) fn handle(
             ("POST", "/v1/messages") => {
                 let n_predict = jnum(&req.body, "max_tokens").unwrap_or(24.0).max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
+                // [H 2026-10-09] 빈 messages 거부 — chat과 동일 표면.
+                if !has_message_content(&req.body) {
+                    resp(
+                        stream,
+                        400,
+                        "application/json",
+                        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages required\"}}",
+                    );
+                    continue;
+                }
                 let text = jmessages_render(&req.body);
                 let ids = crate::engine::greedy_encode(&text);
                 run_and_emit_anthropic(
-                    &mut stream,
+                    stream,
                     tx.clone(),
                     ids,
                     n_predict,
@@ -496,12 +535,7 @@ pub(crate) fn handle(
                     jstop(&req.body), // A14: stop_sequences(jstop이 배열 파싱)
                 );
             }
-            _ => resp(
-                &mut stream,
-                404,
-                "application/json",
-                "{\"error\":\"not found\"}",
-            ),
+            _ => resp(stream, 404, "application/json", "{\"error\":\"not found\"}"),
         }
     }
 }
@@ -588,6 +622,18 @@ fn run_and_emit(
     stops: Vec<u32>,
     sampler: Option<llm170_core::sampler::SamplerParams>,
 ) {
+    // [H 2026-10-09] 빈 프롬프트는 전 엔드포인트 동일 400 — 종전엔 빈 배열은
+    // 400인데 빈 문자열 prompt·빈 chat 렌더는 통과해 스케줄러가 0번 토큰에서
+    // 조용히 디코드했다(표면 불일치).
+    if ids.is_empty() {
+        resp(
+            stream,
+            400,
+            "application/json",
+            "{\"error\":\"empty prompt\"}",
+        );
+        return;
+    }
     // ctx 검증 — 프롬프트+생성이 컨텍스트를 넘으면 400 (context-shift v1:
     // 슬롯 무상태라 이동 없이 거절 — 이동 재배치는 접두 캐시 도입 시).
     let ctx = *SERVER_CTX.get().unwrap_or(&4096);
@@ -926,6 +972,16 @@ fn run_and_emit_anthropic(
     // A14: stop_sequences — jstop이 문자열·배열 모두 파싱.
     stop_strs: Vec<String>,
 ) {
+    // [H 2026-10-09] 빈 프롬프트 — OAI·Anthropic 동일 400(이중 표면 제거).
+    if ids.is_empty() {
+        resp(
+            stream,
+            400,
+            "application/json",
+            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"empty prompt\"}}",
+        );
+        return;
+    }
     // A14: ctx 사전 검증 — run_and_emit과 동일(엔진 Err→500보다 400이 정확).
     let ctx = *SERVER_CTX.get().unwrap_or(&4096);
     if ids.len() + n_predict + 8 >= ctx {
@@ -942,15 +998,21 @@ fn run_and_emit_anthropic(
         );
         return;
     }
+    let prompt_len = ids.len();
     let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, vec![STOP_EOT], sampler) else {
         return;
     };
     if stream_mode {
         resp_sse_open(stream);
+        // [H 2026-10-09] message_start 스텁 보강 — SDK가 요구하는
+        // id/type/model/content/usage 골격(종전 role 하나뿐).
+        let msg_id = anthropic_msg_id();
         let _ = sse(
             stream,
             "message_start",
-            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}",
+            &format!(
+                "{{\"type\":\"message_start\",\"message\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"llm170\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":{prompt_len},\"output_tokens\":0}}}}}}"
+            ),
         );
         let mut det = crate::engine::Detok::new();
         // A14: stop_sequences holdback — run_and_emit과 동일 원리(누적 텍스트에서
@@ -962,10 +1024,13 @@ fn run_and_emit_anthropic(
         let hb = stop_strs.iter().map(|s| s.len()).max().unwrap_or(0);
         let holdback = hb.saturating_sub(1);
         let mut scan_from = 0usize;
+        // [H] stop_reason 판정용 생성 수 — 정지 토큰(미방출)은 제외.
+        let mut n_out = 0usize;
         for t in prx {
             if t == llm170_core::qwen35::EOS_EOT || t == STOP_EOT {
                 break; // 정지 토큰 미방출(스트림 델타)
             }
+            n_out += 1;
             let before = acc.len();
             acc.push_str(&det.push(t));
             if let Some((sp, _)) = earliest_stop(&acc, &stop_strs, scan_from) {
@@ -1013,11 +1078,21 @@ fn run_and_emit_anthropic(
             );
         }
         let _ = orx.recv();
-        let reason = if stopped { "stop_sequence" } else { "end_turn" };
+        // [H 2026-10-09] max_tokens 방출 — 종전엔 length 정지도 end_turn으로
+        // 뭉갰다(Anthropic 규약 위반).
+        let reason = if stopped {
+            "stop_sequence"
+        } else if n_out >= n_predict {
+            "max_tokens"
+        } else {
+            "end_turn"
+        };
         let _ = sse(
             stream,
             "message_delta",
-            &format!("{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{reason}\"}}}}"),
+            &format!(
+                "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{reason}\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":{n_out}}}}}"
+            ),
         );
         let _ = sse(stream, "message_stop", "{\"type\":\"message_stop\"}");
         let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -1064,17 +1139,23 @@ fn run_and_emit_anthropic(
         text.truncate(sp);
     }
     let esc = crate::json::esc(&text);
+    // [H 2026-10-09] stop_reason 우선순위(stop_sequence > max_tokens > end_turn)
+    // + usage 골격 — 종전엔 length 정지도 end_turn으로 뭉갰다.
+    let reason = if stopped.is_some() {
+        "stop_sequence"
+    } else if all.len() >= n_predict {
+        "max_tokens"
+    } else {
+        "end_turn"
+    };
     resp(
         stream,
         200,
         "application/json",
         &format!(
-            "{{\"id\":\"msg_llm170\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{esc}\"}}],\"stop_reason\":\"{}\"}}",
-            if stopped.is_some() {
-                "stop_sequence"
-            } else {
-                "end_turn"
-            }
+            "{{\"id\":\"{}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{esc}\"}}],\"stop_reason\":\"{reason}\",\"stop_sequence\":null,\"usage\":{{\"input_tokens\":{prompt_len},\"output_tokens\":{}}}}}",
+            anthropic_msg_id(),
+            all.len()
         ),
     );
 }
@@ -1209,6 +1290,23 @@ mod http_tests {
         assert_eq!(floor_char_boundary(s, 2), 0);
         assert_eq!(floor_char_boundary(s, 3), 3);
         assert_eq!(floor_char_boundary(s, 9), 9);
+    }
+
+    /// H(2026-10-09): 빈 messages 표면 — chat/anthropic 400 판정.
+    #[test]
+    fn empty_messages_surface() {
+        assert!(!has_message_content(r#"{"messages":[]}"#));
+        assert!(!has_message_content(
+            r#"{"messages":[{"role":"user","content":""}]}"#
+        ));
+        assert!(!has_message_content(r#"{"max_tokens":4}"#));
+        assert!(has_message_content(
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#
+        ));
+        // Anthropic 블록 배열 content.
+        assert!(has_message_content(
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#
+        ));
     }
 
     #[test]

@@ -83,16 +83,45 @@ pub fn serve(
         Err(e) => return Err(e.to_string()),
     };
     eprintln!("# llm170-server listening on http://{addr}");
+    // [H 2026-10-09] 연결 상한 — 종전엔 수락마다 스레드를 무제한 생성했다.
+    // 초과분은 503 후 즉시 종료(스레드·소켓 자원 보호).
+    let conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+        let Ok(mut stream) = stream else { continue };
         // [2026-10-09 P5] 소형 SSE 프레임 × Nagle 지연 제거 — 연결당 1회.
         let _ = stream.set_nodelay(true);
+        // [H] 쓰기 타임아웃 — 소켓 버퍼가 찬 slow consumer에 write가 영구
+        // 블록되어 워커 스레드가 매달리는 것 방지(SSE는 write 실패로 조기 종료).
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(120)));
+        let n = conns.fetch_add(1, Ordering::AcqRel);
+        if n >= MAX_CONNS {
+            conns.fetch_sub(1, Ordering::AcqRel);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            continue;
+        }
+        let guard = ConnGuard(conns.clone());
         let tx = tx.clone();
         std::thread::spawn(move || {
             let _ = crate::oai::handle(stream, tx);
+            drop(guard);
         });
     }
     Ok(())
+}
+
+/// 동시 연결 상한(수락 스레드 폭주 방지) — 슬롯·큐와 무관한 전송 계층 가드.
+const MAX_CONNS: usize = 256;
+
+/// 연결 카운터 감소 가드 — accept 실패/패닉 경로에서도 누수 없이 감소.
+struct ConnGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub type TokOut = InferResult;
@@ -325,11 +354,14 @@ fn read_request_from<R: Read>(reader: &mut BufReader<R>) -> Result<HttpReq, ReqE
     })
 }
 
-pub(crate) fn read_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
+/// 연결당 리더 1개를 받는다(H 2026-10-09) — 종전엔 호출마다 BufReader를
+/// 새로 만들어, 선행 판독분(파이프라인 잔여 바이트)이 리더와 함께 폐기됐다.
+pub(crate) fn read_request(reader: &mut BufReader<TcpStream>) -> Result<HttpReq, String> {
     // QA-2: 읽기 타임아웃 — 헤더/바디 미완 송신(절단·slow-loris) 영구 블록 방지.
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
-    let mut reader = BufReader::new(stream);
-    match read_request_from(&mut reader) {
+    let _ = reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(120)));
+    match read_request_from(reader) {
         Ok(r) => Ok(r),
         Err(ReqErr::Status(code, reason, msg)) => {
             let _ = write!(

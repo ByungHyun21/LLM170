@@ -87,9 +87,16 @@ fn model_bytes(p: &Path) -> u64 {
             }
         }
         walk(p, &mut total);
-        return total.saturating_add(4u64 << 30);
+        return total.saturating_add(runtime_scratch(total));
     }
     p.metadata().map(|m| m.len()).unwrap_or(0)
+}
+
+/// 런타임 스크래치 추정(H 2026-10-09) — KV·활성·업로드 스테이징 몫.
+/// 종전 고정 4GiB는 대형 모델에서 과소평가였다(가드 취지 = 초대형 이중 적재
+/// 동결 방지): 모델 크기/8을 하한 4GiB와 함께 가산한다(소형은 종전과 동일).
+fn runtime_scratch(model_bytes: u64) -> u64 {
+    (model_bytes / 8).max(4 << 30)
 }
 
 /// /proc/meminfo 한 줄(kB) 파싱 — MemTotal/MemAvailable 공용.
@@ -305,6 +312,14 @@ mod tests {
         // (이중 적재 동결 방지)상 이것이 옳다(2026-09-16: 통과 기대는 산식과
         // 모순되어 수정).
         assert!(check(103_700 * (1 << 20), Some(90 * GIB), None, true).is_err());
+    }
+
+    #[test]
+    fn runtime_scratch_scales_for_large_models() {
+        // 소형/중형(27B급 13.6GiB)은 종전과 동일 4GiB.
+        assert_eq!(runtime_scratch(13_600 * (1 << 20)), 4 << 30);
+        // 대형(136GiB)은 1/8 = 17GiB — 고정 4GiB 과소평가 교정.
+        assert_eq!(runtime_scratch(136 * GIB), 17 * GIB);
     }
 
     #[test]
