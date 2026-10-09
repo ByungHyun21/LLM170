@@ -1750,7 +1750,7 @@ impl W4a16Dec {
             return self.cc.launch(
                 f,
                 t.div_ceil(32) as u32,
-                n.div_ceil(64) as u32,
+                n.div_ceil(32) as u32,
                 256,
                 &mut args,
             );
@@ -2057,7 +2057,7 @@ impl W4a16Dec {
             return self.cc.launch(
                 f,
                 t.div_ceil(32) as u32,
-                n.div_ceil(64) as u32,
+                n.div_ceil(32) as u32,
                 256,
                 &mut args,
             );
@@ -3537,7 +3537,7 @@ impl W4a16Dec {
             self.cc.launch(
                 fm,
                 t.div_ceil(32) as u32,
-                n.div_ceil(64) as u32,
+                n.div_ceil(32) as u32,
                 256,
                 &mut a2,
             )?;
@@ -3645,7 +3645,7 @@ impl W4a16Dec {
             self.cc.launch(
                 fm,
                 t.div_ceil(32) as u32,
-                n.div_ceil(64) as u32,
+                n.div_ceil(32) as u32,
                 256,
                 &mut a2,
             )?;

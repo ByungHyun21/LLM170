@@ -410,8 +410,8 @@ extern "C" __global__ void w4a16_gemv_bf16(
 // 타일: 블록 256스레드(8워프) = M32 × N64, k청크 64(스테이징 12KB) → 워프당
 // m16×n16(2× n8 mma). 워프 w: m타일 w/4, n타일 (w%4)*16.
 #define MMA_M 32
-#define MMA_N 64
-#define MMA_KC 64
+#define MMA_N 32
+#define MMA_KC 64   // 128은 smem 증가로 블록 감소(0.18 vs 0.13ms 실측)
 
 __device__ __forceinline__ unsigned short f2bf16(float v) {
     // RNE — __floats2bfloat162_rn과 동일 비트(스모크에서 대조 검증).
@@ -462,7 +462,7 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
     const int g = lane >> 2;
     const int tt = lane & 3;
     const int mt = (warp >> 2) * 16;      // 워프 m 오프셋(0/16)
-    const int ntw = (warp & 3) * 16;      // 워프 n 오프셋(0/16/32/48)
+    const int ntw = (warp & 3) * 8;      // [병렬도] T1과 동일(16×8)
     float c[2][4];
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -472,8 +472,8 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
         __syncthreads();
         // xs 스테이징: M32×KC64 f32→bf16 (float4 벡터화)
         for (int e = tid; e < MMA_M * MMA_KC / 4; e += 256) {
-            const int r = e >> 4;          // 64/4 = 16 float4 per row
-            const int c4 = e & 15;
+            const int r = e / (MMA_KC / 4);
+            const int c4 = e % (MMA_KC / 4);
             const int gi = k0 + c4 * 4;
             const float4 v = (m0 + r < t)
                 ? *reinterpret_cast<const float4*>(&x[(size_t)(m0 + r) * k + gi])
@@ -492,8 +492,8 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
         }
         // ws 스테이징: N64×KC64 bf16 (uint4 벡터화)
         for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
-            const int r = e >> 3;          // 64/8 = 8 uint4 per row
-            const int c8 = e & 7;
+            const int r = e / (MMA_KC / 8);
+            const int c8 = e % (MMA_KC / 8);
             const int gi = k0 + c8 * 8;
             unsigned short* dst = &ws[r][c8 * 8];
             if (n0 + r < n && gi + 7 < k) {
@@ -517,7 +517,7 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
             unsigned a0, a1, a2, a3;
             ldm_x4(a0, a1, a2, a3, &xs[mt + row][kb + colblk]);
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) {
+            for (int nt = 0; nt < 1; ++nt) {
                 const int nb = ntw + nt * 8;
                 // B: ldmatrix.x2.trans — 레인 0-7이 n행(열 kb), 8-15가 n행(열 kb+8).
                 unsigned b0, b1;
@@ -532,7 +532,7 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
     }
     // 에필로그 — 프래그먼트 규약 그대로 기록(범위 가드).
 #pragma unroll
-    for (int nt = 0; nt < 2; ++nt) {
+    for (int nt = 0; nt < 1; ++nt) {
         const int col = n0 + ntw + nt * 8 + 2 * tt;
         const int r0 = m0 + mt + g;
         if (r0 < t) {
@@ -581,8 +581,11 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
     const int warp = tid >> 5;
     const int g = lane >> 2;
     const int tt = lane & 3;
+    // [병렬도] 워프 타일 16×8(N=32, 8워프 = 2m×4n) — ncu: 스케줄러당 활성
+    // 워프 4.24(No Eligible 76%)로 지연 노출. 블록 32×32로 grid 272→544.
+    // 가중치 트래픽은 타일과 무관(각 블록이 자기 행만 읽음) — x 재판독만 2배.
     const int mt = (warp >> 2) * 16;
-    const int ntw = (warp & 3) * 16;
+    const int ntw = (warp & 3) * 8;
     const int k8 = k >> 3;
     const int kg = k >> 7;
     float c[2][4];
@@ -594,8 +597,8 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
     int k0 = 0;
     // 초기 스테이징(청크 0).
     for (int e = tid; e < MMA_M * MMA_KC / 4; e += 256) {
-        const int r = e >> 4;
-        const int c4 = e & 15;
+        const int r = e / (MMA_KC / 4);
+        const int c4 = e % (MMA_KC / 4);
         const int gi = c4 * 4;
         float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         if (m0 + r < t && gi + 3 < k) {
@@ -615,8 +618,8 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
         xs[0][r][c4 * 4 + 3] = __half_as_ushort(__float2half_rn(v.w));
     }
     for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
-        const int r = e >> 3;
-        const int c8 = e & 7;
+        const int r = e / (MMA_KC / 8);
+        const int c8 = e % (MMA_KC / 8);
         const int gi = c8 * 8;
         const bool live = (n0 + r < n) && (gi + 7 < k);
         unsigned short scb = 0;
@@ -644,8 +647,8 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
         const int kn = k0 + MMA_KC;
         if (kn < k) {
             for (int e = tid; e < MMA_M * MMA_KC / 4; e += 256) {
-                const int r = e >> 4;
-                const int c4 = e & 15;
+                const int r = e / (MMA_KC / 4);
+                const int c4 = e % (MMA_KC / 4);
                 const int gi = kn + c4 * 4;
                 float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                 if (m0 + r < t && gi + 3 < k) {
@@ -665,8 +668,8 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
                 xs[cur ^ 1][r][c4 * 4 + 3] = __half_as_ushort(__float2half_rn(v.w));
             }
             for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
-                const int r = e >> 3;
-                const int c8 = e & 7;
+                const int r = e / (MMA_KC / 8);
+                const int c8 = e % (MMA_KC / 8);
                 const int gi = kn + c8 * 8;
                 const bool live = (n0 + r < n) && (gi + 7 < k);
                 unsigned short scb = 0;
@@ -700,7 +703,7 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
             const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
             const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) {
+            for (int nt = 0; nt < 1; ++nt) {
                 const int nb = ntw + nt * 8;
                 const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
                 const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
@@ -713,7 +716,7 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
         }
     }
 #pragma unroll
-    for (int nt = 0; nt < 2; ++nt) {
+    for (int nt = 0; nt < 1; ++nt) {
         const int col = n0 + ntw + nt * 8 + 2 * tt;
         const int r0 = m0 + mt + g;
         if (r0 < t) {
