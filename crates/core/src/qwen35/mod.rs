@@ -148,6 +148,22 @@ impl Model {
         let Some(bind::Eng::Plain { name, .. }) = bind::eng("token_embd.weight") else {
             return Err(ModelError::MissingTensor("token_embd.weight".into()));
         };
+        // [2026-10-09 P4] mmap 슬라이스 경유 — 종전 토큰마다 File::open+
+        // seek+read_exact(+close)의 3~4 syscall + 할당. mmap에서 행 바이트를
+        // 직접 취해 같은 decode_f32로 디코드한다(값 동일 — 같은 오프셋·같은
+        // 디코더). mmap 부재(비정상) 시 종전 경로 폴백.
+        // 이득: 프리필(청크당 토큰 수만큼)·디코드 토큰당 syscall 0.
+        if let (Some(buf), Some(e)) = (self.w4.tensor_slice(&name), self.w4.entry(&name))
+            && e.shape.len() == 2
+        {
+            let cols = e.shape[1] as usize;
+            let nb = e.dtype.nbytes() as usize;
+            let off = tok as usize * cols * nb;
+            if let Some(row) = buf.get(off..off + cols * nb) {
+                return crate::w4a16::decode_f32(row, e.dtype, &name)
+                    .map_err(|err| ModelError::W4a16(err.to_string()));
+            }
+        }
         self.w4
             .plain_rows_f32(&name, tok as u64, tok as u64 + 1)
             .map_err(|e| ModelError::W4a16(e.to_string()))

@@ -85,6 +85,8 @@ pub fn serve(
     eprintln!("# llm170-server listening on http://{addr}");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        // [2026-10-09 P5] 소형 SSE 프레임 × Nagle 지연 제거 — 연결당 1회.
+        let _ = stream.set_nodelay(true);
         let tx = tx.clone();
         std::thread::spawn(move || {
             let _ = crate::oai::handle(stream, tx);
@@ -303,8 +305,17 @@ pub(crate) fn resp_sse_open(stream: &mut TcpStream) {
 
 /// 쓰기 오류를 반환한다 — 종전 `let _ =`가 절단된
 /// 클라이언트로의 쓰기 실패를 삼켜, 잔여 n_predict를 GPU가 끝까지 계산했다.
+/// [2026-10-09 P5] 프레임을 문자열로 조립해 단일 write_all — 종전 write!는
+/// 포맷 조각마다 write(2)(프레임당 ~5회) + Nagle과 겹쳐 스톨 소지.
+/// 값/의미 불변(전송 바이트 동일).
 pub(crate) fn sse(stream: &mut TcpStream, event: &str, data: &str) -> std::io::Result<()> {
-    write!(stream, "event: {event}\ndata: {data}\n\n")?;
+    let mut frame = String::with_capacity(event.len() + data.len() + 16);
+    frame.push_str("event: ");
+    frame.push_str(event);
+    frame.push_str("\ndata: ");
+    frame.push_str(data);
+    frame.push_str("\n\n");
+    stream.write_all(frame.as_bytes())?;
     stream.flush()
 }
 
