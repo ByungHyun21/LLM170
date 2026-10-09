@@ -614,6 +614,14 @@ mod tests {
         assert!(W4a16Model::check_quant(&qtext(4, false, 128)).is_err());
     }
 
+    /// I: 양자화 설정 거부 매트릭스 — 결손/타 방식은 명시 거부(조용한 기본값 금지).
+    #[test]
+    fn quant_malformed_rejects() {
+        assert!(W4a16Model::check_quant("{}").is_err());
+        assert!(W4a16Model::check_quant(r#"{"quant_method":"rtn"}"#).is_err());
+        assert!(W4a16Model::check_quant("not json").is_err());
+    }
+
     /// H(2026-10-09) 경화 — 조각표 중복 id 충돌·스파스는 거부, 조밀은 통과.
     #[test]
     fn load_pieces_rejects_dup_and_sparse() {

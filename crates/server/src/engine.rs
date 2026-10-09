@@ -220,24 +220,30 @@ impl Detok {
         if let Some(t) = TOKENIZER.get() {
             t.piece_bytes_into(tok, &mut self.buf);
         }
-        let mut v = 0usize;
-        let b = &self.buf;
-        while v < b.len() {
-            let ok2 = v + 1 < b.len() && b[v + 1] & 0xC0 == 0x80;
-            let ok3 = v + 2 < b.len() && b[v + 1] & 0xC0 == 0x80 && b[v + 2] & 0xC0 == 0x80;
-            let ok4 = v + 3 < b.len() && ok3 && b[v + 3] & 0xC0 == 0x80;
-            match b[v] {
-                x if x < 0x80 => v += 1,
-                0xC0..=0xDF if ok2 => v += 2,
-                0xE0..=0xEF if ok3 => v += 3,
-                0xF0..=0xF7 if ok4 => v += 4,
-                _ => break,
-            }
-        }
-        let out = String::from_utf8_lossy(&b[..v]).into_owned();
+        let v = complete_utf8_prefix(&self.buf);
+        let out = String::from_utf8_lossy(&self.buf[..v]).into_owned();
         self.buf.drain(..v);
         out
     }
+}
+
+/// 완결 UTF-8 접두 길이 — 미완 멀티바이트(조각 경계 분할)는 홀드백.
+/// [I 2026-10-10] Detok에서 순수 함수로 추출(테스트 표면).
+fn complete_utf8_prefix(b: &[u8]) -> usize {
+    let mut v = 0usize;
+    while v < b.len() {
+        let ok2 = v + 1 < b.len() && b[v + 1] & 0xC0 == 0x80;
+        let ok3 = v + 2 < b.len() && b[v + 1] & 0xC0 == 0x80 && b[v + 2] & 0xC0 == 0x80;
+        let ok4 = v + 3 < b.len() && ok3 && b[v + 3] & 0xC0 == 0x80;
+        match b[v] {
+            x if x < 0x80 => v += 1,
+            0xC0..=0xDF if ok2 => v += 2,
+            0xE0..=0xEF if ok3 => v += 3,
+            0xF0..=0xF7 if ok4 => v += 4,
+            _ => break,
+        }
+    }
+    v
 }
 
 use crate::sched::load_gpu_retry;
@@ -248,4 +254,31 @@ pub static TOKENIZER: std::sync::OnceLock<crate::tokenize::Tokenizer> = std::syn
 
 pub fn greedy_encode(text: &str) -> Vec<u32> {
     TOKENIZER.get().map(|t| t.encode(text)).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::complete_utf8_prefix;
+
+    /// I: Detok 멀티바이트 홀드백 — 조각이 나뉘어 도착해도 완결 접두만 방출.
+    #[test]
+    fn detok_holdback_multibyte() {
+        // '한'(U+D55C = ED 95 9C)이 2조각으로.
+        assert_eq!(
+            complete_utf8_prefix(&[0xED, 0x95]),
+            0,
+            "미완 3바이트 홀드백"
+        );
+        assert_eq!(complete_utf8_prefix(&[0xED, 0x95, 0x9C]), 3);
+        // 😀(F0 9F 98 80) 3조각.
+        assert_eq!(complete_utf8_prefix(&[0xF0, 0x9F, 0x98]), 0);
+        assert_eq!(complete_utf8_prefix(&[0xF0, 0x9F, 0x98, 0x80]), 4);
+        // ASCII + 미완 꼬리.
+        assert_eq!(complete_utf8_prefix(b"ab\xC3"), 2);
+        assert_eq!(complete_utf8_prefix(b"ab\xC3\xA9"), 4); // é
+        // 연속 바이트 단독 선두 — 전진 금지.
+        assert_eq!(complete_utf8_prefix(&[0x80, 0x80]), 0);
+        assert_eq!(complete_utf8_prefix(b"abc"), 3);
+        assert_eq!(complete_utf8_prefix(b""), 0);
+    }
 }

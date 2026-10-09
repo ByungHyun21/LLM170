@@ -109,37 +109,49 @@ fn pick(s: &mut Slot, logits: &[f32]) -> u32 {
 }
 
 /// Q35 np 디코드 — 샘플링 슬롯 포함시 logits 경로(decode), 아니면 GPU argmax 판.
+/// [A9-3 2026-10-10] 혼합 워크로드: 그리디 슬롯은 배치(가중 상각), 샘플링
+/// 슬롯만 직렬 — 슬롯별 상태 독립이라 순서 무관. 그리디가 1개 이하면 종전 직렬.
 fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[usize]) {
-    let toks: Vec<u32> = seqs.iter().map(|&i| slots[i].next).collect();
-    if seqs
-        .iter()
-        .any(|&i| slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy()))
-    {
-        match e.decode(seqs, &toks) {
+    // 그리디/샘플링 분할.
+    let (mut greedy, mut sampled): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+    for &i in seqs {
+        if slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy()) {
+            sampled.push(i);
+        } else {
+            greedy.push(i);
+        }
+    }
+    if greedy.len() >= 2 {
+        let toks: Vec<u32> = greedy.iter().map(|&i| slots[i].next).collect();
+        match e.decode_np_greedy(&greedy, &toks) {
+            Ok(ts) => {
+                for (row, &i) in greedy.iter().enumerate() {
+                    slot_emit(&mut slots[i], ts[row]);
+                }
+            }
+            Err(err) => {
+                eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀");
+                for &i2 in &greedy {
+                    slot_fail(&mut slots[i2], format!("decode_np_greedy: {err}"));
+                }
+            }
+        }
+    } else if let Some(&i) = greedy.first() {
+        sampled.push(i); // 그리디 1개 — logits 경로로 합류(직렬).
+    }
+    if !sampled.is_empty() {
+        let toks: Vec<u32> = sampled.iter().map(|&i| slots[i].next).collect();
+        match e.decode(&sampled, &toks) {
             Ok(rows) => {
-                for (row, &i) in seqs.iter().enumerate() {
+                for (row, &i) in sampled.iter().enumerate() {
                     let t = pick(&mut slots[i], &rows[row]);
                     slot_emit(&mut slots[i], t);
                 }
             }
             Err(err) => {
                 eprintln!("# decode 실패({err}) — 이번 회차 건너뜀");
-                for &i2 in seqs {
+                for &i2 in &sampled {
                     slot_fail(&mut slots[i2], format!("decode: {err}"));
-                }
-            }
-        }
-    } else {
-        match e.decode_np_greedy(seqs, &toks) {
-            Ok(toks) => {
-                for (row, &i) in seqs.iter().enumerate() {
-                    slot_emit(&mut slots[i], toks[row]);
-                }
-            }
-            Err(err) => {
-                eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀");
-                for &i2 in seqs {
-                    slot_fail(&mut slots[i2], format!("decode_np_greedy: {err}"));
                 }
             }
         }

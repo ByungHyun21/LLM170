@@ -233,7 +233,55 @@ pub fn greedy_from(logits: &[f32]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::greedy_from;
+    use super::{dequant_row_w4a16_split, greedy_from};
+
+    /// I: split arm 행 디양자화 — g128/f16(27B). 니블 j = j, 스케일 1.0/0.5.
+    #[test]
+    fn split_dequant_row_g128_f16() {
+        let (k, group) = (256usize, 128usize);
+        let mut q = vec![0u8; k / 2];
+        for w in 0..k / 8 {
+            let mut word: u32 = 0;
+            for j in 0..8u32 {
+                word |= (j & 0xF) << (4 * j);
+            }
+            q[w * 4..w * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut s = Vec::new();
+        s.extend_from_slice(&0x3C00u16.to_le_bytes()); // f16 1.0
+        s.extend_from_slice(&0x3800u16.to_le_bytes()); // f16 0.5
+        let mut out = vec![0f32; k];
+        dequant_row_w4a16_split(&q, &s, 0, k, group, false, &mut out);
+        for (i, v) in out.iter().enumerate() {
+            let nib = (i % 8) as i32;
+            let sc = if i < 128 { 1.0 } else { 0.5 };
+            assert_eq!(*v, (nib - 8) as f32 * sc, "i={i}");
+        }
+    }
+
+    /// I: split arm 행 디양자화 — g32/bf16(35B). 스케일 전부 bf16 1.0.
+    #[test]
+    fn split_dequant_row_g32_bf16() {
+        let (k, group) = (64usize, 32usize);
+        let mut q = vec![0u8; k / 2];
+        for w in 0..k / 8 {
+            let mut word: u32 = 0;
+            for j in 0..8u32 {
+                word |= ((7 - j) & 0xF) << (4 * j); // 역순 니블 — 인덱스 규약 확인
+            }
+            q[w * 4..w * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut s = Vec::new();
+        for _ in 0..2 {
+            s.extend_from_slice(&0x3F80u16.to_le_bytes()); // bf16 1.0
+        }
+        let mut out = vec![0f32; k];
+        dequant_row_w4a16_split(&q, &s, 0, k, group, true, &mut out);
+        for (i, v) in out.iter().enumerate() {
+            let nib = (7 - (i % 8)) as i32;
+            assert_eq!(*v, (nib - 8) as f32, "i={i}");
+        }
+    }
 
     /// greedy 아그맥스 계약(2026-10-09): 엄격 비교 → 동률은 최저 인덱스,
     /// NaN은 순위 제외(비교 false), 전부 NaN이면 0 — 실수 경로는 finiteness
