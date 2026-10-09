@@ -9,9 +9,10 @@
 //    목적은 35B-A3B GDN 형상 지원(hidden=2048, h_k=16, h_v=32,
 //    conv_ch=8192 — 실측 형상 config.json
 //    text_config 실측 2026-10-04).
-// 2) scan 공유메모리 합계 70,020B(sk/sv/KS/QS 8KB×4 · A/KQ 2KB×2 ·
-//    dc 16KB · Stile 8KB×2(더블 버퍼, A5-2) · bp/gcs/wsm 388B)는 CUDA 정적
-//    __shared__ 한계 48KB를 초과한다(ROCm LDS 64KB에서는 상주 가능했던 배치) → 동적
+// 2) scan 공유메모리 합계 57,732B(A5-4: sk 8KB · qs 16KB · sv/KS/QS 4KB×3 ·
+//    A/KQ 2KB×2 · dc 8KB · Stile 8KB×2(더블 버퍼) · bp/gcs/wsm 388B — V-타일
+//    64열 기준)는 CUDA 정적 __shared__ 한계 48KB를 초과한다(ROCm LDS 64KB에서는
+//    상주 가능했던 배치) → 동적
 //    공유메모리(extern __shared__ + cuFuncSetAttribute opt-in)로 동일
 //    배치·동일 산술로 이식. 배치 순서·f16 저장 지점은 불변.
 // 3) conv 원본의 자리표시 행(o = silu(xt)·0+0 — 무효 산출, 원본 주석
@@ -44,13 +45,13 @@
 //   h의 T개 블록이 동일 abuf 슬라이스를 재판독하므로 L2(T축 재사용)
 //   로 흡수된다. WG=128·red[128] 트리 환원은 산술 계약(환원 순서
 //   미러 대상)이라 유지.
-// - scan: 청크 순차(상태 S 의존 — 청크 c+1은 c의 상태 갱신 후에만
-//   실행 가능)라 헤드(h_v블록) 이상의 병렬화는 계약상 불가. 동적 공유
-//   61,828B → GA100 164KB/SM 기준 2블록/SM 상한이나 그리드 h_v(27B
-//   48 < 70SM)라 실질 1블록/SM×48SM 사용 — 목표기 실측 전까지 유지
-//   (D열 2분할은 A/KQ 전치점(전체 128내적) 중복 연산을 유발해 손익
-//   미확정). A/KQ·KS/QS 페이즈의 스레드 활용(32/128)은 원본 구조
-//   1:1 — 정합 우선, SASS 수준 최적화는 170HX 도착 후 판단.
+// - scan: [A5-4 2026-10-10] A/KQ·gcs 전제는 청크 병렬 prepass
+//   (gdn_scan_akq, 그리드 h_v×n_chunks)로 분리 — 상태 의존부(KS/QS·전진
+//   대입·출력·상태 갱신)만 남기고 state 열을 V-타일(NSPLIT=4)로 나눠
+//   grid=h_v×4. 구 "D열 2분할 손익 미확정"(A/KQ 전체 128내적 중복이
+//   원인)은 prepass가 중복을 제거해 성립 — 비트동일 유지. 동적 공유
+//   43,396B. KS/QS는 2-wide LDS(니블 쌍·float2) 적용. SASS 미세 최적화는
+//   170HX 도착 후 재판단(현 잔여 스톨: 배리어·스케줄러 지연).
 // - gate: 그리드 (h_v, T), 블록 128 — 메모리 본드 소형, 특기 사항 없음.
 #include <cuda_fp16.h>
 
@@ -274,56 +275,108 @@ extern "C" __global__ void gdn_l2perm(
                     q_out, k_out, v_out, bg, t_len, layer, h_k, h_v, hidden);
 }
 
-// gdn_scan — FLA 청크 알고리즘(구 rawhip 커널 L484-608 직이식,
-// CS=32·TILE=16·8패스). A/KQ/KS/QS/sk/sv f16, dc f32 전진대입 소거
-// (d[i] = β·(v_i − e^{g_i}·KS_i) 먼저, 이후 j<i 감산 — 순서 계약),
-// o는 각 i의 소거 직후(필요한 dc[p≤i]는 전부 확정) 산출. 상태 P6
-// 갱신. q 입력(q2)은 l2perm에서 이미 L2 정규화됨 — 이 커널에서 중복
-// 스케일 금지(§3.3; qscale=1/√d는 어텐션 스케일이지 재정규화 아님).
-// 공유메모리는 동적 61,828B(최상단 주석 2항). 그리드 (h_v, 1), WG=128.
+// gdn_scan — FLA 청크 알고리즘. [A5-4 2026-10-10 FLA 2단] A/KQ·gcs 전제는
+// 청크 병렬 prepass(gdn_scan_akq)로 분리 — 상태 의존부(KS/QS·전진대입·
+// 출력·상태 갱신)만 이 커널에 남기고 state 열을 V-타일(GDN_NSPLIT)로 나눠
+// grid = h_v×NSPLIT로 넓힌다. 누적 순서(i·s2p·j)는 전부 원序 → 비트동일.
+// CS=32·TILE=16·8패스. KS/QS/sk/sv f16, dc f32 전진대입 소거(순서 계약),
+// o는 소거 직후 산출. 상태 P6 갱신. q는 L2 정규화 완료(중복 스케일 금지).
+// 공유메모리는 동적 GDN_SCAN_SMEM(호스트 미러). 블록=512스레드.
 #define GDN_CS 32
 #define GDN_TILE 16
-// V축 슬라이스 수 — 1 = 슬라이싱 없음(grid=h_v, 블록 128스레드).
-// [실측 2026-10-08] 4로 올리면 192블록이 되지만 블록당 32스레드가 되어 K축
-// 공통 작업(sk 적재·A/KQ)이 4배로 늘어 오히려 74.6µs(67µs 대비 열화) — 1 유지.
-#define GDN_VSLICE 1
-#define GDN_VW (128 / GDN_VSLICE)
-// [A5 2026-10-10] 워크그룹 수 — 블록 = GDN_NGRP×GDN_VW스레드. ncu: 점유
-// 8.3%(32블록×4워프)·No-Eligible 83% = 지연 노출 → 4그룹(512스레드)으로
-// 스케줄러당 워프 4개. 누적 순서(i·s2·j 전부 원순서)를 보존해 **비트동일**.
-#define GDN_NGRP 4
+// [A5-4] state 열 V-타일: 블록 = (h, vs타일). 구 VSLICE와 달리 A/KQ는
+// prepass가 비중복 계산한다(절단 시 A/KQ 중복이 기각 원인이었다).
+#define GDN_NSPLIT 4
+#define GDN_VS (128 / GDN_NSPLIT)   // 블록당 열 수
+#define GDN_NGRP 16                 // 워크그룹 = 512스레드 / GDN_VS
+
+// [A5-4] A/KQ 사전 계산 — 그리드 (h_v, n_chunks) 청크 병렬. 종전 융합
+// 커널의 셀 계산을 그대로 이관(내적 s2 오름차순·half 반올림 지점 동일 —
+// 값 비트동일). 출력 [2][h_v][n_chunks][CS][CS] half(A 평면 → KQ 평면).
+extern "C" __global__ void gdn_scan_akq(
+    const float* __restrict__ q,   // [T][k_len]
+    const float* __restrict__ k,   // [T][k_len] L2
+    const float* __restrict__ bg,  // [T][2*h_v]
+    __half* __restrict__ akq,
+    int t_len, int h_k, int h_v, int d)
+{
+    const int h = blockIdx.x;
+    const int c = blockIdx.y;
+    const int t0 = c * GDN_CS;
+    const int n = min(t_len - t0, GDN_CS);
+    const int kh = h % h_k;
+    __shared__ __half sk[GDN_CS * 128];
+    __shared__ float qs[GDN_CS * 128];
+    __shared__ float gcs[GDN_CS + 1];
+    __shared__ float bp[GDN_CS];
+    for (int e = threadIdx.x; e < GDN_CS * 128; e += blockDim.x) {
+        int t = e / 128, dv = e % 128;
+        bool live = t < n;
+        sk[e] = __float2half_rn(live ? k[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f);
+        qs[e] = live ? q[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f;
+    }
+    if (threadIdx.x < GDN_CS) {
+        float acc = 0.0f;
+        for (int t = 0; t < GDN_CS; t++) {
+            acc += (t < n) ? bg[(t0 + t) * (2 * h_v) + h_v + h] : 0.0f;
+            gcs[t] = acc;
+        }
+        gcs[GDN_CS] = acc;
+        bp[threadIdx.x] = (threadIdx.x < n) ? bg[(t0 + threadIdx.x) * (2 * h_v) + h] : 0.0f;
+    }
+    __syncthreads();
+    const float qscale = 1.0f / sqrtf((float)d);
+    const size_t plane = (size_t)h_v * gridDim.y * GDN_CS * GDN_CS;
+    __half* Aout = akq + (size_t)h * gridDim.y * GDN_CS * GDN_CS + (size_t)c * GDN_CS * GDN_CS;
+    __half* KQout = Aout + plane;
+    for (int e = threadIdx.x; e < GDN_CS * GDN_CS; e += blockDim.x) {
+        int i = e / GDN_CS, j = e % GDN_CS;
+        if (i < n) {
+            float dk = 0.0f, dq = 0.0f;
+            for (int s2 = 0; s2 < 128; s2++) {
+                float kj = __half2float(sk[j * 128 + s2]);
+                dk += __half2float(sk[i * 128 + s2]) * kj;
+                dq += qs[i * 128 + s2] * kj;
+            }
+            float bi = bp[i];
+            Aout[i * GDN_CS + j] = __float2half_rn((j < i) ? dk * bi * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
+            KQout[i * GDN_CS + j] = __float2half_rn((j <= i) ? dq * qscale * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
+        } else {
+            Aout[i * GDN_CS + j] = __float2half_rn(0.0f);
+            KQout[i * GDN_CS + j] = __float2half_rn(0.0f);
+        }
+    }
+}
 extern "C" __global__ void gdn_scan(
     const float* __restrict__ q,     // [T][k_len]
     const float* __restrict__ k,     // [T][k_len] L2
     const float* __restrict__ v,     // [T][h_v*128] lc
     const float* __restrict__ bg,    // [T][2*h_v]
+    const __half* __restrict__ akq,  // [2][h_v][n_chunks][CS][CS] — A5-4 prepass
     float* __restrict__ st,          // [L][h_v][128*128] r/w — S0≠0 경로 의무
     float* __restrict__ outv,        // [T][h_v*128] o_lc
     int t_len, int h_k, int h_v, int d, int layer)
 {
-    // [2026-10-08 P3-b 후속 — V-슬라이싱] 종전 grid=h_v(27B 48블록) × 128스레드
-    // = 48 SM만 점유(스케줄러당 1워프, IPC 0.11 — 실측 gdn_scan 67µs×48=3.2ms).
-    // V축(128)을 GDN_VSLICE로 잘라 grid=h_v*VSLICE(192블록), 블록=GDN_VW스레드.
-    // V원소별 계산은 독립이라 **비트 안전**(K축·A/KQ는 슬라이스별 중복 — 계획서
-    // §4.4-3의 "A/KQ 중복 무시 가능" 판단 그대로).
+    // [A5-4] 그리드 (h_v×NSPLIT) — 블록이 state 열 타일(vs)을 소유.
     extern __shared__ char smem_raw[];
     __half* sk = (__half*)smem_raw;                    // [CS*128]
-    __half* sv = sk + GDN_CS * 128;                   // [CS*GDN_VW]
-    __half* A = sv + GDN_CS * GDN_VW;                 // [CS*CS]
-    __half* KQ = A + GDN_CS * GDN_CS;                 // [CS*CS]
-    __half* KS = KQ + GDN_CS * GDN_CS;                // [CS*GDN_VW]
-    __half* QS = KS + GDN_CS * GDN_VW;                // [CS*GDN_VW]
-    float* dc = (float*)(QS + GDN_CS * GDN_VW);       // [CS*GDN_VW]
-    float* Stile = dc + GDN_CS * GDN_VW;              // [2*TILE*GDN_VW] (A5-2 더블 버퍼)
-    float* bp = Stile + 2 * GDN_TILE * GDN_VW;        // [CS]
-    float* gcs = bp + GDN_CS;                         // [CS+1]
-    float* wsm = gcs + (GDN_CS + 1);                  // [CS]
-    int h = blockIdx.x / GDN_VSLICE;
-    int vs = (blockIdx.x % GDN_VSLICE) * GDN_VW;
+    float* qs = (float*)(sk + GDN_CS * 128);           // [CS*128] (A5-4 q 스테이징)
+    __half* sv = (__half*)(qs + GDN_CS * 128);         // [CS*GDN_VS]
+    __half* A = sv + GDN_CS * GDN_VS;                  // [CS*CS]
+    __half* KQ = A + GDN_CS * GDN_CS;                  // [CS*CS]
+    __half* KS = KQ + GDN_CS * GDN_CS;                 // [CS*GDN_VS]
+    __half* QS = KS + GDN_CS * GDN_VS;                 // [CS*GDN_VS]
+    float* dc = (float*)(QS + GDN_CS * GDN_VS);        // [CS*GDN_VS]
+    float* Stile = dc + GDN_CS * GDN_VS;               // [2*TILE*GDN_VS] (더블 버퍼)
+    float* bp = Stile + 2 * GDN_TILE * GDN_VS;         // [CS]
+    float* gcs = bp + GDN_CS;                          // [CS+1]
+    float* wsm = gcs + (GDN_CS + 1);                   // [CS]
+    int h = blockIdx.x / GDN_NSPLIT;
+    int vs = (blockIdx.x % GDN_NSPLIT) * GDN_VS;
     int kh = h % h_k;
-    // [A5] 열 소유자 tid(0..VW-1) + 워크그룹 grp — 원순서 보존 분배.
-    int tid = threadIdx.x % GDN_VW;
-    int grp = threadIdx.x / GDN_VW;
+    // [A5] 열 소유자 tid(0..VS-1) + 워크그룹 grp — 원순서 보존 분배.
+    int tid = threadIdx.x % GDN_VS;
+    int grp = threadIdx.x / GDN_VS;
     int n_chunks = (t_len + GDN_CS - 1) / GDN_CS;
     // G5 정밀화: rsqrtf(≤2ulp 근사) 대신 IEEE sqrt+div — 호스트 미러와
     // 비트동일(양측 sqrt.rn·div.rn).
@@ -338,9 +391,10 @@ extern "C" __global__ void gdn_scan(
             int t = e / 128, dv = e % 128;
             bool live = t < n;
             sk[e] = __float2half_rn(live ? k[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f);
+            qs[e] = live ? q[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f;
         }
-        for (int e = threadIdx.x; e < GDN_CS * GDN_VW; e += blockDim.x) {
-            int t = e / GDN_VW, dvl = e % GDN_VW;
+        for (int e = threadIdx.x; e < GDN_CS * GDN_VS; e += blockDim.x) {
+            int t = e / GDN_VS, dvl = e % GDN_VS;
             bool live = t < n;
             sv[e] = __float2half_rn(live ? v[(t0 + t) * (h_v * d) + h * 128 + vs + dvl] : 0.0f);
         }
@@ -353,35 +407,22 @@ extern "C" __global__ void gdn_scan(
             gcs[GDN_CS] = acc;
             bp[tid] = (tid < n) ? bg[(t0 + tid) * (2 * h_v) + h] : 0.0f;
         }
-        __syncthreads();
-
-        // [A5] A/KQ — (i,j) 2D 매핑(전 스레드). 종전 i직렬·tid<32만 활성
-        // (128스레드 중 96 유휴) — 셀당 128차 내적은 s2 오름차순 그대로라
-        // **셀 값은 비트동일**(골든 판정). i≥n 셀은 소비자(dc/o 루프)가 읽지
-        // 않지만 종전의 스테일 값 대신 0 기록(불변 — aij!=0 가드와 무관).
-        for (int e = threadIdx.x; e < GDN_CS * GDN_CS; e += blockDim.x) {
-            int i = e / GDN_CS, j = e % GDN_CS;
-            if (i < n) {
-                float dk = 0.0f, dq = 0.0f;
-                int qbase = (t0 + i) * (h_k * d) + kh * 128;
-                for (int s2 = 0; s2 < 128; s2++) {
-                    float kj = __half2float(sk[j * 128 + s2]);
-                    dk += __half2float(sk[i * 128 + s2]) * kj;
-                    dq += q[qbase + s2] * kj;
-                }
-                float bi = bp[i];
-                A[i * GDN_CS + j] = __float2half_rn((j < i) ? dk * bi * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
-                KQ[i * GDN_CS + j] = __float2half_rn((j <= i) ? dq * qscale * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
-            } else {
-                A[i * GDN_CS + j] = __float2half_rn(0.0f);
-                KQ[i * GDN_CS + j] = __float2half_rn(0.0f);
+        // [A5-4] A/KQ는 prepass 산출 복사(prepass와 셀 값 비트동일).
+        {
+            const size_t plane = (size_t)h_v * n_chunks * GDN_CS * GDN_CS;
+            const __half* Ag =
+                akq + (size_t)h * n_chunks * GDN_CS * GDN_CS + (size_t)c * GDN_CS * GDN_CS;
+            const __half* KQg = Ag + plane;
+            for (int e = threadIdx.x; e < GDN_CS * GDN_CS; e += blockDim.x) {
+                A[e] = Ag[e];
+                KQ[e] = KQg[e];
             }
         }
         __syncthreads();
 
-        // [A5-2 2026-10-10] KS/QS 레지스터 누적(pass마다 half 반올림 — 값
-        // 순서 불변·비트동일) + Stile 더블 버퍼(다음 타일 프리페치) —
-        // smem RMW·배리어 절감(ncu: barrier 4.76·short_scoreboard 4.84).
+        // [A5-2] KS/QS 레지스터 누적(pass마다 half 반올림 — 값 순서 불변) +
+        // Stile 더블 버퍼(cp.async 프리페치). [A5-4] sk/qs는 니블 쌍(2-wide)
+        // LDS — 두 누산 chain 순서는 s2p 오름차순 원序 그대로(비트동일).
         constexpr int IK = (GDN_CS + GDN_NGRP - 1) / GDN_NGRP;
         float rks[IK], rqs[IK];
 #pragma unroll
@@ -391,8 +432,8 @@ extern "C" __global__ void gdn_scan(
         }
         {
             // pass 0 타일 선적재(buf 0) — cp.async(레지스터 경유 제거).
-            for (int e = threadIdx.x; e < GDN_TILE * GDN_VW; e += blockDim.x) {
-                int r = e / GDN_VW, cl = e % GDN_VW;
+            for (int e = threadIdx.x; e < GDN_TILE * GDN_VS; e += blockDim.x) {
+                int r = e / GDN_VS, cl = e % GDN_VS;
                 unsigned sa = (unsigned)__cvta_generic_to_shared(&Stile[e]);
                 const float* src = &st[st_h + (long)r * d + cl];
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(sa),
@@ -406,10 +447,10 @@ extern "C" __global__ void gdn_scan(
             int s2b = pass_ * GDN_TILE;
             // 다음 타일을 반대 버퍼에 cp.async 프리페치(소비와 완전 중첩).
             if (pass_ + 1 < 8) {
-                float* nxt = Stile + ((pass_ & 1) ^ 1) * (GDN_TILE * GDN_VW);
+                float* nxt = Stile + ((pass_ & 1) ^ 1) * (GDN_TILE * GDN_VS);
                 const int nb = s2b + GDN_TILE;
-                for (int e = threadIdx.x; e < GDN_TILE * GDN_VW; e += blockDim.x) {
-                    int r = e / GDN_VW, cl = e % GDN_VW;
+                for (int e = threadIdx.x; e < GDN_TILE * GDN_VS; e += blockDim.x) {
+                    int r = e / GDN_VS, cl = e % GDN_VS;
                     unsigned sa = (unsigned)__cvta_generic_to_shared(&nxt[e]);
                     const float* src = &st[st_h + (long)(nb + r) * d + cl];
                     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(sa),
@@ -417,32 +458,33 @@ extern "C" __global__ void gdn_scan(
                 }
                 asm volatile("cp.async.commit_group;");
             }
-            const float* cur = Stile + (pass_ & 1) * (GDN_TILE * GDN_VW);
-            // [A5-3] 타일 16값을 레지스터로 1회 로드(그룹 내 8개 i가 재사용
-            // — LDS ÷8). 값·순서 불변(비트동일).
+            const float* cur = Stile + (pass_ & 1) * (GDN_TILE * GDN_VS);
+            // [A5-3] 타일 16값을 레지스터로 1회 로드(그룹 내 i들이 재사용).
             float sv0[GDN_TILE];
 #pragma unroll
             for (int r = 0; r < GDN_TILE; ++r) {
-                sv0[r] = cur[r * GDN_VW + tid];
+                sv0[r] = cur[r * GDN_VS + tid];
             }
             // [A5] i축 워크그룹 분배 — i별 누적 순서(pass·s2p)는 원序 그대로.
             for (int k = 0; k < IK; ++k) {
                 const int i = grp + k * GDN_NGRP;
-                // T<n 행 스킵 — KS/QS[i≥n]는 소비자(출력·상태 갱신)가 i<n만
-                // 읽으므로 계산·기록 모두 불필요(종전엔 32행 전부 계산).
+                // T<n 행 스킵 — KS/QS[i≥n]는 소비자가 i<n만 읽는다.
                 if (i >= n) {
                     continue;
                 }
                 float ak = 0.0f, aq = 0.0f;
-                int qbase = (t0 + i) * (h_k * d) + kh * 128;
-                for (int s2p = 0; s2p < GDN_TILE; s2p++) {
-                    float s_el = sv0[s2p];
-                    ak += __half2float(sk[i * 128 + s2b + s2p]) * s_el;
-                    // T=1이면 i=1..31의 q 행은
-                    // 할당되지 않는다. 프로브 T=32에서 숨었던 CUresult=700;
-                    // 비활성 행만 0으로 마스킹(활성 산술 순서 불변).
-                    float qv = (i < n) ? q[qbase + s2b + s2p] : 0.0f;
-                    aq += qv * s_el;
+                for (int s2p = 0; s2p < GDN_TILE; s2p += 2) {
+                    const float s0 = sv0[s2p];
+                    const float s1 = sv0[s2p + 1];
+                    const __half2 sk2 =
+                        *reinterpret_cast<const __half2*>(&sk[i * 128 + s2b + s2p]);
+                    const float2 skf = __half22float2(sk2);
+                    const float2 qf =
+                        *reinterpret_cast<const float2*>(&qs[i * 128 + s2b + s2p]);
+                    ak += skf.x * s0;
+                    ak += skf.y * s1;
+                    aq += qf.x * s0;
+                    aq += qf.y * s1;
                 }
                 rks[k] = __half2float(__float2half_rn(rks[k] + ak));
                 rqs[k] = __half2float(__float2half_rn(rqs[k] + aq * qscale));
@@ -454,11 +496,11 @@ extern "C" __global__ void gdn_scan(
         for (int k = 0; k < IK; ++k) {
             const int i = grp + k * GDN_NGRP;
             if (i < n) {
-                KS[i * GDN_VW + tid] = __float2half_rn(rks[k]);
-                QS[i * GDN_VW + tid] = __float2half_rn(rqs[k]);
+                KS[i * GDN_VS + tid] = __float2half_rn(rks[k]);
+                QS[i * GDN_VS + tid] = __float2half_rn(rqs[k]);
             } else {
-                KS[i * GDN_VW + tid] = __float2half_rn(0.0f);
-                QS[i * GDN_VW + tid] = __float2half_rn(0.0f);
+                KS[i * GDN_VS + tid] = __float2half_rn(0.0f);
+                QS[i * GDN_VS + tid] = __float2half_rn(0.0f);
             }
         }
         __syncthreads();
@@ -466,16 +508,16 @@ extern "C" __global__ void gdn_scan(
         // [A5] 전치대입/출력 — 열(tid) 소유라 그룹0만(다른 그룹은 배리어 대기).
         if (grp == 0) {
             for (int i = 0; i < n; i++) {
-                float rhs = bp[i] * (__half2float(sv[i * GDN_VW + tid]) - gdn_expf(gcs[i]) * __half2float(KS[i * GDN_VW + tid]));
+                float rhs = bp[i] * (__half2float(sv[i * GDN_VS + tid]) - gdn_expf(gcs[i]) * __half2float(KS[i * GDN_VS + tid]));
                 for (int j = 0; j < i; j++) {
                     float aij = __half2float(A[i * GDN_CS + j]);
-                    if (aij != 0.0f) rhs -= aij * dc[j * GDN_VW + tid];
+                    if (aij != 0.0f) rhs -= aij * dc[j * GDN_VS + tid];
                 }
-                dc[i * GDN_VW + tid] = rhs;
-                float oi = gdn_expf(gcs[i]) * __half2float(QS[i * GDN_VW + tid]);
+                dc[i * GDN_VS + tid] = rhs;
+                float oi = gdn_expf(gcs[i]) * __half2float(QS[i * GDN_VS + tid]);
                 for (int p = 0; p <= i; p++) {
                     float w = __half2float(KQ[i * GDN_CS + p]);
-                    if (w != 0.0f) oi += w * dc[p * GDN_VW + tid];
+                    if (w != 0.0f) oi += w * dc[p * GDN_VS + tid];
                 }
                 outv[(t0 + i) * (h_v * d) + h * 128 + vs + tid] = oi;
             }
@@ -487,12 +529,11 @@ extern "C" __global__ void gdn_scan(
             float gt_exp = gdn_expf(gtot);
             if (threadIdx.x < GDN_CS) wsm[threadIdx.x] = (threadIdx.x < n) ? gdn_expf(gtot - gcs[threadIdx.x]) : 0.0f;
             __syncthreads();
-            // [A5-3] dc 열(≤32)을 레지스터 1회 — 상태 갱신 재판독 제거
-            // (LDS ~1024→32/스레드/청크). 값·순서 불변.
+            // [A5-3] dc 열(≤32)을 레지스터 1회 — 상태 갱신 재판독 제거.
             float dcr[GDN_CS];
 #pragma unroll
             for (int j = 0; j < GDN_CS; ++j) {
-                dcr[j] = dc[j * GDN_VW + tid];
+                dcr[j] = dc[j * GDN_VS + tid];
             }
             // [A5] 상태 갱신 행(s2) 워크그룹 분배 — 행별 j 순서는 원序 그대로.
             for (int s2 = grp; s2 < 128; s2 += GDN_NGRP) {

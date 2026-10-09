@@ -27,14 +27,16 @@ pub const ATTN_F3S_TMAX: usize = 512;
 // t 무제한, FFMA 폴백만 32 상한(chain_device_t 가드).
 pub const CHAIN_TMAX: usize = 512;
 /// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
-/// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — GDN_VSLICE=1, Stile 더블
-/// 버퍼(A5-2) 기준).
-pub const GDN_SCAN_SMEM: u32 = 70_020;
-/// gdn_scan V-슬라이스 수(커널 GDN_VSLICE와 동일 계약 — 1=슬라이싱 없음).
-pub const GDN_VSLICE: usize = 1;
-/// [A5 2026-10-10] gdn_scan 워크그룹 수(커널 GDN_NGRP와 동일 계약) —
-/// 블록 = GDN_NGRP×(128/GDN_VSLICE)스레드. 누적 순서 보존(비트동일) 분배.
-pub const GDN_NGRP: usize = 4;
+/// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — A5-4: qs 스테이징 +
+/// V-타일(GDN_NSPLIT) + Stile 더블 버퍼 기준).
+pub const GDN_SCAN_SMEM: u32 = 43_396;
+/// [A5-4 2026-10-10 FLA 2단] gdn_scan V-타일 분할 수(커널 GDN_NSPLIT와
+/// 동일 계약) — grid = h_v×NSPLIT, 블록 = GDN_NGRP×GDN_VS스레드.
+pub const GDN_NSPLIT: usize = 4;
+/// [A5-4] gdn_scan 워크그룹 수(커널 GDN_NGRP와 동일 계약).
+pub const GDN_NGRP: usize = 16;
+/// gdn_scan 청크 크기(커널 GDN_CS와 동일 계약) — prepass 그리드·스크래치 산정.
+pub const GDN_CS: usize = 32;
 
 /// GDN 체인 형상(서버가 config에서 유도해 명시 등록 — 추정 금지).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -301,6 +303,8 @@ pub struct W4a16Dec {
     /// [P9] t=1 GDN 분할 부분합([h_v][4][2][128] f32)과 dc([h_v][128]).
     dgpart: CUdeviceptr,
     dgdc: CUdeviceptr,
+    /// [A5-4] gdn_scan A/KQ prepass 스크래치 — [2][h_v][maxchunks][CS][CS] half.
+    dakq: CUdeviceptr,
     dgate: CUdeviceptr,
     gdn_t_cap: usize,
     // ── attn ──
@@ -427,6 +431,7 @@ impl W4a16Dec {
                 "gdn_conv",
                 "gdn_l2perm",
                 "gdn_scan",
+                "gdn_scan_akq",
                 "gdn1_part",
                 "gdn1_comb",
                 "gdn1_upd",
@@ -549,6 +554,7 @@ impl W4a16Dec {
             dgo: 0,
             dgpart: 0,
             dgdc: 0,
+            dakq: 0,
             dgate: 0,
             gdn_t_cap: 0,
             attn: None,
@@ -993,6 +999,7 @@ impl W4a16Dec {
                 &mut self.dgate,
                 &mut self.dgpart,
                 &mut self.dgdc,
+                &mut self.dakq,
             ],
             [
                 t_len * cch * 4,
@@ -1009,6 +1016,8 @@ impl W4a16Dec {
                 t_len * vl * 4,
                 dm.h_v * 8 * 256 * 4,
                 dm.h_v * 128 * 4,
+                // [A5-4] A/KQ prepass 스크래치(최대 청크 수 기준, t_len 무관).
+                dm.h_v * (CHAIN_TMAX / GDN_CS) * 2 * GDN_CS * GDN_CS * 2,
             ],
         )?;
         self.gdn_t_cap = t_len;
@@ -1173,35 +1182,56 @@ impl W4a16Dec {
             skip_scan = true;
         }
         if !skip_scan {
+            // [A5-4] FLA 2단: A/KQ 청크 병렬 prepass(값 비트동일) →
+            // 상태/출력 V-타일 스캔. 스크래치는 dakq(로드 시 확보).
+            let nch = t_len.div_ceil(GDN_CS) as u32;
+            let fp = self.cc.function("gdn_scan_akq")?;
+            let (mut p0, mut p1, mut p2, mut p3) = (self.dq2, self.dk2, self.dbg, self.dakq);
+            let (mut pt, mut phk, mut phv, mut pd) =
+                (t_len as i32, dm.h_k as i32, dm.h_v as i32, dm.d as i32);
+            let mut pa: [*mut std::ffi::c_void; 8] = [
+                (&mut p0) as *mut _ as *mut _,
+                (&mut p1) as *mut _ as *mut _,
+                (&mut p2) as *mut _ as *mut _,
+                (&mut p3) as *mut _ as *mut _,
+                (&mut pt) as *mut _ as *mut _,
+                (&mut phk) as *mut _ as *mut _,
+                (&mut phv) as *mut _ as *mut _,
+                (&mut pd) as *mut _ as *mut _,
+            ];
+            self.cc.launch(fp, dm.h_v as u32, nch, 512, &mut pa)?;
+
             let f = self.cc.function("gdn_scan")?;
             self.cc.set_dynamic_smem(f, GDN_SCAN_SMEM)?;
-            let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5) = (
+            let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6) = (
                 self.dq2,
                 self.dk2,
                 self.dv2,
                 self.dbg,
+                self.dakq,
                 self.dgst + (st_slot as u64) * 4,
                 self.dgo,
             );
-            let mut as_: [*mut std::ffi::c_void; 11] = [
+            let mut as_: [*mut std::ffi::c_void; 12] = [
                 (&mut s0) as *mut _ as *mut _,
                 (&mut s1) as *mut _ as *mut _,
                 (&mut s2) as *mut _ as *mut _,
                 (&mut s3) as *mut _ as *mut _,
                 (&mut s4) as *mut _ as *mut _,
                 (&mut s5) as *mut _ as *mut _,
+                (&mut s6) as *mut _ as *mut _,
                 (&mut tl) as *mut _ as *mut _,
                 (&mut hk) as *mut _ as *mut _,
                 (&mut hv) as *mut _ as *mut _,
                 (&mut dd) as *mut _ as *mut _,
                 (&mut lay) as *mut _ as *mut _,
             ];
-            // grid = h_v × VSLICE(블록 = GDN_NGRP×GDN_VW = 512스레드 — A5).
+            // grid = h_v×NSPLIT(블록 = GDN_NGRP×GDN_VS = 512스레드).
             self.cc.launch_shared(
                 f,
-                (dm.h_v * GDN_VSLICE) as u32,
+                (dm.h_v * GDN_NSPLIT) as u32,
                 1,
-                (GDN_NGRP * (128 / GDN_VSLICE)) as u32,
+                (GDN_NGRP * (128 / GDN_NSPLIT)) as u32,
                 GDN_SCAN_SMEM,
                 &mut as_,
             )?;
@@ -4602,7 +4632,7 @@ mod tests {
 /// (미러 불일치 = smem 오버런·버퍼 계약 위반이라 변경 시 사전 차단).
 #[cfg(test)]
 mod mirror_contract {
-    use super::{ATTN_F3S_TMAX, CHAIN_TMAX, GDN_NGRP, GDN_SCAN_SMEM, GDN_VSLICE};
+    use super::{ATTN_F3S_TMAX, CHAIN_TMAX, GDN_CS, GDN_NGRP, GDN_NSPLIT, GDN_SCAN_SMEM};
 
     /// `#define NAME 값` 파싱 — 값은 정수 리터럴만 다룬다(대상 목록 한정).
     fn define(src: &str, name: &str) -> u64 {
@@ -4633,24 +4663,26 @@ mod mirror_contract {
         let cu = include_str!("assets/gdn.cu");
         let cs = define(cu, "GDN_CS") as usize;
         let tile = define(cu, "GDN_TILE") as usize;
-        let vslice = define(cu, "GDN_VSLICE") as usize;
-        assert_eq!(vslice, GDN_VSLICE, "gdn.cu GDN_VSLICE ↔ GDN_VSLICE");
+        let nsplit = define(cu, "GDN_NSPLIT") as usize;
+        assert_eq!(cs, GDN_CS, "gdn.cu GDN_CS ↔ GDN_CS");
+        assert_eq!(nsplit, GDN_NSPLIT, "gdn.cu GDN_NSPLIT ↔ GDN_NSPLIT");
         assert_eq!(
             define(cu, "GDN_NGRP") as usize,
             GDN_NGRP,
             "gdn.cu GDN_NGRP ↔ GDN_NGRP"
         );
-        let vw = 128 / vslice;
-        // gdn_scan 레이아웃(sk/sv/A/KQ/KS/QS/dc/Stile×2/bp/gcs/wsm) 바이트 합 —
-        // gdn.cu 상단 주석 2항(70,020B)과 동일 산식(A5-2 더블 버퍼 반영).
+        let vs = 128 / nsplit;
+        // gdn_scan 레이아웃(sk/qs/sv/A/KQ/KS/QS/dc/Stile×2/bp/gcs/wsm) 바이트
+        // 합 — A5-4(qs 스테이징·V-타일·더블 버퍼) 반영.
         let total = cs * 128 * 2
-            + cs * vw * 2
+            + cs * 128 * 4
+            + cs * vs * 2
             + cs * cs * 2
             + cs * cs * 2
-            + cs * vw * 2
-            + cs * vw * 2
-            + cs * vw * 4
-            + 2 * tile * vw * 4
+            + cs * vs * 2
+            + cs * vs * 2
+            + cs * vs * 4
+            + 2 * tile * vs * 4
             + cs * 4
             + (cs + 1) * 4
             + cs * 4;
