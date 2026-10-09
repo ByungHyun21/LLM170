@@ -505,10 +505,11 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         let h = hp.n_embd;
         let mut i = 0usize;
         while i < prompt.len() {
-            // [2026-10-09 개방 결함] MoE 배치 프리필 t≥8 NaN — MoE는 t=1 고정.
-            // LLM170_MOE_DBG(진단)에서만 배치를 허용해 추적한다.
-            let cap = if hp.n_experts > 0 && !llm170_diag::flag::ne0("LLM170_MOE_DBG") {
+            // [2026-10-09] MoE 상주는 32(gdn_exp_d 도메인 수정 후), 스트리밍은 1.
+            let cap = if hp.n_experts > 0 && !dec.moe_experts_resident() {
                 1
+            } else if hp.n_experts > 0 {
+                32
             } else {
                 8
             };

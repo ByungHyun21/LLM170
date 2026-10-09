@@ -119,16 +119,16 @@ impl GpuEngine {
             return last.ok_or_else(|| "prefill: 빈 프롬프트".to_string());
         }
         // 청크 크기 오버라이드(진단/폴백): LLM170_PREFILL_T로 고정.
-        // [2026-10-09 개방 결함] MoE(플레인) 배치 프리필은 t≥8에서 post-attn
-        // 정규화 7행이 NaN(27B dense는 동일 norm/GDN 경로로 정상 — 플레인 경로
-        // 특이). 원인 규명 전까지 MoE는 t=1 고정, dense는 8(검증됨).
-        let tmax = if self.dec.is_moe() {
+        // [2026-10-09] MoE 배치 프리필 결함 수정(gdn_exp_d 도메인 가드) 후
+        // 재허용 — 상주면 32, 스트리밍은 t=1 폴백, dense는 8(계약).
+        let tmax = if self.dec.is_moe() && !self.dec.moe_experts_resident() {
             1
         } else {
+            let def = if self.dec.is_moe() { 32 } else { 8 };
             llm170_diag::flag::val("LLM170_PREFILL_T")
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(8)
-                .clamp(1, 8)
+                .unwrap_or(def)
+                .clamp(1, 32)
         };
         let mut i = 0usize;
         while i < n {
