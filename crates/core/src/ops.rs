@@ -160,3 +160,24 @@ pub fn rope_head(head: &mut [f32], pos: u32, n_rot: usize, base: f32) {
         head[p + half] = (x0 * sf + x1 * cf) as f32;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H(2026-10-09): zip 조용 절단 금지 — 길이 불일치는 즉시 패닉.
+    #[test]
+    #[should_panic(expected = "길이 불일치")]
+    fn rms_norm_length_mismatch_panics() {
+        let _ = rms_norm(&[1.0, 2.0], &[1.0], 1e-6);
+    }
+
+    #[test]
+    fn rms_norm_unit_scale() {
+        // w=1, x=1 → rms_norm = 1/sqrt(1+eps) 근사.
+        let y = rms_norm(&[1.0f32; 4], &[1.0f32; 4], 0.0);
+        for v in y {
+            assert!((v - 1.0).abs() < 1e-5, "{v}");
+        }
+    }
+}

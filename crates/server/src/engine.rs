@@ -249,7 +249,3 @@ pub static TOKENIZER: std::sync::OnceLock<crate::tokenize::Tokenizer> = std::syn
 pub fn greedy_encode(text: &str) -> Vec<u32> {
     TOKENIZER.get().map(|t| t.encode(text)).unwrap_or_default()
 }
-// 마커 eh2
-// 마커 eh3
-// 마커 eh4
-// 마커 eh5
