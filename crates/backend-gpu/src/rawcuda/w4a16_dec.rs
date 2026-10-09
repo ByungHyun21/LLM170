@@ -2267,12 +2267,7 @@ impl W4a16Dec {
     /// [P1] idx/wt는 호출자가 디바이스에 기록한다(moe_route_dev) — 종전
     /// h2d 2회(층당) 제거. gDN 경로(moe_ffn_dev_t)는 호스트 선택이 남아
     /// 이 함수 앞에서 moe_idx/moe_wt를 h2d로 채운 뒤 ns를 넘긴다.
-    fn moe_experts_batch(
-        &mut self,
-        il: usize,
-        xn: CUdeviceptr,
-        ns: usize,
-    ) -> Result<(), String> {
+    fn moe_experts_batch(&mut self, il: usize, xn: CUdeviceptr, ns: usize) -> Result<(), String> {
         let n_exp = self.n_experts;
         let h = self.hidden;
         let n_ff = self.moe_ffn;
