@@ -7,6 +7,45 @@
 use crate::rawcuda::ffi::{self, CUDA_SUCCESS, CUdeviceptr, CUfunction, CUstream};
 use std::collections::HashMap;
 
+/// 진단 타이머 범주(P8) — 커널 심볼명 분류.
+pub const PROF_CATS: [&str; 9] = [
+    "misc", "norm", "gemv", "gemm", "gdn", "attn", "ew", "head", "moe",
+];
+
+/// 심볼명 → 범주 인덱스(순서 주의: moe를 gemv보다 먼저 검사).
+pub fn prof_cat(name: &str) -> usize {
+    if name.contains("moe") {
+        8
+    } else if name.contains("norm") {
+        1
+    } else if name.contains("gemv") {
+        2
+    } else if name.contains("gemm") {
+        3
+    } else if name.contains("gdn") {
+        4
+    } else if name.contains("attn") {
+        5
+    } else if name.contains("ew") || name.contains("axpy") || name.contains("shared_add") {
+        6
+    } else if name.contains("head") {
+        7
+    } else {
+        0
+    }
+}
+
+/// 진단 타이머 상태 — LLM170_TIME=1일 때만 launch마다 이벤트를 남긴다.
+/// 커널은 단일 스트림에 직렬이므로 (ev[i], ev[i+1]) 경과 = i번째 커널 소요.
+pub struct Prof {
+    pub on: bool,
+    /// 캡처 중에는 마킹 금지 — 캡처 스트림의 cuEventRecord는 그래프 노드가
+    /// 되어 타이밍이 왜곡되고 캡처 자체를 깨뜨릴 수 있다.
+    pub capturing: std::cell::Cell<bool>,
+    evs: std::cell::RefCell<Vec<ffi::CUevent>>,
+    cats: std::cell::RefCell<Vec<usize>>,
+}
+
 pub struct CudaCtx {
     drv: &'static ffi::Driver,
     pub device: ffi::CUdevice,
@@ -16,6 +55,9 @@ pub struct CudaCtx {
     /// 디바이스 체인(드래프트 호스트 왕복 제거)에서
     /// cuStreamCreate 도입 시 교체.
     pub stream: CUstream,
+    /// 진단 타이머(P8) — LLM170_TIME=1일 때 launch마다 이벤트 1개 기록.
+    /// 커널별 소요를 뒤에서 (ev[i], ev[i+1]) 경과로 복원한다(동일 스트림 직렬).
+    pub prof: Prof,
     modules: HashMap<&'static str, ffi::CUmodule>,
     fns: HashMap<&'static str, CUfunction>,
     /// 복사 계측(모니터링) — 방향별 (바이트, ns, 호출). "최신 누적값"만.
@@ -99,6 +141,12 @@ impl CudaCtx {
             }
             Ok(CudaCtx {
                 drv,
+                prof: Prof {
+                    on: llm170_diag::flag::ne0("LLM170_TIME"),
+                    capturing: std::cell::Cell::new(false),
+                    evs: std::cell::RefCell::new(Vec::new()),
+                    cats: std::cell::RefCell::new(Vec::new()),
+                },
                 device: dev,
                 device_name,
                 ctx,
@@ -296,6 +344,7 @@ impl CudaCtx {
         block: u32,
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
+        self.prof_mark(f);
         // SAFETY: f는 function()이 돌려준 유효 핸들, args 포인터들은
         // 호출 시점까지 유효한 스택 로컬(호출자 계약).
         unsafe {
@@ -351,6 +400,7 @@ impl CudaCtx {
         shared: u32,
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
+        self.prof_mark(f);
         // SAFETY: launch와 동일 계약 — f는 유효 핸들, args 포인터들은
         // 호출 시점까지 유효한 스택 로컬(호출자 계약).
         unsafe {
@@ -445,6 +495,7 @@ impl CudaCtx {
     /// 그래프 캡처 개시(THREAD_LOCAL) — 이후 이 스트림의 발사가 그래프 노드로
     /// 기록된다(실행 아님). 캡처 중 동기 복사·alloc·sync는 금지.
     pub fn capture_begin(&self) -> Result<(), String> {
+        self.prof.capturing.set(true);
         // SAFETY: stream은 create_stream이 설정한 유효 핸들.
         unsafe {
             let r = (self.drv.stream_begin_capture)(self.stream, 1);
@@ -460,6 +511,7 @@ impl CudaCtx {
 
     /// 캡처 종료 → 그래프 핸들. 실패 시에도 캡처 상태는 해제된다.
     pub fn capture_end(&self) -> Result<ffi::CUgraph, String> {
+        self.prof.capturing.set(false);
         // SAFETY: 출력은 스택 로컬 — 그래프 핸들은 호출자 소유(graph_destroy).
         unsafe {
             let mut g: ffi::CUgraph = std::ptr::null_mut();
@@ -727,5 +779,111 @@ pub fn cuda_mem_free() -> Option<(u64, u64)> {
             return None;
         }
         Some((free as u64, total as u64))
+    }
+}
+
+impl CudaCtx {
+    /// 이벤트 생성(진단 타이머).
+    pub fn event_create(&self) -> Result<ffi::CUevent, String> {
+        let mut ev: ffi::CUevent = std::ptr::null_mut();
+        // SAFETY: 초기화 경로(단일 스레드) — 출력 포인터는 스택 로컬.
+        let r = unsafe { (self.drv.event_create)(&mut ev, 0) };
+        if r != CUDA_SUCCESS {
+            return Err(format!("rawcuda: cuEventCreate: {}", ffi::err_text(r)));
+        }
+        Ok(ev)
+    }
+
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn event_record(&self, ev: ffi::CUevent) -> Result<(), String> {
+        // SAFETY: ev는 event_create 산출 핸들(호출자 수명 계약).
+        let r = unsafe { (self.drv.event_record)(ev, self.stream) };
+        if r != CUDA_SUCCESS {
+            return Err(format!("rawcuda: cuEventRecord: {}", ffi::err_text(r)));
+        }
+        Ok(())
+    }
+
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn event_destroy(&self, ev: ffi::CUevent) {
+        // SAFETY: ev는 본 모듈이 만든 핸들 — 파괴 후 재사용 금지(호출자 계약).
+        unsafe {
+            let _ = (self.drv.event_destroy)(ev);
+        }
+    }
+
+    /// 커널 발사 직전 훅 — 함수 포인터를 심볼명(역상)으로 찾아 범주와 함께
+    /// 이벤트를 남긴다. fns는 ~40항목이라 런치당 선형탐색이 저렴하다.
+    pub fn prof_mark(&self, f: CUfunction) {
+        if !self.prof.on || self.prof.capturing.get() {
+            return;
+        }
+        let mut name = "";
+        for (k, v) in &self.fns {
+            if *v == f {
+                name = k;
+                break;
+            }
+        }
+        let Ok(ev) = self.event_create() else { return };
+        if self.event_record(ev).is_err() {
+            return;
+        }
+        self.prof.evs.borrow_mut().push(ev);
+        self.prof.cats.borrow_mut().push(prof_cat(name));
+    }
+
+    /// 범주별 합산 리포트(ms/토큰, %). 호출 전 sync 권장 — 여기서 마지막
+    /// 센티넬 이벤트를 기록하고 sync한다. 이벤트는 파괴 후 비운다.
+    pub fn prof_report(&self, label: &str) -> Result<String, String> {
+        if !self.prof.on {
+            return Ok(String::new());
+        }
+        let sentinel = self.event_create()?;
+        self.event_record(sentinel)?;
+        // SAFETY: 스트림 완료 대기(동기 호출 — 계약: 단일 스레드 사용).
+        let r = unsafe { (self.drv.stream_synchronize)(self.stream) };
+        if r != CUDA_SUCCESS {
+            return Err(format!("rawcuda: prof sync: {}", ffi::err_text(r)));
+        }
+        let evs = self.prof.evs.borrow();
+        let cats = self.prof.cats.borrow();
+        let mut acc = [0f64; PROF_CATS.len()];
+        let mut total = 0f64;
+        for i in 0..evs.len() {
+            let a = evs[i];
+            let b = if i + 1 < evs.len() {
+                evs[i + 1]
+            } else {
+                sentinel
+            };
+            let mut ms = 0f32;
+            // SAFETY: 두 이벤트 모두 기록 완료(sync 후) — elapsed 유효.
+            let r = unsafe { (self.drv.event_elapsed)(&mut ms, a, b) };
+            if r == CUDA_SUCCESS {
+                acc[cats[i]] += ms as f64;
+                total += ms as f64;
+            }
+        }
+        let mut out = format!("prof[{label}] 합 {total:.2}ms");
+        for (i, cat) in PROF_CATS.iter().enumerate() {
+            if acc[i] > 0.001 {
+                out.push_str(&format!(
+                    " · {cat} {:.2}ms({:.0}%)",
+                    acc[i],
+                    100.0 * acc[i] / total.max(0.001)
+                ));
+            }
+        }
+        drop(evs);
+        drop(cats);
+        for ev in self.prof.evs.borrow_mut().drain(..) {
+            self.event_destroy(ev);
+        }
+        self.prof.cats.borrow_mut().clear();
+        self.event_destroy(sentinel);
+        Ok(out)
     }
 }

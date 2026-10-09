@@ -388,13 +388,26 @@ extern "C" __global__ void attn_fwd3s(
     for (int base = 0; base < lim; base += ATTN_CHUNK) {
         int nch = min(ATTN_CHUNK, lim - base);
         // 스코어: 행=base+tid(tid<nch), 256차원 직렬 내적(hip L232-239 동일)
+        // [2026-10-09 P8-attn] float4 판독 — 워프당 로드 명령 4배 감소(스코어가
+        // attn의 ~73%, 4k 실측: 워프당 32개 라인 비코얼레스). 가산 순서는 d
+        // 오름차순 그대로(비트 동일 — p += q*d 순차, FMA 체인 유지).
         float p = -1e30f;
         if (tid < nch) {
             int row = base + tid;
-            p = 0.0f;
-            for (int d = 0; d < 256; d++)
-                p += qs[d] * kc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + d];
-            p *= scale;
+            const float* krow = kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256;
+            const float4* k4 = reinterpret_cast<const float4*>(krow);
+            const float4* q4 = reinterpret_cast<const float4*>(qs);
+            float p0 = 0.0f;
+#pragma unroll 8
+            for (int d4 = 0; d4 < 64; d4++) {
+                const float4 kv = k4[d4];
+                const float4 qv = q4[d4];
+                p0 += qv.x * kv.x;
+                p0 += qv.y * kv.y;
+                p0 += qv.z * kv.z;
+                p0 += qv.w * kv.w;
+            }
+            p = p0 * scale;
         }
         sarr[tid] = p;
         __syncthreads();
@@ -422,6 +435,9 @@ extern "C" __global__ void attn_fwd3s(
         }
         // AV: 자기 dim에 청크 전 행 누산(행 순서는 이전 구현과 동일 — 순차)
         acc *= corr;
+        // [2026-10-09 P8-attn] 언롤 — 행 순차 누산 순서 불변(계약), vc 로드
+        // 프리페치로 지연 은닉(종전 미언롤 = 행마다 로드 대기).
+#pragma unroll 8
         for (int i = 0; i < nch; i++) {
             int row = base + i;
             acc += sarr[i] * vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid];

@@ -25,6 +25,7 @@ pub type CUstream = *mut c_void;
 /// CUgraph/CUgraphExec — 그래프 캡처 핸들(불투명).
 pub type CUgraph = *mut c_void;
 pub type CUgraphExec = *mut c_void;
+pub type CUevent = *mut c_void;
 
 /// CUresult — 드라이버 API 반환 코드(0 = CUDA_SUCCESS).
 pub type CUresult = c_uint;
@@ -142,6 +143,16 @@ pub type CuMemFreeFn = unsafe extern "system" fn(dptr: CUdeviceptr) -> CUresult;
 pub type CuFuncSetAttributeFn =
     unsafe extern "system" fn(f: CUfunction, attrib: c_uint, value: c_int) -> CUresult;
 
+/// cuEventCreate — 타임스탬프 이벤트(진단 타이머 P8).
+pub type CuEventCreateFn = unsafe extern "system" fn(ev: *mut CUevent, flags: c_uint) -> CUresult;
+/// cuEventRecord — 스트림에 이벤트 기록(비동기·비블로킹).
+pub type CuEventRecordFn = unsafe extern "system" fn(ev: CUevent, s: CUstream) -> CUresult;
+/// cuEventElapsedTime — 두 이벤트 간 경과(ms f32).
+pub type CuEventElapsedTimeFn =
+    unsafe extern "system" fn(ms: *mut f32, a: CUevent, b: CUevent) -> CUresult;
+/// cuEventDestroy.
+pub type CuEventDestroyFn = unsafe extern "system" fn(ev: CUevent) -> CUresult;
+
 /// cuMemGetInfo_v2 — 가용/전체 디바이스 메모리(바이트). B6:
 /// 리소스 가드의 CUDA 런타임 VRAM 조회용(현재 컨텍스트 기준).
 pub type CuMemGetInfoFn =
@@ -181,6 +192,12 @@ pub(crate) struct Driver {
     /// cuMemGetInfo_v2 — 가드 VRAM 프로브(B6).
     pub mem_get_info: CuMemGetInfoFn,
     pub func_set_attribute: CuFuncSetAttributeFn,
+
+    /// 진단 타이머(P8) — 이벤트 4종.
+    pub event_create: CuEventCreateFn,
+    pub event_record: CuEventRecordFn,
+    pub event_elapsed: CuEventElapsedTimeFn,
+    pub event_destroy: CuEventDestroyFn,
 }
 
 impl Driver {
@@ -287,6 +304,18 @@ impl Driver {
                 mem_free: std::mem::transmute::<*mut c_void, CuMemFreeFn>(sym!("cuMemFree_v2")),
                 func_set_attribute: std::mem::transmute::<*mut c_void, CuFuncSetAttributeFn>(sym!(
                     "cuFuncSetAttribute"
+                )),
+                event_create: std::mem::transmute::<*mut c_void, CuEventCreateFn>(sym!(
+                    "cuEventCreate"
+                )),
+                event_record: std::mem::transmute::<*mut c_void, CuEventRecordFn>(sym!(
+                    "cuEventRecord"
+                )),
+                event_elapsed: std::mem::transmute::<*mut c_void, CuEventElapsedTimeFn>(sym!(
+                    "cuEventElapsedTime"
+                )),
+                event_destroy: std::mem::transmute::<*mut c_void, CuEventDestroyFn>(sym!(
+                    "cuEventDestroy"
                 )),
 
                 mem_get_info: std::mem::transmute::<*mut c_void, CuMemGetInfoFn>(sym!(

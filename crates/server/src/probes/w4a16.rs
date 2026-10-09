@@ -335,6 +335,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut moe_check = false;
     let mut plain_check = false;
     let mut mma_smoke = false;
+    let mut bench_gemv: Option<(String, usize)> = None;
     let mut h2d_mb = 0usize;
     let mut bench: Option<(String, usize, usize)> = None; // (lin, t, reps)
     let mut it = args.iter().skip(1);
@@ -374,6 +375,21 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--h2d-bench requires MB")?;
                 h2d_mb = mb;
+            }
+            "--bench-gemv" => {
+                let name = it.next().ok_or("--bench-gemv requires a name")?.clone();
+                let reps = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--bench-gemv requires reps")?;
+                bench_gemv = Some((name, reps));
+            }
+            "--bench-gemv-all" => {
+                let reps = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--bench-gemv-all requires reps")?;
+                bench_gemv = Some(("ALL".to_string(), reps));
             }
             "--bench-gemm" => {
                 let name = it.next().ok_or("--bench-gemm requires a name")?.clone();
@@ -467,6 +483,47 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         llm170_core::matmul::matmul(xn, &head, &mut lg);
         lg
     };
+    // 마이크로벤치(진단): 지정 선형의 t=1 GEMV 반복 — 실효 가중치 대역.
+    if let Some((name, reps)) = &bench_gemv
+        && name == "ALL"
+    {
+        let (ms, wb) = dec.gemv_walk_bench(*reps)?;
+        let gbs = wb as f64 * 1e-9 / (ms * 1e-3);
+        return Ok(format!(
+            "bench-gemv-all: {ms:.2} ms/회 · 가중치 {gbs:.0} GB/s ({:.2} GB)",
+            wb as f64 / 1e9
+        ));
+    }
+    if let Some((name, reps)) = &bench_gemv {
+        let (n, k) = model
+            .w_raw(name)
+            .map(|w| (w.n_out as usize, w.n_in as usize))
+            .ok_or_else(|| format!("--bench-gemv {name}: 무게 없음"))?;
+        let xf: Vec<f32> = vec![1.0f32; k];
+        let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
+        let dx = dec.alloc_scratch(xf.len() * 4)?;
+        dec.h2d_scratch(dx, xb)?;
+        let dy = dec.alloc_scratch(n * 4)?;
+        dec.gemv_bench_launch(name, dx, dy)?;
+        dec.sync_bench()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..*reps {
+            dec.gemv_bench_launch(name, dx, dy)?;
+        }
+        dec.sync_bench()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / *reps as f64;
+        let wb = if model.w_raw(name).map(|w| w.ty) == Some(llm170_core::wtype::WType::W4a16Split) {
+            (n * k) as f64 / 2.0
+        } else {
+            (n * k) as f64 * 2.0
+        };
+        let gbs = wb * 1e-9 / (ms * 1e-3);
+        dec.free_scratch(dx)?;
+        dec.free_scratch(dy)?;
+        return Ok(format!(
+            "bench-gemv {name} n={n} k={k}: {ms:.3} ms/회 · 가중치 {gbs:.0} GB/s"
+        ));
+    }
     // 마이크로벤치(진단): 지정 선형의 t≥2 GEMM 반복 시간·실효 GB/s.
     if let Some((name, bt, reps)) = &bench {
         let (n, k) = model
@@ -545,6 +602,9 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         }
     }
     out.push(next);
+    if llm170_diag::flag::ne0("LLM170_TIME") {
+        eprintln!("{}", dec.prof_report("prefill")?);
+    }
     for _ in 0..n_predict {
         let row = model.embed_row(next).map_err(|e| e.to_string())?;
         if head_gpu {
@@ -559,6 +619,11 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             next = llm170_core::matmul::greedy_from(&head_logits(&xn));
         }
         out.push(next);
+    }
+    if llm170_diag::flag::ne0("LLM170_TIME") {
+        // 진단(P8): 커널 범주별 소요 — 그래프 캡처 중에는 마킹이 꺼지므로
+        // LLM170_GRAPH=0 직접 경로에서 의미가 있다.
+        eprintln!("{}", dec.prof_report(&format!("decode {n_predict}토큰"))?);
     }
     let gen_ms = t1.elapsed().as_secs_f64() * 1e3;
     let csv = out
