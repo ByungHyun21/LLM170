@@ -215,10 +215,10 @@ extern "C" __global__ void w4a16_gemv_g32_bf16(
 // 잔여 지연 요인은 미규명(모델: warp-jj ~30사이클 × 2.78M ≈ 380µs vs 실측 620).
 // 채택본: R=8 + x f32(cast_x32 공유 — 변환·h2f 없음) + smem 스테이징 + 언롤.
 // 산술 계약 불변(행·토큰별 레인 l은 i=l,l+64,… 오름차순 f32 누산 → tree64).
-#define G4_TMAX 8
+#define G4_GTMAX 32            // g128 GEMM 토큰 상한(2026-10-09: 8→32)
 #define G4_ROWS 8
 #define G4_LANES 64
-#define G4_KC 256              // k-청크(64의 배수)
+#define G4_KC 128              // k-청크(64의 배수 · x smem 128×36×4=18KB)
 
 // SHIFT = 그룹 로그2(7 = g128, 5 = g32), BF16 = 스케일 dtype.
 template <int SHIFT, bool BF16>
@@ -235,16 +235,16 @@ __device__ __forceinline__ void gemm_body(
     const int g = threadIdx.x >> 6;
     const int l = threadIdx.x & (G4_LANES - 1);
     const int o = o0 + g;
-    const bool live = (o < n) && (t > 0) && (t <= G4_TMAX);
+    const bool live = (o < n) && (t > 0) && (t <= G4_GTMAX);
     __shared__ float sc[G4_ROWS][G4_SCMAX];
-    // x 스테이징 = 전치+패딩 레이아웃([il][12]): 레인당 float4 2회 판독
-    // (종전 8회 스칼라 — L1TEX 트래픽 ÷4). 12 = 8토큰 + 4패딩(16B 정렬·
-    // 뱅크 충돌 회피: 행 stride 48B).
-    __shared__ float xs[G4_KC][12];
+    // x 스테이징 = 전치+패딩 레이아웃([il][36]): 레인당 float4 8회 판독
+    // (종전 8토큰 float4 2회 — 2026-10-09 t≤32 확대). 36 = 32토큰 + 4패딩
+    // (16B 정렬·뱅크 충돌 회피: 행 stride 144B).
+    __shared__ float xs[G4_KC][36];
     __shared__ double red[G4_ROWS][G4_LANES];
-    float acc[G4_TMAX];
+    float acc[G4_GTMAX];
 #pragma unroll
-    for (int u = 0; u < G4_TMAX; ++u) {
+    for (int u = 0; u < G4_GTMAX; ++u) {
         acc[u] = 0.0f;
     }
     const int k8 = k >> 3;
@@ -257,7 +257,7 @@ __device__ __forceinline__ void gemm_body(
     const int li = l & 7;
     for (int base = 0; base < k; base += G4_KC) {
         __syncthreads(); // 이전 청크 소비 완료 대기
-        for (int idx = threadIdx.x; idx < G4_TMAX * G4_KC; idx += blockDim.x) {
+        for (int idx = threadIdx.x; idx < G4_GTMAX * G4_KC; idx += blockDim.x) {
             const int ti = idx / G4_KC;
             const int il = idx - ti * G4_KC;
             const int gi = base + il;
@@ -278,6 +278,12 @@ __device__ __forceinline__ void gemm_body(
                     // 전치 패딩 레이아웃에서 float4 2회로 8토큰 판독(smem 트래픽 ÷4).
                     const float4 xa = *reinterpret_cast<const float4*>(&xs[il][0]);
                     const float4 xb = *reinterpret_cast<const float4*>(&xs[il][4]);
+                    const float4 xc = *reinterpret_cast<const float4*>(&xs[il][8]);
+                    const float4 xd = *reinterpret_cast<const float4*>(&xs[il][12]);
+                    const float4 xe = *reinterpret_cast<const float4*>(&xs[il][16]);
+                    const float4 xf = *reinterpret_cast<const float4*>(&xs[il][20]);
+                    const float4 xg2 = *reinterpret_cast<const float4*>(&xs[il][24]);
+                    const float4 xh = *reinterpret_cast<const float4*>(&xs[il][28]);
                     if (t > 0) acc[0] += w * xa.x;
                     if (t > 1) acc[1] += w * xa.y;
                     if (t > 2) acc[2] += w * xa.z;
@@ -286,6 +292,30 @@ __device__ __forceinline__ void gemm_body(
                     if (t > 5) acc[5] += w * xb.y;
                     if (t > 6) acc[6] += w * xb.z;
                     if (t > 7) acc[7] += w * xb.w;
+                    if (t > 8) acc[8] += w * xc.x;
+                    if (t > 9) acc[9] += w * xc.y;
+                    if (t > 10) acc[10] += w * xc.z;
+                    if (t > 11) acc[11] += w * xc.w;
+                    if (t > 12) acc[12] += w * xd.x;
+                    if (t > 13) acc[13] += w * xd.y;
+                    if (t > 14) acc[14] += w * xd.z;
+                    if (t > 15) acc[15] += w * xd.w;
+                    if (t > 16) acc[16] += w * xe.x;
+                    if (t > 17) acc[17] += w * xe.y;
+                    if (t > 18) acc[18] += w * xe.z;
+                    if (t > 19) acc[19] += w * xe.w;
+                    if (t > 20) acc[20] += w * xf.x;
+                    if (t > 21) acc[21] += w * xf.y;
+                    if (t > 22) acc[22] += w * xf.z;
+                    if (t > 23) acc[23] += w * xf.w;
+                    if (t > 24) acc[24] += w * xg2.x;
+                    if (t > 25) acc[25] += w * xg2.y;
+                    if (t > 26) acc[26] += w * xg2.z;
+                    if (t > 27) acc[27] += w * xg2.w;
+                    if (t > 28) acc[28] += w * xh.x;
+                    if (t > 29) acc[29] += w * xh.y;
+                    if (t > 30) acc[30] += w * xh.z;
+                    if (t > 31) acc[31] += w * xh.w;
                 }
             }
         }
@@ -293,7 +323,7 @@ __device__ __forceinline__ void gemm_body(
     // 토큰별 트리 — 계약 순서(1단 a[i]+=a[i+32] 후 off 16,8,4,2,1)를 병렬화:
     // 워프 셔플로 각 단을 병렬 가산(각 가산은 독립 — 비트 동일), 배리어는
     // red 기록용 1회/토큰만.
-    for (int ti = 0; ti < G4_TMAX; ++ti) {
+    for (int ti = 0; ti < G4_GTMAX; ++ti) {
         if (ti < t) {
             red[g][l] = (double)acc[ti];
         }
@@ -364,6 +394,8 @@ extern "C" __global__ void w4a16_gemv_bf16(
         }
     }
 }
+
+#define G4_TMAX 8              // 플레인 v1 GEMM 전용 토큰 상한
 
 // 플레인 bf16 GEMM(t≤8) — 행=블록(64레인), **가중치 1회 판독 × t토큰 재사용**
 // (t=1 경로와 같은 레인·환원 순서 — 판정은 토큰 수준, 골든). x는 원시 f32

@@ -2990,9 +2990,9 @@ impl W4a16Dec {
         let mut gi = 0usize;
         // 플레인(MoE) 모드 — bf16 GEMM(x 원시 f32), FFN은 MoE 배치.
         let plain = self.plain_weights;
-        // dense(split GEMM) 경로는 t≤8 계약 — 초과는 조용한 무기록 대신 거부.
-        if !plain && t > 8 {
-            return Err(format!("chain_device_t: dense 경로 t={t} > 8(가드)"));
+        // dense(split GEMM) 경로 상한 = 커널 G4_GTMAX(32) — 초과는 거부.
+        if !plain && t > 32 {
+            return Err(format!("chain_device_t: dense 경로 t={t} > 32(가드)"));
         }
         for il in 0..self.n_layers {
             let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };
