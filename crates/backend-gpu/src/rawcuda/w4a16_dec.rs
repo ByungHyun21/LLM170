@@ -37,6 +37,10 @@ pub const GDN_NSPLIT: usize = 4;
 pub const GDN_NGRP: usize = 16;
 /// gdn_scan 청크 크기(커널 GDN_CS와 동일 계약) — prepass 그리드·스크래치 산정.
 pub const GDN_CS: usize = 32;
+/// [A9 2026-10-10] 배치 디코드 최대 토큰(커널 head.cu HEAD_TMAX 미러).
+pub const BATCH_DEC_MAX: usize = 8;
+/// [A9-fix2] t행 GEMV 블록당 행 수(커널 gptq4.cu GEMV_TR 미러) — x 재사용.
+pub const GEMV_TR: usize = 8;
 
 /// GDN 체인 형상(서버가 config에서 유도해 명시 등록 — 추정 금지).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -363,6 +367,16 @@ pub struct W4a16Dec {
     pin_pos: *mut std::ffi::c_void,
     pin_out: *mut std::ffi::c_void,
     pin_out_len: usize,
+    /// [A9 2026-10-10] 배치 디코드 부속 — 로짓[t×head_n]·argmax[t]·핀드
+    /// (토큰·임베딩 행·슬롯 pos) + 슬롯집합별 캡처 그래프 캐시.
+    dbatch_lg: CUdeviceptr,
+    dbatch_am: CUdeviceptr,
+    pin_batch_tok: *mut std::ffi::c_void,
+    pin_batch_in: *mut std::ffi::c_void,
+    pin_batch_pos: *mut std::ffi::c_void,
+    batch_graphs: Vec<(Vec<usize>, ffi::CUgraphExec, ffi::CUgraph)>,
+    /// 캡처 실패 후 직접 발사 고정(재시도 방지 — t=1 graph_failed와 동형).
+    batch_capture_failed: bool,
     /// 층별 잔차 합 덤프(CPU LLM170_DUMP=debug_layers와 대조용).
     pub debug_layers: bool,
 }
@@ -389,8 +403,10 @@ impl W4a16Dec {
             &[
                 "w4a16_gemm_g128",
                 "w4a16_gemv_g128",
+                "w4a16_gemv_g128_t",
                 "w4a16_gemm_g32_bf16",
                 "w4a16_gemv_g32_bf16",
+                "w4a16_gemv_bf16_t",
                 "w4a16_cast_x32",
                 "w4a16_axpy",
                 "w4a16_shared_add",
@@ -466,7 +482,13 @@ impl W4a16Dec {
                     "src/rawcuda/assets/head.fatbin",
                 ],
             )?,
-            &["head_bf16", "head_transpose", "w4a16_argmax_min"],
+            &[
+                "head_bf16",
+                "head_bf16_t",
+                "head_transpose",
+                "w4a16_argmax_min",
+                "w4a16_argmax_min_t",
+            ],
         )?;
         cc.load_fatbin(
             "ew",
@@ -596,6 +618,13 @@ impl W4a16Dec {
             pin_pos: std::ptr::null_mut(),
             pin_out: std::ptr::null_mut(),
             pin_out_len: 0,
+            dbatch_lg: 0,
+            dbatch_am: 0,
+            pin_batch_tok: std::ptr::null_mut(),
+            pin_batch_in: std::ptr::null_mut(),
+            pin_batch_pos: std::ptr::null_mut(),
+            batch_graphs: Vec::new(),
+            batch_capture_failed: false,
             debug_layers: false,
         })
     }
@@ -1014,8 +1043,9 @@ impl W4a16Dec {
                 t_len * dm.bg_len() * 4,
                 t_len * vl * 4,
                 t_len * vl * 4,
-                dm.h_v * 8 * 256 * 4,
-                dm.h_v * 128 * 4,
+                // [A9] 토큰별 트리오 스크래치 — 배치 디코드 = 슬롯 수 상한.
+                self.n_slots * dm.h_v * 8 * 256 * 4,
+                self.n_slots * dm.h_v * 128 * 4,
                 // [A5-4] A/KQ prepass 스크래치(최대 청크 수 기준, t_len 무관).
                 dm.h_v * (CHAIN_TMAX / GDN_CS) * 2 * GDN_CS * GDN_CS * 2,
             ],
@@ -2384,6 +2414,87 @@ impl W4a16Dec {
         }
     }
 
+    /// [A9 진단] t행 GEMV 벤치(ms/회) — 지정 선형 반복.
+    pub fn bench_gemv_t(&mut self, name: &str, t: usize, reps: usize) -> Result<f64, String> {
+        let (_, _, n, k) = self.lin_spec(name)?;
+        let x = self.cc.alloc(t * k * 4)?;
+        let y = self.cc.alloc(t * n * 4)?;
+        self.cc.sync()?;
+        let r = (|| -> Result<f64, String> {
+            self.gemv_t_launch(name, x, y, t)?;
+            self.cc.sync()?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                self.gemv_t_launch(name, x, y, t)?;
+            }
+            self.cc.sync()?;
+            Ok(t0.elapsed().as_secs_f64() * 1e3 / reps as f64)
+        })();
+        let _ = self.cc.free(x);
+        let _ = self.cc.free(y);
+        r
+    }
+
+    /// [A9 2026-10-10] 배치 t행 GEMV(split g128) — 가중 판독 1회를 t행 공유,
+    /// 행별 산술은 GEMV와 비트동일. x는 cast_x32 산출 f32.
+    fn gemv_t_launch(
+        &mut self,
+        name: &str,
+        x_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let (dq, ds, n, k) = self.lin_spec(name)?;
+        let f = self.cc.function("w4a16_gemv_g128_t")?;
+        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, x_dev, y_dev);
+        let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+        let mut args: [*mut std::ffi::c_void; 7] = [
+            (&mut p_q) as *mut _ as *mut _,
+            (&mut p_s) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_y) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+            (&mut p_t) as *mut _ as *mut _,
+        ];
+        self.cc.launch(
+            f,
+            n.div_ceil(GEMV_TR) as u32,
+            1,
+            (64 * GEMV_TR) as u32,
+            &mut args,
+        )
+    }
+
+    /// [A9] 배치 t행 GEMV(플레인 bf16) — 원시 f32 x, 행별 GEMV 비트동일.
+    fn plain_gemv_t_launch(
+        &mut self,
+        name: &str,
+        x_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let (w, n, k) = self.plain_spec(name)?;
+        let f = self.cc.function("w4a16_gemv_bf16_t")?;
+        let (mut p_w, mut p_x, mut p_o) = (w, x_dev, y_dev);
+        let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+        let mut args: [*mut std::ffi::c_void; 6] = [
+            (&mut p_w) as *mut _ as *mut _,
+            (&mut p_x) as *mut _ as *mut _,
+            (&mut p_o) as *mut _ as *mut _,
+            (&mut p_n) as *mut _ as *mut _,
+            (&mut p_k) as *mut _ as *mut _,
+            (&mut p_t) as *mut _ as *mut _,
+        ];
+        self.cc.launch(
+            f,
+            n.div_ceil(GEMV_TR) as u32,
+            1,
+            (64 * GEMV_TR) as u32,
+            &mut args,
+        )
+    }
+
     /// 플레인 GEMV → 스테이징 dst 직접 쓰기 + 폭 검사.
     fn plain_stage_x32(
         &self,
@@ -3286,6 +3397,175 @@ impl W4a16Dec {
         Ok(self.dgate)
     }
 
+    /// [A9 2026-10-10] GDN 디코드 배치 — 토큰별 슬롯 상태(링·스캔)를 쓴다.
+    /// 청크 스캔은 혼합 슬롯에서 의미론이 깨지므로(타 슬롯 토큰과 intra-chunk
+    /// 어텐션) t=1 트리오(gdn1_*)를 토큰 수만큼 발사한다 — 행 단위 커널
+    /// (l2perm·gate)만 1회. 각 토큰 산술은 단독 t=1 경로와 동일(골든 계약).
+    fn gdn_chain_dev_batch(
+        &mut self,
+        slots: &[usize],
+        layer: usize,
+        t_len: usize,
+        xn_dev: CUdeviceptr,
+        qkv_dev: CUdeviceptr,
+        z_dev: CUdeviceptr,
+    ) -> Result<CUdeviceptr, String> {
+        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        if t_len == 0 || t_len != slots.len() || slots.iter().any(|&s| s >= self.n_slots) {
+            return Err("GDN batch: 슬롯/토큰 계약 위반".into());
+        }
+        self.ensure_gdn_bufs(t_len)?;
+        let (mut kl, mut vl, mut cch, mut hv, mut hd) = (
+            dm.k_len() as i32,
+            dm.v_len() as i32,
+            dm.conv_ch() as i32,
+            dm.h_v as i32,
+            dm.hidden as i32,
+        );
+        let (mut hk, mut dd) = (dm.h_k as i32, dm.d as i32);
+        let mut lay = layer as i32;
+        let mut one = 1i32;
+        let st_stride = (dm.n_gdn * dm.h_v * 128 * 128) as u64;
+        let ring_stride = (dm.n_gdn * 3 * dm.conv_ch()) as u64;
+        let bg_stride = dm.bg_len() as u64;
+        // conv — 토큰별(링 = 슬롯).
+        let f = self.cc.function("gdn_conv")?;
+        for (k, &slot) in slots.iter().enumerate() {
+            let mut c0 = qkv_dev + k as u64 * cch as u64 * 4;
+            let mut c1 = self.dcw;
+            let mut c2 = self.dring + (slot as u64 * ring_stride) * 4;
+            let mut c3 = self.dgq + k as u64 * kl as u64 * 4;
+            let mut c4 = self.dgk + k as u64 * kl as u64 * 4;
+            let mut c5 = self.dgv + k as u64 * vl as u64 * 4;
+            let mut ac: [*mut std::ffi::c_void; 11] = [
+                (&mut c0) as *mut _ as *mut _,
+                (&mut c1) as *mut _ as *mut _,
+                (&mut c2) as *mut _ as *mut _,
+                (&mut c3) as *mut _ as *mut _,
+                (&mut c4) as *mut _ as *mut _,
+                (&mut c5) as *mut _ as *mut _,
+                (&mut one) as *mut _ as *mut _,
+                (&mut lay) as *mut _ as *mut _,
+                (&mut kl) as *mut _ as *mut _,
+                (&mut vl) as *mut _ as *mut _,
+                (&mut cch) as *mut _ as *mut _,
+            ];
+            self.cc
+                .launch(f, (dm.conv_ch() / 128) as u32, 1, 128, &mut ac)?;
+        }
+        // l2perm — 행 단위 1회.
+        {
+            let f = self.cc.function("gdn_l2perm")?;
+            let (mut l0, mut l1, mut l2, mut l3, mut l4, mut l5, mut l6) = (
+                self.dgq, self.dgk, self.dgv, xn_dev, self.dab_c, self.dalog, self.ddtb,
+            );
+            let (mut l7, mut l8, mut l9, mut l10) = (self.dq2, self.dk2, self.dv2, self.dbg);
+            let mut tl = t_len as i32;
+            let mut al: [*mut std::ffi::c_void; 16] = [
+                (&mut l0) as *mut _ as *mut _,
+                (&mut l1) as *mut _ as *mut _,
+                (&mut l2) as *mut _ as *mut _,
+                (&mut l3) as *mut _ as *mut _,
+                (&mut l4) as *mut _ as *mut _,
+                (&mut l5) as *mut _ as *mut _,
+                (&mut l6) as *mut _ as *mut _,
+                (&mut l7) as *mut _ as *mut _,
+                (&mut l8) as *mut _ as *mut _,
+                (&mut l9) as *mut _ as *mut _,
+                (&mut l10) as *mut _ as *mut _,
+                (&mut tl) as *mut _ as *mut _,
+                (&mut lay) as *mut _ as *mut _,
+                (&mut hk) as *mut _ as *mut _,
+                (&mut hv) as *mut _ as *mut _,
+                (&mut hd) as *mut _ as *mut _,
+            ];
+            self.cc
+                .launch(f, dm.h_v as u32, t_len as u32, 128, &mut al)?;
+        }
+        // t=1 트리오 — 토큰별(상태 = 슬롯).
+        let part_stride = (dm.h_v * 8 * 256) as u64;
+        let dc_stride = (dm.h_v * 128) as u64;
+        let (fp, fc, fu) = (
+            self.cc.function("gdn1_part")?,
+            self.cc.function("gdn1_comb")?,
+            self.cc.function("gdn1_upd")?,
+        );
+        for (k, &slot) in slots.iter().enumerate() {
+            let q2k = self.dq2 + k as u64 * kl as u64 * 4;
+            let k2k = self.dk2 + k as u64 * kl as u64 * 4;
+            let v2k = self.dv2 + k as u64 * vl as u64 * 4;
+            let bgk = self.dbg + k as u64 * bg_stride * 4;
+            let stk = self.dgst + slot as u64 * st_stride * 4;
+            let partk = self.dgpart + k as u64 * part_stride * 4;
+            let dck = self.dgdc + k as u64 * dc_stride * 4;
+            let outk = self.dgo + k as u64 * vl as u64 * 4;
+            {
+                let (mut p0, mut p1, mut p2, mut p3) = (q2k, k2k, stk, partk);
+                let mut ap: [*mut std::ffi::c_void; 8] = [
+                    (&mut p0) as *mut _ as *mut _,
+                    (&mut p1) as *mut _ as *mut _,
+                    (&mut p2) as *mut _ as *mut _,
+                    (&mut p3) as *mut _ as *mut _,
+                    (&mut hk) as *mut _ as *mut _,
+                    (&mut hv) as *mut _ as *mut _,
+                    (&mut dd) as *mut _ as *mut _,
+                    (&mut lay) as *mut _ as *mut _,
+                ];
+                self.cc.launch(fp, dm.h_v as u32, 8, 128, &mut ap)?;
+            }
+            {
+                let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6) =
+                    (q2k, k2k, v2k, bgk, partk, dck, outk);
+                let mut acomb: [*mut std::ffi::c_void; 10] = [
+                    (&mut c0) as *mut _ as *mut _,
+                    (&mut c1) as *mut _ as *mut _,
+                    (&mut c2) as *mut _ as *mut _,
+                    (&mut c3) as *mut _ as *mut _,
+                    (&mut c4) as *mut _ as *mut _,
+                    (&mut c5) as *mut _ as *mut _,
+                    (&mut c6) as *mut _ as *mut _,
+                    (&mut hk) as *mut _ as *mut _,
+                    (&mut hv) as *mut _ as *mut _,
+                    (&mut dd) as *mut _ as *mut _,
+                ];
+                self.cc.launch(fc, dm.h_v as u32, 1, 128, &mut acomb)?;
+            }
+            {
+                let (mut u0, mut u1, mut u2, mut u3) = (k2k, bgk, dck, stk);
+                let mut aup: [*mut std::ffi::c_void; 8] = [
+                    (&mut u0) as *mut _ as *mut _,
+                    (&mut u1) as *mut _ as *mut _,
+                    (&mut u2) as *mut _ as *mut _,
+                    (&mut u3) as *mut _ as *mut _,
+                    (&mut hk) as *mut _ as *mut _,
+                    (&mut hv) as *mut _ as *mut _,
+                    (&mut dd) as *mut _ as *mut _,
+                    (&mut lay) as *mut _ as *mut _,
+                ];
+                self.cc.launch(fu, dm.h_v as u32, 8, 128, &mut aup)?;
+            }
+        }
+        // gate — 행 단위 1회.
+        {
+            let f = self.cc.function("gdn_gate")?;
+            let (mut g0, mut g1, mut g2, mut g3) = (self.dgo, z_dev, self.dnwg, self.dgate);
+            let mut tl = t_len as i32;
+            let mut ag: [*mut std::ffi::c_void; 8] = [
+                (&mut g0) as *mut _ as *mut _,
+                (&mut g1) as *mut _ as *mut _,
+                (&mut g2) as *mut _ as *mut _,
+                (&mut g3) as *mut _ as *mut _,
+                (&mut tl) as *mut _ as *mut _,
+                (&mut lay) as *mut _ as *mut _,
+                (&mut hk) as *mut _ as *mut _,
+                (&mut hv) as *mut _ as *mut _,
+            ];
+            self.cc
+                .launch(f, dm.h_v as u32, t_len as u32, 128, &mut ag)?;
+        }
+        Ok(self.dgate)
+    }
+
     /// 어텐션 체인 디바이스 상주 — qg·kin·vin(디바이스) → doutv.
     fn attn_chain_dev_run(
         &mut self,
@@ -3309,6 +3589,125 @@ impl W4a16Dec {
         // [A3] 스테이징 d2d 3회/층 제거 — 호출자 버퍼를 커널 인자로 직접 소비.
         self.attn_prep_launch(slot, layer, t_len, qg_dev, kin_dev, vin_dev)?;
         self.attn_fwd3s_launch(slot, layer, t_len, qg_dev)?;
+        Ok(self.doutv_a)
+    }
+
+    /// [A9 2026-10-10] 어텐션 디코드 배치 — 토큰별 슬롯의 KV/pos를 쓰고,
+    /// prep·part·merge를 토큰 수만큼 발사(각 t=1 — 단독 경로와 동일 산술).
+    /// KVQ(int8)는 미지원(직렬 폴백). 분할 경로 전용(단일 경로는 27B/3토큰
+    /// 프리필 골든용 — 디코드는 항상 분할 경로).
+    fn attn_chain_dev_batch(
+        &mut self,
+        slots: &[usize],
+        layer: usize,
+        t_len: usize,
+        qg_dev: CUdeviceptr,
+        kin_dev: CUdeviceptr,
+        vin_dev: CUdeviceptr,
+    ) -> Result<CUdeviceptr, String> {
+        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        if self.kvq {
+            return Err("attn batch: KVQ 상태 — 직렬 경로로 폴백".into());
+        }
+        if t_len == 0
+            || t_len > BATCH_DEC_MAX
+            || t_len != slots.len()
+            || layer >= dm.n_attn
+            || self.dattn_part == 0
+            || slots.iter().any(|&s| s >= self.n_slots)
+        {
+            return Err("attn batch: 도메인/범위 위반".into());
+        }
+        // dpp(슬롯 pos)는 배치 진입부가 1회 일괄 h2d(pin_batch_pos) — 캡처
+        // 그래프 replay 시에도 갱신되도록 여기서는 호출하지 않는다.
+        for &s in slots {
+            let pos = self.slot_pos[s];
+            if pos as usize + 1 > dm.cap {
+                return Err(format!("attn batch: slot{s} pos{pos} > cap{}", dm.cap));
+            }
+        }
+        self.ensure_attn_bufs(t_len)?;
+        let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
+        let (qgd, kvd, qdd) = (dm.qg_dim() as u64, dm.kv_dim() as u64, dm.q_dim() as u64);
+        let pstride = (dm.q_heads * ATTN_SPLITS * 258) as u64;
+        let mut sp = ATTN_SPLITS as i32;
+        // prep — 토큰별.
+        let f = self.cc.function("attn_prep")?;
+        for (k, &slot) in slots.iter().enumerate() {
+            let mut a0 = qg_dev + k as u64 * qgd * 4;
+            let mut a1 = kin_dev + k as u64 * kvd * 4;
+            let mut a2 = vin_dev + k as u64 * kvd * 4;
+            let mut a3 = self.dqnw_a;
+            let mut a4 = self.dknw_a;
+            let mut a5 = self.dqh_a + k as u64 * qdd * 4;
+            let mut a6 = self.attn_kv_ptr(slot);
+            let mut a7 = self.attn_vc_ptr(slot);
+            let mut a8 = self.attn_pp_ptr(slot);
+            let (mut tl, mut lay, mut qh2, mut kvh2, mut cp2) = (1i32, layer as i32, qh, kvh, cp);
+            let mut args: [*mut std::ffi::c_void; 14] = [
+                (&mut a0) as *mut _ as *mut _,
+                (&mut a1) as *mut _ as *mut _,
+                (&mut a2) as *mut _ as *mut _,
+                (&mut a3) as *mut _ as *mut _,
+                (&mut a4) as *mut _ as *mut _,
+                (&mut a5) as *mut _ as *mut _,
+                (&mut a6) as *mut _ as *mut _,
+                (&mut a7) as *mut _ as *mut _,
+                (&mut a8) as *mut _ as *mut _,
+                (&mut tl) as *mut _ as *mut _,
+                (&mut lay) as *mut _ as *mut _,
+                (&mut qh2) as *mut _ as *mut _,
+                (&mut kvh2) as *mut _ as *mut _,
+                (&mut cp2) as *mut _ as *mut _,
+            ];
+            self.cc
+                .launch(f, 1, (dm.q_heads + dm.kv_heads) as u32, 128, &mut args)?;
+        }
+        // fwd3s part + merge — 토큰별.
+        let fp = self.cc.function("attn_fwd3s_part")?;
+        let fm = self.cc.function("attn_fwd3s_merge")?;
+        for (k, &slot) in slots.iter().enumerate() {
+            let qhk = self.dqh_a + k as u64 * qdd * 4;
+            let partk = self.dattn_part + k as u64 * pstride * 4;
+            {
+                let (mut f0, mut f1, mut f2, mut f3) =
+                    (qhk, self.attn_kv_ptr(slot), self.attn_vc_ptr(slot), partk);
+                let mut f4 = self.attn_pp_ptr(slot);
+                let (mut tl, mut lay) = (1i32, layer as i32);
+                let mut pa: [*mut std::ffi::c_void; 11] = [
+                    (&mut f0) as *mut _ as *mut _,
+                    (&mut f1) as *mut _ as *mut _,
+                    (&mut f2) as *mut _ as *mut _,
+                    (&mut f3) as *mut _ as *mut _,
+                    (&mut f4) as *mut _ as *mut _,
+                    (&mut tl) as *mut _ as *mut _,
+                    (&mut lay) as *mut _ as *mut _,
+                    (&mut qh) as *mut _ as *mut _,
+                    (&mut kvh) as *mut _ as *mut _,
+                    (&mut cp) as *mut _ as *mut _,
+                    (&mut sp) as *mut _ as *mut _,
+                ];
+                self.cc
+                    .launch(fp, 1, (dm.q_heads * ATTN_SPLITS) as u32, 256, &mut pa)?;
+            }
+            {
+                let (mut mp, mut mg, mut mo) = (
+                    partk,
+                    qg_dev + k as u64 * qgd * 4,
+                    self.doutv_a + k as u64 * qdd * 4,
+                );
+                let (mut tl2, mut qh2) = (1i32, dm.q_heads as i32);
+                let mut ma: [*mut std::ffi::c_void; 6] = [
+                    (&mut mp) as *mut _ as *mut _,
+                    (&mut mg) as *mut _ as *mut _,
+                    (&mut mo) as *mut _ as *mut _,
+                    (&mut tl2) as *mut _ as *mut _,
+                    (&mut qh2) as *mut _ as *mut _,
+                    (&mut sp) as *mut _ as *mut _,
+                ];
+                self.cc.launch(fm, 1, dm.q_heads as u32, 256, &mut ma)?;
+            }
+        }
         Ok(self.doutv_a)
     }
 
@@ -3517,6 +3916,10 @@ impl W4a16Dec {
         // [A8] 캐시 전량 폐기 — 옛 포인터를 기록한 exec는 replay 금지.
         for e in self.graph_cache.drain(..) {
             let _ = self.cc.graph_destroy(e.exec, e.handle);
+        }
+        // [A9] 배치(슬롯집합) 그래프도 동일 계약.
+        for (_, e, g) in self.batch_graphs.drain(..) {
+            let _ = self.cc.graph_destroy(e, g);
         }
     }
 
@@ -3810,6 +4213,77 @@ impl W4a16Dec {
         Ok(u32::from_le_bytes(ob))
     }
 
+    /// [A9 2026-10-10] 배치 greedy 디코드 — 슬롯별 임베딩 행(t=n_active)을
+    /// 단일 체인으로 통과, 슬롯 순서의 다음 토큰 반환. 호출부가 전제
+    /// (전 슬롯 greedy·t≤BATCH_DEC_MAX)를 보장한다.
+    pub fn forward_device_argmax_batch(
+        &mut self,
+        slots: &[usize],
+        rows: &[f32],
+    ) -> Result<Vec<u32>, String> {
+        let t = slots.len();
+        if !(2..=BATCH_DEC_MAX).contains(&t) {
+            return Err("batch: t 2..=BATCH_DEC_MAX 전용".into());
+        }
+        let _g = self.cc.guard()?;
+        if rows.len() != t * self.hidden
+            || (self.n_experts > 0 && !self.moe_resident)
+            || self.head_w == 0
+            || slots.iter().any(|&s| s >= self.n_slots)
+        {
+            return Err(format!("batch: 전제 위반 t={t}"));
+        }
+        let cap = self.attn.ok_or("attn: 형상 미등록")?.cap;
+        for &s in slots {
+            if self.slot_pos[s] as usize + 1 > cap {
+                return Err(format!("batch: slot{s} 컨텍스트 초과"));
+            }
+        }
+        self.ensure_batch_bufs()?;
+        // 핀드 행/pos 기입(그래프 h2d 노드가 replay 시점에 읽는다).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                rows.as_ptr() as *const u8,
+                self.pin_batch_in as *mut u8,
+                t * self.hidden * 4,
+            );
+            let pp = self.pin_batch_pos as *mut u8;
+            for s in 0..self.n_slots {
+                let pos = self.slot_pos[s];
+                std::ptr::copy_nonoverlapping(pos.to_le_bytes().as_ptr(), pp.add(s * 4), 4);
+            }
+        }
+        let key: Vec<usize> = slots.to_vec();
+        if let Some(k) = self.batch_graphs.iter().position(|(ks, _, _)| *ks == key) {
+            let exec = self.batch_graphs[k].1;
+            self.cc.graph_launch(exec)?;
+            self.cc.sync()?;
+            let out = self.batch_read_tokens(t);
+            for &s in slots {
+                self.slot_pos[s] += 1;
+            }
+            return Ok(out);
+        }
+        // 미스: 미캡처 실발사(정답) → 캡처(미실행)로 다음부터 replay.
+        self.batch_launch(slots, t)?;
+        self.cc.sync()?;
+        let out = self.batch_read_tokens(t);
+        if !self.batch_capture_failed {
+            match self.batch_capture(&key, t) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("# batch 그래프 캡처 실패 — 직접 발사 유지: {e}");
+                    self.batch_capture_failed = true;
+                    self.cc.sync().ok();
+                }
+            }
+        }
+        for &s in slots {
+            self.slot_pos[s] += 1;
+        }
+        Ok(out)
+    }
+
     /// 배치 체인(t∈2..=8) — 프리필 청크. GEMM(t≥2) 경로 + 배치 버퍼.
     /// 반환: 마지막 행의 xn(또는 head면 로짓). t≥2 GEMM은 w4a16-gemm
     /// 게이트가 비트 판정(행별 64레인·tree64 동일) — t=1 경로와 계약 동일.
@@ -3973,6 +4447,187 @@ impl W4a16Dec {
             llm170_diag::fp::fp_record("gpu.xn", &v);
         }
         Ok(v)
+    }
+
+    /// [A9 2026-10-10] 배치 디코드 단일 체인 — 슬롯별 1토큰(t=n_active)을
+    /// 한 번에 통과한다. 가중 커널(GEMM·MoE·head)은 t행 배치로 상각하고,
+    /// 상태 커널(attn KV/pos·GDN 링/트리오)은 토큰별 슬롯 자원을 쓴다.
+    /// 반환: 슬롯 순서의 다음 토큰(argmax, greedy 전용).
+    /// 전제(호출부 가드): t∈2..=BATCH_DEC_MAX · 전 슬롯 greedy · !kvq ·
+    /// MoE면 상주 모드 · head/argmax 등록. 그래프 밖(직접 발사) 경로.
+    /// [A9] 배치 체인 1회 발사 — 행/pos는 핀드(pin_batch_in/pos)에서 읽어
+    /// h2d 노드로 기록된다(캡처 가능). sync·slot_pos 갱신은 호출부 소관.
+    fn batch_launch(&mut self, slots: &[usize], t: usize) -> Result<(), String> {
+        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.is_none() {
+            return Err("batch_launch: 디코더 상수 미등록".into());
+        }
+        self.ensure_chain_bufs()?;
+        self.ensure_norm_bufs(t)?;
+        self.ensure_gdn_bufs(t)?;
+        self.ensure_attn_bufs(t)?;
+        self.ensure_batch_bufs()?;
+        let dyt = self.ensure_dyt(t)?;
+        {
+            let rb = unsafe {
+                std::slice::from_raw_parts(self.pin_batch_in as *const u8, t * self.hidden * 4)
+            };
+            self.cc.h2d_async(self.dres, rb)?;
+            let pb = unsafe {
+                std::slice::from_raw_parts(self.pin_batch_pos as *const u8, self.n_slots * 4)
+            };
+            self.cc.h2d_async(self.dpp, pb)?;
+        }
+        let [s0, s1, s1b, s2, s3] = self.dchain;
+        let (w2, h) = (self.stg_w2, self.hidden);
+        let mut ab = self.dab_dev;
+        let mut gi = 0usize;
+        let plain = self.plain_weights;
+        if t > 32 {
+            return Err(format!("chain_device_batch: t={t} > 32 FFMA 상한"));
+        }
+        for il in 0..self.n_layers {
+            let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };
+            let xn = self
+                .norm_resid_dev(2 * il, self.dres, ab, t, xh)
+                .map_err(|e| format!("B{il} input norm: {e}"))?;
+            let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
+            let branch = if (il + 1) % interval == 0 {
+                if plain {
+                    self.plain_gemv_t_launch(&format!("blk.{il}.attn_q.weight"), xn, s0, t)?;
+                    self.plain_gemv_t_launch(&format!("blk.{il}.attn_k.weight"), xn, s1, t)?;
+                    self.plain_gemv_t_launch(&format!("blk.{il}.attn_v.weight"), xn, s1b, t)?;
+                } else {
+                    self.gemv_t_launch(&format!("blk.{il}.attn_q.weight"), xh, s0, t)?;
+                    self.gemv_t_launch(&format!("blk.{il}.attn_k.weight"), xh, s1, t)?;
+                    self.gemv_t_launch(&format!("blk.{il}.attn_v.weight"), xh, s1b, t)?;
+                }
+                self.attn_chain_dev_batch(slots, il / interval, t, s0, s1, s1b)
+                    .map_err(|e| format!("B{il} attn: {e}"))?
+            } else {
+                if plain {
+                    self.plain_gemv_t_launch(&format!("blk.{il}.attn_qkv.weight"), xn, s0, t)?;
+                    self.plain_gemv_t_launch(&format!("blk.{il}.attn_gate.weight"), xn, s1, t)?;
+                } else {
+                    self.gemv_t_launch(&format!("blk.{il}.attn_qkv.weight"), xh, s0, t)?;
+                    self.gemv_t_launch(&format!("blk.{il}.attn_gate.weight"), xh, s1, t)?;
+                }
+                let g = self
+                    .gdn_chain_dev_batch(slots, gi, t, xn, s0, s1)
+                    .map_err(|e| format!("B{il} gdn: {e}"))?;
+                gi += 1;
+                g
+            };
+            let lo = if (il + 1) % interval == 0 {
+                format!("blk.{il}.attn_output.weight")
+            } else {
+                format!("blk.{il}.ssm_out.weight")
+            };
+            if plain {
+                self.plain_gemv_t_launch(&lo, branch, dyt, t)?;
+            } else {
+                let (_, _, _, ko) = self.lin_spec(&lo)?;
+                let xh2 = self.cast_x32(branch, t * ko)?;
+                self.gemv_t_launch(&lo, xh2, dyt, t)?;
+            }
+            let xh = self.ensure_dx32(t * h)?;
+            let xn2 = self
+                .norm_resid_dev(2 * il + 1, self.dres, dyt, t, xh)
+                .map_err(|e| format!("B{il} post norm: {e}"))?;
+            if plain {
+                ab = self
+                    .moe_ffn_dev_t(il, xn2, t)
+                    .map_err(|e| format!("B{il} moe: {e}"))?;
+            } else {
+                let xh3 = xh;
+                let _ = xn2;
+                self.gemv_t_launch(&format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
+                self.gemv_t_launch(&format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
+                self.ew_dev(s0, s1, s2, t * w2)?;
+                let dn = format!("blk.{il}.ffn_down.weight");
+                let (_, _, _, kd) = self.lin_spec(&dn)?;
+                let xh4 = self.cast_x32(s2, t * kd)?;
+                self.gemv_t_launch(&dn, xh4, s3, t)?;
+                ab = s3;
+            }
+        }
+        // 전 행 최종 노름 → 배치 head(가중 판독 상각) → 배치 argmax → 1회 d2h.
+        let xn_all = self
+            .norm_resid_dev(2 * self.n_layers, self.dres, ab, t, 0)
+            .map_err(|e| format!("B final norm: {e}"))?;
+        {
+            let f = self.cc.function("head_bf16_t")?;
+            let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn_all, self.dbatch_lg);
+            let (mut p_n, mut p_k, mut p_t) = (self.head_n as i32, self.head_k as i32, t as i32);
+            let mut args: [*mut std::ffi::c_void; 6] = [
+                (&mut p_w) as *mut _ as *mut _,
+                (&mut p_x) as *mut _ as *mut _,
+                (&mut p_o) as *mut _ as *mut _,
+                (&mut p_n) as *mut _ as *mut _,
+                (&mut p_k) as *mut _ as *mut _,
+                (&mut p_t) as *mut _ as *mut _,
+            ];
+            self.cc
+                .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
+        }
+        {
+            let fa = self.cc.function("w4a16_argmax_min_t")?;
+            let (mut p_l, mut p_n, mut p_t, mut p_a) =
+                (self.dbatch_lg, self.head_n as i32, t as i32, self.dbatch_am);
+            let mut aa: [*mut std::ffi::c_void; 4] = [
+                (&mut p_l) as *mut _ as *mut _,
+                (&mut p_n) as *mut _ as *mut _,
+                (&mut p_t) as *mut _ as *mut _,
+                (&mut p_a) as *mut _ as *mut _,
+            ];
+            self.cc.launch(fa, t as u32, 1, 1024, &mut aa)?;
+        }
+        let tb = unsafe { std::slice::from_raw_parts_mut(self.pin_batch_tok as *mut u8, t * 4) };
+        self.cc.d2h_async(tb.as_mut_ptr(), self.dbatch_am, t * 4)?;
+        Ok(())
+    }
+
+    /// [A9] 핀드 토큰 판독(sync 후).
+    fn batch_read_tokens(&self, t: usize) -> Vec<u32> {
+        let tb = unsafe { std::slice::from_raw_parts(self.pin_batch_tok as *const u8, t * 4) };
+        (0..t)
+            .map(|k| u32::from_le_bytes([tb[k * 4], tb[k * 4 + 1], tb[k * 4 + 2], tb[k * 4 + 3]]))
+            .collect()
+    }
+
+    /// [A9] 배치 그래프 캡처 — 슬롯집합 키. 캡처는 실행하지 않는다(상태 불변).
+    fn batch_capture(&mut self, key: &[usize], t: usize) -> Result<(), String> {
+        if self.batch_graphs.len() >= 8 {
+            let (_, e, g) = self.batch_graphs.remove(0);
+            let _ = self.cc.graph_destroy(e, g);
+        }
+        self.cc.capture_begin()?;
+        if let Err(e) = self.batch_launch(key, t) {
+            let _ = self.cc.capture_end();
+            return Err(e);
+        }
+        let g = self.cc.capture_end()?;
+        let e = self.cc.graph_instantiate(g)?;
+        self.batch_graphs.push((key.to_vec(), e, g));
+        eprintln!("[batch-graph] captured slots={key:?}");
+        Ok(())
+    }
+
+    /// [A9] 배치 디코드 부속 버퍼 — 로짓[t×head_n]·argmax[t]·핀드 입출력.
+    fn ensure_batch_bufs(&mut self) -> Result<(), String> {
+        if self.head_n == 0 {
+            return Err("batch: head 미등록(업로드 선행)".into());
+        }
+        let tmax = self.n_slots.min(BATCH_DEC_MAX);
+        if self.dbatch_lg == 0 {
+            self.dbatch_lg = self.cc.alloc(tmax * self.head_n * 4)?;
+            self.dbatch_am = self.cc.alloc(tmax * 4)?;
+        }
+        if self.pin_batch_tok.is_null() {
+            self.pin_batch_tok = self.cc.pinned_alloc(tmax * 4)?;
+            self.pin_batch_in = self.cc.pinned_alloc(tmax * self.hidden * 4)?;
+            self.pin_batch_pos = self.cc.pinned_alloc(self.n_slots * 4)?;
+        }
+        Ok(())
     }
 
     /// 마이크로벤치 표면(진단 전용) — 스크래치 alloc/h2d/free + GEMM 발사/sync.
@@ -4636,7 +5291,7 @@ mod tests {
 /// (미러 불일치 = smem 오버런·버퍼 계약 위반이라 변경 시 사전 차단).
 #[cfg(test)]
 mod mirror_contract {
-    use super::{ATTN_F3S_TMAX, CHAIN_TMAX, GDN_CS, GDN_NGRP, GDN_NSPLIT, GDN_SCAN_SMEM};
+    use super::{ATTN_F3S_TMAX, CHAIN_TMAX, GDN_CS, GDN_NGRP, GDN_NSPLIT, GDN_SCAN_SMEM, GEMV_TR};
 
     /// `#define NAME 값` 파싱 — 값은 정수 리터럴만 다룬다(대상 목록 한정).
     fn define(src: &str, name: &str) -> u64 {
@@ -4697,5 +5352,11 @@ mod mirror_contract {
     fn g4_scmax_mirror() {
         let scmax = define(include_str!("assets/gptq4.cu"), "G4_SCMAX") as usize;
         assert_eq!(scmax, crate::rawcuda::gptq4::G4_SCMAX, "gptq4.cu G4_SCMAX");
+    }
+
+    #[test]
+    fn gemv_tr_mirror() {
+        let tr = define(include_str!("assets/gptq4.cu"), "GEMV_TR") as usize;
+        assert_eq!(tr, GEMV_TR, "gptq4.cu GEMV_TR ↔ GEMV_TR");
     }
 }

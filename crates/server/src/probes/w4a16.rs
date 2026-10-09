@@ -337,6 +337,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut bench_ew = false;
     let mut mma_smoke = false;
     let mut bench_gemv: Option<(String, usize)> = None;
+    let mut bench_gemv_t: Option<(String, usize, usize)> = None;
     let mut bench_plain: Option<(String, usize, usize)> = None;
     let mut mma_diff: Option<(String, usize)> = None;
     let mut moe_topk_check: Option<(usize, usize, usize)> = None;
@@ -433,6 +434,18 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--bench-gemm requires reps")?;
                 bench = Some((name, t, reps));
+            }
+            "--bench-gemv-t" => {
+                let name = it.next().ok_or("--bench-gemv-t requires a name")?.clone();
+                let t = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--bench-gemv-t requires t")?;
+                let reps = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--bench-gemv-t requires reps")?;
+                bench_gemv_t = Some((name, t, reps));
             }
             other => return Err(format!("unknown flag: {other}")),
         }
@@ -549,6 +562,11 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             "bench-plain {name} n={n} k={k} t={bt}: {ms:.3} ms/회 · {:.2} TF",
             flop * 1e-9 / (ms * 1e-3)
         ));
+    }
+    // 마이크로벤치(진단): t행 GEMV(배치 디코드 커널) 반복 — A9 판정.
+    if let Some((name, t, reps)) = &bench_gemv_t {
+        let ms = dec.bench_gemv_t(name, *t, *reps)?;
+        return Ok(format!("bench-gemv-t {name} t={t}: {ms:.3} ms/회"));
     }
     // 마이크로벤치(진단): 지정 선형의 t=1 GEMV 반복 — 실효 가중치 대역.
     if let Some((name, reps)) = &bench_gemv

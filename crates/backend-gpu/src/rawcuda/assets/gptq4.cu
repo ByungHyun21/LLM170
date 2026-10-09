@@ -272,6 +272,122 @@ extern "C" __global__ void w4a16_gemv_g32_bf16(
     gemv_body<5, true>(q, s, x, out, n, k);
 }
 
+// [A9 2026-10-10] t행 GEMV(split g128) — 가중 판독 1회를 t행이 공유.
+// 행별 산술은 w4a16_gemv_g128(gemv_row_body)과 **비트동일**(레인 i는
+// l, l+64,… 오름차순 f32 누산 → tree64; 행별로 같은 시퀀스). t≤8
+// (호스트 BATCH_DEC_MAX 미러). 배치 디코드 전용.
+// [A9-fix] t는 템플릿 상수(T)로 받는다 — 런타임 t면 acc[r]이 로컬 스필
+// (실측 0.125ms vs 0.032ms, 4×). 언롤 16 + q·x 포인터 진행(1행판 동형).
+// [A9 2026-10-10] t행 GEMV(split g128) — 가중 판독 1회를 t행이 공유.
+// 행별 산술은 w4a16_gemv_g128(gemv_row_body)과 **비트동일**(레인 i는
+// l, l+64,… 오름차순 f32 누산 → tree64; 행별로 같은 시퀀스). t≤8
+// (호스트 BATCH_DEC_MAX 미러). 배치 디코드 전용.
+// [A9-fix1] t는 템플릿 상수(T) — 런타임 t면 acc[r] 로컬 스필(실측 4×).
+// [A9-fix2] 블록당 GEMV_TR행 — x(t×k)를 블록 내 재사용(L1)해 행당 x
+// L1/L2 재판독을 ÷GEMV_TR. 실측 t=4: 0.114 → 아래 수치.
+#define GEMV_TR 8
+
+// red/sc는 extern 커널에서 1회 할당 후 전달(템플릿 인라인 시 인스턴스별
+// 중복 할당 — TR=8에서 8×96KB > 48KB ptxas 한계로 실측).
+template <int T>
+__device__ __forceinline__ void gemv_g128_t_body(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k, int o0,
+    double (*red)[G4_LANES], float (*sc)[G4_SCMAX])
+{
+    const int l = threadIdx.x & (G4_LANES - 1);
+    const int g = threadIdx.x >> 6; // 행 그룹 0..GEMV_TR-1
+    const int o = o0 + g;
+    const bool live = o < n;
+    const int k8 = k >> 3;
+    const int kg = k >> 7;
+    if (live) {
+        for (int gg = l; gg < kg; gg += G4_LANES) {
+            sc[g][gg] = ld_scale<false>(s + (size_t)o * kg, gg);
+        }
+    }
+    __syncthreads();
+    // [A9-fix3] T3-2(1행판) 구조 그대로: 128폭 청크·니블 쌍·float2 x —
+    // 행별 누산 시퀀스가 w4a16_gemv_g128(T3-2)과 동일(비트동일).
+    const unsigned* qrow = q + (size_t)o * k8;
+    const int jn = k >> 7;
+    const int sh = 8 * (l & 3);
+    float acc[T];
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        acc[r] = 0.0f;
+    }
+    const unsigned* qp = qrow + (l >> 2);
+    const float2* xp[T];
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        xp[r] = reinterpret_cast<const float2*>(x) + (size_t)r * (k >> 1) + l;
+    }
+#pragma unroll 32
+    for (int jj = 0; jj < jn; ++jj) {
+        const unsigned qw = __ldcs(qp);
+        qp += 16;
+        const unsigned byte = (qw >> sh) & 0xFFu;
+        const float scv = sc[g][jj];
+        const float w0 = fmaf((float)(byte & 0xFu), scv, -8.0f * scv);
+        const float w1 = fmaf((float)(byte >> 4), scv, -8.0f * scv);
+#pragma unroll
+        for (int r = 0; r < T; ++r) {
+            const float2 xv = *xp[r];
+            // T3-2와 동일: 단일 누산 체인(쌍 순차) — 이 분리가 비트동일 조건.
+            acc[r] = fmaf(w0, xv.x, acc[r]);
+            acc[r] = fmaf(w1, xv.y, acc[r]);
+            xp[r] += 64;
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < T; ++rr) {
+        // 행당 64레인 tree — 1행판과 동일 구조(누산 시퀀스도 동일).
+        red[g][l] = (double)acc[rr];
+        __syncthreads();
+        if (l < 32 && live) {
+            double v = red[g][l] + red[g][l + 32];
+#pragma unroll
+            for (int off = 16; off >= 1; off >>= 1) {
+                const double oth = shfl_down_f64(v, off);
+                if (l < off) {
+                    v += oth;
+                }
+            }
+            if (l == 0) {
+                out[(size_t)rr * n + o] = (float)v;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void w4a16_gemv_g128_t(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x,   // [t][k] f32 (cast_x32 산출값)
+    float* __restrict__ out,       // [t][n]
+    int n, int k, int t)
+{
+    const int o0 = blockIdx.x * GEMV_TR;
+    if (o0 >= n) {
+        return;
+    }
+    __shared__ double red[GEMV_TR][G4_LANES];
+    __shared__ float sc[GEMV_TR][G4_SCMAX];
+    switch (t) {
+    case 1: gemv_g128_t_body<1>(q, s, x, out, n, k, o0, red, sc); break;
+    case 2: gemv_g128_t_body<2>(q, s, x, out, n, k, o0, red, sc); break;
+    case 3: gemv_g128_t_body<3>(q, s, x, out, n, k, o0, red, sc); break;
+    case 4: gemv_g128_t_body<4>(q, s, x, out, n, k, o0, red, sc); break;
+    case 5: gemv_g128_t_body<5>(q, s, x, out, n, k, o0, red, sc); break;
+    case 6: gemv_g128_t_body<6>(q, s, x, out, n, k, o0, red, sc); break;
+    case 7: gemv_g128_t_body<7>(q, s, x, out, n, k, o0, red, sc); break;
+    case 8: gemv_g128_t_body<8>(q, s, x, out, n, k, o0, red, sc); break;
+    default: break; // 호스트 계약 밖(t≤8)
+    }
+}
+
+
 // out[t][n] = x[t][k] · W4A16(g128, sym) — t≥2(프리필 배치) 전용.
 // [2026-10-08 P3-b 최종 — 채택 변형] 1라운드 진화(벤치 실측): 행=블록 43 →
 // smem(R=4) 51 → smem f16→f32 변환 63 → **R=8(512스레드) 72~77(채택)** →
@@ -430,6 +546,7 @@ extern "C" __global__ void w4a16_gemm_g32_bf16(
 // 플레인 bf16 GEMV — 행=블록(64레인), 레인 l = i=l,l+64,… f32 누산 → tree64.
 // split 커널과 동일한 레인·환원 구조(플레인 경로 판정은 토큰 수준 — 골든).
 // w는 [n][k] 행 우선(업로드 원본 그대로 — 전치 없음).
+
 extern "C" __global__ void w4a16_gemv_bf16(
     const unsigned short* __restrict__ w,  // [n][k] bf16
     const float* __restrict__ x,           // [k] f32
@@ -461,6 +578,84 @@ extern "C" __global__ void w4a16_gemv_bf16(
         if (l == 0) {
             out[o] = (float)r;
         }
+    }
+}
+
+
+// [A9 2026-10-10] t행 GEMV(플레인 bf16) — 가중 판독 1회를 t행이 공유.
+// 행별 산술은 w4a16_gemv_bf16과 **비트동일**(i 오름차순 mul·add 분리·tree64).
+// t 템플릿 상수 + GEMV_TR행/블록(A9-fix1/2 — split 판 동형).
+template <int T>
+__device__ __forceinline__ void gemv_bf16_t_body(
+    const unsigned short* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ out, int n, int k, int o0, double (*red)[G4_LANES])
+{
+    const int l = threadIdx.x & (G4_LANES - 1);
+    const int g = threadIdx.x >> 6;
+    const int o = o0 + g;
+    const bool live = o < n;
+    const unsigned short* wrow = w + (size_t)o * k;
+    float acc[T];
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        acc[r] = 0.0f;
+    }
+    const float* xp[T];
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        xp[r] = x + (size_t)r * k + l;
+    }
+#pragma unroll 32
+    for (int i = l; i < k; i += G4_LANES) {
+        const float wv = b2f(wrow[i]);
+#pragma unroll
+        for (int r = 0; r < T; ++r) {
+            acc[r] += wv * *xp[r];
+            xp[r] += G4_LANES;
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < T; ++rr) {
+        red[g][l] = (double)acc[rr];
+        __syncthreads();
+        if (l < 32 && live) {
+            double v = red[g][l] + red[g][l + 32];
+#pragma unroll
+            for (int off = 16; off >= 1; off >>= 1) {
+                const double oth = shfl_down_f64(v, off);
+                if (l < off) {
+                    v += oth;
+                }
+            }
+            if (l == 0) {
+                out[(size_t)rr * n + o] = (float)v;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void w4a16_gemv_bf16_t(
+    const unsigned short* __restrict__ w, // [n][k] bf16
+    const float* __restrict__ x,          // [t][k] f32(원시 — h2f 왕복 없음)
+    float* __restrict__ out,              // [t][n]
+    int n, int k, int t)
+{
+    const int o0 = blockIdx.x * GEMV_TR;
+    if (o0 >= n) {
+        return;
+    }
+    __shared__ double red[GEMV_TR][G4_LANES];
+    switch (t) {
+    case 1: gemv_bf16_t_body<1>(w, x, out, n, k, o0, red); break;
+    case 2: gemv_bf16_t_body<2>(w, x, out, n, k, o0, red); break;
+    case 3: gemv_bf16_t_body<3>(w, x, out, n, k, o0, red); break;
+    case 4: gemv_bf16_t_body<4>(w, x, out, n, k, o0, red); break;
+    case 5: gemv_bf16_t_body<5>(w, x, out, n, k, o0, red); break;
+    case 6: gemv_bf16_t_body<6>(w, x, out, n, k, o0, red); break;
+    case 7: gemv_bf16_t_body<7>(w, x, out, n, k, o0, red); break;
+    case 8: gemv_bf16_t_body<8>(w, x, out, n, k, o0, red); break;
+    default: break;
     }
 }
 
