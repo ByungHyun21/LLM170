@@ -222,6 +222,7 @@ pub struct W4a16Dec {
     /// [P11] 전문가-우선 슬롯 정렬(프리필 그룹 GEMV) — gslot[n_exp×gmax]+cnt.
     moe_gslot: CUdeviceptr,
     moe_gcnt: CUdeviceptr,
+    moe_goff: CUdeviceptr,
     moe_gmax: usize,
     /// 배치 전문가 출력([top_k][n_ff] · [top_k][hidden]) — act는 ew 전용
     /// 별도 버퍼(ew 커널 __restrict__ 계약 — 제자리 호출 금지).
@@ -375,7 +376,7 @@ impl W4a16Dec {
                 "w4a16_axpy",
                 "w4a16_shared_add",
                 "w4a16_gemv_experts_g32_bf16",
-                "w4a16_gemv_experts_g32_bf16_perm",
+                "w4a16_gemm_g32_mma_grp",
                 "w4a16_moe_align",
                 "w4a16_moe_accum",
                 "w4a16_moe_topk",
@@ -484,6 +485,7 @@ impl W4a16Dec {
             moe_wt: 0,
             moe_gslot: 0,
             moe_gcnt: 0,
+            moe_goff: 0,
             moe_gmax: 0,
             dexp_gate: 0,
             dexp_up: 0,
@@ -2475,16 +2477,18 @@ impl W4a16Dec {
         if self.moe_gslot == 0 || self.moe_gmax < tk {
             self.graph_invalidate();
             self.cc.sync()?;
-            for p in [self.moe_gslot, self.moe_gcnt] {
+            for p in [self.moe_gslot, self.moe_gcnt, self.moe_goff] {
                 if p != 0 {
                     self.cc.free(p)?;
                 }
             }
             self.moe_gslot = 0;
             self.moe_gcnt = 0;
+            self.moe_goff = 0;
             self.moe_gmax = 0;
             self.moe_gslot = self.cc.alloc(n_exp * tk * 4)?;
             self.moe_gcnt = self.cc.alloc(n_exp * 4)?;
+            self.moe_goff = self.cc.alloc(n_exp * 4)?;
             self.moe_gmax = tk;
         }
         if self.dexp_cap < tk {
@@ -2563,22 +2567,23 @@ impl W4a16Dec {
     fn moe_align_launch(&self, nslots: usize) -> Result<(), String> {
         let f = self.cc.function("w4a16_moe_align")?;
         let (mut p_i, mut p_ns) = (self.moe_idx, nslots as i32);
-        let (mut p_g, mut p_c, mut p_ne) = (self.moe_gslot, self.moe_gcnt, self.n_experts as i32);
-        let mut args: [*mut std::ffi::c_void; 5] = [
+        let (mut p_g, mut p_c, mut p_o) = (self.moe_gslot, self.moe_gcnt, self.moe_goff);
+        let mut p_ne = self.n_experts as i32;
+        let mut args: [*mut std::ffi::c_void; 6] = [
             (&mut p_i) as *mut _ as *mut _,
             (&mut p_ns) as *mut _ as *mut _,
             (&mut p_g) as *mut _ as *mut _,
             (&mut p_c) as *mut _ as *mut _,
+            (&mut p_o) as *mut _ as *mut _,
             (&mut p_ne) as *mut _ as *mut _,
         ];
         self.cc.launch(f, 1, 1, 256, &mut args)
     }
 
-    /// [P11] 순열 전문가 GEMV 발사 — grid (슬롯 × n), 슬롯 순서만 전문가-우선.
-    fn gemv_experts_perm_launch(
+    /// [P11] 그룹 mma GEMM(g32) 발사 — grid (전문가 × n타일), M=전문가 슬롯 수.
+    fn gemm_g32_mma_grp_launch(
         &self,
         base: usize,
-        nslots: usize,
         x_dev: CUdeviceptr,
         xstride: usize,
         sp: usize,
@@ -2586,9 +2591,9 @@ impl W4a16Dec {
         n: usize,
         k: usize,
     ) -> Result<(), String> {
-        let f = self.cc.function("w4a16_gemv_experts_g32_bf16_perm")?;
+        let f = self.cc.function("w4a16_gemm_g32_mma_grp")?;
         let (mut p_t, mut p_b) = (self.moe_dev_tab, base as i32);
-        let (mut p_i, mut p_p, mut p_ns) = (self.moe_idx, self.moe_gslot, nslots as i32);
+        let (mut p_g, mut p_c, mut p_of) = (self.moe_gslot, self.moe_gcnt, self.moe_goff);
         let (mut p_x, mut p_xs, mut p_sp, mut p_o, mut p_n, mut p_k) = (
             x_dev,
             xstride as i32,
@@ -2600,9 +2605,9 @@ impl W4a16Dec {
         let mut args: [*mut std::ffi::c_void; 11] = [
             (&mut p_t) as *mut _ as *mut _,
             (&mut p_b) as *mut _ as *mut _,
-            (&mut p_i) as *mut _ as *mut _,
-            (&mut p_p) as *mut _ as *mut _,
-            (&mut p_ns) as *mut _ as *mut _,
+            (&mut p_g) as *mut _ as *mut _,
+            (&mut p_c) as *mut _ as *mut _,
+            (&mut p_of) as *mut _ as *mut _,
             (&mut p_x) as *mut _ as *mut _,
             (&mut p_xs) as *mut _ as *mut _,
             (&mut p_sp) as *mut _ as *mut _,
@@ -2610,7 +2615,13 @@ impl W4a16Dec {
             (&mut p_n) as *mut _ as *mut _,
             (&mut p_k) as *mut _ as *mut _,
         ];
-        self.cc.launch(f, (n * nslots) as u32, 1, 64, &mut args)
+        self.cc.launch(
+            f,
+            self.n_experts as u32,
+            n.div_ceil(32) as u32,
+            256,
+            &mut args,
+        )
     }
 
     /// 선택 순서 가중 누적 — y[ti] = Σ_{s∈ti} w[s]·d[s][i] (sp = 토큰당 슬롯).
@@ -2856,9 +2867,10 @@ impl W4a16Dec {
         // 슬롯을 연속 처리해 가중치 행을 L2 재사용(슬롯별 산술 동일 = 비트 동일).
         let group = t > 1 && n_exp <= 1024;
         if group {
+            // [P11] 그룹 mma GEMM — 전문가별 슬롯 묶음(M=슬롯 수), T1 계약 미러.
             self.moe_align_launch(ns)?;
-            self.gemv_experts_perm_launch(base, ns, xn, h, tk, self.dexp_gate, n_ff, h)?;
-            self.gemv_experts_perm_launch(base + 1, ns, xn, h, tk, self.dexp_up, n_ff, h)?;
+            self.gemm_g32_mma_grp_launch(base, xn, h, tk, self.dexp_gate, n_ff, h)?;
+            self.gemm_g32_mma_grp_launch(base + 1, xn, h, tk, self.dexp_up, n_ff, h)?;
         } else {
             self.gemv_experts_launch(base, ns, xn, h, tk, self.dexp_gate, n_ff, h)?;
             self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.dexp_up, n_ff, h)?;
@@ -2881,16 +2893,7 @@ impl W4a16Dec {
             eprintln!("[t-dbg] act nan-slots={bad:?} ns={ns}");
         }
         if group {
-            self.gemv_experts_perm_launch(
-                base + 2,
-                ns,
-                self.dexp_act,
-                n_ff,
-                1,
-                self.dexp_dn,
-                h,
-                n_ff,
-            )?;
+            self.gemm_g32_mma_grp_launch(base + 2, self.dexp_act, n_ff, 1, self.dexp_dn, h, n_ff)?;
         } else {
             self.gemv_experts_launch(base + 2, ns, self.dexp_act, n_ff, 1, self.dexp_dn, h, n_ff)?;
         }
@@ -3427,14 +3430,23 @@ impl W4a16Dec {
         self.ensure_gdn_bufs(CHAIN_TMAX)?;
         self.ensure_attn_bufs(CHAIN_TMAX)?;
         self.ensure_dyt(CHAIN_TMAX)?;
+        // [P11 fix] lins + plains **둘 다** — 플레인(MoE) 모델은 가중치가
+        // plains에 있어 lins만 보면 dy/dx32가 0 → 캡처 중 ensure_dy 재할당 →
+        // 재할당 경로의 sync가 캡처 금지 API(CUresult=900)로 캡처 실패(실측:
+        // 35B serve가 직접 경로로 폴백 → tg 93.6→81.6).
         let (mut mk, mut mn) = (0usize, 0usize);
         for &(_, _, n, k) in self.lins.values() {
+            mk = mk.max(k);
+            mn = mn.max(n);
+        }
+        for &(_, n, k) in self.plains.values() {
             mk = mk.max(k);
             mn = mn.max(n);
         }
         // 프리필 norm 융합(ensure_dx32(t*h))과 FFN 캐스트(cast_x32(t×k))를
         // 모두 커버 — 캡처 후 재할당(재캡처·옛 포인터)을 봉인한다.
         mk = mk.max(CHAIN_TMAX * mk.max(self.hidden));
+        mn = mn.max(self.hidden);
         if mk > self.dx32_cap {
             self.graph_invalidate(); // [P10]
             self.cc.sync()?;

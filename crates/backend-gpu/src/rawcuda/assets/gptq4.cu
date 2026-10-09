@@ -206,7 +206,8 @@ extern "C" __global__ void w4a16_gemv_experts_g32_bf16(
 // 결과는 순서 무관(비트 동일). n_exp ≤ 1024 계약(호스트 가드).
 extern "C" __global__ void w4a16_moe_align(
     const int* __restrict__ idx, int nslots,
-    unsigned* __restrict__ gslot, unsigned* __restrict__ gcnt, int n_exp)
+    unsigned* __restrict__ gslot, unsigned* __restrict__ gcnt,
+    unsigned* __restrict__ goff, int n_exp)
 {
     __shared__ unsigned cnt[1024];
     __shared__ unsigned off[1024];
@@ -226,6 +227,7 @@ extern "C" __global__ void w4a16_moe_align(
             off[i] = acc;
             acc += cnt[i];
             gcnt[i] = cnt[i];
+            goff[i] = off[i]; // 연속 레이아웃 기저(그룹 커널 소비)
         }
     }
     __syncthreads();
@@ -234,27 +236,6 @@ extern "C" __global__ void w4a16_moe_align(
         const unsigned p = atomicAdd(&off[e], 1u);
         gslot[p] = (unsigned)j;
     }
-}
-
-// [P11] 순열 전문가 GEMV — 블록 구조는 w4a16_gemv_experts_g32_bf16과 동일
-// (grid = 슬롯 × n), 슬롯 순서만 perm(전문가-우선)으로 치환. 슬롯별 산술
-// 완전 동일(비트 동일) — 순서는 L2 재사용만 바꾼다.
-extern "C" __global__ void w4a16_gemv_experts_g32_bf16_perm(
-    const unsigned long long* __restrict__ tab, int base,
-    const int* __restrict__ idx, const unsigned* __restrict__ perm, int nslots,
-    const float* __restrict__ x, int xstride, int sp,
-    float* __restrict__ out, int n, int k)
-{
-    const int sl = blockIdx.x / n;
-    if (sl >= nslots) {
-        return;
-    }
-    const int o = blockIdx.x - sl * n;
-    const unsigned p = perm[sl];
-    const unsigned long long* e = tab + (size_t)(base + idx[p] * 3) * 2;
-    const size_t xoff = (size_t)(p / (sp > 0 ? sp : 1)) * (size_t)xstride;
-    gemv_row_body<5, true>((const unsigned*)e[0], (const unsigned short*)e[1],
-                           x + xoff, out + (size_t)p * n, o, k);
 }
 
 extern "C" __global__ void w4a16_gemv_g128(
@@ -792,6 +773,150 @@ extern "C" __global__ void w4a16_gemm_g128_mma(
             }
             if (col + 1 < n) {
                 out[(size_t)(r0 + 8) * n + col + 1] = c[nt][3];
+            }
+        }
+    }
+}
+
+// ── [P11] 그룹 mma GEMM(g32·bf16 스케일) — MoE 프리필 전문가 묶음 ──
+// 블록 = (전문가, n타일). M = 그 전문가의 슬롯 수(가변 — m타일 루프),
+// A = 슬롯→토큰 매핑으로 모은 x 행(f16 스테이징), B = g32 디퀀트(f16).
+// 프래그먼트·타일 계약은 T1과 동일(명시 판독 — ldmatrix 전치 불일치 회피).
+// 판정은 토큰 골든(계약 완화 — 허용오차 등급).
+extern "C" __global__ void w4a16_gemm_g32_mma_grp(
+    const unsigned long long* __restrict__ tab, int base,
+    const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
+    const unsigned* __restrict__ goff,
+    const float* __restrict__ x, int xstride, int sp,
+    float* __restrict__ out, int n, int k)
+{
+    const int e = blockIdx.x;
+    const unsigned cnt = gcnt[e];
+    if (cnt == 0) {
+        return;
+    }
+    const int n0 = blockIdx.y * MMA_N;
+    const unsigned long long* wp = tab + (size_t)(base + e * 3) * 2;
+    const unsigned* q = (const unsigned*)wp[0];
+    const unsigned short* s = (const unsigned short*)wp[1];
+    const unsigned* gs = gslot + (size_t)goff[e];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int g = lane >> 2;
+    const int tt = lane & 3;
+    const int mt = (warp >> 2) * 16;
+    const int ntw = (warp & 3) * 8;
+    const int k8 = k >> 3;
+    const int kg = k >> 5; // g32
+    __shared__ unsigned short xs[MMA_M][MMA_KC + 8];
+    __shared__ unsigned short ws[MMA_N][MMA_KC + 8];
+    const unsigned mtiles = (cnt + MMA_M - 1) / MMA_M;
+    for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
+        const unsigned rbase = mtile * MMA_M;
+        float c[2][4];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            ((float*)c)[i] = 0.0f;
+        }
+        for (int k0 = 0; k0 < k; k0 += MMA_KC) {
+            __syncthreads(); // 이전 mma 완료(버퍼 재사용) + 스테이징 가시화
+            // A 스테이징 — 슬롯 r의 x 행(슬롯→토큰: sl/sp·xstride), f16.
+            for (int ee = tid; ee < MMA_M * MMA_KC / 4; ee += 256) {
+                const int r = ee / (MMA_KC / 4);
+                const int c4 = ee % (MMA_KC / 4);
+                const int gi = k0 + c4 * 4;
+                float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                if (rbase + r < cnt) {
+                    const unsigned sl = gs[rbase + r];
+                    const size_t xoff =
+                        (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
+                    if (gi + 3 < k) {
+                        v = *reinterpret_cast<const float4*>(&x[xoff + gi]);
+                    } else {
+                        float t4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        for (int j = 0; j < 4; ++j) {
+                            if (gi + j < k) {
+                                t4[j] = x[xoff + gi + j];
+                            }
+                        }
+                        v = make_float4(t4[0], t4[1], t4[2], t4[3]);
+                    }
+                }
+                xs[r][c4 * 4 + 0] = __half_as_ushort(__float2half_rn(v.x));
+                xs[r][c4 * 4 + 1] = __half_as_ushort(__float2half_rn(v.y));
+                xs[r][c4 * 4 + 2] = __half_as_ushort(__float2half_rn(v.z));
+                xs[r][c4 * 4 + 3] = __half_as_ushort(__float2half_rn(v.w));
+            }
+            // B 스테이징 — g32 디퀀트(스케일 bf16 → f32은 비트 상위 시프트).
+            for (int ee = tid; ee < MMA_N * MMA_KC / 8; ee += 256) {
+                const int r = ee / (MMA_KC / 8);
+                const int c8 = ee % (MMA_KC / 8);
+                const int gi = k0 + c8 * 8;
+                const bool live = (n0 + r < n) && (gi + 7 < k);
+                unsigned short scb = 0;
+                if (n0 + r < n) {
+                    scb = s[(size_t)(n0 + r) * kg + (gi >> 5)];
+                }
+                const float scf = __uint_as_float((unsigned)scb << 16);
+                const unsigned qw = live ? q[(size_t)(n0 + r) * k8 + (gi >> 3)] : 0u;
+                if (live) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
+                        ws[r][c8 * 8 + j] =
+                            __half_as_ushort(__float2half_rn((float)nib * scf));
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        ws[r][c8 * 8 + j] = 0;
+                    }
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int ks = 0; ks < MMA_KC / 16; ++ks) {
+                const int kb = ks * 16;
+                const unsigned a0 = pk2bf(&xs[mt + g][kb + 2 * tt]);
+                const unsigned a1 = pk2bf(&xs[mt + g + 8][kb + 2 * tt]);
+                const unsigned a2 = pk2bf(&xs[mt + g][kb + 2 * tt + 8]);
+                const unsigned a3 = pk2bf(&xs[mt + g + 8][kb + 2 * tt + 8]);
+#pragma unroll
+                for (int nt = 0; nt < 1; ++nt) {
+                    const int nb = ntw + nt * 8;
+                    const unsigned b0 = pk2bf(&ws[nb + g][kb + 2 * tt]);
+                    const unsigned b1 = pk2bf(&ws[nb + g][kb + 2 * tt + 8]);
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3])
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                }
+            }
+        }
+        // 에필로그 — 원본 슬롯 행으로 기록(범위 가드).
+#pragma unroll
+        for (int nt = 0; nt < 1; ++nt) {
+            const int col = n0 + ntw + nt * 8 + 2 * tt;
+            const int r0 = mt + g;
+            if (rbase + r0 < cnt) {
+                const unsigned sl = gs[rbase + r0];
+                if (col < n) {
+                    out[(size_t)sl * n + col] = c[nt][0];
+                }
+                if (col + 1 < n) {
+                    out[(size_t)sl * n + col + 1] = c[nt][1];
+                }
+            }
+            if (rbase + r0 + 8 < cnt) {
+                const unsigned sl = gs[rbase + r0 + 8];
+                if (col < n) {
+                    out[(size_t)sl * n + col] = c[nt][2];
+                }
+                if (col + 1 < n) {
+                    out[(size_t)sl * n + col + 1] = c[nt][3];
+                }
             }
         }
     }
