@@ -1,85 +1,93 @@
 //! CPU matmul — 스레드 수 · 단행/배치 내적 + W4A16 split arm(분리 버퍼 디양자화).
 
+/// 가용 스레드 수(1회 캐시) — 종전 호출마다 available_parallelism(절반은
+/// /proc·sched_getaffinity 판독)이었다. [P12] OnceLock 상수화.
 pub fn n_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(32)
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(32)
+    })
 }
 use super::weight::Weight;
 use llm170_diag::profile_span;
+
+/// [P12] 상수 풀 실행 — GDN AR 풀 재사용(호출마다 thread::scope OS 스폰 제거).
+/// 잡이 'static이어야 하므로 호출자 소유 버퍼는 원시 포인터로 캡처하고,
+/// run_par가 전원 완료 카운터에 도달한 뒤에만 반환함으로써 수명을 증명한다
+/// (gdn::ar_pool 계약과 동일 — SAFETY는 각 호출부).
+fn run_rows(n: usize, job: impl Fn(usize) -> Box<dyn FnOnce() + Send + 'static>) {
+    crate::gdn::ar_pool::run_par(n, job);
+}
 
 pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
     profile_span!("cpu::matmul1");
     // W4A16 split(§3.5 A안 직접 로드) — 분리 버퍼 디양자화 + f32 내적.
     // f32 레퍼런스(비트 격리 계약은 quant lane 소관).
+    let n_in = w.n_in as usize;
+    let nt = n_threads().max(1).min(out.len().max(1));
+    let rows_per = out.len().div_ceil(nt).max(1);
+    let nch = out.len().div_ceil(rows_per);
     if w.ty == crate::wtype::WType::W4a16Split {
         let scale = w
             .aux
             .expect("w4a16 split: aux(scale) 필수 계약 — Model::w 보장");
-        let n_in = w.n_in as usize;
-        let nt = n_threads().max(1).min(out.len());
-        let rows_per = out.len().div_ceil(nt);
-        let mut chunks: Vec<&mut [f32]> = out.chunks_mut(rows_per).collect();
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for (lo, ch) in chunks.iter_mut().enumerate() {
-                let row0 = lo * rows_per;
-                handles.push(scope.spawn(move || {
-                    let mut scratch = vec![0.0f32; n_in];
-                    for (r, o) in ch.iter_mut().enumerate() {
-                        dequant_row_w4a16_split(
-                            w.data,
-                            scale,
-                            row0 + r,
-                            n_in,
-                            w.group,
-                            w.scale_bf16,
-                            &mut scratch,
-                        );
-                        let mut acc = 0.0f32;
-                        for i in 0..n_in {
-                            acc += x[i] * scratch[i];
-                        }
-                        *o = acc;
-                    }
-                }));
-            }
-            for h in handles {
-                h.join().unwrap();
-            }
-        });
-        return;
-    }
-    let n_in = w.n_in as usize;
-    let nt = n_threads().max(1).min(out.len());
-    let rows_per = out.len().div_ceil(nt);
-    let mut chunks: Vec<&mut [f32]> = out.chunks_mut(rows_per).collect();
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (lo, ch) in chunks.iter_mut().enumerate() {
-            let row0 = lo * rows_per;
-            handles.push(scope.spawn(move || {
+        let (dp, dl, sp, sl) = (
+            w.data.as_ptr() as usize,
+            w.data.len(),
+            scale.as_ptr() as usize,
+            scale.len(),
+        );
+        let (xp, xl) = (x.as_ptr() as usize, x.len());
+        let (op, olen) = (out.as_mut_ptr() as usize, out.len());
+        let (group, sbf) = (w.group, w.scale_bf16);
+        // SAFETY: op는 이 호출의 &mut out(길이 olen) — 잡은 run_rows(전원 완료
+        // 대기) 안에서만 실행되고 반환 전에 끝난다. dp/xp도 호출 내 수명.
+        run_rows(nch, move |g| {
+            Box::new(move || {
+                let data = unsafe { std::slice::from_raw_parts(dp as *const u8, dl) };
+                let scale = unsafe { std::slice::from_raw_parts(sp as *const u8, sl) };
+                let x = unsafe { std::slice::from_raw_parts(xp as *const f32, xl) };
+                let out = unsafe { std::slice::from_raw_parts_mut(op as *mut f32, olen) };
+                let row0 = g * rows_per;
+                let rows = olen.saturating_sub(row0).min(rows_per);
                 let mut scratch = vec![0.0f32; n_in];
-                for (r, o) in ch.iter_mut().enumerate() {
-                    crate::quant::dequant_row(
-                        w.ty,
-                        w.data,
-                        (row0 + r) as u64,
-                        w.n_in,
-                        &mut scratch,
-                    );
+                for r in 0..rows {
+                    dequant_row_w4a16_split(data, scale, row0 + r, n_in, group, sbf, &mut scratch);
                     let mut acc = 0.0f32;
                     for i in 0..n_in {
                         acc += x[i] * scratch[i];
                     }
-                    *o = acc;
+                    out[row0 + r] = acc;
                 }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
+            })
+        });
+        return;
+    }
+    let (dp, dl) = (w.data.as_ptr() as usize, w.data.len());
+    let (xp, xl) = (x.as_ptr() as usize, x.len());
+    let (op, olen) = (out.as_mut_ptr() as usize, out.len());
+    let (ty, n_in_w) = (w.ty, w.n_in);
+    // SAFETY: 위 split arm과 동일 계약(op = 이 호출의 &mut out).
+    run_rows(nch, move |g| {
+        Box::new(move || {
+            let data = unsafe { std::slice::from_raw_parts(dp as *const u8, dl) };
+            let x = unsafe { std::slice::from_raw_parts(xp as *const f32, xl) };
+            let out = unsafe { std::slice::from_raw_parts_mut(op as *mut f32, olen) };
+            let row0 = g * rows_per;
+            let rows = olen.saturating_sub(row0).min(rows_per);
+            let mut scratch = vec![0.0f32; n_in];
+            for r in 0..rows {
+                crate::quant::dequant_row(ty, data, (row0 + r) as u64, n_in_w, &mut scratch);
+                let mut acc = 0.0f32;
+                for i in 0..n_in {
+                    acc += x[i] * scratch[i];
+                }
+                out[row0 + r] = acc;
+            }
+        })
     });
 }
 
@@ -87,98 +95,59 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
 /// 행(o)별로 한 번 디양자화해 B 토큰과 내적 — prefill에서 디양자화 비용 상각.
 /// 스레드별 로컬 결과 [T][rows_per] → 조인 후 스캐터 (행 슬라이스 교차 차입 회피).
 pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
-    // W4A16 split(§3.5 A안) — 행별 1회 디양자화 후 T토큰 내적(일반 경로 미러).
-    if w.ty == crate::wtype::WType::W4a16Split {
-        let scale = w
-            .aux
-            .expect("w4a16 split: aux(scale) 필수 계약 — Model::w 보장");
-        profile_span!("cpu::matmulB");
-        let n_in = w.n_in as usize;
-        let n_out = w.n_out as usize;
-        let t = xs.len();
-        assert_eq!(outs.len(), t);
-        let nt = n_threads().max(1).min(n_out);
-        let rows_per = n_out.div_ceil(nt);
-        let mut locals: Vec<Vec<f32>> = vec![vec![0.0f32; t * rows_per]; nt];
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for (g, local) in locals.iter_mut().enumerate() {
-                let row0 = g * rows_per;
-                handles.push(scope.spawn(move || {
-                    let mut scratch = vec![0.0f32; n_in];
-                    let rows = n_out.saturating_sub(row0).min(rows_per);
-                    for r in 0..rows {
-                        dequant_row_w4a16_split(
-                            w.data,
-                            scale,
-                            row0 + r,
-                            n_in,
-                            w.group,
-                            w.scale_bf16,
-                            &mut scratch,
-                        );
-                        for (ti, x) in xs.iter().enumerate() {
-                            let mut acc = 0.0f32;
-                            for i in 0..n_in {
-                                acc += x[i] * scratch[i];
-                            }
-                            local[ti * rows_per + r] = acc;
-                        }
-                    }
-                }));
-            }
-            for h in handles {
-                h.join().unwrap();
-            }
-        });
-        for (g, local) in locals.iter().enumerate() {
-            let row0 = g * rows_per;
-            let rows = n_out.saturating_sub(row0).min(rows_per);
-            for ti in 0..t {
-                for r in 0..rows {
-                    outs[ti][row0 + r] = local[ti * rows_per + r];
-                }
-            }
-        }
-        return;
-    }
     profile_span!("cpu::matmulB");
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
     let t = xs.len();
     assert_eq!(outs.len(), t);
-    let nt = n_threads().max(1).min(n_out);
-    let rows_per = n_out.div_ceil(nt);
-
-    let mut locals: Vec<Vec<f32>> = vec![vec![0.0f32; t * rows_per]; nt];
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (g, local) in locals.iter_mut().enumerate() {
+    let nt = n_threads().max(1).min(n_out.max(1));
+    let rows_per = n_out.div_ceil(nt).max(1);
+    let nch = n_out.div_ceil(rows_per);
+    let mut locals: Vec<Vec<f32>> = vec![vec![0.0f32; t * rows_per]; nch];
+    let locals_base = locals.as_mut_ptr() as usize;
+    let lstride = t * rows_per;
+    let (dp, dl) = (w.data.as_ptr() as usize, w.data.len());
+    let (ty, n_in_w) = (w.ty, w.n_in);
+    let xp: Vec<usize> = xs.iter().map(|v| v.as_ptr() as usize).collect();
+    let xl = n_in;
+    let split = w.ty == crate::wtype::WType::W4a16Split;
+    let (sp, sl) = match w.aux {
+        Some(s) if split => (s.as_ptr() as usize, s.len()),
+        _ => (0usize, 0usize),
+    };
+    let (group, sbf) = (w.group, w.scale_bf16);
+    // SAFETY: locals_base는 이 호출의 로컬 버퍼(잡 g는 자기 몫 lstride만 접근) —
+    // run_rows(전원 완료 대기)가 반환 전 완료를 보장. dp/xp도 호출 내 수명.
+    run_rows(nch, move |g| {
+        let xp = xp.clone(); // 잡마다 복제(Fn 클로저는 캡처를 move할 수 없다)
+        Box::new(move || {
+            let data = unsafe { std::slice::from_raw_parts(dp as *const u8, dl) };
+            let local = unsafe {
+                std::slice::from_raw_parts_mut((locals_base as *mut f32).add(g * lstride), lstride)
+            };
+            let xsl: Vec<&[f32]> = xp
+                .iter()
+                .map(|&p| unsafe { std::slice::from_raw_parts(p as *const f32, xl) })
+                .collect();
             let row0 = g * rows_per;
-            handles.push(scope.spawn(move || {
-                let mut scratch = vec![0.0f32; n_in];
-                let rows = n_out.saturating_sub(row0).min(rows_per);
-                for r in 0..rows {
-                    crate::quant::dequant_row(
-                        w.ty,
-                        w.data,
-                        (row0 + r) as u64,
-                        w.n_in,
-                        &mut scratch,
-                    );
-                    for (ti, x) in xs.iter().enumerate() {
-                        let mut acc = 0.0f32;
-                        for i in 0..n_in {
-                            acc += x[i] * scratch[i];
-                        }
-                        local[ti * rows_per + r] = acc;
-                    }
+            let rows = n_out.saturating_sub(row0).min(rows_per);
+            let mut scratch = vec![0.0f32; n_in];
+            for r in 0..rows {
+                if split {
+                    let scale = unsafe { std::slice::from_raw_parts(sp as *const u8, sl) };
+                    dequant_row_w4a16_split(data, scale, row0 + r, n_in, group, sbf, &mut scratch);
+                } else {
+                    crate::quant::dequant_row(ty, data, (row0 + r) as u64, n_in_w, &mut scratch);
                 }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
+                for (ti, x) in xsl.iter().enumerate() {
+                    let mut acc = 0.0f32;
+                    for i in 0..n_in {
+                        acc += x[i] * scratch[i];
+                    }
+                    local[ti * rows_per + r] = acc;
+                }
+            }
+        })
     });
     for (g, local) in locals.iter().enumerate() {
         let row0 = g * rows_per;
