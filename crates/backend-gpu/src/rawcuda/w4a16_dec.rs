@@ -368,6 +368,7 @@ impl W4a16Dec {
                 "w4a16_gemm_bf16",
                 "w4a16_gemm_bf16_t",
                 "w4a16_gemm_bf16_mma",
+                "w4a16_gemm_g128_mma",
             ],
         )?;
         cc.load_fatbin(
@@ -1730,6 +1731,29 @@ impl W4a16Dec {
         t: usize,
     ) -> Result<(), String> {
         let (dq, ds, n, k) = self.lin_spec(name)?;
+        // [T1] split mma 경로(LLM170_TC=1, t≥16) — int4→f16 디퀀트+mma.
+        // A=xh(f16 — split 경로가 이미 f2h 캐스트 제공), 계약 완화 승인 후.
+        if t >= 16 && llm170_diag::flag::on_nonzero("LLM170_TC") {
+            let f = self.cc.function("w4a16_gemm_g128_mma")?;
+            let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, xh_dev, y_out);
+            let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+            let mut args: [*mut std::ffi::c_void; 7] = [
+                (&mut p_q) as *mut _ as *mut _,
+                (&mut p_s) as *mut _ as *mut _,
+                (&mut p_x) as *mut _ as *mut _,
+                (&mut p_y) as *mut _ as *mut _,
+                (&mut p_n) as *mut _ as *mut _,
+                (&mut p_k) as *mut _ as *mut _,
+                (&mut p_t) as *mut _ as *mut _,
+            ];
+            return self.cc.launch(
+                f,
+                t.div_ceil(32) as u32,
+                n.div_ceil(64) as u32,
+                256,
+                &mut args,
+            );
+        }
         let f = self.cc.function("w4a16_gemm_g128")?;
         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, xh_dev, y_out);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
@@ -2010,7 +2034,7 @@ impl W4a16Dec {
         // [T2] mma 경로(LLM170_TC=1, 기본 OFF) — bf16 mma GEMM(계약 완화 승인
         // 후 첫 본체). t≥16에서만(타일 M32 — 부분 타일은 가드로 동작하나 이득이
         // 작음). 토큰 수준 판정(플레인 계약).
-        if t >= 16 && llm170_diag::flag::ne0("LLM170_TC") {
+        if t >= 16 && llm170_diag::flag::on_nonzero("LLM170_TC") {
             {
                 static ONCE: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);

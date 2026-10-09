@@ -1,3 +1,5 @@
+#include <cuda_fp16.h>
+
 // ── W4A16(GPTQ4·g128·sym) GEMV/GEMM CUDA — 비트 계약: core dot_row_w4a16_lane ──
 // 산술 계약(crates/core/src/quant/lane.rs와 1:1):
 //  - 레인 l = 0..63: i = l, l+64, … f32 누산
@@ -526,6 +528,131 @@ extern "C" __global__ void w4a16_gemm_bf16_mma(
         }
     }
     // 에필로그 — 프래그먼트 규약 그대로 기록(범위 가드).
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+        const int col = n0 + ntw + nt * 8 + 2 * tt;
+        const int r0 = m0 + mt + g;
+        if (r0 < t) {
+            if (col < n) {
+                out[(size_t)r0 * n + col] = c[nt][0];
+            }
+            if (col + 1 < n) {
+                out[(size_t)r0 * n + col + 1] = c[nt][1];
+            }
+        }
+        if (r0 + 8 < t) {
+            if (col < n) {
+                out[(size_t)(r0 + 8) * n + col] = c[nt][2];
+            }
+            if (col + 1 < n) {
+                out[(size_t)(r0 + 8) * n + col + 1] = c[nt][3];
+            }
+        }
+    }
+}
+
+// ── T1(2026-10-09): split(g128·f16) mma GEMM — int4 디퀀트→f16→mma ──
+// ncu: split GEMM은 L1/명령 바운드(DRAM 3.7%·compute 46%) → mma 여지 큼.
+// A=xh(f16 — split 경로가 이미 f2h 캐스트 제공, 계약과 동일 값), B=디퀀트 f16.
+// 디퀀트는 marlin식 마법 상수: f16(1024+n) = 0x6400|n (n<16이 mantissa 하위
+// 비트에 정확히 더해짐) → w=(n−8)·s = (1024+n)·s − 1032·s = hfma2 1회.
+// 니블 순서는 __byte_perm으로 (e0,e1),(e2,e3) 정렬(8원소/u32당 ~8 op).
+// 타일·ldmatrix는 T2와 동일(M32×N64, k청크 64).
+extern "C" __global__ void w4a16_gemm_g128_mma(
+    const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
+    const unsigned short* __restrict__ s,  // [n][k/128] f16 스케일
+    const unsigned short* __restrict__ xh, // [t][k] f16 (cast_x32 동일 값)
+    float* __restrict__ out, int n, int k, int t)
+{
+    __shared__ unsigned short xs[MMA_M][MMA_KC + 8];
+    __shared__ unsigned short ws[MMA_N][MMA_KC + 8];
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.x * MMA_M;
+    const int n0 = blockIdx.y * MMA_N;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int g = lane >> 2;
+    const int tt = lane & 3;
+    const int mt = (warp >> 2) * 16;
+    const int ntw = (warp & 3) * 16;
+    const int k8 = k >> 3;
+    const int kg = k >> 7;
+    float c[2][4];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        ((float*)c)[i] = 0.0f;
+    }
+    for (int k0 = 0; k0 < k; k0 += MMA_KC) {
+        __syncthreads();
+        // xs: M32×64 f16 직접(uint4 = 8 f16)
+        for (int e = tid; e < MMA_M * MMA_KC / 8; e += 256) {
+            const int r = e >> 3;
+            const int c8 = e & 7;
+            unsigned short* dst = &xs[r][c8 * 8];
+            if (m0 + r < t && k0 + c8 * 8 + 7 < k) {
+                *reinterpret_cast<uint4*>(dst) =
+                    *reinterpret_cast<const uint4*>(&xh[(size_t)(m0 + r) * k + k0 + c8 * 8]);
+            } else {
+                for (int j = 0; j < 8; ++j) {
+                    dst[j] = (m0 + r < t && k0 + c8 * 8 + j < k)
+                        ? xh[(size_t)(m0 + r) * k + k0 + c8 * 8 + j]
+                        : (unsigned short)0;
+                }
+            }
+        }
+        // ws: 디퀀트(M64×64, 스레드당 8원소 = u32 1개)
+        for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
+            const int r = e >> 3;
+            const int c8 = e & 7;
+            const int gi = k0 + c8 * 8;
+            const bool live = (n0 + r < n) && (gi + 7 < k);
+            unsigned short scb = 0;
+            if (n0 + r < n) {
+                scb = s[(size_t)(n0 + r) * kg + (gi >> 7)];
+            }
+            const float scf = __half2float(*reinterpret_cast<const __half*>(&scb));
+            const unsigned s2 = (unsigned)scb | ((unsigned)scb << 16);
+            const __half2 ch = __float2half2_rn(-1032.0f * scf);
+            const unsigned qw = live ? q[(size_t)(n0 + r) * k8 + (gi >> 3)] : 0u;
+            const unsigned lo = (qw & 0x0F0F0F0Fu) | 0x64006400u;
+            const unsigned hi = ((qw >> 4) & 0x0F0F0F0Fu) | 0x64006400u;
+            const unsigned p01 = __byte_perm(lo, hi, 0x5410);
+            const unsigned p23 = __byte_perm(lo, hi, 0x7632);
+            const __half2 w0 = __hfma2(*reinterpret_cast<const __half2*>(&p01),
+                                       *reinterpret_cast<const __half2*>(&s2), ch);
+            const __half2 w1 = __hfma2(*reinterpret_cast<const __half2*>(&p23),
+                                       *reinterpret_cast<const __half2*>(&s2), ch);
+            if (live) {
+                *reinterpret_cast<unsigned*>(&ws[r][c8 * 8]) = *reinterpret_cast<const unsigned*>(&w0);
+                *reinterpret_cast<unsigned*>(&ws[r][c8 * 8 + 2]) = *reinterpret_cast<const unsigned*>(&w1);
+            } else {
+                ws[r][c8 * 8] = 0;
+                ws[r][c8 * 8 + 1] = 0;
+                ws[r][c8 * 8 + 2] = 0;
+                ws[r][c8 * 8 + 3] = 0;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int ks = 0; ks < MMA_KC / 16; ++ks) {
+            const int kb = ks * 16;
+            const int row = (lane & 15);
+            const int colblk = (lane & 16) ? 8 : 0;
+            unsigned a0, a1, a2, a3;
+            ldm_x4(a0, a1, a2, a3, &xs[mt + row][kb + colblk]);
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const int nb = ntw + nt * 8;
+                unsigned b0, b1;
+                ldm_x2t(b0, b1, &ws[nb + (lane & 7)][kb + ((lane & 8) ? 8 : 0)]);
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3])
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+        }
+    }
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
         const int col = n0 + ntw + nt * 8 + 2 * tt;
