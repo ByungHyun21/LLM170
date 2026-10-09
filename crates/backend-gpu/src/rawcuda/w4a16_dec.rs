@@ -56,6 +56,10 @@ impl GdnDims {
     }
 }
 
+/// KV 분할 attention(P8-attn-3) — 긴 컨텍스트에서 블록 수 = q_heads×S.
+/// lim ≤ 256(단문·골든 구간)은 종전 단일 블록 경로 그대로(비트 동일).
+pub const ATTN_SPLITS: usize = 8; // 진단
+
 /// 어텐션 형상(서버 등록 — d=256·rope 64차 고정 계약).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AttnDims {
@@ -279,6 +283,9 @@ pub struct W4a16Dec {
     dkin_a: CUdeviceptr,
     dvin_a: CUdeviceptr,
     dqh_a: CUdeviceptr,
+    /// P8-attn-3: KV 분할 attention 부분합 스크래치
+    /// ([T][q_heads][ATTN_SPLITS][258] f32 — m·l·acc256).
+    dattn_part: CUdeviceptr,
     doutv_a: CUdeviceptr,
     attn_t_cap: usize,
     // ── 디바이스 체인(S10 — 연산별 왕복 제거) ──
@@ -396,6 +403,8 @@ impl W4a16Dec {
                 "attn_prep",
                 "attn_prep_hostpos",
                 "attn_fwd3s",
+                "attn_fwd3s_part",
+                "attn_fwd3s_merge",
                 "attn_pos_bump",
             ],
         )?;
@@ -502,6 +511,7 @@ impl W4a16Dec {
             dvin_a: 0,
             dqh_a: 0,
             doutv_a: 0,
+            dattn_part: 0,
             attn_t_cap: 0,
             dres: 0,
             dab_dev: 0,
@@ -1171,6 +1181,7 @@ impl W4a16Dec {
                 &mut self.dvin_a,
                 &mut self.dqh_a,
                 &mut self.doutv_a,
+                &mut self.dattn_part,
             ],
             [
                 t_len * dm.qg_dim() * 4,
@@ -1178,6 +1189,7 @@ impl W4a16Dec {
                 t_len * dm.kv_dim() * 4,
                 t_len * dm.q_dim() * 4,
                 t_len * dm.q_dim() * 4,
+                t_len * dm.q_heads * ATTN_SPLITS * 258 * 4,
             ],
         )?;
         self.attn_t_cap = t_len;
@@ -1262,6 +1274,57 @@ impl W4a16Dec {
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
         if t_len == 0 || t_len > ATTN_F3S_TMAX {
             return Err(format!("attn fwd3s: T={t_len} — 소형 전용 도메인 위반"));
+        }
+        // [2026-10-09 P8-attn-3] KV 분할 경로 — lim = pp[0]+t+1 ≤ pos+t_len이므로
+        // pos+t_len > 256이면 분할(블록 q_heads×S). ≤256은 종전 단일 경로(골든
+        // 구간 비트 동일 — 단문/3토큰 프롬프트는 항상 이쪽).
+        let pos = self.slot_pos[slot] as usize;
+        if pos + t_len > 256 && self.dattn_part != 0 {
+            let fp = self.cc.function("attn_fwd3s_part")?;
+            let (mut tl, mut lay) = (t_len as i32, layer as i32);
+            let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
+            let mut sp = ATTN_SPLITS as i32;
+            let (mut f0, mut f1, mut f2, mut f3) = (
+                self.dqh_a,
+                self.attn_kv_ptr(slot),
+                self.attn_vc_ptr(slot),
+                self.dattn_part,
+            );
+            let mut f4 = self.attn_pp_ptr(slot);
+            let mut pa: [*mut std::ffi::c_void; 11] = [
+                (&mut f0) as *mut _ as *mut _,
+                (&mut f1) as *mut _ as *mut _,
+                (&mut f2) as *mut _ as *mut _,
+                (&mut f3) as *mut _ as *mut _,
+                (&mut f4) as *mut _ as *mut _,
+                (&mut tl) as *mut _ as *mut _,
+                (&mut lay) as *mut _ as *mut _,
+                (&mut qh) as *mut _ as *mut _,
+                (&mut kvh) as *mut _ as *mut _,
+                (&mut cp) as *mut _ as *mut _,
+                (&mut sp) as *mut _ as *mut _,
+            ];
+            self.cc.launch(
+                fp,
+                t_len as u32,
+                (dm.q_heads * ATTN_SPLITS) as u32,
+                256,
+                &mut pa,
+            )?;
+            let fm = self.cc.function("attn_fwd3s_merge")?;
+            let (mut mp, mut mg, mut mo) = (self.dattn_part, self.dqg_a, self.doutv_a);
+            let (mut tl2, mut qh2) = (t_len as i32, dm.q_heads as i32);
+            let mut ma: [*mut std::ffi::c_void; 6] = [
+                (&mut mp) as *mut _ as *mut _,
+                (&mut mg) as *mut _ as *mut _,
+                (&mut mo) as *mut _ as *mut _,
+                (&mut tl2) as *mut _ as *mut _,
+                (&mut qh2) as *mut _ as *mut _,
+                (&mut sp) as *mut _ as *mut _,
+            ];
+            return self
+                .cc
+                .launch(fm, t_len as u32, dm.q_heads as u32, 256, &mut ma);
         }
         let f = self.cc.function("attn_fwd3s")?;
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
