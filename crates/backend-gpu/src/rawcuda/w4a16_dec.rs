@@ -19,12 +19,12 @@ use crate::rawcuda::ffi::{self, CUdeviceptr};
 use std::collections::HashMap;
 
 /// fwd3s T 상한(assets/attn.cu ATTN_TMAX와 동일 값).
-pub // 커널 ATTN_TMAX와 동기(2026-10-09: 8→32 — 프리필 청크 확대).
-const ATTN_F3S_TMAX: usize = 32;
+// 커널 ATTN_TMAX와 동기(2026-10-09: 8→32→128 — P10 프리필 청크 확대).
+pub const ATTN_F3S_TMAX: usize = 128;
 /// 프리필 배치 상한 — 체인 버퍼·GEMM t 계약(attn fwd3s와 동일 상한).
-// 프리필 청크 상한 — 2026-10-09: 8→32(가중치 재사용 ↑). 플레인(MoE) 경로는
-// 배치 GEMM v2가 전 t를 커버, dense(split GEMM) 경로는 여전히 t≤8(체인 가드).
-pub const CHAIN_TMAX: usize = 32;
+// 프리필 청크 상한 — 2026-10-09: 8→32→128(P10 — 가중치 재사용 ↑). mma GEMM
+// (TC ON·t≥16)은 t 무제한, FFMA 폴백만 32 상한(chain_device_t 가드).
+pub const CHAIN_TMAX: usize = 128;
 /// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
 /// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — GDN_VSLICE=1 기준).
 pub const GDN_SCAN_SMEM: u32 = 61_828;
@@ -656,6 +656,8 @@ impl W4a16Dec {
             return Err(format!("gemv {name}: x={} != k={k}", x.len()));
         }
         if k > self.xh_cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?;
             if self.dxh != 0 {
                 self.cc.free(self.dxh)?;
             }
@@ -665,6 +667,8 @@ impl W4a16Dec {
             self.xh_cap = k;
         }
         if n > self.y_cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
             if self.dy != 0 {
                 self.cc.free(self.dy)?;
             }
@@ -675,6 +679,8 @@ impl W4a16Dec {
         }
         // P3-b: 신 GEMM은 f32 x 계약 — 호스트에서 h2f(f2h(v)) 동형 변환.
         if k > self.dx32_cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?;
             if self.dx32 != 0 {
                 self.cc.free(self.dx32)?;
             }
@@ -751,6 +757,8 @@ impl W4a16Dec {
     fn ensure_norm_bufs(&mut self, t_len: usize) -> Result<(), String> {
         let need = t_len * self.hidden;
         if need > self.norm_cap {
+            self.graph_invalidate(); // [P10] 재할당 — 캡처 옛 포인터 차단.
+            self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
             self.norm_cap = 0; // G1: 실패 시 재진입 보장(성공 뒤에만 갱신).
             realloc_fields(
                 |p| self.cc.free(p),
@@ -766,6 +774,8 @@ impl W4a16Dec {
     /// dx32(x32 버퍼) 용량 보장 — 융합 노름·cast_x32 공용.
     fn ensure_dx32(&mut self, n: usize) -> Result<CUdeviceptr, String> {
         if n > self.dx32_cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
             if self.dx32 != 0 {
                 self.cc.free(self.dx32)?;
             }
@@ -837,6 +847,8 @@ impl W4a16Dec {
 
     fn ensure_ew_bufs(&mut self, n: usize) -> Result<(), String> {
         if n > self.ew_cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
             self.ew_cap = 0; // G1
             realloc_fields(
                 |p| self.cc.free(p),
@@ -934,6 +946,8 @@ impl W4a16Dec {
         }
         let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
         let (hd, cch, kl, vl) = (dm.hidden, dm.conv_ch(), dm.k_len(), dm.v_len());
+        self.graph_invalidate(); // [P10]
+        self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
         self.gdn_t_cap = 0; // G1: 실패 시 재진입 보장.
         realloc_fields(
             |p| self.cc.free(p),
@@ -1292,6 +1306,8 @@ impl W4a16Dec {
             return Ok(());
         }
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        self.graph_invalidate(); // [P10]
+        self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
         self.attn_t_cap = 0; // G1: 실패 시 재진입 보장.
         realloc_fields(
             |p| self.cc.free(p),
@@ -1821,6 +1837,8 @@ impl W4a16Dec {
         // 배치 프리필(t≤CHAIN_TMAX)까지 수용 — 버퍼는 t배 폭으로 잡는다
         // (t=1 경로는 오프셋 0만 사용하므로 동작 불변).
         let tb = CHAIN_TMAX;
+        self.graph_invalidate(); // [P10]
+        self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
         let [c0, c1, c2, c3, c4] = &mut self.dchain;
         realloc_fields(
             |p| self.cc.free(p),
@@ -1848,6 +1866,10 @@ impl W4a16Dec {
     /// (q/k/v·gate/up: 종전 gemv마다 캐스트 = 런치 2배). 반환은 self.dx32.
     fn cast_x32(&mut self, x_dev: CUdeviceptr, k: usize) -> Result<CUdeviceptr, String> {
         if k > self.dx32_cap {
+            // [P10] 재할당 전 무효화+동기 — 프리필 cast_x32(t×k) 성장이
+            // 비행 중 norm xn32 기록을 해제 버퍼로 보낸다(새니타이저 실측).
+            self.graph_invalidate();
+            self.cc.sync()?;
             if self.dx32 != 0 {
                 self.cc.free(self.dx32)?;
             }
@@ -1933,6 +1955,8 @@ impl W4a16Dec {
         mn = mn.max(self.hidden).max(self.n_experts);
         let need = t * mn;
         if need > self.dyt_cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
             if self.dyt != 0 {
                 self.cc.free(self.dyt)?;
             }
@@ -1943,6 +1967,8 @@ impl W4a16Dec {
         }
         // 배치 캐스트 입력(xh: t×k f16)도 함께 보장.
         if t * mk > self.xh_cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?;
             if self.dxh != 0 {
                 self.cc.free(self.dxh)?;
             }
@@ -1987,6 +2013,8 @@ impl W4a16Dec {
     /// dy 버퍼 보장(n f32).
     fn ensure_dy(&mut self, n: usize) -> Result<CUdeviceptr, String> {
         if n > self.y_cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
             if self.dy != 0 {
                 self.cc.free(self.dy)?;
             }
@@ -2408,6 +2436,8 @@ impl W4a16Dec {
         // 전문가 최대 행렬 = h×n_ff(gate/up) = h×n_ff(down) — 동일 크기.
         let pk = h * n_ff / 2;
         let sk = h * n_ff / self.moe_group * 2;
+        self.graph_invalidate(); // [P10]
+        self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
         realloc_fields(
             |p| self.cc.free(p),
             |b| self.cc.alloc(b),
@@ -3176,6 +3206,8 @@ impl W4a16Dec {
                 self.gemv_dev_x32(&lo, x32b)
                     .map_err(|e| format!("L{il} {lo}: {e}"))?
             };
+            // [P10] cast_x32(ko) 재할당 대비 — 현재 dx32 재확인(위 주석 참조).
+            let x32 = self.ensure_dx32(self.hidden)?;
             let xn2 = self
                 .norm_resid_dev(2 * il + 1, self.dres, out, 1, x32)
                 .map_err(|e| format!("L{il} post norm: {e}"))?;
@@ -3252,6 +3284,19 @@ impl W4a16Dec {
             && (self.n_experts == 0 || self.moe_resident)
     }
 
+    /// 캡처 그래프 무효화 — 버퍼 재할당 시 옛 포인터 replay를 차단한다
+    /// (다음 디코드가 재캡처). 재할당은 캡처 밖(프리필·업로드)에서만 일어난다.
+    /// [P10 실측 2026-10-09] 워밍업 t=16 캡처 → t=128 프리필이 norm 버퍼를
+    /// 재할당 → replay가 해제 주소에 기록(norm_resid OOB) → CUDA 700.
+    fn graph_invalidate(&mut self) {
+        if !self.graph_exec.is_null() {
+            let _ = self.cc.graph_destroy(self.graph_exec, self.graph_handle);
+            self.graph_exec = std::ptr::null_mut();
+            self.graph_handle = std::ptr::null_mut();
+            self.graph_slot = usize::MAX;
+        }
+    }
+
     /// 캡처 전 버퍼 워밍업 — **불변식: 체인에서 지연 할당되는 모든 버퍼는
     /// 여기서 선할당한다.** 캡처 중 `cuMemAlloc`은 금지 API라 드라이버가
     /// instantiate에서 SIGSEGV로 죽는다(2026-10-08 실측 — gemv dx32/dy 누락이
@@ -3265,15 +3310,24 @@ impl W4a16Dec {
             // P1: MoE 상주 체인의 지연 할당원(drt/dexp_*/dmo/moe_idx/moe_wt).
             self.ensure_moe_bufs()?;
         }
-        self.ensure_norm_bufs(1)?;
-        self.ensure_gdn_bufs(1)?;
-        self.ensure_attn_bufs(1)?;
+        // [P10] t=1이 아니라 **최대 청크(CHAIN_TMAX)** 로 선할당 — 그래프는
+        // 캡처 시점의 포인터를 기록하므로, 이후 프리필이 버퍼를 재할당하면
+        // replay가 해제 주소를 쓴다(위 graph_invalidate 주석의 실측 결함).
+        self.ensure_norm_bufs(CHAIN_TMAX)?;
+        self.ensure_gdn_bufs(CHAIN_TMAX)?;
+        self.ensure_attn_bufs(CHAIN_TMAX)?;
+        self.ensure_dyt(CHAIN_TMAX)?;
         let (mut mk, mut mn) = (0usize, 0usize);
         for &(_, _, n, k) in self.lins.values() {
             mk = mk.max(k);
             mn = mn.max(n);
         }
+        // 프리필 norm 융합(ensure_dx32(t*h))과 FFN 캐스트(cast_x32(t×k))를
+        // 모두 커버 — 캡처 후 재할당(재캡처·옛 포인터)을 봉인한다.
+        mk = mk.max(CHAIN_TMAX * mk.max(self.hidden));
         if mk > self.dx32_cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?;
             if self.dx32 != 0 {
                 self.cc.free(self.dx32)?;
             }
@@ -3283,6 +3337,8 @@ impl W4a16Dec {
             self.dx32_cap = mk;
         }
         if mn > self.y_cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?;
             if self.dy != 0 {
                 self.cc.free(self.dy)?;
             }
@@ -3441,9 +3497,13 @@ impl W4a16Dec {
         let mut gi = 0usize;
         // 플레인(MoE) 모드 — bf16 GEMM(x 원시 f32), FFN은 MoE 배치.
         let plain = self.plain_weights;
-        // dense(split GEMM) 경로 상한 = 커널 G4_GTMAX(32) — 초과는 거부.
-        if !plain && t > 32 {
-            return Err(format!("chain_device_t: dense 경로 t={t} > 32(가드)"));
+        // [P10] GEMM 상한 — mma 경로(TC ON·t≥16)는 t 무제한, FFMA 폴백
+        // 커널(G4_GTMAX/G4_TMAX2=32)만 32 상한. 폴백으로 t>32를 태우지 않는다.
+        let gemm_mma = t >= 16 && llm170_diag::flag::ne0("LLM170_TC");
+        if t > 32 && !gemm_mma {
+            return Err(format!(
+                "chain_device_t: t={t} > 32 — FFMA 폴백 상한(TC=0 진단 또는 t<16)"
+            ));
         }
         for il in 0..self.n_layers {
             let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };
@@ -3493,6 +3553,10 @@ impl W4a16Dec {
                 let xh2 = self.cast_x32(branch, t * ko)?;
                 self.gemm_launch(&lo, xh2, dyt, t)?;
             }
+            // [P10] cast_x32(t×ko)가 dx32를 재할당했을 수 있다 — 노름 융합
+            // 기록(xn32)은 **현재** 포인터를 다시 확인한다. 옛 포인터를 계속
+            // 쓰면 비행 커널이 해제 버퍼에 기록한다(새니타이저 OOB 실측).
+            let xh = self.ensure_dx32(t * h)?;
             let xn2 = self
                 .norm_resid_dev(2 * il + 1, self.dres, dyt, t, xh)
                 .map_err(|e| format!("T{il} post norm: {e}"))?;
