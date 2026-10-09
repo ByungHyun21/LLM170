@@ -65,7 +65,10 @@ __device__ __forceinline__ double ew_exp_d(double x)
 
 __device__ __forceinline__ float ew_expf(float x)
 {
-    return (float)ew_exp_d((double)x);
+    // [계약 완화 2026-10-09] 종전 f64 트윈(ew_exp_d) — 독립 벤치 실측
+    // (--bench-ew, n=245760): 0.015ms/발사(197GB/s) vs __expf 0.004ms(722GB/s)
+    // = 커널 3.7×. 허용오차 등급(골든·장문 토큰 판정 통과).
+    return __expf(x);
 }
 
 // ── ew 본체(구 rawhip 커널 L898-908 직이식, exp만 트윈 치환) ──

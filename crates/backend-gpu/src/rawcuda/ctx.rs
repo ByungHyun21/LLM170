@@ -13,6 +13,10 @@ pub const PROF_CATS: [&str; 13] = [
     "gate",
 ];
 
+/// [진단] 호스트 발사 누적 — (ns, calls). launch가 갱신, 보고가 판독.
+pub static HOST_LAUNCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static HOST_LAUNCH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 심볼명 → 범주 인덱스(순서 주의: moe를 gemv보다 먼저 검사).
 pub fn prof_cat(name: &str) -> usize {
     if name.contains("scan") {
@@ -353,6 +357,10 @@ impl CudaCtx {
         block: u32,
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
+        // [진단] 호스트 발사 비용·횟수 — LLM170_TIME 보고에 합산(프로파일러가
+        // 발사 '전'에만 이벤트를 기록하므로 갭이 직전 커널에 귀속되는 문제의
+        // 실체 판정용).
+        let t0 = std::time::Instant::now();
         self.prof_mark(f);
         // SAFETY: f는 function()이 돌려준 유효 핸들, args 포인터들은
         // 호출 시점까지 유효한 스택 로컬(호출자 계약).
@@ -374,7 +382,20 @@ impl CudaCtx {
                 return Err(format!("rawcuda: cuLaunchKernel: {}", ffi::err_text(r)));
             }
         }
+        HOST_LAUNCH_NS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        HOST_LAUNCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// 호스트 발사 누적(진단): (ns, calls).
+    pub fn host_launch_stats() -> (u64, u64) {
+        (
+            HOST_LAUNCH_NS.load(std::sync::atomic::Ordering::Relaxed),
+            HOST_LAUNCH_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// 함수 속성: 동적 공유메모리 상한 opt-in(정적 48KB 초과 커널 —
@@ -886,6 +907,16 @@ impl CudaCtx {
                 ));
             }
         }
+        out.push_str(&format!(
+            " · [host] {:.2}ms/{}회(평균 {:.1}µs)",
+            HOST_LAUNCH_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+            HOST_LAUNCH_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            HOST_LAUNCH_NS.load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1e3
+                / HOST_LAUNCH_CALLS
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(1) as f64
+        ));
         drop(evs);
         drop(cats);
         for ev in self.prof.evs.borrow_mut().drain(..) {
