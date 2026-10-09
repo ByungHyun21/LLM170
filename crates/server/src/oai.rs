@@ -733,6 +733,7 @@ fn run_and_emit(
         .max()
         .unwrap_or(0);
     let mut stopped = false;
+    let mut scan_from = 0usize;
     for t in prx {
         // 정지 토큰은 텍스트로 방출하지 않는다(비스트림은 finish_slot이
         // 트림하지만 스트림 델타는 여기서 걸러야 새어나가지 않는다).
@@ -740,8 +741,9 @@ fn run_and_emit(
             break;
         }
         ntok += 1;
+        let before = acc.len();
         acc.push_str(&det.push(t));
-        if let Some((p, l)) = earliest_stop(&acc, &fmt.stop_strs) {
+        if let Some((p, l)) = earliest_stop(&acc, &fmt.stop_strs, scan_from) {
             let end = if fmt.include_stop { p + l } else { p };
             if end > emitted {
                 let piece = crate::json::esc(&acc[emitted..end]);
@@ -755,6 +757,7 @@ fn run_and_emit(
             stopped = true;
             break; // prx drop → 기존 cancelled 경로로 슬롯 회수
         }
+        scan_from = before.saturating_sub(holdback);
         let safe = floor_char_boundary(&acc, acc.len().saturating_sub(holdback));
         if safe > emitted {
             let piece = crate::json::esc(&acc[emitted..safe]);
@@ -870,16 +873,22 @@ fn jcontent(o: &str) -> Option<String> {
 }
 
 /// 스트림 누적 텍스트에서 stop 문자열 최초 등장 — (바이트 위치, 길이).
-fn earliest_stop(acc: &str, stops: &[String]) -> Option<(usize, usize)> {
+/// [2026-10-09 D4] from = 이번 라운드 이전에 이미 스캔한 접두(의미상 확정된
+/// 부분). 이전 라운드에서 매치가 없었다면 새 매치는 `old_len - (최장 stop-1)`
+/// 이후에서만 시작할 수 있다(그보다 앞이면 이전 스캔이 이미 찾았어야 함) —
+/// 호출자가 그 값을 넘긴다. 종전엔 토큰마다 누적 전체를 재스캔했다(O(N²)).
+fn earliest_stop(acc: &str, stops: &[String], from: usize) -> Option<(usize, usize)> {
+    let base = from.min(acc.len());
     let mut best: Option<(usize, usize)> = None;
     for s in stops {
         if s.is_empty() {
             continue;
         }
-        if let Some(p) = acc.find(s.as_str())
-            && best.is_none_or(|(bp, _)| p < bp)
-        {
-            best = Some((p, s.len()));
+        if let Some(p) = acc[base..].find(s.as_str()) {
+            let p = base + p;
+            if best.is_none_or(|(bp, _)| p < bp) {
+                best = Some((p, s.len()));
+            }
         }
     }
     best
@@ -949,12 +958,17 @@ fn run_and_emit_anthropic(
         let mut acc = String::new();
         let mut sent = 0usize;
         let mut stopped = false;
+        // [D4] stop 스캔 창 — 이전 스캔 접두(최장 stop-1 이전) 재스캔 금지.
+        let hb = stop_strs.iter().map(|s| s.len()).max().unwrap_or(0);
+        let holdback = hb.saturating_sub(1);
+        let mut scan_from = 0usize;
         for t in prx {
             if t == llm170_core::qwen35::EOS_EOT || t == STOP_EOT {
                 break; // 정지 토큰 미방출(스트림 델타)
             }
+            let before = acc.len();
             acc.push_str(&det.push(t));
-            if let Some((sp, _)) = earliest_stop(&acc, &stop_strs) {
+            if let Some((sp, _)) = earliest_stop(&acc, &stop_strs, scan_from) {
                 if sp > sent {
                     let esc = crate::json::esc(&acc[sent..sp]);
                     let _ = sse(
@@ -968,6 +982,7 @@ fn run_and_emit_anthropic(
                 stopped = true;
                 break;
             }
+            scan_from = before.saturating_sub(holdback);
             let hold = stop_strs
                 .iter()
                 .map(|s| s.len().saturating_sub(1))
@@ -1044,7 +1059,7 @@ fn run_and_emit_anthropic(
     let mut det = crate::engine::Detok::new();
     let mut text: String = all.iter().map(|&t| det.push(t)).collect();
     // A14: stop_sequences 절단(비스트림) — stop 본문 미포함이 Anthropic 규약.
-    let stopped = earliest_stop(&text, &stop_strs);
+    let stopped = earliest_stop(&text, &stop_strs, 0);
     if let Some((sp, _)) = stopped {
         text.truncate(sp);
     }
@@ -1175,13 +1190,15 @@ mod http_tests {
     #[test]
     fn earliest_stop_boundaries() {
         let stops = vec!["AB".to_string()];
-        assert_eq!(earliest_stop("xxAByy", &stops), Some((2, 2)));
-        assert_eq!(earliest_stop("", &stops), None);
+        assert_eq!(earliest_stop("xxAByy", &stops, 0), Some((2, 2)));
+        assert_eq!(earliest_stop("", &stops, 0), None);
         // 빈 stop은 무시(무한 절단 방지 계약)
-        assert_eq!(earliest_stop("any", &[String::new()]), None);
+        assert_eq!(earliest_stop("any", &[String::new()], 0), None);
         // 가장 이른 등장 선택
         let two = vec!["YY".to_string(), "XX".to_string()];
-        assert_eq!(earliest_stop("aXXbYY", &two), Some((1, 2)));
+        assert_eq!(earliest_stop("aXXbYY", &two, 0), Some((1, 2)));
+        // D4 창 경계 — from 이후에서도 절대 위치를 돌려준다.
+        assert_eq!(earliest_stop("aXXbYY", &two, 2), Some((4, 2)));
     }
 
     #[test]
