@@ -9,7 +9,10 @@
 #   4. D(35B-A3B INT4 g32): 참조(CPU) MoE 오라클 — W4-1(2026-10-08) g32/bf16
 #      전문가 + 라우터 top-8·shared 게이트. 골든 접두 일치 + 로드 완전성.
 #   5. D2(35B) GPU 체인(MoE) — w4a16-gpu 골든 접두(플레인 bf16 + 전문가 상주).
-#   6. E(FN FP8PLE): 자원 가드 명시 거부(120GiB > 호스트).
+#   6. D3(35B) 다중 청크(35토큰 = 32+3) — 배치 프리필 t≤32의 CPU/GPU 골든.
+#      (2026-10-09 교훈: 3토큰 케이스는 단일 청크만 탄다 — 다중 청크를 상시
+#       검증한다. 이 케이스가 gdn_exp 도메인 결함을 잡는 그물이다.)
+#   7. E(FN FP8PLE): 자원 가드 명시 거부(120GiB > 호스트).
 # 사용법: scripts/swap_models.sh
 set -u
 cd "$(dirname "$0")/.."
@@ -17,6 +20,9 @@ BIN=./target/release/llm170
 GOLDEN="156037,16072,154029,209495,30"
 # W4-1 MoE(35B-A3B g32) — 참조 골든 접두(2026-10-09 확정).
 GOLDEN35="156037,16072,154029,156504,30"
+# 다중 청크(35토큰)골든 — CPU·GPU 동일 실측(2026-10-09).
+GOLDEN35L="271,248068,271,248069,271,168951,227596,149285,65233"
+P35L="148678,65233,202419,156037,16072,154029,156504,30,149285,65233,195939,149820,152091,150868,54581,155180,177992,12434,170819,149820,152091,16869,201523,229231,204817,13,153343,51643,155497,171699,25845,159667,32762,189291,13"
 # A2: 동시 실행 충돌 방지 — 실행별 런 디렉터리·포트(고정 18210/고정 파일명 해소).
 mkdir -p /tmp/opencode
 RUN=$(mktemp -d /tmp/opencode/w4a16-smoke.XXXXXX)
@@ -30,7 +36,7 @@ fail=0
 note() { echo "[w4a16] $*"; }
 
 # ── 1. A(27B) 참조 토큰 ──
-note "[1/6] A(27B) 참조 실행 — w4a16-ref"
+note "[1/7] A(27B) 참조 실행 — w4a16-ref"
 timeout 900 "$BIN" w4a16-ref "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/a.out" 2> "$RUN/a.log"
 A=$(grep -m1 '^tokens:' "$RUN/a.out" | sed 's/^tokens: //')
@@ -41,7 +47,7 @@ case "$A" in
 esac
 
 # ── 2. B(27B) GPU 체인 ──
-note "[2/6] B(27B) GPU 체인 — w4a16-gpu"
+note "[2/7] B(27B) GPU 체인 — w4a16-gpu"
 timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/b.out" 2> "$RUN/b.log"
 B=$(grep -m1 '^ tokens:' "$RUN/b.out" | sed 's/^ tokens: //')
@@ -52,7 +58,7 @@ case "$B" in
 esac
 
 # ── 3. C(27B) serve HTTP 종단 ──
-note "[3/6] C(27B) serve HTTP — runtime=cuda + 골든 접두"
+note "[3/7] C(27B) serve HTTP — runtime=cuda + 골든 접두"
 : > "$RUN/c.log"
 "$BIN" serve --model "$M_27B" --ctx 1024 --slots 1 --port "$PORT" > "$RUN/c.log" 2>&1 &
 SERVE_PID=$!
@@ -85,7 +91,7 @@ case "$C" in
 esac
 
 # ── 4. D(35B INT4 g32) 참조 오라클(W4-1 MoE) ──
-note "[4/6] D(35B INT4 g32) 참조 실행 — w4a16-ref (MoE g32/bf16)"
+note "[4/7] D(35B INT4 g32) 참조 실행 — w4a16-ref (MoE g32/bf16)"
 timeout 2400 "$BIN" w4a16-ref "$M_35B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/d.out" 2> "$RUN/d.log"
 D=$(grep -m1 '^tokens:' "$RUN/d.out" | sed 's/^tokens: //')
@@ -96,7 +102,7 @@ case "$D" in
 esac
 
 # ── 5. D2(35B INT4 g32) GPU 체인(MoE) ──
-note "[5/6] D2(35B) GPU 체인 — w4a16-gpu (MoE)"
+note "[5/7] D2(35B) GPU 체인 — w4a16-gpu (MoE)"
 timeout 1800 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/d2.out" 2> "$RUN/d2.log"
 D2=$(grep -m1 '^ tokens:' "$RUN/d2.out" | sed 's/^ tokens: //')
@@ -106,8 +112,27 @@ case "$D2" in
   *) echo "[w4a16] FAIL: 35B GPU 골든 불일치: $(echo "$D2" | head -c 60)"; fail=1;;
 esac
 
-# ── 6. E(FN FP8PLE) 자원 가드 명시 거부 ──
-note "[6/6] E(FN FP8PLE) 자원 가드 명시 거부 판정"
+# ── 6. D3(35B) 다중 청크(35토큰) — 배치 프리필 t≤32 CPU/GPU 골든 ──
+note "[6/7] D3(35B) 다중 청크 — 참조(CPU) + GPU (배치 t≤32)"
+timeout 2400 "$BIN" w4a16-ref "$M_35B" --prompt-tokens "$P35L" --n-predict 8 --ctx 1024 \
+  > "$RUN/d3a.out" 2> "$RUN/d3a.log"
+DA=$(grep -m1 '^tokens:' "$RUN/d3a.out" | sed 's/^tokens: //')
+case "$DA" in
+  "$GOLDEN35L"*) note "긴 프롬프트 참조 OK: $(echo "$DA" | head -c 50)";;
+  "") echo "[w4a16] FAIL: 긴 참조 실패 — ${RUN}/d3a.log"; fail=1;;
+  *) echo "[w4a16] FAIL: 긴 참조 골든 불일치: $(echo "$DA" | head -c 50)"; fail=1;;
+esac
+timeout 900 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens "$P35L" --n-predict 8 --ctx 1024 \
+  > "$RUN/d3b.out" 2> "$RUN/d3b.log"
+DB=$(grep -m1 '^ tokens:' "$RUN/d3b.out" | sed 's/^ tokens: //')
+case "$DB" in
+  "$GOLDEN35L"*) note "긴 프롬프트 GPU OK: $(echo "$DB" | head -c 50)";;
+  "") echo "[w4a16] FAIL: 긴 GPU 실패 — ${RUN}/d3b.log"; fail=1;;
+  *) echo "[w4a16] FAIL: 긴 GPU 골든 불일치: $(echo "$DB" | head -c 50)"; fail=1;;
+esac
+
+# ── 7. E(FN FP8PLE) 자원 가드 명시 거부 ──
+note "[7/7] E(FN FP8PLE) 자원 가드 명시 거부 판정"
 if timeout 60 "$BIN" w4a16-load "$M_FN" > "$RUN/e.log" 2>&1; then
   echo "[w4a16] FAIL: 가드가 통과시킴(120GiB) — ${RUN}/e.log"; fail=1
 elif grep -qE "insufficient resources|rsrc-guard" "$RUN/e.log"; then
