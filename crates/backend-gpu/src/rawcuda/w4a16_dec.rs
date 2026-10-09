@@ -185,6 +185,15 @@ fn asset_bytes(env: &str, rel: &[&str]) -> Result<Vec<u8>, String> {
     Err(format!("자산 부재 — {rel:?} 또는 {env}"))
 }
 
+/// [A8] 캡처 그래프 1개 — (slot, head, argmax)가 캐시 키.
+struct GraphEntry {
+    exec: ffi::CUgraphExec,
+    handle: ffi::CUgraph,
+    slot: usize,
+    head: bool,
+    argmax: bool,
+}
+
 pub struct W4a16Dec {
     pub cc: CudaCtx,
     pub hidden: usize,
@@ -328,14 +337,11 @@ pub struct W4a16Dec {
     /// [P3] argmax 결과(u32 1개) — 그래프 4B readback 대상.
     argmax_out: CUdeviceptr,
     // ── CUDA Graph(체인 캡처 — 토큰당 1 launch) ──
-    graph_exec: ffi::CUgraphExec,
-    graph_handle: ffi::CUgraph,
-    /// 캡처된 슬롯(usize::MAX = 없음).
-    graph_slot: usize,
-    /// 캡처에 head 포함 여부(모드 전환 시 재캡처).
-    graph_head: bool,
-    /// [P3] 캡처에 argmax 포함 여부(head 대신 4B d2h) — 세 번째 모드.
-    graph_argmax: bool,
+    /// [A8 2026-10-09] 슬롯·모드별 캡처 exec 캐시 — 종전 단일 그래프를
+    /// 슬롯/모드 전환마다 destroy+재캡처(다중 슬롯 틱마다 수 ms)했고, 이
+    /// 캐시가 그 비용을 1회 캡처로 상각한다. 키 = (slot, head, argmax).
+    /// 버퍼 재할당(graph_invalidate) 시 전량 폐기(옛 포인터 replay 차단).
+    graph_cache: Vec<GraphEntry>,
     /// 캡처 실패 후 직접 경로 고정(매 토큰 재시도 방지).
     graph_failed: bool,
     /// 캡처 중 임베딩 복사 소스를 pinned로 고정(캡처는 pageable async 불가).
@@ -567,11 +573,7 @@ impl W4a16Dec {
             head_k: 0,
             head_out: 0,
             argmax_out: 0,
-            graph_exec: std::ptr::null_mut(),
-            graph_handle: std::ptr::null_mut(),
-            graph_slot: usize::MAX,
-            graph_head: false,
-            graph_argmax: false,
+            graph_cache: Vec::new(),
             graph_failed: false,
             capture_pinned_src: false,
             pin_embed: std::ptr::null_mut(),
@@ -3399,11 +3401,9 @@ impl W4a16Dec {
     /// [P10 실측 2026-10-09] 워밍업 t=16 캡처 → t=128 프리필이 norm 버퍼를
     /// 재할당 → replay가 해제 주소에 기록(norm_resid OOB) → CUDA 700.
     fn graph_invalidate(&mut self) {
-        if !self.graph_exec.is_null() {
-            let _ = self.cc.graph_destroy(self.graph_exec, self.graph_handle);
-            self.graph_exec = std::ptr::null_mut();
-            self.graph_handle = std::ptr::null_mut();
-            self.graph_slot = usize::MAX;
+        // [A8] 캐시 전량 폐기 — 옛 포인터를 기록한 exec는 replay 금지.
+        for e in self.graph_cache.drain(..) {
+            let _ = self.cc.graph_destroy(e.exec, e.handle);
         }
     }
 
@@ -3469,22 +3469,22 @@ impl W4a16Dec {
         Ok(())
     }
 
-    /// 그래프 준비(슬롯·head 모드별 1회) — 버퍼 워밍업 → 캡처 → 인스턴스화.
+    /// 그래프 준비 — 캐시 히트면 즉시 exec 반환(A8, 슬롯/모드별 1회 캡처).
+    /// 미스 시 버퍼 워밍업 → 캡처 → 인스턴스화 → 캐시 등록.
     /// 캡처 중 금지 API(동기 복사·alloc)를 배제하기 위해 ensure_*를 선행한다.
-    fn ensure_graph(&mut self, slot: usize, head: bool, argmax: bool) -> Result<(), String> {
-        if !self.graph_exec.is_null()
-            && self.graph_slot == slot
-            && self.graph_head == head
-            && self.graph_argmax == argmax
+    fn ensure_graph(
+        &mut self,
+        slot: usize,
+        head: bool,
+        argmax: bool,
+    ) -> Result<ffi::CUgraphExec, String> {
+        // [A8] 캐시 히트 — 슬롯/모드 전환 재캡처 제거.
+        if let Some(e) = self
+            .graph_cache
+            .iter()
+            .find(|e| e.slot == slot && e.head == head && e.argmax == argmax)
         {
-            return Ok(());
-        }
-        if !self.graph_exec.is_null() {
-            // 슬롯/모드 전환 — 이전 그래프 폐기 후 재캡처.
-            self.cc.graph_destroy(self.graph_exec, self.graph_handle)?;
-            self.graph_exec = std::ptr::null_mut();
-            self.graph_handle = std::ptr::null_mut();
-            self.graph_slot = usize::MAX;
+            return Ok(e.exec);
         }
         self.warm_for_capture()?;
         // 2) 실스트림·pinned 1회 준비.
@@ -3554,22 +3554,35 @@ impl W4a16Dec {
         }
         let g = self.cc.capture_end()?;
         let e = self.cc.graph_instantiate(g)?;
-        self.graph_handle = g;
-        self.graph_exec = e;
-        self.graph_slot = slot;
-        self.graph_head = head;
-        self.graph_argmax = argmax;
+        // [A8] 캐시 등록 — 상한 = 슬롯×모드 3종(방어적으로 초과 시 최古 폐기).
+        let cap = self.n_slots.max(1) * 3;
+        if self.graph_cache.len() >= cap {
+            let old = self.graph_cache.remove(0);
+            let _ = self.cc.graph_destroy(old.exec, old.handle);
+        }
+        self.graph_cache.push(GraphEntry {
+            exec: e,
+            handle: g,
+            slot,
+            head,
+            argmax,
+        });
         // 캡처 성공 1회 로그 — 경로 가시화(MoE 상주 = P1 개방분 포함).
         eprintln!(
             "[graph] captured slot={slot} head={head} argmax={argmax} moe_resident={}",
             self.moe_resident
         );
-        Ok(())
+        Ok(e)
     }
 
     /// 그래프 replay — pinned 입력 기입 → dpp 1회 갱신 → launch 1회 → sync →
     /// pinned 출력 회수. 반환: head 모드면 로짓, 아니면 xn.
-    fn graph_replay(&mut self, slot: usize, embed_row: &[f32]) -> Result<Vec<f32>, String> {
+    fn graph_replay(
+        &mut self,
+        exec: ffi::CUgraphExec,
+        slot: usize,
+        embed_row: &[f32],
+    ) -> Result<Vec<f32>, String> {
         let pos = self.slot_pos[slot];
         // SAFETY: pinned 버퍼는 hidden*4/n_slots*4 크기 계약(ensure_graph 할당).
         unsafe {
@@ -3589,7 +3602,7 @@ impl W4a16Dec {
             unsafe { std::slice::from_raw_parts(self.pin_pos as *const u8, self.n_slots * 4) };
         self.cc
             .h2d_async(self.dpp + (slot as u64) * 4, &posb[slot * 4..slot * 4 + 4])?;
-        self.cc.graph_launch(self.graph_exec)?;
+        self.cc.graph_launch(exec)?;
         self.cc.sync()?;
         let out =
             unsafe { std::slice::from_raw_parts(self.pin_out as *const f32, self.pin_out_len / 4) };
@@ -3600,7 +3613,12 @@ impl W4a16Dec {
 
     /// [P3] 그래프 replay(argmax 모드) — 4B 인덱스 회수. graph_replay와 동일
     /// 계약(입력 pinned 기입 → dpp 1회 → launch 1회 → sync).
-    fn graph_replay_argmax(&mut self, slot: usize, embed_row: &[f32]) -> Result<u32, String> {
+    fn graph_replay_argmax(
+        &mut self,
+        exec: ffi::CUgraphExec,
+        slot: usize,
+        embed_row: &[f32],
+    ) -> Result<u32, String> {
         let pos = self.slot_pos[slot];
         // SAFETY: pinned 버퍼는 hidden*4/n_slots*4 크기 계약(ensure_graph 할당).
         unsafe {
@@ -3619,7 +3637,7 @@ impl W4a16Dec {
             unsafe { std::slice::from_raw_parts(self.pin_pos as *const u8, self.n_slots * 4) };
         self.cc
             .h2d_async(self.dpp + (slot as u64) * 4, &posb[slot * 4..slot * 4 + 4])?;
-        self.cc.graph_launch(self.graph_exec)?;
+        self.cc.graph_launch(exec)?;
         self.cc.sync()?;
         let ob = unsafe { std::slice::from_raw_parts(self.pin_out as *const u8, 4) };
         self.slot_pos[slot] = pos + 1;
@@ -3636,7 +3654,7 @@ impl W4a16Dec {
         if self.graph_ok() {
             match self
                 .ensure_graph(slot, true, true)
-                .and_then(|()| self.graph_replay_argmax(slot, embed_row))
+                .and_then(|exec| self.graph_replay_argmax(exec, slot, embed_row))
             {
                 Ok(t) => return Ok(t),
                 Err(e) => {
@@ -4277,7 +4295,7 @@ impl W4a16Dec {
         if self.graph_ok() {
             match self
                 .ensure_graph(slot, false, false)
-                .and_then(|()| self.graph_replay(slot, embed_row))
+                .and_then(|exec| self.graph_replay(exec, slot, embed_row))
             {
                 Ok(xn) => {
                     llm170_diag::fp::fp_record("gpu.xn", &xn);
@@ -4389,7 +4407,7 @@ impl W4a16Dec {
         if self.graph_ok() {
             match self
                 .ensure_graph(slot, true, false)
-                .and_then(|()| self.graph_replay(slot, embed_row))
+                .and_then(|exec| self.graph_replay(exec, slot, embed_row))
             {
                 Ok(lg) => {
                     llm170_diag::fp::fp_record("gpu.logits", &lg);
