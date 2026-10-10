@@ -53,54 +53,9 @@ pub const GEMV_TR: usize = 8;
 /// [R21] FFMA 폴백 GEMM의 t 상한(커널 gptq4.cu G4_GTMAX 미러) — 체인 가드용.
 pub const GEMM_FFMA_TMAX: usize = 32;
 
-/// [R8 2026-10-10] KV 양자화 모드 — 종전 `kvq: u8`(0/8/4) 분기 16곳의
-/// 캡슐화. 바이트 규칙·커널 선택·mem_stats가 이 타입에 모인다.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum KvMode {
-    /// f32 KV(기본).
-    F32,
-    /// int8 KV(4× 절감 — `LLM170_KVQ` 비영).
-    Int8,
-    /// int4 KV(8× 절감, 니블 패킹 — `LLM170_KVQ=4`).
-    Int4,
-}
-
-impl KvMode {
-    /// env 확정 — "4"=Int4, 그 외 비영=Int8(후방 호환), 미설정/0=F32.
-    pub fn from_env() -> Self {
-        match llm170_diag::flag::val("LLM170_KVQ") {
-            Some("4") => KvMode::Int4,
-            Some(v) if v != "0" => KvMode::Int8,
-            _ => KvMode::F32,
-        }
-    }
-    /// 활성 여부(KVQ 기록/판독 경로 선택).
-    pub fn is_on(self) -> bool {
-        self != KvMode::F32
-    }
-    /// 슬롯 요소 e개의 KV 바이트 수(int4 = 니블 패킹 → 절반).
-    pub fn kv_bytes(self, elems: usize) -> usize {
-        match self {
-            KvMode::Int4 => elems / 2,
-            KvMode::Int8 => elems,
-            KvMode::F32 => elems * 4,
-        }
-    }
-    /// KV 기록 커널.
-    pub fn prep_kernel(self) -> &'static str {
-        match self {
-            KvMode::Int4 => "attn_prep_q4",
-            _ => "attn_prep_q",
-        }
-    }
-    /// KV 판독(part) 커널.
-    pub fn part_kernel(self) -> &'static str {
-        match self {
-            KvMode::Int4 => "attn_fwd3s_part_q4",
-            _ => "attn_fwd3s_part_q",
-        }
-    }
-}
+// [KVQ 채택 2026-10-10] int8 KV 단일 경로 — KvMode/LLM170_KVQ 제거.
+// 근거(실측): int8 PPL 델타 ±0.3% 이내(장문 27B +0.0025%) · 장문 프리필
+// +54%@16K(42.7→27.7s) · 단문 동급 — f32/int4 경로는 삭제(benchmark/eval.md).
 
 /// [R5 2026-10-10] 단일 버퍼(ptr+cap) — ensure_*가 쌍을 함께 갱신한다.
 #[derive(Clone, Copy, Default)]
@@ -387,8 +342,6 @@ pub struct W4a16Dec {
     /// [P13] int8 KV 스케일(K/V 각각 [n_attn*cap][kv_heads] f32) — KVQ 전용.
     dksc: CUdeviceptr,
     dvsc: CUdeviceptr,
-    /// [P13/C3/R8] KV 양자화 모드 — set_attn에서 env로 확정(KvMode::from_env).
-    kvq: KvMode,
     dpp: CUdeviceptr,
     dqg_a: CUdeviceptr,
     dkin_a: CUdeviceptr,
@@ -559,7 +512,6 @@ impl W4a16Dec {
             dvc: 0,
             dksc: 0,
             dvsc: 0,
-            kvq: KvMode::F32,
             dpp: 0,
             dqg_a: 0,
             dkin_a: 0,

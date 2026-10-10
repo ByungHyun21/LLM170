@@ -13,11 +13,12 @@
 #      (2026-10-09 교훈: 3토큰 케이스는 단일 청크만 탄다 — 다중 청크를 상시
 #       검증한다. 이 케이스가 gdn_exp 도메인 결함을 잡는 그물이다.)
 #   7. E(FN FP8PLE): 자원 가드 명시 거부(120GiB > 호스트).
-#   8. F(27B): KVQ(int8 KV, P13) — 골든 접두(양자화 경로 상시 검증).
-#   9. G(27B): 장문 600·4000토큰 — lim>256(attn 분할)·다중 청크 경로 골든.
-#  10. G2(35B): 장문 600·4000토큰 — 동일(35B MoE).
-# 장문 골든(600/4000)은 GPU 동결(2026-10-10, 2회 재현) — CPU 대조는 35토큰
-# 한계(D3). 경로 회귀 검출용(값 변경 시 원인 판정 후 재동결).
+#   8. G(27B): 장문 600·4000토큰 — lim>256(attn 분할)·다중 청크 경로 골든.
+#   9. G2(35B): 장문 600·4000토큰 — 동일(35B MoE).
+# 장문 골든(600/4000)은 GPU 동결(2회 재현) — CPU 대조는 35토큰 한계(D3).
+# 경로 회귀 검출용(값 변경 시 원인 판정 후 재동결).
+# [KVQ 채택 2026-10-10] int8 KV가 단일 경로 — 구 F(KVQ) 섹션은 기본 경로와
+# 동일해져 제거. 35B 600 골든은 int8 채택값으로 재동결(2회 재현, eval.md).
 # 사용법: scripts/swap_models.sh
 set -u
 cd "$(dirname "$0")/.."
@@ -30,7 +31,7 @@ P600=$(python3 -c "print(','.join(str(1000+i) for i in range(600)))")
 P4000=$(python3 -c "print(','.join(str(1000+i) for i in range(4000)))")
 GOLDEN27_600="220,197,320,198,197,320,198,197,320"
 GOLDEN27_4K="291,806,1184,2354,597,749,477,13,198"
-GOLDEN35_600="198,248046,198,248045,248068,271,248069,271,2064"
+GOLDEN35_600="198,248046,198,248045,248068,198,8160,579,264" # 2026-10-10 int8 KV 재동결(2회 재현)
 GOLDEN35_4K="291,806,81,2177,248046,198,248045,248068,198"
 # 다중 청크(35토큰)골든 — CPU·GPU 동일 실측(2026-10-09).
 GOLDEN35L="271,248068,271,248069,271,168951,227596,149285,65233"
@@ -48,7 +49,7 @@ fail=0
 note() { echo "[w4a16] $*"; }
 
 # ── 1. A(27B) 참조 토큰 ──
-note "[1/10] A(27B) 참조 실행 — w4a16-ref"
+note "[1/9] A(27B) 참조 실행 — w4a16-ref"
 timeout 900 "$BIN" w4a16-ref "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/a.out" 2> "$RUN/a.log"
 A=$(grep -m1 '^tokens:' "$RUN/a.out" | sed 's/^tokens: //')
@@ -59,7 +60,7 @@ case "$A" in
 esac
 
 # ── 2. B(27B) GPU 체인 ──
-note "[2/10] B(27B) GPU 체인 — w4a16-gpu"
+note "[2/9] B(27B) GPU 체인 — w4a16-gpu"
 timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/b.out" 2> "$RUN/b.log"
 B=$(grep -m1 '^ tokens:' "$RUN/b.out" | sed 's/^ tokens: //')
@@ -70,7 +71,7 @@ case "$B" in
 esac
 
 # ── 3. C(27B) serve HTTP 종단 ──
-note "[3/10] C(27B) serve HTTP — runtime=cuda + 골든 접두"
+note "[3/9] C(27B) serve HTTP — runtime=cuda + 골든 접두"
 : > "$RUN/c.log"
 "$BIN" serve --model "$M_27B" --ctx 1024 --slots 1 --port "$PORT" > "$RUN/c.log" 2>&1 &
 SERVE_PID=$!
@@ -103,7 +104,7 @@ case "$C" in
 esac
 
 # ── 4. D(35B INT4 g32) 참조 오라클(W4-1 MoE) ──
-note "[4/10] D(35B INT4 g32) 참조 실행 — w4a16-ref (MoE g32/bf16)"
+note "[4/9] D(35B INT4 g32) 참조 실행 — w4a16-ref (MoE g32/bf16)"
 timeout 2400 "$BIN" w4a16-ref "$M_35B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/d.out" 2> "$RUN/d.log"
 D=$(grep -m1 '^tokens:' "$RUN/d.out" | sed 's/^tokens: //')
@@ -114,7 +115,7 @@ case "$D" in
 esac
 
 # ── 5. D2(35B INT4 g32) GPU 체인(MoE) ──
-note "[5/10] D2(35B) GPU 체인 — w4a16-gpu (MoE)"
+note "[5/9] D2(35B) GPU 체인 — w4a16-gpu (MoE)"
 timeout 1800 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/d2.out" 2> "$RUN/d2.log"
 D2=$(grep -m1 '^ tokens:' "$RUN/d2.out" | sed 's/^ tokens: //')
@@ -125,7 +126,7 @@ case "$D2" in
 esac
 
 # ── 6. D3(35B) 다중 청크(35토큰) — 배치 프리필 t≤32 CPU/GPU 골든 ──
-note "[6/10] D3(35B) 다중 청크 — 참조(CPU) + GPU (배치 t≤32)"
+note "[6/9] D3(35B) 다중 청크 — 참조(CPU) + GPU (배치 t≤32)"
 timeout 2400 "$BIN" w4a16-ref "$M_35B" --prompt-tokens "$P35L" --n-predict 8 --ctx 1024 \
   > "$RUN/d3a.out" 2> "$RUN/d3a.log"
 DA=$(grep -m1 '^tokens:' "$RUN/d3a.out" | sed 's/^tokens: //')
@@ -144,7 +145,7 @@ case "$DB" in
 esac
 
 # ── 7. E(FN FP8PLE) 자원 가드 명시 거부 ──
-note "[7/10] E(FN FP8PLE) 자원 가드 명시 거부 판정"
+note "[7/9] E(FN FP8PLE) 자원 가드 명시 거부 판정"
 if timeout 60 "$BIN" w4a16-load "$M_FN" > "$RUN/e.log" 2>&1; then
   echo "[w4a16] FAIL: 가드가 통과시킴(120GiB) — ${RUN}/e.log"; fail=1
 elif grep -qE "insufficient resources|rsrc-guard" "$RUN/e.log"; then
@@ -153,28 +154,8 @@ else
   echo "[w4a16] FAIL: 가드 외 사유 — ${RUN}/e.log"; fail=1
 fi
 
-# ── 8. F(27B) KVQ(int8/int4 KV, P13/C3) 골든 ──
-note "[8/10] F(27B) KVQ int8·int4 — w4a16-gpu 골든 접두"
-LLM170_KVQ=1 timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
-  > "$RUN/f.out" 2> "$RUN/f.log"
-F=$(grep -m1 '^ tokens:' "$RUN/f.out" | sed 's/^ tokens: //')
-case "$F" in
-  "$GOLDEN"*) note "KVQ int8 토큰 OK: $(echo "$F" | head -c 60)";;
-  "") echo "[w4a16] FAIL: KVQ 실행 실패 — ${RUN}/f.log"; fail=1;;
-  *) echo "[w4a16] FAIL: KVQ 골든 불일치: $(echo "$F" | head -c 60)"; fail=1;;
-esac
-# [C3] int4 KV — 27B는 골든 일치 실측(35B는 이탈 — int8 권장, plan 기록).
-LLM170_KVQ=4 timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
-  > "$RUN/f4.out" 2> "$RUN/f4.log"
-F4=$(grep -m1 '^ tokens:' "$RUN/f4.out" | sed 's/^ tokens: //')
-case "$F4" in
-  "$GOLDEN"*) note "KVQ int4 토큰 OK: $(echo "$F4" | head -c 60)";;
-  "") echo "[w4a16] FAIL: KVQ int4 실행 실패 — ${RUN}/f4.log"; fail=1;;
-  *) echo "[w4a16] FAIL: KVQ int4 골든 불일치: $(echo "$F4" | head -c 60)"; fail=1;;
-esac
-
 # ── 9. G(27B) 장문 600·4000토큰 — lim>256·다중 청크 ──
-note "[9/10] G(27B) 장문 600/4000토큰 GPU 골든"
+note "[8/9] G(27B) 장문 600/4000토큰 GPU 골든"
 timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens "$P600" --n-predict 8 --ctx 4096 \
   > "$RUN/g1.out" 2> "$RUN/g1.log"
 G1=$(grep -m1 '^ tokens:' "$RUN/g1.out" | sed 's/^ tokens: //')
@@ -193,7 +174,7 @@ case "$G2" in
 esac
 
 # ── 10. G2(35B) 장문 600·4000토큰 ──
-note "[10/10] G2(35B) 장문 600/4000토큰 GPU 골든"
+note "[9/9] G2(35B) 장문 600/4000토큰 GPU 골든"
 timeout 900 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens "$P600" --n-predict 8 --ctx 4096 \
   > "$RUN/g3.out" 2> "$RUN/g3.log"
 G3=$(grep -m1 '^ tokens:' "$RUN/g3.out" | sed 's/^ tokens: //')
@@ -212,7 +193,7 @@ case "$G4" in
 esac
 
 if [ $fail -eq 0 ]; then
-  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve·KVQ·장문 / 35B MoE 참조+GPU·장문 / E 가드 거부)"
+  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve·장문 / 35B MoE 참조+GPU·장문 / E 가드 거부) — int8 KV 단일 경로"
 else
   echo "[w4a16] smoke: FAILURES PRESENT"
 fi

@@ -71,12 +71,8 @@ impl W4a16Dec {
             .attn
             .map(|d| {
                 let rows = (self.n_slots as u64) * (d.n_attn as u64) * (d.cap as u64);
-                if self.kvq.is_on() {
-                    rows * (self.kvq.kv_bytes(d.kv_dim()) as u64)
-                        + rows * (d.kv_heads as u64) * 4 * 2
-                } else {
-                    2 * rows * (d.kv_dim() as u64) * 4
-                }
+                // [KVQ 채택 2026-10-10] int8 KV + 행×헤드 f32 스케일 2벌.
+                rows * (d.kv_dim() as u64) + rows * (d.kv_heads as u64) * 4 * 2
             })
             .unwrap_or(0);
         let experts = self.experts_bytes;

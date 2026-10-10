@@ -616,7 +616,7 @@ impl W4a16Dec {
     /// 한 번에 통과한다. 가중 커널(GEMM·MoE·head)은 t행 배치로 상각하고,
     /// 상태 커널(attn KV/pos·GDN 링/트리오)은 토큰별 슬롯 자원을 쓴다.
     /// 반환: 슬롯 순서의 다음 토큰(argmax, greedy 전용).
-    /// 전제(호출부 가드): t∈2..=BATCH_DEC_MAX · 전 슬롯 greedy · !kvq ·
+    /// 전제(호출부 가드): t∈2..=BATCH_DEC_MAX · 전 슬롯 greedy ·
     /// MoE면 상주 모드 · head/argmax 등록. 그래프 밖(직접 발사) 경로.
     /// [A9] 배치 체인 1회 발사 — 행/pos는 핀드(pin_batch_in/pos)에서 읽어
     /// h2d 노드로 기록된다(캡처 가능). sync·slot_pos 갱신은 호출부 소관.
