@@ -386,6 +386,10 @@ extern "C" __global__ void gdn_scan(
     int t_len, int h_k, int h_v, int d, int layer)
 {
     // [A5-4] 그리드 (h_v×NSPLIT) — 블록이 state 열 타일(vs)을 소유.
+    // [2026-10-10 기각 기록] launch_bounds(512,3) = 33→36.6ms(스필>점유),
+    // dcr 레지스터 배열 제거+3블록 = 35.5ms — 레지스터 64는 실수요.
+    // FLA 4단 재작성은 예측 기각: GDN f16 저장 경계 민감도(실측 ×289 증폭,
+    // fast-exp 기각과 동일 클래스)로 재구성 시 장문 골든 플립 확실.
     extern __shared__ char smem_raw[];
     __half* sk = (__half*)smem_raw;                    // [CS*128]
     // [A5-4b 2026-10-10] qs 스테이징(16KB) 제거 — q는 글로벌 직접 판독
