@@ -58,7 +58,7 @@ impl W4a16Dec {
         let rb = unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, rows.len() * 4) };
         self.cc.h2d_async(self.dres, rb)?;
         let [s0, s1, s1b, s2, s3] = self.dchain;
-        let (w2, h) = (self.stg_w2, self.hidden);
+        let h = self.hidden;
         let mut ab = self.dab_dev;
         let mut gi = 0usize;
         // 플레인(MoE) 모드 — bf16 GEMM(x 원시 f32), FFN은 MoE 배치.
@@ -161,8 +161,12 @@ impl W4a16Dec {
                 self.lin_forward(plain, LinPath::Gemm, &lo, branch, dyt, t)?;
             } else {
                 let (_, _, _, ko) = self.lin_spec(&lo)?;
-                let xh2 = self.cast_x32(branch, t * ko)?;
-                self.lin_forward(plain, LinPath::Gemm, &lo, xh2, dyt, t)?;
+                // [4.1 2026-10-11] branch 생산자 융합 — cast_x32 노드 제거
+                // (mma는 dx16 미러, FFMA는 dx32를 읽는다 — 둘 다 생산자 기록).
+                if self.dx32.cap < t * ko || self.dx16.cap < t * ko {
+                    return Err(format!("T{il} branch 융합: dx32/dx16 부족 {}", t * ko));
+                }
+                self.lin_forward(plain, LinPath::Gemm, &lo, self.dx32.ptr, dyt, t)?;
             }
             // [P10] cast_x32(t×ko)가 dx32를 재할당했을 수 있다 — 노름 융합
             // 기록(xn32)은 **현재** 포인터를 다시 확인한다. 옛 포인터를 계속
@@ -194,11 +198,11 @@ impl W4a16Dec {
                     s1,
                     t,
                 )?;
-                self.ew_dev(s0, s1, s2, t * w2)?;
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
-                let xh4 = self.cast_x32(s2, t * kd)?;
-                self.lin_forward(false, LinPath::Gemm, &dn, xh4, s3, t)?;
+                // [4.1 2026-10-11] ew 융합 — cast_x32 노드 제거.
+                self.ew_dev_fused(s0, s1, s2, t * kd)?;
+                self.lin_forward(false, LinPath::Gemm, &dn, self.dx32.ptr, s3, t)?;
                 ab = s3;
             }
         }

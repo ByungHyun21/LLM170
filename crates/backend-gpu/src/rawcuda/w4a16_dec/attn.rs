@@ -149,15 +149,21 @@ impl W4a16Dec {
                 &mut qh, &mut kvh, &mut cp, &mut sp,
             ),
         )?;
+        // [4.1 2026-10-11] merge가 x32/미러 동시 기록 — cast_x32 노드 제거.
+        let nm = t_len * dm.q_heads * 256;
+        let (m32, m16) = (self.ensure_dx32(nm)?, self.ensure_dx16(nm)?);
         let fm = self.cc.function("attn_fwd3s_merge")?;
         let (mut mp, mut mg, mut mo) = (self.dattn_part, qg_dev, self.doutv_a);
+        let (mut mo32, mut mo16) = (m32, m16);
         let (mut tl2, mut qh2) = (t_len as i32, dm.q_heads as i32);
         self.cc.launch(
             fm,
             t_len as u32,
             dm.q_heads as u32,
             256,
-            &mut crate::rawcuda::args::l6(&mut mp, &mut mg, &mut mo, &mut tl2, &mut qh2, &mut sp),
+            &mut crate::rawcuda::args::l8(
+                &mut mp, &mut mg, &mut mo, &mut mo32, &mut mo16, &mut tl2, &mut qh2, &mut sp,
+            ),
         )
     }
 
@@ -302,6 +308,12 @@ impl W4a16Dec {
         // fwd3s part + merge — 토큰별.
         let fp = self.cc.function("attn_fwd3s_part_q")?;
         let fm = self.cc.function("attn_fwd3s_merge")?;
+        // [4.1] 배치 merge 융합 기록 — dx32/dx16 = t_len×q_heads×256 보장.
+        {
+            let nm = t_len * dm.q_heads * 256;
+            self.ensure_dx32(nm)?;
+            self.ensure_dx16(nm)?;
+        }
         for (k, &slot) in slots.iter().enumerate() {
             let qhk = self.dqh_a + k as u64 * qdd * 4;
             let partk = self.dattn_part + k as u64 * pstride * 4;
@@ -328,10 +340,15 @@ impl W4a16Dec {
                 )?;
             }
             {
+                // [4.1] merge x32/미러 융합(배치 cast_x32 노드 제거) — 슬롯 오프셋.
                 let (mut mp, mut mg, mut mo) = (
                     partk,
                     qg_dev + k as u64 * qgd * 4,
                     self.doutv_a + k as u64 * qdd * 4,
+                );
+                let (mut mo32, mut mo16) = (
+                    self.dx32.ptr + k as u64 * qdd * 4,
+                    self.dx16.ptr + k as u64 * qdd * 2,
                 );
                 let (mut tl2, mut qh2) = (1i32, dm.q_heads as i32);
                 self.cc.launch(
@@ -339,8 +356,9 @@ impl W4a16Dec {
                     1,
                     dm.q_heads as u32,
                     256,
-                    &mut crate::rawcuda::args::l6(
-                        &mut mp, &mut mg, &mut mo, &mut tl2, &mut qh2, &mut sp,
+                    &mut crate::rawcuda::args::l8(
+                        &mut mp, &mut mg, &mut mo, &mut mo32, &mut mo16, &mut tl2, &mut qh2,
+                        &mut sp,
                     ),
                 )?;
             }

@@ -50,8 +50,8 @@ for cu in "$A"/*.cu; do
         echo "FAIL — $(basename "$cu") 가 fatbin보다 새로움(리빌드: scripts/build_cuda_kernels.sh)"; stale=1
     fi
 done
-# cast_common.cuh는 gptq4/norm/ew가 include(헤더 변경도 리빌드 대상).
-for n in gptq4 norm ew; do
+# cast_common.cuh는 gptq4/norm/ew/gdn/attn이 include(헤더 변경도 리빌드 대상).
+for n in gptq4 norm ew gdn attn; do
     fb="$A/$n.fatbin"
     if [[ ! -f "$fb" || "$A/cast_common.cuh" -nt "$fb" ]]; then
         echo "FAIL — cast_common.cuh 가 $n.fatbin보다 새로움(리빌드 필요)"; stale=1

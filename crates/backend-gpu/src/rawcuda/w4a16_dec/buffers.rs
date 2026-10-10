@@ -20,7 +20,7 @@ impl W4a16Dec {
         Ok(())
     }
 
-    /// dx32(x32 버퍼) 용량 보장 — 융합 노름·cast_x32 공용.
+    /// dx32(x32 버퍼) 용량 보장 — 융합 노름·생산자(ew/gate/merge) 공용.
     pub(super) fn ensure_dx32(&mut self, n: usize) -> Result<CUdeviceptr, String> {
         if n > self.dx32.cap {
             self.cc.capture_guard("dx32_cap"); // [R12]
@@ -35,6 +35,24 @@ impl W4a16Dec {
             self.dx32.cap = n;
         }
         Ok(self.dx32.ptr)
+    }
+
+    /// [4.1 2026-10-11] f16 미러(dx16) 용량 보장 — ew/gate/merge 융합 기록용
+    /// (cast_x16 인라인 가드와 동일 계약: capture_guard + P10 무효화·동기).
+    pub(super) fn ensure_dx16(&mut self, n: usize) -> Result<CUdeviceptr, String> {
+        if n > self.dx16.cap {
+            self.cc.capture_guard("dx16_cap"); // [R12]
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
+            if self.dx16.ptr != 0 {
+                self.cc.free(self.dx16.ptr)?;
+            }
+            self.dx16.ptr = 0; // G1
+            self.dx16.cap = 0;
+            self.dx16.ptr = self.cc.alloc(n * 2)?;
+            self.dx16.cap = n;
+        }
+        Ok(self.dx16.ptr)
     }
 
     pub(super) fn ensure_ew_bufs(&mut self, n: usize) -> Result<(), String> {

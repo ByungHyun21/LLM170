@@ -493,7 +493,12 @@ impl W4a16Dec {
             self.gemv_experts_launch(base, ns, xn, h, tk, self.exp.gate, n_ff, h)?;
             self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.exp.up, n_ff, h)?;
         }
-        self.ew_dev(self.exp.gate, self.exp.up, self.exp.act, ns * n_ff)?;
+        if group {
+            // [4.1 2026-10-11] ew가 f16 미러 동시 기록 — cast_x16 노드 제거.
+            self.ew_dev_mirror(self.exp.gate, self.exp.up, self.exp.act, ns * n_ff)?;
+        } else {
+            self.ew_dev(self.exp.gate, self.exp.up, self.exp.act, ns * n_ff)?;
+        }
         if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
             let mut vb = vec![0u8; ns * n_ff * 4];
             self.cc
@@ -511,8 +516,7 @@ impl W4a16Dec {
             eprintln!("[t-dbg] act nan-slots={bad:?} ns={ns}");
         }
         if group {
-            let a16 = self.cast_x16(self.exp.act, ns * n_ff)?;
-            self.gemm_g32_mma_grp_launch(base + 2, a16, n_ff, 1, self.exp.dn, h, n_ff)?;
+            self.gemm_g32_mma_grp_launch(base + 2, self.dx16.ptr, n_ff, 1, self.exp.dn, h, n_ff)?;
         } else {
             self.gemv_experts_launch(base + 2, ns, self.exp.act, n_ff, 1, self.exp.dn, h, n_ff)?;
         }

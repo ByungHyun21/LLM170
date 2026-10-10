@@ -188,7 +188,7 @@ impl W4a16Dec {
         };
         self.cc.h2d_async(self.dres, row)?;
         let [s0, s1, s1b, s2, s3] = self.dchain;
-        let (w0, w1, w2) = (self.stg_w0, self.stg_w1, self.stg_w2);
+        let (w0, w1) = (self.stg_w0, self.stg_w1);
         let mut ab = self.dab_dev;
         let mut gi = 0usize;
         // 플레인 모드(MoE 모델) — GEMV는 bf16(head_bf16), x는 원시 f32
@@ -273,10 +273,12 @@ impl W4a16Dec {
                     .map_err(|e| format!("L{il} {lo}: {e}"))?
             } else {
                 let (_, _, _, ko) = self.lin_spec(&lo)?;
-                let x32b = self
-                    .cast_x32(branch, ko)
-                    .map_err(|e| format!("L{il} branch cast: {e}"))?;
-                self.gemv_dev_x32(&lo, x32b)
+                // [4.1 2026-10-11] branch 생산자(merge/gate)가 x32/미러 동시
+                // 기록 — cast_x32 노드 제거(값 비트동일).
+                if self.dx32.cap < ko || self.dx16.cap < ko {
+                    return Err(format!("L{il} branch 융합: dx32/dx16 부족 {ko}"));
+                }
+                self.gemv_dev_x32(&lo, self.dx32.ptr)
                     .map_err(|e| format!("L{il} {lo}: {e}"))?
             };
             // [P10] cast_x32(ko) 재할당 대비 — 현재 dx32 재확인(위 주석 참조).
@@ -310,14 +312,13 @@ impl W4a16Dec {
                     1,
                 )
                 .map_err(|e| format!("L{il} up: {e}"))?;
-                self.ew_dev(s0, s1, s2, w2)?;
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
-                let x32d = self
-                    .cast_x32(s2, kd)
-                    .map_err(|e| format!("L{il} down cast: {e}"))?;
+                // [4.1 2026-10-11] ew가 x32/미러 동시 기록 — cast 노드 제거.
+                self.ew_dev_fused(s0, s1, s2, kd)
+                    .map_err(|e| format!("L{il} ew: {e}"))?;
                 // down은 s3 직접 쓰기 — dy 경유 d2d 제거.
-                self.gemv_launch(&dn, x32d, s3)
+                self.gemv_launch(&dn, self.dx32.ptr, s3)
                     .map_err(|e| format!("L{il} down: {e}"))?;
                 ab = s3;
             }
@@ -379,7 +380,7 @@ impl W4a16Dec {
             self.cc.h2d_async(self.dpp, pb)?;
         }
         let [s0, s1, s1b, s2, s3] = self.dchain;
-        let (w2, h) = (self.stg_w2, self.hidden);
+        let h = self.hidden;
         let mut ab = self.dab_dev;
         let mut gi = 0usize;
         let plain = self.plain_weights;
@@ -454,8 +455,11 @@ impl W4a16Dec {
                 self.lin_forward(plain, LinPath::GemvT, &lo, branch, dyt, t)?;
             } else {
                 let (_, _, _, ko) = self.lin_spec(&lo)?;
-                let xh2 = self.cast_x32(branch, t * ko)?;
-                self.lin_forward(plain, LinPath::GemvT, &lo, xh2, dyt, t)?;
+                // [4.1 2026-10-11] branch 생산자 융합 — cast_x32 노드 제거.
+                if self.dx32.cap < t * ko || self.dx16.cap < t * ko {
+                    return Err(format!("B{il} branch 융합: dx32/dx16 부족 {}", t * ko));
+                }
+                self.lin_forward(plain, LinPath::GemvT, &lo, self.dx32.ptr, dyt, t)?;
             }
             let xh = self.ensure_dx32(t * h)?;
             let xn2 = self
@@ -484,11 +488,11 @@ impl W4a16Dec {
                     s1,
                     t,
                 )?;
-                self.ew_dev(s0, s1, s2, t * w2)?;
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
-                let xh4 = self.cast_x32(s2, t * kd)?;
-                self.lin_forward(false, LinPath::GemvT, &dn, xh4, s3, t)?;
+                // [4.1 2026-10-11] ew 융합 — cast_x32 노드 제거.
+                self.ew_dev_fused(s0, s1, s2, t * kd)?;
+                self.lin_forward(false, LinPath::GemvT, &dn, self.dx32.ptr, s3, t)?;
                 ab = s3;
             }
         }

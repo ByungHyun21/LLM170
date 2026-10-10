@@ -49,6 +49,7 @@
 // - pos_bump: 1스레드 — 캡처 그래프 내 pos 전진(h2d 불가 대체, 결함 16호
 //   정신). 원본 그대로.
 #include <cuda_fp16.h>
+#include "cast_common.cuh" // [4.1] merge 융합 기록(f2h/h2f — cast 커널과 동일)
 
 // ── 미러 트랜센던트(G6 — G5 gdn_exp_d와 동일 노선) ──
 // 계약: 장치 초월함수(libdevice expf 2ulp·rsqrtf·powf/cosf/sinf)는 호스트
@@ -457,10 +458,14 @@ extern "C" __global__ void attn_fwd3s_part_q(
 
 // 병합: 분할 s=0..S-1 오름차순 고정 — 결정적. m=최대, l·acc를 exp(m_s−m)로
 // 스케일해 합산(수학적으로 단일 경로와 동일, 반올림만 상이 — lim>256 완화 등급).
+// [4.1 2026-10-11] 생산자 융합 — 선택 출력 out32/out16(nullable) 동시 기록.
+// out32 = h2f(f2h(ov))·out16 = f2h(ov) — cast_x32/cast_x16 커널과 동일 산식.
 extern "C" __global__ void attn_fwd3s_merge(
     const float* __restrict__ part,
     const float* __restrict__ qg,
     float* __restrict__ outv,
+    float* __restrict__ out32,            // [4.1] x32(roundtrip) — nullable
+    unsigned short* __restrict__ out16,   // [4.1] f16 미러 — nullable
     int t_len, int q_heads, int splits)
 {
     int t = blockIdx.x;
@@ -488,8 +493,15 @@ extern "C" __global__ void attn_fwd3s_merge(
         acc += ps[2 + tid] * w;
     }
     float g = qg[(long)t * (q_heads * 512) + (long)h * 512 + 256 + tid];
-    outv[(long)t * (q_heads * 256) + (long)h * 256 + tid] =
-        (acc / l) * (1.0f / (1.0f + attn_expf(-g)));
+    float ov = (acc / l) * (1.0f / (1.0f + attn_expf(-g)));
+    const long oi = (long)t * (q_heads * 256) + (long)h * 256 + tid;
+    outv[oi] = ov;
+    if (out32 != (float*)0) {
+        out32[oi] = h2f(f2h(ov));
+    }
+    if (out16 != (unsigned short*)0) {
+        out16[oi] = f2h(ov);
+    }
 }
 
 // 마커 f3sc

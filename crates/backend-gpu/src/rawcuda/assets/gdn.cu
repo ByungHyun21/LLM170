@@ -54,6 +54,7 @@
 //   170HX 도착 후 재판단(현 잔여 스톨: 배리어·스케줄러 지연).
 // - gate: 그리드 (h_v, T), 블록 128 — 메모리 본드 소형, 특기 사항 없음.
 #include <cuda_fp16.h>
+#include "cast_common.cuh" // [4.1] gdn_gate 융합 기록(f2h/h2f — cast 커널과 동일)
 
 // ── 미러 트랜센던트(G5 정밀화) ──
 // 계약: 장치 초월함수(libdevice expf 2ulp·__expf/__logf fast)는 호스트
@@ -822,11 +823,16 @@ extern "C" __global__ void gdn_spec_scan(
 
 // gdn_gate — rms(o_lc)·nw·silu(z) → gated(HF), 역순열 포함
 // (구 rawhip 커널 L368-393 직이식, 폭 인자화). 그리드 (h_v, T), WG=128.
+// [4.1 2026-10-11] 생산자 융합 — 선택 출력 gated32/gated16(nullable) 동시
+// 기록. gated32 = h2f(f2h(gv))·gated16 = f2h(gv) — cast_x32/cast_x16 커널과
+// 동일 산식(norm xn32/xn16 P6 패턴, cast_common 동일 함수 → 비트 동일).
 extern "C" __global__ void gdn_gate(
     const float* __restrict__ o_lc,  // [T][h_v*128] lc
     const float* __restrict__ z,     // [T][h_v*128] HF
     const float* __restrict__ nw,    // [L][128]
     float* __restrict__ gated,       // [T][h_v*128] HF
+    float* __restrict__ gated32,     // [4.1] x32(roundtrip) — nullable
+    unsigned short* __restrict__ gated16, // [4.1] f16 미러 — nullable
     int t_len, int layer, int h_k, int h_v)
 {
     __shared__ float red[128];
@@ -845,6 +851,12 @@ extern "C" __global__ void gdn_gate(
     }
     float inv = 1.0f / sqrtf(red[0] / 128.0f + 1e-6f);
     float zv = z[t * (h_v * 128) + h * 128 + tid];
-    gated[t * (h_v * 128) + h * 128 + tid] =
-        ov * inv * nw[layer * 128 + tid] * (zv / (1.0f + gdn_expf(-zv)));
+    float gv = ov * inv * nw[layer * 128 + tid] * (zv / (1.0f + gdn_expf(-zv)));
+    gated[t * (h_v * 128) + h * 128 + tid] = gv;
+    if (gated32 != (float*)0) {
+        gated32[t * (h_v * 128) + h * 128 + tid] = h2f(f2h(gv));
+    }
+    if (gated16 != (unsigned short*)0) {
+        gated16[t * (h_v * 128) + h * 128 + tid] = f2h(gv);
+    }
 }

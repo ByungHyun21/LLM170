@@ -220,15 +220,21 @@ impl W4a16Dec {
             )?;
         }
 
+        // [4.1 2026-10-11] gate가 x32/미러 동시 기록 — split 체인의 cast_x32
+        // 노드 제거(값 비트동일). dx32/dx16 = t_len×v_len 보장.
+        let ng = t_len * dm.v_len();
+        let (g32, g16) = (self.ensure_dx32(ng)?, self.ensure_dx16(ng)?);
         let f = self.cc.function("gdn_gate")?;
         let (mut g0, mut g1, mut g2, mut g3) = (self.dgo, z_dev, self.dnwg, self.dgate);
+        let (mut g4, mut g5) = (g32, g16);
         self.cc.launch(
             f,
             dm.h_v as u32,
             t_len as u32,
             128,
-            &mut crate::rawcuda::args::l8(
-                &mut g0, &mut g1, &mut g2, &mut g3, &mut tl, &mut lay, &mut hk, &mut hv,
+            &mut crate::rawcuda::args::l10(
+                &mut g0, &mut g1, &mut g2, &mut g3, &mut g4, &mut g5, &mut tl, &mut lay, &mut hk,
+                &mut hv,
             ),
         )?;
         Ok(())
@@ -434,18 +440,22 @@ impl W4a16Dec {
                 )?;
             }
         }
-        // gate — 행 단위 1회.
+        // gate — 행 단위 1회. [4.1] x32/미러 융합(배치 cast_x32 노드 제거).
         {
+            let ng = t_len * dm.v_len();
+            let (g32, g16) = (self.ensure_dx32(ng)?, self.ensure_dx16(ng)?);
             let f = self.cc.function("gdn_gate")?;
             let (mut g0, mut g1, mut g2, mut g3) = (self.dgo, z_dev, self.dnwg, self.dgate);
+            let (mut g4, mut g5) = (g32, g16);
             let mut tl = t_len as i32;
             self.cc.launch(
                 f,
                 dm.h_v as u32,
                 t_len as u32,
                 128,
-                &mut crate::rawcuda::args::l8(
-                    &mut g0, &mut g1, &mut g2, &mut g3, &mut tl, &mut lay, &mut hk, &mut hv,
+                &mut crate::rawcuda::args::l10(
+                    &mut g0, &mut g1, &mut g2, &mut g3, &mut g4, &mut g5, &mut tl, &mut lay,
+                    &mut hk, &mut hv,
                 ),
             )?;
         }

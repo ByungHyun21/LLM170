@@ -76,52 +76,6 @@ impl W4a16Dec {
         )
     }
 
-    // ── ew(silu·mul) ──
-
-    /// 활성 f32 → x32(h2f 왕복) 캐스트 1회 — 같은 xn을 쓰는 GEMV들이 공유한다
-    /// (q/k/v·gate/up: 종전 gemv마다 캐스트 = 런치 2배). 반환은 self.dx32.ptr.
-    /// [A3 판정 2026-10-10] GEMV 로드에 h2f를 인라인해 이 노드를 없애는 안은
-    /// 기각 — 디코드 GEMV +1op/가중치(+15%, ~+2.4ms/토큰) > 런치 절감
-    /// (단일 소비자 2회/층 ~0.4ms).
-    pub(super) fn cast_x32(&mut self, x_dev: CUdeviceptr, k: usize) -> Result<CUdeviceptr, String> {
-        if k > self.dx32.cap {
-            // [P10] 재할당 전 무효화+동기 — 프리필 cast_x32(t×k) 성장이
-            // 비행 중 norm xn32 기록을 해제 버퍼로 보낸다(새니타이저 실측).
-            self.graph_invalidate();
-            self.cc.sync()?;
-            if self.dx32.ptr != 0 {
-                self.cc.free(self.dx32.ptr)?;
-            }
-            self.dx32.ptr = 0; // G1
-            self.dx32.cap = 0;
-            self.dx32.ptr = self.cc.alloc(k * 4)?;
-            self.dx32.cap = k;
-        }
-        // [marlin-A] f16 미러 동시 기록 — mma GEMM A(대역 절반, 비트 동일).
-        if k > self.dx16.cap {
-            self.graph_invalidate();
-            self.cc.sync()?;
-            if self.dx16.ptr != 0 {
-                self.cc.free(self.dx16.ptr)?;
-            }
-            self.dx16.ptr = 0;
-            self.dx16.cap = 0;
-            self.dx16.ptr = self.cc.alloc(k * 2)?;
-            self.dx16.cap = k;
-        }
-        let f = self.cc.function("w4a16_cast_x32")?;
-        let mut nn = k as i32;
-        let (mut c0, mut c1, mut c2) = (x_dev, self.dx32.ptr, self.dx16.ptr);
-        self.cc.launch(
-            f,
-            k.div_ceil(256) as u32,
-            1,
-            256,
-            &mut crate::rawcuda::args::l4(&mut c0, &mut c1, &mut c2, &mut nn),
-        )?;
-        Ok(self.dx32.ptr)
-    }
-
     /// [marlin-A5] f32 → dx16(f16) 캐스트만 — MoE 그룹 GEMM의 A(xn/act)용.
     /// 값은 cast_x32와 동일 반올림(비트 동일) — GEMM A 대역 절반.
     pub(super) fn cast_x16(&mut self, x_dev: CUdeviceptr, n: usize) -> Result<CUdeviceptr, String> {
@@ -582,7 +536,9 @@ impl W4a16Dec {
         self.norm_resid_at(w, x_dev, ab_dev, t_len, xn32)
     }
 
-    /// ew(silu·mul) 디바이스 발사 — g·u → y.
+    // ── ew(silu·mul) ──
+
+    /// ew(silu·mul) 디바이스 발사 — g·u → y(원시 f32 — MoE 소비 경로).
     pub(super) fn ew_dev(
         &mut self,
         g_dev: CUdeviceptr,
@@ -595,13 +551,65 @@ impl W4a16Dec {
         }
         let f = self.cc.function("ew")?;
         let mut nn = n as i32;
-        let (mut a0, mut a1, mut a2) = (g_dev, u_dev, y_dev);
+        let (mut a0, mut a1, mut a2, mut a3, mut a4) = (g_dev, u_dev, y_dev, 0u64, 0u64);
         self.cc.launch(
             f,
             n.div_ceil(128) as u32,
             1,
             128,
-            &mut crate::rawcuda::args::l4(&mut a0, &mut a1, &mut a2, &mut nn),
+            &mut crate::rawcuda::args::l6(&mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut nn),
+        )
+    }
+
+    /// [4.1 2026-10-11] ew + x32/미러 동시 기록 — split 체인의 cast_x32 노드
+    /// 제거(값 비트동일: h2f(f2h(act))·f2h(act) — cast 커널과 동일 산식).
+    /// dx32/dx16을 n까지 보장하고 커널에 넘긴다.
+    pub(super) fn ew_dev_fused(
+        &mut self,
+        g_dev: CUdeviceptr,
+        u_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        n: usize,
+    ) -> Result<(), String> {
+        if n == 0 {
+            return Err("ew: n=0".into());
+        }
+        self.ensure_dx32(n)?;
+        self.ensure_dx16(n)?;
+        let f = self.cc.function("ew")?;
+        let mut nn = n as i32;
+        let (mut a0, mut a1, mut a2, mut a3, mut a4) =
+            (g_dev, u_dev, y_dev, self.dx32.ptr, self.dx16.ptr);
+        self.cc.launch(
+            f,
+            n.div_ceil(128) as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l6(&mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut nn),
+        )
+    }
+
+    /// [4.1 2026-10-11] ew + f16 미러만 — MoE 그룹 GEMM A(cast_x16 대체).
+    pub(super) fn ew_dev_mirror(
+        &mut self,
+        g_dev: CUdeviceptr,
+        u_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        n: usize,
+    ) -> Result<(), String> {
+        if n == 0 {
+            return Err("ew: n=0".into());
+        }
+        self.ensure_dx16(n)?;
+        let f = self.cc.function("ew")?;
+        let mut nn = n as i32;
+        let (mut a0, mut a1, mut a2, mut a3, mut a4) = (g_dev, u_dev, y_dev, 0u64, self.dx16.ptr);
+        self.cc.launch(
+            f,
+            n.div_ceil(128) as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l6(&mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut nn),
         )
     }
 }
