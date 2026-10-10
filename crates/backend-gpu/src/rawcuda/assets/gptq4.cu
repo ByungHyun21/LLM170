@@ -820,6 +820,25 @@ __device__ __forceinline__ unsigned pk2bf(const unsigned short* p) {
     return (unsigned)p[0] | ((unsigned)p[1] << 16);
 }
 
+// [FLA-10 2026-10-10] f32 → bf16 미러 — bf16_mma의 A 재판독(L2 68% 실측)
+// 절반화. f2bf16과 동일 산술(비트동일 — 커널 내 변환을 대체). float4 벡터.
+extern "C" __global__ void w4a16_cast_bf16(const float* __restrict__ in,
+                                           unsigned short* __restrict__ out, int n) {
+    const int i4 = blockIdx.x * blockDim.x + threadIdx.x;
+    if ((i4 + 1) * 4 <= n) {
+        const float4 v = *reinterpret_cast<const float4*>(in + i4 * 4);
+        unsigned short* o = out + i4 * 4;
+        o[0] = f2bf16(v.x);
+        o[1] = f2bf16(v.y);
+        o[2] = f2bf16(v.z);
+        o[3] = f2bf16(v.w);
+    } else {
+        for (int j = i4 * 4; j < n; ++j) {
+            out[j] = f2bf16(in[j]);
+        }
+    }
+}
+
 // ldmatrix — 프래그먼트 smem 재판독(8× 중복)을 1명령으로. A는 x4(비전치),
 // B는 x2.trans([n][k]→[k][n] 전치 = col-major 프래그먼트).
 __device__ __forceinline__ void ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2,
@@ -842,9 +861,9 @@ __device__ __forceinline__ void ldm_x2(unsigned& r0, unsigned& r1, const void* p
 
 extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
     const unsigned short* __restrict__ w,  // [n][k] bf16
-    const float* __restrict__ x,           // [t][k] f32
+    const float* __restrict__ x,           // [t][k] f32 (xbf=0) / bf16 미러
     float* __restrict__ out,               // [t][n]
-    int n, int k, int t)
+    int n, int k, int t, int xbf)
 {
     // [뱅크 충돌] 행 stride를 128B(전 뱅크 주기)로 두면 프래그먼트 로드가
     // 8-way 충돌(실측: 패딩 없음 0.056ms = v3와 동일). +8 bf16(16B) 패딩으로
@@ -867,7 +886,27 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
     }
     for (int k0 = 0; k0 < k; k0 += MMA_KC) {
         __syncthreads();
-        // xs 스테이징: M32×KC64 f32→bf16 (float4 벡터화)
+        // [FLA-10] A 스테이징 — xbf=1이면 bf16 미러 직접 복사(uint4), 아니면
+        // f32→bf16 변환(float4). 두 경로의 xs 값은 비트동일.
+        if (xbf) {
+            const unsigned short* x16 = reinterpret_cast<const unsigned short*>(x);
+            for (int e = tid; e < BMMA_M * MMA_KC / 8; e += 256) {
+                const int r = e / (MMA_KC / 8);
+                const int c8 = e % (MMA_KC / 8);
+                const int gi = k0 + c8 * 8;
+                unsigned short* dst = &xs[r][c8 * 8];
+                if (m0 + r < t && gi + 7 < k) {
+                    *reinterpret_cast<uint4*>(dst) =
+                        *reinterpret_cast<const uint4*>(&x16[(size_t)(m0 + r) * k + gi]);
+                } else {
+                    for (int j = 0; j < 8; ++j) {
+                        dst[j] = (m0 + r < t && gi + j < k)
+                            ? x16[(size_t)(m0 + r) * k + gi + j]
+                            : (unsigned short)0;
+                    }
+                }
+            }
+        } else
         for (int e = tid; e < BMMA_M * MMA_KC / 4; e += 256) {
             const int r = e / (MMA_KC / 4);
             const int c4 = e % (MMA_KC / 4);

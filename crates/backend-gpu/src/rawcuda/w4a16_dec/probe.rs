@@ -531,13 +531,14 @@ impl W4a16Dec {
             let fm = self.cc.function("w4a16_gemm_bf16_mma")?;
             let (mut m_w, mut m_x, mut m_o) = (w, dx, db);
             let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
+            let mut m_b = 0i32; // [FLA-10] 게이트는 f32 경로(xbf=0).
             self.cc.launch(
                 fm,
                 t.div_ceil(GEMM_BMMA_M) as u32,
                 n.div_ceil(GEMM_BMMA_N) as u32,
                 256,
-                &mut crate::rawcuda::args::l6(
-                    &mut m_w, &mut m_x, &mut m_o, &mut m_n, &mut m_k, &mut m_t,
+                &mut crate::rawcuda::args::l7(
+                    &mut m_w, &mut m_x, &mut m_o, &mut m_n, &mut m_k, &mut m_t, &mut m_b,
                 ),
             )?;
             self.cc.sync()?;
@@ -584,7 +585,7 @@ impl W4a16Dec {
 
     /// 플레인 GEMM 단발 발사(벤치·진단 — T2 mma 비교용).
     pub fn plain_bench_launch(
-        &self,
+        &mut self,
         name: &str,
         x: CUdeviceptr,
         y: CUdeviceptr,
