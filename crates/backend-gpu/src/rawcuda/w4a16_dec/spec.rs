@@ -72,6 +72,53 @@ impl W4a16Dec {
         )
     }
 
+    /// [A-1 진단] spec scan 커널 토글(교차 대조용).
+    pub fn spec_set_scan(&mut self, on: bool) {
+        self.spec_scan_on = on;
+    }
+
+    /// [A-1 진단] GDN 출력(o_lc) 덤프 — 마지막 GDN 층 값.
+    pub fn spec_dump_outv(&mut self, n: usize) -> Result<Vec<f32>, String> {
+        let mut b = vec![0u8; n * 4];
+        self.cc.d2h(&mut b, self.dgo)?;
+        self.cc.sync()?;
+        Ok(b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    }
+
+    /// [A-1 진단] 슬롯 GDN 상태 저장/복원(전 층·헤드) — 검증 대조용.
+    pub fn spec_save_state(&mut self, slot: usize) -> Result<(), String> {
+        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
+        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
+        let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
+        let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
+        self.copy_dev(self.dsave, self.dgst + st_slot * 4, st_bytes)?;
+        self.copy_dev(
+            self.dsave + st_bytes,
+            self.dring + ring_slot * 4,
+            ring_bytes,
+        )
+    }
+
+    /// [A-1 진단] 저장 상태 복원(스냅샷 기반 롤백과 별개 — 대조 실험용).
+    pub fn spec_load_state(&mut self, slot: usize) -> Result<(), String> {
+        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
+        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
+        let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
+        let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
+        self.copy_dev(self.dgst + st_slot * 4, self.dsave, st_bytes)?;
+        self.copy_dev(
+            self.dring + ring_slot * 4,
+            self.dsave + st_bytes,
+            ring_bytes,
+        )
+    }
+
     /// [A-1] pos 되감기 — slot_pos/attn pos를 n만큼 되돌린다(스테일 KV는
     /// 다음 쓰기가 덮는다).
     pub fn spec_rewind_pos(&mut self, slot: usize, n: u32) -> Result<(), String> {

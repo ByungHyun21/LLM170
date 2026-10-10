@@ -143,7 +143,7 @@ impl W4a16Dec {
             )?;
             skip_scan = true;
         }
-        if !skip_scan && self.spec_on && (2..=8).contains(&t_len) {
+        if !skip_scan && self.spec_on && self.spec_scan_on && (2..=8).contains(&t_len) {
             // [A-1] 스펙 검증 — 토큰 루프 + 토큰별 상태 스냅샷(부분 수용
             // 롤백 지점). 산술은 t=1 trio와 비트동일.
             if self.dsnap == 0 {
@@ -281,6 +281,10 @@ impl W4a16Dec {
         let elems = 8 * self.n_layers * dm.h_v * dm.d * dm.d;
         self.dsnap = self.cc.alloc(elems * 4)?;
         self.dsnap_ring = self.cc.alloc(8 * self.n_layers * 3 * dm.conv_ch() * 4)?;
+        // [A-1 진단] 슬롯 상태 저장 스크래치(상태 + conv 링) — save/load용.
+        self.dsave = self.cc.alloc(
+            self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4,
+        )?;
         self.spec_on = true;
         Ok(())
     }
