@@ -99,6 +99,16 @@ impl KvMode {
     }
 }
 
+/// [R10 2026-10-10] 체인 선형 경로 — 3체인의 차이를 주입하는 열거.
+/// Gemv1: t=1 단독(1행 GEMV — 스테이징 폭 w 검사 동반),
+/// Gemm: t≥2 프리필(mma/FFMA GEMM), GemvT: t≤8 배치(TR GEMV).
+#[derive(Clone, Copy)]
+pub enum LinPath {
+    Gemv1 { w: usize },
+    Gemm,
+    GemvT,
+}
+
 /// GDN 체인 형상(서버가 config에서 유도해 명시 등록 — 추정 금지).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GdnDims {

@@ -190,6 +190,28 @@ impl W4a16Dec {
         self.gemv_launch(name, x32_dev, dst)
     }
 
+    /// [R10 2026-10-10] 체인 선형 경로 — 3체인(단독 t=1 / 프리필 t≥2 /
+    /// 배치 t≤8)의 차이는 이 열거 하나다. 방출 커널·인자 순서는 종전과 동일
+    /// (그래프 캡처 불변식 — 골든·스모크로 검증).
+    pub(super) fn lin_forward(
+        &mut self,
+        plain: bool,
+        path: LinPath,
+        name: &str,
+        x: CUdeviceptr,
+        dst: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        match (plain, path) {
+            (false, LinPath::Gemv1 { w }) => self.gemv_stage_x32(name, x, dst, w),
+            (false, LinPath::Gemm) => self.gemm_launch(name, x, dst, t),
+            (false, LinPath::GemvT) => self.gemv_t_launch(name, x, dst, t),
+            (true, LinPath::Gemv1 { w }) => self.plain_stage_x32(name, x, dst, w),
+            (true, LinPath::Gemm) => self.plain_gemm_launch(name, x, dst, t),
+            (true, LinPath::GemvT) => self.plain_gemv_t_launch(name, x, dst, t),
+        }
+    }
+
     // ── 플레인 bf16(MoE 모델 — 35B) + MoE FFN ──
 
     /// bf16 GEMV — 행=블록(w4a16_gemv_bf16), x는 **원시 f32**(h2f 왕복 없음).

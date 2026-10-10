@@ -206,35 +206,57 @@ impl W4a16Dec {
                 .map_err(|e| format!("L{il} input norm: {e}"))?;
             let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
             let branch = if (il + 1) % interval == 0 {
-                if plain {
-                    self.plain_stage_x32(&format!("blk.{il}.attn_q.weight"), xn, s0, w0)
-                        .map_err(|e| format!("L{il} q: {e}"))?;
-                    self.plain_stage_x32(&format!("blk.{il}.attn_k.weight"), xn, s1, w1)
-                        .map_err(|e| format!("L{il} k: {e}"))?;
-                    self.plain_stage_x32(&format!("blk.{il}.attn_v.weight"), xn, s1b, w1)
-                        .map_err(|e| format!("L{il} v: {e}"))?;
-                } else {
-                    self.gemv_stage_x32(&format!("blk.{il}.attn_q.weight"), x32, s0, w0)
-                        .map_err(|e| format!("L{il} q: {e}"))?;
-                    self.gemv_stage_x32(&format!("blk.{il}.attn_k.weight"), x32, s1, w1)
-                        .map_err(|e| format!("L{il} k: {e}"))?;
-                    self.gemv_stage_x32(&format!("blk.{il}.attn_v.weight"), x32, s1b, w1)
-                        .map_err(|e| format!("L{il} v: {e}"))?;
-                }
+                // [R10] 4변형(plain×split) → lin_forward 단일 디스패치.
+                let xin = if plain { xn } else { x32 };
+                self.lin_forward(
+                    plain,
+                    LinPath::Gemv1 { w: w0 },
+                    &format!("blk.{il}.attn_q.weight"),
+                    xin,
+                    s0,
+                    1,
+                )
+                .map_err(|e| format!("L{il} q: {e}"))?;
+                self.lin_forward(
+                    plain,
+                    LinPath::Gemv1 { w: w1 },
+                    &format!("blk.{il}.attn_k.weight"),
+                    xin,
+                    s1,
+                    1,
+                )
+                .map_err(|e| format!("L{il} k: {e}"))?;
+                self.lin_forward(
+                    plain,
+                    LinPath::Gemv1 { w: w1 },
+                    &format!("blk.{il}.attn_v.weight"),
+                    xin,
+                    s1b,
+                    1,
+                )
+                .map_err(|e| format!("L{il} v: {e}"))?;
                 self.attn_chain_dev_run(slot, il / interval, 1, s0, s1, s1b)
                     .map_err(|e| format!("L{il} attn: {e}"))?
             } else {
-                if plain {
-                    self.plain_stage_x32(&format!("blk.{il}.attn_qkv.weight"), xn, s0, w0)
-                        .map_err(|e| format!("L{il} qkv: {e}"))?;
-                    self.plain_stage_x32(&format!("blk.{il}.attn_gate.weight"), xn, s1, w1)
-                        .map_err(|e| format!("L{il} z: {e}"))?;
-                } else {
-                    self.gemv_stage_x32(&format!("blk.{il}.attn_qkv.weight"), x32, s0, w0)
-                        .map_err(|e| format!("L{il} qkv: {e}"))?;
-                    self.gemv_stage_x32(&format!("blk.{il}.attn_gate.weight"), x32, s1, w1)
-                        .map_err(|e| format!("L{il} z: {e}"))?;
-                }
+                let xin = if plain { xn } else { x32 };
+                self.lin_forward(
+                    plain,
+                    LinPath::Gemv1 { w: w0 },
+                    &format!("blk.{il}.attn_qkv.weight"),
+                    xin,
+                    s0,
+                    1,
+                )
+                .map_err(|e| format!("L{il} qkv: {e}"))?;
+                self.lin_forward(
+                    plain,
+                    LinPath::Gemv1 { w: w1 },
+                    &format!("blk.{il}.attn_gate.weight"),
+                    xin,
+                    s1,
+                    1,
+                )
+                .map_err(|e| format!("L{il} z: {e}"))?;
                 let g = self
                     .gdn_chain_dev_run(slot, gi, 1, xn, s0, s1)
                     .map_err(|e| format!("L{il} gdn: {e}"))?;
@@ -270,10 +292,24 @@ impl W4a16Dec {
             } else {
                 let x32n = x32; // 노름 융합 기록
                 let _ = xn2;
-                self.gemv_stage_x32(&format!("blk.{il}.ffn_gate.weight"), x32n, s0, w0)
-                    .map_err(|e| format!("L{il} gate: {e}"))?;
-                self.gemv_stage_x32(&format!("blk.{il}.ffn_up.weight"), x32n, s1, w1)
-                    .map_err(|e| format!("L{il} up: {e}"))?;
+                self.lin_forward(
+                    false,
+                    LinPath::Gemv1 { w: w0 },
+                    &format!("blk.{il}.ffn_gate.weight"),
+                    x32n,
+                    s0,
+                    1,
+                )
+                .map_err(|e| format!("L{il} gate: {e}"))?;
+                self.lin_forward(
+                    false,
+                    LinPath::Gemv1 { w: w1 },
+                    &format!("blk.{il}.ffn_up.weight"),
+                    x32n,
+                    s1,
+                    1,
+                )
+                .map_err(|e| format!("L{il} up: {e}"))?;
                 self.ew_dev(s0, s1, s2, w2)?;
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
@@ -368,28 +404,73 @@ impl W4a16Dec {
                 .map_err(|e| format!("T{il} input norm: {e}"))?;
             let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
             let branch = if (il + 1) % interval == 0 {
-                if plain {
-                    self.plain_gemm_launch(&format!("blk.{il}.attn_q.weight"), xn, s0, t)?;
-                    self.plain_gemm_launch(&format!("blk.{il}.attn_k.weight"), xn, s1, t)?;
-                    self.plain_gemm_launch(&format!("blk.{il}.attn_v.weight"), xn, s1b, t)?;
-                } else {
-                    self.gemm_launch(&format!("blk.{il}.attn_q.weight"), xh, s0, t)?;
-                    self.gemm_launch(&format!("blk.{il}.attn_k.weight"), xh, s1, t)?;
-                    self.gemm_launch(&format!("blk.{il}.attn_v.weight"), xh, s1b, t)?;
-                }
+                // [R10] 4변형 → lin_forward 단일 디스패치(Gemm 경로).
+                let xin = if plain { xn } else { xh };
+                self.lin_forward(
+                    plain,
+                    LinPath::Gemm,
+                    &format!("blk.{il}.attn_q.weight"),
+                    xin,
+                    s0,
+                    t,
+                )?;
+                self.lin_forward(
+                    plain,
+                    LinPath::Gemm,
+                    &format!("blk.{il}.attn_k.weight"),
+                    xin,
+                    s1,
+                    t,
+                )?;
+                self.lin_forward(
+                    plain,
+                    LinPath::Gemm,
+                    &format!("blk.{il}.attn_v.weight"),
+                    xin,
+                    s1b,
+                    t,
+                )?;
                 self.attn_chain_dev_run(slot, il / interval, t, s0, s1, s1b)
                     .map_err(|e| format!("T{il} attn: {e}"))?
             } else {
                 if plain {
-                    self.plain_gemm_launch(&format!("blk.{il}.attn_qkv.weight"), xn, s0, t)?;
-                    self.plain_gemm_launch(&format!("blk.{il}.attn_gate.weight"), xn, s1, t)?;
+                    self.lin_forward(
+                        plain,
+                        LinPath::Gemm,
+                        &format!("blk.{il}.attn_qkv.weight"),
+                        xn,
+                        s0,
+                        t,
+                    )?;
+                    self.lin_forward(
+                        plain,
+                        LinPath::Gemm,
+                        &format!("blk.{il}.attn_gate.weight"),
+                        xn,
+                        s1,
+                        t,
+                    )?;
                 } else {
                     // [2026-10-09 P6] xh(=self.dx32)는 norm_resid_dev가 이미
                     // h2f(f2h(xn)) 융합 기록(norm.cu xn32 — cast_x32와 비트 동일
                     // 계약, 실측 근거 주석 포함). 종전 cast_x32 재계산은 중복
                     // 런치였다. 값 불변(골든 검증).
-                    self.gemm_launch(&format!("blk.{il}.attn_qkv.weight"), xh, s0, t)?;
-                    self.gemm_launch(&format!("blk.{il}.attn_gate.weight"), xh, s1, t)?;
+                    self.lin_forward(
+                        plain,
+                        LinPath::Gemm,
+                        &format!("blk.{il}.attn_qkv.weight"),
+                        xh,
+                        s0,
+                        t,
+                    )?;
+                    self.lin_forward(
+                        plain,
+                        LinPath::Gemm,
+                        &format!("blk.{il}.attn_gate.weight"),
+                        xh,
+                        s1,
+                        t,
+                    )?;
                 }
                 let g = self
                     .gdn_chain_dev_run(slot, gi, t, xn, s0, s1)
@@ -403,11 +484,11 @@ impl W4a16Dec {
                 format!("blk.{il}.ssm_out.weight")
             };
             if plain {
-                self.plain_gemm_launch(&lo, branch, dyt, t)?;
+                self.lin_forward(plain, LinPath::Gemm, &lo, branch, dyt, t)?;
             } else {
                 let (_, _, _, ko) = self.lin_spec(&lo)?;
                 let xh2 = self.cast_x32(branch, t * ko)?;
-                self.gemm_launch(&lo, xh2, dyt, t)?;
+                self.lin_forward(plain, LinPath::Gemm, &lo, xh2, dyt, t)?;
             }
             // [P10] cast_x32(t×ko)가 dx32를 재할당했을 수 있다 — 노름 융합
             // 기록(xn32)은 **현재** 포인터를 다시 확인한다. 옛 포인터를 계속
@@ -423,13 +504,27 @@ impl W4a16Dec {
             } else {
                 let xh3 = xh; // 노름 융합 기록
                 let _ = xn2;
-                self.gemm_launch(&format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
-                self.gemm_launch(&format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
+                self.lin_forward(
+                    false,
+                    LinPath::Gemm,
+                    &format!("blk.{il}.ffn_gate.weight"),
+                    xh3,
+                    s0,
+                    t,
+                )?;
+                self.lin_forward(
+                    false,
+                    LinPath::Gemm,
+                    &format!("blk.{il}.ffn_up.weight"),
+                    xh3,
+                    s1,
+                    t,
+                )?;
                 self.ew_dev(s0, s1, s2, t * w2)?;
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
                 let xh4 = self.cast_x32(s2, t * kd)?;
-                self.gemm_launch(&dn, xh4, s3, t)?;
+                self.lin_forward(false, LinPath::Gemm, &dn, xh4, s3, t)?;
                 ab = s3;
             }
         }
@@ -523,25 +618,52 @@ impl W4a16Dec {
                 .map_err(|e| format!("B{il} input norm: {e}"))?;
             let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
             let branch = if (il + 1) % interval == 0 {
-                if plain {
-                    self.plain_gemv_t_launch(&format!("blk.{il}.attn_q.weight"), xn, s0, t)?;
-                    self.plain_gemv_t_launch(&format!("blk.{il}.attn_k.weight"), xn, s1, t)?;
-                    self.plain_gemv_t_launch(&format!("blk.{il}.attn_v.weight"), xn, s1b, t)?;
-                } else {
-                    self.gemv_t_launch(&format!("blk.{il}.attn_q.weight"), xh, s0, t)?;
-                    self.gemv_t_launch(&format!("blk.{il}.attn_k.weight"), xh, s1, t)?;
-                    self.gemv_t_launch(&format!("blk.{il}.attn_v.weight"), xh, s1b, t)?;
-                }
+                // [R10] 4변형 → lin_forward 단일 디스패치(GemvT 경로).
+                let xin = if plain { xn } else { xh };
+                self.lin_forward(
+                    plain,
+                    LinPath::GemvT,
+                    &format!("blk.{il}.attn_q.weight"),
+                    xin,
+                    s0,
+                    t,
+                )?;
+                self.lin_forward(
+                    plain,
+                    LinPath::GemvT,
+                    &format!("blk.{il}.attn_k.weight"),
+                    xin,
+                    s1,
+                    t,
+                )?;
+                self.lin_forward(
+                    plain,
+                    LinPath::GemvT,
+                    &format!("blk.{il}.attn_v.weight"),
+                    xin,
+                    s1b,
+                    t,
+                )?;
                 self.attn_chain_dev_batch(slots, il / interval, t, s0, s1, s1b)
                     .map_err(|e| format!("B{il} attn: {e}"))?
             } else {
-                if plain {
-                    self.plain_gemv_t_launch(&format!("blk.{il}.attn_qkv.weight"), xn, s0, t)?;
-                    self.plain_gemv_t_launch(&format!("blk.{il}.attn_gate.weight"), xn, s1, t)?;
-                } else {
-                    self.gemv_t_launch(&format!("blk.{il}.attn_qkv.weight"), xh, s0, t)?;
-                    self.gemv_t_launch(&format!("blk.{il}.attn_gate.weight"), xh, s1, t)?;
-                }
+                let xin = if plain { xn } else { xh };
+                self.lin_forward(
+                    plain,
+                    LinPath::GemvT,
+                    &format!("blk.{il}.attn_qkv.weight"),
+                    xin,
+                    s0,
+                    t,
+                )?;
+                self.lin_forward(
+                    plain,
+                    LinPath::GemvT,
+                    &format!("blk.{il}.attn_gate.weight"),
+                    xin,
+                    s1,
+                    t,
+                )?;
                 let g = self
                     .gdn_chain_dev_batch(slots, gi, t, xn, s0, s1)
                     .map_err(|e| format!("B{il} gdn: {e}"))?;
@@ -554,11 +676,11 @@ impl W4a16Dec {
                 format!("blk.{il}.ssm_out.weight")
             };
             if plain {
-                self.plain_gemv_t_launch(&lo, branch, dyt, t)?;
+                self.lin_forward(plain, LinPath::GemvT, &lo, branch, dyt, t)?;
             } else {
                 let (_, _, _, ko) = self.lin_spec(&lo)?;
                 let xh2 = self.cast_x32(branch, t * ko)?;
-                self.gemv_t_launch(&lo, xh2, dyt, t)?;
+                self.lin_forward(plain, LinPath::GemvT, &lo, xh2, dyt, t)?;
             }
             let xh = self.ensure_dx32(t * h)?;
             let xn2 = self
@@ -571,13 +693,27 @@ impl W4a16Dec {
             } else {
                 let xh3 = xh;
                 let _ = xn2;
-                self.gemv_t_launch(&format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
-                self.gemv_t_launch(&format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
+                self.lin_forward(
+                    false,
+                    LinPath::GemvT,
+                    &format!("blk.{il}.ffn_gate.weight"),
+                    xh3,
+                    s0,
+                    t,
+                )?;
+                self.lin_forward(
+                    false,
+                    LinPath::GemvT,
+                    &format!("blk.{il}.ffn_up.weight"),
+                    xh3,
+                    s1,
+                    t,
+                )?;
                 self.ew_dev(s0, s1, s2, t * w2)?;
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
                 let xh4 = self.cast_x32(s2, t * kd)?;
-                self.gemv_t_launch(&dn, xh4, s3, t)?;
+                self.lin_forward(false, LinPath::GemvT, &dn, xh4, s3, t)?;
                 ab = s3;
             }
         }
