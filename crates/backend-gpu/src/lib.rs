@@ -7,6 +7,8 @@
 pub mod rawcuda;
 
 pub use rawcuda::ctx::{DeviceCaps, VramSampler};
+/// 게이트 프로브 호스트 — 프로덕션 런처(w4a16_dec)와 **의도적 분리**:
+/// 커널 게이트는 독립 판정자여야 하므로 런처를 공유하지 않는다([R19]).
 pub use rawcuda::gptq4::Gptq4;
 pub use rawcuda::gptq4::h2f;
 pub use rawcuda::w4a16_dec::{AttnDims, BATCH_DEC_MAX, GdnDims, W4a16Dec, f32_to_f16};
