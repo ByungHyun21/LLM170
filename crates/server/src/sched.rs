@@ -241,20 +241,14 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     // 503이라 클라이언트가 계측을 시작하지 않는다.
     {
         let warm: Vec<u32> = vec![1u32; 16];
-        let w: Result<(), String> = match &mut eng {
-            Engine::Gpu(e) => e.prefill(0, &warm).and_then(|l| {
-                let t = llm170_core::qwen35::greedy(&l);
-                e.decode_greedy(0, t).map(|_| ())
-            }),
-        };
+        let w: Result<(), String> = eng.0.prefill(0, &warm).and_then(|l| {
+            let t = llm170_core::qwen35::greedy(&l);
+            eng.0.decode_greedy(0, t).map(|_| ())
+        });
         if let Err(err) = w {
             eprintln!("# warmup 실패(치명 아님): {err}");
         }
-        match &mut eng {
-            Engine::Gpu(e) => {
-                let _ = e.reset_states();
-            }
-        }
+        let _ = eng.0.reset_states();
     }
     crate::http::READY.store(true, std::sync::atomic::Ordering::Release);
     let mut slots: Vec<Slot> = (0..n_slots).map(|_| Slot::free()).collect();
@@ -313,9 +307,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             decoded = true;
             let _dt = std::time::Instant::now();
             llm170_diag::watchdog::bump();
-            match &mut eng {
-                Engine::Gpu(e) => q35_decode(e, &mut slots, &active),
-            }
+            q35_decode(&mut eng.0, &mut slots, &active);
             dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
             // 완료 슬롯 정리 — 결과 전송·반환
             for &i in &active {
@@ -365,15 +357,13 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     // 샘플링 슬롯은 로짓 판(마지막 청크만 판정에 사용) — Q4도
                     // prefill_greedy 대신 prefill. greedy는 종전 최적 경로.
                     let samp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
-                    let r: Result<u32, String> = match &mut eng {
-                        Engine::Gpu(e) => e.prefill(i, &part).map(|l| {
-                            if samp {
-                                pick(&mut slots[i], &l)
-                            } else {
-                                llm170_core::qwen35::greedy(&l)
-                            }
-                        }),
-                    };
+                    let r: Result<u32, String> = eng.0.prefill(i, &part).map(|l| {
+                        if samp {
+                            pick(&mut slots[i], &l)
+                        } else {
+                            llm170_core::qwen35::greedy(&l)
+                        }
+                    });
                     (end, r)
                 };
                 // [B5] 라운드로빈 — 방금 전진한 슬롯을 최신으로 갱신, 다음

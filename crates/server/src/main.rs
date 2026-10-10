@@ -309,9 +309,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         n_slots: slots.unwrap_or(1),
         model_bytes: dir_bytes(&model_path),
     });
-    // 라우팅: W4A16 = qwen35 CPU 경로 단일(가속은 W2 커널 이후).
-    let sel = engine::BackendSel::Cpu;
-    match http::serve(&format!("127.0.0.1:{port}"), req, sel, slots, queue) {
+    match http::serve(&format!("127.0.0.1:{port}"), req, slots, queue) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");

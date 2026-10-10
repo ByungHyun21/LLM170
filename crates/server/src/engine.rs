@@ -2,13 +2,6 @@
 
 use std::path::PathBuf;
 
-pub enum BackendSel {
-    Cpu,
-    /// 후속(W2/W3): CUDA W4A16 가속 부착 경로에서 사용 예정 — 현 프런트
-    /// (serve/infer)는 Cpu 단일이라 아직 생성되지 않는다.
-    #[allow(dead_code)]
-    Gpu,
-}
 /// 모델 경로 포맷 판정 — 2026-10-08 단일 트랙:
 /// 수용은 **W4A16 디렉터리 단일** — 그 외는 명시 에러로 안내.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -114,45 +107,32 @@ pub struct InferResult {
     pub error: Option<String>,
 }
 
-pub enum Engine {
-    /// W3-3: GPU 단일 경로 — W4A16 CUDA 체인(호스트 스테이징) + CPU head.
-    Gpu(Box<crate::gpu_engine::GpuEngine>),
-}
+pub struct Engine(pub Box<crate::gpu_engine::GpuEngine>);
 
 impl Engine {
     /// 메모리 분류(모니터링) — (가중치, KV, CPU 오프로드, PLE 오프로드).
     pub fn mem_stats(&self) -> (u64, u64, u64, u64) {
-        match self {
-            Engine::Gpu(e) => e.mem_stats(),
-        }
+        self.0.mem_stats()
     }
 
     /// 토큰당 활성 가중치 바이트(실효 대역폭 계산용).
     pub fn active_weight_bytes(&self) -> u64 {
-        match self {
-            Engine::Gpu(e) => e.active_weight_bytes(),
-        }
+        self.0.active_weight_bytes()
     }
 
     /// MoE 배치 모드 — "none" | "resident" | "streaming".
     pub fn moe_mode(&self) -> &'static str {
-        match self {
-            Engine::Gpu(e) => e.moe_mode(),
-        }
+        self.0.moe_mode()
     }
 
     /// 복사 계측 — [h2d, d2h, d2d] × (바이트, ns, 호출).
     pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
-        match self {
-            Engine::Gpu(e) => e.copy_stats(),
-        }
+        self.0.copy_stats()
     }
 
     /// 정지 토큰(F5 — 하드코드 248044 일반화): Q35는 아키텍처 상수.
     pub fn eos(&self) -> u32 {
-        match self {
-            Engine::Gpu(_) => llm170_core::qwen35::EOS_EOT,
-        }
+        llm170_core::qwen35::EOS_EOT
     }
 }
 
@@ -177,7 +157,7 @@ fn banner(
     );
 }
 
-pub fn build_slots(req: InferRequest, _backend: BackendSel, n_slots: usize) -> Engine {
+pub fn build_slots(req: InferRequest, n_slots: usize) -> Engine {
     // W3-3: GPU 경로 단일 — 가중치 VRAM 상주(호스트 스테이징 체인).
     let eng = load_gpu_retry(&req.model, n_slots, req.ctx);
     banner(
@@ -189,17 +169,13 @@ pub fn build_slots(req: InferRequest, _backend: BackendSel, n_slots: usize) -> E
         req.ctx,
         n_slots,
     );
-    Engine::Gpu(Box::new(eng))
+    Engine(Box::new(eng))
 }
 
 impl Engine {
     /// 슬롯 단위 리셋 위임.
     pub fn reset_seq(&mut self, seq: usize) {
-        match self {
-            Engine::Gpu(e) => {
-                let _ = e.reset_seq(seq);
-            }
-        }
+        let _ = self.0.reset_seq(seq);
     }
 }
 
