@@ -515,6 +515,9 @@ extern "C" __global__ void attn_fwd3s(
 
 // 부분합: 분할 s의 KV 구간 [lo, hi)에 대해 온라인 소프트맥스(m·l·acc256).
 // 산술은 단일 커널과 동일(청크 내 순차·d 오름차순) — 분할 간 병합만 다르다.
+// [A-2 GQA 패킹 기각 2026-10-10] 블록=(t,kv_head,split) + gq 순차 처리 실측:
+// 4K 디코드 attn 1.5→3.6ms/토큰 — q_heads 병렬도 상실(P8 분할 취지 상쇄)이
+// L1 공유 이득을 압도. KV 재판독은 이미 L2(99% 히트)가 흡수. 종전 유지.
 extern "C" __global__ void attn_fwd3s_part(
     const float* __restrict__ qh,
     const float* __restrict__ kc,
