@@ -551,9 +551,13 @@ extern "C" __global__ void gdn_scan(
         if (grp == 0) {
             for (int i = 0; i < n; i++) {
                 float rhs = bp[i] * (__half2float(sv[i * GDN_VS + tid]) - e[i] * __half2float(KS[i * GDN_VS + tid]));
-                for (int j = 0; j < i; j++) {
+                // [FLA-3 2026-10-10] j를 고정 32회 전개 — A[i][j≥i]=0(prepass가
+                // 0 기록)이므로 무조건 누산이 동일 값(0·dc=±0, rhs∓0=rhs —
+                // 비트동일). 동적 하한 루프의 smem 지연 노출(i×~35cyc) 제거.
+#pragma unroll
+                for (int j = 0; j < GDN_CS; j++) {
                     float aij = __half2float(A[i * GDN_CS + j]);
-                    if (aij != 0.0f) rhs -= aij * dc[j * GDN_VS + tid];
+                    rhs -= aij * dc[j * GDN_VS + tid];
                 }
                 dc[i * GDN_VS + tid] = rhs;
             }
@@ -573,9 +577,11 @@ extern "C" __global__ void gdn_scan(
                     break;
                 }
                 float oi = e[i] * __half2float(QS[i * GDN_VS + tid]);
-                for (int p = 0; p <= i; p++) {
+                // [FLA-3] p 고정 32회 전개 — KQ[i][p>i]=0(비트동일).
+#pragma unroll
+                for (int p = 0; p < GDN_CS; p++) {
                     float w = __half2float(KQ[i * GDN_CS + p]);
-                    if (w != 0.0f) oi += w * dc[p * GDN_VS + tid];
+                    oi += w * dc[p * GDN_VS + tid];
                 }
                 outv[(t0 + i) * (h_v * d) + h * 128 + vs + tid] = oi;
             }
