@@ -330,6 +330,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     }
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     let mut n_predict = 8usize;
+    let mut spec_k: usize = 0; // [A-1] 스페큘러티브 초안 상한(0=off).
     let mut ctx = 1024usize;
     let mut no_head = false;
     let mut moe_check = false;
@@ -363,6 +364,12 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                     .next()
                     .and_then(|v| v.parse().ok())
                     .ok_or("--n-predict requires a number")?;
+            }
+            "--spec" => {
+                spec_k = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--spec requires a number")?;
             }
             "--ctx" => {
                 ctx = it
@@ -694,7 +701,53 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     if llm170_diag::flag::ne0("LLM170_TIME") {
         eprintln!("{}", dec.prof_report("prefill")?);
     }
-    for _ in 0..n_predict {
+    // [A-1] 스페큘러티브 디코딩 — n-gram 초안 + 배치 검증 + GDN 롤백.
+    // 출력 토큰 스트림은 비스펙(그리디)과 **정확히 동일**해야 한다(골든 판정).
+    let mut hist: Vec<u32> = prompt.to_vec();
+    if spec_k >= 2 && head_gpu {
+        dec.enable_spec()?;
+    }
+    let (mut spec_rounds, mut spec_drafted, mut spec_acc) = (0u64, 0u64, 0u64);
+    let spec_t0 = std::time::Instant::now();
+    // 원 루프(for _ in 0..n_predict) = n_predict회 **추가** — out은 프리필
+    // 첫 토큰을 이미 담고 있다(오프바이원 실측: 35B 4000 골든 8토큰).
+    while out.len() <= n_predict {
+        if spec_k >= 2 && head_gpu {
+            // 초안 = 최대 spec_k-1개(검증 배치 = 1+초안 ≤ spec_k).
+            // n=4 — 12는 우리 산문 테스트에서 발화 0(실측). 짧은 패턴이
+            // 반복 구조(리스트·코드)를 더 자주 잡는다(수용률은 검증이 판정).
+            let draft = llm170_core::spec::ngram_draft(&hist, 4, 48, spec_k - 1);
+            if !draft.is_empty() {
+                let t = 1 + draft.len();
+                let mut rows: Vec<f32> = Vec::with_capacity(t * hp.n_embd);
+                rows.extend_from_slice(&model.embed_row(next).map_err(|e| e.to_string())?);
+                for &tk in &draft {
+                    rows.extend_from_slice(&model.embed_row(tk).map_err(|e| e.to_string())?);
+                }
+                let toks = dec.spec_verify(0, &rows, t)?;
+                let mut acc = 0usize;
+                while acc < draft.len() && toks[acc] == draft[acc] {
+                    acc += 1;
+                }
+                spec_rounds += 1;
+                spec_drafted += draft.len() as u64;
+                spec_acc += acc as u64;
+                let corr = toks[acc]; // 보정(또는 초안 전량 수용 시 보너스).
+                if acc + 1 < t {
+                    // 부분 수용 — 상태·pos를 배치 acc+1토큰 시점으로 되감기.
+                    dec.spec_rollback(0, acc + 1)?;
+                    dec.spec_rewind_pos(0, (t - (acc + 1)) as u32)?;
+                }
+                for &tk in &draft[..acc] {
+                    out.push(tk);
+                    hist.push(tk);
+                }
+                out.push(corr);
+                hist.push(corr);
+                next = corr;
+                continue;
+            }
+        }
         let row = model.embed_row(next).map_err(|e| e.to_string())?;
         if head_gpu {
             // [P3] 디코드는 디바이스 argmax(4B d2h) — 토큰 스트림은 종전
@@ -709,11 +762,19 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
             next = llm170_core::matmul::greedy_from(&head_logits(&xn));
         }
         out.push(next);
+        hist.push(next);
     }
     if llm170_diag::flag::ne0("LLM170_TIME") {
         // 진단(P8): 커널 범주별 소요 — 그래프 캡처 중에는 마킹이 꺼지므로
         // LLM170_GRAPH=0 직접 경로에서 의미가 있다.
         eprintln!("{}", dec.prof_report(&format!("decode {n_predict}토큰"))?);
+    }
+    if spec_rounds > 0 {
+        eprintln!(
+            "[spec] 라운드 {spec_rounds} · 초안 {spec_drafted} · 수용 {spec_acc} (수용률 {:.0}%) · {:.1}ms",
+            spec_acc as f64 / spec_drafted.max(1) as f64 * 100.0,
+            spec_t0.elapsed().as_secs_f64() * 1e3
+        );
     }
     let gen_ms = t1.elapsed().as_secs_f64() * 1e3;
     let csv = out

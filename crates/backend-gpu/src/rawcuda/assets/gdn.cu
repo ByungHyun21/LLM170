@@ -142,6 +142,8 @@ extern "C" __global__ void gdn_conv(
     float* __restrict__ q_out,       // [T][k_len]
     float* __restrict__ k_out,       // [T][k_len]
     float* __restrict__ v_out,       // [T][v_len]
+    float* __restrict__ ring_snap,   // [T][L][3][conv_ch] — 토큰 i 처리 후 링
+                                     // (스펙 롤백용, 0이면 생략)
     int t_len, int layer, int k_len, int v_len, int conv_ch)
 {
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
@@ -175,6 +177,14 @@ extern "C" __global__ void gdn_conv(
             v_out[t * v_len + (ch - 2 * k_len)] = o;
         }
         h0 = h1; h1 = h2; h2 = xt;
+        if (ring_snap != (float*)0) {
+            // 토큰 t 처리 후 링 = (x[t-2], x[t-1], x[t]). 호스트가 층 슬라이스
+            // (layer * TMAX * 3 * conv_ch)를 더해 전달 — 레이아웃 [t][3][ch].
+            float* rs = ring_snap + ((long)t * 3) * conv_ch + ch;
+            rs[0] = h0;
+            rs[(long)conv_ch] = h1;
+            rs[(long)2 * conv_ch] = h2;
+        }
     }
     if (t1 == t_len) {
         ring[layer * 3 * conv_ch + 0 * conv_ch + ch] = h0;
@@ -656,6 +666,78 @@ extern "C" __global__ void gdn1_upd(
         const float kv = __half2float(__float2half_rn(k[kh * 128 + i]));
         float* p = &st[st_h + (long)i * d + tid];
         *p = *p * e + kv * dcv;
+    }
+}
+
+// [A-1 2026-10-10] 스펙 검증용 GDN — t≤8 토큰 루프 + **토큰별 상태 스냅샷**.
+// t=1 trio(part/comb/upd)를 블록=(h) 하나로 융합하되 산술은 trio와 **비트
+// 동일**: KS/QS는 8분할(16행) 부분합을 분할 순서로 결합, half(k)/half(v)/
+// exp 라운딩 지점 동일, kq00은 동일 트리. 각 토큰 처리 후 그 토큰의 상태
+// (이 층·이 헤드 128×128)를 snap[t]에 기록 — 부분 수용 롤백의 복원 지점.
+// (열 소유 스레드 구조라 토큰 간 상태 의존이 스레드-로컬 — 동기화는 kq00
+// 트리뿐.)
+extern "C" __global__ void gdn_spec_scan(
+    const float* __restrict__ q,     // [T][k_len]
+    const float* __restrict__ k,     // [T][k_len]
+    const float* __restrict__ v,     // [T][h_v*128]
+    const float* __restrict__ bg,    // [T][2*h_v]
+    float* __restrict__ st,          // [L][h_v][d*d] r/w — 최종 상태
+    float* __restrict__ snap,        // [KMAX][L][h_v][d*d] — 토큰별 상태
+    float* __restrict__ outv,        // [T][h_v*128]
+    int t_len, int h_k, int h_v, int d, int layer, int n_layers)
+{
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x; // = d 인덱스
+    const int kh = h % h_k;
+    const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    __shared__ float red[128];
+    const float qscale = 1.0f / sqrtf((float)d);
+    for (int t = 0; t < t_len; ++t) {
+        const float* qt = q + (long)t * (h_k * 128);
+        const float* kt = k + (long)t * (h_k * 128);
+        // part(8분할 부분합 → 분할 순서 결합) — trio gdn1_part/comb 미러.
+        float ks = 0.0f, qs = 0.0f;
+        for (int s = 0; s < GDN1_SPLIT; ++s) {
+            const int i0 = s * (128 / GDN1_SPLIT);
+            float pks = 0.0f, pqs = 0.0f;
+            for (int ii = 0; ii < 128 / GDN1_SPLIT; ++ii) {
+                const int i = i0 + ii;
+                const float stv = st[st_h + (long)i * d + tid];
+                pks += __half2float(__float2half_rn(kt[kh * 128 + i])) * stv;
+                pqs += qt[kh * 128 + i] * stv;
+            }
+            ks += pks;
+            qs += pqs;
+        }
+        // kq00 — trio comb의 블록 트리와 동일 순서.
+        red[tid] = qt[kh * 128 + tid] * __half2float(__float2half_rn(kt[kh * 128 + tid]));
+        __syncthreads();
+        for (int stp = 64; stp > 0; stp >>= 1) {
+            if (tid < stp) {
+                red[tid] += red[tid + stp];
+            }
+            __syncthreads();
+        }
+        const float kq00 = red[0] * qscale;
+        const float g = bg[t * (2 * h_v) + h_v + h];
+        const float beta = bg[t * (2 * h_v) + h];
+        const float e = gdn_expf(g);
+        const float sv = __half2float(__float2half_rn(v[t * (h_v * 128) + h * 128 + tid]));
+        const float rhs = beta * (sv - e * ks);
+        outv[t * (h_v * 128) + h * 128 + tid] = e * qs * qscale + kq00 * rhs;
+        // 상태 갱신(trio gdn1_upd 미러) + 스냅샷 기록(이 토큰 처리 후).
+        float* sst = st + st_h;
+        for (int i = 0; i < 128; ++i) {
+            const float kv = __half2float(__float2half_rn(kt[kh * 128 + i]));
+            float* p = &sst[(long)i * d + tid];
+            *p = *p * e + kv * rhs;
+        }
+        // 스냅샷 — snap[t][layer][h][i][d] (t는 배치 내 위치 — 상한 t_len).
+        float* sn = snap + (((long)t * n_layers + layer) * h_v + h) * ((long)d * d);
+        for (int i = 0; i < 128; ++i) {
+            sn[(long)i * d + tid] = sst[(long)i * d + tid];
+        }
+        __syncthreads(); // 다음 토큰 kq00 트리 전 정리
     }
 }
 

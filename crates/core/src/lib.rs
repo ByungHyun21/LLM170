@@ -8,6 +8,7 @@ pub mod ops;
 pub mod quant;
 pub mod qwen35;
 pub mod sampler;
+pub mod spec;
 pub mod st;
 pub mod w4a16;
 pub mod wtype;

@@ -39,15 +39,21 @@ impl W4a16Dec {
             self.dgk,
             self.dgv,
         );
+        // [A-1] 스펙 검증이면 토큰별 링 스냅샷 기록(층 슬라이스 = layer×8×3×ch).
+        let mut c6 = if self.spec_on && (2..=8).contains(&t_len) {
+            self.dsnap_ring + (layer as u64 * 8 * 3 * dm.conv_ch() as u64) * 4
+        } else {
+            0
+        };
         self.cc.launch(
             f,
             (dm.conv_ch() / 128) as u32,
             // [토큰축 병렬] y = ceil(t_len/16) — 4탭은 입력 이력만 필요.
             (t_len.div_ceil(16)) as u32,
             128,
-            &mut crate::rawcuda::args::l11(
-                &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut tl, &mut lay, &mut kl,
-                &mut vl, &mut cch,
+            &mut crate::rawcuda::args::l12(
+                &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut tl, &mut lay,
+                &mut kl, &mut vl, &mut cch,
             ),
         )?;
 
@@ -136,6 +142,37 @@ impl W4a16Dec {
                 ),
             )?;
             skip_scan = true;
+        }
+        if !skip_scan && self.spec_on && (2..=8).contains(&t_len) {
+            // [A-1] 스펙 검증 — 토큰 루프 + 토큰별 상태 스냅샷(부분 수용
+            // 롤백 지점). 산술은 t=1 trio와 비트동일.
+            if self.dsnap == 0 {
+                return Err("GDN spec: enable_spec 미호출".into());
+            }
+            let f = self.cc.function("gdn_spec_scan")?;
+            let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6) = (
+                self.dq2,
+                self.dk2,
+                self.dv2,
+                self.dbg,
+                self.dgst + (st_slot as u64) * 4,
+                self.dsnap,
+                self.dgo,
+            );
+            let (mut tl, mut hk, mut hv, mut dd) =
+                (t_len as i32, dm.h_k as i32, dm.h_v as i32, dm.d as i32);
+            let (mut lay, mut nl) = (layer as i32, self.n_layers as i32);
+            self.cc.launch(
+                f,
+                dm.h_v as u32,
+                1,
+                128,
+                &mut crate::rawcuda::args::l13(
+                    &mut s0, &mut s1, &mut s2, &mut s3, &mut s4, &mut s5, &mut s6, &mut tl,
+                    &mut hk, &mut hv, &mut dd, &mut lay, &mut nl,
+                ),
+            )?;
+            return Ok(());
         }
         if !skip_scan {
             // [A5-4] FLA 2단: A/KQ 청크 병렬 prepass(값 비트동일) →
@@ -233,6 +270,21 @@ impl W4a16Dec {
     // ── 어텐션 ──
 
     /// GDN 체인 디바이스 상주 — xn·qkv·z(디바이스) → dgate.
+    /// [A-1] 스펙 검증 활성화 — GDN 토큰별 스냅샷 버퍼 확보(KMAX=8 고정).
+    /// VRAM: 8 × n_layers × h_v × 128×128 × 4B (35B 436MB · 27B 654MB).
+    pub fn enable_spec(&mut self) -> Result<(), String> {
+        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        if self.dsnap != 0 {
+            self.spec_on = true;
+            return Ok(());
+        }
+        let elems = 8 * self.n_layers * dm.h_v * dm.d * dm.d;
+        self.dsnap = self.cc.alloc(elems * 4)?;
+        self.dsnap_ring = self.cc.alloc(8 * self.n_layers * 3 * dm.conv_ch() * 4)?;
+        self.spec_on = true;
+        Ok(())
+    }
+
     pub(super) fn gdn_chain_dev_run(
         &mut self,
         slot: usize,
@@ -288,14 +340,15 @@ impl W4a16Dec {
             let mut c3 = self.dgq + k as u64 * kl as u64 * 4;
             let mut c4 = self.dgk + k as u64 * kl as u64 * 4;
             let mut c5 = self.dgv + k as u64 * vl as u64 * 4;
+            let mut c6 = 0u64;
             self.cc.launch(
                 f,
                 (dm.conv_ch() / 128) as u32,
                 1,
                 128,
-                &mut crate::rawcuda::args::l11(
-                    &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut one, &mut lay,
-                    &mut kl, &mut vl, &mut cch,
+                &mut crate::rawcuda::args::l12(
+                    &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut one,
+                    &mut lay, &mut kl, &mut vl, &mut cch,
                 ),
             )?;
         }

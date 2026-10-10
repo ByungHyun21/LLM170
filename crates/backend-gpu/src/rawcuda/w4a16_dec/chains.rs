@@ -360,6 +360,20 @@ impl W4a16Dec {
         t: usize,
         head: bool,
     ) -> Result<Vec<f32>, String> {
+        self.chain_t(slot, rows, t, head, false)
+    }
+
+    /// [A-1] 스펙 검증 체인 — `all`=true면 **전 위치** 최종 노름+배치 head+
+    /// 배치 argmax로 토큰 t개(id를 f32로)를 반환(상태·pos는 전진).
+    /// 롤백은 호출부(상태 복원 + pos 되감기) 소관.
+    pub(super) fn chain_t(
+        &mut self,
+        slot: usize,
+        rows: &[f32],
+        t: usize,
+        head: bool,
+        all: bool,
+    ) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
         if !(2..=CHAIN_TMAX).contains(&t) || rows.len() != t * self.hidden || slot >= self.n_slots {
             return Err(format!(
@@ -527,6 +541,40 @@ impl W4a16Dec {
                 self.lin_forward(false, LinPath::Gemm, &dn, xh4, s3, t)?;
                 ab = s3;
             }
+        }
+        if all {
+            // [A-1] 전 위치 최종 노름 → 배치 head → 배치 argmax → 토큰 t개.
+            let xn_all = self
+                .norm_resid_dev(2 * self.n_layers, self.dres, ab, t, 0)
+                .map_err(|e| format!("S final norm: {e}"))?;
+            self.ensure_batch_bufs()?;
+            self.head_gemv_t_launch(xn_all, self.dbatch_lg, t)?;
+            {
+                let fa = self.cc.function("w4a16_argmax_min_t")?;
+                let (mut p_l, mut p_n, mut p_t, mut p_a) =
+                    (self.dbatch_lg, self.head_n as i32, t as i32, self.dbatch_am);
+                self.cc.launch(
+                    fa,
+                    t as u32,
+                    1,
+                    1024,
+                    &mut crate::rawcuda::args::l4(&mut p_l, &mut p_n, &mut p_t, &mut p_a),
+                )?;
+            }
+            // SAFETY: self 소유 pinned 스크래치 단독 가변 접근(수명=self).
+            let tb =
+                unsafe { std::slice::from_raw_parts_mut(self.pin_batch_tok as *mut u8, t * 4) };
+            self.cc.d2h_async(tb.as_mut_ptr(), self.dbatch_am, t * 4)?;
+            self.cc.sync()?;
+            let pos_after = pos + t as u32;
+            self.slot_pos[slot] = pos_after;
+            self.attn_set_pos(slot, pos_after)?;
+            return Ok((0..t)
+                .map(|k| {
+                    u32::from_le_bytes([tb[k * 4], tb[k * 4 + 1], tb[k * 4 + 2], tb[k * 4 + 3]])
+                        as f32
+                })
+                .collect());
         }
         // 마지막 행만 최종 노름(+head) — 중간 행 로짓은 불필요(상각).
         let last = (t - 1) as u64 * (h as u64) * 4;

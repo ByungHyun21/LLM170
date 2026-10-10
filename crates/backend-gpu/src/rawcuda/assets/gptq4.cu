@@ -629,6 +629,16 @@ extern "C" __global__ void w4a16_gemv_bf16(
 }
 
 
+// [A-1 2026-10-10] D2D 복사 — 스펙 롤백용. cuMemcpyDtoDAsync가 드라이버에서
+// 세그폴트(초유일 사용 경로, 실측 백트레이스)라 커널로 대체.
+extern "C" __global__ void w4a16_copy(const float4* __restrict__ src,
+                                      float4* __restrict__ dst, long n4) {
+    long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+    if (i < n4) {
+        dst[i] = src[i];
+    }
+}
+
 // [B-4 2026-10-10] 다중 세그먼트 GEMV — 같은 x를 공유하는 소형 선형 여럿을
 // 1런치로(소형 커널 런치 플로어 제거: 35B 실측 4런치 ~18µs → 1런치 ~5µs/층).
 // tab[seg] = (w, out, n, k) u64×4(호스트가 층별로 작성). 1블록 = 1행,
