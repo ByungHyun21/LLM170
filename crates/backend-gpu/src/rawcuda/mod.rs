@@ -7,6 +7,7 @@
 //!
 //! dead_code 허용 — 커널 자산은 소비자(W2 디코더) 배선 전까지 미판독이다.
 
+pub mod args;
 pub mod assets;
 pub mod ctx;
 pub mod ffi;

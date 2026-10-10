@@ -99,30 +99,15 @@ impl W4a16Dec {
                 self.attn_vsc_ptr(slot),
                 self.attn_pp_ptr(slot),
             );
-            let mut args: [*mut std::ffi::c_void; 16] = [
-                (&mut a0) as *mut _ as *mut _,
-                (&mut a1) as *mut _ as *mut _,
-                (&mut a2) as *mut _ as *mut _,
-                (&mut a3) as *mut _ as *mut _,
-                (&mut a4) as *mut _ as *mut _,
-                (&mut a5) as *mut _ as *mut _,
-                (&mut a6) as *mut _ as *mut _,
-                (&mut a7) as *mut _ as *mut _,
-                (&mut a8) as *mut _ as *mut _,
-                (&mut a9) as *mut _ as *mut _,
-                (&mut aa) as *mut _ as *mut _,
-                (&mut tl) as *mut _ as *mut _,
-                (&mut lay) as *mut _ as *mut _,
-                (&mut qh) as *mut _ as *mut _,
-                (&mut kvh) as *mut _ as *mut _,
-                (&mut cp) as *mut _ as *mut _,
-            ];
             return self.cc.launch(
                 f,
                 t_len as u32,
                 (dm.q_heads + dm.kv_heads) as u32,
                 128,
-                &mut args,
+                &mut crate::rawcuda::args::l16(
+                    &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
+                    &mut a8, &mut a9, &mut aa, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
+                ),
             );
         }
         let kv = self.attn_kv_ptr(slot);
@@ -139,28 +124,15 @@ impl W4a16Dec {
             self.attn_vc_ptr(slot),
             self.attn_pp_ptr(slot),
         );
-        let mut args: [*mut std::ffi::c_void; 14] = [
-            (&mut a0) as *mut _ as *mut _,
-            (&mut a1) as *mut _ as *mut _,
-            (&mut a2) as *mut _ as *mut _,
-            (&mut a3) as *mut _ as *mut _,
-            (&mut a4) as *mut _ as *mut _,
-            (&mut a5) as *mut _ as *mut _,
-            (&mut a6) as *mut _ as *mut _,
-            (&mut a7) as *mut _ as *mut _,
-            (&mut a8) as *mut _ as *mut _,
-            (&mut tl) as *mut _ as *mut _,
-            (&mut lay) as *mut _ as *mut _,
-            (&mut qh) as *mut _ as *mut _,
-            (&mut kvh) as *mut _ as *mut _,
-            (&mut cp) as *mut _ as *mut _,
-        ];
         self.cc.launch(
             f,
             t_len as u32,
             (dm.q_heads + dm.kv_heads) as u32,
             128,
-            &mut args,
+            &mut crate::rawcuda::args::l14(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7, &mut a8,
+                &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
+            ),
         )
     }
 
@@ -200,27 +172,15 @@ impl W4a16Dec {
                     self.dattn_part,
                 );
                 let mut f6 = self.attn_pp_ptr(slot);
-                let mut pa: [*mut std::ffi::c_void; 13] = [
-                    (&mut f0) as *mut _ as *mut _,
-                    (&mut f1) as *mut _ as *mut _,
-                    (&mut f2) as *mut _ as *mut _,
-                    (&mut f3) as *mut _ as *mut _,
-                    (&mut f4) as *mut _ as *mut _,
-                    (&mut f5) as *mut _ as *mut _,
-                    (&mut f6) as *mut _ as *mut _,
-                    (&mut tl) as *mut _ as *mut _,
-                    (&mut lay) as *mut _ as *mut _,
-                    (&mut qh) as *mut _ as *mut _,
-                    (&mut kvh) as *mut _ as *mut _,
-                    (&mut cp) as *mut _ as *mut _,
-                    (&mut sp) as *mut _ as *mut _,
-                ];
                 self.cc.launch(
                     fp,
                     t_len as u32,
                     (dm.q_heads * ATTN_SPLITS) as u32,
                     256,
-                    &mut pa,
+                    &mut crate::rawcuda::args::l13(
+                        &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut f5, &mut f6, &mut tl,
+                        &mut lay, &mut qh, &mut kvh, &mut cp, &mut sp,
+                    ),
                 )?;
             } else {
                 let fp = self.cc.function("attn_fwd3s_part")?;
@@ -231,41 +191,29 @@ impl W4a16Dec {
                     self.dattn_part,
                 );
                 let mut f4 = self.attn_pp_ptr(slot);
-                let mut pa: [*mut std::ffi::c_void; 11] = [
-                    (&mut f0) as *mut _ as *mut _,
-                    (&mut f1) as *mut _ as *mut _,
-                    (&mut f2) as *mut _ as *mut _,
-                    (&mut f3) as *mut _ as *mut _,
-                    (&mut f4) as *mut _ as *mut _,
-                    (&mut tl) as *mut _ as *mut _,
-                    (&mut lay) as *mut _ as *mut _,
-                    (&mut qh) as *mut _ as *mut _,
-                    (&mut kvh) as *mut _ as *mut _,
-                    (&mut cp) as *mut _ as *mut _,
-                    (&mut sp) as *mut _ as *mut _,
-                ];
                 self.cc.launch(
                     fp,
                     t_len as u32,
                     (dm.q_heads * ATTN_SPLITS) as u32,
                     256,
-                    &mut pa,
+                    &mut crate::rawcuda::args::l11(
+                        &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut tl, &mut lay, &mut qh,
+                        &mut kvh, &mut cp, &mut sp,
+                    ),
                 )?;
             }
             let fm = self.cc.function("attn_fwd3s_merge")?;
             let (mut mp, mut mg, mut mo) = (self.dattn_part, qg_dev, self.doutv_a);
             let (mut tl2, mut qh2) = (t_len as i32, dm.q_heads as i32);
-            let mut ma: [*mut std::ffi::c_void; 6] = [
-                (&mut mp) as *mut _ as *mut _,
-                (&mut mg) as *mut _ as *mut _,
-                (&mut mo) as *mut _ as *mut _,
-                (&mut tl2) as *mut _ as *mut _,
-                (&mut qh2) as *mut _ as *mut _,
-                (&mut sp) as *mut _ as *mut _,
-            ];
-            return self
-                .cc
-                .launch(fm, t_len as u32, dm.q_heads as u32, 256, &mut ma);
+            return self.cc.launch(
+                fm,
+                t_len as u32,
+                dm.q_heads as u32,
+                256,
+                &mut crate::rawcuda::args::l6(
+                    &mut mp, &mut mg, &mut mo, &mut tl2, &mut qh2, &mut sp,
+                ),
+            );
         }
         let f = self.cc.function("attn_fwd3s")?;
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
@@ -278,21 +226,16 @@ impl W4a16Dec {
             self.doutv_a,
             self.attn_pp_ptr(slot),
         );
-        let mut args: [*mut std::ffi::c_void; 11] = [
-            (&mut f0) as *mut _ as *mut _,
-            (&mut f1) as *mut _ as *mut _,
-            (&mut f2) as *mut _ as *mut _,
-            (&mut f3) as *mut _ as *mut _,
-            (&mut f4) as *mut _ as *mut _,
-            (&mut f5) as *mut _ as *mut _,
-            (&mut tl) as *mut _ as *mut _,
-            (&mut lay) as *mut _ as *mut _,
-            (&mut qh) as *mut _ as *mut _,
-            (&mut kvh) as *mut _ as *mut _,
-            (&mut cp) as *mut _ as *mut _,
-        ];
-        self.cc
-            .launch(f, t_len as u32, dm.q_heads as u32, 256, &mut args)
+        self.cc.launch(
+            f,
+            t_len as u32,
+            dm.q_heads as u32,
+            256,
+            &mut crate::rawcuda::args::l11(
+                &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut f5, &mut tl, &mut lay, &mut qh,
+                &mut kvh, &mut cp,
+            ),
+        )
     }
 
     /// 어텐션 체인 호스트 진입 — qg·kin·vin 업로드 → pp=pos0 → prep → fwd3s
@@ -424,24 +367,16 @@ impl W4a16Dec {
             let mut a7 = self.attn_vc_ptr(slot);
             let mut a8 = self.attn_pp_ptr(slot);
             let (mut tl, mut lay, mut qh2, mut kvh2, mut cp2) = (1i32, layer as i32, qh, kvh, cp);
-            let mut args: [*mut std::ffi::c_void; 14] = [
-                (&mut a0) as *mut _ as *mut _,
-                (&mut a1) as *mut _ as *mut _,
-                (&mut a2) as *mut _ as *mut _,
-                (&mut a3) as *mut _ as *mut _,
-                (&mut a4) as *mut _ as *mut _,
-                (&mut a5) as *mut _ as *mut _,
-                (&mut a6) as *mut _ as *mut _,
-                (&mut a7) as *mut _ as *mut _,
-                (&mut a8) as *mut _ as *mut _,
-                (&mut tl) as *mut _ as *mut _,
-                (&mut lay) as *mut _ as *mut _,
-                (&mut qh2) as *mut _ as *mut _,
-                (&mut kvh2) as *mut _ as *mut _,
-                (&mut cp2) as *mut _ as *mut _,
-            ];
-            self.cc
-                .launch(f, 1, (dm.q_heads + dm.kv_heads) as u32, 128, &mut args)?;
+            self.cc.launch(
+                f,
+                1,
+                (dm.q_heads + dm.kv_heads) as u32,
+                128,
+                &mut crate::rawcuda::args::l14(
+                    &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
+                    &mut a8, &mut tl, &mut lay, &mut qh2, &mut kvh2, &mut cp2,
+                ),
+            )?;
         }
         // fwd3s part + merge — 토큰별.
         let fp = self.cc.function("attn_fwd3s_part")?;
@@ -454,21 +389,16 @@ impl W4a16Dec {
                     (qhk, self.attn_kv_ptr(slot), self.attn_vc_ptr(slot), partk);
                 let mut f4 = self.attn_pp_ptr(slot);
                 let (mut tl, mut lay) = (1i32, layer as i32);
-                let mut pa: [*mut std::ffi::c_void; 11] = [
-                    (&mut f0) as *mut _ as *mut _,
-                    (&mut f1) as *mut _ as *mut _,
-                    (&mut f2) as *mut _ as *mut _,
-                    (&mut f3) as *mut _ as *mut _,
-                    (&mut f4) as *mut _ as *mut _,
-                    (&mut tl) as *mut _ as *mut _,
-                    (&mut lay) as *mut _ as *mut _,
-                    (&mut qh) as *mut _ as *mut _,
-                    (&mut kvh) as *mut _ as *mut _,
-                    (&mut cp) as *mut _ as *mut _,
-                    (&mut sp) as *mut _ as *mut _,
-                ];
-                self.cc
-                    .launch(fp, 1, (dm.q_heads * ATTN_SPLITS) as u32, 256, &mut pa)?;
+                self.cc.launch(
+                    fp,
+                    1,
+                    (dm.q_heads * ATTN_SPLITS) as u32,
+                    256,
+                    &mut crate::rawcuda::args::l11(
+                        &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut tl, &mut lay, &mut qh,
+                        &mut kvh, &mut cp, &mut sp,
+                    ),
+                )?;
             }
             {
                 let (mut mp, mut mg, mut mo) = (
@@ -477,15 +407,15 @@ impl W4a16Dec {
                     self.doutv_a + k as u64 * qdd * 4,
                 );
                 let (mut tl2, mut qh2) = (1i32, dm.q_heads as i32);
-                let mut ma: [*mut std::ffi::c_void; 6] = [
-                    (&mut mp) as *mut _ as *mut _,
-                    (&mut mg) as *mut _ as *mut _,
-                    (&mut mo) as *mut _ as *mut _,
-                    (&mut tl2) as *mut _ as *mut _,
-                    (&mut qh2) as *mut _ as *mut _,
-                    (&mut sp) as *mut _ as *mut _,
-                ];
-                self.cc.launch(fm, 1, dm.q_heads as u32, 256, &mut ma)?;
+                self.cc.launch(
+                    fm,
+                    1,
+                    dm.q_heads as u32,
+                    256,
+                    &mut crate::rawcuda::args::l6(
+                        &mut mp, &mut mg, &mut mo, &mut tl2, &mut qh2, &mut sp,
+                    ),
+                )?;
             }
         }
         Ok(self.doutv_a)

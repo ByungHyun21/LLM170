@@ -20,17 +20,15 @@ impl W4a16Dec {
         let mut wo = (w * self.hidden) as i32;
         let mut hd = self.hidden as i32;
         let (mut a0, mut a1, mut a2, mut a3, mut a4) = (x_dev, self.dnw, ab_dev, self.dxn, xn32);
-        let mut args: [*mut std::ffi::c_void; 8] = [
-            (&mut a0) as *mut _ as *mut _,
-            (&mut a1) as *mut _ as *mut _,
-            (&mut a2) as *mut _ as *mut _,
-            (&mut a3) as *mut _ as *mut _,
-            (&mut a4) as *mut _ as *mut _,
-            (&mut tl) as *mut _ as *mut _,
-            (&mut wo) as *mut _ as *mut _,
-            (&mut hd) as *mut _ as *mut _,
-        ];
-        self.cc.launch(f, t_len as u32, 1, 1024, &mut args)?;
+        self.cc.launch(
+            f,
+            t_len as u32,
+            1,
+            1024,
+            &mut crate::rawcuda::args::l8(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut tl, &mut wo, &mut hd,
+            ),
+        )?;
         Ok(self.dxn)
     }
 
@@ -83,12 +81,13 @@ impl W4a16Dec {
         let f = self.cc.function("w4a16_cast_x32")?;
         let mut nn = k as i32;
         let (mut c0, mut c1) = (x_dev, self.dx32);
-        let mut ca: [*mut std::ffi::c_void; 3] = [
-            (&mut c0) as *mut _ as *mut _,
-            (&mut c1) as *mut _ as *mut _,
-            (&mut nn) as *mut _ as *mut _,
-        ];
-        self.cc.launch(f, k.div_ceil(256) as u32, 1, 256, &mut ca)?;
+        self.cc.launch(
+            f,
+            k.div_ceil(256) as u32,
+            1,
+            256,
+            &mut crate::rawcuda::args::l3(&mut c0, &mut c1, &mut nn),
+        )?;
         Ok(self.dx32)
     }
 
@@ -108,37 +107,29 @@ impl W4a16Dec {
             let f = self.cc.function("w4a16_gemm_g128_mma")?;
             let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, xh_dev, y_out);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
-            let mut args: [*mut std::ffi::c_void; 7] = [
-                (&mut p_q) as *mut _ as *mut _,
-                (&mut p_s) as *mut _ as *mut _,
-                (&mut p_x) as *mut _ as *mut _,
-                (&mut p_y) as *mut _ as *mut _,
-                (&mut p_n) as *mut _ as *mut _,
-                (&mut p_k) as *mut _ as *mut _,
-                (&mut p_t) as *mut _ as *mut _,
-            ];
             return self.cc.launch(
                 f,
                 t.div_ceil(GEMM_MMA_M) as u32,
                 n.div_ceil(GEMM_MMA_N) as u32,
                 256,
-                &mut args,
+                &mut crate::rawcuda::args::l7(
+                    &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
+                ),
             );
         }
         let f = self.cc.function("w4a16_gemm_g128")?;
         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, xh_dev, y_out);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
-        let mut args: [*mut std::ffi::c_void; 7] = [
-            (&mut p_q) as *mut _ as *mut _,
-            (&mut p_s) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_y) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-            (&mut p_t) as *mut _ as *mut _,
-        ];
         // 8행/블록 커널(512스레드 = 8그룹×64레인) — grid = ceil(n/8).
-        self.cc.launch(f, n.div_ceil(8) as u32, 1, 512, &mut args)
+        self.cc.launch(
+            f,
+            n.div_ceil(8) as u32,
+            1,
+            512,
+            &mut crate::rawcuda::args::l7(
+                &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
+            ),
+        )
     }
 
     /// GEMV 발사(공용) — x32 입력 → y_out 직접 쓰기(dy·d2d 경유 제거).
@@ -161,15 +152,15 @@ impl W4a16Dec {
         let f = self.cc.function("w4a16_gemv_g128")?;
         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, x32_dev, y_out);
         let (mut p_n, mut p_k) = (n as i32, k as i32);
-        let mut args: [*mut std::ffi::c_void; 6] = [
-            (&mut p_q) as *mut _ as *mut _,
-            (&mut p_s) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_y) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-        ];
-        self.cc.launch(f, n as u32, 1, 64, &mut args)
+        self.cc.launch(
+            f,
+            n as u32,
+            1,
+            64,
+            &mut crate::rawcuda::args::l6(
+                &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k,
+            ),
+        )
     }
 
     /// GEMV(x32 입력) → self.dy — 반환 포인터는 다음 gemv가 덮는다(스트림 순서).
@@ -213,14 +204,13 @@ impl W4a16Dec {
         let f = self.cc.function("w4a16_gemv_bf16")?;
         let (mut p_w, mut p_x, mut p_o) = (w, x_dev, out_dev);
         let (mut p_n, mut p_k) = (n as i32, k as i32);
-        let mut args: [*mut std::ffi::c_void; 5] = [
-            (&mut p_w) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_o) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-        ];
-        self.cc.launch(f, n as u32, 1, 64, &mut args)
+        self.cc.launch(
+            f,
+            n as u32,
+            1,
+            64,
+            &mut crate::rawcuda::args::l5(&mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k),
+        )
     }
 
     /// 플레인 bf16 GEMM(t≤8) — x는 원시 f32 [t][k](h2f 왕복 없음),
@@ -247,20 +237,14 @@ impl W4a16Dec {
             let f = self.cc.function("w4a16_gemm_bf16_mma")?;
             let (mut p_w, mut p_x, mut p_o) = (w, x_dev, y_out);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
-            let mut args: [*mut std::ffi::c_void; 6] = [
-                (&mut p_w) as *mut _ as *mut _,
-                (&mut p_x) as *mut _ as *mut _,
-                (&mut p_o) as *mut _ as *mut _,
-                (&mut p_n) as *mut _ as *mut _,
-                (&mut p_k) as *mut _ as *mut _,
-                (&mut p_t) as *mut _ as *mut _,
-            ];
             return self.cc.launch(
                 f,
                 t.div_ceil(GEMM_MMA_M) as u32,
                 n.div_ceil(GEMM_MMA_N) as u32,
                 256,
-                &mut args,
+                &mut crate::rawcuda::args::l6(
+                    &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+                ),
             );
         }
         // [B2] v3(8행/블록 + 행별 smem + k청크) 상시 — t=1은 GEMV 경로라
@@ -274,18 +258,26 @@ impl W4a16Dec {
         })?;
         let (mut p_w, mut p_x, mut p_o) = (w, x_dev, y_out);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
-        let mut args: [*mut std::ffi::c_void; 6] = [
-            (&mut p_w) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_o) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-            (&mut p_t) as *mut _ as *mut _,
-        ];
         if v3 {
-            self.cc.launch(f, n.div_ceil(8) as u32, 1, 512, &mut args)
+            self.cc.launch(
+                f,
+                n.div_ceil(8) as u32,
+                1,
+                512,
+                &mut crate::rawcuda::args::l6(
+                    &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+                ),
+            )
         } else {
-            self.cc.launch(f, n as u32, 1, 64, &mut args)
+            self.cc.launch(
+                f,
+                n as u32,
+                1,
+                64,
+                &mut crate::rawcuda::args::l6(
+                    &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+                ),
+            )
         }
     }
 
@@ -304,21 +296,14 @@ impl W4a16Dec {
         let f = self.cc.function("w4a16_gemv_g128_t")?;
         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, x_dev, y_dev);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
-        let mut args: [*mut std::ffi::c_void; 7] = [
-            (&mut p_q) as *mut _ as *mut _,
-            (&mut p_s) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_y) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-            (&mut p_t) as *mut _ as *mut _,
-        ];
         self.cc.launch(
             f,
             n.div_ceil(GEMV_TR) as u32,
             1,
             (64 * GEMV_TR) as u32,
-            &mut args,
+            &mut crate::rawcuda::args::l7(
+                &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
+            ),
         )
     }
 
@@ -334,20 +319,14 @@ impl W4a16Dec {
         let f = self.cc.function("w4a16_gemv_bf16_t")?;
         let (mut p_w, mut p_x, mut p_o) = (w, x_dev, y_dev);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
-        let mut args: [*mut std::ffi::c_void; 6] = [
-            (&mut p_w) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_o) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-            (&mut p_t) as *mut _ as *mut _,
-        ];
         self.cc.launch(
             f,
             n.div_ceil(GEMV_TR) as u32,
             1,
             (64 * GEMV_TR) as u32,
-            &mut args,
+            &mut crate::rawcuda::args::l6(
+                &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+            ),
         )
     }
 
@@ -392,15 +371,15 @@ impl W4a16Dec {
         let f = self.cc.function(sym)?;
         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, x_dev, y_out);
         let (mut p_n, mut p_k) = (n as i32, k as i32);
-        let mut args: [*mut std::ffi::c_void; 6] = [
-            (&mut p_q) as *mut _ as *mut _,
-            (&mut p_s) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_y) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-        ];
-        self.cc.launch(f, n as u32, 1, 64, &mut args)
+        self.cc.launch(
+            f,
+            n as u32,
+            1,
+            64,
+            &mut crate::rawcuda::args::l6(
+                &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k,
+            ),
+        )
     }
 
     /// 가중 누적 — y += w·x.
@@ -415,13 +394,13 @@ impl W4a16Dec {
         let mut ww = w;
         let (mut p_x, mut p_y) = (x, y);
         let mut nn = n as i32;
-        let mut args: [*mut std::ffi::c_void; 4] = [
-            (&mut ww) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_y) as *mut _ as *mut _,
-            (&mut nn) as *mut _ as *mut _,
-        ];
-        self.cc.launch(f, n.div_ceil(256) as u32, 1, 256, &mut args)
+        self.cc.launch(
+            f,
+            n.div_ceil(256) as u32,
+            1,
+            256,
+            &mut crate::rawcuda::args::l4(&mut ww, &mut p_x, &mut p_y, &mut nn),
+        )
     }
 
     /// shared 게이트 가산 — y[t][i] += sigmoid(sg[t])·x[t][i] (grid = t).
@@ -436,14 +415,13 @@ impl W4a16Dec {
         let f = self.cc.function("w4a16_shared_add")?;
         let (mut p_sg, mut p_x, mut p_y) = (sg, x, y);
         let mut nn = n as i32;
-        let mut args: [*mut std::ffi::c_void; 4] = [
-            (&mut p_sg) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_y) as *mut _ as *mut _,
-            (&mut nn) as *mut _ as *mut _,
-        ];
-        self.cc
-            .launch(f, t.max(1) as u32, n.div_ceil(256) as u32, 256, &mut args)
+        self.cc.launch(
+            f,
+            t.max(1) as u32,
+            n.div_ceil(256) as u32,
+            256,
+            &mut crate::rawcuda::args::l4(&mut p_sg, &mut p_x, &mut p_y, &mut nn),
+        )
     }
 
     /// 노름 1회(디바이스 x·ab) — xn은 self.dxn(다음 노름이 덮는다).
@@ -473,12 +451,12 @@ impl W4a16Dec {
         let f = self.cc.function("ew")?;
         let mut nn = n as i32;
         let (mut a0, mut a1, mut a2) = (g_dev, u_dev, y_dev);
-        let mut args: [*mut std::ffi::c_void; 4] = [
-            (&mut a0) as *mut _ as *mut _,
-            (&mut a1) as *mut _ as *mut _,
-            (&mut a2) as *mut _ as *mut _,
-            (&mut nn) as *mut _ as *mut _,
-        ];
-        self.cc.launch(f, n.div_ceil(128) as u32, 1, 128, &mut args)
+        self.cc.launch(
+            f,
+            n.div_ceil(128) as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l4(&mut a0, &mut a1, &mut a2, &mut nn),
+        )
     }
 }

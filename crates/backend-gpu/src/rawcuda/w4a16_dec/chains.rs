@@ -446,15 +446,13 @@ impl W4a16Dec {
             let f = self.cc.function("head_bf16")?;
             let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn_last, self.head_out);
             let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
-            let mut args: [*mut std::ffi::c_void; 5] = [
-                (&mut p_w) as *mut _ as *mut _,
-                (&mut p_x) as *mut _ as *mut _,
-                (&mut p_o) as *mut _ as *mut _,
-                (&mut p_n) as *mut _ as *mut _,
-                (&mut p_k) as *mut _ as *mut _,
-            ];
-            self.cc
-                .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
+            self.cc.launch(
+                f,
+                self.head_n.div_ceil(4 * 256) as u32,
+                1,
+                256,
+                &mut crate::rawcuda::args::l5(&mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k),
+            )?;
             // 동기 d2h 금지 — 그래프 캡처가 만든 커스텀(비차단) 스트림과
             // 경합한다(실측: serve 배치 프리필 쓰레기 토큰). 스트림 순서 복사.
             self.cc
@@ -591,28 +589,27 @@ impl W4a16Dec {
             let f = self.cc.function("head_bf16_t")?;
             let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn_all, self.dbatch_lg);
             let (mut p_n, mut p_k, mut p_t) = (self.head_n as i32, self.head_k as i32, t as i32);
-            let mut args: [*mut std::ffi::c_void; 6] = [
-                (&mut p_w) as *mut _ as *mut _,
-                (&mut p_x) as *mut _ as *mut _,
-                (&mut p_o) as *mut _ as *mut _,
-                (&mut p_n) as *mut _ as *mut _,
-                (&mut p_k) as *mut _ as *mut _,
-                (&mut p_t) as *mut _ as *mut _,
-            ];
-            self.cc
-                .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
+            self.cc.launch(
+                f,
+                self.head_n.div_ceil(4 * 256) as u32,
+                1,
+                256,
+                &mut crate::rawcuda::args::l6(
+                    &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+                ),
+            )?;
         }
         {
             let fa = self.cc.function("w4a16_argmax_min_t")?;
             let (mut p_l, mut p_n, mut p_t, mut p_a) =
                 (self.dbatch_lg, self.head_n as i32, t as i32, self.dbatch_am);
-            let mut aa: [*mut std::ffi::c_void; 4] = [
-                (&mut p_l) as *mut _ as *mut _,
-                (&mut p_n) as *mut _ as *mut _,
-                (&mut p_t) as *mut _ as *mut _,
-                (&mut p_a) as *mut _ as *mut _,
-            ];
-            self.cc.launch(fa, t as u32, 1, 1024, &mut aa)?;
+            self.cc.launch(
+                fa,
+                t as u32,
+                1,
+                1024,
+                &mut crate::rawcuda::args::l4(&mut p_l, &mut p_n, &mut p_t, &mut p_a),
+            )?;
         }
         // SAFETY: self 소유 pinned 스크래치의 단독 가변 접근(수명=self).
         let tb = unsafe { std::slice::from_raw_parts_mut(self.pin_batch_tok as *mut u8, t * 4) };
