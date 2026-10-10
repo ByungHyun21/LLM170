@@ -31,6 +31,9 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
       W4A16(compressed-tensors int4 sym g128) 로더 완전성 검증 — 트리플·커버리지.
   llm170 w4a16-ref <dir> --prompt-tokens <ids> [--n-predict N] [--ctx N]
       참조(CPU) greedy 토큰열 — 커널/서빙 판정 오라클·디버깅 전용.
+  llm170 w4a16-eval ppl <dir> --corpus <txt> [--ctx N] [--limit N] [--out dump.tsv] [--json]
+  llm170 w4a16-eval agree <a.tsv> <b.tsv>
+      통계 eval — PPL·teacher-forced argmax 일치율(연산 경로 편차 계측기).
   llm170 tokenize --model <dir> (--text <s> | --file <f> | --stdin)
       토크나이저 인코딩 [id, ...] 출력.
   llm170 help

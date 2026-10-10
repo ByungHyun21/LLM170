@@ -1,0 +1,133 @@
+# PROJECT KNOWLEDGE BASE
+
+**Updated:** 2026-10-10 (연산 경로 단일화 방침 · marlin 프리필 · 35B tg 7.1ms)
+
+## OVERVIEW
+
+Local-LLM inference workspace in Rust (edition 2024, resolver 3, 4 crates).
+**Single track: CUDA + W4A16** (int4 sym g128/g32 group-quant, f16
+activations) for NVIDIA CMP 170HX (GA100-class, sm_80) — also runs on RTX
+4090 (sm_89). Everything else was dropped on 2026-10-08 (EXL3·GGUF formats,
+HIP/Vulkan backends, their crates/scripts/goldens) per user directive.
+
+Current state: 27B g128 — CPU 오라클 + CUDA 디코드(디바이스 체인 + CUDA
+Graph + GPU head, tg 21.0ms/토큰 @4090 · 프리필 marlin(레지스터 디큐트+
+cp.async) pp512 1320 tok/s). 35B-A3B g32 MoE — CPU 오라클
+(라우터 top-8·shared) + GPU 디코드(플레인 bf16 병렬 GEMV + 전문가 배치
+디스패치; 전문가 전량 상주 시 7.1ms/토큰 @4090, 64GB는 무스트리밍).
+Kernel assets live in `crates/backend-gpu/src/rawcuda/assets/*.cu`
+(attn/gdn/norm/ew/gptq4/head/smoke). Bit contract: split 커널은 CPU
+`dot_row_w4a16_lane*`(g128·f16 / g32·bf16) 비트일치, 플레인(비양자화)
+경로는 토큰 수준(골든) 판정.
+
+## STRUCTURE
+
+```
+LLM170/
+├── crates/core/          # W4A16 loader, CPU reference (quant lane), qwen35 engine
+├── crates/backend-gpu/   # rawcuda: CUDA driver FFI (hand-written) + kernel assets
+├── crates/server/        # llm170 binary: CLI, continuous batching, HTTP, tokenizer
+├── crates/diag/          # cross-cutting diagnostics; LLM170_* env-read contract
+├── scripts/              # preflight, fs-preflight, swap_models, build_cuda_kernels
+├── benchmark/            # measurement ledgers (this dev machine: 4090.md)
+├── plans/                # single live TODO doc (gitignored; history deleted per campaign — never cite from code)
+└── README.md             # bench tables only (표 외 텍스트 기입 금지)
+```
+
+Dep graph: server → {core, diag, backend-gpu}; core → diag; backend-gpu → diag.
+server is binary-only; nothing imports it.
+
+## WHERE TO LOOK
+
+| Task | Location | Notes |
+|------|----------|-------|
+| W4A16 loading / name map | w4a16.rs = store (format) · qwen35/bind.rs = arch binding |
+| Weight type tags | crates/core/src/wtype.rs | `WType` — F32/F16/Bf16/W4a16Split (+group·scale_bf16) |
+| CPU bit-contract kernel | crates/core/src/quant/lane.rs | `dot_row_w4a16_lane`(g128) · `_group`(g32/bf16) |
+| Model layers / attention math | crates/core/src/qwen35/ | mod.rs (Model/Engine), stages/ |
+| CUDA host + kernel assets | crates/backend-gpu/src/rawcuda/ | assets/*.cu = source of truth |
+| Serving / HTTP / CLI | crates/server/src/ | SCHED static batching, probes/* dev CLIs |
+| Monitoring | crates/server/src/metrics.rs | `/stats`(JSON) · `/metrics`(Prometheus) — 최신 스냅샷만 |
+| Env-flag semantics | crates/diag (llm170_diag::flag) | all env reads; `LLM170_*` |
+| safetensors / JSON readers | crates/core/src/{st,json}.rs | migrated from exl3 crate (deleted) |
+| Kernel asset rebuild | scripts/build_cuda_kernels.sh | nvcc sm_80+sm_89; .cu→.fatbin only |
+| Pre-commit gate | scripts/preflight.sh | 4 steps: fmt, clippy, warnings, env |
+| W4A16 smoke | scripts/swap_models.sh | 참조·GPU·serve 골든 토큰 + D·E 명시 거부 |
+| Dev bench ledger | benchmark/4090.md | this machine (RTX 4090, sm_89) — tables only |
+| Kernel module gates | `llm170 w4a16-gemv` / `w4a16-gemm` | bit judgment vs lane, shapes auto-enumerated |
+| GPU chain / decoder | `server/src/gpu_engine.rs` + `backend-gpu/.../w4a16_dec.rs` | 디바이스 상주 체인 + GPU head, runtime=cuda · MoE(플레인+전문가 디스패치) |
+
+## CONVENTIONS
+
+- Comments Korean. Record facts self-contained next to the code — do NOT
+  cite plans/ (plans are deleted after each campaign, so citations go
+  unfindable). Keep dates for measured facts.
+- backend-gpu errors: `Result<T, String>`.
+- All toggles via `LLM170_*` env vars read through `llm170_diag::flag` —
+  direct `std::env` in production sources forbidden (statically tested,
+  diag/tests/env_hotpath_scan.rs).
+- **연산 경로는 모듈당 하나 — fast를 기본으로** (2026-10-10 방침). 수치를
+  바꾸는 fast 후보를 런타임 env 플래그로 병존시키지 않는다. 후보는 머지
+  시점에 통계 eval(PPL·argmax 일치율)로 편차를 계측해 단일 경로로
+  채택(골든 재동결 + 사유·델타 기록) 또는 삭제(코드 제거, 기록만).
+  `LLM170_*`는 진단·운영 전용 — 연산 경로 선택에 쓰지 않는다. W4A16
+  양자화 산술(lane 비트 계약)은 채택 대상이 아니다(형식 계약 — 불변).
+- Workspace clippy allows for kernel-mirror code (too_many_arguments,
+  needless_range_loop, ...). `[lints] workspace = true` in all crates
+  except diag (standalone; `profile` feature shared with backend-gpu).
+- README bench: "표 외 텍스트 기입 금지" — values inside tables only.
+- `rand` crate forbidden — splitmix64 (core sampler.rs).
+
+## ANTI-PATTERNS (THIS PROJECT)
+
+- NEVER hand-edit generated artifacts: `unicode_data.rs`, `.fatbin` blobs,
+  dot-prefixed goldens. `.cu` is the source of truth; rebuild via
+  scripts/build_cuda_kernels.sh.
+- Binary assets never read as text: `.fatbin`, `.co`, `.o`.
+- Fatbin rebuild without matching -fmad policy is forbidden: attn/gdn/ew
+  require `-fmad=false` (bit-identity mirror); norm/smoke keep default fmad.
+- Heavy GPU runs (W2/W3 kernel gates) need exclusivity — VRAM OOM otherwise.
+- CPU reference changes that touch W4A16 arithmetic must re-verify the bit
+  contract against lane.rs before kernel work is judged.
+- NEVER add env flags that select compute/numeric paths — 후보는 채택(단일
+  경로 교체 + 골든 재동결) 또는 삭제만. 옵트인 병존 금지(위 CONVENTIONS
+  단일화 방침).
+
+## UNIQUE STYLES
+
+- Bit-contract: CUDA output must match CPU `dot_row_w4a16_lane` (f64 lane
+  accumulation → tree64) — governs every kernel edit.
+- V-head permutation is mandatory: engine is subhead-major (V head h ↔ K
+  head h % nk); loader supplies permuted copies (PermStore).
+- Norm +1 correction (HF zero-centered w−1 → w), `ssm_a = -exp(A_log)` —
+  loader-side synth, see w4a16.rs eng() map.
+- SAFETY comment format in backend-gpu unsafe code.
+
+## COMMANDS
+
+```bash
+cargo build --release
+cargo run --release -- infer|serve|w4a16-load|w4a16-ref|tokenize|diag ...   # serve/infer=CUDA 고정
+cargo test -p <crate>
+scripts/preflight.sh                    # pre-commit gate (4 steps)
+scripts/swap_models.sh                  # W4A16 smoke: w4a16-ref 골든 + B·C 거부 판정
+scripts/build_cuda_kernels.sh           # .cu → .fatbin (nvcc sm_80+sm_89)
+```
+
+## NOTES
+
+- Hardware target (user directive 2026-10-08): NVIDIA CMP 170HX 64GB
+  (GA100-class HBM2e, headless, sm_80). fatbins also carry sm_89 for this
+  dev machine (RTX 4090). No int4×f16 tensor core exists pre-Blackwell — all
+  4-bit formats run dequant→fp16 mma; W4A16 g128 (4.125bpw) chosen for bytes/
+  kernel fit. Dev benchmarks go to benchmark/4090.md.
+- Target models: repo-parent `../models` — W4A16 only now:
+  Qwen3.8-27B-W4A16-AutoRound (g128, full path), Qwen3.6-35B-A3B-INT4-W4A16
+  (g32 MoE, full path — experts streaming or fully resident),
+  Qwen3.8-Flash-Next-W4A16-FP8PLE (rejected by resource guard — 136.5GiB).
+- Golden tokens for 27B W4A16 CPU (prompt 148678,65233,202419, n=4):
+  `156037,16072,154029,209495,30` (n=8 adds `271,248068,198,760`).
+- Golden tokens for 35B-A3B g32 MoE CPU (same prompt, n=8):
+  `156037,16072,154029,156504,30,271,248068,271,248069` (2026-10-09).
+- `target/w4a16-27b.gguf` and other target/ remnants are orphaned junk.
+- Legacy scripts that hardcode `/home/yoon/...` paths are dead history.

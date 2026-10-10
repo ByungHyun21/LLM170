@@ -25,11 +25,14 @@ pub(crate) fn arg_str(args: &[String], i: usize, d: &str) -> String {
 // 5. 종단 최종 상태가 버전 간 유일 불변량(형상이 다르면 중간값 비교 무의미).
 
 mod diag;
+mod eval;
 mod w4a16;
 
 /// 프로브 커맨드이면 실행해 Some(코드) 반환, 아니면 None.
 pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
-    diag::try_run(cmd, args).or_else(|| w4a16::try_run(cmd, args))
+    diag::try_run(cmd, args)
+        .or_else(|| eval::try_run(cmd, args))
+        .or_else(|| w4a16::try_run(cmd, args))
 }
 
 /// Result<String, String> → ExitCode 공통 변환(구 run() 테일).
