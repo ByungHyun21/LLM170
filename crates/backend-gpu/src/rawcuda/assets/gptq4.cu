@@ -799,6 +799,9 @@ extern "C" __global__ void w4a16_gemv_bf16_t(
 #define MMA_N 128
 // [marlin-A2 결함수정] w4a16_gemm_bf16_mma는 자체 N64 고정(워프 매핑 하드코딩)
 // — MMA_N 공유 시 N128에서 상위 절반 미계산(35B 4000 골든 실측).
+// [FLA-7 기각 2026-10-10] N64→128(A f32 재판독 절반 — L2 68% 바운드 실측)
+// 골든은 불변이나 bf16_mma 27→32ms·프리필 145→149ms — 점유 6→4블록 손실
+// 우세(마린-A3 KC64와 동형). 이 커널은 L2보다 점유 민감. 되돌림.
 #define BMMA_N 64
 #define BMMA_M 32
 #define GRP_M 64
@@ -1206,6 +1209,11 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     // A는 cp.async, B는 디큐트 ALU(다음 청크를 mma와 겹쳐 발사).
     // [marlin-B 재기각] 파이프라인 확보 후에도 레지스터 디큐트 = 88.6→90.5ms
     // (프래그먼트 디큐트 체인이 mma 의존 사슬에 직렬). f16 smem 디큐트 유지.
+    // [FLA-5 기각 2026-10-10] B 스테이징 2단 분리(q/s cp.async 선행 + smem
+    // 디큐트, 전역 지연 은닉) — 이득 0(P512 158 vs 159ms) + 600토큰에서
+    // illegal access(경계 결함). 되돌림. g32 시도 누적 6회 전부 실측 기각
+    // (레지스터 디큐트×2·cp.async·KC·NSPLIT·FLA-5) — SASS상 디큐트는 이미
+    // 컴파일러 최적(PRMT 팩·STS.64).
     __shared__ __align__(16) unsigned short xs[2][GRP_M][MMA_KC + 8];
     __shared__ unsigned short ws[2][GRP_N][MMA_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
