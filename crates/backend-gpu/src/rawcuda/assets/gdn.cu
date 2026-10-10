@@ -388,8 +388,9 @@ extern "C" __global__ void gdn_scan(
     // [A5-4] 그리드 (h_v×NSPLIT) — 블록이 state 열 타일(vs)을 소유.
     extern __shared__ char smem_raw[];
     __half* sk = (__half*)smem_raw;                    // [CS*128]
-    float* qs = (float*)(sk + GDN_CS * 128);           // [CS*128] (A5-4 q 스테이징)
-    __half* sv = (__half*)(qs + GDN_CS * 128);         // [CS*GDN_VS]
+    // [A5-4b 2026-10-10] qs 스테이징(16KB) 제거 — q는 글로벌 직접 판독
+    // (dq2가 L1에 상주). smem 43.4→27.0KB → 3블록/SM(배리어 은닉).
+    __half* sv = (__half*)(sk + GDN_CS * 128);         // [CS*GDN_VS]
     __half* A = sv + GDN_CS * GDN_VS;                  // [CS*CS]
     __half* KQ = A + GDN_CS * GDN_CS;                  // [CS*CS]
     __half* KS = KQ + GDN_CS * GDN_CS;                 // [CS*GDN_VS]
@@ -419,7 +420,6 @@ extern "C" __global__ void gdn_scan(
             int t = e / 128, dv = e % 128;
             bool live = t < n;
             sk[e] = __float2half_rn(live ? k[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f);
-            qs[e] = live ? q[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f;
         }
         for (int e = threadIdx.x; e < GDN_CS * GDN_VS; e += blockDim.x) {
             int t = e / GDN_VS, dvl = e % GDN_VS;
@@ -507,8 +507,10 @@ extern "C" __global__ void gdn_scan(
                     const __half2 sk2 =
                         *reinterpret_cast<const __half2*>(&sk[i * 128 + s2b + s2p]);
                     const float2 skf = __half22float2(sk2);
-                    const float2 qf =
-                        *reinterpret_cast<const float2*>(&qs[i * 128 + s2b + s2p]);
+                    const float2 qf = (i < n)
+                        ? *reinterpret_cast<const float2*>(
+                              &q[(t0 + i) * (h_k * d) + kh * 128 + s2b + s2p])
+                        : make_float2(0.0f, 0.0f);
                     ak += skf.x * s0;
                     ak += skf.y * s1;
                     aq += qf.x * s0;
