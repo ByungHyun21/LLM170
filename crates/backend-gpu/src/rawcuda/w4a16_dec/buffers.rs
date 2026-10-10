@@ -3,52 +3,52 @@ use super::*;
 impl W4a16Dec {
     pub(super) fn ensure_norm_bufs(&mut self, t_len: usize) -> Result<(), String> {
         let need = t_len * self.hidden;
-        if need > self.norm_cap {
+        if need > self.norm.cap {
             self.cc.capture_guard("norm_cap"); // [R12]
             self.graph_invalidate(); // [P10] 재할당 — 캡처 옛 포인터 차단.
             self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
-            self.norm_cap = 0; // G1: 실패 시 재진입 보장(성공 뒤에만 갱신).
+            self.norm.cap = 0; // G1: 실패 시 재진입 보장(성공 뒤에만 갱신).
             realloc_fields(
                 |p| self.cc.free(p),
                 |n| self.cc.alloc(n),
-                [&mut self.dx, &mut self.dab, &mut self.dxn],
+                [&mut self.norm.dx, &mut self.norm.dab, &mut self.norm.dxn],
                 [need * 4, need * 4, need * 4],
             )?;
-            self.norm_cap = need;
+            self.norm.cap = need;
         }
         Ok(())
     }
 
     /// dx32(x32 버퍼) 용량 보장 — 융합 노름·cast_x32 공용.
     pub(super) fn ensure_dx32(&mut self, n: usize) -> Result<CUdeviceptr, String> {
-        if n > self.dx32_cap {
+        if n > self.dx32.cap {
             self.cc.capture_guard("dx32_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
-            if self.dx32 != 0 {
-                self.cc.free(self.dx32)?;
+            if self.dx32.ptr != 0 {
+                self.cc.free(self.dx32.ptr)?;
             }
-            self.dx32 = 0; // G1
-            self.dx32_cap = 0;
-            self.dx32 = self.cc.alloc(n * 4)?;
-            self.dx32_cap = n;
+            self.dx32.ptr = 0; // G1
+            self.dx32.cap = 0;
+            self.dx32.ptr = self.cc.alloc(n * 4)?;
+            self.dx32.cap = n;
         }
-        Ok(self.dx32)
+        Ok(self.dx32.ptr)
     }
 
     pub(super) fn ensure_ew_bufs(&mut self, n: usize) -> Result<(), String> {
-        if n > self.ew_cap {
+        if n > self.ew.cap {
             self.cc.capture_guard("ew_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
-            self.ew_cap = 0; // G1
+            self.ew.cap = 0; // G1
             realloc_fields(
                 |p| self.cc.free(p),
                 |b| self.cc.alloc(b),
-                [&mut self.dewg, &mut self.dewu, &mut self.dew],
+                [&mut self.ew.dewg, &mut self.ew.dewu, &mut self.ew.dew],
                 [n * 4, n * 4, n * 4],
             )?;
-            self.ew_cap = n;
+            self.ew.cap = n;
         }
         Ok(())
     }
@@ -203,49 +203,49 @@ impl W4a16Dec {
         }
         mn = mn.max(self.hidden).max(self.n_experts);
         let need = t * mn;
-        if need > self.dyt_cap {
+        if need > self.dyt.cap {
             self.cc.capture_guard("dyt_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
-            if self.dyt != 0 {
-                self.cc.free(self.dyt)?;
+            if self.dyt.ptr != 0 {
+                self.cc.free(self.dyt.ptr)?;
             }
-            self.dyt = 0; // G1
-            self.dyt_cap = 0;
-            self.dyt = self.cc.alloc(need * 4)?;
-            self.dyt_cap = need;
+            self.dyt.ptr = 0; // G1
+            self.dyt.cap = 0;
+            self.dyt.ptr = self.cc.alloc(need * 4)?;
+            self.dyt.cap = need;
         }
         // 배치 캐스트 입력(xh: t×k f16)도 함께 보장.
-        if t * mk > self.xh_cap {
+        if t * mk > self.xh.cap {
             self.cc.capture_guard("xh_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?;
-            if self.dxh != 0 {
-                self.cc.free(self.dxh)?;
+            if self.xh.ptr != 0 {
+                self.cc.free(self.xh.ptr)?;
             }
-            self.dxh = 0;
-            self.xh_cap = 0;
-            self.dxh = self.cc.alloc(t * mk * 2)?;
-            self.xh_cap = t * mk;
+            self.xh.ptr = 0;
+            self.xh.cap = 0;
+            self.xh.ptr = self.cc.alloc(t * mk * 2)?;
+            self.xh.cap = t * mk;
         }
-        Ok(self.dyt)
+        Ok(self.dyt.ptr)
     }
 
     /// dy 버퍼 보장(n f32).
     pub(super) fn ensure_dy(&mut self, n: usize) -> Result<CUdeviceptr, String> {
-        if n > self.y_cap {
+        if n > self.dy.cap {
             self.cc.capture_guard("y_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
-            if self.dy != 0 {
-                self.cc.free(self.dy)?;
+            if self.dy.ptr != 0 {
+                self.cc.free(self.dy.ptr)?;
             }
-            self.dy = 0; // G1
-            self.y_cap = 0;
-            self.dy = self.cc.alloc(n * 4)?;
-            self.y_cap = n;
+            self.dy.ptr = 0; // G1
+            self.dy.cap = 0;
+            self.dy.ptr = self.cc.alloc(n * 4)?;
+            self.dy.cap = n;
         }
-        Ok(self.dy)
+        Ok(self.dy.ptr)
     }
 
     /// MoE 버퍼 보장(전문가 스테이징·라우터·출력).
@@ -274,16 +274,16 @@ impl W4a16Dec {
             |p| self.cc.free(p),
             |b| self.cc.alloc(b),
             [
-                &mut self.dstg_q,
-                &mut self.dstg_s,
-                &mut self.drt,
-                &mut self.dmo,
+                &mut self.stg.q,
+                &mut self.stg.s,
+                &mut self.drt.ptr,
+                &mut self.dmo.ptr,
             ],
             [pk, sk, tmax * n_exp * 4, tmax * h * 4],
         )?;
-        self.dstg_cap = (pk, sk);
-        self.drt_cap = tmax * n_exp;
-        self.dmo_cap = tmax * h;
+        self.stg.cap = (pk, sk);
+        self.drt.cap = tmax * n_exp;
+        self.dmo.cap = tmax * h;
         // 배치 전문가 출력([TMAX×top_k][n_ff]·[TMAX×top_k][h]) + 슬롯 idx/가중.
         let tk = tmax * self.top_k.max(1);
         // [P11] 전문가-우선 정렬 버퍼 — gslot[n_exp][tk] + cnt[n_exp].
@@ -304,22 +304,22 @@ impl W4a16Dec {
             self.moe_goff = self.cc.alloc(n_exp * 4)?;
             self.moe_gmax = tk;
         }
-        if self.dexp_cap < tk {
-            for p in [self.dexp_gate, self.dexp_up, self.dexp_act, self.dexp_dn] {
+        if self.exp.cap < tk {
+            for p in [self.exp.gate, self.exp.up, self.exp.act, self.exp.dn] {
                 if p != 0 {
                     self.cc.free(p)?;
                 }
             }
-            self.dexp_gate = 0;
-            self.dexp_up = 0;
-            self.dexp_act = 0;
-            self.dexp_dn = 0;
-            self.dexp_cap = 0;
-            self.dexp_gate = self.cc.alloc(tk * n_ff * 4)?;
-            self.dexp_up = self.cc.alloc(tk * n_ff * 4)?;
-            self.dexp_act = self.cc.alloc(tk * n_ff * 4)?;
-            self.dexp_dn = self.cc.alloc(tk * h * 4)?;
-            self.dexp_cap = tk;
+            self.exp.gate = 0;
+            self.exp.up = 0;
+            self.exp.act = 0;
+            self.exp.dn = 0;
+            self.exp.cap = 0;
+            self.exp.gate = self.cc.alloc(tk * n_ff * 4)?;
+            self.exp.up = self.cc.alloc(tk * n_ff * 4)?;
+            self.exp.act = self.cc.alloc(tk * n_ff * 4)?;
+            self.exp.dn = self.cc.alloc(tk * h * 4)?;
+            self.exp.cap = tk;
         }
         for p in [self.moe_idx, self.moe_wt] {
             if p != 0 {
@@ -371,29 +371,29 @@ impl W4a16Dec {
         // 모두 커버 — 캡처 후 재할당(재캡처·옛 포인터)을 봉인한다.
         mk = mk.max(CHAIN_TMAX * mk.max(self.hidden));
         mn = mn.max(self.hidden);
-        if mk > self.dx32_cap {
+        if mk > self.dx32.cap {
             self.cc.capture_guard("dx32_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?;
-            if self.dx32 != 0 {
-                self.cc.free(self.dx32)?;
+            if self.dx32.ptr != 0 {
+                self.cc.free(self.dx32.ptr)?;
             }
-            self.dx32 = 0; // G1 관례: 실패 시 재시도 이중해제 방지.
-            self.dx32_cap = 0;
-            self.dx32 = self.cc.alloc(mk * 4)?;
-            self.dx32_cap = mk;
+            self.dx32.ptr = 0; // G1 관례: 실패 시 재시도 이중해제 방지.
+            self.dx32.cap = 0;
+            self.dx32.ptr = self.cc.alloc(mk * 4)?;
+            self.dx32.cap = mk;
         }
-        if mn > self.y_cap {
+        if mn > self.dy.cap {
             self.cc.capture_guard("y_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?;
-            if self.dy != 0 {
-                self.cc.free(self.dy)?;
+            if self.dy.ptr != 0 {
+                self.cc.free(self.dy.ptr)?;
             }
-            self.dy = 0;
-            self.y_cap = 0;
-            self.dy = self.cc.alloc(mn * 4)?;
-            self.y_cap = mn;
+            self.dy.ptr = 0;
+            self.dy.cap = 0;
+            self.dy.ptr = self.cc.alloc(mn * 4)?;
+            self.dy.cap = mn;
         }
         Ok(())
     }

@@ -99,6 +99,49 @@ impl KvMode {
     }
 }
 
+/// [R5 2026-10-10] 단일 버퍼(ptr+cap) — ensure_*가 쌍을 함께 갱신한다.
+#[derive(Clone, Copy, Default)]
+pub struct Buf {
+    pub ptr: CUdeviceptr,
+    pub cap: usize,
+}
+
+/// 노름 3버퍼(공유 cap) — ensure_norm_bufs가 그룹 단위 교체.
+#[derive(Clone, Copy, Default)]
+pub struct NormBufs {
+    pub dx: CUdeviceptr,
+    pub dab: CUdeviceptr,
+    pub dxn: CUdeviceptr,
+    pub cap: usize,
+}
+
+/// ew 3버퍼(공유 cap).
+#[derive(Clone, Copy, Default)]
+pub struct EwBufs {
+    pub dewg: CUdeviceptr,
+    pub dewu: CUdeviceptr,
+    pub dew: CUdeviceptr,
+    pub cap: usize,
+}
+
+/// 전문가 스트리밍 4버퍼(공유 cap).
+#[derive(Clone, Copy, Default)]
+pub struct ExpBufs {
+    pub gate: CUdeviceptr,
+    pub up: CUdeviceptr,
+    pub act: CUdeviceptr,
+    pub dn: CUdeviceptr,
+    pub cap: usize,
+}
+
+/// 스테이징 q/s(각 cap).
+#[derive(Clone, Copy, Default)]
+pub struct StgBufs {
+    pub q: CUdeviceptr,
+    pub s: CUdeviceptr,
+    pub cap: (usize, usize),
+}
+
 /// [R10 2026-10-10] 체인 선형 경로 — 3체인의 차이를 주입하는 열거.
 /// Gemv1: t=1 단독(1행 GEMV — 스테이징 폭 w 검사 동반),
 /// Gemm: t≥2 프리필(mma/FFMA GEMM), GemvT: t≤8 배치(TR GEMV).
@@ -301,15 +344,9 @@ pub struct W4a16Dec {
     moe_gmax: usize,
     /// 배치 전문가 출력([top_k][n_ff] · [top_k][hidden]) — act는 ew 전용
     /// 별도 버퍼(ew 커널 __restrict__ 계약 — 제자리 호출 금지).
-    dexp_gate: CUdeviceptr,
-    dexp_up: CUdeviceptr,
-    dexp_act: CUdeviceptr,
-    dexp_dn: CUdeviceptr,
-    dexp_cap: usize,
+    exp: ExpBufs,
     /// MoE 스테이징 — 전문가 packed/scale(1쌍 재사용, 스트림 순서 안전).
-    dstg_q: CUdeviceptr,
-    dstg_s: CUdeviceptr,
-    dstg_cap: (usize, usize),
+    stg: StgBufs,
     /// [C2 2026-10-09] 호스트 RAM 스테이징 — 스트리밍 전문가의 mmap 슬라이스
     /// 1회 복사본(set_expert_table). 스트리밍 업로드가 SSD/페이지캐시 경로에
     /// 의존하지 않게 한다. Vec 버퍼 주소는 불변이므로 moe_tab이 이 안을
@@ -319,29 +356,19 @@ pub struct W4a16Dec {
     /// 바이트 수(0 = 미등록). 등록 구간 소스는 h2d DMA가 직행한다.
     host_stage_reg: usize,
     /// 라우터 로짓/ shared 게이트 스크래치(n_experts ≥ 1).
-    drt: CUdeviceptr,
-    drt_cap: usize,
+    drt: Buf,
     /// MoE 출력(hidden) — 잔차 ab로 소비된다.
-    dmo: CUdeviceptr,
-    dmo_cap: usize,
+    dmo: Buf,
     moe_bufs_ok: bool,
     /// GEMV 스테이징 — x f16 [t][k], y f32 [t][n].
-    dxh: CUdeviceptr,
-    xh_cap: usize,
-    dy: CUdeviceptr,
-    y_cap: usize,
+    xh: Buf,
+    dy: Buf,
     // ── norm ──
     dnw: CUdeviceptr,
     norm_w_rows: usize,
-    dx: CUdeviceptr,
-    dab: CUdeviceptr,
-    dxn: CUdeviceptr,
-    norm_cap: usize,
+    norm: NormBufs,
     // ── ew ──
-    dewg: CUdeviceptr,
-    dewu: CUdeviceptr,
-    dew: CUdeviceptr,
-    ew_cap: usize,
+    ew: EwBufs,
     // ── GDN ──
     gdn: Option<GdnDims>,
     dcw: CUdeviceptr,
@@ -399,11 +426,9 @@ pub struct W4a16Dec {
     stg_w2: usize,
     chain_bufs_ok: bool,
     /// t=1 GEMV 입력 x32(h2f 왕복 f32) 버퍼.
-    dx32: CUdeviceptr,
-    dx32_cap: usize,
+    dx32: Buf,
     /// t≥2 GEMM 출력 스크래치([t][max_n] f32).
-    dyt: CUdeviceptr,
-    dyt_cap: usize,
+    dyt: Buf,
     // ── GPU head(output.weight bf16) ──
     head_w: CUdeviceptr,
     head_n: usize,
@@ -491,35 +516,19 @@ impl W4a16Dec {
             moe_gcnt: 0,
             moe_goff: 0,
             moe_gmax: 0,
-            dexp_gate: 0,
-            dexp_up: 0,
-            dexp_act: 0,
-            dexp_dn: 0,
-            dexp_cap: 0,
-            dstg_q: 0,
-            dstg_s: 0,
-            dstg_cap: (0, 0),
+            exp: ExpBufs::default(),
+            stg: StgBufs::default(),
             host_stage: Vec::new(),
             host_stage_reg: 0,
-            drt: 0,
-            drt_cap: 0,
-            dmo: 0,
-            dmo_cap: 0,
+            drt: Buf::default(),
+            dmo: Buf::default(),
             moe_bufs_ok: false,
-            dxh: 0,
-            xh_cap: 0,
-            dy: 0,
-            y_cap: 0,
+            xh: Buf::default(),
+            dy: Buf::default(),
             dnw: 0,
             norm_w_rows: 0,
-            dx: 0,
-            dab: 0,
-            dxn: 0,
-            norm_cap: 0,
-            dewg: 0,
-            dewu: 0,
-            dew: 0,
-            ew_cap: 0,
+            norm: NormBufs::default(),
+            ew: EwBufs::default(),
             gdn: None,
             dcw: 0,
             dab_c: 0,
@@ -567,10 +576,8 @@ impl W4a16Dec {
             stg_w1: 0,
             stg_w2: 0,
             chain_bufs_ok: false,
-            dx32: 0,
-            dx32_cap: 0,
-            dyt: 0,
-            dyt_cap: 0,
+            dx32: Buf::default(),
+            dyt: Buf::default(),
             head_w: 0,
             head_n: 0,
             head_k: 0,
@@ -681,39 +688,39 @@ impl W4a16Dec {
         if x.len() != k {
             return Err(format!("gemv {name}: x={} != k={k}", x.len()));
         }
-        if k > self.xh_cap {
+        if k > self.xh.cap {
             self.graph_invalidate(); // [P10]
             self.cc.sync()?;
-            if self.dxh != 0 {
-                self.cc.free(self.dxh)?;
+            if self.xh.ptr != 0 {
+                self.cc.free(self.xh.ptr)?;
             }
-            self.dxh = 0; // G1: alloc 실패 시 재시도 이중해제 방지.
-            self.xh_cap = 0;
-            self.dxh = self.cc.alloc(k * 2)?;
-            self.xh_cap = k;
+            self.xh.ptr = 0; // G1: alloc 실패 시 재시도 이중해제 방지.
+            self.xh.cap = 0;
+            self.xh.ptr = self.cc.alloc(k * 2)?;
+            self.xh.cap = k;
         }
-        if n > self.y_cap {
+        if n > self.dy.cap {
             self.graph_invalidate(); // [P10]
             self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
-            if self.dy != 0 {
-                self.cc.free(self.dy)?;
+            if self.dy.ptr != 0 {
+                self.cc.free(self.dy.ptr)?;
             }
-            self.dy = 0; // G1
-            self.y_cap = 0;
-            self.dy = self.cc.alloc(n * 4)?;
-            self.y_cap = n;
+            self.dy.ptr = 0; // G1
+            self.dy.cap = 0;
+            self.dy.ptr = self.cc.alloc(n * 4)?;
+            self.dy.cap = n;
         }
         // P3-b: 신 GEMM은 f32 x 계약 — 호스트에서 h2f(f2h(v)) 동형 변환.
-        if k > self.dx32_cap {
+        if k > self.dx32.cap {
             self.graph_invalidate(); // [P10]
             self.cc.sync()?;
-            if self.dx32 != 0 {
-                self.cc.free(self.dx32)?;
+            if self.dx32.ptr != 0 {
+                self.cc.free(self.dx32.ptr)?;
             }
-            self.dx32 = 0; // G1
-            self.dx32_cap = 0;
-            self.dx32 = self.cc.alloc(k * 4)?;
-            self.dx32_cap = k;
+            self.dx32.ptr = 0; // G1
+            self.dx32.cap = 0;
+            self.dx32.ptr = self.cc.alloc(k * 4)?;
+            self.dx32.cap = k;
         }
         let xf: Vec<f32> = x
             .iter()
@@ -721,9 +728,9 @@ impl W4a16Dec {
             .collect();
         // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
-        self.cc.h2d(self.dx32, xb)?;
+        self.cc.h2d(self.dx32.ptr, xb)?;
         let f = self.cc.function("w4a16_gemm_g128")?;
-        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx32, self.dy);
+        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx32.ptr, self.dy.ptr);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, 1i32);
         // 스테이징 폴백(t=1)도 신 GEMM 커널 계약(8행/블록·512스레드)으로 —
         // 구 계약(grid n/8·block 64)은 재작성 후 1/8행만 계산하는 결함이었다.
@@ -737,7 +744,7 @@ impl W4a16Dec {
             ),
         )?;
         let mut ob = vec![0u8; n * 4];
-        self.cc.d2h_async(ob.as_mut_ptr(), self.dy, n * 4)?; // 커스텀 스트림 대비
+        self.cc.d2h_async(ob.as_mut_ptr(), self.dy.ptr, n * 4)?; // 커스텀 스트림 대비
         self.cc.sync()?;
         Ok(ob
             .as_chunks::<4>()
@@ -790,11 +797,11 @@ impl W4a16Dec {
         let gb = unsafe { std::slice::from_raw_parts(g.as_ptr() as *const u8, g.len() * 4) };
         // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let ub = unsafe { std::slice::from_raw_parts(u.as_ptr() as *const u8, u.len() * 4) };
-        self.cc.h2d(self.dewg, gb)?;
-        self.cc.h2d(self.dewu, ub)?;
+        self.cc.h2d(self.ew.dewg, gb)?;
+        self.cc.h2d(self.ew.dewu, ub)?;
         let f = self.cc.function("ew")?;
         let mut nn = g.len() as i32;
-        let (mut a0, mut a1, mut a2) = (self.dewg, self.dewu, self.dew);
+        let (mut a0, mut a1, mut a2) = (self.ew.dewg, self.ew.dewu, self.ew.dew);
         self.cc.launch(
             f,
             g.len().div_ceil(128) as u32,
@@ -803,7 +810,7 @@ impl W4a16Dec {
             &mut crate::rawcuda::args::l4(&mut a0, &mut a1, &mut a2, &mut nn),
         )?;
         let mut yb = vec![0u8; g.len() * 4];
-        self.cc.d2h(&mut yb, self.dew)?;
+        self.cc.d2h(&mut yb, self.ew.dew)?;
         self.cc.sync()?;
         // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         Ok(unsafe { std::slice::from_raw_parts(yb.as_ptr() as *const f32, g.len()) }.to_vec())
