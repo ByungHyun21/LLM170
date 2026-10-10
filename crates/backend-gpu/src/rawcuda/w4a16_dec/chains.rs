@@ -538,16 +538,7 @@ impl W4a16Dec {
             if self.head_w == 0 {
                 return Err("chain_device_t: head 미등록".into());
             }
-            let f = self.cc.function("head_bf16")?;
-            let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn_last, self.head_out);
-            let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
-            self.cc.launch(
-                f,
-                self.head_n.div_ceil(4 * 256) as u32,
-                1,
-                256,
-                &mut crate::rawcuda::args::l5(&mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k),
-            )?;
+            self.head_gemv_launch(xn_last, self.head_out)?;
             // 동기 d2h 금지 — 그래프 캡처가 만든 커스텀(비차단) 스트림과
             // 경합한다(실측: serve 배치 프리필 쓰레기 토큰). 스트림 순서 복사.
             self.cc
@@ -721,20 +712,7 @@ impl W4a16Dec {
         let xn_all = self
             .norm_resid_dev(2 * self.n_layers, self.dres, ab, t, 0)
             .map_err(|e| format!("B final norm: {e}"))?;
-        {
-            let f = self.cc.function("head_bf16_t")?;
-            let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn_all, self.dbatch_lg);
-            let (mut p_n, mut p_k, mut p_t) = (self.head_n as i32, self.head_k as i32, t as i32);
-            self.cc.launch(
-                f,
-                self.head_n.div_ceil(4 * 256) as u32,
-                1,
-                256,
-                &mut crate::rawcuda::args::l6(
-                    &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
-                ),
-            )?;
-        }
+        self.head_gemv_t_launch(xn_all, self.dbatch_lg, t)?;
         {
             let fa = self.cc.function("w4a16_argmax_min_t")?;
             let (mut p_l, mut p_n, mut p_t, mut p_a) =

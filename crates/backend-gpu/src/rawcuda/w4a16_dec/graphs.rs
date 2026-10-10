@@ -84,16 +84,7 @@ impl W4a16Dec {
             let row = vec![0f32; self.hidden]; // 내용 무의미(캡처는 실행 아님).
             let xn = self.chain_device(slot, &row)?;
             if head {
-                let f = self.cc.function("head_bf16")?;
-                let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn, self.head_out);
-                let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
-                self.cc.launch(
-                    f,
-                    self.head_n.div_ceil(4 * 256) as u32,
-                    1,
-                    256,
-                    &mut crate::rawcuda::args::l5(&mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k),
-                )?;
+                self.head_gemv_launch(xn, self.head_out)?;
                 if argmax {
                     // [P3] argmax 커널 + 4B d2h — 로짓 전량 readback 제거.
                     let fa = self.cc.function("w4a16_argmax_min")?;
@@ -240,16 +231,7 @@ impl W4a16Dec {
         }
         let pos = self.slot_pos[slot];
         let xn = self.chain_device(slot, embed_row)?;
-        let f = self.cc.function("head_bf16")?;
-        let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn, self.head_out);
-        let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
-        self.cc.launch(
-            f,
-            self.head_n.div_ceil(4 * 256) as u32,
-            1,
-            256,
-            &mut crate::rawcuda::args::l5(&mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k),
-        )?;
+        self.head_gemv_launch(xn, self.head_out)?;
         let fa = self.cc.function("w4a16_argmax_min")?;
         let (mut p_l, mut p_nn, mut p_a) = (self.head_out, self.head_n as i32, self.argmax_out);
         self.cc.launch(
@@ -440,16 +422,7 @@ impl W4a16Dec {
         }
         let pos = self.slot_pos[slot];
         let xn = self.chain_device(slot, embed_row)?;
-        let f = self.cc.function("head_bf16")?;
-        let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn, self.head_out);
-        let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
-        self.cc.launch(
-            f,
-            self.head_n.div_ceil(4 * 256) as u32,
-            1,
-            256,
-            &mut crate::rawcuda::args::l5(&mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k),
-        )?;
+        self.head_gemv_launch(xn, self.head_out)?;
         let mut ob = vec![0u8; self.head_n * 4];
         self.cc
             .d2h_async(ob.as_mut_ptr(), self.head_out, self.head_n * 4)?;
