@@ -1,3 +1,4 @@
+use super::mem::realloc_fields;
 use super::*;
 
 impl W4a16Dec {
