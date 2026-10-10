@@ -429,6 +429,7 @@ mod graphs;
 mod kernels;
 mod mem;
 mod moe;
+mod prefill;
 mod probe;
 mod upload;
 
