@@ -15,7 +15,7 @@ impl W4a16Dec {
             && !self.debug_layers
             && !self.graph_failed
             // [2026-10-09 P1] MoE 상주 경로는 캡처 가능해졌다: 라우터 top-k가
-            // 디바이스(w4a16_moe_topk — 호스트 왕복 0), 전문가 디스패치가
+            // 디바이스(w4a16_moe_topk_t — 호스트 왕복 0), 전문가 디스패치가
             // 데이터 주도(디바이스 idx 포인터 테이블 — 포인터는 고정), h2d/sync
             // 없음(P1·P2). 스트리밍은 전문가 파일 스테이징(h2d_chunked sync)이라
             // 여전히 불가. 미검증 경로는 직접 경로 폴백(graph_failed)이 덮는다.

@@ -15,6 +15,15 @@
 
 #include "cast_common.cuh"
 
+// ── [R3 2026-10-10] define 소유권 표 (값 변경 시 영향 범위 — 비트/토큰 재판정) ──
+// 커널별 전용은 접두 분리(BMMA_* 전례 — MMA_M/N 공유 사고 2회).
+//  G4_LANES/G4_ROWS — t=1 GEMV + g128/g32 FFMA GEMM 공유.
+//  G4_SCMAX — t=1 GEMV(k 상한).  G4_GTMAX/G4_KC — FFMA GEMM 패밀리.
+//  G4_TMAX — 배치 GEMV·플레인 v1 GEMM 공유(재정의 2곳 — 동일 값 유지).
+//  MMA_M/MMA_N/MMA_KC — g128 mma GEMM.  BMMA_M/BMMA_N — bf16 mma(분리).
+//  GRP_M/GRP_N — g32 그룹 mma.  GEMV_TR — t행 GEMV(호스트 GEMV_TR 미러).
+//  MOE_TK_WARPS/MOE_TK256_N/MOE_TK256_C — MoE topk_t/256 전용.
+
 // 활성 f32 [n] → h2f(f2h(v)) f32 [n] — t=1 GEMV 입력의 사전 변환.
 // 계약: 커널 안에서 h2f(xt[i])하던 값을 밖에서 한 번 계산해 두는 것과 동일
 // (f2h→h2f 왕복이 비트를 보존). 반드시 f2h/h2f와 동형 수정.
@@ -444,8 +453,7 @@ extern "C" __global__ void w4a16_gemv_g128_t(
 // 채택본: R=8 + x f32(cast_x32 공유 — 변환·h2f 없음) + smem 스테이징 + 언롤.
 // 산술 계약 불변(행·토큰별 레인 l은 i=l,l+64,… 오름차순 f32 누산 → tree64).
 #define G4_GTMAX 32            // g128 GEMM 토큰 상한(2026-10-09: 8→32)
-#define G4_ROWS 8
-#define G4_LANES 64
+// [R3] G4_ROWS/G4_LANES 중복 정의 제거 — 상단(t=1 GEMV) 정의(8/64) 공유.
 #define G4_KC 128              // k-청크(64의 배수 · x smem 128×36×4=18KB)
 
 // SHIFT = 그룹 로그2(7 = g128, 5 = g32), BF16 = 스케일 dtype.
@@ -1323,6 +1331,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     }
 }
 
+// [R3] G4_TMAX 재정의(동일 값 8) — 배치 GEMV 정의(상단)와 반드시 동일 유지.
 #define G4_TMAX 8              // 플레인 v1 GEMM 전용 토큰 상한
 
 // 플레인 bf16 GEMM(t≤8) — 행=블록(64레인), **가중치 1회 판독 × t토큰 재사용**
@@ -1469,54 +1478,9 @@ extern "C" __global__ void w4a16_moe_accum(const float* __restrict__ w,
     }
 }
 
-// [2026-10-09 P1] MoE 라우터 top-k — 호스트 moe_topk 미러:
-// softmax(f32, max-빼기) → k라운드 최대 선택(p 내림차순, 동률 낮은 idx) →
-// 재정규화. 단일 스레드 순차(결정적·캡처 안전 — 호스트 왕복 제거). n ≤ 1024.
-// exp는 CUDA expf — 호스트 libm exp와 ulp 차이 허용(플레인 경로 — 토큰 골든
-// 판정). idx/wt는 디바이스에 남아 배치 GEMV·moe_accum이 직접 소비한다.
-extern "C" __global__ void w4a16_moe_topk(const float* __restrict__ lg,
-                                          unsigned* __restrict__ idx,
-                                          float* __restrict__ wt, int n, int k) {
-    __shared__ float p[1024];
-    __shared__ unsigned char used[1024];
-    if (threadIdx.x != 0) {
-        return;
-    }
-    float mx = -INFINITY;
-    for (int i = 0; i < n; i++) {
-        mx = fmaxf(mx, lg[i]);
-    }
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        p[i] = expf(lg[i] - mx);
-        sum += p[i];
-    }
-    for (int i = 0; i < n; i++) {
-        p[i] /= sum;
-        used[i] = 0;
-    }
-    float wsum = 0.0f;
-    for (int r = 0; r < k; r++) {
-        int bi = 0;
-        float bv = -INFINITY;
-        for (int i = 0; i < n; i++) {
-            if (used[i]) {
-                continue;
-            }
-            if (p[i] > bv) {
-                bv = p[i];
-                bi = i;
-            }
-        }
-        used[bi] = 1;
-        idx[r] = (unsigned)bi;
-        wt[r] = bv;
-        wsum += bv;
-    }
-    for (int r = 0; r < k; r++) {
-        wt[r] /= wsum;
-    }
-}
+// [R3 2026-10-10] 구 w4a16_moe_topk(단일 스레드·32스레드 블록) 제거 —
+// t=1은 워프 병렬 w4a16_moe_topk_t(B-3), n=128은 w4a16_moe_topk256(B-4)이
+// 대체. 시맨틱 미러 설명은 아래 topk_t 주석 참조.
 
 // [P11] 프리필용 배치 라우터 top-k — 워프당 1토큰(t 토큰 동시). 종전엔
 // 층·청크마다 d2h(32KB)+sync+호스트 전체 정렬(512×32)로 프리필의 ~10%.

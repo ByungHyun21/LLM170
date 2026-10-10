@@ -1,17 +1,9 @@
-// llm170 rawcuda 스모크 커널 (2026-10-04).
-// 계약 소스는 이 .cu — 빌드 자산(smoke.fatbin)은 scripts/build_cuda.bat가
-// nvcc -fatbin 으로 같은 디렉터리에 생성·커밋한다(rawhip co/*.co 미러:
-// 소스와 자산을 함께 커밋, 커널 산술 변경은 이 파일부터).
-//
-// 산출 검증: out[i] = in[i]*scale + i. 프로브(구 프로브)는
-// in[i]=i*0.5, scale=4.0 을 투입해 out[i]==i*2+i==3i 의 비트동일(f32 정확표현)
-// 값을 요구한다 — 스모크는 배관(모듈로드·런치·복사) 검증이므로 근사 허용 없음.
+// llm170 rawcuda 스모크 커널 (2026-10-04, [R3 2026-10-10] 정리).
+// 계약 소스는 이 .cu — 빌드 자산(smoke.fatbin)은
+// scripts/build_cuda_kernels.sh가 nvcc -fatbin으로 생성한다(소스·자산 동시 커밋).
+// [R3] 구 llm170_smoke_add(배관 스모크)는 프로브 폐기(2026-09-08) 후
+// 미사용이라 제거 — 현행 스모크는 llm170_mma_smoke 단독(도구·수치 검증).
 #include <cuda_bf16.h>
-
-extern "C" __global__ void llm170_smoke_add(const float* in, float* out, int n, float scale) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = in[i] * scale + (float)i;
-}
 
 // [2026-10-09] 텐서코어 도구·수치 스모크 — bf16 mma.sync.m16n8k16 → f32 누적.
 // A 16×16(행우선) × B 16×8(k우선: b[k][n]) → C 16×8. 프래그먼트 = PTX ISA
