@@ -137,7 +137,13 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
             }
         }
     } else if let Some(&i) = greedy.first() {
-        sampled.push(i); // 그리디 1개 — logits 경로로 합류(직렬).
+        // [E-1 후속 2026-10-10] 단독 그리디는 **GPU argmax**(4B d2h) —
+        // 종전 logits 경로 합류는 토큰당 로짓 993KB pageable D2H + CPU
+        // argmax(248K)를 지불했다(실측 ~0.5ms/토큰). 샘플링 슬롯만 logits 판.
+        match e.decode_greedy(i, slots[i].next) {
+            Ok(t) => slot_emit(&mut slots[i], t),
+            Err(err) => slot_fail(&mut slots[i], format!("decode_greedy: {err}")),
+        }
     }
     if !sampled.is_empty() {
         let toks: Vec<u32> = sampled.iter().map(|&i| slots[i].next).collect();
