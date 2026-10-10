@@ -190,7 +190,7 @@ impl W4a16Dec {
     /// 수행(moe_multi_gate). 여기는 drt 로짓 → idx/wt 선택만.
     pub(super) fn moe_topk_dev(&mut self) -> Result<(), String> {
         // [B-3 2026-10-10] t=1도 **워프 병렬 topk_t** — 종전 단일 스레드
-        // (w4a16_moe_topk, 32스레드 블록)는 128전문가 softmax+8라운드를
+        // 커널(R3에서 제거 — 구 w4a16_moe_topk)은 128전문가 softmax+8라운드를
         // 한 스레드가 순차 처리(층당 수µs × 40층). 시맨틱은 동일 미러
         // (gptq4.cu 주석) — 골든으로 판정.
         // [B-4 후속 2026-10-10] n=128은 레지스터 전용 커널(비트동일) —

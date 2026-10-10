@@ -937,10 +937,5 @@ extern "C" __global__ void attn_fwd3s_merge(
 
 // 마커 f3sc
 
-// pos_bump 직이식(구 rawhip 커널 L1152-1155) — pp[0] += 1. 캡처
-// 그래프 내 pos 전진(h2d 불가 대체 — 결함 16호 정신). 어텐션 행 루프가
-// 디바이스 체인으로 남는 결함 4호 계약의 짝.
-extern "C" __global__ void attn_pos_bump(unsigned* __restrict__ pp)
-{
-    if (threadIdx.x == 0 && blockIdx.x == 0) pp[0] += 1u;
-}
+// [R3 2026-10-10] attn_pos_bump 제거 — 미사용(호스트가 attn_set_pos의
+// h2d_async로 pp 갱신; 캡처 그래프에서는 replay 전 1회 갱신).
