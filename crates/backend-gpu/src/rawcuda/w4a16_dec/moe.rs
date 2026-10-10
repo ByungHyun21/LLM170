@@ -482,8 +482,10 @@ impl W4a16Dec {
         if group {
             // [P11] 그룹 mma GEMM — 전문가별 슬롯 묶음(M=슬롯 수), T1 계약 미러.
             self.moe_align_launch(ns)?;
-            self.gemm_g32_mma_grp_launch(base, xn, h, tk, self.exp.gate, n_ff, h)?;
-            self.gemm_g32_mma_grp_launch(base + 1, xn, h, tk, self.exp.up, n_ff, h)?;
+            // [marlin-A5] A는 f16(xn 미러) — 그룹 GEMM A 재판독 절반.
+            let x16 = self.cast_x16(xn, t * h)?;
+            self.gemm_g32_mma_grp_launch(base, x16, h, tk, self.exp.gate, n_ff, h)?;
+            self.gemm_g32_mma_grp_launch(base + 1, x16, h, tk, self.exp.up, n_ff, h)?;
         } else {
             self.gemv_experts_launch(base, ns, xn, h, tk, self.exp.gate, n_ff, h)?;
             self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.exp.up, n_ff, h)?;
@@ -506,7 +508,8 @@ impl W4a16Dec {
             eprintln!("[t-dbg] act nan-slots={bad:?} ns={ns}");
         }
         if group {
-            self.gemm_g32_mma_grp_launch(base + 2, self.exp.act, n_ff, 1, self.exp.dn, h, n_ff)?;
+            let a16 = self.cast_x16(self.exp.act, ns * n_ff)?;
+            self.gemm_g32_mma_grp_launch(base + 2, a16, n_ff, 1, self.exp.dn, h, n_ff)?;
         } else {
             self.gemv_experts_launch(base + 2, ns, self.exp.act, n_ff, 1, self.exp.dn, h, n_ff)?;
         }

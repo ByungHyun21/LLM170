@@ -122,6 +122,34 @@ impl W4a16Dec {
         Ok(self.dx32.ptr)
     }
 
+    /// [marlin-A5] f32 → dx16(f16) 캐스트만 — MoE 그룹 GEMM의 A(xn/act)용.
+    /// 값은 cast_x32와 동일 반올림(비트 동일) — GEMM A 대역 절반.
+    pub(super) fn cast_x16(&mut self, x_dev: CUdeviceptr, n: usize) -> Result<CUdeviceptr, String> {
+        if n > self.dx16.cap {
+            self.cc.capture_guard("dx16_cap"); // [R12]
+            self.graph_invalidate();
+            self.cc.sync()?;
+            if self.dx16.ptr != 0 {
+                self.cc.free(self.dx16.ptr)?;
+            }
+            self.dx16.ptr = 0;
+            self.dx16.cap = 0;
+            self.dx16.ptr = self.cc.alloc(n * 2)?;
+            self.dx16.cap = n;
+        }
+        let f = self.cc.function("w4a16_cast_x32")?;
+        let mut nn = n as i32;
+        let (mut c0, mut c1, mut c2) = (x_dev, 0u64, self.dx16.ptr);
+        self.cc.launch(
+            f,
+            n.div_ceil(256) as u32,
+            1,
+            256,
+            &mut crate::rawcuda::args::l4(&mut c0, &mut c1, &mut c2, &mut nn),
+        )?;
+        Ok(self.dx16.ptr)
+    }
+
     /// t≥2 GEMM 발사 — x f16 [t][k] → out [t][n] 직접 쓰기.
     pub(super) fn gemm_launch(
         &mut self,
