@@ -19,6 +19,18 @@ pub struct GpuEngine {
     head_gpu: bool,
 }
 
+/// [R16] 프리필 청크 tmax 정책 — 순수 함수(테스트 표면).
+/// 규칙: MoE 스트리밍은 t=1 폴백(전문가 업로드가 토큰 단위), 그 외는
+/// `LLM170_PREFILL_T`(진단 오버라이드) 또는 기본 512(가중치 상각), 1..=512.
+pub fn prefill_tmax(is_moe: bool, resident: bool, env: Option<&str>) -> usize {
+    if is_moe && !resident {
+        return 1;
+    }
+    env.and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512)
+        .clamp(1, 512)
+}
+
 impl GpuEngine {
     /// 모델 로드 + 가중치 상주 업로드(간헐 ENOENT 재시도는 호출부 소관).
     pub fn load(dir: &Path, n_slots: usize, ctx: usize) -> Result<Self, String> {
@@ -127,17 +139,12 @@ impl GpuEngine {
             }
             return last.ok_or_else(|| "prefill: 빈 프롬프트".to_string());
         }
-        // 청크 크기 오버라이드(진단/폴백): LLM170_PREFILL_T로 고정.
-        // [2026-10-09] MoE 배치 프리필 결함 수정(gdn_exp_d 도메인 가드) 후
-        // 재허용 — 상주면 32, 스트리밍은 t=1 폴백, dense는 8(계약).
-        let tmax = if self.dec.is_moe() && !self.dec.moe_experts_resident() {
-            1
-        } else {
-            llm170_diag::flag::val("LLM170_PREFILL_T")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(512) // 청크 확대(가중치 상각 — 128→512)
-                .clamp(1, 512)
-        };
+        // 청크 크기 정책 — 순수 함수(테스트 표면, [R16]).
+        let tmax = prefill_tmax(
+            self.dec.is_moe(),
+            self.dec.moe_experts_resident(),
+            llm170_diag::flag::val("LLM170_PREFILL_T"),
+        );
         let mut i = 0usize;
         while i < n {
             let t = (n - i).min(tmax);
@@ -440,4 +447,37 @@ pub(crate) fn upload_model(
     }
     dec.set_attn(ad, &qnw, &knw)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefill_tmax;
+
+    /// [R16] 프리필 tmax 정책 — 스트리밍 MoE 폴백·env 오버라이드·상한.
+    #[test]
+    fn prefill_tmax_policy() {
+        assert_eq!(
+            prefill_tmax(true, false, None),
+            1,
+            "MoE 스트리밍 = t=1 폴백"
+        );
+        assert_eq!(prefill_tmax(true, true, None), 512, "MoE 상주 = 기본 512");
+        assert_eq!(prefill_tmax(false, false, None), 512, "dense = 기본 512");
+        assert_eq!(
+            prefill_tmax(false, false, Some("128")),
+            128,
+            "env 오버라이드"
+        );
+        assert_eq!(
+            prefill_tmax(false, false, Some("99999")),
+            512,
+            "상한 클램프"
+        );
+        assert_eq!(prefill_tmax(false, false, Some("0")), 1, "하한 클램프");
+        assert_eq!(
+            prefill_tmax(false, false, Some("abc")),
+            512,
+            "파싱 실패 = 기본"
+        );
+    }
 }
