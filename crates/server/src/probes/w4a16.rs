@@ -69,7 +69,7 @@ fn reference(args: &[String]) -> Result<String, String> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--prompt-tokens" => {
-                let v = it.next().ok_or("--prompt-tokens requires ids")?;
+                let v = super::arg(&mut it, "--prompt-tokens requires ids")?;
                 let ids: Vec<u32> = v
                     .split(',')
                     .map(|t| t.trim().parse::<u32>())
@@ -168,7 +168,7 @@ fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
                     .ok_or("--seed requires a number")?;
             }
             "--lin" => {
-                lin = Some(it.next().ok_or("--lin requires a name")?.clone());
+                lin = Some(super::arg(&mut it, "--lin requires a name")?.to_string());
             }
             other => return Err(format!("unknown flag: {other}")),
         }
@@ -347,7 +347,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--prompt-tokens" => {
-                let v = it.next().ok_or("--prompt-tokens requires ids")?;
+                let v = super::arg(&mut it, "--prompt-tokens requires ids")?;
                 let ids: Vec<u32> = v
                     .split(',')
                     .map(|t| t.trim().parse::<u32>())
@@ -389,7 +389,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                 moe_topk_check = Some((t, n, k));
             }
             "--mma-diff" => {
-                let name = it.next().ok_or("--mma-diff requires a name")?.clone();
+                let name = super::arg(&mut it, "--mma-diff requires a name")?.to_string();
                 let t = it
                     .next()
                     .and_then(|v| v.parse().ok())
@@ -397,7 +397,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                 mma_diff = Some((name, t));
             }
             "--bench-plain" => {
-                let name = it.next().ok_or("--bench-plain requires a name")?.clone();
+                let name = super::arg(&mut it, "--bench-plain requires a name")?.to_string();
                 let t = it
                     .next()
                     .and_then(|v| v.parse().ok())
@@ -409,7 +409,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                 bench_plain = Some((name, t, reps));
             }
             "--bench-gemv" => {
-                let name = it.next().ok_or("--bench-gemv requires a name")?.clone();
+                let name = super::arg(&mut it, "--bench-gemv requires a name")?.to_string();
                 let reps = it
                     .next()
                     .and_then(|v| v.parse().ok())
@@ -424,7 +424,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                 bench_gemv = Some(("ALL".to_string(), reps));
             }
             "--bench-gemm" => {
-                let name = it.next().ok_or("--bench-gemm requires a name")?.clone();
+                let name = super::arg(&mut it, "--bench-gemm requires a name")?.to_string();
                 let t = it
                     .next()
                     .and_then(|v| v.parse().ok())
@@ -436,7 +436,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                 bench = Some((name, t, reps));
             }
             "--bench-gemv-t" => {
-                let name = it.next().ok_or("--bench-gemv-t requires a name")?.clone();
+                let name = super::arg(&mut it, "--bench-gemv-t requires a name")?.to_string();
                 let t = it
                     .next()
                     .and_then(|v| v.parse().ok())
