@@ -970,3 +970,162 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
         }
     }
 }
+
+
+// [§1.2 2026-10-11] 게이트·업 2N 융합 — grp와 동일 파이프라인에서 N타일을
+// 2×GRP_N(행 0..31=게이트, 32..63=업)으로 확장. ncu 확정: grp 병목은
+// 배리어 스톨 41%+MIO 12%(청크당 A/B 스테이징+배리어 2회가 지배, DRAM 17%,
+// mma 파이프 유휴) — 청크당 작업을 2배로 해 배리어·스테이징을 상각한다.
+// A 스테이징 1회 공유(발사 1회로 게이트+업 동시), B만 2벌. 워프 n매핑
+// ntw=(warp&1)*32·nt 0..3. 요소별 mma 누산 순서 동일 — 토큰 골든 판정.
+extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
+    const unsigned long long* __restrict__ tab, int base,
+    const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
+    const unsigned* __restrict__ goff,
+    const unsigned short* __restrict__ x, int xstride, int sp,
+    float* __restrict__ out, float* __restrict__ out2, int n, int k)
+{
+    const int e = blockIdx.x;
+    const unsigned cnt = gcnt[e];
+    if (cnt == 0) {
+        return;
+    }
+    const int n0 = blockIdx.y * GRP_N;
+    const unsigned long long* wp0 = tab + (size_t)(base + e * 3) * 2;
+    const unsigned long long* wp1 = tab + (size_t)(base + e * 3 + 1) * 2;
+    const unsigned* q0 = (const unsigned*)wp0[0];
+    const unsigned short* s0 = (const unsigned short*)wp0[1];
+    const unsigned* q1 = (const unsigned*)wp1[0];
+    const unsigned short* s1 = (const unsigned short*)wp1[1];
+    const unsigned* gs = gslot + (size_t)goff[e];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int g = lane >> 2;
+    const int tt = lane & 3;
+    const int mt = (warp >> 1) * 16; // 4 m워프 × 16 = M64
+    const int ntw = (warp & 1) * 32; // 2 n워프 × 32 = N64(게이트 32+업 32)
+    const int k8 = k >> 3;
+    const int kg = k >> 5; // g32
+    __shared__ __align__(16) unsigned short xs[2][GRP_M][MMA_KC + 8];
+    __shared__ unsigned short ws[2][2 * GRP_N][MMA_KC + 8];
+    const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
+    for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
+        const unsigned rbase = mtile * GRP_M;
+        float c[4][4];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            ((float*)c)[i] = 0.0f;
+        }
+        auto stage_ab = [&](int st, int kn) {
+            for (int ee = tid; ee < GRP_M * MMA_KC / 8; ee += 256) {
+                const int r = ee / (MMA_KC / 8);
+                const int c8 = ee % (MMA_KC / 8);
+                const int gi = kn + c8 * 8;
+                if (rbase + r < cnt) {
+                    const unsigned sl = gs[rbase + r];
+                    const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
+                    if (gi + 7 < k) {
+                        cp_async16(&xs[st][r][c8 * 8], &x[xoff + gi]);
+                    } else {
+                        unsigned short t8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                        for (int j = 0; j < 8; ++j) {
+                            if (gi + j < k) {
+                                t8[j] = x[xoff + gi + j];
+                            }
+                        }
+                        *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) =
+                            *reinterpret_cast<const uint4*>(t8);
+                    }
+                } else {
+                    *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) = make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
+            for (int ee = tid; ee < 2 * GRP_N * MMA_KC / 8; ee += 256) {
+                const int r = ee / (MMA_KC / 8);
+                const int c8 = ee % (MMA_KC / 8);
+                const int gi = kn + c8 * 8;
+                const int rr = n0 + (r & (GRP_N - 1));
+                const unsigned* q = (r < GRP_N) ? q0 : q1;
+                const unsigned short* s = (r < GRP_N) ? s0 : s1;
+                const bool live = (rr < n) && (gi + 7 < k);
+                unsigned short scb = 0;
+                if (rr < n) {
+                    scb = s[(size_t)rr * kg + (gi >> 5)];
+                }
+                const float scf = __uint_as_float((unsigned)scb << 16);
+                const unsigned qw = live ? q[(size_t)rr * k8 + (gi >> 3)] : 0u;
+                if (live) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
+                        ws[st][r][c8 * 8 + j] =
+                            __half_as_ushort(__float2half_rn((float)nib * scf));
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        ws[st][r][c8 * 8 + j] = 0;
+                    }
+                }
+            }
+        };
+        stage_ab(0, 0);
+        asm volatile("cp.async.commit_group;");
+        int cur = 0;
+        for (int k0 = 0; k0 < k; k0 += MMA_KC, cur ^= 1) {
+            const int kn = k0 + MMA_KC;
+            if (kn < k) {
+                stage_ab(cur ^ 1, kn);
+            }
+            asm volatile("cp.async.commit_group;");
+            asm volatile("cp.async.wait_group 1;");
+            __syncthreads();
+#pragma unroll
+            for (int ks = 0; ks < MMA_KC / 16; ++ks) {
+                const int kb = ks * 16;
+                const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
+                const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
+                const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
+                const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    const int nb = ntw + nt * 8;
+                    const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
+                    const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3])
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const int col64 = ntw + nt * 8 + 2 * tt;
+            const int col = n0 + (col64 & (GRP_N - 1));
+            float* o = (col64 >= GRP_N) ? out2 : out;
+            const int r0 = mt + g;
+            if (rbase + r0 < cnt) {
+                const unsigned sl = gs[rbase + r0];
+                if (col < n) {
+                    o[(size_t)sl * n + col] = c[nt][0];
+                }
+                if (col + 1 < n) {
+                    o[(size_t)sl * n + col + 1] = c[nt][1];
+                }
+            }
+            if (rbase + r0 + 8 < cnt) {
+                const unsigned sl = gs[rbase + r0 + 8];
+                if (col < n) {
+                    o[(size_t)sl * n + col] = c[nt][2];
+                }
+                if (col + 1 < n) {
+                    o[(size_t)sl * n + col + 1] = c[nt][3];
+                }
+            }
+        }
+    }
+}

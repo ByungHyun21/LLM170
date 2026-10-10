@@ -128,6 +128,36 @@ impl W4a16Dec {
         )
     }
 
+    /// [§1.2 2026-10-11] 게이트·업 2N 융합 발사 — 한 커널이 base·base+1 두
+    /// 투영을 동시 처리(N64 = 게이트 32 + 업 32). A 스테이징·배리어를 상각.
+    pub(super) fn gemm_g32_mma_grp2_launch(
+        &self,
+        base: usize,
+        x_dev: CUdeviceptr,
+        xstride: usize,
+        sp: usize,
+        out_gate: CUdeviceptr,
+        out_up: CUdeviceptr,
+        n: usize,
+        k: usize,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_gemm_g32_mma_grp2")?;
+        let (mut p_t, mut p_b) = (self.moe_dev_tab, base as i32);
+        let (mut p_g, mut p_c, mut p_of) = (self.moe_gslot, self.moe_gcnt, self.moe_goff);
+        let (mut p_x, mut p_xs, mut p_sp) = (x_dev, xstride as i32, sp as i32);
+        let (mut p_o, mut p_o2, mut p_n, mut p_k) = (out_gate, out_up, n as i32, k as i32);
+        self.cc.launch(
+            f,
+            self.n_experts as u32,
+            n.div_ceil(GEMM_GRP_N) as u32,
+            256,
+            &mut crate::rawcuda::args::l12(
+                &mut p_t, &mut p_b, &mut p_g, &mut p_c, &mut p_of, &mut p_x, &mut p_xs, &mut p_sp,
+                &mut p_o, &mut p_o2, &mut p_n, &mut p_k,
+            ),
+        )
+    }
+
     /// 선택 순서 가중 누적 — y[ti] = Σ_{s∈ti} w[s]·d[s][i] (sp = 토큰당 슬롯).
     pub(super) fn moe_accum_dev(
         &mut self,
@@ -487,8 +517,8 @@ impl W4a16Dec {
             self.moe_align_launch(ns)?;
             // [marlin-A5] A는 f16(xn 미러) — 그룹 GEMM A 재판독 절반.
             let x16 = self.cast_x16(xn, t * h)?;
-            self.gemm_g32_mma_grp_launch(base, x16, h, tk, self.exp.gate, n_ff, h)?;
-            self.gemm_g32_mma_grp_launch(base + 1, x16, h, tk, self.exp.up, n_ff, h)?;
+            // [§1.2 2026-10-11] 게이트·업 2N 융합 — 발사 1회(A 스테이징·배리어 상각).
+            self.gemm_g32_mma_grp2_launch(base, x16, h, tk, self.exp.gate, self.exp.up, n_ff, h)?;
         } else {
             self.gemv_experts_launch(base, ns, xn, h, tk, self.exp.gate, n_ff, h)?;
             self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.exp.up, n_ff, h)?;

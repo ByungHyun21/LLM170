@@ -39,6 +39,7 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_cast_x32",
             "w4a16_gemv_experts_g32_bf16",
             "w4a16_gemm_g32_mma_grp",
+            "w4a16_gemm_g32_mma_grp2",
             "w4a16_moe_align",
             "w4a16_gemm_g128_mma",
         ],
