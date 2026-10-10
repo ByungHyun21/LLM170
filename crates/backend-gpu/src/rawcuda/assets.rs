@@ -106,7 +106,12 @@ pub const ASSETS: &[Asset] = &[
             "crates/backend-gpu/src/rawcuda/assets/attn.fatbin",
             "src/rawcuda/assets/attn.fatbin",
         ],
-        syms: &["attn_fwd3s_part_q", "attn_prep_q", "attn_fwd3s_merge"],
+        syms: &[
+            "attn_fwd3s_part_q",
+            "attn_fwd3s_part_qg",
+            "attn_prep_q",
+            "attn_fwd3s_merge",
+        ],
         boot: true,
     },
     Asset {

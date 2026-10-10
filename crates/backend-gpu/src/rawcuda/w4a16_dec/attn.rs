@@ -130,7 +130,15 @@ impl W4a16Dec {
         // [§8.1] 디코드(t≤8)는 분할 32 — 점유 회복(ncu: 192블록 25%).
         let spv = if t_len <= 8 { ATTN_SPLITS_D } else { ATTN_SPLITS };
         let mut sp = spv as i32;
-        let fp = self.cc.function("attn_fwd3s_part_q")?;
+        // [§8.2 2026-10-11] 프리필(t>8)은 GQA 패킹 커널 — kv헤드 그룹의 gq개
+        // q헤드가 K/V 행 판독을 공유(그리드 y = kv_heads×S). 디코드는 종전
+        // part_q(블록 수 = q_heads×S 유지 — 패킹 시 점유 감소).
+        let qgp = t_len > 8;
+        let fp = self.cc.function(if qgp {
+            "attn_fwd3s_part_qg"
+        } else {
+            "attn_fwd3s_part_q"
+        })?;
         #[allow(clippy::type_complexity)]
         let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
             self.dqh_a,
@@ -144,7 +152,7 @@ impl W4a16Dec {
         self.cc.launch(
             fp,
             t_len as u32,
-            (dm.q_heads * spv) as u32,
+            (if qgp { dm.kv_heads } else { dm.q_heads } * spv) as u32,
             256,
             &mut crate::rawcuda::args::l13(
                 &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut f5, &mut f6, &mut tl, &mut lay,

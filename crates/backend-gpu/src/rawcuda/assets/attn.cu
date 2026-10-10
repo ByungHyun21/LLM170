@@ -537,3 +537,199 @@ extern "C" __global__ void attn_fwd3s_merge(
 
 // [R3 2026-10-10] attn_pos_bump 제거 — 미사용(호스트가 attn_set_pos의
 // h2d_async로 pp 갱신; 캡처 그래프에서는 replay 전 1회 갱신).
+
+
+// [§8.2 2026-10-11] GQA 패킹 프리필 전용 — kv헤드 1개를 공유하는 gq(=q_heads/
+// kv_heads ≤ 8)개 q헤드를 한 블록이 처리: K 행 판독을 레지스터에서 공유
+// (gq개 dot이 같은 uint4 워드를 재사용)·V/vsc도 공유(vv 곱 1회). 트리는
+// GQ_MAX 병렬(배리어 수 = 종전 1헤드분). 헤드별 산술 순서·트리 페어링·
+// AV 행 오름차순 전부 동일 — **비트동일 계약**. 그리드 = (t, kv_heads×S).
+// 디코드(t≤8)는 종전 part_q 유지(블록 수 = q_heads×S 필요 — 패킹 시 감소).
+#define ATTN_GQ_MAX 8
+extern "C" __global__ void attn_fwd3s_part_qg(
+    const float* __restrict__ qh,
+    const signed char* __restrict__ kc,
+    const signed char* __restrict__ vc,
+    const float* __restrict__ ksc,
+    const float* __restrict__ vsc,
+    float* __restrict__ part,   // [T][q_heads][S][258]
+    const unsigned* __restrict__ pp,
+    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits)
+{
+    int t = blockIdx.x;
+    int hs = blockIdx.y;
+    int kh = hs / splits;
+    int s = hs - kh * splits;
+    int tid = threadIdx.x;
+    int gq = q_heads / kv_heads;
+    int h0 = kh * gq;
+    float scale = 0.0625f;
+    int lim = (int)pp[0] + t + 1;
+    long kv_dim = (long)kv_heads * 256;
+    __shared__ float qs[ATTN_GQ_MAX][256];
+    __shared__ float sarr[ATTN_GQ_MAX][ATTN_CHUNK];
+    __shared__ float reds[ATTN_GQ_MAX][256];
+    __shared__ float mrun[ATTN_GQ_MAX], lrun[ATTN_GQ_MAX], corr[ATTN_GQ_MAX], mnew[ATTN_GQ_MAX];
+    for (int h = 0; h < gq; ++h) {
+        const long qrow = (long)t * (q_heads * 256) + (long)(h0 + h) * 256;
+        qs[h][tid] = qh[qrow + tid];
+    }
+    __syncthreads();
+    const int eff = (lim <= 256) ? 1 : splits;
+    if (s >= eff) {
+        for (int h = 0; h < gq; ++h) {
+            float* out = part + (((long)t * q_heads + (h0 + h)) * splits + s) * 258;
+            if (tid == 0) {
+                out[0] = -1e30f;
+                out[1] = 0.0f;
+            }
+            out[2 + tid] = 0.0f;
+        }
+        return;
+    }
+    int chunk_rows = (lim + eff - 1) / eff;
+    chunk_rows = ((chunk_rows + ATTN_CHUNK - 1) / ATTN_CHUNK) * ATTN_CHUNK;
+    int lo = s * chunk_rows;
+    int hi = min(lim, lo + chunk_rows);
+    if (tid < gq) {
+        mrun[tid] = -1e30f;
+        lrun[tid] = 0.0f;
+    }
+    float acc[ATTN_GQ_MAX];
+#pragma unroll
+    for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+        acc[h] = 0.0f;
+    }
+    for (int base = lo; base < hi; base += ATTN_CHUNK) {
+        const int nch = min(ATTN_CHUNK, hi - base);
+        // 스코어 — 행당 1스레드, K 행(uint4)을 gq개 헤드 dot이 공유.
+        if (tid < nch) {
+            const int row = base + tid;
+            const uint4* k16 = reinterpret_cast<const uint4*>(
+                kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256);
+            float p[ATTN_GQ_MAX];
+#pragma unroll
+            for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+                p[h] = 0.0f;
+            }
+#pragma unroll 4
+            for (int d16 = 0; d16 < 16; d16++) {
+                const uint4 w = k16[d16];
+#pragma unroll
+                for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+                    if (h < gq) {
+                        const float4 qa = *reinterpret_cast<const float4*>(&qs[h][d16 * 16 + 0]);
+                        const float4 qb = *reinterpret_cast<const float4*>(&qs[h][d16 * 16 + 4]);
+                        const float4 qc = *reinterpret_cast<const float4*>(&qs[h][d16 * 16 + 8]);
+                        const float4 qd = *reinterpret_cast<const float4*>(&qs[h][d16 * 16 + 12]);
+                        p[h] += qa.x * (float)(signed char)(w.x & 0xffu);
+                        p[h] += qa.y * (float)(signed char)((w.x >> 8) & 0xffu);
+                        p[h] += qa.z * (float)(signed char)((w.x >> 16) & 0xffu);
+                        p[h] += qa.w * (float)(signed char)(w.x >> 24);
+                        p[h] += qb.x * (float)(signed char)(w.y & 0xffu);
+                        p[h] += qb.y * (float)(signed char)((w.y >> 8) & 0xffu);
+                        p[h] += qb.z * (float)(signed char)((w.y >> 16) & 0xffu);
+                        p[h] += qb.w * (float)(signed char)(w.y >> 24);
+                        p[h] += qc.x * (float)(signed char)(w.z & 0xffu);
+                        p[h] += qc.y * (float)(signed char)((w.z >> 8) & 0xffu);
+                        p[h] += qc.z * (float)(signed char)((w.z >> 16) & 0xffu);
+                        p[h] += qc.w * (float)(signed char)(w.z >> 24);
+                        p[h] += qd.x * (float)(signed char)(w.w & 0xffu);
+                        p[h] += qd.y * (float)(signed char)((w.w >> 8) & 0xffu);
+                        p[h] += qd.z * (float)(signed char)((w.w >> 16) & 0xffu);
+                        p[h] += qd.w * (float)(signed char)(w.w >> 24);
+                    }
+                }
+            }
+            const float sc = scale * ksc[((long)layer * cap + row) * kv_heads + kh];
+#pragma unroll
+            for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+                sarr[h][tid] = (h < gq) ? p[h] * sc : -1e30f;
+            }
+        } else {
+#pragma unroll
+            for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+                sarr[h][tid] = -1e30f;
+            }
+        }
+        __syncthreads();
+        // 청크 max 트리 — GQ_MAX 병렬(페어링 종전과 동일).
+#pragma unroll
+        for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+            reds[h][tid] = sarr[h][tid];
+        }
+        __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (tid < st) {
+#pragma unroll
+                for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+                    reds[h][tid] = fmaxf(reds[h][tid], reds[h][tid + st]);
+                }
+            }
+            __syncthreads();
+        }
+        if (tid < gq) {
+            mnew[tid] = fmaxf(mrun[tid], reds[tid][0]);
+            corr[tid] = (mrun[tid] <= -1e29f) ? 0.0f : attn_expf(mrun[tid] - mnew[tid]);
+        }
+        __syncthreads();
+        // exp + 청크 sum.
+        float e = 0.0f;
+        if (tid < nch) {
+#pragma unroll
+            for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+                if (h < gq) {
+                    e = attn_expf(sarr[h][tid] - mnew[h]);
+                    sarr[h][tid] = e;
+                    reds[h][tid] = e;
+                }
+            }
+        } else {
+#pragma unroll
+            for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+                reds[h][tid] = 0.0f;
+            }
+        }
+        __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (tid < st) {
+#pragma unroll
+                for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+                    reds[h][tid] += reds[h][tid + st];
+                }
+            }
+            __syncthreads();
+        }
+        // AV — V/vsc 곱(vv)을 gq개 헤드가 공유(행 오름차순 유지 — 비트동일).
+#pragma unroll
+        for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+            if (h < gq) {
+                acc[h] *= corr[h];
+            }
+        }
+        for (int i = 0; i < nch; i++) {
+            const int row = base + i;
+            const float vv = (float)vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid] *
+                             vsc[((long)layer * cap + row) * kv_heads + kh];
+#pragma unroll
+            for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+                if (h < gq) {
+                    acc[h] += sarr[h][i] * vv;
+                }
+            }
+        }
+        if (tid < gq) {
+            lrun[tid] = lrun[tid] * corr[tid] + reds[tid][0];
+            mrun[tid] = mnew[tid];
+        }
+        __syncthreads();
+    }
+    for (int h = 0; h < gq; ++h) {
+        float* out = part + (((long)t * q_heads + (h0 + h)) * splits + s) * 258;
+        if (tid == 0) {
+            out[0] = mrun[h];
+            out[1] = lrun[h];
+        }
+        out[2 + tid] = acc[h];
+    }
+}
