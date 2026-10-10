@@ -398,6 +398,56 @@ extern "C" __global__ void attn_prep_q(
 // 정의 그대로)하며 f16 GEMM 누산(1.6e-2)보다 작다. 실사용 판정은 기존과
 // 동일하게 argmax 일치다.
 #define ATTN_CHUNK 256
+// [R13 2026-10-10] part/단일 커널 공통 청크 스텝 — 온라인 소프트맥스.
+// kdot(i) = 스코어(스케일 적용 — 청크 로컬 i는 호출부가 row로 환산),
+// vacc(i) = 이 스레드 dim의 V 값. 산술 순서는 종전 4벌의 인라인 루프와
+// 동일(청크 내 순차·d 오름차순·exp 순서 동일) — 값 불변 계약.
+template <typename KDot, typename VAcc>
+__device__ __forceinline__ void attn_part_step(KDot kdot, VAcc vacc,
+                                               float* __restrict__ sarr,
+                                               float* __restrict__ reds, int nch,
+                                               int tid, float& m_run, float& l_run,
+                                               float& acc)
+{
+    float p = -1e30f;
+    if (tid < nch) {
+        p = kdot(tid);
+    }
+    sarr[tid] = p;
+    __syncthreads();
+    // 청크 max(트리) — reds[0] 확정(균질)
+    reds[tid] = (tid < nch) ? sarr[tid] : -1e30f;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (tid < st) reds[tid] = fmaxf(reds[tid], reds[tid + st]);
+        __syncthreads();
+    }
+    float m_new = fmaxf(m_run, reds[0]);
+    float corr = (m_run <= -1e29f) ? 0.0f : attn_expf(m_run - m_new);
+    __syncthreads(); // reds[0](청크 max) 판독 완료 후 e 기록 — 덮어쓰기 레이스 방지
+    // exp+청크 sum — e를 sarr에 재기록(AV 재사용)
+    float e = 0.0f;
+    if (tid < nch) {
+        e = attn_expf(sarr[tid] - m_new);
+        sarr[tid] = e;
+    }
+    reds[tid] = e;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (tid < st) reds[tid] += reds[tid + st];
+        __syncthreads();
+    }
+    // AV: 자기 dim에 청크 전 행 누산(행 순서·언롤 불변 — 계약)
+    acc *= corr;
+#pragma unroll 8
+    for (int i = 0; i < nch; i++) {
+        acc += sarr[i] * vacc(i);
+    }
+    l_run = l_run * corr + reds[0];
+    m_run = m_new;
+    __syncthreads(); // sarr 재사용 전 전체 완료(다음 청크 스코어 덮어쓰기 보호)
+}
+
 extern "C" __global__ void attn_fwd3s(
     const float* __restrict__ qh,    // [T][q_heads*256]
     const float* __restrict__ kc,    // [n_attn*cap][kv_heads*256]
@@ -427,66 +477,31 @@ extern "C" __global__ void attn_fwd3s(
     // 무관해지므로 위치축 상한이 사라진다(위 S12 주석).
     float m_run = -1e30f;
     float l_run = 0.0f;
-    float acc = 0.0f;   // 스레드(dim=tid)별 AV 누산
+    float acc = 0.0f;
     for (int base = 0; base < lim; base += ATTN_CHUNK) {
-        int nch = min(ATTN_CHUNK, lim - base);
-        // 스코어: 행=base+tid(tid<nch), 256차원 직렬 내적(hip L232-239 동일)
-        // [2026-10-09 P8-attn] float4 판독 — 워프당 32개 라인 비코얼레스 로드
-        // (스코어가 attn의 ~73%). 가산 순서는 d 오름차순 그대로(비트 동일).
-        float p = -1e30f;
-        if (tid < nch) {
-            int row = base + tid;
-            const float* krow = kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256;
-            const float4* k4 = reinterpret_cast<const float4*>(krow);
-            const float4* q4 = reinterpret_cast<const float4*>(qs);
-            float p0 = 0.0f;
+        const int nch = min(ATTN_CHUNK, lim - base);
+        attn_part_step(
+            [&](int i) -> float {
+                const int row = base + i;
+                const float* krow = kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256;
+                const float4* k4 = reinterpret_cast<const float4*>(krow);
+                const float4* q4 = reinterpret_cast<const float4*>(qs);
+                float p0 = 0.0f;
 #pragma unroll 8
-            for (int d4 = 0; d4 < 64; d4++) {
-                const float4 kv = k4[d4];
-                const float4 qv = q4[d4];
-                p0 += qv.x * kv.x;
-                p0 += qv.y * kv.y;
-                p0 += qv.z * kv.z;
-                p0 += qv.w * kv.w;
-            }
-            p = p0 * scale;
-        }
-        sarr[tid] = p;
-        __syncthreads();
-        // 청크 max(트리) — reds[0] 확정(균질)
-        reds[tid] = (tid < nch) ? sarr[tid] : -1e30f;
-        __syncthreads();
-        for (int st = 128; st > 0; st >>= 1) {
-            if (tid < st) reds[tid] = fmaxf(reds[tid], reds[tid + st]);
-            __syncthreads();
-        }
-        float m_new = fmaxf(m_run, reds[0]);
-        float corr = (m_run <= -1e29f) ? 0.0f : attn_expf(m_run - m_new);
-        __syncthreads(); // reds[0](청크 max) 판독 완료 후 e 기록 — 덮어쓰기 레이스 방지
-        // exp+청크 sum — e를 sarr에 재기록(AV 재사용)
-        float e = 0.0f;
-        if (tid < nch) {
-            e = attn_expf(sarr[tid] - m_new);
-            sarr[tid] = e;
-        }
-        reds[tid] = e;
-        __syncthreads();
-        for (int st = 128; st > 0; st >>= 1) {
-            if (tid < st) reds[tid] += reds[tid + st];
-            __syncthreads();
-        }
-        // AV: 자기 dim에 청크 전 행 누산(행 순서는 이전 구현과 동일 — 순차)
-        acc *= corr;
-        // [2026-10-09 P8-attn] 언롤 — 행 순차 누산 순서 불변(계약), vc 로드
-        // 프리페치로 지연 은닉(종전 미언롤 = 행마다 로드 대기).
-#pragma unroll 8
-        for (int i = 0; i < nch; i++) {
-            int row = base + i;
-            acc += sarr[i] * vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid];
-        }
-        l_run = l_run * corr + reds[0];
-        m_run = m_new;
-        __syncthreads(); // sarr 재사용 전 전체 완료(다음 청크 스코어 덮어쓰기 보호)
+                for (int d4 = 0; d4 < 64; d4++) {
+                    const float4 kv = k4[d4];
+                    const float4 qv = q4[d4];
+                    p0 += qv.x * kv.x;
+                    p0 += qv.y * kv.y;
+                    p0 += qv.z * kv.z;
+                    p0 += qv.w * kv.w;
+                }
+                return p0 * scale;
+            },
+            [&](int i) -> float {
+                return vc[((long)layer * cap + (base + i)) * kv_dim + (long)kh * 256 + tid];
+            },
+            sarr, reds, nch, tid, m_run, l_run, acc);
     }
     float g = qg[(long)t * (q_heads * 512) + (long)h * 512 + 256 + tid];
     outv[qrow + tid] = (acc / l_run) * (1.0f / (1.0f + attn_expf(-g)));
@@ -548,56 +563,29 @@ extern "C" __global__ void attn_fwd3s_part(
     float l_run = 0.0f;
     float acc = 0.0f;
     for (int base = lo; base < hi; base += ATTN_CHUNK) {
-        int nch = min(ATTN_CHUNK, hi - base);
-        float p = -1e30f;
-        if (tid < nch) {
-            int row = base + tid;
-            const float* krow = kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256;
-            const float4* k4 = reinterpret_cast<const float4*>(krow);
-            const float4* q4 = reinterpret_cast<const float4*>(qs);
-            float p0 = 0.0f;
+        const int nch = min(ATTN_CHUNK, hi - base);
+        attn_part_step(
+            [&](int i) -> float {
+                const int row = base + i;
+                const float* krow = kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256;
+                const float4* k4 = reinterpret_cast<const float4*>(krow);
+                const float4* q4 = reinterpret_cast<const float4*>(qs);
+                float p0 = 0.0f;
 #pragma unroll 8
-            for (int d4 = 0; d4 < 64; d4++) {
-                const float4 kv = k4[d4];
-                const float4 qv = q4[d4];
-                p0 += qv.x * kv.x;
-                p0 += qv.y * kv.y;
-                p0 += qv.z * kv.z;
-                p0 += qv.w * kv.w;
-            }
-            p = p0 * scale;
-        }
-        sarr[tid] = p;
-        __syncthreads();
-        reds[tid] = (tid < nch) ? sarr[tid] : -1e30f;
-        __syncthreads();
-        for (int st = 128; st > 0; st >>= 1) {
-            if (tid < st) reds[tid] = fmaxf(reds[tid], reds[tid + st]);
-            __syncthreads();
-        }
-        float m_new = fmaxf(m_run, reds[0]);
-        float corr = (m_run <= -1e29f) ? 0.0f : attn_expf(m_run - m_new);
-        __syncthreads();
-        float e = 0.0f;
-        if (tid < nch) {
-            e = attn_expf(sarr[tid] - m_new);
-            sarr[tid] = e;
-        }
-        reds[tid] = e;
-        __syncthreads();
-        for (int st = 128; st > 0; st >>= 1) {
-            if (tid < st) reds[tid] += reds[tid + st];
-            __syncthreads();
-        }
-        acc *= corr;
-#pragma unroll 8
-        for (int i = 0; i < nch; i++) {
-            int row = base + i;
-            acc += sarr[i] * vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid];
-        }
-        l_run = l_run * corr + reds[0];
-        m_run = m_new;
-        __syncthreads();
+                for (int d4 = 0; d4 < 64; d4++) {
+                    const float4 kv = k4[d4];
+                    const float4 qv = q4[d4];
+                    p0 += qv.x * kv.x;
+                    p0 += qv.y * kv.y;
+                    p0 += qv.z * kv.z;
+                    p0 += qv.w * kv.w;
+                }
+                return p0 * scale;
+            },
+            [&](int i) -> float {
+                return vc[((long)layer * cap + (base + i)) * kv_dim + (long)kh * 256 + tid];
+            },
+            sarr, reds, nch, tid, m_run, l_run, acc);
     }
     if (tid == 0) {
         out[0] = m_run;
@@ -654,58 +642,31 @@ extern "C" __global__ void attn_fwd3s_part_q(
     float l_run = 0.0f;
     float acc = 0.0f;
     for (int base = lo; base < hi; base += ATTN_CHUNK) {
-        int nch = min(ATTN_CHUNK, hi - base);
-        float p = -1e30f;
-        if (tid < nch) {
-            int row = base + tid;
-            const unsigned* k4 =
-                reinterpret_cast<const unsigned*>(kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256);
-            const float4* q4 = reinterpret_cast<const float4*>(qs);
-            float p0 = 0.0f;
+        const int nch = min(ATTN_CHUNK, hi - base);
+        attn_part_step(
+            [&](int i) -> float {
+                const int row = base + i;
+                const unsigned* k4 = reinterpret_cast<const unsigned*>(
+                    kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256);
+                const float4* q4 = reinterpret_cast<const float4*>(qs);
+                float p0 = 0.0f;
 #pragma unroll 8
-            for (int d4 = 0; d4 < 64; d4++) {
-                const unsigned w = k4[d4];
-                const float4 qv = q4[d4];
-                p0 += qv.x * (float)(signed char)(w & 0xffu);
-                p0 += qv.y * (float)(signed char)((w >> 8) & 0xffu);
-                p0 += qv.z * (float)(signed char)((w >> 16) & 0xffu);
-                p0 += qv.w * (float)(signed char)(w >> 24);
-            }
-            p = p0 * (scale * ksc[((long)layer * cap + row) * kv_heads + kh]);
-        }
-        sarr[tid] = p;
-        __syncthreads();
-        reds[tid] = (tid < nch) ? sarr[tid] : -1e30f;
-        __syncthreads();
-        for (int st = 128; st > 0; st >>= 1) {
-            if (tid < st) reds[tid] = fmaxf(reds[tid], reds[tid + st]);
-            __syncthreads();
-        }
-        float m_new = fmaxf(m_run, reds[0]);
-        float corr = (m_run <= -1e29f) ? 0.0f : attn_expf(m_run - m_new);
-        __syncthreads();
-        float e = 0.0f;
-        if (tid < nch) {
-            e = attn_expf(sarr[tid] - m_new);
-            sarr[tid] = e;
-        }
-        reds[tid] = e;
-        __syncthreads();
-        for (int st = 128; st > 0; st >>= 1) {
-            if (tid < st) reds[tid] += reds[tid + st];
-            __syncthreads();
-        }
-        acc *= corr;
-#pragma unroll 8
-        for (int i = 0; i < nch; i++) {
-            int row = base + i;
-            acc += sarr[i] *
-                   ((float)vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid] *
-                    vsc[((long)layer * cap + row) * kv_heads + kh]);
-        }
-        l_run = l_run * corr + reds[0];
-        m_run = m_new;
-        __syncthreads();
+                for (int d4 = 0; d4 < 64; d4++) {
+                    const unsigned w = k4[d4];
+                    const float4 qv = q4[d4];
+                    p0 += qv.x * (float)(signed char)(w & 0xffu);
+                    p0 += qv.y * (float)(signed char)((w >> 8) & 0xffu);
+                    p0 += qv.z * (float)(signed char)((w >> 16) & 0xffu);
+                    p0 += qv.w * (float)(signed char)(w >> 24);
+                }
+                return p0 * (scale * ksc[((long)layer * cap + row) * kv_heads + kh]);
+            },
+            [&](int i) -> float {
+                const int row = base + i;
+                return (float)vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid] *
+                       vsc[((long)layer * cap + row) * kv_heads + kh];
+            },
+            sarr, reds, nch, tid, m_run, l_run, acc);
     }
     if (tid == 0) {
         out[0] = m_run;
@@ -894,65 +855,38 @@ extern "C" __global__ void attn_fwd3s_part_q4(
     float l_run = 0.0f;
     float acc = 0.0f;
     for (int base = lo; base < hi; base += ATTN_CHUNK) {
-        int nch = min(ATTN_CHUNK, hi - base);
-        float p = -1e30f;
-        if (tid < nch) {
-            int row = base + tid;
-            const unsigned* k4 = reinterpret_cast<const unsigned*>(
-                kc + ((long)layer * cap + row) * kv_rowb + (long)kh * 128);
-            const float4* q4 = reinterpret_cast<const float4*>(qs);
-            float p0 = 0.0f;
+        const int nch = min(ATTN_CHUNK, hi - base);
+        attn_part_step(
+            [&](int i) -> float {
+                const int row = base + i;
+                const unsigned* k4 = reinterpret_cast<const unsigned*>(
+                    kc + ((long)layer * cap + row) * kv_rowb + (long)kh * 128);
+                const float4* q4 = reinterpret_cast<const float4*>(qs);
+                float p0 = 0.0f;
 #pragma unroll 8
-            for (int d4 = 0; d4 < 32; d4++) { // 32워드 × 8 = 256차원
-                const unsigned w = k4[d4];
-                const float4 qa = q4[2 * d4];
-                const float4 qb = q4[2 * d4 + 1];
-                p0 += qa.x * (float)((int)(w & 0xFu) - 8);
-                p0 += qa.y * (float)((int)((w >> 4) & 0xFu) - 8);
-                p0 += qa.z * (float)((int)((w >> 8) & 0xFu) - 8);
-                p0 += qa.w * (float)((int)((w >> 12) & 0xFu) - 8);
-                p0 += qb.x * (float)((int)((w >> 16) & 0xFu) - 8);
-                p0 += qb.y * (float)((int)((w >> 20) & 0xFu) - 8);
-                p0 += qb.z * (float)((int)((w >> 24) & 0xFu) - 8);
-                p0 += qb.w * (float)((int)(w >> 28) - 8);
-            }
-            p = p0 * (scale * ksc[((long)layer * cap + row) * kv_heads + kh]);
-        }
-        sarr[tid] = p;
-        __syncthreads();
-        reds[tid] = (tid < nch) ? sarr[tid] : -1e30f;
-        __syncthreads();
-        for (int st = 128; st > 0; st >>= 1) {
-            if (tid < st) reds[tid] = fmaxf(reds[tid], reds[tid + st]);
-            __syncthreads();
-        }
-        float m_new = fmaxf(m_run, reds[0]);
-        float corr = (m_run <= -1e29f) ? 0.0f : attn_expf(m_run - m_new);
-        __syncthreads();
-        float e = 0.0f;
-        if (tid < nch) {
-            e = attn_expf(sarr[tid] - m_new);
-            sarr[tid] = e;
-        }
-        reds[tid] = e;
-        __syncthreads();
-        for (int st = 128; st > 0; st >>= 1) {
-            if (tid < st) reds[tid] += reds[tid + st];
-            __syncthreads();
-        }
-        acc *= corr;
-#pragma unroll 8
-        for (int i = 0; i < nch; i++) {
-            int row = base + i;
-            const unsigned char byte =
-                vc[((long)layer * cap + row) * kv_rowb + (long)kh * 128 + (tid >> 1)];
-            const int nib = (tid & 1) ? (int)((byte >> 4) & 0xFu) : (int)(byte & 0xFu);
-            acc += sarr[i] * ((float)(nib - 8) *
-                              vsc[((long)layer * cap + row) * kv_heads + kh]);
-        }
-        l_run = l_run * corr + reds[0];
-        m_run = m_new;
-        __syncthreads();
+                for (int d4 = 0; d4 < 32; d4++) {
+                    const unsigned w = k4[d4];
+                    const float4 qa = q4[2 * d4];
+                    const float4 qb = q4[2 * d4 + 1];
+                    p0 += qa.x * (float)((int)(w & 0xFu) - 8);
+                    p0 += qa.y * (float)((int)((w >> 4) & 0xFu) - 8);
+                    p0 += qa.z * (float)((int)((w >> 8) & 0xFu) - 8);
+                    p0 += qa.w * (float)((int)((w >> 12) & 0xFu) - 8);
+                    p0 += qb.x * (float)((int)((w >> 16) & 0xFu) - 8);
+                    p0 += qb.y * (float)((int)((w >> 20) & 0xFu) - 8);
+                    p0 += qb.z * (float)((int)((w >> 24) & 0xFu) - 8);
+                    p0 += qb.w * (float)((int)(w >> 28) - 8);
+                }
+                return p0 * (scale * ksc[((long)layer * cap + row) * kv_heads + kh]);
+            },
+            [&](int i) -> float {
+                const int row = base + i;
+                const unsigned char byte =
+                    vc[((long)layer * cap + row) * kv_rowb + (long)kh * 128 + (tid >> 1)];
+                const int nib = (tid & 1) ? (int)((byte >> 4) & 0xFu) : (int)(byte & 0xFu);
+                return (float)(nib - 8) * vsc[((long)layer * cap + row) * kv_heads + kh];
+            },
+            sarr, reds, nch, tid, m_run, l_run, acc);
     }
     if (tid == 0) {
         out[0] = m_run;
