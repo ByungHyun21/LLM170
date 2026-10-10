@@ -303,7 +303,8 @@ extern "C" __global__ void gdn_l2perm(
 #define GDN_TILE 16
 // [A5-4] state 열 V-타일: 블록 = (h, vs타일). 구 VSLICE와 달리 A/KQ는
 // prepass가 비중복 계산한다(절단 시 A/KQ 중복이 기각 원인이었다).
-#define GDN_NSPLIT 4
+#define GDN_NSPLIT 4 // [2026-10-10 실험] 8은 smem 36.2KB — 3블록 문턱
+                     // 33.3KB 미달로 점유 무변(원복).
 #define GDN_VS (128 / GDN_NSPLIT)   // 블록당 열 수
 #define GDN_NGRP 16                 // 워크그룹 = 512스레드 / GDN_VS
 
