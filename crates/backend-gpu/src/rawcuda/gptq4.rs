@@ -89,36 +89,11 @@ pub struct Gptq4 {
 }
 
 impl Gptq4 {
-    /// gptq4.fatbin 자산 해석 — env 오버라이드 우선(계산 경로 분기 아님).
-    fn fatbin_bytes() -> Result<Vec<u8>, String> {
-        const ENV: &str = "LLM170_CUDA_GPTQ4_FATBIN_PATH";
-        const REL: &[&str] = &[
-            "crates/backend-gpu/src/rawcuda/assets/gptq4.fatbin",
-            "src/rawcuda/assets/gptq4.fatbin",
-        ];
-        if let Some(p) = llm170_diag::flag::val(ENV) {
-            return std::fs::read(p).map_err(|e| format!("{ENV}({p}) 읽기 실패: {e}"));
-        }
-        for r in REL {
-            if let Ok(b) = std::fs::read(r) {
-                return Ok(b);
-            }
-        }
-        Err(format!("gptq4.fatbin 부재 — {REL:?} 또는 {ENV}"))
-    }
-
     pub fn new() -> Result<Self, String> {
         let mut cc = CudaCtx::new()?;
-        cc.load_fatbin(
-            "gptq4",
-            &Self::fatbin_bytes()?,
-            &[
-                "w4a16_gemm_g128",
-                "w4a16_gemv_g128",
-                "w4a16_gemm_g32_bf16",
-                "w4a16_gemv_g32_bf16",
-            ],
-        )?;
+        // [R9] 매니페스트 단일 출처 — 게이트 호스트도 같은 표를 쓴다.
+        let a = crate::rawcuda::assets::asset("gptq4");
+        cc.load_fatbin(a.name, &crate::rawcuda::assets::asset_bytes(a)?, a.syms)?;
         Ok(Gptq4 { cc })
     }
 
