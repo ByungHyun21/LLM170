@@ -224,7 +224,7 @@ fn text_stream_holdback_and_stop() {
     // 잔여 플러시(stop 미도달) — 홀드백(최장 stop-1 = 2B)은 보류된다.
     let mut ts = TextStream::new(vec!["END".into()], false);
     assert!(ts.push_text("hi").is_none(), "2B는 홀드백 보류");
-    assert_eq!(ts.flush().as_deref(), Some("hi"));
+    assert_eq!(ts.flush(), Some("hi"));
     let mut ts = TextStream::new(vec!["END".into()], false);
     assert!(ts.push_text("hi").is_none());
     assert_eq!(
@@ -232,7 +232,7 @@ fn text_stream_holdback_and_stop() {
         Some("hi"),
         "4B-홀드백=2B 방출"
     );
-    assert_eq!(ts.flush().as_deref(), Some("zz"));
+    assert_eq!(ts.flush(), Some("zz"));
 }
 
 /// [R3-fix] 멀티바이트 stop — 스캔 창(from)이 문자 중간에 떨어져도 패닉 금지
