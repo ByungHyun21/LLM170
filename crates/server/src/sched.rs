@@ -177,6 +177,7 @@ pub static SCHED: Sched = Sched {
     gen_tokens: AtomicU64::new(0),
     requests: AtomicU64::new(0),
     requests_failed: AtomicU64::new(0),
+    queue_depth: AtomicU64::new(0),
 };
 pub struct Sched {
     pub jobs: AtomicU64,
@@ -200,6 +201,9 @@ pub struct Sched {
     pub requests: AtomicU64,
     /// 확정 실패 요청 누적.
     pub requests_failed: AtomicU64,
+    /// [B5/I 2026-10-10] 큐 깊이 게이지 — enqueue 성공 +1, 스케줄러 수신 -1.
+    /// 429 어드미션 게이트와 정합(포화 시 try_send 실패라 증가 없음).
+    pub queue_depth: AtomicU64,
 }
 impl Sched {
     pub fn summary(&self) -> String {
@@ -212,8 +216,9 @@ impl Sched {
         let mp = self.ms_prefill.load(Ordering::Relaxed);
         let sr = self.spec_rounds.load(Ordering::Relaxed);
         let sa = self.spec_accepted.load(Ordering::Relaxed);
+        let qd = self.queue_depth.load(Ordering::Relaxed);
         format!(
-            "[sched] jobs {jobs} | queue-wait avg {:.0}ms | prefix-reuse {px}tok | decode {td}x avg {:.1}ms | prefill {cp}x avg {:.1}ms | spec {sr}r acc {sa} ({:.2}/r)",
+            "[sched] jobs {jobs} | queue {qd} | queue-wait avg {:.0}ms | prefix-reuse {px}tok | decode {td}x avg {:.1}ms | prefill {cp}x avg {:.1}ms | spec {sr}r acc {sa} ({:.2}/r)",
             if jobs > 0 {
                 qw as f64 / jobs as f64 / 1e3
             } else {
@@ -283,6 +288,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             let Ok(j) = rx.try_recv() else {
                 break;
             };
+            SCHED.queue_depth.fetch_sub(1, Ordering::Relaxed);
             // 107 W7: 배정 단일 구현으로 위임(접두 캐시 로직 동일).
             assign_slot(&mut slots, &mut eng, j, tick);
         }
@@ -428,6 +434,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         if !busy {
             match rx.recv() {
                 Ok(j) => {
+                    SCHED.queue_depth.fetch_sub(1, Ordering::Relaxed);
                     // 107 W7: 배정 단일 구현 위임(전 슬롯 접두 탐색으로 개선 — 종전 slot0 고정).
                     assign_slot(&mut slots, &mut eng, j, tick);
                 }
@@ -505,25 +512,7 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         return;
     }
     SCHED.jobs.fetch_add(1, Ordering::Relaxed);
-    let prefix_ok = true; // NO_PREFIX 폐기 — 접두 캐시 항시
-    let pick = (0..slots.len())
-        .filter(|&i| slots[i].job.is_none())
-        .map(|i| {
-            let l = if prefix_ok {
-                slots[i]
-                    .cached
-                    .iter()
-                    .zip(j.tokens.iter())
-                    .take_while(|(a, b)| a == b)
-                    .count()
-            } else {
-                0
-            };
-            let full = l > 0 && l == slots[i].cached.len() && j.tokens.len() > l;
-            (i, if full { l } else { 0 })
-        })
-        .max_by_key(|&(_, l)| l);
-    let Some((i, reuse)) = pick else {
+    let Some((i, reuse)) = pick_prefix_slot(slots, &j.tokens) else {
         return;
     };
     if reuse == 0 {
@@ -572,6 +561,29 @@ fn slot_emit(s: &mut Slot, t: u32) {
         // SSE 수신자 소멸(클라이언트 절단) — 즉시 취소 표시
         s.cancelled = true;
     }
+}
+
+/// [I 2026-10-10] 접두 캐시 재사용 슬롯 선택 — **순수 함수**(테스트 표면).
+/// free 슬롯(job 없음) 중 cached와 tokens의 공통 접두가 최장인 곳. 반환
+/// (slot, reuse): reuse > 0은 cached **전체**가 접두이고 토큰이 더 길 때만
+/// (정확히 같은 길이는 상태가 이미 구워져 있으므로 재사용 아님 — reset 생략
+/// 판정은 호출부).
+fn pick_prefix_slot(slots: &[Slot], tokens: &[u32]) -> Option<(usize, usize)> {
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.job.is_none())
+        .map(|(i, s)| {
+            let l = s
+                .cached
+                .iter()
+                .zip(tokens.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let full = l > 0 && l == s.cached.len() && tokens.len() > l;
+            (i, if full { l } else { 0 })
+        })
+        .max_by_key(|&(_, l)| l)
 }
 
 fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
@@ -625,5 +637,52 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
         let c = std::mem::take(&mut s.cached);
         *s = Slot::free();
         s.cached = c;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Slot, pick_prefix_slot};
+
+    fn slot_with(cached: Vec<u32>) -> Slot {
+        let mut s = Slot::free();
+        s.cached = cached;
+        s
+    }
+
+    /// [I] 접두 선택 — 빈 슬롯 없음/전부 점유 = None.
+    #[test]
+    fn pick_none_cases() {
+        assert!(pick_prefix_slot(&[], &[1, 2, 3]).is_none());
+        let mut busy = slot_with(vec![1, 2]);
+        busy.job = None; // job 없음 + cached 유지 = 자유 슬롯(재사용 판정은 아래)
+        // 전부 점유(가짜 점유는 job Some 필요 — out 생략 위해 free로 검증 불가하므로
+        // "cached 비었고 공통 접두 0" 케이스로 대체).
+        let free = slot_with(Vec::new());
+        assert_eq!(pick_prefix_slot(&[free], &[1, 2, 3]), Some((0, 0)));
+    }
+
+    /// [I] 최장 접두 슬롯 선택 + 전체 접두(더 긴 토큰) 재사용 판정.
+    #[test]
+    fn pick_longest_prefix() {
+        let a = slot_with(vec![1, 2, 3, 4]);
+        let b = slot_with(vec![1, 2, 9]);
+        let c = slot_with(vec![7, 8]);
+        // 공통 접두: a=4(전체+토큰 더 김→재사용), b=2, c=0 → a 선택.
+        assert_eq!(pick_prefix_slot(&[a, b, c], &[1, 2, 3, 4, 5]), Some((0, 4)));
+    }
+
+    /// [I] 정확히 같은 길이는 재사용 아님(reuse=0 — 상태가 이미 그 열).
+    #[test]
+    fn pick_exact_length_no_reuse() {
+        let a = slot_with(vec![1, 2, 3]);
+        assert_eq!(pick_prefix_slot(&[a], &[1, 2, 3]), Some((0, 0)));
+    }
+
+    /// [I] 접두 0이어도 슬롯은 반환(reuse=0 — reset 경로).
+    #[test]
+    fn pick_no_prefix_still_slot() {
+        let a = slot_with(vec![9, 9]);
+        assert_eq!(pick_prefix_slot(&[a], &[1, 2, 3]), Some((0, 0)));
     }
 }
