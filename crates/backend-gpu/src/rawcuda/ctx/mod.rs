@@ -367,6 +367,16 @@ impl CudaCtx {
         Ok(())
     }
 
+    /// [R12 2026-10-10] 캡처 중 재할당 감지 — debug 빌드 즉시 실패(P10 함정
+    /// 자동 검출: warm_for_capture 선할당 누락). release에서는 비용 0.
+    #[inline]
+    pub fn capture_guard(&self, what: &str) {
+        debug_assert!(
+            !self.prof.capturing.get(),
+            "캡처 중 버퍼 재할당({what}) — warm_for_capture 선할당 누락(P10)"
+        );
+    }
+
     /// 기본 스트림 동기화.
     pub fn sync(&self) -> Result<(), String> {
         // SAFETY: stream 필드는 new()가 설정한 값(레거시 기본 스트림 0).

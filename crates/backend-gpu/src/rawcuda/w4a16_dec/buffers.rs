@@ -4,6 +4,7 @@ impl W4a16Dec {
     pub(super) fn ensure_norm_bufs(&mut self, t_len: usize) -> Result<(), String> {
         let need = t_len * self.hidden;
         if need > self.norm_cap {
+            self.cc.capture_guard("norm_cap"); // [R12]
             self.graph_invalidate(); // [P10] 재할당 — 캡처 옛 포인터 차단.
             self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
             self.norm_cap = 0; // G1: 실패 시 재진입 보장(성공 뒤에만 갱신).
@@ -21,6 +22,7 @@ impl W4a16Dec {
     /// dx32(x32 버퍼) 용량 보장 — 융합 노름·cast_x32 공용.
     pub(super) fn ensure_dx32(&mut self, n: usize) -> Result<CUdeviceptr, String> {
         if n > self.dx32_cap {
+            self.cc.capture_guard("dx32_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
             if self.dx32 != 0 {
@@ -36,6 +38,7 @@ impl W4a16Dec {
 
     pub(super) fn ensure_ew_bufs(&mut self, n: usize) -> Result<(), String> {
         if n > self.ew_cap {
+            self.cc.capture_guard("ew_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
             self.ew_cap = 0; // G1
@@ -201,6 +204,7 @@ impl W4a16Dec {
         mn = mn.max(self.hidden).max(self.n_experts);
         let need = t * mn;
         if need > self.dyt_cap {
+            self.cc.capture_guard("dyt_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
             if self.dyt != 0 {
@@ -213,6 +217,7 @@ impl W4a16Dec {
         }
         // 배치 캐스트 입력(xh: t×k f16)도 함께 보장.
         if t * mk > self.xh_cap {
+            self.cc.capture_guard("xh_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?;
             if self.dxh != 0 {
@@ -229,6 +234,7 @@ impl W4a16Dec {
     /// dy 버퍼 보장(n f32).
     pub(super) fn ensure_dy(&mut self, n: usize) -> Result<CUdeviceptr, String> {
         if n > self.y_cap {
+            self.cc.capture_guard("y_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
             if self.dy != 0 {
@@ -366,6 +372,7 @@ impl W4a16Dec {
         mk = mk.max(CHAIN_TMAX * mk.max(self.hidden));
         mn = mn.max(self.hidden);
         if mk > self.dx32_cap {
+            self.cc.capture_guard("dx32_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?;
             if self.dx32 != 0 {
@@ -377,6 +384,7 @@ impl W4a16Dec {
             self.dx32_cap = mk;
         }
         if mn > self.y_cap {
+            self.cc.capture_guard("y_cap"); // [R12]
             self.graph_invalidate(); // [P10]
             self.cc.sync()?;
             if self.dy != 0 {
