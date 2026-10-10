@@ -62,7 +62,8 @@ fn realloc_fields_partial_failure_retry_safe() {
 
 use super::{
     ATTN_F3S_TMAX, ATTN_SPLITS, BATCH_DEC_MAX, CHAIN_TMAX, GDN_CS, GDN_NGRP, GDN_NSPLIT,
-    GDN_SCAN_SMEM, GEMM_FFMA_TMAX, GEMM_GRP_M, GEMM_GRP_N, GEMM_MMA_M, GEMM_MMA_N, GEMV_TR,
+    GDN_SCAN_SMEM, GEMM_BMMA_M, GEMM_BMMA_N, GEMM_FFMA_TMAX, GEMM_GRP_M, GEMM_GRP_N, GEMM_MMA_M,
+    GEMM_MMA_N, GEMV_TR,
 };
 
 /// [R21] head/attn/FFMA 상한 미러 — 종전 미검사분(커널-호스트 드리프트 방지).
@@ -117,6 +118,16 @@ fn gemm_mma_mirror() {
         define(cu, "MMA_M") as usize,
         GEMM_MMA_M,
         "gptq4.cu MMA_M ↔ GEMM_MMA_M"
+    );
+    assert_eq!(
+        define(include_str!("../assets/gptq4.cu"), "BMMA_M") as usize,
+        GEMM_BMMA_M,
+        "gptq4.cu BMMA_M ↔ GEMM_BMMA_M(bf16 mma 전용)"
+    );
+    assert_eq!(
+        define(include_str!("../assets/gptq4.cu"), "BMMA_N") as usize,
+        GEMM_BMMA_N,
+        "gptq4.cu BMMA_N ↔ GEMM_BMMA_N(bf16 mma 전용)"
     );
     assert_eq!(
         define(cu, "MMA_N") as usize,
