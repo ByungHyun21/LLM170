@@ -150,7 +150,7 @@ impl W4a16Dec {
                 t_len * dm.kv_dim() * 4,
                 t_len * dm.q_dim() * 4,
                 t_len * dm.q_dim() * 4,
-                t_len * dm.q_heads * ATTN_SPLITS * 258 * 4,
+                t_len * dm.q_heads * (if t_len <= 8 { ATTN_SPLITS_D } else { ATTN_SPLITS }) * 258 * 4,
             ],
         )?;
         self.attn_t_cap = t_len;

@@ -127,7 +127,9 @@ impl W4a16Dec {
         }
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
-        let mut sp = ATTN_SPLITS as i32;
+        // [§8.1] 디코드(t≤8)는 분할 32 — 점유 회복(ncu: 192블록 25%).
+        let spv = if t_len <= 8 { ATTN_SPLITS_D } else { ATTN_SPLITS };
+        let mut sp = spv as i32;
         let fp = self.cc.function("attn_fwd3s_part_q")?;
         #[allow(clippy::type_complexity)]
         let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
@@ -142,7 +144,7 @@ impl W4a16Dec {
         self.cc.launch(
             fp,
             t_len as u32,
-            (dm.q_heads * ATTN_SPLITS) as u32,
+            (dm.q_heads * spv) as u32,
             256,
             &mut crate::rawcuda::args::l13(
                 &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut f5, &mut f6, &mut tl, &mut lay,
@@ -277,8 +279,10 @@ impl W4a16Dec {
         self.ensure_attn_bufs(t_len)?;
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
         let (qgd, kvd, qdd) = (dm.qg_dim() as u64, dm.kv_dim() as u64, dm.q_dim() as u64);
-        let pstride = (dm.q_heads * ATTN_SPLITS * 258) as u64;
-        let mut sp = ATTN_SPLITS as i32;
+        // [§8.1] 배치 디코드도 분할 32(t_len=슬롯 수 ≤ 8).
+        let spv = if t_len <= 8 { ATTN_SPLITS_D } else { ATTN_SPLITS };
+        let pstride = (dm.q_heads * spv * 258) as u64;
+        let mut sp = spv as i32;
         // prep — 토큰별.
         let f = self.cc.function("attn_prep_q")?;
         for (k, &slot) in slots.iter().enumerate() {
@@ -331,7 +335,7 @@ impl W4a16Dec {
                 self.cc.launch(
                     fp,
                     1,
-                    (dm.q_heads * ATTN_SPLITS) as u32,
+                    (dm.q_heads * spv) as u32,
                     256,
                     &mut crate::rawcuda::args::l13(
                         &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut f5, &mut f6, &mut tl,

@@ -137,7 +137,12 @@ impl GdnDims {
 
 /// KV 분할 attention(P8-attn-3) — 긴 컨텍스트에서 블록 수 = q_heads×S.
 /// lim ≤ 256(단문·골든 구간)은 종전 단일 블록 경로 그대로(비트 동일).
-pub const ATTN_SPLITS: usize = 8; // 진단
+pub const ATTN_SPLITS: usize = 8; // 프리필(그리드 t×q_heads×8로 충분)
+/// [§8.1 2026-10-11] 디코드(t≤8) 분할 수 — t=1 그리드 192블록(q_heads×8)이
+/// 128SM에서 스케줄러당 3워프·무이슈 79.7%(ncu)라 분할 확대로 점유 회복.
+pub const ATTN_SPLITS_D: usize = 32;
+/// attn.cu 병합 smem(ATTN_SPLITS_MAX)과 동일해야 함(테스트 대조).
+pub const ATTN_SPLITS_MAX: usize = 32;
 
 /// 어텐션 형상(서버 등록 — d=256·rope 64차 고정 계약).
 #[derive(Debug, Clone, Copy, PartialEq)]

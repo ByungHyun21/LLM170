@@ -378,7 +378,9 @@ __device__ __forceinline__ void attn_part_step(KDot kdot, VAcc vacc,
 // ATTN_SPLITS(8)로 나눠 블록 = q_heads×S(27B 192블록)로 병렬화하고, 병합은
 // 분할 인덱스 오름차순 고정 순서(결정적). lim≤256은 종전 단일 경로 유지 —
 // 골든 구간 비트 동일 계약 보존.
-#define ATTN_SPLITS_C 8
+// [§8.1 2026-10-11] 병합 smem 상한 — 디코드(t≤8) 분할 32까지 수용.
+// 프리필 분할(8)은 호스트 ATTN_SPLITS, 디코드는 ATTN_SPLITS_D(32) 사용.
+#define ATTN_SPLITS_MAX 32
 
 
 
@@ -499,7 +501,7 @@ extern "C" __global__ void attn_fwd3s_merge(
     int h = blockIdx.y;
     int tid = threadIdx.x;
     const float* pb = part + ((long)t * q_heads + h) * splits * 258;
-    __shared__ float ms[ATTN_SPLITS_C];
+    __shared__ float ms[ATTN_SPLITS_MAX];
     if (tid < splits) {
         ms[tid] = pb[tid * 258];
     }

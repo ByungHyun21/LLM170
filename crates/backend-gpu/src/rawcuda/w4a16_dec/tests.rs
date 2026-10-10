@@ -76,9 +76,9 @@ fn head_attn_ffma_mirrors() {
         "moe.cu G4_TMAX ↔ BATCH_DEC_MAX(디코드 배치 상한 — head 이관 후)"
     );
     assert_eq!(
-        define(include_str!("../assets/attn.cu"), "ATTN_SPLITS_C") as usize,
-        ATTN_SPLITS,
-        "attn.cu ATTN_SPLITS_C ↔ ATTN_SPLITS"
+        define(include_str!("../assets/attn.cu"), "ATTN_SPLITS_MAX") as usize,
+        ATTN_SPLITS_MAX,
+        "attn.cu ATTN_SPLITS_MAX ↔ ATTN_SPLITS_MAX"
     );
     assert_eq!(
         define(include_str!("../assets/gptq4.cu"), "G4_GTMAX") as usize,
@@ -193,8 +193,9 @@ fn gemv_tr_mirror() {
 
 #[test]
 fn attn_splits_mirror() {
-    let s = define(include_str!("../assets/attn.cu"), "ATTN_SPLITS_C") as usize;
-    assert_eq!(s, ATTN_SPLITS, "attn.cu ATTN_SPLITS_C ↔ ATTN_SPLITS");
+    let s = define(include_str!("../assets/attn.cu"), "ATTN_SPLITS_MAX") as usize;
+    assert_eq!(s, ATTN_SPLITS_MAX, "attn.cu ATTN_SPLITS_MAX ↔ ATTN_SPLITS_MAX");
+    assert!(ATTN_SPLITS_D <= ATTN_SPLITS_MAX, "디코드 분할 ≤ 병합 상한");
 }
 
 #[test]
