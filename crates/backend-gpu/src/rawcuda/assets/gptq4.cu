@@ -220,6 +220,40 @@ extern "C" __global__ void w4a16_gemv_experts_g32_bf16(
                            x + xoff, out + (size_t)sl * n, o, k);
 }
 
+// [B-1/B-2 2026-10-10] 전문가 gate+up+ew 융합 — 1블록이 (행, 슬롯)의 gate·up
+// 두 행을 계산해 act = silu(gate)·up을 직접 기록. ew 커널·게이트/업 중간
+// 버퍼 왕복·x 재판독(게이트+업 각 1회 → 1회) 제거. 산술: 행별은
+// gemv_row_body 그대로(비트동일), silu·mul은 ew 커널과 동일식(__expf,
+// f32 div, -fmad=false) → act 비트동일(골든 판정). t=1 상주 전용.
+extern "C" __global__ void w4a16_gemv_experts_glu(
+    const unsigned long long* __restrict__ tab, int base,
+    const int* __restrict__ idx, int nslots,
+    const float* __restrict__ x, int xstride, int sp,
+    float* __restrict__ act, int n, int k)
+{
+    const int sl = blockIdx.x / n;
+    if (sl >= nslots) {
+        return;
+    }
+    const int o = blockIdx.x - sl * n;
+    const unsigned long long* eg = tab + (size_t)(base + idx[sl] * 3) * 2;
+    const unsigned long long* eu = tab + (size_t)(base + 1 + idx[sl] * 3) * 2;
+    const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
+    float* slot = act + (size_t)sl * n;
+    gemv_row_body<5, true>((const unsigned*)eg[0], (const unsigned short*)eg[1],
+                           x + xoff, slot, o, k);
+    __syncthreads();
+    const float g = slot[o];
+    gemv_row_body<5, true>((const unsigned*)eu[0], (const unsigned short*)eu[1],
+                           x + xoff, slot, o, k);
+    __syncthreads();
+    const float u = slot[o];
+    if (threadIdx.x == 0) {
+        const float e = __expf(-g);
+        slot[o] = (g / (1.0f + e)) * u;
+    }
+}
+
 // t=1 GEMV 래퍼 — g128·f16(27B) / g32·bf16(35B 전문가).
 // [P11] 전문가-우선 슬롯 순열 — 같은 전문가의 슬롯을 연속 배치. 목적:
 // 전문가 GEMV 블록의 실행 순서를 전문가 단위로 묶어 같은 가중치 행을 L2에서

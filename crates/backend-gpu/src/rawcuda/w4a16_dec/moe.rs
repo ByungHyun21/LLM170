@@ -39,6 +39,43 @@ impl W4a16Dec {
         )
     }
 
+    /// [B-1/B-2 2026-10-10] gate+up+ew 융합 런치(act 직접 기록) — t=1 상주.
+    /// grid = n(행)×nslots, 블록 64(행당 2회 gemv_row_body).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn gemv_experts_glu_launch(
+        &self,
+        base: usize,
+        nslots: usize,
+        x_dev: CUdeviceptr,
+        xstride: usize,
+        sp: usize,
+        act_dev: CUdeviceptr,
+        n: usize,
+        k: usize,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_gemv_experts_glu")?;
+        let (mut p_t, mut p_b, mut p_i, mut p_ns) =
+            (self.moe_dev_tab, base as i32, self.moe_idx, nslots as i32);
+        let (mut p_x, mut p_xs, mut p_sp, mut p_o, mut p_n, mut p_k) = (
+            x_dev,
+            xstride as i32,
+            sp as i32,
+            act_dev,
+            n as i32,
+            k as i32,
+        );
+        self.cc.launch(
+            f,
+            (n * nslots) as u32,
+            1,
+            64,
+            &mut crate::rawcuda::args::l10(
+                &mut p_t, &mut p_b, &mut p_i, &mut p_ns, &mut p_x, &mut p_xs, &mut p_sp, &mut p_o,
+                &mut p_n, &mut p_k,
+            ),
+        )
+    }
+
     /// [P11] 전문가-우선 슬롯 순열 발사(프리필 전용) — w4a16_moe_align.
     /// n_exp ≤ 1024 계약(초과 시 호출부가 종전 경로로 폴백).
     pub(super) fn moe_align_launch(&self, nslots: usize) -> Result<(), String> {
@@ -218,11 +255,11 @@ impl W4a16Dec {
         let n_exp = self.n_experts;
         let h = self.hidden;
         let n_ff = self.moe_ffn;
-        // gate/up 배치(x 공통) → ew → down 배치(x 슬롯별) → 가중 누적.
+        // [B-1/B-2 2026-10-10] gate+up+ew 융합 1런치(x 공통) → down → 누적.
+        // ew 커널(실측 0.35ms/토큰)과 중간 버퍼 왕복·x 재판독 제거 — act는
+        // 융합 커널이 직접 기록(산술 비트동일).
         let base = il * n_exp * 3;
-        self.gemv_experts_launch(base, ns, xn, 0, ns, self.exp.gate, n_ff, h)?;
-        self.gemv_experts_launch(base + 1, ns, xn, 0, ns, self.exp.up, n_ff, h)?;
-        self.ew_dev(self.exp.gate, self.exp.up, self.exp.act, ns * n_ff)?;
+        self.gemv_experts_glu_launch(base, ns, xn, 0, ns, self.exp.act, n_ff, h)?;
         self.gemv_experts_launch(base + 2, ns, self.exp.act, n_ff, 1, self.exp.dn, h, n_ff)?;
         self.moe_accum_dev(self.moe_wt, self.exp.dn, self.dmo.ptr, ns, ns, h)
     }
