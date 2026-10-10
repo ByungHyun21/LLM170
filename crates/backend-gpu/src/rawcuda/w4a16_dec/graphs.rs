@@ -171,12 +171,14 @@ impl W4a16Dec {
         }
         // dpp 갱신은 그래프 밖·같은 스트림(그래프보다 먼저 실행 — 순서 보장).
         let posb =
+            // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
             unsafe { std::slice::from_raw_parts(self.pin_pos as *const u8, self.n_slots * 4) };
         self.cc
             .h2d_async(self.dpp + (slot as u64) * 4, &posb[slot * 4..slot * 4 + 4])?;
         self.cc.graph_launch(exec)?;
         self.cc.sync()?;
         let out =
+            // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
             unsafe { std::slice::from_raw_parts(self.pin_out as *const f32, self.pin_out_len / 4) };
         let v = out.to_vec();
         self.slot_pos[slot] = pos + 1;
@@ -206,11 +208,13 @@ impl W4a16Dec {
             );
         }
         let posb =
+            // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
             unsafe { std::slice::from_raw_parts(self.pin_pos as *const u8, self.n_slots * 4) };
         self.cc
             .h2d_async(self.dpp + (slot as u64) * 4, &posb[slot * 4..slot * 4 + 4])?;
         self.cc.graph_launch(exec)?;
         self.cc.sync()?;
+        // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
         let ob = unsafe { std::slice::from_raw_parts(self.pin_out as *const u8, 4) };
         self.slot_pos[slot] = pos + 1;
         Ok(u32::from_le_bytes([ob[0], ob[1], ob[2], ob[3]]))
@@ -293,6 +297,7 @@ impl W4a16Dec {
         }
         self.ensure_batch_bufs()?;
         // 핀드 행/pos 기입(그래프 h2d 노드가 replay 시점에 읽는다).
+        // SAFETY: 핀드 스테이징 간 비중첩 복사 — 범위는 호출부가 보장.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 rows.as_ptr() as *const u8,
@@ -402,6 +407,7 @@ impl W4a16Dec {
         self.slot_pos[slot] = pos + 1;
         self.attn_set_pos(slot, pos + 1)?;
         let xn =
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, self.hidden) }.to_vec();
         // S5: 지문 파이프라인 부활 — LLM170_FP_FILE 시 스테이지 해시 기록
         // (`diag diff`로 실행 2개의 최초 발산 스테이지 추적).

@@ -61,9 +61,29 @@ fn realloc_fields_partial_failure_retry_safe() {
 }
 
 use super::{
-    ATTN_F3S_TMAX, CHAIN_TMAX, GDN_CS, GDN_NGRP, GDN_NSPLIT, GDN_SCAN_SMEM, GEMM_GRP_M, GEMM_GRP_N,
-    GEMM_MMA_M, GEMM_MMA_N, GEMV_TR,
+    ATTN_F3S_TMAX, ATTN_SPLITS, BATCH_DEC_MAX, CHAIN_TMAX, GDN_CS, GDN_NGRP, GDN_NSPLIT,
+    GDN_SCAN_SMEM, GEMM_FFMA_TMAX, GEMM_GRP_M, GEMM_GRP_N, GEMM_MMA_M, GEMM_MMA_N, GEMV_TR,
 };
+
+/// [R21] head/attn/FFMA 상한 미러 — 종전 미검사분(커널-호스트 드리프트 방지).
+#[test]
+fn head_attn_ffma_mirrors() {
+    assert_eq!(
+        define(include_str!("../assets/head.cu"), "HEAD_TMAX") as usize,
+        BATCH_DEC_MAX,
+        "head.cu HEAD_TMAX ↔ BATCH_DEC_MAX"
+    );
+    assert_eq!(
+        define(include_str!("../assets/attn.cu"), "ATTN_SPLITS_C") as usize,
+        ATTN_SPLITS,
+        "attn.cu ATTN_SPLITS_C ↔ ATTN_SPLITS"
+    );
+    assert_eq!(
+        define(include_str!("../assets/gptq4.cu"), "G4_GTMAX") as usize,
+        GEMM_FFMA_TMAX,
+        "gptq4.cu G4_GTMAX ↔ GEMM_FFMA_TMAX"
+    );
+}
 
 /// `#define NAME 값` 파싱 — 값은 정수 리터럴만 다룬다(대상 목록 한정).
 fn define(src: &str, name: &str) -> u64 {

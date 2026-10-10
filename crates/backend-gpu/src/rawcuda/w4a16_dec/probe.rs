@@ -63,7 +63,9 @@ impl W4a16Dec {
         let db = self.cc.alloc(b.len() * 4)?;
         let dc = self.cc.alloc(cref.len() * 4)?;
         let r = (|| -> Result<Vec<f32>, String> {
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) };
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let bb = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u8, b.len() * 4) };
             self.cc.h2d(da, ab)?;
             self.cc.h2d(db, bb)?;
@@ -115,6 +117,7 @@ impl W4a16Dec {
         let x: Vec<f32> = (0..t * k)
             .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 2048.0 - 0.5)
             .collect();
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
         let dx = self.cc.alloc(t * k * 4)?;
         let da = self.cc.alloc(t * n * 4)?;
@@ -177,6 +180,7 @@ impl W4a16Dec {
         let x: Vec<f32> = (0..k)
             .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 2048.0 - 0.5)
             .collect();
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
         let dx = self.cc.alloc(k * 4)?;
         let da = self.cc.alloc(n * 4)?;
@@ -188,6 +192,7 @@ impl W4a16Dec {
             self.gemv_launch_raw(e0.0, e0.2, n, k, dx, da)?;
             // 배치 — idx=[0], base=0, nslots=1.
             let idx = [0u32];
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let ib = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, 4) };
             self.cc.h2d(self.moe_idx, ib)?;
             self.gemv_experts_launch(0, 1, dx, 0, 1, db, n, k)?;
@@ -244,6 +249,7 @@ impl W4a16Dec {
             wb += (n * k / 2) as u64;
         }
         let xf: Vec<f32> = vec![1.0f32; mk];
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         let dx = self.cc.alloc(xf.len() * 4)?;
         self.cc.h2d(dx, xb)?;
@@ -281,6 +287,7 @@ impl W4a16Dec {
         let xf: Vec<f32> = (0..t * k)
             .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5)
             .collect();
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         let dx = self.cc.alloc(t * k * 4)?;
         self.cc.h2d(dx, xb)?;
@@ -395,6 +402,7 @@ impl W4a16Dec {
         let du = self.cc.alloc(n * 4)?;
         let dy = self.cc.alloc(n * 4)?;
         let v: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.1 - 0.3).collect();
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let b = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 4) };
         self.cc.h2d(dg, b)?;
         self.cc.h2d(du, b)?;
@@ -435,6 +443,7 @@ impl W4a16Dec {
         let lg: Vec<f32> = (0..t * n)
             .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 2048.0 - 0.5)
             .collect();
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let lb = unsafe { std::slice::from_raw_parts(lg.as_ptr() as *const u8, lg.len() * 4) };
         let dl = self.cc.alloc(t * n * 4)?;
         let di = self.cc.alloc(t * k * 4)?;
@@ -503,6 +512,7 @@ impl W4a16Dec {
         let xf: Vec<f32> = (0..t * k)
             .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5)
             .collect();
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         let dx = self.cc.alloc(t * k * 4)?;
         self.cc.h2d(dx, xb)?;
