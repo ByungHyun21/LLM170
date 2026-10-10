@@ -149,15 +149,21 @@ impl W4a16Dec {
     /// 라우터 디바이스 상주(P1) — gate GEMV → w4a16_moe_topk(idx/wt 디바이스).
     pub(super) fn moe_route_dev(&mut self, il: usize, xn: CUdeviceptr) -> Result<(), String> {
         self.plain_gemv_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt.ptr)?;
-        let f = self.cc.function("w4a16_moe_topk")?;
+        // [B-3 2026-10-10] t=1도 **워프 병렬 topk_t** — 종전 단일 스레드
+        // (w4a16_moe_topk, 32스레드 블록)는 128전문가 softmax+8라운드를
+        // 한 스레드가 순차 처리(층당 수µs × 40층). 시맨틱은 동일 미러
+        // (gptq4.cu 주석) — 골든으로 판정.
+        let f = self.cc.function("w4a16_moe_topk_t")?;
         let (mut p_lg, mut p_ix, mut p_wt) = (self.drt.ptr, self.moe_idx, self.moe_wt);
-        let (mut nn, mut kk) = (self.n_experts as i32, self.top_k as i32);
+        let (mut p_t, mut p_n, mut p_k) = (1i32, self.n_experts as i32, self.top_k as i32);
         self.cc.launch(
             f,
             1,
             1,
-            32,
-            &mut crate::rawcuda::args::l5(&mut p_lg, &mut p_ix, &mut p_wt, &mut nn, &mut kk),
+            256,
+            &mut crate::rawcuda::args::l6(
+                &mut p_lg, &mut p_ix, &mut p_wt, &mut p_t, &mut p_n, &mut p_k,
+            ),
         )
     }
 
