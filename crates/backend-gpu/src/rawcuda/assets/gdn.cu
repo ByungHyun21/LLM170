@@ -227,9 +227,17 @@ __device__ __forceinline__ void gdn_l2perm_body(
     if (t >= t_len) return;
     const float eps = 1e-6f;
 
+    // [FLA-9 2026-10-10] a/b 도트 루프 병합 — xn 판독 1회(종전 2회, L2 96%
+    // 포화 실측). 각 누산의 i-오름차순 순서는 원序 그대로(비트동일).
     float pa = 0.0f;
-    for (int i = tid; i < hidden; i += 128)
-        pa += xn[t * hidden + i] * abuf[(layer * 2) * h_v * hidden + h * hidden + i];
+    float pb = 0.0f;
+    const float* abA = abuf + (layer * 2) * h_v * hidden + h * hidden;
+    const float* abB = abA + h_v * hidden;
+    for (int i = tid; i < hidden; i += 128) {
+        const float xv = xn[t * hidden + i];
+        pa += xv * abA[i];
+        pb += xv * abB[i];
+    }
     red[tid] = pa;
     __syncthreads();
     for (int st = 64; st > 0; st >>= 1) {
@@ -239,9 +247,6 @@ __device__ __forceinline__ void gdn_l2perm_body(
     float a_val = red[0];
     __syncthreads();
 
-    float pb = 0.0f;
-    for (int i = tid; i < hidden; i += 128)
-        pb += xn[t * hidden + i] * abuf[(layer * 2 + 1) * h_v * hidden + h * hidden + i];
     red[tid] = pb;
     __syncthreads();
     for (int st = 64; st > 0; st >>= 1) {
