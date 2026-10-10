@@ -331,6 +331,7 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     let mut n_predict = 8usize;
     let mut spec_k: usize = 0; // [A-1] 스페큘러티브 초안 상한(0=off).
+    let mut spec_check = false; // [A-1 진단] 검증 vs t=1 디코드 토큰 대조.
     let mut ctx = 1024usize;
     let mut no_head = false;
     let mut moe_check = false;
@@ -370,6 +371,9 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                     .next()
                     .and_then(|v| v.parse().ok())
                     .ok_or("--spec requires a number")?;
+            }
+            "--spec-check" => {
+                spec_check = true;
             }
             "--ctx" => {
                 ctx = it
@@ -706,6 +710,52 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut hist: Vec<u32> = prompt.to_vec();
     if spec_k >= 2 && head_gpu {
         dec.enable_spec()?;
+    }
+    if spec_check && head_gpu {
+        // [A-1 진단] 검증(t=4 배치) vs t=1 디코드의 토큰 대조.
+        // S0 저장 → t=1 4회(T1..T4) → S0 복원+pos 되감기 → 검증 [next,T1,T2,T3].
+        dec.enable_spec()?;
+        dec.spec_save_state(0)?;
+        let mut t1_4: Vec<u32> = Vec::new();
+        {
+            let mut cur = next;
+            for _ in 0..4 {
+                let row = model.embed_row(cur).map_err(|e| e.to_string())?;
+                cur = dec.forward_device_argmax(0, &row)?;
+                t1_4.push(cur);
+            }
+        }
+        dec.spec_load_state(0)?;
+        dec.spec_rewind_pos(0, 4)?;
+        let mut rows: Vec<f32> = Vec::with_capacity(4 * hp.n_embd);
+        rows.extend_from_slice(&model.embed_row(next).map_err(|e| e.to_string())?);
+        for &tk in &t1_4[..3] {
+            rows.extend_from_slice(&model.embed_row(tk).map_err(|e| e.to_string())?);
+        }
+        let toks = dec.spec_verify(0, &rows, 4)?;
+        eprintln!("[spec-check] t1={t1_4:?} verify={toks:?}");
+        // o_lc 대조 — spec scan on vs off(같은 입력·같은 상태).
+        let nv = 4 * 32 * 128; // h_v=32 고정 가정(35B)
+        let a = dec.spec_dump_outv(nv)?;
+        dec.spec_load_state(0)?;
+        dec.spec_rewind_pos(0, 4)?;
+        dec.spec_set_scan(false);
+        let _ = dec.spec_verify(0, &rows, 4)?;
+        let b = dec.spec_dump_outv(nv)?;
+        dec.spec_set_scan(true);
+        let mut mx = 0.0f32;
+        for i in 0..nv {
+            let d = (a[i] - b[i]).abs();
+            if d > mx {
+                mx = d;
+            }
+        }
+        eprintln!(
+            "[spec-check] o_lc maxdiff(on-off) = {mx:.6e} (첫 on={:.6} off={:.6})",
+            a[0], b[0]
+        );
+        dec.spec_load_state(0)?;
+        dec.spec_rewind_pos(0, 4)?;
     }
     let (mut spec_rounds, mut spec_drafted, mut spec_acc) = (0u64, 0u64, 0u64);
     let spec_t0 = std::time::Instant::now();

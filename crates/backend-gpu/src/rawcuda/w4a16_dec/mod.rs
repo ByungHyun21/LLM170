@@ -441,7 +441,10 @@ pub struct W4a16Dec {
     /// 스냅샷([L][t][3][conv_ch]).
     dsnap: CUdeviceptr,
     dsnap_ring: CUdeviceptr,
+    dsave: CUdeviceptr,
     spec_on: bool,
+    /// [A-1 진단] spec scan 커널 on/off(기본 = spec_on) — 교차 대조용.
+    spec_scan_on: bool,
     /// t≥2 GEMM 출력 스크래치([t][max_n] f32).
     dyt: Buf,
     // ── GPU head(output.weight bf16) ──
@@ -599,7 +602,9 @@ impl W4a16Dec {
             dx16: Buf::default(),
             dsnap: 0,
             dsnap_ring: 0,
+            dsave: 0,
             spec_on: false,
+            spec_scan_on: true,
             dyt: Buf::default(),
             head_w: 0,
             head_n: 0,
