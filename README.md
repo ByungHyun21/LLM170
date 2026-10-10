@@ -12,12 +12,17 @@ pressure low and rides the mature GPTQ-style kernel line.
 Current state: `serve`/`infer` run the **CUDA chain** end-to-end on W4A16
 directories (compressed-tensors / AutoRound auto_gptq packing —
 `.weight_packed` · `.weight_scale` · `.weight_shape`): weights are
-VRAM-resident, the 64-layer chain runs device-resident (activations stay on
+VRAM-resident, the layer chain runs device-resident (activations stay on
 GPU — the only per-token round trips are the embedding upload and the logits
 read), and the chain is captured as a CUDA graph (one launch per token;
-`LLM170_GRAPH=0` falls back to direct launches). The token stream matches
-the golden set; module gates are `w4a16-gemv`/`w4a16-gemm` (bit judgment
-vs `dot_row_w4a16_lane`).
+`LLM170_GRAPH=0` falls back to direct launches). Dense models (27B) run
+g128 split weights — t=1 GEMV decode + mma prefill (register dequant,
+cp.async staging); 35B-A3B MoE runs g32 split experts behind a device
+router top-k, with a plain bf16 path for attention/shared layers and
+batched expert dispatch. KV cache is int8 (single path). The token stream
+matches the golden set; module gates are `w4a16-gemv`/`w4a16-gemm` (bit
+judgment vs `dot_row_w4a16_lane`) and `w4a16-eval ppl|agree` tracks
+quality drift.
 
 Bit contract: CUDA kernel outputs must match the CPU reference
 (`crates/core/src/quant/lane.rs` — `dot_row_w4a16_lane`).
