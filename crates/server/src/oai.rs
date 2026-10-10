@@ -586,7 +586,12 @@ fn enqueue_job(
     // 종전엔 사망/포화가 같은 503 "queue full"이라 클라이언트가 재시도 여부를
     // 판단할 수 없었다(Retry-After 부재).
     match tx.try_send(job) {
-        Ok(()) => {}
+        Ok(()) => {
+            // [B5/I] 큐 깊이 게이지 — 스케줄러 수신 시 -1(sched::slot_loop).
+            crate::sched::SCHED
+                .queue_depth
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Err(std::sync::mpsc::TrySendError::Full(_)) => {
             crate::http::resp_429(stream, "{\"error\":\"queue full — admission gate\"}");
             return Err(());
@@ -790,7 +795,20 @@ fn run_and_emit(
         .unwrap_or(0);
     let mut stopped = false;
     let mut scan_from = 0usize;
-    for t in prx {
+    // [I 2026-10-10] keep-alive — 토큰 공백 5s마다 SSE 주석 프레임(장문
+    // 프리필 TTFT 수십 초 동안 프록시·클라 타임아웃 방지). 쓰기 실패는
+    // 즉시 탈출(prx drop → cancelled 경로로 슬롯 회수).
+    loop {
+        let t = match prx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(t) => t,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if crate::http::sse_comment(stream, "keep-alive").is_err() {
+                    return;
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         // 정지 토큰은 텍스트로 방출하지 않는다(비스트림은 finish_slot이
         // 트림하지만 스트림 델타는 여기서 걸러야 새어나가지 않는다).
         if t == llm170_core::qwen35::EOS_EOT || t == STOP_EOT {
@@ -1055,7 +1073,18 @@ fn run_and_emit_anthropic(
         let mut scan_from = 0usize;
         // [H] stop_reason 판정용 생성 수 — 정지 토큰(미방출)은 제외.
         let mut n_out = 0usize;
-        for t in prx {
+        // [I 2026-10-10] keep-alive — OAI 경로와 동일(5s 주석 프레임).
+        loop {
+            let t = match prx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(t) => t,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if crate::http::sse_comment(stream, "keep-alive").is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             if t == llm170_core::qwen35::EOS_EOT || t == STOP_EOT {
                 break; // 정지 토큰 미방출(스트림 델타)
             }

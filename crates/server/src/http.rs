@@ -398,6 +398,17 @@ pub(crate) fn resp_sse_open(stream: &mut TcpStream) {
     );
 }
 
+/// [I 2026-10-10] SSE 주석 프레임 — ':'으로 시작하는 줄은 클라이언트가 무시.
+/// 토큰 공백(장문 프리필 TTFT 수십 초 등)에 보내 프록시·클라 타임아웃을 막는다.
+pub(crate) fn sse_comment_frame(text: &str) -> String {
+    format!(": {text}\n\n")
+}
+
+pub(crate) fn sse_comment(stream: &mut TcpStream, text: &str) -> std::io::Result<()> {
+    stream.write_all(sse_comment_frame(text).as_bytes())?;
+    stream.flush()
+}
+
 /// [D 2026-10-10] 어드미션 게이트 응답 — 429 Too Many Requests + Retry-After.
 /// 큐 포화(하드게이트) 전용 — 로딩/엔진 사망은 503(호출부 판단).
 pub(crate) fn resp_429(stream: &mut TcpStream, body: &str) {
@@ -555,5 +566,11 @@ mod req_tests {
             "{r}"
         );
         assert!(r.ends_with(&format!("\r\n\r\n{body}")), "{r}");
+    }
+
+    /// [I] SSE keep-alive 주석 프레임 — ':' 줄 + 빈 줄(클라 무시 계약).
+    #[test]
+    fn sse_comment_frame_contract() {
+        assert_eq!(sse_comment_frame("keep-alive"), ": keep-alive\n\n");
     }
 }
