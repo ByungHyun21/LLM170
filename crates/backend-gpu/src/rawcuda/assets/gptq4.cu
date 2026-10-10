@@ -1194,6 +1194,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     // [marlin-C3 2026-10-10] A·B 완전 더블버퍼 + cp.async — 청크 직렬
     // (스테이징→sync→mma→sync ×64청크)이 지배 병목(ncu 배리어 스톨).
     // A는 cp.async, B는 디큐트 ALU(다음 청크를 mma와 겹쳐 발사).
+    // [marlin-B 재기각] 파이프라인 확보 후에도 레지스터 디큐트 = 88.6→90.5ms
+    // (프래그먼트 디큐트 체인이 mma 의존 사슬에 직렬). f16 smem 디큐트 유지.
     __shared__ __align__(16) unsigned short xs[2][GRP_M][MMA_KC + 8];
     __shared__ unsigned short ws[2][GRP_N][MMA_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
