@@ -1191,11 +1191,11 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     const int ntw = (warp & 1) * 16; // 2 n워프 × 16 = N32(워프 16×16)
     const int k8 = k >> 3;
     const int kg = k >> 5; // g32
-    __shared__ __align__(16) unsigned short xs[GRP_M][MMA_KC + 8];
-    // [marlin-B 기각 2026-10-10] g32_grp에 레지스터 디큐트 적용 = gemm
-    // 89→101ms(프래그먼트 디큐트 체인이 mma 파이프 차단 — g128판과 달리
-    // cp.async 파이프라인이 없어 겹칠 곳이 없다). 종전 f16 smem 디큐트 유지.
-    __shared__ unsigned short ws[GRP_N][MMA_KC + 8];
+    // [marlin-C3 2026-10-10] A·B 완전 더블버퍼 + cp.async — 청크 직렬
+    // (스테이징→sync→mma→sync ×64청크)이 지배 병목(ncu 배리어 스톨).
+    // A는 cp.async, B는 디큐트 ALU(다음 청크를 mma와 겹쳐 발사).
+    __shared__ __align__(16) unsigned short xs[2][GRP_M][MMA_KC + 8];
+    __shared__ unsigned short ws[2][GRP_N][MMA_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
     for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
         const unsigned rbase = mtile * GRP_M;
@@ -1204,20 +1204,17 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
         for (int i = 0; i < 8; ++i) {
             ((float*)c)[i] = 0.0f;
         }
-        for (int k0 = 0; k0 < k; k0 += MMA_KC) {
-            __syncthreads(); // 이전 mma 완료(버퍼 재사용) + 스테이징 가시화
-            // A 스테이징 — 슬롯 r의 x 행(슬롯→토큰: sl/sp·xstride), f16 복사.
+        // 스테이지 발사(스테이지 st, 청크 kn) — A는 cp.async, B는 디큐트 ALU.
+        auto stage_ab = [&](int st, int kn) {
             for (int ee = tid; ee < GRP_M * MMA_KC / 8; ee += 256) {
                 const int r = ee / (MMA_KC / 8);
                 const int c8 = ee % (MMA_KC / 8);
-                const int gi = k0 + c8 * 8;
-                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                const int gi = kn + c8 * 8;
                 if (rbase + r < cnt) {
                     const unsigned sl = gs[rbase + r];
-                    const size_t xoff =
-                        (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
+                    const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
                     if (gi + 7 < k) {
-                        v = *reinterpret_cast<const uint4*>(&x[xoff + gi]);
+                        cp_async16(&xs[st][r][c8 * 8], &x[xoff + gi]);
                     } else {
                         unsigned short t8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                         for (int j = 0; j < 8; ++j) {
@@ -1225,16 +1222,17 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
                                 t8[j] = x[xoff + gi + j];
                             }
                         }
-                        v = *reinterpret_cast<const uint4*>(t8);
+                        *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) =
+                            *reinterpret_cast<const uint4*>(t8);
                     }
+                } else {
+                    *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) = make_uint4(0u, 0u, 0u, 0u);
                 }
-                *reinterpret_cast<uint4*>(&xs[r][c8 * 8]) = v;
             }
-            // B 스테이징 — g32 디퀀트(스케일 bf16 → f32은 비트 상위 시프트).
             for (int ee = tid; ee < GRP_N * MMA_KC / 8; ee += 256) {
                 const int r = ee / (MMA_KC / 8);
                 const int c8 = ee % (MMA_KC / 8);
-                const int gi = k0 + c8 * 8;
+                const int gi = kn + c8 * 8;
                 const bool live = (n0 + r < n) && (gi + 7 < k);
                 unsigned short scb = 0;
                 if (n0 + r < n) {
@@ -1246,29 +1244,42 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
                         const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
-                        ws[r][c8 * 8 + j] =
+                        ws[st][r][c8 * 8 + j] =
                             __half_as_ushort(__float2half_rn((float)nib * scf));
                     }
                 } else {
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
-                        ws[r][c8 * 8 + j] = 0;
+                        ws[st][r][c8 * 8 + j] = 0;
                     }
                 }
             }
+        };
+        stage_ab(0, 0);
+        asm volatile("cp.async.commit_group;");
+        int cur = 0;
+        for (int k0 = 0; k0 < k; k0 += MMA_KC, cur ^= 1) {
+            // 다음 청크를 발사(mma와 겹침) — A cp.async + B 디큐트.
+            const int kn = k0 + MMA_KC;
+            if (kn < k) {
+                stage_ab(cur ^ 1, kn);
+            }
+            asm volatile("cp.async.commit_group;");
+            asm volatile("cp.async.wait_group 1;");
             __syncthreads();
+
 #pragma unroll
             for (int ks = 0; ks < MMA_KC / 16; ++ks) {
                 const int kb = ks * 16;
-                const unsigned a0 = pk2bf(&xs[mt + g][kb + 2 * tt]);
-                const unsigned a1 = pk2bf(&xs[mt + g + 8][kb + 2 * tt]);
-                const unsigned a2 = pk2bf(&xs[mt + g][kb + 2 * tt + 8]);
-                const unsigned a3 = pk2bf(&xs[mt + g + 8][kb + 2 * tt + 8]);
+                const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
+                const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
+                const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
+                const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
                     const int nb = ntw + nt * 8;
-                    const unsigned b0 = pk2bf(&ws[nb + g][kb + 2 * tt]);
-                    const unsigned b1 = pk2bf(&ws[nb + g][kb + 2 * tt + 8]);
+                    const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
+                    const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
                     asm volatile(
                         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
