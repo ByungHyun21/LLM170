@@ -23,11 +23,7 @@ impl W4a16Dec {
         match self.attn {
             Some(dm) => {
                 let e = dm.kv_slot_elems(slot) as u64;
-                let off = match self.kvq {
-                    4 => e / 2,
-                    8 => e,
-                    _ => e * 4,
-                };
+                let off = self.kvq.kv_bytes(e as usize) as u64;
                 self.dkc + off
             }
             None => self.dkc,
@@ -38,11 +34,7 @@ impl W4a16Dec {
         match self.attn {
             Some(dm) => {
                 let e = dm.kv_slot_elems(slot) as u64;
-                let off = match self.kvq {
-                    4 => e / 2,
-                    8 => e,
-                    _ => e * 4,
-                };
+                let off = self.kvq.kv_bytes(e as usize) as u64;
                 self.dvc + off
             }
             None => self.dvc,
@@ -77,13 +69,9 @@ impl W4a16Dec {
     ) -> Result<(), String> {
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
-        if self.kvq > 0 {
-            // [P13/C3] int8/int4 기록 — ksc/vsc 추가 인자(시그니처 동일).
-            let f = self.cc.function(if self.kvq == 4 {
-                "attn_prep_q4"
-            } else {
-                "attn_prep_q"
-            })?;
+        if self.kvq.is_on() {
+            // [P13/C3/R8] int8/int4 기록 — ksc/vsc 추가 인자(시그니처 동일).
+            let f = self.cc.function(self.kvq.prep_kernel())?;
             let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
             #[allow(clippy::type_complexity)]
             let (
@@ -199,13 +187,9 @@ impl W4a16Dec {
             let (mut tl, mut lay) = (t_len as i32, layer as i32);
             let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
             let mut sp = ATTN_SPLITS as i32;
-            if self.kvq > 0 {
-                // [P13/C3] int8/int4 KV 판독 — ksc/vsc 추가 인자(동일).
-                let fp = self.cc.function(if self.kvq == 4 {
-                    "attn_fwd3s_part_q4"
-                } else {
-                    "attn_fwd3s_part_q"
-                })?;
+            if self.kvq.is_on() {
+                // [P13/C3/R8] int8/int4 KV 판독 — ksc/vsc 추가 인자(동일).
+                let fp = self.cc.function(self.kvq.part_kernel())?;
                 #[allow(clippy::type_complexity)]
                 let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
                     self.dqh_a,
@@ -341,6 +325,7 @@ impl W4a16Dec {
         }
         self.ensure_attn_bufs(t_len)?;
         let b =
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         self.cc.h2d(self.dqg_a, b(qg))?;
         self.cc.h2d(self.dkin_a, b(kin))?;
@@ -353,6 +338,7 @@ impl W4a16Dec {
         self.cc.d2h(&mut buf, self.doutv_a)?;
         self.cc.sync()?;
         Ok(
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, t_len * dm.q_dim()) }
                 .to_vec(),
         )
@@ -400,7 +386,7 @@ impl W4a16Dec {
         vin_dev: CUdeviceptr,
     ) -> Result<CUdeviceptr, String> {
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
-        if self.kvq > 0 {
+        if self.kvq.is_on() {
             return Err("attn batch: KVQ 상태 — 직렬 경로로 폴백".into());
         }
         if t_len == 0

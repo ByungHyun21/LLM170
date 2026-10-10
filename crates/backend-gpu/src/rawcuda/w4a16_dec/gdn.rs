@@ -250,6 +250,7 @@ impl W4a16Dec {
         }
         self.ensure_gdn_bufs(t_len)?;
         let b =
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         self.cc.h2d(self.dgxn, b(xn))?;
         self.cc.h2d(self.dqkv, b(qkv))?;
@@ -260,6 +261,7 @@ impl W4a16Dec {
         self.cc.d2h(&mut ob, self.dgate)?;
         self.cc.sync()?;
         Ok(
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, t_len * dm.v_len()) }
                 .to_vec(),
         )

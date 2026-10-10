@@ -45,6 +45,7 @@ impl W4a16Dec {
             return Err("norm: 순차 잔차/분기 폭 계약 위반".into());
         }
         self.ensure_norm_bufs(1)?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let abb = unsafe { std::slice::from_raw_parts(ab.as_ptr() as *const u8, ab.len() * 4) };
         self.cc.h2d(self.dab, abb)?;
         let xn = self.norm_resid_at(w, x_dev, self.dab, 1, 0)?;
@@ -52,6 +53,7 @@ impl W4a16Dec {
         self.cc.d2h(&mut bytes, xn)?;
         self.cc.sync()?;
         Ok(
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, self.hidden) }
                 .to_vec(),
         )

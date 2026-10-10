@@ -129,9 +129,11 @@ impl Gptq4 {
         check_shapes(t, q.len(), s.len(), x.len(), n, k, group)?;
         let sym_gemv = kernel_sym(false, group, scale_bf16)?;
         let sym_gemm = kernel_sym(true, group, scale_bf16)?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let bytes_u32 = |v: &[u32]| unsafe {
             std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v))
         };
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let bytes_u16 = |v: &[u16]| unsafe {
             std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v))
         };
@@ -148,6 +150,7 @@ impl Gptq4 {
             if t == 1 {
                 let xf: Vec<f32> = x.iter().map(|&h| h2f(h)).collect();
                 let xb =
+                    // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
                     unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
                 self.cc.h2d(dx32, xb)?;
                 let f = self.cc.function(sym_gemv)?;
@@ -174,6 +177,7 @@ impl Gptq4 {
             }
             // P3-b: 커널이 f32 x를 받는다(cast_x32 계약) — 호스트 h2f로 동형.
             let xf: Vec<f32> = x.iter().map(|&h| h2f(h)).collect();
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
             self.cc.h2d(dx, xb)?;
             let f = self.cc.function(sym_gemm)?;

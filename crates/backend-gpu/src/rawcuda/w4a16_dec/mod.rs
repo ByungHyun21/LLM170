@@ -47,6 +47,57 @@ pub const GDN_CS: usize = 32;
 pub const BATCH_DEC_MAX: usize = 8;
 /// [A9-fix2] t행 GEMV 블록당 행 수(커널 gptq4.cu GEMV_TR 미러) — x 재사용.
 pub const GEMV_TR: usize = 8;
+/// [R21] FFMA 폴백 GEMM의 t 상한(커널 gptq4.cu G4_GTMAX 미러) — 체인 가드용.
+pub const GEMM_FFMA_TMAX: usize = 32;
+
+/// [R8 2026-10-10] KV 양자화 모드 — 종전 `kvq: u8`(0/8/4) 분기 16곳의
+/// 캡슐화. 바이트 규칙·커널 선택·mem_stats가 이 타입에 모인다.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KvMode {
+    /// f32 KV(기본).
+    F32,
+    /// int8 KV(4× 절감 — `LLM170_KVQ` 비영).
+    Int8,
+    /// int4 KV(8× 절감, 니블 패킹 — `LLM170_KVQ=4`).
+    Int4,
+}
+
+impl KvMode {
+    /// env 확정 — "4"=Int4, 그 외 비영=Int8(후방 호환), 미설정/0=F32.
+    pub fn from_env() -> Self {
+        match llm170_diag::flag::val("LLM170_KVQ") {
+            Some("4") => KvMode::Int4,
+            Some(v) if v != "0" => KvMode::Int8,
+            _ => KvMode::F32,
+        }
+    }
+    /// 활성 여부(KVQ 기록/판독 경로 선택).
+    pub fn is_on(self) -> bool {
+        self != KvMode::F32
+    }
+    /// 슬롯 요소 e개의 KV 바이트 수(int4 = 니블 패킹 → 절반).
+    pub fn kv_bytes(self, elems: usize) -> usize {
+        match self {
+            KvMode::Int4 => elems / 2,
+            KvMode::Int8 => elems,
+            KvMode::F32 => elems * 4,
+        }
+    }
+    /// KV 기록 커널.
+    pub fn prep_kernel(self) -> &'static str {
+        match self {
+            KvMode::Int4 => "attn_prep_q4",
+            _ => "attn_prep_q",
+        }
+    }
+    /// KV 판독(part) 커널.
+    pub fn part_kernel(self) -> &'static str {
+        match self {
+            KvMode::Int4 => "attn_fwd3s_part_q4",
+            _ => "attn_fwd3s_part_q",
+        }
+    }
+}
 
 /// GDN 체인 형상(서버가 config에서 유도해 명시 등록 — 추정 금지).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -317,9 +368,8 @@ pub struct W4a16Dec {
     /// [P13] int8 KV 스케일(K/V 각각 [n_attn*cap][kv_heads] f32) — KVQ 전용.
     dksc: CUdeviceptr,
     dvsc: CUdeviceptr,
-    /// [P13/C3] KV 양자화 모드 — 0=f32 · 8=int8(4×) · 4=int4(8×, 니블 패킹).
-    /// set_attn에서 env(LLM170_KVQ: "4"=int4, 그 외 비영=int8)로 확정.
-    kvq: u8,
+    /// [P13/C3/R8] KV 양자화 모드 — set_attn에서 env로 확정(KvMode::from_env).
+    kvq: KvMode,
     dpp: CUdeviceptr,
     dqg_a: CUdeviceptr,
     dkin_a: CUdeviceptr,
@@ -491,7 +541,7 @@ impl W4a16Dec {
             dvc: 0,
             dksc: 0,
             dvsc: 0,
-            kvq: 0,
+            kvq: KvMode::F32,
             dpp: 0,
             dqg_a: 0,
             dkin_a: 0,
@@ -659,6 +709,7 @@ impl W4a16Dec {
             .iter()
             .map(|&v| crate::rawcuda::gptq4::h2f(f32_to_f16(v)))
             .collect();
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         self.cc.h2d(self.dx32, xb)?;
         let f = self.cc.function("w4a16_gemm_g128")?;
@@ -709,6 +760,7 @@ impl W4a16Dec {
         }
         self.dnw = 0; // G1: 실패 시 재시도가 0을 해제하지 않게.
         self.norm_w_rows = 0;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let b = unsafe { std::slice::from_raw_parts(nw.as_ptr() as *const u8, nw.len() * 4) };
         let d = self.cc.alloc(nw.len() * 4)?;
         if let Err(e) = Self::h2d_chunked(&self.cc, d, b) {
@@ -725,7 +777,9 @@ impl W4a16Dec {
             return Err(format!("ew: g={} u={} 계약 위반", g.len(), u.len()));
         }
         self.ensure_ew_bufs(g.len())?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let gb = unsafe { std::slice::from_raw_parts(g.as_ptr() as *const u8, g.len() * 4) };
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let ub = unsafe { std::slice::from_raw_parts(u.as_ptr() as *const u8, u.len() * 4) };
         self.cc.h2d(self.dewg, gb)?;
         self.cc.h2d(self.dewu, ub)?;
@@ -743,6 +797,7 @@ impl W4a16Dec {
         let mut yb = vec![0u8; g.len() * 4];
         self.cc.d2h(&mut yb, self.dew)?;
         self.cc.sync()?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         Ok(unsafe { std::slice::from_raw_parts(yb.as_ptr() as *const f32, g.len()) }.to_vec())
     }
 
@@ -776,6 +831,7 @@ impl W4a16Dec {
         (self.dcw, self.dab_c, self.dalog, self.ddtb, self.dnwg) = (0, 0, 0, 0, 0);
         (self.dring, self.dgst) = (0, 0);
         let b =
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         let dcw = self.cc.alloc(cw.len() * 4)?;
         Self::h2d_chunked(&self.cc, dcw, b(cw))?;
@@ -808,12 +864,8 @@ impl W4a16Dec {
         let kv_elems = slots * n * dims.cap * dims.kv_dim();
         // [P13] KV 양자화 — 옵트인(LLM170_KVQ). int8 4× 절감, 스케일은
         // 행×헤드 f32 1개(무시 가능). 미설정 = 종전 f32 경로 그대로.
-        // [C3 2026-10-10] LLM170_KVQ: "4"=int4, 그 외 비영=int8(후방 호환).
-        let kvq: u8 = match llm170_diag::flag::val("LLM170_KVQ") {
-            Some("4") => 4,
-            Some(v) if v != "0" => 8,
-            _ => 0,
-        };
+        // [C3/R8] LLM170_KVQ: "4"=int4, 그 외 비영=int8(후방 호환).
+        let kvq = KvMode::from_env();
         let kv_scales = slots * n * dims.cap * dims.kv_heads;
         for q in [
             self.dqnw_a,
@@ -845,15 +897,16 @@ impl W4a16Dec {
         ) = (0, 0, 0, 0, 0);
         self.attn_t_cap = 0;
         let b =
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         let dq = self.cc.alloc(qnw.len() * 4)?;
         Self::h2d_chunked(&self.cc, dq, b(qnw))?;
         let dk = self.cc.alloc(knw.len() * 4)?;
         Self::h2d_chunked(&self.cc, dk, b(knw))?;
-        let (dkc, dvc) = if kvq > 0 {
-            // [P13/C3] int8(1B)·int4(0.5B) KV + 스케일 2벌. 기록은
+        let (dkc, dvc) = if kvq.is_on() {
+            // [P13/C3/R8] int8(1B)·int4(0.5B) KV + 스케일 2벌. 기록은
             // attn_prep_q(_4), 판독은 attn_fwd3s_part_q(_4)(병합은 f32 그대로).
-            let kbytes = if kvq == 4 { kv_elems / 2 } else { kv_elems };
+            let kbytes = kvq.kv_bytes(kv_elems);
             let kc = self.cc.alloc(kbytes)?;
             Self::zero_dev(&self.cc, kc, kbytes)?;
             let vc = self.cc.alloc(kbytes)?;
@@ -935,10 +988,9 @@ impl W4a16Dec {
             .attn
             .map(|d| {
                 let rows = (self.n_slots as u64) * (d.n_attn as u64) * (d.cap as u64);
-                if self.kvq == 4 {
-                    rows * (d.kv_dim() as u64) + rows * (d.kv_heads as u64) * 4 * 2
-                } else if self.kvq == 8 {
-                    rows * (d.kv_dim() as u64) * 2 + rows * (d.kv_heads as u64) * 4 * 2
+                if self.kvq.is_on() {
+                    rows * (self.kvq.kv_bytes(d.kv_dim()) as u64)
+                        + rows * (d.kv_heads as u64) * 4 * 2
                 } else {
                     2 * rows * (d.kv_dim() as u64) * 4
                 }
@@ -1161,7 +1213,9 @@ impl W4a16Dec {
         let r = (|| -> Result<(), String> {
             for (i, e) in host_tab.iter().enumerate() {
                 let p = i % 3;
+                // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
                 let qb = unsafe { std::slice::from_raw_parts(e.0 as *const u8, e.1 as usize) };
+                // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
                 let sb = unsafe { std::slice::from_raw_parts(e.2 as *const u8, e.3 as usize) };
                 Self::h2d_chunked(&self.cc, dpk[p] + opk2[p] as u64, qb)?;
                 Self::h2d_chunked(&self.cc, dsk[p] + osk2[p] as u64, sb)?;
@@ -1182,6 +1236,7 @@ impl W4a16Dec {
             flat.push(e.0);
             flat.push(e.2);
         }
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let fb = unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 8) };
         if self.moe_dev_tab != 0 {
             let _ = self.cc.free(self.moe_dev_tab);

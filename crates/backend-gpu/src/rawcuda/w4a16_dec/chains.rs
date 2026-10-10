@@ -20,6 +20,7 @@ impl W4a16Dec {
         }
         let dres = self.cc.alloc(self.hidden * 4)?;
         let result = (|| {
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let row = unsafe {
                 std::slice::from_raw_parts(embed_row.as_ptr() as *const u8, self.hidden * 4)
             };
@@ -179,8 +180,10 @@ impl W4a16Dec {
         let row = if self.capture_pinned_src {
             // 캡처 중: pageable async 복사는 캡처 불가 — pinned 버퍼를 소스로
             // 기록하고 replay가 실행 직전에 내용을 채운다.
+            // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
             unsafe { std::slice::from_raw_parts(self.pin_embed as *const u8, self.hidden * 4) }
         } else {
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             unsafe { std::slice::from_raw_parts(embed_row.as_ptr() as *const u8, self.hidden * 4) }
         };
         self.cc.h2d_async(self.dres, row)?;
@@ -341,6 +344,7 @@ impl W4a16Dec {
         self.ensure_gdn_bufs(t)?;
         self.ensure_attn_bufs(t)?;
         let dyt = self.ensure_dyt(t)?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let rb = unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, rows.len() * 4) };
         self.cc.h2d_async(self.dres, rb)?;
         let [s0, s1, s1b, s2, s3] = self.dchain;
@@ -352,9 +356,9 @@ impl W4a16Dec {
         // [P10] GEMM 상한 — mma 경로(TC ON·t≥16)는 t 무제한, FFMA 폴백
         // 커널(G4_GTMAX/G4_TMAX2=32)만 32 상한. 폴백으로 t>32를 태우지 않는다.
         let gemm_mma = t >= 16 && llm170_diag::flag::ne0("LLM170_TC");
-        if t > 32 && !gemm_mma {
+        if t > GEMM_FFMA_TMAX && !gemm_mma {
             return Err(format!(
-                "chain_device_t: t={t} > 32 — FFMA 폴백 상한(TC=0 진단 또는 t<16)"
+                "chain_device_t: t={t} > {GEMM_FFMA_TMAX} — FFMA 폴백 상한(TC=0 진단 또는 t<16)"
             ));
         }
         for il in 0..self.n_layers {
@@ -495,10 +499,12 @@ impl W4a16Dec {
         self.ensure_batch_bufs()?;
         let dyt = self.ensure_dyt(t)?;
         {
+            // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
             let rb = unsafe {
                 std::slice::from_raw_parts(self.pin_batch_in as *const u8, t * self.hidden * 4)
             };
             self.cc.h2d_async(self.dres, rb)?;
+            // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
             let pb = unsafe {
                 std::slice::from_raw_parts(self.pin_batch_pos as *const u8, self.n_slots * 4)
             };
@@ -608,6 +614,7 @@ impl W4a16Dec {
             ];
             self.cc.launch(fa, t as u32, 1, 1024, &mut aa)?;
         }
+        // SAFETY: self 소유 pinned 스크래치의 단독 가변 접근(수명=self).
         let tb = unsafe { std::slice::from_raw_parts_mut(self.pin_batch_tok as *mut u8, t * 4) };
         self.cc.d2h_async(tb.as_mut_ptr(), self.dbatch_am, t * 4)?;
         Ok(())
@@ -615,6 +622,7 @@ impl W4a16Dec {
 
     /// [A9] 핀드 토큰 판독(sync 후).
     pub(super) fn batch_read_tokens(&self, t: usize) -> Vec<u32> {
+        // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
         let tb = unsafe { std::slice::from_raw_parts(self.pin_batch_tok as *const u8, t * 4) };
         (0..t)
             .map(|k| u32::from_le_bytes([tb[k * 4], tb[k * 4 + 1], tb[k * 4 + 2], tb[k * 4 + 3]]))
