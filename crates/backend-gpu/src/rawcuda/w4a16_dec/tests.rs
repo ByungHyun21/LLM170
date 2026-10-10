@@ -188,3 +188,22 @@ fn gemv_tr_mirror() {
     let tr = define(include_str!("../assets/gptq4.cu"), "GEMV_TR") as usize;
     assert_eq!(tr, GEMV_TR, "gptq4.cu GEMV_TR ↔ GEMV_TR");
 }
+
+#[test]
+fn attn_splits_mirror() {
+    let s = define(include_str!("../assets/attn.cu"), "ATTN_SPLITS_C") as usize;
+    assert_eq!(s, ATTN_SPLITS, "attn.cu ATTN_SPLITS_C ↔ ATTN_SPLITS");
+}
+
+#[test]
+fn gemm_ffma_tmax_mirror() {
+    let t = define(include_str!("../assets/gptq4.cu"), "G4_GTMAX") as usize;
+    assert_eq!(t, GEMM_FFMA_TMAX, "gptq4.cu G4_GTMAX ↔ GEMM_FFMA_TMAX");
+}
+
+#[test]
+fn batch_dec_max_mirror() {
+    // G4_TMAX는 배치 GEMV(첫 정의)·플레인 v1 GEMM(재정의) 공유 — 첫 정의 판독.
+    let t = define(include_str!("../assets/gptq4.cu"), "G4_TMAX") as usize;
+    assert_eq!(t, BATCH_DEC_MAX, "gptq4.cu G4_TMAX ↔ BATCH_DEC_MAX");
+}
