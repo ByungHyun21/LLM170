@@ -71,9 +71,9 @@ use super::{
 #[test]
 fn head_attn_ffma_mirrors() {
     assert_eq!(
-        define(include_str!("../assets/gptq4.cu"), "G4_TMAX") as usize,
+        define(include_str!("../assets/moe.cu"), "G4_TMAX") as usize,
         BATCH_DEC_MAX,
-        "gptq4.cu G4_TMAX ↔ BATCH_DEC_MAX(디코드 배치 상한 — head 이관 후)"
+        "moe.cu G4_TMAX ↔ BATCH_DEC_MAX(디코드 배치 상한 — head 이관 후)"
     );
     assert_eq!(
         define(include_str!("../assets/attn.cu"), "ATTN_SPLITS_C") as usize,
@@ -121,14 +121,14 @@ fn gemm_mma_mirror() {
         "gptq4.cu MMA_M ↔ GEMM_MMA_M"
     );
     assert_eq!(
-        define(include_str!("../assets/gptq4.cu"), "BMMA_M") as usize,
+        define(include_str!("../assets/moe.cu"), "BMMA_M") as usize,
         GEMM_BMMA_M,
-        "gptq4.cu BMMA_M ↔ GEMM_BMMA_M(bf16 mma 전용)"
+        "moe.cu BMMA_M ↔ GEMM_BMMA_M(bf16 mma 전용)"
     );
     assert_eq!(
-        define(include_str!("../assets/gptq4.cu"), "BMMA_N") as usize,
+        define(include_str!("../assets/moe.cu"), "BMMA_N") as usize,
         GEMM_BMMA_N,
-        "gptq4.cu BMMA_N ↔ GEMM_BMMA_N(bf16 mma 전용)"
+        "moe.cu BMMA_N ↔ GEMM_BMMA_N(bf16 mma 전용)"
     );
     assert_eq!(
         define(cu, "MMA_N") as usize,
@@ -186,8 +186,9 @@ fn g4_scmax_mirror() {
 
 #[test]
 fn gemv_tr_mirror() {
-    let tr = define(include_str!("../assets/gptq4.cu"), "GEMV_TR") as usize;
-    assert_eq!(tr, GEMV_TR, "gptq4.cu GEMV_TR ↔ GEMV_TR");
+    // [R5] GEMV_TR은 g4_common.cuh(플레인·split 공용) 소유.
+    let tr = define(include_str!("../assets/g4_common.cuh"), "GEMV_TR") as usize;
+    assert_eq!(tr, GEMV_TR, "g4_common.cuh GEMV_TR ↔ GEMV_TR");
 }
 
 #[test]
@@ -204,7 +205,7 @@ fn gemm_ffma_tmax_mirror() {
 
 #[test]
 fn batch_dec_max_mirror() {
-    // G4_TMAX는 배치 GEMV(첫 정의)·플레인 v1 GEMM(재정의) 공유 — 첫 정의 판독.
-    let t = define(include_str!("../assets/gptq4.cu"), "G4_TMAX") as usize;
-    assert_eq!(t, BATCH_DEC_MAX, "gptq4.cu G4_TMAX ↔ BATCH_DEC_MAX");
+    // [R5] G4_TMAX는 moe.cu 단일 정의(재정의 통합 — 배치 GEMV·플레인 v1 GEMM).
+    let t = define(include_str!("../assets/moe.cu"), "G4_TMAX") as usize;
+    assert_eq!(t, BATCH_DEC_MAX, "moe.cu G4_TMAX ↔ BATCH_DEC_MAX");
 }

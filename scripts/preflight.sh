@@ -3,7 +3,8 @@
 #
 # 검증: (1) rustfmt, (2) clippy -D warnings, (3) cargo 경고 0,
 #       (4) env 스냅샷↔라이브 동치(108 P1), (5) 스테일 fatbin 가드
-#       (.cu/cast_common.cuh가 fatbin보다 새로우면 FAIL — grep|tail 사고 클래스).
+#       (.cu/cast_common.cuh/g4_common.cuh가 fatbin보다 새로우면 FAIL —
+#        grep|tail 사고 클래스).
 # [2026-10-08] 단일 트랙 재편 — spv·charhash
 # 스텝 제거. W4A16 커널(W2) 도입 시 그 게이트는 새 스크립트로 붙인다.
 # 사용: scripts/preflight.sh
@@ -54,6 +55,13 @@ for n in gptq4 norm ew; do
     fb="$A/$n.fatbin"
     if [[ ! -f "$fb" || "$A/cast_common.cuh" -nt "$fb" ]]; then
         echo "FAIL — cast_common.cuh 가 $n.fatbin보다 새로움(리빌드 필요)"; stale=1
+    fi
+done
+# g4_common.cuh는 gptq4/moe가 include(R5 분할 — 헤더 변경도 리빌드 대상).
+for n in gptq4 moe; do
+    fb="$A/$n.fatbin"
+    if [[ ! -f "$fb" || "$A/g4_common.cuh" -nt "$fb" ]]; then
+        echo "FAIL — g4_common.cuh 가 $n.fatbin보다 새로움(리빌드 필요)"; stale=1
     fi
 done
 if [[ "$stale" -eq 0 ]]; then echo "OK"; else fail=1; fi
