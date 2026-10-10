@@ -218,7 +218,6 @@ pub(crate) fn handle(
 /// Err면 이미 응답을 썼다(큐 포화 429 / 엔진 사망 503). 반환: (최종 결과
 /// 수신기, 스트림 토큰 수신기 — 비스트림 모드는 진행 채널이 그대로 닫힌다).
 #[allow(clippy::type_complexity)]
-
 fn enqueue_job(
     stream: &mut TcpStream,
     tx: &std::sync::mpsc::SyncSender<SlotJob>,

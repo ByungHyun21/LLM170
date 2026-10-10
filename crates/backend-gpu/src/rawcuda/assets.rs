@@ -20,8 +20,6 @@ pub struct Asset {
     pub boot: bool,
 }
 
-const ASSET_DIR: &str = "crates/backend-gpu/src/rawcuda/assets";
-
 pub const ASSETS: &[Asset] = &[
     Asset {
         name: "gptq4",
@@ -225,13 +223,14 @@ mod tests {
         }
     }
 
-    /// 경로 상수 미사용 방지(문서용 상수 — ASSET_DIR 기준 표기 확인).
+    /// 경로 표기 규약 — 레포 루트 상대 또는 src/ 상대.
     #[test]
     fn asset_dir_prefix_consistent() {
         for a in ASSETS {
             for p in a.paths {
                 assert!(
-                    p.starts_with(ASSET_DIR) || p.starts_with("src/"),
+                    p.starts_with("crates/backend-gpu/src/rawcuda/assets/")
+                        || p.starts_with("src/"),
                     "{}: 경로 표기 규약 위반 {p}",
                     a.name
                 );
