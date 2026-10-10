@@ -127,9 +127,14 @@ __device__ __forceinline__ float gdn_logf(float y)
     return (float)gdn_log_d((double)y);
 }
 
-// gdn_conv — 채널별 3탭 링 순차 회전(구 rawhip 커널 L330-365 직이식,
-// 폭 인자화). 그리드 (conv_ch/128, 1), 블록 128. 링 [L][3][conv_ch]은
-// 커널이 r/w — T행 전체를 한 런치에서 순회(§3.3).
+// gdn_conv — 채널별 4탭(링 3 + 현재) conv + silu. [2026-10-10 토큰축 병렬화]
+// 종전: 그리드 (conv_ch/128, 1) 단일 런치가 T행을 **순차 순회** — ncu 실측
+// No Eligible 96.8%·IPC 0.13(512토큰 0.53ms/층, 프리필 conv 13.4ms의 원인).
+// 4탭은 **입력 이력**만 필요(출력 의존 아님) → 토큰을 CONV_TC 블록으로
+// 나눠 병렬화. 산술식·순서는 종전과 동일(비트동일 — 골든 판정).
+// 링 [L][3][conv_ch]: t0==0 블록이 이전 청크의 x[-3..-1]을 읽고, 마지막
+// 블록(t1==t_len)이 이번 청크의 x[t_len-3..t_len-1]을 기록(§3.3 계약 유지).
+#define CONV_TC 16
 extern "C" __global__ void gdn_conv(
     const float* __restrict__ qkv,   // [T][conv_ch]
     const float* __restrict__ convw, // [L][conv_ch][4]
@@ -145,10 +150,20 @@ extern "C" __global__ void gdn_conv(
     float w1 = convw[layer * conv_ch * 4 + ch * 4 + 1];
     float w2 = convw[layer * conv_ch * 4 + ch * 4 + 2];
     float w3 = convw[layer * conv_ch * 4 + ch * 4 + 3];
-    float h0 = ring[layer * 3 * conv_ch + 0 * conv_ch + ch];
-    float h1 = ring[layer * 3 * conv_ch + 1 * conv_ch + ch];
-    float h2 = ring[layer * 3 * conv_ch + 2 * conv_ch + ch];
-    for (int t = 0; t < t_len; t++) {
+    const int t0 = blockIdx.y * CONV_TC;
+    const int t1 = min(t_len, t0 + CONV_TC);
+    float h0, h1, h2;
+    if (t0 == 0) {
+        h0 = ring[layer * 3 * conv_ch + 0 * conv_ch + ch];
+        h1 = ring[layer * 3 * conv_ch + 1 * conv_ch + ch];
+        h2 = ring[layer * 3 * conv_ch + 2 * conv_ch + ch];
+    } else {
+        // 내부 청크 헤일로 = 같은 qkv의 앞 3행(CONV_TC ≥ 4 전제).
+        h0 = qkv[(t0 - 3) * conv_ch + ch];
+        h1 = qkv[(t0 - 2) * conv_ch + ch];
+        h2 = qkv[(t0 - 1) * conv_ch + ch];
+    }
+    for (int t = t0; t < t1; t++) {
         float xt = qkv[t * conv_ch + ch];
         float o = (w3 * xt + w0 * h0 + w1 * h1 + w2 * h2);
         o = o / (1.0f + gdn_expf(-o));
@@ -161,9 +176,11 @@ extern "C" __global__ void gdn_conv(
         }
         h0 = h1; h1 = h2; h2 = xt;
     }
-    ring[layer * 3 * conv_ch + 0 * conv_ch + ch] = h0;
-    ring[layer * 3 * conv_ch + 1 * conv_ch + ch] = h1;
-    ring[layer * 3 * conv_ch + 2 * conv_ch + ch] = h2;
+    if (t1 == t_len) {
+        ring[layer * 3 * conv_ch + 0 * conv_ch + ch] = h0;
+        ring[layer * 3 * conv_ch + 1 * conv_ch + ch] = h1;
+        ring[layer * 3 * conv_ch + 2 * conv_ch + ch] = h2;
+    }
 }
 
 // l2perm 본체 — a/b 도트(xn·abuf) + q/k L2 + v·beta|g lc 순열

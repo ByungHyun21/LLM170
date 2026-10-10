@@ -42,7 +42,8 @@ impl W4a16Dec {
         self.cc.launch(
             f,
             (dm.conv_ch() / 128) as u32,
-            1,
+            // [토큰축 병렬] y = ceil(t_len/16) — 4탭은 입력 이력만 필요.
+            (t_len.div_ceil(16)) as u32,
             128,
             &mut crate::rawcuda::args::l11(
                 &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut tl, &mut lay, &mut kl,
