@@ -330,6 +330,9 @@ impl W4a16Dec {
         self.moe_wt = 0;
         self.moe_idx = self.cc.alloc(tk * 4)?;
         self.moe_wt = self.cc.alloc(tk * 4)?;
+        // [B-4] 다중 세그먼트 GEMV 테이블(drt/dchain 포인터 참조 — 재할당 시 재작성).
+        self.ensure_chain_bufs()?;
+        self.build_moe_multi_tab()?;
         self.moe_bufs_ok = true;
         Ok(())
     }

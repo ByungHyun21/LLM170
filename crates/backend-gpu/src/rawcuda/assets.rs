@@ -29,6 +29,8 @@ pub const ASSETS: &[Asset] = &[
             "src/rawcuda/assets/gptq4.fatbin",
         ],
         syms: &[
+            "w4a16_gemv_multi",
+            "w4a16_moe_topk256",
             "w4a16_gemm_g128",
             "w4a16_gemv_g128",
             "w4a16_gemv_g128_t",

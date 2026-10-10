@@ -337,6 +337,10 @@ pub struct W4a16Dec {
     /// 선택 슬롯 인덱스·가중(호스트 → 디바이스, [top_k]).
     moe_idx: CUdeviceptr,
     moe_wt: CUdeviceptr,
+    /// [B-4] 다중 세그먼트 GEMV 테이블(층×3세그먼트×4u64: w,out,n,k) +
+    /// 층별 행 합(그리드). 라우터 게이트 + shared gate/up 1런치용.
+    moe_multi_tab: CUdeviceptr,
+    moe_multi_rows: Vec<u32>,
     /// [P11] 전문가-우선 슬롯 정렬(프리필 그룹 GEMV) — gslot[n_exp×gmax]+cnt.
     moe_gslot: CUdeviceptr,
     moe_gcnt: CUdeviceptr,
@@ -512,6 +516,8 @@ impl W4a16Dec {
             moe_dev_tab: 0,
             moe_idx: 0,
             moe_wt: 0,
+            moe_multi_tab: 0,
+            moe_multi_rows: Vec::new(),
             moe_gslot: 0,
             moe_gcnt: 0,
             moe_goff: 0,
