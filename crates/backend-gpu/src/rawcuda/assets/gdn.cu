@@ -404,6 +404,7 @@ extern "C" __global__ void gdn_scan(
     float* bp = Stile + 2 * GDN_TILE * GDN_VS;         // [CS]
     float* gcs = bp + GDN_CS;                          // [CS+1]
     float* wsm = gcs + (GDN_CS + 1);                   // [CS]
+    float* e = wsm + GDN_CS;                           // [CS] exp(gcs) 사전값
     int h = blockIdx.x / GDN_NSPLIT;
     int vs = (blockIdx.x % GDN_NSPLIT) * GDN_VS;
     int kh = h % h_k;
@@ -537,23 +538,24 @@ extern "C" __global__ void gdn_scan(
                 QS[i * GDN_VS + tid] = __float2half_rn(0.0f);
             }
         }
+        // [FLA-1 2026-10-10] e[i]=exp(gcs[i]) 사전 계산(병렬) — 해(solve)의
+        // 직렬 exp 2n회 제거. 값은 종전 인라인 계산과 비트동일(같은 함수·입력).
+        if (threadIdx.x < GDN_CS) {
+            e[threadIdx.x] = (threadIdx.x < n) ? gdn_expf(gcs[threadIdx.x]) : 0.0f;
+        }
         __syncthreads();
 
-        // [A5] 전치대입/출력 — 열(tid) 소유라 그룹0만(다른 그룹은 배리어 대기).
+        // [A5] 전치대입(rhs/dc) — 열(tid) 소유라 그룹0만(다른 그룹은 배리어
+        // 대기). [FLA-1 2026-10-10] 출력(oi)은 상태 갱신 뒤 전 그룹 병렬로
+        // 이동 — 직렬 구간 단축(값·순서 불변, 비트동일). e[i]는 사전 계산값.
         if (grp == 0) {
             for (int i = 0; i < n; i++) {
-                float rhs = bp[i] * (__half2float(sv[i * GDN_VS + tid]) - gdn_expf(gcs[i]) * __half2float(KS[i * GDN_VS + tid]));
+                float rhs = bp[i] * (__half2float(sv[i * GDN_VS + tid]) - e[i] * __half2float(KS[i * GDN_VS + tid]));
                 for (int j = 0; j < i; j++) {
                     float aij = __half2float(A[i * GDN_CS + j]);
                     if (aij != 0.0f) rhs -= aij * dc[j * GDN_VS + tid];
                 }
                 dc[i * GDN_VS + tid] = rhs;
-                float oi = gdn_expf(gcs[i]) * __half2float(QS[i * GDN_VS + tid]);
-                for (int p = 0; p <= i; p++) {
-                    float w = __half2float(KQ[i * GDN_CS + p]);
-                    if (w != 0.0f) oi += w * dc[p * GDN_VS + tid];
-                }
-                outv[(t0 + i) * (h_v * d) + h * 128 + vs + tid] = oi;
             }
         }
         __syncthreads();
@@ -563,6 +565,20 @@ extern "C" __global__ void gdn_scan(
             float gt_exp = gdn_expf(gtot);
             if (threadIdx.x < GDN_CS) wsm[threadIdx.x] = (threadIdx.x < n) ? gdn_expf(gtot - gcs[threadIdx.x]) : 0.0f;
             __syncthreads();
+            // [FLA-1 2026-10-10] 출력 병렬화 — 16그룹 × 2행(행별 순서 그대로:
+            // e[i]·QS + KQ[i][p≤i]·dc[p]). 상태 갱신과 독립(배리어 불증).
+            for (int r = 0; r < 2; ++r) {
+                const int i = grp * 2 + r;
+                if (i >= n) {
+                    break;
+                }
+                float oi = e[i] * __half2float(QS[i * GDN_VS + tid]);
+                for (int p = 0; p <= i; p++) {
+                    float w = __half2float(KQ[i * GDN_CS + p]);
+                    if (w != 0.0f) oi += w * dc[p * GDN_VS + tid];
+                }
+                outv[(t0 + i) * (h_v * d) + h * 128 + vs + tid] = oi;
+            }
             // [A5-3] dc 열(≤32)을 레지스터 1회 — 상태 갱신 재판독 제거.
             float dcr[GDN_CS];
 #pragma unroll

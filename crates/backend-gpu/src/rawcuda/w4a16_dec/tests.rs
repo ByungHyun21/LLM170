@@ -173,6 +173,7 @@ fn gdn_scan_layout_mirror() {
         + 2 * tile * vs * 4
         + cs * 4
         + (cs + 1) * 4
+        + cs * 4
         + cs * 4;
     assert_eq!(total as u32, GDN_SCAN_SMEM, "gdn_scan 동적 smem 합");
 }
