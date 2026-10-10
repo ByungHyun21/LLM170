@@ -22,9 +22,8 @@ impl W4a16Dec {
     pub(super) fn attn_kv_ptr(&self, slot: usize) -> CUdeviceptr {
         match self.attn {
             Some(dm) => {
-                let e = dm.kv_slot_elems(slot) as u64;
-                let off = self.kvq.kv_bytes(e as usize) as u64;
-                self.dkc + off
+                // [KVQ 채택 2026-10-10] int8 KV — 슬롯 오프셋 = 원소 수(1B/원소).
+                self.dkc + dm.kv_slot_elems(slot) as u64
             }
             None => self.dkc,
         }
@@ -33,9 +32,8 @@ impl W4a16Dec {
     pub(super) fn attn_vc_ptr(&self, slot: usize) -> CUdeviceptr {
         match self.attn {
             Some(dm) => {
-                let e = dm.kv_slot_elems(slot) as u64;
-                let off = self.kvq.kv_bytes(e as usize) as u64;
-                self.dvc + off
+                // [KVQ 채택 2026-10-10] int8 KV — 슬롯 오프셋 = 원소 수(1B/원소).
+                self.dvc + dm.kv_slot_elems(slot) as u64
             }
             None => self.dvc,
         }
@@ -58,6 +56,7 @@ impl W4a16Dec {
 
     /// 어텐션 prep — [A3 2026-10-09] qg·kin·vin은 커널 인자 직접 소비
     /// (스테이징 d2d 제거). 출력은 dqh_a(정규화 q)·KV 캐시.
+    /// [KVQ 채택 2026-10-10] int8 KV 단일 경로 — ksc/vsc(행×헤드 f32) 인자.
     pub(super) fn attn_prep_launch(
         &mut self,
         slot: usize,
@@ -69,59 +68,32 @@ impl W4a16Dec {
     ) -> Result<(), String> {
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
-        if self.kvq.is_on() {
-            // [P13/C3/R8] int8/int4 기록 — ksc/vsc 추가 인자(시그니처 동일).
-            let f = self.cc.function(self.kvq.prep_kernel())?;
-            let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
-            #[allow(clippy::type_complexity)]
-            let (
-                mut a0,
-                mut a1,
-                mut a2,
-                mut a3,
-                mut a4,
-                mut a5,
-                mut a6,
-                mut a7,
-                mut a8,
-                mut a9,
-                mut aa,
-            ) = (
-                qg_dev,
-                kin_dev,
-                vin_dev,
-                self.dqnw_a,
-                self.dknw_a,
-                self.dqh_a,
-                self.attn_kv_ptr(slot),
-                self.attn_vc_ptr(slot),
-                self.attn_ksc_ptr(slot),
-                self.attn_vsc_ptr(slot),
-                self.attn_pp_ptr(slot),
-            );
-            return self.cc.launch(
-                f,
-                t_len as u32,
-                (dm.q_heads + dm.kv_heads) as u32,
-                128,
-                &mut crate::rawcuda::args::l16(
-                    &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
-                    &mut a8, &mut a9, &mut aa, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
-                ),
-            );
-        }
-        let kv = self.attn_kv_ptr(slot);
-        let f = self.cc.function("attn_prep")?;
+        let f = self.cc.function("attn_prep_q")?;
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
-        let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) = (
+        #[allow(clippy::type_complexity)]
+        let (
+            mut a0,
+            mut a1,
+            mut a2,
+            mut a3,
+            mut a4,
+            mut a5,
+            mut a6,
+            mut a7,
+            mut a8,
+            mut a9,
+            mut aa,
+        ) = (
             qg_dev,
             kin_dev,
             vin_dev,
             self.dqnw_a,
             self.dknw_a,
             self.dqh_a,
-            kv,
+            self.attn_kv_ptr(slot),
             self.attn_vc_ptr(slot),
+            self.attn_ksc_ptr(slot),
+            self.attn_vsc_ptr(slot),
             self.attn_pp_ptr(slot),
         );
         self.cc.launch(
@@ -129,14 +101,16 @@ impl W4a16Dec {
             t_len as u32,
             (dm.q_heads + dm.kv_heads) as u32,
             128,
-            &mut crate::rawcuda::args::l14(
+            &mut crate::rawcuda::args::l16(
                 &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7, &mut a8,
-                &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
+                &mut a9, &mut aa, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
             ),
         )
     }
 
     /// fwd3s — [A3 2026-10-09] gate(qg)는 커널 인자 직접 소비(스테이징 제거).
+    /// [KVQ 채택 2026-10-10] int8 KV 판독 단일 경로 — 분할 s + 병합. 분할 수는
+    /// 커널이 lim으로 결정(그래프 캡처 무관) — 호스트는 항상 분할 경로.
     pub(super) fn attn_fwd3s_launch(
         &mut self,
         slot: usize,
@@ -148,93 +122,42 @@ impl W4a16Dec {
         if t_len == 0 || t_len > ATTN_F3S_TMAX {
             return Err(format!("attn fwd3s: T={t_len} — 소형 전용 도메인 위반"));
         }
-        // [2026-10-09 P8-attn-3] KV 분할 경로 — lim = pp[0]+t+1 ≤ pos+t_len이므로
-        // pos+t_len > 256이면 분할(블록 q_heads×S). ≤256은 종전 단일 경로(골든
-        // 구간 비트 동일 — 단문/3토큰 프롬프트는 항상 이쪽).
-        let pos = self.slot_pos[slot] as usize;
-        // [2026-10-09 P8-attn-3b] 분할 수는 커널이 lim으로 결정한다(그래프 캡처
-        // 무관) — 호스트는 항상 분할 경로를 쓴다. dattn_part 부재 시만 단일.
-        let _ = pos;
-        if self.dattn_part != 0 {
-            let (mut tl, mut lay) = (t_len as i32, layer as i32);
-            let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
-            let mut sp = ATTN_SPLITS as i32;
-            if self.kvq.is_on() {
-                // [P13/C3/R8] int8/int4 KV 판독 — ksc/vsc 추가 인자(동일).
-                let fp = self.cc.function(self.kvq.part_kernel())?;
-                #[allow(clippy::type_complexity)]
-                let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
-                    self.dqh_a,
-                    self.attn_kv_ptr(slot),
-                    self.attn_vc_ptr(slot),
-                    self.attn_ksc_ptr(slot),
-                    self.attn_vsc_ptr(slot),
-                    self.dattn_part,
-                );
-                let mut f6 = self.attn_pp_ptr(slot);
-                self.cc.launch(
-                    fp,
-                    t_len as u32,
-                    (dm.q_heads * ATTN_SPLITS) as u32,
-                    256,
-                    &mut crate::rawcuda::args::l13(
-                        &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut f5, &mut f6, &mut tl,
-                        &mut lay, &mut qh, &mut kvh, &mut cp, &mut sp,
-                    ),
-                )?;
-            } else {
-                let fp = self.cc.function("attn_fwd3s_part")?;
-                let (mut f0, mut f1, mut f2, mut f3) = (
-                    self.dqh_a,
-                    self.attn_kv_ptr(slot),
-                    self.attn_vc_ptr(slot),
-                    self.dattn_part,
-                );
-                let mut f4 = self.attn_pp_ptr(slot);
-                self.cc.launch(
-                    fp,
-                    t_len as u32,
-                    (dm.q_heads * ATTN_SPLITS) as u32,
-                    256,
-                    &mut crate::rawcuda::args::l11(
-                        &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut tl, &mut lay, &mut qh,
-                        &mut kvh, &mut cp, &mut sp,
-                    ),
-                )?;
-            }
-            let fm = self.cc.function("attn_fwd3s_merge")?;
-            let (mut mp, mut mg, mut mo) = (self.dattn_part, qg_dev, self.doutv_a);
-            let (mut tl2, mut qh2) = (t_len as i32, dm.q_heads as i32);
-            return self.cc.launch(
-                fm,
-                t_len as u32,
-                dm.q_heads as u32,
-                256,
-                &mut crate::rawcuda::args::l6(
-                    &mut mp, &mut mg, &mut mo, &mut tl2, &mut qh2, &mut sp,
-                ),
-            );
+        if self.dattn_part == 0 {
+            return Err("attn fwd3s: dattn_part 미할당 — ensure_attn_bufs 선행".into());
         }
-        let f = self.cc.function("attn_fwd3s")?;
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
+        let mut sp = ATTN_SPLITS as i32;
+        let fp = self.cc.function("attn_fwd3s_part_q")?;
+        #[allow(clippy::type_complexity)]
         let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
             self.dqh_a,
             self.attn_kv_ptr(slot),
             self.attn_vc_ptr(slot),
-            qg_dev,
-            self.doutv_a,
-            self.attn_pp_ptr(slot),
+            self.attn_ksc_ptr(slot),
+            self.attn_vsc_ptr(slot),
+            self.dattn_part,
         );
+        let mut f6 = self.attn_pp_ptr(slot);
         self.cc.launch(
-            f,
+            fp,
+            t_len as u32,
+            (dm.q_heads * ATTN_SPLITS) as u32,
+            256,
+            &mut crate::rawcuda::args::l13(
+                &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut f5, &mut f6, &mut tl, &mut lay,
+                &mut qh, &mut kvh, &mut cp, &mut sp,
+            ),
+        )?;
+        let fm = self.cc.function("attn_fwd3s_merge")?;
+        let (mut mp, mut mg, mut mo) = (self.dattn_part, qg_dev, self.doutv_a);
+        let (mut tl2, mut qh2) = (t_len as i32, dm.q_heads as i32);
+        self.cc.launch(
+            fm,
             t_len as u32,
             dm.q_heads as u32,
             256,
-            &mut crate::rawcuda::args::l11(
-                &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut f5, &mut tl, &mut lay, &mut qh,
-                &mut kvh, &mut cp,
-            ),
+            &mut crate::rawcuda::args::l6(&mut mp, &mut mg, &mut mo, &mut tl2, &mut qh2, &mut sp),
         )
     }
 
@@ -317,8 +240,7 @@ impl W4a16Dec {
 
     /// [A9 2026-10-10] 어텐션 디코드 배치 — 토큰별 슬롯의 KV/pos를 쓰고,
     /// prep·part·merge를 토큰 수만큼 발사(각 t=1 — 단독 경로와 동일 산술).
-    /// KVQ(int8)는 미지원(직렬 폴백). 분할 경로 전용(단일 경로는 27B/3토큰
-    /// 프리필 골든용 — 디코드는 항상 분할 경로).
+    /// [KVQ 채택 2026-10-10] int8 KV 커널(_q)로 포팅 — 직렬 폴백 제거.
     pub(super) fn attn_chain_dev_batch(
         &mut self,
         slots: &[usize],
@@ -329,9 +251,6 @@ impl W4a16Dec {
         vin_dev: CUdeviceptr,
     ) -> Result<CUdeviceptr, String> {
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
-        if self.kvq.is_on() {
-            return Err("attn batch: KVQ 상태 — 직렬 경로로 폴백".into());
-        }
         if t_len == 0
             || t_len > BATCH_DEC_MAX
             || t_len != slots.len()
@@ -355,7 +274,7 @@ impl W4a16Dec {
         let pstride = (dm.q_heads * ATTN_SPLITS * 258) as u64;
         let mut sp = ATTN_SPLITS as i32;
         // prep — 토큰별.
-        let f = self.cc.function("attn_prep")?;
+        let f = self.cc.function("attn_prep_q")?;
         for (k, &slot) in slots.iter().enumerate() {
             let mut a0 = qg_dev + k as u64 * qgd * 4;
             let mut a1 = kin_dev + k as u64 * kvd * 4;
@@ -365,38 +284,46 @@ impl W4a16Dec {
             let mut a5 = self.dqh_a + k as u64 * qdd * 4;
             let mut a6 = self.attn_kv_ptr(slot);
             let mut a7 = self.attn_vc_ptr(slot);
-            let mut a8 = self.attn_pp_ptr(slot);
+            let mut a8 = self.attn_ksc_ptr(slot);
+            let mut a9 = self.attn_vsc_ptr(slot);
+            let mut aa = self.attn_pp_ptr(slot);
             let (mut tl, mut lay, mut qh2, mut kvh2, mut cp2) = (1i32, layer as i32, qh, kvh, cp);
             self.cc.launch(
                 f,
                 1,
                 (dm.q_heads + dm.kv_heads) as u32,
                 128,
-                &mut crate::rawcuda::args::l14(
+                &mut crate::rawcuda::args::l16(
                     &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
-                    &mut a8, &mut tl, &mut lay, &mut qh2, &mut kvh2, &mut cp2,
+                    &mut a8, &mut a9, &mut aa, &mut tl, &mut lay, &mut qh2, &mut kvh2, &mut cp2,
                 ),
             )?;
         }
         // fwd3s part + merge — 토큰별.
-        let fp = self.cc.function("attn_fwd3s_part")?;
+        let fp = self.cc.function("attn_fwd3s_part_q")?;
         let fm = self.cc.function("attn_fwd3s_merge")?;
         for (k, &slot) in slots.iter().enumerate() {
             let qhk = self.dqh_a + k as u64 * qdd * 4;
             let partk = self.dattn_part + k as u64 * pstride * 4;
             {
-                let (mut f0, mut f1, mut f2, mut f3) =
-                    (qhk, self.attn_kv_ptr(slot), self.attn_vc_ptr(slot), partk);
-                let mut f4 = self.attn_pp_ptr(slot);
+                let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
+                    qhk,
+                    self.attn_kv_ptr(slot),
+                    self.attn_vc_ptr(slot),
+                    self.attn_ksc_ptr(slot),
+                    self.attn_vsc_ptr(slot),
+                    partk,
+                );
+                let mut f6 = self.attn_pp_ptr(slot);
                 let (mut tl, mut lay) = (1i32, layer as i32);
                 self.cc.launch(
                     fp,
                     1,
                     (dm.q_heads * ATTN_SPLITS) as u32,
                     256,
-                    &mut crate::rawcuda::args::l11(
-                        &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut tl, &mut lay, &mut qh,
-                        &mut kvh, &mut cp, &mut sp,
+                    &mut crate::rawcuda::args::l13(
+                        &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut f5, &mut f6, &mut tl,
+                        &mut lay, &mut qh, &mut kvh, &mut cp, &mut sp,
                     ),
                 )?;
             }

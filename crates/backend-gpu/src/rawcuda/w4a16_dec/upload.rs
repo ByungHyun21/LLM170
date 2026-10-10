@@ -142,10 +142,8 @@ impl W4a16Dec {
         }
         let slots = self.n_slots;
         let kv_elems = slots * n * dims.cap * dims.kv_dim();
-        // [P13] KV 양자화 — 옵트인(LLM170_KVQ). int8 4× 절감, 스케일은
-        // 행×헤드 f32 1개(무시 가능). 미설정 = 종전 f32 경로 그대로.
-        // [C3/R8] LLM170_KVQ: "4"=int4, 그 외 비영=int8(후방 호환).
-        let kvq = KvMode::from_env();
+        // [KVQ 채택 2026-10-10] int8 KV 단일 경로(4× 절감) — 스케일은
+        // 행×헤드 f32 1개(무시 가능).
         let kv_scales = slots * n * dims.cap * dims.kv_heads;
         for q in [
             self.dqnw_a,
@@ -167,7 +165,6 @@ impl W4a16Dec {
         }
         (self.dqnw_a, self.dknw_a, self.dkc, self.dvc, self.dpp) = (0, 0, 0, 0, 0);
         (self.dksc, self.dvsc) = (0, 0);
-        self.kvq = kvq;
         (
             self.dqg_a,
             self.dkin_a,
@@ -183,10 +180,10 @@ impl W4a16Dec {
         Self::h2d_chunked(&self.cc, dq, b(qnw))?;
         let dk = self.cc.alloc(knw.len() * 4)?;
         Self::h2d_chunked(&self.cc, dk, b(knw))?;
-        let (dkc, dvc) = if kvq.is_on() {
-            // [P13/C3/R8] int8(1B)·int4(0.5B) KV + 스케일 2벌. 기록은
-            // attn_prep_q(_4), 판독은 attn_fwd3s_part_q(_4)(병합은 f32 그대로).
-            let kbytes = kvq.kv_bytes(kv_elems);
+        let (dkc, dvc) = {
+            // int8 KV(1B/원소) + 스케일 2벌. 기록 attn_prep_q,
+            // 판독 attn_fwd3s_part_q(병합은 f32 그대로).
+            let kbytes = kv_elems;
             let kc = self.cc.alloc(kbytes)?;
             Self::zero_dev(&self.cc, kc, kbytes)?;
             let vc = self.cc.alloc(kbytes)?;
@@ -197,12 +194,6 @@ impl W4a16Dec {
             Self::zero_dev(&self.cc, vs, kv_scales * 4)?;
             self.dksc = ks;
             self.dvsc = vs;
-            (kc, vc)
-        } else {
-            let kc = self.cc.alloc(kv_elems * 4)?;
-            Self::zero_dev(&self.cc, kc, kv_elems * 4)?;
-            let vc = self.cc.alloc(kv_elems * 4)?;
-            Self::zero_dev(&self.cc, vc, kv_elems * 4)?;
             (kc, vc)
         };
         let dpp = self.cc.alloc(slots * 4)?;
