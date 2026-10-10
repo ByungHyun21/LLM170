@@ -30,17 +30,9 @@ impl W4a16Dec {
     /// (허용오차 1e-4). 1b(플레인 mma GEMM) 착륙 전 도구·프래그먼트 검증.
     pub fn mma_smoke(&mut self) -> Result<String, String> {
         let _g = self.cc.guard()?;
-        self.cc.load_fatbin(
-            "smoke",
-            &asset_bytes(
-                "LLM170_CUDA_SMOKE_FATBIN_PATH",
-                &[
-                    "crates/backend-gpu/src/rawcuda/assets/smoke.fatbin",
-                    "src/rawcuda/assets/smoke.fatbin",
-                ],
-            )?,
-            &["llm170_mma_smoke", "llm170_smoke_add"],
-        )?;
+        let a = crate::rawcuda::assets::asset("smoke");
+        self.cc
+            .load_fatbin(a.name, &crate::rawcuda::assets::asset_bytes(a)?, a.syms)?;
         // 결정적 준난수 ∈ [-1, 1) — 곱·합 ≤ 16이라 f32 누적순서 오차 ~1e-6.
         let mk = |n: usize| -> Vec<f32> {
             (0..n)

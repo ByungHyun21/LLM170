@@ -189,18 +189,6 @@ fn realloc_fields<const N: usize>(
     Ok(())
 }
 
-fn asset_bytes(env: &str, rel: &[&str]) -> Result<Vec<u8>, String> {
-    if let Some(p) = llm170_diag::flag::val(env) {
-        return std::fs::read(p).map_err(|e| format!("{env}({p}) 읽기 실패: {e}"));
-    }
-    for r in rel {
-        if let Ok(b) = std::fs::read(r) {
-            return Ok(b);
-        }
-    }
-    Err(format!("자산 부재 — {rel:?} 또는 {env}"))
-}
-
 /// [A8] 캡처 그래프 1개 — (slot, head, argmax)가 캐시 키.
 struct GraphEntry {
     exec: ffi::CUgraphExec,
@@ -413,118 +401,10 @@ impl W4a16Dec {
     /// 디코더 생성 — 5개 fatbin(체인 커널) 로드. 가중치는 upload_*로 공급.
     pub fn new(n_slots: usize, hidden: usize, n_layers: usize) -> Result<Self, String> {
         let mut cc = CudaCtx::new()?;
-        cc.load_fatbin(
-            "gptq4",
-            &asset_bytes(
-                "LLM170_CUDA_GPTQ4_FATBIN_PATH",
-                &[
-                    "crates/backend-gpu/src/rawcuda/assets/gptq4.fatbin",
-                    "src/rawcuda/assets/gptq4.fatbin",
-                ],
-            )?,
-            &[
-                "w4a16_gemm_g128",
-                "w4a16_gemv_g128",
-                "w4a16_gemv_g128_t",
-                "w4a16_gemm_g32_bf16",
-                "w4a16_gemv_g32_bf16",
-                "w4a16_gemv_bf16_t",
-                "w4a16_cast_x32",
-                "w4a16_axpy",
-                "w4a16_shared_add",
-                "w4a16_gemv_experts_g32_bf16",
-                "w4a16_gemm_g32_mma_grp",
-                "w4a16_moe_align",
-                "w4a16_moe_accum",
-                "w4a16_moe_topk",
-                "w4a16_moe_topk_t",
-                "w4a16_gemv_bf16",
-                "w4a16_gemm_bf16",
-                "w4a16_gemm_bf16_t",
-                "w4a16_gemm_bf16_mma",
-                "w4a16_gemm_g128_mma",
-            ],
-        )?;
-        cc.load_fatbin(
-            "norm",
-            &asset_bytes(
-                "LLM170_CUDA_NORM_FATBIN_PATH",
-                &[
-                    "crates/backend-gpu/src/rawcuda/assets/norm.fatbin",
-                    "src/rawcuda/assets/norm.fatbin",
-                ],
-            )?,
-            &["norm_resid"],
-        )?;
-        cc.load_fatbin(
-            "gdn",
-            &asset_bytes(
-                "LLM170_CUDA_GDN_FATBIN_PATH",
-                &[
-                    "crates/backend-gpu/src/rawcuda/assets/gdn.fatbin",
-                    "src/rawcuda/assets/gdn.fatbin",
-                ],
-            )?,
-            &[
-                "gdn_conv",
-                "gdn_l2perm",
-                "gdn_scan",
-                "gdn_scan_akq",
-                "gdn1_part",
-                "gdn1_comb",
-                "gdn1_upd",
-                "gdn_gate",
-            ],
-        )?;
-        cc.load_fatbin(
-            "attn",
-            &asset_bytes(
-                "LLM170_CUDA_ATTN_FATBIN_PATH",
-                &[
-                    "crates/backend-gpu/src/rawcuda/assets/attn.fatbin",
-                    "src/rawcuda/assets/attn.fatbin",
-                ],
-            )?,
-            &[
-                "attn_prep",
-                "attn_fwd3s",
-                "attn_fwd3s_part",
-                "attn_fwd3s_part_q",
-                "attn_fwd3s_part_q4",
-                "attn_prep_q",
-                "attn_prep_q4",
-                "attn_fwd3s_merge",
-                "attn_pos_bump",
-            ],
-        )?;
-        cc.load_fatbin(
-            "head",
-            &asset_bytes(
-                "LLM170_CUDA_HEAD_FATBIN_PATH",
-                &[
-                    "crates/backend-gpu/src/rawcuda/assets/head.fatbin",
-                    "src/rawcuda/assets/head.fatbin",
-                ],
-            )?,
-            &[
-                "head_bf16",
-                "head_bf16_t",
-                "head_transpose",
-                "w4a16_argmax_min",
-                "w4a16_argmax_min_t",
-            ],
-        )?;
-        cc.load_fatbin(
-            "ew",
-            &asset_bytes(
-                "LLM170_CUDA_EW_FATBIN_PATH",
-                &[
-                    "crates/backend-gpu/src/rawcuda/assets/ew.fatbin",
-                    "src/rawcuda/assets/ew.fatbin",
-                ],
-            )?,
-            &["ew"],
-        )?;
+        // [R9] 자산 매니페스트 단일 출처(rawcuda/assets.rs) — 부팅 로드분.
+        for a in crate::rawcuda::assets::ASSETS.iter().filter(|a| a.boot) {
+            cc.load_fatbin(a.name, &crate::rawcuda::assets::asset_bytes(a)?, a.syms)?;
+        }
         Ok(W4a16Dec {
             cc,
             hidden,
