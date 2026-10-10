@@ -421,15 +421,29 @@ extern "C" __global__ void gdn_scan(
         int t0 = c * GDN_CS;
         int n = min(t_len - t0, GDN_CS);
 
-        for (int e = threadIdx.x; e < GDN_CS * 128; e += blockDim.x) {
-            int t = e / 128, dv = e % 128;
+        // [FLA-4 2026-10-10] float4 적재 — 4차원 동시 변환·기록(값 동일:
+        // __floats2half2_rn = __float2half_rn 쌍, RN-even). 명령·MLP 개선.
+        for (int e4 = threadIdx.x; e4 < GDN_CS * 32; e4 += blockDim.x) {
+            int t = e4 / 32, dv4 = (e4 % 32) * 4;
             bool live = t < n;
-            sk[e] = __float2half_rn(live ? k[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f);
+            float4 kv = live ? *reinterpret_cast<const float4*>(
+                                  &k[(t0 + t) * (h_k * d) + kh * 128 + dv4])
+                             : make_float4(0.f, 0.f, 0.f, 0.f);
+            *reinterpret_cast<__half2*>(&sk[t * 128 + dv4]) =
+                __floats2half2_rn(kv.x, kv.y);
+            *reinterpret_cast<__half2*>(&sk[t * 128 + dv4 + 2]) =
+                __floats2half2_rn(kv.z, kv.w);
         }
-        for (int e = threadIdx.x; e < GDN_CS * GDN_VS; e += blockDim.x) {
-            int t = e / GDN_VS, dvl = e % GDN_VS;
+        for (int e4 = threadIdx.x; e4 < GDN_CS * (GDN_VS / 4); e4 += blockDim.x) {
+            int t = e4 / (GDN_VS / 4), dvl4 = (e4 % (GDN_VS / 4)) * 4;
             bool live = t < n;
-            sv[e] = __float2half_rn(live ? v[(t0 + t) * (h_v * d) + h * 128 + vs + dvl] : 0.0f);
+            float4 vv = live ? *reinterpret_cast<const float4*>(
+                                   &v[(t0 + t) * (h_v * d) + h * 128 + vs + dvl4])
+                             : make_float4(0.f, 0.f, 0.f, 0.f);
+            *reinterpret_cast<__half2*>(&sv[t * GDN_VS + dvl4]) =
+                __floats2half2_rn(vv.x, vv.y);
+            *reinterpret_cast<__half2*>(&sv[t * GDN_VS + dvl4 + 2]) =
+                __floats2half2_rn(vv.z, vv.w);
         }
         if (threadIdx.x < GDN_CS) {
             float acc = 0.0f;
@@ -446,9 +460,12 @@ extern "C" __global__ void gdn_scan(
             const __half* Ag =
                 akq + (size_t)h * n_chunks * GDN_CS * GDN_CS + (size_t)c * GDN_CS * GDN_CS;
             const __half* KQg = Ag + plane;
-            for (int e = threadIdx.x; e < GDN_CS * GDN_CS; e += blockDim.x) {
-                A[e] = Ag[e];
-                KQ[e] = KQg[e];
+            // [FLA-4] uint2(4 half) 벡터 복사.
+            for (int e4 = threadIdx.x; e4 < GDN_CS * GDN_CS / 4; e4 += blockDim.x) {
+                reinterpret_cast<uint2*>(A)[e4] =
+                    reinterpret_cast<const uint2*>(Ag)[e4];
+                reinterpret_cast<uint2*>(KQ)[e4] =
+                    reinterpret_cast<const uint2*>(KQg)[e4];
             }
         }
         __syncthreads();
