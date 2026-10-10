@@ -328,7 +328,7 @@ impl W4a16Dec {
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
             return self.cc.launch(
                 f,
-                t.div_ceil(GEMM_MMA_M) as u32,
+                t.div_ceil(GEMM_BMMA_M) as u32,
                 n.div_ceil(GEMM_BMMA_N) as u32,
                 256,
                 &mut crate::rawcuda::args::l6(

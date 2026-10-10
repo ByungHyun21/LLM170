@@ -770,7 +770,9 @@ extern "C" __global__ void w4a16_gemv_bf16_t(
 // m16×n16(2× n8 mma). 워프 w: m타일 w/4, n타일 (w%4)*16.
 // [B1/B3 2026-10-10] ncu 이중 병목(L2 86% x 재판독 ÷2·ALU 57.7 디퀀트)·KC32
 // 실측: ffn_up t512 1.58→1.35ms. 그룹(MoE) = GRP_M64×GRP_N32(슬롯행 재사용).
-#define MMA_M 32
+// [marlin-A4 2026-10-10] 32→64: B 재판독이 m타일 수에 비례(16) — M64면
+// 절반. 워프당 32행(누산 c[2][4][4]), smem A 2×64×40×2=10KB.
+#define MMA_M 64
 // [marlin-A2 2026-10-10] 64→128: A 재판독이 n타일 수에 비례 — ncu 실측 L2
 // 4.12GB/런치(= 예상 2.1GB의 2×, L2 90% 바운드). N128이면 n타일 절반 →
 // A 트래픽 절반. (marlin이 thread_n_blocks=16=N256을 쓰는 이유와 동형.)
@@ -778,6 +780,7 @@ extern "C" __global__ void w4a16_gemv_bf16_t(
 // [marlin-A2 결함수정] w4a16_gemm_bf16_mma는 자체 N64 고정(워프 매핑 하드코딩)
 // — MMA_N 공유 시 N128에서 상위 절반 미계산(35B 4000 골든 실측).
 #define BMMA_N 64
+#define BMMA_M 32
 #define GRP_M 64
 #define GRP_N 32
 // [B1/B3 실험] 64→32: smem 절반 → 점유 2배(지연 노출 완화). [marlin-A3
@@ -823,10 +826,10 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
     // [뱅크 충돌] 행 stride를 128B(전 뱅크 주기)로 두면 프래그먼트 로드가
     // 8-way 충돌(실측: 패딩 없음 0.056ms = v3와 동일). +8 bf16(16B) 패딩으로
     // 행마다 4뱅크씩 이동 → conflict-free.
-    __shared__ unsigned short xs[MMA_M][MMA_KC + 8];
+    __shared__ unsigned short xs[BMMA_M][MMA_KC + 8];
     __shared__ unsigned short ws[BMMA_N][MMA_KC + 8];
     const int tid = threadIdx.x;
-    const int m0 = blockIdx.x * MMA_M;
+    const int m0 = blockIdx.x * BMMA_M;
     const int n0 = blockIdx.y * BMMA_N;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -842,7 +845,7 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
     for (int k0 = 0; k0 < k; k0 += MMA_KC) {
         __syncthreads();
         // xs 스테이징: M32×KC64 f32→bf16 (float4 벡터화)
-        for (int e = tid; e < MMA_M * MMA_KC / 4; e += 256) {
+        for (int e = tid; e < BMMA_M * MMA_KC / 4; e += 256) {
             const int r = e / (MMA_KC / 4);
             const int c4 = e % (MMA_KC / 4);
             const int gi = k0 + c4 * 4;
@@ -936,7 +939,7 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
 // 비트에 정확히 더해짐) → w=(n−8)·s = (1024+n)·s − 1032·s = hfma2 1회.
 // 니블 순서는 __byte_perm으로 (e0,e1),(e2,e3) 정렬(8원소/u32당 ~8 op).
 // 타일·ldmatrix는 T2와 동일(M32×N64, k청크 32 — B1/B3).
-extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g128_mma(
+extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
     const unsigned short* __restrict__ s,  // [n][k/128] f16 스케일
     const unsigned short* __restrict__ x,  // [t][k] f16 — split 경로 계약
@@ -959,13 +962,13 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g128_mma(
     const int tt = lane & 3;
     // [B1/B3 2026-10-10] 워프 타일 16×16(M32×N64, 8워프 = 2m×4n) — ncu:
     // ALU 57.7%(디퀀트)·L2 86%(x f32 재판독) 이중 병목. N64로 x 재판독 절반.
-    const int mt = (warp >> 2) * 16;
+    const int mt = (warp >> 2) * 32; // [marlin-A4] M64: 2 m워프 × 32 = M64
     const int ntw = (warp & 3) * 32; // [marlin-A2] N128: 워프당 32열
     const int k8 = k >> 3;
     const int kg = k >> 7;
-    float c[4][4];
+    float c[2][4][4]; // [marlin-A4] M64: 2 m프래그먼트 × 4 n프래그먼트
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 32; ++i) {
         ((float*)c)[i] = 0.0f;
     }
     int cur = 0;
@@ -1067,41 +1070,50 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g128_mma(
             const int kb = ks * 16;
             // 프래그먼트 = 스모크 검증 방식(명시 판독). ldmatrix는 전치/분배
             // 불일치로 계통 오차(실측 maxabs 3e10) — 정확성 우선으로 되돌림.
-            const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
-            const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
-            const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
-            const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
+            // [marlin-A4] M64: mf 2(16행 프래그먼트 2개) × nt 4.
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                const int nb = ntw + nt * 8;
-                const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
-                const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
-                asm volatile(
-                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                    : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3])
-                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            for (int mf = 0; mf < 2; ++mf) {
+                const int mr = mt + mf * 16;
+                const unsigned a0 = pk2bf(&xs[cur][mr + g][kb + 2 * tt]);
+                const unsigned a1 = pk2bf(&xs[cur][mr + g + 8][kb + 2 * tt]);
+                const unsigned a2 = pk2bf(&xs[cur][mr + g][kb + 2 * tt + 8]);
+                const unsigned a3 = pk2bf(&xs[cur][mr + g + 8][kb + 2 * tt + 8]);
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    const int nb = ntw + nt * 8;
+                    const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
+                    const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(c[mf][nt][0]), "+f"(c[mf][nt][1]), "+f"(c[mf][nt][2]),
+                          "+f"(c[mf][nt][3])
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                }
             }
         }
     }
 #pragma unroll
-    for (int nt = 0; nt < 4; ++nt) {
-        const int col = n0 + ntw + nt * 8 + 2 * tt;
-        const int r0 = m0 + mt + g;
-        if (r0 < t) {
-            if (col < n) {
-                out[(size_t)r0 * n + col] = c[nt][0];
+    for (int mf = 0; mf < 2; ++mf) {
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const int col = n0 + ntw + nt * 8 + 2 * tt;
+            const int r0 = m0 + mt + mf * 16 + g;
+            if (r0 < t) {
+                if (col < n) {
+                    out[(size_t)r0 * n + col] = c[mf][nt][0];
+                }
+                if (col + 1 < n) {
+                    out[(size_t)r0 * n + col + 1] = c[mf][nt][1];
+                }
             }
-            if (col + 1 < n) {
-                out[(size_t)r0 * n + col + 1] = c[nt][1];
-            }
-        }
-        if (r0 + 8 < t) {
-            if (col < n) {
-                out[(size_t)(r0 + 8) * n + col] = c[nt][2];
-            }
-            if (col + 1 < n) {
-                out[(size_t)(r0 + 8) * n + col + 1] = c[nt][3];
+            if (r0 + 8 < t) {
+                if (col < n) {
+                    out[(size_t)(r0 + 8) * n + col] = c[mf][nt][2];
+                }
+                if (col + 1 < n) {
+                    out[(size_t)(r0 + 8) * n + col + 1] = c[mf][nt][3];
+                }
             }
         }
     }

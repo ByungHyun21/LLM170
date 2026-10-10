@@ -28,9 +28,10 @@ pub const ATTN_F3S_TMAX: usize = 512;
 pub const CHAIN_TMAX: usize = 512;
 /// [B1/B3 2026-10-10] mma GEMM 타일 미러(assets/gptq4.cu MMA_M/MMA_N —
 /// T1/T2, GRP_M/GRP_N — 그룹(MoE). 정적검사: gemm_mma_mirror 테스트).
-pub const GEMM_MMA_M: usize = 32;
+pub const GEMM_MMA_M: usize = 64; // [marlin-A4] 32→64: B 재판독 m타일 절반
 pub const GEMM_MMA_N: usize = 128; // [marlin-A2] 64→128: A 재판독 절반(L2 바운드)
-/// bf16 mma GEMM(플레인) 전용 N — 커널 BMMA_N 미러(워프 매핑 N64 고정).
+/// bf16 mma GEMM(플레인) 전용 타일 — 커널 BMMA_M/N 미러(워프 매핑 32×64 고정).
+pub const GEMM_BMMA_M: usize = 32;
 pub const GEMM_BMMA_N: usize = 64;
 pub const GEMM_GRP_M: usize = 64;
 pub const GEMM_GRP_N: usize = 32;
