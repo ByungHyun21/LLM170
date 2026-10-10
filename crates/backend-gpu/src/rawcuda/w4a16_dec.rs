@@ -329,8 +329,9 @@ pub struct W4a16Dec {
     /// [P13] int8 KV 스케일(K/V 각각 [n_attn*cap][kv_heads] f32) — KVQ 전용.
     dksc: CUdeviceptr,
     dvsc: CUdeviceptr,
-    /// [P13] KV 양자화(int8) — set_attn에서 env(LLM170_KVQ)로 확정.
-    kvq: bool,
+    /// [P13/C3] KV 양자화 모드 — 0=f32 · 8=int8(4×) · 4=int4(8×, 니블 패킹).
+    /// set_attn에서 env(LLM170_KVQ: "4"=int4, 그 외 비영=int8)로 확정.
+    kvq: u8,
     dpp: CUdeviceptr,
     dqg_a: CUdeviceptr,
     dkin_a: CUdeviceptr,
@@ -477,7 +478,9 @@ impl W4a16Dec {
                 "attn_fwd3s",
                 "attn_fwd3s_part",
                 "attn_fwd3s_part_q",
+                "attn_fwd3s_part_q4",
                 "attn_prep_q",
+                "attn_prep_q4",
                 "attn_fwd3s_merge",
                 "attn_pos_bump",
             ],
@@ -596,7 +599,7 @@ impl W4a16Dec {
             dvc: 0,
             dksc: 0,
             dvsc: 0,
-            kvq: false,
+            kvq: 0,
             dpp: 0,
             dqg_a: 0,
             dkin_a: 0,
@@ -1339,7 +1342,12 @@ impl W4a16Dec {
         let kv_elems = slots * n * dims.cap * dims.kv_dim();
         // [P13] KV 양자화 — 옵트인(LLM170_KVQ). int8 4× 절감, 스케일은
         // 행×헤드 f32 1개(무시 가능). 미설정 = 종전 f32 경로 그대로.
-        let kvq = llm170_diag::flag::on_nonzero("LLM170_KVQ");
+        // [C3 2026-10-10] LLM170_KVQ: "4"=int4, 그 외 비영=int8(후방 호환).
+        let kvq: u8 = match llm170_diag::flag::val("LLM170_KVQ") {
+            Some("4") => 4,
+            Some(v) if v != "0" => 8,
+            _ => 0,
+        };
         let kv_scales = slots * n * dims.cap * dims.kv_heads;
         for q in [
             self.dqnw_a,
@@ -1376,13 +1384,14 @@ impl W4a16Dec {
         Self::h2d_chunked(&self.cc, dq, b(qnw))?;
         let dk = self.cc.alloc(knw.len() * 4)?;
         Self::h2d_chunked(&self.cc, dk, b(knw))?;
-        let (dkc, dvc) = if kvq {
-            // [P13] int8 KV + 스케일 2벌. 기록은 attn_prep_q, 판독은
-            // attn_fwd3s_part_q(병합은 f32 part 그대로).
-            let kc = self.cc.alloc(kv_elems)?;
-            Self::zero_dev(&self.cc, kc, kv_elems)?;
-            let vc = self.cc.alloc(kv_elems)?;
-            Self::zero_dev(&self.cc, vc, kv_elems)?;
+        let (dkc, dvc) = if kvq > 0 {
+            // [P13/C3] int8(1B)·int4(0.5B) KV + 스케일 2벌. 기록은
+            // attn_prep_q(_4), 판독은 attn_fwd3s_part_q(_4)(병합은 f32 그대로).
+            let kbytes = if kvq == 4 { kv_elems / 2 } else { kv_elems };
+            let kc = self.cc.alloc(kbytes)?;
+            Self::zero_dev(&self.cc, kc, kbytes)?;
+            let vc = self.cc.alloc(kbytes)?;
+            Self::zero_dev(&self.cc, vc, kbytes)?;
             let ks = self.cc.alloc(kv_scales * 4)?;
             Self::zero_dev(&self.cc, ks, kv_scales * 4)?;
             let vs = self.cc.alloc(kv_scales * 4)?;
@@ -1459,17 +1468,31 @@ impl W4a16Dec {
     }
 
     fn attn_kv_ptr(&self, slot: usize) -> CUdeviceptr {
-        let b = if self.kvq { 1 } else { 4 }; // [P13] int8=1바이트
         match self.attn {
-            Some(dm) => self.dkc + (dm.kv_slot_elems(slot) as u64) * b,
+            Some(dm) => {
+                let e = dm.kv_slot_elems(slot) as u64;
+                let off = match self.kvq {
+                    4 => e / 2,
+                    8 => e,
+                    _ => e * 4,
+                };
+                self.dkc + off
+            }
             None => self.dkc,
         }
     }
 
     fn attn_vc_ptr(&self, slot: usize) -> CUdeviceptr {
-        let b = if self.kvq { 1 } else { 4 };
         match self.attn {
-            Some(dm) => self.dvc + (dm.kv_slot_elems(slot) as u64) * b,
+            Some(dm) => {
+                let e = dm.kv_slot_elems(slot) as u64;
+                let off = match self.kvq {
+                    4 => e / 2,
+                    8 => e,
+                    _ => e * 4,
+                };
+                self.dvc + off
+            }
             None => self.dvc,
         }
     }
@@ -1502,9 +1525,13 @@ impl W4a16Dec {
     ) -> Result<(), String> {
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
-        if self.kvq {
-            // [P13] int8 기록 — ksc/vsc 추가 인자.
-            let f = self.cc.function("attn_prep_q")?;
+        if self.kvq > 0 {
+            // [P13/C3] int8/int4 기록 — ksc/vsc 추가 인자(시그니처 동일).
+            let f = self.cc.function(if self.kvq == 4 {
+                "attn_prep_q4"
+            } else {
+                "attn_prep_q"
+            })?;
             let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
             #[allow(clippy::type_complexity)]
             let (
@@ -1620,9 +1647,13 @@ impl W4a16Dec {
             let (mut tl, mut lay) = (t_len as i32, layer as i32);
             let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
             let mut sp = ATTN_SPLITS as i32;
-            if self.kvq {
-                // [P13] int8 KV 판독 — ksc/vsc 추가 인자.
-                let fp = self.cc.function("attn_fwd3s_part_q")?;
+            if self.kvq > 0 {
+                // [P13/C3] int8/int4 KV 판독 — ksc/vsc 추가 인자(동일).
+                let fp = self.cc.function(if self.kvq == 4 {
+                    "attn_fwd3s_part_q4"
+                } else {
+                    "attn_fwd3s_part_q"
+                })?;
                 #[allow(clippy::type_complexity)]
                 let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
                     self.dqh_a,
@@ -2220,7 +2251,9 @@ impl W4a16Dec {
             .attn
             .map(|d| {
                 let rows = (self.n_slots as u64) * (d.n_attn as u64) * (d.cap as u64);
-                if self.kvq {
+                if self.kvq == 4 {
+                    rows * (d.kv_dim() as u64) + rows * (d.kv_heads as u64) * 4 * 2
+                } else if self.kvq == 8 {
                     rows * (d.kv_dim() as u64) * 2 + rows * (d.kv_heads as u64) * 4 * 2
                 } else {
                     2 * rows * (d.kv_dim() as u64) * 4
@@ -3675,7 +3708,7 @@ impl W4a16Dec {
         vin_dev: CUdeviceptr,
     ) -> Result<CUdeviceptr, String> {
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
-        if self.kvq {
+        if self.kvq > 0 {
             return Err("attn batch: KVQ 상태 — 직렬 경로로 폴백".into());
         }
         if t_len == 0
