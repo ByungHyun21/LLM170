@@ -839,6 +839,11 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     // [FLA-5 기각 2026-10-10] B 스테이징 2단 분리(q/s cp.async 선행 + smem
     // 디큐트, 전역 지연 은닉) — 이득 0(P512 158 vs 159ms) + 600토큰에서
     // illegal access(경계 결함). 되돌림. g32 시도 누적 6회 전부 실측 기각
+    // [FLA-14 기각 2026-10-10] A 프래그먼트 ldmatrix.x4 — 명시 판독 4×pk2bf를
+    // 1명령으로(mio 후보). 골든 비트동일(35B 600/4000 — 분배 규약 정확)이나
+    // **성능 무이득**: 교차 A/B P512 127~128ms 동일 · g32_grp 58.7~59.0ms
+    // 동일(P4096 정상상태 457.6→456.8). 1차 측정의 −5%는 기준선 아웃라이어
+    // (62ms) 오염이었다. 되돌림.
     // (레지스터 디큐트×2·cp.async·KC·NSPLIT·FLA-5) — SASS상 디큐트는 이미
     // 컴파일러 최적(PRMT 팩·STS.64).
     __shared__ __align__(16) unsigned short xs[2][GRP_M][MMA_KC + 8];
