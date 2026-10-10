@@ -1051,6 +1051,8 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
         ssm[0][e] = __half2float(*reinterpret_cast<const __half*>(&scb));
     }
     // 초기 스테이지 완료 대기 + 가시화(이후 루프가 관리).
+    // [marlin-C4 기각 2026-10-10] 4스테이지 확장 = gemm 236→277ms —
+    // smem 30.5KB/블록으로 L1 캐시 축소(프래그먼트·스테이징 L1 의존).
     asm volatile("cp.async.wait_group 0;");
     __syncthreads();
     for (; k0 < k; k0 += MMA_KC, cur ^= 1) {
