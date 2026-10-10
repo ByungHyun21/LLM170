@@ -87,26 +87,25 @@ impl W4a16Dec {
                 let f = self.cc.function("head_bf16")?;
                 let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn, self.head_out);
                 let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
-                let mut args: [*mut std::ffi::c_void; 5] = [
-                    (&mut p_w) as *mut _ as *mut _,
-                    (&mut p_x) as *mut _ as *mut _,
-                    (&mut p_o) as *mut _ as *mut _,
-                    (&mut p_n) as *mut _ as *mut _,
-                    (&mut p_k) as *mut _ as *mut _,
-                ];
-                self.cc
-                    .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
+                self.cc.launch(
+                    f,
+                    self.head_n.div_ceil(4 * 256) as u32,
+                    1,
+                    256,
+                    &mut crate::rawcuda::args::l5(&mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k),
+                )?;
                 if argmax {
                     // [P3] argmax 커널 + 4B d2h — 로짓 전량 readback 제거.
                     let fa = self.cc.function("w4a16_argmax_min")?;
                     let (mut p_l, mut p_n, mut p_o) =
                         (self.head_out, self.head_n as i32, self.argmax_out);
-                    let mut aa: [*mut std::ffi::c_void; 3] = [
-                        (&mut p_l) as *mut _ as *mut _,
-                        (&mut p_n) as *mut _ as *mut _,
-                        (&mut p_o) as *mut _ as *mut _,
-                    ];
-                    self.cc.launch(fa, 1, 1, 1024, &mut aa)?;
+                    self.cc.launch(
+                        fa,
+                        1,
+                        1,
+                        1024,
+                        &mut crate::rawcuda::args::l3(&mut p_l, &mut p_n, &mut p_o),
+                    )?;
                     self.cc
                         .d2h_async(self.pin_out as *mut u8, self.argmax_out, 4)?;
                 } else {
@@ -244,23 +243,22 @@ impl W4a16Dec {
         let f = self.cc.function("head_bf16")?;
         let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn, self.head_out);
         let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
-        let mut args: [*mut std::ffi::c_void; 5] = [
-            (&mut p_w) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_o) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-        ];
-        self.cc
-            .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
+        self.cc.launch(
+            f,
+            self.head_n.div_ceil(4 * 256) as u32,
+            1,
+            256,
+            &mut crate::rawcuda::args::l5(&mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k),
+        )?;
         let fa = self.cc.function("w4a16_argmax_min")?;
         let (mut p_l, mut p_nn, mut p_a) = (self.head_out, self.head_n as i32, self.argmax_out);
-        let mut aa: [*mut std::ffi::c_void; 3] = [
-            (&mut p_l) as *mut _ as *mut _,
-            (&mut p_nn) as *mut _ as *mut _,
-            (&mut p_a) as *mut _ as *mut _,
-        ];
-        self.cc.launch(fa, 1, 1, 1024, &mut aa)?;
+        self.cc.launch(
+            fa,
+            1,
+            1,
+            1024,
+            &mut crate::rawcuda::args::l3(&mut p_l, &mut p_nn, &mut p_a),
+        )?;
         let mut ob = [0u8; 4];
         self.cc.d2h_async(ob.as_mut_ptr(), self.argmax_out, 4)?;
         self.cc.sync()?;
@@ -445,15 +443,13 @@ impl W4a16Dec {
         let f = self.cc.function("head_bf16")?;
         let (mut p_w, mut p_x, mut p_o) = (self.head_w, xn, self.head_out);
         let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
-        let mut args: [*mut std::ffi::c_void; 5] = [
-            (&mut p_w) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_o) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-        ];
-        self.cc
-            .launch(f, self.head_n.div_ceil(4 * 256) as u32, 1, 256, &mut args)?;
+        self.cc.launch(
+            f,
+            self.head_n.div_ceil(4 * 256) as u32,
+            1,
+            256,
+            &mut crate::rawcuda::args::l5(&mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k),
+        )?;
         let mut ob = vec![0u8; self.head_n * 4];
         self.cc
             .d2h_async(ob.as_mut_ptr(), self.head_out, self.head_n * 4)?;

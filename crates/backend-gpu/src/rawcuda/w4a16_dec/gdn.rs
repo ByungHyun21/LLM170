@@ -39,21 +39,16 @@ impl W4a16Dec {
             self.dgk,
             self.dgv,
         );
-        let mut ac: [*mut std::ffi::c_void; 11] = [
-            (&mut c0) as *mut _ as *mut _,
-            (&mut c1) as *mut _ as *mut _,
-            (&mut c2) as *mut _ as *mut _,
-            (&mut c3) as *mut _ as *mut _,
-            (&mut c4) as *mut _ as *mut _,
-            (&mut c5) as *mut _ as *mut _,
-            (&mut tl) as *mut _ as *mut _,
-            (&mut lay) as *mut _ as *mut _,
-            (&mut kl) as *mut _ as *mut _,
-            (&mut vl) as *mut _ as *mut _,
-            (&mut cch) as *mut _ as *mut _,
-        ];
-        self.cc
-            .launch(f, (dm.conv_ch() / 128) as u32, 1, 128, &mut ac)?;
+        self.cc.launch(
+            f,
+            (dm.conv_ch() / 128) as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l11(
+                &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut tl, &mut lay, &mut kl,
+                &mut vl, &mut cch,
+            ),
+        )?;
 
         let f = self.cc.function("gdn_l2perm")?;
         let (
@@ -72,26 +67,16 @@ impl W4a16Dec {
             self.dgq, self.dgk, self.dgv, xn_dev, self.dab_c, self.dalog, self.ddtb, self.dq2,
             self.dk2, self.dv2, self.dbg,
         );
-        let mut al: [*mut std::ffi::c_void; 16] = [
-            (&mut l0) as *mut _ as *mut _,
-            (&mut l1) as *mut _ as *mut _,
-            (&mut l2) as *mut _ as *mut _,
-            (&mut l3) as *mut _ as *mut _,
-            (&mut l4) as *mut _ as *mut _,
-            (&mut l5) as *mut _ as *mut _,
-            (&mut l6) as *mut _ as *mut _,
-            (&mut l7) as *mut _ as *mut _,
-            (&mut l8) as *mut _ as *mut _,
-            (&mut l9) as *mut _ as *mut _,
-            (&mut l10) as *mut _ as *mut _,
-            (&mut tl) as *mut _ as *mut _,
-            (&mut lay) as *mut _ as *mut _,
-            (&mut hk) as *mut _ as *mut _,
-            (&mut hv) as *mut _ as *mut _,
-            (&mut hd) as *mut _ as *mut _,
-        ];
-        self.cc
-            .launch(f, dm.h_v as u32, t_len as u32, 128, &mut al)?;
+        self.cc.launch(
+            f,
+            dm.h_v as u32,
+            t_len as u32,
+            128,
+            &mut crate::rawcuda::args::l16(
+                &mut l0, &mut l1, &mut l2, &mut l3, &mut l4, &mut l5, &mut l6, &mut l7, &mut l8,
+                &mut l9, &mut l10, &mut tl, &mut lay, &mut hk, &mut hv, &mut hd,
+            ),
+        )?;
 
         // [P9] t=1 전용 — i축 분할 3커널(grid h_v×4 = 192블록). ncu 실측
         // gdn_scan 점유 8.3%(지연 바운드) → 분할로 병렬도 확보. t>1은 종전.
@@ -104,17 +89,15 @@ impl W4a16Dec {
                 self.dgst + (st_slot as u64) * 4,
                 self.dgpart,
             );
-            let mut ap: [*mut std::ffi::c_void; 8] = [
-                (&mut p0) as *mut _ as *mut _,
-                (&mut p1) as *mut _ as *mut _,
-                (&mut p2) as *mut _ as *mut _,
-                (&mut p3) as *mut _ as *mut _,
-                (&mut hk) as *mut _ as *mut _,
-                (&mut hv) as *mut _ as *mut _,
-                (&mut dd) as *mut _ as *mut _,
-                (&mut lay) as *mut _ as *mut _,
-            ];
-            self.cc.launch(fp, dm.h_v as u32, 8, 128, &mut ap)?;
+            self.cc.launch(
+                fp,
+                dm.h_v as u32,
+                8,
+                128,
+                &mut crate::rawcuda::args::l8(
+                    &mut p0, &mut p1, &mut p2, &mut p3, &mut hk, &mut hv, &mut dd, &mut lay,
+                ),
+            )?;
             let fc = self.cc.function("gdn1_comb")?;
             let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6) = (
                 self.dq2,
@@ -125,19 +108,16 @@ impl W4a16Dec {
                 self.dgdc,
                 self.dgo,
             );
-            let mut acomb: [*mut std::ffi::c_void; 10] = [
-                (&mut c0) as *mut _ as *mut _,
-                (&mut c1) as *mut _ as *mut _,
-                (&mut c2) as *mut _ as *mut _,
-                (&mut c3) as *mut _ as *mut _,
-                (&mut c4) as *mut _ as *mut _,
-                (&mut c5) as *mut _ as *mut _,
-                (&mut c6) as *mut _ as *mut _,
-                (&mut hk) as *mut _ as *mut _,
-                (&mut hv) as *mut _ as *mut _,
-                (&mut dd) as *mut _ as *mut _,
-            ];
-            self.cc.launch(fc, dm.h_v as u32, 1, 128, &mut acomb)?;
+            self.cc.launch(
+                fc,
+                dm.h_v as u32,
+                1,
+                128,
+                &mut crate::rawcuda::args::l10(
+                    &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut hk,
+                    &mut hv, &mut dd,
+                ),
+            )?;
             let fu = self.cc.function("gdn1_upd")?;
             let (mut u0, mut u1, mut u2, mut u3) = (
                 self.dk2,
@@ -145,17 +125,15 @@ impl W4a16Dec {
                 self.dgdc,
                 self.dgst + (st_slot as u64) * 4,
             );
-            let mut aup: [*mut std::ffi::c_void; 8] = [
-                (&mut u0) as *mut _ as *mut _,
-                (&mut u1) as *mut _ as *mut _,
-                (&mut u2) as *mut _ as *mut _,
-                (&mut u3) as *mut _ as *mut _,
-                (&mut hk) as *mut _ as *mut _,
-                (&mut hv) as *mut _ as *mut _,
-                (&mut dd) as *mut _ as *mut _,
-                (&mut lay) as *mut _ as *mut _,
-            ];
-            self.cc.launch(fu, dm.h_v as u32, 8, 128, &mut aup)?;
+            self.cc.launch(
+                fu,
+                dm.h_v as u32,
+                8,
+                128,
+                &mut crate::rawcuda::args::l8(
+                    &mut u0, &mut u1, &mut u2, &mut u3, &mut hk, &mut hv, &mut dd, &mut lay,
+                ),
+            )?;
             skip_scan = true;
         }
         if !skip_scan {
@@ -166,17 +144,15 @@ impl W4a16Dec {
             let (mut p0, mut p1, mut p2, mut p3) = (self.dq2, self.dk2, self.dbg, self.dakq);
             let (mut pt, mut phk, mut phv, mut pd) =
                 (t_len as i32, dm.h_k as i32, dm.h_v as i32, dm.d as i32);
-            let mut pa: [*mut std::ffi::c_void; 8] = [
-                (&mut p0) as *mut _ as *mut _,
-                (&mut p1) as *mut _ as *mut _,
-                (&mut p2) as *mut _ as *mut _,
-                (&mut p3) as *mut _ as *mut _,
-                (&mut pt) as *mut _ as *mut _,
-                (&mut phk) as *mut _ as *mut _,
-                (&mut phv) as *mut _ as *mut _,
-                (&mut pd) as *mut _ as *mut _,
-            ];
-            self.cc.launch(fp, dm.h_v as u32, nch, 512, &mut pa)?;
+            self.cc.launch(
+                fp,
+                dm.h_v as u32,
+                nch,
+                512,
+                &mut crate::rawcuda::args::l8(
+                    &mut p0, &mut p1, &mut p2, &mut p3, &mut pt, &mut phk, &mut phv, &mut pd,
+                ),
+            )?;
 
             let f = self.cc.function("gdn_scan")?;
             self.cc.set_dynamic_smem(f, GDN_SCAN_SMEM)?;
@@ -189,20 +165,6 @@ impl W4a16Dec {
                 self.dgst + (st_slot as u64) * 4,
                 self.dgo,
             );
-            let mut as_: [*mut std::ffi::c_void; 12] = [
-                (&mut s0) as *mut _ as *mut _,
-                (&mut s1) as *mut _ as *mut _,
-                (&mut s2) as *mut _ as *mut _,
-                (&mut s3) as *mut _ as *mut _,
-                (&mut s4) as *mut _ as *mut _,
-                (&mut s5) as *mut _ as *mut _,
-                (&mut s6) as *mut _ as *mut _,
-                (&mut tl) as *mut _ as *mut _,
-                (&mut hk) as *mut _ as *mut _,
-                (&mut hv) as *mut _ as *mut _,
-                (&mut dd) as *mut _ as *mut _,
-                (&mut lay) as *mut _ as *mut _,
-            ];
             // grid = h_v×NSPLIT(블록 = GDN_NGRP×GDN_VS = 512스레드).
             self.cc.launch_shared(
                 f,
@@ -210,24 +172,24 @@ impl W4a16Dec {
                 1,
                 (GDN_NGRP * (128 / GDN_NSPLIT)) as u32,
                 GDN_SCAN_SMEM,
-                &mut as_,
+                &mut crate::rawcuda::args::l12(
+                    &mut s0, &mut s1, &mut s2, &mut s3, &mut s4, &mut s5, &mut s6, &mut tl,
+                    &mut hk, &mut hv, &mut dd, &mut lay,
+                ),
             )?;
         }
 
         let f = self.cc.function("gdn_gate")?;
         let (mut g0, mut g1, mut g2, mut g3) = (self.dgo, z_dev, self.dnwg, self.dgate);
-        let mut ag: [*mut std::ffi::c_void; 8] = [
-            (&mut g0) as *mut _ as *mut _,
-            (&mut g1) as *mut _ as *mut _,
-            (&mut g2) as *mut _ as *mut _,
-            (&mut g3) as *mut _ as *mut _,
-            (&mut tl) as *mut _ as *mut _,
-            (&mut lay) as *mut _ as *mut _,
-            (&mut hk) as *mut _ as *mut _,
-            (&mut hv) as *mut _ as *mut _,
-        ];
-        self.cc
-            .launch(f, dm.h_v as u32, t_len as u32, 128, &mut ag)?;
+        self.cc.launch(
+            f,
+            dm.h_v as u32,
+            t_len as u32,
+            128,
+            &mut crate::rawcuda::args::l8(
+                &mut g0, &mut g1, &mut g2, &mut g3, &mut tl, &mut lay, &mut hk, &mut hv,
+            ),
+        )?;
         Ok(())
     }
 
@@ -325,21 +287,16 @@ impl W4a16Dec {
             let mut c3 = self.dgq + k as u64 * kl as u64 * 4;
             let mut c4 = self.dgk + k as u64 * kl as u64 * 4;
             let mut c5 = self.dgv + k as u64 * vl as u64 * 4;
-            let mut ac: [*mut std::ffi::c_void; 11] = [
-                (&mut c0) as *mut _ as *mut _,
-                (&mut c1) as *mut _ as *mut _,
-                (&mut c2) as *mut _ as *mut _,
-                (&mut c3) as *mut _ as *mut _,
-                (&mut c4) as *mut _ as *mut _,
-                (&mut c5) as *mut _ as *mut _,
-                (&mut one) as *mut _ as *mut _,
-                (&mut lay) as *mut _ as *mut _,
-                (&mut kl) as *mut _ as *mut _,
-                (&mut vl) as *mut _ as *mut _,
-                (&mut cch) as *mut _ as *mut _,
-            ];
-            self.cc
-                .launch(f, (dm.conv_ch() / 128) as u32, 1, 128, &mut ac)?;
+            self.cc.launch(
+                f,
+                (dm.conv_ch() / 128) as u32,
+                1,
+                128,
+                &mut crate::rawcuda::args::l11(
+                    &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut one, &mut lay,
+                    &mut kl, &mut vl, &mut cch,
+                ),
+            )?;
         }
         // l2perm — 행 단위 1회.
         {
@@ -349,26 +306,16 @@ impl W4a16Dec {
             );
             let (mut l7, mut l8, mut l9, mut l10) = (self.dq2, self.dk2, self.dv2, self.dbg);
             let mut tl = t_len as i32;
-            let mut al: [*mut std::ffi::c_void; 16] = [
-                (&mut l0) as *mut _ as *mut _,
-                (&mut l1) as *mut _ as *mut _,
-                (&mut l2) as *mut _ as *mut _,
-                (&mut l3) as *mut _ as *mut _,
-                (&mut l4) as *mut _ as *mut _,
-                (&mut l5) as *mut _ as *mut _,
-                (&mut l6) as *mut _ as *mut _,
-                (&mut l7) as *mut _ as *mut _,
-                (&mut l8) as *mut _ as *mut _,
-                (&mut l9) as *mut _ as *mut _,
-                (&mut l10) as *mut _ as *mut _,
-                (&mut tl) as *mut _ as *mut _,
-                (&mut lay) as *mut _ as *mut _,
-                (&mut hk) as *mut _ as *mut _,
-                (&mut hv) as *mut _ as *mut _,
-                (&mut hd) as *mut _ as *mut _,
-            ];
-            self.cc
-                .launch(f, dm.h_v as u32, t_len as u32, 128, &mut al)?;
+            self.cc.launch(
+                f,
+                dm.h_v as u32,
+                t_len as u32,
+                128,
+                &mut crate::rawcuda::args::l16(
+                    &mut l0, &mut l1, &mut l2, &mut l3, &mut l4, &mut l5, &mut l6, &mut l7,
+                    &mut l8, &mut l9, &mut l10, &mut tl, &mut lay, &mut hk, &mut hv, &mut hd,
+                ),
+            )?;
         }
         // t=1 트리오 — 토큰별(상태 = 슬롯).
         let part_stride = (dm.h_v * 8 * 256) as u64;
@@ -389,48 +336,41 @@ impl W4a16Dec {
             let outk = self.dgo + k as u64 * vl as u64 * 4;
             {
                 let (mut p0, mut p1, mut p2, mut p3) = (q2k, k2k, stk, partk);
-                let mut ap: [*mut std::ffi::c_void; 8] = [
-                    (&mut p0) as *mut _ as *mut _,
-                    (&mut p1) as *mut _ as *mut _,
-                    (&mut p2) as *mut _ as *mut _,
-                    (&mut p3) as *mut _ as *mut _,
-                    (&mut hk) as *mut _ as *mut _,
-                    (&mut hv) as *mut _ as *mut _,
-                    (&mut dd) as *mut _ as *mut _,
-                    (&mut lay) as *mut _ as *mut _,
-                ];
-                self.cc.launch(fp, dm.h_v as u32, 8, 128, &mut ap)?;
+                self.cc.launch(
+                    fp,
+                    dm.h_v as u32,
+                    8,
+                    128,
+                    &mut crate::rawcuda::args::l8(
+                        &mut p0, &mut p1, &mut p2, &mut p3, &mut hk, &mut hv, &mut dd, &mut lay,
+                    ),
+                )?;
             }
             {
                 let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6) =
                     (q2k, k2k, v2k, bgk, partk, dck, outk);
-                let mut acomb: [*mut std::ffi::c_void; 10] = [
-                    (&mut c0) as *mut _ as *mut _,
-                    (&mut c1) as *mut _ as *mut _,
-                    (&mut c2) as *mut _ as *mut _,
-                    (&mut c3) as *mut _ as *mut _,
-                    (&mut c4) as *mut _ as *mut _,
-                    (&mut c5) as *mut _ as *mut _,
-                    (&mut c6) as *mut _ as *mut _,
-                    (&mut hk) as *mut _ as *mut _,
-                    (&mut hv) as *mut _ as *mut _,
-                    (&mut dd) as *mut _ as *mut _,
-                ];
-                self.cc.launch(fc, dm.h_v as u32, 1, 128, &mut acomb)?;
+                self.cc.launch(
+                    fc,
+                    dm.h_v as u32,
+                    1,
+                    128,
+                    &mut crate::rawcuda::args::l10(
+                        &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut hk,
+                        &mut hv, &mut dd,
+                    ),
+                )?;
             }
             {
                 let (mut u0, mut u1, mut u2, mut u3) = (k2k, bgk, dck, stk);
-                let mut aup: [*mut std::ffi::c_void; 8] = [
-                    (&mut u0) as *mut _ as *mut _,
-                    (&mut u1) as *mut _ as *mut _,
-                    (&mut u2) as *mut _ as *mut _,
-                    (&mut u3) as *mut _ as *mut _,
-                    (&mut hk) as *mut _ as *mut _,
-                    (&mut hv) as *mut _ as *mut _,
-                    (&mut dd) as *mut _ as *mut _,
-                    (&mut lay) as *mut _ as *mut _,
-                ];
-                self.cc.launch(fu, dm.h_v as u32, 8, 128, &mut aup)?;
+                self.cc.launch(
+                    fu,
+                    dm.h_v as u32,
+                    8,
+                    128,
+                    &mut crate::rawcuda::args::l8(
+                        &mut u0, &mut u1, &mut u2, &mut u3, &mut hk, &mut hv, &mut dd, &mut lay,
+                    ),
+                )?;
             }
         }
         // gate — 행 단위 1회.
@@ -438,18 +378,15 @@ impl W4a16Dec {
             let f = self.cc.function("gdn_gate")?;
             let (mut g0, mut g1, mut g2, mut g3) = (self.dgo, z_dev, self.dnwg, self.dgate);
             let mut tl = t_len as i32;
-            let mut ag: [*mut std::ffi::c_void; 8] = [
-                (&mut g0) as *mut _ as *mut _,
-                (&mut g1) as *mut _ as *mut _,
-                (&mut g2) as *mut _ as *mut _,
-                (&mut g3) as *mut _ as *mut _,
-                (&mut tl) as *mut _ as *mut _,
-                (&mut lay) as *mut _ as *mut _,
-                (&mut hk) as *mut _ as *mut _,
-                (&mut hv) as *mut _ as *mut _,
-            ];
-            self.cc
-                .launch(f, dm.h_v as u32, t_len as u32, 128, &mut ag)?;
+            self.cc.launch(
+                f,
+                dm.h_v as u32,
+                t_len as u32,
+                128,
+                &mut crate::rawcuda::args::l8(
+                    &mut g0, &mut g1, &mut g2, &mut g3, &mut tl, &mut lay, &mut hk, &mut hv,
+                ),
+            )?;
         }
         Ok(self.dgate)
     }

@@ -27,19 +27,16 @@ impl W4a16Dec {
             n as i32,
             k as i32,
         );
-        let mut args: [*mut std::ffi::c_void; 10] = [
-            (&mut p_t) as *mut _ as *mut _,
-            (&mut p_b) as *mut _ as *mut _,
-            (&mut p_i) as *mut _ as *mut _,
-            (&mut p_ns) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_xs) as *mut _ as *mut _,
-            (&mut p_sp) as *mut _ as *mut _,
-            (&mut p_o) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-        ];
-        self.cc.launch(f, (n * nslots) as u32, 1, 64, &mut args)
+        self.cc.launch(
+            f,
+            (n * nslots) as u32,
+            1,
+            64,
+            &mut crate::rawcuda::args::l10(
+                &mut p_t, &mut p_b, &mut p_i, &mut p_ns, &mut p_x, &mut p_xs, &mut p_sp, &mut p_o,
+                &mut p_n, &mut p_k,
+            ),
+        )
     }
 
     /// [P11] 전문가-우선 슬롯 순열 발사(프리필 전용) — w4a16_moe_align.
@@ -49,15 +46,15 @@ impl W4a16Dec {
         let (mut p_i, mut p_ns) = (self.moe_idx, nslots as i32);
         let (mut p_g, mut p_c, mut p_o) = (self.moe_gslot, self.moe_gcnt, self.moe_goff);
         let mut p_ne = self.n_experts as i32;
-        let mut args: [*mut std::ffi::c_void; 6] = [
-            (&mut p_i) as *mut _ as *mut _,
-            (&mut p_ns) as *mut _ as *mut _,
-            (&mut p_g) as *mut _ as *mut _,
-            (&mut p_c) as *mut _ as *mut _,
-            (&mut p_o) as *mut _ as *mut _,
-            (&mut p_ne) as *mut _ as *mut _,
-        ];
-        self.cc.launch(f, 1, 1, 256, &mut args)
+        self.cc.launch(
+            f,
+            1,
+            1,
+            256,
+            &mut crate::rawcuda::args::l6(
+                &mut p_i, &mut p_ns, &mut p_g, &mut p_c, &mut p_o, &mut p_ne,
+            ),
+        )
     }
 
     /// [P11] 그룹 mma GEMM(g32) 발사 — grid (전문가 × n타일), M=전문가 슬롯 수.
@@ -82,25 +79,15 @@ impl W4a16Dec {
             n as i32,
             k as i32,
         );
-        let mut args: [*mut std::ffi::c_void; 11] = [
-            (&mut p_t) as *mut _ as *mut _,
-            (&mut p_b) as *mut _ as *mut _,
-            (&mut p_g) as *mut _ as *mut _,
-            (&mut p_c) as *mut _ as *mut _,
-            (&mut p_of) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_xs) as *mut _ as *mut _,
-            (&mut p_sp) as *mut _ as *mut _,
-            (&mut p_o) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-        ];
         self.cc.launch(
             f,
             self.n_experts as u32,
             n.div_ceil(GEMM_GRP_N) as u32,
             256,
-            &mut args,
+            &mut crate::rawcuda::args::l11(
+                &mut p_t, &mut p_b, &mut p_g, &mut p_c, &mut p_of, &mut p_x, &mut p_xs, &mut p_sp,
+                &mut p_o, &mut p_n, &mut p_k,
+            ),
         )
     }
 
@@ -117,15 +104,15 @@ impl W4a16Dec {
         let f = self.cc.function("w4a16_moe_accum")?;
         let (mut p_w, mut p_d, mut p_y) = (w_dev, d_dev, y_dev);
         let (mut p_sp, mut p_ns, mut nn) = (sp as i32, nslots as i32, n as i32);
-        let mut args: [*mut std::ffi::c_void; 6] = [
-            (&mut p_w) as *mut _ as *mut _,
-            (&mut p_d) as *mut _ as *mut _,
-            (&mut p_y) as *mut _ as *mut _,
-            (&mut p_sp) as *mut _ as *mut _,
-            (&mut p_ns) as *mut _ as *mut _,
-            (&mut nn) as *mut _ as *mut _,
-        ];
-        self.cc.launch(f, n.div_ceil(256) as u32, 1, 256, &mut args)
+        self.cc.launch(
+            f,
+            n.div_ceil(256) as u32,
+            1,
+            256,
+            &mut crate::rawcuda::args::l6(
+                &mut p_w, &mut p_d, &mut p_y, &mut p_sp, &mut p_ns, &mut nn,
+            ),
+        )
     }
 
     /// MoE FFN(35B-A3B) — 라우터(bf16 GEMV→호스트 top-k) + 전문가 스트리밍
@@ -165,14 +152,13 @@ impl W4a16Dec {
         let f = self.cc.function("w4a16_moe_topk")?;
         let (mut p_lg, mut p_ix, mut p_wt) = (self.drt, self.moe_idx, self.moe_wt);
         let (mut nn, mut kk) = (self.n_experts as i32, self.top_k as i32);
-        let mut args: [*mut std::ffi::c_void; 5] = [
-            (&mut p_lg) as *mut _ as *mut _,
-            (&mut p_ix) as *mut _ as *mut _,
-            (&mut p_wt) as *mut _ as *mut _,
-            (&mut nn) as *mut _ as *mut _,
-            (&mut kk) as *mut _ as *mut _,
-        ];
-        self.cc.launch(f, 1, 1, 32, &mut args)
+        self.cc.launch(
+            f,
+            1,
+            1,
+            32,
+            &mut crate::rawcuda::args::l5(&mut p_lg, &mut p_ix, &mut p_wt, &mut nn, &mut kk),
+        )
     }
 
     /// 라우터 — bf16 GEMV(원시 xn) → 로짓 판독 → 호스트 top-k 선택.
@@ -319,15 +305,15 @@ impl W4a16Dec {
             let f = self.cc.function("w4a16_moe_topk_t")?;
             let (mut p_lg, mut p_ix, mut p_wt) = (self.drt, self.moe_idx, self.moe_wt);
             let (mut p_t, mut p_n, mut p_k) = (t as i32, n_exp as i32, tk as i32);
-            let mut a: [*mut std::ffi::c_void; 6] = [
-                (&mut p_lg) as *mut _ as *mut _,
-                (&mut p_ix) as *mut _ as *mut _,
-                (&mut p_wt) as *mut _ as *mut _,
-                (&mut p_t) as *mut _ as *mut _,
-                (&mut p_n) as *mut _ as *mut _,
-                (&mut p_k) as *mut _ as *mut _,
-            ];
-            self.cc.launch(f, t.div_ceil(8) as u32, 1, 256, &mut a)?;
+            self.cc.launch(
+                f,
+                t.div_ceil(8) as u32,
+                1,
+                256,
+                &mut crate::rawcuda::args::l6(
+                    &mut p_lg, &mut p_ix, &mut p_wt, &mut p_t, &mut p_n, &mut p_k,
+                ),
+            )?;
         }
         let ns = t * tk;
         // 2) 전문가 배치.

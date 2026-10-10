@@ -715,18 +715,17 @@ impl W4a16Dec {
         let f = self.cc.function("w4a16_gemm_g128")?;
         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx32, self.dy);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, 1i32);
-        let mut args: [*mut std::ffi::c_void; 7] = [
-            (&mut p_q) as *mut _ as *mut _,
-            (&mut p_s) as *mut _ as *mut _,
-            (&mut p_x) as *mut _ as *mut _,
-            (&mut p_y) as *mut _ as *mut _,
-            (&mut p_n) as *mut _ as *mut _,
-            (&mut p_k) as *mut _ as *mut _,
-            (&mut p_t) as *mut _ as *mut _,
-        ];
         // 스테이징 폴백(t=1)도 신 GEMM 커널 계약(8행/블록·512스레드)으로 —
         // 구 계약(grid n/8·block 64)은 재작성 후 1/8행만 계산하는 결함이었다.
-        self.cc.launch(f, n.div_ceil(8) as u32, 1, 512, &mut args)?;
+        self.cc.launch(
+            f,
+            n.div_ceil(8) as u32,
+            1,
+            512,
+            &mut crate::rawcuda::args::l7(
+                &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
+            ),
+        )?;
         let mut ob = vec![0u8; n * 4];
         self.cc.d2h_async(ob.as_mut_ptr(), self.dy, n * 4)?; // 커스텀 스트림 대비
         self.cc.sync()?;
@@ -786,14 +785,13 @@ impl W4a16Dec {
         let f = self.cc.function("ew")?;
         let mut nn = g.len() as i32;
         let (mut a0, mut a1, mut a2) = (self.dewg, self.dewu, self.dew);
-        let mut args: [*mut std::ffi::c_void; 4] = [
-            (&mut a0) as *mut _ as *mut _,
-            (&mut a1) as *mut _ as *mut _,
-            (&mut a2) as *mut _ as *mut _,
-            (&mut nn) as *mut _ as *mut _,
-        ];
-        self.cc
-            .launch(f, g.len().div_ceil(128) as u32, 1, 128, &mut args)?;
+        self.cc.launch(
+            f,
+            g.len().div_ceil(128) as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l4(&mut a0, &mut a1, &mut a2, &mut nn),
+        )?;
         let mut yb = vec![0u8; g.len() * 4];
         self.cc.d2h(&mut yb, self.dew)?;
         self.cc.sync()?;
@@ -1319,18 +1317,12 @@ impl W4a16Dec {
             let f = self.cc.function("head_transpose")?;
             let (mut p_in, mut p_out) = (dtmp, dw);
             let (mut p_n, mut p_k) = (n as i32, k as i32);
-            let mut args: [*mut std::ffi::c_void; 4] = [
-                (&mut p_in) as *mut _ as *mut _,
-                (&mut p_out) as *mut _ as *mut _,
-                (&mut p_n) as *mut _ as *mut _,
-                (&mut p_k) as *mut _ as *mut _,
-            ];
             self.cc.launch(
                 f,
                 k.div_ceil(32) as u32,
                 n.div_ceil(32) as u32,
                 1024,
-                &mut args,
+                &mut crate::rawcuda::args::l4(&mut p_in, &mut p_out, &mut p_n, &mut p_k),
             )?;
             self.cc.sync()
         })();
