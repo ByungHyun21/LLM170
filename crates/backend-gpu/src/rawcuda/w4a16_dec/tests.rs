@@ -194,8 +194,14 @@ fn gemv_tr_mirror() {
 #[test]
 fn attn_splits_mirror() {
     let s = define(include_str!("../assets/attn.cu"), "ATTN_SPLITS_MAX") as usize;
-    assert_eq!(s, ATTN_SPLITS_MAX, "attn.cu ATTN_SPLITS_MAX ↔ ATTN_SPLITS_MAX");
-    assert!(ATTN_SPLITS_D <= ATTN_SPLITS_MAX, "디코드 분할 ≤ 병합 상한");
+    assert_eq!(
+        s, ATTN_SPLITS_MAX,
+        "attn.cu ATTN_SPLITS_MAX ↔ ATTN_SPLITS_MAX"
+    );
+    assert!(
+        ATTN_SPLITS.max(ATTN_SPLITS_D) <= s,
+        "프리필·디코드 분할 ≤ 병합 상한"
+    );
 }
 
 #[test]

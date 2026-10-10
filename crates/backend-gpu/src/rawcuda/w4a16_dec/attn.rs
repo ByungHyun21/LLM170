@@ -128,7 +128,11 @@ impl W4a16Dec {
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
         // [§8.1] 디코드(t≤8)는 분할 32 — 점유 회복(ncu: 192블록 25%).
-        let spv = if t_len <= 8 { ATTN_SPLITS_D } else { ATTN_SPLITS };
+        let spv = if t_len <= 8 {
+            ATTN_SPLITS_D
+        } else {
+            ATTN_SPLITS
+        };
         let mut sp = spv as i32;
         // [§8.2 2026-10-11] 프리필(t>8)은 GQA 패킹 커널 — kv헤드 그룹의 gq개
         // q헤드가 K/V 행 판독을 공유(그리드 y = kv_heads×S). 디코드는 종전
@@ -288,7 +292,11 @@ impl W4a16Dec {
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
         let (qgd, kvd, qdd) = (dm.qg_dim() as u64, dm.kv_dim() as u64, dm.q_dim() as u64);
         // [§8.1] 배치 디코드도 분할 32(t_len=슬롯 수 ≤ 8).
-        let spv = if t_len <= 8 { ATTN_SPLITS_D } else { ATTN_SPLITS };
+        let spv = if t_len <= 8 {
+            ATTN_SPLITS_D
+        } else {
+            ATTN_SPLITS
+        };
         let pstride = (dm.q_heads * spv * 258) as u64;
         let mut sp = spv as i32;
         // prep — 토큰별.
