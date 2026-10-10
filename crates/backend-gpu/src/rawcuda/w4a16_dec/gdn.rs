@@ -172,7 +172,10 @@ impl W4a16Dec {
                     &mut hk, &mut hv, &mut dd, &mut lay, &mut nl,
                 ),
             )?;
-            return Ok(());
+            // [결함수정] return으로 gdn_chain_dev 전체를 빠져나가면 **게이트가
+            // 건너뛰어져**(dgate 미갱신) 검증 토큰이 붕괴한다(실측 328,73,73,73).
+            // akq+scan만 건너뛰고 게이트로 진행한다.
+            skip_scan = true;
         }
         if !skip_scan {
             // [A5-4] FLA 2단: A/KQ 청크 병렬 prepass(값 비트동일) →
