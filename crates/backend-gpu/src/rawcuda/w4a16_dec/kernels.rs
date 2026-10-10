@@ -191,6 +191,35 @@ impl W4a16Dec {
         self.gemv_launch(name, x32_dev, dst)
     }
 
+    /// [A-4] head GEMV([n][k] 원본) — TR 커널 t=1(8행/블록).
+    /// 행별 누산 시퀀스가 1행판과 동일(i=l,l+64,… + f64 트리) → 비트 동일.
+    /// 이득: 블록 내 8행 그룹이 x를 L1 공유 → x L2 재판독 ÷8
+    /// (35B head 실측 1.05ms — x L2 1.2GB가 가중치 622MB와 경합).
+    pub(super) fn head_gemv_launch(&self, x: CUdeviceptr, out: CUdeviceptr) -> Result<(), String> {
+        self.head_gemv_t_launch(x, out, 1)
+    }
+
+    /// [A-4] head GEMV 배치(t≤8) — TR 커널(행=블록 공유).
+    pub(super) fn head_gemv_t_launch(
+        &self,
+        x: CUdeviceptr,
+        out: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_gemv_bf16_t")?;
+        let (mut p_w, mut p_x, mut p_o) = (self.head_w, x, out);
+        let (mut p_n, mut p_k, mut p_t) = (self.head_n as i32, self.head_k as i32, t as i32);
+        self.cc.launch(
+            f,
+            self.head_n.div_ceil(GEMV_TR) as u32,
+            1,
+            (64 * GEMV_TR) as u32,
+            &mut crate::rawcuda::args::l6(
+                &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+            ),
+        )
+    }
+
     /// [R10 2026-10-10] 체인 선형 경로 — 3체인(단독 t=1 / 프리필 t≥2 /
     /// 배치 t≤8)의 차이는 이 열거 하나다. 방출 커널·인자 순서는 종전과 동일
     /// (그래프 캡처 불변식 — 골든·스모크로 검증).

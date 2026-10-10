@@ -1322,31 +1322,15 @@ impl W4a16Dec {
         self.head_out = 0;
         self.head_n = 0;
         self.head_k = 0;
-        // 전치 업로드: 원본 n-major를 임시 버퍼로 올린 뒤 head_transpose로
-        // [k][n] 상주 버퍼를 만든다(판독 응집 — 실측 근거는 assets/head.cu).
-        let dtmp = self.cc.alloc(need)?;
-        if let Err(e) = Self::h2d_chunked(&self.cc, dtmp, &data[..need]) {
-            let _ = self.cc.free(dtmp);
-            return Err(e);
-        }
+        // [A-4 2026-10-10] **원본 [n][k] 레이아웃 유지** — 종전 head_transpose로
+        // [k][n]을 만들어 head_bf16(행당 k직렬·열 판독)으로 읽었으나 실측
+        // DRAM 2.55GB(가중치 1.556GB의 1.64×)·디코드의 12~25%를 차지.
+        // 행=블록 w4a16_gemv_bf16([n][k] 원본 — "토큰 수준 판정" 설계)을
+        // 재사용하면 완전 순차 판독. 로드 전치(3.5ms)도 제거.
         let dw = self.cc.alloc(need)?;
-        let tr = (|| -> Result<(), String> {
-            let f = self.cc.function("head_transpose")?;
-            let (mut p_in, mut p_out) = (dtmp, dw);
-            let (mut p_n, mut p_k) = (n as i32, k as i32);
-            self.cc.launch(
-                f,
-                k.div_ceil(32) as u32,
-                n.div_ceil(32) as u32,
-                1024,
-                &mut crate::rawcuda::args::l4(&mut p_in, &mut p_out, &mut p_n, &mut p_k),
-            )?;
-            self.cc.sync()
-        })();
-        let _ = self.cc.free(dtmp); // 전치 완료 — 임시 해제(피크 VRAM 절감).
-        if let Err(e) = tr {
+        if let Err(e) = Self::h2d_chunked(&self.cc, dw, &data[..need]) {
             let _ = self.cc.free(dw);
-            return Err(format!("head 전치: {e}"));
+            return Err(e);
         }
         let dout = match self.cc.alloc(n * 4).and_then(|p| {
             self.cc.alloc(4).map(|a| {

@@ -69,9 +69,9 @@ use super::{
 #[test]
 fn head_attn_ffma_mirrors() {
     assert_eq!(
-        define(include_str!("../assets/head.cu"), "HEAD_TMAX") as usize,
+        define(include_str!("../assets/gptq4.cu"), "G4_TMAX") as usize,
         BATCH_DEC_MAX,
-        "head.cu HEAD_TMAX ↔ BATCH_DEC_MAX"
+        "gptq4.cu G4_TMAX ↔ BATCH_DEC_MAX(디코드 배치 상한 — head 이관 후)"
     );
     assert_eq!(
         define(include_str!("../assets/attn.cu"), "ATTN_SPLITS_C") as usize,

@@ -641,6 +641,9 @@ __device__ __forceinline__ void gemv_bf16_t_body(
     }
 }
 
+// t 상한 — 호스트 BATCH_DEC_MAX 미러(디코드 배치 상한; GEMV_T_CASE_BF 1..8).
+#define G4_TMAX 8
+
 extern "C" __global__ void w4a16_gemv_bf16_t(
     const unsigned short* __restrict__ w, // [n][k] bf16
     const float* __restrict__ x,          // [t][k] f32(원시 — h2f 왕복 없음)
@@ -648,7 +651,7 @@ extern "C" __global__ void w4a16_gemv_bf16_t(
     int n, int k, int t)
 {
     const int o0 = blockIdx.x * GEMV_TR;
-    if (o0 >= n) {
+    if (o0 >= n || t <= 0 || t > G4_TMAX) {
         return;
     }
     __shared__ double red[GEMV_TR][G4_LANES];
