@@ -53,10 +53,20 @@ fn ppl(args: &[String]) -> Result<String, String> {
     let (mut corpus, mut from_tokens, mut out_path) =
         (None::<String>, None::<String>, None::<String>);
     let (mut ctx, mut limit, mut json) = (8192usize, usize::MAX, false);
+    let mut chunk = 1usize;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--corpus" => corpus = Some(arg(&mut it, "--corpus requires a path")?.to_string()),
+            "--chunk" => {
+                chunk = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--chunk requires a number")?;
+                if !(1..=32).contains(&chunk) {
+                    return Err(format!("--chunk {chunk}: 1..=32(GEMM_FFMA_TMAX)"));
+                }
+            }
             "--from-tokens" => {
                 from_tokens = Some(arg(&mut it, "--from-tokens requires a path")?.to_string())
             }
@@ -123,21 +133,55 @@ fn ppl(args: &[String]) -> Result<String, String> {
     let vocab = head.n_out as usize;
     let mut rows: Vec<Row> = Vec::with_capacity(n - 1);
     let mut nll_sum = 0f64;
-    for i in 0..n - 1 {
-        let row = model.embed_row(toks[i]).map_err(|e| e.to_string())?;
-        let lg: Vec<f32> = if head_gpu {
-            dec.forward_device_head(0, &row)?
-        } else {
-            let xn = dec.forward_device(0, &row)?;
-            let mut lg = vec![0.0f32; vocab];
-            llm170_core::matmul::matmul(&xn, &head, &mut lg);
-            lg
-        };
-        let (am, margin) = argmax_margin(&lg);
-        let tgt = toks[i + 1];
-        let nll = nll_of(&lg, tgt);
-        nll_sum += nll;
-        rows.push((i as u32 + 1, tgt, am, nll, margin));
+    if chunk >= 2 {
+        // [2026-10-10] 청크 경로 — t행 배치 프리필 + 전 위치 로짓 회수
+        // (GEMM t≥2 — t=1 GEMV와 수치 계급이 다름: 방법 B, eval.md 참조).
+        if !head_gpu {
+            return Err("--chunk≥2는 GPU head 필요(CPU head 경로 미지원)".into());
+        }
+        dec.batch_tmax_min = chunk;
+        let mut i = 0usize;
+        while i + 1 < n {
+            let t = (n - i).min(chunk);
+            if t < 2 {
+                break;
+            }
+            let mut rb: Vec<f32> = Vec::with_capacity(t * hp.n_embd);
+            for &tok in &toks[i..i + t] {
+                rb.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);
+            }
+            let lg = dec.forward_prefill_logits(0, &rb, t)?;
+            for r in 0..t {
+                let g = i + r;
+                if g + 1 >= n {
+                    break;
+                }
+                let lr = &lg[r * vocab..(r + 1) * vocab];
+                let (am, margin) = argmax_margin(lr);
+                let tgt = toks[g + 1];
+                let nll = nll_of(lr, tgt);
+                nll_sum += nll;
+                rows.push((g as u32 + 1, tgt, am, nll, margin));
+            }
+            i += t;
+        }
+    } else {
+        for i in 0..n - 1 {
+            let row = model.embed_row(toks[i]).map_err(|e| e.to_string())?;
+            let lg: Vec<f32> = if head_gpu {
+                dec.forward_device_head(0, &row)?
+            } else {
+                let xn = dec.forward_device(0, &row)?;
+                let mut lg = vec![0.0f32; vocab];
+                llm170_core::matmul::matmul(&xn, &head, &mut lg);
+                lg
+            };
+            let (am, margin) = argmax_margin(&lg);
+            let tgt = toks[i + 1];
+            let nll = nll_of(&lg, tgt);
+            nll_sum += nll;
+            rows.push((i as u32 + 1, tgt, am, nll, margin));
+        }
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     let mean = nll_sum / rows.len() as f64;
@@ -145,7 +189,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
     if let Some(p) = &out_path {
         let mut s = String::with_capacity(rows.len() * 40 + 256);
         s.push_str(&format!(
-            "# w4a16-eval dump v1 model={dir} tokens={n} head={} nll_sum={nll_sum:.9} ppl={ppl:.9}\n",
+            "# w4a16-eval dump v1 model={dir} tokens={n} head={} chunk={chunk} nll_sum={nll_sum:.9} ppl={ppl:.9}\n",
             if head_gpu { "gpu" } else { "cpu" }
         ));
         s.push_str("# cols: pos target argmax nll margin\n");
@@ -156,7 +200,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
     }
     if json {
         return Ok(format!(
-            "{{\"model\":\"{dir}\",\"tokens\":{n},\"scored\":{},\"nll_mean\":{mean:.9},\"ppl\":{ppl:.9},\"head\":\"{}\",\"elapsed_ms\":{ms:.1},\"dump\":{}}}",
+            "{{\"model\":\"{dir}\",\"tokens\":{n},\"scored\":{},\"nll_mean\":{mean:.9},\"ppl\":{ppl:.9},\"head\":\"{}\",\"chunk\":{chunk},\"elapsed_ms\":{ms:.1},\"dump\":{}}}",
             rows.len(),
             if head_gpu { "gpu" } else { "cpu" },
             out_path
@@ -166,7 +210,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
         ));
     }
     Ok(format!(
-        "w4a16-eval ppl {dir}\n  토큰 {n} (NLL {}위치) · head {} · 업로드+순회 {ms:.0}ms ({:.1}ms/토큰)\n  NLL평균 {mean:.6} · PPL {ppl:.6}{}",
+        "w4a16-eval ppl {dir}\n  토큰 {n} (NLL {}위치) · head {} · 청크 {chunk} · 업로드+순회 {ms:.0}ms ({:.1}ms/토큰)\n  NLL평균 {mean:.6} · PPL {ppl:.6}{}",
         rows.len(),
         if head_gpu { "GPU" } else { "CPU" },
         ms / rows.len() as f64,

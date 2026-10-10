@@ -400,6 +400,8 @@ pub struct W4a16Dec {
     /// (토큰·임베딩 행·슬롯 pos) + 슬롯집합별 캡처 그래프 캐시.
     dbatch_lg: CUdeviceptr,
     dbatch_am: CUdeviceptr,
+    /// [eval] 배치 버퍼 tmax 하한 — 청크 프리필 로짓 회수용(0=기본 공식).
+    pub batch_tmax_min: usize,
     pin_batch_tok: *mut std::ffi::c_void,
     pin_batch_in: *mut std::ffi::c_void,
     pin_batch_pos: *mut std::ffi::c_void,
@@ -549,6 +551,7 @@ impl W4a16Dec {
             pin_out_len: 0,
             dbatch_lg: 0,
             dbatch_am: 0,
+            batch_tmax_min: 0,
             pin_batch_tok: std::ptr::null_mut(),
             pin_batch_in: std::ptr::null_mut(),
             pin_batch_pos: std::ptr::null_mut(),

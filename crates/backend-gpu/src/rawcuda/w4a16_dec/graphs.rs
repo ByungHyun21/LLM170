@@ -395,6 +395,24 @@ impl W4a16Dec {
         Ok(xn)
     }
 
+    /// [eval 2026-10-10] t행 프리필 로짓 회수 — chain_t all 경로의 로짓
+    /// 모드(t∈2..=BATCH_DEC_MAX, GPU head 필요). 반환 [t][head_n] 행 우선.
+    /// 용도: 통계 eval의 청크 프리필 가속(batch_tmax_min ≥ t 선행).
+    pub fn forward_prefill_logits(
+        &mut self,
+        slot: usize,
+        rows: &[f32],
+        t: usize,
+    ) -> Result<Vec<f32>, String> {
+        if !(2..=GEMM_FFMA_TMAX).contains(&t) {
+            return Err(format!("prefill_logits: t={t} — 2..={GEMM_FFMA_TMAX} 전용"));
+        }
+        if self.head_w == 0 {
+            return Err("prefill_logits: head 미등록 — upload_head 선행".into());
+        }
+        self.chain_t(slot, rows, t, true, true, true)
+    }
+
     /// 1토큰 forward + GPU head — xn 판독 없이 로짓만 회수(왕복 1회).
     pub fn forward_device_head(
         &mut self,

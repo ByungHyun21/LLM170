@@ -23,7 +23,7 @@ impl W4a16Dec {
         if !(2..=8).contains(&t) {
             return Err(format!("spec_verify: t={t} 계약(2..=8)"));
         }
-        let v = self.chain_t(slot, rows, t, false, true)?;
+        let v = self.chain_t(slot, rows, t, false, true, false)?;
         Ok(v.into_iter().map(|x| x as u32).collect())
     }
 

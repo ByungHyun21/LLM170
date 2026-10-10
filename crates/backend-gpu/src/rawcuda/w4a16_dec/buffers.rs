@@ -420,10 +420,11 @@ impl W4a16Dec {
             return Err("batch: head 미등록(업로드 선행)".into());
         }
         // [A-1] 스펙 검증은 단일 슬롯에 t≤8토큰을 통과 — 배치 버퍼를 8로.
-        let tmax =
-            self.n_slots
-                .min(BATCH_DEC_MAX)
-                .max(if self.spec_on { BATCH_DEC_MAX } else { 0 });
+        let tmax = self
+            .n_slots
+            .min(BATCH_DEC_MAX)
+            .max(if self.spec_on { BATCH_DEC_MAX } else { 0 })
+            .max(self.batch_tmax_min);
         if self.dbatch_lg == 0 {
             self.dbatch_lg = self.cc.alloc(tmax * self.head_n * 4)?;
             self.dbatch_am = self.cc.alloc(tmax * 4)?;
