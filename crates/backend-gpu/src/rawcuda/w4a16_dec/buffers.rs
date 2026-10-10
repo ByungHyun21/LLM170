@@ -386,6 +386,18 @@ impl W4a16Dec {
             self.dx32.ptr = self.cc.alloc(mk * 4)?;
             self.dx32.cap = mk;
         }
+        if mk > self.dx16.cap {
+            self.cc.capture_guard("dx16_cap"); // [R12]
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?;
+            if self.dx16.ptr != 0 {
+                self.cc.free(self.dx16.ptr)?;
+            }
+            self.dx16.ptr = 0;
+            self.dx16.cap = 0;
+            self.dx16.ptr = self.cc.alloc(mk * 2)?;
+            self.dx16.cap = mk;
+        }
         if mn > self.dy.cap {
             self.cc.capture_guard("y_cap"); // [R12]
             self.graph_invalidate(); // [P10]

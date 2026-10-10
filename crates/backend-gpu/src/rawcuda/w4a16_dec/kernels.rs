@@ -15,19 +15,37 @@ impl W4a16Dec {
         if w >= self.norm_w_rows {
             return Err(format!("norm: w={w} >= rows={}", self.norm_w_rows));
         }
+        // [marlin-A] xn16 미러 — xn32와 같은 조건으로 함께 기록.
+        let xn16 = if xn32 != 0 {
+            let need = t_len * self.hidden;
+            if need > self.dx16.cap {
+                self.graph_invalidate();
+                self.cc.sync()?;
+                if self.dx16.ptr != 0 {
+                    self.cc.free(self.dx16.ptr)?;
+                }
+                self.dx16.ptr = 0;
+                self.dx16.cap = 0;
+                self.dx16.ptr = self.cc.alloc(need * 2)?;
+                self.dx16.cap = need;
+            }
+            self.dx16.ptr
+        } else {
+            0
+        };
         let f = self.cc.function("norm_resid")?;
         let mut tl = t_len as i32;
         let mut wo = (w * self.hidden) as i32;
         let mut hd = self.hidden as i32;
-        let (mut a0, mut a1, mut a2, mut a3, mut a4) =
-            (x_dev, self.dnw, ab_dev, self.norm.dxn, xn32);
+        let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) =
+            (x_dev, self.dnw, ab_dev, self.norm.dxn, xn32, xn16);
         self.cc.launch(
             f,
             t_len as u32,
             1,
             1024,
-            &mut crate::rawcuda::args::l8(
-                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut tl, &mut wo, &mut hd,
+            &mut crate::rawcuda::args::l9(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut tl, &mut wo, &mut hd,
             ),
         )?;
         Ok(self.norm.dxn)
@@ -79,15 +97,27 @@ impl W4a16Dec {
             self.dx32.ptr = self.cc.alloc(k * 4)?;
             self.dx32.cap = k;
         }
+        // [marlin-A] f16 미러 동시 기록 — mma GEMM A(대역 절반, 비트 동일).
+        if k > self.dx16.cap {
+            self.graph_invalidate();
+            self.cc.sync()?;
+            if self.dx16.ptr != 0 {
+                self.cc.free(self.dx16.ptr)?;
+            }
+            self.dx16.ptr = 0;
+            self.dx16.cap = 0;
+            self.dx16.ptr = self.cc.alloc(k * 2)?;
+            self.dx16.cap = k;
+        }
         let f = self.cc.function("w4a16_cast_x32")?;
         let mut nn = k as i32;
-        let (mut c0, mut c1) = (x_dev, self.dx32.ptr);
+        let (mut c0, mut c1, mut c2) = (x_dev, self.dx32.ptr, self.dx16.ptr);
         self.cc.launch(
             f,
             k.div_ceil(256) as u32,
             1,
             256,
-            &mut crate::rawcuda::args::l3(&mut c0, &mut c1, &mut nn),
+            &mut crate::rawcuda::args::l4(&mut c0, &mut c1, &mut c2, &mut nn),
         )?;
         Ok(self.dx32.ptr)
     }
@@ -105,8 +135,15 @@ impl W4a16Dec {
         // 검증: 27B 4k·35B 600 토큰이 원본과 동일, 골든 유지, 허용오차 ~6e-4.
         // A=xh(f16 — split 경로가 이미 f2h 캐스트 제공), 계약 완화 승인 후.
         if t >= 16 && llm170_diag::flag::ne0("LLM170_TC") {
+            // [marlin-A 2026-10-10] A는 f16 미러(dx16) — 불변식: split 경로
+            // GEMM A는 직전 cast_x32/norm_resid 산출(dx32)이고 dx16이 같은
+            // [t][k] 값을 갖는다(두 경로가 항상 함께 기록). 종전 f32 A는
+            // ncu상 L2 트래픽의 80%였다.
+            if self.dx16.cap < t * k {
+                return Err(format!("gemm: dx16 부족 {} < {}", self.dx16.cap, t * k));
+            }
             let f = self.cc.function("w4a16_gemm_g128_mma")?;
-            let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, xh_dev, y_out);
+            let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx16.ptr, y_out);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
             return self.cc.launch(
                 f,
@@ -292,7 +329,7 @@ impl W4a16Dec {
             return self.cc.launch(
                 f,
                 t.div_ceil(GEMM_MMA_M) as u32,
-                n.div_ceil(GEMM_MMA_N) as u32,
+                n.div_ceil(GEMM_BMMA_N) as u32,
                 256,
                 &mut crate::rawcuda::args::l6(
                     &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,

@@ -29,7 +29,9 @@ pub const CHAIN_TMAX: usize = 512;
 /// [B1/B3 2026-10-10] mma GEMM 타일 미러(assets/gptq4.cu MMA_M/MMA_N —
 /// T1/T2, GRP_M/GRP_N — 그룹(MoE). 정적검사: gemm_mma_mirror 테스트).
 pub const GEMM_MMA_M: usize = 32;
-pub const GEMM_MMA_N: usize = 64;
+pub const GEMM_MMA_N: usize = 128; // [marlin-A2] 64→128: A 재판독 절반(L2 바운드)
+/// bf16 mma GEMM(플레인) 전용 N — 커널 BMMA_N 미러(워프 매핑 N64 고정).
+pub const GEMM_BMMA_N: usize = 64;
 pub const GEMM_GRP_M: usize = 64;
 pub const GEMM_GRP_N: usize = 32;
 /// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
@@ -431,6 +433,9 @@ pub struct W4a16Dec {
     chain_bufs_ok: bool,
     /// t=1 GEMV 입력 x32(h2f 왕복 f32) 버퍼.
     dx32: Buf,
+    /// [marlin-A 2026-10-10] dx32의 f16 미러(split 경로 A — cast/norm이 함께
+    /// 기록). mma GEMM이 이 버퍼를 복사-스테이징 → A L2 대역 절반.
+    dx16: Buf,
     /// t≥2 GEMM 출력 스크래치([t][max_n] f32).
     dyt: Buf,
     // ── GPU head(output.weight bf16) ──
@@ -583,6 +588,7 @@ impl W4a16Dec {
             stg_w2: 0,
             chain_bufs_ok: false,
             dx32: Buf::default(),
+            dx16: Buf::default(),
             dyt: Buf::default(),
             head_w: 0,
             head_n: 0,

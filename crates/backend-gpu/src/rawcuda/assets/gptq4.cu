@@ -19,10 +19,15 @@
 // 계약: 커널 안에서 h2f(xt[i])하던 값을 밖에서 한 번 계산해 두는 것과 동일
 // (f2h→h2f 왕복이 비트를 보존). 반드시 f2h/h2f와 동형 수정.
 extern "C" __global__ void w4a16_cast_x32(const float* __restrict__ in,
-                                          float* __restrict__ out, int n) {
+                                          float* __restrict__ out,
+                                          unsigned short* __restrict__ out16, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        out[i] = h2f(f2h(in[i]));
+        const unsigned short h = f2h(in[i]);
+        out[i] = h2f(h);
+        if (out16 != (unsigned short*)0) {
+            out16[i] = h; // f16 미러 — mma GEMM A(대역 절반, 비트 동일).
+        }
     }
 }
 
@@ -766,10 +771,18 @@ extern "C" __global__ void w4a16_gemv_bf16_t(
 // [B1/B3 2026-10-10] ncu 이중 병목(L2 86% x 재판독 ÷2·ALU 57.7 디퀀트)·KC32
 // 실측: ffn_up t512 1.58→1.35ms. 그룹(MoE) = GRP_M64×GRP_N32(슬롯행 재사용).
 #define MMA_M 32
-#define MMA_N 64
+// [marlin-A2 2026-10-10] 64→128: A 재판독이 n타일 수에 비례 — ncu 실측 L2
+// 4.12GB/런치(= 예상 2.1GB의 2×, L2 90% 바운드). N128이면 n타일 절반 →
+// A 트래픽 절반. (marlin이 thread_n_blocks=16=N256을 쓰는 이유와 동형.)
+#define MMA_N 128
+// [marlin-A2 결함수정] w4a16_gemm_bf16_mma는 자체 N64 고정(워프 매핑 하드코딩)
+// — MMA_N 공유 시 N128에서 상위 절반 미계산(35B 4000 골든 실측).
+#define BMMA_N 64
 #define GRP_M 64
 #define GRP_N 32
-#define MMA_KC 32   // [B1/B3 실험] 64→32: smem 절반 → 점유 2배(지연 노출 완화)
+// [B1/B3 실험] 64→32: smem 절반 → 점유 2배(지연 노출 완화). [marlin-A3
+// 2026-10-10 재실측] 64 재시도 = gemm 338→451ms(점유 2블록/SM 악화) — 32 유지.
+#define MMA_KC 32
 
 __device__ __forceinline__ unsigned short f2bf16(float v) {
     // RNE — __floats2bfloat162_rn과 동일 비트(스모크에서 대조 검증).
@@ -811,10 +824,10 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
     // 8-way 충돌(실측: 패딩 없음 0.056ms = v3와 동일). +8 bf16(16B) 패딩으로
     // 행마다 4뱅크씩 이동 → conflict-free.
     __shared__ unsigned short xs[MMA_M][MMA_KC + 8];
-    __shared__ unsigned short ws[MMA_N][MMA_KC + 8];
+    __shared__ unsigned short ws[BMMA_N][MMA_KC + 8];
     const int tid = threadIdx.x;
     const int m0 = blockIdx.x * MMA_M;
-    const int n0 = blockIdx.y * MMA_N;
+    const int n0 = blockIdx.y * BMMA_N;
     const int lane = tid & 31;
     const int warp = tid >> 5;
     const int g = lane >> 2;
@@ -849,7 +862,7 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
             }
         }
         // ws 스테이징: N64×KC64 bf16 (uint4 벡터화)
-        for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
+        for (int e = tid; e < BMMA_N * MMA_KC / 8; e += 256) {
             const int r = e / (MMA_KC / 8);
             const int c8 = e % (MMA_KC / 8);
             const int gi = k0 + c8 * 8;
@@ -923,18 +936,19 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
 // 비트에 정확히 더해짐) → w=(n−8)·s = (1024+n)·s − 1032·s = hfma2 1회.
 // 니블 순서는 __byte_perm으로 (e0,e1),(e2,e3) 정렬(8원소/u32당 ~8 op).
 // 타일·ldmatrix는 T2와 동일(M32×N64, k청크 32 — B1/B3).
-extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_g128_mma(
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g128_mma(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
     const unsigned short* __restrict__ s,  // [n][k/128] f16 스케일
-    const float* __restrict__ x,           // [t][k] f32 = h2f(f2h(활성)) —
-                                           // split 경로 계약(cast_x32 산출).
-                                           // 커널이 __float2half_rn로 f16화
-                                           // (동일 값 — cast_x32와 같은 반올림).
+    const unsigned short* __restrict__ x,  // [t][k] f16 — split 경로 계약
+                                           // (cast_x32/norm이 h2f(f2h)와 함께
+                                           // 기록한 미러). 종전 f32 재판독이
+                                           // L2의 80%(ncu 실측) → 16B 복사
+                                           // 스테이징으로 대역 절반(marlin A).
     float* __restrict__ out, int n, int k, int t)
 {
     // [지연 은닉] 더블 버퍼 — ncu: Compute 27%·점유 35%·No Eligible 77%(지연
     // 바운드). 스테이징(k+1)과 mma(k)를 겹친다(버퍼 2×27.6KB = 55KB < 100KB).
-    __shared__ unsigned short xs[2][MMA_M][MMA_KC + 8];
+    __shared__ __align__(16) unsigned short xs[2][MMA_M][MMA_KC + 8];
     __shared__ unsigned short ws[2][MMA_N][MMA_KC + 8];
     const int tid = threadIdx.x;
     const int m0 = blockIdx.x * MMA_M;
@@ -946,37 +960,34 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_g128_mma(
     // [B1/B3 2026-10-10] 워프 타일 16×16(M32×N64, 8워프 = 2m×4n) — ncu:
     // ALU 57.7%(디퀀트)·L2 86%(x f32 재판독) 이중 병목. N64로 x 재판독 절반.
     const int mt = (warp >> 2) * 16;
-    const int ntw = (warp & 3) * 16;
+    const int ntw = (warp & 3) * 32; // [marlin-A2] N128: 워프당 32열
     const int k8 = k >> 3;
     const int kg = k >> 7;
-    float c[2][4];
+    float c[4][4];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 16; ++i) {
         ((float*)c)[i] = 0.0f;
     }
     int cur = 0;
     int k0 = 0;
-    // 초기 스테이징(청크 0).
-    for (int e = tid; e < MMA_M * MMA_KC / 4; e += 256) {
-        const int r = e / (MMA_KC / 4);
-        const int c4 = e % (MMA_KC / 4);
-        const int gi = c4 * 4;
-        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        if (m0 + r < t && gi + 3 < k) {
-            v = *reinterpret_cast<const float4*>(&x[(size_t)(m0 + r) * k + gi]);
+    // 초기 스테이징(청크 0) — f16 16B 로드 → 그대로 복사(변환 없음).
+    for (int e = tid; e < MMA_M * MMA_KC / 8; e += 256) {
+        const int r = e / (MMA_KC / 8);
+        const int c8 = e % (MMA_KC / 8);
+        const int gi = c8 * 8;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (m0 + r < t && gi + 7 < k) {
+            v = *reinterpret_cast<const uint4*>(&x[(size_t)(m0 + r) * k + gi]);
         } else if (m0 + r < t) {
-            float t4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            for (int j = 0; j < 4; ++j) {
+            unsigned short t8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (int j = 0; j < 8; ++j) {
                 if (gi + j < k) {
-                    t4[j] = x[(size_t)(m0 + r) * k + gi + j];
+                    t8[j] = x[(size_t)(m0 + r) * k + gi + j];
                 }
             }
-            v = make_float4(t4[0], t4[1], t4[2], t4[3]);
+            v = *reinterpret_cast<const uint4*>(t8);
         }
-        xs[0][r][c4 * 4 + 0] = __half_as_ushort(__float2half_rn(v.x));
-        xs[0][r][c4 * 4 + 1] = __half_as_ushort(__float2half_rn(v.y));
-        xs[0][r][c4 * 4 + 2] = __half_as_ushort(__float2half_rn(v.z));
-        xs[0][r][c4 * 4 + 3] = __half_as_ushort(__float2half_rn(v.w));
+        *reinterpret_cast<uint4*>(&xs[0][r][c8 * 8]) = v;
     }
     for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
         const int r = e / (MMA_KC / 8);
@@ -1007,26 +1018,23 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_g128_mma(
         // 다음 청크 스테이징(다른 버퍼) — mma와 겹친다.
         const int kn = k0 + MMA_KC;
         if (kn < k) {
-            for (int e = tid; e < MMA_M * MMA_KC / 4; e += 256) {
-                const int r = e / (MMA_KC / 4);
-                const int c4 = e % (MMA_KC / 4);
-                const int gi = kn + c4 * 4;
-                float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                if (m0 + r < t && gi + 3 < k) {
-                    v = *reinterpret_cast<const float4*>(&x[(size_t)(m0 + r) * k + gi]);
+            for (int e = tid; e < MMA_M * MMA_KC / 8; e += 256) {
+                const int r = e / (MMA_KC / 8);
+                const int c8 = e % (MMA_KC / 8);
+                const int gi = kn + c8 * 8;
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                if (m0 + r < t && gi + 7 < k) {
+                    v = *reinterpret_cast<const uint4*>(&x[(size_t)(m0 + r) * k + gi]);
                 } else if (m0 + r < t) {
-                    float t4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    for (int j = 0; j < 4; ++j) {
+                    unsigned short t8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                    for (int j = 0; j < 8; ++j) {
                         if (gi + j < k) {
-                            t4[j] = x[(size_t)(m0 + r) * k + gi + j];
+                            t8[j] = x[(size_t)(m0 + r) * k + gi + j];
                         }
                     }
-                    v = make_float4(t4[0], t4[1], t4[2], t4[3]);
+                    v = *reinterpret_cast<const uint4*>(t8);
                 }
-                xs[cur ^ 1][r][c4 * 4 + 0] = __half_as_ushort(__float2half_rn(v.x));
-                xs[cur ^ 1][r][c4 * 4 + 1] = __half_as_ushort(__float2half_rn(v.y));
-                xs[cur ^ 1][r][c4 * 4 + 2] = __half_as_ushort(__float2half_rn(v.z));
-                xs[cur ^ 1][r][c4 * 4 + 3] = __half_as_ushort(__float2half_rn(v.w));
+                *reinterpret_cast<uint4*>(&xs[cur ^ 1][r][c8 * 8]) = v;
             }
             for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
                 const int r = e / (MMA_KC / 8);
@@ -1064,7 +1072,7 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_g128_mma(
             const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
             const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) {
+            for (int nt = 0; nt < 4; ++nt) {
                 const int nb = ntw + nt * 8;
                 const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
                 const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
@@ -1077,7 +1085,7 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_g128_mma(
         }
     }
 #pragma unroll
-    for (int nt = 0; nt < 2; ++nt) {
+    for (int nt = 0; nt < 4; ++nt) {
         const int col = n0 + ntw + nt * 8 + 2 * tt;
         const int r0 = m0 + mt + g;
         if (r0 < t) {
