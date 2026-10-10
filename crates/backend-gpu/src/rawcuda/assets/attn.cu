@@ -714,6 +714,253 @@ extern "C" __global__ void attn_fwd3s_part_q(
     out[2 + tid] = acc;
 }
 
+// ── [C3 2026-10-10] int4 KV — 니블 2개/바이트(저니블=짝수 차원), +8 바이어스 ──
+// 저장 nib = q+8(0..15), 판독 값 = (nib−8)·scale — W4A16 니블 관례와 동일.
+// 스케일은 int8과 같은 행×헤드 f32(absmax/7) — 오차 ≤ scale/2 = absmax/14.
+extern "C" __global__ void attn_prep_q4(
+    const float* __restrict__ qg, const float* __restrict__ kin,
+    const float* __restrict__ vin, const float* __restrict__ qnw,
+    const float* __restrict__ knw, float* __restrict__ qh,
+    unsigned char* __restrict__ kc, unsigned char* __restrict__ vc,
+    float* __restrict__ ksc, float* __restrict__ vsc,
+    const unsigned* __restrict__ pp,
+    int t_len, int layer, int q_heads, int kv_heads, int cap)
+{
+    __shared__ float red[128];
+    __shared__ float hd[256];
+    __shared__ unsigned char stg[256];
+    int t = blockIdx.x;
+    int j = blockIdx.y;
+    int tid = threadIdx.x;
+    int pos = (int)pp[0] + t;
+    long kv_dim = (long)kv_heads * 256;
+
+    if (j < q_heads) {
+        int src = t * (q_heads * 512) + j * 512;
+        hd[tid] = qg[src + tid];
+        hd[tid + 128] = qg[src + 128 + tid];
+        __syncthreads();
+        float ss = hd[tid] * hd[tid] + hd[tid + 128] * hd[tid + 128];
+        red[tid] = ss;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        float inv = 1.0f / sqrtf(red[0] / 256.0f + 1e-6f);
+        hd[tid] = hd[tid] * inv * qnw[layer * 256 + tid];
+        hd[tid + 128] = hd[tid + 128] * inv * qnw[layer * 256 + 128 + tid];
+        __syncthreads();
+        if (tid < 32) {
+            float theta = attn_theta(tid);
+            float ang = (float)pos * theta;
+            float c = attn_cosf(ang), s2 = attn_sinf(ang);
+            float x0 = hd[tid], x1 = hd[tid + 32];
+            hd[tid] = x0 * c - x1 * s2;
+            hd[tid + 32] = x0 * s2 + x1 * c;
+        }
+        __syncthreads();
+        qh[(long)t * (q_heads * 256) + (long)j * 256 + tid] = hd[tid];
+        qh[(long)t * (q_heads * 256) + (long)j * 256 + 128 + tid] = hd[tid + 128];
+    } else {
+        int m = j - q_heads;
+        int src = t * (int)kv_dim + m * 256;
+        hd[tid] = kin[src + tid];
+        hd[tid + 128] = kin[src + 128 + tid];
+        __syncthreads();
+        float ss = hd[tid] * hd[tid] + hd[tid + 128] * hd[tid + 128];
+        red[tid] = ss;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        float inv = 1.0f / sqrtf(red[0] / 256.0f + 1e-6f);
+        hd[tid] = hd[tid] * inv * knw[layer * 256 + tid];
+        hd[tid + 128] = hd[tid + 128] * inv * knw[layer * 256 + 128 + tid];
+        __syncthreads();
+        if (tid < 32) {
+            float theta = attn_theta(tid);
+            float ang = (float)pos * theta;
+            float c = attn_cosf(ang), s2 = attn_sinf(ang);
+            float x0 = hd[tid], x1 = hd[tid + 32];
+            hd[tid] = x0 * c - x1 * s2;
+            hd[tid + 32] = x0 * s2 + x1 * c;
+        }
+        __syncthreads();
+        long rowb = (long)kv_heads * 128; // int4 행 바이트(헤드당 128B)
+        long dst = ((long)layer * cap + pos) * rowb + (long)m * 128;
+        long sr = ((long)layer * cap + pos) * kv_heads + m;
+        // K absmax → int4
+        red[tid] = fmaxf(fabsf(hd[tid]), fabsf(hd[tid + 128]));
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+            __syncthreads();
+        }
+        float ks = red[0] * (1.0f / 7.0f);
+        if (ks == 0.0f) {
+            ks = 1.0f;
+        }
+        float ik = 1.0f / ks;
+        __syncthreads(); // red[0] 판독 완료 후 재사용
+        int q0 = __float2int_rn(hd[tid] * ik);
+        int q1 = __float2int_rn(hd[tid + 128] * ik);
+        q0 = max(-7, min(7, q0));
+        q1 = max(-7, min(7, q1));
+        stg[tid] = (unsigned char)(q0 + 8);
+        stg[tid + 128] = (unsigned char)(q1 + 8);
+        if (tid == 0) {
+            ksc[sr] = ks;
+        }
+        __syncthreads();
+        if (tid < 128) {
+            kc[dst + tid] =
+                (unsigned char)(stg[2 * tid] | (stg[2 * tid + 1] << 4));
+        }
+        // V absmax → int4
+        float v0 = vin[src + tid];
+        float v1 = vin[src + 128 + tid];
+        __syncthreads(); // K 패킹(stg 판독) 완료 후 stg 재사용
+        red[tid] = fmaxf(fabsf(v0), fabsf(v1));
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+            __syncthreads();
+        }
+        float vs = red[0] * (1.0f / 7.0f);
+        if (vs == 0.0f) {
+            vs = 1.0f;
+        }
+        float iv = 1.0f / vs;
+        int w0 = __float2int_rn(v0 * iv);
+        int w1 = __float2int_rn(v1 * iv);
+        w0 = max(-7, min(7, w0));
+        w1 = max(-7, min(7, w1));
+        stg[tid] = (unsigned char)(w0 + 8);
+        stg[tid + 128] = (unsigned char)(w1 + 8);
+        if (tid == 0) {
+            vsc[sr] = vs;
+        }
+        __syncthreads();
+        if (tid < 128) {
+            vc[dst + tid] =
+                (unsigned char)(stg[2 * tid] | (stg[2 * tid + 1] << 4));
+        }
+    }
+}
+
+extern "C" __global__ void attn_fwd3s_part_q4(
+    const float* __restrict__ qh,
+    const unsigned char* __restrict__ kc,
+    const unsigned char* __restrict__ vc,
+    const float* __restrict__ ksc,
+    const float* __restrict__ vsc,
+    float* __restrict__ part,   // [T][q_heads][S][258]: m, l, acc[256]
+    const unsigned* __restrict__ pp,
+    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits)
+{
+    int t = blockIdx.x;
+    int hs = blockIdx.y;
+    int h = hs / splits;
+    int s = hs - h * splits;
+    int tid = threadIdx.x;
+    int gq = q_heads / kv_heads;
+    int kh = h / gq;
+    float scale = 0.0625f;
+    int lim = (int)pp[0] + t + 1;
+    long kv_rowb = (long)kv_heads * 128; // int4 행 바이트
+    long qrow = (long)t * (q_heads * 256) + (long)h * 256;
+    __shared__ float qs[256];
+    __shared__ float sarr[ATTN_CHUNK];
+    __shared__ float reds[256];
+    qs[tid] = qh[qrow + tid];
+    __syncthreads();
+    const int eff = (lim <= 256) ? 1 : splits;
+    float* out = part + (((long)t * q_heads + h) * splits + s) * 258;
+    if (s >= eff) {
+        if (tid == 0) {
+            out[0] = -1e30f;
+            out[1] = 0.0f;
+        }
+        out[2 + tid] = 0.0f;
+        return;
+    }
+    int chunk_rows = (lim + eff - 1) / eff;
+    chunk_rows = ((chunk_rows + ATTN_CHUNK - 1) / ATTN_CHUNK) * ATTN_CHUNK;
+    int lo = s * chunk_rows;
+    int hi = min(lim, lo + chunk_rows);
+    float m_run = -1e30f;
+    float l_run = 0.0f;
+    float acc = 0.0f;
+    for (int base = lo; base < hi; base += ATTN_CHUNK) {
+        int nch = min(ATTN_CHUNK, hi - base);
+        float p = -1e30f;
+        if (tid < nch) {
+            int row = base + tid;
+            const unsigned* k4 = reinterpret_cast<const unsigned*>(
+                kc + ((long)layer * cap + row) * kv_rowb + (long)kh * 128);
+            const float4* q4 = reinterpret_cast<const float4*>(qs);
+            float p0 = 0.0f;
+#pragma unroll 8
+            for (int d4 = 0; d4 < 32; d4++) { // 32워드 × 8 = 256차원
+                const unsigned w = k4[d4];
+                const float4 qa = q4[2 * d4];
+                const float4 qb = q4[2 * d4 + 1];
+                p0 += qa.x * (float)((int)(w & 0xFu) - 8);
+                p0 += qa.y * (float)((int)((w >> 4) & 0xFu) - 8);
+                p0 += qa.z * (float)((int)((w >> 8) & 0xFu) - 8);
+                p0 += qa.w * (float)((int)((w >> 12) & 0xFu) - 8);
+                p0 += qb.x * (float)((int)((w >> 16) & 0xFu) - 8);
+                p0 += qb.y * (float)((int)((w >> 20) & 0xFu) - 8);
+                p0 += qb.z * (float)((int)((w >> 24) & 0xFu) - 8);
+                p0 += qb.w * (float)((int)(w >> 28) - 8);
+            }
+            p = p0 * (scale * ksc[((long)layer * cap + row) * kv_heads + kh]);
+        }
+        sarr[tid] = p;
+        __syncthreads();
+        reds[tid] = (tid < nch) ? sarr[tid] : -1e30f;
+        __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (tid < st) reds[tid] = fmaxf(reds[tid], reds[tid + st]);
+            __syncthreads();
+        }
+        float m_new = fmaxf(m_run, reds[0]);
+        float corr = (m_run <= -1e29f) ? 0.0f : attn_expf(m_run - m_new);
+        __syncthreads();
+        float e = 0.0f;
+        if (tid < nch) {
+            e = attn_expf(sarr[tid] - m_new);
+            sarr[tid] = e;
+        }
+        reds[tid] = e;
+        __syncthreads();
+        for (int st = 128; st > 0; st >>= 1) {
+            if (tid < st) reds[tid] += reds[tid + st];
+            __syncthreads();
+        }
+        acc *= corr;
+#pragma unroll 8
+        for (int i = 0; i < nch; i++) {
+            int row = base + i;
+            const unsigned char byte =
+                vc[((long)layer * cap + row) * kv_rowb + (long)kh * 128 + (tid >> 1)];
+            const int nib = (tid & 1) ? (int)((byte >> 4) & 0xFu) : (int)(byte & 0xFu);
+            acc += sarr[i] * ((float)(nib - 8) *
+                              vsc[((long)layer * cap + row) * kv_heads + kh]);
+        }
+        l_run = l_run * corr + reds[0];
+        m_run = m_new;
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[0] = m_run;
+        out[1] = l_run;
+    }
+    out[2 + tid] = acc;
+}
+
 // 병합: 분할 s=0..S-1 오름차순 고정 — 결정적. m=최대, l·acc를 exp(m_s−m)로
 // 스케일해 합산(수학적으로 단일 경로와 동일, 반올림만 상이 — lim>256 완화 등급).
 extern "C" __global__ void attn_fwd3s_merge(

@@ -153,15 +153,24 @@ else
   echo "[w4a16] FAIL: 가드 외 사유 — ${RUN}/e.log"; fail=1
 fi
 
-# ── 8. F(27B) KVQ(int8 KV, P13) 골든 ──
-note "[8/10] F(27B) KVQ int8 — w4a16-gpu 골든 접두"
+# ── 8. F(27B) KVQ(int8/int4 KV, P13/C3) 골든 ──
+note "[8/10] F(27B) KVQ int8·int4 — w4a16-gpu 골든 접두"
 LLM170_KVQ=1 timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
   > "$RUN/f.out" 2> "$RUN/f.log"
 F=$(grep -m1 '^ tokens:' "$RUN/f.out" | sed 's/^ tokens: //')
 case "$F" in
-  "$GOLDEN"*) note "KVQ 토큰 OK: $(echo "$F" | head -c 60)";;
+  "$GOLDEN"*) note "KVQ int8 토큰 OK: $(echo "$F" | head -c 60)";;
   "") echo "[w4a16] FAIL: KVQ 실행 실패 — ${RUN}/f.log"; fail=1;;
   *) echo "[w4a16] FAIL: KVQ 골든 불일치: $(echo "$F" | head -c 60)"; fail=1;;
+esac
+# [C3] int4 KV — 27B는 골든 일치 실측(35B는 이탈 — int8 권장, plan 기록).
+LLM170_KVQ=4 timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
+  > "$RUN/f4.out" 2> "$RUN/f4.log"
+F4=$(grep -m1 '^ tokens:' "$RUN/f4.out" | sed 's/^ tokens: //')
+case "$F4" in
+  "$GOLDEN"*) note "KVQ int4 토큰 OK: $(echo "$F4" | head -c 60)";;
+  "") echo "[w4a16] FAIL: KVQ int4 실행 실패 — ${RUN}/f4.log"; fail=1;;
+  *) echo "[w4a16] FAIL: KVQ int4 골든 불일치: $(echo "$F4" | head -c 60)"; fail=1;;
 esac
 
 # ── 9. G(27B) 장문 600·4000토큰 — lim>256·다중 청크 ──
