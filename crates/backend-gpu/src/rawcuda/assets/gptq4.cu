@@ -1192,6 +1192,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     const int k8 = k >> 3;
     const int kg = k >> 5; // g32
     __shared__ __align__(16) unsigned short xs[GRP_M][MMA_KC + 8];
+    // [marlin-B 기각 2026-10-10] g32_grp에 레지스터 디큐트 적용 = gemm
+    // 89→101ms(프래그먼트 디큐트 체인이 mma 파이프 차단 — g128판과 달리
+    // cp.async 파이프라인이 없어 겹칠 곳이 없다). 종전 f16 smem 디큐트 유지.
     __shared__ unsigned short ws[GRP_N][MMA_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
     for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
