@@ -24,7 +24,9 @@ extern "C" __global__ void w4a16_cast_x32(const float* __restrict__ in,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         const unsigned short h = f2h(in[i]);
-        out[i] = h2f(h);
+        if (out != (float*)0) {
+            out[i] = h2f(h);
+        }
         if (out16 != (unsigned short*)0) {
             out16[i] = h; // f16 미러 — mma GEMM A(대역 절반, 비트 동일).
         }
@@ -1129,7 +1131,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     const unsigned long long* __restrict__ tab, int base,
     const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
     const unsigned* __restrict__ goff,
-    const float* __restrict__ x, int xstride, int sp,
+    const unsigned short* __restrict__ x, int xstride, int sp,
     float* __restrict__ out, int n, int k)
 {
     const int e = blockIdx.x;
@@ -1142,6 +1144,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     const unsigned* q = (const unsigned*)wp[0];
     const unsigned short* s = (const unsigned short*)wp[1];
     const unsigned* gs = gslot + (size_t)goff[e];
+    // [marlin-A5 2026-10-10] A는 f16 — 호스트가 cast로 기록한 미러(xn/act의
+    // f2h). 종전 f32 재판독(콜당 ~536MB, 16 n타일 재판독) → 절반. 값 동일
+    // (커널 내부 __float2half_rn과 같은 반올림).
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -1151,7 +1156,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     const int ntw = (warp & 1) * 16; // 2 n워프 × 16 = N32(워프 16×16)
     const int k8 = k >> 3;
     const int kg = k >> 5; // g32
-    __shared__ unsigned short xs[GRP_M][MMA_KC + 8];
+    __shared__ __align__(16) unsigned short xs[GRP_M][MMA_KC + 8];
     __shared__ unsigned short ws[GRP_N][MMA_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
     for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
@@ -1163,32 +1168,29 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
         }
         for (int k0 = 0; k0 < k; k0 += MMA_KC) {
             __syncthreads(); // 이전 mma 완료(버퍼 재사용) + 스테이징 가시화
-            // A 스테이징 — 슬롯 r의 x 행(슬롯→토큰: sl/sp·xstride), f16.
-            for (int ee = tid; ee < GRP_M * MMA_KC / 4; ee += 256) {
-                const int r = ee / (MMA_KC / 4);
-                const int c4 = ee % (MMA_KC / 4);
-                const int gi = k0 + c4 * 4;
-                float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            // A 스테이징 — 슬롯 r의 x 행(슬롯→토큰: sl/sp·xstride), f16 복사.
+            for (int ee = tid; ee < GRP_M * MMA_KC / 8; ee += 256) {
+                const int r = ee / (MMA_KC / 8);
+                const int c8 = ee % (MMA_KC / 8);
+                const int gi = k0 + c8 * 8;
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
                 if (rbase + r < cnt) {
                     const unsigned sl = gs[rbase + r];
                     const size_t xoff =
                         (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
-                    if (gi + 3 < k) {
-                        v = *reinterpret_cast<const float4*>(&x[xoff + gi]);
+                    if (gi + 7 < k) {
+                        v = *reinterpret_cast<const uint4*>(&x[xoff + gi]);
                     } else {
-                        float t4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                        for (int j = 0; j < 4; ++j) {
+                        unsigned short t8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                        for (int j = 0; j < 8; ++j) {
                             if (gi + j < k) {
-                                t4[j] = x[xoff + gi + j];
+                                t8[j] = x[xoff + gi + j];
                             }
                         }
-                        v = make_float4(t4[0], t4[1], t4[2], t4[3]);
+                        v = *reinterpret_cast<const uint4*>(t8);
                     }
                 }
-                xs[r][c4 * 4 + 0] = __half_as_ushort(__float2half_rn(v.x));
-                xs[r][c4 * 4 + 1] = __half_as_ushort(__float2half_rn(v.y));
-                xs[r][c4 * 4 + 2] = __half_as_ushort(__float2half_rn(v.z));
-                xs[r][c4 * 4 + 3] = __half_as_ushort(__float2half_rn(v.w));
+                *reinterpret_cast<uint4*>(&xs[r][c8 * 8]) = v;
             }
             // B 스테이징 — g32 디퀀트(스케일 bf16 → f32은 비트 상위 시프트).
             for (int ee = tid; ee < GRP_N * MMA_KC / 8; ee += 256) {
