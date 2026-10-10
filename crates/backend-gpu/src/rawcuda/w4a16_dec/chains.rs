@@ -451,7 +451,7 @@ impl W4a16Dec {
                         t,
                     )?;
                 } else {
-                    // [2026-10-09 P6] xh(=self.dx32)는 norm_resid_dev가 이미
+                    // [2026-10-09 P6] xh(=self.dx32.ptr)는 norm_resid_dev가 이미
                     // h2f(f2h(xn)) 융합 기록(norm.cu xn32 — cast_x32와 비트 동일
                     // 계약, 실측 근거 주석 포함). 종전 cast_x32 재계산은 중복
                     // 런치였다. 값 불변(골든 검증).

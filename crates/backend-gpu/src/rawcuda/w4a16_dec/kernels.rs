@@ -19,7 +19,8 @@ impl W4a16Dec {
         let mut tl = t_len as i32;
         let mut wo = (w * self.hidden) as i32;
         let mut hd = self.hidden as i32;
-        let (mut a0, mut a1, mut a2, mut a3, mut a4) = (x_dev, self.dnw, ab_dev, self.dxn, xn32);
+        let (mut a0, mut a1, mut a2, mut a3, mut a4) =
+            (x_dev, self.dnw, ab_dev, self.norm.dxn, xn32);
         self.cc.launch(
             f,
             t_len as u32,
@@ -29,7 +30,7 @@ impl W4a16Dec {
                 &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut tl, &mut wo, &mut hd,
             ),
         )?;
-        Ok(self.dxn)
+        Ok(self.norm.dxn)
     }
 
     /// 잔차 x_dev에 ab(호스트) 가산 + 노름 xn 판독(스테이징 1행).
@@ -45,8 +46,8 @@ impl W4a16Dec {
         self.ensure_norm_bufs(1)?;
         // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let abb = unsafe { std::slice::from_raw_parts(ab.as_ptr() as *const u8, ab.len() * 4) };
-        self.cc.h2d(self.dab, abb)?;
-        let xn = self.norm_resid_at(w, x_dev, self.dab, 1, 0)?;
+        self.cc.h2d(self.norm.dab, abb)?;
+        let xn = self.norm_resid_at(w, x_dev, self.norm.dab, 1, 0)?;
         let mut bytes = vec![0u8; self.hidden * 4];
         self.cc.d2h(&mut bytes, xn)?;
         self.cc.sync()?;
@@ -60,27 +61,27 @@ impl W4a16Dec {
     // ── ew(silu·mul) ──
 
     /// 활성 f32 → x32(h2f 왕복) 캐스트 1회 — 같은 xn을 쓰는 GEMV들이 공유한다
-    /// (q/k/v·gate/up: 종전 gemv마다 캐스트 = 런치 2배). 반환은 self.dx32.
+    /// (q/k/v·gate/up: 종전 gemv마다 캐스트 = 런치 2배). 반환은 self.dx32.ptr.
     /// [A3 판정 2026-10-10] GEMV 로드에 h2f를 인라인해 이 노드를 없애는 안은
     /// 기각 — 디코드 GEMV +1op/가중치(+15%, ~+2.4ms/토큰) > 런치 절감
     /// (단일 소비자 2회/층 ~0.4ms).
     pub(super) fn cast_x32(&mut self, x_dev: CUdeviceptr, k: usize) -> Result<CUdeviceptr, String> {
-        if k > self.dx32_cap {
+        if k > self.dx32.cap {
             // [P10] 재할당 전 무효화+동기 — 프리필 cast_x32(t×k) 성장이
             // 비행 중 norm xn32 기록을 해제 버퍼로 보낸다(새니타이저 실측).
             self.graph_invalidate();
             self.cc.sync()?;
-            if self.dx32 != 0 {
-                self.cc.free(self.dx32)?;
+            if self.dx32.ptr != 0 {
+                self.cc.free(self.dx32.ptr)?;
             }
-            self.dx32 = 0; // G1
-            self.dx32_cap = 0;
-            self.dx32 = self.cc.alloc(k * 4)?;
-            self.dx32_cap = k;
+            self.dx32.ptr = 0; // G1
+            self.dx32.cap = 0;
+            self.dx32.ptr = self.cc.alloc(k * 4)?;
+            self.dx32.cap = k;
         }
         let f = self.cc.function("w4a16_cast_x32")?;
         let mut nn = k as i32;
-        let (mut c0, mut c1) = (x_dev, self.dx32);
+        let (mut c0, mut c1) = (x_dev, self.dx32.ptr);
         self.cc.launch(
             f,
             k.div_ceil(256) as u32,
@@ -88,7 +89,7 @@ impl W4a16Dec {
             256,
             &mut crate::rawcuda::args::l3(&mut c0, &mut c1, &mut nn),
         )?;
-        Ok(self.dx32)
+        Ok(self.dx32.ptr)
     }
 
     /// t≥2 GEMM 발사 — x f16 [t][k] → out [t][n] 직접 쓰기.
@@ -163,7 +164,7 @@ impl W4a16Dec {
         )
     }
 
-    /// GEMV(x32 입력) → self.dy — 반환 포인터는 다음 gemv가 덮는다(스트림 순서).
+    /// GEMV(x32 입력) → self.dy.ptr — 반환 포인터는 다음 gemv가 덮는다(스트림 순서).
     pub(super) fn gemv_dev_x32(
         &mut self,
         name: &str,
@@ -367,7 +368,7 @@ impl W4a16Dec {
         self.plain_gemv_launch(name, x_dev, dst)
     }
 
-    /// 플레인 GEMV → self.dy.
+    /// 플레인 GEMV → self.dy.ptr.
     pub(super) fn plain_gemv_dev(
         &mut self,
         name: &str,
@@ -446,7 +447,7 @@ impl W4a16Dec {
         )
     }
 
-    /// 노름 1회(디바이스 x·ab) — xn은 self.dxn(다음 노름이 덮는다).
+    /// 노름 1회(디바이스 x·ab) — xn은 self.norm.dxn(다음 노름이 덮는다).
     pub(super) fn norm_resid_dev(
         &mut self,
         w: usize,
