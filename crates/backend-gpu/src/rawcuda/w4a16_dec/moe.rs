@@ -141,10 +141,13 @@ impl W4a16Dec {
         let f = self.cc.function("w4a16_moe_accum")?;
         let (mut p_w, mut p_d, mut p_y) = (w_dev, d_dev, y_dev);
         let (mut p_sp, mut p_ns, mut nn) = (sp as i32, nslots as i32, n as i32);
+        // [FLA-6] grid.y = 출력 행(토큰) — 종전 1은 토큰 루프 직렬(99% 유휴).
+        let spt = if sp > 0 { sp } else { nslots.max(1) };
+        let rows = nslots.div_ceil(spt) as u32;
         self.cc.launch(
             f,
             n.div_ceil(256) as u32,
-            1,
+            rows,
             256,
             &mut crate::rawcuda::args::l6(
                 &mut p_w, &mut p_d, &mut p_y, &mut p_sp, &mut p_ns, &mut nn,

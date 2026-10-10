@@ -1459,22 +1459,25 @@ extern "C" __global__ void w4a16_axpy(float w, const float* __restrict__ x,
     }
 }
 
-// 전문가 가중 누적 — y[i] += Σ_s w[s]·d[s][i] (선택 순서 가산 — CPU 미러).
+// 전문가 가중 누적 — y[row][i] = Σ_{s∈row} w[s]·d[s][i] (선택 순서 가산 — CPU 미러).
+// [FLA-6 2026-10-10] 행(토큰) 병렬 — grid.y = 출력 행. 종전엔 열만 병렬(그리드
+// n/256 = 8블록)로 토큰 루프가 스레드당 4096회 직렬(실측 GPU 99% 유휴,
+// 343µs/런치 = DRAM의 1/10). 가산 순서·값 불변(비트동일).
 extern "C" __global__ void w4a16_moe_accum(const float* __restrict__ w,
                                            const float* __restrict__ d,
                                            float* __restrict__ y, int sp, int nslots,
                                            int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int spt = (sp > 0) ? sp : nslots;
+    const int row = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        const int spt = (sp > 0) ? sp : nslots;
-        for (int ti = 0; ti < nslots; ti += spt) {
-            float acc = 0.0f;
-            const int end = (ti + spt < nslots) ? ti + spt : nslots;
-            for (int s = ti; s < end; ++s) {
-                acc += w[s] * d[(size_t)s * n + i];
-            }
-            y[(size_t)(ti / spt) * n + i] = acc;
+        const int ti = row * spt;
+        const int end = (ti + spt < nslots) ? ti + spt : nslots;
+        float acc = 0.0f;
+        for (int s = ti; s < end; ++s) {
+            acc += w[s] * d[(size_t)s * n + i];
         }
+        y[(size_t)row * n + i] = acc;
     }
 }
 
