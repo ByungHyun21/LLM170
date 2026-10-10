@@ -588,6 +588,59 @@ extern "C" __global__ void w4a16_gemv_bf16(
 }
 
 
+// [B-4 2026-10-10] 다중 세그먼트 GEMV — 같은 x를 공유하는 소형 선형 여럿을
+// 1런치로(소형 커널 런치 플로어 제거: 35B 실측 4런치 ~18µs → 1런치 ~5µs/층).
+// tab[seg] = (w, out, n, k) u64×4(호스트가 층별로 작성). 1블록 = 1행,
+// 세그먼트는 행 누적으로 선택(count≤8 선형 탐색 — 전 블록 공통 테이블).
+// **행별 산술은 w4a16_gemv_bf16과 비트동일**(i=l,l+64… mul·add 분리·tree64).
+extern "C" __global__ void w4a16_gemv_multi(
+    const unsigned long long* __restrict__ tab, // [count][4]: w, out, n, k
+    const float* __restrict__ x,                // 공통 x [k]
+    int count)
+{
+    const int blk = blockIdx.x;
+    int seg = count - 1;
+    int base = 0;
+    for (int s = 0; s < count; ++s) {
+        const int ns = (int)tab[s * 4 + 2];
+        if (blk < base + ns) {
+            seg = s;
+            break;
+        }
+        base += ns;
+    }
+    const int n = (int)tab[seg * 4 + 2];
+    const int o = blk - base;
+    if (o < 0 || o >= n) {
+        return;
+    }
+    const int k = (int)tab[seg * 4 + 3];
+    const unsigned short* w = (const unsigned short*)(size_t)tab[seg * 4 + 0];
+    float* out = (float*)(size_t)tab[seg * 4 + 1];
+    const int l = threadIdx.x;
+    __shared__ double red[G4_LANES];
+    const unsigned short* wrow = w + (size_t)o * k;
+    float acc = 0.0f;
+    for (int i = l; i < k; i += G4_LANES) {
+        acc += b2f(wrow[i]) * x[i];
+    }
+    red[l] = (double)acc;
+    __syncthreads();
+    if (l < 32) {
+        double r = red[l] + red[l + 32];
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(r, off);
+            if (l < off) {
+                r += oth;
+            }
+        }
+        if (l == 0) {
+            out[o] = (float)r;
+        }
+    }
+}
+
 // [A9 2026-10-10] t행 GEMV(플레인 bf16) — 가중 판독 1회를 t행이 공유.
 // 행별 산술은 w4a16_gemv_bf16과 **비트동일**(i 오름차순 mul·add 분리·tree64).
 // t 템플릿 상수 + GEMV_TR행/블록(A9-fix1/2 — split 판 동형).
@@ -1387,7 +1440,9 @@ extern "C" __global__ void w4a16_moe_topk_t(
     int cnt = 0;
     float sum = 0.0f;
     for (int i = lane; i < n; i += 32) {
-        pv[cnt] = expf(l[i] - mx);
+        // [B-4 후속 2026-10-10] 정밀 expf → __expf(단문 실측 10.4µs = 의존성
+        // 지연 지배, IPC 0.36). ew와 같은 완화 등급 — 토큰 골든 판정.
+        pv[cnt] = __expf(l[i] - mx);
         pidx[cnt] = (unsigned)i;
         sum += pv[cnt];
         ++cnt;
@@ -1439,6 +1494,89 @@ extern "C" __global__ void w4a16_moe_topk_t(
     __syncwarp();
     for (int r = lane; r < k; r += 32) {
         wt[(size_t)ti * k + r] = wt[(size_t)ti * k + r] / wsum;
+    }
+}
+
+// [B-4 후속 2026-10-10] 라우터 top-k t=1 전용(n=256 = 32레인×8) — **전부
+// 레지스터**. 종전 topk_t는 pv[32]/pidx[32]의 동적 인덱싱이 로컬 메모리
+// 왕복을 강제 → 단일 워프 임계 경로 2,474명령/21,445사이클(실측 10.2µs,
+// 층당 = 디코드의 ~5%). 산술·환원 순서·동률 규칙은 topk_t와 **비트동일**
+// (softmax 순차 누산·shuffle_xor 16→1·라운드 스캔 순서 그대로).
+#define MOE_TK256_N 256
+#define MOE_TK256_C 8
+
+extern "C" __global__ void w4a16_moe_topk256(
+    const float* __restrict__ lg, // [256]
+    unsigned* __restrict__ idx,   // [k]
+    float* __restrict__ wt,       // [k]
+    int k)
+{
+    const int lane = threadIdx.x & 31;
+    float v[MOE_TK256_C];
+#pragma unroll
+    for (int j = 0; j < MOE_TK256_C; ++j) {
+        v[j] = lg[lane + 32 * j];
+    }
+    float mx = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < MOE_TK256_C; ++j) {
+        mx = fmaxf(mx, v[j]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+    }
+    float p[MOE_TK256_C];
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < MOE_TK256_C; ++j) {
+        p[j] = __expf(v[j] - mx);
+        sum += p[j];
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    }
+    unsigned used = 0u;
+    float wsum = 0.0f;
+    for (int r = 0; r < k; ++r) {
+        float bv = -INFINITY;
+        unsigned bi = 0xffffffffu;
+#pragma unroll
+        for (int j = 0; j < MOE_TK256_C; ++j) {
+            if (used & (1u << j)) {
+                continue;
+            }
+            const unsigned ii = (unsigned)(lane + 32 * j);
+            if (p[j] > bv || (p[j] == bv && ii < bi)) {
+                bv = p[j];
+                bi = ii;
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+            const unsigned oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < MOE_TK256_C; ++j) {
+            if ((unsigned)(lane + 32 * j) == bi) {
+                used |= (1u << j);
+            }
+        }
+        if (lane == 0) {
+            idx[r] = bi;
+            wt[r] = bv;
+        }
+        wsum += bv;
+    }
+    __syncwarp();
+    for (int r = lane; r < k; r += 32) {
+        wt[r] = wt[r] / wsum;
     }
 }
 

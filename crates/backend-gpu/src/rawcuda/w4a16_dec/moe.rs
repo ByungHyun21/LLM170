@@ -135,7 +135,10 @@ impl W4a16Dec {
         // 스트리밍은 전문가 파일 스테이징에 호스트 선택이 필요해 종전 경로 유지
         // (zero_dev도 axpy 누적 전용 — 상주는 moe_accum이 전 행 덮어씀, P2).
         if self.moe_resident {
-            self.moe_route_dev(il, xn)?;
+            // [B-4 2026-10-10] 라우터 게이트 + shared gate/up를 1런치로
+            // (동일 x=xn·상호 무의존) → topk는 게이트 결과(drt) 소비.
+            self.moe_multi_gate(il, xn)?;
+            self.moe_topk_dev()?;
             self.moe_experts_batch(il, xn, self.top_k)?;
         } else {
             let sel = self.moe_route(il, xn)?;
@@ -146,13 +149,27 @@ impl W4a16Dec {
         Ok(self.dmo.ptr)
     }
 
-    /// 라우터 디바이스 상주(P1) — gate GEMV → w4a16_moe_topk(idx/wt 디바이스).
-    pub(super) fn moe_route_dev(&mut self, il: usize, xn: CUdeviceptr) -> Result<(), String> {
-        self.plain_gemv_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt.ptr)?;
+    /// 라우터 top-k 디바이스(P1) — 게이트 GEMV는 [B-4] 다중 세그먼트 런치가
+    /// 수행(moe_multi_gate). 여기는 drt 로짓 → idx/wt 선택만.
+    pub(super) fn moe_topk_dev(&mut self) -> Result<(), String> {
         // [B-3 2026-10-10] t=1도 **워프 병렬 topk_t** — 종전 단일 스레드
         // (w4a16_moe_topk, 32스레드 블록)는 128전문가 softmax+8라운드를
         // 한 스레드가 순차 처리(층당 수µs × 40층). 시맨틱은 동일 미러
         // (gptq4.cu 주석) — 골든으로 판정.
+        // [B-4 후속 2026-10-10] n=128은 레지스터 전용 커널(비트동일) —
+        // 종전 topk_t t=1 실측 10.2µs(2,474명령·로컬메모리 왕복).
+        if self.n_experts == 256 {
+            let f = self.cc.function("w4a16_moe_topk256")?;
+            let (mut p_lg, mut p_ix, mut p_wt) = (self.drt.ptr, self.moe_idx, self.moe_wt);
+            let mut p_k = self.top_k as i32;
+            return self.cc.launch(
+                f,
+                1,
+                1,
+                32,
+                &mut crate::rawcuda::args::l4(&mut p_lg, &mut p_ix, &mut p_wt, &mut p_k),
+            );
+        }
         let f = self.cc.function("w4a16_moe_topk_t")?;
         let (mut p_lg, mut p_ix, mut p_wt) = (self.drt.ptr, self.moe_idx, self.moe_wt);
         let (mut p_t, mut p_n, mut p_k) = (1i32, self.n_experts as i32, self.top_k as i32);
@@ -160,7 +177,7 @@ impl W4a16Dec {
             f,
             1,
             1,
-            256,
+            32,
             &mut crate::rawcuda::args::l6(
                 &mut p_lg, &mut p_ix, &mut p_wt, &mut p_t, &mut p_n, &mut p_k,
             ),
@@ -265,16 +282,92 @@ impl W4a16Dec {
         Ok(())
     }
 
+    /// [B-4 2026-10-10] 다중 세그먼트 GEMV 테이블 — 라우터 게이트 + shared
+    /// gate/up(x=xn 공통·상호 무의존)을 1런치로 묶는다. 소형 커널 런치
+    /// 플로어 제거(35B 실측: 게이트+shared 4런치 ~18µs → 1런치 ~5µs, 층당).
+    /// 포인터는 버퍼 수명 내 불변 — 그래프 캡처가 테이블을 참조한다.
+    pub(super) fn build_moe_multi_tab(&mut self) -> Result<(), String> {
+        let nl = self.n_layers;
+        let (d0, d1) = (self.dchain[0], self.dchain[1]);
+        let drt = self.drt.ptr;
+        let shared = self.shared_ffn > 0;
+        let mut ent: Vec<u64> = Vec::with_capacity(nl * 3 * 4);
+        let mut rows: Vec<u32> = Vec::with_capacity(nl);
+        for il in 0..nl {
+            let (gw, gn, gk) = self.plain_spec(&format!("blk.{il}.moe_gate.weight"))?;
+            ent.extend([gw, drt, gn as u64, gk as u64]);
+            let mut r = gn as u32;
+            if shared {
+                for (suf, out) in [("moe_shared_gate", d0), ("moe_shared_up", d1)] {
+                    let (w, n, k) = self.plain_spec(&format!("blk.{il}.{suf}.weight"))?;
+                    ent.extend([w, out, n as u64, k as u64]);
+                    r += n as u32;
+                }
+            } else {
+                ent.extend([0u64; 8]);
+            }
+            rows.push(r);
+        }
+        let bytes = ent.len() * 8;
+        if self.moe_multi_tab != 0 {
+            self.cc.free(self.moe_multi_tab)?;
+            self.moe_multi_tab = 0;
+        }
+        let p = self.cc.alloc(bytes)?;
+        let mut buf: Vec<u8> = Vec::with_capacity(bytes);
+        for v in &ent {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Err(e) = Self::h2d_chunked(&self.cc, p, &buf) {
+            let _ = self.cc.free(p);
+            return Err(e);
+        }
+        self.moe_multi_tab = p;
+        self.moe_multi_rows = rows;
+        Ok(())
+    }
+
+    /// [B-4] 다중 세그먼트 GEMV 런치(라우터 게이트 + shared gate/up).
+    pub(super) fn moe_multi_gate(&mut self, il: usize, xn: CUdeviceptr) -> Result<(), String> {
+        self.ensure_moe_bufs()?;
+        let rows = *self
+            .moe_multi_rows
+            .get(il)
+            .ok_or("moe: 다중 세그먼트 테이블 미작성")?;
+        if rows == 0 {
+            return Ok(());
+        }
+        let f = self.cc.function("w4a16_gemv_multi")?;
+        let (mut p_tab, mut p_x, mut p_c) =
+            (self.moe_multi_tab + (il as u64) * 3 * 4 * 8, xn, 3i32);
+        self.cc.launch(
+            f,
+            rows,
+            1,
+            64,
+            &mut crate::rawcuda::args::l3(&mut p_tab, &mut p_x, &mut p_c),
+        )
+    }
+
     /// shared 전문가 — sigmoid(sgate·xn)·down(silu(gate·xn)·up·xn).
+    /// 상주 경로는 게이트/업이 다중 세그먼트 런치에 포함 — 꼬리만 수행.
     pub(super) fn moe_shared(&mut self, il: usize, xn: CUdeviceptr) -> Result<(), String> {
         if self.shared_ffn == 0 {
             return Ok(());
         }
+        if !self.moe_resident {
+            let [s0, s1, ..] = self.dchain;
+            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_gate.weight"), xn, s0)?;
+            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_up.weight"), xn, s1)?;
+        }
+        self.moe_shared_tail(il, xn)
+    }
+
+    /// shared 꼬리 — ew(silu·mul) → down → sgate → 누적.
+    fn moe_shared_tail(&mut self, il: usize, xn: CUdeviceptr) -> Result<(), String> {
         let h = self.hidden;
         let sf = self.shared_ffn;
         let [s0, s1, _s1b, s2, s3] = self.dchain;
-        self.plain_gemv_launch(&format!("blk.{il}.moe_shared_gate.weight"), xn, s0)?;
-        self.plain_gemv_launch(&format!("blk.{il}.moe_shared_up.weight"), xn, s1)?;
         self.ew_dev(s0, s1, s2, sf)?;
         self.plain_gemv_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3)?;
         self.plain_gemv_launch(
