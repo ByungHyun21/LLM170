@@ -89,6 +89,21 @@ impl W4a16Dec {
             .collect())
     }
 
+    /// [A-1 진단] 슬롯 GDN 상태 덤프(d2h) — trio vs spec scan 대조용.
+    pub fn spec_dump_state(&mut self, slot: usize) -> Result<Vec<f32>, String> {
+        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
+        let bytes = dm.n_gdn * dm.h_v * dm.d * dm.d * 4;
+        let mut b = vec![0u8; bytes];
+        self.cc.d2h(&mut b, self.dgst + st_slot * 4)?;
+        self.cc.sync()?;
+        Ok(b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    }
+
     /// [A-1 진단] 슬롯 GDN 상태 저장/복원(전 층·헤드) — 검증 대조용.
     pub fn spec_save_state(&mut self, slot: usize) -> Result<(), String> {
         let dm = self.gdn.ok_or("GDN: 형상 미등록")?;

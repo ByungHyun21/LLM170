@@ -725,6 +725,8 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                 t1_4.push(cur);
             }
         }
+        // trio(4×t=1)의 최종 상태 저장 — spec scan 대조의 정답 참조.
+        let s_trio = dec.spec_dump_state(0)?;
         dec.spec_load_state(0)?;
         dec.spec_rewind_pos(0, 4)?;
         let mut rows: Vec<f32> = Vec::with_capacity(4 * hp.n_embd);
@@ -744,15 +746,60 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
         let b = dec.spec_dump_outv(nv)?;
         dec.spec_set_scan(true);
         let mut mx = 0.0f32;
+        let mut mi = 0usize;
         for i in 0..nv {
             let d = (a[i] - b[i]).abs();
             if d > mx {
                 mx = d;
+                mi = i;
             }
         }
         eprintln!(
-            "[spec-check] o_lc maxdiff(on-off) = {mx:.6e} (첫 on={:.6} off={:.6})",
-            a[0], b[0]
+            "[spec-check] o_lc maxdiff(on-off) = {mx:.6e} @i={mi}(t={} h={} d={}) on={:.6e} off={:.6e}",
+            mi / (32 * 128),
+            (mi / 128) % 32,
+            mi % 128,
+            a[mi],
+            b[mi]
+        );
+        for t in 0..4 {
+            let mut tm = 0.0f32;
+            for i in t * 32 * 128..(t + 1) * 32 * 128 {
+                tm = tm.max((a[i] - b[i]).abs());
+            }
+            eprintln!("[spec-check] t={t} maxdiff={tm:.6e}");
+        }
+        // [핵심 대조] spec scan(t=4) 최종 상태 vs trio(4×t=1) 최종 상태.
+        // + 정상 scan(WY) 경로도 같은 비교 — 공식 차이 규모 판별.
+        dec.spec_load_state(0)?;
+        dec.spec_rewind_pos(0, 4)?;
+        dec.spec_set_scan(false);
+        let _ = dec.spec_verify(0, &rows, 4)?;
+        let s_wy = dec.spec_dump_state(0)?;
+        dec.spec_set_scan(true);
+        dec.spec_load_state(0)?;
+        dec.spec_rewind_pos(0, 4)?;
+        let _ = dec.spec_verify(0, &rows, 4)?;
+        let mut wmx = 0.0f32;
+        for i in 0..s_trio.len().min(s_wy.len()) {
+            wmx = wmx.max((s_trio[i] - s_wy[i]).abs());
+        }
+        eprintln!("[spec-check] state maxdiff(trio-WY) = {wmx:.6e}");
+        let s_spec = dec.spec_dump_state(0)?;
+        let mut smx = 0.0f32;
+        let mut smi = 0usize;
+        for i in 0..s_trio.len().min(s_spec.len()) {
+            let d = (s_trio[i] - s_spec[i]).abs();
+            if d > smx {
+                smx = d;
+                smi = i;
+            }
+        }
+        eprintln!(
+            "[spec-check] state maxdiff(trio-spec) = {smx:.6e} @i={smi} (층 {}) trio={:.6e} spec={:.6e}",
+            smi / (32 * 128 * 128),
+            s_trio[smi],
+            s_spec[smi]
         );
         dec.spec_load_state(0)?;
         dec.spec_rewind_pos(0, 4)?;
