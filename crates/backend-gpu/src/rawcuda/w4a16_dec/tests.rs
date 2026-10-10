@@ -1,3 +1,4 @@
+use super::mem::realloc_fields;
 use super::*;
 use std::cell::{Cell, RefCell};
 
