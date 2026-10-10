@@ -951,6 +951,33 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
 // 비트에 정확히 더해짐) → w=(n−8)·s = (1024+n)·s − 1032·s = hfma2 1회.
 // 니블 순서는 __byte_perm으로 (e0,e1),(e2,e3) 정렬(8원소/u32당 ~8 op).
 // 타일·ldmatrix는 T2와 동일(M32×N64, k청크 32 — B1/B3).
+// [marlin-C 2026-10-10] cp.async 스테이징 — 스테이징 지연을 compute와 겹친다
+// (ncu: L2 62%·No Eligible 62% = 지연 바운드, 점유 3블록).
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
+    const unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(sa), "l"(gmem));
+}
+__device__ __forceinline__ void cp_async4(void* smem, const void* gmem) {
+    const unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(sa), "l"(gmem));
+}
+
+// [marlin-B 2026-10-10] 패킹 u32에서 (2tt, 2tt+1) 니블 2개 → f16 쌍(u32).
+// 종전 smem f16 디큐트 `__float2half_rn((float)(nib-8)*scf)`와 **비트동일**:
+// hsub2(1024+n)-(1024+8) = n-8 정확(f16 정수) → f32 곱 → RNE. 스테이징이
+// 순수 복사가 되고 smem B가 1/4(L1·smem 압력↓).
+__device__ __forceinline__ unsigned deq_pair_b(unsigned qw, int tt, float sc) {
+    const unsigned sub8 = 0x64086408u; // half2(1024+8)
+    const unsigned byte = (qw >> (8 * tt)) & 0xFFu;
+    unsigned w = ((byte & 0xFu) | ((byte & 0xF0u) << 12)) & 0x000f000fu;
+    w |= 0x64006400u;
+    __half2 h = __hsub2(*reinterpret_cast<const __half2*>(&w),
+                        *reinterpret_cast<const __half2*>(&sub8));
+    const float2 f = __half22float2(h);
+    const __half2 r = __float22half2_rn(make_float2(f.x * sc, f.y * sc));
+    return *reinterpret_cast<const unsigned*>(&r);
+}
+
 extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
     const unsigned short* __restrict__ s,  // [n][k/128] f16 스케일
@@ -964,7 +991,9 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
     // [지연 은닉] 더블 버퍼 — ncu: Compute 27%·점유 35%·No Eligible 77%(지연
     // 바운드). 스테이징(k+1)과 mma(k)를 겹친다(버퍼 2×27.6KB = 55KB < 100KB).
     __shared__ __align__(16) unsigned short xs[2][MMA_M][MMA_KC + 8];
-    __shared__ unsigned short ws[2][MMA_N][MMA_KC + 8];
+    // [marlin-B] B는 패킹 int4 그대로(디큐트는 레지스터, mma 전) + 청크 스케일.
+    __shared__ unsigned wsp[2][MMA_N][MMA_KC / 8];
+    __shared__ float ssm[2][MMA_N];
     const int tid = threadIdx.x;
     const int m0 = blockIdx.x * MMA_M;
     const int n0 = blockIdx.y * MMA_N;
@@ -990,9 +1019,8 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
         const int r = e / (MMA_KC / 8);
         const int c8 = e % (MMA_KC / 8);
         const int gi = c8 * 8;
-        uint4 v = make_uint4(0u, 0u, 0u, 0u);
         if (m0 + r < t && gi + 7 < k) {
-            v = *reinterpret_cast<const uint4*>(&x[(size_t)(m0 + r) * k + gi]);
+            cp_async16(&xs[0][r][c8 * 8], &x[(size_t)(m0 + r) * k + gi]);
         } else if (m0 + r < t) {
             unsigned short t8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             for (int j = 0; j < 8; ++j) {
@@ -1000,46 +1028,41 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
                     t8[j] = x[(size_t)(m0 + r) * k + gi + j];
                 }
             }
-            v = *reinterpret_cast<const uint4*>(t8);
+            *reinterpret_cast<uint4*>(&xs[0][r][c8 * 8]) =
+                *reinterpret_cast<const uint4*>(t8);
+        } else {
+            *reinterpret_cast<uint4*>(&xs[0][r][c8 * 8]) = make_uint4(0u, 0u, 0u, 0u);
         }
-        *reinterpret_cast<uint4*>(&xs[0][r][c8 * 8]) = v;
     }
-    for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
+    asm volatile("cp.async.commit_group;");
+    for (int e = tid; e < MMA_N * (MMA_KC / 8); e += 256) {
         const int r = e / (MMA_KC / 8);
         const int c8 = e % (MMA_KC / 8);
         const int gi = c8 * 8;
         const bool live = (n0 + r < n) && (gi + 7 < k);
-        unsigned short scb = 0;
-        if (n0 + r < n) {
-            scb = s[(size_t)(n0 + r) * kg + (gi >> 7)];
-        }
-        const float scf = __half2float(*reinterpret_cast<const __half*>(&scb));
-        const unsigned qw = live ? q[(size_t)(n0 + r) * k8 + (gi >> 3)] : 0u;
-        if (live) {
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
-                ws[0][r][c8 * 8 + j] = __half_as_ushort(__float2half_rn((float)nib * scf));
-            }
-        } else {
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                ws[0][r][c8 * 8 + j] = 0;
-            }
-        }
+        // 패딩 니블 = 8(값 0) — 0u면 (0-8)*sc ≠ 0이 된다.
+        wsp[0][r][c8] = live ? q[(size_t)(n0 + r) * k8 + (gi >> 3)] : 0x88888888u;
     }
+    for (int e = tid; e < MMA_N; e += 256) {
+        unsigned short scb = 0;
+        if (n0 + e < n) {
+            scb = s[(size_t)(n0 + e) * kg];
+        }
+        ssm[0][e] = __half2float(*reinterpret_cast<const __half*>(&scb));
+    }
+    // 초기 스테이지 완료 대기 + 가시화(이후 루프가 관리).
+    asm volatile("cp.async.wait_group 0;");
+    __syncthreads();
     for (; k0 < k; k0 += MMA_KC, cur ^= 1) {
-        __syncthreads(); // 이전 compute 완료(버퍼 재사용) + 스테이징 가시화
-        // 다음 청크 스테이징(다른 버퍼) — mma와 겹친다.
+        // 다음 청크 스테이징을 cp.async로 발사 — 아래 mma와 겹친다.
         const int kn = k0 + MMA_KC;
         if (kn < k) {
             for (int e = tid; e < MMA_M * MMA_KC / 8; e += 256) {
                 const int r = e / (MMA_KC / 8);
                 const int c8 = e % (MMA_KC / 8);
                 const int gi = kn + c8 * 8;
-                uint4 v = make_uint4(0u, 0u, 0u, 0u);
                 if (m0 + r < t && gi + 7 < k) {
-                    v = *reinterpret_cast<const uint4*>(&x[(size_t)(m0 + r) * k + gi]);
+                    cp_async16(&xs[cur ^ 1][r][c8 * 8], &x[(size_t)(m0 + r) * k + gi]);
                 } else if (m0 + r < t) {
                     unsigned short t8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                     for (int j = 0; j < 8; ++j) {
@@ -1047,35 +1070,32 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
                             t8[j] = x[(size_t)(m0 + r) * k + gi + j];
                         }
                     }
-                    v = *reinterpret_cast<const uint4*>(t8);
+                    *reinterpret_cast<uint4*>(&xs[cur ^ 1][r][c8 * 8]) =
+                        *reinterpret_cast<const uint4*>(t8);
+                } else {
+                    *reinterpret_cast<uint4*>(&xs[cur ^ 1][r][c8 * 8]) =
+                        make_uint4(0u, 0u, 0u, 0u);
                 }
-                *reinterpret_cast<uint4*>(&xs[cur ^ 1][r][c8 * 8]) = v;
             }
-            for (int e = tid; e < MMA_N * MMA_KC / 8; e += 256) {
+            for (int e = tid; e < MMA_N * (MMA_KC / 8); e += 256) {
                 const int r = e / (MMA_KC / 8);
                 const int c8 = e % (MMA_KC / 8);
                 const int gi = kn + c8 * 8;
                 const bool live = (n0 + r < n) && (gi + 7 < k);
-                unsigned short scb = 0;
-                if (n0 + r < n) {
-                    scb = s[(size_t)(n0 + r) * kg + (gi >> 7)];
-                }
-                const float scf = __half2float(*reinterpret_cast<const __half*>(&scb));
-                const unsigned qw = live ? q[(size_t)(n0 + r) * k8 + (gi >> 3)] : 0u;
                 if (live) {
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
-                        ws[cur ^ 1][r][c8 * 8 + j] =
-                            __half_as_ushort(__float2half_rn((float)nib * scf));
-                    }
+                    cp_async4(&wsp[cur ^ 1][r][c8], &q[(size_t)(n0 + r) * k8 + (gi >> 3)]);
                 } else {
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        ws[cur ^ 1][r][c8 * 8 + j] = 0;
-                    }
+                    wsp[cur ^ 1][r][c8] = 0x88888888u;
                 }
             }
+            for (int e = tid; e < MMA_N; e += 256) {
+                unsigned short scb = 0;
+                if (n0 + e < n) {
+                    scb = s[(size_t)(n0 + e) * kg + (kn >> 7)];
+                }
+                ssm[cur ^ 1][e] = __half2float(*reinterpret_cast<const __half*>(&scb));
+            }
+            asm volatile("cp.async.commit_group;");
         }
 #pragma unroll
         for (int ks = 0; ks < MMA_KC / 16; ++ks) {
@@ -1093,8 +1113,10 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt) {
                     const int nb = ntw + nt * 8;
-                    const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
-                    const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
+                    // [marlin-B] 레지스터 디큐트(비트동일 — deq_pair_b 주석).
+                    const float bsc = ssm[cur][nb + g];
+                    const unsigned b0 = deq_pair_b(wsp[cur][nb + g][kb >> 3], tt, bsc);
+                    const unsigned b1 = deq_pair_b(wsp[cur][nb + g][(kb >> 3) + 1], tt, bsc);
                     asm volatile(
                         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -1104,6 +1126,9 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
                 }
             }
         }
+        // 다음 스테이지 완료 대기 + 가시화(다음 반복 compute 전).
+        asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
     }
 #pragma unroll
     for (int mf = 0; mf < 2; ++mf) {
