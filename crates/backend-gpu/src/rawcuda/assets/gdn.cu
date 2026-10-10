@@ -98,9 +98,18 @@ __device__ __forceinline__ double gdn_exp_d(double x)
     return p * scale;
 }
 
+// [FLA-8 채택 2026-10-10] f64 폴리 → __expf/__logf(2ulp) — eval 판정 후 채택.
+// 근거: f64 트랜센던털이 GDN 소형 커널들의 지배 비용(conv 201µs/런치 = f64
+// 파이프 2/cyc 포화, gate·akq 동형). 실측: 35B 프리필 145→132ms(-9%) ·
+// 27B 377→357ms(-5%) · scan 11.5→9.5ms · conv·gate 대폭 감소.
+// 판정(방법 B, eval.md): 골든 6종(단문·35토큰·600·4K ×2모델) 전부 통과 —
+// 편차가 f16 저장 경계에 흡수. 장문 PPL 델타 +0.024%(35B)/−0.002%(27B),
+// 일치율 97.7%/99.9% — 방법 자체 노이즈 대역. 종전 기각(conv-only fast exp
+// → 600 플립)은 eval 이전 판정 — 전면 적용은 통과(구 기록: 속도 플랜).
+// 도메인 가드(±708/709)는 __expf가 자연 처리(언더플로 0·오버플로 inf).
 __device__ __forceinline__ float gdn_expf(float x)
 {
-    return (float)gdn_exp_d((double)x);
+    return __expf(x);
 }
 
 __device__ __forceinline__ double gdn_log_d(double y)
@@ -122,9 +131,10 @@ __device__ __forceinline__ double gdn_log_d(double y)
     return 2.0 * s * q + (double)e * ln2;
 }
 
+// [FLA-8 채택] __logf(2ulp) — softplus 게이트 경로(값 계약은 exp와 동일 계급).
 __device__ __forceinline__ float gdn_logf(float y)
 {
-    return (float)gdn_log_d((double)y);
+    return __logf(y);
 }
 
 // gdn_conv — 채널별 4탭(링 3 + 현재) conv + silu. [2026-10-10 토큰축 병렬화]
