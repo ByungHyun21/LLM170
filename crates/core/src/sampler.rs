@@ -144,51 +144,133 @@ impl Sampler {
         if self.params.temperature <= 0.0 {
             return crate::matmul::greedy_from(&l);
         }
-        // 후보 = (인덱스, 로짓) — 정렬용
-        let mut cand: Vec<(u32, f32)> = l
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| v.is_finite())
-            .map(|(i, &v)| (i as u32, v))
-            .collect();
+        // [E-1 후속 2026-10-10] **max−20 컷 경로** → 미달 시 전량 폴백.
+        // 서빙 실측: 종전 248K 전량 후보 구축+정렬+꼬리 exp = 1.6~2.2ms/토큰.
+        if let Some(tok) = self.sample_core(&l, true) {
+            return tok;
+        }
+        self.sample_core(&l, false).unwrap_or(0)
+    }
+
+    /// 샘플링 핵심. `cut=true`: max−20(exp(−20)=2.06e-9) 초과만 후보로 하고
+    /// 그 이하 항은 exp 호출 없이 **상한 가산**(항수×2.06e-9 — sum 상대
+    /// ~1e-7; 경계가 민감한 평탄 분포에선 항수가 커져 상대오차 자체가
+    /// 작아진다). `cut=false`: 전량(폴백 — 평탄 분포에서 nucleus가 컷
+    /// 안에서 안 닫힐 때). 반환 None = 컷 경로에서 nucleus 미달.
+    /// 그 외 시맨틱(정렬·동률·top_k/top_p/min_p·추출)은 구 전량 구현과 동일.
+    fn sample_core(&mut self, l: &[f32], cut: bool) -> Option<u32> {
+        const CUT_D: f32 = 20.0;
+        let cmp_desc = |a: &(u32, f32), b: &(u32, f32)| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        // 후보 구축(+ 컷 이하 개수).
+        let mut n_below = 0usize;
+        let mut cand: Vec<(u32, f32)> = if cut {
+            let mut mx = f32::NEG_INFINITY;
+            for &v in l {
+                if v > mx {
+                    mx = v; // NaN은 비교 false — 최대에서 제외.
+                }
+            }
+            let cutv = mx - CUT_D;
+            let mut c = Vec::with_capacity(1024);
+            for (i, &v) in l.iter().enumerate() {
+                if !v.is_finite() {
+                    continue;
+                }
+                if v > cutv {
+                    c.push((i as u32, v));
+                } else {
+                    n_below += 1;
+                }
+            }
+            c
+        } else {
+            l.iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .map(|(i, &v)| (i as u32, v))
+                .collect()
+        };
+        if cand.is_empty() {
+            return None;
+        }
         // ③ top_k — 상위 k개
         if self.params.top_k > 0 && cand.len() > self.params.top_k {
-            cand.select_nth_unstable_by(self.params.top_k - 1, |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            cand.select_nth_unstable_by(self.params.top_k - 1, cmp_desc);
             cand.truncate(self.params.top_k);
         }
-        // 안정 softmax 순서를 위해 내림차순 정렬 (top_p/min_p 누적에 필요)
-        cand.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // 안정 softmax 순서를 위해 내림차순 정렬 (top_p/min_p 누적에 필요).
+        // 전량 폴백에서 4096 초과면 부분 선택(상위만 정렬, 꼬리는 sum 기여).
+        const CAND_N: usize = 4096;
+        let tail_from = if cand.len() > CAND_N {
+            cand.select_nth_unstable_by(CAND_N - 1, cmp_desc);
+            CAND_N
+        } else {
+            cand.len()
+        };
+        cand[..tail_from].sort_unstable_by(cmp_desc);
         // ② temperature — 필터(top_k) 후·softmax 전 적용(QA-30: llama.cpp
-        // 체인 준수. 종전엔 top_k/min_p 이전에 나눠 nucleus 멤버십이 갈렸다).
-        if self.params.temperature > 0.0 && self.params.temperature != 1.0 {
-            let t = self.params.temperature;
-            for (_, v) in &mut cand {
-                *v /= t;
-            }
-        }
-        let max = cand.first().map(|&(_, v)| v).unwrap_or(0.0);
-        let mut probs: Vec<f64> = cand
+        // 체인 준수). 양수 스케일은 단조 — 정렬 순서 불변.
+        let t = self.params.temperature;
+        let sc = |v: f32| if t > 0.0 && t != 1.0 { v / t } else { v };
+        let max = sc(cand[0].1);
+        let mut probs: Vec<f64> = cand[..tail_from]
             .iter()
-            .map(|&(_, v)| ((v - max) as f64).exp())
+            .map(|&(_, v)| ((sc(v) - max) as f64).exp())
             .collect();
-        let sum: f64 = probs.iter().sum();
+        let mut sum: f64 = probs.iter().sum();
+        // 꼬리(부분 선택으로 밀린 나머지) — sum에만 기여.
+        for &(_, v) in &cand[tail_from..] {
+            sum += ((sc(v) - max) as f64).exp();
+        }
+        // 컷 이하 항 — exp 없이 상한 가산.
+        if n_below > 0 {
+            sum += (n_below as f64) * (-(CUT_D as f64)).exp();
+        }
         if sum <= 0.0 || !sum.is_finite() {
-            return cand.first().map(|&(i, _)| i).unwrap_or(0);
+            return Some(cand[0].0);
         }
         for p in &mut probs {
             *p /= sum;
         }
         // ④ top_p (nucleus) — 누적 ≥ p인 최소 접두
         if self.params.top_p < 1.0 {
+            let p_thr = self.params.top_p as f64;
             let mut cum = 0.0;
             let mut keep = probs.len();
+            let mut closed = false;
             for (i, &p) in probs.iter().enumerate() {
                 cum += p;
-                if cum >= self.params.top_p as f64 {
+                if cum >= p_thr {
                     keep = i + 1;
+                    closed = true;
                     break;
+                }
+            }
+            if !closed {
+                if cut {
+                    // 컷 이하(2e-9 미만)까지 필요 — 전량 폴백.
+                    return None;
+                }
+                // 전량 경로: 부분 선택으로 밀린 꼬리를 정렬해 이어 걷는다
+                // (전역 내림차순 복원 — nucleus가 4096을 넘는 평탄 분포).
+                if tail_from < cand.len() {
+                    cand[tail_from..].sort_unstable_by(cmp_desc);
+                    for &(_, v) in &cand[tail_from..] {
+                        probs.push(((sc(v) - max) as f64).exp() / sum);
+                    }
+                    let mut ext = None;
+                    for (off, &pp) in probs[keep..].iter().enumerate() {
+                        cum += pp;
+                        if cum >= p_thr {
+                            ext = Some(keep + off + 1);
+                            break;
+                        }
+                    }
+                    if let Some(k) = ext {
+                        keep = k;
+                    }
                 }
             }
             probs.truncate(keep);
@@ -225,10 +307,10 @@ impl Sampler {
         for (i, &p) in probs.iter().enumerate() {
             acc += p;
             if r < acc {
-                return cand[i].0;
+                return Some(cand[i].0);
             }
         }
-        cand.last().map(|&(i, _)| i).unwrap_or(0)
+        Some(cand.last().map(|&(i, _)| i).unwrap_or(0))
     }
 }
 
@@ -286,6 +368,125 @@ mod tests {
         });
         // 온도 0 = greedy — top_p 등 나머지 기본 off
         assert_eq!(s.sample(&logits(&[0.1, 9.0, 2.0])), 1);
+    }
+
+    /// [E-1] 구 알고리즘(전량 정렬) 참조 구현 — 부분 선택 경로의 동치 판정용.
+    /// 5e8387c4 이전 sample()의 정렬 이후부를 그대로 옮긴 것(repeat_penalty
+    /// 미사용 가정 — 테스트는 recent 없이 호출).
+    fn sample_reference_full(p: &SamplerParams, rng: &mut Rng, logits: &[f32]) -> u32 {
+        let l = logits.to_vec();
+        if p.temperature <= 0.0 {
+            return crate::matmul::greedy_from(&l);
+        }
+        let mut cand: Vec<(u32, f32)> = l
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_finite())
+            .map(|(i, &v)| (i as u32, v))
+            .collect();
+        if p.top_k > 0 && cand.len() > p.top_k {
+            cand.select_nth_unstable_by(p.top_k - 1, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            cand.truncate(p.top_k);
+        }
+        cand.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if p.temperature != 1.0 {
+            let t = p.temperature;
+            for (_, v) in &mut cand {
+                *v /= t;
+            }
+        }
+        let max = cand.first().map(|&(_, v)| v).unwrap_or(0.0);
+        let mut probs: Vec<f64> = cand
+            .iter()
+            .map(|&(_, v)| ((v - max) as f64).exp())
+            .collect();
+        let sum: f64 = probs.iter().sum();
+        if sum <= 0.0 || !sum.is_finite() {
+            return cand.first().map(|&(i, _)| i).unwrap_or(0);
+        }
+        for q in &mut probs {
+            *q /= sum;
+        }
+        if p.top_p < 1.0 {
+            let mut cum = 0.0;
+            let mut keep = probs.len();
+            for (i, &q) in probs.iter().enumerate() {
+                cum += q;
+                if cum >= p.top_p as f64 {
+                    keep = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(keep);
+            cand.truncate(keep);
+            let s: f64 = probs.iter().sum();
+            for q in &mut probs {
+                *q /= s;
+            }
+        }
+        if p.min_p > 0.0 {
+            let mx = probs.first().copied().unwrap_or(0.0);
+            let thr = mx as f32 * p.min_p;
+            let mut keep = probs.len();
+            for (i, &q) in probs.iter().enumerate() {
+                if (q as f32) < thr {
+                    keep = i;
+                    break;
+                }
+            }
+            if keep == 0 {
+                keep = 1;
+            }
+            probs.truncate(keep);
+            cand.truncate(keep);
+            let s: f64 = probs.iter().sum();
+            for q in &mut probs {
+                *q /= s;
+            }
+        }
+        let r = rng.next_f64();
+        let mut acc = 0.0;
+        for (i, &q) in probs.iter().enumerate() {
+            acc += q;
+            if r < acc {
+                return cand[i].0;
+            }
+        }
+        cand.last().map(|&(i, _)| i).unwrap_or(0)
+    }
+
+    #[test]
+    fn partial_select_matches_full_sort() {
+        let mut l: Vec<f32> = (0..8192)
+            .map(|i| 9.0 - (i as f32) * 0.0008 - ((i % 11) as f32) * 0.00003)
+            .collect();
+        l[3] = f32::NAN;
+        l[4000] = f32::NEG_INFINITY;
+        l[500] = l[501]; // 동률
+        for &(tp, tk, mp) in &[
+            (0.9f32, 0usize, 0.0f32),
+            (0.99, 0, 0.0),
+            (1.0, 40, 0.0),
+            (0.95, 0, 0.02),
+        ] {
+            let p = SamplerParams {
+                temperature: 0.8,
+                top_p: tp,
+                top_k: tk,
+                min_p: mp,
+                seed: 0x5EED,
+                ..Default::default()
+            };
+            let mut a = Sampler::new(p.clone());
+            let mut rng = Rng::new(p.seed);
+            for _ in 0..16 {
+                let x = a.sample(&l);
+                let y = sample_reference_full(&p, &mut rng, &l);
+                assert_eq!(x, y, "tp={tp} tk={tk} mp={mp}");
+            }
+        }
     }
 
     #[test]
