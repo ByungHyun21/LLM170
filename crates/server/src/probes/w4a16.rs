@@ -821,6 +821,10 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                 for &tk in &draft {
                     rows.extend_from_slice(&model.embed_row(tk).map_err(|e| e.to_string())?);
                 }
+                // [A-1 완화 ①] 검증 전 상태 저장 — 보정 토큰을 t=1로 재계산
+                // (배치 검증의 근접 동률 argmax 플립이 오거부/오보정을 만들던
+                // 구조적 한계 해소: 수용 판정만 배치, 방출 토큰은 정확 수치).
+                dec.spec_save_state(0)?;
                 let toks = dec.spec_verify(0, &rows, t)?;
                 let mut acc = 0usize;
                 while acc < draft.len() && toks[acc] == draft[acc] {
@@ -829,12 +833,17 @@ fn gpu_run(args: &[String]) -> Result<String, String> {
                 spec_rounds += 1;
                 spec_drafted += draft.len() as u64;
                 spec_acc += acc as u64;
-                let corr = toks[acc]; // 보정(또는 초안 전량 수용 시 보너스).
-                if acc + 1 < t {
-                    // 부분 수용 — 상태·pos를 배치 acc+1토큰 시점으로 되감기.
-                    dec.spec_rollback(0, acc + 1)?;
-                    dec.spec_rewind_pos(0, (t - (acc + 1)) as u32)?;
+                // 상태·pos를 마지막 수용 토큰 **직전**으로 되감고 t=1 디코드.
+                let last = if acc >= 1 { draft[acc - 1] } else { next };
+                if acc >= 1 {
+                    dec.spec_rollback(0, acc)?;
+                    dec.spec_rewind_pos(0, (t - acc) as u32)?;
+                } else {
+                    dec.spec_load_state(0)?;
+                    dec.spec_rewind_pos(0, t as u32)?;
                 }
+                let lrow = model.embed_row(last).map_err(|e| e.to_string())?;
+                let corr = dec.forward_device_argmax(0, &lrow)?;
                 for &tk in &draft[..acc] {
                     out.push(tk);
                     hist.push(tk);
