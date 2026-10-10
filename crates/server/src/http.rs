@@ -15,7 +15,7 @@
 //! 토크나이저는 탐욕 최장일치 근사 — 자기일관(self-consistent) 검증용.
 //! llama.cpp 토큰 경계와 완전 일치하지 않음 (주석 참조).
 
-use crate::engine::{BackendSel, InferRequest, InferResult, SlotJob};
+use crate::engine::{InferRequest, InferResult, SlotJob};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 기동 준비 완료 플래그 — 기동 워밍업(slot_loop 진입 시) 전에는 /health가 503.
@@ -34,7 +34,6 @@ pub static SERVER_CTX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 pub fn serve(
     addr: &str,
     req: InferRequest,
-    backend: BackendSel,
     slots_flag: Option<usize>,
     queue_flag: Option<usize>,
 ) -> Result<(), String> {
@@ -60,7 +59,7 @@ pub fn serve(
             .unwrap_or(512),
     };
     let (tx, rx) = std::sync::mpsc::sync_channel::<SlotJob>(qcap);
-    let eng = crate::engine::build_slots(req.clone(), backend, slots);
+    let eng = crate::engine::build_slots(req.clone(), slots);
     // B20: 적재 완료 — 전역 적재 락 해제(다음 기동의 재판정이 이 상주분을 본다).
     crate::resource::release_load_lock();
     // QA-11: 엔진 스레드 패닉 포착 — 종전엔 스레드가 죽어도 큐가 살아
