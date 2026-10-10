@@ -160,10 +160,9 @@ fn gdn_scan_layout_mirror() {
         "gdn.cu GDN_NGRP ↔ GDN_NGRP"
     );
     let vs = 128 / nsplit;
-    // gdn_scan 레이아웃(sk/qs/sv/A/KQ/KS/QS/dc/Stile×2/bp/gcs/wsm) 바이트
-    // 합 — A5-4(qs 스테이징·V-타일·더블 버퍼) 반영.
+    // gdn_scan 레이아웃(sk/sv/A/KQ/KS/QS/dc/Stile×2/bp/gcs/wsm) 바이트
+    // 합 — [A5-4b] qs 스테이징 제거(글로벌 직접 판독, -16KB) 반영.
     let total = cs * 128 * 2
-        + cs * 128 * 4
         + cs * vs * 2
         + cs * cs * 2
         + cs * cs * 2
