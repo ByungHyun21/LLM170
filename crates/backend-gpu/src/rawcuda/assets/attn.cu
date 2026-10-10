@@ -433,18 +433,37 @@ extern "C" __global__ void attn_fwd3s_part_q(
         attn_part_step(
             [&](int i) -> float {
                 const int row = base + i;
-                const unsigned* k4 = reinterpret_cast<const unsigned*>(
+                // [§8.2 2026-10-11] K 벡터화 — 종전 unsigned(4B)×64 판독은 워프당
+                // 32라인을 건드려 L1 웨이브프런트 32/로드(ncu: L1/TEX 87.5% 병목).
+                // uint4(16B)×16으로 웨이브프런트 ÷4. 누산 순서는 d 0..255 오름차순
+                // 그대로(4B 시절과 동일) — **비트동일 계약 유지**.
+                const uint4* k16 = reinterpret_cast<const uint4*>(
                     kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256);
                 const float4* q4 = reinterpret_cast<const float4*>(qs);
                 float p0 = 0.0f;
-#pragma unroll 8
-                for (int d4 = 0; d4 < 64; d4++) {
-                    const unsigned w = k4[d4];
-                    const float4 qv = q4[d4];
-                    p0 += qv.x * (float)(signed char)(w & 0xffu);
-                    p0 += qv.y * (float)(signed char)((w >> 8) & 0xffu);
-                    p0 += qv.z * (float)(signed char)((w >> 16) & 0xffu);
-                    p0 += qv.w * (float)(signed char)(w >> 24);
+#pragma unroll 4
+                for (int d16 = 0; d16 < 16; d16++) {
+                    const uint4 w = k16[d16];
+                    const float4 qa = q4[d16 * 4 + 0];
+                    const float4 qb = q4[d16 * 4 + 1];
+                    const float4 qc = q4[d16 * 4 + 2];
+                    const float4 qd = q4[d16 * 4 + 3];
+                    p0 += qa.x * (float)(signed char)(w.x & 0xffu);
+                    p0 += qa.y * (float)(signed char)((w.x >> 8) & 0xffu);
+                    p0 += qa.z * (float)(signed char)((w.x >> 16) & 0xffu);
+                    p0 += qa.w * (float)(signed char)(w.x >> 24);
+                    p0 += qb.x * (float)(signed char)(w.y & 0xffu);
+                    p0 += qb.y * (float)(signed char)((w.y >> 8) & 0xffu);
+                    p0 += qb.z * (float)(signed char)((w.y >> 16) & 0xffu);
+                    p0 += qb.w * (float)(signed char)(w.y >> 24);
+                    p0 += qc.x * (float)(signed char)(w.z & 0xffu);
+                    p0 += qc.y * (float)(signed char)((w.z >> 8) & 0xffu);
+                    p0 += qc.z * (float)(signed char)((w.z >> 16) & 0xffu);
+                    p0 += qc.w * (float)(signed char)(w.z >> 24);
+                    p0 += qd.x * (float)(signed char)(w.w & 0xffu);
+                    p0 += qd.y * (float)(signed char)((w.w >> 8) & 0xffu);
+                    p0 += qd.z * (float)(signed char)((w.w >> 16) & 0xffu);
+                    p0 += qd.w * (float)(signed char)(w.w >> 24);
                 }
                 return p0 * (scale * ksc[((long)layer * cap + row) * kv_heads + kh]);
             },
