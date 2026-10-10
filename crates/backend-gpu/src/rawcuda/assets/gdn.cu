@@ -206,6 +206,16 @@ extern "C" __global__ void gdn_conv(
 // l2perm 본체 — a/b 도트(xn·abuf) + q/k L2 + v·beta|g lc 순열
 // (구 rawhip 커널 L397-472 직이식, 폭 인자화). 그리드 (h_v, T), WG=128.
 // v는 scatter, beta|g는 lc 순열 scatter(bg[.. + p_inv]).
+// [FLA-15 기각 2026-10-10] T-배칭(블록당 4토큰 — abuf 슬라이스 공유로 L2
+// 트래픽 ÷4 목표): 구현·전 크기 기준선 일치 검증까지 완료했으나 **이득
+// 무의미** — 27B 13.42→12.89ms(-4%)·35B 2.40→2.35ms, 벽시계 불변(27B
+// 351~354 vs 350~352ms). 원인: 환원을 토큰별 순차로 유지해야 했고(아래)
+// 그 배리어 직렬화가 L2 절감을 상쇄. 되돌림.
+// **[주의 — 재사용 금지 클래스]** 환원까지 배칭한 변형(2D smem
+// `red[2*TB][128]` 또는 동일 주소의 행-오프셋 형태)은 t∈[65..96]
+// (n_chunks=3)에서만 NaN(출력 0) — 1D red[128]+순차 환원은 전 크기 정상.
+// 주소·산술이 동일한데 차원만 바꾼 형태가 실패 = nvcc 코드젠 의심(원인
+// 미규명). smem red 형태 변경 시 전 크기 스윕(t=64/88/96/128) 필수.
 __device__ __forceinline__ void gdn_l2perm_body(
     const float* __restrict__ q_in,   // [T][k_len]
     const float* __restrict__ k_in,   // [T][k_len]
