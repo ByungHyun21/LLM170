@@ -37,6 +37,9 @@ extern "C" __global__ void norm_resid(
     float* __restrict__ xn32,     // [T][hidden] h2f(f2h(xn)) — 융합 캐스트.
                                   // 0이면 생략(cast_x32 커널과 비트 동일 계약:
                                   // 노드 −2/층 → 그래프 노드·런치 절감).
+    unsigned short* __restrict__ xn16, // [T][hidden] f16 미러 — mma GEMM A용
+                                  // (split 경로 A는 이미 f16 값 — 비트 동일).
+                                  // 0이면 생략.
     int t_len, int w_off, int hidden)
 {
     __shared__ float red[1024];
@@ -66,6 +69,9 @@ extern "C" __global__ void norm_resid(
         xn[e] = y;
         if (xn32 != (float*)0) {
             xn32[e] = h2f(f2h(y)); // cast_x32 커널과 동일 산식(비트 동일)
+        }
+        if (xn16 != (unsigned short*)0) {
+            xn16[e] = f2h(y); // xn32와 동일 비트(f16) — A 재판독 대역 절반.
         }
         x[e] = v[j];
     }
