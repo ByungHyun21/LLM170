@@ -287,6 +287,12 @@ extern "C" __global__ void w4a16_gemv_g32_bf16(
 // L1/L2 재판독을 ÷GEMV_TR. 실측 t=4: 0.114 → 아래 수치.
 #define GEMV_TR 8
 
+// [R14 2026-10-10] t-커널 스위치 매크로 — t 1..8 케이스 나열을 한 줄로.
+// (인스턴스는 종전과 동일 — 코드젠 불변.)
+#define GEMV_T_CASE(N) case N: gemv_g128_t_body<N>(q, s, x, out, n, k, o0, red, sc); break;
+#define GEMV_T_CASE_BF(N) \
+    case N: gemv_bf16_t_body<N>(w, x, out, n, k, o0, red); break;
+
 // red/sc는 extern 커널에서 1회 할당 후 전달(템플릿 인라인 시 인스턴스별
 // 중복 할당 — TR=8에서 8×96KB > 48KB ptxas 한계로 실측).
 template <int T>
@@ -375,15 +381,15 @@ extern "C" __global__ void w4a16_gemv_g128_t(
     __shared__ double red[GEMV_TR][G4_LANES];
     __shared__ float sc[GEMV_TR][G4_SCMAX];
     switch (t) {
-    case 1: gemv_g128_t_body<1>(q, s, x, out, n, k, o0, red, sc); break;
-    case 2: gemv_g128_t_body<2>(q, s, x, out, n, k, o0, red, sc); break;
-    case 3: gemv_g128_t_body<3>(q, s, x, out, n, k, o0, red, sc); break;
-    case 4: gemv_g128_t_body<4>(q, s, x, out, n, k, o0, red, sc); break;
-    case 5: gemv_g128_t_body<5>(q, s, x, out, n, k, o0, red, sc); break;
-    case 6: gemv_g128_t_body<6>(q, s, x, out, n, k, o0, red, sc); break;
-    case 7: gemv_g128_t_body<7>(q, s, x, out, n, k, o0, red, sc); break;
-    case 8: gemv_g128_t_body<8>(q, s, x, out, n, k, o0, red, sc); break;
-    default: break; // 호스트 계약 밖(t≤8)
+        GEMV_T_CASE(1) // gemv_g128_t_body<1>
+        GEMV_T_CASE(2) // gemv_g128_t_body<2>
+        GEMV_T_CASE(3) // gemv_g128_t_body<3>
+        GEMV_T_CASE(4) // gemv_g128_t_body<4>
+        GEMV_T_CASE(5) // gemv_g128_t_body<5>
+        GEMV_T_CASE(6) // gemv_g128_t_body<6>
+        GEMV_T_CASE(7) // gemv_g128_t_body<7>
+        GEMV_T_CASE(8) // gemv_g128_t_body<8>
+        default: break; // 호스트 계약 밖(t≤8)
     }
 }
 
@@ -647,15 +653,15 @@ extern "C" __global__ void w4a16_gemv_bf16_t(
     }
     __shared__ double red[GEMV_TR][G4_LANES];
     switch (t) {
-    case 1: gemv_bf16_t_body<1>(w, x, out, n, k, o0, red); break;
-    case 2: gemv_bf16_t_body<2>(w, x, out, n, k, o0, red); break;
-    case 3: gemv_bf16_t_body<3>(w, x, out, n, k, o0, red); break;
-    case 4: gemv_bf16_t_body<4>(w, x, out, n, k, o0, red); break;
-    case 5: gemv_bf16_t_body<5>(w, x, out, n, k, o0, red); break;
-    case 6: gemv_bf16_t_body<6>(w, x, out, n, k, o0, red); break;
-    case 7: gemv_bf16_t_body<7>(w, x, out, n, k, o0, red); break;
-    case 8: gemv_bf16_t_body<8>(w, x, out, n, k, o0, red); break;
-    default: break;
+        GEMV_T_CASE_BF(1)
+        GEMV_T_CASE_BF(2)
+        GEMV_T_CASE_BF(3)
+        GEMV_T_CASE_BF(4)
+        GEMV_T_CASE_BF(5)
+        GEMV_T_CASE_BF(6)
+        GEMV_T_CASE_BF(7)
+        GEMV_T_CASE_BF(8)
+        default: break; // 호스트 계약 밖(t≤8)
     }
 }
 

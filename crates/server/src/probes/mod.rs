@@ -45,3 +45,12 @@ pub(crate) fn finish(r: Result<String, String>) -> ExitCode {
         }
     }
 }
+
+/// [R4 2026-10-10] 플래그 값 요구 — 다음 토큰 또는 msg 오류(프로브 공용).
+/// 종전 `it.next().ok_or("...")?` 반복을 한 곳으로.
+pub(crate) fn arg<'a, I: Iterator<Item = &'a String>>(
+    it: &mut I,
+    msg: &str,
+) -> Result<&'a str, String> {
+    it.next().map(|s| s.as_str()).ok_or_else(|| msg.to_string())
+}
