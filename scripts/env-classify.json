@@ -6,6 +6,7 @@
   "LLM170_CUDA_EW_FATBIN_PATH": "operational",
   "LLM170_CUDA_GDN_FATBIN_PATH": "operational",
   "LLM170_CUDA_GPTQ4_FATBIN_PATH": "operational",
+  "LLM170_CUDA_MOE_FATBIN_PATH": "operational",
   "LLM170_CUDA_HEAD_FATBIN_PATH": "operational",
   "LLM170_CUDA_NORM_FATBIN_PATH": "operational",
   "LLM170_CUDA_SMOKE_FATBIN_PATH": "operational",
