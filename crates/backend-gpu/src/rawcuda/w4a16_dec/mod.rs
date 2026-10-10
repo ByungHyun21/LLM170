@@ -437,6 +437,11 @@ pub struct W4a16Dec {
     /// [marlin-A 2026-10-10] dx32의 f16 미러(split 경로 A — cast/norm이 함께
     /// 기록). mma GEMM이 이 버퍼를 복사-스테이징 → A L2 대역 절반.
     dx16: Buf,
+    /// [A-1] 스펙 검증 — GDN 토큰별 상태 스냅샷([t][L][h_v][d*d]) + conv 링
+    /// 스냅샷([L][t][3][conv_ch]).
+    dsnap: CUdeviceptr,
+    dsnap_ring: CUdeviceptr,
+    spec_on: bool,
     /// t≥2 GEMM 출력 스크래치([t][max_n] f32).
     dyt: Buf,
     // ── GPU head(output.weight bf16) ──
@@ -488,6 +493,8 @@ mod graphs;
 mod kernels;
 mod moe;
 mod probe;
+
+mod spec;
 
 #[cfg(test)]
 mod tests;
@@ -590,6 +597,9 @@ impl W4a16Dec {
             chain_bufs_ok: false,
             dx32: Buf::default(),
             dx16: Buf::default(),
+            dsnap: 0,
+            dsnap_ring: 0,
+            spec_on: false,
             dyt: Buf::default(),
             head_w: 0,
             head_n: 0,

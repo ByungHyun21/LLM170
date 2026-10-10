@@ -30,6 +30,7 @@ pub const ASSETS: &[Asset] = &[
         ],
         syms: &[
             "w4a16_gemv_multi",
+            "w4a16_copy",
             "w4a16_moe_topk256",
             "w4a16_gemv_experts_glu",
             "w4a16_gemm_g128",
@@ -76,6 +77,7 @@ pub const ASSETS: &[Asset] = &[
             "gdn_conv",
             "gdn_l2perm",
             "gdn_scan",
+            "gdn_spec_scan",
             "gdn_scan_akq",
             "gdn1_part",
             "gdn1_comb",
