@@ -29,6 +29,10 @@ impl W4a16Dec {
 
     /// [A-1] 롤백 — 배치 `keep`개 토큰 처리 시점(스냅샷[keep-1])으로 슬롯
     /// GDN 상태·conv 링 복원. pos 되감기는 spec_rewind_pos 소관.
+    /// [결함수정 2026-10-11] 루프를 **GDN 층(n_gdn) 한정** — 종전 n_layers
+    /// (모델 층) 순회는 상태/링 버퍼([slot][n_gdn] 크기)를 넘어 illegal
+    /// access(compute-sanitizer 실측: w4a16_copy +1537B 초과). 스냅샷
+    /// 스트라이드는 n_layers(스캔 계약), 상태·링 스트라이드는 n_gdn.
     pub fn spec_rollback(&mut self, slot: usize, keep: usize) -> Result<(), String> {
         let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
         if !self.spec_on || !(1..=8).contains(&keep) {
@@ -39,14 +43,13 @@ impl W4a16Dec {
         let ring_slot = slot * dm.n_gdn * 3 * dm.conv_ch();
         let st_elems = (dm.h_v * dm.d * dm.d) as u64;
         let ring_elems = (3 * dm.conv_ch()) as u64;
-        for layer in 0..self.n_layers {
-            let src = self.dsnap
-                + ((keep - 1) as u64 * self.n_layers as u64 + layer as u64) * st_elems * 4;
-            let dst = self.dgst + (st_slot as u64 + layer as u64 * st_elems) * 4;
+        let nl = self.n_layers as u64;
+        for gi in 0..dm.n_gdn {
+            let src = self.dsnap + ((keep - 1) as u64 * nl + gi as u64) * st_elems * 4;
+            let dst = self.dgst + (st_slot as u64 + gi as u64 * st_elems) * 4;
             self.copy_dev(dst, src, st_elems * 4)?;
-            let rsrc = self.dsnap_ring
-                + (layer as u64 * 8 * ring_elems + (keep - 1) as u64 * ring_elems) * 4;
-            let rdst = self.dring + (ring_slot as u64 + layer as u64 * ring_elems) * 4;
+            let rsrc = self.dsnap_ring + (gi as u64 * 8 + (keep - 1) as u64) * ring_elems * 4;
+            let rdst = self.dring + (ring_slot as u64 + gi as u64 * ring_elems) * 4;
             self.copy_dev(rdst, rsrc, ring_elems * 4)?;
         }
         Ok(())
