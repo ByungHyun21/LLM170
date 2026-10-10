@@ -360,12 +360,14 @@ impl W4a16Dec {
         t: usize,
         head: bool,
     ) -> Result<Vec<f32>, String> {
-        self.chain_t(slot, rows, t, head, false)
+        self.chain_t(slot, rows, t, head, false, false)
     }
 
     /// [A-1] 스펙 검증 체인 — `all`=true면 **전 위치** 최종 노름+배치 head+
     /// 배치 argmax로 토큰 t개(id를 f32로)를 반환(상태·pos는 전진).
     /// 롤백은 호출부(상태 복원 + pos 되감기) 소관.
+    /// [eval 2026-10-10] `logits`=true(all과 함께)면 argmax 대신 [t][head_n]
+    /// 로짓을 회수한다(청크 프리필 PPL 가속 — eval 프로브 전용).
     pub(super) fn chain_t(
         &mut self,
         slot: usize,
@@ -373,6 +375,7 @@ impl W4a16Dec {
         t: usize,
         head: bool,
         all: bool,
+        logits: bool,
     ) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
         if !(2..=CHAIN_TMAX).contains(&t) || rows.len() != t * self.hidden || slot >= self.n_slots {
@@ -548,7 +551,35 @@ impl W4a16Dec {
                 .norm_resid_dev(2 * self.n_layers, self.dres, ab, t, 0)
                 .map_err(|e| format!("S final norm: {e}"))?;
             self.ensure_batch_bufs()?;
-            self.head_gemv_t_launch(xn_all, self.dbatch_lg, t)?;
+            if logits && t > BATCH_DEC_MAX {
+                // [eval] t>8 — head GEMV-T 상한(G4_TMAX) 초과: 행별 표준 GEMV
+                // (행=블록 DRAM 포화 경로 — eval 전용).
+                for r in 0..t {
+                    self.head_gemv_launch(
+                        xn_all + (r * self.hidden) as u64 * 4,
+                        self.dbatch_lg + (r * self.head_n) as u64 * 4,
+                    )?;
+                }
+            } else {
+                self.head_gemv_t_launch(xn_all, self.dbatch_lg, t)?;
+            }
+            if logits {
+                // [eval] 로짓 회수 모드 — argmax 대신 [t][head_n] d2h.
+                // (행별 표준 GEMV 대안은 실측 더 느림 — head_gemv_t 유지.)
+                let mut ob = vec![0u8; t * self.head_n * 4];
+                self.cc
+                    .d2h_async(ob.as_mut_ptr(), self.dbatch_lg, ob.len())?;
+                self.cc.sync()?;
+                let pos_after = pos + t as u32;
+                self.slot_pos[slot] = pos_after;
+                self.attn_set_pos(slot, pos_after)?;
+                return Ok(ob
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect());
+            }
             {
                 let fa = self.cc.function("w4a16_argmax_min_t")?;
                 let (mut p_l, mut p_n, mut p_t, mut p_a) =
