@@ -365,6 +365,9 @@ pub struct W4a16Dec {
     /// [marlin-A 2026-10-10] dx32의 f16 미러(split 경로 A — cast/norm이 함께
     /// 기록). mma GEMM이 이 버퍼를 복사-스테이징 → A L2 대역 절반.
     dx16: Buf,
+    /// [FLA-10 2026-10-10] 플레인(bf16) 경로 A 미러([t][k] bf16) — bf16_mma가
+    /// f32 대신 판독(재판독 대역 절반). cast_bf16과 커널 내 변환이 비트동일.
+    dabf: Buf,
     /// [A-1] 스펙 검증 — GDN 토큰별 상태 스냅샷([t][L][h_v][d*d]) + conv 링
     /// 스냅샷([L][t][3][conv_ch]).
     dsnap: CUdeviceptr,
@@ -531,6 +534,7 @@ impl W4a16Dec {
             chain_bufs_ok: false,
             dx32: Buf::default(),
             dx16: Buf::default(),
+            dabf: Buf::default(),
             dsnap: 0,
             dsnap_ring: 0,
             dsave: 0,

@@ -333,7 +333,7 @@ impl W4a16Dec {
     /// 플레인 bf16 GEMM(t≤8) — x는 원시 f32 [t][k](h2f 왕복 없음),
     /// 가중치 1회 판독 × t토큰 재사용(프리필 청크의 dense 경로).
     pub(super) fn plain_gemm_launch(
-        &self,
+        &mut self,
         name: &str,
         x_dev: CUdeviceptr,
         y_out: CUdeviceptr,
@@ -351,16 +351,44 @@ impl W4a16Dec {
                     eprintln!("[TC] mma GEMM 경로 진입: {name} n={n} k={k} t={t}");
                 }
             }
+            // [FLA-10 2026-10-10] A 미러 — f32 x를 bf16으로 선변환(L2 A
+            // 재판독 절반 — bf16_mma L2 68% 바운드 실측). cast_bf16과 커널
+            // 내 f2bf16이 비트동일 → 결과 불변.
+            let need = t * k * 2;
+            if need > self.dabf.cap {
+                self.graph_invalidate();
+                self.cc.sync()?;
+                if self.dabf.ptr != 0 {
+                    self.cc.free(self.dabf.ptr)?;
+                }
+                self.dabf.ptr = 0;
+                self.dabf.cap = 0;
+                self.dabf.ptr = self.cc.alloc(need)?;
+                self.dabf.cap = need;
+            }
+            {
+                let fc = self.cc.function("w4a16_cast_bf16")?;
+                let (mut c_in, mut c_out) = (x_dev, self.dabf.ptr);
+                let mut c_n = (t * k) as i32;
+                self.cc.launch(
+                    fc,
+                    (t * k).div_ceil(1024) as u32,
+                    1,
+                    256,
+                    &mut crate::rawcuda::args::l3(&mut c_in, &mut c_out, &mut c_n),
+                )?;
+            }
             let f = self.cc.function("w4a16_gemm_bf16_mma")?;
-            let (mut p_w, mut p_x, mut p_o) = (w, x_dev, y_out);
+            let (mut p_w, mut p_x, mut p_o) = (w, self.dabf.ptr, y_out);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+            let mut p_b = 1i32;
             return self.cc.launch(
                 f,
                 t.div_ceil(GEMM_BMMA_M) as u32,
                 n.div_ceil(GEMM_BMMA_N) as u32,
                 256,
-                &mut crate::rawcuda::args::l6(
-                    &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+                &mut crate::rawcuda::args::l7(
+                    &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t, &mut p_b,
                 ),
             );
         }
