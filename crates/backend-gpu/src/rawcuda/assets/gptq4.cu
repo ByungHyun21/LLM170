@@ -382,6 +382,10 @@ __device__ __forceinline__ void gemv_g128_t_body(
     }
 }
 
+// [§np4 실측 기각 2026-10-11] launch_bounds(512,3)(점유 2→3블록): np4 103→
+// 98.9 tok/s(스필 우세). ncu: t=5에서 점유 2블록(64 regs)·long_scoreboard
+// 12.63·barrier 4.49 — 지연은 트리 배리어(계약)+x float2 패턴에 내재.
+// 대안(Gemm 경로 21 tok/s·lb) 전부 실측 기각 — 잔여는 구조 재설계 영역.
 extern "C" __global__ void w4a16_gemv_g128_t(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x,   // [t][k] f32 (cast_x32 산출값)
