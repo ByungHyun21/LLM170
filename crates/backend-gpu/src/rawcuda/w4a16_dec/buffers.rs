@@ -211,7 +211,93 @@ impl W4a16Dec {
         self.stg_w0 = w0;
         self.stg_w1 = w1;
         self.stg_w2 = ff_up;
+        // [S2 2026-10-11] 다중세그먼트 테이블(branch·gate/up) — dchain/스펙
+        // 확정 후 1회. 캡처 전(warm_for_capture→본 함수) 작성이 계약.
+        self.build_multi_tables()?;
         self.chain_bufs_ok = true;
+        Ok(())
+    }
+
+    /// [S2 2026-10-11] 다중세그먼트 테이블 작성 — 층별 branch(attn q/k/v ≤3,
+    /// GDN qkv/z 2)·gate/up(2, split 전용 — 플레인은 MoE 공용 multi_gate가
+    /// 담당). split = (q,s,out,n,k) u64×5 / 플레인 = (w,out,n,k) u64×4.
+    /// 폭 검사는 종전 gemv_stage_x32/plain_stage_x32 계약 미러(스테이징 초과
+    /// 거부). 내용은 이후 불변(그래프 정적 계약).
+    fn build_multi_tables(&mut self) -> Result<(), String> {
+        let plain = self.plain_weights;
+        let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
+        let [s0, s1, s1b, _s2, _s3] = self.dchain;
+        let (w0, w1) = (self.stg_w0, self.stg_w1);
+        let nl = self.n_layers;
+        let span = if plain { 20usize } else { 25usize }; // u64/층
+        let mut tab: Vec<u64> = vec![0; nl * span];
+        let mut meta: Vec<[u32; 8]> = Vec::with_capacity(nl);
+        for il in 0..nl {
+            let mut br: Vec<(String, u64, usize)> = Vec::new();
+            if (il + 1) % interval == 0 {
+                br.push((format!("blk.{il}.attn_q.weight"), s0, w0));
+                br.push((format!("blk.{il}.attn_k.weight"), s1, w1));
+                br.push((format!("blk.{il}.attn_v.weight"), s1b, w1));
+            } else {
+                br.push((format!("blk.{il}.attn_qkv.weight"), s0, w0));
+                br.push((format!("blk.{il}.attn_gate.weight"), s1, w1));
+            }
+            let gu: Vec<(String, u64, usize)> = if plain {
+                Vec::new()
+            } else {
+                vec![
+                    (format!("blk.{il}.ffn_gate.weight"), s0, w0),
+                    (format!("blk.{il}.ffn_up.weight"), s1, w1),
+                ]
+            };
+            let mut wr = il * span;
+            let mut gm = [[0u32; 4]; 2];
+            for (gi, segs) in [&br, &gu].into_iter().enumerate() {
+                let off = wr as u32;
+                let mut total = 0usize;
+                let mut tgrid = 0usize;
+                let mut cnt = 0u32;
+                for (name, out, wmax) in segs {
+                    let (p0, p1, n, k) = if plain {
+                        let (w, n, k) = self.plain_spec(name)?;
+                        (w, 0u64, n, k)
+                    } else {
+                        self.lin_spec(name)?
+                    };
+                    if n > *wmax {
+                        return Err(format!("gemv_multi({name}): n={n} > 스테이징 {wmax}"));
+                    }
+                    tab[wr] = p0;
+                    wr += 1;
+                    if !plain {
+                        tab[wr] = p1;
+                        wr += 1;
+                    }
+                    tab[wr] = *out;
+                    wr += 1;
+                    tab[wr] = n as u64;
+                    wr += 1;
+                    tab[wr] = k as u64;
+                    wr += 1;
+                    total += n;
+                    tgrid += n.div_ceil(GEMV_TR);
+                    cnt += 1;
+                }
+                gm[gi] = [off, cnt, total as u32, tgrid as u32];
+            }
+            meta.push([
+                gm[0][0], gm[0][1], gm[0][2], gm[1][0], gm[1][1], gm[1][2], gm[0][3], gm[1][3],
+            ]);
+        }
+        let bytes = tab.len() * 8;
+        // SAFETY: 로컬 Vec<u64>의 유효 수명 내 바이트 뷰(길이 = 원소수×8).
+        let buf = unsafe { std::slice::from_raw_parts(tab.as_ptr() as *const u8, bytes) };
+        if self.dmulti == 0 {
+            self.dmulti = self.cc.alloc(bytes)?;
+        }
+        self.cc.h2d(self.dmulti, buf)?;
+        self.cc.sync()?;
+        self.dmulti_meta = meta;
         Ok(())
     }
 

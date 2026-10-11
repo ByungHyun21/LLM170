@@ -414,6 +414,123 @@ impl W4a16Dec {
         )
     }
 
+    /// [S2 2026-10-11] 다중세그먼트 t=1 GEMV 런치 — 테이블 u64 오프셋·행 합.
+    /// split = (q,s,out,n,k)(w4a16_gemv_g128_multi) / 플레인 = (w,out,n,k)
+    /// (w4a16_gemv_multi). 값은 세그먼트 단독 런치와 비트동일(행 독립).
+    pub(super) fn gemv_multi_launch(
+        &self,
+        plain: bool,
+        table: CUdeviceptr,
+        x_dev: CUdeviceptr,
+        total: usize,
+        count: usize,
+    ) -> Result<(), String> {
+        let name = if plain {
+            "w4a16_gemv_multi"
+        } else {
+            "w4a16_gemv_g128_multi"
+        };
+        let f = self.cc.function(name)?;
+        let (mut p_t, mut p_x) = (table, x_dev);
+        let mut p_c = count as i32;
+        self.cc.launch(
+            f,
+            total as u32,
+            1,
+            64,
+            &mut crate::rawcuda::args::l3(&mut p_t, &mut p_x, &mut p_c),
+        )
+    }
+
+    /// [S2] 층·그룹의 다중세그먼트 런치(테이블 메타 조회 — group 0=branch,
+    /// 1=gate/up). 테이블은 ensure_chain_bufs가 1회 작성.
+    pub(super) fn gemv_multi_dev(
+        &mut self,
+        plain: bool,
+        il: usize,
+        group: usize,
+        x_dev: CUdeviceptr,
+    ) -> Result<(), String> {
+        let m = *self
+            .dmulti_meta
+            .get(il)
+            .ok_or_else(|| format!("gemv_multi: 메타 부족 il={il}"))?;
+        let (off, cnt, total) = if group == 0 {
+            (m[0], m[1], m[2])
+        } else {
+            (m[3], m[4], m[5])
+        };
+        if cnt == 0 {
+            return Err(format!("gemv_multi: 세그먼트 없음 il={il} g={group}"));
+        }
+        self.gemv_multi_launch(
+            plain,
+            self.dmulti + off as u64 * 8,
+            x_dev,
+            total as usize,
+            cnt as usize,
+        )
+    }
+
+    /// [S2 2026-10-11] 다중세그먼트 t행 GEMV 런치(t≤8) — grid =
+    /// Σceil(n_s/GEMV_TR)(테이블 메타 *_tgrid). 값은 단독 GemvT와 비트동일.
+    pub(super) fn gemv_multi_t_launch(
+        &self,
+        plain: bool,
+        table: CUdeviceptr,
+        x_dev: CUdeviceptr,
+        total: usize,
+        count: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        let name = if plain {
+            "w4a16_gemv_bf16_multi_t"
+        } else {
+            "w4a16_gemv_g128_multi_t"
+        };
+        let f = self.cc.function(name)?;
+        let (mut p_t, mut p_x) = (table, x_dev);
+        let (mut p_c, mut p_tt) = (count as i32, t as i32);
+        self.cc.launch(
+            f,
+            total as u32,
+            1,
+            (64 * GEMV_TR) as u32,
+            &mut crate::rawcuda::args::l4(&mut p_t, &mut p_x, &mut p_c, &mut p_tt),
+        )
+    }
+
+    /// [S2] 층·그룹의 다중세그먼트 t행 런치(메타 idx 6/7 = *_tgrid).
+    pub(super) fn gemv_multi_t_dev(
+        &mut self,
+        plain: bool,
+        il: usize,
+        group: usize,
+        x_dev: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let m = *self
+            .dmulti_meta
+            .get(il)
+            .ok_or_else(|| format!("gemv_multi_t: 메타 부족 il={il}"))?;
+        let (off, cnt, tgrid) = if group == 0 {
+            (m[0], m[1], m[6])
+        } else {
+            (m[3], m[4], m[7])
+        };
+        if cnt == 0 {
+            return Err(format!("gemv_multi_t: 세그먼트 없음 il={il} g={group}"));
+        }
+        self.gemv_multi_t_launch(
+            plain,
+            self.dmulti + off as u64 * 8,
+            x_dev,
+            tgrid as usize,
+            cnt as usize,
+            t,
+        )
+    }
+
     /// [A9] 배치 t행 GEMV(플레인 bf16) — 원시 f32 x, 행별 GEMV 비트동일.
     pub(super) fn plain_gemv_t_launch(
         &mut self,

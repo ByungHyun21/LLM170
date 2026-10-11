@@ -191,6 +191,47 @@ extern "C" __global__ void w4a16_gemv_bf16_t(
     }
 }
 
+// [S2 2026-10-11] 다중 세그먼트 t행 GEMV(플레인 bf16) — 테이블은 t=1
+// w4a16_gemv_multi와 공용((w,out,n,k)). 세그먼트 블록수 ceil(n/GEMV_TR),
+// 호스트 grid = Σceil. 행별 산술은 w4a16_gemv_bf16_t와 **비트동일**.
+extern "C" __global__ void w4a16_gemv_bf16_multi_t(
+    const unsigned long long* __restrict__ tab, // [count][4]: w, out, n, k
+    const float* __restrict__ x,                // [t][k] f32(원시)
+    int count, int t)
+{
+    const int blk = blockIdx.x;
+    int seg = count - 1;
+    int base = 0;
+    for (int ss = 0; ss < count; ++ss) {
+        const int ns = ((int)tab[ss * 4 + 2] + GEMV_TR - 1) / GEMV_TR;
+        if (blk < base + ns) {
+            seg = ss;
+            break;
+        }
+        base += ns;
+    }
+    const unsigned short* w = (const unsigned short*)(size_t)tab[seg * 4 + 0];
+    float* out = (float*)(size_t)tab[seg * 4 + 1];
+    const int n = (int)tab[seg * 4 + 2];
+    const int k = (int)tab[seg * 4 + 3];
+    const int o0 = (blk - base) * GEMV_TR;
+    if (o0 >= n || t <= 0 || t > G4_TMAX) {
+        return;
+    }
+    __shared__ double red[GEMV_TR][G4_LANES];
+    switch (t) {
+        GEMV_T_CASE_BF(1)
+        GEMV_T_CASE_BF(2)
+        GEMV_T_CASE_BF(3)
+        GEMV_T_CASE_BF(4)
+        GEMV_T_CASE_BF(5)
+        GEMV_T_CASE_BF(6)
+        GEMV_T_CASE_BF(7)
+        GEMV_T_CASE_BF(8)
+        default: break; // 호스트 계약 밖(t≤8)
+    }
+}
+
 // ── T2(2026-10-09): 플레인 bf16 mma GEMM — 계약 완화 승인 후 첫 본체 ──
 // A=x(bf16 반올림, 스테이징에서 f32→bf16 RNE), B=w bf16(스토어 원본 [n][k]),
 // f32 누적. 프래그먼트 규약은 --mma-smoke에서 검증(비트동일 0.00e0):

@@ -382,6 +382,14 @@ pub struct W4a16Dec {
     dchk: CUdeviceptr,
     /// 체크포인트 위치(토큰 수) — 0 = 없음.
     dchk_pos: Vec<u32>,
+    /// [S2 2026-10-11] 다중세그먼트 테이블(디바이스 u64) — q/k/v·qkv/z·gate/up
+    /// 을 1런치로(런치 꼬리 제거). 업로드·dchain 확정 후 ensure_chain_bufs에서
+    /// 1회 작성 — 그래프 캡처 정적 계약(리플레이 간 내용 불변).
+    dmulti: CUdeviceptr,
+    /// [S2] 층별 [branch_off, branch_cnt, branch_total, gateup_off,
+    /// gateup_cnt, gateup_total, branch_tgrid, gateup_tgrid] — 오프셋은 u64
+    /// 인덱스, total = 행 합(grid, t=1), *_tgrid = Σceil(n/GEMV_TR)(t행 판).
+    dmulti_meta: Vec<[u32; 8]>,
     spec_on: bool,
     /// [A-1 진단] spec scan 커널 on/off(기본 = spec_on) — 교차 대조용.
     spec_scan_on: bool,
@@ -550,6 +558,8 @@ impl W4a16Dec {
             dsave: 0,
             dchk: 0,
             dchk_pos: Vec::new(),
+            dmulti: 0,
+            dmulti_meta: Vec::new(),
             spec_on: false,
             spec_scan_on: true,
             dyt: Buf::default(),

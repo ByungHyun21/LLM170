@@ -293,6 +293,38 @@ extern "C" __global__ void w4a16_gemv_g32_bf16(
     gemv_body<5, true>(q, s, x, out, n, k);
 }
 
+// [S2 2026-10-11] 다중 세그먼트 t=1 GEMV(split) — 같은 x를 공유하는 소형
+// 선형 여럿을 1런치로(런치 꼬리 제거 — moe.cu w4a16_gemv_multi의 split 판).
+// tab[seg] = (q, s, out, n, k) u64×5 — 호스트가 업로드 후 1회 작성(그래프
+// 캡처 정적 계약: 리플레이 간 내용 불변). 행별 산술은 w4a16_gemv_g128과
+// **비트동일**(gemv_row_body 그대로 — 행 독립이라 세그먼트 결합 무영향).
+extern "C" __global__ void w4a16_gemv_g128_multi(
+    const unsigned long long* __restrict__ tab, // [count][5]: q, s, out, n, k
+    const float* __restrict__ x,                // 공통 x [k] f32(h2f 왕복)
+    int count)
+{
+    const int blk = blockIdx.x;
+    int seg = count - 1;
+    int base = 0;
+    for (int s = 0; s < count; ++s) {
+        const int ns = (int)tab[s * 5 + 3];
+        if (blk < base + ns) {
+            seg = s;
+            break;
+        }
+        base += ns;
+    }
+    const int n = (int)tab[seg * 5 + 3];
+    const int o = blk - base;
+    if (o < 0 || o >= n) {
+        return;
+    }
+    const int k = (int)tab[seg * 5 + 4];
+    gemv_row_body<7, false>((const unsigned*)(size_t)tab[seg * 5 + 0],
+                            (const unsigned short*)(size_t)tab[seg * 5 + 1],
+                            x, (float*)(size_t)tab[seg * 5 + 2], o, k);
+}
+
 // [A9 2026-10-10] t행 GEMV(split g128) — 가중 판독 1회를 t행이 공유.
 // 행별 산술은 w4a16_gemv_g128(gemv_row_body)과 **비트동일**(레인 i는
 // l, l+64,… 오름차순 f32 누산 → tree64; 행별로 같은 시퀀스). t≤8
@@ -419,6 +451,50 @@ extern "C" __global__ void w4a16_gemv_g128_t(
         GEMV_T_CASE(6) // gemv_g128_t_body<6>
         GEMV_T_CASE(7) // gemv_g128_t_body<7>
         GEMV_T_CASE(8) // gemv_g128_t_body<8>
+        default: break; // 호스트 계약 밖(t≤8)
+    }
+}
+
+// [S2 2026-10-11] 다중 세그먼트 t행 GEMV(배치 디코드·검증 t≤8) — 테이블은
+// t=1 판 w4a16_gemv_g128_multi와 공용((q,s,out,n,k)). 세그먼트 블록수는
+// ceil(n/GEMV_TR), 호스트 grid = Σceil(n_s/GEMV_TR). 행별 산술은
+// w4a16_gemv_g128_t와 **비트동일**(gemv_g128_t_body 그대로 — 행 독립).
+extern "C" __global__ void w4a16_gemv_g128_multi_t(
+    const unsigned long long* __restrict__ tab, // [count][5]: q, s, out, n, k
+    const float* __restrict__ x,                // [t][k] f32(cast_x32 산출)
+    int count, int t)
+{
+    const int blk = blockIdx.x;
+    int seg = count - 1;
+    int base = 0;
+    for (int ss = 0; ss < count; ++ss) {
+        const int ns = ((int)tab[ss * 5 + 3] + GEMV_TR - 1) / GEMV_TR;
+        if (blk < base + ns) {
+            seg = ss;
+            break;
+        }
+        base += ns;
+    }
+    const unsigned* q = (const unsigned*)(size_t)tab[seg * 5 + 0];
+    const unsigned short* s = (const unsigned short*)(size_t)tab[seg * 5 + 1];
+    float* out = (float*)(size_t)tab[seg * 5 + 2];
+    const int n = (int)tab[seg * 5 + 3];
+    const int k = (int)tab[seg * 5 + 4];
+    const int o0 = (blk - base) * GEMV_TR;
+    if (o0 >= n) {
+        return;
+    }
+    __shared__ double red[GEMV_TR][G4_LANES];
+    __shared__ float sc[GEMV_TR][G4_SCMAX];
+    switch (t) {
+        GEMV_T_CASE(1)
+        GEMV_T_CASE(2)
+        GEMV_T_CASE(3)
+        GEMV_T_CASE(4)
+        GEMV_T_CASE(5)
+        GEMV_T_CASE(6)
+        GEMV_T_CASE(7)
+        GEMV_T_CASE(8)
         default: break; // 호스트 계약 밖(t≤8)
     }
 }
