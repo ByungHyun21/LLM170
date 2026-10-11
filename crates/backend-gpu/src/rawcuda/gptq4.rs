@@ -164,7 +164,7 @@ impl Gptq4 {
                     &mut p_n as *mut _ as *mut c_void,
                     &mut p_k as *mut _ as *mut c_void,
                 ];
-                self.cc.launch(f, n as u32, 1, 64, &mut args)?;
+                self.cc.launch(f, n as u32, 1, 64, &mut args)?; // [A2-float4 v2] 종전 grid
                 self.cc.sync()?;
                 let mut ob = vec![0u8; n * 4];
                 self.cc.d2h(&mut ob, dout)?;

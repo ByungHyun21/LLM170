@@ -174,7 +174,7 @@ impl W4a16Dec {
         let (mut p_n, mut p_k) = (n as i32, k as i32);
         self.cc.launch(
             f,
-            n as u32,
+            n as u32, // [A2-float4 v2] 256폭·64레인 — 종전 grid/블록 유지
             1,
             64,
             &mut crate::rawcuda::args::l6(
@@ -599,7 +599,7 @@ impl W4a16Dec {
         let (mut p_n, mut p_k) = (n as i32, k as i32);
         self.cc.launch(
             f,
-            n as u32,
+            n as u32, // [A2-float4 v2] 256폭·64레인 — 종전 grid 유지
             1,
             64,
             &mut crate::rawcuda::args::l6(

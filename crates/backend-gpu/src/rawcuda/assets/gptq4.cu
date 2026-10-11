@@ -184,6 +184,85 @@ __device__ __forceinline__ void gemv_body(
     gemv_row_body<SHIFT, BF16>(q, s, x, out, o, k);
 }
 
+// [A2-float4 2026-10-11] t=1 로우 커널 float4판 — **[256폭 청크·64레인 유지]**
+// (종전 128폭·2원소/레인 → 256폭·4원소/레인: 레인 l = k 4l..4l+3/256청크).
+// 블록·grid 구조는 종전과 동일(행=블록 64스레드·grid n) — 레인 수 불변이라
+// 병렬도 보존, x float4(1판독/4원소)·웨이트 u16(코얼레싱)만 회수.
+// 수치 클래스 — t=1 PPL(eval) 직접 판정(비트 계약 아님).
+// 기각(2026-10-11): 32레인/행·2행/블록(128폭) 변형 = tg −3.5%(49.5 t/s) —
+// 행당 스레드 반감으로 지연 은닉 손실. 64레인 유지가 정답이었다.
+template <int SHIFT>
+__device__ __forceinline__ int sidx256(int l, int jj) {
+    // (4l + 256j) >> SHIFT — g128: 2j + (l>>5), g32: 8j + (l>>3).
+    return (jj << (8 - SHIFT)) + (l >> (SHIFT - 2));
+}
+
+template <int SHIFT, bool BF16>
+__device__ __forceinline__ void gemv_row_body4(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int o, int k)
+{
+    if (o < 0) {
+        return;
+    }
+    const int l = threadIdx.x;
+    __shared__ double red[G4_LANES];
+    __shared__ float sc[G4_SCMAX];
+    const int k8 = k >> 3;
+    const int kg = k >> SHIFT;
+    for (int g = l; g < kg; g += G4_LANES) {
+        sc[g] = ld_scale<BF16>(s + (size_t)o * kg, g);
+    }
+    __syncthreads();
+    const int jn = k >> 8; // 256폭 청크(전 모델 k는 256 배수 — 128 배수 상위)
+    const unsigned short* qh =
+        reinterpret_cast<const unsigned short*>(q + (size_t)o * k8) + l;
+    const float4* xp = reinterpret_cast<const float4*>(x) + l;
+    float acc = 0.0f;
+#pragma unroll 16
+    for (int jj = 0; jj < jn; ++jj) {
+        const unsigned qw = (unsigned)qh[jj * 64];
+        const float scv = sc[sidx256<SHIFT>(l, jj)];
+        const float w0 = fmaf((float)(qw & 0xFu), scv, -8.0f * scv);
+        const float w1 = fmaf((float)((qw >> 4) & 0xFu), scv, -8.0f * scv);
+        const float w2 = fmaf((float)((qw >> 8) & 0xFu), scv, -8.0f * scv);
+        const float w3 = fmaf((float)(qw >> 12), scv, -8.0f * scv);
+        const float4 xv = *xp;
+        acc = fmaf(w0, xv.x, acc);
+        acc = fmaf(w1, xv.y, acc);
+        acc = fmaf(w2, xv.z, acc);
+        acc = fmaf(w3, xv.w, acc);
+        xp += 64;
+    }
+    red[l] = (double)acc;
+    __syncthreads();
+    if (l < 32) {
+        double r = red[l] + red[l + 32];
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(r, off);
+            if (l < off) {
+                r += oth;
+            }
+        }
+        if (l == 0) {
+            out[o] = (float)r;
+        }
+    }
+}
+
+template <int SHIFT, bool BF16>
+__device__ __forceinline__ void gemv_body4(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k)
+{
+    const int o = blockIdx.x;
+    if (o >= n) {
+        return;
+    }
+    gemv_row_body4<SHIFT, BF16>(q, s, x, out, o, k);
+}
+
 // 전문가 배치 GEMV — 전문가 포인터 테이블(tab, (q,s) 쌍) + 슬롯 인덱스.
 // 테이블 레이아웃 = (il, e, proj) 순서 — 커널 항목 = base + idx[sl]·3
 // (같은 층·proj의 전문가). xstride: 게이트/업은 0(x 공통 브로드캐스트),
@@ -285,12 +364,12 @@ extern "C" __global__ void w4a16_moe_align(
 extern "C" __global__ void w4a16_gemv_g128(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x, float* __restrict__ out, int n, int k) {
-    gemv_body<7, false>(q, s, x, out, n, k);
+    gemv_body4<7, false>(q, s, x, out, n, k); // [A2-float4] 2행/블록
 }
 extern "C" __global__ void w4a16_gemv_g32_bf16(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x, float* __restrict__ out, int n, int k) {
-    gemv_body<5, true>(q, s, x, out, n, k);
+    gemv_body4<5, true>(q, s, x, out, n, k); // [A2-float4] 2행/블록
 }
 
 // [S2 2026-10-11] 다중 세그먼트 t=1 GEMV(split) — 같은 x를 공유하는 소형
