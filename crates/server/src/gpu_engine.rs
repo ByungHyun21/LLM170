@@ -216,6 +216,33 @@ impl GpuEngine {
         self.dec.reset_state(seq)
     }
 
+    /// [§7.1 2026-10-11] 스펙 서빙 — GDN 토큰별 스냅샷 버퍼 확보(모델당 1회).
+    /// VRAM: 27B 654MB+dsave(슬롯당 ~154MB)·35B 436MB+dsave.
+    pub fn enable_spec(&mut self) -> Result<(), String> {
+        self.dec.enable_spec()
+    }
+    pub fn spec_save_state(&mut self, slot: usize) -> Result<(), String> {
+        self.dec.spec_save_state(slot)
+    }
+    pub fn spec_load_state(&mut self, slot: usize) -> Result<(), String> {
+        self.dec.spec_load_state(slot)
+    }
+    pub fn spec_verify(&mut self, slot: usize, rows: &[f32], t: usize) -> Result<Vec<u32>, String> {
+        self.dec.spec_verify(slot, rows, t)
+    }
+    pub fn spec_rollback(&mut self, slot: usize, keep: usize) -> Result<(), String> {
+        self.dec.spec_rollback(slot, keep)
+    }
+    pub fn spec_rewind_pos(&mut self, slot: usize, n: u32) -> Result<(), String> {
+        self.dec.spec_rewind_pos(slot, n)
+    }
+    pub fn embed_row(&self, tok: u32) -> Result<Vec<f32>, String> {
+        self.model.embed_row(tok).map_err(|e| e.to_string())
+    }
+    pub fn n_embd(&self) -> usize {
+        self.model.hp.n_embd
+    }
+
     /// 전 슬롯 리셋(서버 워밍업 종료 후).
     pub fn reset_states(&mut self) -> Result<(), String> {
         for s in 0..self.n_slots {

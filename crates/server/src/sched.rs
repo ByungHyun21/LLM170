@@ -90,7 +90,13 @@ pub(crate) fn load_gpu_retry(
 ) -> crate::gpu_engine::GpuEngine {
     for i in 0..5 {
         match crate::gpu_engine::GpuEngine::load(p, n_slots, ctx) {
-            Ok(e) => return e,
+            Ok(mut e) => {
+                // [§7.1] 스펙 스냅샷 버퍼 — 실패(VRAM 부족 등) 시 비활성 로그.
+                if let Err(err) = e.enable_spec() {
+                    eprintln!("# spec 비활성: {err}");
+                }
+                return e;
+            }
             Err(err) => {
                 eprintln!("# gpu 엔진 로드 재시도 {}/5: {err}", i + 1);
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -121,6 +127,18 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
             greedy.push(i);
         }
     }
+    // [§7.1 2026-10-11] 스펙 서빙 — 초안이 발화하는 그리디 슬롯은 검증
+    // 라운드(직렬). 값 보존: 검증+보정 토큰이 t=1 디코드와 비트동일
+    // (스펙 골든 계약 — spec_round 주석 참조). 나머지는 종전 배치/단독.
+    let mut g2: Vec<usize> = Vec::with_capacity(greedy.len());
+    for &i in &greedy {
+        match spec_round(i, &mut slots[i], e) {
+            Ok(true) => {}
+            Ok(false) => g2.push(i),
+            Err(err) => slot_fail(&mut slots[i], format!("spec: {err}")),
+        }
+    }
+    let greedy = g2;
     if greedy.len() >= 2 {
         let toks: Vec<u32> = greedy.iter().map(|&i| slots[i].next).collect();
         match e.decode_np_greedy(&greedy, &toks) {
@@ -542,6 +560,56 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         failed: None,
     };
 }
+/// [§7.1 2026-10-11] 스펙 라운드 — n-gram 초안(4-gram·최대 SPEC_K-1) 발화 시
+/// 1회. Ok(true)=라운드 수행(토큰 방출), Ok(false)=초안 없음(종전 경로).
+/// 값 보존: 검증 배치가 전 위치 토큰을 내고, 수용분+보정(t=1 재계산)이
+/// 단독 디코드와 동일한 토큰열을 만든다(프로브 [A-1 완화 ①]과 동일 절차 —
+/// 35B/27B 스펙 골든 접두가 판정).
+const SPEC_K: usize = 4;
+fn spec_round(
+    i: usize,
+    s: &mut Slot,
+    e: &mut crate::gpu_engine::GpuEngine,
+) -> Result<bool, String> {
+    let mut hist: Vec<u32> = Vec::new();
+    if let Some(j) = &s.job {
+        hist.extend_from_slice(&j.tokens);
+    }
+    hist.extend_from_slice(&s.tokens);
+    let draft = llm170_core::spec::ngram_draft(&hist, 4, 48, SPEC_K - 1);
+    if draft.is_empty() {
+        return Ok(false);
+    }
+    let t = 1 + draft.len();
+    let mut rows: Vec<f32> = Vec::with_capacity(t * e.n_embd());
+    rows.extend_from_slice(&e.embed_row(s.next)?);
+    for &tk in &draft {
+        rows.extend_from_slice(&e.embed_row(tk)?);
+    }
+    e.spec_save_state(i)?;
+    let toks = e.spec_verify(i, &rows, t)?;
+    let mut acc = 0usize;
+    while acc < draft.len() && toks[acc] == draft[acc] {
+        acc += 1;
+    }
+    let last = if acc >= 1 { draft[acc - 1] } else { s.next };
+    if acc >= 1 {
+        e.spec_rollback(i, acc)?;
+        e.spec_rewind_pos(i, (t - acc) as u32)?;
+    } else {
+        e.spec_load_state(i)?;
+        e.spec_rewind_pos(i, t as u32)?;
+    }
+    let corr = e.decode_greedy(i, last)?;
+    for &tk in &draft[..acc] {
+        slot_emit(s, tk);
+    }
+    slot_emit(s, corr);
+    SCHED.spec_rounds.fetch_add(1, Ordering::Relaxed);
+    SCHED.spec_accepted.fetch_add(acc as u64, Ordering::Relaxed);
+    Ok(true)
+}
+
 fn slot_emit(s: &mut Slot, t: u32) {
     s.next = t;
     s.tokens.push(t);
