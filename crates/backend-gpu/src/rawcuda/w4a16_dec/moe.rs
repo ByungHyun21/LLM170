@@ -361,7 +361,7 @@ impl W4a16Dec {
         let (d0, d1) = (self.dchain[0], self.dchain[1]);
         let drt = self.drt.ptr;
         let shared = self.shared_ffn > 0;
-        let mut ent: Vec<u64> = Vec::with_capacity(nl * 3 * 4);
+        let mut ent: Vec<u64> = Vec::with_capacity(nl * 4 * 4);
         let mut rows: Vec<u32> = Vec::with_capacity(nl);
         for il in 0..nl {
             let (gw, gn, gk) = self.plain_spec(&format!("blk.{il}.moe_gate.weight"))?;
@@ -373,8 +373,15 @@ impl W4a16Dec {
                     ent.extend([w, out, n as u64, k as u64]);
                     r += n as u32;
                 }
+                // [§4.5 2026-10-11] sgate를 4세그먼트로 편입 — 꼬리 GEMV
+                // 런치 -1/층. 출력은 전용 슬롯(drt+n_exp — 라우터는 [0..n_exp)
+                // 만 기록하고 topk 소비 후 shared_add가 읽어 순서 안전).
+                let (w, n, k) =
+                    self.plain_spec(&format!("blk.{il}.moe_shared_sgate.weight"))?;
+                ent.extend([w, drt + self.n_experts as u64 * 4, n as u64, k as u64]);
+                r += n as u32;
             } else {
-                ent.extend([0u64; 8]);
+                ent.extend([0u64; 12]);
             }
             rows.push(r);
         }
@@ -409,7 +416,7 @@ impl W4a16Dec {
         }
         let f = self.cc.function("w4a16_gemv_multi")?;
         let (mut p_tab, mut p_x, mut p_c) =
-            (self.moe_multi_tab + (il as u64) * 3 * 4 * 8, xn, 3i32);
+            (self.moe_multi_tab + (il as u64) * 4 * 4 * 8, xn, 4i32);
         self.cc.launch(
             f,
             rows,
@@ -429,23 +436,32 @@ impl W4a16Dec {
             let [s0, s1, ..] = self.dchain;
             self.plain_gemv_launch(&format!("blk.{il}.moe_shared_gate.weight"), xn, s0)?;
             self.plain_gemv_launch(&format!("blk.{il}.moe_shared_up.weight"), xn, s1)?;
+            // [§4.5] 스트리밍은 multi_gate 미사용 — sgate를 전용 슬롯에 여기서.
+            self.plain_gemv_launch(
+                &format!("blk.{il}.moe_shared_sgate.weight"),
+                xn,
+                self.drt.ptr + self.n_experts as u64 * 4,
+            )?;
         }
         self.moe_shared_tail(il, xn)
     }
 
-    /// shared 꼬리 — ew(silu·mul) → down → sgate → 누적.
-    fn moe_shared_tail(&mut self, il: usize, xn: CUdeviceptr) -> Result<(), String> {
+    /// shared 꼬리 — ew(silu·mul) → down → 누적(sgate는 [§4.5] multi_gate/
+    /// 스트리밍 분기가 전용 슬롯에 선기록 — 런치 -1/층).
+    fn moe_shared_tail(&mut self, il: usize, _xn: CUdeviceptr) -> Result<(), String> {
         let h = self.hidden;
         let sf = self.shared_ffn;
         let [s0, s1, _s1b, s2, s3] = self.dchain;
         self.ew_dev(s0, s1, s2, sf)?;
         self.plain_gemv_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3)?;
-        self.plain_gemv_launch(
-            &format!("blk.{il}.moe_shared_sgate.weight"),
-            xn,
-            self.drt.ptr,
-        )?;
-        self.shared_add_dev(self.drt.ptr, s3, self.dmo.ptr, h, 1)
+        // [§4.5] sgate는 multi_gate 4세그먼트(상주) 또는 스트리밍 분기가 기록.
+        self.shared_add_dev(
+            self.drt.ptr + self.n_experts as u64 * 4,
+            s3,
+            self.dmo.ptr,
+            h,
+            1,
+        )
     }
 
     /// MoE FFN 배치(t≤8) — 라우터 플레인 GEMM → 디바이스 top-k(t×top_k 슬롯,

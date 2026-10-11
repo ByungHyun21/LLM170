@@ -616,6 +616,11 @@ __device__ __forceinline__ unsigned deq_pair_b(unsigned qw, int tt, float sc) {
     return *reinterpret_cast<const unsigned*>(&r);
 }
 
+// [§1.3 실측 기각 2026-10-11] B smem-f16 디큐트(블록 1회 — 레지스터 디큐트의
+// m워프 중복 제거): 골든 비트동일·math_pipe 부하 감소에도 **전면 악화**
+// (P4096 2765→2838ms·pp16384 14494→15241ms·커널 7712→7958ms) — smem
+// 30.7KB로 L1 축소가 우세(marlin-C4 30.5KB 실측과 동형). 되돌림. 잔여
+// math_pipe_throttle(2.88) 해소는 smem 비증가 구조에서만 시도할 것.
 extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
     const unsigned short* __restrict__ s,  // [n][k/128] f16 스케일
