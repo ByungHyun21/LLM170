@@ -386,6 +386,18 @@ __device__ __forceinline__ void gemv_g128_t_body(
 // 98.9 tok/s(스필 우세). ncu: t=5에서 점유 2블록(64 regs)·long_scoreboard
 // 12.63·barrier 4.49 — 지연은 트리 배리어(계약)+x float2 패턴에 내재.
 // 대안(Gemm 경로 21 tok/s·lb) 전부 실측 기각 — 잔여는 구조 재설계 영역.
+// [S1-a 실측 기각 2026-10-11] 환원 재배치(행별 2배리어 → 상반부 슬롯 기록+
+// 배리어 1, 산술 비트동일) 시도: 27B np4 109.6→107.1 tok/s(동일 세션 2×2
+// fatbin A/B −2.2%)·t=4 격리 bench 0.065→0.066ms. 격리 대조(o2v=old+4KB
+// smem(0.065) · o58=old maxrregcount=58(0.064) · n12=new sc축소 12KB(0.066))
+// 로 smem·레지스터 가설 배제 — barrier 4.49는 임계 경로 아님(long_scoreboard
+// 지배). 무변경 원복.
+// [S1-b 실측 기각 2026-10-11] GEMV_TR 8→16(x L2 재판독 ÷2 가설 — np 스텝
+// 스케일링 +5~6ms/토큰 근거): 27B 프리필 t=2..8이 0층부터 NaN(토큰 골든
+// 붕괴). 대조 실측: t=1 체인·35B 프리필(bf16_t)·27B 스펙 검증 t=4는 정상,
+// TR=12도 동일 실패(1024스레드·레지스터 정확 적합 가설 배제), T=2 단독 SASS는
+// TR 스케일 상수 5개 외 동일. TR-비의존 국소화 실패(원인 미규명) — TR=8
+// 원복. 가설 자체는 미검증으로 잔존.
 extern "C" __global__ void w4a16_gemv_g128_t(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x,   // [t][k] f32 (cast_x32 산출값)

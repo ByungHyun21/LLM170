@@ -107,6 +107,11 @@ extern "C" __global__ void w4a16_gemv_multi(
 // [A9 2026-10-10] t행 GEMV(플레인 bf16) — 가중 판독 1회를 t행이 공유.
 // 행별 산술은 w4a16_gemv_bf16과 **비트동일**(i 오름차순 mul·add 분리·tree64).
 // t 템플릿 상수 + GEMV_TR행/블록(A9-fix1/2 — split 판 동형).
+// [S1-a 실측 기각 2026-10-11] 환원 재배치(상반부 슬롯+1배리어) 시도 — 실측
+// 역행으로 원복(gptq4.cu gemv_g128_t_body 기록 참조).
+// [S1-b 실측 기각 2026-10-11] GEMV_TR 8→16(공용 define) — g128_t에서 27B
+// 프리필 NaN, 본 커널(bf16_t)은 35B 프리필 정상이나 공용 define 원복에 포함
+// (기록: gptq4.cu).
 template <int T>
 __device__ __forceinline__ void gemv_bf16_t_body(
     const unsigned short* __restrict__ w, const float* __restrict__ x,
