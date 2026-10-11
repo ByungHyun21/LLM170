@@ -237,6 +237,24 @@ impl CudaCtx {
         Ok(())
     }
 
+    /// [M16 2026-10-11] SM 수 조회(타일 디스패치용) — 실패 시 0.
+    pub fn sm_count(&self) -> u32 {
+        // SAFETY: self.device는 본 컨텍스트의 유효 장치 핸들 — 스칼라 속성.
+        unsafe {
+            let mut v: std::os::raw::c_int = 0;
+            if (self.drv.device_get_attribute)(
+                &mut v,
+                ffi::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                self.device,
+            ) == CUDA_SUCCESS
+            {
+                v.max(0) as u32
+            } else {
+                0
+            }
+        }
+    }
+
     /// 로드된 커널 핸들 조회.
     pub fn function(&self, name: &str) -> Result<CUfunction, String> {
         self.fns

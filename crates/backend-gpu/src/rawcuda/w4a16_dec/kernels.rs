@@ -332,13 +332,21 @@ impl W4a16Dec {
                     &mut crate::rawcuda::args::l3(&mut c_in, &mut c_out, &mut c_n),
                 )?;
             }
-            let f = self.cc.function("w4a16_gemm_bf16_mma")?;
+            // [M16 2026-10-11] 그리드 기아 형상이면 M16 변형(블록 2배) —
+            // 값은 MM32와 비트동일(같은 k 순서·mma). 판정: M32 타일 수 < SM 수.
+            let tiles32 = t.div_ceil(GEMM_BMMA_M) as u64 * n.div_ceil(GEMM_BMMA_N) as u64;
+            let m16 = tiles32 < 2 * self.cc.sm_count().max(1) as u64;
+            let f = self.cc.function(if m16 {
+                "w4a16_gemm_bf16_mma16"
+            } else {
+                "w4a16_gemm_bf16_mma"
+            })?;
             let (mut p_w, mut p_x, mut p_o) = (w, self.dabf.ptr, y_out);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
             let mut p_b = 1i32;
             return self.cc.launch(
                 f,
-                t.div_ceil(GEMM_BMMA_M) as u32,
+                t.div_ceil(if m16 { 16 } else { GEMM_BMMA_M }) as u32,
                 n.div_ceil(GEMM_BMMA_N) as u32,
                 256,
                 &mut crate::rawcuda::args::l7(

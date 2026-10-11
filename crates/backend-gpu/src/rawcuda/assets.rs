@@ -59,6 +59,7 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_gemv_bf16_t",
             "w4a16_cast_bf16",
             "w4a16_gemm_bf16_mma",
+            "w4a16_gemm_bf16_mma16",
             "w4a16_gemm_bf16",
             "w4a16_gemm_bf16_t",
             "w4a16_axpy",

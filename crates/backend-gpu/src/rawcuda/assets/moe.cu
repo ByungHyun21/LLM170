@@ -250,7 +250,11 @@ __device__ __forceinline__ void ldm_x2(unsigned& r0, unsigned& r1, const void* p
                  : "r"(a));
 }
 
-extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
+// [M16 2026-10-11] 타일 M을 템플릿화 — MM=16 변형은 그리드 기아 형상
+// (t/32×n/64 < SM수)에서 블록 2배. 워프 매핑: MM32=2m×4n(워프 16×16),
+// MM16=1m×8n(워프 16×8). k 순서·mma 동일 — 두 변형 값 비트동일.
+template <int MM>
+__device__ __forceinline__ void bmma_body(
     const unsigned short* __restrict__ w,  // [n][k] bf16
     const float* __restrict__ x,           // [t][k] f32 (xbf=0) / bf16 미러
     float* __restrict__ out,               // [t][n]
@@ -259,20 +263,21 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
     // [뱅크 충돌] 행 stride를 128B(전 뱅크 주기)로 두면 프래그먼트 로드가
     // 8-way 충돌(실측: 패딩 없음 0.056ms = v3와 동일). +8 bf16(16B) 패딩으로
     // 행마다 4뱅크씩 이동 → conflict-free.
-    __shared__ unsigned short xs[BMMA_M][MMA_KC + 8];
+    __shared__ unsigned short xs[MM][MMA_KC + 8];
     __shared__ unsigned short ws[BMMA_N][MMA_KC + 8];
     const int tid = threadIdx.x;
-    const int m0 = blockIdx.x * BMMA_M;
+    const int m0 = blockIdx.x * MM;
     const int n0 = blockIdx.y * BMMA_N;
     const int lane = tid & 31;
     const int warp = tid >> 5;
     const int g = lane >> 2;
     const int tt = lane & 3;
-    const int mt = (warp >> 2) * 16;      // [B1/B3] 2 m워프 × 16 = M32
-    const int ntw = (warp & 3) * 16;      // 4 n워프 × 16 = N64(워프 16×16)
-    float c[2][4];
+    const int mt = (MM == 32) ? (warp >> 2) * 16 : 0; // MM32: 2m워프 / MM16: 1m
+    const int ntw = (MM == 32) ? (warp & 3) * 16 : warp * 8; // MM32: 4n / MM16: 8n
+    constexpr int NF = (MM == 32) ? 2 : 1; // n프래그먼트 수
+    float c[NF][4];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 4 * NF; ++i) {
         ((float*)c)[i] = 0.0f;
     }
     for (int k0 = 0; k0 < k; k0 += MMA_KC) {
@@ -281,7 +286,7 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
         // f32→bf16 변환(float4). 두 경로의 xs 값은 비트동일.
         if (xbf) {
             const unsigned short* x16 = reinterpret_cast<const unsigned short*>(x);
-            for (int e = tid; e < BMMA_M * MMA_KC / 8; e += 256) {
+            for (int e = tid; e < MM * MMA_KC / 8; e += 256) {
                 const int r = e / (MMA_KC / 8);
                 const int c8 = e % (MMA_KC / 8);
                 const int gi = k0 + c8 * 8;
@@ -298,7 +303,7 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
                 }
             }
         } else
-        for (int e = tid; e < BMMA_M * MMA_KC / 4; e += 256) {
+        for (int e = tid; e < MM * MMA_KC / 4; e += 256) {
             const int r = e / (MMA_KC / 4);
             const int c4 = e % (MMA_KC / 4);
             const int gi = k0 + c4 * 4;
@@ -344,9 +349,9 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
             unsigned a0, a1, a2, a3;
             ldm_x4(a0, a1, a2, a3, &xs[mt + row][kb + colblk]);
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) {
+            for (int nt = 0; nt < NF; ++nt) {
                 const int nb = ntw + nt * 8;
-                // B: ldmatrix.x2.trans — 레인 0-7이 n행(열 kb), 8-15가 n행(열 kb+8).
+                // B: ldmatrix.x2 — 레인 0-7이 n행(열 kb), 8-15가 n행(열 kb+8).
                 unsigned b0, b1;
                 ldm_x2(b0, b1, &ws[nb + (lane & 7)][kb + ((lane & 8) ? 8 : 0)]);
                 asm volatile(
@@ -359,7 +364,7 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
     }
     // 에필로그 — 프래그먼트 규약 그대로 기록(범위 가드).
 #pragma unroll
-    for (int nt = 0; nt < 2; ++nt) {
+    for (int nt = 0; nt < NF; ++nt) {
         const int col = n0 + ntw + nt * 8 + 2 * tt;
         const int r0 = m0 + mt + g;
         if (r0 < t) {
@@ -379,6 +384,22 @@ extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
             }
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma(
+    const unsigned short* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ out, int n, int k, int t, int xbf)
+{
+    bmma_body<32>(w, x, out, n, k, t, xbf);
+}
+
+// [M16] 그리드 기아 형상(t/32×n/64 < SM) 전용 — 블록 2배(워프 16×8).
+// 값은 MM32와 비트동일(같은 k 순서·같은 mma) — 골든 판정.
+extern "C" __global__ void w4a16_gemm_bf16_mma16(
+    const unsigned short* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ out, int n, int k, int t, int xbf)
+{
+    bmma_body<16>(w, x, out, n, k, t, xbf);
 }
 
 // [R5 2026-10-10] G4_TMAX 재정의 제거 — 단일 정의(gemv_bf16_t 상단)로 통합.
