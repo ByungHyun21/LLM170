@@ -35,6 +35,10 @@ impl W4a16Dec {
         for (_, e, g) in self.batch_graphs.drain(..) {
             let _ = self.cc.graph_destroy(e, g);
         }
+        // [A6-1] 검증 체인 그래프도 동일 계약.
+        for (_, e, g) in self.spec_graphs.drain(..) {
+            let _ = self.cc.graph_destroy(e, g);
+        }
     }
 
     /// 그래프 준비 — 캐시 히트면 즉시 exec 반환(A8, 슬롯/모드별 1회 캡처).

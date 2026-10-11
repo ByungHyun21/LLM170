@@ -440,6 +440,11 @@ pub struct W4a16Dec {
     pin_batch_in: *mut std::ffi::c_void,
     pin_batch_pos: *mut std::ffi::c_void,
     batch_graphs: Vec<(Vec<usize>, ffi::CUgraphExec, ffi::CUgraph)>,
+    /// [A6-1 2026-10-11] 검증 체인 (slot, t) 그래프 캐시 — 캡처 실패 시 비활성.
+    spec_graphs: Vec<((usize, usize), ffi::CUgraphExec, ffi::CUgraph)>,
+    spec_graph_ok: bool,
+    /// [A6-1] 캡처 본문에서 호스트 갱신(sync·slot_pos·체크포인트) 생략 게이트.
+    capture_no_host: bool,
     /// 캡처 실패 후 직접 발사 고정(재시도 방지 — t=1 graph_failed와 동형).
     batch_capture_failed: bool,
     /// 층별 잔차 합 덤프(CPU LLM170_DUMP=debug_layers와 대조용).
@@ -604,6 +609,9 @@ impl W4a16Dec {
             pin_batch_in: std::ptr::null_mut(),
             pin_batch_pos: std::ptr::null_mut(),
             batch_graphs: Vec::new(),
+            spec_graphs: Vec::new(),
+            spec_graph_ok: true,
+            capture_no_host: false,
             batch_capture_failed: false,
             debug_layers: false,
         })

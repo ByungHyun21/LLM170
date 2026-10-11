@@ -189,7 +189,7 @@ impl W4a16Dec {
         // [A2 2026-10-11] 2048 경계 — 접두 재사용 체크포인트(GDN 상태+conv
         // 링, 순수 복사 — 산술 불변). 실패는 무시(기능만 미제공).
         let endp = pos + t as u32;
-        if endp.is_multiple_of(2048) {
+        if !self.capture_no_host && endp.is_multiple_of(2048) {
             let _ = self.checkpoint_gdn(slot, endp);
         }
         if all {
@@ -216,10 +216,12 @@ impl W4a16Dec {
                 let mut ob = vec![0u8; t * self.head_n * 4];
                 self.cc
                     .d2h_async(ob.as_mut_ptr(), self.dbatch_lg, ob.len())?;
-                self.cc.sync()?;
-                let pos_after = pos + t as u32;
-                self.slot_pos[slot] = pos_after;
-                self.attn_set_pos(slot, pos_after)?;
+                if !self.capture_no_host {
+                    self.cc.sync()?;
+                    let pos_after = pos + t as u32;
+                    self.slot_pos[slot] = pos_after;
+                    self.attn_set_pos(slot, pos_after)?;
+                }
                 return Ok(ob
                     .as_chunks::<4>()
                     .0
@@ -243,10 +245,12 @@ impl W4a16Dec {
             let tb =
                 unsafe { std::slice::from_raw_parts_mut(self.pin_batch_tok as *mut u8, t * 4) };
             self.cc.d2h_async(tb.as_mut_ptr(), self.dbatch_am, t * 4)?;
-            self.cc.sync()?;
-            let pos_after = pos + t as u32;
-            self.slot_pos[slot] = pos_after;
-            self.attn_set_pos(slot, pos_after)?;
+            if !self.capture_no_host {
+                self.cc.sync()?;
+                let pos_after = pos + t as u32;
+                self.slot_pos[slot] = pos_after;
+                self.attn_set_pos(slot, pos_after)?;
+            }
             return Ok((0..t)
                 .map(|k| {
                     u32::from_le_bytes([tb[k * 4], tb[k * 4 + 1], tb[k * 4 + 2], tb[k * 4 + 3]])
