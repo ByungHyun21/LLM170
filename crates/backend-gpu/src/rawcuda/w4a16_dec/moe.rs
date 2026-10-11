@@ -541,6 +541,44 @@ impl W4a16Dec {
         if group {
             // [P11] 그룹 mma GEMM — 전문가별 슬롯 묶음(M=슬롯 수), T1 계약 미러.
             self.moe_align_launch(ns)?;
+            // [S13/S5 2026-10-11] 라우팅 분포 진단(LLM170_DUMP=moe_cnt) —
+            // gcnt 히스토그램 + Σceil(cnt/GRP_M) 타일 수(M64/32/16 비교).
+            if llm170_diag::dump::opts().key("moe_cnt") {
+                let mut cb = vec![0u8; n_exp * 4];
+                self.cc
+                    .d2h_async(cb.as_mut_ptr(), self.moe_gcnt, n_exp * 4)?;
+                self.cc.sync()?;
+                let cnts: Vec<u32> = cb
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_le_bytes(*c))
+                    .collect();
+                let mut hist = [0usize; 8];
+                let mut sum = 0usize;
+                let (mut t64, mut t32, mut t16) = (0usize, 0usize, 0usize);
+                for &c in &cnts {
+                    let c = c as usize;
+                    sum += c;
+                    t64 += c.div_ceil(64);
+                    t32 += c.div_ceil(32);
+                    t16 += c.div_ceil(16);
+                    let b = match c {
+                        0 => 0,
+                        1..=8 => 1,
+                        9..=16 => 2,
+                        17..=32 => 3,
+                        33..=48 => 4,
+                        49..=64 => 5,
+                        65..=96 => 6,
+                        _ => 7,
+                    };
+                    hist[b] += 1;
+                }
+                eprintln!(
+                    "[moe-cnt] il={il} slots={ns} sum={sum} tiles M64={t64} M32={t32} M16={t16} hist[0|1-8|9-16|17-32|33-48|49-64|65-96|97+]={hist:?}"
+                );
+            }
             // [marlin-A5] A는 f16(xn 미러) — 그룹 GEMM A 재판독 절반.
             let x16 = self.cast_x16(xn, t * h)?;
             // [§1.2 2026-10-11] 게이트·업 2N 융합 — 발사 1회(A 스테이징·배리어 상각).

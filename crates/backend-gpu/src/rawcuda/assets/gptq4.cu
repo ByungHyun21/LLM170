@@ -920,6 +920,14 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
 // A = 슬롯→토큰 매핑으로 모은 x 행(f16 스테이징), B = g32 디퀀트(f16).
 // 프래그먼트·타일 계약은 T1과 동일(명시 판독 — ldmatrix 전치 불일치 회피).
 // 판정은 토큰 골든(계약 완화 — 허용오차 등급).
+// [S5-lite 채택 2026-10-11] GRP_KC 32→64 — grp/grp2 전용(공용 MMA_KC는
+// dense mma 계약·점유 실측으로 32 유지 — marlin-A3 기각 이력). 근거: grp
+// 병목 = 청크당 배리어 2회 스톨 41%(§1.2 ncu) — KC 2배 = 배리어·스테이징
+// 횟수 절반. 값 비트동일(mma k순서 불변 — 35B 골든 일치 실측). 실측: pp512
+// 4520→4695(+3.7%)·pp4096 4110→4240(+3.2%). smem 27.6KB·스필 0.
+// (라우팅 분포 실측 부기: 256전문가·4096슬롯 → 전문가당 1-16 다수 —
+// M타일 축소(M32/16)는 B 디큐트 타일 중복 때문에 역효과로 모델링됨.)
+#define GRP_KC 64
 extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     const unsigned long long* __restrict__ tab, int base,
     const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
@@ -964,8 +972,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     // (62ms) 오염이었다. 되돌림.
     // (레지스터 디큐트×2·cp.async·KC·NSPLIT·FLA-5) — SASS상 디큐트는 이미
     // 컴파일러 최적(PRMT 팩·STS.64).
-    __shared__ __align__(16) unsigned short xs[2][GRP_M][MMA_KC + 8];
-    __shared__ unsigned short ws[2][GRP_N][MMA_KC + 8];
+    __shared__ __align__(16) unsigned short xs[2][GRP_M][GRP_KC + 8];
+    __shared__ unsigned short ws[2][GRP_N][GRP_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
     for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
         const unsigned rbase = mtile * GRP_M;
@@ -976,9 +984,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
         }
         // 스테이지 발사(스테이지 st, 청크 kn) — A는 cp.async, B는 디큐트 ALU.
         auto stage_ab = [&](int st, int kn) {
-            for (int ee = tid; ee < GRP_M * MMA_KC / 8; ee += 256) {
-                const int r = ee / (MMA_KC / 8);
-                const int c8 = ee % (MMA_KC / 8);
+            for (int ee = tid; ee < GRP_M * GRP_KC / 8; ee += 256) {
+                const int r = ee / (GRP_KC / 8);
+                const int c8 = ee % (GRP_KC / 8);
                 const int gi = kn + c8 * 8;
                 if (rbase + r < cnt) {
                     const unsigned sl = gs[rbase + r];
@@ -999,9 +1007,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
                     *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) = make_uint4(0u, 0u, 0u, 0u);
                 }
             }
-            for (int ee = tid; ee < GRP_N * MMA_KC / 8; ee += 256) {
-                const int r = ee / (MMA_KC / 8);
-                const int c8 = ee % (MMA_KC / 8);
+            for (int ee = tid; ee < GRP_N * GRP_KC / 8; ee += 256) {
+                const int r = ee / (GRP_KC / 8);
+                const int c8 = ee % (GRP_KC / 8);
                 const int gi = kn + c8 * 8;
                 const bool live = (n0 + r < n) && (gi + 7 < k);
                 unsigned short scb = 0;
@@ -1029,9 +1037,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
         stage_ab(0, 0);
         asm volatile("cp.async.commit_group;");
         int cur = 0;
-        for (int k0 = 0; k0 < k; k0 += MMA_KC, cur ^= 1) {
+        for (int k0 = 0; k0 < k; k0 += GRP_KC, cur ^= 1) {
             // 다음 청크를 발사(mma와 겹침) — A cp.async + B 디큐트.
-            const int kn = k0 + MMA_KC;
+            const int kn = k0 + GRP_KC;
             if (kn < k) {
                 stage_ab(cur ^ 1, kn);
             }
@@ -1040,7 +1048,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
             __syncthreads();
 
 #pragma unroll
-            for (int ks = 0; ks < MMA_KC / 16; ++ks) {
+            for (int ks = 0; ks < GRP_KC / 16; ++ks) {
                 const int kb = ks * 16;
                 const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
                 const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
@@ -1126,8 +1134,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
     const int ntw = (warp & 1) * 32; // 2 n워프 × 32 = N64(게이트 32+업 32)
     const int k8 = k >> 3;
     const int kg = k >> 5; // g32
-    __shared__ __align__(16) unsigned short xs[2][GRP_M][MMA_KC + 8];
-    __shared__ unsigned short ws[2][2 * GRP_N][MMA_KC + 8];
+    __shared__ __align__(16) unsigned short xs[2][GRP_M][GRP_KC + 8];
+    __shared__ unsigned short ws[2][2 * GRP_N][GRP_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
     for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
         const unsigned rbase = mtile * GRP_M;
@@ -1137,9 +1145,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
             ((float*)c)[i] = 0.0f;
         }
         auto stage_ab = [&](int st, int kn) {
-            for (int ee = tid; ee < GRP_M * MMA_KC / 8; ee += 256) {
-                const int r = ee / (MMA_KC / 8);
-                const int c8 = ee % (MMA_KC / 8);
+            for (int ee = tid; ee < GRP_M * GRP_KC / 8; ee += 256) {
+                const int r = ee / (GRP_KC / 8);
+                const int c8 = ee % (GRP_KC / 8);
                 const int gi = kn + c8 * 8;
                 if (rbase + r < cnt) {
                     const unsigned sl = gs[rbase + r];
@@ -1160,9 +1168,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
                     *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) = make_uint4(0u, 0u, 0u, 0u);
                 }
             }
-            for (int ee = tid; ee < 2 * GRP_N * MMA_KC / 8; ee += 256) {
-                const int r = ee / (MMA_KC / 8);
-                const int c8 = ee % (MMA_KC / 8);
+            for (int ee = tid; ee < 2 * GRP_N * GRP_KC / 8; ee += 256) {
+                const int r = ee / (GRP_KC / 8);
+                const int c8 = ee % (GRP_KC / 8);
                 const int gi = kn + c8 * 8;
                 const int rr = n0 + (r & (GRP_N - 1));
                 const unsigned* q = (r < GRP_N) ? q0 : q1;
@@ -1194,8 +1202,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
         stage_ab(0, 0);
         asm volatile("cp.async.commit_group;");
         int cur = 0;
-        for (int k0 = 0; k0 < k; k0 += MMA_KC, cur ^= 1) {
-            const int kn = k0 + MMA_KC;
+        for (int k0 = 0; k0 < k; k0 += GRP_KC, cur ^= 1) {
+            const int kn = k0 + GRP_KC;
             if (kn < k) {
                 stage_ab(cur ^ 1, kn);
             }
@@ -1203,7 +1211,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
             asm volatile("cp.async.wait_group 1;");
             __syncthreads();
 #pragma unroll
-            for (int ks = 0; ks < MMA_KC / 16; ++ks) {
+            for (int ks = 0; ks < GRP_KC / 16; ++ks) {
                 const int kb = ks * 16;
                 const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
                 const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
