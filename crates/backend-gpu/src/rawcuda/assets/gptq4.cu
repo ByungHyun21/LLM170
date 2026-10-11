@@ -524,7 +524,10 @@ __device__ __forceinline__ void gemv_g128_t_body(
 // 모델 오답 위치의 ulp 플립) — eval.md 후보 표 기록. 골든(프로브·spec·
 // np4 serve) 3종 유지·smoke 10/10. 초기 구현의 하프워프 셔플(마스크 UB·
 // 행)은 전 워프 참여형으로 수정(위 rr 루프).
-extern "C" __global__ void w4a16_gemv_g128_t(
+// [A1-점유 2026-10-11] 72→64reg 강제(4블록/SM — np4 27B 119.0→128.0(+7.6%),
+// 스필 228/344B 감수). ncu 실측: DRAM 38%·long_scoreboard 13.7·점유 50%(3블록
+// 한계) = 완전 지연 바운드 — cp.async 스테이징이 아니라 **점유**가 정답이었다.
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g128_t(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x,   // [t][k] f32 (cast_x32 산출값)
     float* __restrict__ out,       // [t][n]
@@ -553,7 +556,8 @@ extern "C" __global__ void w4a16_gemv_g128_t(
 // t=1 판 w4a16_gemv_g128_multi와 공용((q,s,out,n,k)). 세그먼트 블록수는
 // ceil(n/GEMV_TR), 호스트 grid = Σceil(n_s/GEMV_TR). 행별 산술은
 // w4a16_gemv_g128_t와 **비트동일**(gemv_g128_t_body 그대로 — 행 독립).
-extern "C" __global__ void w4a16_gemv_g128_multi_t(
+// [A1-점유] 4블록 강제(위 g128_t와 동형 — multi_t도 72reg/3블록 한계).
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g128_multi_t(
     const unsigned long long* __restrict__ tab, // [count][5]: q, s, out, n, k
     const float* __restrict__ x,                // [t][k] f32(cast_x32 산출)
     int count, int t)
