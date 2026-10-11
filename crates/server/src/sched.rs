@@ -51,6 +51,8 @@ struct Slot {
     err_count: u32,
     /// QA-1: 연속 실패 상한(3) 도달 시 확정 실패 사유.
     failed: Option<String>,
+    /// [§7.5] 스펙 적응 게이트 — 연속 무수용 라운드 수(2 도달 시 128토큰마다 재시도).
+    spec_miss: u32,
 }
 
 impl Slot {
@@ -67,6 +69,7 @@ impl Slot {
             sampler: None,
             err_count: 0,
             failed: None,
+            spec_miss: 0,
         }
     }
 }
@@ -558,6 +561,7 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         sampler: sampler_new,
         err_count: 0,
         failed: None,
+        spec_miss: 0,
     };
 }
 /// [§7.1 2026-10-11] 스펙 라운드 — n-gram 초안(4-gram·최대 SPEC_K-1) 발화 시
@@ -571,6 +575,12 @@ fn spec_round(
     s: &mut Slot,
     e: &mut crate::gpu_engine::GpuEngine,
 ) -> Result<bool, String> {
+    // [§7.5 2026-10-11] 적응 게이트 — 연속 무수용 2회면 128토큰마다만 재시도.
+    // 산문 벤치 실측(서빙 A/B): 초안이 발화하나 수용 0이 반복되면 검증 비용
+    // (~0.85틱)이 순손실 — tg −1.6%·np4 −5.7%. 수용 시 즉시 해제.
+    if s.spec_miss >= 1 && (s.generated & 255) != 0 {
+        return Ok(false);
+    }
     let mut hist: Vec<u32> = Vec::new();
     if let Some(j) = &s.job {
         hist.extend_from_slice(&j.tokens);
@@ -599,6 +609,11 @@ fn spec_round(
     } else {
         e.spec_load_state(i)?;
         e.spec_rewind_pos(i, t as u32)?;
+    }
+    if acc == 0 {
+        s.spec_miss = (s.spec_miss + 1).min(3);
+    } else {
+        s.spec_miss = 0;
     }
     let corr = e.decode_greedy(i, last)?;
     for &tk in &draft[..acc] {
