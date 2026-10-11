@@ -316,6 +316,11 @@ impl GpuEngine {
 
     /// [§7.1 2026-10-11] 스펙 서빙 — GDN 토큰별 스냅샷 버퍼 확보(모델당 1회).
     /// VRAM: 27B 654MB+dsave(슬롯당 ~154MB)·35B 436MB+dsave.
+    /// [2026-10-12] 스펙 활성 여부 — 비활성(스트리밍·VRAM 부족)이면 스케줄러가
+    /// 라운드를 시도하지 않는다.
+    pub fn spec_on(&self) -> bool {
+        self.dec.spec_on()
+    }
     pub fn enable_spec(&mut self) -> Result<(), String> {
         self.dec.enable_spec()
     }

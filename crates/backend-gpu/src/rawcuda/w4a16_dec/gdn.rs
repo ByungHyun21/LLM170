@@ -281,7 +281,18 @@ impl W4a16Dec {
     /// GDN 체인 디바이스 상주 — xn·qkv·z(디바이스) → dgate.
     /// [A-1] 스펙 검증 활성화 — GDN 토큰별 스냅샷 버퍼 확보(KMAX=8 고정).
     /// VRAM: 8 × n_layers × h_v × 128×128 × 4B (35B 436MB · 27B 654MB).
+    /// [2026-10-12] 스펙 활성 여부 — 스케줄러가 라운드 시도 전에 확인한다
+    /// (비활성 상태의 라운드 시도가 요청을 죽이던 결함 — 실측 500).
+    pub fn spec_on(&self) -> bool {
+        self.spec_on
+    }
+
     pub fn enable_spec(&mut self) -> Result<(), String> {
+        // [2026-10-12] 스트리밍(비상주 MoE)은 검증 체인(t>1 체인) 미지원 —
+        // 검증 라운드가 실패해 요청이 죽는다(실측 500). 시작 시 명시 비활성.
+        if self.n_experts > 0 && !self.moe_resident {
+            return Err("스트리밍(비상주 MoE) — 검증 체인 미지원(t>1 상주 전용)".into());
+        }
         let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
         if self.dsnap != 0 {
             self.spec_on = true;

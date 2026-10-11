@@ -140,8 +140,15 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
     // [§7.1 2026-10-11] 스펙 서빙 — 초안이 발화하는 그리디 슬롯은 검증
     // 라운드(직렬). 값 보존: 검증+보정 토큰이 t=1 디코드와 비트동일
     // (스펙 골든 계약 — spec_round 주석 참조). 나머지는 종전 배치/단독.
+    // [2026-10-12] 스펙 비활성(스트리밍·VRAM 부족)이면 라운드 시도 금지 —
+    // 비활성 상태 시도가 요청을 죽이던 결함(실측: 스트리밍 서브 500).
+    let spec_ok = e.spec_on();
     let mut g2: Vec<usize> = Vec::with_capacity(greedy.len());
     for &i in &greedy {
+        if !spec_ok {
+            g2.push(i);
+            continue;
+        }
         match spec_round(i, &mut slots[i], e) {
             Ok(true) => {}
             Ok(false) => g2.push(i),
@@ -154,6 +161,10 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
     // 순서 무관).
     let mut s2: Vec<usize> = Vec::with_capacity(sampled.len());
     for &i in &sampled {
+        if !spec_ok {
+            s2.push(i);
+            continue;
+        }
         match spec_round_sampled(i, &mut slots[i], e) {
             Ok(true) => {}
             Ok(false) => s2.push(i),

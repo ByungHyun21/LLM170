@@ -163,6 +163,10 @@ impl W4a16Dec {
         src: CUdeviceptr,
         bytes: u64,
     ) -> Result<(), String> {
+        // [2026-10-12] 컨텍스트 가드 — 스케줄 스레드 등 비-로드 스레드에서
+        // 무가드 런치는 invalid device context(201)로 죽는다(실측: 스트리밍
+        // 서브 스펙 라운드).
+        let _g = self.cc.guard()?;
         let f = self.cc.function("w4a16_copy")?;
         let n4 = (bytes / 16) as i64;
         let (mut p_s, mut p_d, mut p_n) = (src, dst, n4);
