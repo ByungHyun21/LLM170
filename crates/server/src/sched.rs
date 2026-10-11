@@ -149,6 +149,44 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
         }
     }
     let greedy = g2;
+    // [§7 2단계] 샘플드 스펙 — 초안 발화 슬롯은 검증 라운드(직렬), 나머지 배치.
+    // [S11 2026-10-11] 혼합 통합을 위해 그리디 배치보다 먼저 처리(슬롯 독립 —
+    // 순서 무관).
+    let mut s2: Vec<usize> = Vec::with_capacity(sampled.len());
+    for &i in &sampled {
+        match spec_round_sampled(i, &mut slots[i], e) {
+            Ok(true) => {}
+            Ok(false) => s2.push(i),
+            Err(err) => slot_fail(&mut slots[i], format!("spec(샘플): {err}")),
+        }
+    }
+    let sampled = s2;
+    // [S11] 혼합(그리디+샘플) — 한 배치 체인으로 통합(종전 np_k + np_m 2회).
+    // 실패 시 분리 경로로 폴백.
+    if !greedy.is_empty() && !sampled.is_empty() {
+        let mut uslots: Vec<usize> = Vec::with_capacity(greedy.len() + sampled.len());
+        let mut utoks: Vec<u32> = Vec::with_capacity(uslots.capacity());
+        for &i in greedy.iter().chain(sampled.iter()) {
+            uslots.push(i);
+            utoks.push(slots[i].next);
+        }
+        match e.decode_np_mixed(&uslots, &utoks) {
+            Ok((toks, mut flat)) => {
+                let hn = flat.len() / uslots.len();
+                for (row, (chunk, &i)) in flat.chunks_mut(hn).zip(uslots.iter()).enumerate() {
+                    let smp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
+                    let t = if smp {
+                        pick(&mut slots[i], chunk)
+                    } else {
+                        toks[row]
+                    };
+                    slot_emit(&mut slots[i], t);
+                }
+                return;
+            }
+            Err(err) => eprintln!("# 혼합 배치 폴백(분리): {err}"),
+        }
+    }
     if greedy.len() >= 2 {
         let toks: Vec<u32> = greedy.iter().map(|&i| slots[i].next).collect();
         match e.decode_np_greedy(&greedy, &toks) {
@@ -173,23 +211,20 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
             Err(err) => slot_fail(&mut slots[i], format!("decode_greedy: {err}")),
         }
     }
-    // [§7 2단계] 샘플드 스펙 — 초안 발화 슬롯은 검증 라운드(직렬), 나머지 배치.
-    let mut s2: Vec<usize> = Vec::with_capacity(sampled.len());
-    for &i in &sampled {
-        match spec_round_sampled(i, &mut slots[i], e) {
-            Ok(true) => {}
-            Ok(false) => s2.push(i),
-            Err(err) => slot_fail(&mut slots[i], format!("spec(샘플): {err}")),
-        }
-    }
-    let sampled = s2;
     if !sampled.is_empty() {
         let toks: Vec<u32> = sampled.iter().map(|&i| slots[i].next).collect();
-        match e.decode(&sampled, &toks) {
-            Ok(mut rows) => {
-                for (row, &i) in sampled.iter().enumerate() {
-                    let t = pick(&mut slots[i], &mut rows[row]);
+        // [S11 2026-10-11] t≥2 샘플링은 배치 체인 1회(로짓 d2h) — 종전
+        // 슬롯별 t=1 직렬(≈19.5ms×N) 대비 대폭 상각. 로짓은 행별 t=1 head와
+        // 비트동일이라 호스트 샘플러 토큰열 불변. t=1은 종전 직렬 유지.
+        match e.decode_np_logits(&sampled, &toks) {
+            Ok(mut flat) => {
+                let hn = flat.len() / sampled.len();
+                let mut off = 0usize;
+                for &i in &sampled {
+                    let (row, _rest) = flat[off..].split_at_mut(hn);
+                    let t = pick(&mut slots[i], row);
                     slot_emit(&mut slots[i], t);
+                    off += hn;
                 }
             }
             Err(err) => {

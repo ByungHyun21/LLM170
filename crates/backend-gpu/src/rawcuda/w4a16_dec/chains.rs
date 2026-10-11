@@ -425,4 +425,29 @@ impl W4a16Dec {
             .map(|k| u32::from_le_bytes([tb[k * 4], tb[k * 4 + 1], tb[k * 4 + 2], tb[k * 4 + 3]]))
             .collect()
     }
+
+    /// [S11 2026-10-11] 배치 로짓 판독 — dbatch_lg[t][head_n] d2h(핀드).
+    /// 배치 head(gemv_bf16_t)의 행별 산술은 t=1 판과 동일(비트동일 계약 —
+    /// 행별 64레인 tree)이므로 호스트 샘플러가 보는 값·순서가 직렬 경로와
+    /// 같다 → 샘플링 토큰열 불변. 호출 전 배치 체인 sync 완료가 계약.
+    pub fn batch_read_logits(&mut self, t: usize) -> Result<Vec<f32>, String> {
+        let _g = self.cc.guard()?;
+        if t == 0 || t > BATCH_DEC_MAX || self.dbatch_lg == 0 {
+            return Err(format!("batch_read_logits: 계약 위반 t={t}"));
+        }
+        self.ensure_batch_bufs()?;
+        let bytes = t * self.head_n * 4;
+        // pin_batch_lg는 pinned_alloc 소유 스크래치(수명=self) — d2h가 전량 재기록.
+        self.cc
+            .d2h_async(self.pin_batch_lg as *mut u8, self.dbatch_lg, bytes)?;
+        self.cc.sync()?;
+        // SAFETY: 방금 d2h로 채운 pinned 버퍼의 바이트 뷰(bytes = 원소수×4).
+        let pb = unsafe { std::slice::from_raw_parts(self.pin_batch_lg as *const u8, bytes) };
+        Ok(pb
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    }
 }

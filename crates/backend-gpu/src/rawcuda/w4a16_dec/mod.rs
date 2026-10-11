@@ -423,6 +423,8 @@ pub struct W4a16Dec {
     /// [eval] 배치 버퍼 tmax 하한 — 청크 프리필 로짓 회수용(0=기본 공식).
     pub batch_tmax_min: usize,
     pin_batch_tok: *mut std::ffi::c_void,
+    /// [S11 2026-10-11] 샘플 배치 로짓 핀드 판독 버퍼([t][head_n] f32).
+    pin_batch_lg: *mut std::ffi::c_void,
     pin_batch_in: *mut std::ffi::c_void,
     pin_batch_pos: *mut std::ffi::c_void,
     batch_graphs: Vec<(Vec<usize>, ffi::CUgraphExec, ffi::CUgraph)>,
@@ -579,6 +581,7 @@ impl W4a16Dec {
             dbatch_am: 0,
             batch_tmax_min: 0,
             pin_batch_tok: std::ptr::null_mut(),
+            pin_batch_lg: std::ptr::null_mut(),
             pin_batch_in: std::ptr::null_mut(),
             pin_batch_pos: std::ptr::null_mut(),
             batch_graphs: Vec::new(),

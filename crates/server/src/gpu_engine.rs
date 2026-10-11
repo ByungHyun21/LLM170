@@ -211,6 +211,59 @@ impl GpuEngine {
         self.token_greedy(seq, &row)
     }
 
+    /// [S11 2026-10-11] 혼합 배치(그리디+샘플 슬롯 한 배치) — 배치 체인이
+    /// 토큰(argmax)과 로짓(dbatch_lg)을 동시 산출하므로 한 번에 회수한다.
+    /// 반환 = (전 행 토큰, 전 행 로짓 평탄 [t][head_n]). 그리디 행은 토큰,
+    /// 샘플 행은 로짓 사용 — 둘 다 단독 경로와 비트동일.
+    pub fn decode_np_mixed(
+        &mut self,
+        seq_ids: &[usize],
+        tokens: &[u32],
+    ) -> Result<(Vec<u32>, Vec<f32>), String> {
+        if !(2..=llm170_backend_gpu::BATCH_DEC_MAX).contains(&seq_ids.len()) {
+            return Err("mixed: t 2..=BATCH_DEC_MAX 전용".into());
+        }
+        let h = self.model.hp.n_embd;
+        let mut rows = Vec::with_capacity(seq_ids.len() * h);
+        for tok in tokens {
+            rows.extend_from_slice(&self.model.embed_row(*tok).map_err(|e| e.to_string())?);
+        }
+        let toks = self.dec.forward_device_argmax_batch(seq_ids, &rows)?;
+        let lg = self.dec.batch_read_logits(seq_ids.len())?;
+        Ok((toks, lg))
+    }
+
+    /// [S11 2026-10-11] 배치 디코드 로짓(샘플링 슬롯) — 배치 체인(argmax
+    /// 그래프 재사용: dbatch_lg가 이미 로짓) + 로짓 d2h. 행별 로짓은 t=1
+    /// forward_device_head와 비트동일 → 호스트 샘플러 토큰열 불변.
+    /// 반환 = 행 우선 평탄 [t][head_n]. 전제 위반 시 슬롯별 직렬 폴백.
+    pub fn decode_np_logits(
+        &mut self,
+        seq_ids: &[usize],
+        tokens: &[u32],
+    ) -> Result<Vec<f32>, String> {
+        if (2..=llm170_backend_gpu::BATCH_DEC_MAX).contains(&seq_ids.len()) {
+            let h = self.model.hp.n_embd;
+            let mut rows = Vec::with_capacity(seq_ids.len() * h);
+            for tok in tokens {
+                rows.extend_from_slice(&self.model.embed_row(*tok).map_err(|e| e.to_string())?);
+            }
+            match self.dec.forward_device_argmax_batch(seq_ids, &rows) {
+                Ok(_tok_discard) => match self.dec.batch_read_logits(seq_ids.len()) {
+                    Ok(lg) => return Ok(lg),
+                    Err(e) => eprintln!("# np-logits 판독 폴백(직렬): {e}"),
+                },
+                Err(e) => eprintln!("# np-logits 배치 폴백(직렬): {e}"),
+            }
+        }
+        let mut out = Vec::new();
+        for (s, tok) in seq_ids.iter().zip(tokens.iter()) {
+            let row = self.model.embed_row(*tok).map_err(|e| e.to_string())?;
+            out.extend_from_slice(&self.logits(*s, &row)?);
+        }
+        Ok(out)
+    }
+
     /// 슬롯 상태 리셋(GDN 링/스캔 + pp + pos).
     pub fn reset_seq(&mut self, seq: usize) -> Result<(), String> {
         self.dec.reset_state(seq)

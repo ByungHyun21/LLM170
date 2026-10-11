@@ -545,6 +545,8 @@ impl W4a16Dec {
             self.pin_batch_tok = self.cc.pinned_alloc(tmax * 4)?;
             self.pin_batch_in = self.cc.pinned_alloc(tmax * self.hidden * 4)?;
             self.pin_batch_pos = self.cc.pinned_alloc(self.n_slots * 4)?;
+            // [S11] 샘플 로짓 판독 핀드 — pageable 대비 d2h 가속.
+            self.pin_batch_lg = self.cc.pinned_alloc(tmax * self.head_n * 4)?;
         }
         Ok(())
     }
