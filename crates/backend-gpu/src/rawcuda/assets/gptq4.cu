@@ -430,6 +430,14 @@ __device__ __forceinline__ void gemv_g128_t_body(
 // TR=12도 동일 실패(1024스레드·레지스터 정확 적합 가설 배제), T=2 단독 SASS는
 // TR 스케일 상수 5개 외 동일. TR-비의존 국소화 실패(원인 미규명) — TR=8
 // 원복. 가설 자체는 미검증으로 잔존.
+// [A 진단·기각 2026-10-11] (진단)x 로드 제거(값 상수 대체) = 27B np4
+// 110.8→137.0 t/s(**+24%** — x 축이 실재·상한). (시도)cp.async smem
+// 스테이징(2×2048 f32·KC=2048/T 청크·프리페치 파이프): np4 80.4(프리페치
+// 미겹침)→87.4(겹침) — **base 110.8 대비 대폭 역행**. 원인: 청크 경계
+// 배리어가 unroll-32 ILP를 4로 축소(LDS 지연·2-way 뱅크·smem 16KB 가세) —
+// x 비용은 대역이 아니라 **ILP/스케줄 성분**. 잔여 유효 경로 = float4
+// 4-연속-k 재매핑(레인 4원소·u16 가중 로드 — k 소유 순서 변경 = 통계 eval
+// 클래스 + 블록 레이아웃 개조)뿐 — 별도 캠페인.
 extern "C" __global__ void w4a16_gemv_g128_t(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x,   // [t][k] f32 (cast_x32 산출값)
