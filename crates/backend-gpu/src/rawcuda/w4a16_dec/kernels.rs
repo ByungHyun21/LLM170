@@ -407,7 +407,7 @@ impl W4a16Dec {
             f,
             n.div_ceil(GEMV_TR) as u32,
             1,
-            (64 * GEMV_TR) as u32,
+            (32 * GEMV_TR) as u32, // [A-float4] 32레인/행 — 호스트 미러
             &mut crate::rawcuda::args::l7(
                 &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
             ),
@@ -491,11 +491,13 @@ impl W4a16Dec {
         let f = self.cc.function(name)?;
         let (mut p_t, mut p_x) = (table, x_dev);
         let (mut p_c, mut p_tt) = (count as i32, t as i32);
+        // [A-float4] split은 32레인/행 — 플레인(bf16)은 종전 64레인.
+        let blk = if plain { 64 * GEMV_TR } else { 32 * GEMV_TR } as u32;
         self.cc.launch(
             f,
             total as u32,
             1,
-            (64 * GEMV_TR) as u32,
+            blk,
             &mut crate::rawcuda::args::l4(&mut p_t, &mut p_x, &mut p_c, &mut p_tt),
         )
     }

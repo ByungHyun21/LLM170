@@ -341,74 +341,77 @@ extern "C" __global__ void w4a16_gemv_g128_multi(
 
 // red/sc는 extern 커널에서 1회 할당 후 전달(템플릿 인라인 시 인스턴스별
 // 중복 할당 — TR=8에서 8×96KB > 48KB ptxas 한계로 실측).
+// [A-float4 2026-10-11] 4-연속-k 레인 재매핑(수치 변경 — eval 판정 클래스):
+// 레인 l(0..31) = k 4l..4l+3/128청크, 웨이트 u16(바이트 2l,2l+1 = 니블 4개)
+// 완전 코얼레싱, x float4(16B 정렬), FMA 4연쇄. 레인당 로드 명령 절반(진단
+// 상한 +24%의 회수 시도). 행당 32레인 f64 트리(∪l,l+16 → 셔플 8..1).
+// 블록 = 32×GEMV_TR(256스레드·행/블록 = GEMV_TR — 호스트 grid 불변).
 template <int T>
 __device__ __forceinline__ void gemv_g128_t_body(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x, float* __restrict__ out, int n, int k, int o0,
-    double (*red)[G4_LANES], float (*sc)[G4_SCMAX])
+    double (*red)[32], float (*sc)[G4_SCMAX])
 {
-    const int l = threadIdx.x & (G4_LANES - 1);
-    const int g = threadIdx.x >> 6; // 행 그룹 0..GEMV_TR-1
+    const int l = threadIdx.x & 31;
+    const int g = threadIdx.x >> 5; // 행 그룹 0..GEMV_TR-1
     const int o = o0 + g;
     const bool live = o < n;
     const int k8 = k >> 3;
     const int kg = k >> 7;
     if (live) {
-        for (int gg = l; gg < kg; gg += G4_LANES) {
+        for (int gg = l; gg < kg; gg += 32) {
             sc[g][gg] = ld_scale<false>(s + (size_t)o * kg, gg);
         }
     }
     __syncthreads();
-    // [A9-fix3] T3-2(1행판) 구조 그대로: 128폭 청크·니블 쌍·float2 x —
-    // 행별 누산 시퀀스가 w4a16_gemv_g128(T3-2)과 동일(비트동일).
-    const unsigned* qrow = q + (size_t)o * k8;
     const int jn = k >> 7;
-    const int sh = 8 * (l & 3);
     float acc[T];
 #pragma unroll
     for (int r = 0; r < T; ++r) {
         acc[r] = 0.0f;
     }
-    const unsigned* qp = qrow + (l >> 2);
-    const float2* xp[T];
+    // 청크 j의 레인별 u16 = 바이트 64j+2l,64j+2l+1 — 워프 전량 코얼레싱.
+    const unsigned short* qh =
+        reinterpret_cast<const unsigned short*>(q + (size_t)o * k8) + l;
+    const float4* xp[T];
 #pragma unroll
     for (int r = 0; r < T; ++r) {
-        xp[r] = reinterpret_cast<const float2*>(x) + (size_t)r * (k >> 1) + l;
+        xp[r] = reinterpret_cast<const float4*>(x) + (size_t)r * (k >> 2) + l;
     }
 #pragma unroll 32
     for (int jj = 0; jj < jn; ++jj) {
-        const unsigned qw = __ldcs(qp);
-        qp += 16;
-        const unsigned byte = (qw >> sh) & 0xFFu;
+        const unsigned qw = (unsigned)qh[jj * 32];
         const float scv = sc[g][jj];
-        const float w0 = fmaf((float)(byte & 0xFu), scv, -8.0f * scv);
-        const float w1 = fmaf((float)(byte >> 4), scv, -8.0f * scv);
+        const float w0 = fmaf((float)(qw & 0xFu), scv, -8.0f * scv);
+        const float w1 = fmaf((float)((qw >> 4) & 0xFu), scv, -8.0f * scv);
+        const float w2 = fmaf((float)((qw >> 8) & 0xFu), scv, -8.0f * scv);
+        const float w3 = fmaf((float)(qw >> 12), scv, -8.0f * scv);
 #pragma unroll
         for (int r = 0; r < T; ++r) {
-            const float2 xv = *xp[r];
-            // T3-2와 동일: 단일 누산 체인(쌍 순차) — 이 분리가 비트동일 조건.
+            const float4 xv = *xp[r];
             acc[r] = fmaf(w0, xv.x, acc[r]);
             acc[r] = fmaf(w1, xv.y, acc[r]);
-            xp[r] += 64;
+            acc[r] = fmaf(w2, xv.z, acc[r]);
+            acc[r] = fmaf(w3, xv.w, acc[r]);
+            xp[r] += 32;
         }
     }
 #pragma unroll
     for (int rr = 0; rr < T; ++rr) {
-        // 행당 64레인 tree — 1행판과 동일 구조(누산 시퀀스도 동일).
         red[g][l] = (double)acc[rr];
         __syncthreads();
-        if (l < 32 && live) {
-            double v = red[g][l] + red[g][l + 32];
+        // [A-float4] 전 워프 참여 셔플(마스크 0xffffffff 계약 — l≥16도 참여),
+        // 합산·기록은 하위 레인만(첫 결합 l<16, 셔플 8..1).
+        double v = (l < 16) ? (red[g][l] + red[g][l + 16]) : 0.0;
 #pragma unroll
-            for (int off = 16; off >= 1; off >>= 1) {
-                const double oth = shfl_down_f64(v, off);
-                if (l < off) {
-                    v += oth;
-                }
+        for (int off = 8; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(v, off);
+            if (l < off) {
+                v += oth;
             }
-            if (l == 0) {
-                out[(size_t)rr * n + o] = (float)v;
-            }
+        }
+        if (l == 0 && live) {
+            out[(size_t)rr * n + o] = (float)v;
         }
         __syncthreads();
     }
@@ -434,10 +437,14 @@ __device__ __forceinline__ void gemv_g128_t_body(
 // 110.8→137.0 t/s(**+24%** — x 축이 실재·상한). (시도)cp.async smem
 // 스테이징(2×2048 f32·KC=2048/T 청크·프리페치 파이프): np4 80.4(프리페치
 // 미겹침)→87.4(겹침) — **base 110.8 대비 대폭 역행**. 원인: 청크 경계
-// 배리어가 unroll-32 ILP를 4로 축소(LDS 지연·2-way 뱅크·smem 16KB 가세) —
-// x 비용은 대역이 아니라 **ILP/스케줄 성분**. 잔여 유효 경로 = float4
-// 4-연속-k 재매핑(레인 4원소·u16 가중 로드 — k 소유 순서 변경 = 통계 eval
-// 클래스 + 블록 레이아웃 개조)뿐 — 별도 캠페인.
+// 배리어가 unroll-32 ILP를 4로 축소 — x 비용은 대역이 아니라 **ILP/스케줄
+// 성분**. 단계적 보류 후 —
+// **[A-float4 채택 2026-10-11]** 4-연속-k 레인 재매핑(위 body): 27B np4
+// 110.8→118.6(**+7.0%**)·tg/pp 불변. 수치 클래스(eval 판정): chunk4
+// PPL 델타 en +0.0211%·ko +0.0000%·argmax 일치 99.904%/99.770%(발산은
+// 모델 오답 위치의 ulp 플립) — eval.md 후보 표 기록. 골든(프로브·spec·
+// np4 serve) 3종 유지·smoke 10/10. 초기 구현의 하프워프 셔플(마스크 UB·
+// 행)은 전 워프 참여형으로 수정(위 rr 루프).
 extern "C" __global__ void w4a16_gemv_g128_t(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x,   // [t][k] f32 (cast_x32 산출값)
@@ -448,7 +455,7 @@ extern "C" __global__ void w4a16_gemv_g128_t(
     if (o0 >= n) {
         return;
     }
-    __shared__ double red[GEMV_TR][G4_LANES];
+    __shared__ double red[GEMV_TR][32]; // [A-float4] 32레인 트리
     __shared__ float sc[GEMV_TR][G4_SCMAX];
     switch (t) {
         GEMV_T_CASE(1) // gemv_g128_t_body<1>
@@ -492,7 +499,7 @@ extern "C" __global__ void w4a16_gemv_g128_multi_t(
     if (o0 >= n) {
         return;
     }
-    __shared__ double red[GEMV_TR][G4_LANES];
+    __shared__ double red[GEMV_TR][32]; // [A-float4] 32레인 트리
     __shared__ float sc[GEMV_TR][G4_SCMAX];
     switch (t) {
         GEMV_T_CASE(1)
