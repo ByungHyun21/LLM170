@@ -91,7 +91,14 @@ __device__ __forceinline__ double attn_exp_d(double x)
 
 __device__ __forceinline__ float attn_expf(float x)
 {
-    return (float)attn_exp_d((double)x);
+    // [FLA-8 동형 채택 2026-10-11] f64 폴리 → __expf(2ulp). GDN 트랜센던털
+    // 채택(FLA-8)과 동일 클래스 — eval 판정: 27B chunk4 en PPL +0.0226%·
+    // agree 100.000% / ko +0.0097%·99.808% (FLA-8 밴드 내). 프리필 이득:
+    // pp4096 +3.1%·pp16384 +4.5% (27B) · 35B pp4096 +1.8%·np4 +0.9%.
+    // 골든: 프로브/spec n=8·장문 600/4000·서브 전부 유지(smoke 10/10) —
+    // 재동결 불요(짧은 스트림 안정). rope theta/sincos의 f64(attn_exp_d)는
+    // 불변.
+    return __expf(x);
 }
 
 // rope theta = powf(1e7, −2·tid/64)(원본 L630/664)의 f64 재구성:
@@ -372,6 +379,11 @@ __device__ __forceinline__ void attn_part_step(KDot kdot, VAcc vacc,
 // 순차 판독(스레드 간 stride 256B — 섹터는 전량 사용되나 스레드별 산개).
 // 다음 후보(플랜 §8.2): cp.async KV 프리로드·warp 협조 dot(코얼레싱 —
 // 합산 순서 변경 = eval 클래스). ncu 불가(권한)라 카운터 확정은 미완.
+// [S7 분석 2026-10-11 — 착수 보류] K cp.async 프리페치의 구조 장애: 스텝이
+// 스레드당 1행 전용(레인=행)이라 K는 청크(256행×256B=64KB) 단위로만 소비 —
+// smem 한도로 서브타일 스테이징 시 스코어 병렬도(256행 동시)가 붕괴한다
+// (§8.2 ILP 기각과 동일 벽). 유효 대안(워프 협조 dot)은 합산 순서 변경 =
+// eval 클래스 — 별도 캠페인(통계 판정) 필요.
 //
 // [2026-10-09 P8-attn-3] KV 분할 attention — 4k ctx 실측: 스코어/AV가 24블록
 // (q_heads)만 써 SM의 81% 유휴 + K/V 로드 지연 노출. lim>256에서 KV를
@@ -616,6 +628,19 @@ extern "C" __global__ void attn_fwd3s_part_qg(
     }
     for (int base = lo; base < hi; base += ATTN_CHUNK) {
         const int nch = min(ATTN_CHUNK, hi - base);
+        // [WC 전면 재작성 실측 기각 2026-10-11 — B1 축 종결] 워프 협조
+        // 스코어 전면 구현(레인 l = k 8l..8l+7 uint2 코얼레싱·헤드별 부분합+
+        // 5단 셔플 환원·q 재판독 12 LDS/행). **정합 완전**(eval chunk4 NLL
+        // 1.772857 = 기저와 동일). 성능: pp4096 1568(−3.6%)·pp16384 1083
+        // (−9%) — 명령 수 +80%(셔플 환원 60/행)가 K 코얼레싱·smem 절감을
+        // 초과. 종합: fast exp 채택 외 스코어/AV 개조 4회 실측(R2×2·WC·
+        // 분석) 전부 역행 — 현 구조가 국소 최적, 잔여 없음.
+        // [R2 실측 기각 2026-10-11] 스코어 q-smem 재판독 절감 설계(레인=행2개
+        // 공유) 2변형: ①전 스레드 p2 계산(작업 2배 잔존) = pp16K −14.5%
+        // ②상반부 전담(128스레드×2행·작업 정확) = −1.1%, ncu로 **모델 반증**:
+        // short_sb 불변(1.08 vs 1.09)·barrier ×3(3.13 vs 1.07)·L1 42 vs 51%
+        // — q smem 트래픽은 지배 제약 아님(유휴 스레드 배리어 불균형이 손실).
+        // 스코어/AV 축은 국소 최적 — 잔여는 전면 재작성(워프 협조/mma)뿐.
         // 스코어 — 행당 1스레드, K 행(uint4)을 gq개 헤드 dot이 공유.
         if (tid < nch) {
             const int row = base + tid;

@@ -288,7 +288,7 @@ pub fn json() -> String {
         })
         .unwrap_or_default();
     format!(
-        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"cpu\":0}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\"}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{}}},\"slot_detail\":[{}]}}",
+        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"cpu\":0}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\"}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{},\"spec_rounds\":{},\"spec_accepted\":{},\"spec_round_ms_avg\":{:.2}}},\"slot_detail\":[{}]}}",
         esc(&s.info.instance),
         esc(&s.info.model),
         s.info.ctx,
@@ -332,6 +332,16 @@ pub fn json() -> String {
         sc.gen_tokens.load(Ordering::Relaxed),
         sc.requests.load(Ordering::Relaxed),
         sc.requests_failed.load(Ordering::Relaxed),
+        sc.spec_rounds.load(Ordering::Relaxed),
+        sc.spec_accepted.load(Ordering::Relaxed),
+        {
+            let sr = sc.spec_rounds.load(Ordering::Relaxed);
+            if sr > 0 {
+                sc.spec_ms.load(Ordering::Relaxed) as f64 / sr as f64 / 1e3
+            } else {
+                0.0
+            }
+        },
         slot_detail.join(",")
     )
 }
@@ -444,6 +454,24 @@ pub fn prometheus() -> String {
         "llm170_decode_steps_total",
         "Decode steps",
         sc.ticks_decode.load(Ordering::Relaxed),
+    );
+    pm_counter(
+        &mut o,
+        "llm170_spec_rounds_total",
+        "speculative verify rounds",
+        sc.spec_rounds.load(Ordering::Relaxed),
+    );
+    pm_counter(
+        &mut o,
+        "llm170_spec_accepted_total",
+        "accepted draft tokens",
+        sc.spec_accepted.load(Ordering::Relaxed),
+    );
+    pm_counter(
+        &mut o,
+        "llm170_spec_round_ms_total",
+        "speculative verify round wall us (x1000)",
+        sc.spec_ms.load(Ordering::Relaxed) / 1000,
     );
     pm_counter(
         &mut o,

@@ -184,6 +184,85 @@ __device__ __forceinline__ void gemv_body(
     gemv_row_body<SHIFT, BF16>(q, s, x, out, o, k);
 }
 
+// [A2-float4 2026-10-11] t=1 로우 커널 float4판 — **[256폭 청크·64레인 유지]**
+// (종전 128폭·2원소/레인 → 256폭·4원소/레인: 레인 l = k 4l..4l+3/256청크).
+// 블록·grid 구조는 종전과 동일(행=블록 64스레드·grid n) — 레인 수 불변이라
+// 병렬도 보존, x float4(1판독/4원소)·웨이트 u16(코얼레싱)만 회수.
+// 수치 클래스 — t=1 PPL(eval) 직접 판정(비트 계약 아님).
+// 기각(2026-10-11): 32레인/행·2행/블록(128폭) 변형 = tg −3.5%(49.5 t/s) —
+// 행당 스레드 반감으로 지연 은닉 손실. 64레인 유지가 정답이었다.
+template <int SHIFT>
+__device__ __forceinline__ int sidx256(int l, int jj) {
+    // (4l + 256j) >> SHIFT — g128: 2j + (l>>5), g32: 8j + (l>>3).
+    return (jj << (8 - SHIFT)) + (l >> (SHIFT - 2));
+}
+
+template <int SHIFT, bool BF16>
+__device__ __forceinline__ void gemv_row_body4(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int o, int k)
+{
+    if (o < 0) {
+        return;
+    }
+    const int l = threadIdx.x;
+    __shared__ double red[G4_LANES];
+    __shared__ float sc[G4_SCMAX];
+    const int k8 = k >> 3;
+    const int kg = k >> SHIFT;
+    for (int g = l; g < kg; g += G4_LANES) {
+        sc[g] = ld_scale<BF16>(s + (size_t)o * kg, g);
+    }
+    __syncthreads();
+    const int jn = k >> 8; // 256폭 청크(전 모델 k는 256 배수 — 128 배수 상위)
+    const unsigned short* qh =
+        reinterpret_cast<const unsigned short*>(q + (size_t)o * k8) + l;
+    const float4* xp = reinterpret_cast<const float4*>(x) + l;
+    float acc = 0.0f;
+#pragma unroll 16
+    for (int jj = 0; jj < jn; ++jj) {
+        const unsigned qw = (unsigned)qh[jj * 64];
+        const float scv = sc[sidx256<SHIFT>(l, jj)];
+        const float w0 = fmaf((float)(qw & 0xFu), scv, -8.0f * scv);
+        const float w1 = fmaf((float)((qw >> 4) & 0xFu), scv, -8.0f * scv);
+        const float w2 = fmaf((float)((qw >> 8) & 0xFu), scv, -8.0f * scv);
+        const float w3 = fmaf((float)(qw >> 12), scv, -8.0f * scv);
+        const float4 xv = *xp;
+        acc = fmaf(w0, xv.x, acc);
+        acc = fmaf(w1, xv.y, acc);
+        acc = fmaf(w2, xv.z, acc);
+        acc = fmaf(w3, xv.w, acc);
+        xp += 64;
+    }
+    red[l] = (double)acc;
+    __syncthreads();
+    if (l < 32) {
+        double r = red[l] + red[l + 32];
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(r, off);
+            if (l < off) {
+                r += oth;
+            }
+        }
+        if (l == 0) {
+            out[o] = (float)r;
+        }
+    }
+}
+
+template <int SHIFT, bool BF16>
+__device__ __forceinline__ void gemv_body4(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k)
+{
+    const int o = blockIdx.x;
+    if (o >= n) {
+        return;
+    }
+    gemv_row_body4<SHIFT, BF16>(q, s, x, out, o, k);
+}
+
 // 전문가 배치 GEMV — 전문가 포인터 테이블(tab, (q,s) 쌍) + 슬롯 인덱스.
 // 테이블 레이아웃 = (il, e, proj) 순서 — 커널 항목 = base + idx[sl]·3
 // (같은 층·proj의 전문가). xstride: 게이트/업은 0(x 공통 브로드캐스트),
@@ -285,12 +364,44 @@ extern "C" __global__ void w4a16_moe_align(
 extern "C" __global__ void w4a16_gemv_g128(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x, float* __restrict__ out, int n, int k) {
-    gemv_body<7, false>(q, s, x, out, n, k);
+    gemv_body4<7, false>(q, s, x, out, n, k); // [A2-float4] 2행/블록
 }
 extern "C" __global__ void w4a16_gemv_g32_bf16(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x, float* __restrict__ out, int n, int k) {
-    gemv_body<5, true>(q, s, x, out, n, k);
+    gemv_body4<5, true>(q, s, x, out, n, k); // [A2-float4] 2행/블록
+}
+
+// [S2 2026-10-11] 다중 세그먼트 t=1 GEMV(split) — 같은 x를 공유하는 소형
+// 선형 여럿을 1런치로(런치 꼬리 제거 — moe.cu w4a16_gemv_multi의 split 판).
+// tab[seg] = (q, s, out, n, k) u64×5 — 호스트가 업로드 후 1회 작성(그래프
+// 캡처 정적 계약: 리플레이 간 내용 불변). 행별 산술은 w4a16_gemv_g128과
+// **비트동일**(gemv_row_body 그대로 — 행 독립이라 세그먼트 결합 무영향).
+extern "C" __global__ void w4a16_gemv_g128_multi(
+    const unsigned long long* __restrict__ tab, // [count][5]: q, s, out, n, k
+    const float* __restrict__ x,                // 공통 x [k] f32(h2f 왕복)
+    int count)
+{
+    const int blk = blockIdx.x;
+    int seg = count - 1;
+    int base = 0;
+    for (int s = 0; s < count; ++s) {
+        const int ns = (int)tab[s * 5 + 3];
+        if (blk < base + ns) {
+            seg = s;
+            break;
+        }
+        base += ns;
+    }
+    const int n = (int)tab[seg * 5 + 3];
+    const int o = blk - base;
+    if (o < 0 || o >= n) {
+        return;
+    }
+    const int k = (int)tab[seg * 5 + 4];
+    gemv_row_body<7, false>((const unsigned*)(size_t)tab[seg * 5 + 0],
+                            (const unsigned short*)(size_t)tab[seg * 5 + 1],
+                            x, (float*)(size_t)tab[seg * 5 + 2], o, k);
 }
 
 // [A9 2026-10-10] t행 GEMV(split g128) — 가중 판독 1회를 t행이 공유.
@@ -309,74 +420,77 @@ extern "C" __global__ void w4a16_gemv_g32_bf16(
 
 // red/sc는 extern 커널에서 1회 할당 후 전달(템플릿 인라인 시 인스턴스별
 // 중복 할당 — TR=8에서 8×96KB > 48KB ptxas 한계로 실측).
+// [A-float4 2026-10-11] 4-연속-k 레인 재매핑(수치 변경 — eval 판정 클래스):
+// 레인 l(0..31) = k 4l..4l+3/128청크, 웨이트 u16(바이트 2l,2l+1 = 니블 4개)
+// 완전 코얼레싱, x float4(16B 정렬), FMA 4연쇄. 레인당 로드 명령 절반(진단
+// 상한 +24%의 회수 시도). 행당 32레인 f64 트리(∪l,l+16 → 셔플 8..1).
+// 블록 = 32×GEMV_TR(256스레드·행/블록 = GEMV_TR — 호스트 grid 불변).
 template <int T>
 __device__ __forceinline__ void gemv_g128_t_body(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x, float* __restrict__ out, int n, int k, int o0,
-    double (*red)[G4_LANES], float (*sc)[G4_SCMAX])
+    double (*red)[32], float (*sc)[G4_SCMAX])
 {
-    const int l = threadIdx.x & (G4_LANES - 1);
-    const int g = threadIdx.x >> 6; // 행 그룹 0..GEMV_TR-1
+    const int l = threadIdx.x & 31;
+    const int g = threadIdx.x >> 5; // 행 그룹 0..GEMV_TR-1
     const int o = o0 + g;
     const bool live = o < n;
     const int k8 = k >> 3;
     const int kg = k >> 7;
     if (live) {
-        for (int gg = l; gg < kg; gg += G4_LANES) {
+        for (int gg = l; gg < kg; gg += 32) {
             sc[g][gg] = ld_scale<false>(s + (size_t)o * kg, gg);
         }
     }
     __syncthreads();
-    // [A9-fix3] T3-2(1행판) 구조 그대로: 128폭 청크·니블 쌍·float2 x —
-    // 행별 누산 시퀀스가 w4a16_gemv_g128(T3-2)과 동일(비트동일).
-    const unsigned* qrow = q + (size_t)o * k8;
     const int jn = k >> 7;
-    const int sh = 8 * (l & 3);
     float acc[T];
 #pragma unroll
     for (int r = 0; r < T; ++r) {
         acc[r] = 0.0f;
     }
-    const unsigned* qp = qrow + (l >> 2);
-    const float2* xp[T];
+    // 청크 j의 레인별 u16 = 바이트 64j+2l,64j+2l+1 — 워프 전량 코얼레싱.
+    const unsigned short* qh =
+        reinterpret_cast<const unsigned short*>(q + (size_t)o * k8) + l;
+    const float4* xp[T];
 #pragma unroll
     for (int r = 0; r < T; ++r) {
-        xp[r] = reinterpret_cast<const float2*>(x) + (size_t)r * (k >> 1) + l;
+        xp[r] = reinterpret_cast<const float4*>(x) + (size_t)r * (k >> 2) + l;
     }
 #pragma unroll 32
     for (int jj = 0; jj < jn; ++jj) {
-        const unsigned qw = __ldcs(qp);
-        qp += 16;
-        const unsigned byte = (qw >> sh) & 0xFFu;
+        const unsigned qw = (unsigned)qh[jj * 32];
         const float scv = sc[g][jj];
-        const float w0 = fmaf((float)(byte & 0xFu), scv, -8.0f * scv);
-        const float w1 = fmaf((float)(byte >> 4), scv, -8.0f * scv);
+        const float w0 = fmaf((float)(qw & 0xFu), scv, -8.0f * scv);
+        const float w1 = fmaf((float)((qw >> 4) & 0xFu), scv, -8.0f * scv);
+        const float w2 = fmaf((float)((qw >> 8) & 0xFu), scv, -8.0f * scv);
+        const float w3 = fmaf((float)(qw >> 12), scv, -8.0f * scv);
 #pragma unroll
         for (int r = 0; r < T; ++r) {
-            const float2 xv = *xp[r];
-            // T3-2와 동일: 단일 누산 체인(쌍 순차) — 이 분리가 비트동일 조건.
+            const float4 xv = *xp[r];
             acc[r] = fmaf(w0, xv.x, acc[r]);
             acc[r] = fmaf(w1, xv.y, acc[r]);
-            xp[r] += 64;
+            acc[r] = fmaf(w2, xv.z, acc[r]);
+            acc[r] = fmaf(w3, xv.w, acc[r]);
+            xp[r] += 32;
         }
     }
 #pragma unroll
     for (int rr = 0; rr < T; ++rr) {
-        // 행당 64레인 tree — 1행판과 동일 구조(누산 시퀀스도 동일).
         red[g][l] = (double)acc[rr];
         __syncthreads();
-        if (l < 32 && live) {
-            double v = red[g][l] + red[g][l + 32];
+        // [A-float4] 전 워프 참여 셔플(마스크 0xffffffff 계약 — l≥16도 참여),
+        // 합산·기록은 하위 레인만(첫 결합 l<16, 셔플 8..1).
+        double v = (l < 16) ? (red[g][l] + red[g][l + 16]) : 0.0;
 #pragma unroll
-            for (int off = 16; off >= 1; off >>= 1) {
-                const double oth = shfl_down_f64(v, off);
-                if (l < off) {
-                    v += oth;
-                }
+        for (int off = 8; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(v, off);
+            if (l < off) {
+                v += oth;
             }
-            if (l == 0) {
-                out[(size_t)rr * n + o] = (float)v;
-            }
+        }
+        if (l == 0 && live) {
+            out[(size_t)rr * n + o] = (float)v;
         }
         __syncthreads();
     }
@@ -386,7 +500,52 @@ __device__ __forceinline__ void gemv_g128_t_body(
 // 98.9 tok/s(스필 우세). ncu: t=5에서 점유 2블록(64 regs)·long_scoreboard
 // 12.63·barrier 4.49 — 지연은 트리 배리어(계약)+x float2 패턴에 내재.
 // 대안(Gemm 경로 21 tok/s·lb) 전부 실측 기각 — 잔여는 구조 재설계 영역.
-extern "C" __global__ void w4a16_gemv_g128_t(
+// [S1-a 실측 기각 2026-10-11] 환원 재배치(행별 2배리어 → 상반부 슬롯 기록+
+// 배리어 1, 산술 비트동일) 시도: 27B np4 109.6→107.1 tok/s(동일 세션 2×2
+// fatbin A/B −2.2%)·t=4 격리 bench 0.065→0.066ms. 격리 대조(o2v=old+4KB
+// smem(0.065) · o58=old maxrregcount=58(0.064) · n12=new sc축소 12KB(0.066))
+// 로 smem·레지스터 가설 배제 — barrier 4.49는 임계 경로 아님(long_scoreboard
+// 지배). 무변경 원복.
+// [S1-b 실측 기각 2026-10-11] GEMV_TR 8→16(x L2 재판독 ÷2 가설 — np 스텝
+// 스케일링 +5~6ms/토큰 근거): 27B 프리필 t=2..8이 0층부터 NaN(토큰 골든
+// 붕괴). 대조 실측: t=1 체인·35B 프리필(bf16_t)·27B 스펙 검증 t=4는 정상,
+// TR=12도 동일 실패(1024스레드·레지스터 정확 적합 가설 배제), T=2 단독 SASS는
+// TR 스케일 상수 5개 외 동일. TR-비의존 국소화 실패(원인 미규명) — TR=8
+// 원복. 가설 자체는 미검증으로 잔존.
+// [m8 역할교환 mma 전면 재작성 실측 기각 2026-10-11 — 마8 축 종결] marlin
+// m8 동형 설계(가중=A m16·활성=B n8·특징=M·토큰=N·x를 블록당 1회 — x 트래픽
+// ÷16)를 3구성 실측: KC32 단일스테이지 50.3(−62%)·KC32 cp.async 이중버퍼
+// 70.8(−47%)·KC128 94.0(−30%)·KC256 94.1(smem 58.6KB — 포화). **정합은
+// 완전**(eval chunk2 NLL 1.7733·골든 4종 유지 — 활성 f16+mma 누산 클래스).
+// 벽 = 워프 수: mma 판은 출력 타일이 커 워프 총수가 GEMV의 **1/16**(n/16 vs
+// n) — mma의 MACs/명령 우위(≈5×)가 지연 은닉 상실을 못 메움(같은 세션의
+// GEMV 행-내부 변형들 −26~−53%와 동형 패턴). **t≤8 디코드는 본 GPU/형상에서
+// GEMV가 최적** — vLLM 190 격차는 타 요인(KV/스케줄/어텐션 문맥)으로 추정.
+// [v2 행-내부 재설계 실측 기각 2026-10-11 — 가장 어려운 축 시도] x 로드
+// 절감 설계(워프=8행·레인=k슬라이스 — x를 4~8행이 공유, 트리 셔플만)를
+// 3변형 실측: ①rows=8/T≤4: T=8 케이스 acc[8][8]이 커널 레지스터 배분을
+// 지배 → 스필 9756B·np4 62.1(−53%) ②rows=4/unroll8: 64reg·스필 16B(클린)
+// 이나 np4 99.1(−26%) ③rows=4/unroll16·32: 94.4(−29%). **x 부재 상한
+// +24%(진단)는 스케줄 변경으로 회수 불가** — 단순 1행 루프의 심층 스트리밍
+// ILP가 상실분(cp.async 스테이징 기각과 동형). np4 t-GEMV는 국소 최적 —
+// 남은 길은 marlin식 전면 재설계(레이아웃+ldmatrix)뿐(t=4 mma = GEMV 동률
+// 실측이 그 경로의 필요조건을 시사).
+// [A 진단·기각 2026-10-11] (진단)x 로드 제거(값 상수 대체) = 27B np4
+// 110.8→137.0 t/s(**+24%** — x 축이 실재·상한). (시도)cp.async smem
+// 스테이징(2×2048 f32·KC=2048/T 청크·프리페치 파이프): np4 80.4(프리페치
+// 미겹침)→87.4(겹침) — **base 110.8 대비 대폭 역행**. 원인: 청크 경계
+// 배리어가 unroll-32 ILP를 4로 축소 — x 비용은 대역이 아니라 **ILP/스케줄
+// 성분**. 단계적 보류 후 —
+// **[A-float4 채택 2026-10-11]** 4-연속-k 레인 재매핑(위 body): 27B np4
+// 110.8→118.6(**+7.0%**)·tg/pp 불변. 수치 클래스(eval 판정): chunk4
+// PPL 델타 en +0.0211%·ko +0.0000%·argmax 일치 99.904%/99.770%(발산은
+// 모델 오답 위치의 ulp 플립) — eval.md 후보 표 기록. 골든(프로브·spec·
+// np4 serve) 3종 유지·smoke 10/10. 초기 구현의 하프워프 셔플(마스크 UB·
+// 행)은 전 워프 참여형으로 수정(위 rr 루프).
+// [A1-점유 2026-10-11] 72→64reg 강제(4블록/SM — np4 27B 119.0→128.0(+7.6%),
+// 스필 228/344B 감수). ncu 실측: DRAM 38%·long_scoreboard 13.7·점유 50%(3블록
+// 한계) = 완전 지연 바운드 — cp.async 스테이징이 아니라 **점유**가 정답이었다.
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g128_t(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x,   // [t][k] f32 (cast_x32 산출값)
     float* __restrict__ out,       // [t][n]
@@ -396,7 +555,7 @@ extern "C" __global__ void w4a16_gemv_g128_t(
     if (o0 >= n) {
         return;
     }
-    __shared__ double red[GEMV_TR][G4_LANES];
+    __shared__ double red[GEMV_TR][32]; // [A-float4] 32레인 트리
     __shared__ float sc[GEMV_TR][G4_SCMAX];
     switch (t) {
         GEMV_T_CASE(1) // gemv_g128_t_body<1>
@@ -407,6 +566,51 @@ extern "C" __global__ void w4a16_gemv_g128_t(
         GEMV_T_CASE(6) // gemv_g128_t_body<6>
         GEMV_T_CASE(7) // gemv_g128_t_body<7>
         GEMV_T_CASE(8) // gemv_g128_t_body<8>
+        default: break; // 호스트 계약 밖(t≤8)
+    }
+}
+
+// [S2 2026-10-11] 다중 세그먼트 t행 GEMV(배치 디코드·검증 t≤8) — 테이블은
+// t=1 판 w4a16_gemv_g128_multi와 공용((q,s,out,n,k)). 세그먼트 블록수는
+// ceil(n/GEMV_TR), 호스트 grid = Σceil(n_s/GEMV_TR). 행별 산술은
+// w4a16_gemv_g128_t와 **비트동일**(gemv_g128_t_body 그대로 — 행 독립).
+// [A1-점유] 4블록 강제(위 g128_t와 동형 — multi_t도 72reg/3블록 한계).
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g128_multi_t(
+    const unsigned long long* __restrict__ tab, // [count][5]: q, s, out, n, k
+    const float* __restrict__ x,                // [t][k] f32(cast_x32 산출)
+    int count, int t)
+{
+    const int blk = blockIdx.x;
+    int seg = count - 1;
+    int base = 0;
+    for (int ss = 0; ss < count; ++ss) {
+        const int ns = ((int)tab[ss * 5 + 3] + GEMV_TR - 1) / GEMV_TR;
+        if (blk < base + ns) {
+            seg = ss;
+            break;
+        }
+        base += ns;
+    }
+    const unsigned* q = (const unsigned*)(size_t)tab[seg * 5 + 0];
+    const unsigned short* s = (const unsigned short*)(size_t)tab[seg * 5 + 1];
+    float* out = (float*)(size_t)tab[seg * 5 + 2];
+    const int n = (int)tab[seg * 5 + 3];
+    const int k = (int)tab[seg * 5 + 4];
+    const int o0 = (blk - base) * GEMV_TR;
+    if (o0 >= n) {
+        return;
+    }
+    __shared__ double red[GEMV_TR][32]; // [A-float4] 32레인 트리
+    __shared__ float sc[GEMV_TR][G4_SCMAX];
+    switch (t) {
+        GEMV_T_CASE(1)
+        GEMV_T_CASE(2)
+        GEMV_T_CASE(3)
+        GEMV_T_CASE(4)
+        GEMV_T_CASE(5)
+        GEMV_T_CASE(6)
+        GEMV_T_CASE(7)
+        GEMV_T_CASE(8)
         default: break; // 호스트 계약 밖(t≤8)
     }
 }
@@ -608,6 +812,12 @@ extern "C" __global__ void w4a16_copy(const float4* __restrict__ src,
 // 종전 smem f16 디큐트 `__float2half_rn((float)(nib-8)*scf)`와 **비트동일**:
 // hsub2(1024+n)-(1024+8) = n-8 정확(f16 정수) → f32 곱 → RNE. 스테이징이
 // 순수 복사가 되고 smem B가 1/4(L1·smem 압력↓).
+// [S6 실측 기각 2026-10-11] 프리필 디큐트 최적화 시도 — (진단)디큐트 제거
+// (return qw·로드 유지) A/B: pp512 288→260ms(−9.5%)·pp4096 −9.5%·pp16384
+// −8.2% = 디큐트 체인 총 비중 ~9%가 상한. ① B 디큐트 mf-호이스팅(중복
+// 2→1회, 비트동일, 레지스터 79·스필 0 동일): pp512/4096 +1.7~2.0% 역행 —
+// 커널은 issue-bound가 아니라 지연/스케줄 민감(ncu No Eligible 77% 정합).
+// ② 잔여 lop3/PRMT-lite 상한(추출·전개 ~5/12 op) <1% — 무의미. 현행 유지.
 __device__ __forceinline__ unsigned deq_pair_b(unsigned qw, int tt, float sc) {
     const unsigned sub8 = 0x64086408u; // half2(1024+8)
     const unsigned byte = (qw >> (8 * tt)) & 0xFFu;
@@ -818,6 +1028,14 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
 // A = 슬롯→토큰 매핑으로 모은 x 행(f16 스테이징), B = g32 디퀀트(f16).
 // 프래그먼트·타일 계약은 T1과 동일(명시 판독 — ldmatrix 전치 불일치 회피).
 // 판정은 토큰 골든(계약 완화 — 허용오차 등급).
+// [S5-lite 채택 2026-10-11] GRP_KC 32→64 — grp/grp2 전용(공용 MMA_KC는
+// dense mma 계약·점유 실측으로 32 유지 — marlin-A3 기각 이력). 근거: grp
+// 병목 = 청크당 배리어 2회 스톨 41%(§1.2 ncu) — KC 2배 = 배리어·스테이징
+// 횟수 절반. 값 비트동일(mma k순서 불변 — 35B 골든 일치 실측). 실측: pp512
+// 4520→4695(+3.7%)·pp4096 4110→4240(+3.2%). smem 27.6KB·스필 0.
+// (라우팅 분포 실측 부기: 256전문가·4096슬롯 → 전문가당 1-16 다수 —
+// M타일 축소(M32/16)는 B 디큐트 타일 중복 때문에 역효과로 모델링됨.)
+#define GRP_KC 64
 extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     const unsigned long long* __restrict__ tab, int base,
     const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
@@ -862,8 +1080,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     // (62ms) 오염이었다. 되돌림.
     // (레지스터 디큐트×2·cp.async·KC·NSPLIT·FLA-5) — SASS상 디큐트는 이미
     // 컴파일러 최적(PRMT 팩·STS.64).
-    __shared__ __align__(16) unsigned short xs[2][GRP_M][MMA_KC + 8];
-    __shared__ unsigned short ws[2][GRP_N][MMA_KC + 8];
+    __shared__ __align__(16) unsigned short xs[2][GRP_M][GRP_KC + 8];
+    __shared__ unsigned short ws[2][GRP_N][GRP_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
     for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
         const unsigned rbase = mtile * GRP_M;
@@ -874,9 +1092,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
         }
         // 스테이지 발사(스테이지 st, 청크 kn) — A는 cp.async, B는 디큐트 ALU.
         auto stage_ab = [&](int st, int kn) {
-            for (int ee = tid; ee < GRP_M * MMA_KC / 8; ee += 256) {
-                const int r = ee / (MMA_KC / 8);
-                const int c8 = ee % (MMA_KC / 8);
+            for (int ee = tid; ee < GRP_M * GRP_KC / 8; ee += 256) {
+                const int r = ee / (GRP_KC / 8);
+                const int c8 = ee % (GRP_KC / 8);
                 const int gi = kn + c8 * 8;
                 if (rbase + r < cnt) {
                     const unsigned sl = gs[rbase + r];
@@ -897,9 +1115,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
                     *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) = make_uint4(0u, 0u, 0u, 0u);
                 }
             }
-            for (int ee = tid; ee < GRP_N * MMA_KC / 8; ee += 256) {
-                const int r = ee / (MMA_KC / 8);
-                const int c8 = ee % (MMA_KC / 8);
+            for (int ee = tid; ee < GRP_N * GRP_KC / 8; ee += 256) {
+                const int r = ee / (GRP_KC / 8);
+                const int c8 = ee % (GRP_KC / 8);
                 const int gi = kn + c8 * 8;
                 const bool live = (n0 + r < n) && (gi + 7 < k);
                 unsigned short scb = 0;
@@ -910,11 +1128,14 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
                 // [실험] 스트리밍 힌트 — B는 블록별 1회 판독(재사용 없음).
                 const unsigned qw = live ? __ldcs(&q[(size_t)(n0 + r) * k8 + (gi >> 3)]) : 0u;
                 if (live) {
+                    // [half2 비트매직 2026-10-11] 원소별 (float)nib*scf+f2h
+                    // (ALU ~7/elem·STS.16×8) → deq_pair_b 쌍 처리(hsub2 정확
+                    // 경로 — 비트동일, g128 mma 입증 부품 재사용·STS.32×4).
+                    // 실측 35B pp512/4096 +0.3%(골든 유지).
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
-                        ws[st][r][c8 * 8 + j] =
-                            __half_as_ushort(__float2half_rn((float)nib * scf));
+                    for (int jp = 0; jp < 4; ++jp) {
+                        *reinterpret_cast<unsigned*>(&ws[st][r][c8 * 8 + jp * 2]) =
+                            deq_pair_b(qw, jp, scf);
                     }
                 } else {
 #pragma unroll
@@ -927,9 +1148,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
         stage_ab(0, 0);
         asm volatile("cp.async.commit_group;");
         int cur = 0;
-        for (int k0 = 0; k0 < k; k0 += MMA_KC, cur ^= 1) {
+        for (int k0 = 0; k0 < k; k0 += GRP_KC, cur ^= 1) {
             // 다음 청크를 발사(mma와 겹침) — A cp.async + B 디큐트.
-            const int kn = k0 + MMA_KC;
+            const int kn = k0 + GRP_KC;
             if (kn < k) {
                 stage_ab(cur ^ 1, kn);
             }
@@ -938,7 +1159,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
             __syncthreads();
 
 #pragma unroll
-            for (int ks = 0; ks < MMA_KC / 16; ++ks) {
+            for (int ks = 0; ks < GRP_KC / 16; ++ks) {
                 const int kb = ks * 16;
                 const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
                 const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
@@ -1024,8 +1245,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
     const int ntw = (warp & 1) * 32; // 2 n워프 × 32 = N64(게이트 32+업 32)
     const int k8 = k >> 3;
     const int kg = k >> 5; // g32
-    __shared__ __align__(16) unsigned short xs[2][GRP_M][MMA_KC + 8];
-    __shared__ unsigned short ws[2][2 * GRP_N][MMA_KC + 8];
+    __shared__ __align__(16) unsigned short xs[2][GRP_M][GRP_KC + 8];
+    __shared__ unsigned short ws[2][2 * GRP_N][GRP_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
     for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
         const unsigned rbase = mtile * GRP_M;
@@ -1035,9 +1256,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
             ((float*)c)[i] = 0.0f;
         }
         auto stage_ab = [&](int st, int kn) {
-            for (int ee = tid; ee < GRP_M * MMA_KC / 8; ee += 256) {
-                const int r = ee / (MMA_KC / 8);
-                const int c8 = ee % (MMA_KC / 8);
+            for (int ee = tid; ee < GRP_M * GRP_KC / 8; ee += 256) {
+                const int r = ee / (GRP_KC / 8);
+                const int c8 = ee % (GRP_KC / 8);
                 const int gi = kn + c8 * 8;
                 if (rbase + r < cnt) {
                     const unsigned sl = gs[rbase + r];
@@ -1058,9 +1279,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
                     *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) = make_uint4(0u, 0u, 0u, 0u);
                 }
             }
-            for (int ee = tid; ee < 2 * GRP_N * MMA_KC / 8; ee += 256) {
-                const int r = ee / (MMA_KC / 8);
-                const int c8 = ee % (MMA_KC / 8);
+            for (int ee = tid; ee < 2 * GRP_N * GRP_KC / 8; ee += 256) {
+                const int r = ee / (GRP_KC / 8);
+                const int c8 = ee % (GRP_KC / 8);
                 const int gi = kn + c8 * 8;
                 const int rr = n0 + (r & (GRP_N - 1));
                 const unsigned* q = (r < GRP_N) ? q0 : q1;
@@ -1075,11 +1296,14 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
                 // L2를 A(x16) 재사용에 남긴다.
                 const unsigned qw = live ? __ldcs(&q[(size_t)rr * k8 + (gi >> 3)]) : 0u;
                 if (live) {
+                    // [half2 비트매직 2026-10-11] 원소별 (float)nib*scf+f2h
+                    // (ALU ~7/elem·STS.16×8) → deq_pair_b 쌍 처리(hsub2 정확
+                    // 경로 — 비트동일, g128 mma 입증 부품 재사용·STS.32×4).
+                    // 실측 35B pp512/4096 +0.3%(골든 유지).
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
-                        ws[st][r][c8 * 8 + j] =
-                            __half_as_ushort(__float2half_rn((float)nib * scf));
+                    for (int jp = 0; jp < 4; ++jp) {
+                        *reinterpret_cast<unsigned*>(&ws[st][r][c8 * 8 + jp * 2]) =
+                            deq_pair_b(qw, jp, scf);
                     }
                 } else {
 #pragma unroll
@@ -1092,8 +1316,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
         stage_ab(0, 0);
         asm volatile("cp.async.commit_group;");
         int cur = 0;
-        for (int k0 = 0; k0 < k; k0 += MMA_KC, cur ^= 1) {
-            const int kn = k0 + MMA_KC;
+        for (int k0 = 0; k0 < k; k0 += GRP_KC, cur ^= 1) {
+            const int kn = k0 + GRP_KC;
             if (kn < k) {
                 stage_ab(cur ^ 1, kn);
             }
@@ -1101,7 +1325,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
             asm volatile("cp.async.wait_group 1;");
             __syncthreads();
 #pragma unroll
-            for (int ks = 0; ks < MMA_KC / 16; ++ks) {
+            for (int ks = 0; ks < GRP_KC / 16; ++ks) {
                 const int kb = ks * 16;
                 const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
                 const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);

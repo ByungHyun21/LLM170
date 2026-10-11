@@ -174,7 +174,7 @@ impl W4a16Dec {
         let (mut p_n, mut p_k) = (n as i32, k as i32);
         self.cc.launch(
             f,
-            n as u32,
+            n as u32, // [A2-float4 v2] 256폭·64레인 — 종전 grid/블록 유지
             1,
             64,
             &mut crate::rawcuda::args::l6(
@@ -215,26 +215,48 @@ impl W4a16Dec {
     /// 이득: 블록 내 8행 그룹이 x를 L1 공유 → x L2 재판독 ÷8
     /// (35B head 실측 1.05ms — x L2 1.2GB가 가중치 622MB와 경합).
     pub(super) fn head_gemv_launch(&self, x: CUdeviceptr, out: CUdeviceptr) -> Result<(), String> {
-        self.head_gemv_t_launch(x, out, 1)
+        // [I8head] t=1은 전용 행=블록 커널(TR 판은 t=1에서 역행 실측 이력).
+        self.head_gemv_i8_launch(x, out)
     }
 
-    /// [A-4] head GEMV 배치(t≤8) — TR 커널(행=블록 공유).
+    /// [A-4 / I8head] head GEMV 배치(t≤8) — TR 커널(가중 1판독 t행 공유).
+    /// [I8head 2026-10-11] int8 판(행별 스케일) — bf16 대비 대역 절반.
     pub(super) fn head_gemv_t_launch(
         &self,
         x: CUdeviceptr,
         out: CUdeviceptr,
         t: usize,
     ) -> Result<(), String> {
-        let f = self.cc.function("w4a16_gemv_bf16_t")?;
-        let (mut p_w, mut p_x, mut p_o) = (self.head_w, x, out);
+        let f = self.cc.function("w4a16_gemv_i8_t")?;
+        let (mut p_w, mut p_sc, mut p_x, mut p_o) = (self.head_w, self.head_sc, x, out);
         let (mut p_n, mut p_k, mut p_t) = (self.head_n as i32, self.head_k as i32, t as i32);
         self.cc.launch(
             f,
-            self.head_n.div_ceil(GEMV_TR) as u32,
+            self.head_n as u32,
             1,
-            (64 * GEMV_TR) as u32,
+            64,
+            &mut crate::rawcuda::args::l7(
+                &mut p_w, &mut p_sc, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+            ),
+        )
+    }
+
+    /// [I8head] head GEMV t=1 — 행=블록 64레인 int8(디코드 주 경로).
+    pub(super) fn head_gemv_i8_launch(
+        &self,
+        x: CUdeviceptr,
+        out: CUdeviceptr,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_gemv_i8")?;
+        let (mut p_w, mut p_sc, mut p_x, mut p_o) = (self.head_w, self.head_sc, x, out);
+        let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
+        self.cc.launch(
+            f,
+            self.head_n as u32,
+            1,
+            64,
             &mut crate::rawcuda::args::l6(
-                &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+                &mut p_w, &mut p_sc, &mut p_x, &mut p_o, &mut p_n, &mut p_k,
             ),
         )
     }
@@ -407,10 +429,129 @@ impl W4a16Dec {
             f,
             n.div_ceil(GEMV_TR) as u32,
             1,
-            (64 * GEMV_TR) as u32,
+            (32 * GEMV_TR) as u32, // [A-float4] 32레인/행 — 호스트 미러
             &mut crate::rawcuda::args::l7(
                 &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
             ),
+        )
+    }
+
+    /// [S2 2026-10-11] 다중세그먼트 t=1 GEMV 런치 — 테이블 u64 오프셋·행 합.
+    /// split = (q,s,out,n,k)(w4a16_gemv_g128_multi) / 플레인 = (w,out,n,k)
+    /// (w4a16_gemv_multi). 값은 세그먼트 단독 런치와 비트동일(행 독립).
+    pub(super) fn gemv_multi_launch(
+        &self,
+        plain: bool,
+        table: CUdeviceptr,
+        x_dev: CUdeviceptr,
+        total: usize,
+        count: usize,
+    ) -> Result<(), String> {
+        let name = if plain {
+            "w4a16_gemv_multi"
+        } else {
+            "w4a16_gemv_g128_multi"
+        };
+        let f = self.cc.function(name)?;
+        let (mut p_t, mut p_x) = (table, x_dev);
+        let mut p_c = count as i32;
+        self.cc.launch(
+            f,
+            total as u32,
+            1,
+            64,
+            &mut crate::rawcuda::args::l3(&mut p_t, &mut p_x, &mut p_c),
+        )
+    }
+
+    /// [S2] 층·그룹의 다중세그먼트 런치(테이블 메타 조회 — group 0=branch,
+    /// 1=gate/up). 테이블은 ensure_chain_bufs가 1회 작성.
+    pub(super) fn gemv_multi_dev(
+        &mut self,
+        plain: bool,
+        il: usize,
+        group: usize,
+        x_dev: CUdeviceptr,
+    ) -> Result<(), String> {
+        let m = *self
+            .dmulti_meta
+            .get(il)
+            .ok_or_else(|| format!("gemv_multi: 메타 부족 il={il}"))?;
+        let (off, cnt, total) = if group == 0 {
+            (m[0], m[1], m[2])
+        } else {
+            (m[3], m[4], m[5])
+        };
+        if cnt == 0 {
+            return Err(format!("gemv_multi: 세그먼트 없음 il={il} g={group}"));
+        }
+        self.gemv_multi_launch(
+            plain,
+            self.dmulti + off as u64 * 8,
+            x_dev,
+            total as usize,
+            cnt as usize,
+        )
+    }
+
+    /// [S2 2026-10-11] 다중세그먼트 t행 GEMV 런치(t≤8) — grid =
+    /// Σceil(n_s/GEMV_TR)(테이블 메타 *_tgrid). 값은 단독 GemvT와 비트동일.
+    pub(super) fn gemv_multi_t_launch(
+        &self,
+        plain: bool,
+        table: CUdeviceptr,
+        x_dev: CUdeviceptr,
+        total: usize,
+        count: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        let name = if plain {
+            "w4a16_gemv_bf16_multi_t"
+        } else {
+            "w4a16_gemv_g128_multi_t"
+        };
+        let f = self.cc.function(name)?;
+        let (mut p_t, mut p_x) = (table, x_dev);
+        let (mut p_c, mut p_tt) = (count as i32, t as i32);
+        // [A-float4] split은 32레인/행 — 플레인(bf16)은 종전 64레인.
+        let blk = if plain { 64 * GEMV_TR } else { 32 * GEMV_TR } as u32;
+        self.cc.launch(
+            f,
+            total as u32,
+            1,
+            blk,
+            &mut crate::rawcuda::args::l4(&mut p_t, &mut p_x, &mut p_c, &mut p_tt),
+        )
+    }
+
+    /// [S2] 층·그룹의 다중세그먼트 t행 런치(메타 idx 6/7 = *_tgrid).
+    pub(super) fn gemv_multi_t_dev(
+        &mut self,
+        plain: bool,
+        il: usize,
+        group: usize,
+        x_dev: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let m = *self
+            .dmulti_meta
+            .get(il)
+            .ok_or_else(|| format!("gemv_multi_t: 메타 부족 il={il}"))?;
+        let (off, cnt, tgrid) = if group == 0 {
+            (m[0], m[1], m[6])
+        } else {
+            (m[3], m[4], m[7])
+        };
+        if cnt == 0 {
+            return Err(format!("gemv_multi_t: 세그먼트 없음 il={il} g={group}"));
+        }
+        self.gemv_multi_t_launch(
+            plain,
+            self.dmulti + off as u64 * 8,
+            x_dev,
+            tgrid as usize,
+            cnt as usize,
+            t,
         )
     }
 
@@ -422,11 +563,24 @@ impl W4a16Dec {
         y_dev: CUdeviceptr,
         t: usize,
     ) -> Result<(), String> {
+        self.plain_gemv_t_launch_on(self.cc.stream, name, x_dev, y_dev, t)
+    }
+
+    /// [B3] t행 플레인 GEMV — 보조 스트림 발사 변형(shared 꼬리 포크).
+    pub(super) fn plain_gemv_t_launch_on(
+        &mut self,
+        s: ffi::CUstream,
+        name: &str,
+        x_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
         let (w, n, k) = self.plain_spec(name)?;
         let f = self.cc.function("w4a16_gemv_bf16_t")?;
         let (mut p_w, mut p_x, mut p_o) = (w, x_dev, y_dev);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
-        self.cc.launch(
+        self.cc.launch_on(
+            s,
             f,
             n.div_ceil(GEMV_TR) as u32,
             1,
@@ -480,7 +634,7 @@ impl W4a16Dec {
         let (mut p_n, mut p_k) = (n as i32, k as i32);
         self.cc.launch(
             f,
-            n as u32,
+            n as u32, // [A2-float4 v2] 256폭·64레인 — 종전 grid 유지
             1,
             64,
             &mut crate::rawcuda::args::l6(
@@ -580,13 +734,26 @@ impl W4a16Dec {
         y_dev: CUdeviceptr,
         n: usize,
     ) -> Result<(), String> {
+        self.ew_dev_on(self.cc.stream, g_dev, u_dev, y_dev, n)
+    }
+
+    /// [B3] ew — 보조 스트림 발사 변형(shared 꼬리 포크).
+    pub(super) fn ew_dev_on(
+        &mut self,
+        s: ffi::CUstream,
+        g_dev: CUdeviceptr,
+        u_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        n: usize,
+    ) -> Result<(), String> {
         if n == 0 {
             return Err("ew: n=0".into());
         }
         let f = self.cc.function("ew")?;
         let mut nn = n as i32;
         let (mut a0, mut a1, mut a2, mut a3, mut a4) = (g_dev, u_dev, y_dev, 0u64, 0u64);
-        self.cc.launch(
+        self.cc.launch_on(
+            s,
             f,
             n.div_ceil(128) as u32,
             1,

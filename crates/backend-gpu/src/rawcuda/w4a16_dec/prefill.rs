@@ -34,11 +34,28 @@ impl W4a16Dec {
         all: bool,
         logits: bool,
     ) -> Result<Vec<f32>, String> {
+        self.chain_t_sel(slot, Some(rows), t, head, all, logits)
+    }
+
+    /// [S3-1 2026-10-11] 입력 선택판 — Some = 호스트 행 h2d, None = dres 기채움
+    /// (임베딩 gather 경로가 사전 기록). 나머지 계약·산술은 chain_t와 동일.
+    pub(super) fn chain_t_sel(
+        &mut self,
+        slot: usize,
+        rows: Option<&[f32]>,
+        t: usize,
+        head: bool,
+        all: bool,
+        logits: bool,
+    ) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
-        if !(2..=CHAIN_TMAX).contains(&t) || rows.len() != t * self.hidden || slot >= self.n_slots {
+        if !(2..=CHAIN_TMAX).contains(&t)
+            || rows.is_some_and(|r| r.len() != t * self.hidden)
+            || slot >= self.n_slots
+        {
             return Err(format!(
-                "chain_device_t: t={t} rows={} 계약 위반",
-                rows.len()
+                "chain_device_t: t={t} rows={:?} 계약 위반",
+                rows.map(<[f32]>::len)
             ));
         }
         let pos = self.slot_pos[slot];
@@ -54,9 +71,11 @@ impl W4a16Dec {
         self.ensure_gdn_bufs(t)?;
         self.ensure_attn_bufs(t)?;
         let dyt = self.ensure_dyt(t)?;
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
-        let rb = unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, rows.len() * 4) };
-        self.cc.h2d_async(self.dres, rb)?;
+        if let Some(r) = rows {
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+            let rb = unsafe { std::slice::from_raw_parts(r.as_ptr() as *const u8, r.len() * 4) };
+            self.cc.h2d_async(self.dres, rb)?;
+        }
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let h = self.hidden;
         let mut ab = self.dab_dev;
@@ -80,6 +99,9 @@ impl W4a16Dec {
         } else {
             LinPath::Gemm
         };
+        // [S2 2026-10-11] t≤8(GemvT)은 다중세그먼트 융합 경로(스펙 검증·
+        // 소형 청크) — t≥9(Gemm)는 종전 단독 런치 유지.
+        let fuse = matches!(lp, LinPath::GemvT);
         for il in 0..self.n_layers {
             let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };
             let xn = self
@@ -89,22 +111,28 @@ impl W4a16Dec {
             let branch = if (il + 1) % interval == 0 {
                 // [R10] 4변형 → lin_forward 단일 디스패치(Gemm 경로).
                 let xin = if plain { xn } else { xh };
-                self.lin_forward(plain, lp, &format!("blk.{il}.attn_q.weight"), xin, s0, t)?;
-                self.lin_forward(plain, lp, &format!("blk.{il}.attn_k.weight"), xin, s1, t)?;
-                self.lin_forward(plain, lp, &format!("blk.{il}.attn_v.weight"), xin, s1b, t)?;
+                if fuse {
+                    // [S2] q/k/v 3런치 → 다중세그먼트 1런치.
+                    self.gemv_multi_t_dev(plain, il, 0, xin, t)
+                        .map_err(|e| format!("T{il} qkv: {e}"))?;
+                } else {
+                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_q.weight"), xin, s0, t)?;
+                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_k.weight"), xin, s1, t)?;
+                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_v.weight"), xin, s1b, t)?;
+                }
                 self.attn_chain_dev_run(slot, il / interval, t, s0, s1, s1b)
                     .map_err(|e| format!("T{il} attn: {e}"))?
             } else {
-                if plain {
-                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_qkv.weight"), xn, s0, t)?;
-                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_gate.weight"), xn, s1, t)?;
+                // [P6] xh(=dx32)는 norm_resid_dev가 h2f(f2h(xn)) 융합 기록 —
+                // cast 재계산 없음(값 불변·골든 검증). [S2] qkv/z도 같은 x.
+                let xin = if plain { xn } else { xh };
+                if fuse {
+                    // [S2] qkv/z 2런치 → 1런치.
+                    self.gemv_multi_t_dev(plain, il, 0, xin, t)
+                        .map_err(|e| format!("T{il} qkvz: {e}"))?;
                 } else {
-                    // [2026-10-09 P6] xh(=self.dx32.ptr)는 norm_resid_dev가 이미
-                    // h2f(f2h(xn)) 융합 기록(norm.cu xn32 — cast_x32와 비트 동일
-                    // 계약, 실측 근거 주석 포함). 종전 cast_x32 재계산은 중복
-                    // 런치였다. 값 불변(골든 검증).
-                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_qkv.weight"), xh, s0, t)?;
-                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_gate.weight"), xh, s1, t)?;
+                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_qkv.weight"), xin, s0, t)?;
+                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_gate.weight"), xin, s1, t)?;
                 }
                 let g = self
                     .gdn_chain_dev_run(slot, gi, t, xn, s0, s1)
@@ -142,8 +170,14 @@ impl W4a16Dec {
             } else {
                 let xh3 = xh; // 노름 융합 기록
                 let _ = xn2;
-                self.lin_forward(false, lp, &format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
-                self.lin_forward(false, lp, &format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
+                if fuse {
+                    // [S2 2026-10-11] gate/up 2런치 → 다중세그먼트 1런치.
+                    self.gemv_multi_t_dev(false, il, 1, xh3, t)
+                        .map_err(|e| format!("T{il} gateup: {e}"))?;
+                } else {
+                    self.lin_forward(false, lp, &format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
+                    self.lin_forward(false, lp, &format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
+                }
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
                 // [4.1 2026-10-11] ew 융합 — cast_x32 노드 제거.
@@ -155,7 +189,7 @@ impl W4a16Dec {
         // [A2 2026-10-11] 2048 경계 — 접두 재사용 체크포인트(GDN 상태+conv
         // 링, 순수 복사 — 산술 불변). 실패는 무시(기능만 미제공).
         let endp = pos + t as u32;
-        if endp.is_multiple_of(2048) {
+        if !self.capture_no_host && endp.is_multiple_of(2048) {
             let _ = self.checkpoint_gdn(slot, endp);
         }
         if all {
@@ -182,10 +216,12 @@ impl W4a16Dec {
                 let mut ob = vec![0u8; t * self.head_n * 4];
                 self.cc
                     .d2h_async(ob.as_mut_ptr(), self.dbatch_lg, ob.len())?;
-                self.cc.sync()?;
-                let pos_after = pos + t as u32;
-                self.slot_pos[slot] = pos_after;
-                self.attn_set_pos(slot, pos_after)?;
+                if !self.capture_no_host {
+                    self.cc.sync()?;
+                    let pos_after = pos + t as u32;
+                    self.slot_pos[slot] = pos_after;
+                    self.attn_set_pos(slot, pos_after)?;
+                }
                 return Ok(ob
                     .as_chunks::<4>()
                     .0
@@ -209,10 +245,12 @@ impl W4a16Dec {
             let tb =
                 unsafe { std::slice::from_raw_parts_mut(self.pin_batch_tok as *mut u8, t * 4) };
             self.cc.d2h_async(tb.as_mut_ptr(), self.dbatch_am, t * 4)?;
-            self.cc.sync()?;
-            let pos_after = pos + t as u32;
-            self.slot_pos[slot] = pos_after;
-            self.attn_set_pos(slot, pos_after)?;
+            if !self.capture_no_host {
+                self.cc.sync()?;
+                let pos_after = pos + t as u32;
+                self.slot_pos[slot] = pos_after;
+                self.attn_set_pos(slot, pos_after)?;
+            }
             return Ok((0..t)
                 .map(|k| {
                     u32::from_le_bytes([tb[k * 4], tb[k * 4 + 1], tb[k * 4 + 2], tb[k * 4 + 3]])

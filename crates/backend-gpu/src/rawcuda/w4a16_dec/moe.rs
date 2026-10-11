@@ -95,7 +95,9 @@ impl W4a16Dec {
     }
 
     /// [P11] 그룹 mma GEMM(g32) 발사 — grid (전문가 × n타일), M=전문가 슬롯 수.
-    pub(super) fn gemm_g32_mma_grp_launch(
+    /// [B2 2026-10-12] down 전용 N64 발사 — grp의 배리어 상각판(그리드 y =
+    /// ceil(n/64)). 값은 grp와 동일 계열(골든 판정) — 커널 주석 참조.
+    pub(super) fn gemm_g32_mma_grp_d64_launch(
         &self,
         base: usize,
         x_dev: CUdeviceptr,
@@ -105,7 +107,7 @@ impl W4a16Dec {
         n: usize,
         k: usize,
     ) -> Result<(), String> {
-        let f = self.cc.function("w4a16_gemm_g32_mma_grp")?;
+        let f = self.cc.function("w4a16_gemm_g32_mma_grp_d64")?;
         let (mut p_t, mut p_b) = (self.moe_dev_tab, base as i32);
         let (mut p_g, mut p_c, mut p_of) = (self.moe_gslot, self.moe_gcnt, self.moe_goff);
         let (mut p_x, mut p_xs, mut p_sp, mut p_o, mut p_n, mut p_k) = (
@@ -119,7 +121,7 @@ impl W4a16Dec {
         self.cc.launch(
             f,
             self.n_experts as u32,
-            n.div_ceil(GEMM_GRP_N) as u32,
+            n.div_ceil(64) as u32,
             256,
             &mut crate::rawcuda::args::l11(
                 &mut p_t, &mut p_b, &mut p_g, &mut p_c, &mut p_of, &mut p_x, &mut p_xs, &mut p_sp,
@@ -130,6 +132,8 @@ impl W4a16Dec {
 
     /// [§1.2 2026-10-11] 게이트·업 2N 융합 발사 — 한 커널이 base·base+1 두
     /// 투영을 동시 처리(N64 = 게이트 32 + 업 32). A 스테이징·배리어를 상각.
+    /// [B2 2026-10-12] KC32 변형 채택 시 미사용(비교용 보존).
+    #[allow(dead_code)]
     pub(super) fn gemm_g32_mma_grp2_launch(
         &self,
         base: usize,
@@ -211,7 +215,14 @@ impl W4a16Dec {
             self.moe_topk_dev()?;
             self.moe_experts_batch(il, xn, self.top_k)?;
         } else {
-            let sel = self.moe_route(il, xn)?;
+            // [B7+B6 2026-10-12] 스트리밍도 multi_tab 재사용 — 라우터+shared
+            // 게이트/업/sgate 1런치(종전 4런치: 라우터 + shared gate/up/sgate).
+            // topk는 디바이스(topk_t) — 호스트로는 id/wt 8쌍만(종전 로짓 128
+            // d2h + 호스트 전체 정렬). 스테이징에 id 선택만 필요해 호스트 몫
+            // 최소화. 시맨틱 동일(softmax→k→재정규화 미러) — 골든 판정.
+            self.moe_multi_gate(il, xn)?;
+            self.moe_topk_dev()?;
+            let sel = self.moe_read_selection()?;
             Self::zero_dev(&self.cc, self.dmo.ptr, self.hidden * 4)?;
             self.moe_experts_streaming(il, xn, &sel)?;
         }
@@ -254,25 +265,23 @@ impl W4a16Dec {
         )
     }
 
-    /// 라우터 — bf16 GEMV(원시 xn) → 로짓 판독 → 호스트 top-k 선택.
-    pub(super) fn moe_route(
-        &mut self,
-        il: usize,
-        xn: CUdeviceptr,
-    ) -> Result<Vec<(usize, f32)>, String> {
-        let n_exp = self.n_experts;
-        self.plain_gemv_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt.ptr)?;
-        let mut lb = vec![0u8; n_exp * 4];
-        self.cc
-            .d2h_async(lb.as_mut_ptr(), self.drt.ptr, n_exp * 4)?;
+    /// [B6/B7 2026-10-12] 디바이스 top-k(id/wt, moe_idx/moe_wt) → 호스트 목록.
+    /// 스트리밍 스테이징은 id 선택만 필요 — 종전 라우터 로짓 128 d2h+호스트
+    /// 정렬(moe_route)을 대체한다(시맨틱은 topk_t가 미러 — 골든 판정).
+    fn moe_read_selection(&mut self) -> Result<Vec<(usize, f32)>, String> {
+        let tk = self.top_k.max(1);
+        let mut ib = vec![0u8; tk * 4];
+        let mut wb = vec![0u8; tk * 4];
+        self.cc.d2h_async(ib.as_mut_ptr(), self.moe_idx, tk * 4)?;
+        self.cc.d2h_async(wb.as_mut_ptr(), self.moe_wt, tk * 4)?;
         self.cc.sync()?;
-        let logits: Vec<f32> = lb
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect();
-        Ok(moe_topk(&logits, self.top_k))
+        let mut out: Vec<(usize, f32)> = Vec::with_capacity(tk);
+        for k in 0..tk {
+            let e = u32::from_le_bytes(ib[k * 4..k * 4 + 4].try_into().unwrap()) as usize;
+            let w = f32::from_le_bytes(wb[k * 4..k * 4 + 4].try_into().unwrap());
+            out.push((e, w));
+        }
+        Ok(out)
     }
 
     /// 전문가 배치(상주) — 테이블 간접 GEMV + 가중 누적.
@@ -321,24 +330,68 @@ impl W4a16Dec {
         debug_assert!(
             self.stg.cap.0 >= qsz * sel.len() * 3 && self.stg.cap.1 >= ssz * sel.len() * 3
         );
+        // [B4-2 2026-10-12] 전문가 LRU 캐시 — hit은 h2d 생략(가중치 불변이라
+        // 수치 무변화), miss는 캐시 슬롯(빈/LRU 퇴거)으로 직접 h2d. 캐시 없음
+        // (mcache_k=0)이면 종전 stg 경로 그대로.
+        let use_cache = self.mcache_k > 0;
+        let mut qd_list: Vec<(u64, u64)> = Vec::with_capacity(sel.len());
         for (j, &(e, _)) in sel.iter().enumerate() {
-            let base = (il * n_exp + e) * 3;
-            for p in 0..3 {
-                let (qp, ql, sp, sl) = self.moe_tab[base + p];
-                let qd = self.stg.q + ((j * 3 + p) * qsz) as u64;
-                let sd = self.stg.s + ((j * 3 + p) * ssz) as u64;
-                // SAFETY: tab 항목은 set_expert_table 수명 계약(mmap/호스트
-                // 스테이징), ql/sl은 위 qsz/ssz 형상 계약을 따른다.
-                let qb = unsafe { std::slice::from_raw_parts(qp as *const u8, ql as usize) };
-                let sb = unsafe { std::slice::from_raw_parts(sp as *const u8, sl as usize) };
-                self.cc.h2d_async(qd, qb)?;
-                self.cc.h2d_async(sd, sb)?;
+            let (qd, sd, need_h2d) = if use_cache {
+                match self.mcache_lookup(il, e) {
+                    Some(slot) => {
+                        self.mcache_hits += 1;
+                        let qb =
+                            self.mcache_q + ((il * self.mcache_k + slot) * 3) as u64 * qsz as u64;
+                        let sb =
+                            self.mcache_s + ((il * self.mcache_k + slot) * 3) as u64 * ssz as u64;
+                        (qb, sb, false)
+                    }
+                    None => {
+                        self.mcache_miss += 1;
+                        let slot = self.mcache_insert(il, e)?;
+                        let qb =
+                            self.mcache_q + ((il * self.mcache_k + slot) * 3) as u64 * qsz as u64;
+                        let sb =
+                            self.mcache_s + ((il * self.mcache_k + slot) * 3) as u64 * ssz as u64;
+                        (qb, sb, true)
+                    }
+                }
+            } else {
+                let qb = self.stg.q + ((j * 3) * qsz) as u64;
+                let sb = self.stg.s + ((j * 3) * ssz) as u64;
+                (qb, sb, true)
+            };
+            if need_h2d {
+                let base = (il * n_exp + e) * 3;
+                for p in 0..3 {
+                    let (qp, ql, sp, sl) = self.moe_tab[base + p];
+                    let qdd = qd + (p * qsz) as u64;
+                    let sdd = sd + (p * ssz) as u64;
+                    // SAFETY: tab 항목은 set_expert_table 수명 계약(mmap/호스트
+                    // 스테이징), ql/sl은 위 qsz/ssz 형상 계약을 따른다.
+                    let qb = unsafe { std::slice::from_raw_parts(qp as *const u8, ql as usize) };
+                    let sb = unsafe { std::slice::from_raw_parts(sp as *const u8, sl as usize) };
+                    self.cc.h2d_async(qdd, qb)?;
+                    self.cc.h2d_async(sdd, sb)?;
+                }
             }
+            qd_list.push((qd, sd));
         }
         self.cc.sync()?;
+        if use_cache
+            && llm170_diag::flag::on_nonzero("LLM170_MOE_DBG")
+            && self.mcache_hits + self.mcache_miss > 0
+            && (self.mcache_hits + self.mcache_miss).is_multiple_of(2560)
+        {
+            eprintln!(
+                "[mcache] hit {} / {} ({:.1}%)",
+                self.mcache_hits,
+                self.mcache_hits + self.mcache_miss,
+                100.0 * self.mcache_hits as f64 / (self.mcache_hits + self.mcache_miss) as f64
+            );
+        }
         for (j, &(_e, w)) in sel.iter().enumerate() {
-            let q0 = self.stg.q + ((j * 3) * qsz) as u64;
-            let p0 = self.stg.s + ((j * 3) * ssz) as u64;
+            let (q0, p0) = qd_list[j];
             let q1 = q0 + qsz as u64;
             let p1 = p0 + ssz as u64;
             let q2 = q0 + (2 * qsz) as u64;
@@ -353,37 +406,124 @@ impl W4a16Dec {
         Ok(())
     }
 
+    /// [B4-2] 캐시 조회 — hit이면 슬롯 반환 + 나이 갱신.
+    fn mcache_lookup(&mut self, il: usize, e: usize) -> Option<usize> {
+        self.mcache_tick = self.mcache_tick.wrapping_add(1);
+        let base = il * self.mcache_k;
+        for slot in 0..self.mcache_k {
+            if self.mcache_ids[base + slot] == e as u16 {
+                self.mcache_age[base + slot] = self.mcache_tick;
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    /// [B4-2] 빈 슬롯 우선, 없으면 LRU(최소 나이) 퇴거 — 새 expert id/나이를
+    /// 기록하고 슬롯 반환(호출자가 그 슬롯으로 h2d).
+    /// [B4-1] 삽입 시 장치 테이블 엔트리((q,s)쌍 ×3투영, 48B)도 갱신한다 —
+    /// t≤8 프리필 경로가 테이블 간접 참조로 이 슬롯을 소비한다.
+    fn mcache_insert(&mut self, il: usize, e: usize) -> Result<usize, String> {
+        self.mcache_tick = self.mcache_tick.wrapping_add(1);
+        let base = il * self.mcache_k;
+        let mut slot = 0usize;
+        let mut best = u32::MAX;
+        for s in 0..self.mcache_k {
+            if self.mcache_ids[base + s] == u16::MAX {
+                slot = s;
+                break;
+            }
+            if self.mcache_age[base + s] < best {
+                best = self.mcache_age[base + s];
+                slot = s;
+            }
+        }
+        self.mcache_ids[base + slot] = e as u16;
+        self.mcache_age[base + slot] = self.mcache_tick;
+        if self.moe_dev_tab != 0 {
+            let h = self.hidden;
+            let n_ff = self.moe_ffn;
+            let qsz = h * n_ff / 2;
+            let ssz = h * n_ff / self.moe_group.max(32) * 2;
+            let qb = self.mcache_q + ((il * self.mcache_k + slot) * 3) as u64 * qsz as u64;
+            let sb = self.mcache_s + ((il * self.mcache_k + slot) * 3) as u64 * ssz as u64;
+            let mut bytes = [0u8; 48];
+            for p in 0..3 {
+                let q = qb + (p * qsz) as u64;
+                let sv = sb + (p * ssz) as u64;
+                bytes[p * 16..p * 16 + 8].copy_from_slice(&q.to_le_bytes());
+                bytes[p * 16 + 8..p * 16 + 16].copy_from_slice(&sv.to_le_bytes());
+            }
+            let off = ((il * self.n_experts + e) * 3) as u64 * 2 * 8;
+            self.cc.h2d_async(self.moe_dev_tab + off, &bytes)?;
+        }
+        Ok(slot)
+    }
+
+    /// [B4-1 2026-10-12] 스트리밍 t≤8 전문가 스테이징 — topk_t 기록(moe_idx)을
+    /// 판독해 distinct 전문가를 LRU 캐시에 보장(삽입이 장치 테이블 엔트리 갱신).
+    /// 이후 전문가 GEMV(융합 t≤8 경로)가 테이블 간접 참조로 동작한다.
+    fn moe_stage_t(&mut self, il: usize, t: usize) -> Result<(), String> {
+        if self.mcache_k == 0 || self.moe_dev_tab == 0 {
+            return Err("moe 스트리밍 t>1: 전문가 캐시 미구성".into());
+        }
+        let tk = self.top_k.max(1);
+        let ns = t * tk;
+        let mut ib = vec![0u8; ns * 4];
+        self.cc.d2h_async(ib.as_mut_ptr(), self.moe_idx, ns * 4)?;
+        self.cc.sync()?;
+        let mut seen = vec![false; self.n_experts];
+        for j in 0..ns {
+            let e = u32::from_le_bytes(ib[j * 4..j * 4 + 4].try_into().unwrap()) as usize;
+            if e >= self.n_experts || seen[e] {
+                continue;
+            }
+            seen[e] = true;
+            if self.mcache_lookup(il, e).is_none() {
+                self.mcache_insert(il, e)?;
+            }
+        }
+        Ok(())
+    }
+
     /// [B-4 2026-10-10] 다중 세그먼트 GEMV 테이블 — 라우터 게이트 + shared
     /// gate/up(x=xn 공통·상호 무의존)을 1런치로 묶는다. 소형 커널 런치
     /// 플로어 제거(35B 실측: 게이트+shared 4런치 ~18µs → 1런치 ~5µs, 층당).
     /// 포인터는 버퍼 수명 내 불변 — 그래프 캡처가 테이블을 참조한다.
     pub(super) fn build_moe_multi_tab(&mut self) -> Result<(), String> {
         let nl = self.n_layers;
-        let (d0, d1) = (self.dchain[0], self.dchain[1]);
+        // [B7 2026-10-12] shared 게이트/업은 전용 슬롯(dsh)으로 — dchain은
+        // 스트리밍 전문가 스크래치와 충돌(게이트/업이 전문가보다 선계산).
+        let (d0, d1) = (self.dsh[0], self.dsh[1]);
         let drt = self.drt.ptr;
         let shared = self.shared_ffn > 0;
         let mut ent: Vec<u64> = Vec::with_capacity(nl * 4 * 4);
         let mut rows: Vec<u32> = Vec::with_capacity(nl);
+        let mut rows_t3: Vec<u32> = Vec::with_capacity(nl);
         for il in 0..nl {
             let (gw, gn, gk) = self.plain_spec(&format!("blk.{il}.moe_gate.weight"))?;
             ent.extend([gw, drt, gn as u64, gk as u64]);
             let mut r = gn as u32;
+            let mut rt3 = gn.div_ceil(GEMV_TR) as u32;
             if shared {
                 for (suf, out) in [("moe_shared_gate", d0), ("moe_shared_up", d1)] {
                     let (w, n, k) = self.plain_spec(&format!("blk.{il}.{suf}.weight"))?;
                     ent.extend([w, out, n as u64, k as u64]);
                     r += n as u32;
+                    rt3 += n.div_ceil(GEMV_TR) as u32;
                 }
                 // [§4.5 2026-10-11] sgate를 4세그먼트로 편입 — 꼬리 GEMV
-                // 런치 -1/층. 출력은 전용 슬롯(drt+n_exp — 라우터는 [0..n_exp)
-                // 만 기록하고 topk 소비 후 shared_add가 읽어 순서 안전).
+                // 런치 -1/층. [B3-2b 2026-10-12] 출력은 전용 슬롯(dsg)으로
+                // 통일 + t 경로(rows_t3)에도 편입 — t≤8 꼬리 런치 추가 -1.
                 let (w, n, k) = self.plain_spec(&format!("blk.{il}.moe_shared_sgate.weight"))?;
-                ent.extend([w, drt + self.n_experts as u64 * 4, n as u64, k as u64]);
+                ent.extend([w, self.dsg, n as u64, k as u64]);
                 r += n as u32;
+                rt3 += n.div_ceil(GEMV_TR) as u32;
             } else {
                 ent.extend([0u64; 12]);
             }
             rows.push(r);
+            rows_t3.push(rt3);
         }
         let bytes = ent.len() * 8;
         if self.moe_multi_tab != 0 {
@@ -401,7 +541,65 @@ impl W4a16Dec {
         }
         self.moe_multi_tab = p;
         self.moe_multi_rows = rows;
+        self.moe_multi_rows_t3 = rows_t3;
         Ok(())
+    }
+
+    /// [S10-잔여 2026-10-11] t행(2..8) 상주 라우터+shared gate/up 융합 —
+    /// t=1 multi_gate의 t판(moe_multi_tab 세그먼트 0..2 공용). 종전 층당
+    /// 3런치(라우터 게이트 + shared gate/up plain_gemm) → 1런치.
+    /// [B3-2b 2026-10-12] sgate를 4세그먼트로 확장(count=4) — 꼬리 런치 -1/층
+    /// (출력은 dsg 전용 슬롯). 값은 단독 GemvT와 비트동일(커널 계약).
+    pub(super) fn moe_multi_gate_t(
+        &mut self,
+        il: usize,
+        xn: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        self.ensure_moe_bufs()?;
+        let total = *self
+            .moe_multi_rows_t3
+            .get(il)
+            .ok_or("moe: 다중 세그먼트 t 테이블 미작성")?;
+        if total == 0 {
+            return Ok(());
+        }
+        self.gemv_multi_t_launch(
+            true,
+            self.moe_multi_tab + (il as u64) * 4 * 4 * 8,
+            xn,
+            total as usize,
+            4,
+            t,
+        )
+    }
+
+    /// [S10-잔여] shared 꼬리(t판) — ew → down → 가산([B3-2b 2026-10-12]
+    /// sgate는 multi_gate_t 4세그먼트가 dsg에 선기록 — 런치 -1/층). 게이트/
+    /// 업은 multi_gate_t가 선기록(moe_shared_t에서 gate/up 런치 제거판).
+    /// [B3] forked=true면 머리(ew/down)가 보조 스트림에 선발사됨 — 조인 후
+    /// 가산만(조인 대상은 dsg·s3).
+    fn moe_shared_tail_t(
+        &mut self,
+        il: usize,
+        _xn: CUdeviceptr,
+        t: usize,
+        forked: bool,
+    ) -> Result<(), String> {
+        let h = self.hidden;
+        let sf = self.shared_ffn;
+        let [_s0, _s1, _s1b, s2, s3] = self.dchain;
+        if forked {
+            // [B3] 보조 스트림 조인 후 가산(ew/down은 포크가 선발사).
+            let e2 = self.ev_fork[il * 2 + 1];
+            self.cc.stream_wait(self.cc.stream, e2)?;
+            return self.shared_add_dev(self.dsg, s3, self.dmo.ptr, h, t);
+        }
+        self.ew_dev(self.dsh[0], self.dsh[1], s2, t * sf)?;
+        // [S10-잔여 확장] down은 t행 GEMV — v3 GEMM 대비 동값
+        // (plain-gemm-selfcheck 0/65536 실측)·소형 t에서 우세.
+        self.plain_gemv_t_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3, t)?;
+        self.shared_add_dev(self.dsg, s3, self.dmo.ptr, h, t)
     }
 
     /// [B-4] 다중 세그먼트 GEMV 런치(라우터 게이트 + shared gate/up).
@@ -427,35 +625,26 @@ impl W4a16Dec {
     }
 
     /// shared 전문가 — sigmoid(sgate·xn)·down(silu(gate·xn)·up·xn).
-    /// 상주 경로는 게이트/업이 다중 세그먼트 런치에 포함 — 꼬리만 수행.
-    pub(super) fn moe_shared(&mut self, il: usize, xn: CUdeviceptr) -> Result<(), String> {
+    /// [B7 2026-10-12] 게이트/업/sgate는 multi_gate(multi_tab 4세그먼트)가
+    /// 선기록(상주·스트리밍 공통) — 꼬리만 수행(스트리밍 분기 런치 -3/층).
+    pub(super) fn moe_shared(&mut self, il: usize, _xn: CUdeviceptr) -> Result<(), String> {
         if self.shared_ffn == 0 {
             return Ok(());
         }
-        if !self.moe_resident {
-            let [s0, s1, ..] = self.dchain;
-            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_gate.weight"), xn, s0)?;
-            self.plain_gemv_launch(&format!("blk.{il}.moe_shared_up.weight"), xn, s1)?;
-            // [§4.5] 스트리밍은 multi_gate 미사용 — sgate를 전용 슬롯에 여기서.
-            self.plain_gemv_launch(
-                &format!("blk.{il}.moe_shared_sgate.weight"),
-                xn,
-                self.drt.ptr + self.n_experts as u64 * 4,
-            )?;
-        }
-        self.moe_shared_tail(il, xn)
+        self.moe_shared_tail(il)
     }
 
-    /// shared 꼬리 — ew(silu·mul) → down → 누적(sgate는 [§4.5] multi_gate/
-    /// 스트리밍 분기가 전용 슬롯에 선기록 — 런치 -1/층).
-    fn moe_shared_tail(&mut self, il: usize, _xn: CUdeviceptr) -> Result<(), String> {
+    /// shared 꼬리 — ew(silu·mul) → down → 누적(sgate는 multi_gate 4세그먼트가
+    /// dsg에 선기록 — 런치 -1/층).
+    fn moe_shared_tail(&mut self, il: usize) -> Result<(), String> {
         let h = self.hidden;
         let sf = self.shared_ffn;
-        let [s0, s1, _s1b, s2, s3] = self.dchain;
-        self.ew_dev(s0, s1, s2, sf)?;
+        let [_s0, _s1, _s1b, s2, s3] = self.dchain;
+        self.ew_dev(self.dsh[0], self.dsh[1], s2, sf)?;
         self.plain_gemv_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3)?;
-        // [§4.5] sgate는 multi_gate 4세그먼트(상주) 또는 스트리밍 분기가 기록.
-        let sg = self.drt.ptr + self.n_experts as u64 * 4;
+        // [B7] sgate는 multi_gate 4세그먼트([B3-2b] 출력 dsg)가 선기록 —
+        // 상주·스트리밍 공통.
+        let sg = self.dsg;
         if self.moe_resident {
             // [§4.5] 상주 — 전문가 누적 + shared 가산 융합(런치 -1/층).
             // 누적은 여기(shared down 이후)로 이동 — 값 순서 동일(acc + σ·s3).
@@ -492,15 +681,35 @@ impl W4a16Dec {
         if n_exp == 0 || self.moe_tab.len() < (il + 1) * n_exp * 3 {
             return Err("moe: 구성/전문가 테이블 미등록".into());
         }
-        if !self.moe_resident {
-            return Err("moe t>1: 상주 모드 전용(스트리밍 프리필 미구현)".into());
+        // [B4-1 2026-10-12] 스트리밍도 t≤8(BATCH_DEC_MAX)은 캐시 스테이징 +
+        // 장치 테이블로 융합 경로 사용(종전 t=1 폴백 — 512토큰 ~9.3s). t>8은
+        // 청크 전문가 스테이징 미구현.
+        if !self.moe_resident && t > BATCH_DEC_MAX {
+            return Err("moe t>8: 스트리밍 프리필 미구현(청크 ≤8)".into());
         }
         self.ensure_moe_bufs()?;
+        // [S10-잔여 2026-10-11] t≤8(디코드 배치·검증): 라우터+shared 게이트/
+        // 업/sgate를 multi_t 1런치로 융합(종전 4런치). t>8(프리필)은 종전 유지.
+        let fused = self.shared_ffn > 0 && t <= BATCH_DEC_MAX;
         // 1) 라우터 [t][n_exp] — 플레인 GEMM → **디바이스 top-k**(P11).
         // 종전: d2h(32KB)+sync+호스트 전체 정렬(512×t)이 층·청크마다 — 프리필의
         // ~10%. 시맨틱은 moe_topk 미러(softmax→k라운드→재정규화).
         // 실측(2026-10-09): 35B 512토큰 프리필 1294→1088ms.
-        self.plain_gemm_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt.ptr, t)?;
+        if fused {
+            self.moe_multi_gate_t(il, xn, t)?;
+        } else {
+            self.plain_gemm_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt.ptr, t)?;
+        }
+        // [B3 2026-10-12] shared 꼬리 선포크 — ew→down→sgate(게이트/업은
+        // multi_gate_t가 선기록)를 보조 스트림에 선발사해 topk·전문가 GEMV와
+        // 병렬화한다. 조인은 shared_add 직전(꼬리). sgate 출력은 전용 슬롯
+        // (dsg — 종전 drt 재사용은 topk와의 경합). 실측 상한(꼬리 제거):
+        // tg +4.1%·np4 +5.6% — 기대 실효는 발사 몫 회수분.
+        let forked = if fused {
+            self.moe_shared_head_t_fork(il, xn, t)?
+        } else {
+            false
+        };
         {
             let f = self.cc.function("w4a16_moe_topk_t")?;
             let (mut p_lg, mut p_ix, mut p_wt) = (self.drt.ptr, self.moe_idx, self.moe_wt);
@@ -516,6 +725,11 @@ impl W4a16Dec {
             )?;
         }
         let ns = t * tk;
+        // [B4-1] 스트리밍: topk_t idx의 distinct 전문가를 캐시에 보장(장치
+        // 테이블 갱신 완료) — 이후 GEMV가 테이블 간접 참조로 소비.
+        if !self.moe_resident {
+            self.moe_stage_t(il, t)?;
+        }
         // 2) 전문가 배치.
         if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
             // xn(정규화 출력) 행별 NaN — 업스트림 vs 전문가 GEMV 판별.
@@ -537,10 +751,54 @@ impl W4a16Dec {
         let base = il * n_exp * 3;
         // [P11] 프리필(t>1)은 전문가-우선 정렬 + 그룹 GEMV — 같은 전문가의
         // 슬롯을 연속 처리해 가중치 행을 L2 재사용(슬롯별 산술 동일 = 비트 동일).
-        let group = t > 1 && n_exp <= 1024;
+        // [S10-잔여 확장 2026-10-11] t≤8(np4·검증)은 GEMV 전문가 경로 —
+        // t=1 단독 디코드와 **동일 커널 계열**(f32 x·f64 트리)로 통일해 배치
+        // 디코드 = 단독 디코드 일관성을 회복하고 +8.1% np4. grp2(mma·f16
+        // 스테이징)와는 수치 클래스 상이 — eval chunk4 A/B: en PPL +0.1697%·
+        // agree 98.566% / ko +0.0091%·97.337%(밴드: int8 KV 채택 이력보다 작음).
+        // t≥9(프리필)는 종전 grp2 유지.
+        let group = t > 8 && n_exp <= 1024;
         if group {
             // [P11] 그룹 mma GEMM — 전문가별 슬롯 묶음(M=슬롯 수), T1 계약 미러.
             self.moe_align_launch(ns)?;
+            // [S13/S5 2026-10-11] 라우팅 분포 진단(LLM170_DUMP=moe_cnt) —
+            // gcnt 히스토그램 + Σceil(cnt/GRP_M) 타일 수(M64/32/16 비교).
+            if llm170_diag::dump::opts().key("moe_cnt") {
+                let mut cb = vec![0u8; n_exp * 4];
+                self.cc
+                    .d2h_async(cb.as_mut_ptr(), self.moe_gcnt, n_exp * 4)?;
+                self.cc.sync()?;
+                let cnts: Vec<u32> = cb
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_le_bytes(*c))
+                    .collect();
+                let mut hist = [0usize; 8];
+                let mut sum = 0usize;
+                let (mut t64, mut t32, mut t16) = (0usize, 0usize, 0usize);
+                for &c in &cnts {
+                    let c = c as usize;
+                    sum += c;
+                    t64 += c.div_ceil(64);
+                    t32 += c.div_ceil(32);
+                    t16 += c.div_ceil(16);
+                    let b = match c {
+                        0 => 0,
+                        1..=8 => 1,
+                        9..=16 => 2,
+                        17..=32 => 3,
+                        33..=48 => 4,
+                        49..=64 => 5,
+                        65..=96 => 6,
+                        _ => 7,
+                    };
+                    hist[b] += 1;
+                }
+                eprintln!(
+                    "[moe-cnt] il={il} slots={ns} sum={sum} tiles M64={t64} M32={t32} M16={t16} hist[0|1-8|9-16|17-32|33-48|49-64|65-96|97+]={hist:?}"
+                );
+            }
             // [marlin-A5] A는 f16(xn 미러) — 그룹 GEMM A 재판독 절반.
             let x16 = self.cast_x16(xn, t * h)?;
             // [§1.2 2026-10-11] 게이트·업 2N 융합 — 발사 1회(A 스테이징·배리어 상각).
@@ -572,13 +830,51 @@ impl W4a16Dec {
             eprintln!("[t-dbg] act nan-slots={bad:?} ns={ns}");
         }
         if group {
-            self.gemm_g32_mma_grp_launch(base + 2, self.dx16.ptr, n_ff, 1, self.exp.dn, h, n_ff)?;
+            // [B2 2026-10-12] down N64 변형 — grp 배리어 상각(골든 판정).
+            self.gemm_g32_mma_grp_d64_launch(
+                base + 2,
+                self.dx16.ptr,
+                n_ff,
+                1,
+                self.exp.dn,
+                h,
+                n_ff,
+            )?;
         } else {
             self.gemv_experts_launch(base + 2, ns, self.exp.act, n_ff, 1, self.exp.dn, h, n_ff)?;
         }
         self.moe_accum_dev(self.moe_wt, self.exp.dn, self.dmo.ptr, tk, ns, h)?;
-        self.moe_shared_t(il, xn, t)?;
+        if fused {
+            self.moe_shared_tail_t(il, xn, t, forked)?;
+        } else {
+            self.moe_shared_t(il, xn, t)?;
+        }
         Ok(self.dmo.ptr)
+    }
+
+    /// [B3 2026-10-12] shared 꼬리 머리(ew→down→sgate)를 보조 스트림에 선발사.
+    /// 반환 true면 ew/down/sgate가 이미 발사됨(조인은 moe_shared_tail_t).
+    fn moe_shared_head_t_fork(
+        &mut self,
+        il: usize,
+        _xn: CUdeviceptr,
+        t: usize,
+    ) -> Result<bool, String> {
+        let aux = self.cc.stream2;
+        if aux.is_null() || self.dsg == 0 || self.ev_fork.len() < (il + 1) * 2 {
+            return Ok(false);
+        }
+        let sf = self.shared_ffn;
+        let [_s0, _s1, _s1b, s2, s3] = self.dchain;
+        let (e1, e2) = (self.ev_fork[il * 2], self.ev_fork[il * 2 + 1]);
+        // 포크: 게이트/업(multi_gate_t) 완료 → 보조 스트림에 ew/down.
+        // (sgate는 [B3-2b] multi_gate_t 4세그먼트가 dsg에 선기록.)
+        self.cc.event_record_on(e1, self.cc.stream)?;
+        self.cc.stream_wait(aux, e1)?;
+        self.ew_dev_on(aux, self.dsh[0], self.dsh[1], s2, t * sf)?;
+        self.plain_gemv_t_launch_on(aux, &format!("blk.{il}.moe_shared_down.weight"), s2, s3, t)?;
+        self.cc.event_record_on(e2, aux)?;
+        Ok(true)
     }
 
     /// shared 전문가 배치(t≤8) — 플레인 GEMM ×3 + 토큰별 게이트 가산.

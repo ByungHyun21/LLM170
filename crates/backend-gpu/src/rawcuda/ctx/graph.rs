@@ -1,13 +1,16 @@
 use super::*;
 
 impl CudaCtx {
-    /// 그래프 캡처 개시(THREAD_LOCAL) — 이후 이 스트림의 발사가 그래프 노드로
+    /// 그래프 캡처 개시(GLOBAL) — 이후 이 스트림의 발사가 그래프 노드로
     /// 기록된다(실행 아님). 캡처 중 동기 복사·alloc·sync는 금지.
+    /// [B3 2026-10-12] THREAD_LOCAL(1)→GLOBAL(0): 보조 스트림 포크/조인
+    /// (moe shared 꼬리)을 그래프 노드로 포착하려면 컨텍스트 전 스트림이
+    /// 캡처에 참여해야 한다(단일 스레드 디코더 — 다른 스트림 발사원 없음).
     pub fn capture_begin(&self) -> Result<(), String> {
         self.prof.capturing.set(true);
         // SAFETY: stream은 create_stream이 설정한 유효 핸들.
         unsafe {
-            let r = (self.drv.stream_begin_capture)(self.stream, 1);
+            let r = (self.drv.stream_begin_capture)(self.stream, 0);
             if r != CUDA_SUCCESS {
                 return Err(format!(
                     "rawcuda: cuStreamBeginCapture: {}",

@@ -20,11 +20,12 @@ pub struct GpuEngine {
 }
 
 /// [R16] 프리필 청크 tmax 정책 — 순수 함수(테스트 표면).
-/// 규칙: MoE 스트리밍은 t=1 폴백(전문가 업로드가 토큰 단위), 그 외는
-/// `LLM170_PREFILL_T`(진단 오버라이드) 또는 기본 512(가중치 상각), 1..=512.
+/// 규칙: MoE 스트리밍은 캐시 스테이징 기반 t≤8 청크(종전 t=1 폴백 — 512토큰
+/// ~9.3s), 그 외는 `LLM170_PREFILL_T`(진단 오버라이드) 또는 기본 512
+/// (가중치 상각), 1..=512.
 pub fn prefill_tmax(is_moe: bool, resident: bool, env: Option<&str>) -> usize {
     if is_moe && !resident {
-        return 1;
+        return 8;
     }
     env.and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(512)
@@ -46,6 +47,20 @@ impl GpuEngine {
         {
             dec.upload_head(w.data, w.n_out as usize, w.n_in as usize)?;
             head_gpu = true;
+        }
+        // [S3-1 2026-10-11] token_embd 상주 — 프리필 행 조립을 GPU gather로.
+        if let Some(w) = model.w("token_embd.weight")
+            && matches!(
+                w.ty,
+                llm170_core::wtype::WType::F16 | llm170_core::wtype::WType::Bf16
+            )
+        {
+            dec.upload_embed(
+                w.data,
+                w.n_out as usize,
+                w.n_in as usize,
+                w.ty == llm170_core::wtype::WType::Bf16,
+            )?;
         }
         Ok(GpuEngine {
             model,
@@ -148,18 +163,43 @@ impl GpuEngine {
         let mut i = 0usize;
         while i < n {
             let t = (n - i).min(tmax);
-            let mut rows = Vec::with_capacity(t * h);
-            for &tok in &tokens[i..i + t] {
-                rows.extend_from_slice(&self.model.embed_row(tok).map_err(|e| e.to_string())?);
-            }
             let is_last = i + t == n;
-            if is_last && self.head_gpu {
-                last = Some(self.dec.forward_prefill(seq, &rows, t, true)?);
-            } else if is_last {
-                let xn = self.dec.forward_prefill(seq, &rows, t, false)?;
-                last = Some(self.head_logits(&xn)?);
+            let part = &tokens[i..i + t];
+            if t == 1 {
+                let row = self.model.embed_row(part[0]).map_err(|e| e.to_string())?;
+                if is_last && self.head_gpu {
+                    last = Some(self.dec.forward_prefill(seq, &row, 1, true)?);
+                } else if is_last {
+                    let xn = self.dec.forward_prefill(seq, &row, 1, false)?;
+                    last = Some(self.head_logits(&xn)?);
+                } else {
+                    self.dec.forward_prefill(seq, &row, 1, false)?;
+                }
+            } else if self.dec.embed_ready() {
+                // [S3-1 2026-10-11] 임베딩 GPU gather — 행 조립(mmap 디코드+
+                // 할당+h2d t×h×4B)을 id h2d(4B/행)+gather로 대체. 값 동일
+                // (h2f/b2f = decode_f32 동일 함수 — 골든 계약).
+                if is_last && self.head_gpu {
+                    last = Some(self.dec.forward_prefill_toks(seq, part, t, true)?);
+                } else if is_last {
+                    let xn = self.dec.forward_prefill_toks(seq, part, t, false)?;
+                    last = Some(self.head_logits(&xn)?);
+                } else {
+                    self.dec.forward_prefill_toks(seq, part, t, false)?;
+                }
             } else {
-                self.dec.forward_prefill(seq, &rows, t, false)?;
+                let mut rows = Vec::with_capacity(t * h);
+                for &tok in part {
+                    rows.extend_from_slice(&self.model.embed_row(tok).map_err(|e| e.to_string())?);
+                }
+                if is_last && self.head_gpu {
+                    last = Some(self.dec.forward_prefill(seq, &rows, t, true)?);
+                } else if is_last {
+                    let xn = self.dec.forward_prefill(seq, &rows, t, false)?;
+                    last = Some(self.head_logits(&xn)?);
+                } else {
+                    self.dec.forward_prefill(seq, &rows, t, false)?;
+                }
             }
             i += t;
         }
@@ -211,6 +251,65 @@ impl GpuEngine {
         self.token_greedy(seq, &row)
     }
 
+    /// [S11 2026-10-11] 혼합 배치(그리디+샘플 슬롯 한 배치) — 배치 체인이
+    /// 토큰(argmax)과 로짓(dbatch_lg)을 동시 산출하므로 한 번에 회수한다.
+    /// 반환 = (전 행 토큰, 전 행 로짓 평탄 [t][head_n]). 그리디 행은 토큰,
+    /// 샘플 행은 로짓 사용 — 둘 다 단독 경로와 비트동일.
+    pub fn decode_np_mixed(
+        &mut self,
+        seq_ids: &[usize],
+        tokens: &[u32],
+    ) -> Result<(Vec<u32>, Vec<f32>), String> {
+        if !(2..=llm170_backend_gpu::BATCH_DEC_MAX).contains(&seq_ids.len()) {
+            return Err("mixed: t 2..=BATCH_DEC_MAX 전용".into());
+        }
+        let h = self.model.hp.n_embd;
+        let mut rows = Vec::with_capacity(seq_ids.len() * h);
+        for tok in tokens {
+            rows.extend_from_slice(&self.model.embed_row(*tok).map_err(|e| e.to_string())?);
+        }
+        let toks = self.dec.forward_device_argmax_batch(seq_ids, &rows)?;
+        let lg = self.dec.batch_read_logits(seq_ids.len())?;
+        Ok((toks, lg))
+    }
+
+    /// [S11 2026-10-11] 배치 디코드 로짓(샘플링 슬롯) — 배치 체인(argmax
+    /// 그래프 재사용: dbatch_lg가 이미 로짓) + 로짓 d2h. 행별 로짓은 t=1
+    /// forward_device_head와 비트동일 → 호스트 샘플러 토큰열 불변.
+    /// 반환 = 행 우선 평탄 [t][head_n]. 전제 위반 시 슬롯별 직렬 폴백.
+    pub fn decode_np_logits(
+        &mut self,
+        seq_ids: &[usize],
+        tokens: &[u32],
+    ) -> Result<Vec<f32>, String> {
+        if (2..=llm170_backend_gpu::BATCH_DEC_MAX).contains(&seq_ids.len()) {
+            let h = self.model.hp.n_embd;
+            let mut rows = Vec::with_capacity(seq_ids.len() * h);
+            for tok in tokens {
+                rows.extend_from_slice(&self.model.embed_row(*tok).map_err(|e| e.to_string())?);
+            }
+            match self.dec.forward_device_argmax_batch(seq_ids, &rows) {
+                Ok(_tok_discard) => match self.dec.batch_read_logits(seq_ids.len()) {
+                    Ok(lg) => return Ok(lg),
+                    Err(e) => eprintln!("# np-logits 판독 폴백(직렬): {e}"),
+                },
+                Err(e) => eprintln!("# np-logits 배치 폴백(직렬): {e}"),
+            }
+        }
+        let mut out = Vec::new();
+        for (s, tok) in seq_ids.iter().zip(tokens.iter()) {
+            let row = self.model.embed_row(*tok).map_err(|e| e.to_string())?;
+            out.extend_from_slice(&self.logits(*s, &row)?);
+        }
+        Ok(out)
+    }
+
+    /// [S13 2026-10-11] GPU 커널 범주 프로파일(LLM170_TIME=1 이벤트 계측) —
+    /// serve 스텝 분해(srv_time 요약에 연동). off면 빈 문자열.
+    pub fn prof_report(&mut self, label: &str) -> Result<String, String> {
+        self.dec.prof_report(label)
+    }
+
     /// 슬롯 상태 리셋(GDN 링/스캔 + pp + pos).
     pub fn reset_seq(&mut self, seq: usize) -> Result<(), String> {
         self.dec.reset_state(seq)
@@ -218,6 +317,11 @@ impl GpuEngine {
 
     /// [§7.1 2026-10-11] 스펙 서빙 — GDN 토큰별 스냅샷 버퍼 확보(모델당 1회).
     /// VRAM: 27B 654MB+dsave(슬롯당 ~154MB)·35B 436MB+dsave.
+    /// [2026-10-12] 스펙 활성 여부 — 비활성(스트리밍·VRAM 부족)이면 스케줄러가
+    /// 라운드를 시도하지 않는다.
+    pub fn spec_on(&self) -> bool {
+        self.dec.spec_on()
+    }
     pub fn enable_spec(&mut self) -> Result<(), String> {
         self.dec.enable_spec()
     }
@@ -504,7 +608,7 @@ mod tests {
     fn prefill_tmax_policy() {
         assert_eq!(
             prefill_tmax(true, false, None),
-            1,
+            8,
             "MoE 스트리밍 = t=1 폴백"
         );
         assert_eq!(prefill_tmax(true, true, None), 512, "MoE 상주 = 기본 512");

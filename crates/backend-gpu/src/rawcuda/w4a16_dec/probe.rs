@@ -400,7 +400,7 @@ impl W4a16Dec {
         self.cc.h2d(dg, b)?;
         self.cc.h2d(du, b)?;
         let f = self.cc.function("ew")?;
-        let (mut a0, mut a1, mut a2) = (dg, du, dy);
+        let (mut a0, mut a1, mut a2, mut a3, mut a4) = (dg, du, dy, 0u64, 0u64);
         let mut nn = n as i32;
         for _ in 0..10 {
             self.cc.launch(
@@ -408,7 +408,7 @@ impl W4a16Dec {
                 n.div_ceil(128) as u32,
                 1,
                 128,
-                &mut crate::rawcuda::args::l4(&mut a0, &mut a1, &mut a2, &mut nn),
+                &mut crate::rawcuda::args::l6(&mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut nn),
             )?;
         }
         self.cc.sync()?;
@@ -419,7 +419,7 @@ impl W4a16Dec {
                 n.div_ceil(128) as u32,
                 1,
                 128,
-                &mut crate::rawcuda::args::l4(&mut a0, &mut a1, &mut a2, &mut nn),
+                &mut crate::rawcuda::args::l6(&mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut nn),
             )?;
         }
         self.cc.sync()?;

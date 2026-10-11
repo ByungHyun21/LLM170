@@ -17,10 +17,24 @@ NVCC=${NVCC:-nvcc}
 command -v "$NVCC" >/dev/null || { echo "nvcc 없음: $NVCC" >&2; exit 1; }
 A=crates/backend-gpu/src/rawcuda/assets
 
+# [경고 2026-10-11] gptq4.cu(대형·mma)는 nvcc 13.0.48에서 **비결정 컴파일**
+# (동일 플래그 재컴파일 시 SASS 상이 — 코드젠 추첨). 실측 드로우 간 27B
+# pp512 1680~1820(±4%). 리빌드 후 반드시 pp 재측정 + 필요 시 재뽑기 —
+# 채택 드로우는 커밋된 fatbin 바이트로 고정된다. 그 외 자산(moe/attn/gdn/
+# norm/ew/head)은 결정적(2회 동일 실측).
 build() { # name fmad_flag("" | "-fmad=false")
     local name=$1 fmad=${2:-}
     local src=$A/$name.cu out=$A/$name.fatbin
     [ -f "$src" ] || { echo "소스 없음: $src" >&2; exit 1; }
+    # [2026-10-11] 신선도 스킵(make식) — 소스·공용 헤더보다 fatbin이 새로우면
+    # 재빌드 생략. gptq4는 재빌드마다 코드젠 추첨이 리셋되므로(실측 ±4%)
+    # 불필요한 재컴파일이 고정 드로우를 덮어쓰는 사고를 막는다.
+    # 강제 재빌드: touch <name>.cu 후 실행.
+    if [ -f "$out" ] && [ "$out" -nt "$src" ] \
+        && [ "$out" -nt "$A/cast_common.cuh" ] && [ "$out" -nt "$A/g4_common.cuh" ]; then
+        echo "CUDA $name 스킵(최신 — 강제: touch $src)"
+        return
+    fi
     local tmp
     tmp=$(mktemp /tmp/opencode/${name}.XXXXXX.fatbin)
     "$NVCC" -fatbin -O3 $fmad \
@@ -36,6 +50,7 @@ build norm
 build gdn   -fmad=false
 build attn  -fmad=false
 build ew    -fmad=false
+build embed -fmad=false
 build gptq4 -fmad=false
 build moe   -fmad=false
 build head  -fmad=false

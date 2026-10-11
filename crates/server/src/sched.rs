@@ -140,8 +140,15 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
     // [§7.1 2026-10-11] 스펙 서빙 — 초안이 발화하는 그리디 슬롯은 검증
     // 라운드(직렬). 값 보존: 검증+보정 토큰이 t=1 디코드와 비트동일
     // (스펙 골든 계약 — spec_round 주석 참조). 나머지는 종전 배치/단독.
+    // [2026-10-12] 스펙 비활성(스트리밍·VRAM 부족)이면 라운드 시도 금지 —
+    // 비활성 상태 시도가 요청을 죽이던 결함(실측: 스트리밍 서브 500).
+    let spec_ok = e.spec_on();
     let mut g2: Vec<usize> = Vec::with_capacity(greedy.len());
     for &i in &greedy {
+        if !spec_ok {
+            g2.push(i);
+            continue;
+        }
         match spec_round(i, &mut slots[i], e) {
             Ok(true) => {}
             Ok(false) => g2.push(i),
@@ -149,6 +156,48 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
         }
     }
     let greedy = g2;
+    // [§7 2단계] 샘플드 스펙 — 초안 발화 슬롯은 검증 라운드(직렬), 나머지 배치.
+    // [S11 2026-10-11] 혼합 통합을 위해 그리디 배치보다 먼저 처리(슬롯 독립 —
+    // 순서 무관).
+    let mut s2: Vec<usize> = Vec::with_capacity(sampled.len());
+    for &i in &sampled {
+        if !spec_ok {
+            s2.push(i);
+            continue;
+        }
+        match spec_round_sampled(i, &mut slots[i], e) {
+            Ok(true) => {}
+            Ok(false) => s2.push(i),
+            Err(err) => slot_fail(&mut slots[i], format!("spec(샘플): {err}")),
+        }
+    }
+    let sampled = s2;
+    // [S11] 혼합(그리디+샘플) — 한 배치 체인으로 통합(종전 np_k + np_m 2회).
+    // 실패 시 분리 경로로 폴백.
+    if !greedy.is_empty() && !sampled.is_empty() {
+        let mut uslots: Vec<usize> = Vec::with_capacity(greedy.len() + sampled.len());
+        let mut utoks: Vec<u32> = Vec::with_capacity(uslots.capacity());
+        for &i in greedy.iter().chain(sampled.iter()) {
+            uslots.push(i);
+            utoks.push(slots[i].next);
+        }
+        match e.decode_np_mixed(&uslots, &utoks) {
+            Ok((toks, mut flat)) => {
+                let hn = flat.len() / uslots.len();
+                for (row, (chunk, &i)) in flat.chunks_mut(hn).zip(uslots.iter()).enumerate() {
+                    let smp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
+                    let t = if smp {
+                        pick(&mut slots[i], chunk)
+                    } else {
+                        toks[row]
+                    };
+                    slot_emit(&mut slots[i], t);
+                }
+                return;
+            }
+            Err(err) => eprintln!("# 혼합 배치 폴백(분리): {err}"),
+        }
+    }
     if greedy.len() >= 2 {
         let toks: Vec<u32> = greedy.iter().map(|&i| slots[i].next).collect();
         match e.decode_np_greedy(&greedy, &toks) {
@@ -173,23 +222,20 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
             Err(err) => slot_fail(&mut slots[i], format!("decode_greedy: {err}")),
         }
     }
-    // [§7 2단계] 샘플드 스펙 — 초안 발화 슬롯은 검증 라운드(직렬), 나머지 배치.
-    let mut s2: Vec<usize> = Vec::with_capacity(sampled.len());
-    for &i in &sampled {
-        match spec_round_sampled(i, &mut slots[i], e) {
-            Ok(true) => {}
-            Ok(false) => s2.push(i),
-            Err(err) => slot_fail(&mut slots[i], format!("spec(샘플): {err}")),
-        }
-    }
-    let sampled = s2;
     if !sampled.is_empty() {
         let toks: Vec<u32> = sampled.iter().map(|&i| slots[i].next).collect();
-        match e.decode(&sampled, &toks) {
-            Ok(mut rows) => {
-                for (row, &i) in sampled.iter().enumerate() {
-                    let t = pick(&mut slots[i], &mut rows[row]);
+        // [S11 2026-10-11] t≥2 샘플링은 배치 체인 1회(로짓 d2h) — 종전
+        // 슬롯별 t=1 직렬(≈19.5ms×N) 대비 대폭 상각. 로짓은 행별 t=1 head와
+        // 비트동일이라 호스트 샘플러 토큰열 불변. t=1은 종전 직렬 유지.
+        match e.decode_np_logits(&sampled, &toks) {
+            Ok(mut flat) => {
+                let hn = flat.len() / sampled.len();
+                let mut off = 0usize;
+                for &i in &sampled {
+                    let (row, _rest) = flat[off..].split_at_mut(hn);
+                    let t = pick(&mut slots[i], row);
                     slot_emit(&mut slots[i], t);
+                    off += hn;
                 }
             }
             Err(err) => {
@@ -216,6 +262,7 @@ pub static SCHED: Sched = Sched {
     ms_prefill: AtomicU64::new(0),
     spec_rounds: AtomicU64::new(0),
     spec_accepted: AtomicU64::new(0),
+    spec_ms: AtomicU64::new(0),
     slots_active: AtomicU64::new(0),
     prompt_tokens: AtomicU64::new(0),
     gen_tokens: AtomicU64::new(0),
@@ -234,6 +281,8 @@ pub struct Sched {
     /// 스펙 라운드 수/수용 토큰 수 계측(수용률 = acc/rounds).
     pub spec_rounds: AtomicU64,
     pub spec_accepted: AtomicU64,
+    /// [A6-3] 스펙 라운드 누적 ms(평균 = ms/rounds).
+    pub spec_ms: AtomicU64,
     // ── 모니터링(2026-10-09) — "최신 누적값"만(히스토리 없음) ──
     /// 활성 작업 슬롯 수(게이지 — slot_loop가 게시).
     pub slots_active: AtomicU64,
@@ -260,9 +309,10 @@ impl Sched {
         let mp = self.ms_prefill.load(Ordering::Relaxed);
         let sr = self.spec_rounds.load(Ordering::Relaxed);
         let sa = self.spec_accepted.load(Ordering::Relaxed);
+        let sms = self.spec_ms.load(Ordering::Relaxed);
         let qd = self.queue_depth.load(Ordering::Relaxed);
         format!(
-            "[sched] jobs {jobs} | queue {qd} | queue-wait avg {:.0}ms | prefix-reuse {px}tok | decode {td}x avg {:.1}ms | prefill {cp}x avg {:.1}ms | spec {sr}r acc {sa} ({:.2}/r)",
+            "[sched] jobs {jobs} | queue {qd} | queue-wait avg {:.0}ms | prefix-reuse {px}tok | decode {td}x avg {:.1}ms | prefill {cp}x avg {:.1}ms | spec {sr}r acc {sa} ({:.2}/r) avg {:.1}ms",
             if jobs > 0 {
                 qw as f64 / jobs as f64 / 1e3
             } else {
@@ -271,6 +321,11 @@ impl Sched {
             if td > 0 { md as f64 / td as f64 } else { 0.0 },
             if cp > 0 { mp as f64 / cp as f64 } else { 0.0 },
             if sr > 0 { sa as f64 / sr as f64 } else { 0.0 },
+            if sr > 0 {
+                sms as f64 / sr as f64 / 1e3
+            } else {
+                0.0
+            },
         )
     }
 }
@@ -298,7 +353,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     let mut slots: Vec<Slot> = (0..n_slots).map(|_| Slot::free()).collect();
     let mut tick: u64 = 0;
     let (mut n_dec, mut n_pf) = (0u64, 0u64);
-    let (mut ms_dec, mut ms_pf) = (0f64, 0f64);
+    let (mut ms_dec, mut ms_pf, mut ms_fin) = (0f64, 0f64, 0f64);
     let npw = llm170_diag::dump::opts().key("wall_time");
     let t0w = std::time::Instant::now();
     let mut last_wt = std::time::Instant::now();
@@ -354,9 +409,11 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             q35_decode(&mut eng.0, &mut slots, &active);
             dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
             // 완료 슬롯 정리 — 결과 전송·반환
+            let _ft = std::time::Instant::now();
             for &i in &active {
                 finish_slot(&mut slots[i], &mut eng, i, eos);
             }
+            ms_fin += _ft.elapsed().as_secs_f64() * 1e3;
         }
 
         // ③ 프리필 1청크 — 디코드가 없었던 회차이거나, 아직 프리필이 남은 대기 슬롯이
@@ -464,13 +521,20 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             SCHED.ms_decode.fetch_add(dec_ms as u64, Ordering::Relaxed);
             if llm170_diag::dump::opts().key("srv_time") && n_dec % 32 == 0 {
                 eprintln!(
-                    "[srv] steps={} decode avg {:.1}ms | prefill {}x avg {:.1}ms | {}",
+                    "[srv] steps={} decode avg {:.1}ms (결과 처리 {:.2}ms) | prefill {}x avg {:.1}ms | {}",
                     n_dec,
                     ms_dec / n_dec as f64,
+                    ms_fin / n_dec as f64,
                     n_pf,
                     if n_pf > 0 { ms_pf / n_pf as f64 } else { 0.0 },
                     SCHED.summary()
                 );
+                // [S13] GPU 범주 분해(LLM170_TIME=1 시 — 캡처 밖 발사만 집계).
+                if let Ok(p) = eng.0.prof_report("serve")
+                    && !p.is_empty()
+                {
+                    eprintln!("{p}");
+                }
             }
         }
         // 유휴 시 차단 수신 — 종료(송신자 전 소멸) 시 루프 탈출.
@@ -653,6 +717,7 @@ fn spec_round(
     for &tk in &draft {
         rows.extend_from_slice(&e.embed_row(tk)?);
     }
+    let rt0 = std::time::Instant::now();
     e.spec_save_state(i)?;
     let toks = e.spec_verify(i, &rows, t)?;
     let mut acc = 0usize;
@@ -684,6 +749,9 @@ fn spec_round(
     slot_emit(s, corr);
     SCHED.spec_rounds.fetch_add(1, Ordering::Relaxed);
     SCHED.spec_accepted.fetch_add(acc as u64, Ordering::Relaxed);
+    SCHED
+        .spec_ms
+        .fetch_add(rt0.elapsed().as_micros() as u64, Ordering::Relaxed);
     Ok(true)
 }
 

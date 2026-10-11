@@ -33,6 +33,8 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_gemv_experts_glu",
             "w4a16_gemm_g128",
             "w4a16_gemv_g128",
+            "w4a16_gemv_g128_multi",
+            "w4a16_gemv_g128_multi_t",
             "w4a16_gemv_g128_t",
             "w4a16_gemm_g32_bf16",
             "w4a16_gemv_g32_bf16",
@@ -57,6 +59,7 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_gemv_bf16",
             "w4a16_gemv_multi",
             "w4a16_gemv_bf16_t",
+            "w4a16_gemv_bf16_multi_t",
             "w4a16_cast_bf16",
             "w4a16_gemm_bf16_mma",
             "w4a16_gemm_bf16_mma16",
@@ -68,6 +71,7 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_moe_topk256",
             "w4a16_shared_add",
             "w4a16_moe_accum_sg",
+            "w4a16_gemm_g32_mma_grp_d64",
         ],
         boot: true,
     },
@@ -123,7 +127,12 @@ pub const ASSETS: &[Asset] = &[
             "crates/backend-gpu/src/rawcuda/assets/head.fatbin",
             "src/rawcuda/assets/head.fatbin",
         ],
-        syms: &["w4a16_argmax_min", "w4a16_argmax_min_t"],
+        syms: &[
+            "w4a16_argmax_min",
+            "w4a16_argmax_min_t",
+            "w4a16_gemv_i8",
+            "w4a16_gemv_i8_t",
+        ],
         boot: true,
     },
     Asset {
@@ -134,6 +143,17 @@ pub const ASSETS: &[Asset] = &[
             "src/rawcuda/assets/ew.fatbin",
         ],
         syms: &["ew"],
+        boot: true,
+    },
+    Asset {
+        // [S3-1 2026-10-11] 임베딩 행 gather — 프리필 행 조립 대체.
+        name: "embed",
+        env: "LLM170_CUDA_EMBED_FATBIN_PATH",
+        paths: &[
+            "crates/backend-gpu/src/rawcuda/assets/embed.fatbin",
+            "src/rawcuda/assets/embed.fatbin",
+        ],
+        syms: &["w4a16_embed_gather"],
         boot: true,
     },
     Asset {
@@ -180,6 +200,7 @@ pub fn cu_source(name: &str) -> &'static str {
         "attn" => include_str!("assets/attn.cu"),
         "head" => include_str!("assets/head.cu"),
         "ew" => include_str!("assets/ew.cu"),
+        "embed" => include_str!("assets/embed.cu"),
         "smoke" => include_str!("assets/smoke.cu"),
         _ => panic!("cu_source: 미지 자산 {name}"),
     }

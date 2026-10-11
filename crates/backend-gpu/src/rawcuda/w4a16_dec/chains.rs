@@ -188,7 +188,6 @@ impl W4a16Dec {
         };
         self.cc.h2d_async(self.dres, row)?;
         let [s0, s1, s1b, s2, s3] = self.dchain;
-        let (w0, w1) = (self.stg_w0, self.stg_w1);
         let mut ab = self.dab_dev;
         let mut gi = 0usize;
         // 플레인 모드(MoE 모델) — GEMV는 bf16(head_bf16), x는 원시 f32
@@ -206,57 +205,18 @@ impl W4a16Dec {
                 .map_err(|e| format!("L{il} input norm: {e}"))?;
             let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
             let branch = if (il + 1) % interval == 0 {
-                // [R10] 4변형(plain×split) → lin_forward 단일 디스패치.
+                // [S2 2026-10-11] q/k/v 단독 3런치 → 다중세그먼트 1런치(테이블은
+                // ensure_chain_bufs 1회 작성 — 값 비트동일).
                 let xin = if plain { xn } else { x32 };
-                self.lin_forward(
-                    plain,
-                    LinPath::Gemv1 { w: w0 },
-                    &format!("blk.{il}.attn_q.weight"),
-                    xin,
-                    s0,
-                    1,
-                )
-                .map_err(|e| format!("L{il} q: {e}"))?;
-                self.lin_forward(
-                    plain,
-                    LinPath::Gemv1 { w: w1 },
-                    &format!("blk.{il}.attn_k.weight"),
-                    xin,
-                    s1,
-                    1,
-                )
-                .map_err(|e| format!("L{il} k: {e}"))?;
-                self.lin_forward(
-                    plain,
-                    LinPath::Gemv1 { w: w1 },
-                    &format!("blk.{il}.attn_v.weight"),
-                    xin,
-                    s1b,
-                    1,
-                )
-                .map_err(|e| format!("L{il} v: {e}"))?;
+                self.gemv_multi_dev(plain, il, 0, xin)
+                    .map_err(|e| format!("L{il} qkv: {e}"))?;
                 self.attn_chain_dev_run(slot, il / interval, 1, s0, s1, s1b)
                     .map_err(|e| format!("L{il} attn: {e}"))?
             } else {
                 let xin = if plain { xn } else { x32 };
-                self.lin_forward(
-                    plain,
-                    LinPath::Gemv1 { w: w0 },
-                    &format!("blk.{il}.attn_qkv.weight"),
-                    xin,
-                    s0,
-                    1,
-                )
-                .map_err(|e| format!("L{il} qkv: {e}"))?;
-                self.lin_forward(
-                    plain,
-                    LinPath::Gemv1 { w: w1 },
-                    &format!("blk.{il}.attn_gate.weight"),
-                    xin,
-                    s1,
-                    1,
-                )
-                .map_err(|e| format!("L{il} z: {e}"))?;
+                // [S2] qkv/z 2런치 → 1런치.
+                self.gemv_multi_dev(plain, il, 0, xin)
+                    .map_err(|e| format!("L{il} qkvz: {e}"))?;
                 let g = self
                     .gdn_chain_dev_run(slot, gi, 1, xn, s0, s1)
                     .map_err(|e| format!("L{il} gdn: {e}"))?;
@@ -294,24 +254,9 @@ impl W4a16Dec {
             } else {
                 let x32n = x32; // 노름 융합 기록
                 let _ = xn2;
-                self.lin_forward(
-                    false,
-                    LinPath::Gemv1 { w: w0 },
-                    &format!("blk.{il}.ffn_gate.weight"),
-                    x32n,
-                    s0,
-                    1,
-                )
-                .map_err(|e| format!("L{il} gate: {e}"))?;
-                self.lin_forward(
-                    false,
-                    LinPath::Gemv1 { w: w1 },
-                    &format!("blk.{il}.ffn_up.weight"),
-                    x32n,
-                    s1,
-                    1,
-                )
-                .map_err(|e| format!("L{il} up: {e}"))?;
+                // [S2 2026-10-11] gate/up 2런치 → 다중세그먼트 1런치.
+                self.gemv_multi_dev(false, il, 1, x32n)
+                    .map_err(|e| format!("L{il} gateup: {e}"))?;
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
                 // [4.1 2026-10-11] ew가 x32/미러 동시 기록 — cast 노드 제거.
@@ -394,52 +339,18 @@ impl W4a16Dec {
                 .map_err(|e| format!("B{il} input norm: {e}"))?;
             let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
             let branch = if (il + 1) % interval == 0 {
-                // [R10] 4변형 → lin_forward 단일 디스패치(GemvT 경로).
+                // [S2 2026-10-11] q/k/v 3런치 → 다중세그먼트 1런치(테이블 공용
+                // — t=1 판과 동일 메타, grid만 Σceil(n/TR)).
                 let xin = if plain { xn } else { xh };
-                self.lin_forward(
-                    plain,
-                    LinPath::GemvT,
-                    &format!("blk.{il}.attn_q.weight"),
-                    xin,
-                    s0,
-                    t,
-                )?;
-                self.lin_forward(
-                    plain,
-                    LinPath::GemvT,
-                    &format!("blk.{il}.attn_k.weight"),
-                    xin,
-                    s1,
-                    t,
-                )?;
-                self.lin_forward(
-                    plain,
-                    LinPath::GemvT,
-                    &format!("blk.{il}.attn_v.weight"),
-                    xin,
-                    s1b,
-                    t,
-                )?;
+                self.gemv_multi_t_dev(plain, il, 0, xin, t)
+                    .map_err(|e| format!("B{il} qkv: {e}"))?;
                 self.attn_chain_dev_batch(slots, il / interval, t, s0, s1, s1b)
                     .map_err(|e| format!("B{il} attn: {e}"))?
             } else {
                 let xin = if plain { xn } else { xh };
-                self.lin_forward(
-                    plain,
-                    LinPath::GemvT,
-                    &format!("blk.{il}.attn_qkv.weight"),
-                    xin,
-                    s0,
-                    t,
-                )?;
-                self.lin_forward(
-                    plain,
-                    LinPath::GemvT,
-                    &format!("blk.{il}.attn_gate.weight"),
-                    xin,
-                    s1,
-                    t,
-                )?;
+                // [S2] qkv/z 2런치 → 1런치.
+                self.gemv_multi_t_dev(plain, il, 0, xin, t)
+                    .map_err(|e| format!("B{il} qkvz: {e}"))?;
                 let g = self
                     .gdn_chain_dev_batch(slots, gi, t, xn, s0, s1)
                     .map_err(|e| format!("B{il} gdn: {e}"))?;
@@ -472,22 +383,9 @@ impl W4a16Dec {
             } else {
                 let xh3 = xh;
                 let _ = xn2;
-                self.lin_forward(
-                    false,
-                    LinPath::GemvT,
-                    &format!("blk.{il}.ffn_gate.weight"),
-                    xh3,
-                    s0,
-                    t,
-                )?;
-                self.lin_forward(
-                    false,
-                    LinPath::GemvT,
-                    &format!("blk.{il}.ffn_up.weight"),
-                    xh3,
-                    s1,
-                    t,
-                )?;
+                // [S2 2026-10-11] gate/up 2런치 → 다중세그먼트 1런치.
+                self.gemv_multi_t_dev(false, il, 1, xh3, t)
+                    .map_err(|e| format!("B{il} gateup: {e}"))?;
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
                 // [4.1 2026-10-11] ew 융합 — cast_x32 노드 제거.
@@ -526,5 +424,30 @@ impl W4a16Dec {
         (0..t)
             .map(|k| u32::from_le_bytes([tb[k * 4], tb[k * 4 + 1], tb[k * 4 + 2], tb[k * 4 + 3]]))
             .collect()
+    }
+
+    /// [S11 2026-10-11] 배치 로짓 판독 — dbatch_lg[t][head_n] d2h(핀드).
+    /// 배치 head(gemv_bf16_t)의 행별 산술은 t=1 판과 동일(비트동일 계약 —
+    /// 행별 64레인 tree)이므로 호스트 샘플러가 보는 값·순서가 직렬 경로와
+    /// 같다 → 샘플링 토큰열 불변. 호출 전 배치 체인 sync 완료가 계약.
+    pub fn batch_read_logits(&mut self, t: usize) -> Result<Vec<f32>, String> {
+        let _g = self.cc.guard()?;
+        if t == 0 || t > BATCH_DEC_MAX || self.dbatch_lg == 0 {
+            return Err(format!("batch_read_logits: 계약 위반 t={t}"));
+        }
+        self.ensure_batch_bufs()?;
+        let bytes = t * self.head_n * 4;
+        // pin_batch_lg는 pinned_alloc 소유 스크래치(수명=self) — d2h가 전량 재기록.
+        self.cc
+            .d2h_async(self.pin_batch_lg as *mut u8, self.dbatch_lg, bytes)?;
+        self.cc.sync()?;
+        // SAFETY: 방금 d2h로 채운 pinned 버퍼의 바이트 뷰(bytes = 원소수×4).
+        let pb = unsafe { std::slice::from_raw_parts(self.pin_batch_lg as *const u8, bytes) };
+        Ok(pb
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
     }
 }

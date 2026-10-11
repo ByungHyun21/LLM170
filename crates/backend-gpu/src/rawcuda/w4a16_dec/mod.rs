@@ -279,6 +279,9 @@ pub struct W4a16Dec {
     /// 층별 행 합(그리드). 라우터 게이트 + shared gate/up 1런치용.
     moe_multi_tab: CUdeviceptr,
     moe_multi_rows: Vec<u32>,
+    /// [S10-잔여] t행(≤8) 판 다중세그먼트 grid — 라우터+shared gate/up 3세그먼트
+    /// Σceil(n/GEMV_TR)/층(sgate 제외 — 출력 레이아웃 [t][n] 충돌 회피).
+    moe_multi_rows_t3: Vec<u32>,
     /// [P11] 전문가-우선 슬롯 정렬(프리필 그룹 GEMV) — gslot[n_exp×gmax]+cnt.
     moe_gslot: CUdeviceptr,
     moe_gcnt: CUdeviceptr,
@@ -302,6 +305,25 @@ pub struct W4a16Dec {
     /// MoE 출력(hidden) — 잔차 ab로 소비된다.
     dmo: Buf,
     moe_bufs_ok: bool,
+    /// [B3 2026-10-12] shared 꼬리 포크 전용 sgate 출력 슬롯(t≤8행 f32 —
+    /// 종전 drt 재사용은 topk와의 병렬 경합). 1회 할당·불변(캡처 안전).
+    dsg: CUdeviceptr,
+    /// [B3] 층별 이벤트 쌍 [fork, join] — 캡처 중 재기록 회피(층당 고유).
+    ev_fork: Vec<ffi::CUevent>,
+    /// [B7 2026-10-12] shared 게이트/업 전용 슬롯 — dchain 재사용은 스트리밍
+    /// 전문가 스크래치와 충돌(게이트/업이 전문가보다 먼저 계산됨).
+    dsh: [CUdeviceptr; 2],
+    dsh_cap: usize,
+    /// [B4-2 2026-10-12] 스트리밍 전문가 LRU 캐시(층별 K×3proj q/s).
+    /// 가중치 불변 → hit 재사용은 수치 무변화(h2d 생략만). 층별 독립 LRU.
+    mcache_q: CUdeviceptr,
+    mcache_s: CUdeviceptr,
+    mcache_k: usize,
+    mcache_ids: Vec<u16>,
+    mcache_age: Vec<u32>,
+    mcache_tick: u32,
+    mcache_hits: u64,
+    mcache_miss: u64,
     /// GEMV 스테이징 — x f16 [t][k], y f32 [t][n].
     xh: Buf,
     dy: Buf,
@@ -382,6 +404,14 @@ pub struct W4a16Dec {
     dchk: CUdeviceptr,
     /// 체크포인트 위치(토큰 수) — 0 = 없음.
     dchk_pos: Vec<u32>,
+    /// [S2 2026-10-11] 다중세그먼트 테이블(디바이스 u64) — q/k/v·qkv/z·gate/up
+    /// 을 1런치로(런치 꼬리 제거). 업로드·dchain 확정 후 ensure_chain_bufs에서
+    /// 1회 작성 — 그래프 캡처 정적 계약(리플레이 간 내용 불변).
+    dmulti: CUdeviceptr,
+    /// [S2] 층별 [branch_off, branch_cnt, branch_total, gateup_off,
+    /// gateup_cnt, gateup_total, branch_tgrid, gateup_tgrid] — 오프셋은 u64
+    /// 인덱스, total = 행 합(grid, t=1), *_tgrid = Σceil(n/GEMV_TR)(t행 판).
+    dmulti_meta: Vec<[u32; 8]>,
     spec_on: bool,
     /// [A-1 진단] spec scan 커널 on/off(기본 = spec_on) — 교차 대조용.
     spec_scan_on: bool,
@@ -389,6 +419,8 @@ pub struct W4a16Dec {
     dyt: Buf,
     // ── GPU head(output.weight bf16) ──
     head_w: CUdeviceptr,
+    /// [I8head] int8 head 행스케일(f32[n]) — head_w는 int8 바이트로 전환.
+    head_sc: CUdeviceptr,
     head_n: usize,
     head_k: usize,
     head_out: CUdeviceptr,
@@ -415,9 +447,23 @@ pub struct W4a16Dec {
     /// [eval] 배치 버퍼 tmax 하한 — 청크 프리필 로짓 회수용(0=기본 공식).
     pub batch_tmax_min: usize,
     pin_batch_tok: *mut std::ffi::c_void,
+    /// [S11 2026-10-11] 샘플 배치 로짓 핀드 판독 버퍼([t][head_n] f32).
+    pin_batch_lg: *mut std::ffi::c_void,
+    /// [S3-1 2026-10-11] 임베딩 gather — token_embd 상주(f16/bf16 원본).
+    emb_dev: CUdeviceptr,
+    emb_n: usize,
+    emb_k: usize,
+    emb_bf16: bool,
+    /// 토큰 id 스테이징(디바이스, CHAIN_TMAX×4B — ensure_chain_bufs).
+    dtg: CUdeviceptr,
     pin_batch_in: *mut std::ffi::c_void,
     pin_batch_pos: *mut std::ffi::c_void,
     batch_graphs: Vec<(Vec<usize>, ffi::CUgraphExec, ffi::CUgraph)>,
+    /// [A6-1 2026-10-11] 검증 체인 (slot, t) 그래프 캐시 — 캡처 실패 시 비활성.
+    spec_graphs: Vec<((usize, usize), ffi::CUgraphExec, ffi::CUgraph)>,
+    spec_graph_ok: bool,
+    /// [A6-1] 캡처 본문에서 호스트 갱신(sync·slot_pos·체크포인트) 생략 게이트.
+    capture_no_host: bool,
     /// 캡처 실패 후 직접 발사 고정(재시도 방지 — t=1 graph_failed와 동형).
     batch_capture_failed: bool,
     /// 층별 잔차 합 덤프(CPU LLM170_DUMP=debug_layers와 대조용).
@@ -477,8 +523,21 @@ impl W4a16Dec {
             moe_dev_tab: 0,
             moe_idx: 0,
             moe_wt: 0,
+            dsg: 0,
+            ev_fork: Vec::new(),
+            dsh: [0, 0],
+            dsh_cap: 0,
+            mcache_q: 0,
+            mcache_s: 0,
+            mcache_k: 0,
+            mcache_ids: Vec::new(),
+            mcache_age: Vec::new(),
+            mcache_tick: 0,
+            mcache_hits: 0,
+            mcache_miss: 0,
             moe_multi_tab: 0,
             moe_multi_rows: Vec::new(),
+            moe_multi_rows_t3: Vec::new(),
             moe_gslot: 0,
             moe_gcnt: 0,
             moe_goff: 0,
@@ -550,10 +609,13 @@ impl W4a16Dec {
             dsave: 0,
             dchk: 0,
             dchk_pos: Vec::new(),
+            dmulti: 0,
+            dmulti_meta: Vec::new(),
             spec_on: false,
             spec_scan_on: true,
             dyt: Buf::default(),
             head_w: 0,
+            head_sc: 0,
             head_n: 0,
             head_k: 0,
             head_out: 0,
@@ -569,9 +631,18 @@ impl W4a16Dec {
             dbatch_am: 0,
             batch_tmax_min: 0,
             pin_batch_tok: std::ptr::null_mut(),
+            pin_batch_lg: std::ptr::null_mut(),
+            emb_dev: 0,
+            emb_n: 0,
+            emb_k: 0,
+            emb_bf16: false,
+            dtg: 0,
             pin_batch_in: std::ptr::null_mut(),
             pin_batch_pos: std::ptr::null_mut(),
             batch_graphs: Vec::new(),
+            spec_graphs: Vec::new(),
+            spec_graph_ok: true,
+            capture_no_host: false,
             batch_capture_failed: false,
             debug_layers: false,
         })
@@ -669,13 +740,16 @@ impl W4a16Dec {
         self.cc.h2d(self.ew.dewu, ub)?;
         let f = self.cc.function("ew")?;
         let mut nn = g.len() as i32;
-        let (mut a0, mut a1, mut a2) = (self.ew.dewg, self.ew.dewu, self.ew.dew);
+        // [결함수정 2026-10-11] 6-param 커널에 l4(4인자) 발사 — y32/y16 파라미터가
+        // 스택 잔여값을 읽는 미정의 동작이었다. 널 명시(l6).
+        let (mut a0, mut a1, mut a2, mut a3, mut a4) =
+            (self.ew.dewg, self.ew.dewu, self.ew.dew, 0u64, 0u64);
         self.cc.launch(
             f,
             g.len().div_ceil(128) as u32,
             1,
             128,
-            &mut crate::rawcuda::args::l4(&mut a0, &mut a1, &mut a2, &mut nn),
+            &mut crate::rawcuda::args::l6(&mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut nn),
         )?;
         let mut yb = vec![0u8; g.len() * 4];
         self.cc.d2h(&mut yb, self.ew.dew)?;

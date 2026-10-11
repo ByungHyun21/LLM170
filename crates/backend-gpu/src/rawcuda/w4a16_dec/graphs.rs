@@ -35,6 +35,10 @@ impl W4a16Dec {
         for (_, e, g) in self.batch_graphs.drain(..) {
             let _ = self.cc.graph_destroy(e, g);
         }
+        // [A6-1] 검증 체인 그래프도 동일 계약.
+        for (_, e, g) in self.spec_graphs.drain(..) {
+            let _ = self.cc.graph_destroy(e, g);
+        }
     }
 
     /// 그래프 준비 — 캐시 히트면 즉시 exec 반환(A8, 슬롯/모드별 1회 캡처).
@@ -324,6 +328,7 @@ impl W4a16Dec {
 
     /// [A9] 배치 그래프 캡처 — 슬롯집합 키. 캡처는 실행하지 않는다(상태 불변).
     pub(super) fn batch_capture(&mut self, key: &[usize], t: usize) -> Result<(), String> {
+        let _tt = std::time::Instant::now();
         if self.batch_graphs.len() >= 8 {
             let (_, e, g) = self.batch_graphs.remove(0);
             let _ = self.cc.graph_destroy(e, g);
@@ -337,7 +342,10 @@ impl W4a16Dec {
         let e = self.cc.graph_instantiate(g)?;
         self.cc.graph_upload(e)?; // [§4.3]
         self.batch_graphs.push((key.to_vec(), e, g));
-        eprintln!("[batch-graph] captured slots={key:?}");
+        eprintln!(
+            "[batch-graph] captured slots={key:?} ({:.2}ms)",
+            _tt.elapsed().as_secs_f64() * 1e3
+        );
         Ok(())
     }
 

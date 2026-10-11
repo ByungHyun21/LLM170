@@ -211,7 +211,97 @@ impl W4a16Dec {
         self.stg_w0 = w0;
         self.stg_w1 = w1;
         self.stg_w2 = ff_up;
+        // [S3-1 2026-10-11] 토큰 id 스테이징(gather 입력) — 캡처 전 선할당 계약.
+        if self.dtg == 0 {
+            self.dtg = self.cc.alloc(tb * 4)?;
+        }
+        // [S2 2026-10-11] 다중세그먼트 테이블(branch·gate/up) — dchain/스펙
+        // 확정 후 1회. 캡처 전(warm_for_capture→본 함수) 작성이 계약.
+        self.build_multi_tables()?;
         self.chain_bufs_ok = true;
+        Ok(())
+    }
+
+    /// [S2 2026-10-11] 다중세그먼트 테이블 작성 — 층별 branch(attn q/k/v ≤3,
+    /// GDN qkv/z 2)·gate/up(2, split 전용 — 플레인은 MoE 공용 multi_gate가
+    /// 담당). split = (q,s,out,n,k) u64×5 / 플레인 = (w,out,n,k) u64×4.
+    /// 폭 검사는 종전 gemv_stage_x32/plain_stage_x32 계약 미러(스테이징 초과
+    /// 거부). 내용은 이후 불변(그래프 정적 계약).
+    fn build_multi_tables(&mut self) -> Result<(), String> {
+        let plain = self.plain_weights;
+        let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
+        let [s0, s1, s1b, _s2, _s3] = self.dchain;
+        let (w0, w1) = (self.stg_w0, self.stg_w1);
+        let nl = self.n_layers;
+        let span = if plain { 20usize } else { 25usize }; // u64/층
+        let mut tab: Vec<u64> = vec![0; nl * span];
+        let mut meta: Vec<[u32; 8]> = Vec::with_capacity(nl);
+        for il in 0..nl {
+            let mut br: Vec<(String, u64, usize)> = Vec::new();
+            if (il + 1) % interval == 0 {
+                br.push((format!("blk.{il}.attn_q.weight"), s0, w0));
+                br.push((format!("blk.{il}.attn_k.weight"), s1, w1));
+                br.push((format!("blk.{il}.attn_v.weight"), s1b, w1));
+            } else {
+                br.push((format!("blk.{il}.attn_qkv.weight"), s0, w0));
+                br.push((format!("blk.{il}.attn_gate.weight"), s1, w1));
+            }
+            let gu: Vec<(String, u64, usize)> = if plain {
+                Vec::new()
+            } else {
+                vec![
+                    (format!("blk.{il}.ffn_gate.weight"), s0, w0),
+                    (format!("blk.{il}.ffn_up.weight"), s1, w1),
+                ]
+            };
+            let mut wr = il * span;
+            let mut gm = [[0u32; 4]; 2];
+            for (gi, segs) in [&br, &gu].into_iter().enumerate() {
+                let off = wr as u32;
+                let mut total = 0usize;
+                let mut tgrid = 0usize;
+                let mut cnt = 0u32;
+                for (name, out, wmax) in segs {
+                    let (p0, p1, n, k) = if plain {
+                        let (w, n, k) = self.plain_spec(name)?;
+                        (w, 0u64, n, k)
+                    } else {
+                        self.lin_spec(name)?
+                    };
+                    if n > *wmax {
+                        return Err(format!("gemv_multi({name}): n={n} > 스테이징 {wmax}"));
+                    }
+                    tab[wr] = p0;
+                    wr += 1;
+                    if !plain {
+                        tab[wr] = p1;
+                        wr += 1;
+                    }
+                    tab[wr] = *out;
+                    wr += 1;
+                    tab[wr] = n as u64;
+                    wr += 1;
+                    tab[wr] = k as u64;
+                    wr += 1;
+                    total += n;
+                    tgrid += n.div_ceil(GEMV_TR);
+                    cnt += 1;
+                }
+                gm[gi] = [off, cnt, total as u32, tgrid as u32];
+            }
+            meta.push([
+                gm[0][0], gm[0][1], gm[0][2], gm[1][0], gm[1][1], gm[1][2], gm[0][3], gm[1][3],
+            ]);
+        }
+        let bytes = tab.len() * 8;
+        // SAFETY: 로컬 Vec<u64>의 유효 수명 내 바이트 뷰(길이 = 원소수×8).
+        let buf = unsafe { std::slice::from_raw_parts(tab.as_ptr() as *const u8, bytes) };
+        if self.dmulti == 0 {
+            self.dmulti = self.cc.alloc(bytes)?;
+        }
+        self.cc.h2d(self.dmulti, buf)?;
+        self.cc.sync()?;
+        self.dmulti_meta = meta;
         Ok(())
     }
 
@@ -357,6 +447,73 @@ impl W4a16Dec {
         self.moe_wt = 0;
         self.moe_idx = self.cc.alloc(tk * 4)?;
         self.moe_wt = self.cc.alloc(tk * 4)?;
+        // [B3 2026-10-12] shared 꼬리 포크 자원 — 보조 스트림·전용 sgate
+        // 슬롯(t≤8행)·층별 이벤트 쌍. 1회 생성 후 불변(캡처 그래프가 참조).
+        if self.cc.stream2.is_null() {
+            self.cc.create_stream2()?;
+        }
+        if self.dsg == 0 {
+            self.dsg = self.cc.alloc(8 * 4)?;
+        }
+        // [B7] shared 게이트/업 전용 슬롯 — dchain(d0/d1) 재사용은 스트리밍
+        // 전문가 스크래치와 충돌(실측 골든 파손). t≤8 경로는 [t][n] 레이아웃
+        // (tmax 배) — 크기 부족 시 인접 버퍼 파손(실측).
+        let dsh_need = tmax * self.shared_ffn.max(1);
+        if self.dsh_cap < dsh_need {
+            for p in self.dsh {
+                if p != 0 {
+                    self.cc.free(p)?;
+                }
+            }
+            self.dsh = [0, 0];
+            self.dsh_cap = 0;
+            let sz = dsh_need * 4;
+            self.dsh = [self.cc.alloc(sz)?, self.cc.alloc(sz)?];
+            self.dsh_cap = dsh_need;
+        }
+        if self.ev_fork.is_empty() && self.n_layers > 0 {
+            for _ in 0..self.n_layers * 2 {
+                let ev = self.cc.event_create_nt()?;
+                self.ev_fork.push(ev);
+            }
+        }
+        // [B4-2 2026-10-12] 스트리밍 전문가 LRU 캐시 — 상주면 불필요(전문가
+        // VRAM 상주). 여유의 1/4 한도로 K 산정(무료 VRAM 부족 시 자동 축소/비활성).
+        if !self.moe_resident && self.mcache_k == 0 && self.n_layers > 0 {
+            let qsz = h * n_ff / 2;
+            let ssz = h * n_ff / self.moe_group.max(32) * 2;
+            let per_slot = 3 * (qsz + ssz);
+            let free = crate::cuda_mem_free().map(|(f, _)| f).unwrap_or(0);
+            let kmax = ((free / 4) / (self.n_layers * per_slot).max(1) as u64) as usize;
+            let k = 96usize.min(kmax);
+            if k > 0 {
+                let qb = self.n_layers * k * 3 * qsz;
+                let sb = self.n_layers * k * 3 * ssz;
+                let qr = self.cc.alloc(qb);
+                let sr = self.cc.alloc(sb);
+                if let (Ok(q), Ok(s)) = (qr, sr) {
+                    self.mcache_q = q;
+                    self.mcache_s = s;
+                    self.mcache_k = k;
+                    self.mcache_ids = vec![u16::MAX; self.n_layers * k];
+                    self.mcache_age = vec![0u32; self.n_layers * k];
+                    eprintln!(
+                        "[moe] 스트리밍 전문가 캐시 {k}슬롯/층 ({}MiB)",
+                        (qb + sb) >> 20
+                    );
+                    // [B4-1 2026-10-12] 스트리밍 t≤8 프리필용 장치 테이블
+                    // ((q,s)쌍 per 층·전문가·투영) — 캐시 삽입이 엔트리를
+                    // 갱신하고, 전문가 GEMV가 idx 간접 참조로 읽는다.
+                    if self.moe_dev_tab == 0 && self.n_experts > 0 {
+                        let n = self.n_layers * self.n_experts * 3 * 2;
+                        let p = self.cc.alloc(n * 8)?;
+                        let zeros = vec![0u8; n * 8];
+                        Self::h2d_chunked(&self.cc, p, &zeros)?;
+                        self.moe_dev_tab = p;
+                    }
+                }
+            }
+        }
         // [B-4] 다중 세그먼트 GEMV 테이블(drt/dchain 포인터 참조 — 재할당 시 재작성).
         self.ensure_chain_bufs()?;
         self.build_moe_multi_tab()?;
@@ -459,6 +616,8 @@ impl W4a16Dec {
             self.pin_batch_tok = self.cc.pinned_alloc(tmax * 4)?;
             self.pin_batch_in = self.cc.pinned_alloc(tmax * self.hidden * 4)?;
             self.pin_batch_pos = self.cc.pinned_alloc(self.n_slots * 4)?;
+            // [S11] 샘플 로짓 판독 핀드 — pageable 대비 d2h 가속.
+            self.pin_batch_lg = self.cc.pinned_alloc(tmax * self.head_n * 4)?;
         }
         Ok(())
     }

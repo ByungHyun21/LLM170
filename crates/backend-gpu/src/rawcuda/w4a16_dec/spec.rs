@@ -23,6 +23,86 @@ impl W4a16Dec {
         if !(2..=8).contains(&t) {
             return Err(format!("spec_verify: t={t} 계약(2..=8)"));
         }
+        // [A6-1 2026-10-11] 검증 체인 (slot,t) 그래프 캐시 — 런치 오버헤드 제거.
+        // 행은 핀드 고정 버퍼(캡처 h2d 소스 고정), pos는 replay 직전 그래프
+        // 밖 h2d(같은 스트림 순서). 미스 = 직접 발사(정답·호스트 갱신 포함)
+        // 후 캡처(미실행) — batch_capture 동형. 캡처 실패 시 영구 비활성.
+        if self.spec_graph_ok
+            && !self.pin_batch_in.is_null()
+            && !self.pin_pos.is_null()
+            && self.n_slots > 0
+        {
+            let h = self.hidden;
+            if rows.len() != t * h {
+                return Err(format!("spec_verify: rows 계약 {}", rows.len()));
+            }
+            // SAFETY: 핀드 스크래치는 self 소유(수명=self)·복사 크기 t*h*4.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    rows.as_ptr() as *const u8,
+                    self.pin_batch_in as *mut u8,
+                    t * h * 4,
+                );
+            }
+            let pos = self.slot_pos[slot];
+            // SAFETY: pin_pos = n_slots*4 핀드(그래프 경로 선행 할당).
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pos.to_le_bytes().as_ptr(),
+                    (self.pin_pos as *mut u8).add(slot * 4),
+                    4,
+                );
+            }
+            let posb =
+                // SAFETY: self.pin_*는 pinned_alloc 소유(수명=self).
+                unsafe { std::slice::from_raw_parts(self.pin_pos as *const u8, self.n_slots * 4) };
+            self.cc
+                .h2d_async(self.dpp + (slot as u64) * 4, &posb[slot * 4..slot * 4 + 4])?;
+            if let Some(k) = self
+                .spec_graphs
+                .iter()
+                .position(|(key, _, _)| *key == (slot, t))
+            {
+                let exec = self.spec_graphs[k].1;
+                self.cc.graph_launch(exec)?;
+                self.cc.sync()?;
+                let toks = self.batch_read_tokens(t);
+                self.slot_pos[slot] = pos + t as u32;
+                return Ok(toks);
+            }
+            // SAFETY: 위 복사와 동일 범위(t*h f32) — 핀드 유효.
+            let pin = unsafe { std::slice::from_raw_parts(self.pin_batch_in as *const f32, t * h) };
+            let v = self.chain_t(slot, pin, t, false, true, false)?;
+            let toks: Vec<u32> = v.into_iter().map(|x| x as u32).collect();
+            if self.spec_graphs.len() >= 8 {
+                let (_, e, g) = self.spec_graphs.remove(0);
+                let _ = self.cc.graph_destroy(e, g);
+            }
+            let cap = (|| -> Result<(ffi::CUgraphExec, ffi::CUgraph), String> {
+                self.cc.capture_begin()?;
+                self.capture_pinned_src = true;
+                self.capture_no_host = true;
+                let r = self.chain_t(slot, pin, t, false, true, false);
+                self.capture_no_host = false;
+                self.capture_pinned_src = false;
+                if let Err(e) = r {
+                    let _ = self.cc.capture_end();
+                    return Err(e);
+                }
+                let g = self.cc.capture_end()?;
+                let e = self.cc.graph_instantiate(g)?;
+                self.cc.graph_upload(e)?;
+                Ok((e, g))
+            })();
+            match cap {
+                Ok((e, g)) => self.spec_graphs.push(((slot, t), e, g)),
+                Err(_) => {
+                    self.spec_graph_ok = false;
+                    self.cc.sync().ok();
+                }
+            }
+            return Ok(toks);
+        }
         let v = self.chain_t(slot, rows, t, false, true, false)?;
         Ok(v.into_iter().map(|x| x as u32).collect())
     }
@@ -83,6 +163,10 @@ impl W4a16Dec {
         src: CUdeviceptr,
         bytes: u64,
     ) -> Result<(), String> {
+        // [2026-10-12] 컨텍스트 가드 — 스케줄 스레드 등 비-로드 스레드에서
+        // 무가드 런치는 invalid device context(201)로 죽는다(실측: 스트리밍
+        // 서브 스펙 라운드).
+        let _g = self.cc.guard()?;
         let f = self.cc.function("w4a16_copy")?;
         let n4 = (bytes / 16) as i64;
         let (mut p_s, mut p_d, mut p_n) = (src, dst, n4);

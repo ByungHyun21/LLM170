@@ -314,6 +314,19 @@ impl W4a16Dec {
                 if budget > 0 && !self.host_stage.is_empty() {
                     // memlock 한도가 작은 환경 대비 1/4씩 축소 재시도(하한 4MiB).
                     let mut bytes = self.host_stage.len().min(budget);
+                    // [2026-10-12 결함수정] 등록 경계가 슬라이스(q/s)를 가르면 그
+                    // 슬라이스의 async 복사가 실패한다(실측: 4GiB 경계가 L9
+                    // 슬라이스를 관통 — cuMemcpyHtoDAsync INVALID_VALUE, 그
+                    // 전문가가 선택된 프리필/디코드가 죽음). 등록 길이를 슬라이스
+                    // 경계(선행 q·s 시작 오프셋)로 내린다.
+                    if let Some(edge) = offs
+                        .iter()
+                        .flat_map(|&(qo, so)| [qo, so])
+                        .filter(|&b| b <= bytes)
+                        .max()
+                    {
+                        bytes = edge;
+                    }
                     loop {
                         // SAFETY: host_stage는 구축 후 불변 Vec(boxed slice)라
                         // 해제 전까지 포인터 수명이 유지된다(해제는 상단 unregister).
@@ -445,33 +458,88 @@ impl W4a16Dec {
         Ok(())
     }
 
-    /// bf16 head(output.weight) 상주 업로드 — head_bf16 GEMV.
+    /// head(output.weight) 상주 업로드 — [I8head 2026-10-11] bf16 → int8
+    /// (행별 amax/127 스케일) 양자화 후 업로드.
+    /// 품질 판정(eval chunk4): en PPL +0.061%·argmax 99.139% / ko +0.0002%·
+    /// 99.347% — KV int8 채택 밴드 · 27B 프로브 골든 유지. int4-g128 판은
+    /// 기각(en +0.59%/92.7%). 대역: 2.54GB → 1.27GB+1MB(27B) — head 2.7ms
+    /// (디코드의 14%)가 절반으로.
     pub fn upload_head(&mut self, data: &[u8], n: usize, k: usize) -> Result<(), String> {
         let _g = self.cc.guard()?;
         let need = n * k * 2;
-        if n == 0 || k == 0 || data.len() < need {
+        if n == 0 || k == 0 || data.len() < need || !k.is_multiple_of(4) {
             return Err(format!(
                 "upload_head: 형상 계약 위반 n={n} k={k} bytes={} < {need}",
                 data.len()
             ));
         }
-        for p in [self.head_w, self.head_out] {
+        // 호스트 양자화 — 행별 amax/127. 다중 스레드(1.27G원소 ~수백 ms).
+        let mut q8 = vec![0i8; n * k];
+        let mut scv = vec![0f32; n];
+        let src = &data[..need];
+        let nt = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(4)
+            .min(16);
+        let rows_per = n.div_ceil(nt).max(1);
+        {
+            let qchunks: Vec<_> = q8.chunks_mut(rows_per * k).collect();
+            let schunks: Vec<_> = scv.chunks_mut(rows_per).collect();
+            std::thread::scope(|sp| {
+                let mut r0 = 0usize;
+                for (qc, sc_c) in qchunks.into_iter().zip(schunks) {
+                    let base = r0;
+                    sp.spawn(move || {
+                        let nrows = qc.len() / k;
+                        for r in 0..nrows {
+                            let row = &src[(base + r) * k * 2..(base + r + 1) * k * 2];
+                            let mut amax = 0.0f32;
+                            for i in 0..k {
+                                let v = f32::from_bits(
+                                    u32::from(u16::from_le_bytes([row[i * 2], row[i * 2 + 1]]))
+                                        << 16,
+                                );
+                                amax = amax.max(v.abs());
+                            }
+                            let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                            sc_c[r] = s;
+                            for i in 0..k {
+                                let v = f32::from_bits(
+                                    u32::from(u16::from_le_bytes([row[i * 2], row[i * 2 + 1]]))
+                                        << 16,
+                                );
+                                qc[r * k + i] = (v / s).round().clamp(-127.0, 127.0) as i8;
+                            }
+                        }
+                    });
+                    r0 += rows_per;
+                }
+            });
+        }
+        for p in [self.head_w, self.head_sc, self.head_out] {
             if p != 0 {
                 self.cc.free(p)?;
             }
         }
         self.head_w = 0; // G1: 부분 상태(head_n=0)로 소비되지 않게 마지막에 대입.
+        self.head_sc = 0;
         self.head_out = 0;
         self.head_n = 0;
         self.head_k = 0;
-        // [A-4 2026-10-10] **원본 [n][k] 레이아웃 유지** — 종전 head_transpose로
-        // [k][n]을 만들어 head_bf16(행당 k직렬·열 판독)으로 읽었으나 실측
-        // DRAM 2.55GB(가중치 1.556GB의 1.64×)·디코드의 12~25%를 차지.
-        // 행=블록 w4a16_gemv_bf16([n][k] 원본 — "토큰 수준 판정" 설계)을
-        // 재사용하면 완전 순차 판독. 로드 전치(3.5ms)도 제거.
-        let dw = self.cc.alloc(need)?;
-        if let Err(e) = Self::h2d_chunked(&self.cc, dw, &data[..need]) {
+        // int8 본체 + f32 행스케일 업로드.
+        let dw = self.cc.alloc(n * k)?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수).
+        let qb = unsafe { std::slice::from_raw_parts(q8.as_ptr() as *const u8, n * k) };
+        if let Err(e) = Self::h2d_chunked(&self.cc, dw, qb) {
             let _ = self.cc.free(dw);
+            return Err(e);
+        }
+        let dsc = self.cc.alloc(n * 4)?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let sb = unsafe { std::slice::from_raw_parts(scv.as_ptr() as *const u8, n * 4) };
+        if let Err(e) = Self::h2d_chunked(&self.cc, dsc, sb) {
+            let _ = self.cc.free(dw);
+            let _ = self.cc.free(dsc);
             return Err(e);
         }
         let dout = match self.cc.alloc(n * 4).and_then(|p| {
@@ -483,14 +551,115 @@ impl W4a16Dec {
             Ok(p) => p,
             Err(e) => {
                 let _ = self.cc.free(dw);
+                let _ = self.cc.free(dsc);
                 return Err(e);
             }
         };
         self.head_w = dw;
+        self.head_sc = dsc;
         self.head_out = dout;
         self.head_n = n;
         self.head_k = k;
-        self.weights_bytes += (need + n * 4) as u64;
+        self.weights_bytes += (n * k + n * 4 + n * 4) as u64;
         Ok(())
+    }
+
+    /// [S3-1 2026-10-11] token_embd 상주 업로드 — 프리필 임베딩 gather 원본.
+    /// f16/bf16 원본 바이트 그대로(디코드는 커널 h2f/b2f = Rust 동일 함수 —
+    /// embed_row와 값 비트동일).
+    pub fn upload_embed(
+        &mut self,
+        data: &[u8],
+        n: usize,
+        k: usize,
+        bf16: bool,
+    ) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        let need = n * k * 2;
+        if n == 0 || k == 0 || data.len() < need {
+            return Err(format!(
+                "upload_embed: 형상 계약 위반 n={n} k={k} bytes={} < {need}",
+                data.len()
+            ));
+        }
+        if self.emb_dev != 0 {
+            self.cc.free(self.emb_dev)?;
+        }
+        self.emb_dev = 0; // G1: 부분 상태로 소비되지 않게 마지막에 재대입.
+        self.emb_n = 0;
+        self.emb_k = 0;
+        let dw = self.cc.alloc(need)?;
+        if let Err(e) = Self::h2d_chunked(&self.cc, dw, &data[..need]) {
+            let _ = self.cc.free(dw);
+            return Err(e);
+        }
+        self.emb_dev = dw;
+        self.emb_n = n;
+        self.emb_k = k;
+        self.emb_bf16 = bf16;
+        self.weights_bytes += need as u64;
+        Ok(())
+    }
+
+    /// [S3-1] 임베딩 상주 여부 — 프리필 gather 경로 진입 조건.
+    pub fn embed_ready(&self) -> bool {
+        self.emb_dev != 0 && self.emb_k == self.hidden
+    }
+
+    /// [S3-1] 프리필(t≥2) — 토큰 id 배열 직접 진입. id h2d → gather(dres) →
+    /// 체인. 값은 forward_prefill(행 경로)와 동일(골든 계약).
+    pub fn forward_prefill_toks(
+        &mut self,
+        slot: usize,
+        toks: &[u32],
+        t: usize,
+        head: bool,
+    ) -> Result<Vec<f32>, String> {
+        let _g = self.cc.guard()?;
+        if !self.embed_ready() {
+            return Err("forward_prefill_toks: 임베딩 미등록".into());
+        }
+        if !(2..=CHAIN_TMAX).contains(&t) || toks.len() != t || slot >= self.n_slots {
+            return Err(format!(
+                "forward_prefill_toks: t={t} toks={} 계약 위반",
+                toks.len()
+            ));
+        }
+        if let Some(&bad) = toks.iter().find(|&&x| x as usize >= self.emb_n) {
+            return Err(format!("forward_prefill_toks: 토큰 범위 위반 {bad}"));
+        }
+        self.ensure_chain_bufs()?;
+        // SAFETY: toks 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let tb = unsafe { std::slice::from_raw_parts(toks.as_ptr() as *const u8, t * 4) };
+        self.cc.h2d_async(self.dtg, tb)?;
+        self.embed_gather_launch(self.dtg, self.dres, t)?;
+        self.chain_t_sel(slot, None, t, head, false, false)
+    }
+
+    /// [S3-1] 임베딩 gather 런치 — toks[t] → out[t][k] f32.
+    fn embed_gather_launch(
+        &self,
+        toks: CUdeviceptr,
+        out: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_embed_gather")?;
+        let (mut p_e, mut p_tk, mut p_o) = (self.emb_dev, toks, out);
+        let (mut p_t, mut p_k, mut p_n, mut p_b) = (
+            t as i32,
+            self.emb_k as i32,
+            self.emb_n as i32,
+            self.emb_bf16 as i32,
+        );
+        let elems = t * self.emb_k;
+        self.cc.launch(
+            f,
+            elems.div_ceil(256) as u32,
+            1,
+            256,
+            &mut crate::rawcuda::args::l7(
+                &mut p_e, &mut p_tk, &mut p_o, &mut p_t, &mut p_k, &mut p_n, &mut p_b,
+            ),
+        )
     }
 }
