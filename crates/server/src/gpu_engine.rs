@@ -20,11 +20,12 @@ pub struct GpuEngine {
 }
 
 /// [R16] 프리필 청크 tmax 정책 — 순수 함수(테스트 표면).
-/// 규칙: MoE 스트리밍은 t=1 폴백(전문가 업로드가 토큰 단위), 그 외는
-/// `LLM170_PREFILL_T`(진단 오버라이드) 또는 기본 512(가중치 상각), 1..=512.
+/// 규칙: MoE 스트리밍은 캐시 스테이징 기반 t≤8 청크(종전 t=1 폴백 — 512토큰
+/// ~9.3s), 그 외는 `LLM170_PREFILL_T`(진단 오버라이드) 또는 기본 512
+/// (가중치 상각), 1..=512.
 pub fn prefill_tmax(is_moe: bool, resident: bool, env: Option<&str>) -> usize {
     if is_moe && !resident {
-        return 1;
+        return 8;
     }
     env.and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(512)
@@ -607,7 +608,7 @@ mod tests {
     fn prefill_tmax_policy() {
         assert_eq!(
             prefill_tmax(true, false, None),
-            1,
+            8,
             "MoE 스트리밍 = t=1 폴백"
         );
         assert_eq!(prefill_tmax(true, true, None), 512, "MoE 상주 = 기본 512");

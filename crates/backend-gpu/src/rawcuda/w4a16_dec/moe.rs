@@ -348,7 +348,7 @@ impl W4a16Dec {
                     }
                     None => {
                         self.mcache_miss += 1;
-                        let slot = self.mcache_insert(il, e);
+                        let slot = self.mcache_insert(il, e)?;
                         let qb =
                             self.mcache_q + ((il * self.mcache_k + slot) * 3) as u64 * qsz as u64;
                         let sb =
@@ -421,7 +421,9 @@ impl W4a16Dec {
 
     /// [B4-2] 빈 슬롯 우선, 없으면 LRU(최소 나이) 퇴거 — 새 expert id/나이를
     /// 기록하고 슬롯 반환(호출자가 그 슬롯으로 h2d).
-    fn mcache_insert(&mut self, il: usize, e: usize) -> usize {
+    /// [B4-1] 삽입 시 장치 테이블 엔트리((q,s)쌍 ×3투영, 48B)도 갱신한다 —
+    /// t≤8 프리필 경로가 테이블 간접 참조로 이 슬롯을 소비한다.
+    fn mcache_insert(&mut self, il: usize, e: usize) -> Result<usize, String> {
         self.mcache_tick = self.mcache_tick.wrapping_add(1);
         let base = il * self.mcache_k;
         let mut slot = 0usize;
@@ -438,7 +440,50 @@ impl W4a16Dec {
         }
         self.mcache_ids[base + slot] = e as u16;
         self.mcache_age[base + slot] = self.mcache_tick;
-        slot
+        if self.moe_dev_tab != 0 {
+            let h = self.hidden;
+            let n_ff = self.moe_ffn;
+            let qsz = h * n_ff / 2;
+            let ssz = h * n_ff / self.moe_group.max(32) * 2;
+            let qb = self.mcache_q + ((il * self.mcache_k + slot) * 3) as u64 * qsz as u64;
+            let sb = self.mcache_s + ((il * self.mcache_k + slot) * 3) as u64 * ssz as u64;
+            let mut bytes = [0u8; 48];
+            for p in 0..3 {
+                let q = qb + (p * qsz) as u64;
+                let sv = sb + (p * ssz) as u64;
+                bytes[p * 16..p * 16 + 8].copy_from_slice(&q.to_le_bytes());
+                bytes[p * 16 + 8..p * 16 + 16].copy_from_slice(&sv.to_le_bytes());
+            }
+            let off = ((il * self.n_experts + e) * 3) as u64 * 2 * 8;
+            self.cc.h2d_async(self.moe_dev_tab + off, &bytes)?;
+        }
+        Ok(slot)
+    }
+
+    /// [B4-1 2026-10-12] 스트리밍 t≤8 전문가 스테이징 — topk_t 기록(moe_idx)을
+    /// 판독해 distinct 전문가를 LRU 캐시에 보장(삽입이 장치 테이블 엔트리 갱신).
+    /// 이후 전문가 GEMV(융합 t≤8 경로)가 테이블 간접 참조로 동작한다.
+    fn moe_stage_t(&mut self, il: usize, t: usize) -> Result<(), String> {
+        if self.mcache_k == 0 || self.moe_dev_tab == 0 {
+            return Err("moe 스트리밍 t>1: 전문가 캐시 미구성".into());
+        }
+        let tk = self.top_k.max(1);
+        let ns = t * tk;
+        let mut ib = vec![0u8; ns * 4];
+        self.cc.d2h_async(ib.as_mut_ptr(), self.moe_idx, ns * 4)?;
+        self.cc.sync()?;
+        let mut seen = vec![false; self.n_experts];
+        for j in 0..ns {
+            let e = u32::from_le_bytes(ib[j * 4..j * 4 + 4].try_into().unwrap()) as usize;
+            if e >= self.n_experts || seen[e] {
+                continue;
+            }
+            seen[e] = true;
+            if self.mcache_lookup(il, e).is_none() {
+                self.mcache_insert(il, e)?;
+            }
+        }
+        Ok(())
     }
 
     /// [B-4 2026-10-10] 다중 세그먼트 GEMV 테이블 — 라우터 게이트 + shared
@@ -636,8 +681,11 @@ impl W4a16Dec {
         if n_exp == 0 || self.moe_tab.len() < (il + 1) * n_exp * 3 {
             return Err("moe: 구성/전문가 테이블 미등록".into());
         }
-        if !self.moe_resident {
-            return Err("moe t>1: 상주 모드 전용(스트리밍 프리필 미구현)".into());
+        // [B4-1 2026-10-12] 스트리밍도 t≤8(BATCH_DEC_MAX)은 캐시 스테이징 +
+        // 장치 테이블로 융합 경로 사용(종전 t=1 폴백 — 512토큰 ~9.3s). t>8은
+        // 청크 전문가 스테이징 미구현.
+        if !self.moe_resident && t > BATCH_DEC_MAX {
+            return Err("moe t>8: 스트리밍 프리필 미구현(청크 ≤8)".into());
         }
         self.ensure_moe_bufs()?;
         // [S10-잔여 2026-10-11] t≤8(디코드 배치·검증): 라우터+shared 게이트/
@@ -677,6 +725,11 @@ impl W4a16Dec {
             )?;
         }
         let ns = t * tk;
+        // [B4-1] 스트리밍: topk_t idx의 distinct 전문가를 캐시에 보장(장치
+        // 테이블 갱신 완료) — 이후 GEMV가 테이블 간접 참조로 소비.
+        if !self.moe_resident {
+            self.moe_stage_t(il, t)?;
+        }
         // 2) 전문가 배치.
         if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
             // xn(정규화 출력) 행별 NaN — 업스트림 vs 전문가 GEMV 판별.

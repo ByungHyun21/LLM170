@@ -314,6 +314,19 @@ impl W4a16Dec {
                 if budget > 0 && !self.host_stage.is_empty() {
                     // memlock 한도가 작은 환경 대비 1/4씩 축소 재시도(하한 4MiB).
                     let mut bytes = self.host_stage.len().min(budget);
+                    // [2026-10-12 결함수정] 등록 경계가 슬라이스(q/s)를 가르면 그
+                    // 슬라이스의 async 복사가 실패한다(실측: 4GiB 경계가 L9
+                    // 슬라이스를 관통 — cuMemcpyHtoDAsync INVALID_VALUE, 그
+                    // 전문가가 선택된 프리필/디코드가 죽음). 등록 길이를 슬라이스
+                    // 경계(선행 q·s 시작 오프셋)로 내린다.
+                    if let Some(edge) = offs
+                        .iter()
+                        .flat_map(|&(qo, so)| [qo, so])
+                        .filter(|&b| b <= bytes)
+                        .max()
+                    {
+                        bytes = edge;
+                    }
                     loop {
                         // SAFETY: host_stage는 구축 후 불변 Vec(boxed slice)라
                         // 해제 전까지 포인터 수명이 유지된다(해제는 상단 unregister).

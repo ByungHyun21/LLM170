@@ -501,6 +501,16 @@ impl W4a16Dec {
                         "[moe] 스트리밍 전문가 캐시 {k}슬롯/층 ({}MiB)",
                         (qb + sb) >> 20
                     );
+                    // [B4-1 2026-10-12] 스트리밍 t≤8 프리필용 장치 테이블
+                    // ((q,s)쌍 per 층·전문가·투영) — 캐시 삽입이 엔트리를
+                    // 갱신하고, 전문가 GEMV가 idx 간접 참조로 읽는다.
+                    if self.moe_dev_tab == 0 && self.n_experts > 0 {
+                        let n = self.n_layers * self.n_experts * 3 * 2;
+                        let p = self.cc.alloc(n * 8)?;
+                        let zeros = vec![0u8; n * 8];
+                        Self::h2d_chunked(&self.cc, p, &zeros)?;
+                        self.moe_dev_tab = p;
+                    }
                 }
             }
         }
