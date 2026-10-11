@@ -17,6 +17,11 @@ NVCC=${NVCC:-nvcc}
 command -v "$NVCC" >/dev/null || { echo "nvcc 없음: $NVCC" >&2; exit 1; }
 A=crates/backend-gpu/src/rawcuda/assets
 
+# [경고 2026-10-11] gptq4.cu(대형·mma)는 nvcc 13.0.48에서 **비결정 컴파일**
+# (동일 플래그 재컴파일 시 SASS 상이 — 코드젠 추첨). 실측 드로우 간 27B
+# pp512 1680~1820(±4%). 리빌드 후 반드시 pp 재측정 + 필요 시 재뽑기 —
+# 채택 드로우는 커밋된 fatbin 바이트로 고정된다. 그 외 자산(moe/attn/gdn/
+# norm/ew/head)은 결정적(2회 동일 실측).
 build() { # name fmad_flag("" | "-fmad=false")
     local name=$1 fmad=${2:-}
     local src=$A/$name.cu out=$A/$name.fatbin
