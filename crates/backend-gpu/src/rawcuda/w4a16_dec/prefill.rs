@@ -71,6 +71,15 @@ impl W4a16Dec {
                 "chain_device_t: t={t} > {GEMM_FFMA_TMAX} — FFMA 폴백 상한(TC=0 진단 또는 t<16)"
             ));
         }
+        // [§7 2026-10-11] t≤8(TR 도메인)은 GemvT(행=블록, 8행/블록) — 종전
+        // Gemm(FFMA, G4_GTMAX=32 슬롯 중 t만 유효)은 검증 t=5에서 6.4× 낭비.
+        // TR 커널은 배치 디코드 체인과 동일 경로 — 행별 산술이 t=1 GEMV와
+        // 비트동일(스펙 골든 접두로 검증). t≥9는 종전 Gemm.
+        let lp = if t <= GEMV_TR {
+            LinPath::GemvT
+        } else {
+            LinPath::Gemm
+        };
         for il in 0..self.n_layers {
             let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };
             let xn = self
@@ -82,7 +91,7 @@ impl W4a16Dec {
                 let xin = if plain { xn } else { xh };
                 self.lin_forward(
                     plain,
-                    LinPath::Gemm,
+                    lp,
                     &format!("blk.{il}.attn_q.weight"),
                     xin,
                     s0,
@@ -90,7 +99,7 @@ impl W4a16Dec {
                 )?;
                 self.lin_forward(
                     plain,
-                    LinPath::Gemm,
+                    lp,
                     &format!("blk.{il}.attn_k.weight"),
                     xin,
                     s1,
@@ -98,7 +107,7 @@ impl W4a16Dec {
                 )?;
                 self.lin_forward(
                     plain,
-                    LinPath::Gemm,
+                    lp,
                     &format!("blk.{il}.attn_v.weight"),
                     xin,
                     s1b,
@@ -110,7 +119,7 @@ impl W4a16Dec {
                 if plain {
                     self.lin_forward(
                         plain,
-                        LinPath::Gemm,
+                        lp,
                         &format!("blk.{il}.attn_qkv.weight"),
                         xn,
                         s0,
@@ -118,7 +127,7 @@ impl W4a16Dec {
                     )?;
                     self.lin_forward(
                         plain,
-                        LinPath::Gemm,
+                        lp,
                         &format!("blk.{il}.attn_gate.weight"),
                         xn,
                         s1,
@@ -131,7 +140,7 @@ impl W4a16Dec {
                     // 런치였다. 값 불변(골든 검증).
                     self.lin_forward(
                         plain,
-                        LinPath::Gemm,
+                        lp,
                         &format!("blk.{il}.attn_qkv.weight"),
                         xh,
                         s0,
@@ -139,7 +148,7 @@ impl W4a16Dec {
                     )?;
                     self.lin_forward(
                         plain,
-                        LinPath::Gemm,
+                        lp,
                         &format!("blk.{il}.attn_gate.weight"),
                         xh,
                         s1,
@@ -158,7 +167,7 @@ impl W4a16Dec {
                 format!("blk.{il}.ssm_out.weight")
             };
             if plain {
-                self.lin_forward(plain, LinPath::Gemm, &lo, branch, dyt, t)?;
+                self.lin_forward(plain, lp, &lo, branch, dyt, t)?;
             } else {
                 let (_, _, _, ko) = self.lin_spec(&lo)?;
                 // [4.1 2026-10-11] branch 생산자 융합 — cast_x32 노드 제거
@@ -166,7 +175,7 @@ impl W4a16Dec {
                 if self.dx32.cap < t * ko || self.dx16.cap < t * ko {
                     return Err(format!("T{il} branch 융합: dx32/dx16 부족 {}", t * ko));
                 }
-                self.lin_forward(plain, LinPath::Gemm, &lo, self.dx32.ptr, dyt, t)?;
+                self.lin_forward(plain, lp, &lo, self.dx32.ptr, dyt, t)?;
             }
             // [P10] cast_x32(t×ko)가 dx32를 재할당했을 수 있다 — 노름 융합
             // 기록(xn32)은 **현재** 포인터를 다시 확인한다. 옛 포인터를 계속
@@ -184,7 +193,7 @@ impl W4a16Dec {
                 let _ = xn2;
                 self.lin_forward(
                     false,
-                    LinPath::Gemm,
+                    lp,
                     &format!("blk.{il}.ffn_gate.weight"),
                     xh3,
                     s0,
@@ -192,7 +201,7 @@ impl W4a16Dec {
                 )?;
                 self.lin_forward(
                     false,
-                    LinPath::Gemm,
+                    lp,
                     &format!("blk.{il}.ffn_up.weight"),
                     xh3,
                     s1,
@@ -202,7 +211,7 @@ impl W4a16Dec {
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
                 // [4.1 2026-10-11] ew 융합 — cast_x32 노드 제거.
                 self.ew_dev_fused(s0, s1, s2, t * kd)?;
-                self.lin_forward(false, LinPath::Gemm, &dn, self.dx32.ptr, s3, t)?;
+                self.lin_forward(false, lp, &dn, self.dx32.ptr, s3, t)?;
                 ab = s3;
             }
         }
