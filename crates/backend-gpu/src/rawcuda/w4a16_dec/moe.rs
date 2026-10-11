@@ -364,15 +364,18 @@ impl W4a16Dec {
         let shared = self.shared_ffn > 0;
         let mut ent: Vec<u64> = Vec::with_capacity(nl * 4 * 4);
         let mut rows: Vec<u32> = Vec::with_capacity(nl);
+        let mut rows_t3: Vec<u32> = Vec::with_capacity(nl);
         for il in 0..nl {
             let (gw, gn, gk) = self.plain_spec(&format!("blk.{il}.moe_gate.weight"))?;
             ent.extend([gw, drt, gn as u64, gk as u64]);
             let mut r = gn as u32;
+            let mut rt3 = gn.div_ceil(GEMV_TR) as u32;
             if shared {
                 for (suf, out) in [("moe_shared_gate", d0), ("moe_shared_up", d1)] {
                     let (w, n, k) = self.plain_spec(&format!("blk.{il}.{suf}.weight"))?;
                     ent.extend([w, out, n as u64, k as u64]);
                     r += n as u32;
+                    rt3 += n.div_ceil(GEMV_TR) as u32;
                 }
                 // [§4.5 2026-10-11] sgate를 4세그먼트로 편입 — 꼬리 GEMV
                 // 런치 -1/층. 출력은 전용 슬롯(drt+n_exp — 라우터는 [0..n_exp)
@@ -384,6 +387,7 @@ impl W4a16Dec {
                 ent.extend([0u64; 12]);
             }
             rows.push(r);
+            rows_t3.push(rt3);
         }
         let bytes = ent.len() * 8;
         if self.moe_multi_tab != 0 {
@@ -401,7 +405,55 @@ impl W4a16Dec {
         }
         self.moe_multi_tab = p;
         self.moe_multi_rows = rows;
+        self.moe_multi_rows_t3 = rows_t3;
         Ok(())
+    }
+
+    /// [S10-잔여 2026-10-11] t행(2..8) 상주 라우터+shared gate/up 융합 —
+    /// t=1 multi_gate의 t판(moe_multi_tab 세그먼트 0..2 공용, count=3).
+    /// 종전 층당 3런치(라우터 게이트 + shared gate/up plain_gemm) → 1런치.
+    /// sgate는 꼬리에 잔류([t][n] 아웃 레이아웃이 전용 슬롯과 충돌 — 주석
+    /// moe_shared_tail_t). 값은 단독 GemvT와 비트동일(커널 계약).
+    pub(super) fn moe_multi_gate_t(
+        &mut self,
+        il: usize,
+        xn: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        self.ensure_moe_bufs()?;
+        let total = *self
+            .moe_multi_rows_t3
+            .get(il)
+            .ok_or("moe: 다중 세그먼트 t 테이블 미작성")?;
+        if total == 0 {
+            return Ok(());
+        }
+        self.gemv_multi_t_launch(
+            true,
+            self.moe_multi_tab + (il as u64) * 4 * 4 * 8,
+            xn,
+            total as usize,
+            3,
+            t,
+        )
+    }
+
+    /// [S10-잔여] shared 꼬리(t판) — ew → down → sgate → 가산. 게이트/업은
+    /// multi_gate_t가 선기록(moe_shared_t에서 gate/up 런치 제거판). sgate는
+    /// 종전 t경로 그대로 drt.ptr([t][n] — topk 소비 후 기록이라 안전).
+    fn moe_shared_tail_t(&mut self, il: usize, xn: CUdeviceptr, t: usize) -> Result<(), String> {
+        let h = self.hidden;
+        let sf = self.shared_ffn;
+        let [s0, s1, _s1b, s2, s3] = self.dchain;
+        self.ew_dev(s0, s1, s2, t * sf)?;
+        self.plain_gemm_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3, t)?;
+        self.plain_gemm_launch(
+            &format!("blk.{il}.moe_shared_sgate.weight"),
+            xn,
+            self.drt.ptr,
+            t,
+        )?;
+        self.shared_add_dev(self.drt.ptr, s3, self.dmo.ptr, h, t)
     }
 
     /// [B-4] 다중 세그먼트 GEMV 런치(라우터 게이트 + shared gate/up).
@@ -496,11 +548,18 @@ impl W4a16Dec {
             return Err("moe t>1: 상주 모드 전용(스트리밍 프리필 미구현)".into());
         }
         self.ensure_moe_bufs()?;
+        // [S10-잔여 2026-10-11] t≤8(디코드 배치·검증): 라우터+shared 게이트/
+        // 업/sgate를 multi_t 1런치로 융합(종전 4런치). t>8(프리필)은 종전 유지.
+        let fused = self.shared_ffn > 0 && t <= BATCH_DEC_MAX;
         // 1) 라우터 [t][n_exp] — 플레인 GEMM → **디바이스 top-k**(P11).
         // 종전: d2h(32KB)+sync+호스트 전체 정렬(512×t)이 층·청크마다 — 프리필의
         // ~10%. 시맨틱은 moe_topk 미러(softmax→k라운드→재정규화).
         // 실측(2026-10-09): 35B 512토큰 프리필 1294→1088ms.
-        self.plain_gemm_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt.ptr, t)?;
+        if fused {
+            self.moe_multi_gate_t(il, xn, t)?;
+        } else {
+            self.plain_gemm_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt.ptr, t)?;
+        }
         {
             let f = self.cc.function("w4a16_moe_topk_t")?;
             let (mut p_lg, mut p_ix, mut p_wt) = (self.drt.ptr, self.moe_idx, self.moe_wt);
@@ -615,7 +674,11 @@ impl W4a16Dec {
             self.gemv_experts_launch(base + 2, ns, self.exp.act, n_ff, 1, self.exp.dn, h, n_ff)?;
         }
         self.moe_accum_dev(self.moe_wt, self.exp.dn, self.dmo.ptr, tk, ns, h)?;
-        self.moe_shared_t(il, xn, t)?;
+        if fused {
+            self.moe_shared_tail_t(il, xn, t)?;
+        } else {
+            self.moe_shared_t(il, xn, t)?;
+        }
         Ok(self.dmo.ptr)
     }
 

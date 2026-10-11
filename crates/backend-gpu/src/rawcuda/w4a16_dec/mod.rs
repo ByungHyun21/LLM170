@@ -279,6 +279,9 @@ pub struct W4a16Dec {
     /// 층별 행 합(그리드). 라우터 게이트 + shared gate/up 1런치용.
     moe_multi_tab: CUdeviceptr,
     moe_multi_rows: Vec<u32>,
+    /// [S10-잔여] t행(≤8) 판 다중세그먼트 grid — 라우터+shared gate/up 3세그먼트
+    /// Σceil(n/GEMV_TR)/층(sgate 제외 — 출력 레이아웃 [t][n] 충돌 회피).
+    moe_multi_rows_t3: Vec<u32>,
     /// [P11] 전문가-우선 슬롯 정렬(프리필 그룹 GEMV) — gslot[n_exp×gmax]+cnt.
     moe_gslot: CUdeviceptr,
     moe_gcnt: CUdeviceptr,
@@ -496,6 +499,7 @@ impl W4a16Dec {
             moe_wt: 0,
             moe_multi_tab: 0,
             moe_multi_rows: Vec::new(),
+            moe_multi_rows_t3: Vec::new(),
             moe_gslot: 0,
             moe_gcnt: 0,
             moe_goff: 0,
