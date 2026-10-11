@@ -31,6 +31,9 @@ extern "C" __global__ void ew(
     unsigned short* __restrict__ y16,
     int n)
 {
+    // [float4 벡터화 실측 기각 2026-10-11] 4원소/스레드 변형 = pp4096 −3.0%
+    // (교차 A/B old 1666 vs new 1617 t/s·원소별 산술 동일인데도 역행 —
+    // 원인 미규명, 소형 커널 특성으로 판단) — 스칼라 유지.
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
     float v = g[j];

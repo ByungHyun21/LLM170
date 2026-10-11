@@ -698,13 +698,16 @@ impl W4a16Dec {
         self.cc.h2d(self.ew.dewu, ub)?;
         let f = self.cc.function("ew")?;
         let mut nn = g.len() as i32;
-        let (mut a0, mut a1, mut a2) = (self.ew.dewg, self.ew.dewu, self.ew.dew);
+        // [결함수정 2026-10-11] 6-param 커널에 l4(4인자) 발사 — y32/y16 파라미터가
+        // 스택 잔여값을 읽는 미정의 동작이었다. 널 명시(l6).
+        let (mut a0, mut a1, mut a2, mut a3, mut a4) =
+            (self.ew.dewg, self.ew.dewu, self.ew.dew, 0u64, 0u64);
         self.cc.launch(
             f,
             g.len().div_ceil(128) as u32,
             1,
             128,
-            &mut crate::rawcuda::args::l4(&mut a0, &mut a1, &mut a2, &mut nn),
+            &mut crate::rawcuda::args::l6(&mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut nn),
         )?;
         let mut yb = vec![0u8; g.len() * 4];
         self.cc.d2h(&mut yb, self.ew.dew)?;
