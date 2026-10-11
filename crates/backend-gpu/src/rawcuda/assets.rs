@@ -66,6 +66,7 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_moe_topk_t",
             "w4a16_moe_topk256",
             "w4a16_shared_add",
+            "w4a16_moe_accum_sg",
         ],
         boot: true,
     },

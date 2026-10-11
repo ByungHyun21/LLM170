@@ -294,7 +294,8 @@ impl W4a16Dec {
         let base = il * n_exp * 3;
         self.gemv_experts_glu_launch(base, ns, xn, 0, ns, self.exp.act, n_ff, h)?;
         self.gemv_experts_launch(base + 2, ns, self.exp.act, n_ff, 1, self.exp.dn, h, n_ff)?;
-        self.moe_accum_dev(self.moe_wt, self.exp.dn, self.dmo.ptr, ns, ns, h)
+        // [§4.5] 누적은 꼬리(shared down 이후)의 accum_sg가 수행 — 호출부 참조.
+        Ok(())
     }
 
     /// 전문가 스트리밍(비상주) — 스테이징 1쌍 재사용 h2d + 개별 GEMV.
@@ -455,13 +456,23 @@ impl W4a16Dec {
         self.ew_dev(s0, s1, s2, sf)?;
         self.plain_gemv_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3)?;
         // [§4.5] sgate는 multi_gate 4세그먼트(상주) 또는 스트리밍 분기가 기록.
-        self.shared_add_dev(
-            self.drt.ptr + self.n_experts as u64 * 4,
-            s3,
-            self.dmo.ptr,
-            h,
-            1,
-        )
+        let sg = self.drt.ptr + self.n_experts as u64 * 4;
+        if self.moe_resident {
+            // [§4.5] 상주 — 전문가 누적 + shared 가산 융합(런치 -1/층).
+            // 누적은 여기(shared down 이후)로 이동 — 값 순서 동일(acc + σ·s3).
+            self.moe_accum_sg_dev(
+                self.moe_wt,
+                self.exp.dn,
+                sg,
+                s3,
+                self.dmo.ptr,
+                self.top_k.max(1),
+                h,
+            )?;
+        } else {
+            self.shared_add_dev(sg, s3, self.dmo.ptr, h, 1)?;
+        }
+        Ok(())
     }
 
     /// MoE FFN 배치(t≤8) — 라우터 플레인 GEMM → 디바이스 top-k(t×top_k 슬롯,

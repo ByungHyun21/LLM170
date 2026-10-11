@@ -503,6 +503,33 @@ impl W4a16Dec {
     }
 
     /// shared 게이트 가산 — y[t][i] += sigmoid(sg[t])·x[t][i] (grid = t).
+    /// [§4.5] 전문가 누적 + shared 가산 융합 런치 — accum_dev와 동일 그리드
+    /// ((n/256, 행), 256스레드) + sg/sx 인자.
+    pub(super) fn moe_accum_sg_dev(
+        &mut self,
+        w: CUdeviceptr,
+        d: CUdeviceptr,
+        sg: CUdeviceptr,
+        sx: CUdeviceptr,
+        y: CUdeviceptr,
+        nslots: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_moe_accum_sg")?;
+        let (mut p_w, mut p_d, mut p_sg, mut p_sx, mut p_y) = (w, d, sg, sx, y);
+        let (mut p_sp, mut p_ns, mut p_n) = (0i32, nslots as i32, n as i32);
+        self.cc.launch(
+            f,
+            n.div_ceil(256) as u32,
+            1,
+            256,
+            &mut crate::rawcuda::args::l8(
+                &mut p_w, &mut p_d, &mut p_sg, &mut p_sx, &mut p_y, &mut p_sp, &mut p_ns,
+                &mut p_n,
+            ),
+        )
+    }
+
     pub(super) fn shared_add_dev(
         &mut self,
         sg: CUdeviceptr,

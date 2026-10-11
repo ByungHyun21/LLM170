@@ -709,6 +709,30 @@ extern "C" __global__ void w4a16_moe_topk256(
 }
 
 // shared 게이트 가산 — y[i] += sigmoid(sg[0])·x[i] (sigmoid = 1/(1+e^-v)).
+// [§4.5 2026-10-11] 전문가 누적 + shared 가산 융합 — 종전 accum(덮어쓰기)
+// 과 shared_add(+= σ(sg)·s3) 2런치를 1런치로(런치 -1/층). 값은
+// acc + σ(sg)·s3 — 종전과 같은 f32 가산 1회·같은 expf 산식(비트동일).
+extern "C" __global__ void w4a16_moe_accum_sg(const float* __restrict__ w,
+                                              const float* __restrict__ d,
+                                              const float* __restrict__ sg,
+                                              const float* __restrict__ sx,
+                                              float* __restrict__ y, int sp, int nslots,
+                                              int n) {
+    const int spt = (sp > 0) ? sp : nslots;
+    const int row = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const int ti = row * spt;
+        const int end = (ti + spt < nslots) ? ti + spt : nslots;
+        float acc = 0.0f;
+        for (int s = ti; s < end; ++s) {
+            acc += w[s] * d[(size_t)s * n + i];
+        }
+        const float g = 1.0f / (1.0f + expf(-sg[row]));
+        y[(size_t)row * n + i] = acc + g * sx[(size_t)row * n + i];
+    }
+}
+
 extern "C" __global__ void w4a16_shared_add(const float* __restrict__ sg,
                                             const float* __restrict__ x,
                                             float* __restrict__ y, int n) {
