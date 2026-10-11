@@ -696,6 +696,12 @@ extern "C" __global__ void w4a16_copy(const float4* __restrict__ src,
 // 종전 smem f16 디큐트 `__float2half_rn((float)(nib-8)*scf)`와 **비트동일**:
 // hsub2(1024+n)-(1024+8) = n-8 정확(f16 정수) → f32 곱 → RNE. 스테이징이
 // 순수 복사가 되고 smem B가 1/4(L1·smem 압력↓).
+// [S6 실측 기각 2026-10-11] 프리필 디큐트 최적화 시도 — (진단)디큐트 제거
+// (return qw·로드 유지) A/B: pp512 288→260ms(−9.5%)·pp4096 −9.5%·pp16384
+// −8.2% = 디큐트 체인 총 비중 ~9%가 상한. ① B 디큐트 mf-호이스팅(중복
+// 2→1회, 비트동일, 레지스터 79·스필 0 동일): pp512/4096 +1.7~2.0% 역행 —
+// 커널은 issue-bound가 아니라 지연/스케줄 민감(ncu No Eligible 77% 정합).
+// ② 잔여 lop3/PRMT-lite 상한(추출·전개 ~5/12 op) <1% — 무의미. 현행 유지.
 __device__ __forceinline__ unsigned deq_pair_b(unsigned qw, int tt, float sc) {
     const unsigned sub8 = 0x64086408u; // half2(1024+8)
     const unsigned byte = (qw >> (8 * tt)) & 0xFFu;
