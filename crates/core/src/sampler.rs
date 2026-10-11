@@ -153,6 +153,117 @@ impl Sampler {
         self.sample_core(logits, false).unwrap_or(0)
     }
 
+    /// [§7 2026-10-11] 거절샘플링용 — 토큰 x의 후처리 확률 p(x).
+    /// sample()의 체인(컷 → top_k → temp/softmax → top_p → min_p)과 동일
+    /// 산식·정규화로 x의 최종 확률을 반환. 0 = x가 후보 밖(비유한/컷/top_k/
+    /// top_p/min_p 제외 또는 상위 CAND_N 밖 — 근사: 그 구간 p < ~1e-4).
+    /// 대상: 비greedy 스펙 수용 판정(target-only 거절샘플링, 프로브 A-1 확장).
+    pub fn prob_of(&self, logits: &[f32], x: u32) -> f64 {
+        const CUT_D: f32 = 20.0;
+        const CAND_N: usize = 4096;
+        let cmp_desc = |a: &(u32, f32), b: &(u32, f32)| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        let mut n_below = 0usize;
+        let mut mx = f32::NEG_INFINITY;
+        for &v in logits {
+            if v > mx {
+                mx = v;
+            }
+        }
+        let cutv = mx - CUT_D;
+        let mut cand: Vec<(u32, f32)> = Vec::with_capacity(1024);
+        for (i, &v) in logits.iter().enumerate() {
+            if !v.is_finite() {
+                continue;
+            }
+            if v > cutv {
+                cand.push((i as u32, v));
+            } else {
+                n_below += 1;
+            }
+        }
+        if cand.is_empty() {
+            return 0.0;
+        }
+        if self.params.top_k > 0 && cand.len() > self.params.top_k {
+            cand.select_nth_unstable_by(self.params.top_k - 1, cmp_desc);
+            cand.truncate(self.params.top_k);
+        }
+        if cand.len() > CAND_N {
+            cand.select_nth_unstable_by(CAND_N - 1, cmp_desc);
+            cand.truncate(CAND_N);
+        }
+        cand.sort_unstable_by(cmp_desc);
+        let t = self.params.temperature;
+        let sc = |v: f32| if t > 0.0 && t != 1.0 { v / t } else { v };
+        let max = sc(cand[0].1);
+        let mut probs: Vec<f64> = cand
+            .iter()
+            .map(|&(_, v)| ((sc(v) - max) as f64).exp())
+            .collect();
+        let mut sum: f64 = probs.iter().sum();
+        if n_below > 0 {
+            sum += (n_below as f64) * (-(CUT_D as f64)).exp();
+        }
+        if sum <= 0.0 || !sum.is_finite() {
+            return 0.0;
+        }
+        for p in &mut probs {
+            *p /= sum;
+        }
+        if self.params.top_p < 1.0 {
+            let p_thr = self.params.top_p as f64;
+            let mut cum = 0.0;
+            let mut keep = probs.len();
+            for (i, &p) in probs.iter().enumerate() {
+                cum += p;
+                if cum >= p_thr {
+                    keep = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(keep);
+            cand.truncate(keep);
+            let s2: f64 = probs.iter().sum();
+            if s2 <= 0.0 {
+                return 0.0;
+            }
+            for p in &mut probs {
+                *p /= s2;
+            }
+        }
+        if self.params.min_p > 0.0 {
+            let mxp = probs.first().copied().unwrap_or(0.0);
+            let thr = mxp as f32 * self.params.min_p;
+            let mut keep = probs.len();
+            for (i, &p) in probs.iter().enumerate() {
+                if (p as f32) < thr {
+                    keep = i;
+                    break;
+                }
+            }
+            if keep == 0 {
+                keep = 1;
+            }
+            probs.truncate(keep);
+            cand.truncate(keep);
+            let s3: f64 = probs.iter().sum();
+            if s3 <= 0.0 {
+                return 0.0;
+            }
+            for p in &mut probs {
+                *p /= s3;
+            }
+        }
+        for (i, &(tok, _)) in cand.iter().enumerate() {
+            if tok == x {
+                return probs[i];
+            }
+        }
+        0.0
+    }
+
     /// 샘플링 핵심. `cut=true`: max−20(exp(−20)=2.06e-9) 초과만 후보로 하고
     /// 그 이하 항은 exp 호출 없이 **상한 가산**(항수×2.06e-9 — sum 상대
     /// ~1e-7; 경계가 민감한 평탄 분포에선 항수가 커져 상대오차 자체가
@@ -586,5 +697,40 @@ mod tests {
         for _ in 0..16 {
             assert_eq!(s.sample(&mut logits(&[1.0, 0.9])), 0);
         }
+    }
+
+    #[test]
+    fn prob_of_matches_sampling_frequency() {
+        let l = logits(&[3.0, 2.0, 1.0, 0.5]);
+        let mut s = Sampler::new(SamplerParams {
+            temperature: 1.0,
+            seed: 7,
+            ..Default::default()
+        });
+        let p0 = s.prob_of(&l, 0);
+        let p1 = s.prob_of(&l, 1);
+        let (mut c0, mut c1, n) = (0usize, 0usize, 4000usize);
+        for _ in 0..n {
+            let mut ll = l.clone();
+            match s.sample(&mut ll) {
+                0 => c0 += 1,
+                1 => c1 += 1,
+                _ => {}
+            }
+        }
+        let (f0, f1) = (c0 as f64 / n as f64, c1 as f64 / n as f64);
+        assert!((f0 - p0).abs() < 0.03, "p0 {p0} vs {f0}");
+        assert!((f1 - p1).abs() < 0.03, "p1 {p1} vs {f1}");
+    }
+
+    #[test]
+    fn prob_of_topk_exclusion_is_zero() {
+        let l = logits(&[3.0, 2.0, 1.0]);
+        let s = Sampler::new(SamplerParams {
+            top_k: 1,
+            ..Default::default()
+        });
+        assert!(s.prob_of(&l, 0) > 0.99);
+        assert_eq!(s.prob_of(&l, 1), 0.0);
     }
 }
