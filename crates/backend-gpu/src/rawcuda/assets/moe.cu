@@ -810,3 +810,177 @@ extern "C" __global__ void w4a16_shared_add(const float* __restrict__ sg,
         y[(size_t)ti * n + i] += s * x[(size_t)ti * n + i];
     }
 }
+
+
+// ── [B2 2026-10-12] down 투영 전용 N64 변형 ──
+// 근거(ncu): grp 병목 = 청크당 A/B 스테이징 + 배리어 2회(배리어 스톨 41%+
+// MIO 12%, mma 파이프 유휴·DRAM 17%). 게이트/업은 grp2(N64 융합)로 상각했고,
+// down(N=hidden, GRP_N=32)만 N32로 남아 같은 일을 배리어 2배로 지불했다.
+// down은 단일 투영이라 grp2식 2텐서 융합 대신 N을 64로 확장(워프 2n×32=64열,
+// n타일 4) — 청크당 mma 작업 2배로 배리어·스테이징 상각.
+// 계약: 산술은 grp와 동일 계열(deq_pair_b·pk2bf·mma 누산 순서) — down 값
+// 골든 판정(토큰). deq_pair_b는 gptq4.cu 정의의 **비트동일 복제**다(g4_common
+// 이동은 전 자산 재빌드 → gptq4 코드젠 추첨 리셋 — 금지).
+__device__ __forceinline__ unsigned deq_pair_b_d(unsigned qw, int tt, float sc) {
+    const unsigned sub8 = 0x64086408u; // half2(1024+8)
+    const unsigned byte = (qw >> (8 * tt)) & 0xFFu;
+    unsigned w = ((byte & 0xFu) | ((byte & 0xF0u) << 12)) & 0x000f000fu;
+    w |= 0x64006400u;
+    __half2 h = __hsub2(*reinterpret_cast<const __half2*>(&w),
+                        *reinterpret_cast<const __half2*>(&sub8));
+    const float2 f = __half22float2(h);
+    const __half2 r = __float22half2_rn(make_float2(f.x * sc, f.y * sc));
+    return *reinterpret_cast<const unsigned*>(&r);
+}
+
+#define DGRP_M 64
+#define DGRP_N 64
+#define DGRP_KC 32
+
+extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64(
+    const unsigned long long* __restrict__ tab, int base,
+    const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
+    const unsigned* __restrict__ goff,
+    const unsigned short* __restrict__ x, int xstride, int sp,
+    float* __restrict__ out, int n, int k)
+{
+    const int e = blockIdx.x;
+    const unsigned cnt = gcnt[e];
+    if (cnt == 0) {
+        return;
+    }
+    const int n0 = blockIdx.y * DGRP_N;
+    const unsigned long long* wp = tab + (size_t)(base + e * 3) * 2;
+    const unsigned* q = (const unsigned*)wp[0];
+    const unsigned short* s = (const unsigned short*)wp[1];
+    const unsigned* gs = gslot + (size_t)goff[e];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int g = lane >> 2;
+    const int tt = lane & 3;
+    const int mt = (warp >> 1) * 16; // 4 m워프 × 16 = M64
+    const int ntw = (warp & 1) * 32; // 2 n워프 × 32 = N64
+    const int k8 = k >> 3;
+    const int kg = k >> 5; // g32
+    __shared__ __align__(16) unsigned short xs[2][DGRP_M][DGRP_KC + 8];
+    __shared__ unsigned short ws[2][DGRP_N][DGRP_KC + 8];
+    const unsigned mtiles = (cnt + DGRP_M - 1) / DGRP_M;
+    for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
+        const unsigned rbase = mtile * DGRP_M;
+        float c[4][4];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            ((float*)c)[i] = 0.0f;
+        }
+        auto stage_ab = [&](int st, int kn) {
+            for (int ee = tid; ee < DGRP_M * DGRP_KC / 8; ee += 256) {
+                const int r = ee / (DGRP_KC / 8);
+                const int c8 = ee % (DGRP_KC / 8);
+                const int gi = kn + c8 * 8;
+                if (rbase + r < cnt) {
+                    const unsigned sl = gs[rbase + r];
+                    const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
+                    if (gi + 7 < k) {
+                        cp_async16(&xs[st][r][c8 * 8], &x[xoff + gi]);
+                    } else {
+                        unsigned short t8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                        for (int j = 0; j < 8; ++j) {
+                            if (gi + j < k) {
+                                t8[j] = x[xoff + gi + j];
+                            }
+                        }
+                        *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) =
+                            *reinterpret_cast<const uint4*>(t8);
+                    }
+                } else {
+                    *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) = make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
+            for (int ee = tid; ee < DGRP_N * DGRP_KC / 8; ee += 256) {
+                const int r = ee / (DGRP_KC / 8);
+                const int c8 = ee % (DGRP_KC / 8);
+                const int gi = kn + c8 * 8;
+                const int rr = n0 + r;
+                const bool live = (rr < n) && (gi + 7 < k);
+                unsigned short scb = 0;
+                if (rr < n) {
+                    scb = s[(size_t)rr * kg + (gi >> 5)];
+                }
+                const float scf = __uint_as_float((unsigned)scb << 16);
+                const unsigned qw = live ? __ldcs(&q[(size_t)rr * k8 + (gi >> 3)]) : 0u;
+                if (live) {
+#pragma unroll
+                    for (int jp = 0; jp < 4; ++jp) {
+                        *reinterpret_cast<unsigned*>(&ws[st][r][c8 * 8 + jp * 2]) =
+                            deq_pair_b_d(qw, jp, scf);
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        ws[st][r][c8 * 8 + j] = 0;
+                    }
+                }
+            }
+        };
+        stage_ab(0, 0);
+        asm volatile("cp.async.commit_group;");
+        int cur = 0;
+        for (int k0 = 0; k0 < k; k0 += DGRP_KC, cur ^= 1) {
+            const int kn = k0 + DGRP_KC;
+            if (kn < k) {
+                stage_ab(cur ^ 1, kn);
+            }
+            asm volatile("cp.async.commit_group;");
+            asm volatile("cp.async.wait_group 1;");
+            __syncthreads();
+#pragma unroll
+            for (int ks = 0; ks < DGRP_KC / 16; ++ks) {
+                const int kb = ks * 16;
+                const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
+                const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
+                const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
+                const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    const int nb = ntw + nt * 8;
+                    const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
+                    const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3])
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const int col = n0 + ntw + nt * 8 + 2 * tt;
+            const int r0 = mt + g;
+            if (rbase + r0 < cnt) {
+                const unsigned sl = gs[rbase + r0];
+                if (col < n) {
+                    out[(size_t)sl * n + col] = c[nt][0];
+                }
+                if (col + 1 < n) {
+                    out[(size_t)sl * n + col + 1] = c[nt][1];
+                }
+            }
+            if (rbase + r0 + 8 < cnt) {
+                const unsigned sl = gs[rbase + r0 + 8];
+                if (col < n) {
+                    out[(size_t)sl * n + col] = c[nt][2];
+                }
+                if (col + 1 < n) {
+                    out[(size_t)sl * n + col + 1] = c[nt][3];
+                }
+            }
+        }
+    }
+}
+
+#undef DGRP_M
+#undef DGRP_N
+#undef DGRP_KC
