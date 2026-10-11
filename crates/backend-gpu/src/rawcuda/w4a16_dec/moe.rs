@@ -378,11 +378,12 @@ impl W4a16Dec {
                     rt3 += n.div_ceil(GEMV_TR) as u32;
                 }
                 // [§4.5 2026-10-11] sgate를 4세그먼트로 편입 — 꼬리 GEMV
-                // 런치 -1/층. 출력은 전용 슬롯(drt+n_exp — 라우터는 [0..n_exp)
-                // 만 기록하고 topk 소비 후 shared_add가 읽어 순서 안전).
+                // 런치 -1/층. [B3-2b 2026-10-12] 출력은 전용 슬롯(dsg)으로
+                // 통일 + t 경로(rows_t3)에도 편입 — t≤8 꼬리 런치 추가 -1.
                 let (w, n, k) = self.plain_spec(&format!("blk.{il}.moe_shared_sgate.weight"))?;
-                ent.extend([w, drt + self.n_experts as u64 * 4, n as u64, k as u64]);
+                ent.extend([w, self.dsg, n as u64, k as u64]);
                 r += n as u32;
+                rt3 += n.div_ceil(GEMV_TR) as u32;
             } else {
                 ent.extend([0u64; 12]);
             }
@@ -410,10 +411,10 @@ impl W4a16Dec {
     }
 
     /// [S10-잔여 2026-10-11] t행(2..8) 상주 라우터+shared gate/up 융합 —
-    /// t=1 multi_gate의 t판(moe_multi_tab 세그먼트 0..2 공용, count=3).
-    /// 종전 층당 3런치(라우터 게이트 + shared gate/up plain_gemm) → 1런치.
-    /// sgate는 꼬리에 잔류([t][n] 아웃 레이아웃이 전용 슬롯과 충돌 — 주석
-    /// moe_shared_tail_t). 값은 단독 GemvT와 비트동일(커널 계약).
+    /// t=1 multi_gate의 t판(moe_multi_tab 세그먼트 0..2 공용). 종전 층당
+    /// 3런치(라우터 게이트 + shared gate/up plain_gemm) → 1런치.
+    /// [B3-2b 2026-10-12] sgate를 4세그먼트로 확장(count=4) — 꼬리 런치 -1/층
+    /// (출력은 dsg 전용 슬롯). 값은 단독 GemvT와 비트동일(커널 계약).
     pub(super) fn moe_multi_gate_t(
         &mut self,
         il: usize,
@@ -433,18 +434,20 @@ impl W4a16Dec {
             self.moe_multi_tab + (il as u64) * 4 * 4 * 8,
             xn,
             total as usize,
-            3,
+            4,
             t,
         )
     }
 
-    /// [S10-잔여] shared 꼬리(t판) — ew → down → sgate → 가산. 게이트/업은
-    /// multi_gate_t가 선기록(moe_shared_t에서 gate/up 런치 제거판). sgate는
-    /// 종전 t경로 그대로 drt.ptr([t][n] — topk 소비 후 기록이라 안전).
+    /// [S10-잔여] shared 꼬리(t판) — ew → down → 가산([B3-2b 2026-10-12]
+    /// sgate는 multi_gate_t 4세그먼트가 dsg에 선기록 — 런치 -1/층). 게이트/
+    /// 업은 multi_gate_t가 선기록(moe_shared_t에서 gate/up 런치 제거판).
+    /// [B3] forked=true면 머리(ew/down)가 보조 스트림에 선발사됨 — 조인 후
+    /// 가산만(조인 대상은 dsg·s3).
     fn moe_shared_tail_t(
         &mut self,
         il: usize,
-        xn: CUdeviceptr,
+        _xn: CUdeviceptr,
         t: usize,
         forked: bool,
     ) -> Result<(), String> {
@@ -452,22 +455,16 @@ impl W4a16Dec {
         let sf = self.shared_ffn;
         let [s0, s1, _s1b, s2, s3] = self.dchain;
         if forked {
-            // [B3] 보조 스트림 조인 후 가산(ew/down/sgate는 포크가 선발사).
+            // [B3] 보조 스트림 조인 후 가산(ew/down은 포크가 선발사).
             let e2 = self.ev_fork[il * 2 + 1];
             self.cc.stream_wait(self.cc.stream, e2)?;
             return self.shared_add_dev(self.dsg, s3, self.dmo.ptr, h, t);
         }
         self.ew_dev(s0, s1, s2, t * sf)?;
-        // [S10-잔여 확장] down/sgate는 t행 GEMV — v3 GEMM 대비 동값
+        // [S10-잔여 확장] down은 t행 GEMV — v3 GEMM 대비 동값
         // (plain-gemm-selfcheck 0/65536 실측)·소형 t에서 우세.
         self.plain_gemv_t_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3, t)?;
-        self.plain_gemv_t_launch(
-            &format!("blk.{il}.moe_shared_sgate.weight"),
-            xn,
-            self.drt.ptr,
-            t,
-        )?;
-        self.shared_add_dev(self.drt.ptr, s3, self.dmo.ptr, h, t)
+        self.shared_add_dev(self.dsg, s3, self.dmo.ptr, h, t)
     }
 
     /// [B-4] 다중 세그먼트 GEMV 런치(라우터 게이트 + shared gate/up).
@@ -520,8 +517,13 @@ impl W4a16Dec {
         let [s0, s1, _s1b, s2, s3] = self.dchain;
         self.ew_dev(s0, s1, s2, sf)?;
         self.plain_gemv_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3)?;
-        // [§4.5] sgate는 multi_gate 4세그먼트(상주) 또는 스트리밍 분기가 기록.
-        let sg = self.drt.ptr + self.n_experts as u64 * 4;
+        // [§4.5] sgate는 multi_gate 4세그먼트(상주 — [B3-2b] 출력 dsg) 또는
+        // 스트리밍 분기(drt+n_exp)가 기록.
+        let sg = if self.moe_resident {
+            self.dsg
+        } else {
+            self.drt.ptr + self.n_experts as u64 * 4
+        };
         if self.moe_resident {
             // [§4.5] 상주 — 전문가 누적 + shared 가산 융합(런치 -1/층).
             // 누적은 여기(shared down 이후)로 이동 — 값 순서 동일(acc + σ·s3).
@@ -717,7 +719,7 @@ impl W4a16Dec {
     fn moe_shared_head_t_fork(
         &mut self,
         il: usize,
-        xn: CUdeviceptr,
+        _xn: CUdeviceptr,
         t: usize,
     ) -> Result<bool, String> {
         let aux = self.cc.stream2;
@@ -727,18 +729,12 @@ impl W4a16Dec {
         let sf = self.shared_ffn;
         let [s0, s1, _s1b, s2, s3] = self.dchain;
         let (e1, e2) = (self.ev_fork[il * 2], self.ev_fork[il * 2 + 1]);
-        // 포크: 게이트/업(multi_gate_t) 완료 → 보조 스트림에 ew/down/sgate.
+        // 포크: 게이트/업(multi_gate_t) 완료 → 보조 스트림에 ew/down.
+        // (sgate는 [B3-2b] multi_gate_t 4세그먼트가 dsg에 선기록.)
         self.cc.event_record_on(e1, self.cc.stream)?;
         self.cc.stream_wait(aux, e1)?;
         self.ew_dev_on(aux, s0, s1, s2, t * sf)?;
         self.plain_gemv_t_launch_on(aux, &format!("blk.{il}.moe_shared_down.weight"), s2, s3, t)?;
-        self.plain_gemv_t_launch_on(
-            aux,
-            &format!("blk.{il}.moe_shared_sgate.weight"),
-            xn,
-            self.dsg,
-            t,
-        )?;
         self.cc.event_record_on(e2, aux)?;
         Ok(true)
     }
