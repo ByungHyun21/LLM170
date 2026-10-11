@@ -1,3 +1,4 @@
+#include "g4_common.cuh" // [I8head] shfl_down_f64(tree64) 공용
 // head 자산 — 로짓 argmax(min-index-on-tie) 커널.
 // [A-4 2026-10-10] 종전 head_bf16/head_bf16_t/head_transpose는 제거됐다:
 // head GEMV는 플레인 표준 경로 w4a16_gemv_bf16(_t)(행=블록, [n][k] 원본 —
@@ -108,5 +109,140 @@ extern "C" __global__ void w4a16_argmax_min_t(
     }
     if (tid == 0) {
         out[row] = bi[0];
+    }
+}
+
+// ── [I8head 2026-10-11] int8 head GEMV — 품질 프로브(eval) 통과판 ──
+// bf16 head는 디코드마다 2.54GB(27B)를 재판독(디코드의 14%) — int8 팩킹으로
+// 절반(1.27GB+행스케일 1MB). eval chunk4: en PPL +0.061%·argmax 99.139% /
+// ko +0.0002%·99.347%(KV int8 밴드 내) · 27B 프로브 골든 유지.
+// 행별 스케일(amax/127) · 산술 = (Σ q·x)·s — 토큰 수준 판정(골든·smoke).
+// (int4-g128 head는 기각: en +0.59%/92.7% — 4090.md.)
+// [I8head t판 — 행=블록 확장형] t=1 행 커널과 동일 몸체에 T 루프 추가:
+// 블록 64스레드가 한 행(o)의 웨이트를 1회만 읽고 t토큰에 재사용(amortization
+// 유지). 512스레드 8행그룹 판(구현 이력의 코드젠 결함 — 진단 미규명)을
+// 피해 검증된 행=블록 형태만 사용.
+template <int T>
+__device__ __forceinline__ void gemv_i8_trow_body(
+    const signed char* __restrict__ w, const float* __restrict__ sc,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k, int o,
+    double* __restrict__ red)
+{
+    const int l = threadIdx.x;
+    const unsigned* q32 = reinterpret_cast<const unsigned*>(w + (size_t)o * k);
+    const float s = sc[o];
+    const int k4 = k >> 2;
+    float acc[T];
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        acc[r] = 0.0f;
+    }
+    const float4* xp[T];
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        xp[r] = reinterpret_cast<const float4*>(x) + (size_t)r * k4 + l;
+    }
+#pragma unroll 16
+    for (int i = l; i < k4; i += 64) {
+        const unsigned qw = q32[i];
+        const float q0 = (float)(signed char)(qw & 0xFFu);
+        const float q1 = (float)(signed char)((qw >> 8) & 0xFFu);
+        const float q2 = (float)(signed char)((qw >> 16) & 0xFFu);
+        const float q3 = (float)(signed char)(qw >> 24);
+#pragma unroll
+        for (int r = 0; r < T; ++r) {
+            const float4 xv = *xp[r];
+            acc[r] += q0 * xv.x;
+            acc[r] += q1 * xv.y;
+            acc[r] += q2 * xv.z;
+            acc[r] += q3 * xv.w;
+            xp[r] += 64;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        red[l] = (double)acc[r];
+        __syncthreads();
+        if (l < 32) {
+            double v = red[l] + red[l + 32];
+#pragma unroll
+            for (int off = 16; off >= 1; off >>= 1) {
+                const double oth = shfl_down_f64(v, off);
+                if (l < off) {
+                    v += oth;
+                }
+            }
+            if (l == 0) {
+                out[(size_t)r * n + o] = (float)v * s;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+#define GEMV_I8_TROW_CASE(N) \
+    case N: gemv_i8_trow_body<N>(w, sc, x, out, n, k, o, red); break;
+extern "C" __global__ void w4a16_gemv_i8_t(
+    const signed char* __restrict__ w, const float* __restrict__ sc,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k, int t)
+{
+    const int o = blockIdx.x;
+    if (o >= n || t <= 0 || t > 8) {
+        return;
+    }
+    __shared__ double red[64];
+    switch (t) {
+        GEMV_I8_TROW_CASE(1)
+        GEMV_I8_TROW_CASE(2)
+        GEMV_I8_TROW_CASE(3)
+        GEMV_I8_TROW_CASE(4)
+        GEMV_I8_TROW_CASE(5)
+        GEMV_I8_TROW_CASE(6)
+        GEMV_I8_TROW_CASE(7)
+        GEMV_I8_TROW_CASE(8)
+        default: break;
+    }
+}
+
+// [I8head t=1] 행=블록·64레인 — 검증된 주 경로(디코드 tg +7.6%/9.3% 실측).
+extern "C" __global__ void w4a16_gemv_i8(
+    const signed char* __restrict__ w, const float* __restrict__ sc,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k)
+{
+    const int o = blockIdx.x;
+    if (o >= n) {
+        return;
+    }
+    const int l = threadIdx.x;
+    const unsigned* q32 = reinterpret_cast<const unsigned*>(w + (size_t)o * k);
+    const float s = sc[o];
+    const int k4 = k >> 2;
+    const float4* xp = reinterpret_cast<const float4*>(x) + l;
+    float acc = 0.0f;
+#pragma unroll 16
+    for (int i = l; i < k4; i += 64) {
+        const unsigned qw = q32[i];
+        const float4 xv = *xp;
+        acc += (float)(signed char)(qw & 0xFFu) * xv.x;
+        acc += (float)(signed char)((qw >> 8) & 0xFFu) * xv.y;
+        acc += (float)(signed char)((qw >> 16) & 0xFFu) * xv.z;
+        acc += (float)(signed char)(qw >> 24) * xv.w;
+        xp += 64;
+    }
+    __shared__ double red[64];
+    red[l] = (double)acc;
+    __syncthreads();
+    if (l < 32) {
+        double v = red[l] + red[l + 32];
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(v, off);
+            if (l < off) {
+                v += oth;
+            }
+        }
+        if (l == 0) {
+            out[o] = (float)v * s;
+        }
     }
 }

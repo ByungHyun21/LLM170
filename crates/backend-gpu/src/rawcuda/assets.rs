@@ -126,7 +126,12 @@ pub const ASSETS: &[Asset] = &[
             "crates/backend-gpu/src/rawcuda/assets/head.fatbin",
             "src/rawcuda/assets/head.fatbin",
         ],
-        syms: &["w4a16_argmax_min", "w4a16_argmax_min_t"],
+        syms: &[
+            "w4a16_argmax_min",
+            "w4a16_argmax_min_t",
+            "w4a16_gemv_i8",
+            "w4a16_gemv_i8_t",
+        ],
         boot: true,
     },
     Asset {

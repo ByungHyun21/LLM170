@@ -400,6 +400,8 @@ pub struct W4a16Dec {
     dyt: Buf,
     // ── GPU head(output.weight bf16) ──
     head_w: CUdeviceptr,
+    /// [I8head] int8 head 행스케일(f32[n]) — head_w는 int8 바이트로 전환.
+    head_sc: CUdeviceptr,
     head_n: usize,
     head_k: usize,
     head_out: CUdeviceptr,
@@ -577,6 +579,7 @@ impl W4a16Dec {
             spec_scan_on: true,
             dyt: Buf::default(),
             head_w: 0,
+            head_sc: 0,
             head_n: 0,
             head_k: 0,
             head_out: 0,

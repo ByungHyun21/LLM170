@@ -215,26 +215,48 @@ impl W4a16Dec {
     /// 이득: 블록 내 8행 그룹이 x를 L1 공유 → x L2 재판독 ÷8
     /// (35B head 실측 1.05ms — x L2 1.2GB가 가중치 622MB와 경합).
     pub(super) fn head_gemv_launch(&self, x: CUdeviceptr, out: CUdeviceptr) -> Result<(), String> {
-        self.head_gemv_t_launch(x, out, 1)
+        // [I8head] t=1은 전용 행=블록 커널(TR 판은 t=1에서 역행 실측 이력).
+        self.head_gemv_i8_launch(x, out)
     }
 
-    /// [A-4] head GEMV 배치(t≤8) — TR 커널(행=블록 공유).
+    /// [A-4 / I8head] head GEMV 배치(t≤8) — TR 커널(가중 1판독 t행 공유).
+    /// [I8head 2026-10-11] int8 판(행별 스케일) — bf16 대비 대역 절반.
     pub(super) fn head_gemv_t_launch(
         &self,
         x: CUdeviceptr,
         out: CUdeviceptr,
         t: usize,
     ) -> Result<(), String> {
-        let f = self.cc.function("w4a16_gemv_bf16_t")?;
-        let (mut p_w, mut p_x, mut p_o) = (self.head_w, x, out);
+        let f = self.cc.function("w4a16_gemv_i8_t")?;
+        let (mut p_w, mut p_sc, mut p_x, mut p_o) = (self.head_w, self.head_sc, x, out);
         let (mut p_n, mut p_k, mut p_t) = (self.head_n as i32, self.head_k as i32, t as i32);
         self.cc.launch(
             f,
-            self.head_n.div_ceil(GEMV_TR) as u32,
+            self.head_n as u32,
             1,
-            (64 * GEMV_TR) as u32,
+            64,
+            &mut crate::rawcuda::args::l7(
+                &mut p_w, &mut p_sc, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+            ),
+        )
+    }
+
+    /// [I8head] head GEMV t=1 — 행=블록 64레인 int8(디코드 주 경로).
+    pub(super) fn head_gemv_i8_launch(
+        &self,
+        x: CUdeviceptr,
+        out: CUdeviceptr,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_gemv_i8")?;
+        let (mut p_w, mut p_sc, mut p_x, mut p_o) = (self.head_w, self.head_sc, x, out);
+        let (mut p_n, mut p_k) = (self.head_n as i32, self.head_k as i32);
+        self.cc.launch(
+            f,
+            self.head_n as u32,
+            1,
+            64,
             &mut crate::rawcuda::args::l6(
-                &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+                &mut p_w, &mut p_sc, &mut p_x, &mut p_o, &mut p_n, &mut p_k,
             ),
         )
     }
