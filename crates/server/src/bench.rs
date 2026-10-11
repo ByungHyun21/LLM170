@@ -1,7 +1,7 @@
 //! bench — llama-bench 규격 PP/TG/NP 측정 (2026-10-11 복원 — W4A16/CUDA 단일
 //! 트랙용 재작성).
 //!
-//! 원형(fd612a97, 구 트랙)의 의미론 승계: 합성 LCG 토큰(seed 0x1234_5678 —
+//! 원형(구 트랙 bench CLI — 이미 삭제된 커밋)의 의미론 승계: 합성 LCG 토큰(seed 0x1234_5678 —
 //! 크레이트 관례, rand 금지), 워밍업 1회 + reps회 측정, llama-bench 스타일
 //! 출력. **엔진 직접**(GpuEngine — HTTP 무경유). PP = prefill 벽(로그짓 전),
 //! TG = 프리필 후 greedy 디코드, NP = N슬롯 배치 디코드 합산(슬롯별 짧은
