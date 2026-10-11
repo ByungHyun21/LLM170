@@ -455,10 +455,53 @@ impl W4a16Dec {
         if self.dsg == 0 {
             self.dsg = self.cc.alloc(8 * 4)?;
         }
+        // [B7] shared 게이트/업 전용 슬롯 — dchain(d0/d1) 재사용은 스트리밍
+        // 전문가 스크래치와 충돌(실측 골든 파손). t≤8 경로는 [t][n] 레이아웃
+        // (tmax 배) — 크기 부족 시 인접 버퍼 파손(실측).
+        let dsh_need = tmax * self.shared_ffn.max(1);
+        if self.dsh_cap < dsh_need {
+            for p in self.dsh {
+                if p != 0 {
+                    self.cc.free(p)?;
+                }
+            }
+            self.dsh = [0, 0];
+            self.dsh_cap = 0;
+            let sz = dsh_need * 4;
+            self.dsh = [self.cc.alloc(sz)?, self.cc.alloc(sz)?];
+            self.dsh_cap = dsh_need;
+        }
         if self.ev_fork.is_empty() && self.n_layers > 0 {
             for _ in 0..self.n_layers * 2 {
                 let ev = self.cc.event_create_nt()?;
                 self.ev_fork.push(ev);
+            }
+        }
+        // [B4-2 2026-10-12] 스트리밍 전문가 LRU 캐시 — 상주면 불필요(전문가
+        // VRAM 상주). 여유의 1/4 한도로 K 산정(무료 VRAM 부족 시 자동 축소/비활성).
+        if !self.moe_resident && self.mcache_k == 0 && self.n_layers > 0 {
+            let qsz = h * n_ff / 2;
+            let ssz = h * n_ff / self.moe_group.max(32) * 2;
+            let per_slot = 3 * (qsz + ssz);
+            let free = crate::cuda_mem_free().map(|(f, _)| f).unwrap_or(0);
+            let kmax = ((free / 4) / (self.n_layers * per_slot).max(1) as u64) as usize;
+            let k = 64usize.min(kmax);
+            if k > 0 {
+                let qb = self.n_layers * k * 3 * qsz;
+                let sb = self.n_layers * k * 3 * ssz;
+                let qr = self.cc.alloc(qb);
+                let sr = self.cc.alloc(sb);
+                if let (Ok(q), Ok(s)) = (qr, sr) {
+                    self.mcache_q = q;
+                    self.mcache_s = s;
+                    self.mcache_k = k;
+                    self.mcache_ids = vec![u16::MAX; self.n_layers * k];
+                    self.mcache_age = vec![0u32; self.n_layers * k];
+                    eprintln!(
+                        "[moe] 스트리밍 전문가 캐시 {k}슬롯/층 ({}MiB)",
+                        (qb + sb) >> 20
+                    );
+                }
             }
         }
         // [B-4] 다중 세그먼트 GEMV 테이블(drt/dchain 포인터 참조 — 재할당 시 재작성).

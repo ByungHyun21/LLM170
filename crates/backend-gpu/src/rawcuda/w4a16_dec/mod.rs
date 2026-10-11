@@ -310,6 +310,20 @@ pub struct W4a16Dec {
     dsg: CUdeviceptr,
     /// [B3] 층별 이벤트 쌍 [fork, join] — 캡처 중 재기록 회피(층당 고유).
     ev_fork: Vec<ffi::CUevent>,
+    /// [B7 2026-10-12] shared 게이트/업 전용 슬롯 — dchain 재사용은 스트리밍
+    /// 전문가 스크래치와 충돌(게이트/업이 전문가보다 먼저 계산됨).
+    dsh: [CUdeviceptr; 2],
+    dsh_cap: usize,
+    /// [B4-2 2026-10-12] 스트리밍 전문가 LRU 캐시(층별 K×3proj q/s).
+    /// 가중치 불변 → hit 재사용은 수치 무변화(h2d 생략만). 층별 독립 LRU.
+    mcache_q: CUdeviceptr,
+    mcache_s: CUdeviceptr,
+    mcache_k: usize,
+    mcache_ids: Vec<u16>,
+    mcache_age: Vec<u32>,
+    mcache_tick: u32,
+    mcache_hits: u64,
+    mcache_miss: u64,
     /// GEMV 스테이징 — x f16 [t][k], y f32 [t][n].
     xh: Buf,
     dy: Buf,
@@ -511,6 +525,16 @@ impl W4a16Dec {
             moe_wt: 0,
             dsg: 0,
             ev_fork: Vec::new(),
+            dsh: [0, 0],
+            dsh_cap: 0,
+            mcache_q: 0,
+            mcache_s: 0,
+            mcache_k: 0,
+            mcache_ids: Vec::new(),
+            mcache_age: Vec::new(),
+            mcache_tick: 0,
+            mcache_hits: 0,
+            mcache_miss: 0,
             moe_multi_tab: 0,
             moe_multi_rows: Vec::new(),
             moe_multi_rows_t3: Vec::new(),
