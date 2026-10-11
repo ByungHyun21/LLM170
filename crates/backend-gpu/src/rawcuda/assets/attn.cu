@@ -725,6 +725,7 @@ extern "C" __global__ void attn_fwd3s_part_qg(
         // vv는 행별 종전 산식 그대로). ncu: L1 75.6%·SM 75.2% 동시 병목 —
         // sarr 스칼라 LDS(gq×256/청크)를 ÷4. 값 비트동일(합산 순서 불변).
         int i = 0;
+#pragma unroll 4
         for (; i + 3 < nch; i += 4) {
             const int r0 = base + i;
             const float v0 =
