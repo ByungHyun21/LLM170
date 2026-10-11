@@ -57,6 +57,9 @@ cargo run --release -- w4a16-ref <w4a16_dir> --prompt-tokens 148678,65233,202419
 # HTTP server (OpenAI/Anthropic-compatible; CUDA chain)
 cargo run --release -- serve --model <w4a16_dir> --port 8080 --slots 4   # --slots N: continuous batching (default 1)
 
+# llama-bench 규격 측정(엔진 직접 — 합성 LCG 토큰)
+cargo run --release -- bench --model <w4a16_dir> --pp 512,1024,2048 --tg 128 --np 4 --reps 2
+
 # GPU chain run (probe) / CPU oracle
 cargo run --release -- w4a16-gpu <w4a16_dir> --prompt-tokens 148678,65233,202419 --n-predict 8
 cargo run --release -- w4a16-ref <w4a16_dir> --prompt-tokens 148678,65233,202419 --n-predict 8

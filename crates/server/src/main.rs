@@ -2,6 +2,7 @@
 //!
 //! - infer: qwen35 CPU 참조 추론 (greedy). 토큰 id 입력 — 토크나이저는 후속 단계.
 
+mod bench;
 mod engine;
 mod gpu_engine;
 mod http;
@@ -25,6 +26,9 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
   llm170 infer --model <w4a16_dir> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
               [--n-predict N] [--ctx N]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
+  llm170 bench --model <w4a16_dir> [--pp N[,N..]] [--tg N[,N..]] [--np N[,N..]]
+              [--reps N] [--ctx N]
+      llama-bench 규격 PP/TG/NP 측정(엔진 직접 — HTTP 무경유, 합성 LCG 토큰).
   llm170 serve --model <w4a16_dir> [--port N] [--ctx N] [--slots N] [--queue N]
       OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯.
   llm170 w4a16-load <dir>
@@ -209,6 +213,7 @@ fn run_main() -> ExitCode {
         return code;
     }
     match args.first().map(String::as_str) {
+        Some("bench") => bench::cmd_bench(&ma.rest, &ma),
         Some("infer") => infer::cmd_infer(&ma.rest, &ma),
         Some("serve") => cmd_serve(&ma.rest, &ma),
         Some("tokenize") => cmd_tokenize(&ma),
