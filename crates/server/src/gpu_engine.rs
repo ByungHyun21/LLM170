@@ -264,6 +264,12 @@ impl GpuEngine {
         Ok(out)
     }
 
+    /// [S13 2026-10-11] GPU 커널 범주 프로파일(LLM170_TIME=1 이벤트 계측) —
+    /// serve 스텝 분해(srv_time 요약에 연동). off면 빈 문자열.
+    pub fn prof_report(&mut self, label: &str) -> Result<String, String> {
+        self.dec.prof_report(label)
+    }
+
     /// 슬롯 상태 리셋(GDN 링/스캔 + pp + pos).
     pub fn reset_seq(&mut self, seq: usize) -> Result<(), String> {
         self.dec.reset_state(seq)

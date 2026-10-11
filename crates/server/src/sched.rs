@@ -333,7 +333,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     let mut slots: Vec<Slot> = (0..n_slots).map(|_| Slot::free()).collect();
     let mut tick: u64 = 0;
     let (mut n_dec, mut n_pf) = (0u64, 0u64);
-    let (mut ms_dec, mut ms_pf) = (0f64, 0f64);
+    let (mut ms_dec, mut ms_pf, mut ms_fin) = (0f64, 0f64, 0f64);
     let npw = llm170_diag::dump::opts().key("wall_time");
     let t0w = std::time::Instant::now();
     let mut last_wt = std::time::Instant::now();
@@ -389,9 +389,11 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             q35_decode(&mut eng.0, &mut slots, &active);
             dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
             // 완료 슬롯 정리 — 결과 전송·반환
+            let _ft = std::time::Instant::now();
             for &i in &active {
                 finish_slot(&mut slots[i], &mut eng, i, eos);
             }
+            ms_fin += _ft.elapsed().as_secs_f64() * 1e3;
         }
 
         // ③ 프리필 1청크 — 디코드가 없었던 회차이거나, 아직 프리필이 남은 대기 슬롯이
@@ -499,13 +501,20 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             SCHED.ms_decode.fetch_add(dec_ms as u64, Ordering::Relaxed);
             if llm170_diag::dump::opts().key("srv_time") && n_dec % 32 == 0 {
                 eprintln!(
-                    "[srv] steps={} decode avg {:.1}ms | prefill {}x avg {:.1}ms | {}",
+                    "[srv] steps={} decode avg {:.1}ms (결과 처리 {:.2}ms) | prefill {}x avg {:.1}ms | {}",
                     n_dec,
                     ms_dec / n_dec as f64,
+                    ms_fin / n_dec as f64,
                     n_pf,
                     if n_pf > 0 { ms_pf / n_pf as f64 } else { 0.0 },
                     SCHED.summary()
                 );
+                // [S13] GPU 범주 분해(LLM170_TIME=1 시 — 캡처 밖 발사만 집계).
+                if let Ok(p) = eng.0.prof_report("serve")
+                    && !p.is_empty()
+                {
+                    eprintln!("{p}");
+                }
             }
         }
         // 유휴 시 차단 수신 — 종료(송신자 전 소멸) 시 루프 탈출.

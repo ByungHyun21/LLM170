@@ -8,9 +8,11 @@ use crate::rawcuda::ffi::{self, CUDA_SUCCESS, CUdeviceptr, CUfunction, CUstream}
 use std::collections::HashMap;
 
 /// 진단 타이머 범주(P8) — 커널 심볼명 분류.
-pub const PROF_CATS: [&str; 13] = [
+/// [S13 2026-10-11] "grp" 추가 — MoE 그룹 GEMM(gemm_g32_mma_grp/grp2)을
+/// dense gemm과 분리(S5 전제: 35B 프리필의 MoE 비중 판독).
+pub const PROF_CATS: [&str; 14] = [
     "misc", "norm", "gemv", "gemm", "gdn", "attn", "ew", "head", "moe", "scan", "l2perm", "conv",
-    "gate",
+    "gate", "grp",
 ];
 
 /// [진단] 호스트 발사 누적 — (ns, calls). launch가 갱신, 보고가 판독.
@@ -27,6 +29,8 @@ pub fn prof_cat(name: &str) -> usize {
         11
     } else if name.contains("gate") {
         12
+    } else if name.contains("grp") {
+        13 // [S13] MoE 그룹 GEMM — gemm 검사보다 먼저
     } else if name.contains("moe") {
         8
     } else if name.contains("norm") {
