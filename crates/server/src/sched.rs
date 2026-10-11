@@ -15,6 +15,10 @@ const PF_BUDGET_TOKENS: usize = 1024;
 const PF_CHUNK_MAX: usize = 512;
 /// 청크 최소.
 const PF_CHUNK_MIN: usize = 64;
+/// [§2 2026-10-11] 혼합 정책 — 타 슬롯이 디코드 중이면 프리필 청크를 이 값으로
+/// 캡. 512청크는 27B에서 ~443ms 동안 타 슬롯 디코드를 정지(실측). 단독
+/// 프리필(벤치마크·첫 요청)은 종전 최대 청크 유지 — 토큰 산술 불변.
+const PF_CHUNK_MIXED: usize = 128;
 /// 이 길이 초과 프롬프트는 경합 시 절반 청크(라운드로빈 최대 대기 ↓).
 const PF_LONG_PROMPT: usize = 2048;
 
@@ -374,6 +378,14 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     .clamp(PF_CHUNK_MIN, PF_CHUNK_MAX);
                 if backlog > 1 && left > PF_LONG_PROMPT {
                     chunk = chunk.min(PF_CHUNK_MAX / 2);
+                }
+                // [§2] 혼합 — 타 슬롯이 이미 디코드 중(프리필 완료+잔존)이면
+                // 청크 캡으로 디코드 정지 시간을 유계화(프리필 총량은 동일).
+                let others_decoding = slots.iter().enumerate().any(|(j, s)| {
+                    j != i && s.job.is_some() && s.prefilled == s.job.as_ref().unwrap().tokens.len()
+                });
+                if others_decoding {
+                    chunk = chunk.min(PF_CHUNK_MIXED);
                 }
                 let chunk = chunk.min(left);
                 // Q4(FN)는 prefill_greedy — 청크마다 어휘 152k
