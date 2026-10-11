@@ -230,6 +230,18 @@ impl GpuEngine {
     pub fn spec_verify(&mut self, slot: usize, rows: &[f32], t: usize) -> Result<Vec<u32>, String> {
         self.dec.spec_verify(slot, rows, t)
     }
+    /// [§7 2단계] 검증 체인 로짓([t][vocab]) — 비greedy 거절샘플링용.
+    pub fn spec_verify_logits(
+        &mut self,
+        slot: usize,
+        rows: &[f32],
+        t: usize,
+    ) -> Result<Vec<f32>, String> {
+        self.dec.spec_verify_logits(slot, rows, t)
+    }
+    pub fn vocab(&self) -> usize {
+        self.model.hp.vocab
+    }
     pub fn spec_rollback(&mut self, slot: usize, keep: usize) -> Result<(), String> {
         self.dec.spec_rollback(slot, keep)
     }

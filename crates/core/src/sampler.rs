@@ -113,15 +113,9 @@ impl Sampler {
         }
     }
 
-    pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
-        if self.is_greedy() {
-            return crate::matmul::greedy_from(logits);
-        }
-        // [§5.1 2026-10-11] in-place — 종전 logits.to_vec()(어휘 993KB/토큰
-        // 복사) 제거. 호출부가 소유 버퍼를 넘기고 여기서 직접 수정한다.
-        // ① repeat penalty — 히스토리 토큰에 양수 나눗셈/음수 곱셈.
-        // QA-29: 유니크 토큰당 1회 — llama.cpp는 token_count 맵으로 1회만
-        // 적용(빈도는 freq/presence 전용). 종전엔 중복 m회 → p^m 과잉 억제.
+    /// [§7 2단계 2026-10-11] repeat penalty 전처리 — sample()에서 분리해
+    /// 거절샘플링(prob_of·잔차)과 공유. 산식·순서 불변(sample()이 호출).
+    pub fn apply_penalties(&self, logits: &mut [f32]) {
         if self.params.repeat_penalty != 1.0 && !self.recent.is_empty() {
             let p = self.params.repeat_penalty;
             let mut uniq: Vec<u32> = Vec::with_capacity(self.recent.len());
@@ -140,6 +134,47 @@ impl Sampler {
                 }
             }
         }
+    }
+
+    /// [§7 2단계] repeat penalty 전처리(추가 히스토리 포함) — 거절샘플링의
+    /// 위치별 수용 판정에서 수용된 초안 토큰을 히스토리에 가산해 적용.
+    pub fn apply_penalties_ext(&self, logits: &mut [f32], extra: &[u32]) {
+        if self.params.repeat_penalty == 1.0 || (self.recent.is_empty() && extra.is_empty()) {
+            return;
+        }
+        let p = self.params.repeat_penalty;
+        let mut uniq: Vec<u32> = Vec::with_capacity(self.recent.len() + extra.len());
+        for &t in self.recent.iter().chain(extra.iter()) {
+            if !uniq.contains(&t) {
+                uniq.push(t);
+            }
+        }
+        for t in uniq {
+            if let Some(v) = logits.get_mut(t as usize) {
+                if *v > 0.0 {
+                    *v /= p;
+                } else {
+                    *v *= p;
+                }
+            }
+        }
+    }
+
+    /// [§7 2단계] 수용 coin — 균등 [0,1). 시드 스트림 결정적(sample과 동일 RNG).
+    pub fn next_coin(&mut self) -> f64 {
+        self.rng.next_f64()
+    }
+
+    pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
+        if self.is_greedy() {
+            return crate::matmul::greedy_from(logits);
+        }
+        // [§5.1 2026-10-11] in-place — 종전 logits.to_vec()(어휘 993KB/토큰
+        // 복사) 제거. 호출부가 소유 버퍼를 넘기고 여기서 직접 수정한다.
+        // ① repeat penalty — 히스토리 토큰에 양수 나눗셈/음수 곱셈.
+        // QA-29: 유니크 토큰당 1회 — llama.cpp는 token_count 맵으로 1회만
+        // 적용(빈도는 freq/presence 전용). 종전엔 중복 m회 → p^m 과잉 억제.
+        self.apply_penalties(logits);
         // QA-30 보강: temp<=0은 페널티 적용 **후** 결정적 argmax(llama.cpp
         // 준수) — 종전엔 페널티 활성 시 temp 0도 softmax 난수 추출이었다.
         if self.params.temperature <= 0.0 {

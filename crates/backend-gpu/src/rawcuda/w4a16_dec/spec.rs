@@ -27,6 +27,26 @@ impl W4a16Dec {
         Ok(v.into_iter().map(|x| x as u32).collect())
     }
 
+    /// [§7 2단계 2026-10-11] 검증 체인 + [t][vocab] 로짓 회수 — 비greedy
+    /// 거절샘플링용(eval logits 경로 재사용). 상태·pos는 전진(호출부 롤백).
+    pub fn spec_verify_logits(
+        &mut self,
+        slot: usize,
+        rows: &[f32],
+        t: usize,
+    ) -> Result<Vec<f32>, String> {
+        if self.head_w == 0 {
+            return Err("spec_verify_logits: head 미등록".into());
+        }
+        if !self.spec_on {
+            return Err("spec_verify_logits: enable_spec 미호출".into());
+        }
+        if !(2..=8).contains(&t) {
+            return Err(format!("spec_verify_logits: t={t} 계약(2..=8)"));
+        }
+        self.chain_t(slot, rows, t, false, true, true)
+    }
+
     /// [A-1] 롤백 — 배치 `keep`개 토큰 처리 시점(스냅샷[keep-1])으로 슬롯
     /// GDN 상태·conv 링 복원. pos 되감기는 spec_rewind_pos 소관.
     /// [결함수정 2026-10-11] 루프를 **GDN 층(n_gdn) 한정** — 종전 n_layers

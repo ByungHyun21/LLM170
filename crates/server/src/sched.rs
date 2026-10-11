@@ -173,6 +173,16 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
             Err(err) => slot_fail(&mut slots[i], format!("decode_greedy: {err}")),
         }
     }
+    // [§7 2단계] 샘플드 스펙 — 초안 발화 슬롯은 검증 라운드(직렬), 나머지 배치.
+    let mut s2: Vec<usize> = Vec::with_capacity(sampled.len());
+    for &i in &sampled {
+        match spec_round_sampled(i, &mut slots[i], e) {
+            Ok(true) => {}
+            Ok(false) => s2.push(i),
+            Err(err) => slot_fail(&mut slots[i], format!("spec(샘플): {err}")),
+        }
+    }
+    let sampled = s2;
     if !sampled.is_empty() {
         let toks: Vec<u32> = sampled.iter().map(|&i| slots[i].next).collect();
         match e.decode(&sampled, &toks) {
@@ -641,6 +651,100 @@ fn spec_round(
     let corr = e.decode_greedy(i, last)?;
     for &tk in &draft[..acc] {
         slot_emit(s, tk);
+    }
+    slot_emit(s, corr);
+    SCHED.spec_rounds.fetch_add(1, Ordering::Relaxed);
+    SCHED.spec_accepted.fetch_add(acc as u64, Ordering::Relaxed);
+    Ok(true)
+}
+
+/// [§7 2단계 2026-10-11] 비greedy 스펙 라운드 — target-only 거절샘플링.
+/// 수용: coin < p(x_k)(prob_of — 후처리 체인 미러, 수용 초안 가산 페널티).
+/// 보정: t=1 재계산 로짓의 표본 — 거절 시 잔차(≠x 재추출 = 조건분포 정확).
+/// 방출 분포 = 표적 분포(기대 수용 = E[p]). 그리디 라운드와 롤백 구조 동일.
+fn spec_round_sampled(
+    i: usize,
+    s: &mut Slot,
+    e: &mut crate::gpu_engine::GpuEngine,
+) -> Result<bool, String> {
+    if s.sampler.is_none() || (s.spec_miss >= 1 && (s.generated & 255) != 0) {
+        return Ok(false);
+    }
+    let mut hist: Vec<u32> = Vec::new();
+    if let Some(j) = &s.job {
+        hist.extend_from_slice(&j.tokens);
+    }
+    hist.extend_from_slice(&s.tokens);
+    let draft = llm170_core::spec::ngram_draft(&hist, 4, 48, s.spec_k - 1);
+    if draft.is_empty() {
+        return Ok(false);
+    }
+    let t = 1 + draft.len();
+    let mut rows: Vec<f32> = Vec::with_capacity(t * e.n_embd());
+    rows.extend_from_slice(&e.embed_row(s.next)?);
+    for &tk in &draft {
+        rows.extend_from_slice(&e.embed_row(tk)?);
+    }
+    e.spec_save_state(i)?;
+    let lg = e.spec_verify_logits(i, &rows, t)?;
+    let vocab = e.vocab();
+    if lg.len() != t * vocab {
+        return Err(format!(
+            "spec(샘플) 로짓 크기 {} != {}",
+            lg.len(),
+            t * vocab
+        ));
+    }
+    let mut acc = 0usize;
+    for k in 0..draft.len() {
+        let mut lk = lg[k * vocab..(k + 1) * vocab].to_vec();
+        let sm = s.sampler.as_mut().unwrap();
+        sm.apply_penalties_ext(&mut lk, &draft[..k]);
+        let px = sm.prob_of(&lk, draft[k]);
+        let coin = sm.next_coin();
+        if coin < px {
+            acc += 1;
+        } else {
+            break;
+        }
+    }
+    let last = if acc >= 1 { draft[acc - 1] } else { s.next };
+    if acc >= 1 {
+        e.spec_rollback(i, acc)?;
+        e.spec_rewind_pos(i, (t - acc) as u32)?;
+    } else {
+        e.spec_load_state(i)?;
+        e.spec_rewind_pos(i, t as u32)?;
+    }
+    if acc == 0 {
+        s.spec_miss = (s.spec_miss + 1).min(3);
+    } else {
+        s.spec_miss = 0;
+    }
+    if acc == draft.len() {
+        s.spec_k = (s.spec_k + 1).min(8);
+    } else if acc <= 1 {
+        s.spec_k = 4;
+    }
+    for &tk in &draft[..acc] {
+        slot_emit(s, tk);
+    }
+    let lg1 = e.decode(&[i], &[last])?.pop().unwrap_or_default();
+    if lg1.len() != vocab {
+        return Err(format!("spec(샘플) 보정 로짓 {} != {vocab}", lg1.len()));
+    }
+    let mut corr = {
+        let mut l = lg1.clone();
+        s.sampler.as_mut().unwrap().sample(&mut l)
+    };
+    if acc < draft.len() {
+        let x = draft[acc];
+        let mut guard = 0;
+        while corr == x && guard < 64 {
+            let mut l = lg1.clone();
+            corr = s.sampler.as_mut().unwrap().sample(&mut l);
+            guard += 1;
+        }
     }
     slot_emit(s, corr);
     SCHED.spec_rounds.fetch_add(1, Ordering::Relaxed);
