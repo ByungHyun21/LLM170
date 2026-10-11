@@ -91,7 +91,14 @@ __device__ __forceinline__ double attn_exp_d(double x)
 
 __device__ __forceinline__ float attn_expf(float x)
 {
-    return (float)attn_exp_d((double)x);
+    // [FLA-8 동형 채택 2026-10-11] f64 폴리 → __expf(2ulp). GDN 트랜센던털
+    // 채택(FLA-8)과 동일 클래스 — eval 판정: 27B chunk4 en PPL +0.0226%·
+    // agree 100.000% / ko +0.0097%·99.808% (FLA-8 밴드 내). 프리필 이득:
+    // pp4096 +3.1%·pp16384 +4.5% (27B) · 35B pp4096 +1.8%·np4 +0.9%.
+    // 골든: 프로브/spec n=8·장문 600/4000·서브 전부 유지(smoke 10/10) —
+    // 재동결 불요(짧은 스트림 안정). rope theta/sincos의 f64(attn_exp_d)는
+    // 불변.
+    return __expf(x);
 }
 
 // rope theta = powf(1e7, −2·tid/64)(원본 L630/664)의 f64 재구성:
