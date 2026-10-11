@@ -80,6 +80,9 @@ impl W4a16Dec {
         } else {
             LinPath::Gemm
         };
+        // [S2 2026-10-11] t≤8(GemvT)은 다중세그먼트 융합 경로(스펙 검증·
+        // 소형 청크) — t≥9(Gemm)는 종전 단독 런치 유지.
+        let fuse = matches!(lp, LinPath::GemvT);
         for il in 0..self.n_layers {
             let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };
             let xn = self
@@ -89,22 +92,28 @@ impl W4a16Dec {
             let branch = if (il + 1) % interval == 0 {
                 // [R10] 4변형 → lin_forward 단일 디스패치(Gemm 경로).
                 let xin = if plain { xn } else { xh };
-                self.lin_forward(plain, lp, &format!("blk.{il}.attn_q.weight"), xin, s0, t)?;
-                self.lin_forward(plain, lp, &format!("blk.{il}.attn_k.weight"), xin, s1, t)?;
-                self.lin_forward(plain, lp, &format!("blk.{il}.attn_v.weight"), xin, s1b, t)?;
+                if fuse {
+                    // [S2] q/k/v 3런치 → 다중세그먼트 1런치.
+                    self.gemv_multi_t_dev(plain, il, 0, xin, t)
+                        .map_err(|e| format!("T{il} qkv: {e}"))?;
+                } else {
+                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_q.weight"), xin, s0, t)?;
+                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_k.weight"), xin, s1, t)?;
+                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_v.weight"), xin, s1b, t)?;
+                }
                 self.attn_chain_dev_run(slot, il / interval, t, s0, s1, s1b)
                     .map_err(|e| format!("T{il} attn: {e}"))?
             } else {
-                if plain {
-                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_qkv.weight"), xn, s0, t)?;
-                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_gate.weight"), xn, s1, t)?;
+                // [P6] xh(=dx32)는 norm_resid_dev가 h2f(f2h(xn)) 융합 기록 —
+                // cast 재계산 없음(값 불변·골든 검증). [S2] qkv/z도 같은 x.
+                let xin = if plain { xn } else { xh };
+                if fuse {
+                    // [S2] qkv/z 2런치 → 1런치.
+                    self.gemv_multi_t_dev(plain, il, 0, xin, t)
+                        .map_err(|e| format!("T{il} qkvz: {e}"))?;
                 } else {
-                    // [2026-10-09 P6] xh(=self.dx32.ptr)는 norm_resid_dev가 이미
-                    // h2f(f2h(xn)) 융합 기록(norm.cu xn32 — cast_x32와 비트 동일
-                    // 계약, 실측 근거 주석 포함). 종전 cast_x32 재계산은 중복
-                    // 런치였다. 값 불변(골든 검증).
-                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_qkv.weight"), xh, s0, t)?;
-                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_gate.weight"), xh, s1, t)?;
+                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_qkv.weight"), xin, s0, t)?;
+                    self.lin_forward(plain, lp, &format!("blk.{il}.attn_gate.weight"), xin, s1, t)?;
                 }
                 let g = self
                     .gdn_chain_dev_run(slot, gi, t, xn, s0, s1)
@@ -142,8 +151,14 @@ impl W4a16Dec {
             } else {
                 let xh3 = xh; // 노름 융합 기록
                 let _ = xn2;
-                self.lin_forward(false, lp, &format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
-                self.lin_forward(false, lp, &format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
+                if fuse {
+                    // [S2 2026-10-11] gate/up 2런치 → 다중세그먼트 1런치.
+                    self.gemv_multi_t_dev(false, il, 1, xh3, t)
+                        .map_err(|e| format!("T{il} gateup: {e}"))?;
+                } else {
+                    self.lin_forward(false, lp, &format!("blk.{il}.ffn_gate.weight"), xh3, s0, t)?;
+                    self.lin_forward(false, lp, &format!("blk.{il}.ffn_up.weight"), xh3, s1, t)?;
+                }
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
                 // [4.1 2026-10-11] ew 융합 — cast_x32 노드 제거.
