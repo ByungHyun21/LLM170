@@ -501,15 +501,30 @@ extern "C" __global__ void attn_fwd3s_merge(
     int h = blockIdx.y;
     int tid = threadIdx.x;
     const float* pb = part + ((long)t * q_heads + h) * splits * 258;
+    // [§8.2 2026-10-11] 분할 가중 exp를 스레드 0..S-1이 1회만 계산해 smem
+    // 공유 — 종전엔 256스레드 전부가 분할마다 exp(f64 미러)를 중복 계산
+    // (블록당 S×256회 → S회). 값·누산 순서(오름차순) 완전 동일 — 비트동일.
     __shared__ float ms[ATTN_SPLITS_MAX];
+    __shared__ float ws[ATTN_SPLITS_MAX];
+    __shared__ float mred[1];
     if (tid < splits) {
         ms[tid] = pb[tid * 258];
     }
     __syncthreads();
-    float m = -1e30f;
-    for (int s = 0; s < splits; s++) {
-        m = fmaxf(m, ms[s]);
+    if (tid == 0) {
+        float m0 = -1e30f;
+        for (int s = 0; s < splits; s++) {
+            m0 = fmaxf(m0, ms[s]);
+        }
+        mred[0] = m0;
     }
+    __syncthreads();
+    const float m = mred[0];
+    if (tid < splits) {
+        const float* ps = pb + tid * 258;
+        ws[tid] = (ps[1] <= 0.0f) ? 0.0f : attn_expf(ps[0] - m);
+    }
+    __syncthreads();
     float l = 0.0f;
     float acc = 0.0f;
     for (int s = 0; s < splits; s++) {
@@ -517,9 +532,8 @@ extern "C" __global__ void attn_fwd3s_merge(
         if (ps[1] <= 0.0f) {
             continue; // 빈 분할(0 기여 — 결정적)
         }
-        float w = attn_expf(ps[0] - m);
-        l += ps[1] * w;
-        acc += ps[2 + tid] * w;
+        l += ps[1] * ws[s];
+        acc += ps[2 + tid] * ws[s];
     }
     float g = qg[(long)t * (q_heads * 512) + (long)h * 512 + 256 + tid];
     float ov = (acc / l) * (1.0f / (1.0f + attn_expf(-g)));
