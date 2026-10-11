@@ -51,8 +51,10 @@ struct Slot {
     err_count: u32,
     /// QA-1: 연속 실패 상한(3) 도달 시 확정 실패 사유.
     failed: Option<String>,
-    /// [§7.5] 스펙 적응 게이트 — 연속 무수용 라운드 수(2 도달 시 128토큰마다 재시도).
+    /// [§7.5] 스펙 적응 게이트 — 연속 무수용 라운드 수(1 도달 시 256토큰마다 재시도).
     spec_miss: u32,
+    /// [§7.5] 적응 초안 폭 — 전량 수용이면 확대(≤8=TR 도메인), 부진하면 4로 복귀.
+    spec_k: usize,
 }
 
 impl Slot {
@@ -70,6 +72,7 @@ impl Slot {
             err_count: 0,
             failed: None,
             spec_miss: 0,
+            spec_k: SPEC_K,
         }
     }
 }
@@ -562,6 +565,7 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         err_count: 0,
         failed: None,
         spec_miss: 0,
+        spec_k: SPEC_K,
     };
 }
 /// [§7.1 2026-10-11] 스펙 라운드 — n-gram 초안(4-gram·최대 SPEC_K-1) 발화 시
@@ -586,7 +590,9 @@ fn spec_round(
         hist.extend_from_slice(&j.tokens);
     }
     hist.extend_from_slice(&s.tokens);
-    let draft = llm170_core::spec::ngram_draft(&hist, 4, 48, SPEC_K - 1);
+    // [§7.5] 적응 폭 — 전량 수용이면 +1(≤8 — 검증 t≤8이 TR GEMV 도메인),
+    // 부진(≤1)이면 4로 복귀. 초안 폭은 수용 판정만 좌우(값 불변).
+    let draft = llm170_core::spec::ngram_draft(&hist, 4, 48, s.spec_k - 1);
     if draft.is_empty() {
         return Ok(false);
     }
@@ -614,6 +620,11 @@ fn spec_round(
         s.spec_miss = (s.spec_miss + 1).min(3);
     } else {
         s.spec_miss = 0;
+    }
+    if acc == draft.len() {
+        s.spec_k = (s.spec_k + 1).min(8);
+    } else if acc <= 1 {
+        s.spec_k = 4;
     }
     let corr = e.decode_greedy(i, last)?;
     for &tk in &draft[..acc] {
