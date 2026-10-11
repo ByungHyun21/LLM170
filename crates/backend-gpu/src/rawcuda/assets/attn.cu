@@ -628,6 +628,12 @@ extern "C" __global__ void attn_fwd3s_part_qg(
     }
     for (int base = lo; base < hi; base += ATTN_CHUNK) {
         const int nch = min(ATTN_CHUNK, hi - base);
+        // [R2 실측 기각 2026-10-11] 스코어 q-smem 재판독 절감 설계(레인=행2개
+        // 공유) 2변형: ①전 스레드 p2 계산(작업 2배 잔존) = pp16K −14.5%
+        // ②상반부 전담(128스레드×2행·작업 정확) = −1.1%, ncu로 **모델 반증**:
+        // short_sb 불변(1.08 vs 1.09)·barrier ×3(3.13 vs 1.07)·L1 42 vs 51%
+        // — q smem 트래픽은 지배 제약 아님(유휴 스레드 배리어 불균형이 손실).
+        // 스코어/AV 축은 국소 최적 — 잔여는 전면 재작성(워프 협조/mma)뿐.
         // 스코어 — 행당 1스레드, K 행(uint4)을 gq개 헤드 dot이 공유.
         if (tid < nch) {
             const int row = base + tid;
