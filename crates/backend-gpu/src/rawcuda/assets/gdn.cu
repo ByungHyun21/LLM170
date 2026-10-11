@@ -668,6 +668,12 @@ extern "C" __global__ void gdn_scan(
 // 지점(KS/QS 8패스 half 누적)은 계약 완화로 f32 단일 누적으로 단순화.
 #define GDN1_SPLIT 8
 
+// [S4 실측 기각 2026-10-11] t=1 trio(본 3커널)를 gdn_spec_scan 1런치
+// (t_len=1·snap=null)로 융합 시도 — 실측 역행: 27B tg 50.46→49.03 tok/s
+// (−2.8%)·np4 109.0→102.9(−5.6%). 원인: 융합 커널은 블록 h_v개·i축 128직렬
+// (spec_scan 구조 — t≤8 배치 전용 설계)이라 trio의 8분할 병렬도
+// (part/upd grid h_v×8)를 잃는다. 런치 −2/층 이득을 병렬도 손실이 초과.
+// trio 유지(spec_scan은 t≥2 배치·스펙 전용 — 역할 불변).
 extern "C" __global__ void gdn1_part(
     const float* __restrict__ q, const float* __restrict__ k,
     const float* __restrict__ st, float* __restrict__ part,
