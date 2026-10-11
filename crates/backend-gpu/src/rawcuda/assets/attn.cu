@@ -721,7 +721,36 @@ extern "C" __global__ void attn_fwd3s_part_qg(
                 acc[h] *= corr[h];
             }
         }
-        for (int i = 0; i < nch; i++) {
+        // [§8.2 2026-10-11] AV sarr LDS.128 배칭 — 4행 묶음(행 오름차순 유지,
+        // vv는 행별 종전 산식 그대로). ncu: L1 75.6%·SM 75.2% 동시 병목 —
+        // sarr 스칼라 LDS(gq×256/청크)를 ÷4. 값 비트동일(합산 순서 불변).
+        int i = 0;
+        for (; i + 3 < nch; i += 4) {
+            const int r0 = base + i;
+            const float v0 =
+                (float)vc[((long)layer * cap + r0) * kv_dim + (long)kh * 256 + tid] *
+                vsc[((long)layer * cap + r0) * kv_heads + kh];
+            const float v1 =
+                (float)vc[((long)layer * cap + r0 + 1) * kv_dim + (long)kh * 256 + tid] *
+                vsc[((long)layer * cap + r0 + 1) * kv_heads + kh];
+            const float v2 =
+                (float)vc[((long)layer * cap + r0 + 2) * kv_dim + (long)kh * 256 + tid] *
+                vsc[((long)layer * cap + r0 + 2) * kv_heads + kh];
+            const float v3 =
+                (float)vc[((long)layer * cap + r0 + 3) * kv_dim + (long)kh * 256 + tid] *
+                vsc[((long)layer * cap + r0 + 3) * kv_heads + kh];
+#pragma unroll
+            for (int h = 0; h < ATTN_GQ_MAX; ++h) {
+                if (h < gq) {
+                    const float4 s4 = *reinterpret_cast<const float4*>(&sarr[h][i]);
+                    acc[h] += s4.x * v0;
+                    acc[h] += s4.y * v1;
+                    acc[h] += s4.z * v2;
+                    acc[h] += s4.w * v3;
+                }
+            }
+        }
+        for (; i < nch; i++) {
             const int row = base + i;
             const float vv = (float)vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid] *
                              vsc[((long)layer * cap + row) * kv_heads + kh];
