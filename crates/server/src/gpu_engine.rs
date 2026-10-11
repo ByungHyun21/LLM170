@@ -47,6 +47,20 @@ impl GpuEngine {
             dec.upload_head(w.data, w.n_out as usize, w.n_in as usize)?;
             head_gpu = true;
         }
+        // [S3-1 2026-10-11] token_embd 상주 — 프리필 행 조립을 GPU gather로.
+        if let Some(w) = model.w("token_embd.weight")
+            && matches!(
+                w.ty,
+                llm170_core::wtype::WType::F16 | llm170_core::wtype::WType::Bf16
+            )
+        {
+            dec.upload_embed(
+                w.data,
+                w.n_out as usize,
+                w.n_in as usize,
+                w.ty == llm170_core::wtype::WType::Bf16,
+            )?;
+        }
         Ok(GpuEngine {
             model,
             dec,
@@ -148,18 +162,43 @@ impl GpuEngine {
         let mut i = 0usize;
         while i < n {
             let t = (n - i).min(tmax);
-            let mut rows = Vec::with_capacity(t * h);
-            for &tok in &tokens[i..i + t] {
-                rows.extend_from_slice(&self.model.embed_row(tok).map_err(|e| e.to_string())?);
-            }
             let is_last = i + t == n;
-            if is_last && self.head_gpu {
-                last = Some(self.dec.forward_prefill(seq, &rows, t, true)?);
-            } else if is_last {
-                let xn = self.dec.forward_prefill(seq, &rows, t, false)?;
-                last = Some(self.head_logits(&xn)?);
+            let part = &tokens[i..i + t];
+            if t == 1 {
+                let row = self.model.embed_row(part[0]).map_err(|e| e.to_string())?;
+                if is_last && self.head_gpu {
+                    last = Some(self.dec.forward_prefill(seq, &row, 1, true)?);
+                } else if is_last {
+                    let xn = self.dec.forward_prefill(seq, &row, 1, false)?;
+                    last = Some(self.head_logits(&xn)?);
+                } else {
+                    self.dec.forward_prefill(seq, &row, 1, false)?;
+                }
+            } else if self.dec.embed_ready() {
+                // [S3-1 2026-10-11] 임베딩 GPU gather — 행 조립(mmap 디코드+
+                // 할당+h2d t×h×4B)을 id h2d(4B/행)+gather로 대체. 값 동일
+                // (h2f/b2f = decode_f32 동일 함수 — 골든 계약).
+                if is_last && self.head_gpu {
+                    last = Some(self.dec.forward_prefill_toks(seq, part, t, true)?);
+                } else if is_last {
+                    let xn = self.dec.forward_prefill_toks(seq, part, t, false)?;
+                    last = Some(self.head_logits(&xn)?);
+                } else {
+                    self.dec.forward_prefill_toks(seq, part, t, false)?;
+                }
             } else {
-                self.dec.forward_prefill(seq, &rows, t, false)?;
+                let mut rows = Vec::with_capacity(t * h);
+                for &tok in part {
+                    rows.extend_from_slice(&self.model.embed_row(tok).map_err(|e| e.to_string())?);
+                }
+                if is_last && self.head_gpu {
+                    last = Some(self.dec.forward_prefill(seq, &rows, t, true)?);
+                } else if is_last {
+                    let xn = self.dec.forward_prefill(seq, &rows, t, false)?;
+                    last = Some(self.head_logits(&xn)?);
+                } else {
+                    self.dec.forward_prefill(seq, &rows, t, false)?;
+                }
             }
             i += t;
         }

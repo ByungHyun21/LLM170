@@ -211,6 +211,10 @@ impl W4a16Dec {
         self.stg_w0 = w0;
         self.stg_w1 = w1;
         self.stg_w2 = ff_up;
+        // [S3-1 2026-10-11] 토큰 id 스테이징(gather 입력) — 캡처 전 선할당 계약.
+        if self.dtg == 0 {
+            self.dtg = self.cc.alloc(tb * 4)?;
+        }
         // [S2 2026-10-11] 다중세그먼트 테이블(branch·gate/up) — dchain/스펙
         // 확정 후 1회. 캡처 전(warm_for_capture→본 함수) 작성이 계약.
         self.build_multi_tables()?;

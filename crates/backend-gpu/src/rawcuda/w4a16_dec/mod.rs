@@ -425,6 +425,13 @@ pub struct W4a16Dec {
     pin_batch_tok: *mut std::ffi::c_void,
     /// [S11 2026-10-11] 샘플 배치 로짓 핀드 판독 버퍼([t][head_n] f32).
     pin_batch_lg: *mut std::ffi::c_void,
+    /// [S3-1 2026-10-11] 임베딩 gather — token_embd 상주(f16/bf16 원본).
+    emb_dev: CUdeviceptr,
+    emb_n: usize,
+    emb_k: usize,
+    emb_bf16: bool,
+    /// 토큰 id 스테이징(디바이스, CHAIN_TMAX×4B — ensure_chain_bufs).
+    dtg: CUdeviceptr,
     pin_batch_in: *mut std::ffi::c_void,
     pin_batch_pos: *mut std::ffi::c_void,
     batch_graphs: Vec<(Vec<usize>, ffi::CUgraphExec, ffi::CUgraph)>,
@@ -582,6 +589,11 @@ impl W4a16Dec {
             batch_tmax_min: 0,
             pin_batch_tok: std::ptr::null_mut(),
             pin_batch_lg: std::ptr::null_mut(),
+            emb_dev: 0,
+            emb_n: 0,
+            emb_k: 0,
+            emb_bf16: false,
+            dtg: 0,
             pin_batch_in: std::ptr::null_mut(),
             pin_batch_pos: std::ptr::null_mut(),
             batch_graphs: Vec::new(),

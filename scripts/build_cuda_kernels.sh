@@ -26,6 +26,15 @@ build() { # name fmad_flag("" | "-fmad=false")
     local name=$1 fmad=${2:-}
     local src=$A/$name.cu out=$A/$name.fatbin
     [ -f "$src" ] || { echo "소스 없음: $src" >&2; exit 1; }
+    # [2026-10-11] 신선도 스킵(make식) — 소스·공용 헤더보다 fatbin이 새로우면
+    # 재빌드 생략. gptq4는 재빌드마다 코드젠 추첨이 리셋되므로(실측 ±4%)
+    # 불필요한 재컴파일이 고정 드로우를 덮어쓰는 사고를 막는다.
+    # 강제 재빌드: touch <name>.cu 후 실행.
+    if [ -f "$out" ] && [ "$out" -nt "$src" ] \
+        && [ "$out" -nt "$A/cast_common.cuh" ] && [ "$out" -nt "$A/g4_common.cuh" ]; then
+        echo "CUDA $name 스킵(최신 — 강제: touch $src)"
+        return
+    fi
     local tmp
     tmp=$(mktemp /tmp/opencode/${name}.XXXXXX.fatbin)
     "$NVCC" -fatbin -O3 $fmad \
@@ -41,6 +50,7 @@ build norm
 build gdn   -fmad=false
 build attn  -fmad=false
 build ew    -fmad=false
+build embed -fmad=false
 build gptq4 -fmad=false
 build moe   -fmad=false
 build head  -fmad=false

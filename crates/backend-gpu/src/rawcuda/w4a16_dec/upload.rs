@@ -493,4 +493,103 @@ impl W4a16Dec {
         self.weights_bytes += (need + n * 4) as u64;
         Ok(())
     }
+
+    /// [S3-1 2026-10-11] token_embd 상주 업로드 — 프리필 임베딩 gather 원본.
+    /// f16/bf16 원본 바이트 그대로(디코드는 커널 h2f/b2f = Rust 동일 함수 —
+    /// embed_row와 값 비트동일).
+    pub fn upload_embed(
+        &mut self,
+        data: &[u8],
+        n: usize,
+        k: usize,
+        bf16: bool,
+    ) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        let need = n * k * 2;
+        if n == 0 || k == 0 || data.len() < need {
+            return Err(format!(
+                "upload_embed: 형상 계약 위반 n={n} k={k} bytes={} < {need}",
+                data.len()
+            ));
+        }
+        if self.emb_dev != 0 {
+            self.cc.free(self.emb_dev)?;
+        }
+        self.emb_dev = 0; // G1: 부분 상태로 소비되지 않게 마지막에 재대입.
+        self.emb_n = 0;
+        self.emb_k = 0;
+        let dw = self.cc.alloc(need)?;
+        if let Err(e) = Self::h2d_chunked(&self.cc, dw, &data[..need]) {
+            let _ = self.cc.free(dw);
+            return Err(e);
+        }
+        self.emb_dev = dw;
+        self.emb_n = n;
+        self.emb_k = k;
+        self.emb_bf16 = bf16;
+        self.weights_bytes += need as u64;
+        Ok(())
+    }
+
+    /// [S3-1] 임베딩 상주 여부 — 프리필 gather 경로 진입 조건.
+    pub fn embed_ready(&self) -> bool {
+        self.emb_dev != 0 && self.emb_k == self.hidden
+    }
+
+    /// [S3-1] 프리필(t≥2) — 토큰 id 배열 직접 진입. id h2d → gather(dres) →
+    /// 체인. 값은 forward_prefill(행 경로)와 동일(골든 계약).
+    pub fn forward_prefill_toks(
+        &mut self,
+        slot: usize,
+        toks: &[u32],
+        t: usize,
+        head: bool,
+    ) -> Result<Vec<f32>, String> {
+        let _g = self.cc.guard()?;
+        if !self.embed_ready() {
+            return Err("forward_prefill_toks: 임베딩 미등록".into());
+        }
+        if !(2..=CHAIN_TMAX).contains(&t) || toks.len() != t || slot >= self.n_slots {
+            return Err(format!(
+                "forward_prefill_toks: t={t} toks={} 계약 위반",
+                toks.len()
+            ));
+        }
+        if let Some(&bad) = toks.iter().find(|&&x| x as usize >= self.emb_n) {
+            return Err(format!("forward_prefill_toks: 토큰 범위 위반 {bad}"));
+        }
+        self.ensure_chain_bufs()?;
+        // SAFETY: toks 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let tb = unsafe { std::slice::from_raw_parts(toks.as_ptr() as *const u8, t * 4) };
+        self.cc.h2d_async(self.dtg, tb)?;
+        self.embed_gather_launch(self.dtg, self.dres, t)?;
+        self.chain_t_sel(slot, None, t, head, false, false)
+    }
+
+    /// [S3-1] 임베딩 gather 런치 — toks[t] → out[t][k] f32.
+    fn embed_gather_launch(
+        &self,
+        toks: CUdeviceptr,
+        out: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let f = self.cc.function("w4a16_embed_gather")?;
+        let (mut p_e, mut p_tk, mut p_o) = (self.emb_dev, toks, out);
+        let (mut p_t, mut p_k, mut p_n, mut p_b) = (
+            t as i32,
+            self.emb_k as i32,
+            self.emb_n as i32,
+            self.emb_bf16 as i32,
+        );
+        let elems = t * self.emb_k;
+        self.cc.launch(
+            f,
+            elems.div_ceil(256) as u32,
+            1,
+            256,
+            &mut crate::rawcuda::args::l7(
+                &mut p_e, &mut p_tk, &mut p_o, &mut p_t, &mut p_k, &mut p_n, &mut p_b,
+            ),
+        )
+    }
 }

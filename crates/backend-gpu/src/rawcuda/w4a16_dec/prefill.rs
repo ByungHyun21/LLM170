@@ -34,11 +34,28 @@ impl W4a16Dec {
         all: bool,
         logits: bool,
     ) -> Result<Vec<f32>, String> {
+        self.chain_t_sel(slot, Some(rows), t, head, all, logits)
+    }
+
+    /// [S3-1 2026-10-11] 입력 선택판 — Some = 호스트 행 h2d, None = dres 기채움
+    /// (임베딩 gather 경로가 사전 기록). 나머지 계약·산술은 chain_t와 동일.
+    pub(super) fn chain_t_sel(
+        &mut self,
+        slot: usize,
+        rows: Option<&[f32]>,
+        t: usize,
+        head: bool,
+        all: bool,
+        logits: bool,
+    ) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
-        if !(2..=CHAIN_TMAX).contains(&t) || rows.len() != t * self.hidden || slot >= self.n_slots {
+        if !(2..=CHAIN_TMAX).contains(&t)
+            || rows.is_some_and(|r| r.len() != t * self.hidden)
+            || slot >= self.n_slots
+        {
             return Err(format!(
-                "chain_device_t: t={t} rows={} 계약 위반",
-                rows.len()
+                "chain_device_t: t={t} rows={:?} 계약 위반",
+                rows.map(<[f32]>::len)
             ));
         }
         let pos = self.slot_pos[slot];
@@ -54,9 +71,11 @@ impl W4a16Dec {
         self.ensure_gdn_bufs(t)?;
         self.ensure_attn_bufs(t)?;
         let dyt = self.ensure_dyt(t)?;
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
-        let rb = unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, rows.len() * 4) };
-        self.cc.h2d_async(self.dres, rb)?;
+        if let Some(r) = rows {
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+            let rb = unsafe { std::slice::from_raw_parts(r.as_ptr() as *const u8, r.len() * 4) };
+            self.cc.h2d_async(self.dres, rb)?;
+        }
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let h = self.hidden;
         let mut ab = self.dab_dev;

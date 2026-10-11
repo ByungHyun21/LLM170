@@ -140,6 +140,17 @@ pub const ASSETS: &[Asset] = &[
         boot: true,
     },
     Asset {
+        // [S3-1 2026-10-11] 임베딩 행 gather — 프리필 행 조립 대체.
+        name: "embed",
+        env: "LLM170_CUDA_EMBED_FATBIN_PATH",
+        paths: &[
+            "crates/backend-gpu/src/rawcuda/assets/embed.fatbin",
+            "src/rawcuda/assets/embed.fatbin",
+        ],
+        syms: &["w4a16_embed_gather"],
+        boot: true,
+    },
+    Asset {
         name: "smoke",
         env: "LLM170_CUDA_SMOKE_FATBIN_PATH",
         paths: &[
@@ -183,6 +194,7 @@ pub fn cu_source(name: &str) -> &'static str {
         "attn" => include_str!("assets/attn.cu"),
         "head" => include_str!("assets/head.cu"),
         "ew" => include_str!("assets/ew.cu"),
+        "embed" => include_str!("assets/embed.cu"),
         "smoke" => include_str!("assets/smoke.cu"),
         _ => panic!("cu_source: 미지 자산 {name}"),
     }
