@@ -446,8 +446,10 @@ impl W4a16Dec {
         let sf = self.shared_ffn;
         let [s0, s1, _s1b, s2, s3] = self.dchain;
         self.ew_dev(s0, s1, s2, t * sf)?;
-        self.plain_gemm_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3, t)?;
-        self.plain_gemm_launch(
+        // [S10-잔여 확장] down/sgate는 t행 GEMV — v3 GEMM 대비 동값
+        // (plain-gemm-selfcheck 0/65536 실측)·소형 t에서 우세.
+        self.plain_gemv_t_launch(&format!("blk.{il}.moe_shared_down.weight"), s2, s3, t)?;
+        self.plain_gemv_t_launch(
             &format!("blk.{il}.moe_shared_sgate.weight"),
             xn,
             self.drt.ptr,
