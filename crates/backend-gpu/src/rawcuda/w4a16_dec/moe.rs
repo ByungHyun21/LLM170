@@ -441,10 +441,22 @@ impl W4a16Dec {
     /// [S10-잔여] shared 꼬리(t판) — ew → down → sgate → 가산. 게이트/업은
     /// multi_gate_t가 선기록(moe_shared_t에서 gate/up 런치 제거판). sgate는
     /// 종전 t경로 그대로 drt.ptr([t][n] — topk 소비 후 기록이라 안전).
-    fn moe_shared_tail_t(&mut self, il: usize, xn: CUdeviceptr, t: usize) -> Result<(), String> {
+    fn moe_shared_tail_t(
+        &mut self,
+        il: usize,
+        xn: CUdeviceptr,
+        t: usize,
+        forked: bool,
+    ) -> Result<(), String> {
         let h = self.hidden;
         let sf = self.shared_ffn;
         let [s0, s1, _s1b, s2, s3] = self.dchain;
+        if forked {
+            // [B3] 보조 스트림 조인 후 가산(ew/down/sgate는 포크가 선발사).
+            let e2 = self.ev_fork[il * 2 + 1];
+            self.cc.stream_wait(self.cc.stream, e2)?;
+            return self.shared_add_dev(self.dsg, s3, self.dmo.ptr, h, t);
+        }
         self.ew_dev(s0, s1, s2, t * sf)?;
         // [S10-잔여 확장] down/sgate는 t행 GEMV — v3 GEMM 대비 동값
         // (plain-gemm-selfcheck 0/65536 실측)·소형 t에서 우세.
@@ -562,6 +574,16 @@ impl W4a16Dec {
         } else {
             self.plain_gemm_launch(&format!("blk.{il}.moe_gate.weight"), xn, self.drt.ptr, t)?;
         }
+        // [B3 2026-10-12] shared 꼬리 선포크 — ew→down→sgate(게이트/업은
+        // multi_gate_t가 선기록)를 보조 스트림에 선발사해 topk·전문가 GEMV와
+        // 병렬화한다. 조인은 shared_add 직전(꼬리). sgate 출력은 전용 슬롯
+        // (dsg — 종전 drt 재사용은 topk와의 경합). 실측 상한(꼬리 제거):
+        // tg +4.1%·np4 +5.6% — 기대 실효는 발사 몫 회수분.
+        let forked = if fused {
+            self.moe_shared_head_t_fork(il, xn, t)?
+        } else {
+            false
+        };
         {
             let f = self.cc.function("w4a16_moe_topk_t")?;
             let (mut p_lg, mut p_ix, mut p_wt) = (self.drt.ptr, self.moe_idx, self.moe_wt);
@@ -683,11 +705,42 @@ impl W4a16Dec {
         }
         self.moe_accum_dev(self.moe_wt, self.exp.dn, self.dmo.ptr, tk, ns, h)?;
         if fused {
-            self.moe_shared_tail_t(il, xn, t)?;
+            self.moe_shared_tail_t(il, xn, t, forked)?;
         } else {
             self.moe_shared_t(il, xn, t)?;
         }
         Ok(self.dmo.ptr)
+    }
+
+    /// [B3 2026-10-12] shared 꼬리 머리(ew→down→sgate)를 보조 스트림에 선발사.
+    /// 반환 true면 ew/down/sgate가 이미 발사됨(조인은 moe_shared_tail_t).
+    fn moe_shared_head_t_fork(
+        &mut self,
+        il: usize,
+        xn: CUdeviceptr,
+        t: usize,
+    ) -> Result<bool, String> {
+        let aux = self.cc.stream2;
+        if aux.is_null() || self.dsg == 0 || self.ev_fork.len() < (il + 1) * 2 {
+            return Ok(false);
+        }
+        let sf = self.shared_ffn;
+        let [s0, s1, _s1b, s2, s3] = self.dchain;
+        let (e1, e2) = (self.ev_fork[il * 2], self.ev_fork[il * 2 + 1]);
+        // 포크: 게이트/업(multi_gate_t) 완료 → 보조 스트림에 ew/down/sgate.
+        self.cc.event_record_on(e1, self.cc.stream)?;
+        self.cc.stream_wait(aux, e1)?;
+        self.ew_dev_on(aux, s0, s1, s2, t * sf)?;
+        self.plain_gemv_t_launch_on(aux, &format!("blk.{il}.moe_shared_down.weight"), s2, s3, t)?;
+        self.plain_gemv_t_launch_on(
+            aux,
+            &format!("blk.{il}.moe_shared_sgate.weight"),
+            xn,
+            self.dsg,
+            t,
+        )?;
+        self.cc.event_record_on(e2, aux)?;
+        Ok(true)
     }
 
     /// shared 전문가 배치(t≤8) — 플레인 GEMM ×3 + 토큰별 게이트 가산.

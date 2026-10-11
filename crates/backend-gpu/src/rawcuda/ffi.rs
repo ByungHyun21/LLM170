@@ -113,6 +113,9 @@ pub type CuMemcpyDtoDAsyncFn = unsafe extern "system" fn(
 /// cuStreamCreate — 실스트림 생성(그래프 캡처 전제 — 레거시 0은 캡처 불가).
 pub type CuStreamCreateFn =
     unsafe extern "system" fn(ph_stream: *mut CUstream, flags: c_uint) -> CUresult;
+/// cuStreamWaitEvent — 스트림이 이벤트를 대기([B3] shared 꼬리 포크/조인).
+pub type CuStreamWaitEventFn =
+    unsafe extern "system" fn(s: CUstream, ev: CUevent, flags: c_uint) -> CUresult;
 /// cuMemHostAlloc — pinned 호스트 메모리(캡처 가능한 async 복사 소스/목적).
 pub type CuMemHostAllocFn =
     unsafe extern "system" fn(pp: *mut *mut c_void, bytes: usize, flags: c_uint) -> CUresult;
@@ -215,6 +218,7 @@ pub(crate) struct Driver {
     pub launch_kernel: CuLaunchKernelFn,
     pub stream_synchronize: CuStreamSynchronizeFn,
     pub stream_create: CuStreamCreateFn,
+    pub stream_wait_event: CuStreamWaitEventFn,
     pub mem_host_alloc: CuMemHostAllocFn,
     pub mem_free_host: CuMemFreeHostFn,
     pub memcpy_dtoh_async: CuMemcpyDtoHAsyncFn,
@@ -319,6 +323,9 @@ impl Driver {
                 ),
                 stream_create: std::mem::transmute::<*mut c_void, CuStreamCreateFn>(sym!(
                     "cuStreamCreate"
+                )),
+                stream_wait_event: std::mem::transmute::<*mut c_void, CuStreamWaitEventFn>(sym!(
+                    "cuStreamWaitEvent"
                 )),
                 mem_host_alloc: std::mem::transmute::<*mut c_void, CuMemHostAllocFn>(sym!(
                     "cuMemHostAlloc"

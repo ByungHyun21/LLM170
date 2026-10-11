@@ -72,6 +72,9 @@ pub struct CudaCtx {
     /// 디바이스 체인(드래프트 호스트 왕복 제거)에서
     /// cuStreamCreate 도입 시 교체.
     pub stream: CUstream,
+    /// [B3 2026-10-12] 보조 스트림 — shared 꼬리(ew→down→sgate)를 전문가
+    /// GEMV와 병렬 발사하는 포크/조인 전용(캡처는 GLOBAL 모드).
+    pub stream2: CUstream,
     /// 진단 타이머(P8) — LLM170_TIME=1일 때 launch마다 이벤트 1개 기록.
     /// 커널별 소요를 뒤에서 (ev[i], ev[i+1]) 경과로 복원한다(동일 스트림 직렬).
     pub prof: Prof,
@@ -177,6 +180,7 @@ impl CudaCtx {
                 device_name,
                 ctx,
                 stream: std::ptr::null_mut(),
+                stream2: std::ptr::null_mut(),
                 modules: HashMap::new(),
                 fns: HashMap::new(),
                 copy_h2d: std::cell::Cell::new((0, 0, 0)),
@@ -282,6 +286,21 @@ impl CudaCtx {
         block: u32,
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
+        self.launch_on(self.stream, f, gx, gy, block, args)
+    }
+
+    /// [B3] 임의 스트림 발사 — 보조 스트림 포크 경로(launch의 스트림 변형).
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn launch_on(
+        &self,
+        s: CUstream,
+        f: CUfunction,
+        gx: u32,
+        gy: u32,
+        block: u32,
+        args: &mut [*mut std::ffi::c_void],
+    ) -> Result<(), String> {
         // [진단] 호스트 발사 비용·횟수 — LLM170_TIME 보고에 합산(프로파일러가
         // 발사 '전'에만 이벤트를 기록하므로 갭이 직전 커널에 귀속되는 문제의
         // 실체 판정용).
@@ -299,7 +318,7 @@ impl CudaCtx {
                 1,
                 1,
                 0,
-                self.stream,
+                s,
                 args.as_mut_ptr(),
                 std::ptr::null_mut(),
             );
@@ -397,6 +416,33 @@ impl CudaCtx {
             !self.prof.capturing.get(),
             "캡처 중 버퍼 재할당({what}) — warm_for_capture 선할당 누락(P10)"
         );
+    }
+
+    /// [B3] 보조 스트림 생성(포크/조인 병렬 경로 — 캡처는 GLOBAL 모드).
+    /// 파괴는 프로세스 수명(주 스트림과 동일 계약).
+    pub fn create_stream2(&mut self) -> Result<(), String> {
+        // SAFETY: 출력은 스택 로컬 — 생성 핸들은 필드 보관.
+        unsafe {
+            let mut s: CUstream = std::ptr::null_mut();
+            let r = (self.drv.stream_create)(&mut s, 1); // CU_STREAM_NON_BLOCKING
+            if r != CUDA_SUCCESS {
+                return Err(format!("rawcuda: cuStreamCreate(2): {}", ffi::err_text(r)));
+            }
+            self.stream2 = s;
+        }
+        Ok(())
+    }
+
+    /// [B3] 임의 스트림이 이벤트를 대기(포크/조인).
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn stream_wait(&self, s: CUstream, ev: ffi::CUevent) -> Result<(), String> {
+        // SAFETY: s/ev는 본 모듈 산출 핸들(호출자 수명 계약), flags=0.
+        let r = unsafe { (self.drv.stream_wait_event)(s, ev, 0) };
+        if r != CUDA_SUCCESS {
+            return Err(format!("rawcuda: cuStreamWaitEvent: {}", ffi::err_text(r)));
+        }
+        Ok(())
     }
 
     /// 기본 스트림 동기화.

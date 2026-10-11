@@ -447,6 +447,20 @@ impl W4a16Dec {
         self.moe_wt = 0;
         self.moe_idx = self.cc.alloc(tk * 4)?;
         self.moe_wt = self.cc.alloc(tk * 4)?;
+        // [B3 2026-10-12] shared 꼬리 포크 자원 — 보조 스트림·전용 sgate
+        // 슬롯(t≤8행)·층별 이벤트 쌍. 1회 생성 후 불변(캡처 그래프가 참조).
+        if self.cc.stream2.is_null() {
+            self.cc.create_stream2()?;
+        }
+        if self.dsg == 0 {
+            self.dsg = self.cc.alloc(8 * 4)?;
+        }
+        if self.ev_fork.is_empty() && self.n_layers > 0 {
+            for _ in 0..self.n_layers * 2 {
+                let ev = self.cc.event_create_nt()?;
+                self.ev_fork.push(ev);
+            }
+        }
         // [B-4] 다중 세그먼트 GEMV 테이블(drt/dchain 포인터 참조 — 재할당 시 재작성).
         self.ensure_chain_bufs()?;
         self.build_moe_multi_tab()?;

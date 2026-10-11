@@ -12,6 +12,30 @@ impl CudaCtx {
         Ok(ev)
     }
 
+    /// [B3] 비타이밍 이벤트 생성 — 그래프 캡처에 허용되는 플래그
+    /// (CU_EVENT_DISABLE_TIMING=2; 타이밍 이벤트는 캡처 금지).
+    pub fn event_create_nt(&self) -> Result<ffi::CUevent, String> {
+        let mut ev: ffi::CUevent = std::ptr::null_mut();
+        // SAFETY: 초기화 경로(단일 스레드) — 출력 포인터는 스택 로컬.
+        let r = unsafe { (self.drv.event_create)(&mut ev, 2) };
+        if r != CUDA_SUCCESS {
+            return Err(format!("rawcuda: cuEventCreate(nt): {}", ffi::err_text(r)));
+        }
+        Ok(ev)
+    }
+
+    /// [B3] 임의 스트림에 이벤트 기록(포크/조인).
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn event_record_on(&self, ev: ffi::CUevent, s: ffi::CUstream) -> Result<(), String> {
+        // SAFETY: ev/s는 본 모듈 산출 핸들(호출자 수명 계약).
+        let r = unsafe { (self.drv.event_record)(ev, s) };
+        if r != CUDA_SUCCESS {
+            return Err(format!("rawcuda: cuEventRecord: {}", ffi::err_text(r)));
+        }
+        Ok(())
+    }
+
     /// clippy allow — launch와 동일 판정(불투명 핸들).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn event_record(&self, ev: ffi::CUevent) -> Result<(), String> {

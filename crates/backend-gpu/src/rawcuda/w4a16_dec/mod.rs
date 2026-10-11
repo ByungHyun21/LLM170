@@ -305,6 +305,11 @@ pub struct W4a16Dec {
     /// MoE 출력(hidden) — 잔차 ab로 소비된다.
     dmo: Buf,
     moe_bufs_ok: bool,
+    /// [B3 2026-10-12] shared 꼬리 포크 전용 sgate 출력 슬롯(t≤8행 f32 —
+    /// 종전 drt 재사용은 topk와의 병렬 경합). 1회 할당·불변(캡처 안전).
+    dsg: CUdeviceptr,
+    /// [B3] 층별 이벤트 쌍 [fork, join] — 캡처 중 재기록 회피(층당 고유).
+    ev_fork: Vec<ffi::CUevent>,
     /// GEMV 스테이징 — x f16 [t][k], y f32 [t][n].
     xh: Buf,
     dy: Buf,
@@ -504,6 +509,8 @@ impl W4a16Dec {
             moe_dev_tab: 0,
             moe_idx: 0,
             moe_wt: 0,
+            dsg: 0,
+            ev_fork: Vec::new(),
             moe_multi_tab: 0,
             moe_multi_rows: Vec::new(),
             moe_multi_rows_t3: Vec::new(),

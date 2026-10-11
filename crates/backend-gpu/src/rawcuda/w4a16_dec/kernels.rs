@@ -563,11 +563,24 @@ impl W4a16Dec {
         y_dev: CUdeviceptr,
         t: usize,
     ) -> Result<(), String> {
+        self.plain_gemv_t_launch_on(self.cc.stream, name, x_dev, y_dev, t)
+    }
+
+    /// [B3] t행 플레인 GEMV — 보조 스트림 발사 변형(shared 꼬리 포크).
+    pub(super) fn plain_gemv_t_launch_on(
+        &mut self,
+        s: ffi::CUstream,
+        name: &str,
+        x_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
         let (w, n, k) = self.plain_spec(name)?;
         let f = self.cc.function("w4a16_gemv_bf16_t")?;
         let (mut p_w, mut p_x, mut p_o) = (w, x_dev, y_dev);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
-        self.cc.launch(
+        self.cc.launch_on(
+            s,
             f,
             n.div_ceil(GEMV_TR) as u32,
             1,
@@ -721,13 +734,26 @@ impl W4a16Dec {
         y_dev: CUdeviceptr,
         n: usize,
     ) -> Result<(), String> {
+        self.ew_dev_on(self.cc.stream, g_dev, u_dev, y_dev, n)
+    }
+
+    /// [B3] ew — 보조 스트림 발사 변형(shared 꼬리 포크).
+    pub(super) fn ew_dev_on(
+        &mut self,
+        s: ffi::CUstream,
+        g_dev: CUdeviceptr,
+        u_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        n: usize,
+    ) -> Result<(), String> {
         if n == 0 {
             return Err("ew: n=0".into());
         }
         let f = self.cc.function("ew")?;
         let mut nn = n as i32;
         let (mut a0, mut a1, mut a2, mut a3, mut a4) = (g_dev, u_dev, y_dev, 0u64, 0u64);
-        self.cc.launch(
+        self.cc.launch_on(
+            s,
             f,
             n.div_ceil(128) as u32,
             1,
