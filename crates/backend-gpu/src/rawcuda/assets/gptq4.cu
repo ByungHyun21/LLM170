@@ -1119,11 +1119,14 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
                 // [실험] 스트리밍 힌트 — B는 블록별 1회 판독(재사용 없음).
                 const unsigned qw = live ? __ldcs(&q[(size_t)(n0 + r) * k8 + (gi >> 3)]) : 0u;
                 if (live) {
+                    // [half2 비트매직 2026-10-11] 원소별 (float)nib*scf+f2h
+                    // (ALU ~7/elem·STS.16×8) → deq_pair_b 쌍 처리(hsub2 정확
+                    // 경로 — 비트동일, g128 mma 입증 부품 재사용·STS.32×4).
+                    // 실측 35B pp512/4096 +0.3%(골든 유지).
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
-                        ws[st][r][c8 * 8 + j] =
-                            __half_as_ushort(__float2half_rn((float)nib * scf));
+                    for (int jp = 0; jp < 4; ++jp) {
+                        *reinterpret_cast<unsigned*>(&ws[st][r][c8 * 8 + jp * 2]) =
+                            deq_pair_b(qw, jp, scf);
                     }
                 } else {
 #pragma unroll
@@ -1284,11 +1287,14 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
                 // L2를 A(x16) 재사용에 남긴다.
                 const unsigned qw = live ? __ldcs(&q[(size_t)rr * k8 + (gi >> 3)]) : 0u;
                 if (live) {
+                    // [half2 비트매직 2026-10-11] 원소별 (float)nib*scf+f2h
+                    // (ALU ~7/elem·STS.16×8) → deq_pair_b 쌍 처리(hsub2 정확
+                    // 경로 — 비트동일, g128 mma 입증 부품 재사용·STS.32×4).
+                    // 실측 35B pp512/4096 +0.3%(골든 유지).
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
-                        ws[st][r][c8 * 8 + j] =
-                            __half_as_ushort(__float2half_rn((float)nib * scf));
+                    for (int jp = 0; jp < 4; ++jp) {
+                        *reinterpret_cast<unsigned*>(&ws[st][r][c8 * 8 + jp * 2]) =
+                            deq_pair_b(qw, jp, scf);
                     }
                 } else {
 #pragma unroll
