@@ -116,6 +116,7 @@ impl W4a16Dec {
         }
         let g = self.cc.capture_end()?;
         let e = self.cc.graph_instantiate(g)?;
+        self.cc.graph_upload(e)?; // [§4.3] implicit upload spin 제거
         // [A8] 캐시 등록 — 상한 = 슬롯×모드 3종(방어적으로 초과 시 최古 폐기).
         let cap = self.n_slots.max(1) * 3;
         if self.graph_cache.len() >= cap {
@@ -334,6 +335,7 @@ impl W4a16Dec {
         }
         let g = self.cc.capture_end()?;
         let e = self.cc.graph_instantiate(g)?;
+        self.cc.graph_upload(e)?; // [§4.3]
         self.batch_graphs.push((key.to_vec(), e, g));
         eprintln!("[batch-graph] captured slots={key:?}");
         Ok(())

@@ -101,7 +101,7 @@ pub(crate) fn load_gpu_retry(
 }
 
 /// 슬롯 로짓 → 토큰: 활성 샘플러면 sample, 아니면 greedy (동률 최저 인덱스).
-fn pick(s: &mut Slot, logits: &[f32]) -> u32 {
+fn pick(s: &mut Slot, logits: &mut [f32]) -> u32 {
     match &mut s.sampler {
         Some(sm) if !sm.is_greedy() => sm.sample(logits),
         _ => llm170_core::qwen35::greedy(logits),
@@ -148,9 +148,9 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
     if !sampled.is_empty() {
         let toks: Vec<u32> = sampled.iter().map(|&i| slots[i].next).collect();
         match e.decode(&sampled, &toks) {
-            Ok(rows) => {
+            Ok(mut rows) => {
                 for (row, &i) in sampled.iter().enumerate() {
-                    let t = pick(&mut slots[i], &rows[row]);
+                    let t = pick(&mut slots[i], &mut rows[row]);
                     slot_emit(&mut slots[i], t);
                 }
             }
@@ -363,9 +363,9 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     // 샘플링 슬롯은 로짓 판(마지막 청크만 판정에 사용) — Q4도
                     // prefill_greedy 대신 prefill. greedy는 종전 최적 경로.
                     let samp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
-                    let r: Result<u32, String> = eng.0.prefill(i, &part).map(|l| {
+                    let r: Result<u32, String> = eng.0.prefill(i, &part).map(|mut l| {
                         if samp {
-                            pick(&mut slots[i], &l)
+                            pick(&mut slots[i], &mut l)
                         } else {
                             llm170_core::qwen35::greedy(&l)
                         }

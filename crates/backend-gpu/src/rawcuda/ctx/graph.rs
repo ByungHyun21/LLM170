@@ -64,6 +64,20 @@ impl CudaCtx {
         Ok(())
     }
 
+    /// [§4.3] 그래프 업로드 — instantiate 직후 1회(같은 스트림에 선행 제출).
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn graph_upload(&self, e: ffi::CUgraphExec) -> Result<(), String> {
+        // SAFETY: e는 graph_instantiate가 돌려준 유효 실행 핸들.
+        unsafe {
+            let r = (self.drv.graph_upload)(e, self.stream);
+            if r != CUDA_SUCCESS {
+                return Err(format!("rawcuda: cuGraphUpload: {}", ffi::err_text(r)));
+            }
+        }
+        Ok(())
+    }
+
     /// 그래프·실행 핸들 해제.
     /// clippy allow — launch와 동일 판정(불투명 핸들).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]

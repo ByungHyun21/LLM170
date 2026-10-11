@@ -134,6 +134,10 @@ pub type CuGraphInstantiateWithFlagsFn =
     unsafe extern "system" fn(ph_exec: *mut CUgraphExec, graph: CUgraph, flags: u64) -> CUresult;
 pub type CuGraphLaunchFn =
     unsafe extern "system" fn(exec: CUgraphExec, stream: CUstream) -> CUresult;
+/// [§4.3 2026-10-11] cuGraphUpload — instantiate 직후 명시 업로드(첫 launch의
+/// implicit upload가 device spin 뒤 대기하는 비용 제거).
+pub type CuGraphUploadFn =
+    unsafe extern "system" fn(exec: CUgraphExec, stream: CUstream) -> CUresult;
 pub type CuGraphExecDestroyFn = unsafe extern "system" fn(exec: CUgraphExec) -> CUresult;
 pub type CuGraphDestroyFn = unsafe extern "system" fn(graph: CUgraph) -> CUresult;
 
@@ -218,6 +222,7 @@ pub(crate) struct Driver {
     pub stream_end_capture: CuStreamEndCaptureFn,
     pub graph_instantiate: CuGraphInstantiateWithFlagsFn,
     pub graph_launch: CuGraphLaunchFn,
+    pub graph_upload: CuGraphUploadFn,
     pub graph_exec_destroy: CuGraphExecDestroyFn,
     pub graph_destroy: CuGraphDestroyFn,
     pub mem_free: CuMemFreeFn,
@@ -335,6 +340,9 @@ impl Driver {
                 ),
                 graph_launch: std::mem::transmute::<*mut c_void, CuGraphLaunchFn>(sym!(
                     "cuGraphLaunch"
+                )),
+                graph_upload: std::mem::transmute::<*mut c_void, CuGraphUploadFn>(sym!(
+                    "cuGraphUpload"
                 )),
                 graph_exec_destroy: std::mem::transmute::<*mut c_void, CuGraphExecDestroyFn>(sym!(
                     "cuGraphExecDestroy"

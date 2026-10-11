@@ -113,11 +113,12 @@ impl Sampler {
         }
     }
 
-    pub fn sample(&mut self, logits: &[f32]) -> u32 {
+    pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
         if self.is_greedy() {
             return crate::matmul::greedy_from(logits);
         }
-        let mut l = logits.to_vec();
+        // [§5.1 2026-10-11] in-place — 종전 logits.to_vec()(어휘 993KB/토큰
+        // 복사) 제거. 호출부가 소유 버퍼를 넘기고 여기서 직접 수정한다.
         // ① repeat penalty — 히스토리 토큰에 양수 나눗셈/음수 곱셈.
         // QA-29: 유니크 토큰당 1회 — llama.cpp는 token_count 맵으로 1회만
         // 적용(빈도는 freq/presence 전용). 종전엔 중복 m회 → p^m 과잉 억제.
@@ -130,7 +131,7 @@ impl Sampler {
                 }
             }
             for t in uniq {
-                if let Some(v) = l.get_mut(t as usize) {
+                if let Some(v) = logits.get_mut(t as usize) {
                     if *v > 0.0 {
                         *v /= p;
                     } else {
@@ -142,14 +143,14 @@ impl Sampler {
         // QA-30 보강: temp<=0은 페널티 적용 **후** 결정적 argmax(llama.cpp
         // 준수) — 종전엔 페널티 활성 시 temp 0도 softmax 난수 추출이었다.
         if self.params.temperature <= 0.0 {
-            return crate::matmul::greedy_from(&l);
+            return crate::matmul::greedy_from(logits);
         }
         // [E-1 후속 2026-10-10] **max−20 컷 경로** → 미달 시 전량 폴백.
         // 서빙 실측: 종전 248K 전량 후보 구축+정렬+꼬리 exp = 1.6~2.2ms/토큰.
-        if let Some(tok) = self.sample_core(&l, true) {
+        if let Some(tok) = self.sample_core(logits, true) {
             return tok;
         }
-        self.sample_core(&l, false).unwrap_or(0)
+        self.sample_core(logits, false).unwrap_or(0)
     }
 
     /// 샘플링 핵심. `cut=true`: max−20(exp(−20)=2.06e-9) 초과만 후보로 하고
@@ -330,9 +331,9 @@ mod tests {
     fn greedy_default_is_argmax() {
         let mut s = Sampler::new(SamplerParams::default());
         assert!(s.is_greedy());
-        assert_eq!(s.sample(&logits(&[1.0, 5.0, 3.0])), 1);
+        assert_eq!(s.sample(&mut logits(&[1.0, 5.0, 3.0])), 1);
         // 동률 최저 인덱스
-        assert_eq!(s.sample(&logits(&[7.0, 5.0, 7.0])), 0);
+        assert_eq!(s.sample(&mut logits(&[7.0, 5.0, 7.0])), 0);
     }
 
     #[test]
@@ -343,11 +344,11 @@ mod tests {
             seed: 42,
             ..Default::default()
         };
-        let l = logits(&[1.0, 2.0, 0.5, 1.7, 0.9]);
+        let mut l = logits(&[1.0, 2.0, 0.5, 1.7, 0.9]);
         let mut a = Sampler::new(p.clone());
         let mut b = Sampler::new(p);
-        let sa: Vec<u32> = (0..32).map(|_| a.sample(&l)).collect();
-        let sb: Vec<u32> = (0..32).map(|_| b.sample(&l)).collect();
+        let sa: Vec<u32> = (0..32).map(|_| a.sample(&mut l)).collect();
+        let sb: Vec<u32> = (0..32).map(|_| b.sample(&mut l)).collect();
         assert_eq!(sa, sb);
         // 다른 시드는 (실질적으로 확률 1로) 다른 스트림
         let mut c = Sampler::new(SamplerParams {
@@ -355,7 +356,7 @@ mod tests {
             seed: 7,
             ..Default::default()
         });
-        let sc: Vec<u32> = (0..32).map(|_| c.sample(&l)).collect();
+        let sc: Vec<u32> = (0..32).map(|_| c.sample(&mut l)).collect();
         assert_ne!(sa, sc);
     }
 
@@ -367,7 +368,7 @@ mod tests {
             ..Default::default()
         });
         // 온도 0 = greedy — top_p 등 나머지 기본 off
-        assert_eq!(s.sample(&logits(&[0.1, 9.0, 2.0])), 1);
+        assert_eq!(s.sample(&mut logits(&[0.1, 9.0, 2.0])), 1);
     }
 
     /// [E-1] 구 알고리즘(전량 정렬) 참조 구현 — 부분 선택 경로의 동치 판정용.
@@ -482,7 +483,7 @@ mod tests {
             let mut a = Sampler::new(p.clone());
             let mut rng = Rng::new(p.seed);
             for _ in 0..16 {
-                let x = a.sample(&l);
+                let x = a.sample(&mut l);
                 let y = sample_reference_full(&p, &mut rng, &l);
                 assert_eq!(x, y, "tp={tp} tk={tk} mp={mp}");
             }
@@ -497,7 +498,7 @@ mod tests {
             seed: 3,
             ..Default::default()
         });
-        assert_eq!(s.sample(&logits(&[0.1, 9.0, 2.0])), 1);
+        assert_eq!(s.sample(&mut logits(&[0.1, 9.0, 2.0])), 1);
     }
 
     #[test]
@@ -510,9 +511,9 @@ mod tests {
         // 온도 0이라 greedy지만 패널티가 1번을 억누르면 2번이 승
         let mut s = Sampler::new(p);
         s.push_tokens([1u32]);
-        let l = logits(&[0.0, 9.0, 8.0]);
+        let mut l = logits(&[0.0, 9.0, 8.0]);
         // 9.0 / 1000 = 0.009 < 8.0
-        assert_eq!(s.sample(&l), 2);
+        assert_eq!(s.sample(&mut l), 2);
     }
 
     /// QA-29: 중복 토큰은 유니크 1회만 페널티 — 종전 p^m.
@@ -525,9 +526,9 @@ mod tests {
         };
         let mut s = Sampler::new(p);
         s.push_tokens([1u32, 1u32, 1u32]);
-        let l = logits(&[0.0, 9.0, 4.4]);
+        let mut l = logits(&[0.0, 9.0, 4.4]);
         // 1회 적용: 9/2=4.5 > 4.4 → 1 승 (p^3이었다면 1.125 < 4.4 → 2 승)
-        assert_eq!(s.sample(&l), 1);
+        assert_eq!(s.sample(&mut l), 1);
     }
 
     /// QA-30: last_n=0 — 패널티 비활성 의미론.
@@ -543,7 +544,7 @@ mod tests {
         let mut s = Sampler::new(p);
         s.push_tokens([1u32]);
         // 히스토리 미유지 → 억제 없음 → argmax 1
-        assert_eq!(s.sample(&logits(&[0.0, 9.0, 8.0])), 1);
+        assert_eq!(s.sample(&mut logits(&[0.0, 9.0, 8.0])), 1);
     }
 
     #[test]
@@ -555,8 +556,8 @@ mod tests {
             seed: 5,
             ..Default::default()
         });
-        let l = logits(&[0.0, 20.0, 0.0]);
-        assert_eq!(s.sample(&l), 1);
+        let mut l = logits(&[0.0, 20.0, 0.0]);
+        assert_eq!(s.sample(&mut l), 1);
     }
 
     /// min_p(2026-10-09 갭): 최대확률 대비 비율 미달 꼬리 제거 — 시드 무관
@@ -572,7 +573,7 @@ mod tests {
             });
             assert!(!s.is_greedy());
             for _ in 0..16 {
-                assert_eq!(s.sample(&logits(&[10.0, 0.0])), 0);
+                assert_eq!(s.sample(&mut logits(&[10.0, 0.0])), 0);
             }
         }
         // 근접 분포(p0=0.524, p1=0.475 → 비 0.905) — 임계 0.95가 2등을 자른다.
@@ -583,7 +584,7 @@ mod tests {
             ..Default::default()
         });
         for _ in 0..16 {
-            assert_eq!(s.sample(&logits(&[1.0, 0.9])), 0);
+            assert_eq!(s.sample(&mut logits(&[1.0, 0.9])), 0);
         }
     }
 }
