@@ -251,6 +251,7 @@ pub static SCHED: Sched = Sched {
     ms_prefill: AtomicU64::new(0),
     spec_rounds: AtomicU64::new(0),
     spec_accepted: AtomicU64::new(0),
+    spec_ms: AtomicU64::new(0),
     slots_active: AtomicU64::new(0),
     prompt_tokens: AtomicU64::new(0),
     gen_tokens: AtomicU64::new(0),
@@ -269,6 +270,8 @@ pub struct Sched {
     /// 스펙 라운드 수/수용 토큰 수 계측(수용률 = acc/rounds).
     pub spec_rounds: AtomicU64,
     pub spec_accepted: AtomicU64,
+    /// [A6-3] 스펙 라운드 누적 ms(평균 = ms/rounds).
+    pub spec_ms: AtomicU64,
     // ── 모니터링(2026-10-09) — "최신 누적값"만(히스토리 없음) ──
     /// 활성 작업 슬롯 수(게이지 — slot_loop가 게시).
     pub slots_active: AtomicU64,
@@ -295,9 +298,10 @@ impl Sched {
         let mp = self.ms_prefill.load(Ordering::Relaxed);
         let sr = self.spec_rounds.load(Ordering::Relaxed);
         let sa = self.spec_accepted.load(Ordering::Relaxed);
+        let sms = self.spec_ms.load(Ordering::Relaxed);
         let qd = self.queue_depth.load(Ordering::Relaxed);
         format!(
-            "[sched] jobs {jobs} | queue {qd} | queue-wait avg {:.0}ms | prefix-reuse {px}tok | decode {td}x avg {:.1}ms | prefill {cp}x avg {:.1}ms | spec {sr}r acc {sa} ({:.2}/r)",
+            "[sched] jobs {jobs} | queue {qd} | queue-wait avg {:.0}ms | prefix-reuse {px}tok | decode {td}x avg {:.1}ms | prefill {cp}x avg {:.1}ms | spec {sr}r acc {sa} ({:.2}/r) avg {:.1}ms",
             if jobs > 0 {
                 qw as f64 / jobs as f64 / 1e3
             } else {
@@ -306,6 +310,11 @@ impl Sched {
             if td > 0 { md as f64 / td as f64 } else { 0.0 },
             if cp > 0 { mp as f64 / cp as f64 } else { 0.0 },
             if sr > 0 { sa as f64 / sr as f64 } else { 0.0 },
+            if sr > 0 {
+                sms as f64 / sr as f64 / 1e3
+            } else {
+                0.0
+            },
         )
     }
 }
@@ -697,6 +706,7 @@ fn spec_round(
     for &tk in &draft {
         rows.extend_from_slice(&e.embed_row(tk)?);
     }
+    let rt0 = std::time::Instant::now();
     e.spec_save_state(i)?;
     let toks = e.spec_verify(i, &rows, t)?;
     let mut acc = 0usize;
@@ -728,6 +738,9 @@ fn spec_round(
     slot_emit(s, corr);
     SCHED.spec_rounds.fetch_add(1, Ordering::Relaxed);
     SCHED.spec_accepted.fetch_add(acc as u64, Ordering::Relaxed);
+    SCHED
+        .spec_ms
+        .fetch_add(rt0.elapsed().as_micros() as u64, Ordering::Relaxed);
     Ok(true)
 }
 
