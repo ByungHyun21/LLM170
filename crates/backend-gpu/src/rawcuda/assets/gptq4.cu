@@ -726,15 +726,19 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
                         make_uint4(0u, 0u, 0u, 0u);
                 }
             }
-            for (int e = tid; e < MMA_N * (MMA_KC / 8); e += 256) {
-                const int r = e / (MMA_KC / 8);
-                const int c8 = e % (MMA_KC / 8);
-                const int gi = kn + c8 * 8;
-                const bool live = (n0 + r < n) && (gi + 7 < k);
-                if (live) {
-                    cp_async4(&wsp[cur ^ 1][r][c8], &q[(size_t)(n0 + r) * k8 + (gi >> 3)]);
+            // [§1.3 2026-10-11] B 스테이징 16B .cg — 종전 4B .ca는 가중치
+            // (1회 판독·재사용 없음)를 L1에 채워 프래그먼트/A의 L1을 압박
+            // (carveout 실측: 이 커널은 L1 민감). 16B 청크 = 행당 4 u32
+            // (전 k청크 — k%128=0 계약으로 경계 정합) → .cg(L2 전용).
+            if (tid < MMA_N) {
+                const int r = tid;
+                if (n0 + r < n) {
+                    cp_async16(&wsp[cur ^ 1][r][0], &q[(size_t)(n0 + r) * k8 + (kn >> 3)]);
                 } else {
-                    wsp[cur ^ 1][r][c8] = 0x88888888u;
+#pragma unroll
+                    for (int c8 = 0; c8 < MMA_KC / 8; ++c8) {
+                        wsp[cur ^ 1][r][c8] = 0x88888888u;
+                    }
                 }
             }
             for (int e = tid; e < MMA_N; e += 256) {
@@ -900,7 +904,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
                     scb = s[(size_t)(n0 + r) * kg + (gi >> 5)];
                 }
                 const float scf = __uint_as_float((unsigned)scb << 16);
-                const unsigned qw = live ? q[(size_t)(n0 + r) * k8 + (gi >> 3)] : 0u;
+                // [실험] 스트리밍 힌트 — B는 블록별 1회 판독(재사용 없음).
+                const unsigned qw = live ? __ldcs(&q[(size_t)(n0 + r) * k8 + (gi >> 3)]) : 0u;
                 if (live) {
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
@@ -1063,7 +1068,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
                     scb = s[(size_t)rr * kg + (gi >> 5)];
                 }
                 const float scf = __uint_as_float((unsigned)scb << 16);
-                const unsigned qw = live ? q[(size_t)rr * k8 + (gi >> 3)] : 0u;
+                // [실험] 스트리밍 힌트 — B는 블록별 1회 판독(재사용 없음),
+                // L2를 A(x16) 재사용에 남긴다.
+                const unsigned qw = live ? __ldcs(&q[(size_t)rr * k8 + (gi >> 3)]) : 0u;
                 if (live) {
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
