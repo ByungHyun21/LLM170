@@ -377,8 +377,7 @@ impl W4a16Dec {
                 // [§4.5 2026-10-11] sgate를 4세그먼트로 편입 — 꼬리 GEMV
                 // 런치 -1/층. 출력은 전용 슬롯(drt+n_exp — 라우터는 [0..n_exp)
                 // 만 기록하고 topk 소비 후 shared_add가 읽어 순서 안전).
-                let (w, n, k) =
-                    self.plain_spec(&format!("blk.{il}.moe_shared_sgate.weight"))?;
+                let (w, n, k) = self.plain_spec(&format!("blk.{il}.moe_shared_sgate.weight"))?;
                 ent.extend([w, drt + self.n_experts as u64 * 4, n as u64, k as u64]);
                 r += n as u32;
             } else {

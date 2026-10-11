@@ -524,8 +524,7 @@ impl W4a16Dec {
             1,
             256,
             &mut crate::rawcuda::args::l8(
-                &mut p_w, &mut p_d, &mut p_sg, &mut p_sx, &mut p_y, &mut p_sp, &mut p_ns,
-                &mut p_n,
+                &mut p_w, &mut p_d, &mut p_sg, &mut p_sx, &mut p_y, &mut p_sp, &mut p_ns, &mut p_n,
             ),
         )
     }
