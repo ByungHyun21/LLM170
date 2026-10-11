@@ -485,7 +485,7 @@ impl W4a16Dec {
             let per_slot = 3 * (qsz + ssz);
             let free = crate::cuda_mem_free().map(|(f, _)| f).unwrap_or(0);
             let kmax = ((free / 4) / (self.n_layers * per_slot).max(1) as u64) as usize;
-            let k = 64usize.min(kmax);
+            let k = 96usize.min(kmax);
             if k > 0 {
                 let qb = self.n_layers * k * 3 * qsz;
                 let sb = self.n_layers * k * 3 * ssz;
