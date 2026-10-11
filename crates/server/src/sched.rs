@@ -614,7 +614,7 @@ fn spec_round(
     hist.extend_from_slice(&s.tokens);
     // [§7.5] 적응 폭 — 전량 수용이면 +1(≤8 — 검증 t≤8이 TR GEMV 도메인),
     // 부진(≤1)이면 4로 복귀. 초안 폭은 수용 판정만 좌우(값 불변).
-    let draft = llm170_core::spec::ngram_draft(&hist, 4, 48, s.spec_k - 1);
+    let draft = llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1);
     if draft.is_empty() {
         return Ok(false);
     }
@@ -675,7 +675,7 @@ fn spec_round_sampled(
         hist.extend_from_slice(&j.tokens);
     }
     hist.extend_from_slice(&s.tokens);
-    let draft = llm170_core::spec::ngram_draft(&hist, 4, 48, s.spec_k - 1);
+    let draft = llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1);
     if draft.is_empty() {
         return Ok(false);
     }
