@@ -554,18 +554,40 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         return;
     }
     SCHED.jobs.fetch_add(1, Ordering::Relaxed);
-    let Some((i, reuse)) = pick_prefix_slot(slots, &j.tokens) else {
+    let Some((i, l)) = pick_prefix_slot(slots, &j.tokens) else {
         return;
     };
-    if reuse == 0 {
-        if reuse == 0 {
-            eng.reset_seq(i);
-        }
+    // [A2] 재사용 판정 — 전체 접두(상태가 그 끝 위치와 정합) 우선, 부분은
+    // 체크포인트(2048 경계 GDN 상태) ≤ l. 부분은 restore로 상태·pos 복원.
+    let full = l > 0 && l == slots[i].cached.len();
+    let ck = eng.0.checkpoint_pos(i) as usize;
+    let mut reuse = if full {
+        l
+    } else if ck > 0 && ck <= l {
+        ck
     } else {
+        0
+    };
+    if reuse == 0 {
+        eng.reset_seq(i);
+    } else if full {
         SCHED
             .prefix_tokens
             .fetch_add(reuse as u64, Ordering::Relaxed);
-        eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰");
+        eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰(전체)");
+    } else {
+        match eng.0.restore_gdn(i) {
+            Ok(p) if p as usize == reuse => {
+                SCHED
+                    .prefix_tokens
+                    .fetch_add(reuse as u64, Ordering::Relaxed);
+                eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰(체크포인트)");
+            }
+            _ => {
+                eng.reset_seq(i);
+                reuse = 0;
+            }
+        }
     }
     let prev = std::mem::take(&mut slots[i].cached);
     let mut sampler_new = j.sampler.clone().map(llm170_core::sampler::Sampler::new);
@@ -775,6 +797,8 @@ fn slot_emit(s: &mut Slot, t: u32) {
 /// (정확히 같은 길이는 상태가 이미 구워져 있으므로 재사용 아님 — reset 생략
 /// 판정은 호출부).
 fn pick_prefix_slot(slots: &[Slot], tokens: &[u32]) -> Option<(usize, usize)> {
+    // [A2 2026-10-11] 부분 접두까지 l 반환(순수 함수 유지 — 전체/부분/체크포인트
+    // 판정은 호출부가 엔진 체크포인트 조회와 함께 수행).
     slots
         .iter()
         .enumerate()
@@ -786,8 +810,7 @@ fn pick_prefix_slot(slots: &[Slot], tokens: &[u32]) -> Option<(usize, usize)> {
                 .zip(tokens.iter())
                 .take_while(|(a, b)| a == b)
                 .count();
-            let full = l > 0 && l == s.cached.len() && tokens.len() > l;
-            (i, if full { l } else { 0 })
+            (i, l)
         })
         .max_by_key(|&(_, l)| l)
 }

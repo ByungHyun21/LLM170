@@ -378,6 +378,10 @@ pub struct W4a16Dec {
     dsnap: CUdeviceptr,
     dsnap_ring: CUdeviceptr,
     dsave: CUdeviceptr,
+    /// [A2 2026-10-11] 접두 재사용 체크포인트(GDN 상태+conv 링, 슬롯별 1개).
+    dchk: CUdeviceptr,
+    /// 체크포인트 위치(토큰 수) — 0 = 없음.
+    dchk_pos: Vec<u32>,
     spec_on: bool,
     /// [A-1 진단] spec scan 커널 on/off(기본 = spec_on) — 교차 대조용.
     spec_scan_on: bool,
@@ -544,6 +548,8 @@ impl W4a16Dec {
             dsnap: 0,
             dsnap_ring: 0,
             dsave: 0,
+            dchk: 0,
+            dchk_pos: Vec::new(),
             spec_on: false,
             spec_scan_on: true,
             dyt: Buf::default(),

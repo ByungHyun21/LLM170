@@ -152,6 +152,12 @@ impl W4a16Dec {
                 ab = s3;
             }
         }
+        // [A2 2026-10-11] 2048 경계 — 접두 재사용 체크포인트(GDN 상태+conv
+        // 링, 순수 복사 — 산술 불변). 실패는 무시(기능만 미제공).
+        let endp = pos + t as u32;
+        if endp % 2048 == 0 {
+            let _ = self.checkpoint_gdn(slot, endp);
+        }
         if all {
             // [A-1] 전 위치 최종 노름 → 배치 head → 배치 argmax → 토큰 t개.
             let xn_all = self
