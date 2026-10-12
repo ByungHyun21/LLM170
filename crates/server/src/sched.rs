@@ -682,7 +682,7 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
     // [A2] 재사용 판정 — 전체 접두(상태가 그 끝 위치와 정합) 우선, 부분은
     // 체크포인트(2048 경계 GDN 상태) ≤ l. 부분은 restore로 상태·pos 복원.
     let full = l > 0 && l == slots[i].cached.len();
-    let ck = eng.0.checkpoint_pos(i) as usize;
+    let ck = eng.0.checkpoint_pos(i, l as u32) as usize;
     let mut reuse = if full {
         l
     } else if ck > 0 && ck <= l {
@@ -699,7 +699,7 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         SCHED.prefix_full_hits.fetch_add(1, Ordering::Relaxed);
         eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰(전체)");
     } else {
-        match eng.0.restore_gdn(i) {
+        match eng.0.restore_gdn(i, l as u32) {
             Ok(p) if p as usize == reuse => {
                 SCHED
                     .prefix_tokens

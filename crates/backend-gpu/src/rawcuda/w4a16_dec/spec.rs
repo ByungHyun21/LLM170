@@ -211,38 +211,56 @@ impl W4a16Dec {
             .collect())
     }
 
-    /// [A2 2026-10-11] 접두 재사용 체크포인트 — 슬롯 GDN 상태+conv 링 저장 +
-    /// 위치 기억. 2048 경계(프리필 청크 끝)마다 호출 — 부분 접두 재사용의
-    /// 복원 지점. 값은 순수 복사(산술 불변).
+    /// [A2→K3 2026-10-12] 접두 재사용 체크포인트 — 슬롯 GDN 상태+conv 링
+    /// 저장 + 위치 기억. **512 경계마다** 호출 — 환형 스택 4개
+    /// (512/1024/1536/2048 — k=(pos/512-1)%4)에 최근 4경계 유지.
+    /// 값은 순수 복사(산술 불변).
     pub fn checkpoint_gdn(&mut self, slot: usize, pos: u32) -> Result<(), String> {
-        if self.dchk == 0 || slot >= self.dchk_pos.len() {
+        if self.dchk == 0 || slot >= self.dchk_pos.len() || !pos.is_multiple_of(512) {
             return Ok(());
         }
         let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let k = (pos / 512 - 1) as usize % 4;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
-        let base = self.dchk + slot as u64 * (st_bytes + ring_bytes);
+        let per = st_bytes + ring_bytes;
+        let base = self.dchk + (slot as u64 * 4 + k as u64) * per;
         self.copy_dev(base, self.dgst + st_slot * 4, st_bytes)?;
         self.copy_dev(base + st_bytes, self.dring + ring_slot * 4, ring_bytes)?;
-        self.dchk_pos[slot] = pos;
+        self.dchk_pos[slot][k] = pos;
         Ok(())
     }
 
-    /// [A2] 체크포인트 복원 — 상태+링을 슬롯으로 되돌리고 pos를 체크포인트
-    /// 위치로(절대 설정). 반환 = 복원 위치(0 = 없음 — 호출부가 reset).
-    pub fn restore_gdn(&mut self, slot: usize) -> Result<u32, String> {
-        let pos = self.checkpoint_pos(slot);
+    /// [K3] upto 이하 최대 체크포인트 경계 선택(0 = 없음).
+    fn ck_pick(&self, slot: usize, upto: u32) -> u32 {
+        let mut best = 0u32;
+        if let Some(ks) = self.dchk_pos.get(slot) {
+            for &p in ks {
+                if p > 0 && p <= upto && p > best {
+                    best = p;
+                }
+            }
+        }
+        best
+    }
+
+    /// [A2→K3] 체크포인트 복원 — upto 이하 최대 경계의 상태+링을 슬롯으로
+    /// 되돌리고 pos를 해당 위치로(절대 설정). 반환 = 복원 위치(0 = 없음).
+    pub fn restore_gdn(&mut self, slot: usize, upto: u32) -> Result<u32, String> {
+        let pos = self.ck_pick(slot, upto);
         if self.dchk == 0 || pos == 0 {
             return Ok(0);
         }
         let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let k = (pos / 512 - 1) as usize % 4;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
-        let base = self.dchk + slot as u64 * (st_bytes + ring_bytes);
+        let per = st_bytes + ring_bytes;
+        let base = self.dchk + (slot as u64 * 4 + k as u64) * per;
         self.copy_dev(self.dgst + st_slot * 4, base, st_bytes)?;
         self.copy_dev(self.dring + ring_slot * 4, base + st_bytes, ring_bytes)?;
         self.slot_pos[slot] = pos;
@@ -250,9 +268,9 @@ impl W4a16Dec {
         Ok(pos)
     }
 
-    /// [A2] 체크포인트 위치(0 = 없음).
-    pub fn checkpoint_pos(&self, slot: usize) -> u32 {
-        self.dchk_pos.get(slot).copied().unwrap_or(0)
+    /// [A2→K3] 체크포인트 위치 — upto 이하 최대(0 = 없음).
+    pub fn checkpoint_pos(&self, slot: usize, upto: u32) -> u32 {
+        self.ck_pick(slot, upto)
     }
 
     /// [A-1 진단] 슬롯 GDN 상태 저장/복원(전 층·헤드) — 검증 대조용.

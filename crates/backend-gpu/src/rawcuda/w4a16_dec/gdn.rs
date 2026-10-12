@@ -305,13 +305,14 @@ impl W4a16Dec {
         self.dsave = self.cc.alloc(
             self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4,
         )?;
-        // [A2] 접두 재사용 체크포인트 — 실패(VRAM 부족) 시 비활성(기능만 off).
+        // [A2] 접두 재사용 체크포인트 — [K3] 512 경계 스택 4개(환형).
+        // 실패(VRAM 부족) 시 비활성(기능만 off).
         let chk =
-            self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4;
+            4 * self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4;
         match self.cc.alloc(chk) {
             Ok(p) => {
                 self.dchk = p;
-                self.dchk_pos = vec![0u32; self.n_slots];
+                self.dchk_pos = vec![[0u32; 4]; self.n_slots];
             }
             Err(e) => {
                 eprintln!("# prefix-ckpt 비활성(VRAM): {e}");

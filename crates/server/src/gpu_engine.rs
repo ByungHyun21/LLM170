@@ -472,12 +472,13 @@ impl GpuEngine {
     pub fn spec_rewind_pos(&mut self, slot: usize, n: u32) -> Result<(), String> {
         self.dec.spec_rewind_pos(slot, n)
     }
-    /// [A2 2026-10-11] 접두 재사용 체크포인트 — 위치 조회(0=없음)/복원.
-    pub fn checkpoint_pos(&self, slot: usize) -> u32 {
-        self.dec.checkpoint_pos(slot)
+    /// [A2→K3 2026-10-12] 접두 재사용 체크포인트 — upto 이하 최대 경계
+    /// 조회(0=없음)/복원(512 경계 스택 4개).
+    pub fn checkpoint_pos(&self, slot: usize, upto: u32) -> u32 {
+        self.dec.checkpoint_pos(slot, upto)
     }
-    pub fn restore_gdn(&mut self, slot: usize) -> Result<u32, String> {
-        self.dec.restore_gdn(slot)
+    pub fn restore_gdn(&mut self, slot: usize, upto: u32) -> Result<u32, String> {
+        self.dec.restore_gdn(slot, upto)
     }
     pub fn embed_row(&self, tok: u32) -> Result<Vec<f32>, String> {
         self.model.embed_row(tok).map_err(|e| e.to_string())

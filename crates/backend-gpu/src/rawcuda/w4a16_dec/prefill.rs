@@ -189,7 +189,7 @@ impl W4a16Dec {
         // [A2 2026-10-11] 2048 경계 — 접두 재사용 체크포인트(GDN 상태+conv
         // 링, 순수 복사 — 산술 불변). 실패는 무시(기능만 미제공).
         let endp = pos + t as u32;
-        if !self.capture_no_host && endp.is_multiple_of(2048) {
+        if !self.capture_no_host && endp.is_multiple_of(512) {
             let _ = self.checkpoint_gdn(slot, endp);
         }
         if all {
