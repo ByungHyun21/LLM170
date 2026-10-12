@@ -73,6 +73,7 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_moe_accum_sg",
             "w4a16_gemm_g32_mma_grp_d64",
             "w4a16_gemm_g128_marlin",
+            "w4a16_gemm_g32_marlin",
         ],
         boot: true,
     },

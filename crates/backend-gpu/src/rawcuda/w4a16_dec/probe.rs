@@ -515,6 +515,7 @@ impl W4a16Dec {
     /// 정수 니블 패턴이면 기대값 = 정수(Σ(nib−8))이라 mma f32 누적도 비트정확.
     pub fn marlin_selfcheck(
         &mut self,
+        sym: &str,
         qm: &[u32],
         s: &[u16],
         x16: &[u16],
@@ -524,8 +525,9 @@ impl W4a16Dec {
         k: usize,
     ) -> Result<String, String> {
         let _g = self.cc.guard()?;
+        // 스케일 크기 = g128(k/128) 또는 g32(k/32) 계약(변형 커널 수용).
         if qm.len() != (k / 16) * (n / 64) * 128
-            || s.len() != n * (k / 128)
+            || (s.len() != n * (k / 128) && s.len() != n * (k / 32))
             || x16.len() != t * k
             || expect.len() != t * n
         {
@@ -551,7 +553,7 @@ impl W4a16Dec {
         self.cc.h2d(ds, sb)?;
         self.cc.h2d(dx, xb)?;
         let r = (|| -> Result<(), String> {
-            let fm = self.cc.function("w4a16_gemm_g128_marlin")?;
+            let fm = self.cc.function(sym)?;
             let (mut m_q, mut m_s, mut m_x, mut m_y) = (dqm, ds, dx, dout);
             let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
             self.cc.launch(

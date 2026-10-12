@@ -31,6 +31,7 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut mma_diff: Option<(String, usize)> = None;
     let mut marlin_diff: Option<(String, usize)> = None; // [marlin S2] A/B 재패킹 게이트
     let mut marlin_selfcheck: Option<(usize, usize, usize)> = None; // [marlin S2] 격리 자체점검 (t, k, n)
+    let mut marlin_selfcheck32: Option<(usize, usize, usize)> = None; // [marlin g32] bf16 자체점검
     let mut marlin_bench: Vec<(String, usize, usize)> = Vec::new(); // [marlin S2] mma 대비 벤치
     let mut marlin_ref: Option<(String, usize)> = None; // [marlin S2] 실무게 64행 참조 대조
     let mut mode_ref: u8 = 0; // 0 실값, 1 s→1, 2 x→1, 3 둘 다 1
@@ -107,6 +108,15 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--marlin-diff requires t")?;
                 marlin_diff = Some((name, t));
+            }
+            "--marlin-selfcheck32" => {
+                let t = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--marlin-selfcheck32 requires t")?;
+                let k = it.next().and_then(|v| v.parse().ok()).unwrap_or(128usize);
+                let n = it.next().and_then(|v| v.parse().ok()).unwrap_or(128usize);
+                marlin_selfcheck32 = Some((t, k, n));
             }
             "--marlin-ref" => {
                 let name = arg(&mut it, "--marlin-ref requires a name")?.to_string();
@@ -339,7 +349,37 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
                 expect[r * n + nn] = acc as f32;
             }
         }
-        return dec.marlin_selfcheck(&qm, &s, &x16, &expect, t, n, k);
+        return dec.marlin_selfcheck("w4a16_gemm_g128_marlin", &qm, &s, &x16, &expect, t, n, k);
+    }
+    // [marlin g32] 합성 자체점검 — bf16 2^-j 스케일(KC=32=그룹 1개), x=1.
+    if let Some((t, k, n)) = marlin_selfcheck32 {
+        let nib_at = |kk: usize, nn: usize| ((kk * 7 + nn * 3) % 16) as u32;
+        let mut q = vec![0u32; n * (k / 8)];
+        for nn in 0..n {
+            for kk in 0..k {
+                q[nn * (k / 8) + kk / 8] |= nib_at(kk, nn) << ((kk % 8) * 4);
+            }
+        }
+        let mut s = vec![0u16; n * (k / 32)];
+        for nn in 0..n {
+            for gg in 0..(k / 32) {
+                s[nn * (k / 32) + gg] = ((127 - ((nn + gg) % 5)) as u16) << 7;
+            }
+        }
+        let x16 = vec![0x3C00u16; t * k]; // f16 1.0
+        let qm = llm170_core::marlin::marlin_repack_q(&q, n, k)?;
+        let mut expect = vec![0f32; t * n];
+        for r in 0..t {
+            for nn in 0..n {
+                let mut acc = 0f64;
+                for kk in 0..k {
+                    let j = ((nn + kk / 32) % 5) as i32;
+                    acc += (nib_at(kk, nn) as f64 - 8.0) * 2f64.powi(-j);
+                }
+                expect[r * n + nn] = acc as f32;
+            }
+        }
+        return dec.marlin_selfcheck("w4a16_gemm_g32_marlin", &qm, &s, &x16, &expect, t, n, k);
     }
     // [marlin S2 디버그] 실무게 64행 슬라이스 vs 호스트 기대값 — 커널 단독
     // 정오 판정(스케일·디퀀트 포함). 실패 시 (행,열,기대,실제)를 보여준다.
@@ -397,7 +437,16 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
                 expect[r * n + nn] = acc as f32;
             }
         }
-        return dec.marlin_selfcheck(&qm, &s_use, &x_use, &expect, t, n, k);
+        return dec.marlin_selfcheck(
+            "w4a16_gemm_g128_marlin",
+            &qm,
+            &s_use,
+            &x_use,
+            &expect,
+            t,
+            n,
+            k,
+        );
     }
     // [marlin S2] mma 대비 커널 벤치 — 같은 입력·grid·회차(인터리브).
     if !marlin_bench.is_empty() {
