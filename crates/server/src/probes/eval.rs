@@ -586,7 +586,7 @@ fn sample(args: &[String]) -> Result<String, String> {
     }
     let zsum: f64 = idx
         .iter()
-        .map(|&i| f64::from((base_logits[i] - mx).exp()))
+        .map(|&i| f64::from(((base_logits[i] - mx) / temp).exp()))
         .sum();
     let (mut tv, mut chi2) = (0.0f64, 0.0f64);
     for i in 0..nv {
