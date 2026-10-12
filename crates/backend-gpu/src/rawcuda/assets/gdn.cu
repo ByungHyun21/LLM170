@@ -606,10 +606,17 @@ extern "C" __global__ void gdn_scan(
                 // [FLA-3 2026-10-10] j를 고정 32회 전개 — A[i][j≥i]=0(prepass가
                 // 0 기록)이므로 무조건 누산이 동일 값(0·dc=±0, rhs∓0=rhs —
                 // 비트동일). 동적 하한 루프의 smem 지연 노출(i×~35cyc) 제거.
+                // [결함수정 2026-10-12] 단 0·dc는 dc가 유한할 때만 0이다 —
+                // dc는 smem(재사용)이라 미기록 칸(j≥i·j≥n)에 이전 커널의
+                // 쓰레기가 남고 0×inf/NaN=NaN → solve·상태 전멸(런별 층·위치
+                // 변동 NaN의 정체). j<i 가드로 읽기 자체를 제거(유한 dc에서
+                // 값 비트동일 — 곱해지는 항이 정확히 0뿐).
 #pragma unroll
                 for (int j = 0; j < GDN_CS; j++) {
-                    float aij = __half2float(A[i * GDN_CS + j]);
-                    rhs -= aij * dc[j * GDN_VS + tid];
+                    if (j < i) {
+                        float aij = __half2float(A[i * GDN_CS + j]);
+                        rhs -= aij * dc[j * GDN_VS + tid];
+                    }
                 }
                 dc[i * GDN_VS + tid] = rhs;
             }
@@ -630,10 +637,14 @@ extern "C" __global__ void gdn_scan(
                 }
                 float oi = e[i] * __half2float(QS[i * GDN_VS + tid]);
                 // [FLA-3] p 고정 32회 전개 — KQ[i][p>i]=0(비트동일).
+                // [결함수정 2026-10-12] dc[p≥n]은 미기록(smem 쓰레기) —
+                // p <= i 가드로 0×inf/NaN 차단(유한 dc에서 비트동일).
 #pragma unroll
                 for (int p = 0; p < GDN_CS; p++) {
-                    float w = __half2float(KQ[i * GDN_CS + p]);
-                    oi += w * dc[p * GDN_VS + tid];
+                    if (p <= i) {
+                        float w = __half2float(KQ[i * GDN_CS + p]);
+                        oi += w * dc[p * GDN_VS + tid];
+                    }
                 }
                 outv[(t0 + i) * (h_v * d) + h * 128 + vs + tid] = oi;
             }
