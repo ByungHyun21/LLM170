@@ -34,6 +34,8 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut marlin_selfcheck32: Option<(usize, usize, usize)> = None; // [marlin g32] bf16 자체점검
     let mut marlin_bench: Vec<(String, usize, usize, String)> = Vec::new(); // [marlin S2] mma 대비 벤치
     let mut marlin_ref: Option<(String, usize)> = None; // [marlin S2] 실무게 64행 참조 대조
+    let mut attn_fa2: Vec<(usize, usize, u32)> = Vec::new(); // [FA2] A/B (t, layer, pos0)
+    let mut attn_fa2_bench: Vec<(usize, usize, usize, u32)> = Vec::new(); // [FA2] (t, layer, reps, pos0)
     let mut mode_ref: u8 = 0; // 0 실값, 1 s→1, 2 x→1, 3 둘 다 1
     let mut kcap: usize = usize::MAX; // ref k 상한(이분탐색용)
     let mut moe_topk_check: Option<(usize, usize, usize)> = None;
@@ -118,6 +120,35 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
                 let n = it.next().and_then(|v| v.parse().ok()).unwrap_or(128usize);
                 marlin_selfcheck32 = Some((t, k, n));
             }
+            "--attn-fa2-bench" => {
+                let t = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--attn-fa2-bench requires t")?;
+                let lay = it.next().and_then(|v| v.parse().ok()).unwrap_or(0usize);
+                let reps = it.next().and_then(|v| v.parse().ok()).unwrap_or(8usize);
+                let pos0 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0u32);
+                attn_fa2_bench.push((t, lay, reps, pos0));
+            }
+            "--attn-fa2" => {
+                let t = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--attn-fa2 requires t")?;
+                let mut lay = 0usize;
+                if let Some(nx) = it.clone().next()
+                    && !nx.starts_with("--")
+                {
+                    lay = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                }
+                let mut p0 = 0u32;
+                if let Some(nx) = it.clone().next()
+                    && !nx.starts_with("--")
+                {
+                    p0 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                }
+                attn_fa2.push((t, lay, p0));
+            }
             "--marlin-ref" => {
                 let name = arg(&mut it, "--marlin-ref requires a name")?.to_string();
                 let t = it
@@ -133,9 +164,23 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
                     .next()
                     .and_then(|v| v.parse().ok())
                     .ok_or("--marlin-selfcheck requires t")?;
-                let k = it.next().and_then(|v| v.parse().ok()).unwrap_or(128usize);
-                let n = it.next().and_then(|v| v.parse().ok()).unwrap_or(128usize);
-                let m16 = it.next().map(|v| v == "m16").unwrap_or(false);
+                let (mut k, mut n, mut m16) = (128usize, 128usize, false);
+                if let Some(nx) = it.clone().next()
+                    && !nx.starts_with("--")
+                {
+                    k = it.next().and_then(|v| v.parse().ok()).unwrap_or(128);
+                }
+                if let Some(nx) = it.clone().next()
+                    && !nx.starts_with("--")
+                {
+                    n = it.next().and_then(|v| v.parse().ok()).unwrap_or(128);
+                }
+                if let Some(nx) = it.clone().next()
+                    && nx == "m16"
+                {
+                    let _ = it.next();
+                    m16 = true;
+                }
                 marlin_selfcheck = Some((t, k, n, m16));
             }
             "--marlin-bench" => {
@@ -404,6 +449,22 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
             n,
             k,
         );
+    }
+    // [FA2] 프리필 어텐션 벤치 — prep 포함 기존 vs FA2.
+    if !attn_fa2_bench.is_empty() {
+        let mut out = Vec::new();
+        for (t, lay, reps, pos0) in &attn_fa2_bench {
+            out.push(dec.attn_fa2_bench(0, *lay, *t, *reps, *pos0)?);
+        }
+        return Ok(out.join("\n"));
+    }
+    // [FA2] 프리필 어텐션 A/B — 기존 경로 vs attn_fa2_qg.
+    if !attn_fa2.is_empty() {
+        let mut out = Vec::new();
+        for (t, lay, p0) in &attn_fa2 {
+            out.push(dec.attn_fa2_diff(0, *lay, *t, *p0)?);
+        }
+        return Ok(out.join("\n"));
     }
     // [marlin S2 디버그] 실무게 64행 슬라이스 vs 호스트 기대값 — 커널 단독
     // 정오 판정(스케일·디퀀트 포함). 실패 시 (행,열,기대,실제)를 보여준다.

@@ -802,3 +802,363 @@ extern "C" __global__ void attn_fwd3s_part_qg(
         out[2 + tid] = acc[h];
     }
 }
+
+
+// ── [FA2 2026-10-12] 프리필 어텐션 FA2식 재작성 — 블록 = (Q행 32 × q헤드) ──
+// 구조: KV 청크(Bc=32) 타일 루프 + 레지스터 온라인 소프트맥스 + mma(f16).
+// 워프 4: wi=warp>>1(행16 그룹)·wg=warp&1(d반 128). S·소프트맥스 = wg0 두 워프
+// (행 0..15/16..31), 스테이징·PV = 전 워프(d반 분담). K는 int8 smem 보관
+// (프래그먼트 로드 시 f16 변환 — |v|≤127 정확), V는 스테이징 시 f16 전치
+// (VsT[d][j]). 스코어 = (q·k8)·0.0625·ksc, P = exp(S−m)·vsc (f16), l = Σexp
+// (vsc 미포함 f32), O = Σ P·V. 인과 = 행별 n_max 마스크. 미기록 KV행 = 0
+// 기록(0×NaN 전파 차단). lim = pp[0] 디바이스 판독(결함 4호 유지).
+// 【수치 클래스】 q f16 라운딩·mma 스코어·P f16 — eval 대역 + 골든 재동결
+// 절차 대상(기존 part_q/merge 경로는 디코드 t≤8 전용으로 불변).
+#define FA2_BR 32
+#define FA2_BC 32
+
+__device__ __forceinline__ unsigned fa2_pk(unsigned short a, unsigned short b)
+{
+    return (unsigned)a | ((unsigned)b << 16);
+}
+
+__device__ __forceinline__ void fa2_mma(float* c, unsigned a0, unsigned a1,
+                                        unsigned a2, unsigned a3, unsigned b0,
+                                        unsigned b1)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// int8 2개 → f16x2 (|v|≤127 정확 표현).
+__device__ __forceinline__ unsigned fa2_k8(unsigned short v)
+{
+    const int a = (signed char)(v & 0xffu);
+    const int b = (signed char)((v >> 8) & 0xffu);
+    __half2 h = __floats2half2_rn((float)a, (float)b);
+    return *reinterpret_cast<unsigned*>(&h);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
+    const float* __restrict__ qh,
+    const signed char* __restrict__ kc,
+    const signed char* __restrict__ vc,
+    const float* __restrict__ ksc,
+    const float* __restrict__ vsc,
+    const float* __restrict__ qg,
+    float* __restrict__ outv,
+    float* __restrict__ out32,
+    unsigned short* __restrict__ out16,
+    const unsigned* __restrict__ pp,
+    int t_len, int layer, int q_heads, int kv_heads, int cap)
+{
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int g = lane >> 2;
+    const int tt = lane & 3;
+    const int wi = warp >> 1;
+    const int wg = warp & 1;
+    const int h = blockIdx.y;
+    const int gq_ = q_heads / kv_heads;
+    const int kh = h / gq_;
+    const int rb = blockIdx.x * FA2_BR;
+    const int pos0 = (int)pp[0];
+    const long kv_dim = (long)kv_heads * 256;
+
+    __shared__ __align__(16) unsigned short Qs[FA2_BR][264];
+    __shared__ __align__(16) signed char K8[FA2_BC][272];  // 16B 정렬(uint4 스테이징)
+    __shared__ __align__(16) unsigned short VsT[256][34];  // 4B 정렬(4B 프래그먼트 로드)
+    __shared__ __align__(16) unsigned short Ps[FA2_BR][36];
+    __shared__ float ksc_s[FA2_BC];
+    __shared__ float vsc_s[FA2_BC];
+    __shared__ float m_s[FA2_BR];
+    __shared__ float l_s[FA2_BR];
+    __shared__ float corr_s[FA2_BR];
+
+    // [수정 2026-10-12] Q f16 오버플로 방지 — 타일 전역 스케일(소프트맥스는
+    // 양수 스케일에 불변: 점수·m·l·P 모두 같은 인자로 스케일됨). 폭주 행
+    // (|q|>65504, 분산 붕괴 시)이 f16 INF → inf×0 = NaN으로 전파되던 회귀의
+    // 원인. 스케일 s = min(1, 30000/qmax) 후 점수에 1/s를 곱해 복원.
+    float qmx = 0.0f;
+    for (int e = tid; e < FA2_BR * 256; e += 128) {
+        const int r = e >> 8;
+        const int d_ = e & 255;
+        const int row = rb + r;
+        if (row < t_len) {
+            qmx = fmaxf(
+                qmx, fabsf(qh[(size_t)row * (q_heads * 256) + (size_t)h * 256 + d_]));
+        }
+    }
+    __shared__ float qred[128];
+    qred[tid] = qmx;
+    __syncthreads();
+    for (int st = 64; st > 0; st >>= 1) {
+        if (tid < st) {
+            qred[tid] = fmaxf(qred[tid], qred[tid + st]);
+        }
+        __syncthreads();
+    }
+    const float qsc = (qred[0] > 30000.0f) ? (30000.0f / qred[0]) : 1.0f;
+    const float iqsc = 1.0f / qsc;
+    // 프롤로그: Q f16 적재(범위 밖 0) + 상태 초기화.
+    for (int e = tid; e < FA2_BR * 256; e += 128) {
+        const int r = e >> 8;
+        const int d_ = e & 255;
+        const int row = rb + r;
+        float qv = 0.0f;
+        if (row < t_len) {
+            qv = qh[(size_t)row * (q_heads * 256) + (size_t)h * 256 + d_];
+        }
+        Qs[r][d_] = f2h(qv * qsc);
+    }
+    if (tid < FA2_BR) {
+        m_s[tid] = -1e30f;
+        l_s[tid] = 0.0f;
+        corr_s[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const int row_end = min(rb + FA2_BR - 1, t_len - 1);
+    const int lim_max = pos0 + row_end + 1;
+    const int nchunks = (lim_max + FA2_BC - 1) / FA2_BC;
+    const int pos_end = pos0 + t_len;
+
+    float o[16][4];
+#pragma unroll
+    for (int f = 0; f < 16; ++f) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            o[f][i] = 0.0f;
+        }
+    }
+
+    for (int c0 = 0; c0 < nchunks; ++c0) {
+        const int base = c0 * FA2_BC;
+        // ── 스테이징: K int8 복사(또는 0) + V f16 전치 + 스케일 ──
+        for (int e = tid; e < FA2_BC * 16; e += 128) {
+            const int j = e >> 4;
+            const int qq = e & 15;
+            const int row = base + j;
+            const signed char* kp =
+                kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256 + qq * 16;
+            if (row < pos_end) {
+                *reinterpret_cast<uint4*>(&K8[j][qq * 16]) =
+                    *reinterpret_cast<const uint4*>(kp);
+            } else {
+                *reinterpret_cast<uint4*>(&K8[j][qq * 16]) = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        for (int e = tid; e < FA2_BC * 16; e += 128) {
+            const int j = e >> 4;
+            const int qq = e & 15;
+            const int row = base + j;
+            signed char vb[16];
+            if (row < pos_end) {
+                const signed char* vp =
+                    vc + ((long)layer * cap + row) * kv_dim + (long)kh * 256 + qq * 16;
+                *reinterpret_cast<uint4*>(vb) = *reinterpret_cast<const uint4*>(vp);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    vb[i] = 0;
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                VsT[qq * 16 + i][j] = f2h((float)vb[i]);
+            }
+        }
+        if (tid < FA2_BC) {
+            const int row = base + tid;
+            const bool ok = row < pos_end;
+            ksc_s[tid] = ok ? ksc[((long)layer * cap + row) * kv_heads + kh] : 0.0f;
+            vsc_s[tid] = ok ? vsc[((long)layer * cap + row) * kv_heads + kh] : 0.0f;
+        }
+        __syncthreads();
+
+        // ── S = Q·K^T (wg0 워프: 행 그룹 wi) + 온라인 소프트맥스 + P ──
+        if (wg == 0) {
+            float sa[4][4];
+#pragma unroll
+            for (int f = 0; f < 4; ++f) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    sa[f][i] = 0.0f;
+                }
+            }
+#pragma unroll
+            for (int kb = 0; kb < 256; kb += 16) {
+                const unsigned a0 =
+                    *reinterpret_cast<const unsigned*>(&Qs[wi * 16 + g][kb + 2 * tt]);
+                const unsigned a1 =
+                    *reinterpret_cast<const unsigned*>(&Qs[wi * 16 + g + 8][kb + 2 * tt]);
+                const unsigned a2 =
+                    *reinterpret_cast<const unsigned*>(&Qs[wi * 16 + g][kb + 2 * tt + 8]);
+                const unsigned a3 = *reinterpret_cast<const unsigned*>(
+                    &Qs[wi * 16 + g + 8][kb + 2 * tt + 8]);
+#pragma unroll
+                for (int f = 0; f < 4; ++f) {
+                    const int j = f * 8 + g;
+                    const unsigned b0 =
+                        fa2_k8(*reinterpret_cast<const unsigned short*>(&K8[j][kb + 2 * tt]));
+                    const unsigned b1 = fa2_k8(
+                        *reinterpret_cast<const unsigned short*>(&K8[j][kb + 2 * tt + 8]));
+                    fa2_mma(sa[f], a0, a1, a2, a3, b0, b1);
+                }
+            }
+            // 스케일(0.0625·ksc) + 인과 마스크 → 행 max/exp/합/P.
+            const int rA = wi * 16 + g;
+            const int rB = rA + 8;
+            const int nA = pos0 + rb + rA + 1 - base; // 행 rA의 유효 열 수
+            const int nB = pos0 + rb + rB + 1 - base;
+#pragma unroll
+            for (int f = 0; f < 4; ++f) {
+                const int cc = f * 8 + 2 * tt;
+                const float s0 = 0.0625f * ksc_s[cc] * iqsc;
+                const float s1 = 0.0625f * ksc_s[cc + 1] * iqsc;
+                sa[f][0] *= s0;
+                sa[f][1] *= s1;
+                sa[f][2] *= s0;
+                sa[f][3] *= s1;
+                if (cc >= nA) {
+                    sa[f][0] = -1e30f;
+                }
+                if (cc + 1 >= nA) {
+                    sa[f][1] = -1e30f;
+                }
+                if (cc >= nB) {
+                    sa[f][2] = -1e30f;
+                }
+                if (cc + 1 >= nB) {
+                    sa[f][3] = -1e30f;
+                }
+            }
+            float mg = -1e30f;
+            float mh = -1e30f;
+#pragma unroll
+            for (int f = 0; f < 4; ++f) {
+                mg = fmaxf(mg, fmaxf(sa[f][0], sa[f][1]));
+                mh = fmaxf(mh, fmaxf(sa[f][2], sa[f][3]));
+            }
+            mg = fmaxf(mg, __shfl_xor_sync(0xffffffffu, mg, 1));
+            mg = fmaxf(mg, __shfl_xor_sync(0xffffffffu, mg, 2));
+            mh = fmaxf(mh, __shfl_xor_sync(0xffffffffu, mh, 1));
+            mh = fmaxf(mh, __shfl_xor_sync(0xffffffffu, mh, 2));
+            const float moldA = m_s[rA];
+            const float moldB = m_s[rB];
+            const float mnewA = fmaxf(moldA, mg);
+            const float mnewB = fmaxf(moldB, mh);
+            const float corrA = (moldA <= -1e29f) ? 0.0f : attn_expf(moldA - mnewA);
+            const float corrB = (moldB <= -1e29f) ? 0.0f : attn_expf(moldB - mnewB);
+            float sumA = 0.0f;
+            float sumB = 0.0f;
+#pragma unroll
+            for (int f = 0; f < 4; ++f) {
+                const int cc = f * 8 + 2 * tt;
+                const float vs0 = vsc_s[cc];
+                const float vs1 = vsc_s[cc + 1];
+                const float p0 = attn_expf(sa[f][0] - mnewA);
+                const float p1 = attn_expf(sa[f][1] - mnewA);
+                const float p2 = attn_expf(sa[f][2] - mnewB);
+                const float p3 = attn_expf(sa[f][3] - mnewB);
+                sumA += p0 + p1;
+                sumB += p2 + p3;
+                *reinterpret_cast<unsigned*>(&Ps[rA][cc]) =
+                    fa2_pk(f2h(p0 * vs0), f2h(p1 * vs1));
+                *reinterpret_cast<unsigned*>(&Ps[rB][cc]) =
+                    fa2_pk(f2h(p2 * vs0), f2h(p3 * vs1));
+            }
+            sumA += __shfl_xor_sync(0xffffffffu, sumA, 1);
+            sumA += __shfl_xor_sync(0xffffffffu, sumA, 2);
+            sumB += __shfl_xor_sync(0xffffffffu, sumB, 1);
+            sumB += __shfl_xor_sync(0xffffffffu, sumB, 2);
+            // [경쟁 수정 2026-10-12] m_s[moldA]를 전 레인이 먼저 판독했다 — tt==0
+            // 스토어 전 워프 동기(Volta+ 독립 스케줄링에서 무동기 read/write UB).
+            __syncwarp();
+            if (tt == 0) {
+                m_s[rA] = mnewA;
+                m_s[rB] = mnewB;
+                l_s[rA] = l_s[rA] * corrA + sumA;
+                l_s[rB] = l_s[rB] * corrB + sumB;
+                corr_s[rA] = corrA;
+                corr_s[rB] = corrB;
+            }
+        }
+        __syncthreads();
+
+        // ── PV: O = O·corr + P·V (전 워프, d반 분담) ──
+        {
+            const int rA = wi * 16 + g;
+            const int rB = rA + 8;
+            const float corrA = corr_s[rA];
+            const float corrB = corr_s[rB];
+#pragma unroll
+            for (int f = 0; f < 16; ++f) {
+                o[f][0] *= corrA;
+                o[f][1] *= corrA;
+                o[f][2] *= corrB;
+                o[f][3] *= corrB;
+            }
+#pragma unroll
+            for (int kb = 0; kb < FA2_BC; kb += 16) {
+                const unsigned a0 =
+                    *reinterpret_cast<const unsigned*>(&Ps[rA][kb + 2 * tt]);
+                const unsigned a1 =
+                    *reinterpret_cast<const unsigned*>(&Ps[rB][kb + 2 * tt]);
+                const unsigned a2 =
+                    *reinterpret_cast<const unsigned*>(&Ps[rA][kb + 2 * tt + 8]);
+                const unsigned a3 =
+                    *reinterpret_cast<const unsigned*>(&Ps[rB][kb + 2 * tt + 8]);
+#pragma unroll
+                for (int f = 0; f < 16; ++f) {
+                    const int d_ = wg * 128 + f * 8 + g;
+                    const unsigned b0 = *reinterpret_cast<const unsigned*>(
+                        &VsT[d_][kb + 2 * tt]);
+                    const unsigned b1 = *reinterpret_cast<const unsigned*>(
+                        &VsT[d_][kb + 2 * tt + 8]);
+                    fa2_mma(o[f], a0, a1, a2, a3, b0, b1);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ── 에필로그: O/l × sigmoid(gate) + out32/out16 융합 ──
+    {
+        const int rA = wi * 16 + g;
+        const int rB = rA + 8;
+        const float invlA = 1.0f / l_s[rA];
+        const float invlB = 1.0f / l_s[rB];
+        const int rowA = rb + rA;
+        const int rowB = rb + rB;
+#pragma unroll
+        for (int f = 0; f < 16; ++f) {
+            const int d_ = wg * 128 + f * 8 + 2 * tt;
+            // C 프래그먼트 4값 매핑: c0=(행g,열2t) c1=(행g,2t+1) c2=(행g+8,2t)
+            // c3=(행g+8,2t+1).
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int r0 = (e < 2) ? rowA : rowB;
+                const int d2 = d_ + (e & 1);
+                if (r0 < t_len) {
+                    const float gv = qg[(size_t)r0 * (q_heads * 512) + (size_t)h * 512 +
+                                        256 + d2];
+                    const float sg = 1.0f / (1.0f + attn_expf(-gv));
+                    const float ov = o[f][e] * ((e < 2) ? invlA : invlB) * sg;
+                    const long oi = (size_t)r0 * (q_heads * 256) + (size_t)h * 256 + d2;
+                    outv[oi] = ov;
+                    if (out32 != (float*)0) {
+                        out32[oi] = h2f(f2h(ov));
+                    }
+                    if (out16 != (unsigned short*)0) {
+                        out16[oi] = f2h(ov);
+                    }
+                }
+            }
+        }
+    }
+}

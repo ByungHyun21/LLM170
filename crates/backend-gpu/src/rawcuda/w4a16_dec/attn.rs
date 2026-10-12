@@ -118,6 +118,26 @@ impl W4a16Dec {
         t_len: usize,
         qg_dev: CUdeviceptr,
     ) -> Result<(), String> {
+        if t_len == 0 || t_len > ATTN_F3S_TMAX {
+            return Err(format!("attn fwd3s: T={t_len} — 소형 전용 도메인 위반"));
+        }
+        // [FA2 2026-10-12] 프리필(t>8)은 FA2 타일 경로 — part_qg+merge 대체.
+        // (수치 클래스: q f16·P f16·스코어 mma — eval 대역 판정·골든 재동결
+        // 절차. 디코드 t≤8은 기존 part_q+merge 유지.)
+        if t_len > 8 {
+            return self.attn_fa2_launch(slot, layer, t_len, qg_dev);
+        }
+        self.attn_fwd3s_legacy_launch(slot, layer, t_len, qg_dev)
+    }
+
+    /// [FA2] 기존 part_qg+merge 경로 — 디코드(t≤8) 프로덕션 + A/B 참조 전용.
+    pub(super) fn attn_fwd3s_legacy_launch(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        qg_dev: CUdeviceptr,
+    ) -> Result<(), String> {
         let dm = self.attn.ok_or("attn: 형상 미등록")?;
         if t_len == 0 || t_len > ATTN_F3S_TMAX {
             return Err(format!("attn fwd3s: T={t_len} — 소형 전용 도메인 위반"));
@@ -177,6 +197,49 @@ impl W4a16Dec {
             256,
             &mut crate::rawcuda::args::l8(
                 &mut mp, &mut mg, &mut mo, &mut mo32, &mut mo16, &mut tl2, &mut qh2, &mut sp,
+            ),
+        )
+    }
+
+    /// [FA2 2026-10-12] 프리필 어텐션 FA2 경로 — t>8 전용. prep이 기록한
+    /// dqh·int8 KV를 소비해 outv + out32/out16 융합 기록(merge 불요).
+    pub(super) fn attn_fa2_launch(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        qg_dev: CUdeviceptr,
+    ) -> Result<(), String> {
+        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        if t_len == 0 || t_len > ATTN_F3S_TMAX {
+            return Err(format!("attn fa2: T={t_len} — 도메인 위반"));
+        }
+        let f = self.cc.function("attn_fa2_qg")?;
+        let nm = t_len * dm.q_heads * 256;
+        let (m32, m16) = (self.ensure_dx32(nm)?, self.ensure_dx16(nm)?);
+        #[allow(clippy::type_complexity)]
+        let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8, mut a9) = (
+            self.dqh_a,
+            self.attn_kv_ptr(slot),
+            self.attn_vc_ptr(slot),
+            self.attn_ksc_ptr(slot),
+            self.attn_vsc_ptr(slot),
+            qg_dev,
+            self.doutv_a,
+            m32,
+            m16,
+            self.attn_pp_ptr(slot),
+        );
+        let (mut tl, mut lay) = (t_len as i32, layer as i32);
+        let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
+        self.cc.launch(
+            f,
+            t_len.div_ceil(32) as u32,
+            dm.q_heads as u32,
+            128,
+            &mut crate::rawcuda::args::l15(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7, &mut a8,
+                &mut a9, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
             ),
         )
     }

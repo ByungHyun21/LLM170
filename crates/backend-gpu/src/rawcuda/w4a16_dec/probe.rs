@@ -719,6 +719,158 @@ impl W4a16Dec {
         ))
     }
 
+    /// [FA2 2026-10-12] 프리필 어텐션 벤치 — prep 포함 기존(part_qg+merge) vs
+    /// FA2 왕복(인터리브·최소 2라운드). 입력은 결정적 업로드.
+    pub fn attn_fa2_bench(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        reps: usize,
+        pos0: u32,
+    ) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        let (qgd, kvd) = (dm.qg_dim(), dm.kv_dim());
+        let mut seed = 0x243F_6A88_85A3_08D3u64 ^ ((t_len as u64) << 32);
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / 2048.0) - 0.5
+        };
+        let qg: Vec<f32> = (0..t_len * qgd).map(|_| rnd()).collect();
+        let kin: Vec<f32> = (0..t_len * kvd).map(|_| rnd()).collect();
+        let vin: Vec<f32> = (0..t_len * kvd).map(|_| rnd()).collect();
+        self.ensure_attn_bufs(t_len)?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
+        let b =
+            |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        self.cc.h2d(self.dqg_a, b(&qg))?;
+        self.cc.h2d(self.dkin_a, b(&kin))?;
+        self.cc.h2d(self.dvin_a, b(&vin))?;
+        self.attn_set_pos(slot, pos0)?;
+        let (aq, ak, av) = (self.dqg_a, self.dkin_a, self.dvin_a);
+        let r = (|| -> Result<(f64, f64), String> {
+            for _ in 0..2 {
+                self.attn_prep_launch(slot, layer, t_len, aq, ak, av)?;
+                self.attn_fwd3s_launch(slot, layer, t_len, aq)?;
+                self.attn_prep_launch(slot, layer, t_len, aq, ak, av)?;
+                self.attn_fa2_launch(slot, layer, t_len, aq)?;
+            }
+            self.cc.sync()?;
+            let rounds = 4usize;
+            let per = (reps / rounds).max(1);
+            let (mut ta, mut tb) = (0f64, 0f64);
+            for _ in 0..rounds {
+                let t0 = std::time::Instant::now();
+                for _ in 0..per {
+                    self.attn_prep_launch(slot, layer, t_len, aq, ak, av)?;
+                    self.attn_fwd3s_launch(slot, layer, t_len, aq)?;
+                }
+                self.cc.sync()?;
+                ta += t0.elapsed().as_secs_f64();
+                let t0 = std::time::Instant::now();
+                for _ in 0..per {
+                    self.attn_prep_launch(slot, layer, t_len, aq, ak, av)?;
+                    self.attn_fa2_launch(slot, layer, t_len, aq)?;
+                }
+                self.cc.sync()?;
+                tb += t0.elapsed().as_secs_f64();
+            }
+            let n = (per * rounds) as f64;
+            Ok((ta * 1e3 / n, tb * 1e3 / n))
+        })();
+        let (old_ms, new_ms) = r?;
+        Ok(format!(
+            "attn-fa2-bench t={t_len} pos0={pos0} layer={layer} reps={reps}: 기존 {old_ms:.3}ms · FA2 {new_ms:.3}ms · 비율 {:.3}× (prep 포함)",
+            old_ms / new_ms
+        ))
+    }
+
+    /// [FA2 2026-10-12] FA2 프리필 어텐션 A/B — 같은 입력으로 기존(prep+part_qg+
+    /// merge)과 attn_fa2_qg 출력 비교. 수치 클래스(q f16·P f16·스코어 mma)로
+    /// ~5e-4 이하 기대 — rel>5e-3 카운트가 결함 판정.
+    pub fn attn_fa2_diff(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        pos0: u32,
+    ) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        let (qgd, kvd, qdd) = (dm.qg_dim(), dm.kv_dim(), dm.q_dim());
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ ((t_len as u64) << 32) ^ (layer as u64);
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / 2048.0) - 0.5
+        };
+        let qg: Vec<f32> = (0..t_len * qgd).map(|_| rnd()).collect();
+        let kin: Vec<f32> = (0..t_len * kvd).map(|_| rnd()).collect();
+        let vin: Vec<f32> = (0..t_len * kvd).map(|_| rnd()).collect();
+        // 참조 = legacy 경로(prep + part_qg + merge) — 체인 대신 직접 시퀀스.
+        self.ensure_attn_bufs(t_len)?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
+        let b =
+            |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        self.cc.h2d(self.dqg_a, b(&qg))?;
+        self.cc.h2d(self.dkin_a, b(&kin))?;
+        self.cc.h2d(self.dvin_a, b(&vin))?;
+        self.attn_set_pos(slot, pos0)?;
+        let (aq, ak, av) = (self.dqg_a, self.dkin_a, self.dvin_a);
+        self.attn_prep_launch(slot, layer, t_len, aq, ak, av)?;
+        self.attn_fwd3s_legacy_launch(slot, layer, t_len, aq)?;
+        let mut obuf = vec![0u8; t_len * qdd * 4];
+        self.cc.d2h(&mut obuf, self.doutv_a)?;
+        self.cc.sync()?;
+        let old: Vec<f32> = obuf
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        self.attn_prep_launch(slot, layer, t_len, aq, ak, av)?;
+        // FA2 — prep이 기록한 dqh/KV를 그대로 소비(out32/out16은 dx 버퍼 기록).
+        self.attn_fa2_launch(slot, layer, t_len, self.dqg_a)?;
+        let mut buf = vec![0u8; t_len * qdd * 4];
+        self.cc.d2h(&mut buf, self.doutv_a)?;
+        self.cc.sync()?;
+        let new: Vec<f32> = buf
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let mut maxd = 0f32;
+        let mut maxr = 0f32;
+        let mut bad = 0usize;
+        let mut first: Vec<(usize, f32, f32)> = Vec::new();
+        for i in 0..old.len() {
+            let d = (old[i] - new[i]).abs();
+            if d > maxd {
+                maxd = d;
+            }
+            let rl = d / old[i].abs().max(1e-3);
+            if rl > maxr {
+                maxr = rl;
+            }
+            if rl > 5e-3 {
+                bad += 1;
+                if first.len() < 5 {
+                    first.push((i, old[i], new[i]));
+                }
+            }
+        }
+        Ok(format!(
+            "attn-fa2-diff t={t_len} pos0={pos0} layer={layer}: maxabs={maxd:.3e} maxrel={maxr:.3e} rel>5e-3={bad}/{} 예={:?}",
+            old.len(),
+            first
+        ))
+    }
+
     /// [진단] ew 커널 독립 벤치 — 순수 커널 처리량(파이프라인 무관).
     pub fn bench_ew(&mut self) -> Result<String, String> {
         let _g = self.cc.guard()?;
