@@ -1,0 +1,502 @@
+diff --git a/crates/backend-gpu/src/rawcuda/w4a16_dec/chains.rs b/crates/backend-gpu/src/rawcuda/w4a16_dec/chains.rs
+index e86b1a86..30eb64c8 100644
+--- a/crates/backend-gpu/src/rawcuda/w4a16_dec/chains.rs
++++ b/crates/backend-gpu/src/rawcuda/w4a16_dec/chains.rs
+@@ -210,15 +210,26 @@ impl W4a16Dec {
+                 // [S2 2026-10-11] q/k/v 단독 3런치 → 다중세그먼트 1런치(테이블은
+                 // ensure_chain_bufs 1회 작성 — 값 비트동일).
+                 let xin = if plain { xn } else { x32 };
+-                self.gemv_multi_dev(plain, il, 0, xin)
+-                    .map_err(|e| format!("L{il} qkv: {e}"))?;
++                // [marlin (b) 2026-10-12] marlin 상주 — multi(원본 전용) 대체.
++                if self.lin_marlin {
++                    self.lin_group_marlin(il, 0, [s0, s1, s1b], 1)
++                        .map_err(|e| format!("L{il} qkv: {e}"))?;
++                } else {
++                    self.gemv_multi_dev(plain, il, 0, xin)
++                        .map_err(|e| format!("L{il} qkv: {e}"))?;
++                }
+                 self.attn_chain_dev_run(slot, il / interval, 1, s0, s1, s1b)
+                     .map_err(|e| format!("L{il} attn: {e}"))?
+             } else {
+                 let xin = if plain { xn } else { x32 };
+-                // [S2] qkv/z 2런치 → 1런치.
+-                self.gemv_multi_dev(plain, il, 0, xin)
+-                    .map_err(|e| format!("L{il} qkvz: {e}"))?;
++                // [S2] qkv/z 2런치 → 1런치. [marlin (b)] marlin 상주시 개별 m16.
++                if self.lin_marlin {
++                    self.lin_group_marlin(il, 0, [s0, s1, s1b], 1)
++                        .map_err(|e| format!("L{il} qkvz: {e}"))?;
++                } else {
++                    self.gemv_multi_dev(plain, il, 0, xin)
++                        .map_err(|e| format!("L{il} qkvz: {e}"))?;
++                }
+                 let g = self
+                     .gdn_chain_dev_run(slot, gi, 1, xn, s0, s1)
+                     .map_err(|e| format!("L{il} gdn: {e}"))?;
+@@ -233,6 +244,13 @@ impl W4a16Dec {
+             let out = if plain {
+                 self.plain_gemv_dev(&lo, branch)
+                     .map_err(|e| format!("L{il} {lo}: {e}"))?
++            } else if self.lin_marlin {
++                // [marlin (b) 2026-10-12] o/ssm_out — marlin m16 직접(dy 스테이징).
++                let (_, _, n, _) = self.lin_spec(&lo)?;
++                let dy = self.ensure_dy(n)?;
++                self.marlin_launch(&lo, dy, 1)
++                    .map_err(|e| format!("L{il} {lo}: {e}"))?;
++                dy
+             } else {
+                 let (_, _, _, ko) = self.lin_spec(&lo)?;
+                 // [4.1 2026-10-11] branch 생산자(merge/gate)가 x32/미러 동시
+@@ -257,16 +275,28 @@ impl W4a16Dec {
+                 let x32n = x32; // 노름 융합 기록
+                 let _ = xn2;
+                 // [S2 2026-10-11] gate/up 2런치 → 다중세그먼트 1런치.
+-                self.gemv_multi_dev(false, il, 1, x32n)
+-                    .map_err(|e| format!("L{il} gateup: {e}"))?;
++                // [marlin (b)] marlin 상주 — 개별 m16.
++                if self.lin_marlin {
++                    self.lin_group_marlin(il, 1, [s0, s1, s1b], 1)
++                        .map_err(|e| format!("L{il} gateup: {e}"))?;
++                } else {
++                    self.gemv_multi_dev(false, il, 1, x32n)
++                        .map_err(|e| format!("L{il} gateup: {e}"))?;
++                }
+                 let dn = format!("blk.{il}.ffn_down.weight");
+                 let (_, _, _, kd) = self.lin_spec(&dn)?;
+                 // [4.1 2026-10-11] ew가 x32/미러 동시 기록 — cast 노드 제거.
+                 self.ew_dev_fused(s0, s1, s2, kd)
+                     .map_err(|e| format!("L{il} ew: {e}"))?;
+                 // down은 s3 직접 쓰기 — dy 경유 d2d 제거.
+-                self.gemv_launch(&dn, self.dx32.ptr, s3)
+-                    .map_err(|e| format!("L{il} down: {e}"))?;
++                // [marlin (b)] marlin 상주 — m16 직접 기록.
++                if self.lin_marlin {
++                    self.marlin_launch(&dn, s3, 1)
++                        .map_err(|e| format!("L{il} down: {e}"))?;
++                } else {
++                    self.gemv_launch(&dn, self.dx32.ptr, s3)
++                        .map_err(|e| format!("L{il} down: {e}"))?;
++                }
+                 ab = s3;
+             }
+             if self.debug_layers {
+@@ -347,15 +377,26 @@ impl W4a16Dec {
+                 // [S2 2026-10-11] q/k/v 3런치 → 다중세그먼트 1런치(테이블 공용
+                 // — t=1 판과 동일 메타, grid만 Σceil(n/TR)).
+                 let xin = if plain { xn } else { xh };
+-                self.gemv_multi_t_dev(plain, il, 0, xin, t)
+-                    .map_err(|e| format!("B{il} qkv: {e}"))?;
++                // [marlin (b) 2026-10-12] marlin 상주 — 개별 m16.
++                if self.lin_marlin {
++                    self.lin_group_marlin(il, 0, [s0, s1, s1b], t)
++                        .map_err(|e| format!("B{il} qkv: {e}"))?;
++                } else {
++                    self.gemv_multi_t_dev(plain, il, 0, xin, t)
++                        .map_err(|e| format!("B{il} qkv: {e}"))?;
++                }
+                 self.attn_chain_dev_batch(slots, il / interval, t, s0, s1, s1b)
+                     .map_err(|e| format!("B{il} attn: {e}"))?
+             } else {
+                 let xin = if plain { xn } else { xh };
+-                // [S2] qkv/z 2런치 → 1런치.
+-                self.gemv_multi_t_dev(plain, il, 0, xin, t)
+-                    .map_err(|e| format!("B{il} qkvz: {e}"))?;
++                // [S2] qkv/z 2런치 → 1런치. [marlin (b)] marlin 상재 — 개별 m16.
++                if self.lin_marlin {
++                    self.lin_group_marlin(il, 0, [s0, s1, s1b], t)
++                        .map_err(|e| format!("B{il} qkvz: {e}"))?;
++                } else {
++                    self.gemv_multi_t_dev(plain, il, 0, xin, t)
++                        .map_err(|e| format!("B{il} qkvz: {e}"))?;
++                }
+                 let g = self
+                     .gdn_chain_dev_batch(slots, gi, t, xn, s0, s1)
+                     .map_err(|e| format!("B{il} gdn: {e}"))?;
+@@ -389,8 +430,14 @@ impl W4a16Dec {
+                 let xh3 = xh;
+                 let _ = xn2;
+                 // [S2 2026-10-11] gate/up 2런치 → 다중세그먼트 1런치.
+-                self.gemv_multi_t_dev(false, il, 1, xh3, t)
+-                    .map_err(|e| format!("B{il} gateup: {e}"))?;
++                // [marlin (b)] marlin 상주 — 개별 m16.
++                if self.lin_marlin {
++                    self.lin_group_marlin(il, 1, [s0, s1, s1b], t)
++                        .map_err(|e| format!("B{il} gateup: {e}"))?;
++                } else {
++                    self.gemv_multi_t_dev(false, il, 1, xh3, t)
++                        .map_err(|e| format!("B{il} gateup: {e}"))?;
++                }
+                 let dn = format!("blk.{il}.ffn_down.weight");
+                 let (_, _, _, kd) = self.lin_spec(&dn)?;
+                 // [4.1 2026-10-11] ew 융합 — cast_x32 노드 제거.
+diff --git a/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/gemm.rs b/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/gemm.rs
+index 92197814..e4e62817 100644
+--- a/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/gemm.rs
++++ b/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/gemm.rs
+@@ -9,6 +9,10 @@ impl W4a16Dec {
+         y_out: CUdeviceptr,
+         t: usize,
+     ) -> Result<(), String> {
++        // [marlin (b) 2026-10-12] marlin 상주 — 전 t marlin(m16/m64).
++        if self.lin_marlin {
++            return self.marlin_launch(name, y_out, t);
++        }
+         let (dq, ds, n, k) = self.lin_spec(name)?;
+         // [T1] split mma 경로(단일 경로, t≥16). 검증: 27B 4k·35B 600
+         // 토큰이 원본과 동일, 골든 유지, 허용오차 ~6e-4.
+@@ -48,4 +52,71 @@ impl W4a16Dec {
+             ),
+         )
+     }
++
++    /// [marlin (b) 2026-10-12] marlin B 레이아웃 GEMM 발사 — t≤16은 m16
++    /// (M16×N256·128스레드 — 디코드·소형 청크), t≥17은 m64(M64×N128·256
++    /// 스레드). A = dx16 미러(불변식: cast_x32/norm_resid/ew 융합이 dx32와
++    /// 함께 기록 — 기존 mma 경로와 동일 계약). 값은 mma·GEMV 레인과
++    /// 비트동일(§3.1 배터리 판정 — 골든 불변).
++    pub(in crate::rawcuda::w4a16_dec) fn marlin_launch(
++        &mut self,
++        name: &str,
++        y_out: CUdeviceptr,
++        t: usize,
++    ) -> Result<(), String> {
++        let (dq, ds, n, k) = self.lin_spec(name)?;
++        if self.dx16.cap < t * k {
++            return Err(format!(
++                "marlin({name}): dx16 부족 {} < t×k={}",
++                self.dx16.cap,
++                t * k
++            ));
++        }
++        let (sym, gm, gn, blk) = if t <= 16 {
++            ("w4a16_gemm_g128_marlin_m16", 16usize, 256usize, 128u32)
++        } else {
++            ("w4a16_gemm_g128_marlin", GEMM_MMA_M, GEMM_MMA_N, 256u32)
++        };
++        let f = self.cc.function(sym)?;
++        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx16.ptr, y_out);
++        let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
++        self.cc.launch(
++            f,
++            t.div_ceil(gm) as u32,
++            n.div_ceil(gn) as u32,
++            blk,
++            &mut crate::rawcuda::args::l7(
++                &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
++            ),
++        )
++    }
++
++    /// [marlin (b)] 다중세그먼트(gemv_multi*)의 marlin 대체 — 원본 레이아웃
++    /// 전용 multi 커널을 쓸 수 없을 때 층 그룹 가중치를 개별 런치로.
++    /// group 0 = 풀어텐션 q/k/v(→d0,d1,d2) · GDN qkv/z(→d0,d1),
++    /// group 1 = ffn gate/up(→d0,d1). x는 dx16 미러(norm 융합 기록 전제 —
++    /// 호출부 불변식 그대로).
++    pub(in crate::rawcuda::w4a16_dec) fn lin_group_marlin(
++        &mut self,
++        il: usize,
++        group: usize,
++        d: [CUdeviceptr; 3],
++        t: usize,
++    ) -> Result<(), String> {
++        let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
++        if group == 0 {
++            if (il + 1) % interval == 0 {
++                self.marlin_launch(&format!("blk.{il}.attn_q.weight"), d[0], t)?;
++                self.marlin_launch(&format!("blk.{il}.attn_k.weight"), d[1], t)?;
++                self.marlin_launch(&format!("blk.{il}.attn_v.weight"), d[2], t)?;
++            } else {
++                self.marlin_launch(&format!("blk.{il}.attn_qkv.weight"), d[0], t)?;
++                self.marlin_launch(&format!("blk.{il}.attn_gate.weight"), d[1], t)?;
++            }
++        } else {
++            self.marlin_launch(&format!("blk.{il}.ffn_gate.weight"), d[0], t)?;
++            self.marlin_launch(&format!("blk.{il}.ffn_up.weight"), d[1], t)?;
++        }
++        Ok(())
++    }
+ }
+diff --git a/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/gemv.rs b/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/gemv.rs
+index 421a382f..7ab2c80e 100644
+--- a/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/gemv.rs
++++ b/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/gemv.rs
+@@ -17,6 +17,12 @@ impl W4a16Dec {
+         x32_dev: CUdeviceptr,
+         y_out: CUdeviceptr,
+     ) -> Result<(), String> {
++        // [marlin (b)] 원본 레이아웃 전용 — 라우드 실패(조용한 오염 방지).
++        if self.lin_marlin {
++            return Err(format!(
++                "gemv({name}): marlin 레이아웃 상주 — 원본 GEMV 불가"
++            ));
++        }
+         let (dq, ds, n, k) = self.lin_spec(name)?;
+         let f = self.cc.function("w4a16_gemv_g128")?;
+         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, x32_dev, y_out);
+@@ -125,6 +131,12 @@ impl W4a16Dec {
+         y_dev: CUdeviceptr,
+         t: usize,
+     ) -> Result<(), String> {
++        // [marlin (b)] 원본 레이아웃 전용 — 라우드 실패.
++        if self.lin_marlin {
++            return Err(format!(
++                "gemv_t({name}): marlin 레이아웃 상주 — 원본 TR GEMV 불가"
++            ));
++        }
+         let (dq, ds, n, k) = self.lin_spec(name)?;
+         let f = self.cc.function("w4a16_gemv_g128_t")?;
+         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, x_dev, y_dev);
+diff --git a/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/mod.rs b/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/mod.rs
+index 50d94f21..6f17daf9 100644
+--- a/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/mod.rs
++++ b/crates/backend-gpu/src/rawcuda/w4a16_dec/kernels/mod.rs
+@@ -107,6 +107,11 @@ impl W4a16Dec {
+         dst: CUdeviceptr,
+         t: usize,
+     ) -> Result<(), String> {
++        // [marlin (b) 2026-10-12] split + marlin 상주 → 경로 무관 전 t marlin
++        // (원본 레이아웃이 없으므로 Gemv1/GemvT/Gemm 구분이 무의미해진다).
++        if !plain && self.lin_marlin {
++            return self.marlin_launch(name, dst, t);
++        }
+         match (plain, path) {
+             (false, LinPath::Gemv1 { w }) => self.gemv_stage_x32(name, x, dst, w),
+             (false, LinPath::Gemm) => self.gemm_launch(name, x, dst, t),
+diff --git a/crates/backend-gpu/src/rawcuda/w4a16_dec/mod.rs b/crates/backend-gpu/src/rawcuda/w4a16_dec/mod.rs
+index c6c170f2..7c352696 100644
+--- a/crates/backend-gpu/src/rawcuda/w4a16_dec/mod.rs
++++ b/crates/backend-gpu/src/rawcuda/w4a16_dec/mod.rs
+@@ -459,6 +459,12 @@ pub struct W4a16Dec {
+     plains: HashMap<String, (CUdeviceptr, usize, usize)>,
+     /// 플레인 모드(체인 분기 — 전문가 외 전부 bf16인 모델).
+     plain_weights: bool,
++    /// [marlin (b) 2026-10-12] split 선형이 marlin B 레이아웃(qm)로만 상주 —
++    /// 원본 q는 업로드하지 않는다(이중 레이아웃 = VRAM 2배, 24GB에서 27B
++    /// 불가). 참: upload_lin_marlin. 이때 split 선형은 전 t가 marlin
++    /// 커널(t≤16 m16 · t≥17 m64)로만 돈다 — GEMV/GemvT/FFMA/mma는 원본
++    /// 레이아웃 전제라 라우드 가드된다(§3.1 (b) 배치 전용 운용 실험).
++    lin_marlin: bool,
+     /// 상주 가중치 바이트 합(모니터링 — 업로드 시 누적, 재업로드 없음 계약).
+     weights_bytes: u64,
+     /// 전문가 테이블 바이트 합(불변 — 1Hz 집계의 O(92k) 반복 제거).
+@@ -696,6 +702,7 @@ impl W4a16Dec {
+             lins: HashMap::new(),
+             plains: HashMap::new(),
+             plain_weights: false,
++            lin_marlin: false,
+             weights_bytes: 0,
+             experts_bytes: 0,
+             xh: Buf::default(),
+@@ -744,6 +751,13 @@ impl W4a16Dec {
+     /// 상주 선형 GEMV — x f32 → (RN-even) f16 → 커널 → y f32 [n].
+     pub fn gemv_host(&mut self, name: &str, x: &[f32]) -> Result<Vec<f32>, String> {
+         let _g = self.cc.guard()?;
++        // [marlin (b)] 호스트 스테이징 체인은 원본 레이아웃 GEMM — marlin
++        // 상주시 라우드 실패(비-GPU-head 폴백 전용 경로 — 27B는 GPU head).
++        if self.lin_marlin {
++            return Err(format!(
++                "gemv_host {name}: marlin 레이아웃 상주 — 원본 GEMM 불가"
++            ));
++        }
+         let Some(&(dq, ds, n, k)) = self.lins.get(name) else {
+             return Err(format!("gemv: 상주 선형 없음: {name}"));
+         };
+diff --git a/crates/backend-gpu/src/rawcuda/w4a16_dec/prefill.rs b/crates/backend-gpu/src/rawcuda/w4a16_dec/prefill.rs
+index 066a703f..b2d416fe 100644
+--- a/crates/backend-gpu/src/rawcuda/w4a16_dec/prefill.rs
++++ b/crates/backend-gpu/src/rawcuda/w4a16_dec/prefill.rs
+@@ -101,7 +101,9 @@ impl W4a16Dec {
+         };
+         // [S2 2026-10-11] t≤8(GemvT)은 다중세그먼트 융합 경로(스펙 검증·
+         // 소형 청크) — t≥9(Gemm)는 종전 단독 런치 유지.
+-        let fuse = matches!(lp, LinPath::GemvT);
++        // [marlin (b) 2026-10-12] marlin 상주시 multi(원본 레이아웃 전용) 불가
++        // — 개별 marlin 런치로(lin_forward가 t별 m16/m64 분기).
++        let fuse = matches!(lp, LinPath::GemvT) && !self.lin_marlin;
+         for il in 0..self.n_layers {
+             let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };
+             let xn = self
+diff --git a/crates/backend-gpu/src/rawcuda/w4a16_dec/upload.rs b/crates/backend-gpu/src/rawcuda/w4a16_dec/upload.rs
+index e7621148..3802f00a 100644
+--- a/crates/backend-gpu/src/rawcuda/w4a16_dec/upload.rs
++++ b/crates/backend-gpu/src/rawcuda/w4a16_dec/upload.rs
+@@ -13,6 +13,11 @@ impl W4a16Dec {
+         n: usize,
+         k: usize,
+     ) -> Result<(), String> {
++        if self.lin_marlin {
++            return Err(format!(
++                "upload_lin {name}: marlin 레이아웃과 혼합 금지(단일 레이아웃 계약)"
++            ));
++        }
+         if q.len() != n * (k / 2) || s.len() != n * (k / 64) {
+             return Err(format!(
+                 "upload_lin {name}: q={} s={} != n{n} k{k} 계약",
+@@ -47,6 +52,68 @@ impl W4a16Dec {
+         Ok(())
+     }
+ 
++    /// [marlin (b) 2026-10-12] 선형 상주 업로드(marlin B 레이아웃) — qm
++    /// ([k/16][n/64][128] u32 — 호출부가 core::marlin::marlin_repack_q로
++    /// 재패킹해 전달, 이 크레이트는 core에 의존하지 않는다)만 올린다.
++    /// 원본 q는 올리지 않는다(§3.1 (b): 이중 레이아웃은 VRAM 2배 — 27B q
++    /// ~13.6GB라 24GB 불가, 64GB 타깃도 단일 경로 원칙상 폴백 형태).
++    /// 스케일은 원본 [n][k/128] f16 그대로(marlin 커널 계약 — moe.cu의
++    /// w4a16_gemm_g128_marlin 참조). 계약: k%128==0(커널 kg=k>>7 스케일
++    /// 인덱싱) · n%64==0(qm 타일).
++    pub fn upload_lin_marlin(
++        &mut self,
++        name: &str,
++        qm: &[u8],
++        s: &[u8],
++        n: usize,
++        k: usize,
++    ) -> Result<(), String> {
++        if s.len() != n * (k / 64) {
++            return Err(format!(
++                "upload_lin_marlin {name}: s={} != n{n} k{k} 계약",
++                s.len()
++            ));
++        }
++        if !k.is_multiple_of(128) || !n.is_multiple_of(64) {
++            return Err(format!(
++                "upload_lin_marlin {name}: k%128·n%64 계약 위반 k={k} n={n}"
++            ));
++        }
++        let want = (k / 16) * (n / 64) * 128 * 4;
++        if qm.len() != want {
++            return Err(format!(
++                "upload_lin_marlin {name}: qm={} != (k/16)(n/64)128×4 = {want}",
++                qm.len()
++            ));
++        }
++        // G2: alloc 전량 성공 → h2d 성공 시에만 상주 등록(재시도 처음부터).
++        let dq = self.cc.alloc(qm.len())?;
++        let ds = match self.cc.alloc(s.len()) {
++            Ok(p) => p,
++            Err(e) => {
++                let _ = self.cc.free(dq);
++                return Err(e);
++            }
++        };
++        let r = (|| {
++            Self::h2d_chunked(&self.cc, dq, qm)?;
++            Self::h2d_chunked(&self.cc, ds, s)
++        })();
++        if let Err(e) = r {
++            let _ = self.cc.free(dq);
++            let _ = self.cc.free(ds);
++            return Err(e);
++        }
++        // 모니터링은 원래 가중치 바이트 기준(qm과 동일 크기 + 스케일).
++        self.weights_bytes += (qm.len() + s.len()) as u64;
++        if let Some((oq, os, _, _)) = self.lins.insert(name.to_string(), (dq, ds, n, k)) {
++            let _ = self.cc.free(oq);
++            let _ = self.cc.free(os);
++        }
++        self.lin_marlin = true;
++        Ok(())
++    }
++
+     
+     // ── norm ──
+ 
+diff --git a/crates/server/src/gpu_engine.rs b/crates/server/src/gpu_engine.rs
+index efab48ec..dc857916 100644
+--- a/crates/server/src/gpu_engine.rs
++++ b/crates/server/src/gpu_engine.rs
+@@ -38,7 +38,10 @@ impl GpuEngine {
+         let hp = model.hp.clone();
+         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
+         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
+-        upload_model(&mut dec, &model, ctx)?;
++        // [marlin (b) 2026-10-12 §3.1] 엔진은 marlin B 단일 레이아웃으로 상주
++        // — 배치 전용 운용(np4+) 실험 경로. 원본 레이아웃 폴백(프로브·게이트)은
++        // upload_model(marlin=false).
++        upload_model(&mut dec, &model, ctx, true)?;
+         // 5) head — bf16 output.weight는 GPU 커널 경로(아니면 CPU 참조).
+         let mut head_gpu = false;
+         if let Some(w) = model.w("output.weight")
+@@ -607,10 +610,14 @@ pub(crate) fn upload_moe(
+ 
+ /// 모델 상주 업로드(1~4단계) — GpuEngine·w4a16-gpu 프로브 공용.
+ /// head는 호출부 소관(프로브는 --no-head/스테이징 분기가 있다).
++/// [marlin (b) 2026-10-12] marlin=true면 dense split 선형을 marlin B
++/// 레이아웃(qm)로만 상주 — 전 t marlin 커널(m16/m64) 경로. 엔진·eval이
++/// true, 원본 레이아웃을 비교 기준으로 쓰는 프로브 게이트는 false.
+ pub(crate) fn upload_model(
+     dec: &mut llm170_backend_gpu::W4a16Dec,
+     model: &llm170_core::qwen35::Model,
+     ctx: usize,
++    marlin: bool,
+ ) -> Result<(), String> {
+     let hp = model.hp.clone();
+     let interval = hp.full_attn_interval.max(1);
+@@ -629,7 +636,25 @@ pub(crate) fn upload_model(
+                 && w.ty == llm170_core::wtype::WType::W4a16Split
+             {
+                 let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
+-                dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;
++                if marlin {
++                    // [marlin (b)] 호스트 repack(core 의존은 server 층 —
++                    // backend-gpu는 core 비의존 계약) 후 qm만 상주.
++                    let (n, k) = (w.n_out as usize, w.n_in as usize);
++                    // SAFETY: mmap 슬라이스 수명 내 u32 뷰(길이 = n·k/8,
++                    // 4배수 — k%128 가드는 업로드 함수에서).
++                    let qu = unsafe {
++                        std::slice::from_raw_parts(w.data.as_ptr() as *const u32, n * (k / 8))
++                    };
++                    let qm = llm170_core::marlin::marlin_repack_q(qu, n, k)
++                        .map_err(|e| format!("{name}: marlin repack — {e}"))?;
++                    // SAFETY: 로컬 qm 벡터 수명 내 바이트 뷰(길이 = 원소수×4).
++                    let qb = unsafe {
++                        std::slice::from_raw_parts(qm.as_ptr() as *const u8, qm.len() * 4)
++                    };
++                    dec.upload_lin_marlin(&name, qb, s, n, k)?;
++                } else {
++                    dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;
++                }
+             }
+         }
+     }
+diff --git a/crates/server/src/probes/eval.rs b/crates/server/src/probes/eval.rs
+index a9d4a223..194698b9 100644
+--- a/crates/server/src/probes/eval.rs
++++ b/crates/server/src/probes/eval.rs
+@@ -124,7 +124,9 @@ fn ppl(args: &[String]) -> Result<String, String> {
+     let hp = model.hp.clone();
+     let t0 = std::time::Instant::now();
+     let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
+-    crate::gpu_engine::upload_model(&mut dec, &model, ctx)?;
++    // [marlin (b)] eval은 생산 경로(엔진과 동일한 marlin 상주)로 계측.
++    // 커널이 비트동일이므로 수치는 레이아웃과 무관(§3.1 판정 규약).
++    crate::gpu_engine::upload_model(&mut dec, &model, ctx, true)?;
+     let head = model
+         .w("output.weight")
+         .ok_or_else(|| "output.weight 부재".to_string())?;
+@@ -397,7 +399,8 @@ fn needle(args: &[String]) -> Result<String, String> {
+     let tk = crate::tokenize::Tokenizer::load(Path::new(&dir))?;
+     let t0 = std::time::Instant::now();
+     let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
+-    crate::gpu_engine::upload_model(&mut dec, &model, ctx)?;
++    // [marlin (b)] eval은 생산 경로(엔진과 동일한 marlin 상주)로 계측.
++    crate::gpu_engine::upload_model(&mut dec, &model, ctx, true)?;
+     let head = model
+         .w("output.weight")
+         .ok_or_else(|| "output.weight 부재".to_string())?;
+diff --git a/crates/server/src/probes/w4a16/gpu.rs b/crates/server/src/probes/w4a16/gpu.rs
+index b1905c42..9b48eef0 100644
+--- a/crates/server/src/probes/w4a16/gpu.rs
++++ b/crates/server/src/probes/w4a16/gpu.rs
+@@ -1036,7 +1036,9 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
+     let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
+     dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
+     // 1~4) 모델 상주 업로드(GpuEngine 공용 — dense/MoE 분기 포함).
+-    crate::gpu_engine::upload_model(&mut dec, &model, a.ctx)?;
++    // [marlin (b)] 프로브 게이트(mma/marlin-diff·bench)는 lin_spec이 원본
++    // 레이아웃(mma 기준側)이어야 한다 — marlin=false 고정.
++    crate::gpu_engine::upload_model(&mut dec, &model, a.ctx, false)?;
+     // 보고용 split 선형 수(dense 한정 — MoE는 0).
+     let n_lin = model
+         .engine_names()
