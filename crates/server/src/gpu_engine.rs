@@ -179,7 +179,9 @@ impl GpuEngine {
             let is_last = i + t == n;
             let part = &tokens[i..i + t];
             // [MTP] 청크 시작 위치(메인 forward 전에 캡처 — forward가 전진).
-            let mtp_pos = if self.mtp {
+            // [MTP-CHAIN §3.3] 강제 n-gram 시 MTP 프리필 KV 구축도 스킵
+            // (초안을 만들지 않으면 읽을 곳이 없다 — [TC] mma mtp 라인 없음).
+            let mtp_pos = if self.mtp_drafts_on() {
                 Some(self.dec.slot_pos_of(seq))
             } else {
                 None
@@ -270,9 +272,14 @@ impl GpuEngine {
         Ok(out)
     }
 
-    /// [MTP 2026-10-12] 초안기 활성.
-    pub fn mtp_enabled(&self) -> bool {
-        self.mtp
+    /// [MTP-CHAIN §3.3 2026-10-12] 초안 소스 정책 — MTP 헤드 가용 + 강제
+    /// n-gram 아님. LLM170_SPEC_DRAFT_SOURCE: "mtp"(기본/미설정 — MTP 가용
+    /// 시 MTP, 스테일·부재 시 n-gram 폴백) | "ngram"(강제 n-gram — MTP
+    /// 상태 구축[프리필 KV]·생산[mtp_first/single/post_round] 전면 스킵,
+    /// 종전 파킹 경로와 동일). 초안은 검증이 정본이라 이 게이트는 무손실
+    /// (운영 정책 — 수치 경로 분기 아님, 단일화 방침 준수).
+    pub fn mtp_drafts_on(&self) -> bool {
+        self.mtp && llm170_diag::flag::val("LLM170_SPEC_DRAFT_SOURCE") != Some("ngram")
     }
 
     /// [MTP] 라운드 전 — 검증 체인 dres의 수용 접두 acc행을 hidden 어셈블리로
@@ -287,6 +294,18 @@ impl GpuEngine {
 
     /// [MTP-2] 초안 폭 — 총 초안 수(첫 초안 + 재귀). 검증 t = 1+k ≤ 8(TR GEMV).
     const MTP_K: usize = 4;
+
+    /// [MTP-CHAIN §3.3 ② 2026-10-12] 앵커 직후 k-1 재귀 스텝을 장치 체인
+    /// (그래프 리플레이 — 호스트 왕복 0)으로 치환해 초안 [d_1..d_k] 반환.
+    /// t>1 앵커는 진입 계약 시드(mtp_chain_seed — 토큰 레지스터·dpp)가
+    /// 선행, t=1은 멱등 재기입. 체인 실패(계약·캡처 — 리플레이 前 판정)는
+    /// Err → 호출부가 순차 재귀(mtp_recur_step, 스텝당 sync+회수 왕복)로
+    /// 폴백. 순차·체인 두 경로의 소비 입력(ptr5 행0·d_1·위치)은 동일 —
+    /// 토큰열 판정 동일(모듈 계약 승계).
+    fn mtp_chain_round(&mut self, slot: usize, d1: u32, base_pos: u32) -> Result<Vec<u32>, String> {
+        self.dec.mtp_chain_seed(slot, d1, base_pos)?;
+        self.dec.mtp_chain_drafts(slot, Self::MTP_K, base_pos)
+    }
 
     /// [MTP] 라운드 후 — 보정 행 hidden 추가 + t행 순전파 + **MTP-2 재귀**.
     /// pos_start = slot_pos - (수용+1) — 수용 초안·보정 토큰이 그 위치들이다.
@@ -313,16 +332,28 @@ impl GpuEngine {
         let t = toks.len() as u32;
         let pos_start = self.dec.slot_pos_of(slot).saturating_sub(t);
         let draft = self.dec.mtp_run(slot, &toks, &embeds, pos_start)?;
-        let mut drafts = vec![draft];
-        let mut tok = draft;
-        for i in 0..(Self::MTP_K.saturating_sub(1)) {
-            let emb = self.model.embed_row(tok).map_err(|e| e.to_string())?;
-            let d = self
-                .dec
-                .mtp_recur_step(slot, tok, &emb, pos_start + t + i as u32)?;
-            drafts.push(d);
-            tok = d;
-        }
+        // [MTP-CHAIN §3.3] 재귀 k-1스텝 = 체인 1회(호스트 왕복 0 — 종전
+        // 4콜 ≈10.4ms/라운드 → 그래프 리플레이). base_pos = 앵커 마지막 행
+        // 위치(pos_start+t-1): 리플레이의 dpp+1 → 첫 스텝 pos_start+t =
+        // 순차 경로와 동일 위치. 실패(계약·캡처) 시 순차 재귀 폴백.
+        let base_pos = pos_start + t - 1;
+        let drafts = match self.mtp_chain_round(slot, draft, base_pos) {
+            Ok(ds) => ds,
+            Err(err) => {
+                eprintln!("# mtp-chain(폴백 순차): {err}");
+                let mut ds = vec![draft];
+                let mut tok = draft;
+                for i in 0..(Self::MTP_K.saturating_sub(1)) {
+                    let emb = self.model.embed_row(tok).map_err(|e| e.to_string())?;
+                    let d = self
+                        .dec
+                        .mtp_recur_step(slot, tok, &emb, pos_start + t + i as u32)?;
+                    ds.push(d);
+                    tok = d;
+                }
+                ds
+            }
+        };
         // lim=pos+t+1 슬랙이 읽는 pos+1 행의 이전 라운드 잔존분 제거.
         if let Err(err) = self
             .dec
@@ -351,16 +382,28 @@ impl GpuEngine {
         }
         let emb = self.model.embed_row(tok).map_err(|e| e.to_string())?;
         let d = self.dec.mtp_run_prev(slot, tok, &emb)?;
-        let mut drafts = vec![d];
-        let mut tk = d;
-        // 유예 호출은 P = slot_pos-1 위치 → 재귀는 slot_pos..(k-2) 위치.
-        let base = self.dec.slot_pos_of(slot);
-        for i in 0..(Self::MTP_K.saturating_sub(1)) {
-            let eb = self.model.embed_row(tk).map_err(|e| e.to_string())?;
-            let nd = self.dec.mtp_recur_step(slot, tk, &eb, base + i as u32)?;
-            drafts.push(nd);
-            tk = nd;
-        }
+        // [MTP-CHAIN §3.3] 유예 앵커(t=1) 위치 = 저장 시점 slot_pos-1
+        // (프리필 완료 직후 호출 계약 — 디코드가 slot_pos를 전진시키기 전).
+        // base = 그 위치 → 리플레이 dpp+1 = 첫 스텝 slot_pos(순차 base+0과
+        // 동일). 실패 시 순차 재귀 폴백.
+        let base_pos = self.dec.slot_pos_of(slot).saturating_sub(1);
+        let drafts = match self.mtp_chain_round(slot, d, base_pos) {
+            Ok(ds) => ds,
+            Err(err) => {
+                eprintln!("# mtp-chain(폴백 순차): {err}");
+                let mut ds = vec![d];
+                let mut tk = d;
+                for i in 0..(Self::MTP_K.saturating_sub(1)) {
+                    let eb = self.model.embed_row(tk).map_err(|e| e.to_string())?;
+                    let nd = self
+                        .dec
+                        .mtp_recur_step(slot, tk, &eb, base_pos + 1 + i as u32)?;
+                    ds.push(nd);
+                    tk = nd;
+                }
+                ds
+            }
+        };
         self.dec.mtp_store_drafts(slot, &drafts);
         Ok(())
     }
@@ -790,7 +833,14 @@ pub(crate) fn upload_mtp(
     // 스펙 골든 불변(비트 계약 유지). MTP 경로만 디코드 유지(보정 hidden
     // 상태 전진이 초안 체인 입력 — 융합 시 0% 실측). MTP-on(k=4)은 3.07s
     // (41.7 t/s)로 여전히 평범 미달 — 파킹 유지(MTP_ENABLED=false).
-    const MTP_ENABLED: bool = false;
+    // **[MTP-CHAIN §3.3 재활성 2026-10-12]** 파킹 사유의 하나였던 재귀
+    // 4콜 호스트 왕복(≈10.4ms/라운드)을 장치 체인(mtp_chain_drafts —
+    // 그래프 리플레이 k-1회, 중간 왕복 0)으로 치환해 재활성. 초안 소스
+    // 정책은 sched 계층(LLM170_SPEC_DRAFT_SOURCE="ngram" 강제 시 n-gram
+    // 전용, 기본 MTP 가용 시 MTP — 35B MoE MTP는 여기서 early-return
+    // false라 자동 n-gram). 순차 재귀는 체인 실패(계약·캡처) 폴백으로
+    // 유지. 순손실 재발 시 이 자리에서 재파킹(실측 수치 갱신).
+    const MTP_ENABLED: bool = true;
     if !MTP_ENABLED || model.w_raw("mtp.fc.weight").is_none() {
         return Ok(false);
     }

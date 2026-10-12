@@ -86,6 +86,10 @@ pub struct CudaCtx {
     copy_h2d: std::cell::Cell<(u64, u64, u64)>,
     copy_d2h: std::cell::Cell<(u64, u64, u64)>,
     copy_d2d: std::cell::Cell<(u64, u64, u64)>,
+    /// VMM 매핑 대장 — ptr → (물리 핸들, 매핑 크기[granularity 올림]).
+    /// free_vmm이 언맵/반납에 필요한 핸들·크기를 여기서 찾는다
+    /// (alloc_vmm은 CUdeviceptr만 반환하는 계약).
+    vmm: std::cell::RefCell<HashMap<CUdeviceptr, (ffi::CUmemGenericAllocationHandle, usize)>>,
 }
 
 /// 컨텍스트 스코프 가드 — 진입 시 현재 컨텍스트를 이 ctx로 전환,
@@ -186,6 +190,7 @@ impl CudaCtx {
                 copy_h2d: std::cell::Cell::new((0, 0, 0)),
                 copy_d2h: std::cell::Cell::new((0, 0, 0)),
                 copy_d2d: std::cell::Cell::new((0, 0, 0)),
+                vmm: std::cell::RefCell::new(HashMap::new()),
             })
         }
     }

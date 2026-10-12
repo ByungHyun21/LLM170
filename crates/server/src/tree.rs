@@ -78,6 +78,9 @@ impl PrefixTrie {
     }
 
     /// 슬롯 제거 — 해당 슬롯의 모든 경계 참조 삭제(슬롯 폐기/재활용 시).
+    /// [2026-10-12] 현재 호출부는 테스트 전용(생산 sched은 insert·
+    /// longest_prefix만) — cfg(test) 게이트로 release dead_code 경로 제거.
+    #[cfg(test)]
     pub fn remove(&mut self, slot: usize) {
         fn rec(node: &mut TrieNode, slot: usize, counter: &mut usize) {
             let before = node.slots.len();
@@ -92,7 +95,9 @@ impl PrefixTrie {
         self.n_boundaries = n;
     }
 
-    /// 계측 — 등록 경계 수(K1 지표 노출 재료).
+    /// 계측 — 등록 경계 수(K1 지표 노출 재료). [2026-10-12] remove와 동일
+    /// 테스트 전용 게이트.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.n_boundaries
     }

@@ -227,7 +227,7 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
         match e.decode_greedy(i, slots[i].next) {
             Ok(t) => {
                 // [MTP] 비-스펙 단독 디코드 후 초안 생성(다음 라운드 소비).
-                if e.mtp_enabled()
+                if e.mtp_drafts_on()
                     && let Err(err) = e.mtp_single(i, t)
                 {
                     eprintln!("# mtp(무시): {err}");
@@ -641,7 +641,7 @@ fn slot_prefill(
                 slot_emit(&mut slots[i], t);
                 // [MTP] 프리필 완료 — 유예 호출(prev hidden, 첫
                 // 토큰)로 첫 초안 생성(다음 틱 스펙 라운드 소비).
-                if eng.0.mtp_enabled()
+                if eng.0.mtp_drafts_on()
                     && let Err(err) = eng.0.mtp_first(i, t)
                 {
                     eprintln!("# mtp(무시): {err}");
@@ -838,6 +838,9 @@ fn assign_slot(
 /// 단독 디코드와 동일한 토큰열을 만든다(프로브 [A-1 완화 ①]과 동일 절차 —
 /// 35B/27B 스펙 골든 접두가 판정).
 const SPEC_K: usize = 4;
+
+// [MTP-CHAIN §3.3] 초안 소스 정책(mtp/ngram)은 엔진 메서드
+// GpuEngine::mtp_drafts_on — 프리필 KV 구축 게이트와 단일 정의.
 fn spec_round(
     i: usize,
     s: &mut Slot,
@@ -875,6 +878,9 @@ fn spec_round_impl(
     // 임계 1이면 첫 경계 미스로 256토큰 억제 → 42.7 t/s). 현재 MTP는
     // 1-초안이 순손실(런치 오버헤드 ~5.5ms/콜 — 그래프 캡처·MTP-2 후 재평가)
     // 이라 파킹 상태이므로 n-gram 기준 임계 1 유지.
+    // [MTP-CHAIN §3.3 2026-10-12] 체인(호스트 왕복 0)으로 재귀 치환 후
+    // MTP 재활성 — 임계는 서빙 A/B 재실측 전까지 1 유지(선행 실측 근거
+    // 80~82%는 순차 경로 기준 — 체인 편입 후 재계측 필요).
     if s.spec_miss >= 1 && (s.generated & 255) != 0 {
         return Ok(false);
     }
@@ -892,13 +898,16 @@ fn spec_round_impl(
     // [MTP 2026-10-12] 초안 소스: 모델 자체 MTP 헤드(현 위치 유효분) 우선,
     // 없으면 n-gram. 초안은 검증이 정본 — 소스 교체는 정책 계층(무손실).
     // 샘플드는 종전대로 n-gram 전용(MTP 초안 없음).
-    let draft: Vec<u32> = if sampled {
-        llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1)
-    } else {
+    // [MTP-CHAIN §3.3] mtp_drafts_on = MTP 가용 + 강제 n-gram 아님 — false면
+    // 생산(mtp_first/single/post_round)·소비 모두 스킵(순수 n-gram 경로).
+    let mtp_on = !sampled && e.mtp_drafts_on();
+    let draft: Vec<u32> = if mtp_on {
         match e.mtp_take_draft(i) {
             Some(d) => d,
             None => llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1),
         }
+    } else {
+        llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1)
     };
     if draft.is_empty() {
         return Ok(false);
@@ -964,7 +973,7 @@ fn spec_round_impl(
     // 푸시하면 디코드 제거 가능하다는 가설 — 실측 MTP-on 0/381 수용으로
     // 기각(검증 dres 행 acc ≠ 보정 hidden — 롤백/그래프 경로 차이). 디코드를
     // 유지한다(MTP 경로 한정 — n-gram/플레인은 융합 유지).
-    let spec_mtp = !sampled && e.mtp_enabled();
+    let spec_mtp = mtp_on;
     if spec_mtp && let Err(err) = e.mtp_pre_round(acc) {
         eprintln!("# mtp(무시): {err}");
     }

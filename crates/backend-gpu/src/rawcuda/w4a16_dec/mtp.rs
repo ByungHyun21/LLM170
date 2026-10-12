@@ -855,6 +855,21 @@ impl super::W4a16Dec {
         Ok(drafts)
     }
 
+    /// [MTP-CHAIN §3.3 통합 glue 2026-10-12] t>1 앵커 직후 체인 진입 상태
+    /// 시드 — 앵커(mtp_run t행, head)는 dbatch_am[0]=행0 argmax·dpp=앵커
+    /// 시작 pos로 끝난다(체인 계약 = 토큰 레지스터 d_1·dpp 마지막 행 pos와
+    /// 어긋남). t=1 앵커는 앵커 런치가 이미 계약 상태 — 재기입은 동일값
+    /// 멱등. 순차 경로(mtp_recur_step가 소비하는 ptr5 행0·d_1·
+    /// pos_start+t)와 동일 입력을 체인에 공급한다(기존 로직 불변 — 본
+    /// 메서드는 신규 부가분, tested 로직 수정 아님).
+    pub fn mtp_chain_seed(&mut self, slot: usize, d1: u32, base_pos: u32) -> Result<(), String> {
+        if self.dbatch_am == 0 {
+            return Err("mtp chain seed: argmax 미등록".into());
+        }
+        self.cc.h2d_async(self.dbatch_am, &d1.to_le_bytes())?;
+        self.attn_set_pos(slot, base_pos)
+    }
+
     /// [MTP-CHAIN] 체인 그래프 확보 — 슬롯별 1회 캡처. 버퍼 ensure는
     /// 전부 캡처 밖(캡처 중 cuMemAlloc 금지 계약 — ensure_mtp_graph 미러).
     fn ensure_mtp_chain_graph(&mut self, slot: usize) -> Result<ffi::CUgraphExec, String> {
