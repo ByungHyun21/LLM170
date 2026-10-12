@@ -777,15 +777,20 @@ pub(crate) fn upload_mtp(
     // (연산 0.2ms, ~20런치×250µs) + 검증/보정 고정비 → 서빙 38 t/s
     // (평범 디코드 ~50+). **MTP-2(k=4) 구현·실측 완료**: 라운드당 2.62토큰
     // (부분수용 71%)이나 콜 4회 오버헤드(+18ms)로 67.7ms/라운드 = 38.7 t/s.
-    // **[MTP-GRAPH 구현·실측 2026-10-12]** t=1..5 핀 임베드+캡처 인프라
-    // (ensure_mtp_graph·mtp_fwd_launch 분리·graph_invalidate take 계약) —
-    // 캡처 5개 성공에도 **라운드 67.7→68.9ms(무이득)**: 이 기기의 cuGraphLaunch
-    // 자체가 느려 콜 비용 ~5ms는 런치 오버헤드가 아니었다. 라운드 분해 =
-    // 검증 t=5 ~30ms + 보정 t=1 18ms + GDN 스냅샷 ~15ms + MTP ~3ms.
-    // 재개 절차(갱신): ①GDN 스냅샷 축소(f16 §5 또는 증분) ②검증 marlin급
-    // ③MTP-2를 **단일 그래프 내 디바이스 체인**(초안→GPU 임베드 gather→
-    // 다음 런 — 호스트 왕복 제거)으로 재구성 → A/B 목표 1.4× → 게이트 3 →
-    // MTP_ENABLED=true → 스모크·eval.
+    // **[MTP-GRAPH·구간 실측 2026-10-12 — 최종]** t=1..8 캡처 인프라 완비
+    // (핀 임베드·argmax 핀 회수·mtp_fwd_launch 분리·invalidate take·dx32/16
+    // 사전 보장). 라운드 구간 실측(27B 프로즈, k=4): **save 0.00ms · 검증
+    // t=5 37.1ms · 보정 t=1 19.8ms · MTP 4콜 10.4ms · 합 67.4ms**. 즉
+    // (a) GDN 스냅샷은 d2d async라 사실상 무료(추정 15ms는 오판),
+    // (b) 검증 t=5가 t=1(17.9)의 **2.07×**로 지배, (c) 그래프 후 MTP 콜은
+    // 2.6ms/call이나 cuGraphLaunch 자체가 느린 기기라 총합 이득 ~0.
+    // k=7(검증 t=8 풀블록 가설) 실측: 검증 61.7ms로 오히려 악화(블록 완충
+    // 가설 기각), 4.82s/128토큰 = 26.6 t/s. k=4 = 3.4s(37.6 t/s) — 평범
+    // (~50) 대비 여전히 순손실. **정직한 결론: 27B는 가중치 바운드라
+    // 검증(t=k+1)+보정(t=1) 두 체인 고정비가 스펙 수익을 잠식 — 수익화는
+    // ①검증 경로 marlin급(가중치 스트리밍 절반) ②검증+보정 체인 통합
+    // ③MTP-2 단일 그래프 디바이스 체인(호스트 왕복 제거)이 선행돼야 한다.
+    // 파킹 유지(MTP_ENABLED=false).
     const MTP_ENABLED: bool = false;
     if !MTP_ENABLED || model.w_raw("mtp.fc.weight").is_none() {
         return Ok(false);

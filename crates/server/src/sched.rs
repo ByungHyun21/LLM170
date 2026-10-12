@@ -752,8 +752,12 @@ fn spec_round(
         rows.extend_from_slice(&e.embed_row(tk)?);
     }
     let rt0 = std::time::Instant::now();
+    let t_save = std::time::Instant::now();
     e.spec_save_state(i)?;
+    let ms_save = t_save.elapsed().as_secs_f64() * 1e3;
+    let t_ver = std::time::Instant::now();
     let toks = e.spec_verify(i, &rows, t)?;
+    let ms_ver = t_ver.elapsed().as_secs_f64() * 1e3;
     let mut acc = 0usize;
     while acc < draft.len() && toks[acc] == draft[acc] {
         acc += 1;
@@ -791,9 +795,19 @@ fn spec_round(
     } else if acc <= 1 {
         s.spec_k = 4;
     }
+    let t_corr = std::time::Instant::now();
     let corr = e.decode_greedy(i, last)?;
+    let ms_corr = t_corr.elapsed().as_secs_f64() * 1e3;
+    let t_mtp = std::time::Instant::now();
     if spec_mtp && let Err(err) = e.mtp_post_round(i, &draft[..acc], corr) {
         eprintln!("# mtp(무시): {err}");
+    }
+    let ms_mtp = t_mtp.elapsed().as_secs_f64() * 1e3;
+    if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
+        eprintln!(
+            "[spec-ms] save={ms_save:.2} verify={ms_ver:.2} corr={ms_corr:.2} mtp={ms_mtp:.2} tot={:.2}",
+            rt0.elapsed().as_secs_f64() * 1e3
+        );
     }
     for &tk in &draft[..acc] {
         slot_emit(s, tk);
