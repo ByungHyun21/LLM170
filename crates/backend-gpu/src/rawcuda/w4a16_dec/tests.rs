@@ -426,3 +426,122 @@ fn mtp_device_chain_matches_sequential() {
     assert_eq!(d1, d1c, "앵커 argmax 불일치 — 비결정 오염");
     assert_eq!(seq, chain, "장치 체인 초안열 ≠ 순차 경로(토큰열 판정)");
 }
+
+// ═══ [K-STEP 2026-10-12 §3.4 ①] K-스텝 디코드 패리티 — CUDA 필요 ═══
+// 순차 단일 스텝(forward_device_argmax ×4 — 토큰마다 호스트 왕복)과 장치
+// K-스텝 루프(decode_k_greedy — 스텝 그래프 k회 리플레이)의 토큰열 동일성.
+// 모델은 합성 미니(interval=1 전체-어텐션 1층 — 본체 체인 실실행) — 수치
+// 의미 없음, 경로 동일성(토큰열 판정)이 목적. 두 경로는 같은 커널열을
+// 쓰며 임베딩 소스만 h2d ↔ gather(bf16 디코드 비트동일 — embed.cu 계약)로
+// 다르다. 가중은 실제 g128 양자(int4 팩 + f16 스케일)로 생성 — split
+// GEMV 경로까지 실실행.
+#[test]
+fn kstep_decode_matches_sequential() {
+    let h = 1024usize;
+    let (qh, kvh, d, cap) = (4usize, 2usize, 256usize, 64usize);
+    let (qdim, kvdim) = (qh * d, kvh * d); // 1024, 512
+    let (ffn, vocab) = (1024usize, 256usize);
+    let mut dec = super::W4a16Dec::new(1, h, 1).expect("CUDA 컨텍스트/fatbin");
+    let mut s = 0x0dd8_ba11_5eed_0f77u64;
+
+    // split g128 양자 가중 — q는 랜덤 int4 팩(n*k/2B)·s는 소규모 f16
+    // 스케일(n*k/64B — 로짓 폭 억제). 값 자체는 무의미, 두 경로가 같은
+    // 가중을 소비하는 것이 계약.
+    let lin = |dec: &mut super::W4a16Dec, name: &str, n: usize, k: usize, s: &mut u64| {
+        let q: Vec<u8> = (0..n * k / 2).map(|_| (sm64(s) & 0xff) as u8).collect();
+        let sc: Vec<u8> = (0..n * k / 128)
+            .flat_map(|_| f32_to_f16(sm_f32(s, 0.004, 0.016)).to_le_bytes())
+            .collect();
+        dec.upload_lin(name, &q, &sc, n, k).expect("upload_lin");
+    };
+    lin(&mut dec, "blk.0.attn_q.weight", qdim, h, &mut s);
+    lin(&mut dec, "blk.0.attn_k.weight", kvdim, h, &mut s);
+    lin(&mut dec, "blk.0.attn_v.weight", kvdim, h, &mut s);
+    lin(&mut dec, "blk.0.attn_output.weight", h, qdim, &mut s);
+    lin(&mut dec, "blk.0.ffn_gate.weight", ffn, h, &mut s);
+    lin(&mut dec, "blk.0.ffn_up.weight", ffn, h, &mut s);
+    lin(&mut dec, "blk.0.ffn_down.weight", h, ffn, &mut s);
+    // 노름 3행(2L+1) + head(int8 양자 내부) + 임베딩(bf16 상주 — gather 원본).
+    let norms: Vec<f32> = (0..3 * h).map(|_| sm_f32(&mut s, 0.8, 1.2)).collect();
+    dec.set_norm_weights(&norms, 3).expect("set_norm_weights");
+    let head_w: Vec<f32> = (0..vocab * h)
+        .map(|_| sm_f32(&mut s, -0.05, 0.05))
+        .collect();
+    dec.upload_head(&bf16_bytes(&head_w), vocab, h)
+        .expect("upload_head");
+    let emb_b = bf16_bytes(
+        &(0..vocab * h)
+            .map(|_| sm_f32(&mut s, -0.05, 0.05))
+            .collect::<Vec<_>>(),
+    );
+    dec.upload_embed(&emb_b, vocab, h, true)
+        .expect("upload_embed");
+    // GDN — 체인 가드 형상 계약(interval=1 → 실행 없음).
+    let gd = super::GdnDims {
+        n_gdn: 1,
+        hidden: h,
+        h_k: 2,
+        h_v: 4,
+        d: 64,
+    };
+    dec.set_gdn(
+        gd,
+        &vec![0f32; gd.n_gdn * gd.conv_ch() * 4],
+        &vec![0f32; gd.n_gdn * 2 * gd.h_v * gd.hidden],
+        &vec![0f32; gd.n_gdn * gd.h_v],
+        &vec![0f32; gd.n_gdn * gd.h_v],
+        &vec![1f32; gd.n_gdn * 128],
+    )
+    .expect("set_gdn");
+    // 어텐션 — 전체-어텐션 1층(interval=1 → 체인이 항상 attn 분기).
+    let ad = super::AttnDims {
+        n_attn: 1,
+        q_heads: qh,
+        kv_heads: kvh,
+        d,
+        cap,
+        interval: 1,
+    };
+    dec.set_attn(
+        ad,
+        &(0..ad.n_attn * d)
+            .map(|_| sm_f32(&mut s, 0.5, 1.5))
+            .collect::<Vec<_>>(),
+        &(0..ad.n_attn * d)
+            .map(|_| sm_f32(&mut s, 0.5, 1.5))
+            .collect::<Vec<_>>(),
+    )
+    .expect("set_attn");
+
+    let embed_of = |t: u32| bf16_row(&emb_b, t as usize, h);
+    let tok0: u32 = 7;
+
+    // ── 순차(토큰마다 호스트 왕복): reset → forward_device_argmax ×4 ──
+    dec.reset_state(0).expect("reset1");
+    let mut seq: Vec<u32> = Vec::new();
+    let mut tok = tok0;
+    for _ in 0..4 {
+        let t = dec
+            .forward_device_argmax(0, &embed_of(tok))
+            .expect("순차 스텝");
+        seq.push(t);
+        tok = t;
+    }
+
+    // ── K-스텝(스텝 그래프 k회 리플레이): reset → decode_k_greedy(k=4) ──
+    dec.reset_state(0).expect("reset2");
+    let kout = dec.decode_k_greedy(0, tok0, 4, u32::MAX).expect("kstep");
+    assert_eq!(kout.len(), 4, "EOS 아님 → k 전체 방출");
+    assert_eq!(kout, seq, "K-스텝 토큰열 ≠ 순차 경로(토큰열 판정)");
+    assert_eq!(dec.slot_pos_of(0), 4, "slot_pos = 방출 수만큼 전진");
+
+    // ── EOS 정지 — 시드(tok0)와 다른 첫 방출을 eos로 지정하면 그 토큰까지
+    // 방출하고 정지(컨트롤러가 이후 스텝 미기록). 고정 시드 드로우라 결정적.
+    let j = seq
+        .iter()
+        .position(|&t| t != tok0)
+        .expect("시드와 다른 방출 토큰(드로우 가정)");
+    dec.reset_state(0).expect("reset3");
+    let kstop = dec.decode_k_greedy(0, tok0, 4, seq[j]).expect("kstep-eos");
+    assert_eq!(kstop, &seq[..=j], "EOS에서 정지 — 방출 접두만 반환");
+}

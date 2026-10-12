@@ -134,7 +134,9 @@ fn pick(s: &mut Slot, logits: &mut [f32]) -> u32 {
 /// Q35 np 디코드 — 샘플링 슬롯 포함시 logits 경로(decode), 아니면 GPU argmax 판.
 /// [A9-3 2026-10-10] 혼합 워크로드: 그리디 슬롯은 배치(가중 상각), 샘플링
 /// 슬롯만 직렬 — 슬롯별 상태 독립이라 순서 무관. 그리디가 1개 이하면 종전 직렬.
-fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[usize]) {
+/// [K-STEP 2026-10-12] eos 인자 추가 — 단독 그리디 K스텝 장치 루프가
+/// 컨트롤러 eos(캡처 키)로 쓴다.
+fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[usize], eos: u32) {
     // 그리디/샘플링 분할.
     let (mut greedy, mut sampled): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
     for &i in seqs {
@@ -224,17 +226,54 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
         // [E-1 후속 2026-10-10] 단독 그리디는 **GPU argmax**(4B d2h) —
         // 종전 logits 경로 합류는 토큰당 로짓 993KB pageable D2H + CPU
         // argmax(248K)를 지불했다(실측 ~0.5ms/토큰). 샘플링 슬롯만 logits 판.
-        match e.decode_greedy(i, slots[i].next) {
-            Ok(t) => {
-                // [MTP] 비-스펙 단독 디코드 후 초안 생성(다음 라운드 소비).
+        // [K-STEP §3.4 ① 2026-10-12] 먼저 K스텝 장치 루프(스텝 그래프 k회
+        // 리플레이 — 호스트 체크인 K스텝마다)를 시도한다. k = min(K, 잔여
+        // max_tokens) — cap 잔여는 엔진이 클램프(2 미만 Err). EOS는 장치
+        // 컨트롤러가 감지(이후 스텝 미기록)하므로 방출 순서·값은 순차 단일
+        // 스텝과 동일(토큰열 판정). 계약·캡처 실패는 기존 토큰당 경로 폴백.
+        const KSTEP_K: usize = 4;
+        let rem = slots[i]
+            .job
+            .as_ref()
+            .map(|j| {
+                j.n_predict
+                    .max(1)
+                    .saturating_sub(slots[i].generated as usize)
+            })
+            .unwrap_or(0);
+        let k = KSTEP_K.min(rem);
+        let kres = if k >= 2 {
+            e.decode_greedy_k(i, slots[i].next, k, eos)
+        } else {
+            Err("kstep: k<2".into())
+        };
+        match kres {
+            Ok(toks) => {
+                // 방출 루프 — 슬롯 상태(tokn·generated·SSE 프레임)는 기존
+                // 틱당 방출과 동일 경로로 갱신(eos가 로그 끝에 최대 1회).
+                for t in toks {
+                    slot_emit(&mut slots[i], t);
+                }
+                // [MTP] 비-스펙 단독 디코드 후 초안 생성(마지막 방출 토큰 기준
+                // 1회 — 순차 경로의 토큰당 호출과 같은 상태·입력).
                 if e.mtp_drafts_on()
-                    && let Err(err) = e.mtp_single(i, t)
+                    && let Err(err) = e.mtp_single(i, slots[i].next)
                 {
                     eprintln!("# mtp(무시): {err}");
                 }
-                slot_emit(&mut slots[i], t);
             }
-            Err(err) => slot_fail(&mut slots[i], format!("decode_greedy: {err}")),
+            Err(_) => match e.decode_greedy(i, slots[i].next) {
+                Ok(t) => {
+                    // [MTP] 비-스펙 단독 디코드 후 초안 생성(다음 라운드 소비).
+                    if e.mtp_drafts_on()
+                        && let Err(err) = e.mtp_single(i, t)
+                    {
+                        eprintln!("# mtp(무시): {err}");
+                    }
+                    slot_emit(&mut slots[i], t);
+                }
+                Err(err) => slot_fail(&mut slots[i], format!("decode_greedy: {err}")),
+            },
         }
     }
     if !sampled.is_empty() {
@@ -274,6 +313,7 @@ pub static SCHED: Sched = Sched {
     // [K1 2026-10-12] 재사용 분해 — 전체-접두 / 체크포인트(2048 GDN) 히트 횟수.
     prefix_full_hits: AtomicU64::new(0),
     prefix_ckpt_hits: AtomicU64::new(0),
+    trie_boundaries: AtomicU64::new(0),
     ticks_decode: AtomicU64::new(0),
     ms_decode: AtomicU64::new(0),
     chunks_prefill: AtomicU64::new(0),
@@ -295,6 +335,9 @@ pub struct Sched {
     /// [K1 2026-10-12] 재사용 분해 카운터(횟수) — 히트율 = prefix_tokens/prompt_tokens.
     pub prefix_full_hits: AtomicU64,
     pub prefix_ckpt_hits: AtomicU64,
+    /// [§3.4 ③ 2026-10-12] 접두 트리 512 경계 등록 수(모니터링 — metrics json
+    /// trie_boundaries). metrics 표기가 선행 반영됨(계측 배선은 병렬 작업분).
+    pub trie_boundaries: AtomicU64,
     pub ticks_decode: AtomicU64,
     pub ms_decode: AtomicU64,
     pub chunks_prefill: AtomicU64,
@@ -529,7 +572,7 @@ fn slot_decode(slots: &mut [Slot], eng: &mut Engine, eos: u32) -> (Vec<usize>, b
         decoded = true;
         let _dt = std::time::Instant::now();
         llm170_diag::watchdog::bump();
-        q35_decode(&mut eng.0, slots, &active);
+        q35_decode(&mut eng.0, slots, &active, eos);
         dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
         // 완료 슬롯 정리 — 결과 전송·반환
         let _ft = std::time::Instant::now();

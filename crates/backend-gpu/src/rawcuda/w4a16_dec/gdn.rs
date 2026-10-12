@@ -315,6 +315,23 @@ impl W4a16Dec {
         self.gdn.dsave = self.cc.alloc(
             self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4,
         )?;
+        // [§3.4 ② 2026-10-12] 통합 캐시 회계 — 스펙 상태(dsnap+dsnap_ring+
+        // dsave). 로그 전용(트랜셰 2부터 실제 예산 심사).
+        let spec_bytes = (elems * 4
+            + 8 * self.n_layers * 3 * dm.conv_ch() * 4
+            + self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4)
+            as u64;
+        if let Err(e) = self.ucache.allocate(
+            "spec:state",
+            CacheCategory::SpecState,
+            Tier::Hbm,
+            spec_bytes,
+            base_util::SPEC_STATE,
+        ) {
+            eprintln!("[ucache] spec:state 등록 실패(회계 전용): {e}");
+        } else {
+            eprintln!("{}", self.ucache.log_line("spec:state"));
+        }
         // [A2] 접두 재사용 체크포인트 — [K3] 512 경계 스택 4개(환형).
         // 실패(VRAM 부족) 시 비활성(기능만 off).
         let chk =
@@ -323,6 +340,19 @@ impl W4a16Dec {
             Ok(p) => {
                 self.gdn.dchk = p;
                 self.gdn.dchk_pos = vec![[0u32; 4]; self.n_slots];
+                // [§3.4 ②] 체크포인트 회계 — 슬롯×4환형 전체. 실패(VRAM)
+                // 경로는 미등록(기능 off와 정합).
+                if let Err(e) = self.ucache.allocate(
+                    "spec:ckpt",
+                    CacheCategory::Checkpoint,
+                    Tier::Hbm,
+                    chk as u64,
+                    base_util::CKPT,
+                ) {
+                    eprintln!("[ucache] spec:ckpt 등록 실패(회계 전용): {e}");
+                } else {
+                    eprintln!("{}", self.ucache.log_line("spec:ckpt"));
+                }
             }
             Err(e) => {
                 eprintln!("# prefix-ckpt 비활성(VRAM): {e}");

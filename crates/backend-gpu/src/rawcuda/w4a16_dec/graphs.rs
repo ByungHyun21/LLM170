@@ -52,6 +52,13 @@ impl W4a16Dec {
                 let _ = self.cc.graph_destroy(e, h);
             }
         }
+        // [K-STEP §3.4 ①] K-스텝 스텝 그래프((슬롯, eos) 키)도 동일 계약 —
+        // take. 부기 버퍼(kstep.buf)는 재할당 없으므로 그래프만 폐기한다.
+        for g in self.kstep.graphs.iter_mut() {
+            if let Some((_, e, h)) = g.take() {
+                let _ = self.cc.graph_destroy(e, h);
+            }
+        }
     }
 
     /// 그래프 준비 — 캐시 히트면 즉시 exec 반환(A8, 슬롯/모드별 1회 캡처).

@@ -52,3 +52,41 @@ extern "C" __global__ void w4a16_mtp_chain_step(
     *ctr = c + 1u;
     atomicAdd(&dpp[slot], 1u);
 }
+
+// ── [K-STEP 2026-10-12 §3.4 ①] 디코드 K-스텝 컨트롤러 ──
+// K-스텝 디코드 그래프(gather → 체인 → head → argmax → 본 커널)의 마지막
+// 노드 — 직전 argmax(토큰 레지스터 = argmax_out)을 방출 로그에 기록하고
+// 카운터를 전진, EOS면 정지 플래그를 세운다. 정지 후 잔여 리플레이는
+// 부기·dpp 전진 없이 **같은 pos**에서 재실행된다(비조건 그래프 — 노드
+// 스킵 불가). KV 오염은 인과적 고립(이후 스텝은 종료된 시퀀스의 쓰레기
+// 행만 덮어씀 — 컨텍스트 상한 내)으로 무해하다. 정지 전엔 dpp[slot]을
+// +1 해 다음 스텝의 소비 위치를 전진(어텐션 커널은 pp[0] 디바이스 판독
+// — 캡처·리플레이 안전, mtp_chain_step과 동일 계약).
+// max_pos/cap 검사는 호스트가 k를 사전 클램프(k ≤ cap−pos)로 담당 —
+// 컨트롤러는 본체 **뒤에** 실행되므로 in-kernel 검사가 KV 기록을 막을
+// 수 없다(방어가 아닌 죽은 코드가 된다).
+// 산술 없음(복사·정수) — fmad 정책 무관. 1블록 32스레드(스레드 0만 동작).
+// ctr·stop은 리플레이 사이에 유지되는 장치 전역 상태(배치 시작에 호스트가
+// 8B 0 리셋 1회).
+extern "C" __global__ void w4a16_kstep_ctrl(
+    const unsigned* __restrict__ tok, // [1] 직전 argmax(시드 = 직전 방출 토큰)
+    unsigned* __restrict__ out,       // [kmax] 방출 토큰 로그(호스트 회수)
+    unsigned* __restrict__ ctr,       // [1] 방출 카운터
+    unsigned* __restrict__ stop,      // [1] 정지 플래그(EOS 감지)
+    unsigned* __restrict__ dpp,       // [n_slots] 슬롯 pos(+=1 — atomic)
+    int slot, int eos)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+    if (*stop == 0u) {
+        const unsigned t = tok[0];
+        out[*ctr] = t;
+        *ctr = *ctr + 1u;
+        if (t == (unsigned)eos) {
+            *stop = 1u;
+        } else {
+            atomicAdd(&dpp[slot], 1u);
+        }
+    }
+}

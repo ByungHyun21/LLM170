@@ -433,6 +433,24 @@ impl GpuEngine {
         self.token_greedy(seq, &row)
     }
 
+    /// [K-STEP §3.4 ① 2026-10-12] 단독 그리디 K-스텝 디코드 — 체인 스텝
+    /// 그래프를 k회 리플레이해 호스트 체크인을 K스텝마다로. 방출 토큰열은
+    /// 순차 단일 스텝(decode_greedy ×k)과 동일(토큰열 판정 — kstep 모듈
+    /// 계약, 패리티 테스트 승계). 실패(계약·캡처) 시 Err → 호출부(sched
+    /// 단독 그리디 분기)가 기존 토큰당 경로로 폴백.
+    pub fn decode_greedy_k(
+        &mut self,
+        seq: usize,
+        token: u32,
+        k: usize,
+        eos: u32,
+    ) -> Result<Vec<u32>, String> {
+        if !self.head_gpu {
+            return Err("kstep: GPU head 미상주".into());
+        }
+        self.dec.decode_k_greedy(seq, token, k, eos)
+    }
+
     /// [S11 2026-10-11] 혼합 배치(그리디+샘플 슬롯 한 배치) — 배치 체인이
     /// 토큰(argmax)과 로짓(dbatch_lg)을 동시 산출하므로 한 번에 회수한다.
     /// 반환 = (전 행 토큰, 전 행 로짓 평탄 [t][head_n]). 그리디 행은 토큰,

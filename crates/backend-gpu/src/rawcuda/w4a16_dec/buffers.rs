@@ -485,6 +485,20 @@ impl W4a16Dec {
                         "[moe] 스트리밍 전문가 캐시 {k}슬롯/층 ({}MiB)",
                         (qb + sb) >> 20
                     );
+                    // [§3.4 ② 2026-10-12] 통합 캐시 회계 — 전문가 LRU(q+s
+                    // 합산). touch는 트랜셰 2에서 적중률 기반 utility 승격으로
+                    // 이관(핫패스 = 층×토큰마다라 현재는 미연결).
+                    if let Err(e) = self.ucache.allocate(
+                        "moe:expert-lru",
+                        CacheCategory::ExpertWeights,
+                        Tier::Hbm,
+                        (qb + sb) as u64,
+                        base_util::EXPERT_LRU,
+                    ) {
+                        eprintln!("[ucache] moe:expert-lru 등록 실패(회계 전용): {e}");
+                    } else {
+                        eprintln!("{}", self.ucache.log_line("moe:expert-lru"));
+                    }
                     // [B4-1 2026-10-12] 스트리밍 t≤8 프리필용 장치 테이블
                     // ((q,s)쌍 per 층·전문가·투영) — 캐시 삽입이 엔트리를
                     // 갱신하고, 전문가 GEMV가 idx 간접 참조로 읽는다.

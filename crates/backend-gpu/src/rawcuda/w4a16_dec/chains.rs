@@ -189,6 +189,17 @@ impl W4a16Dec {
             unsafe { std::slice::from_raw_parts(embed_row.as_ptr() as *const u8, self.hidden * 4) }
         };
         self.cc.h2d_async(self.dres, row)?;
+        self.chain_device_body(slot)
+    }
+
+    /// [K-STEP §3.4 ① 2026-10-12] 체인 본체 — dres에 이미 조립된 임베딩 행을
+    /// 소비하는 순수 부분(chain_device에서 h2d만 분리). K-스텝 그래프가
+    /// w4a16_embed_gather로 dres를 채운 뒤 이 본체를 캡처한다(입력 소스만
+    /// h2d → gather 교체, 커널열·순서 불변 → 토큰열 판정 동일 —
+    /// mtp_fwd_launch의 emb_h2d=false와 동형). 캡처 중 안전성 보장은
+    /// warm_for_capture(호출부 ensure_kstep_graph)이 기존 t=1 그래프와
+    /// 동일하게 담당한다.
+    pub(super) fn chain_device_body(&mut self, slot: usize) -> Result<CUdeviceptr, String> {
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let mut ab = self.dab_dev;
         let mut gi = 0usize;

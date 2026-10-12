@@ -49,6 +49,9 @@ pub const GDN_NGRP: usize = 16;
 pub const GDN_CS: usize = 32;
 /// [A9 2026-10-10] 배치 디코드 최대 토큰(커널 head.cu HEAD_TMAX 미러).
 pub const BATCH_DEC_MAX: usize = 8;
+/// [K-STEP 2026-10-12 §3.4 ①] K-스텝 디코드 로그 폭(커널 w4a16_kstep_ctrl
+/// out[kmax] 계약). 서빙 k=4 — 상한 8(mtp 체인 로그와 동일 철학).
+pub const KSTEP_KMAX: usize = 8;
 /// [A9-fix2] t행 GEMV 블록당 행 수(커널 gptq4.cu GEMV_TR 미러) — x 재사용.
 pub const GEMV_TR: usize = 8;
 /// [R21] FFMA 폴백 GEMM의 t 상한(커널 gptq4.cu G4_GTMAX 미러) — 체인 가드용.
@@ -415,6 +418,21 @@ pub(super) struct Gdn {
     pub(super) dchk_pos: Vec<[u32; 4]>,
 }
 
+/// [K-STEP 2026-10-12 §3.4 ①] 디바이스 K-스텝 디코드 루프 상태 — W4a16Dec
+/// 필드 도메인 그룹. buf 레이아웃: [ctr 4B][stop 4B][out KSTEP_KMAX×4B]
+/// (w4a16_kstep_ctrl 기록부 — 리플레이 간 유지, 배치마다 호스트 8B 0 리셋).
+pub(super) struct Kstep {
+    /// 부기 버퍼(0 = 미할당 — 첫 캡처 시 확보).
+    pub(super) buf: CUdeviceptr,
+    /// 슬롯별 t=1 스텝 그래프 — 리플레이 k회 = K스텝(KV/dpp 포인터와
+    /// slot·eos가 커널 인자로 베이크 → (슬롯, eos) 키. eos는 모델당 상수
+    /// (서버 eng.eos())라 실전에서 재캡처는 없고, 불일치 엔트리는 폐기 후
+    /// 재캡처(테스트가 서로 다른 eos로 검증).
+    pub(super) graphs: Vec<Option<(u32, ffi::CUgraphExec, ffi::CUgraph)>>,
+    /// 캡처 실패 후 직접 경로 고정(재시도 방지 — t=1 graph_failed와 동형).
+    pub(super) failed: bool,
+}
+
 /// [R10 2026-10-12] CUDA Graph 캡처·핀드 버퍼 — W4a16Dec 필드 도메인 그룹(순수 이동).
 pub(super) struct Graph {
     // ── CUDA Graph(체인 캡처 — 토큰당 1 launch) ──
@@ -449,6 +467,7 @@ pub(super) struct Graph {
 pub struct W4a16Dec {
     pub(super) moe: MoE,
     pub(super) mtp: Mtp,
+    pub(super) kstep: Kstep,
     pub(super) attn: Attn,
     pub(super) gdn: Gdn,
     pub(super) graph: Graph,
@@ -548,6 +567,7 @@ mod chains;
 mod gdn;
 mod graphs;
 mod kernels;
+mod kstep;
 mod mem;
 mod moe;
 mod mtp;
@@ -637,6 +657,11 @@ impl W4a16Dec {
                 mtp_chain_ctr: 0,
                 mtp_chain_log: 0,
                 mtp_chain_graphs: Vec::new(),
+            },
+            kstep: Kstep {
+                buf: 0,
+                graphs: Vec::new(),
+                failed: false,
             },
             attn: Attn {
                 attn: None,
