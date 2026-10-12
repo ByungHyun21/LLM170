@@ -1370,3 +1370,150 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g32_marlin(
     }
 }
 
+
+
+// ── [marlin M16 2026-10-12] 소형-M 변형 — 디코드(t≤16)용. 블록 M16×N256·
+// 128스레드(워프4 = n64 4개). 디퀀트·k순서가 M64 커널과 동일 → t≤16에서
+// 같은 입력이면 행별 비트동일(전체합 t≤16). ──
+#define MM16_M 16
+#define MM16_N 256
+#define MM16_KC 32
+#define MM16_S 4
+
+extern "C" __global__ void __launch_bounds__(128, 4) w4a16_gemm_g128_marlin_m16(
+    const unsigned* __restrict__ qm,      // [k/16][n/64][128] u32 (marlin B)
+    const unsigned short* __restrict__ s, // [n][k/128] f16
+    const unsigned short* __restrict__ x, // [t][k] f16
+    float* __restrict__ out, int n, int k, int t)
+{
+    constexpr int A_STAGE = MM16_M * (MM16_KC + 8);
+    constexpr int B_STAGE = (MM16_KC / 16) * 4 * 128;
+    __shared__ __align__(16) unsigned short xs[MM16_S * A_STAGE];
+    __shared__ __align__(16) unsigned wb[MM16_S * B_STAGE];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wn = tid >> 5; // n64 블록 0..3
+    const int m0 = blockIdx.x * MM16_M;
+    const int n0 = blockIdx.y * MM16_N;
+    const int nt_n = n >> 6;
+    const int kg = k >> 7;
+    const int n16 = lane >> 2;
+    const int k2 = (lane & 3) * 2;
+
+    auto stage = [&](int st, int k0) {
+        if (tid < MM16_M * (MM16_KC / 8)) {
+            const int r = tid >> 2;
+            const int c8 = (tid & 3) * 8;
+            unsigned short* const d = xs + st * A_STAGE + r * (MM16_KC + 8) + c8;
+            if (m0 + r < t) {
+                cp_async16(d, x + (size_t)(m0 + r) * k + k0 + c8);
+            } else {
+                *reinterpret_cast<uint4*>(d) = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        for (int e = tid; e < (MM16_KC / 16) * 128; e += 128) {
+            const int tl = e >> 5; // kl*4 + ntl
+            const int j = e & 31;
+            const int ntg = (n0 >> 6) + (tl & 3);
+            unsigned* const d = wb + st * B_STAGE + tl * 128 + j * 4;
+            if (ntg < nt_n) {
+                cp_async16(
+                    d,
+                    &qm[((size_t)((k0 >> 4) + (tl >> 2)) * nt_n + ntg) * 128 + j * 4]);
+            } else {
+                *reinterpret_cast<uint4*>(d) =
+                    make_uint4(0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u);
+            }
+        }
+    };
+
+    float c[8][4];
+    unsigned s2lo[4], s2hi[4];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        (&c[0][0])[i] = 0.0f;
+    }
+
+    stage(0, 0);
+    asm volatile("cp.async.commit_group;");
+
+    const int nch = k / MM16_KC;
+    const int cpg = 128 / MM16_KC;
+    const int ngroups = k >> 7;
+    int cid = 0;
+    for (int gi = 0; gi < ngroups; ++gi) {
+        {
+            const int nb = n0 + wn * 64;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                int cl = nb + 16 * w + n16;
+                cl = cl < n ? cl : n - 1;
+                const unsigned sl = s[(size_t)cl * kg + gi];
+                const unsigned sh = s[(size_t)(cl + 8 < n ? cl + 8 : n - 1) * kg + gi];
+                s2lo[w] = sl | (sl << 16);
+                s2hi[w] = sh | (sh << 16);
+            }
+        }
+#pragma unroll
+        for (int ci = 0; ci < cpg; ++ci, ++cid) {
+            const int k0 = (gi << 7) + ci * MM16_KC;
+            const int stc = cid & (MM16_S - 1);
+            if (cid + 1 < nch) {
+                stage((cid + 1) & (MM16_S - 1), k0 + MM16_KC);
+                asm volatile("cp.async.commit_group;");
+                asm volatile("cp.async.wait_group 1;");
+            } else {
+                asm volatile("cp.async.wait_group 0;");
+            }
+            __syncthreads();
+
+            const unsigned short* const ab = xs + stc * A_STAGE + n16 * (MM16_KC + 8) + k2;
+            const unsigned* const bb = wb + stc * B_STAGE + wn * 128;
+#pragma unroll
+            for (int kl = 0; kl < MM16_KC / 16; ++kl) {
+                const int kb = kl * 16;
+                const unsigned short* const ar = ab + kb;
+                const unsigned a0 = *reinterpret_cast<const unsigned*>(ar);
+                const unsigned a1 =
+                    *reinterpret_cast<const unsigned*>(ar + 8 * (MM16_KC + 8));
+                const unsigned a2 = *reinterpret_cast<const unsigned*>(ar + 8);
+                const unsigned a3 =
+                    *reinterpret_cast<const unsigned*>(ar + 8 * (MM16_KC + 8) + 8);
+                const uint4 bv = reinterpret_cast<const uint4*>(bb + kl * 512)[lane];
+                const unsigned bq[4] = {bv.x, bv.y, bv.z, bv.w};
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    unsigned lo0, hi0, lo1, hi1;
+                    mar_deq(bq[w], &lo0, &hi0);
+                    mar_deq(bq[w] >> 8, &lo1, &hi1);
+                    mar_mma(c[2 * w], a0, a1, a2, a3, mar_scale(lo0, s2lo[w]),
+                            mar_scale(hi0, s2lo[w]));
+                    mar_mma(c[2 * w + 1], a0, a1, a2, a3, mar_scale(lo1, s2hi[w]),
+                            mar_scale(hi1, s2hi[w]));
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int f = 0; f < 8; ++f) {
+        const int col = n0 + wn * 64 + f * 8 + 2 * (lane & 3);
+        const int r0 = m0 + n16;
+        if (r0 < t) {
+            if (col < n) {
+                out[(size_t)r0 * n + col] = c[f][0];
+            }
+            if (col + 1 < n) {
+                out[(size_t)r0 * n + col + 1] = c[f][1];
+            }
+        }
+        if (r0 + 8 < t) {
+            if (col < n) {
+                out[(size_t)(r0 + 8) * n + col] = c[f][2];
+            }
+            if (col + 1 < n) {
+                out[(size_t)(r0 + 8) * n + col + 1] = c[f][3];
+            }
+        }
+    }
+}

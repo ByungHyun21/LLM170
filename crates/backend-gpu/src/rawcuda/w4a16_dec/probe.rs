@@ -433,15 +433,13 @@ impl W4a16Dec {
         let da = self.cc.alloc(t * n * 4)?;
         let db = self.cc.alloc(t * n * 4)?;
         let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
-            let gx = t.div_ceil(GEMM_MMA_M) as u32;
-            let gy = n.div_ceil(GEMM_MMA_N) as u32;
             let f = self.cc.function("w4a16_gemm_g128_mma")?;
             let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx, da);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
             self.cc.launch(
                 f,
-                gx,
-                gy,
+                t.div_ceil(GEMM_MMA_M) as u32,
+                n.div_ceil(GEMM_MMA_N) as u32,
                 256,
                 &mut crate::rawcuda::args::l7(
                     &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
@@ -452,8 +450,8 @@ impl W4a16Dec {
             let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
             self.cc.launch(
                 fm,
-                gx,
-                gy,
+                t.div_ceil(GEMM_MMA_M) as u32,
+                n.div_ceil(GEMM_MMA_N) as u32,
                 256,
                 &mut crate::rawcuda::args::l7(
                     &mut m_q, &mut m_s, &mut m_x, &mut m_y, &mut m_n, &mut m_k, &mut m_t,
@@ -516,6 +514,9 @@ impl W4a16Dec {
     pub fn marlin_selfcheck(
         &mut self,
         sym: &str,
+        bm: usize,
+        bn: usize,
+        thr: u32,
         qm: &[u32],
         s: &[u16],
         x16: &[u16],
@@ -558,9 +559,9 @@ impl W4a16Dec {
             let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
             self.cc.launch(
                 fm,
-                t.div_ceil(GEMM_MMA_M) as u32,
-                n.div_ceil(GEMM_MMA_N) as u32,
-                256,
+                t.div_ceil(bm) as u32,
+                n.div_ceil(bn) as u32,
+                thr,
                 &mut crate::rawcuda::args::l7(
                     &mut m_q, &mut m_s, &mut m_x, &mut m_y, &mut m_n, &mut m_k, &mut m_t,
                 ),
@@ -608,6 +609,10 @@ impl W4a16Dec {
         t: usize,
         reps: usize,
         qm: &[u32],
+        msym: &str,
+        mbm: usize,
+        mbn: usize,
+        mthr: u32,
     ) -> Result<String, String> {
         let _g = self.cc.guard()?;
         let (dq, ds, n, k) = self.lin_spec(name)?;
@@ -635,17 +640,22 @@ impl W4a16Dec {
         self.cc.h2d(dqm, qb)?;
         let da = self.cc.alloc(t * n * 4)?;
         let db = self.cc.alloc(t * n * 4)?;
-        let gx = t.div_ceil(GEMM_MMA_M) as u32;
-        let gy = n.div_ceil(GEMM_MMA_N) as u32;
-        let run = |me: &Self, sym: &str, pq: CUdeviceptr, py: CUdeviceptr| -> Result<(), String> {
+        let run = |me: &Self,
+                   sym: &str,
+                   pq: CUdeviceptr,
+                   py: CUdeviceptr,
+                   bm: usize,
+                   bn: usize,
+                   thr: u32|
+         -> Result<(), String> {
             let f = me.cc.function(sym)?;
             let (mut p_q, mut p_s, mut p_x, mut p_y) = (pq, ds, dx, py);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
             me.cc.launch(
                 f,
-                gx,
-                gy,
-                256,
+                t.div_ceil(bm) as u32,
+                n.div_ceil(bn) as u32,
+                thr,
                 &mut crate::rawcuda::args::l7(
                     &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
                 ),
@@ -653,8 +663,16 @@ impl W4a16Dec {
         };
         let r = (|| -> Result<(f64, f64), String> {
             for _ in 0..3 {
-                run(self, "w4a16_gemm_g128_mma", dq, da)?;
-                run(self, "w4a16_gemm_g128_marlin", dqm, db)?;
+                run(
+                    self,
+                    "w4a16_gemm_g128_mma",
+                    dq,
+                    da,
+                    GEMM_MMA_M,
+                    GEMM_MMA_N,
+                    256,
+                )?;
+                run(self, msym, dqm, db, mbm, mbn, mthr)?;
             }
             self.cc.sync()?;
             // 인터리브 라운드 — 순서·열 상태 바이어스 제거.
@@ -664,13 +682,21 @@ impl W4a16Dec {
             for _ in 0..rounds {
                 let t0 = std::time::Instant::now();
                 for _ in 0..per {
-                    run(self, "w4a16_gemm_g128_mma", dq, da)?;
+                    run(
+                        self,
+                        "w4a16_gemm_g128_mma",
+                        dq,
+                        da,
+                        GEMM_MMA_M,
+                        GEMM_MMA_N,
+                        256,
+                    )?;
                 }
                 self.cc.sync()?;
                 ta += t0.elapsed().as_secs_f64();
                 let t0 = std::time::Instant::now();
                 for _ in 0..per {
-                    run(self, "w4a16_gemm_g128_marlin", dqm, db)?;
+                    run(self, msym, dqm, db, mbm, mbn, mthr)?;
                 }
                 self.cc.sync()?;
                 tb += t0.elapsed().as_secs_f64();
