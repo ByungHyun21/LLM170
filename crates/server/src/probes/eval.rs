@@ -376,7 +376,7 @@ fn argmax_margin(lg: &[f32]) -> (u32, f32) {
 }
 
 /// -ln p(target) — logsumexp(전 어휘) f64 누적, max 차감.
-fn nll_of(lg: &[f32], tgt: u32) -> f64 {
+pub(crate) fn nll_of(lg: &[f32], tgt: u32) -> f64 {
     let m = lg.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
     if !m.is_finite() {
         return f64::NAN;

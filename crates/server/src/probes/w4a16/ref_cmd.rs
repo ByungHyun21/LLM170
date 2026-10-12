@@ -50,6 +50,8 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     let mut n_predict = 32usize;
     let mut ctx = 4096usize;
+    // [Q1 2026-10-12] 오라클 NLL 모드 — 코퍼스 순회 CPU teacher-forced NLL.
+    let (mut corpus, mut limit) = (None::<String>, usize::MAX);
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -77,14 +79,50 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--ctx requires a number")?;
             }
+            "--eval-corpus" => {
+                corpus = Some(arg(&mut it, "--eval-corpus requires a path")?.to_string())
+            }
+            "--limit" => {
+                limit = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--limit requires a number")?;
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
     }
-    if prompts.is_empty() {
-        return Err("at least one --prompt-tokens required".into());
+    if prompts.is_empty() && corpus.is_none() {
+        return Err("at least one --prompt-tokens 또는 --eval-corpus required".into());
     }
     let model =
         llm170_core::qwen35::Model::load(std::path::Path::new(&dir)).map_err(|e| e.to_string())?;
+    if let Some(c) = &corpus {
+        // [Q1] CPU 오라클 NLL — 전 위치 teacher-forced, 전 어휘 logsumexp(f64).
+        let text = std::fs::read_to_string(c).map_err(|e| format!("corpus {c}: {e}"))?;
+        let tk = crate::tokenize::Tokenizer::load(std::path::Path::new(&dir))?;
+        let toks = tk.encode_opts(&text, false);
+        let n = toks.len().min(limit);
+        if n < 2 {
+            return Err(format!("토큰 {n}개 — NLL에는 2개 이상 필요"));
+        }
+        let mut eng = llm170_core::qwen35::Engine::new(model, 1, ctx);
+        let t0 = std::time::Instant::now();
+        let mut l = eng.prefill(0, &toks[..1]).map_err(|e| e.to_string())?;
+        let mut nll_sum = 0f64;
+        for i in 1..n {
+            nll_sum += crate::probes::eval::nll_of(&l, toks[i]);
+            let mut ls = eng.decode(&[0], &[toks[i]]).map_err(|e| e.to_string())?;
+            l = ls.pop().ok_or("decode logits 부재")?;
+        }
+        let mean = nll_sum / (n - 1) as f64;
+        let ppl = mean.exp();
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        return Ok(format!(
+            "w4a16-ref {dir} — CPU 오라클 NLL (teacher-forced · logsumexp f64)\n  corpus {c} · 토큰 {n} (NLL {}위치) · {ms:.0}ms ({:.0}ms/토큰)\n  NLL평균 {mean:.9} · PPL {ppl:.9}\n",
+            n - 1,
+            ms / (n - 1) as f64
+        ));
+    }
     let n = prompts.len();
     let mut eng = llm170_core::qwen35::Engine::new(model, n, ctx);
     let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
