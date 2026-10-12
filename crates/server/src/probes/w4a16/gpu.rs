@@ -403,14 +403,16 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     if !marlin_bench.is_empty() {
         let mut out = Vec::new();
         for (name, t, reps) in &marlin_bench {
-            let w = model
-                .w_raw(name)
-                .ok_or_else(|| format!("--marlin-bench {name}: 무게 없음"))?;
+            let Some(w) = model.w_raw(name) else {
+                out.push(format!("marlin-bench {name}: 무게 없음(건너뜀)"));
+                continue;
+            };
             if w.ty != llm170_core::wtype::WType::W4a16Split || w.group != 128 || w.scale_bf16 {
-                return Err(format!(
-                    "--marlin-bench {name}: g128·f16 split 전용(ty={:?} group={} bf16={})",
+                out.push(format!(
+                    "marlin-bench {name}: g128·f16 split 아님(건너뜀: ty={:?} group={} bf16={})",
                     w.ty, w.group, w.scale_bf16
                 ));
+                continue;
             }
             let q: Vec<u32> = w
                 .data
