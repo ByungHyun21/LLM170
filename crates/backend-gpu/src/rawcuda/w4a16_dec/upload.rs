@@ -47,7 +47,6 @@ impl W4a16Dec {
         Ok(())
     }
 
-    
     // ── norm ──
 
     /// 노름 가중 상주 등록 — nw [rows][hidden] f32(행 포인터 계약 w·hidden).
@@ -171,6 +170,7 @@ impl W4a16Dec {
             self.attn.dvc,
             self.attn.dksc,
             self.attn.dvsc,
+            self.attn.dblk_tab,
             self.attn.dpp,
             self.attn.dqg_a,
             self.attn.dkin_a,
@@ -190,6 +190,7 @@ impl W4a16Dec {
             self.attn.dpp,
         ) = (0, 0, 0, 0, 0);
         (self.attn.dksc, self.attn.dvsc) = (0, 0);
+        self.attn.dblk_tab = 0;
         (
             self.attn.dqg_a,
             self.attn.dkin_a,
@@ -223,6 +224,36 @@ impl W4a16Dec {
         };
         let dpp = self.cc.alloc(slots * 4)?;
         Self::zero_dev(&self.cc, dpp, slots * 4)?;
+        // [K6-2 2026-10-12] KV 블록 테이블(디바이스 u64 [slot][layer][mb]×4) —
+        // 트랜셰 2: 연속 할당 기반(각 블록 = 슬롯 내 (층, 블록) 기저 주소).
+        // 커널(attn_blk_row) 전개가 종전 주소와 동일함이 구성으로 증명된다
+        // (비트동일). 이후 트랜셰(블록 분할 할당·접두 공유)는 내용만 교체.
+        // 블록 = 512토큰 × 1층(blocktable.rs·K3 체크포인트 정합).
+        let mb = dims.cap.div_ceil(512);
+        let (kvd, kvh) = (dims.kv_dim(), dims.kv_heads);
+        let mut tab = vec![0u64; slots * n * mb * 4];
+        for s in 0..slots {
+            let (kb, vb) = (
+                dkc + dims.kv_slot_elems(s) as u64,
+                dvc + dims.kv_slot_elems(s) as u64,
+            );
+            let sb = (s * n * dims.cap * kvh) as u64 * 4;
+            for l in 0..n {
+                for b in 0..mb {
+                    let e = ((s * n + l) * mb + b) * 4;
+                    let row0 = (l * dims.cap + b * 512) as u64;
+                    tab[e] = kb + row0 * kvd as u64;
+                    tab[e + 1] = vb + row0 * kvd as u64;
+                    tab[e + 2] = self.attn.dksc + sb + row0 * kvh as u64 * 4;
+                    tab[e + 3] = self.attn.dvsc + sb + row0 * kvh as u64 * 4;
+                }
+            }
+        }
+        let dblk = self.cc.alloc(tab.len() * 8)?;
+        // SAFETY: 로컬 Vec<u64>의 유효 수명 내 바이트 뷰(길이 = 원소수×8).
+        let tb = unsafe { std::slice::from_raw_parts(tab.as_ptr() as *const u8, tab.len() * 8) };
+        Self::h2d_chunked(&self.cc, dblk, tb)?;
+        self.attn.dblk_tab = dblk;
         self.attn.dqnw_a = dq;
         self.attn.dknw_a = dk;
         self.attn.dkc = dkc;

@@ -47,6 +47,21 @@ impl W4a16Dec {
         }
     }
 
+    /// [K6-2 2026-10-12] KV 블록 테이블 포인터(슬롯 기저) — 디바이스 u64
+    /// [layer][mb][4](k, v, ksc, vsc). set_attn이 연속 할당 기반으로 구축
+    /// (내용 불변 — 그래프 캡처 계약: 캡처는 테이블 주소만 베이크).
+    /// 어텐션 커널 4종(prep_q·part_q·part_qg·fa2_qg)이 기존 KV 4포인터를
+    /// 대신해 이 1포인터로 간접 어드레싱한다(merge는 KV 무판독 — 무관).
+    pub(super) fn attn_blk_ptr(&self, slot: usize) -> CUdeviceptr {
+        match self.attn.attn {
+            Some(dm) => {
+                let mb = dm.cap.div_ceil(512);
+                self.attn.dblk_tab + (slot * dm.n_attn * mb * 4) as u64 * 8
+            }
+            None => self.attn.dblk_tab,
+        }
+    }
+
     pub(super) fn attn_vsc_ptr(&self, slot: usize) -> CUdeviceptr {
         match self.attn.attn {
             Some(dm) => self.attn.dvsc + (slot * dm.n_attn * dm.cap * dm.kv_heads) as u64 * 4,
@@ -56,7 +71,8 @@ impl W4a16Dec {
 
     /// 어텐션 prep — [A3 2026-10-09] qg·kin·vin은 커널 인자 직접 소비
     /// (스테이징 d2d 제거). 출력은 dqh_a(정규화 q)·KV 캐시.
-    /// [KVQ 채택 2026-10-10] int8 KV 단일 경로 — ksc/vsc(행×헤드 f32) 인자.
+    /// [KVQ 채택 2026-10-10] int8 KV 단일 경로. [K6-2 2026-10-12] KV·스케일
+    /// 4포인터 → 블록 테이블 1포인터 간접화(attn_blk_ptr).
     pub(super) fn attn_prep_launch(
         &mut self,
         slot: usize,
@@ -71,29 +87,14 @@ impl W4a16Dec {
         let f = self.cc.function("attn_prep_q")?;
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
         #[allow(clippy::type_complexity)]
-        let (
-            mut a0,
-            mut a1,
-            mut a2,
-            mut a3,
-            mut a4,
-            mut a5,
-            mut a6,
-            mut a7,
-            mut a8,
-            mut a9,
-            mut aa,
-        ) = (
+        let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut aa) = (
             qg_dev,
             kin_dev,
             vin_dev,
             self.attn.dqnw_a,
             self.attn.dknw_a,
             self.attn.dqh_a,
-            self.attn_kv_ptr(slot),
-            self.attn_vc_ptr(slot),
-            self.attn_ksc_ptr(slot),
-            self.attn_vsc_ptr(slot),
+            self.attn_blk_ptr(slot),
             self.attn_pp_ptr(slot),
         );
         self.cc.launch(
@@ -101,9 +102,9 @@ impl W4a16Dec {
             t_len as u32,
             (dm.q_heads + dm.kv_heads) as u32,
             128,
-            &mut crate::rawcuda::args::l16(
-                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7, &mut a8,
-                &mut a9, &mut aa, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
+            &mut crate::rawcuda::args::l13(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut aa, &mut tl,
+                &mut lay, &mut qh, &mut kvh, &mut cp,
             ),
         )
     }
@@ -163,24 +164,21 @@ impl W4a16Dec {
         } else {
             "attn_fwd3s_part_q"
         })?;
-        #[allow(clippy::type_complexity)]
-        let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
+        // [K6-2] KV 4포인터 → 블록 테이블(attn_blk_ptr) 간접화.
+        let (mut f0, mut f1, mut f2, mut f3) = (
             self.attn.dqh_a,
-            self.attn_kv_ptr(slot),
-            self.attn_vc_ptr(slot),
-            self.attn_ksc_ptr(slot),
-            self.attn_vsc_ptr(slot),
+            self.attn_blk_ptr(slot),
             self.attn.dattn_part,
+            self.attn_pp_ptr(slot),
         );
-        let mut f6 = self.attn_pp_ptr(slot);
         self.cc.launch(
             fp,
             t_len as u32,
             (if qgp { dm.kv_heads } else { dm.q_heads } * spv) as u32,
             256,
-            &mut crate::rawcuda::args::l13(
-                &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut f5, &mut f6, &mut tl, &mut lay,
-                &mut qh, &mut kvh, &mut cp, &mut sp,
+            &mut crate::rawcuda::args::l10(
+                &mut f0, &mut f1, &mut f2, &mut f3, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
+                &mut sp,
             ),
         )?;
         // [4.1 2026-10-11] merge가 x32/미러 동시 기록 — cast_x32 노드 제거.
@@ -217,13 +215,11 @@ impl W4a16Dec {
         let f = self.cc.function("attn_fa2_qg")?;
         let nm = t_len * dm.q_heads * 256;
         let (m32, m16) = (self.ensure_dx32(nm)?, self.ensure_dx16(nm)?);
+        // [K6-2] KV 4포인터 → 블록 테이블(attn_blk_ptr) 간접화.
         #[allow(clippy::type_complexity)]
-        let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8, mut a9) = (
+        let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6) = (
             self.attn.dqh_a,
-            self.attn_kv_ptr(slot),
-            self.attn_vc_ptr(slot),
-            self.attn_ksc_ptr(slot),
-            self.attn_vsc_ptr(slot),
+            self.attn_blk_ptr(slot),
             qg_dev,
             self.attn.doutv_a,
             m32,
@@ -237,9 +233,9 @@ impl W4a16Dec {
             t_len.div_ceil(32) as u32,
             dm.q_heads as u32,
             128,
-            &mut crate::rawcuda::args::l15(
-                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7, &mut a8,
-                &mut a9, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
+            &mut crate::rawcuda::args::l12(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut tl, &mut lay,
+                &mut qh, &mut kvh, &mut cp,
             ),
         )
     }
@@ -371,10 +367,7 @@ impl W4a16Dec {
             let mut a3 = self.attn.dqnw_a;
             let mut a4 = self.attn.dknw_a;
             let mut a5 = self.attn.dqh_a + k as u64 * qdd * 4;
-            let mut a6 = self.attn_kv_ptr(slot);
-            let mut a7 = self.attn_vc_ptr(slot);
-            let mut a8 = self.attn_ksc_ptr(slot);
-            let mut a9 = self.attn_vsc_ptr(slot);
+            let mut a6 = self.attn_blk_ptr(slot);
             let mut aa = self.attn_pp_ptr(slot);
             let (mut tl, mut lay, mut qh2, mut kvh2, mut cp2) = (1i32, layer as i32, qh, kvh, cp);
             self.cc.launch(
@@ -382,9 +375,9 @@ impl W4a16Dec {
                 1,
                 (dm.q_heads + dm.kv_heads) as u32,
                 128,
-                &mut crate::rawcuda::args::l16(
-                    &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
-                    &mut a8, &mut a9, &mut aa, &mut tl, &mut lay, &mut qh2, &mut kvh2, &mut cp2,
+                &mut crate::rawcuda::args::l13(
+                    &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut aa,
+                    &mut tl, &mut lay, &mut qh2, &mut kvh2, &mut cp2,
                 ),
             )?;
         }
@@ -401,24 +394,18 @@ impl W4a16Dec {
             let qhk = self.attn.dqh_a + k as u64 * qdd * 4;
             let partk = self.attn.dattn_part + k as u64 * pstride * 4;
             {
-                let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
-                    qhk,
-                    self.attn_kv_ptr(slot),
-                    self.attn_vc_ptr(slot),
-                    self.attn_ksc_ptr(slot),
-                    self.attn_vsc_ptr(slot),
-                    partk,
-                );
-                let mut f6 = self.attn_pp_ptr(slot);
+                // [K6-2] KV 4포인터 → 블록 테이블(attn_blk_ptr) 간접화.
+                let (mut f0, mut f1, mut f2, mut f3) =
+                    (qhk, self.attn_blk_ptr(slot), partk, self.attn_pp_ptr(slot));
                 let (mut tl, mut lay) = (1i32, layer as i32);
                 self.cc.launch(
                     fp,
                     1,
                     (dm.q_heads * spv) as u32,
                     256,
-                    &mut crate::rawcuda::args::l13(
-                        &mut f0, &mut f1, &mut f2, &mut f3, &mut f4, &mut f5, &mut f6, &mut tl,
-                        &mut lay, &mut qh, &mut kvh, &mut cp, &mut sp,
+                    &mut crate::rawcuda::args::l10(
+                        &mut f0, &mut f1, &mut f2, &mut f3, &mut tl, &mut lay, &mut qh, &mut kvh,
+                        &mut cp, &mut sp,
                     ),
                 )?;
             }

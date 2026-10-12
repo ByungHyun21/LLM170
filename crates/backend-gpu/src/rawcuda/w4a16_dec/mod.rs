@@ -356,6 +356,10 @@ pub(super) struct Attn {
     /// [P13] int8 KV 스케일(K/V 각각 [n_attn*cap][kv_heads] f32) — KVQ 전용.
     pub(super) dksc: CUdeviceptr,
     pub(super) dvsc: CUdeviceptr,
+    /// [K6-2 2026-10-12] KV 블록 테이블(디바이스 u64 [slot][layer][mb]×4 —
+    /// k, v, ksc, vsc 기저 바이트 주소). set_attn이 연속 할당 기반으로 구축,
+    /// 내용 불변(그래프 캡처 계약 — 캡처는 주소만 베이크).
+    pub(super) dblk_tab: CUdeviceptr,
     pub(super) dpp: CUdeviceptr,
     pub(super) dqg_a: CUdeviceptr,
     pub(super) dkin_a: CUdeviceptr,
@@ -630,6 +634,7 @@ impl W4a16Dec {
                 dvc: 0,
                 dksc: 0,
                 dvsc: 0,
+                dblk_tab: 0,
                 dpp: 0,
                 dqg_a: 0,
                 dkin_a: 0,

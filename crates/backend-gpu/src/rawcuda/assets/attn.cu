@@ -161,9 +161,50 @@ __device__ __forceinline__ float attn_sinf(float a)
 
 // 마커 pr1c
 
+// ── [K6-2 2026-10-12] KV 블록 테이블 간접 어드레싱(K6 트랜셰 2) ──
+// 종전 주소 kv_base + ((layer*cap + row)*kv_dim + …)은 슬롯 내 연속
+// [layer][cap][kv_dim] 전제 — 유휴 슬롯도 전체 cap을 점유하고 접두 공유가
+// 불가능하다. 블록 테이블은 **512토큰 × 1층** 블록을 독립 주소 단위로
+// 삼는다: 디바이스 테이블 [slot][layer][block] × u64 4개 =
+// (K기저, V기저, ksc기저, vsc기저 — 바이트 주소). 호스트(set_attn)가
+// 구축해 슬롯 오프셋을 포인터에 베이크해 전달(종전 attn_kv_ptr(slot)과
+// 동일 방식 — 그래프 캡처는 테이블 '주소'만 베이크, 내용 불변).
+//   entry = tab + (layer*mb + row/512)*4,  mb = ceil(cap/512)
+//   행 주소 = entry[kind] + (row%512)*stride + 헤드 오프셋
+// 트랜셰 2는 테이블이 기존 연속 할당 내 주소를 가리킨다(할당 불변):
+// 블록 기저 = 슬롯기저 + (layer*cap + 블록*512)*stride이고
+// row = (row/512)*512 + row%512이므로 전개하면 종전 주소와 동일한 값 —
+// **비트동일은 구성으로 증명**(같은 메모리·같은 접근 순서). 이후 트랜셰
+// (블록 분할 할당·접두 공유)는 테이블 내용만 교체하면 된다.
+struct AttnKvRowPtrs {
+    signed char* k;
+    signed char* v;
+    float* ks;
+    float* vs;
+};
+__device__ __forceinline__ AttnKvRowPtrs attn_blk_row(
+    const unsigned long long* __restrict__ tab, int layer, int cap, int row,
+    long kv_dim, int kv_heads, int kh)
+{
+    const unsigned long long* bt =
+        tab + ((long)layer * ((cap + 511) >> 9) + (row >> 9)) * 4;
+    const unsigned long long ro = (unsigned long long)(row & 511);
+    AttnKvRowPtrs p;
+    p.k = reinterpret_cast<signed char*>(bt[0]) +
+          ro * (unsigned long long)kv_dim + (long)kh * 256;
+    p.v = reinterpret_cast<signed char*>(bt[1]) +
+          ro * (unsigned long long)kv_dim + (long)kh * 256;
+    p.ks = reinterpret_cast<float*>(
+        bt[2] + (ro * (unsigned long long)kv_heads + (unsigned long long)kh) * 4ULL);
+    p.vs = reinterpret_cast<float*>(
+        bt[3] + (ro * (unsigned long long)kv_heads + (unsigned long long)kh) * 4ULL);
+    return p;
+}
+
 // [P13] KV 양자화 prep — attn_prep와 산술 동일(q 브랜치 무변경), KV 기록만
 // int8(행×헤드 absmax 스케일 = max|x|/127, 0이면 1). 스케일 f32 1개/행헤드.
 // 값 차이는 양자화 오차뿐 — 판정은 토큰(단문 골든 + 장문). fwd3s_part_q가 소비.
+// [K6-2] kc/vc/ksc/vsc 4포인터 → 블록 테이블 1포인터로 간접화(위 블록 참조).
 extern "C" __global__ void attn_prep_q(
     const float* __restrict__ qg,    // [T][q_heads*512] q‖gate 인터리브
     const float* __restrict__ kin,   // [T][kv_heads*256]
@@ -171,10 +212,7 @@ extern "C" __global__ void attn_prep_q(
     const float* __restrict__ qnw,   // [n_attn][256]
     const float* __restrict__ knw,   // [n_attn][256]
     float* __restrict__ qh,          // [T][q_heads*256]
-    signed char* __restrict__ kc,    // [n_attn*cap][kv_heads*256] int8
-    signed char* __restrict__ vc,
-    float* __restrict__ ksc,         // [n_attn*cap][kv_heads]
-    float* __restrict__ vsc,
+    const unsigned long long* __restrict__ dblk_tab, // [K6-2] [layer][mb][4]
     const unsigned* __restrict__ pp, // [1] pos0 — 디바이스 판독(결함 4호)
     int t_len, int layer, int q_heads, int kv_heads, int cap)
 {
@@ -239,8 +277,8 @@ extern "C" __global__ void attn_prep_q(
             hd[tid + 32] = x0 * s2 + x1 * c;
         }
         __syncthreads();
-        long dst = ((long)layer * cap + pos) * kv_dim + (long)m * 256;
-        long sr = ((long)layer * cap + pos) * kv_heads + m;
+        // [K6-2] 블록 테이블 간접화 — 종전 dst/sr 전개와 동일 주소(구성 증명).
+        AttnKvRowPtrs rp = attn_blk_row(dblk_tab, layer, cap, pos, kv_dim, kv_heads, m);
         // K absmax → int8
         red[tid] = fmaxf(fabsf(hd[tid]), fabsf(hd[tid + 128]));
         __syncthreads();
@@ -256,10 +294,10 @@ extern "C" __global__ void attn_prep_q(
         __syncthreads(); // red[0](K absmax) 판독 완료 후 red 재사용
         int q0 = __float2int_rn(hd[tid] * ik);
         int q1 = __float2int_rn(hd[tid + 128] * ik);
-        kc[dst + tid] = (signed char)max(-127, min(127, q0));
-        kc[dst + 128 + tid] = (signed char)max(-127, min(127, q1));
+        rp.k[tid] = (signed char)max(-127, min(127, q0));
+        rp.k[128 + tid] = (signed char)max(-127, min(127, q1));
         if (tid == 0) {
-            ksc[sr] = ks;
+            rp.ks[0] = ks;
         }
         // V absmax → int8
         float v0 = vin[src + tid];
@@ -277,10 +315,10 @@ extern "C" __global__ void attn_prep_q(
         float iv = 1.0f / vs;
         int w0 = __float2int_rn(v0 * iv);
         int w1 = __float2int_rn(v1 * iv);
-        vc[dst + tid] = (signed char)max(-127, min(127, w0));
-        vc[dst + 128 + tid] = (signed char)max(-127, min(127, w1));
+        rp.v[tid] = (signed char)max(-127, min(127, w0));
+        rp.v[128 + tid] = (signed char)max(-127, min(127, w1));
         if (tid == 0) {
-            vsc[sr] = vs;
+            rp.vs[0] = vs;
         }
     }
 }
@@ -399,12 +437,10 @@ __device__ __forceinline__ void attn_part_step(KDot kdot, VAcc vacc,
 // [P13] int8 KV 판독 — attn_fwd3s_part와 구조/환원 순서 동일(온라인 소프트맥스·
 // 분할 결정), K/V 로드만 int8 + 스케일 곱. 스코어 (q·k_i8)·(0.0625·ks),
 // AV acc += e·(v_i8·vs). 병합은 f32 part 그대로(attn_fwd3s_merge).
+// [K6-2] KV 4포인터 → 블록 테이블 간접화(파일 상단 attn_blk_row 참조).
 extern "C" __global__ void attn_fwd3s_part_q(
     const float* __restrict__ qh,
-    const signed char* __restrict__ kc,
-    const signed char* __restrict__ vc,
-    const float* __restrict__ ksc,
-    const float* __restrict__ vsc,
+    const unsigned long long* __restrict__ dblk_tab, // [K6-2] [layer][mb][4]
     float* __restrict__ part,   // [T][q_heads][S][258]: m, l, acc[256]
     const unsigned* __restrict__ pp,
     int t_len, int layer, int q_heads, int kv_heads, int cap, int splits)
@@ -451,8 +487,10 @@ extern "C" __global__ void attn_fwd3s_part_q(
                 // 32라인을 건드려 L1 웨이브프런트 32/로드(ncu: L1/TEX 87.5% 병목).
                 // uint4(16B)×16으로 웨이브프런트 ÷4. 누산 순서는 d 0..255 오름차순
                 // 그대로(4B 시절과 동일) — **비트동일 계약 유지**.
-                const uint4* k16 = reinterpret_cast<const uint4*>(
-                    kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256);
+                // [K6-2] 행 기저 = 블록 테이블(종전 kc+… 전개와 동일 주소).
+                const AttnKvRowPtrs rp =
+                    attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                const uint4* k16 = reinterpret_cast<const uint4*>(rp.k);
                 const float4* q4 = reinterpret_cast<const float4*>(qs);
                 float p0 = 0.0f;
 #pragma unroll 4
@@ -479,12 +517,13 @@ extern "C" __global__ void attn_fwd3s_part_q(
                     p0 += qd.z * (float)(signed char)((w.w >> 16) & 0xffu);
                     p0 += qd.w * (float)(signed char)(w.w >> 24);
                 }
-                return p0 * (scale * ksc[((long)layer * cap + row) * kv_heads + kh]);
+                return p0 * (scale * rp.ks[0]);
             },
             [&](int i) -> float {
                 const int row = base + i;
-                return (float)vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid] *
-                       vsc[((long)layer * cap + row) * kv_heads + kh];
+                const AttnKvRowPtrs rp =
+                    attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                return (float)rp.v[tid] * rp.vs[0];
             },
             sarr, reds, nch, tid, m_run, l_run, acc);
     }
@@ -574,10 +613,7 @@ extern "C" __global__ void attn_fwd3s_merge(
 #define ATTN_GQ_MAX 8
 extern "C" __global__ void attn_fwd3s_part_qg(
     const float* __restrict__ qh,
-    const signed char* __restrict__ kc,
-    const signed char* __restrict__ vc,
-    const float* __restrict__ ksc,
-    const float* __restrict__ vsc,
+    const unsigned long long* __restrict__ dblk_tab, // [K6-2] [layer][mb][4]
     float* __restrict__ part,   // [T][q_heads][S][258]
     const unsigned* __restrict__ pp,
     int t_len, int layer, int q_heads, int kv_heads, int cap, int splits)
@@ -644,8 +680,10 @@ extern "C" __global__ void attn_fwd3s_part_qg(
         // 스코어 — 행당 1스레드, K 행(uint4)을 gq개 헤드 dot이 공유.
         if (tid < nch) {
             const int row = base + tid;
-            const uint4* k16 = reinterpret_cast<const uint4*>(
-                kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256);
+            // [K6-2] 행 기저 = 블록 테이블(종전 kc+… 전개와 동일 주소).
+            const AttnKvRowPtrs rp =
+                attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+            const uint4* k16 = reinterpret_cast<const uint4*>(rp.k);
             float p[ATTN_GQ_MAX];
 #pragma unroll
             for (int h = 0; h < ATTN_GQ_MAX; ++h) {
@@ -680,7 +718,7 @@ extern "C" __global__ void attn_fwd3s_part_qg(
                     }
                 }
             }
-            const float sc = scale * ksc[((long)layer * cap + row) * kv_heads + kh];
+            const float sc = scale * rp.ks[0];
 #pragma unroll
             for (int h = 0; h < ATTN_GQ_MAX; ++h) {
                 sarr[h][tid] = (h < gq) ? p[h] * sc : -1e30f;
@@ -753,18 +791,19 @@ extern "C" __global__ void attn_fwd3s_part_qg(
 #pragma unroll 4
         for (; i + 3 < nch; i += 4) {
             const int r0 = base + i;
-            const float v0 =
-                (float)vc[((long)layer * cap + r0) * kv_dim + (long)kh * 256 + tid] *
-                vsc[((long)layer * cap + r0) * kv_heads + kh];
-            const float v1 =
-                (float)vc[((long)layer * cap + r0 + 1) * kv_dim + (long)kh * 256 + tid] *
-                vsc[((long)layer * cap + r0 + 1) * kv_heads + kh];
-            const float v2 =
-                (float)vc[((long)layer * cap + r0 + 2) * kv_dim + (long)kh * 256 + tid] *
-                vsc[((long)layer * cap + r0 + 2) * kv_heads + kh];
-            const float v3 =
-                (float)vc[((long)layer * cap + r0 + 3) * kv_dim + (long)kh * 256 + tid] *
-                vsc[((long)layer * cap + r0 + 3) * kv_heads + kh];
+            // [K6-2] 4행 분할 기저 = 블록 테이블(종전 vc/vsc 전개와 동일 주소).
+            const AttnKvRowPtrs r0p =
+                attn_blk_row(dblk_tab, layer, cap, r0, kv_dim, kv_heads, kh);
+            const AttnKvRowPtrs r1p =
+                attn_blk_row(dblk_tab, layer, cap, r0 + 1, kv_dim, kv_heads, kh);
+            const AttnKvRowPtrs r2p =
+                attn_blk_row(dblk_tab, layer, cap, r0 + 2, kv_dim, kv_heads, kh);
+            const AttnKvRowPtrs r3p =
+                attn_blk_row(dblk_tab, layer, cap, r0 + 3, kv_dim, kv_heads, kh);
+            const float v0 = (float)r0p.v[tid] * r0p.vs[0];
+            const float v1 = (float)r1p.v[tid] * r1p.vs[0];
+            const float v2 = (float)r2p.v[tid] * r2p.vs[0];
+            const float v3 = (float)r3p.v[tid] * r3p.vs[0];
 #pragma unroll
             for (int h = 0; h < ATTN_GQ_MAX; ++h) {
                 if (h < gq) {
@@ -778,8 +817,9 @@ extern "C" __global__ void attn_fwd3s_part_qg(
         }
         for (; i < nch; i++) {
             const int row = base + i;
-            const float vv = (float)vc[((long)layer * cap + row) * kv_dim + (long)kh * 256 + tid] *
-                             vsc[((long)layer * cap + row) * kv_heads + kh];
+            const AttnKvRowPtrs rp =
+                attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+            const float vv = (float)rp.v[tid] * rp.vs[0];
 #pragma unroll
             for (int h = 0; h < ATTN_GQ_MAX; ++h) {
                 if (h < gq) {
@@ -844,10 +884,7 @@ __device__ __forceinline__ unsigned fa2_k8(unsigned short v)
 
 extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
     const float* __restrict__ qh,
-    const signed char* __restrict__ kc,
-    const signed char* __restrict__ vc,
-    const float* __restrict__ ksc,
-    const float* __restrict__ vsc,
+    const unsigned long long* __restrict__ dblk_tab, // [K6-2] [layer][mb][4]
     const float* __restrict__ qg,
     float* __restrict__ outv,
     float* __restrict__ out32,
@@ -939,12 +976,14 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
     for (int c0 = 0; c0 < nchunks; ++c0) {
         const int base = c0 * FA2_BC;
         // ── 스테이징: K int8 복사(또는 0) + V f16 전치 + 스케일 ──
+        // [K6-2] 행 기저 = 블록 테이블(종전 kc/vc+… 전개와 동일 주소).
         for (int e = tid; e < FA2_BC * 16; e += 128) {
             const int j = e >> 4;
             const int qq = e & 15;
             const int row = base + j;
             const signed char* kp =
-                kc + ((long)layer * cap + row) * kv_dim + (long)kh * 256 + qq * 16;
+                attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh).k +
+                qq * 16;
             if (row < pos_end) {
                 *reinterpret_cast<uint4*>(&K8[j][qq * 16]) =
                     *reinterpret_cast<const uint4*>(kp);
@@ -959,7 +998,8 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
             signed char vb[16];
             if (row < pos_end) {
                 const signed char* vp =
-                    vc + ((long)layer * cap + row) * kv_dim + (long)kh * 256 + qq * 16;
+                    attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh).v +
+                    qq * 16;
                 *reinterpret_cast<uint4*>(vb) = *reinterpret_cast<const uint4*>(vp);
             } else {
 #pragma unroll
@@ -975,8 +1015,10 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
         if (tid < FA2_BC) {
             const int row = base + tid;
             const bool ok = row < pos_end;
-            ksc_s[tid] = ok ? ksc[((long)layer * cap + row) * kv_heads + kh] : 0.0f;
-            vsc_s[tid] = ok ? vsc[((long)layer * cap + row) * kv_heads + kh] : 0.0f;
+            const AttnKvRowPtrs rp =
+                attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+            ksc_s[tid] = ok ? rp.ks[0] : 0.0f;
+            vsc_s[tid] = ok ? rp.vs[0] : 0.0f;
         }
         __syncthreads();
 
