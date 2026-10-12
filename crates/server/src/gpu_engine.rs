@@ -303,6 +303,8 @@ impl GpuEngine {
         if !self.dec.mtp_slot_enabled(slot) {
             return Ok(());
         }
+        // 보정행 hidden = 액티브 경로가 전진시킨 현재 dres 행 0.
+        // (pre_round(acc+1) 융합은 실측 기각 — sched 주석 참조.)
         self.dec.mtp_push_hidden(0)?;
         let mut toks: Vec<u32> = accepted.to_vec();
         toks.push(corrected);
@@ -790,7 +792,12 @@ pub(crate) fn upload_mtp(
     // 검증(t=k+1)+보정(t=1) 두 체인 고정비가 스펙 수익을 잠식 — 수익화는
     // ①검증 경로 marlin급(가중치 스트리밍 절반) ②검증+보정 체인 통합
     // ③MTP-2 단일 그래프 디바이스 체인(호스트 왕복 제거)이 선행돼야 한다.
-    // 파킹 유지(MTP_ENABLED=false).
+    // **[보정 융합 채택 2026-10-12]** 스펙 라운드의 보정 토큰 = 검증 행 acc
+    // argmax(toks[acc]) 재사용 — decode_greedy 중복 제거. n-gram 스펙 서빙
+    // **2.6s→2.12s/128토큰(49→60 t/s, +22%)** · 라운드 53.2→32.0ms ·
+    // 스펙 골든 불변(비트 계약 유지). MTP 경로만 디코드 유지(보정 hidden
+    // 상태 전진이 초안 체인 입력 — 융합 시 0% 실측). MTP-on(k=4)은 3.07s
+    // (41.7 t/s)로 여전히 평범 미달 — 파킹 유지(MTP_ENABLED=false).
     const MTP_ENABLED: bool = false;
     if !MTP_ENABLED || model.w_raw("mtp.fc.weight").is_none() {
         return Ok(false);

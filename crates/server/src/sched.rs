@@ -771,6 +771,10 @@ fn spec_round(
     }
     // [MTP] 롤백·보정 전에 검증 dres의 수용 접두를 초안기 hidden으로 스냅샷.
     let spec_mtp = e.mtp_enabled();
+    // [2026-10-12 시도·기각] pre_round(acc+1)로 보정행까지 검증 dres에서
+    // 푸시하면 디코드 제거 가능하다는 가설 — 실측 MTP-on 0/381 수용으로
+    // 기각(검증 dres 행 acc ≠ 보정 hidden — 롤백/그래프 경로 차이). 디코드를
+    // 유지한다(MTP 경로 한정 — n-gram/플레인은 융합 유지).
     if spec_mtp && let Err(err) = e.mtp_pre_round(acc) {
         eprintln!("# mtp(무시): {err}");
     }
@@ -795,9 +799,25 @@ fn spec_round(
     } else if acc <= 1 {
         s.spec_k = 4;
     }
-    let t_corr = std::time::Instant::now();
-    let corr = e.decode_greedy(i, last)?;
-    let ms_corr = t_corr.elapsed().as_secs_f64() * 1e3;
+    // [2026-10-12] 보정 토큰 = 검증 행 acc의 argmax(toks[acc]) — 종전
+    // decode_greedy(last) 재계산은 **동일 값의 중복**이었다(라운드 30%).
+    // 근거: t-그래프 행 acc의 토큰 = last(수용 접두 마지막)이고 그 다음
+    // 토큰이 정확히 보정 토큰. 커널·순서 동일 = 비트동일(스펙 골든 계약).
+    // acc=draft.len()(전량 수용)이면 toks[acc]도 검증 범위 안(길이 1+len).
+    //
+    // [MTP 한정 예외] MTP post_round는 보정 토큰의 **hidden 상태 전진**을
+    // 요구한다(초안 체인의 입력) — 융합하면 dres/norm.dxn이 검증 상태에
+    // 머물러 초안이 붕괴한다(실측: MTP-on 0/508 수용). MTP 활성 경로만
+    // 디코드를 유지(토큰 값은 toks[acc]와 동일 — 부수효과가 계약).
+    let mut ms_corr = 0.0f64;
+    let corr = if spec_mtp {
+        let t_corr = std::time::Instant::now();
+        let d = e.decode_greedy(i, last)?;
+        ms_corr = t_corr.elapsed().as_secs_f64() * 1e3;
+        d
+    } else {
+        toks[acc]
+    };
     let t_mtp = std::time::Instant::now();
     if spec_mtp && let Err(err) = e.mtp_post_round(i, &draft[..acc], corr) {
         eprintln!("# mtp(무시): {err}");
