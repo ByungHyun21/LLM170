@@ -14,6 +14,7 @@ mod probes;
 mod resource;
 mod sched;
 mod tokenize;
+mod tree;
 mod unicode_data;
 
 use std::path::PathBuf;

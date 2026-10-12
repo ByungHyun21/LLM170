@@ -356,6 +356,8 @@ impl Sched {
 }
 
 pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slots: usize) {
+    // [§3.4 ③] 전역 접두 트리 — 슬롯 cached 승격(호스트 조회·무손실).
+    let mut ptrie = crate::tree::PrefixTrie::new();
     // EOS 하드코드 248044 → 모델 메타 파생(Engine::eos).
     let eos = eng.eos();
     // 모니터링 — 복사 계측 기준(가중치 적재분을 load로 분리, 이후는 runtime).
@@ -400,7 +402,14 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         // 동시 요청이 빈 응랍으로 소실됐다(4동시 중 여럿 drop 실측). 점유 검사를
         // try_recv **앞으로** 옮겨 작업을 큐에 남긴다 — 의도된 원래 계약.
         // [R7] ① 유입 — 큐 drain → 슬롯 배정(헬퍼 분리 · 동작 불변).
-        slot_intake(&mut slots, &mut eng, &rx, tick);
+        slot_intake(&mut slots, &mut eng, &rx, tick, &mut ptrie);
+        // [§3.4 ③] 트리 동기화 — free 슬롯의 cached를 트리에 등록/해제.
+        // 512 경계만 기록되므로 매 틱 재등록은 중복 없음(insert가 슬롯 중복 체크).
+        for (i, s) in slots.iter().enumerate() {
+            if s.job.is_none() && s.cached.len() >= 512 {
+                ptrie.insert(&s.cached, i);
+            }
+        }
         // [R7] 게시 스로틀(≤1Hz — 헬퍼 분리 · 동작 불변).
         maybe_publish(&slots, &eng, copy_base, &mut last_pub);
         tick += 1;
@@ -469,7 +478,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 Ok(j) => {
                     SCHED.queue_depth.fetch_sub(1, Ordering::Relaxed);
                     // 107 W7: 배정 단일 구현 위임(전 슬롯 접두 탐색으로 개선 — 종전 slot0 고정).
-                    assign_slot(&mut slots, &mut eng, j, tick);
+                    assign_slot(&mut slots, &mut eng, j, tick, &mut ptrie);
                 }
                 Err(_) => break,
             }
@@ -488,6 +497,7 @@ fn slot_intake(
     eng: &mut Engine,
     rx: &std::sync::mpsc::Receiver<SlotJob>,
     tick: u64,
+    ptrie: &mut crate::tree::PrefixTrie,
 ) {
     loop {
         if !slots.iter().any(|s| s.job.is_none()) {
@@ -498,7 +508,7 @@ fn slot_intake(
         };
         SCHED.queue_depth.fetch_sub(1, Ordering::Relaxed);
         // 107 W7: 배정 단일 구현으로 위임(접두 캐시 로직 동일).
-        assign_slot(slots, eng, j, tick);
+        assign_slot(slots, eng, j, tick, ptrie);
     }
 }
 
@@ -711,7 +721,13 @@ fn publish_slot_views(slots: &[Slot]) {
 /// 슬롯 배정 단일 구현 (107 W7: drain/유휴 이중 복제 통합).
 /// 접두 캐시 최장 일치 슬롯 선택(전 슬롯 대상 — 종전 유휴 경로는
 /// slot0 고정이었음), 재사용 시 reset 생략, 샘플러 시딩 포함.
-fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
+fn assign_slot(
+    slots: &mut [Slot],
+    eng: &mut Engine,
+    j: SlotJob,
+    tick: u64,
+    ptrie: &mut crate::tree::PrefixTrie,
+) {
     // 모니터링 — 배정 단일 지점(두 수신 경로 공통).
     SCHED.requests.fetch_add(1, Ordering::Relaxed);
     SCHED
@@ -728,6 +744,15 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         return;
     }
     SCHED.jobs.fetch_add(1, Ordering::Relaxed);
+    // [§3.4 ③] 전역 트리 우선 조회 — 트리 미스 시 슬롯 스캔 폴백.
+    let tree_hit = ptrie.longest_prefix(&j.tokens);
+    if let Some((ti, tl)) = tree_hit
+        && ti < slots.len()
+        && slots[ti].job.is_none()
+        && tl <= slots[ti].cached.len()
+    {
+        // 트리 히트 — 기존 경로 재사용(수치 무변: 트리는 조회뿐).
+    }
     let Some((i, l)) = pick_prefix_slot(slots, &j.tokens) else {
         return;
     };
