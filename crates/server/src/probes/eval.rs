@@ -35,6 +35,7 @@ fn run(args: &[String]) -> Result<String, String> {
         "ppl" => ppl(&args[1..]),
         "agree" => agree(&args[1..]),
         "needle" => needle(&args[1..]),
+        "sample" => sample(&args[1..]),
         other => Err(format!(
             "w4a16-eval: 서브커맨드 '{other}' — 사용법: w4a16-eval ppl <dir> --corpus <txt> [--out dump] | w4a16-eval agree <a> <b>"
         )),
@@ -510,6 +511,103 @@ fn needle(args: &[String]) -> Result<String, String> {
     }
     s.push_str(&format!("  elapsed {ms:.0}ms\n"));
     Ok(s)
+}
+
+/// [Q4 2026-10-12] 샘플링 검증 하네스 — 고정 LCG 로짓에서 서빙 CPU
+/// 샘플러(splitmix64 시드 — rand 금지 계약)로 N표본 뽑고 이론
+/// softmax(temperature·top_k/top_p/min_p 비활성) 분포와 TV 거리·
+/// 카이제곱을 대조한다(판정 기준은 실행 출력 참조 — docs/eval.md).
+fn sample(args: &[String]) -> Result<String, String> {
+    let mut it = args.iter();
+    let Some(dir) = it.next().cloned() else {
+        return Err("w4a16-eval sample <dir> [--vocab N] [--n N] [--temperature F] [--top-k K] — 예: w4a16-eval sample ../models/...".into());
+    };
+    let (mut nv, mut n, mut temp, mut topk) = (512usize, 50_000usize, 1.0f32, 0usize);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--vocab" => {
+                nv = arg(&mut it, "--vocab requires a number")?
+                    .parse()
+                    .map_err(|_| "--vocab requires a number")?
+            }
+            "--n" => {
+                n = arg(&mut it, "--n requires a number")?
+                    .parse()
+                    .map_err(|_| "--n requires a number")?
+            }
+            "--temperature" => {
+                temp = arg(&mut it, "--temperature requires a number")?
+                    .parse()
+                    .map_err(|_| "--temperature requires a number")?
+            }
+            "--top-k" => {
+                topk = arg(&mut it, "--top-k requires a number")?
+                    .parse()
+                    .map_err(|_| "--top-k requires a number")?
+            }
+            other => return Err(format!("w4a16-eval sample: unknown flag {other}")),
+        }
+    }
+    let _ = std::path::Path::new(&dir)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let params = llm170_core::sampler::SamplerParams {
+        temperature: temp,
+        top_k: topk,
+        top_p: 1.0,
+        min_p: 0.0,
+        repeat_penalty: 1.0,
+        repeat_last_n: 0,
+        seed: 0x5EED_C0DE,
+    };
+    let mut smp = llm170_core::sampler::Sampler::new(params.clone());
+    // 고정 로짓 — LCG 결정적([-8, 8] 범위).
+    let mut seed = 0xABCD_1234_5678_9DEFu64;
+    let base_logits: Vec<f32> = (0..nv)
+        .map(|i| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(i as u64);
+            ((seed >> 33) as f32 / 2147483648.0) * 8.0
+        })
+        .collect();
+    let mut counts = vec![0u64; nv];
+    for _ in 0..n {
+        let mut lg = base_logits.clone();
+        let t = smp.sample(&mut lg);
+        counts[t as usize] += 1;
+    }
+    // 이론 분포 — 비활성 필터(top_k만) 적용 softmax·코드 표본은 f64.
+    let mx = base_logits.iter().cloned().fold(f32::MIN, f32::max);
+    let mut idx: Vec<usize> = (0..nv).collect();
+    if topk > 0 && topk < nv {
+        idx.sort_by(|&a, &b| base_logits[b].total_cmp(&base_logits[a]));
+        idx.truncate(topk);
+    }
+    let zsum: f64 = idx
+        .iter()
+        .map(|&i| f64::from((base_logits[i] - mx).exp()))
+        .sum();
+    let (mut tv, mut chi2) = (0.0f64, 0.0f64);
+    for i in 0..nv {
+        let p = if idx.contains(&i) {
+            f64::from((base_logits[i] - mx).exp()) / zsum
+        } else {
+            0.0
+        };
+        let q = counts[i] as f64 / n as f64;
+        tv += (p - q).abs();
+        if p > 0.0 {
+            let e = p * n as f64;
+            chi2 += (counts[i] as f64 - e).powi(2) / e;
+        }
+    }
+    tv *= 0.5;
+    let df = idx.len() - 1;
+    let z = (chi2 / df as f64 - 1.0) * (df as f64 / 2.0).sqrt();
+    Ok(format!(
+        "sample: vocab={nv} n={n} temperature={temp} top_k={topk} — TV={tv:.5} chi2={chi2:.1} df={df} z={z:+.2} (|z|<3 = 밴드 내)"
+    ))
 }
 
 fn argmax_margin(lg: &[f32]) -> (u32, f32) {
