@@ -234,6 +234,8 @@ impl W4a16Dec {
         self.copy_dev(base, self.gdn.dgst + st_slot * 4, st_bytes)?;
         self.copy_dev(base + st_bytes, self.gdn.dring + ring_slot * 4, ring_bytes)?;
         self.gdn.dchk_pos[slot][k] = pos;
+        // [§3.4 ② 2026-10-12] 사용 갱신 — 512경계 기록 시점 recency 리셋.
+        self.ucache.touch("spec:ckpt")?;
         Ok(())
     }
 
@@ -269,6 +271,8 @@ impl W4a16Dec {
         self.copy_dev(self.gdn.dring + ring_slot * 4, base + st_bytes, ring_bytes)?;
         self.slot_pos[slot] = pos;
         self.attn_set_pos(slot, pos)?;
+        // [§3.4 ②] 사용 갱신 — 접두 히트(재사용 성립) 시점.
+        self.ucache.touch("spec:ckpt")?;
         Ok(pos)
     }
 
@@ -289,7 +293,9 @@ impl W4a16Dec {
             self.gdn.dsave + st_bytes,
             self.gdn.dring + ring_slot * 4,
             ring_bytes,
-        )
+        )?;
+        // [§3.4 ②] 사용 갱신 — 스펙 라운드 저장 시점.
+        self.ucache.touch("spec:state")
     }
 
     /// [A-1 진단] 저장 상태 복원(스냅샷 기반 롤백과 별개 — 대조 실험용).
@@ -304,7 +310,9 @@ impl W4a16Dec {
             self.gdn.dring + ring_slot * 4,
             self.gdn.dsave + st_bytes,
             ring_bytes,
-        )
+        )?;
+        // [§3.4 ②] 사용 갱신 — 복원(수용/롤백) 시점.
+        self.ucache.touch("spec:state")
     }
 
     /// [A-1] pos 되감기 — slot_pos/attn pos를 n만큼 되돌린다(스테일 KV는

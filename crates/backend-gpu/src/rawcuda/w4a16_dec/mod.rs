@@ -17,6 +17,7 @@
 use crate::rawcuda::ctx::CudaCtx;
 use crate::rawcuda::ffi::{self, CUdeviceptr};
 use std::collections::HashMap;
+use unified_cache::{CacheCategory, Tier, UnifiedCacheRegistry, base_util};
 
 /// fwd3s T 상한(assets/attn.cu ATTN_TMAX와 동일 값).
 // 커널 ATTN_TMAX와 동기(2026-10-09: 8→32→128→512 — 프리필 청크 확대).
@@ -452,6 +453,9 @@ pub struct W4a16Dec {
     pub(super) gdn: Gdn,
     pub(super) graph: Graph,
     pub cc: CudaCtx,
+    /// [§3.4 ② 2026-10-12] 통합 캐시 회계(KV·체크포인트·스펙 상태·
+    /// 전문가 LRU 단일 네임스페이스) — 트랜셰 1은 로그 전용 부기.
+    ucache: UnifiedCacheRegistry,
     pub hidden: usize,
     pub n_layers: usize,
     pub n_slots: usize,
@@ -549,6 +553,7 @@ mod moe;
 mod mtp;
 mod prefill;
 mod probe;
+pub mod unified_cache;
 mod upload;
 
 mod spec;
@@ -564,6 +569,13 @@ impl W4a16Dec {
         for a in crate::rawcuda::assets::ASSETS.iter().filter(|a| a.boot) {
             cc.load_fatbin(a.name, &crate::rawcuda::assets::asset_bytes(a)?, a.syms)?;
         }
+        // [§3.4 ②] 통합 캐시 회계 — HBM 예산 = 부팅 시점 여유 VRAM(프로브
+        // 실패 시 무제한). 트랜셰 2(실제 메모리 이관) 전까지 예산 미강제.
+        let mut ucache = UnifiedCacheRegistry::new();
+        if let Some((free, _)) = crate::cuda_mem_free() {
+            ucache.set_budget(Tier::Hbm, free);
+        }
+        ucache.set_enforce(false);
         Ok(W4a16Dec {
             moe: MoE {
                 n_experts: 0,
@@ -694,6 +706,7 @@ impl W4a16Dec {
                 batch_capture_failed: false,
             },
             cc,
+            ucache,
             hidden,
             n_layers,
             n_slots: n_slots.max(1),

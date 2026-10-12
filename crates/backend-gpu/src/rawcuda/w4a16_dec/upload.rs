@@ -163,6 +163,8 @@ impl W4a16Dec {
         // [KVQ 채택 2026-10-10] int8 KV 단일 경로(4× 절감) — 스케일은
         // 행×헤드 f32 1개(무시 가능).
         let kv_scales = slots * n * dims.cap * dims.kv_heads;
+        // [§3.4 ②] KV 재등록 — 구 회계 해제(부재 시 무동작: 최초 등록).
+        self.ucache.release_if_present("attn:kv");
         for q in [
             self.attn.dqnw_a,
             self.attn.dknw_a,
@@ -253,6 +255,21 @@ impl W4a16Dec {
         // SAFETY: 로컬 Vec<u64>의 유효 수명 내 바이트 뷰(길이 = 원소수×8).
         let tb = unsafe { std::slice::from_raw_parts(tab.as_ptr() as *const u8, tab.len() * 8) };
         Self::h2d_chunked(&self.cc, dblk, tb)?;
+        // [§3.4 ② 2026-10-12] 통합 캐시 회계 등록 — KV 본체(int8 k/v 2벌 +
+        // 행×헤드 스케일 2벌 + 블록 테이블). 트랜셰 1은 로그 전용(실패는
+        // 부기 경고 — 기능 좌우 안 함). 트랜셰 2부터 실제 예산 심사로 전환.
+        let kv_bytes = (kv_elems * 2 + kv_scales * 8) as u64 + tab.len() as u64 * 8;
+        if let Err(e) = self.ucache.allocate(
+            "attn:kv",
+            CacheCategory::Kv,
+            Tier::Hbm,
+            kv_bytes,
+            base_util::KV,
+        ) {
+            eprintln!("[ucache] attn:kv 등록 실패(회계 전용): {e}");
+        } else {
+            eprintln!("{}", self.ucache.log_line("attn:kv"));
+        }
         self.attn.dblk_tab = dblk;
         self.attn.dqnw_a = dq;
         self.attn.dknw_a = dk;

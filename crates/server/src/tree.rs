@@ -46,11 +46,9 @@ impl PrefixTrie {
         for (i, &t) in tokens.iter().enumerate() {
             node = node.children.entry(t).or_default();
             node.last_used = self.tick;
-            if (i + 1).is_multiple_of(512) {
-                if node.slots.iter().all(|&(s, _)| s != slot) {
-                    node.slots.push((slot, i + 1));
-                    self.n_boundaries += 1;
-                }
+            if (i + 1).is_multiple_of(512) && node.slots.iter().all(|&(s, _)| s != slot) {
+                node.slots.push((slot, i + 1));
+                self.n_boundaries += 1;
             }
         }
     }
