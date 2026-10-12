@@ -465,7 +465,13 @@ fn run_and_emit(
         let t = match prx.recv_timeout(std::time::Duration::from_secs(1)) {
             Ok(crate::sched::ProgressFrame::Tok(t)) => t,
             Ok(crate::sched::ProgressFrame::Ping) => {
-                continue; // [K0] 생존 프로브 — 방출 없음
+                // [K0-fin] Ping도 recv 타임아웃을 리셋한다 — 프리필 중
+                // 절단 감지가 타임아웃 갈래로 못 넘어오는 자기모순 해소:
+                // Ping마다(≈청크 간격) peer 스파이로 즉시 검사.
+                if !crate::http::peer_alive(stream) {
+                    return;
+                }
+                continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if !crate::http::peer_alive(stream)
@@ -608,7 +614,11 @@ fn run_and_emit_anthropic(
             let t = match prx.recv_timeout(std::time::Duration::from_secs(1)) {
                 Ok(crate::sched::ProgressFrame::Tok(t)) => t,
                 Ok(crate::sched::ProgressFrame::Ping) => {
-                    continue; // [K0] 생존 프로브 — 방출 없음
+                    // [K0-fin] OAI 경로와 동일 — Ping마다 peer 스파이.
+                    if !crate::http::peer_alive(stream) {
+                        return;
+                    }
+                    continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if !crate::http::peer_alive(stream)
