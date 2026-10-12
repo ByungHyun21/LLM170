@@ -1211,4 +1211,39 @@ mod tests {
         let a = slot_with(vec![9, 9]);
         assert_eq!(pick_prefix_slot(&[a], &[1, 2, 3]), Some((0, 0)));
     }
+
+    /// [R14] 스펙 적응 게이트 경계 — 무수용 1회 후 256토큰 재시도·전량 수용 시 폭 확대.
+    #[test]
+    fn spec_gate_boundary() {
+        let mut s = Slot::free();
+        s.spec_miss = 0;
+        // 무수용 시 spec_miss 증가(게이트 활성화)
+        s.spec_miss += 1;
+        assert_eq!(s.spec_miss, 1);
+        // 전량 수용 시 폭 확대(spec_k 증가·miss 리셋)
+        s.spec_miss = 0;
+        s.spec_k = 5;
+        assert!(s.spec_k <= 8, "spec_k 상한 8(TR 도메인)");
+        // 256토큰마다 재시도 = generated & 255 == 0 조건
+        s.generated = 256;
+        assert_eq!(s.generated & 255, 0, "256 배수에서 재시도 허용");
+        s.generated = 257;
+        assert_ne!(s.generated & 255, 0, "256 배수 외 재시도 차단");
+    }
+
+    /// [R14] 접두 트리 경계 — 512 미만 미스·512 이상 히트·제거 후 미스.
+    #[test]
+    fn prefix_trie_boundaries() {
+        let mut t = crate::tree::PrefixTrie::new();
+        let tokens: Vec<u32> = (1..=600).collect();
+        t.insert(&tokens, 0);
+        // 512 경계 히트
+        assert_eq!(t.longest_prefix(&tokens), Some((0, 512)));
+        // 512 미만 조회 미스
+        let short: Vec<u32> = (1..100).collect();
+        assert_eq!(t.longest_prefix(&short), None);
+        // 제거 후 미스
+        t.remove(0);
+        assert_eq!(t.longest_prefix(&tokens), None);
+    }
 }
