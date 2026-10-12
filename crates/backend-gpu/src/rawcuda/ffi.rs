@@ -198,6 +198,119 @@ pub type CuMemsetD8AsyncFn = unsafe extern "system" fn(
     stream: CUstream,
 ) -> CUresult;
 
+// ── VMM(Virtual Memory Management) — 2026-10-12 추가 ──
+// VRAM 탄력성(공존 시나리오): 물리 할당(cuMemCreate)과 가상 주소
+// 예약(cuMemAddressReserve)을 분리해, unmap/release 후 재매핑이
+// 가능하게 하는 API군. 타입 레이아웃은 CUDA 13.0 cuda.h의 _v1 ABI를
+// 미러(로컬 헤더 실측 2026-10-12). VMM 계열은 CUDA 10.2 도입 이후
+// 시그니처 동결 — _v2 변형 없이 평명 심볼이 정규 경로다.
+
+/// CUmemGenericAllocationHandle — VMM 물리 할당 핸들(u64 규격).
+pub type CUmemGenericAllocationHandle = u64;
+
+// CUmemAllocationProp/type — 고정(pinned) 할당만 사용.
+pub const CU_MEM_ALLOCATION_TYPE_PINNED: c_int = 0x1;
+// CUmemAllocationProp/requestedHandleTypes — 내보내기 미사용.
+pub const CU_MEM_HANDLE_TYPE_NONE: c_int = 0x0;
+// CUmemLocation/type — 디바이스 위치(id는 디바이스 서수).
+pub const CU_MEM_LOCATION_TYPE_DEVICE: c_int = 0x1;
+// CUmemAccessDesc/flags — 읽기+쓰기 허용(READ 0x1 | WRITE 0x2).
+pub const CU_MEM_ACCESS_FLAGS_PROT_READWRITE: c_uint = 0x3;
+// cuMemGetAllocationGranularity option — 최소 요구 세목.
+pub const CU_MEM_ALLOC_GRANULARITY_MINIMUM: c_uint = 0x0;
+
+/// CUmemLocation — { 위치 종류, 식별자 }(cuda.h 미러).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CUmemLocation {
+    pub ty: c_int,
+    pub id: c_int,
+}
+
+/// CUmemAccessDesc — 접근 권한 부여 요청 1건(cuMemSetAccess 인자).
+/// 참고: CUDA 13 헤더의 타입명은 CUmemAccessDescriptor가 아니라
+/// CUmemAccessDesc다(구 명칭과 달라 헤더 우선).
+#[repr(C)]
+pub struct CUmemAccessDesc {
+    pub location: CUmemLocation,
+    pub flags: c_uint,
+}
+
+/// CUmemAllocationProp::allocFlags — 압축·GPUDirect 미사용(전 0).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CUmemAllocationPropAllocFlags {
+    pub compression_type: u8,
+    pub gpu_direct_rdma_capable: u8,
+    pub usage: u16,
+    pub reserved: [u8; 4],
+}
+
+/// CUmemAllocationProp — VMM 물리 할당 속성. 디바이스 로컬 PINNED
+/// 경로만 사용: win32_handle_meta_data=null, alloc_flags 전 0.
+#[repr(C)]
+pub struct CUmemAllocationProp {
+    pub ty: c_int,
+    pub requested_handle_types: c_int,
+    pub location: CUmemLocation,
+    pub win32_handle_meta_data: *mut c_void,
+    pub alloc_flags: CUmemAllocationPropAllocFlags,
+}
+
+// ABI 가드 — cuda.h _v1 레이아웃과 크기가 어긋나면 컴파일 시점에
+// 실패해야 한다(드라이버에 구조체 포인터를 넘기므로 정합이 계약).
+const _: () = assert!(std::mem::size_of::<CUmemLocation>() == 8);
+const _: () = assert!(std::mem::size_of::<CUmemAccessDesc>() == 12);
+const _: () = assert!(std::mem::size_of::<CUmemAllocationProp>() == 32);
+
+/// cuMemCreate — VMM 물리 할당(핸들 발급). 크기는 granularity 배수
+/// 여야 한다(호스트가 올림 책임).
+pub type CuMemCreateFn = unsafe extern "system" fn(
+    handle: *mut CUmemGenericAllocationHandle,
+    bytes: usize,
+    prop: *const CUmemAllocationProp,
+    flags: u64,
+) -> CUresult;
+/// cuMemAddressReserve — VA 영역 예약(alignment=0이면 드라이버가
+/// granularity 정렬 선택, addr=0이면 임의 위치).
+pub type CuMemAddressReserveFn = unsafe extern "system" fn(
+    ptr: *mut CUdeviceptr,
+    bytes: usize,
+    alignment: usize,
+    addr: CUdeviceptr,
+    flags: u64,
+) -> CUresult;
+/// cuMemMap — 물리 핸들을 예약 VA에 매핑(offset=물리측 오프셋, 0 고정).
+pub type CuMemMapFn = unsafe extern "system" fn(
+    ptr: CUdeviceptr,
+    bytes: usize,
+    offset: usize,
+    handle: CUmemGenericAllocationHandle,
+    flags: u64,
+) -> CUresult;
+/// cuMemSetAccess — 매핑 영역 접근 권한(desc 배열 count건).
+pub type CuMemSetAccessFn = unsafe extern "system" fn(
+    ptr: CUdeviceptr,
+    bytes: usize,
+    desc: *const CUmemAccessDesc,
+    count: usize,
+) -> CUresult;
+/// cuMemUnmap — VA 매핑 해제(물리 할당은 유지).
+pub type CuMemUnmapFn = unsafe extern "system" fn(ptr: CUdeviceptr, bytes: usize) -> CUresult;
+/// cuMemRelease — 물리 할당 반납(전 매핑 해제 후 유효).
+pub type CuMemReleaseFn =
+    unsafe extern "system" fn(handle: CUmemGenericAllocationHandle) -> CUresult;
+/// cuMemAddressFree — VA 예약 해제.
+pub type CuMemAddressFreeFn = unsafe extern "system" fn(ptr: CUdeviceptr, bytes: usize) -> CUresult;
+/// cuMemGetAllocationGranularity — prop 기준 최소/권장 세목(바이트).
+/// 과제 명세의 "cuMemAllocationGranularity"는 드라이버 수출 심볼이
+/// 아니며 이 이름이 정규(2026-10-12 cuda.h 대조).
+pub type CuMemGetAllocationGranularityFn = unsafe extern "system" fn(
+    granularity: *mut usize,
+    prop: *const CUmemAllocationProp,
+    option: c_uint,
+) -> CUresult;
+
 /// 해석 완료된 드라이버 함수표 — 전부 순수 함수 포인터(Send+Sync 자동).
 pub(crate) struct Driver {
     pub init: CuInitFn,
@@ -242,6 +355,16 @@ pub(crate) struct Driver {
     pub host_unregister: CuMemHostUnregisterFn,
     /// 디바이스 0 채움(H) — zero_dev 경로.
     pub memset_d8_async: CuMemsetD8AsyncFn,
+
+    /// VMM(VRAM 탄력성) — 물리/VA 분리 할당 + 해제·세목 조회(2026-10-12).
+    pub mem_create: CuMemCreateFn,
+    pub mem_address_reserve: CuMemAddressReserveFn,
+    pub mem_map: CuMemMapFn,
+    pub mem_set_access: CuMemSetAccessFn,
+    pub mem_unmap: CuMemUnmapFn,
+    pub mem_release: CuMemReleaseFn,
+    pub mem_address_free: CuMemAddressFreeFn,
+    pub mem_get_allocation_granularity: CuMemGetAllocationGranularityFn,
 
     /// 진단 타이머(P8) — 이벤트 4종.
     pub event_create: CuEventCreateFn,
@@ -388,6 +511,27 @@ impl Driver {
                 )),
                 memset_d8_async: std::mem::transmute::<*mut c_void, CuMemsetD8AsyncFn>(sym!(
                     "cuMemsetD8Async"
+                )),
+                mem_create: std::mem::transmute::<*mut c_void, CuMemCreateFn>(sym!("cuMemCreate")),
+                mem_address_reserve: std::mem::transmute::<*mut c_void, CuMemAddressReserveFn>(
+                    sym!("cuMemAddressReserve"),
+                ),
+                mem_map: std::mem::transmute::<*mut c_void, CuMemMapFn>(sym!("cuMemMap")),
+                mem_set_access: std::mem::transmute::<*mut c_void, CuMemSetAccessFn>(sym!(
+                    "cuMemSetAccess"
+                )),
+                mem_unmap: std::mem::transmute::<*mut c_void, CuMemUnmapFn>(sym!("cuMemUnmap")),
+                mem_release: std::mem::transmute::<*mut c_void, CuMemReleaseFn>(sym!(
+                    "cuMemRelease"
+                )),
+                mem_address_free: std::mem::transmute::<*mut c_void, CuMemAddressFreeFn>(sym!(
+                    "cuMemAddressFree"
+                )),
+                mem_get_allocation_granularity: std::mem::transmute::<
+                    *mut c_void,
+                    CuMemGetAllocationGranularityFn,
+                >(sym!(
+                    "cuMemGetAllocationGranularity"
                 )),
             })
         }
