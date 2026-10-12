@@ -502,6 +502,7 @@ pub struct W4a16Dec {
 unsafe impl Send for W4a16Dec {}
 
 mod attn;
+mod blocktable;
 mod buffers;
 mod chains;
 mod gdn;
