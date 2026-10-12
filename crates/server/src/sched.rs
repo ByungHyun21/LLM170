@@ -24,6 +24,13 @@ const PF_LONG_PROMPT: usize = 2048;
 
 /// 슬롯 스케줄러 (04) — llama.cpp 규칙 1:1: 디코드 우선, 잔여 예산만
 /// 프리필 청크. 슬롯 = 엔진 시퀀스 id. 요청 종료 → 슬롯 반환(reset_seq).
+/// [K0 2026-10-12] progress 프레임 — Tok=토큰(SSE 방출), Ping=생존 프로브
+/// (프리필 청크마다 송신 — 수신자 drop이면 즉시 취소로 조기 반납).
+pub enum ProgressFrame {
+    Tok(u32),
+    Ping,
+}
+
 pub struct SlotJob {
     pub tokens: Vec<u32>,
     pub n_predict: usize,
@@ -31,8 +38,8 @@ pub struct SlotJob {
     pub sampler: Option<llm170_core::sampler::SamplerParams>,
     /// 조기 종료 토큰 (EOS + 채팅 템플릿 종결자).
     pub stops: Vec<u32>,
-    /// 토큰별 SSE 스트림 채널.
-    pub progress: Option<std::sync::mpsc::Sender<u32>>,
+    /// 프레임별 SSE 스트림 채널(Tok=토큰·Ping=생존 프로브 — K0).
+    pub progress: Option<std::sync::mpsc::Sender<ProgressFrame>>,
     /// 최종 결과 송신.
     pub out: std::sync::mpsc::Sender<InferResult>,
     /// 108 P5: 큐 진입 시각 — 배정까지 대기(큐 적체·슬롯 부족 계측).
@@ -504,6 +511,25 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 // 청크는 더 오래 기다린(pending) 슬롯이 받는다. 종전엔 touch가
                 // 배정 시점에만 갱신돼 한 슬롯이 전량 프리필을 독점했다.
                 slots[i].touch = tick;
+                // [K0 2026-10-12] 프리필 중 절단 감지 — 청크마다 Ping 프로브로
+                // 수신자 생존 확인(keep-alive 타임아웃까지 대기 없이 즉시).
+                // 절단이면 잔여 프리필을 버리고 즉시 반납(캐시 폐기 — 절단된
+                // 요청의 상태 신뢰 불가). 종전엔 프리필 완료 후에야 done 판정이
+                // cancelled를 봐 긴 프리필이 슬롯을 끝까지 점유했다(체감 지연).
+                if let Some(p) = slots[i].job.as_ref().and_then(|j| j.progress.as_ref())
+                    && p.send(ProgressFrame::Ping).is_err()
+                {
+                    if let Some(j) = slots[i].job.take() {
+                        // 수신측 이미 절단 — out도 drop 상태라 전송은 최선만.
+                        let _ = j.out.send(InferResult {
+                            tokens: Vec::new(),
+                            error: None,
+                        });
+                    }
+                    eng.reset_seq(i);
+                    slots[i] = Slot::free();
+                    continue;
+                }
                 if npw {
                     eprintln!(
                         "[wall] prefill slot{i} {start}tok done @{}s",
@@ -957,7 +983,7 @@ fn slot_emit(s: &mut Slot, t: u32) {
     }
     if let Some(j) = &s.job
         && let Some(p) = &j.progress
-        && p.send(t).is_err()
+        && p.send(ProgressFrame::Tok(t)).is_err()
     {
         // SSE 수신자 소멸(클라이언트 절단) — 즉시 취소 표시
         s.cancelled = true;

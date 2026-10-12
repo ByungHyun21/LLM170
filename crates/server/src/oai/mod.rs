@@ -228,7 +228,7 @@ fn enqueue_job(
 ) -> Result<
     (
         std::sync::mpsc::Receiver<TokOut>,
-        std::sync::mpsc::Receiver<u32>,
+        std::sync::mpsc::Receiver<crate::sched::ProgressFrame>,
     ),
     (),
 > {
@@ -243,7 +243,7 @@ fn enqueue_job(
         return Err(());
     }
     let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
-    let (ptx, prx) = std::sync::mpsc::channel::<u32>();
+    let (ptx, prx) = std::sync::mpsc::channel::<crate::sched::ProgressFrame>();
     let job = SlotJob {
         tokens: ids,
         n_predict,
@@ -458,14 +458,19 @@ fn run_and_emit(
     // [R3] 디톡·홀드백·stop 스캔은 TextStream(Anthropic 러너와 공유).
     let mut ts = TextStream::new(fmt.stop_strs.clone(), fmt.include_stop);
     let mut ntok = 0usize;
-    // [I 2026-10-10] keep-alive — 토큰 공백 5s마다 SSE 주석 프레임(장문
-    // 프리필 TTFT 수십 초 동안 프록시·클라 타임아웃 방지). 쓰기 실패는
-    // 즉시 탈출(prx drop → cancelled 경로로 슬롯 회수).
+    // [I 2026-10-10] keep-alive — [K0 2026-10-12] 주기 5s→1s: 토큰 공백 중
+    // 프록시·클라 타임아웃 방지와 **절단 감지 상한**을 겸한다(쓰기 실패 =
+    // prx drop → cancelled/조기 반납 — 5s면 슬롯 점유가 그만큼 지연).
     loop {
-        let t = match prx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(t) => t,
+        let t = match prx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(crate::sched::ProgressFrame::Tok(t)) => t,
+            Ok(crate::sched::ProgressFrame::Ping) => {
+                continue; // [K0] 생존 프로브 — 방출 없음
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if crate::http::sse_comment(stream, "keep-alive").is_err() {
+                if !crate::http::peer_alive(stream)
+                    || crate::http::sse_comment(stream, "keep-alive").is_err()
+                {
                     return;
                 }
                 continue;
@@ -597,12 +602,18 @@ fn run_and_emit_anthropic(
         let mut ts = TextStream::new(stop_strs.clone(), false);
         // [H] stop_reason 판정용 생성 수 — 정지 토큰(미방출)은 제외.
         let mut n_out = 0usize;
-        // [I 2026-10-10] keep-alive — OAI 경로와 동일(5s 주석 프레임).
+        // [I 2026-10-10] keep-alive — [K0] OAI 경로와 동일(1s 주석 프레임 —
+        // 절단 감지 상한 단축).
         loop {
-            let t = match prx.recv_timeout(std::time::Duration::from_secs(5)) {
-                Ok(t) => t,
+            let t = match prx.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(crate::sched::ProgressFrame::Tok(t)) => t,
+                Ok(crate::sched::ProgressFrame::Ping) => {
+                    continue; // [K0] 생존 프로브 — 방출 없음
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if crate::http::sse_comment(stream, "keep-alive").is_err() {
+                    if !crate::http::peer_alive(stream)
+                        || crate::http::sse_comment(stream, "keep-alive").is_err()
+                    {
                         return;
                     }
                     continue;

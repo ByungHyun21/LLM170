@@ -408,6 +408,33 @@ pub(crate) fn sse_comment(stream: &mut TcpStream, text: &str) -> std::io::Result
     stream.flush()
 }
 
+/// [K0 2026-10-12] 피어 생존 스파이 — keep-alive 타임아웃마다 논블로킹
+/// peek 1회: 클라 절단(RST/FIN)을 쓰기 버퍼 성공에 가려진 채 기다리지
+/// 않고 즉시 관측한다. WouldBlock/TimedOut = 생존 · Ok(0)/Err(연결) = 절단.
+pub(crate) fn peer_alive(stream: &mut TcpStream) -> bool {
+    use std::io::Read;
+    if stream.set_nonblocking(true).is_err() {
+        return true; // 상태 전환 실패 — 보수적으로 생존 간주
+    }
+    // SSE 업스트림 요청은 이미 완결돼 수신 데이터가 없다 — 1바이트 읽기
+    // 소비 무해: WouldBlock/TimedOut = 생존, EOF/Reset/BrokenPipe = 절단.
+    let mut b = [0u8; 1];
+    let mut alive = match stream.read(&mut b) {
+        Ok(0) => false, // EOF(FIN 절단) — 수신 데이터 유무와 무관하게 연결 종료
+        Ok(_) => true,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+    };
+    if stream.set_nonblocking(false).is_err() {
+        alive = false; // 원복 실패 — 이후 블로킹 쓰기가 불안정하니 절단 처리
+    }
+    alive
+}
+
 /// [D 2026-10-10] 어드미션 게이트 응답 — 429 Too Many Requests + Retry-After.
 /// 큐 포화(하드게이트) 전용 — 로딩/엔진 사망은 503(호출부 판단).
 pub(crate) fn resp_429(stream: &mut TcpStream, body: &str) {
