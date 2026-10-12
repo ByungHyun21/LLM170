@@ -3,6 +3,7 @@
 pub mod gdn;
 pub mod gdn_norm;
 pub mod json;
+pub mod marlin;
 pub mod matmul;
 pub mod ops;
 pub mod quant;
