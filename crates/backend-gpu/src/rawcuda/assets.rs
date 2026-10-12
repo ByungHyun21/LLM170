@@ -157,7 +157,7 @@ pub const ASSETS: &[Asset] = &[
             "crates/backend-gpu/src/rawcuda/assets/embed.fatbin",
             "src/rawcuda/assets/embed.fatbin",
         ],
-        syms: &["w4a16_embed_gather"],
+        syms: &["w4a16_embed_gather", "w4a16_mtp_chain_step"],
         boot: true,
     },
     Asset {
