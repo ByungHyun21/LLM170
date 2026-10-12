@@ -342,6 +342,11 @@ impl GpuEngine {
         self.dec.mtp_slot_on(slot);
     }
 
+    /// [MTP] 슬롯 KV 초기화(새 시퀀스 — 잔존 행 제거).
+    pub fn mtp_slot_kv_reset(&mut self) -> Result<(), String> {
+        self.dec.mtp_kv_reset()
+    }
+
     /// [MTP] 초안 소비(현 위치 유효분만).
     pub fn mtp_take_draft(&mut self, slot: usize) -> Option<u32> {
         self.dec.mtp_take_draft(slot)
@@ -473,6 +478,8 @@ impl GpuEngine {
         for s in 0..self.n_slots {
             self.dec.reset_state(s)?;
         }
+        // [MTP] 층 슬라이스 KV도 리셋(본체 reset_state는 본체 층만).
+        self.dec.mtp_kv_reset()?;
         Ok(())
     }
 
@@ -724,17 +731,21 @@ pub(crate) fn upload_mtp(
     dec: &mut llm170_backend_gpu::W4a16Dec,
     model: &llm170_core::qwen35::Model,
 ) -> Result<bool, String> {
-    // [MTP 2026-10-12 — 파킹] 구조·시맨틱은 vLLM qwen3_5_mtp + 드라이버
-    // 주석으로 검증 완료((P hidden, P+1 토큰)→P+2 페어링·프리필 시프트·
-    // 유예 호출·가상 어텐션 층·norm.dxn 소스·gemv_t t≤8 디스패치), 그러나
-    // **t=1 어텐션(fwd3s)이 NaN**을 내는 잔여 결함이 남아 초안 수용률 0%.
-    // 진단 실측(2026-10-12): part_q의 split0 부분합 m=11.95(유한)·l/acc=NaN,
-    // 유효 입력 전부 유한 확인(dpp=pos 정확·qg/dqh/post5_x nan=0·KV int8+스케일
-    // 유한) — 커널 내부(온라인 소프트맥스 청크 스텝)에서 NaN 발생. t>8(part_qg)
-    // 프리필 경로는 정상. 다음 도구: MTP 호출의 part_q에 ncu, 또는 최소 재현
-    // (동일 입력으로 단독 호출). 활성 시 서빙 −15%라 비활성 유지.
-    // 재개 절차: 이 결함 수정 → MTP_ENABLED=true → 수용률≥40% 확인 →
-    // 서빙 A/B·스모크. 진단 스캐폴딩은 제거됨(원장 기록 참조).
+    // [MTP 2026-10-12 — 파킹(정확성 수정 완료)] 정확성 결함 3건을 모두
+    // 수정해 **수용률 80~82% 실측**(초안=정답 일치). 수정 내역:
+    //  (1) 꼬리(8~11단계: o_proj→post_attention_layernorm→MLP→mtp.norm)
+    //      미구현 — head가 어텐션 前 x를 소비하던 것(CPU 대조 rel≈1e-7 일치).
+    //  (2) norm_resid의 ab 판독이 t행 전체인데 zero 버퍼가 1행(h)이라 t≥2
+    //      에서 OOB(행1+ NaN) → 프리필 K/V 오염 → 전 어텐션 NaN.
+    //  (3) bind의 노름 매칭 ends_with("norm.weight")가 pre_fc_norm_hidden/
+    //      embedding을 놓쳐 +1 없이 raw 사용(그 두 텐서만 zero-centered).
+    //  (4) hidden 소스 = pre-norm 잔차(dres) — vLLM speculator.py 298
+    //      "(logits_hidden, feedback_hidden) for final-norm correctness".
+    // 파킹 사유: **1-초안 스펙이 순손실** — MTP 콜당 런치 오버헤드 ~5.5ms
+    // (연산 0.2ms, ~20런치×250µs) + 검증/보정 고정비 → 서빙 38 t/s
+    // (평범 디코드 ~50+). 재개 절차: MTP 콜 그래프 캡처(5.5→~0.3ms) +
+    // MTP-2 재귀(다초안 k=3~4, 검증 t=5 상각) → A/B 1.4× 목표 →
+    // MTP_ENABLED=true → 스모크·eval. 게이트 임계도 그때 3으로(sched 주석).
     const MTP_ENABLED: bool = false;
     if !MTP_ENABLED || model.w_raw("mtp.fc.weight").is_none() {
         return Ok(false);

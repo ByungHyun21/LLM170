@@ -245,7 +245,11 @@ pub fn eng(name: &str) -> Option<Eng> {
     // (plus1 — 본체 norm 계약), 2D .weight = Plain(BF16). 3D 전문가 스택
     // (35B MoE MTP)은 미지원(None — 차기).
     if name.starts_with("mtp.") {
-        if name.ends_with("norm.weight") {
+        // [정정 2026-10-12] 노름 매칭 = "norm" 포함(.weight) — 종전
+        // ends_with("norm.weight")는 pre_fc_norm_hidden/embedding을 놓쳐
+        // +1 없이 Plain으로 떨어졌다(그 두 텐서만 zero-centered인데 raw
+        // 사용 → MTP 첫 단계부터 왜곡, 초안 상수화의 뿌리).
+        if name.ends_with(".weight") && name.contains("norm") {
             return Some(Eng::Synth {
                 name: name.into(),
                 plus1: true,

@@ -681,6 +681,9 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         eng.0.mtp_slot_reused(i);
     } else {
         eng.0.mtp_slot_fresh(i);
+        if let Err(err) = eng.0.mtp_slot_kv_reset() {
+            eprintln!("# mtp(무시): {err}");
+        }
     }
     let prev = std::mem::take(&mut slots[i].cached);
     let mut sampler_new = j.sampler.clone().map(llm170_core::sampler::Sampler::new);
@@ -716,9 +719,13 @@ fn spec_round(
     s: &mut Slot,
     e: &mut crate::gpu_engine::GpuEngine,
 ) -> Result<bool, String> {
-    // [§7.5 2026-10-11] 적응 게이트 — 연속 무수용 2회면 128토큰마다만 재시도.
+    // [§7.5 2026-10-11] 적응 게이트 — 연속 무수용 시 256토큰마다만 재시도.
     // 산문 벤치 실측(서빙 A/B): 초안이 발화하나 수용 0이 반복되면 검증 비용
     // (~0.85틱)이 순손실 — tg −1.6%·np4 −5.7%. 수용 시 즉시 해제.
+    // [MTP 2026-10-12] MTP 초안(수용 80~82%) 편입 시 임계 3이 적정(실측:
+    // 임계 1이면 첫 경계 미스로 256토큰 억제 → 42.7 t/s). 현재 MTP는
+    // 1-초안이 순손실(런치 오버헤드 ~5.5ms/콜 — 그래프 캡처·MTP-2 후 재평가)
+    // 이라 파킹 상태이므로 n-gram 기준 임계 1 유지.
     if s.spec_miss >= 1 && (s.generated & 255) != 0 {
         return Ok(false);
     }
@@ -775,6 +782,9 @@ fn spec_round(
         s.spec_miss = (s.spec_miss + 1).min(3);
     } else {
         s.spec_miss = 0;
+    }
+    if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
+        s.spec_miss = 0; // 진단: 게이트 우회(수용률 계측) — 증가 뒤에 둬야 유효.
     }
     if acc == draft.len() {
         s.spec_k = (s.spec_k + 1).min(8);

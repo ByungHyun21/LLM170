@@ -94,8 +94,12 @@ impl super::W4a16Dec {
             let _ = self.cc.free(nw);
             return Err(e);
         }
-        let zero = self.cc.alloc(h * 4)?;
-        Self::zero_dev(&self.cc, zero, h * 4)?;
+        // [정정 2026-10-12] zero ab는 **tmax행**이어야 한다 — norm_resid는
+        // ab[e](e=행×hidden+…)로 t행 전체를 읽는다. h(1행)짜리면 t≥2에서
+        // OOB 판독(행1+ = 0 또는 NaN) → 프리필 노름 오염 → K/V NaN → 이후
+        // 전 어텐션 NaN(초안 0%의 실제 뿌리 — t=1 디코드만 무사했던 이유).
+        let zero = self.cc.alloc(tmax * h * 4)?;
+        Self::zero_dev(&self.cc, zero, tmax * h * 4)?;
         let buf = self.cc.alloc(total * 4)?;
         self.mtp_nw = nw;
         self.mtp_zero = zero;
@@ -118,6 +122,23 @@ impl super::W4a16Dec {
             (total * 4) as f64 / (1 << 20) as f64,
             self.mtp_layer
         );
+        {
+            let dm = self.attn.ok_or("mtp: attn")?;
+            let arena = (buf, buf + total as u64 * 4);
+            let nwr = (nw, nw + 5 * h as u64 * 4);
+            let zr = (zero, zero + h as u64 * 4);
+            let ksc0 = self.attn_ksc_ptr(0);
+            let kv0 = self.attn_kv_ptr(0);
+            let ksce = ksc0 + (dm.n_attn * dm.cap * dm.kv_heads * 4) as u64;
+            let kve = kv0 + (dm.n_attn * dm.cap * dm.kv_dim()) as u64;
+            let dq = self.dqh_a;
+            let dqe = dq + (dm.q_dim() * 8) as u64 * 4;
+            eprintln!(
+                "[mtp-ptr] arena={arena:?} nw={nwr:?} zero={zr:?} ksc={ksc0}..{ksce} kv={kv0}..{kve} dqh={dq}..{dqe} ksc_in_arena={} nw_in_ksc={}",
+                arena.0 <= ksc0 && ksc0 < arena.1,
+                ksc0 <= nwr.0 && nwr.0 < ksce
+            );
+        }
         Ok(())
     }
 
@@ -125,9 +146,11 @@ impl super::W4a16Dec {
         self.mtp_buf + (self.mtp_off[idx] as u64) * 4
     }
 
-    /// 체인 최종 norm 출력(norm.dxn)의 `row`행을 MTP hidden 어셈블리에 추가.
-    /// [정정 2026-10-12] vLLM 미러: MTP 입력 hidden = **타깃 최종 norm 출력**
-    /// (pre-norm 잔차 아님 — dres 사용이 초안 퇴화의 원인이었다).
+    /// 체인 최종 잔차(dres, pre-norm)의 `row`행을 MTP hidden 어셈블리에 추가.
+    /// [정정2 2026-10-12] vLLM 원문(speculator.py 298: "logits_hidden,
+    /// feedback_hidden for final-norm correctness") — MTP 입력 = **pre-norm
+    /// 잔차(feedback_hidden)**. 타깃의 최종 norm 출력이 아니다(그 오판이
+    /// 초안 퇴화의 원인이었다 — MTP가 pre_fc_norm_hidden으로 다시 정규화).
     /// 호출 순서: 검증 직후 수용 접두 행들 → 보정 디코드 직후 1행.
     pub fn mtp_push_hidden(&mut self, row: usize) -> Result<(), String> {
         if !self.mtp_ok {
@@ -137,7 +160,7 @@ impl super::W4a16Dec {
             return Err("mtp: hidden 행 상한".into());
         }
         let h = self.hidden;
-        let src = self.norm.dxn + (row * h) as u64 * 4;
+        let src = self.dres + (row * h) as u64 * 4;
         let dst = self.mtp_ptr(1) + (self.mtp_rows * h) as u64 * 4;
         self.copy_dev(dst, src, (h * 4) as u64)?;
         self.mtp_rows += 1;
@@ -265,10 +288,48 @@ impl super::W4a16Dec {
             self.mtp_ptr(9),
         );
         self.slot_pos[slot] = save;
-        let _dout = r?;
+        let dout = r?;
         if !head {
             return Ok(0);
         }
+        // 8) o_proj — 어텐션 출력(doutv [t][q_dim]) → ptr6.
+        self.mtp_plain_gemv_t(
+            "mtp.layers.0.self_attn.o_proj.weight",
+            dout,
+            self.mtp_ptr(6),
+            t,
+        )?;
+        // 9) 잔차 += o_proj → post_attention_layernorm(행3) → x(ptr5).
+        self.mtp_norm_acc(3, self.mtp_ptr(4), self.mtp_ptr(6), self.mtp_ptr(5), t)?;
+        // 10) MLP — gate/up(ptr5) → silu·mul(ptr12) → down(ptr13).
+        self.mtp_plain_gemv_t(
+            "mtp.layers.0.mlp.gate_proj.weight",
+            self.mtp_ptr(5),
+            self.mtp_ptr(10),
+            t,
+        )?;
+        self.mtp_plain_gemv_t(
+            "mtp.layers.0.mlp.up_proj.weight",
+            self.mtp_ptr(5),
+            self.mtp_ptr(11),
+            t,
+        )?;
+        self.ew_dev(
+            self.mtp_ptr(10),
+            self.mtp_ptr(11),
+            self.mtp_ptr(12),
+            t * self.mtp_ffn,
+        )?;
+        self.mtp_plain_gemv_t(
+            "mtp.layers.0.mlp.down_proj.weight",
+            self.mtp_ptr(12),
+            self.mtp_ptr(13),
+            t,
+        )?;
+        // 11) 잔차 += down → mtp.norm(행4) → 최종 xn(ptr5) = head 입력.
+        // [정정 2026-10-12] 종전엔 꼬리(8~11)가 미구현이라 head가 어텐션 前
+        // x에 적용됐다 — 초안 전량 오답(수용 0/62)의 실제 원인.
+        self.mtp_norm_acc(4, self.mtp_ptr(4), self.mtp_ptr(13), self.mtp_ptr(5), t)?;
         // 12) 공유 head + argmax(마지막 행) → d2h.
         // t>8(프리필 서브청크)은 마지막 행만 t=1 head — 로짓 버퍼 절약.
         if t > 8 {
@@ -357,7 +418,7 @@ impl super::W4a16Dec {
             return Err("mtp: 미등록/슬롯".into());
         }
         let h = self.hidden;
-        let src = self.norm.dxn + (row * h) as u64 * 4;
+        let src = self.dres + (row * h) as u64 * 4;
         let dst = self.mtp_buf + (self.mtp_prev_off + slot * h) as u64 * 4;
         self.copy_dev(dst, src, (h * 4) as u64)?;
         self.mtp_prev_pos[slot] = self.slot_pos_of(slot).saturating_sub(1);
@@ -378,6 +439,35 @@ impl super::W4a16Dec {
         let out = self.mtp_run_h(slot, &[tok], embed, pos, true)?;
         self.mtp_prev_pos[slot] = u32::MAX;
         Ok(out)
+    }
+
+    /// [MTP] KV 리셋 — 상태 리셋(웜업 종료·슬롯 재사용) 시 잔존 행 제거.
+    /// 본체 KV는 reset_state가 지우지만 MTP 층 슬라이스는 별도라 방치되면
+    /// t=1 커널의 lim=pos+2 판독이 **웜업 잔존 행**을 읽는다(실측 결함 의심).
+    pub fn mtp_kv_reset(&mut self) -> Result<(), String> {
+        if !self.mtp_ok {
+            return Ok(());
+        }
+        let dm = self.attn.ok_or("mtp: attn")?;
+        let layer = self.mtp_layer;
+        for slot in 0..self.n_slots {
+            let off = (layer * dm.cap) as u64;
+            let kvc = off * dm.kv_dim() as u64;
+            let scc = off * dm.kv_heads as u64 * 4;
+            Self::zero_dev(&self.cc, self.attn_kv_ptr(slot) + kvc, dm.cap * dm.kv_dim())?;
+            Self::zero_dev(&self.cc, self.attn_vc_ptr(slot) + kvc, dm.cap * dm.kv_dim())?;
+            Self::zero_dev(
+                &self.cc,
+                self.attn_ksc_ptr(slot) + scc,
+                dm.cap * dm.kv_heads * 4,
+            )?;
+            Self::zero_dev(
+                &self.cc,
+                self.attn_vsc_ptr(slot) + scc,
+                dm.cap * dm.kv_heads * 4,
+            )?;
+        }
+        Ok(())
     }
 
     /// 슬롯 MTP 비활성/재개(접두 재사용 슬롯 = KV 정합 없음 — 초안 금지).
