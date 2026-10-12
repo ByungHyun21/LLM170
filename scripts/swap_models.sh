@@ -212,8 +212,36 @@ case "$H2" in
   *) echo "[w4a16] FAIL: 35B spec 골든 불일치: $(echo "$H2" | head -c 60)"; fail=1;;
 esac
 
+note "[11/11] J(수치 지문) — 128토큰 창 PPL 동결 대조 (Q2 · 서브토큰 드리프트)"
+FP="benchmark/eval/fingerprint.tsv"
+for pair in "$M_27B:27B" "$M_35B:35B"; do
+  d="${pair%:*}"; n="${pair#*:}"
+  jout=$(timeout 900 "$BIN" w4a16-eval ppl "$d" --corpus benchmark/eval/corpus-en.txt \
+          --limit 128 --json 2> "$RUN/j-$n.log" | tail -1)
+  if [ -z "$jout" ]; then
+    echo "[w4a16] FAIL: $n 수치 지문 실행 실패 — ${RUN}/j-$n.log"; fail=1; continue
+  fi
+  got=$(printf '%s' "$jout" | python3 -c \
+    'import json,sys; d=json.loads(sys.stdin.read()); print(f"{d["ppl"]:.9f} {d["nll_mean"]:.9f}")')
+  ref=$(awk -v m="$n" '!/^#/ && $1==m {print $4" "$3}' "$FP")
+  if [ -z "$ref" ]; then
+    echo "[w4a16] FAIL: $n 지문 기준 없음(${FP})"; fail=1; continue
+  fi
+  if python3 -c "
+import sys
+g=sys.argv[1].split(); r=sys.argv[2].split()
+ok = abs(float(g[0])-float(r[0])) <= 1e-6 and abs(float(g[1])-float(r[1])) <= 1e-6
+sys.exit(0 if ok else 1)
+" "$got" "$ref"; then
+    note "$n 지문 OK: ppl=$(printf '%s' "$got" | cut -d' ' -f1) (기준 $(printf '%s' "$ref" | cut -d' ' -f1))"
+  else
+    echo "[w4a16] FAIL: $n 수치 지문 초과 — got [$got] ≠ ref [$ref] (수치 변경 시 재동결 필요)"
+    fail=1
+  fi
+done
+
 if [ $fail -eq 0 ]; then
-  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve·장문·spec / 35B MoE 참조+GPU·장문·spec / E 가드 거부) — int8 KV 단일 경로"
+  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve·장문·spec / 35B MoE 참조+GPU·장문·spec / E 가드 거부 / 수치 지문) — int8 KV 단일 경로"
 else
   echo "[w4a16] smoke: FAILURES PRESENT"
 fi
