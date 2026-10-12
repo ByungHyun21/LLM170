@@ -112,7 +112,7 @@ impl super::W4a16Dec {
         self.mtp_layer = dm.n_attn - 1; // 가상 층(서버가 +1로 등록)
         self.mtp_rows = 0;
         self.mtp_ffn = ffn;
-        self.mtp_draft = vec![None; self.n_slots];
+        self.mtp_draft = vec![Vec::new(); self.n_slots];
         self.mtp_pos = vec![u32::MAX; self.n_slots];
         self.mtp_prev_pos = vec![u32::MAX; self.n_slots];
         self.mtp_off_slot = vec![false; self.n_slots];
@@ -173,25 +173,72 @@ impl super::W4a16Dec {
     }
 
     /// [진단] 슬롯별 초안 보관(다음 스펙 라운드가 소비).
-    pub fn mtp_store_draft(&mut self, slot: usize, tok: u32) {
+    pub fn mtp_store_drafts(&mut self, slot: usize, toks: &[u32]) {
         if slot < self.mtp_draft.len() {
-            self.mtp_draft[slot] = Some(tok);
-            // 초안은 **slot_pos+1 위치**의 토큰이다(페어링 (P,P+1)→P+2,
+            self.mtp_draft[slot] = toks.to_vec();
+            // 초안열 i번째 = **slot_pos+1+i 위치**의 토큰(페어링 (P,P+1)→P+2,
             // P = slot_pos-1). 소비 검증도 같은 식.
             self.mtp_pos[slot] = self.slot_pos[slot] + 1;
         }
     }
 
-    /// 초안 소비 — 유효(현 위치)일 때만 반환.
-    pub fn mtp_take_draft(&mut self, slot: usize) -> Option<u32> {
+    /// [MTP-2] 재귀 1스텝 — 직전 런의 fin(ptr5, t=1이므로 행 0)을 hidden으로
+    /// 옮기고 (토큰, pos)로 t=1 런. 반환 = 다음 초안.
+    /// KV는 이 위치에 MTP 자신의 k/v가 기록된다(검증 수용분은 이후
+    /// post_round가 같은 위치를 올바른 토큰으로 재기록 — 자기 치유).
+    pub fn mtp_recur_step(
+        &mut self,
+        slot: usize,
+        tok: u32,
+        embed: &[f32],
+        pos: u32,
+    ) -> Result<u32, String> {
+        let h = self.hidden;
+        if embed.len() != h {
+            return Err("mtp: 재귀 임베딩 폭".into());
+        }
+        // 직전 fin(ptr5 행 0) → hidden(ptr1 행 0), rows=1로 고정.
+        self.copy_dev(self.mtp_ptr(1), self.mtp_ptr(5), (h * 4) as u64)?;
+        self.mtp_rows = 1;
+        self.mtp_run_h(slot, &[tok], embed, pos, true)
+    }
+
+    /// [MTP-2] 미래 잔존 행 위생 — pos+1 행(lim 슬랙이 읽는 한 행)의
+    /// k/v/스케일을 0으로(이전 라운드 재귀 잔존분이 lim=pos+t+1 판독에
+    /// 섞이는 것 차단). 초안 정확도만 영향(검증이 정본).
+    pub fn mtp_zero_row(&mut self, pos: usize) -> Result<(), String> {
+        if !self.mtp_ok {
+            return Ok(());
+        }
+        let dm = self.attn.ok_or("mtp: attn")?;
+        if pos >= dm.cap {
+            return Ok(());
+        }
+        let lay = self.mtp_layer;
+        for slot in 0..self.n_slots {
+            let rowoff = (lay * dm.cap + pos) as u64;
+            let kvc = rowoff * dm.kv_dim() as u64;
+            let scc = rowoff * dm.kv_heads as u64 * 4;
+            Self::zero_dev(&self.cc, self.attn_kv_ptr(slot) + kvc, dm.kv_dim())?;
+            Self::zero_dev(&self.cc, self.attn_vc_ptr(slot) + kvc, dm.kv_dim())?;
+            Self::zero_dev(&self.cc, self.attn_ksc_ptr(slot) + scc, dm.kv_heads * 4)?;
+            Self::zero_dev(&self.cc, self.attn_vsc_ptr(slot) + scc, dm.kv_heads * 4)?;
+        }
+        Ok(())
+    }
+
+    /// 초안열 소비 — 유효(현 위치)일 때만 반환.
+    pub fn mtp_take_draft(&mut self, slot: usize) -> Option<Vec<u32>> {
         if slot >= self.mtp_draft.len() {
             return None;
         }
-        let d = self.mtp_draft[slot]?;
         if self.mtp_pos[slot] != self.slot_pos[slot] + 1 {
             return None; // 스테일(위치 불일치)
         }
-        Some(d)
+        if self.mtp_draft[slot].is_empty() {
+            return None;
+        }
+        Some(self.mtp_draft[slot].clone())
     }
 
     /// MTP 순전파(t행) — tokens[i]의 임베딩 + 어셈블된 hidden 행들로

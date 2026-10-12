@@ -325,7 +325,8 @@ pub struct W4a16Dec {
     mtp_layer: usize,
     mtp_rows: usize,
     mtp_ffn: usize,
-    mtp_draft: Vec<Option<u32>>,
+    /// [MTP-2] 슬롯별 재귀 초안열(0=다음+1 … k-1=다음+k).
+    mtp_draft: Vec<Vec<u32>>,
     mtp_pos: Vec<u32>,
     mtp_prev_pos: Vec<u32>,
     mtp_off_slot: Vec<bool>,

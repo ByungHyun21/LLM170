@@ -739,7 +739,7 @@ fn spec_round(
     // [MTP 2026-10-12] 초안 소스: 모델 자체 MTP 헤드(현 위치 유효분) 우선,
     // 없으면 n-gram. 초안은 검증이 정본 — 소스 교체는 정책 계층(무손실).
     let draft: Vec<u32> = match e.mtp_take_draft(i) {
-        Some(d) => vec![d],
+        Some(d) => d,
         None => llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1),
     };
     if draft.is_empty() {

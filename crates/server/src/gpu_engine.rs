@@ -287,8 +287,13 @@ impl GpuEngine {
         Ok(())
     }
 
-    /// [MTP] 라운드 후 — 보정 행 hidden 추가 + t행 순전파 + 초안 보관.
+    /// [MTP-2] 초안 폭 — 총 초안 수(첫 초안 + 재귀). 검증 t = 1+k ≤ 8(TR GEMV).
+    const MTP_K: usize = 4;
+
+    /// [MTP] 라운드 후 — 보정 행 hidden 추가 + t행 순전파 + **MTP-2 재귀**.
     /// pos_start = slot_pos - (수용+1) — 수용 초안·보정 토큰이 그 위치들이다.
+    /// 첫 초안(draft_0)은 (P, P+1)→P+2 규칙 그대로, 이후 k-1개는 직전 fin을
+    /// hidden으로 하는 재귀(각 런이 자기 위치 KV를 갱신).
     pub fn mtp_post_round(
         &mut self,
         slot: usize,
@@ -308,7 +313,24 @@ impl GpuEngine {
         let t = toks.len() as u32;
         let pos_start = self.dec.slot_pos_of(slot).saturating_sub(t);
         let draft = self.dec.mtp_run(slot, &toks, &embeds, pos_start)?;
-        self.dec.mtp_store_draft(slot, draft);
+        let mut drafts = vec![draft];
+        let mut tok = draft;
+        for i in 0..(Self::MTP_K.saturating_sub(1)) {
+            let emb = self.model.embed_row(tok).map_err(|e| e.to_string())?;
+            let d = self
+                .dec
+                .mtp_recur_step(slot, tok, &emb, pos_start + t + i as u32)?;
+            drafts.push(d);
+            tok = d;
+        }
+        // lim=pos+t+1 슬랙이 읽는 pos+1 행의 이전 라운드 잔존분 제거.
+        if let Err(err) = self
+            .dec
+            .mtp_zero_row(self.dec.slot_pos_of(slot) as usize + 1)
+        {
+            eprintln!("# mtp(무시): {err}");
+        }
+        self.dec.mtp_store_drafts(slot, &drafts);
         Ok(())
     }
 
@@ -329,7 +351,17 @@ impl GpuEngine {
         }
         let emb = self.model.embed_row(tok).map_err(|e| e.to_string())?;
         let d = self.dec.mtp_run_prev(slot, tok, &emb)?;
-        self.dec.mtp_store_draft(slot, d);
+        let mut drafts = vec![d];
+        let mut tk = d;
+        // 유예 호출은 P = slot_pos-1 위치 → 재귀는 slot_pos..(k-2) 위치.
+        let base = self.dec.slot_pos_of(slot);
+        for i in 0..(Self::MTP_K.saturating_sub(1)) {
+            let eb = self.model.embed_row(tk).map_err(|e| e.to_string())?;
+            let nd = self.dec.mtp_recur_step(slot, tk, &eb, base + i as u32)?;
+            drafts.push(nd);
+            tk = nd;
+        }
+        self.dec.mtp_store_drafts(slot, &drafts);
         Ok(())
     }
 
@@ -348,7 +380,7 @@ impl GpuEngine {
     }
 
     /// [MTP] 초안 소비(현 위치 유효분만).
-    pub fn mtp_take_draft(&mut self, slot: usize) -> Option<u32> {
+    pub fn mtp_take_draft(&mut self, slot: usize) -> Option<Vec<u32>> {
         self.dec.mtp_take_draft(slot)
     }
 
@@ -743,9 +775,12 @@ pub(crate) fn upload_mtp(
     //      "(logits_hidden, feedback_hidden) for final-norm correctness".
     // 파킹 사유: **1-초안 스펙이 순손실** — MTP 콜당 런치 오버헤드 ~5.5ms
     // (연산 0.2ms, ~20런치×250µs) + 검증/보정 고정비 → 서빙 38 t/s
-    // (평범 디코드 ~50+). 재개 절차: MTP 콜 그래프 캡처(5.5→~0.3ms) +
-    // MTP-2 재귀(다초안 k=3~4, 검증 t=5 상각) → A/B 1.4× 목표 →
-    // MTP_ENABLED=true → 스모크·eval. 게이트 임계도 그때 3으로(sched 주석).
+    // (평범 디코드 ~50+). **MTP-2(k=4) 구현·실측 완료**: 라운드당 2.62토큰
+    // (부분수용 71%)이나 콜 4회 오버헤드(+18ms)로 67.7ms/라운드 = 38.7 t/s.
+    // 재개 절차(우선순): ①MTP 콜 그래프 캡처 — 4회 합 ~22ms → ~1.5ms
+    // (핀 임베드 + 형상(t=1..5)별 캡처 인프라 필요) ②검증 경로 marlin급
+    // (t=k+1 검증이 가중치 바운드 — 27B는 이게 최종 병목) ③게이트 3 →
+    // A/B 목표 1.4× → MTP_ENABLED=true → 스모크·eval.
     const MTP_ENABLED: bool = false;
     if !MTP_ENABLED || model.w_raw("mtp.fc.weight").is_none() {
         return Ok(false);
