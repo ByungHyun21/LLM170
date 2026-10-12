@@ -43,14 +43,12 @@ impl PrefixTrie {
         let mut node = &mut self.root;
         self.tick += 1;
         node.last_used = self.tick;
-        let mut d = 0usize;
         for (i, &t) in tokens.iter().enumerate() {
             node = node.children.entry(t).or_default();
             node.last_used = self.tick;
-            d = i + 1;
-            if d.is_multiple_of(512) {
+            if (i + 1).is_multiple_of(512) {
                 if node.slots.iter().all(|&(s, _)| s != slot) {
-                    node.slots.push((slot, d));
+                    node.slots.push((slot, i + 1));
                     self.n_boundaries += 1;
                 }
             }

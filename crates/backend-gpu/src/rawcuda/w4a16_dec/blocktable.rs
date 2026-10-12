@@ -10,7 +10,9 @@
 use super::CUdeviceptr;
 
 /// 블록 테이블 — 슬롯별 블록 포인터 목록.
+/// [K6-2차 진행 중] attn.cu 간접 참조 통합 전까지 미사용 — 통합 시 활성화.
 /// 블록 크기 = 512 토큰 × kv_dim 바이트(int8 KV 기준).
+#[allow(dead_code)] // K6-2차 통합 대기
 pub struct BlockTable {
     /// 슬롯별 블록 포인터(블록 순서 = 토큰 순서).
     pub blocks: Vec<Vec<CUdeviceptr>>,
@@ -22,6 +24,7 @@ pub struct BlockTable {
     pub n_slots: usize,
 }
 
+#[allow(dead_code)] // K6-2차 통합 대기
 impl BlockTable {
     pub fn new(n_slots: usize, kv_dim: usize) -> Self {
         BlockTable {
