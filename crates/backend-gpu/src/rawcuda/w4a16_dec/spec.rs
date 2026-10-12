@@ -27,9 +27,9 @@ impl W4a16Dec {
         // 행은 핀드 고정 버퍼(캡처 h2d 소스 고정), pos는 replay 직전 그래프
         // 밖 h2d(같은 스트림 순서). 미스 = 직접 발사(정답·호스트 갱신 포함)
         // 후 캡처(미실행) — batch_capture 동형. 캡처 실패 시 영구 비활성.
-        if self.spec_graph_ok
-            && !self.pin_batch_in.is_null()
-            && !self.pin_pos.is_null()
+        if self.graph.spec_graph_ok
+            && !self.graph.pin_batch_in.is_null()
+            && !self.graph.pin_pos.is_null()
             && self.n_slots > 0
         {
             let h = self.hidden;
@@ -40,7 +40,7 @@ impl W4a16Dec {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     rows.as_ptr() as *const u8,
-                    self.pin_batch_in as *mut u8,
+                    self.graph.pin_batch_in as *mut u8,
                     t * h * 4,
                 );
             }
@@ -49,21 +49,24 @@ impl W4a16Dec {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     pos.to_le_bytes().as_ptr(),
-                    (self.pin_pos as *mut u8).add(slot * 4),
+                    (self.graph.pin_pos as *mut u8).add(slot * 4),
                     4,
                 );
             }
             let posb =
                 // SAFETY: self.pin_*는 pinned_alloc 소유(수명=self).
-                unsafe { std::slice::from_raw_parts(self.pin_pos as *const u8, self.n_slots * 4) };
-            self.cc
-                .h2d_async(self.dpp + (slot as u64) * 4, &posb[slot * 4..slot * 4 + 4])?;
+                unsafe { std::slice::from_raw_parts(self.graph.pin_pos as *const u8, self.n_slots * 4) };
+            self.cc.h2d_async(
+                self.attn.dpp + (slot as u64) * 4,
+                &posb[slot * 4..slot * 4 + 4],
+            )?;
             if let Some(k) = self
+                .graph
                 .spec_graphs
                 .iter()
                 .position(|(key, _, _)| *key == (slot, t))
             {
-                let exec = self.spec_graphs[k].1;
+                let exec = self.graph.spec_graphs[k].1;
                 self.cc.graph_launch(exec)?;
                 self.cc.sync()?;
                 let toks = self.batch_read_tokens(t);
@@ -71,20 +74,21 @@ impl W4a16Dec {
                 return Ok(toks);
             }
             // SAFETY: 위 복사와 동일 범위(t*h f32) — 핀드 유효.
-            let pin = unsafe { std::slice::from_raw_parts(self.pin_batch_in as *const f32, t * h) };
+            let pin =
+                unsafe { std::slice::from_raw_parts(self.graph.pin_batch_in as *const f32, t * h) };
             let v = self.chain_t(slot, pin, t, false, true, false)?;
             let toks: Vec<u32> = v.into_iter().map(|x| x as u32).collect();
-            if self.spec_graphs.len() >= 8 {
-                let (_, e, g) = self.spec_graphs.remove(0);
+            if self.graph.spec_graphs.len() >= 8 {
+                let (_, e, g) = self.graph.spec_graphs.remove(0);
                 let _ = self.cc.graph_destroy(e, g);
             }
             let cap = (|| -> Result<(ffi::CUgraphExec, ffi::CUgraph), String> {
                 self.cc.capture_begin()?;
-                self.capture_pinned_src = true;
-                self.capture_no_host = true;
+                self.graph.capture_pinned_src = true;
+                self.graph.capture_no_host = true;
                 let r = self.chain_t(slot, pin, t, false, true, false);
-                self.capture_no_host = false;
-                self.capture_pinned_src = false;
+                self.graph.capture_no_host = false;
+                self.graph.capture_pinned_src = false;
                 if let Err(e) = r {
                     let _ = self.cc.capture_end();
                     return Err(e);
@@ -95,9 +99,9 @@ impl W4a16Dec {
                 Ok((e, g))
             })();
             match cap {
-                Ok((e, g)) => self.spec_graphs.push(((slot, t), e, g)),
+                Ok((e, g)) => self.graph.spec_graphs.push(((slot, t), e, g)),
                 Err(_) => {
-                    self.spec_graph_ok = false;
+                    self.graph.spec_graph_ok = false;
                     self.cc.sync().ok();
                 }
             }
@@ -134,7 +138,7 @@ impl W4a16Dec {
     /// access(compute-sanitizer 실측: w4a16_copy +1537B 초과). 스냅샷
     /// 스트라이드는 n_layers(스캔 계약), 상태·링 스트라이드는 n_gdn.
     pub fn spec_rollback(&mut self, slot: usize, keep: usize) -> Result<(), String> {
-        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         if !self.spec_on || !(1..=8).contains(&keep) {
             return Err(format!("spec_rollback: 계약 위반 keep={keep}"));
         }
@@ -145,11 +149,11 @@ impl W4a16Dec {
         let ring_elems = (3 * dm.conv_ch()) as u64;
         let nl = self.n_layers as u64;
         for gi in 0..dm.n_gdn {
-            let src = self.dsnap + ((keep - 1) as u64 * nl + gi as u64) * st_elems * 4;
-            let dst = self.dgst + (st_slot as u64 + gi as u64 * st_elems) * 4;
+            let src = self.gdn.dsnap + ((keep - 1) as u64 * nl + gi as u64) * st_elems * 4;
+            let dst = self.gdn.dgst + (st_slot as u64 + gi as u64 * st_elems) * 4;
             self.copy_dev(dst, src, st_elems * 4)?;
-            let rsrc = self.dsnap_ring + (gi as u64 * 8 + (keep - 1) as u64) * ring_elems * 4;
-            let rdst = self.dring + (ring_slot as u64 + gi as u64 * ring_elems) * 4;
+            let rsrc = self.gdn.dsnap_ring + (gi as u64 * 8 + (keep - 1) as u64) * ring_elems * 4;
+            let rdst = self.gdn.dring + (ring_slot as u64 + gi as u64 * ring_elems) * 4;
             self.copy_dev(rdst, rsrc, ring_elems * 4)?;
         }
         Ok(())
@@ -187,7 +191,7 @@ impl W4a16Dec {
     /// [A-1 진단] GDN 출력(o_lc) 덤프 — 마지막 GDN 층 값.
     pub fn spec_dump_outv(&mut self, n: usize) -> Result<Vec<f32>, String> {
         let mut b = vec![0u8; n * 4];
-        self.cc.d2h(&mut b, self.dgo)?;
+        self.cc.d2h(&mut b, self.gdn.dgo)?;
         self.cc.sync()?;
         Ok(b.as_chunks::<4>()
             .0
@@ -198,11 +202,11 @@ impl W4a16Dec {
 
     /// [A-1 진단] 슬롯 GDN 상태 덤프(d2h) — trio vs spec scan 대조용.
     pub fn spec_dump_state(&mut self, slot: usize) -> Result<Vec<f32>, String> {
-        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
         let bytes = dm.n_gdn * dm.h_v * dm.d * dm.d * 4;
         let mut b = vec![0u8; bytes];
-        self.cc.d2h(&mut b, self.dgst + st_slot * 4)?;
+        self.cc.d2h(&mut b, self.gdn.dgst + st_slot * 4)?;
         self.cc.sync()?;
         Ok(b.as_chunks::<4>()
             .0
@@ -216,27 +220,27 @@ impl W4a16Dec {
     /// (512/1024/1536/2048 — k=(pos/512-1)%4)에 최근 4경계 유지.
     /// 값은 순수 복사(산술 불변).
     pub fn checkpoint_gdn(&mut self, slot: usize, pos: u32) -> Result<(), String> {
-        if self.dchk == 0 || slot >= self.dchk_pos.len() || !pos.is_multiple_of(512) {
+        if self.gdn.dchk == 0 || slot >= self.gdn.dchk_pos.len() || !pos.is_multiple_of(512) {
             return Ok(());
         }
-        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let k = (pos / 512 - 1) as usize % 4;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
         let per = st_bytes + ring_bytes;
-        let base = self.dchk + (slot as u64 * 4 + k as u64) * per;
-        self.copy_dev(base, self.dgst + st_slot * 4, st_bytes)?;
-        self.copy_dev(base + st_bytes, self.dring + ring_slot * 4, ring_bytes)?;
-        self.dchk_pos[slot][k] = pos;
+        let base = self.gdn.dchk + (slot as u64 * 4 + k as u64) * per;
+        self.copy_dev(base, self.gdn.dgst + st_slot * 4, st_bytes)?;
+        self.copy_dev(base + st_bytes, self.gdn.dring + ring_slot * 4, ring_bytes)?;
+        self.gdn.dchk_pos[slot][k] = pos;
         Ok(())
     }
 
     /// [K3] upto 이하 최대 체크포인트 경계 선택(0 = 없음).
     fn ck_pick(&self, slot: usize, upto: u32) -> u32 {
         let mut best = 0u32;
-        if let Some(ks) = self.dchk_pos.get(slot) {
+        if let Some(ks) = self.gdn.dchk_pos.get(slot) {
             for &p in ks {
                 if p > 0 && p <= upto && p > best {
                     best = p;
@@ -250,19 +254,19 @@ impl W4a16Dec {
     /// 되돌리고 pos를 해당 위치로(절대 설정). 반환 = 복원 위치(0 = 없음).
     pub fn restore_gdn(&mut self, slot: usize, upto: u32) -> Result<u32, String> {
         let pos = self.ck_pick(slot, upto);
-        if self.dchk == 0 || pos == 0 {
+        if self.gdn.dchk == 0 || pos == 0 {
             return Ok(0);
         }
-        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let k = (pos / 512 - 1) as usize % 4;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
         let per = st_bytes + ring_bytes;
-        let base = self.dchk + (slot as u64 * 4 + k as u64) * per;
-        self.copy_dev(self.dgst + st_slot * 4, base, st_bytes)?;
-        self.copy_dev(self.dring + ring_slot * 4, base + st_bytes, ring_bytes)?;
+        let base = self.gdn.dchk + (slot as u64 * 4 + k as u64) * per;
+        self.copy_dev(self.gdn.dgst + st_slot * 4, base, st_bytes)?;
+        self.copy_dev(self.gdn.dring + ring_slot * 4, base + st_bytes, ring_bytes)?;
         self.slot_pos[slot] = pos;
         self.attn_set_pos(slot, pos)?;
         Ok(pos)
@@ -275,30 +279,30 @@ impl W4a16Dec {
 
     /// [A-1 진단] 슬롯 GDN 상태 저장/복원(전 층·헤드) — 검증 대조용.
     pub fn spec_save_state(&mut self, slot: usize) -> Result<(), String> {
-        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
-        self.copy_dev(self.dsave, self.dgst + st_slot * 4, st_bytes)?;
+        self.copy_dev(self.gdn.dsave, self.gdn.dgst + st_slot * 4, st_bytes)?;
         self.copy_dev(
-            self.dsave + st_bytes,
-            self.dring + ring_slot * 4,
+            self.gdn.dsave + st_bytes,
+            self.gdn.dring + ring_slot * 4,
             ring_bytes,
         )
     }
 
     /// [A-1 진단] 저장 상태 복원(스냅샷 기반 롤백과 별개 — 대조 실험용).
     pub fn spec_load_state(&mut self, slot: usize) -> Result<(), String> {
-        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
-        self.copy_dev(self.dgst + st_slot * 4, self.dsave, st_bytes)?;
+        self.copy_dev(self.gdn.dgst + st_slot * 4, self.gdn.dsave, st_bytes)?;
         self.copy_dev(
-            self.dring + ring_slot * 4,
-            self.dsave + st_bytes,
+            self.gdn.dring + ring_slot * 4,
+            self.gdn.dsave + st_bytes,
             ring_bytes,
         )
     }

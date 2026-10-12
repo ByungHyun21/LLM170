@@ -216,3 +216,213 @@ fn batch_dec_max_mirror() {
     let t = define(include_str!("../assets/moe.cu"), "G4_TMAX") as usize;
     assert_eq!(t, BATCH_DEC_MAX, "moe.cu G4_TMAX ↔ BATCH_DEC_MAX");
 }
+
+// ═══ [MTP-CHAIN 2026-10-12 §3.3 ②] 장치 체인 패리티 — CUDA 필요 ═══
+// 순차 호스트 경로(앵커 + mtp_recur_step ×3)와 장치 체인(앵커 +
+// mtp_chain_drafts)의 초안열 동일성. 모델은 합성 미니(플레인 bf16 MTP
+// 가중 + int8 head + 임베딩 상주 + 더미 blk.0/GDN 등록) — 수치 의미 없음,
+// 경로 동일성(토큰열 판정)이 목적. 두 경로는 같은 커널열을 쓰며 임베딩
+// 소스만 h2d ↔ gather(bf16 디코드 비트동일 — embed.cu 계약)로 다르다.
+
+/// splitmix64 — rand 금지 계약(core sampler 미러).
+fn sm64(s: &mut u64) -> u64 {
+    *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// [lo, hi) 균등 f32.
+fn sm_f32(s: &mut u64, lo: f32, hi: f32) -> f32 {
+    lo + (sm64(s) as f64 / u64::MAX as f64) as f32 * (hi - lo)
+}
+
+/// f32 → bf16(절단) 바이트열 — 시험 인코딩. 디코드(u32<<16)가 항등이라
+/// 호스트 판독값과 커널 b2f가 비트동일.
+fn bf16_bytes(v: &[f32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(v.len() * 2);
+    for &x in v {
+        b.extend_from_slice(&((x.to_bits() >> 16) as u16).to_le_bytes());
+    }
+    b
+}
+
+/// 상주 임베딩 바이트의 r행 디코드(커널 b2f와 동일식).
+fn bf16_row(bytes: &[u8], r: usize, k: usize) -> Vec<f32> {
+    (0..k)
+        .map(|c| {
+            let o = (r * k + c) * 2;
+            let u = u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+            f32::from_bits((u as u32) << 16)
+        })
+        .collect()
+}
+
+#[test]
+fn mtp_device_chain_matches_sequential() {
+    let h = 1024usize;
+    let (qh, kvh, d, cap) = (4usize, 2usize, 256usize, 64usize);
+    let (qdim, kvdim) = (qh * d, kvh * d); // 1024, 512
+    let (ffn, vocab) = (1024usize, 256usize);
+    let mut dec = super::W4a16Dec::new(1, h, 1).expect("CUDA 컨텍스트/fatbin");
+    let mut s = 0x1234_5678_9abc_def0u64;
+
+    // blk.0 레지스트리 — ensure_chain_bufs(build_multi_tables) 형상 계약.
+    // 실행되지 않는다(폭 산정만) → 0 채움. g128 q=n·k/2 · s=n·k/64.
+    for name in [
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_up.weight",
+    ] {
+        let (n, k) = (64usize, h);
+        let z = vec![0u8; n * k];
+        dec.upload_lin(name, &z[..n * k / 2], &z[..n * k / 64], n, k)
+            .expect("upload_lin");
+    }
+    // MTP 가중(플레인 bf16) — 실제 실행분.
+    let plain = |dec: &mut super::W4a16Dec, name: &str, n: usize, k: usize, s: &mut u64| {
+        let w: Vec<f32> = (0..n * k).map(|_| sm_f32(s, -0.05, 0.05)).collect();
+        dec.upload_plain(name, &bf16_bytes(&w), n, k)
+            .expect("upload_plain");
+    };
+    plain(&mut dec, "mtp.fc.weight", h, 2 * h, &mut s);
+    plain(
+        &mut dec,
+        "mtp.layers.0.self_attn.q_proj.weight",
+        qdim,
+        h,
+        &mut s,
+    );
+    plain(
+        &mut dec,
+        "mtp.layers.0.self_attn.k_proj.weight",
+        kvdim,
+        h,
+        &mut s,
+    );
+    plain(
+        &mut dec,
+        "mtp.layers.0.self_attn.v_proj.weight",
+        kvdim,
+        h,
+        &mut s,
+    );
+    plain(
+        &mut dec,
+        "mtp.layers.0.self_attn.o_proj.weight",
+        h,
+        qdim,
+        &mut s,
+    );
+    plain(
+        &mut dec,
+        "mtp.layers.0.mlp.gate_proj.weight",
+        ffn,
+        h,
+        &mut s,
+    );
+    plain(&mut dec, "mtp.layers.0.mlp.up_proj.weight", ffn, h, &mut s);
+    plain(
+        &mut dec,
+        "mtp.layers.0.mlp.down_proj.weight",
+        h,
+        ffn,
+        &mut s,
+    );
+    // head(int8 양자화 내부 수행) + 임베딩(bf16 상주 — gather 경로 원본).
+    let head_w: Vec<f32> = (0..vocab * h)
+        .map(|_| sm_f32(&mut s, -0.05, 0.05))
+        .collect();
+    dec.upload_head(&bf16_bytes(&head_w), vocab, h)
+        .expect("upload_head");
+    let emb_b = bf16_bytes(
+        &(0..vocab * h)
+            .map(|_| sm_f32(&mut s, -0.05, 0.05))
+            .collect::<Vec<_>>(),
+    );
+    dec.upload_embed(&emb_b, vocab, h, true)
+        .expect("upload_embed");
+    // GDN — ensure_chain_bufs 형상 계약(체인이 실행하지 않음 → 0/1 채움).
+    let gd = super::GdnDims {
+        n_gdn: 1,
+        hidden: h,
+        h_k: 2,
+        h_v: 4,
+        d: 64,
+    };
+    dec.set_gdn(
+        gd,
+        &vec![0f32; gd.n_gdn * gd.conv_ch() * 4],
+        &vec![0f32; gd.n_gdn * 2 * gd.h_v * gd.hidden],
+        &vec![0f32; gd.n_gdn * gd.h_v],
+        &vec![0f32; gd.n_gdn * gd.h_v],
+        &vec![1f32; gd.n_gdn * 128],
+    )
+    .expect("set_gdn");
+    // 어텐션 — MTP 가상 전체-어텐션 층 1개(n_attn=1 → mtp_layer=0).
+    let ad = super::AttnDims {
+        n_attn: 1,
+        q_heads: qh,
+        kv_heads: kvh,
+        d,
+        cap,
+        interval: 1,
+    };
+    dec.set_attn(
+        ad,
+        &(0..ad.n_attn * d)
+            .map(|_| sm_f32(&mut s, 0.5, 1.5))
+            .collect::<Vec<_>>(),
+        &(0..ad.n_attn * d)
+            .map(|_| sm_f32(&mut s, 0.5, 1.5))
+            .collect::<Vec<_>>(),
+    )
+    .expect("set_attn");
+    // MTP 노름 5행(≈1)·등록 — 체인 부기 버퍼(ctr·log)까지 확보.
+    let norms: Vec<f32> = (0..5 * h).map(|_| sm_f32(&mut s, 0.8, 1.2)).collect();
+    dec.set_mtp(&norms, qdim, kvdim, ffn).expect("set_mtp");
+
+    // dres 행 0 시드(hidden 어셈블리 원천) — 두 경로 동일값.
+    let seed: Vec<f32> = (0..h).map(|_| sm_f32(&mut s, -1.0, 1.0)).collect();
+    dec.ensure_chain_bufs().expect("ensure_chain_bufs");
+    {
+        let _g = dec.cc.guard().expect("guard");
+        // SAFETY: 로컬 시드 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let sb = unsafe { std::slice::from_raw_parts(seed.as_ptr() as *const u8, h * 4) };
+        dec.cc.h2d(dec.dres, sb).expect("dres 시드");
+    }
+
+    let pos: u32 = 4;
+    let tok0: u32 = 7;
+    let emb0 = bf16_row(&emb_b, tok0 as usize, h);
+    let embed_of = |t: u32| bf16_row(&emb_b, t as usize, h);
+
+    // ── 순차(호스트 왕복): 앵커 + mtp_recur_step ×3 ──
+    dec.mtp_kv_reset().expect("kv 리셋");
+    dec.mtp_reset_hidden();
+    dec.mtp_push_hidden(0).expect("push");
+    let d1 = dec.mtp_run(0, &[tok0], &emb0, pos).expect("앵커");
+    let mut seq = vec![d1];
+    let mut tok = d1;
+    for i in 0..3u32 {
+        let d = dec
+            .mtp_recur_step(0, tok, &embed_of(tok), pos + 1 + i)
+            .expect("재귀");
+        seq.push(d);
+        tok = d;
+    }
+
+    // ── 장치 체인: 앵커(동일) + mtp_chain_drafts ──
+    // kv 리셋으로 첫 실행 잔존 KV 제거 — 두 실행의 초기상태를 동일화.
+    dec.mtp_kv_reset().expect("kv 리셋2");
+    dec.mtp_reset_hidden();
+    dec.mtp_push_hidden(0).expect("push2");
+    let d1c = dec.mtp_run(0, &[tok0], &emb0, pos).expect("앵커2");
+    let chain = dec.mtp_chain_drafts(0, 4, pos).expect("체인");
+
+    assert_eq!(d1, d1c, "앵커 argmax 불일치 — 비결정 오염");
+    assert_eq!(seq, chain, "장치 체인 초안열 ≠ 순차 경로(토큰열 판정)");
+}
