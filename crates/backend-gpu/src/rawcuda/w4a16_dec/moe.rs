@@ -133,7 +133,7 @@ impl W4a16Dec {
     /// [§1.2 2026-10-11] 게이트·업 2N 융합 발사 — 한 커널이 base·base+1 두
     /// 투영을 동시 처리(N64 = 게이트 32 + 업 32). A 스테이징·배리어를 상각.
     /// [B2 2026-10-12] KC32 변형 채택 시 미사용(비교용 보존).
-    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn gemm_g32_mma_grp2_launch(
         &self,
         base: usize,

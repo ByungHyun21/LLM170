@@ -233,27 +233,6 @@ impl Model {
         }
     }
 
-    /// Synth 원값(변환 없이) + 순열만 — W3 GPU 조립용.
-    /// (예: A_log — f32_vec는 CPU 계약(-exp)이라 커널이 -exp를 스스로
-    /// 산출하도록 원값이 필요하다.)
-    pub fn synth_raw(&self, name: &str) -> Result<Vec<f32>, ModelError> {
-        match bind::eng(name) {
-            Some(bind::Eng::Synth { name: hf, perm, .. }) => {
-                let raw = self
-                    .w4
-                    .plain_vec_f32(&hf)
-                    .map_err(|e| ModelError::W4a16(e.to_string()))?;
-                Ok(match perm {
-                    1 => bind::permute_heads_f32(&self.cfg, &raw),
-                    2 => bind::conv_rows_f32_permuted(&self.w4, &self.cfg, &hf)
-                        .map_err(|e| ModelError::W4a16(e.to_string()))?,
-                    _ => raw,
-                })
-            }
-            _ => Err(ModelError::W4a16(format!("{name}: Synth 아님"))),
-        }
-    }
-
     /// V축 순열 사본(지연 1회 구축 — 48 선형층 qkv-v/z/out + alpha/beta).
     fn perm_store(&self) -> &bind::PermStore {
         self.perm
@@ -492,15 +471,6 @@ impl Engine {
     pub fn new(model: Model, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState::new(&model, ctx)).collect();
         Engine { model, seqs }
-    }
-
-    /// KV 용량에서 역산한 컨텍스트 길이.
-    pub fn ctx_len(&self) -> usize {
-        let (n_kv, hd) = (self.model.hp.n_kv, self.model.hp.head_dim);
-        self.seqs
-            .first()
-            .and_then(|s| s.kv_k.first().map(|k| k.len() / (n_kv * hd)))
-            .unwrap_or(4096)
     }
 
     /// 시퀀스 상태 전체 초기화 (무상태 HTTP 서버용).

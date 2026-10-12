@@ -156,14 +156,6 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// 호스트 발사 누적(진단): (ns, calls).
-    pub fn host_launch_stats() -> (u64, u64) {
-        (
-            HOST_LAUNCH_NS.load(std::sync::atomic::Ordering::Relaxed),
-            HOST_LAUNCH_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-        )
-    }
-
     /// pinned 호스트 할당 — 캡처 가능한 async 복사의 소스/목적지.
     pub fn pinned_alloc(&self, bytes: usize) -> Result<*mut std::ffi::c_void, String> {
         // SAFETY: 출력은 스택 로컬 — 해제는 pinned_free 계약.
