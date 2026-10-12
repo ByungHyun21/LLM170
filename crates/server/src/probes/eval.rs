@@ -16,6 +16,7 @@
 //!                           [--out dump.tsv] [--json]
 //!   llm170 w4a16-eval ppl <w4a16_dir> --from-tokens <file> [...]
 //!   llm170 w4a16-eval agree <a.tsv> <b.tsv>
+//!   llm170 w4a16-eval needle <w4a16_dir> [--ctx N] [--lens N,N] [--sets N] [--json]
 
 use super::{arg, arg_str, finish};
 use llm170_backend_gpu::W4a16Dec;
@@ -33,6 +34,7 @@ fn run(args: &[String]) -> Result<String, String> {
     match args.first().map(String::as_str).unwrap_or("") {
         "ppl" => ppl(&args[1..]),
         "agree" => agree(&args[1..]),
+        "needle" => needle(&args[1..]),
         other => Err(format!(
             "w4a16-eval: 서브커맨드 '{other}' — 사용법: w4a16-eval ppl <dir> --corpus <txt> [--out dump] | w4a16-eval agree <a> <b>"
         )),
@@ -352,6 +354,164 @@ fn agree(args: &[String]) -> Result<String, String> {
 }
 
 /// argmax + top1-2 마진 — CPU `greedy_from` 규약(엄격 비교, 동률=최저 인덱스).
+/// [Q3 2026-10-12] needle 하네스 — 장문 검색 정확도(플랜 §5 Q3).
+/// 합성 haystack 내 고유 패스코드(결정적 LCG — rand 금지 계약)를 깊이
+/// (10/50/90%)별로 삽입하고, greedy 답변 8토큰에 패스코드 토큰 부분열이
+/// 있는지로 채점한다(토큰 id 기준 — 디코딩 무관·결정적). 문맥 프리필은
+/// ppl 청크 경로와 동일(KV 누적 — 수치 계급 동일).
+fn needle(args: &[String]) -> Result<String, String> {
+    let mut it = args.iter();
+    let Some(dir) = it.next().cloned() else {
+        return Err("w4a16-eval needle <dir> [--ctx N] [--lens N,N] [--sets N] [--json] — 예: w4a16-eval needle ../models/Qwen3.8-27B-W4A16-AutoRound --lens 4096,16384".into());
+    };
+    let (mut ctx, mut lens, mut sets, mut json) =
+        (16384usize, vec![4096usize, 16384], 1usize, false);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--ctx" => {
+                ctx = arg(&mut it, "--ctx requires a number")?
+                    .parse()
+                    .map_err(|_| "--ctx requires a number")?;
+            }
+            "--lens" => {
+                lens = arg(&mut it, "--lens requires N,N")?
+                    .split(',')
+                    .map(|v| {
+                        v.parse::<usize>()
+                            .map_err(|_| "--lens requires N,N".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            "--sets" => {
+                sets = arg(&mut it, "--sets requires a number")?
+                    .parse()
+                    .map_err(|_| "--sets requires a number")?;
+            }
+            "--json" => json = true,
+            other => return Err(format!("w4a16-eval needle: unknown flag {other}")),
+        }
+    }
+    let model = llm170_core::qwen35::Model::load(Path::new(&dir)).map_err(|e| e.to_string())?;
+    let hp = model.hp.clone();
+    let tk = crate::tokenize::Tokenizer::load(Path::new(&dir))?;
+    let t0 = std::time::Instant::now();
+    let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
+    crate::gpu_engine::upload_model(&mut dec, &model, ctx)?;
+    let head = model
+        .w("output.weight")
+        .ok_or_else(|| "output.weight 부재".to_string())?;
+    if head.ty != llm170_core::wtype::WType::Bf16 {
+        return Err("needle은 GPU head 전제(Bf16 head 필요)".into());
+    }
+    dec.upload_head(head.data, head.n_out as usize, head.n_in as usize)?;
+
+    // 합성 haystack — 중성 산책 문장 반복(코퍼스 의존 없음·결정적).
+    const HAY: &str = "The narrow alpine trail bends past the old stone bridge and continues through the quiet valley below the snow line. ";
+    let hay: Vec<u32> = tk.encode_opts(&HAY.repeat(1400), false);
+    let mut seed = 0x5EED_C0DE_1234_5678u64;
+    let mut lcg = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as u32
+    };
+    let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let depths = [10usize, 50, 90];
+    let mut rows: Vec<(usize, usize, usize, bool)> = Vec::new();
+    for &l in &lens {
+        if l + 32 > ctx {
+            return Err(format!("len {l} + 질문 > ctx {ctx} — --ctx 확대 필요"));
+        }
+        for set in 0..sets {
+            let word: String = (0..6)
+                .map(|_| alphabet[(lcg() as usize) % alphabet.len()] as char)
+                .collect();
+            let n_id = tk.encode_opts(
+                &format!(" The secret passcode for slot {set} is {word}. "),
+                false,
+            );
+            let q_id = tk.encode_opts(
+                &format!(
+                    " What is the secret passcode for slot {set}? Reply with the passcode only:"
+                ),
+                false,
+            );
+            let word_id = tk.encode_opts(&word, false);
+            let hay_need = l.saturating_sub(n_id.len() + q_id.len());
+            if hay.len() < hay_need {
+                return Err(format!("haystack 부족: {} < {hay_need}", hay.len()));
+            }
+            for &d in &depths {
+                let cut = hay_need * d / 100;
+                let mut toks: Vec<u32> = Vec::with_capacity(l + 16);
+                toks.extend_from_slice(&hay[..cut]);
+                toks.extend_from_slice(&n_id);
+                toks.extend_from_slice(&hay[cut..hay_need]);
+                toks.extend_from_slice(&q_id);
+                dec.reset_state(0)?;
+                // 문맥 n-1토큰까지 배치 체인 프리필(무로짓·t≥ 2) — 마지막
+                // 토큰은 t=1 head로 예측(프리필/디코드 경계 동일).
+                let n_ctx = toks.len() - 1;
+                let mut i = 0usize;
+                while i < n_ctx {
+                    let t = (n_ctx - i).clamp(2, 512);
+                    let mut rb: Vec<f32> = Vec::with_capacity(t * hp.n_embd);
+                    for &tok in &toks[i..i + t] {
+                        rb.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);
+                    }
+                    dec.forward_prefill(0, &rb, t, false)?;
+                    i += t;
+                }
+                // greedy 8토큰 — 마지막 문맥 토큰에서 시작.
+                let mut row: Vec<f32> = dec.forward_device_head(
+                    0,
+                    &model.embed_row(toks[n_ctx]).map_err(|e| e.to_string())?,
+                )?;
+                let mut picks: Vec<u32> = Vec::with_capacity(8);
+                for _ in 0..8 {
+                    let mut best = (0u32, f32::MIN);
+                    for (j, &v) in row.iter().enumerate() {
+                        if v > best.1 {
+                            best = (j as u32, v);
+                        }
+                    }
+                    picks.push(best.0);
+                    let er = model.embed_row(best.0).map_err(|e| e.to_string())?;
+                    row = dec.forward_device_head(0, &er)?;
+                }
+                let hit = picks.windows(word_id.len()).any(|w| w == &word_id[..]);
+                rows.push((l, d, set, hit));
+            }
+        }
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    let hits = rows.iter().filter(|r| r.3).count();
+    if json {
+        let cells: Vec<String> = rows
+            .iter()
+            .map(|(l, d, s, h)| {
+                format!("{{\"len\":{l},\"depth_pct\":{d},\"set\":{s},\"hit\":{h}}}")
+            })
+            .collect();
+        return Ok(format!(
+            "{{\"model\":\"{dir}\",\"cases\":{},\"hits\":{hits},\"acc\":{:.4},\"elapsed_ms\":{ms:.0},\"rows\":[{}]}}",
+            rows.len(),
+            hits as f64 / rows.len().max(1) as f64,
+            cells.join(",")
+        ));
+    }
+    let mut s = format!(
+        "needle {dir}: {hits}/{} hits ({:.1}%)\n",
+        rows.len(),
+        100.0 * hits as f64 / rows.len().max(1) as f64
+    );
+    for (l, d, set, h) in &rows {
+        s.push_str(&format!("  len={l} depth={d}% set={set} hit={h}\n"));
+    }
+    s.push_str(&format!("  elapsed {ms:.0}ms\n"));
+    Ok(s)
+}
+
 fn argmax_margin(lg: &[f32]) -> (u32, f32) {
     let mut best = f32::NEG_INFINITY;
     let mut bi = 0u32;
