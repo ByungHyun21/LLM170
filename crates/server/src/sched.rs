@@ -399,47 +399,16 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         // break했다 — 꺼낸 작업이 그대로 버려져(송신측 drop → 수신측 즉시 Err)
         // 동시 요청이 빈 응랍으로 소실됐다(4동시 중 여럿 drop 실측). 점유 검사를
         // try_recv **앞으로** 옮겨 작업을 큐에 남긴다 — 의도된 원래 계약.
-        loop {
-            if !slots.iter().any(|s| s.job.is_none()) {
-                break;
-            }
-            let Ok(j) = rx.try_recv() else {
-                break;
-            };
-            SCHED.queue_depth.fetch_sub(1, Ordering::Relaxed);
-            // 107 W7: 배정 단일 구현으로 위임(접두 캐시 로직 동일).
-            assign_slot(&mut slots, &mut eng, j, tick);
-        }
-        if last_pub.elapsed() >= std::time::Duration::from_millis(900) {
-            last_pub = std::time::Instant::now();
-            publish_slot_views(&slots);
-            publish_stats(&eng, copy_base);
-        }
+        // [R7] ① 유입 — 큐 drain → 슬롯 배정(헬퍼 분리 · 동작 불변).
+        slot_intake(&mut slots, &mut eng, &rx, tick);
+        // [R7] 게시 스로틀(≤1Hz — 헬퍼 분리 · 동작 불변).
+        maybe_publish(&slots, &eng, copy_base, &mut last_pub);
         tick += 1;
         let _it0 = std::time::Instant::now();
 
-        // ② 디코드 우선 — prefill 완료 슬롯 전부
-        let active: Vec<usize> = (0..n_slots)
-            .filter(|&i| {
-                slots[i].job.is_some()
-                    && slots[i].prefilled == slots[i].job.as_ref().unwrap().tokens.len()
-            })
-            .collect();
-        let mut decoded = false;
-        let mut dec_ms = 0f64;
-        if !active.is_empty() {
-            decoded = true;
-            let _dt = std::time::Instant::now();
-            llm170_diag::watchdog::bump();
-            q35_decode(&mut eng.0, &mut slots, &active);
-            dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
-            // 완료 슬롯 정리 — 결과 전송·반환
-            let _ft = std::time::Instant::now();
-            for &i in &active {
-                finish_slot(&mut slots[i], &mut eng, i, eos);
-            }
-            ms_fin += _ft.elapsed().as_secs_f64() * 1e3;
-        }
+        // [R7] ② 디코드 우선 — 활성 전 슬롯(헬퍼 분리 · 동작 불변).
+        let (active, decoded, dec_ms, fin_ms) = slot_decode(&mut slots, &mut eng, eos);
+        ms_fin += fin_ms;
 
         // ③ 프리필 1청크 — 디코드가 없었던 회차이거나, 아직 프리필이 남은 대기 슬롯이
         // 있는 경우. (디코드 우선이지만 활성 슬롯의 디코드가 대기 슬롯의 프리필을
@@ -455,113 +424,13 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             .iter()
             .any(|s| s.job.is_some() && s.prefilled < s.job.as_ref().unwrap().tokens.len());
         if !decoded || pending_prefill {
-            let pf = (0..n_slots)
-                .filter(|&i| {
-                    slots[i].job.is_some()
-                        && slots[i].prefilled < slots[i].job.as_ref().unwrap().tokens.len()
-                })
-                .min_by_key(|&i| slots[i].touch);
-            if let Some(i) = pf {
-                let _pft = std::time::Instant::now();
-                llm170_diag::watchdog::bump();
-                // [B5] 가변 청크 — 잔여 예산(디코드 차감) + 경합 시 long 캡.
-                let left = slots[i].job.as_ref().unwrap().tokens.len() - slots[i].prefilled;
-                let backlog = slots
-                    .iter()
-                    .filter(|s| {
-                        s.job.is_some() && s.prefilled < s.job.as_ref().unwrap().tokens.len()
-                    })
-                    .count();
-                let mut chunk = PF_BUDGET_TOKENS
-                    .saturating_sub(active.len())
-                    .clamp(PF_CHUNK_MIN, PF_CHUNK_MAX);
-                if backlog > 1 && left > PF_LONG_PROMPT {
-                    chunk = chunk.min(PF_CHUNK_MAX / 2);
-                }
-                // [§2] 혼합 — 타 슬롯이 이미 디코드 중(프리필 완료+잔존)이면
-                // 청크 캡으로 디코드 정지 시간을 유계화(프리필 총량은 동일).
-                let others_decoding = slots.iter().enumerate().any(|(j, s)| {
-                    j != i && s.job.is_some() && s.prefilled == s.job.as_ref().unwrap().tokens.len()
-                });
-                if others_decoding {
-                    chunk = chunk.min(PF_CHUNK_MIXED);
-                }
-                let chunk = chunk.min(left);
-                // Q4(FN)는 prefill_greedy — 청크마다 어휘 152k
-                // 로짓 pageable D2H(슬로패스 수십 ms) 대신 GPU argmax 8B 회수.
-                // Q35(27B)는 종전 전사 경로(원시 프리필 내부 d2h).
-                let (start, logits) = {
-                    let end = (slots[i].prefilled + chunk)
-                        .min(slots[i].job.as_ref().unwrap().tokens.len());
-                    let part: Vec<u32> =
-                        slots[i].job.as_ref().unwrap().tokens[slots[i].prefilled..end].to_vec();
-                    // 샘플링 슬롯은 로짓 판(마지막 청크만 판정에 사용) — Q4도
-                    // prefill_greedy 대신 prefill. greedy는 종전 최적 경로.
-                    let samp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
-                    let r: Result<u32, String> = eng.0.prefill(i, &part).map(|mut l| {
-                        if samp {
-                            pick(&mut slots[i], &mut l)
-                        } else {
-                            llm170_core::qwen35::greedy(&l)
-                        }
-                    });
-                    (end, r)
-                };
-                // [B5] 라운드로빈 — 방금 전진한 슬롯을 최신으로 갱신, 다음
-                // 청크는 더 오래 기다린(pending) 슬롯이 받는다. 종전엔 touch가
-                // 배정 시점에만 갱신돼 한 슬롯이 전량 프리필을 독점했다.
-                slots[i].touch = tick;
-                // [K0 2026-10-12] 프리필 중 절단 감지 — 청크마다 Ping 프로브로
-                // 수신자 생존 확인(keep-alive 타임아웃까지 대기 없이 즉시).
-                // 절단이면 잔여 프리필을 버리고 즉시 반납(캐시 폐기 — 절단된
-                // 요청의 상태 신뢰 불가). 종전엔 프리필 완료 후에야 done 판정이
-                // cancelled를 봐 긴 프리필이 슬롯을 끝까지 점유했다(체감 지연).
-                if let Some(p) = slots[i].job.as_ref().and_then(|j| j.progress.as_ref())
-                    && p.send(ProgressFrame::Ping).is_err()
-                {
-                    if let Some(j) = slots[i].job.take() {
-                        // 수신측 이미 절단 — out도 drop 상태라 전송은 최선만.
-                        let _ = j.out.send(InferResult {
-                            tokens: Vec::new(),
-                            error: None,
-                        });
-                    }
-                    eng.reset_seq(i);
-                    slots[i] = Slot::free();
-                    continue;
-                }
-                if npw {
-                    eprintln!(
-                        "[wall] prefill slot{i} {start}tok done @{}s",
-                        t0w.elapsed().as_secs_f64()
-                    );
-                }
+            // [R7] ③ 프리필 1청크(헬퍼 분리 · 동작 불변). None = 클라이언트
+            // 절단 — 종전 continue 경로(잔여 카운터·finish 생략) 그대로.
+            if let Some(pf_ms) = slot_prefill(&mut eng, &mut slots, &active, tick, eos, npw, &t0w) {
                 n_pf += 1;
-                ms_pf += _pft.elapsed().as_secs_f64() * 1e3;
-                SCHED.chunks_prefill.fetch_add(1, Ordering::Relaxed);
-                SCHED.ms_prefill.fetch_add(
-                    (_pft.elapsed().as_secs_f64() * 1e3) as u64,
-                    Ordering::Relaxed,
-                );
-                match logits {
-                    Ok(t) => {
-                        slots[i].prefilled = start;
-                        if start == slots[i].job.as_ref().unwrap().tokens.len() {
-                            slot_emit(&mut slots[i], t);
-                            // [MTP] 프리필 완료 — 유예 호출(prev hidden, 첫
-                            // 토큰)로 첫 초안 생성(다음 틱 스펙 라운드 소비).
-                            if eng.0.mtp_enabled()
-                                && let Err(err) = eng.0.mtp_first(i, t)
-                            {
-                                eprintln!("# mtp(무시): {err}");
-                            }
-                        }
-                    }
-                    // QA-1: 프리필 실패 적립 — 종전엔 무시돼 prefilled가 영구
-                    // 갱신되지 않는 스피너였다(매 틱 동일 청크 재시도).
-                    Err(err) => slot_fail(&mut slots[i], format!("prefill: {err}")),
-                }
-                finish_slot(&mut slots[i], &mut eng, i, eos);
+                ms_pf += pf_ms;
+            } else {
+                continue;
             }
         }
 
@@ -607,6 +476,189 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         }
     }
     eprintln!("{}", SCHED.summary());
+}
+
+/// [R7] 틱 ① 유입 — 큐 drain → 가용 슬롯 배정(슬롯 루프에서 순수 이동).
+/// 회귀 픽스(2026-09-16): 종전엔 try_recv로 꺼낸 뒤 "슬롯 점유"를 발견하면
+/// break했다 — 꺼낸 작업이 그대로 버려져(송신측 drop → 수신측 즉시 Err)
+/// 동시 요청이 빈 응답으로 소실됐다(4동시 중 여럿 drop 실측). 점유 검사를
+/// try_recv **앞으로** 옮겨 작업을 큐에 남긴다 — 의도된 원래 계약.
+fn slot_intake(
+    slots: &mut [Slot],
+    eng: &mut Engine,
+    rx: &std::sync::mpsc::Receiver<SlotJob>,
+    tick: u64,
+) {
+    loop {
+        if !slots.iter().any(|s| s.job.is_none()) {
+            break;
+        }
+        let Ok(j) = rx.try_recv() else {
+            break;
+        };
+        SCHED.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        // 107 W7: 배정 단일 구현으로 위임(접두 캐시 로직 동일).
+        assign_slot(slots, eng, j, tick);
+    }
+}
+
+/// [R7] 틱 ② 디코드 우선 — prefill 완료 슬롯 전부(슬롯 루프에서 순수 이동).
+/// 반환 = (활성 슬롯, 디코드 여부, 디코드 ms, 완료 처리 ms) — 호출부 계측
+/// 가산에 그대로 쓴다.
+fn slot_decode(slots: &mut [Slot], eng: &mut Engine, eos: u32) -> (Vec<usize>, bool, f64, f64) {
+    let active: Vec<usize> = (0..slots.len())
+        .filter(|&i| {
+            slots[i].job.is_some()
+                && slots[i].prefilled == slots[i].job.as_ref().unwrap().tokens.len()
+        })
+        .collect();
+    let mut decoded = false;
+    let mut dec_ms = 0f64;
+    let mut fin_ms = 0f64;
+    if !active.is_empty() {
+        decoded = true;
+        let _dt = std::time::Instant::now();
+        llm170_diag::watchdog::bump();
+        q35_decode(&mut eng.0, slots, &active);
+        dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
+        // 완료 슬롯 정리 — 결과 전송·반환
+        let _ft = std::time::Instant::now();
+        for &i in &active {
+            finish_slot(&mut slots[i], eng, i, eos);
+        }
+        fin_ms = _ft.elapsed().as_secs_f64() * 1e3;
+    }
+    (active, decoded, dec_ms, fin_ms)
+}
+
+/// [R7] 틱 ③ 프리필 1청크(슬롯 루프에서 순수 이동). 반환 Some(ms) = 청크
+/// 완료(호출부 n_pf·ms_pf 가산), None = 클라이언트 절단 — 종전 continue
+/// 경로(잔여 카운터·finish 생략) 그대로.
+fn slot_prefill(
+    eng: &mut Engine,
+    slots: &mut [Slot],
+    active: &[usize],
+    tick: u64,
+    eos: u32,
+    npw: bool,
+    t0w: &std::time::Instant,
+) -> Option<f64> {
+    let pf = (0..slots.len())
+        .filter(|&i| {
+            slots[i].job.is_some()
+                && slots[i].prefilled < slots[i].job.as_ref().unwrap().tokens.len()
+        })
+        .min_by_key(|&i| slots[i].touch);
+    let i = pf?;
+    let _pft = std::time::Instant::now();
+    llm170_diag::watchdog::bump();
+    // [B5] 가변 청크 — 잔여 예산(디코드 차감) + 경합 시 long 캡.
+    let left = slots[i].job.as_ref().unwrap().tokens.len() - slots[i].prefilled;
+    let backlog = slots
+        .iter()
+        .filter(|s| s.job.is_some() && s.prefilled < s.job.as_ref().unwrap().tokens.len())
+        .count();
+    let mut chunk = PF_BUDGET_TOKENS
+        .saturating_sub(active.len())
+        .clamp(PF_CHUNK_MIN, PF_CHUNK_MAX);
+    if backlog > 1 && left > PF_LONG_PROMPT {
+        chunk = chunk.min(PF_CHUNK_MAX / 2);
+    }
+    // [§2] 혼합 — 타 슬롯이 이미 디코드 중(프리필 완료+잔존)이면
+    // 청크 캡으로 디코드 정지 시간을 유계화(프리필 총량은 동일).
+    let others_decoding = slots.iter().enumerate().any(|(j, s)| {
+        j != i && s.job.is_some() && s.prefilled == s.job.as_ref().unwrap().tokens.len()
+    });
+    if others_decoding {
+        chunk = chunk.min(PF_CHUNK_MIXED);
+    }
+    let chunk = chunk.min(left);
+    // Q4(FN)는 prefill_greedy — 청크마다 어휘 152k
+    // 로짓 pageable D2H(슬로패스 수십 ms) 대신 GPU argmax 8B 회수.
+    // Q35(27B)는 종전 전사 경로(원시 프리필 내부 d2h).
+    let (start, logits) = {
+        let end = (slots[i].prefilled + chunk).min(slots[i].job.as_ref().unwrap().tokens.len());
+        let part: Vec<u32> =
+            slots[i].job.as_ref().unwrap().tokens[slots[i].prefilled..end].to_vec();
+        // 샘플링 슬롯은 로짓 판(마지막 청크만 판정에 사용) — Q4도
+        // prefill_greedy 대신 prefill. greedy는 종전 최적 경로.
+        let samp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
+        let r: Result<u32, String> = eng.0.prefill(i, &part).map(|mut l| {
+            if samp {
+                pick(&mut slots[i], &mut l)
+            } else {
+                llm170_core::qwen35::greedy(&l)
+            }
+        });
+        (end, r)
+    };
+    // [B5] 라운드로빈 — 방금 전진한 슬롯을 최신으로 갱신, 다음
+    // 청크는 더 오래 기다린(pending) 슬롯이 받는다. 종전엔 touch가
+    // 배정 시점에만 갱신돼 한 슬롯이 전량 프리필을 독점했다.
+    slots[i].touch = tick;
+    // [K0 2026-10-12] 프리필 중 절단 감지 — 청크마다 Ping 프로브로
+    // 수신자 생존 확인(keep-alive 타임아웃까지 대기 없이 즉시).
+    // 절단이면 잔여 프리필을 버리고 즉시 반납(캐시 폐기 — 절단된
+    // 요청의 상태 신뢰 불가). 종전엔 프리필 완료 후에야 done 판정이
+    // cancelled를 봐 긴 프리필이 슬롯을 끝까지 점유했다(체감 지연).
+    if let Some(p) = slots[i].job.as_ref().and_then(|j| j.progress.as_ref())
+        && p.send(ProgressFrame::Ping).is_err()
+    {
+        if let Some(j) = slots[i].job.take() {
+            // 수신측 이미 절단 — out도 drop 상태라 전송은 최선만.
+            let _ = j.out.send(InferResult {
+                tokens: Vec::new(),
+                error: None,
+            });
+        }
+        eng.reset_seq(i);
+        slots[i] = Slot::free();
+        return None;
+    }
+    if npw {
+        eprintln!(
+            "[wall] prefill slot{i} {start}tok done @{}s",
+            t0w.elapsed().as_secs_f64()
+        );
+    }
+    let ms = _pft.elapsed().as_secs_f64() * 1e3;
+    SCHED.chunks_prefill.fetch_add(1, Ordering::Relaxed);
+    SCHED.ms_prefill.fetch_add(ms as u64, Ordering::Relaxed);
+    match logits {
+        Ok(t) => {
+            slots[i].prefilled = start;
+            if start == slots[i].job.as_ref().unwrap().tokens.len() {
+                slot_emit(&mut slots[i], t);
+                // [MTP] 프리필 완료 — 유예 호출(prev hidden, 첫
+                // 토큰)로 첫 초안 생성(다음 틱 스펙 라운드 소비).
+                if eng.0.mtp_enabled()
+                    && let Err(err) = eng.0.mtp_first(i, t)
+                {
+                    eprintln!("# mtp(무시): {err}");
+                }
+            }
+        }
+        // QA-1: 프리필 실패 적립 — 종전엔 무시돼 prefilled가 영구
+        // 갱신되지 않는 스피너였다(매 틱 동일 청크 재시도).
+        Err(err) => slot_fail(&mut slots[i], format!("prefill: {err}")),
+    }
+    finish_slot(&mut slots[i], eng, i, eos);
+    Some(ms)
+}
+
+/// [R7] 모니터링 게시 스로틀(≤1Hz — 최신값만, 핫패스 할당 최소화) —
+/// 슬롯 루프에서 순수 이동.
+fn maybe_publish(
+    slots: &[Slot],
+    eng: &Engine,
+    copy_base: [(u64, u64, u64); 3],
+    last_pub: &mut std::time::Instant,
+) {
+    if last_pub.elapsed() >= std::time::Duration::from_millis(900) {
+        *last_pub = std::time::Instant::now();
+        publish_slot_views(slots);
+        publish_stats(eng, copy_base);
+    }
 }
 
 /// 모니터링 — 메모리 분류 + 복사 계측 게시(최신값만).
@@ -757,6 +809,31 @@ fn spec_round(
     s: &mut Slot,
     e: &mut crate::gpu_engine::GpuEngine,
 ) -> Result<bool, String> {
+    spec_round_impl(i, s, e, false)
+}
+
+/// [§7 2단계 2026-10-11] 비greedy 스펙 라운드 — target-only 거절샘플링.
+/// 수용: coin < p(x_k)(prob_of — 후처리 체인 미러, 수용 초안 가산 페널티).
+/// 보정: t=1 재계산 로짓의 표본 — 거절 시 잔차(≠x 재추출 = 조건분포 정확).
+/// 방출 분포 = 표적 분포(기대 수용 = E[p]). 그리디 라운드와 롤백 구조 동일.
+fn spec_round_sampled(
+    i: usize,
+    s: &mut Slot,
+    e: &mut crate::gpu_engine::GpuEngine,
+) -> Result<bool, String> {
+    spec_round_impl(i, s, e, true)
+}
+
+/// [R6] 스펙 라운드 공용 골격 — 그리디(확정)/샘플드(거절샘플링) 단일 경로.
+/// 게이트·hist 조립·초안·rows·상태 저장·롤백·게이트 갱신은 공유하고, 검증
+/// 및 보정만 `sampled` 정책 분기(내부 로직·호출 순서·로그·주석 원문 유지 —
+/// 동작 불변).
+fn spec_round_impl(
+    i: usize,
+    s: &mut Slot,
+    e: &mut crate::gpu_engine::GpuEngine,
+    sampled: bool,
+) -> Result<bool, String> {
     // [§7.5 2026-10-11] 적응 게이트 — 연속 무수용 시 256토큰마다만 재시도.
     // 산문 벤치 실측(서빙 A/B): 초안이 발화하나 수용 0이 반복되면 검증 비용
     // (~0.85틱)이 순손실 — tg −1.6%·np4 −5.7%. 수용 시 즉시 해제.
@@ -765,6 +842,10 @@ fn spec_round(
     // 1-초안이 순손실(런치 오버헤드 ~5.5ms/콜 — 그래프 캡처·MTP-2 후 재평가)
     // 이라 파킹 상태이므로 n-gram 기준 임계 1 유지.
     if s.spec_miss >= 1 && (s.generated & 255) != 0 {
+        return Ok(false);
+    }
+    // 샘플드 정책 한정 — 비greedy는 샘플러 필수(종전 조건 그대로).
+    if sampled && s.sampler.is_none() {
         return Ok(false);
     }
     let mut hist: Vec<u32> = Vec::new();
@@ -776,9 +857,14 @@ fn spec_round(
     // 부진(≤1)이면 4로 복귀. 초안 폭은 수용 판정만 좌우(값 불변).
     // [MTP 2026-10-12] 초안 소스: 모델 자체 MTP 헤드(현 위치 유효분) 우선,
     // 없으면 n-gram. 초안은 검증이 정본 — 소스 교체는 정책 계층(무손실).
-    let draft: Vec<u32> = match e.mtp_take_draft(i) {
-        Some(d) => d,
-        None => llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1),
+    // 샘플드는 종전대로 n-gram 전용(MTP 초안 없음).
+    let draft: Vec<u32> = if sampled {
+        llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1)
+    } else {
+        match e.mtp_take_draft(i) {
+            Some(d) => d,
+            None => llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1),
+        }
     };
     if draft.is_empty() {
         return Ok(false);
@@ -793,26 +879,58 @@ fn spec_round(
     let t_save = std::time::Instant::now();
     e.spec_save_state(i)?;
     let ms_save = t_save.elapsed().as_secs_f64() * 1e3;
-    let t_ver = std::time::Instant::now();
-    let toks = e.spec_verify(i, &rows, t)?;
-    let ms_ver = t_ver.elapsed().as_secs_f64() * 1e3;
-    let mut acc = 0usize;
-    while acc < draft.len() && toks[acc] == draft[acc] {
-        acc += 1;
-    }
-    if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
-        eprintln!(
-            "[mtp-dbg] draft={draft:?} verify0={:?} acc={acc}",
-            toks.first()
-        );
-        s.spec_miss = 0; // 진단: 게이트 우회(수용률 계측)
-    }
+    let dbg = llm170_diag::flag::on_nonzero("LLM170_MOE_DBG");
+    // 검증 + 수용(acc) 판정 — 정책 분기.
+    // 그리디: 확정 일치 접두(토큰열). 샘플드: target-only 거절샘플링 —
+    // 수용: coin < p(x_k)(prob_of — 후처리 체인 미러, 수용 초안 가산 페널티).
+    let (toks, ms_ver, acc) = if sampled {
+        let lg = e.spec_verify_logits(i, &rows, t)?;
+        let vocab = e.vocab();
+        if lg.len() != t * vocab {
+            return Err(format!(
+                "spec(샘플) 로짓 크기 {} != {}",
+                lg.len(),
+                t * vocab
+            ));
+        }
+        let mut acc = 0usize;
+        for k in 0..draft.len() {
+            let mut lk = lg[k * vocab..(k + 1) * vocab].to_vec();
+            let sm = s.sampler.as_mut().unwrap();
+            sm.apply_penalties_ext(&mut lk, &draft[..k]);
+            let px = sm.prob_of(&lk, draft[k]);
+            let coin = sm.next_coin();
+            if coin < px {
+                acc += 1;
+            } else {
+                break;
+            }
+        }
+        (Vec::new(), 0.0, acc)
+    } else {
+        let t_ver = std::time::Instant::now();
+        let toks = e.spec_verify(i, &rows, t)?;
+        let ms_ver = t_ver.elapsed().as_secs_f64() * 1e3;
+        let mut acc = 0usize;
+        while acc < draft.len() && toks[acc] == draft[acc] {
+            acc += 1;
+        }
+        if dbg {
+            eprintln!(
+                "[mtp-dbg] draft={draft:?} verify0={:?} acc={acc}",
+                toks.first()
+            );
+            s.spec_miss = 0; // 진단: 게이트 우회(수용률 계측)
+        }
+        (toks, ms_ver, acc)
+    };
     // [MTP] 롤백·보정 전에 검증 dres의 수용 접두를 초안기 hidden으로 스냅샷.
-    let spec_mtp = e.mtp_enabled();
+    // (그리디 경로 한정 — 샘플드는 종전대로 MTP 콜 없음.)
     // [2026-10-12 시도·기각] pre_round(acc+1)로 보정행까지 검증 dres에서
     // 푸시하면 디코드 제거 가능하다는 가설 — 실측 MTP-on 0/381 수용으로
     // 기각(검증 dres 행 acc ≠ 보정 hidden — 롤백/그래프 경로 차이). 디코드를
     // 유지한다(MTP 경로 한정 — n-gram/플레인은 융합 유지).
+    let spec_mtp = !sampled && e.mtp_enabled();
     if spec_mtp && let Err(err) = e.mtp_pre_round(acc) {
         eprintln!("# mtp(무시): {err}");
     }
@@ -829,7 +947,7 @@ fn spec_round(
     } else {
         s.spec_miss = 0;
     }
-    if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
+    if dbg && !sampled {
         s.spec_miss = 0; // 진단: 게이트 우회(수용률 계측) — 증가 뒤에 둬야 유효.
     }
     if acc == draft.len() {
@@ -837,8 +955,38 @@ fn spec_round(
     } else if acc <= 1 {
         s.spec_k = 4;
     }
-    // [2026-10-12] 보정 토큰 = 검증 행 acc의 argmax(toks[acc]) — 종전
-    // decode_greedy(last) 재계산은 **동일 값의 중복**이었다(라운드 30%).
+    // 보정 토큰 — 정책 분기.
+    if sampled {
+        // 거절 시 잔차(≠x 재추출 = 조건분포 정확). 방출 분포 = 표적 분포
+        // (기대 수용 = E[p]). 그리디 라운드와 롤백 구조 동일.
+        for &tk in &draft[..acc] {
+            slot_emit(s, tk);
+        }
+        let lg1 = e.decode(&[i], &[last])?.pop().unwrap_or_default();
+        let vocab = e.vocab();
+        if lg1.len() != vocab {
+            return Err(format!("spec(샘플) 보정 로짓 {} != {vocab}", lg1.len()));
+        }
+        let mut corr = {
+            let mut l = lg1.clone();
+            s.sampler.as_mut().unwrap().sample(&mut l)
+        };
+        if acc < draft.len() {
+            let x = draft[acc];
+            let mut guard = 0;
+            while corr == x && guard < 64 {
+                let mut l = lg1.clone();
+                corr = s.sampler.as_mut().unwrap().sample(&mut l);
+                guard += 1;
+            }
+        }
+        slot_emit(s, corr);
+        SCHED.spec_rounds.fetch_add(1, Ordering::Relaxed);
+        SCHED.spec_accepted.fetch_add(acc as u64, Ordering::Relaxed);
+        return Ok(true);
+    }
+    // 그리디 보정 — [2026-10-12] 보정 토큰 = 검증 행 acc의 argmax(toks[acc]) —
+    // 종전 decode_greedy(last) 재계산은 **동일 값의 중복**이었다(라운드 30%).
     // 근거: t-그래프 행 acc의 토큰 = last(수용 접두 마지막)이고 그 다음
     // 토큰이 정확히 보정 토큰. 커널·순서 동일 = 비트동일(스펙 골든 계약).
     // acc=draft.len()(전량 수용)이면 toks[acc]도 검증 범위 안(길이 1+len).
@@ -861,7 +1009,7 @@ fn spec_round(
         eprintln!("# mtp(무시): {err}");
     }
     let ms_mtp = t_mtp.elapsed().as_secs_f64() * 1e3;
-    if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
+    if dbg {
         eprintln!(
             "[spec-ms] save={ms_save:.2} verify={ms_ver:.2} corr={ms_corr:.2} mtp={ms_mtp:.2} tot={:.2}",
             rt0.elapsed().as_secs_f64() * 1e3
@@ -876,100 +1024,6 @@ fn spec_round(
     SCHED
         .spec_ms
         .fetch_add(rt0.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Ok(true)
-}
-
-/// [§7 2단계 2026-10-11] 비greedy 스펙 라운드 — target-only 거절샘플링.
-/// 수용: coin < p(x_k)(prob_of — 후처리 체인 미러, 수용 초안 가산 페널티).
-/// 보정: t=1 재계산 로짓의 표본 — 거절 시 잔차(≠x 재추출 = 조건분포 정확).
-/// 방출 분포 = 표적 분포(기대 수용 = E[p]). 그리디 라운드와 롤백 구조 동일.
-fn spec_round_sampled(
-    i: usize,
-    s: &mut Slot,
-    e: &mut crate::gpu_engine::GpuEngine,
-) -> Result<bool, String> {
-    if s.sampler.is_none() || (s.spec_miss >= 1 && (s.generated & 255) != 0) {
-        return Ok(false);
-    }
-    let mut hist: Vec<u32> = Vec::new();
-    if let Some(j) = &s.job {
-        hist.extend_from_slice(&j.tokens);
-    }
-    hist.extend_from_slice(&s.tokens);
-    let draft = llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1);
-    if draft.is_empty() {
-        return Ok(false);
-    }
-    let t = 1 + draft.len();
-    let mut rows: Vec<f32> = Vec::with_capacity(t * e.n_embd());
-    rows.extend_from_slice(&e.embed_row(s.next)?);
-    for &tk in &draft {
-        rows.extend_from_slice(&e.embed_row(tk)?);
-    }
-    e.spec_save_state(i)?;
-    let lg = e.spec_verify_logits(i, &rows, t)?;
-    let vocab = e.vocab();
-    if lg.len() != t * vocab {
-        return Err(format!(
-            "spec(샘플) 로짓 크기 {} != {}",
-            lg.len(),
-            t * vocab
-        ));
-    }
-    let mut acc = 0usize;
-    for k in 0..draft.len() {
-        let mut lk = lg[k * vocab..(k + 1) * vocab].to_vec();
-        let sm = s.sampler.as_mut().unwrap();
-        sm.apply_penalties_ext(&mut lk, &draft[..k]);
-        let px = sm.prob_of(&lk, draft[k]);
-        let coin = sm.next_coin();
-        if coin < px {
-            acc += 1;
-        } else {
-            break;
-        }
-    }
-    let last = if acc >= 1 { draft[acc - 1] } else { s.next };
-    if acc >= 1 {
-        e.spec_rollback(i, acc)?;
-        e.spec_rewind_pos(i, (t - acc) as u32)?;
-    } else {
-        e.spec_load_state(i)?;
-        e.spec_rewind_pos(i, t as u32)?;
-    }
-    if acc == 0 {
-        s.spec_miss = (s.spec_miss + 1).min(3);
-    } else {
-        s.spec_miss = 0;
-    }
-    if acc == draft.len() {
-        s.spec_k = (s.spec_k + 1).min(8);
-    } else if acc <= 1 {
-        s.spec_k = 4;
-    }
-    for &tk in &draft[..acc] {
-        slot_emit(s, tk);
-    }
-    let lg1 = e.decode(&[i], &[last])?.pop().unwrap_or_default();
-    if lg1.len() != vocab {
-        return Err(format!("spec(샘플) 보정 로짓 {} != {vocab}", lg1.len()));
-    }
-    let mut corr = {
-        let mut l = lg1.clone();
-        s.sampler.as_mut().unwrap().sample(&mut l)
-    };
-    if acc < draft.len() {
-        let x = draft[acc];
-        let mut guard = 0;
-        while corr == x && guard < 64 {
-            let mut l = lg1.clone();
-            corr = s.sampler.as_mut().unwrap().sample(&mut l);
-            guard += 1;
-        }
-    }
-    slot_emit(s, corr);
-    SCHED.spec_rounds.fetch_add(1, Ordering::Relaxed);
-    SCHED.spec_accepted.fetch_add(acc as u64, Ordering::Relaxed);
     Ok(true)
 }
 

@@ -127,10 +127,40 @@ impl GpuEngine {
         Ok(lg)
     }
 
+    /// [R5] 토큰 열 → 임베딩 행 평탄 조립(t×h) — 배치 디코드 부트스트랩
+    /// 공용(동작 불변: 토큰별 embed_row 동일 순서·동일 오류 전파).
+    fn embed_rows(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        let h = self.model.hp.n_embd;
+        let mut rows = Vec::with_capacity(tokens.len() * h);
+        for tok in tokens {
+            rows.extend_from_slice(&self.model.embed_row(*tok).map_err(|e| e.to_string())?);
+        }
+        Ok(rows)
+    }
+
+    /// [R5] 배치 디코드 부트스트랩 공용 골격 — t∈2..=BATCH_DEC_MAX 전제
+    /// 검사 + 임베딩 행 조립 + 배치 argmax 체인 실행. Some(토큰) = 배치
+    /// 성공, None = 전제 미충족 또는 체인 실패(직렬 폴백 — 폴백 로그는
+    /// `label`로 호출부 원문 유지, 동작 불변). 행 조립 실패만 Err 전파.
+    fn np_batch_argmax(
+        &mut self,
+        seq_ids: &[usize],
+        tokens: &[u32],
+        label: &str,
+    ) -> Result<Option<Vec<u32>>, String> {
+        if (2..=llm170_backend_gpu::BATCH_DEC_MAX).contains(&seq_ids.len()) {
+            let rows = self.embed_rows(tokens)?;
+            match self.dec.forward_device_argmax_batch(seq_ids, &rows) {
+                Ok(toks) => return Ok(Some(toks)),
+                Err(e) => eprintln!("# {label} 폴백(직렬): {e}"),
+            }
+        }
+        Ok(None)
+    }
+
     /// 시퀀스 prefill → 마지막 로짓. t≤8 배치 청크(GEMM t≥2 경로)로 처리하고
     /// head는 마지막 토큰만 계산한다(중간 토큰 상각).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
-        let h = self.model.hp.n_embd;
         let n = tokens.len();
         if n == 0 {
             // A10: 빈 프롬프트는 조용한 제로 로짓 대신 명시 오류.
@@ -177,10 +207,8 @@ impl GpuEngine {
                     self.dec.forward_prefill_toks(seq, part, t, false)?;
                 }
             } else {
-                let mut rows = Vec::with_capacity(t * h);
-                for &tok in part {
-                    rows.extend_from_slice(&self.model.embed_row(tok).map_err(|e| e.to_string())?);
-                }
+                // [R5] 행 조립 — embed_rows 공용(동작 불변).
+                let rows = self.embed_rows(part)?;
                 if is_last && self.head_gpu {
                     last = Some(self.dec.forward_prefill(seq, &rows, t, true)?);
                 } else if is_last {
@@ -199,10 +227,8 @@ impl GpuEngine {
                 } else {
                     (&tokens[i + 1..=i + t], None)
                 };
-                let mut emb: Vec<f32> = Vec::with_capacity(calls.len() * h);
-                for &tk in calls {
-                    emb.extend_from_slice(&self.model.embed_row(tk).map_err(|e| e.to_string())?);
-                }
+                // [R5] 행 조립 — embed_rows 공용(동작 불변).
+                let emb = self.embed_rows(calls)?;
                 if let Err(err) = self.dec.mtp_prefill_chunk(seq, calls, &emb, ps, save_row) {
                     eprintln!("# mtp(무시): {err}");
                 }
@@ -213,11 +239,13 @@ impl GpuEngine {
     }
 
     /// 배치 디코드 — seq별 1토큰 forward → 로짓.
+    /// [R5] 행 조립을 embed_rows 공용으로(동작 불변 — 로짓 슬라이스 동일).
     pub fn decode(&mut self, seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
+        let rows = self.embed_rows(tokens)?;
+        let h = self.model.hp.n_embd;
         let mut out = Vec::with_capacity(seq_ids.len());
-        for (s, tok) in seq_ids.iter().zip(tokens.iter()) {
-            let row = self.model.embed_row(*tok).map_err(|e| e.to_string())?;
-            out.push(self.logits(*s, &row)?);
+        for (i, &s) in seq_ids.iter().enumerate() {
+            out.push(self.logits(s, &rows[i * h..(i + 1) * h])?);
         }
         Ok(out)
     }
@@ -230,18 +258,9 @@ impl GpuEngine {
         seq_ids: &[usize],
         tokens: &[u32],
     ) -> Result<Vec<u32>, String> {
-        if (2..=llm170_backend_gpu::BATCH_DEC_MAX).contains(&seq_ids.len()) {
-            let h = self.model.hp.n_embd;
-            let mut rows = Vec::with_capacity(seq_ids.len() * h);
-            for tok in tokens {
-                rows.extend_from_slice(&self.model.embed_row(*tok).map_err(|e| e.to_string())?);
-            }
-            match self.dec.forward_device_argmax_batch(seq_ids, &rows) {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    eprintln!("# np-batch 폴백(직렬): {e}");
-                }
-            }
+        // [R5] 부트스트랩 골격 공용 — 전제 검사·행 조립·배치 체인(로그 원문 유지).
+        if let Some(v) = self.np_batch_argmax(seq_ids, tokens, "np-batch")? {
+            return Ok(v);
         }
         let mut out = Vec::with_capacity(seq_ids.len());
         for (s, tok) in seq_ids.iter().zip(tokens.iter()) {
@@ -383,11 +402,8 @@ impl GpuEngine {
         if !(2..=llm170_backend_gpu::BATCH_DEC_MAX).contains(&seq_ids.len()) {
             return Err("mixed: t 2..=BATCH_DEC_MAX 전용".into());
         }
-        let h = self.model.hp.n_embd;
-        let mut rows = Vec::with_capacity(seq_ids.len() * h);
-        for tok in tokens {
-            rows.extend_from_slice(&self.model.embed_row(*tok).map_err(|e| e.to_string())?);
-        }
+        // [R5] 행 조립 — embed_rows 공용(동작 불변).
+        let rows = self.embed_rows(tokens)?;
         let toks = self.dec.forward_device_argmax_batch(seq_ids, &rows)?;
         let lg = self.dec.batch_read_logits(seq_ids.len())?;
         Ok((toks, lg))
@@ -402,18 +418,14 @@ impl GpuEngine {
         seq_ids: &[usize],
         tokens: &[u32],
     ) -> Result<Vec<f32>, String> {
-        if (2..=llm170_backend_gpu::BATCH_DEC_MAX).contains(&seq_ids.len()) {
-            let h = self.model.hp.n_embd;
-            let mut rows = Vec::with_capacity(seq_ids.len() * h);
-            for tok in tokens {
-                rows.extend_from_slice(&self.model.embed_row(*tok).map_err(|e| e.to_string())?);
-            }
-            match self.dec.forward_device_argmax_batch(seq_ids, &rows) {
-                Ok(_tok_discard) => match self.dec.batch_read_logits(seq_ids.len()) {
-                    Ok(lg) => return Ok(lg),
-                    Err(e) => eprintln!("# np-logits 판독 폴백(직렬): {e}"),
-                },
-                Err(e) => eprintln!("# np-logits 배치 폴백(직렬): {e}"),
+        // [R5] 부트스트랩 골격 공용 — 전제 검사·행 조립·배치 체인(로그 원문 유지).
+        if self
+            .np_batch_argmax(seq_ids, tokens, "np-logits 배치")?
+            .is_some()
+        {
+            match self.dec.batch_read_logits(seq_ids.len()) {
+                Ok(lg) => return Ok(lg),
+                Err(e) => eprintln!("# np-logits 판독 폴백(직렬): {e}"),
             }
         }
         let mut out = Vec::new();
