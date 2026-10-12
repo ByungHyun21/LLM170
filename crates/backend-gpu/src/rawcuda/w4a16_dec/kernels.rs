@@ -113,10 +113,10 @@ impl W4a16Dec {
         t: usize,
     ) -> Result<(), String> {
         let (dq, ds, n, k) = self.lin_spec(name)?;
-        // [T1] split mma 경로(기본 ON — `LLM170_TC=0`으로 해제, t≥16).
-        // 검증: 27B 4k·35B 600 토큰이 원본과 동일, 골든 유지, 허용오차 ~6e-4.
+        // [T1] split mma 경로(단일 경로, t≥16). 검증: 27B 4k·35B 600
+        // 토큰이 원본과 동일, 골든 유지, 허용오차 ~6e-4.
         // A=xh(f16 — split 경로가 이미 f2h 캐스트 제공), 계약 완화 승인 후.
-        if t >= 16 && llm170_diag::flag::ne0("LLM170_TC") {
+        if t >= 16 {
             // [marlin-A 2026-10-10] A는 f16 미러(dx16) — 불변식: split 경로
             // GEMM A는 직전 cast_x32/norm_resid 산출(dx32)이고 dx16이 같은
             // [t][k] 값을 갖는다(두 경로가 항상 함께 기록). 종전 f32 A는
@@ -316,10 +316,10 @@ impl W4a16Dec {
         t: usize,
     ) -> Result<(), String> {
         let (w, n, k) = self.plain_spec(name)?;
-        // [T2] bf16 mma GEMM(기본 ON — `LLM170_TC=0`으로 해제). t≥16에서만
+        // [T2] bf16 mma GEMM(단일 경로). t≥16에서만
         // (타일 M32 — 부분 타일은 가드로 동작하나 이득이 작음). 검증: 35B 600
         // 토큰 동일, 골든 유지, 허용오차 ~1e-3(bf16 활성 반올림).
-        if t >= 16 && llm170_diag::flag::ne0("LLM170_TC") {
+        if t >= 16 {
             {
                 static ONCE: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);

@@ -3,7 +3,6 @@
 //! W3-3 착륙 후 성능 캠페인(2026-10-08): 활성은 디바이스 상주(왕복은
 //! 토큰당 임베딩 업로드 + 로짓 판독뿐), head는 head_bf16 커널(bf16
 //! →f32 시프트 + k 직렬 f32 내적 — CPU 참조와 동일 순서).
-//! LLM170_STAGED=1이면 구 스테이징 경로(호스트 왕복)로 폴백한다.
 //! 판정 기준은 토큰열(골든)이다.
 
 use llm170_backend_gpu::{AttnDims, GdnDims, W4a16Dec};
@@ -13,8 +12,6 @@ pub struct GpuEngine {
     model: llm170_core::qwen35::Model,
     dec: W4a16Dec,
     n_slots: usize,
-    /// 스테이징 폴백(LLM170_STAGED=1 — 비교/디버그 전용).
-    staged: bool,
     /// GPU head 상주 여부(bf16 output.weight 업로드 성공).
     head_gpu: bool,
     /// [MTP 2026-10-12] 모델 자체 MTP 초안기 활성(27B dense v1).
@@ -69,7 +66,6 @@ impl GpuEngine {
             model,
             dec,
             n_slots: n_slots.max(1),
-            staged: llm170_diag::flag::on("LLM170_STAGED"),
             head_gpu,
             mtp,
         })
@@ -97,18 +93,14 @@ impl GpuEngine {
 
     /// 1토큰 체인(로짓 없이 상태만 진행) — prefill 중간 토큰용.
     fn forward(&mut self, slot: usize, row: &[f32]) -> Result<Vec<f32>, String> {
-        if self.staged {
-            self.dec.forward(slot, row)
-        } else {
-            self.dec.forward_device(slot, row)
-        }
+        self.dec.forward_device(slot, row)
     }
 
     /// 1토큰 다음 로짓 — GPU head 상주 시 로짓만 회수(xn 판독 생략),
-    /// 아니면 디바이스/스테이징 체인 + CPU 참조 head.
+    /// 아니면 디바이스 체인 + CPU 참조 head.
     /// [P3] greedy 토큰 — GPU 경로는 디바이스 argmax(로짓 d2h 1MB → 4B).
     fn token_greedy(&mut self, slot: usize, row: &[f32]) -> Result<u32, String> {
-        if self.head_gpu && !self.staged {
+        if self.head_gpu {
             return self.dec.forward_device_argmax(slot, row);
         }
         let lg = self.logits(slot, row)?;
@@ -116,7 +108,7 @@ impl GpuEngine {
     }
 
     fn logits(&mut self, slot: usize, row: &[f32]) -> Result<Vec<f32>, String> {
-        if self.head_gpu && !self.staged {
+        if self.head_gpu {
             return self.dec.forward_device_head(slot, row);
         }
         let xn = self.forward(slot, row)?;
@@ -145,19 +137,6 @@ impl GpuEngine {
             return Err("prefill: 빈 프롬프트 — 토큰 1개 이상 필요".into());
         }
         let mut last = None;
-        if self.staged {
-            // 구 스테이징 경로는 t=1 전용 — 한 토큰씩.
-            for (i, tok) in tokens.iter().enumerate() {
-                let row = self.model.embed_row(*tok).map_err(|e| e.to_string())?;
-                if i + 1 == n {
-                    let xn = self.dec.forward(seq, &row)?;
-                    last = Some(self.head_logits(&xn)?);
-                } else {
-                    self.dec.forward(seq, &row)?;
-                }
-            }
-            return last.ok_or_else(|| "prefill: 빈 프롬프트".to_string());
-        }
         // 청크 크기 정책 — 순수 함수(테스트 표면, [R16]).
         let tmax = prefill_tmax(
             self.dec.is_moe(),

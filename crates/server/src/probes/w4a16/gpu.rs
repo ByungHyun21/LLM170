@@ -288,6 +288,7 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
         let src = vec![0x5Au8; bytes];
         let dst = dec.alloc_scratch(bytes)?;
         let pinned = dec.alloc_pinned_scratch(bytes)?;
+        // SAFETY: pinned은 alloc_pinned_scratch가 돌려준 유효 핸들, bytes는 할당 크기.
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), pinned as *mut u8, bytes);
         }
@@ -581,13 +582,14 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
         }
         return Ok(out.join("\n"));
     }
-    // 마이크로벤치(진단): 플레인 GEMM(t) 반복 — v1/v3 vs mma(LLM170_TC).
+    // 마이크로벤치(진단): 플레인 GEMM(t) 반복 — v1/v3 vs mma.
     if let Some((name, bt, reps)) = &bench_plain {
         let (n, k) = model
             .w_raw(name)
             .map(|w| (w.n_out as usize, w.n_in as usize))
             .ok_or_else(|| format!("--bench-plain {name}: 무게 없음"))?;
         let xf: Vec<f32> = vec![1.0f32; bt * k];
+        // SAFETY: xf는 f32 슬라이스 — 바이트 재해석 읽기(할당 범위 내).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         let dx = dec.alloc_scratch(xf.len() * 4)?;
         dec.h2d_scratch(dx, xb)?;
@@ -630,6 +632,7 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
             .map(|w| (w.n_out as usize, w.n_in as usize))
             .ok_or_else(|| format!("--bench-gemv {name}: 무게 없음"))?;
         let xf: Vec<f32> = vec![1.0f32; k];
+        // SAFETY: xf는 f32 슬라이스 — 바이트 재해석 읽기(할당 범위 내).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         let dx = dec.alloc_scratch(xf.len() * 4)?;
         dec.h2d_scratch(dx, xb)?;
@@ -661,6 +664,7 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
             .map(|w| (w.n_out as usize, w.n_in as usize))
             .ok_or_else(|| format!("--bench-gemm {name}: 무게 없음"))?;
         let xf: Vec<f32> = vec![1.0f32; bt * k]; // f32 1.0 — 수치 무의미
+        // SAFETY: xf는 f32 슬라이스 — 바이트 재해석 읽기(할당 범위 내).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         let dxh = dec.alloc_scratch(xf.len() * 4)?;
         dec.h2d_scratch(dxh, xb)?;
@@ -682,10 +686,9 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
             "bench-gemm {name} n={n} k={k} t={bt} reps={reps}: {ms:.2} ms/회 · 가중치 {gbs:.0} GB/s"
         ));
     }
-    let staged = llm170_diag::flag::on("LLM170_STAGED");
-    // GPU head — bf16 output.weight를 상주 업로드(--no-head·스테이징은 CPU 참조).
+    // GPU head — bf16 output.weight를 상주 업로드(--no-head는 CPU 참조).
     let mut head_gpu = false;
-    if !no_head && !staged && head.ty == llm170_core::wtype::WType::Bf16 {
+    if !no_head && head.ty == llm170_core::wtype::WType::Bf16 {
         dec.upload_head(head.data, head.n_out as usize, head.n_in as usize)?;
         head_gpu = true;
     }
@@ -713,15 +716,7 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
                 rows.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);
             }
             let last = i + t == prompt.len();
-            if staged {
-                for u in 0..t {
-                    let row = &rows[u * h..(u + 1) * h];
-                    let xn = dec.forward(0, row)?;
-                    if last && u + 1 == t {
-                        next = llm170_core::matmul::greedy_from(&head_logits(&xn));
-                    }
-                }
-            } else if head_gpu {
+            if head_gpu {
                 let lg = dec.forward_prefill(0, &rows, t, last)?;
                 if last {
                     next = llm170_core::matmul::greedy_from(&lg);
@@ -894,11 +889,7 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
             // 로짓+CPU greedy_from과 동일해야 한다(골든이 동등성 판정).
             next = dec.forward_device_argmax(0, &row)?;
         } else {
-            let xn = if staged {
-                dec.forward(0, &row)?
-            } else {
-                dec.forward_device(0, &row)?
-            };
+            let xn = dec.forward_device(0, &row)?;
             next = llm170_core::matmul::greedy_from(&head_logits(&xn));
         }
         out.push(next);
@@ -936,12 +927,7 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
         n_lin as f64 * 44.6e-3
     };
     Ok(format!(
-        "w4a16-gpu {dir} — GPU 체인({}{}) · {}\n  업로드 {upload_ms:.0}ms · 생성 {}토큰 {gen_ms:.0}ms ({:.1}ms/토큰)\n tokens: {csv}",
-        if staged {
-            "호스트 스테이징"
-        } else {
-            "디바이스 상주"
-        },
+        "w4a16-gpu {dir} — GPU 체인(디바이스 상주{} · {})\n  업로드 {upload_ms:.0}ms · 생성 {}토큰 {gen_ms:.0}ms ({:.1}ms/토큰)\n tokens: {csv}",
         if head_gpu {
             " + GPU head"
         } else {

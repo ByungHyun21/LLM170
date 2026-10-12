@@ -82,12 +82,12 @@ impl W4a16Dec {
         let mut gi = 0usize;
         // 플레인(MoE) 모드 — bf16 GEMM(x 원시 f32), FFN은 MoE 배치.
         let plain = self.plain_weights;
-        // [P10] GEMM 상한 — mma 경로(TC ON·t≥16)는 t 무제한, FFMA 폴백
+        // [P10] GEMM 상한 — mma 경로(t≥16)는 t 무제한, FFMA 폴백
         // 커널(G4_GTMAX/G4_TMAX2=32)만 32 상한. 폴백으로 t>32를 태우지 않는다.
-        let gemm_mma = t >= 16 && llm170_diag::flag::ne0("LLM170_TC");
+        let gemm_mma = t >= 16;
         if t > GEMM_FFMA_TMAX && !gemm_mma {
             return Err(format!(
-                "chain_device_t: t={t} > {GEMM_FFMA_TMAX} — FFMA 폴백 상한(TC=0 진단 또는 t<16)"
+                "chain_device_t: t={t} > {GEMM_FFMA_TMAX} — FFMA 폴백 상한(t<16 진단 또는 t<16)"
             ));
         }
         // [§7 2026-10-11] t≤8(TR 도메인)은 GemvT(행=블록, 8행/블록) — 종전
