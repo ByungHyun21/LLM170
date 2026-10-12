@@ -39,6 +39,13 @@ impl W4a16Dec {
         for (_, e, g) in self.spec_graphs.drain(..) {
             let _ = self.cc.graph_destroy(e, g);
         }
+        // [MTP-GRAPH] MTP 콜 그래프도 동일 계약 — t 인덱스 배열이므로
+        // drain 금지(t 키 유지): 슬롯별 take.
+        for g in self.mtp_graphs.iter_mut() {
+            if let Some((e, h)) = g.take() {
+                let _ = self.cc.graph_destroy(e, h);
+            }
+        }
     }
 
     /// 그래프 준비 — 캐시 히트면 즉시 exec 반환(A8, 슬롯/모드별 1회 캡처).

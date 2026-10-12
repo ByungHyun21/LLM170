@@ -284,9 +284,100 @@ impl super::W4a16Dec {
         self.ensure_chain_bufs()?;
         self.ensure_attn_bufs(t)?;
         self.ensure_batch_bufs()?; // dbatch_am(argmax d2h 목적지)
-        // 1) 임베딩 h2d → emb[t][h]
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
-        let eb = unsafe { std::slice::from_raw_parts(embeds.as_ptr() as *const u8, t * h * 4) };
+        // [MTP-GRAPH 2026-10-12] 핀드 스테이징(캡처/직접 공용 — pageable 제거).
+        if self.mtp_pin_emb.is_null() {
+            self.mtp_pin_emb = self.cc.pinned_alloc(MTP_TMAX * h * 4)?;
+            self.mtp_pin_out = self.cc.pinned_alloc(8 * 4)?;
+        }
+        // SAFETY: 호출자 슬라이스(t*h f32) 옥 → 핀드(MTP_TMAX*h*4) 기입.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                embeds.as_ptr() as *const u8,
+                self.mtp_pin_emb as *mut u8,
+                t * h * 4,
+            );
+        }
+        // 그래프 경로 — head=true·t≤8·캡처 성공 시 런치 1회(호스트 일감은
+        // 핀 기입 + dpp 1회 + sync + argmax 4B 회수뿐).
+        if head && t <= 8 && !self.mtp_graph_failed {
+            match self.ensure_mtp_graph(slot, t) {
+                Ok(exec) => {
+                    let save = self.slot_pos[slot];
+                    self.slot_pos[slot] = pos_start;
+                    self.attn_set_pos(slot, pos_start)?;
+                    self.cc.graph_launch(exec)?;
+                    self.cc.sync()?;
+                    self.slot_pos[slot] = save;
+                    // SAFETY: pinned argmax(t*4 기입).
+                    let ob =
+                        unsafe { std::slice::from_raw_parts(self.mtp_pin_out as *const u8, t * 4) };
+                    let mut b = [0u8; 4];
+                    b.copy_from_slice(&ob[(t - 1) * 4..t * 4]);
+                    return Ok(u32::from_le_bytes(b));
+                }
+                Err(e) => {
+                    eprintln!("[mtp-graph] 캡처 실패 — 직접 경로: {e}");
+                    self.mtp_graph_failed = true;
+                }
+            }
+        }
+        // 직접 경로(프리필 head=false · t>8 · 캡처 실패).
+        let save = self.slot_pos[slot];
+        self.slot_pos[slot] = pos_start;
+        let r = self.mtp_fwd_launch(slot, t, head);
+        self.slot_pos[slot] = save;
+        r?;
+        if !head {
+            return Ok(0);
+        }
+        self.cc.sync()?;
+        // SAFETY: pinned argmax 회수(t≤8 = t행, t>8 = 마지막 1행 4B).
+        let n = if t > 8 { 4 } else { t * 4 };
+        let ob = unsafe { std::slice::from_raw_parts(self.mtp_pin_out as *const u8, n) };
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&ob[n - 4..n]);
+        Ok(u32::from_le_bytes(b))
+    }
+
+    /// [MTP-GRAPH] t별 캡처 확보 — 실패 시 호출부가 직접 경로로 폴백.
+    fn ensure_mtp_graph(&mut self, slot: usize, t: usize) -> Result<ffi::CUgraphExec, String> {
+        if let Some((e, _)) = self.mtp_graphs[t] {
+            return Ok(e);
+        }
+        self.ensure_chain_bufs()?;
+        self.ensure_attn_bufs(t)?;
+        self.ensure_batch_bufs()?;
+        // fwd3s merge의 dx32/dx16 융합 기록 보장(캡처 중 alloc 금지 계약).
+        {
+            let dm = self.attn.ok_or("mtp: attn")?;
+            let nm = t * dm.q_heads * 256;
+            self.ensure_dx32(nm)?;
+            self.ensure_dx16(nm)?;
+        }
+        self.cc.capture_begin()?;
+        self.capture_pinned_src = true;
+        let cap = self.mtp_fwd_launch(slot, t, true);
+        self.capture_pinned_src = false;
+        if let Err(e) = cap {
+            let _ = self.cc.capture_end();
+            return Err(format!("mtp 캡처 본문: {e}"));
+        }
+        let g = self.cc.capture_end()?;
+        let e = self.cc.graph_instantiate(g)?;
+        self.cc.graph_upload(e)?;
+        self.mtp_graphs[t] = Some((e, g));
+        eprintln!("[mtp-graph] captured t={t}");
+        Ok(e)
+    }
+
+    /// [MTP] 순전파 발사부 — 캡처/직접 공용. 임베드 h2d는 pinned 소스에서,
+    /// argmax d2h는 pinned 목적지로(회수·sync는 호출부). pos는 호출부가
+    /// slot_pos/dpp로 확정한다(커널 인자 아님 — 캡처 안전).
+    fn mtp_fwd_launch(&mut self, slot: usize, t: usize, head: bool) -> Result<(), String> {
+        let h = self.hidden;
+        // 1) 임베딩 h2d ← pinned(호출부가 t*h*4 기입).
+        // SAFETY: pinned 버퍼는 MTP_TMAX*h*4 계약.
+        let eb = unsafe { std::slice::from_raw_parts(self.mtp_pin_emb as *const u8, t * h * 4) };
         self.cc.h2d_async(self.mtp_ptr(0), eb)?;
         // 2) 두 노름 — embed→xn_e, hidden→xn_h (x 제자리 +0, ab=zero).
         self.mtp_norm(1, self.mtp_ptr(0), self.mtp_ptr(15), t)?;
@@ -323,21 +414,17 @@ impl super::W4a16Dec {
             self.mtp_ptr(9),
             t,
         )?;
-        // 7) 어텐션(가상 층) — pos 임시 전환 후 원복.
-        let save = self.slot_pos[slot];
-        self.slot_pos[slot] = pos_start;
-        let r = self.attn_chain_dev_run(
+        // 7) 어텐션(가상 층) — pos는 호출부가 slot_pos/dpp로 확정.
+        let dout = self.attn_chain_dev_run(
             slot,
             self.mtp_layer,
             t,
             self.mtp_ptr(7),
             self.mtp_ptr(8),
             self.mtp_ptr(9),
-        );
-        self.slot_pos[slot] = save;
-        let dout = r?;
+        )?;
         if !head {
-            return Ok(0);
+            return Ok(());
         }
         // 8) o_proj — 어텐션 출력(doutv [t][q_dim]) → ptr6.
         self.mtp_plain_gemv_t(
@@ -392,10 +479,10 @@ impl super::W4a16Dec {
                 1024,
                 &mut crate::rawcuda::args::l3(&mut p_l, &mut p_nn, &mut p_a),
             )?;
-            let mut tb = [0u8; 4];
-            self.cc.d2h_async(tb.as_mut_ptr(), self.dbatch_am, 4)?;
-            self.cc.sync()?;
-            return Ok(u32::from_le_bytes(tb));
+            // SAFETY: pinned 목적지(8*4 계약, 4B 기입).
+            self.cc
+                .d2h_async(self.mtp_pin_out as *mut u8, self.dbatch_am, 4)?;
+            return Ok(());
         }
         self.head_gemv_t_launch(self.mtp_ptr(5), self.mtp_ptr(14), t)?;
         {
@@ -414,11 +501,10 @@ impl super::W4a16Dec {
                 &mut crate::rawcuda::args::l4(&mut p_l, &mut p_n, &mut p_t, &mut p_a),
             )?;
         }
-        let mut tb = [0u8; 8 * 4];
-        self.cc.d2h_async(tb.as_mut_ptr(), self.dbatch_am, t * 4)?;
-        self.cc.sync()?;
-        let last = u32::from_le_bytes(tb[(t - 1) * 4..t * 4].try_into().unwrap());
-        Ok(last)
+        // SAFETY: pinned 목적지(8*4 계약, t*4 기입).
+        self.cc
+            .d2h_async(self.mtp_pin_out as *mut u8, self.dbatch_am, t * 4)?;
+        Ok(())
     }
 
     /// [MTP 프리필] 호출열 = (P의 hidden, P+1의 토큰) — 토큰은 **시프트된

@@ -777,10 +777,15 @@ pub(crate) fn upload_mtp(
     // (연산 0.2ms, ~20런치×250µs) + 검증/보정 고정비 → 서빙 38 t/s
     // (평범 디코드 ~50+). **MTP-2(k=4) 구현·실측 완료**: 라운드당 2.62토큰
     // (부분수용 71%)이나 콜 4회 오버헤드(+18ms)로 67.7ms/라운드 = 38.7 t/s.
-    // 재개 절차(우선순): ①MTP 콜 그래프 캡처 — 4회 합 ~22ms → ~1.5ms
-    // (핀 임베드 + 형상(t=1..5)별 캡처 인프라 필요) ②검증 경로 marlin급
-    // (t=k+1 검증이 가중치 바운드 — 27B는 이게 최종 병목) ③게이트 3 →
-    // A/B 목표 1.4× → MTP_ENABLED=true → 스모크·eval.
+    // **[MTP-GRAPH 구현·실측 2026-10-12]** t=1..5 핀 임베드+캡처 인프라
+    // (ensure_mtp_graph·mtp_fwd_launch 분리·graph_invalidate take 계약) —
+    // 캡처 5개 성공에도 **라운드 67.7→68.9ms(무이득)**: 이 기기의 cuGraphLaunch
+    // 자체가 느려 콜 비용 ~5ms는 런치 오버헤드가 아니었다. 라운드 분해 =
+    // 검증 t=5 ~30ms + 보정 t=1 18ms + GDN 스냅샷 ~15ms + MTP ~3ms.
+    // 재개 절차(갱신): ①GDN 스냅샷 축소(f16 §5 또는 증분) ②검증 marlin급
+    // ③MTP-2를 **단일 그래프 내 디바이스 체인**(초안→GPU 임베드 gather→
+    // 다음 런 — 호스트 왕복 제거)으로 재구성 → A/B 목표 1.4× → 게이트 3 →
+    // MTP_ENABLED=true → 스모크·eval.
     const MTP_ENABLED: bool = false;
     if !MTP_ENABLED || model.w_raw("mtp.fc.weight").is_none() {
         return Ok(false);

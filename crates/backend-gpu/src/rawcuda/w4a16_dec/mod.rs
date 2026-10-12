@@ -478,6 +478,13 @@ pub struct W4a16Dec {
     /// [A6-1 2026-10-11] 검증 체인 (slot, t) 그래프 캐시 — 캡처 실패 시 비활성.
     spec_graphs: Vec<((usize, usize), ffi::CUgraphExec, ffi::CUgraph)>,
     spec_graph_ok: bool,
+    /// [MTP-GRAPH 2026-10-12] MTP 콜 t(1..=8)별 캡처 — 런치 ~20회 → 1회.
+    mtp_graphs: Vec<Option<(ffi::CUgraphExec, ffi::CUgraph)>>,
+    /// 캡처 실패 후 직접 발사 고정(재시도 방지).
+    mtp_graph_failed: bool,
+    /// MTP 핀드 — 임베드 스테이징(MTP_TMAX×h×4) + argmax 회수(8×4).
+    mtp_pin_emb: *mut std::ffi::c_void,
+    mtp_pin_out: *mut std::ffi::c_void,
     /// [A6-1] 캡처 본문에서 호스트 갱신(sync·slot_pos·체크포인트) 생략 게이트.
     capture_no_host: bool,
     /// 캡처 실패 후 직접 발사 고정(재시도 방지 — t=1 graph_failed와 동형).
@@ -671,6 +678,10 @@ impl W4a16Dec {
             pin_batch_pos: std::ptr::null_mut(),
             batch_graphs: Vec::new(),
             spec_graphs: Vec::new(),
+            mtp_graphs: vec![None; 9],
+            mtp_graph_failed: false,
+            mtp_pin_emb: std::ptr::null_mut(),
+            mtp_pin_out: std::ptr::null_mut(),
             spec_graph_ok: true,
             capture_no_host: false,
             batch_capture_failed: false,
