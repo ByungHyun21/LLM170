@@ -516,7 +516,109 @@ impl W4a16Dec {
         self.ensure_chain_bufs()?;
         self.build_moe_multi_tab()?;
         self.moe.moe_bufs_ok = true;
+        // [§3.4 ② 트랜셰 2] 등록(allocate) 중 퇴거가 결정됐을 수 있다 —
+        // 여기서 실제 해제까지 완료(구성 확정 후 소비 — 순서 계약).
+        self.ucache_sweep()?;
         Ok(())
+    }
+
+    /// [§3.4 ② 2026-10-12 트랜셰 2] 레지스트리 퇴거 실행 — `take_evicted()`
+    /// 가 돌려준 엔트리의 실제 디바이스 메모리를 해제한다(enforce=true
+    /// 국면의 소비 지점). 퇴거 결정은 등록 지점(set_attn·enable_spec·
+    /// ensure_moe_bufs·ucache_pressure)의 allocate/set_budget 내부에서만
+    /// 일어나고, 실제 해제는 이 메서드가 맡는다(레지스트리는 포인터를
+    /// 모른다). 안전 계약(순서 고정):
+    /// 1) 그래프 전량 무효화 — 캡처 exec가 옛 포인터(dchk/dsnap/mcache)를
+    ///    replay하는 것 차단(graph_invalidate와 동일 계약).
+    /// 2) sync — 비행 커널의 해제 버퍼 참조 차단(동일 계약).
+    /// 3) 해제 + 소유 필드 0화 + 기능 플래그 정합:
+    ///    - moe:expert-lru → 전문가 LRU 폐기. moe_bufs_ok=false로 재구성
+    ///      유도 — 다음 moe_ffn_dev의 ensure_moe_bufs가 여유 재산정(자가
+    ///      회복, 사이 디코드는 stg 폴백·t≤8 프리필은 재구성 후 진행).
+    ///    - spec:ckpt → dchk 해제. checkpoint/restore 경로는 dchk==0
+    ///      가드로 자동 비활성(재계산 가능한 순수 최적화 — 기능 무손실).
+    ///    - spec:state → WY(dwy_s0/dc/g/k)+dsnap_ring/dsave 해제 +
+    ///      spec_on=false. 검증 라운드는 라운드 사이(호스트 순차 지점)에서만
+    ///      끊기므로 실행 중 라운드 부패는 없다(스케줄러는 spec_on()으로
+    ///      선판정).
+    ///    - attn:kv → **올 수 없다**(Kv 범주 고정) — 오면 부기 정합성
+    ///      오류로 거부(활성 KV 해제는 요청 파괴).
+    ///
+    /// 반환 = 실제 해제한 바이트(0 = 퇴거 없음).
+    pub(super) fn ucache_sweep(&mut self) -> Result<u64, String> {
+        let evicted = self.ucache.take_evicted();
+        if evicted.is_empty() {
+            return Ok(0);
+        }
+        self.graph_invalidate();
+        self.cc.sync()?;
+        let mut freed = 0u64;
+        for e in &evicted {
+            match e.id.as_str() {
+                "moe:expert-lru" => {
+                    for p in [self.moe.mcache_q, self.moe.mcache_s] {
+                        if p != 0 {
+                            self.cc.free(p)?;
+                        }
+                    }
+                    (self.moe.mcache_q, self.moe.mcache_s, self.moe.mcache_k) = (0, 0, 0);
+                    self.moe.mcache_ids.clear();
+                    self.moe.mcache_age.clear();
+                    self.moe.moe_bufs_ok = false; // 자가 재구성 유도
+                }
+                "spec:ckpt" => {
+                    if self.gdn.dchk != 0 {
+                        self.cc.free(self.gdn.dchk)?;
+                    }
+                    self.gdn.dchk = 0; // dchk==0 가드로 체크포인트 자동 비활성
+                }
+                "spec:state" => {
+                    for p in [
+                        self.gdn.dwy_s0,
+                        self.gdn.dwy_dc,
+                        self.gdn.dwy_g,
+                        self.gdn.dwy_k,
+                        self.gdn.dsnap_ring,
+                        self.gdn.dsave,
+                    ] {
+                        if p != 0 {
+                            self.cc.free(p)?;
+                        }
+                    }
+                    (
+                        self.gdn.dwy_s0,
+                        self.gdn.dwy_dc,
+                        self.gdn.dwy_g,
+                        self.gdn.dwy_k,
+                    ) = (0, 0, 0, 0);
+                    (self.gdn.dsnap_ring, self.gdn.dsave) = (0, 0);
+                    self.spec_on = false; // 검증 라운드 차단
+                }
+                id => {
+                    return Err(format!(
+                        "ucache: 퇴거 실행 불가 엔트리 \"{id}\" — Kv는 퇴거 불가 계약 위반"
+                    ));
+                }
+            }
+            freed += e.bytes;
+        }
+        if freed > 0 {
+            eprintln!(
+                "[ucache] 퇴거 실행: {}엔트리 {}MiB 실해제",
+                evicted.len(),
+                freed >> 20
+            );
+        }
+        Ok(freed)
+    }
+
+    /// [§3.4 ②] 런타임 VRAM 압박 반영 — HBM 예산 축소 → 등록부 퇴거 결정
+    /// (set_budget 스윕) → 실제 해제(ucache_sweep)까지 한 번에 완료.
+    /// 반환 = 실제 해제한 바이트. Kv는 고정이라 예산 이하로 내려가지
+    /// 않아도(Kv 단독 과점유) 오류 아니다 — 정책상 허용 국면.
+    pub fn ucache_pressure(&mut self, hbm_budget: u64) -> Result<u64, String> {
+        self.ucache.set_budget(Tier::Hbm, hbm_budget);
+        self.ucache_sweep()
     }
 
     /// 캡처 전 버퍼 워밍업 — **불변식: 체인에서 지연 할당되는 모든 버퍼는

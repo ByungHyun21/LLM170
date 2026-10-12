@@ -224,6 +224,12 @@ fn batch_dec_max_mirror() {
 // 경로 동일성(토큰열 판정)이 목적. 두 경로는 같은 커널열을 쓰며 임베딩
 // 소스만 h2d ↔ gather(bf16 디코드 비트동일 — embed.cu 계약)로 다르다.
 
+/// [§3.4 ② 2026-10-12] CUDA 테스트 직렬화 락 — cargo test의 스레드 병렬
+/// 실행에서 컨텍스트·할당이 겹치면 VRAM 델타 판정(ucache 강제 테스트)이
+/// 우연에 좌우된다. CUDA를 쓰는 테스트는 이 락으로 순차화한다(타이밍
+/// 의존 금지 계약).
+static CUDA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// splitmix64 — rand 금지 계약(core sampler 미러).
 fn sm64(s: &mut u64) -> u64 {
     *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -261,6 +267,7 @@ fn bf16_row(bytes: &[u8], r: usize, k: usize) -> Vec<f32> {
 
 #[test]
 fn mtp_device_chain_matches_sequential() {
+    let _cuda = CUDA_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let h = 1024usize;
     let (qh, kvh, d, cap) = (4usize, 2usize, 256usize, 64usize);
     let (qdim, kvdim) = (qh * d, kvh * d); // 1024, 512
@@ -437,6 +444,7 @@ fn mtp_device_chain_matches_sequential() {
 // GEMV 경로까지 실실행.
 #[test]
 fn kstep_decode_matches_sequential() {
+    let _cuda = CUDA_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let h = 1024usize;
     let (qh, kvh, d, cap) = (4usize, 2usize, 256usize, 64usize);
     let (qdim, kvdim) = (qh * d, kvh * d); // 1024, 512
@@ -544,4 +552,282 @@ fn kstep_decode_matches_sequential() {
     dec.reset_state(0).expect("reset3");
     let kstop = dec.decode_k_greedy(0, tok0, 4, seq[j]).expect("kstep-eos");
     assert_eq!(kstop, &seq[..=j], "EOS에서 정지 — 방출 접두만 반환");
+}
+
+// ═══ [§3.4 ② 2026-10-12 트랜셰 2] 예산 강제 실해제 — CUDA 필요 ═══
+// 압박(ucache_pressure) → 최저 utility 순 퇴거(ckpt u=10 → state u=20) →
+// 실제 cuMemFree → cuda_mem_free 델타 ≥ 퇴거 바이트(실측 회수 판정).
+// 안전 계약 검증: Kv(attn:kv)는 고정이라 생존(활성 메모리 퇴거 금지),
+// 해제된 버퍼는 0화 + spec_on=false(해제 주소로 라운드 시도 차단).
+#[test]
+fn ucache_enforcement_frees_device_memory() {
+    let _cuda = CUDA_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = 1024usize;
+    let (qh, kvh, d, cap) = (4usize, 2usize, 256usize, 64usize);
+    let mut dec = super::W4a16Dec::new(1, h, 1).expect("CUDA 컨텍스트/fatbin");
+
+    // GDN 형상(스펙 상태·체크포인트 버퍼 형상의 원천) — 가중 0/1 더미
+    // (버퍼 확보만 목적, 체인 실행 없음). 형상은 의도적으로 크게: 해제
+    // 합계 ≈ 52MiB ≫ 드라이버 여유 보고 단위(2MiB) — cuda_mem_free 델타
+    // 판정이 반올림에 묻히지 않게 한다(실측: 485KB 해제는 +0B로 측정).
+    let gd = super::GdnDims {
+        n_gdn: 8,
+        hidden: h,
+        h_k: 2,
+        h_v: 16,
+        d: 128,
+    };
+    dec.set_gdn(
+        gd,
+        &vec![0f32; gd.n_gdn * gd.conv_ch() * 4],
+        &vec![0f32; gd.n_gdn * 2 * gd.h_v * gd.hidden],
+        &vec![0f32; gd.n_gdn * gd.h_v],
+        &vec![0f32; gd.n_gdn * gd.h_v],
+        &vec![1f32; gd.n_gdn * 128],
+    )
+    .expect("set_gdn");
+    // 어텐션(KV 등록 원천) — 최소 형상.
+    let ad = super::AttnDims {
+        n_attn: 1,
+        q_heads: qh,
+        kv_heads: kvh,
+        d,
+        cap,
+        interval: 1,
+    };
+    dec.set_attn(ad, &vec![1f32; ad.n_attn * d], &vec![1f32; ad.n_attn * d])
+        .expect("set_attn");
+    // 스펙 상태(WY s0/dc/g/k + dsnap_ring/dsave) + 체크포인트(dchk) 등록.
+    dec.enable_spec().expect("enable_spec");
+    assert!(dec.spec_on(), "스펙 활성 전제(압박 전)");
+    assert_ne!(dec.gdn.dchk, 0, "체크포인트 등록 전제");
+    assert_ne!(dec.gdn.dwy_s0, 0, "스펙 상태(WY S_0) 등록 전제");
+
+    let ckpt = dec.ucache.entry("spec:ckpt").expect("ckpt 등록부").bytes;
+    let state = dec.ucache.entry("spec:state").expect("state 등록부").bytes;
+    let kv = dec.ucache.entry("attn:kv").expect("kv 등록부").bytes;
+    let total = dec.ucache.total(super::unified_cache::Tier::Hbm);
+    assert_eq!(total, ckpt + state + kv, "등록부 회계 정합");
+
+    // 압박: 예산 = KV 단독으로 축소 → ckpt(u10) → state(u20) 순 퇴거,
+    // kv(고정) 생존 후 총점유 = 예산과 정확히 일치.
+    let free0 = crate::cuda_mem_free().expect("VRAM 프로브").0;
+    let freed = dec.ucache_pressure(kv).expect("압박 스윕");
+    assert_eq!(freed, ckpt + state, "퇴거분 전량 실해제");
+    assert_eq!(dec.ucache.evict_count(), 2, "ckpt+state 2건 퇴거");
+
+    // 실측 회수 판정 — 해제분만큼 여유 VRAM 증가(드라이버 산정 ≥ 청구).
+    let free1 = crate::cuda_mem_free().expect("VRAM 프로브").0;
+    assert!(
+        free1 >= free0 && free1 - free0 >= ckpt + state,
+        "VRAM 회수 없음: +{}B (기대 ≥ {}B)",
+        free1.saturating_sub(free0),
+        ckpt + state
+    );
+
+    // 기능 정합 — 해제 버퍼 0화 + 스펙 차단, KV 생존(퇴거 금지 계약).
+    assert_eq!(dec.gdn.dchk, 0, "dchk 해제 후 0화");
+    assert_eq!(dec.gdn.dwy_s0, 0, "WY S_0 해제 후 0화");
+    assert_eq!(dec.gdn.dwy_dc, 0, "WY dc 해제 후 0화");
+    assert_eq!(dec.gdn.dwy_g, 0, "WY g 해제 후 0화");
+    assert_eq!(dec.gdn.dwy_k, 0, "WY k 해제 후 0화");
+    assert_eq!(dec.gdn.dsnap_ring, 0, "dsnap_ring 해제 후 0화");
+    assert_eq!(dec.gdn.dsave, 0, "dsave 해제 후 0화");
+    assert!(!dec.spec_on(), "해제 상태로 라운드 시도 차단");
+    assert!(
+        dec.ucache.entry("attn:kv").is_some(),
+        "KV는 절대 퇴거 불가(고정)"
+    );
+    assert_eq!(
+        dec.ucache.total(super::unified_cache::Tier::Hbm),
+        kv,
+        "퇴거 후 잔여 = KV 단독"
+    );
+}
+
+// ═══ [TreeWY 2.B 2026-10-12] WY solve/reconstruct 커널 대조(합성) ═══
+// gdn_wy_solve(+gdn_wy_reconstruct m) 상태 ≈ gdn_spec_scan(t=m) 순차 최종
+// 상태 — PoC(evidence/TreeWY) eval 클래스 검증의 커널 버전. 헤드별 게이트
+// 도메인 혼합: h0=무감쇠(g=−1e-5)·k토큰 상관, h1=강감쇠(g=−91.6 — 35B
+// 헤드11 부류), h2=현실적 softplus 감쇠, h3=강폭 현실적. k는 L2 정규화
+// (l2perm 계약), S_0는 randn·0.3.
+#[test]
+fn wy_reconstruct_matches_sequential() {
+    let _cuda = CUDA_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (h_k, h_v, d) = (2usize, 4usize, 128usize);
+    let (k_len, v_len) = (h_k * d, h_v * d);
+    let t_len = 4usize;
+    let dec = super::W4a16Dec::new(1, k_len, 1).expect("CUDA 컨텍스트/fatbin");
+    let mut s = 0x5EED_0C0F_FEE1u64;
+
+    // base 벡터(kh=0 토큰 상관용 — 토큰 공통 단위벡터).
+    let mut base = vec![0f32; d];
+    let mut nrm = 0f32;
+    for i in 0..d {
+        base[i] = sm_f32(&mut s, -1.0, 1.0);
+        nrm += base[i] * base[i];
+    }
+    for b in &mut base {
+        *b /= (nrm + 1e-6).sqrt();
+    }
+
+    let mut q = vec![0f32; t_len * k_len];
+    let mut k = vec![0f32; t_len * k_len];
+    let mut v = vec![0f32; t_len * v_len];
+    let mut bg = vec![0f32; t_len * 2 * h_v];
+    for t in 0..t_len {
+        for kh in 0..h_k {
+            let mut acc = 0f32;
+            for i in 0..d {
+                let x = if kh == 0 {
+                    0.4 * sm_f32(&mut s, -1.0, 1.0) + 0.9 * base[i]
+                } else {
+                    sm_f32(&mut s, -1.0, 1.0)
+                };
+                k[t * k_len + kh * d + i] = x;
+                acc += x * x;
+            }
+            let inv = 1.0 / (acc + 1e-6).sqrt();
+            for i in 0..d {
+                k[t * k_len + kh * d + i] *= inv;
+            }
+        }
+        for i in 0..k_len {
+            q[t * k_len + i] = sm_f32(&mut s, -1.0, 1.0);
+        }
+        for i in 0..v_len {
+            v[t * v_len + i] = sm_f32(&mut s, -1.0, 1.0);
+        }
+        for h in 0..h_v {
+            let beta = 1.0f32 / (1.0f32 + (-0.3f32).exp());
+            bg[t * 2 * h_v + h] = beta;
+            let g = match h {
+                0 => -1e-5,
+                1 => -91.6,
+                _ => -(1.0 + sm_f32(&mut s, 0.1, 2.0).exp()).ln() * sm_f32(&mut s, 0.5, 2.0),
+            };
+            bg[t * 2 * h_v + h_v + h] = g;
+        }
+    }
+    let s0_host: Vec<f32> = (0..h_v * d * d)
+        .map(|_| sm_f32(&mut s, -0.3, 0.3))
+        .collect();
+
+    let cc = &dec.cc;
+    let (dq, dk, dv, dbg) = (
+        cc.alloc(t_len * k_len * 4).unwrap(),
+        cc.alloc(t_len * k_len * 4).unwrap(),
+        cc.alloc(t_len * v_len * 4).unwrap(),
+        cc.alloc(t_len * 2 * h_v * 4).unwrap(),
+    );
+    let (dst_, dout) = (
+        cc.alloc(h_v * d * d * 4).unwrap(),
+        cc.alloc(t_len * v_len * 4).unwrap(),
+    );
+    let (ws0, wdc, wg, wk) = (
+        cc.alloc(h_v * d * d * 4).unwrap(),
+        cc.alloc(8 * h_v * d * 4).unwrap(),
+        cc.alloc(8 * h_v * 4).unwrap(),
+        cc.alloc(8 * k_len * 4).unwrap(),
+    );
+    let b = |x: &[f32]| unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
+    cc.h2d(dq, b(&q)).unwrap();
+    cc.h2d(dk, b(&k)).unwrap();
+    cc.h2d(dv, b(&v)).unwrap();
+    cc.h2d(dbg, b(&bg)).unwrap();
+
+    // 참조 S_m — gdn_spec_scan(t=m) 최종 상태(순차 = 정답).
+    let mut refs = vec![Vec::new(); t_len + 1];
+    for m in 1..=t_len {
+        cc.h2d(dst_, b(&s0_host)).unwrap();
+        let f = cc.function("gdn_spec_scan").unwrap();
+        let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) = (dq, dk, dv, dbg, dst_, dout);
+        let (mut tl, mut hk, mut hv, mut dd, mut lay) =
+            (m as i32, h_k as i32, h_v as i32, d as i32, 0i32);
+        cc.launch(
+            f,
+            h_v as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l11(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut tl, &mut hk, &mut hv,
+                &mut dd, &mut lay,
+            ),
+        )
+        .unwrap();
+        cc.sync().unwrap();
+        let mut ob = vec![0u8; h_v * d * d * 4];
+        cc.d2h(&mut ob, dst_).unwrap();
+        // SAFETY: d2h로 채운 버퍼의 f32 재해석(길이 = 원소수).
+        refs[m] =
+            unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, h_v * d * d) }.to_vec();
+    }
+
+    // WY — solve 1회(t=4) + 재구성 m=1..4.
+    cc.h2d(dst_, b(&s0_host)).unwrap();
+    {
+        let f = cc.function("gdn_wy_solve").unwrap();
+        let (mut a0, mut a1, mut a2, mut a3) = (dk, dv, dbg, dst_);
+        let (mut a4, mut a5, mut a6, mut a7) = (ws0, wdc, wg, wk);
+        let (mut tl, mut hk, mut hv, mut dd, mut lay) =
+            (t_len as i32, h_k as i32, h_v as i32, d as i32, 0i32);
+        cc.launch(
+            f,
+            h_v as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l13(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7, &mut tl,
+                &mut hk, &mut hv, &mut dd, &mut lay,
+            ),
+        )
+        .unwrap();
+        let f = cc.function("gdn_spec_scan").unwrap();
+        let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5) = (dq, dk, dv, dbg, dst_, dout);
+        let (mut tl2, mut hk2, mut hv2, mut dd2, mut lay2) =
+            (t_len as i32, h_k as i32, h_v as i32, d as i32, 0i32);
+        cc.launch(
+            f,
+            h_v as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l11(
+                &mut b0, &mut b1, &mut b2, &mut b3, &mut b4, &mut b5, &mut tl2, &mut hk2, &mut hv2,
+                &mut dd2, &mut lay2,
+            ),
+        )
+        .unwrap();
+    }
+    for m in 1..=t_len {
+        let f = cc.function("gdn_wy_reconstruct").unwrap();
+        let (mut a0, mut a1, mut a2, mut a3) = (wk, ws0, wdc, wg);
+        let mut a4 = dst_;
+        let (mut am, mut hk, mut hv, mut dd, mut lay) =
+            (m as i32, h_k as i32, h_v as i32, d as i32, 0i32);
+        cc.launch(
+            f,
+            h_v as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l10(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut am, &mut hk, &mut hv, &mut dd,
+                &mut lay,
+            ),
+        )
+        .unwrap();
+        cc.sync().unwrap();
+        let mut ob = vec![0u8; h_v * d * d * 4];
+        cc.d2h(&mut ob, dst_).unwrap();
+        // SAFETY: d2h로 채운 버퍼의 f32 재해석(길이 = 원소수).
+        let wy = unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, h_v * d * d) };
+        let mut mx = 0.0f32;
+        for i in 0..wy.len() {
+            mx = mx.max((wy[i] - refs[m][i]).abs());
+        }
+        eprintln!("[wy-test] m={m} maxdiff(seq-wy) = {mx:.6e}");
+        assert!(
+            mx < 1e-4,
+            "WY 재구성 m={m} 순차 스캔 초과 편차: {mx:.6e}(기대 ≤1e-4)"
+        );
+    }
 }

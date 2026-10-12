@@ -405,9 +405,16 @@ pub(super) struct Gdn {
     pub(super) dakq: CUdeviceptr,
     pub(super) dgate: CUdeviceptr,
     pub(super) gdn_t_cap: usize,
-    /// [A-1] 스펙 검증 — GDN 토큰별 상태 스냅샷([t][L][h_v][d*d]) + conv 링
-    /// 스냅샷([L][t][3][conv_ch]).
-    pub(super) dsnap: CUdeviceptr,
+    /// [TreeWY 2.B 2026-10-12] 스펙 검증 WY 표현 — S_0([n_gdn][h_v][d*d])·
+    /// 유사값 dc([n_gdn][8][h_v][d])·누적감쇠 G([n_gdn][8][h_v])·k행
+    /// ([n_gdn][8][k_len], f16 반올림 후 값). 종전 dsnap(토큰별 상태
+    /// 스냅샷 [t][n_layers][h_v][d*d], 27B 1.50GiB) 폐지 — 롤백은
+    /// gdn_wy_reconstruct 재구성(PoC fp32 |ΔS_m|≤1.2e-7, eval 클래스).
+    pub(super) dwy_s0: CUdeviceptr,
+    pub(super) dwy_dc: CUdeviceptr,
+    pub(super) dwy_g: CUdeviceptr,
+    pub(super) dwy_k: CUdeviceptr,
+    /// conv 링 스냅샷([n_gdn][8][3][conv_ch]) — 입력 이력(WY 대상 아님).
     pub(super) dsnap_ring: CUdeviceptr,
     pub(super) dsave: CUdeviceptr,
     /// [A2 2026-10-11] 접두 재사용 체크포인트(GDN 상태+conv 링, 슬롯별 1개).
@@ -473,7 +480,8 @@ pub struct W4a16Dec {
     pub(super) graph: Graph,
     pub cc: CudaCtx,
     /// [§3.4 ② 2026-10-12] 통합 캐시 회계(KV·체크포인트·스펙 상태·
-    /// 전문가 LRU 단일 네임스페이스) — 트랜셰 1은 로그 전용 부기.
+    /// 전문가 LRU 단일 네임스페이스) — 트랜셰 2부터 예산 강제(퇴거 실해제는
+    /// ucache_sweep/ucache_pressure).
     ucache: UnifiedCacheRegistry,
     pub hidden: usize,
     pub n_layers: usize,
@@ -590,12 +598,18 @@ impl W4a16Dec {
             cc.load_fatbin(a.name, &crate::rawcuda::assets::asset_bytes(a)?, a.syms)?;
         }
         // [§3.4 ②] 통합 캐시 회계 — HBM 예산 = 부팅 시점 여유 VRAM(프로브
-        // 실패 시 무제한). 트랜셰 2(실제 메모리 이관) 전까지 예산 미강제.
+        // 실패 시 무제한). **트랜셰 2(2026-10-12): enforce 활성** — 예산
+        // 초과 시 퇴거가 실제로 일어나고 엔진(ucache_sweep)이 디바이스
+        // 메모리를 해제한다. 안전 부분집합: Kv 범주는 고정(퇴거 불가 —
+        // 실행 중 디코드 필수 자원), 퇴거 후보는 재계산·재적재 가능한
+        // ckpt → spec 상태 → 전문가 LRU뿐(utility 순)이라 활성 워크로드는
+        // 안전하다. 참고: 가중치·스크래치는 이 네임스페이스 밖이라 예산은
+        // 4 캐시에만 걸린다(전량 회계는 다음 트랜셰).
         let mut ucache = UnifiedCacheRegistry::new();
         if let Some((free, _)) = crate::cuda_mem_free() {
             ucache.set_budget(Tier::Hbm, free);
         }
-        ucache.set_enforce(false);
+        ucache.set_enforce(true);
         Ok(W4a16Dec {
             moe: MoE {
                 n_experts: 0,
@@ -706,7 +720,10 @@ impl W4a16Dec {
                 dakq: 0,
                 dgate: 0,
                 gdn_t_cap: 0,
-                dsnap: 0,
+                dwy_s0: 0,
+                dwy_dc: 0,
+                dwy_g: 0,
+                dwy_k: 0,
                 dsnap_ring: 0,
                 dsave: 0,
                 dchk: 0,

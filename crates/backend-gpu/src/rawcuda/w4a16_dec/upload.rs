@@ -256,8 +256,9 @@ impl W4a16Dec {
         let tb = unsafe { std::slice::from_raw_parts(tab.as_ptr() as *const u8, tab.len() * 8) };
         Self::h2d_chunked(&self.cc, dblk, tb)?;
         // [§3.4 ② 2026-10-12] 통합 캐시 회계 등록 — KV 본체(int8 k/v 2벌 +
-        // 행×헤드 스케일 2벌 + 블록 테이블). 트랜셰 1은 로그 전용(실패는
-        // 부기 경고 — 기능 좌우 안 함). 트랜셰 2부터 실제 예산 심사로 전환.
+        // 행×헤드 스케일 2벌 + 블록 테이블). **Kv 범주는 고정(퇴거 불가)**
+        // 이므로 등록 실패는 예산 부족(과점유) 경고로 그친다 — 이미
+        // 물리 할당이 성공했고 KV 없이는 디코드 자체가 불가능하기 때문.
         let kv_bytes = (kv_elems * 2 + kv_scales * 8) as u64 + tab.len() as u64 * 8;
         if let Err(e) = self.ucache.allocate(
             "attn:kv",
@@ -277,6 +278,10 @@ impl W4a16Dec {
         self.attn.dvc = dvc;
         self.attn.dpp = dpp;
         self.attn.attn = Some(dims);
+        // [§3.4 ② 트랜셰 2] 등록 중 퇴거(ckpt·spec·expert-lru)가 결정됐을
+        // 수 있다 — KV 필드 확정 후 실제 해제까지 완료. KV 자체는 고정
+        // (Kv 범주)이라 이 스윕의 대상이 아니다.
+        self.ucache_sweep()?;
         Ok(())
     }
 

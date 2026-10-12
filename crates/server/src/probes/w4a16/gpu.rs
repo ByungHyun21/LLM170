@@ -900,6 +900,75 @@ fn run_generate(
             s_trio[smi],
             s_spec[smi]
         );
+        // [TreeWY 2.B 2026-10-12] WY 재구성 롤백 대조 — verify(4) 후
+        // rollback(k) 상태 ≈ 순차 t=1 디코드 k회 상태(k=1..4 전 접두).
+        // 참조 = S0 복원 → t=1 디코드마다 덤프(순차 스캔이 정답). 기대
+        // 오차 ~1e-7급(PoC eval 클래스 — 골든 토큰열 판정은 H 섹션이 담당).
+        let mut refs: Vec<Vec<f32>> = Vec::new();
+        {
+            dec.spec_load_state(0)?;
+            dec.spec_rewind_pos(0, 4)?;
+            let mut cur = next;
+            for _ in 0..4 {
+                let row = model.embed_row(cur).map_err(|e| e.to_string())?;
+                cur = dec.forward_device_argmax(0, &row)?;
+                refs.push(dec.spec_dump_state(0)?);
+            }
+        }
+        let mut wy_mx = 0.0f32;
+        let dm_hv = dec.spec_hv().max(1);
+        for k in 1..=4usize {
+            dec.spec_load_state(0)?;
+            dec.spec_rewind_pos(0, 4)?;
+            let _ = dec.spec_verify(0, &rows, 4)?;
+            dec.spec_rollback(0, k)?;
+            let s = dec.spec_dump_state(0)?;
+            let mut mx = 0.0f32;
+            let mut mi = 0usize;
+            for i in 0..s.len().min(refs[k - 1].len()) {
+                let dv = (s[i] - refs[k - 1][i]).abs();
+                if dv > mx {
+                    mx = dv;
+                    mi = i;
+                }
+            }
+            eprintln!(
+                "[spec-check] WY rollback k={k} state maxdiff(seq-wy) = {mx:.6e} @i={mi} (층 {} 헤드{} 행{} 열{}) wy={:.6e} seq={:.6e}",
+                mi / (dm_hv * 128 * 128),
+                (mi / (128 * 128)) % dm_hv,
+                (mi / 128) % 128,
+                mi % 128,
+                s[mi],
+                refs[k - 1][mi]
+            );
+            wy_mx = wy_mx.max(mx);
+        }
+        eprintln!("[spec-check] WY rollback max(k=1..4) = {wy_mx:.6e}");
+        // [TreeWY 진단] **같은 verify(4) 라운드 내** 대조 — 순차 스캔 최종
+        // 상태(S_4) vs 같은 라운드의 wy 데이터로 재구성한 S_4. 입력·pos·
+        // 참조 경로 교란 원천이 없는 순수 커널 대조(합성 단위 테스트
+        // wy_reconstruct_matches_sequential의 실모델 버전 — 기대 ~1e-6).
+        {
+            dec.spec_load_state(0)?;
+            dec.spec_rewind_pos(0, 4)?;
+            let _ = dec.spec_verify(0, &rows, 4)?;
+            let s_batch4 = dec.spec_dump_state(0)?;
+            dec.spec_rollback(0, 4)?;
+            let s_wy4b = dec.spec_dump_state(0)?;
+            let mut mx = 0.0f32;
+            let mut mi = 0usize;
+            for i in 0..s_batch4.len().min(s_wy4b.len()) {
+                let dv = (s_batch4[i] - s_wy4b[i]).abs();
+                if dv > mx {
+                    mx = dv;
+                    mi = i;
+                }
+            }
+            eprintln!(
+                "[spec-check] same-round WY(4) vs scan-final maxdiff = {mx:.6e} @i={mi} wy={:.6e} scan={:.6e}",
+                s_wy4b[mi], s_batch4[mi]
+            );
+        }
         dec.spec_load_state(0)?;
         dec.spec_rewind_pos(0, 4)?;
     }

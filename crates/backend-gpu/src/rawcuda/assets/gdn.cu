@@ -766,11 +766,14 @@ extern "C" __global__ void gdn1_upd(
     }
 }
 
-// [A-1 2026-10-10] 스펙 검증용 GDN — t≤8 토큰 루프 + **토큰별 상태 스냅샷**.
+// [A-1 2026-10-10] 스펙 검증용 GDN — t≤8 토큰 루프 순차 스캔.
+// [TreeWY 2.B 2026-10-12] 토큰별 상태 스냅샷(snap — dsnap 27B 1.50GiB)은
+// 폐지. 롤백 복원 지점은 gdn_wy_solve가 기록하는 WY 표현(S_0·dc·G·k,
+// 27B 약 164MB)에서 gdn_wy_reconstruct가 재구성한다(출력·최종 상태 산술
+// 은 불변 — 스냅샷 기록만 제거).
 // t=1 trio(part/comb/upd)를 블록=(h) 하나로 융합하되 산술은 trio와 **비트
 // 동일**: KS/QS는 8분할(16행) 부분합을 분할 순서로 결합, half(k)/half(v)/
-// exp 라운딩 지점 동일, kq00은 동일 트리. 각 토큰 처리 후 그 토큰의 상태
-// (이 층·이 헤드 128×128)를 snap[t]에 기록 — 부분 수용 롤백의 복원 지점.
+// exp 라운딩 지점 동일, kq00은 동일 트리.
 // (열 소유 스레드 구조라 토큰 간 상태 의존이 스레드-로컬 — 동기화는 kq00
 // 트리뿐.)
 extern "C" __global__ void gdn_spec_scan(
@@ -779,9 +782,8 @@ extern "C" __global__ void gdn_spec_scan(
     const float* __restrict__ v,     // [T][h_v*128]
     const float* __restrict__ bg,    // [T][2*h_v]
     float* __restrict__ st,          // [L][h_v][d*d] r/w — 최종 상태
-    float* __restrict__ snap,        // [KMAX][L][h_v][d*d] — 토큰별 상태
     float* __restrict__ outv,        // [T][h_v*128]
-    int t_len, int h_k, int h_v, int d, int layer, int n_layers)
+    int t_len, int h_k, int h_v, int d, int layer)
 {
     const int h = blockIdx.x;
     const int tid = threadIdx.x; // = d 인덱스
@@ -822,19 +824,154 @@ extern "C" __global__ void gdn_spec_scan(
         const float sv = __half2float(__float2half_rn(v[t * (h_v * 128) + h * 128 + tid]));
         const float rhs = beta * (sv - e * ks);
         outv[t * (h_v * 128) + h * 128 + tid] = e * qs * qscale + kq00 * rhs;
-        // 상태 갱신(trio gdn1_upd 미러) + 스냅샷 기록(이 토큰 처리 후).
+        // 상태 갱신(trio gdn1_upd 미러) — 스냅샷 기록은 TreeWY 폐지.
         float* sst = st + st_h;
         for (int i = 0; i < 128; ++i) {
             const float kv = __half2float(__float2half_rn(kt[kh * 128 + i]));
             float* p = &sst[(long)i * d + tid];
             *p = *p * e + kv * rhs;
         }
-        // 스냅샷 — snap[t][layer][h][i][d] (t는 배치 내 위치 — 상한 t_len).
-        float* sn = snap + (((long)t * n_layers + layer) * h_v + h) * ((long)d * d);
-        for (int i = 0; i < 128; ++i) {
-            sn[(long)i * d + tid] = sst[(long)i * d + tid];
-        }
         __syncthreads(); // 다음 토큰 kq00 트리 전 정리
+    }
+}
+
+// ── [TreeWY 2.B 2026-10-12] WY 표현 — 유사값 solve + 접두 상태 재구성 ──
+// 스펙 롤백의 토큰별 상태 스냅샷(dsnap, 27B 1.50GiB·35B 640MiB)을
+// S_0 1개 + 유사값 dc + 누적감쇠 G + k행(27B 약 164MB)으로 대체한다.
+// 수치 검증 = evidence/TreeWY/poc_treewy.py(fp32 |ΔS_m| ≤1.2e-7 — eval
+// 클래스 판정, 2026-10-12). 규약은 PoC 그대로 — (I+A)dc=rhs0 순전대입
+// (논문 TreeWY 2608.20961의 W=(I−tril(βxxᵀ))⁻¹와는 부호 규약 차이만:
+// L=−A. 항 이동 시 +). 수식:
+//   G_i = Σ_{r≤i} g_r(포함 누적)
+//   A[i][j] = β_i·(k_i·k_j)·exp(G_i−G_j)        (j<i 강하삼각)
+//   rhs0_i  = β_i·(v_i − exp(G_i)·(k_i^T S_0))
+//   dc_i = rhs0_i − Σ_{j<i} A[i][j]·dc_j        (j 오름차순 소거)
+//   S_m = exp(G_{m-1})·S_0 + Σ_{j≤m-1} exp(G_{m-1}−G_j)·k_j·dc_j^T
+// k/v는 순차 스캔(gdn_spec_scan)과 동일한 f16 저장 반올림 경유, 초월함수는
+// gdn_expf(FLA-8 채택 클래스). 검증 출력·최종 상태는 순차 스캔이 그대로
+// 생산(비트 불변) — 본 커널은 롤백 데이터만 담당한다.
+// 버퍼 레이아웃(호스트 enable_spec — n_gdn 스트라이드):
+//   wy_s0[n_gdn][h_v][d²] · wy_dc[n_gdn][8][h_v][128]
+//   wy_g[n_gdn][8][h_v]   · wy_k[n_gdn][8][k_len](f16 반올림 후 값)
+extern "C" __global__ void gdn_wy_solve(
+    const float* __restrict__ k,   // [T][k_len] L2 완료
+    const float* __restrict__ v,   // [T][h_v*128]
+    const float* __restrict__ bg,  // [T][2*h_v]
+    const float* __restrict__ st,  // 슬롯 상태 [n_gdn][h_v][d*d] — S_0(읽기 전용)
+    float* __restrict__ wy_s0,     // [n_gdn][h_v][d*d] — S_0 저장
+    float* __restrict__ wy_dc,     // [n_gdn][8][h_v][128]
+    float* __restrict__ wy_g,      // [n_gdn][8][h_v]
+    float* __restrict__ wy_k,      // [n_gdn][8][k_len]
+    int t_len, int h_k, int h_v, int d, int layer)
+{
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x; // = value 열 인덱스
+    const int kh = h % h_k;
+    const int k_len = h_k * 128;
+    const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    __shared__ float G[8];
+    __shared__ float A[8][8];
+
+    // k행(f16 반올림 후) 저장 — h<h_k 블록이 자기 kh 슬라이스 1회
+    // (l2perm의 q/k 노름 분담 관례와 동일). 재구성 커널은 여기서 읽는다
+    // — dk2는 층마다 덮어써져 라운드 종료 시 마지막 층분만 남는다.
+    if (h < h_k) {
+        for (int t = 0; t < t_len; ++t) {
+            const long ix = kh * 128 + tid;
+            wy_k[((long)layer * 8 + t) * k_len + ix] =
+                __half2float(__float2half_rn(k[(long)t * k_len + ix]));
+        }
+    }
+    // G 누적(포함) — thread 0이 계산·기록.
+    if (tid == 0) {
+        float acc = 0.0f;
+        for (int t = 0; t < t_len; ++t) {
+            acc += bg[(long)t * (2 * h_v) + h_v + h];
+            G[t] = acc;
+            wy_g[((long)layer * 8 + t) * h_v + h] = acc;
+        }
+    }
+    __syncthreads();
+    // Gram A[i][j](j<i) — 셀당 1스레드 길이 128 내적(블록 간 중복은 소량).
+    for (int e = tid; e < t_len * t_len; e += 128) {
+        const int i = e / t_len, j = e % t_len;
+        if (j < i) {
+            float gr = 0.0f;
+            for (int s2 = 0; s2 < 128; ++s2) {
+                gr += __half2float(__float2half_rn(k[(long)i * k_len + kh * 128 + s2]))
+                    * __half2float(__float2half_rn(k[(long)j * k_len + kh * 128 + s2]));
+            }
+            A[i][j] = bg[(long)i * (2 * h_v) + h] * gr * gdn_expf(G[i] - G[j]);
+        } else {
+            A[i][j] = 0.0f;
+        }
+    }
+    __syncthreads();
+    // S_0 저장(열 tid) — 호스트가 본 커널을 gdn_spec_scan 앞에 발사하므로
+    // st는 아직 라운드 시작 상태다.
+    for (int i2 = 0; i2 < 128; ++i2) {
+        wy_s0[st_h + (long)i2 * d + tid] = st[st_h + (long)i2 * d + tid];
+    }
+    // KS0·rhs0 → 순전대입 → dc(i·j 고정 8 전개 — dcr 레지스터 상주).
+    float dcr[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        if (i >= t_len) break;
+        const float beta = bg[(long)i * (2 * h_v) + h];
+        const float di = gdn_expf(G[i]);
+        float ks0 = 0.0f;
+        for (int s2 = 0; s2 < 128; ++s2) {
+            ks0 += __half2float(__float2half_rn(k[(long)i * k_len + kh * 128 + s2]))
+                 * st[st_h + (long)s2 * d + tid];
+        }
+        const float sv =
+            __half2float(__float2half_rn(v[(long)i * (h_v * 128) + h * 128 + tid]));
+        float r = beta * (sv - di * ks0);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j < i) {
+                r -= A[i][j] * dcr[j];
+            }
+        }
+        dcr[i] = r;
+        wy_dc[((long)layer * 8 + i) * (h_v * 128) + (long)h * 128 + tid] = r;
+    }
+}
+
+// [TreeWY 2.B] 접두 m 상태 재구성 — spec_rollback(keep=m)이 dsnap D2D 대신
+// 발사(그리드 h_v, 블록 128 — solve와 동일 열 소유 구조).
+// S_m = exp(G_{m-1})·S_0 + Σ_{j<m} exp(G_{m-1}−G_j)·k_j·dc_j^T
+// (j 오름차순 — PoC wy_state와 동일 순서).
+extern "C" __global__ void gdn_wy_reconstruct(
+    const float* __restrict__ wy_k,  // [n_gdn][8][k_len]
+    const float* __restrict__ wy_s0, // [n_gdn][h_v][d*d]
+    const float* __restrict__ wy_dc, // [n_gdn][8][h_v][128]
+    const float* __restrict__ wy_g,  // [n_gdn][8][h_v]
+    float* __restrict__ st,          // 슬롯 상태 [n_gdn][h_v][d*d] — 기록 대상
+    int m, int h_k, int h_v, int d, int layer)
+{
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x; // = value 열 인덱스
+    const int kh = h % h_k;
+    const int k_len = h_k * 128;
+    const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    __shared__ float w[9]; // w[0]=exp(G_{m-1}), w[1+j]=exp(G_{m-1}−G_j)
+    if (tid == 0) {
+        const float gm = wy_g[((long)layer * 8 + (m - 1)) * h_v + h];
+        w[0] = gdn_expf(gm);
+        for (int j = 0; j < m; ++j) {
+            w[1 + j] = gdn_expf(gm - wy_g[((long)layer * 8 + j) * h_v + h]);
+        }
+    }
+    __syncthreads();
+    for (int i2 = 0; i2 < 128; ++i2) {
+        float acc = w[0] * wy_s0[st_h + (long)i2 * d + tid];
+        for (int j = 0; j < m; ++j) {
+            acc += w[1 + j]
+                 * wy_k[((long)layer * 8 + j) * k_len + kh * 128 + i2]
+                 * wy_dc[((long)layer * 8 + j) * (h_v * 128) + (long)h * 128 + tid];
+        }
+        st[st_h + (long)i2 * d + tid] = acc;
     }
 }
 

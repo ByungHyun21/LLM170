@@ -2,14 +2,18 @@
 //!
 //! K6 트랜셰 2(블록 테이블 전면 간접화, 1038912e) 이후 엔진에는 4개의
 //! 독립 정책 캐시가 있다: KV(dkc/dvc/dksc/dvsc) · K3 체크포인트(dchk —
-//! 512경계 슬롯당 4환형) · 스펙 검증 상태(dsave/dsnap) · 전문가 LRU
-//! (mcache_q/s). 이 모듈은 네 캐시를 단일 네임스페이스로 묶어 **VRAM을
-//! utility로 배분하는 런타임 통화**의 회계 기반을 제공한다.
+//! 512경계 슬롯당 4환형) · 스펙 검증 상태(dsave/WY 표현 — [TreeWY 2.B
+//! 2026-10-12] dsnap 폐지) · 전문가 LRU (mcache_q/s). 이 모듈은 네 캐시를
+//! 단일 네임스페이스로 묶어 **VRAM을 utility로 배분하는 런타임 통화**의
+//! 회계 기반을 제공한다.
 //!
-//! 범위(트랜셰 1): 레지스트리는 **부기만 한다** — 실제 메모리 이동/해제는
-//! 하지 않는다. 할당 지점은 이 레지스트리에 등록·해제하며, 예산 초과는
-//! 로그(enforce=false 국면). 트랜셰 2가 dchk/dsave 등을 레지스트리 조회
-//! 하에 두고 enforce를 켜면 evict_until_fits가 실제 해제를 지시하게 된다.
+//! 범위: 트랜셰 1(64aff1aa)은 부기만 했다. **트랜셰 2(2026-10-12)부터
+//! enforce가 켜져 있다** — 예산 초과 시 유효 utility 최저 순 퇴거가
+//! 등록부에서 실제로 일어나고, 호출자(엔진)가 `take_evicted()`로 받은
+//! 엔트리의 디바이스 메모리를 실제 해제한다(W4a16Dec::ucache_sweep).
+//! 안전 부분집합 계약: **Kv 범주는 퇴거 불가(고정)** — 디코드 실행 중인
+//! KV를 해제하면 요청이 즉시 파괴된다. 퇴거 후보는 재계산·재적재 가능한
+//! 체크포인트 → 스펙 상태 → 전문가 LRU뿐(utility 순).
 //!
 //! 정책: 예산 초과 시 같은 티어에서 **유효 utility(기준 utility × recency
 //! 감쇠) 최저** 엔트리부터 퇴거. 동률은 오래된 것(last_used 낮은 것),
@@ -44,10 +48,13 @@ impl Tier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheCategory {
     /// KV 캐시(슬롯별 연속 — 블록 테이블 간접). 디코드 필수.
+    /// **[§3.4 ② 트랜셰 2] 퇴거 불가(고정)** — 실행 중 디코드가 참조하는
+    /// 활성 자원이라 예산 압박에서도 절대 해제 대상이 되지 않는다.
     Kv,
     /// K3 접두 재사용 체크포인트(dchk) — 재계산 가능한 TTFT 최적화.
     Checkpoint,
-    /// 스펙 검증 상태 저장(dsave/dsnap) — 스펙 라운드 직결.
+    /// 스펙 검증 상태 저장(dsave/WY 표현 — [TreeWY 2.B 2026-10-12] dsnap
+    /// 폐지, dwy_s0/dc/g/k) — 스펙 라운드 직결.
     SpecState,
     /// 35B 스트리밍 전문가 LRU 캐시(mcache_q/s) — 스트리밍 t/s 직결.
     ExpertWeights,
@@ -312,11 +319,14 @@ impl UnifiedCacheRegistry {
 
     /// 같은 티어에서 유효 utility 최저 엔트리 1개 퇴거(등록부에서만).
     /// 동률: age 큰 것(오래된 것) → id 사전순. 대상 없음 = None.
+    /// [§3.4 ② 트랜셰 2] Kv 범주는 고정 — 후보에서 제외한다. 실행 중
+    /// 디코드가 KV를 참조 중이므로 해제는 요청 파괴다(활성 메모리 퇴거
+    /// 금지 계약). evictable 소진 시 None → 호출자가 과점유를 감수한다.
     fn evict_lowest(&mut self, tier: Tier) -> Option<CacheEntry> {
         let tick = self.tick;
         let mut victim: Option<(f64, u64, EntryId)> = None; // (유효util, age, id)
         for e in self.entries.values() {
-            if e.tier != tier {
+            if e.tier != tier || e.category == CacheCategory::Kv {
                 continue;
             }
             let age = tick.saturating_sub(e.last_used);
@@ -430,16 +440,18 @@ mod tests {
     }
 
     /// 동일 utility면 최근 사용(touch)한 쪽이 살고 오래된 쪽이 퇴거.
+    /// [§3.4 ②] Kv는 고정이라 후보가 될 수 없다 — recency 판정 검증은
+    /// 퇴거 가능 범주(전문가 LRU)로 한다.
     #[test]
     fn recency_beats_equal_utility() {
         let mut r = reg();
-        r.allocate("A", CacheCategory::Kv, Tier::Hbm, 50, 1.0)
+        r.allocate("A", CacheCategory::ExpertWeights, Tier::Hbm, 50, 1.0)
             .unwrap();
-        r.allocate("B", CacheCategory::Kv, Tier::Hbm, 50, 1.0)
+        r.allocate("B", CacheCategory::ExpertWeights, Tier::Hbm, 50, 1.0)
             .unwrap();
         r.touch("A").unwrap(); // A 최신 → B가 더 낡음
         assert!(r.utility_effective("B").unwrap() < r.utility_effective("A").unwrap());
-        r.allocate("C", CacheCategory::Kv, Tier::Hbm, 10, 9.0)
+        r.allocate("C", CacheCategory::ExpertWeights, Tier::Hbm, 10, 9.0)
             .unwrap();
         assert!(r.entry("B").is_none(), "같은 utility 중 오래된 B 퇴거");
         assert!(r.entry("A").is_some());
@@ -511,6 +523,8 @@ mod tests {
     }
 
     /// 티어 격리 — HBM 압박이 host RAM 엔트리를 건드리지 않는다.
+    /// [§3.4 ②] HBM측 엔트리는 퇴거 가능 범주로 둔다(Kv 고정과 무관하게
+    /// 판정되도록 — 티어 격리가 이 테스트의 목적).
     #[test]
     fn tier_isolation() {
         let mut r = UnifiedCacheRegistry::new();
@@ -518,12 +532,64 @@ mod tests {
         r.set_budget(Tier::HostRam, 10);
         r.allocate("host", CacheCategory::ExpertWeights, Tier::HostRam, 10, 1.0)
             .unwrap();
-        r.allocate("kv", CacheCategory::Kv, Tier::Hbm, 100, 5.0)
+        r.allocate("gpu", CacheCategory::ExpertWeights, Tier::Hbm, 100, 5.0)
             .unwrap();
-        // HBM 예산 100 → 50으로 축소: kv 퇴거, host 무사.
+        // HBM 예산 100 → 50으로 축소: gpu 퇴거, host 무사.
         r.set_budget(Tier::Hbm, 50);
-        assert!(r.entry("kv").is_none());
+        assert!(r.entry("gpu").is_none());
         assert!(r.entry("host").is_some());
         assert_eq!(r.total(Tier::HostRam), 10);
+    }
+
+    /// [§3.4 ② 트랜셰 2] Kv 고정 — 예산을 KV 크기 이하로 줄여도 KV는
+    /// 생존한다(디코드 필수 자원 — 활성 메모리 퇴거 금지). 대신 체크포인트
+    /// ·스펙 상태가 utility 순으로 내쫓기고, evictable 소진 후에는 과점유를
+    /// 감수한다(퇴거로 예산을 맞출 수 없는 국면 — 정책상 허용).
+    #[test]
+    fn kv_pinned_survives_pressure() {
+        let mut r = UnifiedCacheRegistry::new();
+        r.allocate("kv", CacheCategory::Kv, Tier::Hbm, 600, base_util::KV)
+            .unwrap();
+        r.allocate(
+            "ckpt",
+            CacheCategory::Checkpoint,
+            Tier::Hbm,
+            100,
+            base_util::CKPT,
+        )
+        .unwrap();
+        r.allocate(
+            "spec",
+            CacheCategory::SpecState,
+            Tier::Hbm,
+            100,
+            base_util::SPEC_STATE,
+        )
+        .unwrap();
+        r.set_budget(Tier::Hbm, 500); // kv(600) 단독으로도 예산 초과
+        assert!(r.entry("kv").is_some(), "KV는 절대 퇴거 불가(고정)");
+        assert!(r.entry("ckpt").is_none() && r.entry("spec").is_none());
+        assert_eq!(r.total(Tier::Hbm), 600, "소진 후 과점유 허용");
+        assert_eq!(r.evict_count(), 2);
+        let ev = r.take_evicted();
+        assert_eq!(
+            ev.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["ckpt", "spec"],
+            "utility 오름차순 퇴거(10 → 20)"
+        );
+    }
+
+    /// [§3.4 ②] evictable 소진 상태의 초과 청구 — Kv가 남아 있어도 후보가
+    /// 아니므로 거절(빈 레지스트리의 oversize와 동일 에러).
+    #[test]
+    fn oversize_with_only_pinned_left() {
+        let mut r = reg(); // 예산 100
+        r.allocate("kv", CacheCategory::Kv, Tier::Hbm, 60, base_util::KV)
+            .unwrap();
+        let err = r
+            .allocate("big", CacheCategory::ExpertWeights, Tier::Hbm, 50, 1.0)
+            .unwrap_err(); // 60+50 > 100, evictable 없음(kv 고정)
+        assert!(err.contains("예산"), "거절 사유 명시: {err}");
+        assert!(r.entry("big").is_none());
     }
 }

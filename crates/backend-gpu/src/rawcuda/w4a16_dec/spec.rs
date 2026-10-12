@@ -4,8 +4,10 @@
 //! - 초안: n-gram(core::spec) — 검증으로만 수용되므로 정확성 위험 없음.
 //! - 검증: t토큰 배치 체인 + 전 위치 argmax(chain_t all=true) — 가중 커널이
 //!   t행으로 상각되어 1토큰 비용에 가까움.
-//! - GDN 상태: gdn_spec_scan이 토큰별 스냅샷([t][L][h_v][d²]) 기록 —
-//!   부분 수용 시 스냅샷[keep-1]로 상태·conv 링을 복원(인덱스 전환 + D2D).
+//! - GDN 상태: [TreeWY 2.B 2026-10-12] gdn_wy_solve가 WY 표현(S_0·dc·G·k)
+//!   기록 — 부분 수용 시 gdn_wy_reconstruct가 상태를 재구성하고 conv 링은
+//!   dsnap_ring D2D로 복원(종전 토큰별 상태 스냅샷 dsnap 폐지 — 27B
+//!   1.50GiB→약 164MB, PoC fp32 |ΔS_m|≤1.2e-7 eval 클래스).
 //! - KV/pos는 위치 카운터만 되감으면 됨(스테일 엔트리는 다음 쓰기가 덮음).
 
 use super::*;
@@ -131,27 +133,54 @@ impl W4a16Dec {
         self.chain_t(slot, rows, t, false, true, true)
     }
 
-    /// [A-1] 롤백 — 배치 `keep`개 토큰 처리 시점(스냅샷[keep-1])으로 슬롯
-    /// GDN 상태·conv 링 복원. pos 되감기는 spec_rewind_pos 소관.
-    /// [결함수정 2026-10-11] 루프를 **GDN 층(n_gdn) 한정** — 종전 n_layers
-    /// (모델 층) 순회는 상태/링 버퍼([slot][n_gdn] 크기)를 넘어 illegal
-    /// access(compute-sanitizer 실측: w4a16_copy +1537B 초과). 스냅샷
-    /// 스트라이드는 n_layers(스캔 계약), 상태·링 스트라이드는 n_gdn.
+    /// [A-1→TreeWY 2.B 2026-10-12] 롤백 — 배치 `keep`개 토큰 처리 시점 상태로
+    /// 슬롯 GDN 상태·conv 링 복원. 상태는 WY 재구성
+    /// (S_keep = exp(G_{keep-1})·S_0 + Σ_{j≤keep-1} exp(G_{keep-1}−G_j)·
+    /// k_j·dc_j^T — gdn_wy_reconstruct 런치, 종전 dsnap[keep-1] D2D 대체),
+    /// conv 링은 여전히 dsnap_ring D2D(입력 이력 — WY 대상 아님, 층당
+    /// 61KB급). pos 되감기는 spec_rewind_pos 소관.
+    /// [결함수정 2026-10-11 계약 승계] 상태·링 모두 GDN 서수(n_gdn)
+    /// 스트라이드 — 모델 층(n_layers) 아님.
     pub fn spec_rollback(&mut self, slot: usize, keep: usize) -> Result<(), String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         if !self.spec_on || !(1..=8).contains(&keep) {
             return Err(format!("spec_rollback: 계약 위반 keep={keep}"));
         }
+        if self.gdn.dwy_s0 == 0 {
+            return Err("spec_rollback: WY 버퍼 미확보(enable_spec)".into());
+        }
         let _g = self.cc.guard()?;
         let st_slot = slot * dm.n_gdn * dm.h_v * 128 * 128;
         let ring_slot = slot * dm.n_gdn * 3 * dm.conv_ch();
-        let st_elems = (dm.h_v * dm.d * dm.d) as u64;
         let ring_elems = (3 * dm.conv_ch()) as u64;
-        let nl = self.n_layers as u64;
+        let f = self.cc.function("gdn_wy_reconstruct")?;
         for gi in 0..dm.n_gdn {
-            let src = self.gdn.dsnap + ((keep - 1) as u64 * nl + gi as u64) * st_elems * 4;
-            let dst = self.gdn.dgst + (st_slot as u64 + gi as u64 * st_elems) * 4;
-            self.copy_dev(dst, src, st_elems * 4)?;
+            // [TreeWY] 상태 재구성 — 스냅샷 복사 대신 S_0+dc+G+k에서 조립.
+            // st는 슬롯 베이스(커널이 layer 오프셋을 더한다 — spec_scan 계약).
+            let (mut w0, mut w1, mut w2, mut w3) = (
+                self.gdn.dwy_k,
+                self.gdn.dwy_s0,
+                self.gdn.dwy_dc,
+                self.gdn.dwy_g,
+            );
+            let mut w4 = self.gdn.dgst + (st_slot as u64) * 4;
+            let (mut wm, mut hk, mut hv, mut dd, mut lay) = (
+                keep as i32,
+                dm.h_k as i32,
+                dm.h_v as i32,
+                dm.d as i32,
+                gi as i32,
+            );
+            self.cc.launch(
+                f,
+                dm.h_v as u32,
+                1,
+                128,
+                &mut crate::rawcuda::args::l10(
+                    &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut wm, &mut hk, &mut hv,
+                    &mut dd, &mut lay,
+                ),
+            )?;
             let rsrc = self.gdn.dsnap_ring + (gi as u64 * 8 + (keep - 1) as u64) * ring_elems * 4;
             let rdst = self.gdn.dring + (ring_slot as u64 + gi as u64 * ring_elems) * 4;
             self.copy_dev(rdst, rsrc, ring_elems * 4)?;
@@ -186,6 +215,11 @@ impl W4a16Dec {
     /// [A-1 진단] spec scan 커널 토글(교차 대조용).
     pub fn spec_set_scan(&mut self, on: bool) {
         self.spec_scan_on = on;
+    }
+
+    /// [TreeWY 2.B 진단] GDN h_v — 프로브의 상태 덤프 인덱스 해석용.
+    pub fn spec_hv(&self) -> usize {
+        self.gdn.gdn.map(|d| d.h_v).unwrap_or(0)
     }
 
     /// [A-1 진단] GDN 출력(o_lc) 덤프 — 마지막 GDN 층 값.

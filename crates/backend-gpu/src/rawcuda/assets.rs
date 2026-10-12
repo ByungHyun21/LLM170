@@ -101,6 +101,8 @@ pub const ASSETS: &[Asset] = &[
             "gdn_scan",
             "gdn_spec_scan",
             "gdn_scan_akq",
+            "gdn_wy_solve",
+            "gdn_wy_reconstruct",
             "gdn1_part",
             "gdn1_comb",
             "gdn1_upd",

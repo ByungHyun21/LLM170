@@ -153,32 +153,54 @@ impl W4a16Dec {
             skip_scan = true;
         }
         if !skip_scan && self.spec_on && self.spec_scan_on && (2..=8).contains(&t_len) {
-            // [A-1] 스펙 검증 — 토큰 루프 + 토큰별 상태 스냅샷(부분 수용
-            // 롤백 지점). 산술은 t=1 trio와 비트동일.
-            if self.gdn.dsnap == 0 {
+            // [A-1] 스펙 검증 — 토큰 루프 순차 스캔(출력·최종 상태 — 산술은
+            // t=1 trio와 비트동일) + [TreeWY 2.B 2026-10-12] WY solve(롤백
+            // 데이터 — 토큰별 상태 스냅샷 dsnap 폐지, 27B 1.50GiB→약 164MB).
+            if self.gdn.dwy_s0 == 0 {
                 return Err("GDN spec: enable_spec 미호출".into());
             }
+            // WY solve를 순차 스캔 **앞에** 발사 — 스캔이 상태를 전진시키므로
+            // S_0 판독·저장이 먼저여야 한다(동일 스트림 순서 보장).
+            let fw = self.cc.function("gdn_wy_solve")?;
+            let (mut w0, mut w1, mut w2, mut w3) = (
+                self.gdn.dk2,
+                self.gdn.dv2,
+                self.gdn.dbg,
+                self.gdn.dgst + (st_slot as u64) * 4,
+            );
+            let (mut w4, mut w5, mut w6, mut w7) = (
+                self.gdn.dwy_s0,
+                self.gdn.dwy_dc,
+                self.gdn.dwy_g,
+                self.gdn.dwy_k,
+            );
+            self.cc.launch(
+                fw,
+                dm.h_v as u32,
+                1,
+                128,
+                &mut crate::rawcuda::args::l13(
+                    &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5, &mut w6, &mut w7,
+                    &mut tl, &mut hk, &mut hv, &mut dd, &mut lay,
+                ),
+            )?;
             let f = self.cc.function("gdn_spec_scan")?;
-            let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6) = (
+            let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5) = (
                 self.gdn.dq2,
                 self.gdn.dk2,
                 self.gdn.dv2,
                 self.gdn.dbg,
                 self.gdn.dgst + (st_slot as u64) * 4,
-                self.gdn.dsnap,
                 self.gdn.dgo,
             );
-            let (mut tl, mut hk, mut hv, mut dd) =
-                (t_len as i32, dm.h_k as i32, dm.h_v as i32, dm.d as i32);
-            let (mut lay, mut nl) = (layer as i32, self.n_layers as i32);
             self.cc.launch(
                 f,
                 dm.h_v as u32,
                 1,
                 128,
-                &mut crate::rawcuda::args::l13(
-                    &mut s0, &mut s1, &mut s2, &mut s3, &mut s4, &mut s5, &mut s6, &mut tl,
-                    &mut hk, &mut hv, &mut dd, &mut lay, &mut nl,
+                &mut crate::rawcuda::args::l11(
+                    &mut s0, &mut s1, &mut s2, &mut s3, &mut s4, &mut s5, &mut tl, &mut hk,
+                    &mut hv, &mut dd, &mut lay,
                 ),
             )?;
             // [결함수정] return으로 gdn_chain_dev 전체를 빠져나가면 **게이트가
@@ -289,8 +311,9 @@ impl W4a16Dec {
     // ── 어텐션 ──
 
     /// GDN 체인 디바이스 상주 — xn·qkv·z(디바이스) → dgate.
-    /// [A-1] 스펙 검증 활성화 — GDN 토큰별 스냅샷 버퍼 확보(KMAX=8 고정).
-    /// VRAM: 8 × n_layers × h_v × 128×128 × 4B (35B 436MB · 27B 654MB).
+    /// [A-1→TreeWY 2.B 2026-10-12] 스펙 검증 활성화 — WY 표현 버퍼 확보
+    /// (S_0+dc+G+k — 27B 약 164MB·35B 약 69MB. 종전 dsnap 1.50GiB/640MiB
+    /// 폐지, conv 링 스냅샷 dsnap_ring은 유지).
     /// [2026-10-12] 스펙 활성 여부 — 스케줄러가 라운드 시도 전에 확인한다
     /// (비활성 상태의 라운드 시도가 요청을 죽이던 결함 — 실측 500).
     pub fn spec_on(&self) -> bool {
@@ -304,21 +327,36 @@ impl W4a16Dec {
             return Err("스트리밍(비상주 MoE) — 검증 체인 미지원(t>1 상주 전용)".into());
         }
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
-        if self.gdn.dsnap != 0 {
+        if self.gdn.dwy_s0 != 0 {
             self.spec_on = true;
             return Ok(());
         }
-        let elems = 8 * self.n_layers * dm.h_v * dm.d * dm.d;
-        self.gdn.dsnap = self.cc.alloc(elems * 4)?;
-        self.gdn.dsnap_ring = self.cc.alloc(8 * self.n_layers * 3 * dm.conv_ch() * 4)?;
+        // [TreeWY 2.B 2026-10-12] 토큰별 상태 스냅샷 dsnap(8×n_layers×
+        // h_v×128²×4B — 27B 1.50GiB·35B 640MiB) 폐지 → WY 표현: S_0 1개 +
+        // 유사값 dc + 누적감쇠 G + k행. 롤백은 gdn_wy_reconstruct 재구성
+        // (spec_rollback). 수치 판정 = PoC(evidence/TreeWY — fp32
+        // |ΔS_m| ≤1.2e-7, eval 클래스 채택 기준).
+        let st_elems = dm.n_gdn * dm.h_v * dm.d * dm.d;
+        self.gdn.dwy_s0 = self.cc.alloc(st_elems * 4)?;
+        self.gdn.dwy_dc = self.cc.alloc(8 * dm.n_gdn * dm.h_v * dm.d * 4)?;
+        self.gdn.dwy_g = self.cc.alloc(8 * dm.n_gdn * dm.h_v * 4)?;
+        self.gdn.dwy_k = self.cc.alloc(8 * dm.n_gdn * dm.k_len() * 4)?;
+        // conv 링 스냅샷은 유지(입력 이력 — WY 대상 아님). 첨자는 GDN 서수
+        // (layer·gi)라 n_gdn 스트라이드가 정확(종전 n_layers 할당은 여유분).
+        let ring_snap = 8 * dm.n_gdn * 3 * dm.conv_ch() * 4;
+        self.gdn.dsnap_ring = self.cc.alloc(ring_snap)?;
         // [A-1 진단] 슬롯 상태 저장 스크래치(상태 + conv 링) — save/load용.
         self.gdn.dsave = self.cc.alloc(
             self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4,
         )?;
-        // [§3.4 ② 2026-10-12] 통합 캐시 회계 — 스펙 상태(dsnap+dsnap_ring+
-        // dsave). 로그 전용(트랜셰 2부터 실제 예산 심사).
-        let spec_bytes = (elems * 4
-            + 8 * self.n_layers * 3 * dm.conv_ch() * 4
+        // [§3.4 ② 2026-10-12] 통합 캐시 회계 — 스펙 상태(WY+dsnap_ring+
+        // dsave). 트랜셰 2: 예산 압박 시 이 등록 자체가 ckpt·expert-lru를
+        // 퇴거시킬 수 있다(실제 해제는 함수 끝 ucache_sweep).
+        let spec_bytes = (st_elems * 4
+            + 8 * dm.n_gdn * dm.h_v * dm.d * 4
+            + 8 * dm.n_gdn * dm.h_v * 4
+            + 8 * dm.n_gdn * dm.k_len() * 4
+            + ring_snap
             + self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4)
             as u64;
         if let Err(e) = self.ucache.allocate(
@@ -359,6 +397,13 @@ impl W4a16Dec {
             }
         }
         self.spec_on = true;
+        // [§3.4 ② 트랜셰 2] 등록 중 압박 퇴거 실행 — spec:state가 퇴거됐다면
+        // WY S_0(dwy_s0)가 0화됐으므로 활성화를 되돌린다(해제 버퍼로
+        // 라운드 시도 방지 — 스케줄러는 spec_on()으로 선판정).
+        self.ucache_sweep()?;
+        if self.gdn.dwy_s0 == 0 {
+            self.spec_on = false;
+        }
         Ok(())
     }
 
