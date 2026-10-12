@@ -55,7 +55,7 @@ pub const GEMM_FFMA_TMAX: usize = 32;
 
 // [KVQ 채택 2026-10-10] int8 KV 단일 경로 — KvMode/LLM170_KVQ 제거.
 // 근거(실측): int8 PPL 델타 ±0.3% 이내(장문 27B +0.0025%) · 장문 프리필
-// +54%@16K(42.7→27.7s) · 단문 동급 — f32/int4 경로는 삭제(benchmark/eval.md).
+// +54%@16K(42.7→27.7s) · 단문 동급 — f32/int4 경로는 삭제(docs/eval.md — 로컬 원장).
 
 /// [R5 2026-10-10] 단일 버퍼(ptr+cap) — ensure_*가 쌍을 함께 갱신한다.
 #[derive(Clone, Copy, Default)]

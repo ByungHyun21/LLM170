@@ -47,7 +47,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
     let dir = arg_str(args, 0, "");
     if dir.is_empty() {
         return Err(
-            "w4a16-eval ppl <dir> --corpus <txt> [--out dump] — 예: w4a16-eval ppl ../models/Qwen3.8-27B-W4A16-AutoRound --corpus benchmark/eval/corpus-en.txt --out /tmp/eval-a.tsv".into(),
+            "w4a16-eval ppl <dir> --corpus <txt> [--out dump] — 예: w4a16-eval ppl ../models/Qwen3.8-27B-W4A16-AutoRound --corpus docs/eval/corpus-en.txt --out /tmp/eval-a.tsv".into(),
         );
     }
     let (mut corpus, mut from_tokens, mut out_path) =

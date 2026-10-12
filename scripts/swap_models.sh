@@ -213,10 +213,10 @@ case "$H2" in
 esac
 
 note "[11/11] J(수치 지문) — 128토큰 창 PPL 동결 대조 (Q2 · 서브토큰 드리프트)"
-FP="benchmark/eval/fingerprint.tsv"
+FP="docs/eval/fingerprint.tsv"   # 로컬 원장(docs/ — 푸시 제외)
 for pair in "$M_27B:27B" "$M_35B:35B"; do
   d="${pair%:*}"; n="${pair#*:}"
-  jout=$(timeout 900 "$BIN" w4a16-eval ppl "$d" --corpus benchmark/eval/corpus-en.txt \
+  jout=$(timeout 900 "$BIN" w4a16-eval ppl "$d" --corpus docs/eval/corpus-en.txt \
           --limit 128 --json 2> "$RUN/j-$n.log" | tail -1)
   if [ -z "$jout" ]; then
     echo "[w4a16] FAIL: $n 수치 지문 실행 실패 — ${RUN}/j-$n.log"; fail=1; continue
