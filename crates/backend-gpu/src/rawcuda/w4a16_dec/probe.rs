@@ -613,6 +613,7 @@ impl W4a16Dec {
         mbm: usize,
         mbn: usize,
         mthr: u32,
+        vs_gemv: bool,
     ) -> Result<String, String> {
         let _g = self.cc.guard()?;
         let (dq, ds, n, k) = self.lin_spec(name)?;
@@ -640,6 +641,22 @@ impl W4a16Dec {
         self.cc.h2d(dqm, qb)?;
         let da = self.cc.alloc(t * n * 4)?;
         let db = self.cc.alloc(t * n * 4)?;
+        // [G4 2026-10-12] 행-GEMV 비교 모드 — 같은 LCG 값의 f32 x(GEMV 계약).
+        let dx32 = if vs_gemv {
+            let x32: Vec<f32> = (0..t * k)
+                .map(|i| {
+                    ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5
+                })
+                .collect();
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+            let xb32 =
+                unsafe { std::slice::from_raw_parts(x32.as_ptr() as *const u8, x32.len() * 4) };
+            let d = self.cc.alloc(t * k * 4)?;
+            self.cc.h2d(d, xb32)?;
+            d
+        } else {
+            0
+        };
         let run = |me: &Self,
                    sym: &str,
                    pq: CUdeviceptr,
@@ -661,17 +678,36 @@ impl W4a16Dec {
                 ),
             )
         };
-        let r = (|| -> Result<(f64, f64), String> {
-            for _ in 0..3 {
+        let run_cmp = |me: &Self, py: CUdeviceptr| -> Result<(), String> {
+            if vs_gemv {
+                // [G4] t=1 행-GEMV(w4a16_gemv_g128 — grid n·64레인·f32 x).
+                let f = me.cc.function("w4a16_gemv_g128")?;
+                let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx32, py);
+                let (mut p_n, mut p_k) = (n as i32, k as i32);
+                me.cc.launch(
+                    f,
+                    n as u32,
+                    1,
+                    64,
+                    &mut crate::rawcuda::args::l6(
+                        &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k,
+                    ),
+                )
+            } else {
                 run(
-                    self,
+                    me,
                     "w4a16_gemm_g128_mma",
                     dq,
-                    da,
+                    py,
                     GEMM_MMA_M,
                     GEMM_MMA_N,
                     256,
-                )?;
+                )
+            }
+        };
+        let r = (|| -> Result<(f64, f64), String> {
+            for _ in 0..3 {
+                run_cmp(self, da)?;
                 run(self, msym, dqm, db, mbm, mbn, mthr)?;
             }
             self.cc.sync()?;
@@ -682,15 +718,7 @@ impl W4a16Dec {
             for _ in 0..rounds {
                 let t0 = std::time::Instant::now();
                 for _ in 0..per {
-                    run(
-                        self,
-                        "w4a16_gemm_g128_mma",
-                        dq,
-                        da,
-                        GEMM_MMA_M,
-                        GEMM_MMA_N,
-                        256,
-                    )?;
+                    run_cmp(self, da)?;
                 }
                 self.cc.sync()?;
                 ta += t0.elapsed().as_secs_f64();
@@ -705,14 +733,18 @@ impl W4a16Dec {
             Ok((ta * 1e3 / n, tb * 1e3 / n))
         })();
         let _ = self.cc.free(dx);
+        if vs_gemv {
+            let _ = self.cc.free(dx32);
+        }
         let _ = self.cc.free(dqm);
         let _ = self.cc.free(da);
         let _ = self.cc.free(db);
         let (ms_a, ms_b) = r?;
         let flop = 2.0 * n as f64 * k as f64 * t as f64;
+        let cmp = if vs_gemv { "gemv" } else { "mma" };
         Ok(format!(
             "marlin-bench {name} n={n} k={k} t={t} reps={reps}: \
-             mma {ms_a:.3}ms({:.1}TF) · marlin {ms_b:.3}ms({:.1}TF) · 비율 {:.3}×",
+             {cmp} {ms_a:.3}ms({:.1}TF) · marlin {ms_b:.3}ms({:.1}TF) · 비율 {:.3}×",
             flop * 1e-9 / (ms_a * 1e-3),
             flop * 1e-9 / (ms_b * 1e-3),
             ms_a / ms_b

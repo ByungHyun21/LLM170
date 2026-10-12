@@ -559,12 +559,25 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
                 .map(|c| u32::from_le_bytes(*c))
                 .collect();
             let qm = llm170_core::marlin::marlin_repack_q(&q, w.n_out as usize, w.n_in as usize)?;
-            let (msym, mbm, mbn, mthr) = if kern == "m16" {
-                ("w4a16_gemm_g128_marlin_m16", 16usize, 256usize, 128u32)
-            } else {
-                ("w4a16_gemm_g128_marlin", 64, 128, 256)
+            let (msym, mbm, mbn, mthr, vs_gemv) = match kern.as_str() {
+                // [G4 2026-10-12] m16v = m16 마린 vs 행-GEMV(t=1) — 재개 조건 (a) 판정.
+                "m16v" => (
+                    "w4a16_gemm_g128_marlin_m16",
+                    16usize,
+                    256usize,
+                    128u32,
+                    true,
+                ),
+                "m16" => (
+                    "w4a16_gemm_g128_marlin_m16",
+                    16usize,
+                    256usize,
+                    128u32,
+                    false,
+                ),
+                _ => ("w4a16_gemm_g128_marlin", 64, 128, 256, false),
             };
-            out.push(dec.marlin_bench(name, *t, *reps, &qm, msym, mbm, mbn, mthr)?);
+            out.push(dec.marlin_bench(name, *t, *reps, &qm, msym, mbm, mbn, mthr, vs_gemv)?);
         }
         return Ok(out.join("\n"));
     }
