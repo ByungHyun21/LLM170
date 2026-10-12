@@ -591,7 +591,7 @@ fn sample(args: &[String]) -> Result<String, String> {
     let (mut tv, mut chi2) = (0.0f64, 0.0f64);
     for i in 0..nv {
         let p = if idx.contains(&i) {
-            f64::from((base_logits[i] - mx).exp()) / zsum
+            f64::from(((base_logits[i] - mx) / temp).exp()) / zsum
         } else {
             0.0
         };
@@ -603,6 +603,24 @@ fn sample(args: &[String]) -> Result<String, String> {
         }
     }
     tv *= 0.5;
+    // [Q4-fx] 상위 편차 프로파일 — 편향 방향 진단(토큰·기대·관측·비).
+    let mut top: Vec<(usize, f64, u64)> = idx
+        .iter()
+        .map(|&i| {
+            let pp = f64::from((base_logits[i] - mx).exp()) / zsum;
+            (i, pp, counts[i])
+        })
+        .collect();
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    top.truncate(8);
+    let dump: Vec<String> = top
+        .iter()
+        .map(|(i, pp, c)| {
+            let e = pp * n as f64;
+            format!("{i}:exp={e:.0},obs={c},r={:.2}", *c as f64 / e)
+        })
+        .collect();
+    eprintln!("top8 {}", dump.join(" | "));
     let df = idx.len() - 1;
     let z = (chi2 / df as f64 - 1.0) * (df as f64 / 2.0).sqrt();
     Ok(format!(

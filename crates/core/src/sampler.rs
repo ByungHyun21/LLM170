@@ -734,6 +734,40 @@ mod tests {
         }
     }
 
+    /// [Q4-fx 2026-10-12] 온도 분포 계약 — t≠1.0에서 샘플 표본 분포가
+    /// 이론 softmax(logits/t)와 카이제곱 밴드 내인지(서버 경로 제거·코어
+    /// 직접 대조 — 하네스 편향 보고의 원인 분리用·영구 회귀).
+    #[test]
+    fn temperature_distribution_contract() {
+        let base = [2.0f32, 1.2, 0.4, -0.3, -1.1, -1.9, -2.7, -3.5];
+        for t in [0.8f32, 1.25] {
+            let mut s = Sampler::new(SamplerParams {
+                temperature: t,
+                seed: 0x5EED_C0DE,
+                ..Default::default()
+            });
+            let n = 200_000usize;
+            let mut counts = [0u64; 8];
+            for _ in 0..n {
+                let mut lg = base;
+                counts[s.sample(&mut lg) as usize] += 1;
+            }
+            let mx = base.iter().cloned().fold(f32::MIN, f32::max);
+            let zsum: f64 = base.iter().map(|&v| f64::from(((v - mx) / t).exp())).sum();
+            let mut chi2 = 0.0f64;
+            for (i, &v) in base.iter().enumerate() {
+                let e = f64::from(((v - mx) / t).exp()) / zsum * n as f64;
+                chi2 += (counts[i] as f64 - e).powi(2) / e;
+            }
+            let df = base.len() - 1;
+            let z = (chi2 / df as f64 - 1.0) * (df as f64 / 2.0).sqrt();
+            assert!(
+                z.abs() < 4.0,
+                "t={t}: chi2={chi2:.1} df={df} z={z:+.2} counts={counts:?}"
+            );
+        }
+    }
+
     #[test]
     fn prob_of_matches_sampling_frequency() {
         let l = logits(&[3.0, 2.0, 1.0, 0.5]);
