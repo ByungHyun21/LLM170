@@ -17,6 +17,8 @@ pub struct GpuEngine {
     staged: bool,
     /// GPU head 상주 여부(bf16 output.weight 업로드 성공).
     head_gpu: bool,
+    /// [MTP 2026-10-12] 모델 자체 MTP 초안기 활성(27B dense v1).
+    mtp: bool,
 }
 
 /// [R16] 프리필 청크 tmax 정책 — 순수 함수(테스트 표면).
@@ -62,12 +64,14 @@ impl GpuEngine {
                 w.ty == llm170_core::wtype::WType::Bf16,
             )?;
         }
+        let mtp = upload_mtp(&mut dec, &model)?;
         Ok(GpuEngine {
             model,
             dec,
             n_slots: n_slots.max(1),
             staged: llm170_diag::flag::on("LLM170_STAGED"),
             head_gpu,
+            mtp,
         })
     }
 
@@ -165,6 +169,12 @@ impl GpuEngine {
             let t = (n - i).min(tmax);
             let is_last = i + t == n;
             let part = &tokens[i..i + t];
+            // [MTP] 청크 시작 위치(메인 forward 전에 캡처 — forward가 전진).
+            let mtp_pos = if self.mtp {
+                Some(self.dec.slot_pos_of(seq))
+            } else {
+                None
+            };
             if t == 1 {
                 let row = self.model.embed_row(part[0]).map_err(|e| e.to_string())?;
                 if is_last && self.head_gpu {
@@ -199,6 +209,23 @@ impl GpuEngine {
                     last = Some(self.head_logits(&xn)?);
                 } else {
                     self.dec.forward_prefill(seq, &rows, t, false)?;
+                }
+            }
+            // [MTP] 호출열 = (P의 hidden, P+1의 토큰) → P+2 초안 — 토큰 시프트.
+            // 마지막 청크의 P=L-1은 토큰 at L이 없어 **유예**(마지막 hidden
+            // 저장 → 첫 샘플 후 mtp_first).
+            if let Some(ps) = mtp_pos {
+                let (calls, save_row): (&[u32], Option<usize>) = if is_last {
+                    (&tokens[i + 1..i + t], Some(t - 1))
+                } else {
+                    (&tokens[i + 1..=i + t], None)
+                };
+                let mut emb: Vec<f32> = Vec::with_capacity(calls.len() * h);
+                for &tk in calls {
+                    emb.extend_from_slice(&self.model.embed_row(tk).map_err(|e| e.to_string())?);
+                }
+                if let Err(err) = self.dec.mtp_prefill_chunk(seq, calls, &emb, ps, save_row) {
+                    eprintln!("# mtp(무시): {err}");
                 }
             }
             i += t;
@@ -243,6 +270,81 @@ impl GpuEngine {
             out.push(self.token_greedy(*s, &row)?);
         }
         Ok(out)
+    }
+
+    /// [MTP 2026-10-12] 초안기 활성.
+    pub fn mtp_enabled(&self) -> bool {
+        self.mtp
+    }
+
+    /// [MTP] 라운드 전 — 검증 체인 dres의 수용 접두 acc행을 hidden 어셈블리로
+    /// (롤백·보정 디코드 전에 호출해야 dres가 살아있다).
+    pub fn mtp_pre_round(&mut self, acc: usize) -> Result<(), String> {
+        self.dec.mtp_reset_hidden();
+        for r in 0..acc {
+            self.dec.mtp_push_hidden(r)?;
+        }
+        Ok(())
+    }
+
+    /// [MTP] 라운드 후 — 보정 행 hidden 추가 + t행 순전파 + 초안 보관.
+    /// pos_start = slot_pos - (수용+1) — 수용 초안·보정 토큰이 그 위치들이다.
+    pub fn mtp_post_round(
+        &mut self,
+        slot: usize,
+        accepted: &[u32],
+        corrected: u32,
+    ) -> Result<(), String> {
+        if !self.dec.mtp_slot_enabled(slot) {
+            return Ok(());
+        }
+        self.dec.mtp_push_hidden(0)?;
+        let mut toks: Vec<u32> = accepted.to_vec();
+        toks.push(corrected);
+        let mut embeds: Vec<f32> = Vec::with_capacity(toks.len() * self.model.hp.n_embd);
+        for &tk in &toks {
+            embeds.extend_from_slice(&self.model.embed_row(tk).map_err(|e| e.to_string())?);
+        }
+        let t = toks.len() as u32;
+        let pos_start = self.dec.slot_pos_of(slot).saturating_sub(t);
+        let draft = self.dec.mtp_run(slot, &toks, &embeds, pos_start)?;
+        self.dec.mtp_store_draft(slot, draft);
+        Ok(())
+    }
+
+    /// [MTP] 비-스펙 단독 디코드 후 — 리셋 + 1행 순전파 + 초안 보관.
+    /// (슬롯 off면 no-op — 접두 재사용 슬롯.)
+    pub fn mtp_single(&mut self, slot: usize, tok: u32) -> Result<(), String> {
+        if !self.dec.mtp_slot_enabled(slot) {
+            return Ok(());
+        }
+        self.mtp_pre_round(0)?;
+        self.mtp_post_round(slot, &[], tok)
+    }
+
+    /// [MTP] 프리필 직후 첫 초안 — 유예 호출 (prev hidden, 첫 토큰) → 초안.
+    pub fn mtp_first(&mut self, slot: usize, tok: u32) -> Result<(), String> {
+        if !self.dec.mtp_slot_enabled(slot) {
+            return Ok(());
+        }
+        let emb = self.model.embed_row(tok).map_err(|e| e.to_string())?;
+        let d = self.dec.mtp_run_prev(slot, tok, &emb)?;
+        self.dec.mtp_store_draft(slot, d);
+        Ok(())
+    }
+
+    /// [MTP] 슬롯 재사용(접두 캐시) — KV 정합 없음: 초안 비활성/재개.
+    pub fn mtp_slot_reused(&mut self, slot: usize) {
+        self.dec.mtp_slot_off(slot);
+    }
+
+    pub fn mtp_slot_fresh(&mut self, slot: usize) {
+        self.dec.mtp_slot_on(slot);
+    }
+
+    /// [MTP] 초안 소비(현 위치 유효분만).
+    pub fn mtp_take_draft(&mut self, slot: usize) -> Option<u32> {
+        self.dec.mtp_take_draft(slot)
     }
 
     /// 단일 greedy 디코드.
@@ -571,7 +673,12 @@ pub(crate) fn upload_model(
     }
     dec.set_gdn(gd, &cw, &ab, &alog, &dtb, &gnw)?;
     // 4) 어텐션 q/k 노름(+1 — f32_vec 보정).
-    let n_attn = hp.n_layer / interval;
+    // [MTP 2026-10-12] MTP 존재 시 가상 전체-어텐션 층 1개 추가(n_attn+1,
+    // 마지막 인덱스) — KV 1층 확장 + q/k_norm 행 추가. 커널 무수정.
+    let mtp_attn = model
+        .w_raw("mtp.layers.0.self_attn.q_proj.weight")
+        .is_some();
+    let n_attn = hp.n_layer / interval + usize::from(mtp_attn);
     let ad = AttnDims {
         n_attn,
         q_heads: hp.n_head,
@@ -582,7 +689,7 @@ pub(crate) fn upload_model(
         interval,
     };
     let (mut qnw, mut knw): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
-    for ai in 0..n_attn {
+    for ai in 0..n_attn - usize::from(mtp_attn) {
         let il = ai * interval + interval - 1;
         qnw.extend(
             model
@@ -595,8 +702,86 @@ pub(crate) fn upload_model(
                 .map_err(|e| e.to_string())?,
         );
     }
+    if mtp_attn {
+        qnw.extend(
+            model
+                .f32_vec("mtp.layers.0.self_attn.q_norm.weight")
+                .map_err(|e| e.to_string())?,
+        );
+        knw.extend(
+            model
+                .f32_vec("mtp.layers.0.self_attn.k_norm.weight")
+                .map_err(|e| e.to_string())?,
+        );
+    }
     dec.set_attn(ad, &qnw, &knw)?;
     Ok(())
+}
+
+/// [MTP 2026-10-12] MTP 블록 업로드 — 27B dense 한정(v1). 35B MoE MTP는
+/// 전문가 스택(3D bf16)이라 차기. 성공 시 true.
+pub(crate) fn upload_mtp(
+    dec: &mut llm170_backend_gpu::W4a16Dec,
+    model: &llm170_core::qwen35::Model,
+) -> Result<bool, String> {
+    // [MTP 2026-10-12 — 파킹] 구조·시맨틱은 vLLM qwen3_5_mtp + 드라이버
+    // 주석으로 검증 완료((P hidden, P+1 토큰)→P+2 페어링·프리필 시프트·
+    // 유예 호출·가상 어텐션 층·norm.dxn 소스·gemv_t t≤8 디스패치), 그러나
+    // **t=1 어텐션(fwd3s)이 NaN**을 내는 잔여 결함이 남아 초안 수용률 0%.
+    // 진단 실측(2026-10-12): part_q의 split0 부분합 m=11.95(유한)·l/acc=NaN,
+    // 유효 입력 전부 유한 확인(dpp=pos 정확·qg/dqh/post5_x nan=0·KV int8+스케일
+    // 유한) — 커널 내부(온라인 소프트맥스 청크 스텝)에서 NaN 발생. t>8(part_qg)
+    // 프리필 경로는 정상. 다음 도구: MTP 호출의 part_q에 ncu, 또는 최소 재현
+    // (동일 입력으로 단독 호출). 활성 시 서빙 −15%라 비활성 유지.
+    // 재개 절차: 이 결함 수정 → MTP_ENABLED=true → 수용률≥40% 확인 →
+    // 서빙 A/B·스모크. 진단 스캐폴딩은 제거됨(원장 기록 참조).
+    const MTP_ENABLED: bool = false;
+    if !MTP_ENABLED || model.w_raw("mtp.fc.weight").is_none() {
+        return Ok(false);
+    }
+    if model
+        .w_raw("mtp.layers.0.mlp.experts.gate_up_proj")
+        .is_some()
+    {
+        return Ok(false); // MoE MTP — 차기
+    }
+    let mut q_out = 0usize;
+    for name in [
+        "mtp.fc.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.up_proj.weight",
+        "mtp.layers.0.mlp.down_proj.weight",
+    ] {
+        let w = model
+            .w_raw(name)
+            .ok_or_else(|| format!("mtp: {name} 부재"))?;
+        if name.ends_with("attn.q_proj.weight") {
+            q_out = w.n_out as usize;
+        }
+        dec.upload_plain(name, w.data, w.n_out as usize, w.n_in as usize)?;
+    }
+    let mut norms: Vec<f32> = Vec::new();
+    for name in [
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.norm.weight",
+    ] {
+        norms.extend(model.f32_vec(name).map_err(|e| e.to_string())?);
+    }
+    let hp = &model.hp;
+    let ffn = model
+        .w_raw("mtp.layers.0.mlp.gate_proj.weight")
+        .map(|w| w.n_out as usize)
+        .unwrap_or(0);
+    dec.set_mtp(&norms, q_out, hp.n_kv * hp.head_dim, ffn)?;
+    let _ = hp;
+    Ok(true)
 }
 
 #[cfg(test)]

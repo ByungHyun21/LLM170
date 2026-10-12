@@ -218,7 +218,15 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
         // 종전 logits 경로 합류는 토큰당 로짓 993KB pageable D2H + CPU
         // argmax(248K)를 지불했다(실측 ~0.5ms/토큰). 샘플링 슬롯만 logits 판.
         match e.decode_greedy(i, slots[i].next) {
-            Ok(t) => slot_emit(&mut slots[i], t),
+            Ok(t) => {
+                // [MTP] 비-스펙 단독 디코드 후 초안 생성(다음 라운드 소비).
+                if e.mtp_enabled()
+                    && let Err(err) = e.mtp_single(i, t)
+                {
+                    eprintln!("# mtp(무시): {err}");
+                }
+                slot_emit(&mut slots[i], t);
+            }
             Err(err) => slot_fail(&mut slots[i], format!("decode_greedy: {err}")),
         }
     }
@@ -504,6 +512,13 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         slots[i].prefilled = start;
                         if start == slots[i].job.as_ref().unwrap().tokens.len() {
                             slot_emit(&mut slots[i], t);
+                            // [MTP] 프리필 완료 — 유예 호출(prev hidden, 첫
+                            // 토큰)로 첫 초안 생성(다음 틱 스펙 라운드 소비).
+                            if eng.0.mtp_enabled()
+                                && let Err(err) = eng.0.mtp_first(i, t)
+                            {
+                                eprintln!("# mtp(무시): {err}");
+                            }
                         }
                     }
                     // QA-1: 프리필 실패 적립 — 종전엔 무시돼 prefilled가 영구
@@ -660,6 +675,13 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
             }
         }
     }
+    // [MTP] 접두 재사용 슬롯은 MTP KV 정합이 없다 — 초안 비활성(검증은
+    // 정본이라 손실은 없지만, 초안 비용만 지불하게 된다).
+    if reuse > 0 {
+        eng.0.mtp_slot_reused(i);
+    } else {
+        eng.0.mtp_slot_fresh(i);
+    }
     let prev = std::mem::take(&mut slots[i].cached);
     let mut sampler_new = j.sampler.clone().map(llm170_core::sampler::Sampler::new);
     if let Some(sm) = &mut sampler_new
@@ -707,7 +729,12 @@ fn spec_round(
     hist.extend_from_slice(&s.tokens);
     // [§7.5] 적응 폭 — 전량 수용이면 +1(≤8 — 검증 t≤8이 TR GEMV 도메인),
     // 부진(≤1)이면 4로 복귀. 초안 폭은 수용 판정만 좌우(값 불변).
-    let draft = llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1);
+    // [MTP 2026-10-12] 초안 소스: 모델 자체 MTP 헤드(현 위치 유효분) 우선,
+    // 없으면 n-gram. 초안은 검증이 정본 — 소스 교체는 정책 계층(무손실).
+    let draft: Vec<u32> = match e.mtp_take_draft(i) {
+        Some(d) => vec![d],
+        None => llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1),
+    };
     if draft.is_empty() {
         return Ok(false);
     }
@@ -723,6 +750,18 @@ fn spec_round(
     let mut acc = 0usize;
     while acc < draft.len() && toks[acc] == draft[acc] {
         acc += 1;
+    }
+    if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
+        eprintln!(
+            "[mtp-dbg] draft={draft:?} verify0={:?} acc={acc}",
+            toks.first()
+        );
+        s.spec_miss = 0; // 진단: 게이트 우회(수용률 계측)
+    }
+    // [MTP] 롤백·보정 전에 검증 dres의 수용 접두를 초안기 hidden으로 스냅샷.
+    let spec_mtp = e.mtp_enabled();
+    if spec_mtp && let Err(err) = e.mtp_pre_round(acc) {
+        eprintln!("# mtp(무시): {err}");
     }
     let last = if acc >= 1 { draft[acc - 1] } else { s.next };
     if acc >= 1 {
@@ -743,6 +782,9 @@ fn spec_round(
         s.spec_k = 4;
     }
     let corr = e.decode_greedy(i, last)?;
+    if spec_mtp && let Err(err) = e.mtp_post_round(i, &draft[..acc], corr) {
+        eprintln!("# mtp(무시): {err}");
+    }
     for &tk in &draft[..acc] {
         slot_emit(s, tk);
     }

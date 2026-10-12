@@ -314,6 +314,21 @@ pub struct W4a16Dec {
     /// 전문가 스크래치와 충돌(게이트/업이 전문가보다 먼저 계산됨).
     dsh: [CUdeviceptr; 2],
     dsh_cap: usize,
+    /// [MTP 2026-10-12] 모델 자체 MTP 초안기 — 가중치는 plain 레지스트리
+    /// (이름 참조), 여기는 버퍼/상태만.
+    mtp_ok: bool,
+    mtp_nw: CUdeviceptr,
+    mtp_zero: CUdeviceptr,
+    mtp_buf: CUdeviceptr,
+    mtp_off: [usize; 17],
+    mtp_prev_off: usize,
+    mtp_layer: usize,
+    mtp_rows: usize,
+    mtp_ffn: usize,
+    mtp_draft: Vec<Option<u32>>,
+    mtp_pos: Vec<u32>,
+    mtp_prev_pos: Vec<u32>,
+    mtp_off_slot: Vec<bool>,
     /// [B4-2 2026-10-12] 스트리밍 전문가 LRU 캐시(층별 K×3proj q/s).
     /// 가중치 불변 → hit 재사용은 수치 무변화(h2d 생략만). 층별 독립 LRU.
     mcache_q: CUdeviceptr,
@@ -484,6 +499,7 @@ mod graphs;
 mod kernels;
 mod mem;
 mod moe;
+mod mtp;
 mod prefill;
 mod probe;
 mod upload;
@@ -527,6 +543,19 @@ impl W4a16Dec {
             ev_fork: Vec::new(),
             dsh: [0, 0],
             dsh_cap: 0,
+            mtp_ok: false,
+            mtp_nw: 0,
+            mtp_zero: 0,
+            mtp_buf: 0,
+            mtp_off: [0; 17],
+            mtp_prev_off: 0,
+            mtp_layer: 0,
+            mtp_rows: 0,
+            mtp_ffn: 0,
+            mtp_draft: Vec::new(),
+            mtp_pos: Vec::new(),
+            mtp_prev_pos: Vec::new(),
+            mtp_off_slot: Vec::new(),
             mcache_q: 0,
             mcache_s: 0,
             mcache_k: 0,

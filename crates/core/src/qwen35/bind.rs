@@ -241,6 +241,26 @@ pub fn eng(name: &str) -> Option<Eng> {
             perm: 0,
         });
     }
+    // [MTP 2026-10-12] MTP 블록 — 스토어 키가 HF 이름 그대로. 노름 = Synth
+    // (plus1 — 본체 norm 계약), 2D .weight = Plain(BF16). 3D 전문가 스택
+    // (35B MoE MTP)은 미지원(None — 차기).
+    if name.starts_with("mtp.") {
+        if name.ends_with("norm.weight") {
+            return Some(Eng::Synth {
+                name: name.into(),
+                plus1: true,
+                neg_exp: false,
+                perm: 0,
+            });
+        }
+        if name.ends_with(".weight") {
+            return Some(Eng::Plain {
+                name: name.into(),
+                rows_perm: false,
+            });
+        }
+        return None;
+    }
     let rest = name.strip_prefix("blk.")?;
     let (il, suf) = rest.split_once('.')?;
     let l = format!("model.language_model.layers.{il}");
