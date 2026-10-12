@@ -90,6 +90,10 @@ pub struct CudaCtx {
     /// free_vmm이 언맵/반납에 필요한 핸들·크기를 여기서 찾는다
     /// (alloc_vmm은 CUdeviceptr만 반환하는 계약).
     vmm: std::cell::RefCell<HashMap<CUdeviceptr, (ffi::CUmemGenericAllocationHandle, usize)>>,
+    /// [D2 검수 2026-10-13] 디바이스 할당 대장 — 로드 실패 시 부분 적재
+    /// 정리(free_all)용. 정상 경로에서는 사용하지 않는다(프로세스 수명 =
+    /// 컨텍스트 수명, 버퍼 포인터는 엔진이 계속 소유).
+    allocs: std::cell::RefCell<Vec<CUdeviceptr>>,
 }
 
 /// 컨텍스트 스코프 가드 — 진입 시 현재 컨텍스트를 이 ctx로 전환,
@@ -191,6 +195,7 @@ impl CudaCtx {
                 copy_d2h: std::cell::Cell::new((0, 0, 0)),
                 copy_d2d: std::cell::Cell::new((0, 0, 0)),
                 vmm: std::cell::RefCell::new(HashMap::new()),
+                allocs: std::cell::RefCell::new(Vec::new()),
             })
         }
     }

@@ -13,7 +13,32 @@ impl CudaCtx {
                     ffi::err_text(r)
                 ));
             }
+            // [D2 검수 2026-10-13] 정리 대장 등록 — free_all(로드 실패 경로) 전용.
+            self.allocs.borrow_mut().push(p);
             Ok(p)
+        }
+    }
+
+    /// [D2 검수 2026-10-13] 부분 적재 정리 — 등록된 디바이스 할당 전량 해제.
+    /// **로드 실패 경로 전용**(성공 엔진에서는 호출 금지 — 버퍼 포인터를
+    /// 엔진이 계속 소유하므로 이중 해제가 된다). 재시도 루프가 VRAM을
+    /// 되찾지 못하던 문제(35B MTP 로드 실패 → 후속 시도 전부 OOM)의 해소.
+    pub fn free_all(&self) {
+        // SAFETY: 대장은 alloc 성공 시점에만 기록되고 1회 drain으로 중복 해제
+        // 없음. 로드 실패는 컨텍스트를 만든 동일 스레드에서 즉시 처리되므로
+        // 전환만 보장하면 유효 핸들이다.
+        unsafe {
+            let r = (self.drv.ctx_set_current)(self.ctx);
+            if r != CUDA_SUCCESS {
+                eprintln!("rawcuda: free_all ctx 전환 실패: {}", ffi::err_text(r));
+                return;
+            }
+            for p in self.allocs.borrow_mut().drain(..) {
+                let r = (self.drv.mem_free)(p);
+                if r != CUDA_SUCCESS {
+                    eprintln!("rawcuda: free_all cuMemFree 실패: {}", ffi::err_text(r));
+                }
+            }
         }
     }
 

@@ -116,6 +116,13 @@ pub(crate) fn load_gpu_retry(
             }
             Err(err) => {
                 eprintln!("# gpu 엔진 로드 재시도 {}/5: {err}", i + 1);
+                // [D2 검수 수정 2026-10-13] 재시도는 간헐 클래스(모듈 로드
+                // ENOPT 계열) 한정 — 계약 오류(텐서 부재 등)는 즉시 실패로
+                // 5회 OOM 연쇄(무의미·오해 소지)를 끊는다. 실패한 시도의
+                // 부분 할당은 GpuEngine::load가 free_all_device로 정리한다.
+                if !(err.contains("ENOPT") || err.contains("cuModule")) {
+                    panic!("gpu 엔진 로드 실패(재시도 불가): {} — {err}", p.display());
+                }
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }

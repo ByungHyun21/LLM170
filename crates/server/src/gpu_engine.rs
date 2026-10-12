@@ -38,7 +38,31 @@ impl GpuEngine {
         let hp = model.hp.clone();
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
-        upload_model(&mut dec, &model, ctx)?;
+        // [D2 검수 2026-10-13] 적재 실패 시 부분 할당 정리 — 재시도 루프가
+        // VRAM을 되찾지 못하던 문제(첫 시도 실패 후 전부 OOM)의 해소.
+        match Self::fill(&mut dec, &model, ctx) {
+            Ok((head_gpu, mtp)) => Ok(GpuEngine {
+                model,
+                dec,
+                n_slots: n_slots.max(1),
+                head_gpu,
+                mtp,
+            }),
+            Err(e) => {
+                dec.free_all_device();
+                Err(e)
+            }
+        }
+    }
+
+    /// [D2 검수 2026-10-13] 컨텍스트 생성 **후** 적재 본체(head·embed·MTP).
+    /// 실패는 호출부(load)가 `dec.free_all_device()`로 정리한다.
+    fn fill(
+        dec: &mut W4a16Dec,
+        model: &llm170_core::qwen35::Model,
+        ctx: usize,
+    ) -> Result<(bool, bool), String> {
+        upload_model(dec, model, ctx)?;
         // 5) head — bf16 output.weight는 GPU 커널 경로(아니면 CPU 참조).
         let mut head_gpu = false;
         if let Some(w) = model.w("output.weight")
@@ -61,14 +85,8 @@ impl GpuEngine {
                 w.ty == llm170_core::wtype::WType::Bf16,
             )?;
         }
-        let mtp = upload_mtp(&mut dec, &model)?;
-        Ok(GpuEngine {
-            model,
-            dec,
-            n_slots: n_slots.max(1),
-            head_gpu,
-            mtp,
-        })
+        let mtp = upload_mtp(dec, model)?;
+        Ok((head_gpu, mtp))
     }
 
     /// 메모리 분류(모니터링) — (상주 가중치, KV, CPU 오프로드, PLE 오프로드).
@@ -862,11 +880,14 @@ pub(crate) fn upload_mtp(
     if !MTP_ENABLED || model.w_raw("mtp.fc.weight").is_none() {
         return Ok(false);
     }
-    if model
-        .w_raw("mtp.layers.0.mlp.experts.gate_up_proj")
-        .is_some()
-    {
-        return Ok(false); // MoE MTP — 차기
+    // [D1 검수 수정 2026-10-13] dense MTP 마커 필수 — 종전
+    // `experts.gate_up_proj` 검사는 bind가 None(비 .weight 이름)이라 w_raw가
+    // 볼 수 없어 **무력**했고(35B MoE MTP가 dense 경로로 새어
+    // `mtp.layers.0.mlp.gate_proj.weight 부재`로 로드 실패), 이 자리가
+    // MoE MTP의 스킵 지점이다(자동 n-gram 폴백). MoE MTP 지원은 차기.
+    if model.w_raw("mtp.layers.0.mlp.gate_proj.weight").is_none() {
+        eprintln!("# mtp 스킵: dense MTP 아님(MoE MTP는 차기) — n-gram 폴백");
+        return Ok(false);
     }
     let mut q_out = 0usize;
     for name in [

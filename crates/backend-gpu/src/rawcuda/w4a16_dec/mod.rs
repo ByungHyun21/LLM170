@@ -801,6 +801,13 @@ impl W4a16Dec {
         &self.cc.device_name
     }
 
+    /// [D2 검수 2026-10-13] **로드 실패 경로 전용** — 이 컨텍스트의 등록된
+    /// 디바이스 할당 전량 해제(재시도 루프의 VRAM 회수). 성공 엔진에서는
+    /// 절대 호출 금지(버퍼 포인터를 엔진이 계속 소유 — 이중 해제).
+    pub fn free_all_device(&self) {
+        self.cc.free_all();
+    }
+
     /// 상주 선형 GEMV — x f32 → (RN-even) f16 → 커널 → y f32 [n].
     pub fn gemv_host(&mut self, name: &str, x: &[f32]) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
