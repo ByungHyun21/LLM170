@@ -21,7 +21,7 @@
 /// GPTQ qweight [n][k/8] → marlin B [k/16][n/64][128] u32 (no-g_idx).
 /// 입력 니블 = (n, k) 가중치의 4bit (lsb-first, k 오름차순).
 pub fn marlin_repack_q(q: &[u32], n: usize, k: usize) -> Result<Vec<u32>, String> {
-    if k % 16 != 0 || n % 64 != 0 {
+    if !k.is_multiple_of(16) || !n.is_multiple_of(64) {
         return Err(format!("marlin repack: k={k}%16·n={n}%64 계약 위반"));
     }
     let k8 = k / 8;
@@ -65,7 +65,7 @@ pub fn marlin_repack_q(q: &[u32], n: usize, k: usize) -> Result<Vec<u32>, String
 
 /// 스케일 [n][k/gs] f32 → marlin [k/gs][n] (64-청크 순열 포함).
 pub fn marlin_permute_scales(s: &[f32], n: usize, k: usize, gs: usize) -> Result<Vec<f32>, String> {
-    if n % 64 != 0 || k % gs != 0 {
+    if !n.is_multiple_of(64) || !k.is_multiple_of(gs) {
         return Err(format!("marlin scales: n={n}%64·k={k}%gs={gs} 계약 위반"));
     }
     let kg = k / gs;

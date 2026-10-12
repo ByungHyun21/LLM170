@@ -29,6 +29,12 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut bench_gemv_t: Option<(String, usize, usize)> = None;
     let mut bench_plain: Option<(String, usize, usize)> = None;
     let mut mma_diff: Option<(String, usize)> = None;
+    let mut marlin_diff: Option<(String, usize)> = None; // [marlin S2] A/B 재패킹 게이트
+    let mut marlin_selfcheck: Option<(usize, usize, usize)> = None; // [marlin S2] 격리 자체점검 (t, k, n)
+    let mut marlin_bench: Vec<(String, usize, usize)> = Vec::new(); // [marlin S2] mma 대비 벤치
+    let mut marlin_ref: Option<(String, usize)> = None; // [marlin S2] 실무게 64행 참조 대조
+    let mut mode_ref: u8 = 0; // 0 실값, 1 s→1, 2 x→1, 3 둘 다 1
+    let mut kcap: usize = usize::MAX; // ref k 상한(이분탐색용)
     let mut moe_topk_check: Option<(usize, usize, usize)> = None;
     let mut h2d_mb = 0usize;
     let mut bench: Option<(String, usize, usize)> = None; // (lin, t, reps)
@@ -93,6 +99,45 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--mma-diff requires t")?;
                 mma_diff = Some((name, t));
+            }
+            "--marlin-diff" => {
+                let name = arg(&mut it, "--marlin-diff requires a name")?.to_string();
+                let t = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--marlin-diff requires t")?;
+                marlin_diff = Some((name, t));
+            }
+            "--marlin-ref" => {
+                let name = arg(&mut it, "--marlin-ref requires a name")?.to_string();
+                let t = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--marlin-ref requires t")?;
+                mode_ref = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                kcap = it.next().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+                marlin_ref = Some((name, t));
+            }
+            "--marlin-selfcheck" => {
+                let t = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--marlin-selfcheck requires t")?;
+                let k = it.next().and_then(|v| v.parse().ok()).unwrap_or(128usize);
+                let n = it.next().and_then(|v| v.parse().ok()).unwrap_or(128usize);
+                marlin_selfcheck = Some((t, k, n));
+            }
+            "--marlin-bench" => {
+                let name = arg(&mut it, "--marlin-bench requires a name")?.to_string();
+                let t = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--marlin-bench requires t")?;
+                let reps = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--marlin-bench requires reps")?;
+                marlin_bench.push((name, t, reps));
             }
             "--bench-plain" => {
                 let name = arg(&mut it, "--bench-plain requires a name")?.to_string();
@@ -233,6 +278,151 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     }
     if let Some((name, t)) = &mma_diff {
         return dec.mma_diff_check(name, *t);
+    }
+    // [marlin S2 2026-10-12] marlin B 배치 GEMM A/B — 원본 q를 core::marlin
+    // (호스트 재패킹)으로 변환해 신규 커널 vs 기존 mma 커널 판정. g128·f16 전용.
+    if let Some((name, t)) = &marlin_diff {
+        let w = model
+            .w_raw(name)
+            .ok_or_else(|| format!("--marlin-diff {name}: 무게 없음"))?;
+        if w.ty != llm170_core::wtype::WType::W4a16Split || w.group != 128 || w.scale_bf16 {
+            return Err(format!(
+                "--marlin-diff {name}: g128·f16 split 전용(ty={:?} group={} bf16={})",
+                w.ty, w.group, w.scale_bf16
+            ));
+        }
+        let q: Vec<u32> = w
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        let qm = llm170_core::marlin::marlin_repack_q(&q, w.n_out as usize, w.n_in as usize)?;
+        return dec.marlin_diff_check(name, *t, &qm);
+    }
+    // [marlin S2 디버그] 커널 격리 자체점검 — 합성 n=128·k=128·s=1·x=1.
+    // 기대 = 정수 Σ(nib−8) (f32 누적 순서 무관 비트정확).
+    if let Some((t, k, n)) = marlin_selfcheck {
+        let nib_at = |kk: usize, nn: usize| ((kk * 7 + nn * 3) % 16) as u32;
+        let mut q = vec![0u32; n * (k / 8)];
+        for nn in 0..n {
+            for kk in 0..k {
+                q[nn * (k / 8) + kk / 8] |= nib_at(kk, nn) << ((kk % 8) * 4);
+            }
+        }
+        // 스케일·x = 2의 거듭제곱(정확 f16) — 지수 오배치 시 기대가 어긋난다.
+        let mut s = vec![0u16; n * (k / 128)];
+        for nn in 0..n {
+            for gg in 0..(k / 128) {
+                s[nn * (k / 128) + gg] = ((15 - ((nn + gg) % 5)) as u16) << 10;
+            }
+        }
+        let x16: Vec<u16> = (0..t * k)
+            .map(|i| ((15 - ((i / k + (i % k) / 8) % 4)) as u16) << 10)
+            .collect();
+        let qm = llm170_core::marlin::marlin_repack_q(&q, n, k)?;
+        let sf = |h: u16| -> f64 {
+            let e = ((h >> 10) & 0x1F) as i32;
+            let m = (h & 0x3FF) as f64 / 1024.0;
+            (1.0 + m) * 2f64.powi(e - 15)
+        };
+        let mut expect = vec![0f32; t * n];
+        for r in 0..t {
+            for nn in 0..n {
+                let mut acc = 0f64;
+                for kk in 0..k {
+                    let sc = sf(s[nn * (k / 128) + kk / 128]);
+                    let xv = sf(x16[r * k + kk]);
+                    acc += (nib_at(kk, nn) as f64 - 8.0) * sc * xv;
+                }
+                expect[r * n + nn] = acc as f32;
+            }
+        }
+        return dec.marlin_selfcheck(&qm, &s, &x16, &expect, t, n, k);
+    }
+    // [marlin S2 디버그] 실무게 64행 슬라이스 vs 호스트 기대값 — 커널 단독
+    // 정오 판정(스케일·디퀀트 포함). 실패 시 (행,열,기대,실제)를 보여준다.
+    if let Some((name, t)) = &marlin_ref {
+        let t = *t;
+        let w = model
+            .w_raw(name)
+            .ok_or_else(|| format!("--marlin-ref {name}: 무게 없음"))?;
+        if w.ty != llm170_core::wtype::WType::W4a16Split || w.group != 128 || w.scale_bf16 {
+            return Err(format!("--marlin-ref {name}: g128·f16 split 전용"));
+        }
+        let (n, k) = (64usize, kcap.min(w.n_in as usize));
+        let q: Vec<u32> = w.data[..n * (k / 8) * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        let s16: Vec<u16> = w.aux.ok_or("aux 부재")?[..n * (k / 128) * 2]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        let qm = llm170_core::marlin::marlin_repack_q(&q, n, k)?;
+        let x16: Vec<u16> = (0..t * k)
+            .map(|i| {
+                let v =
+                    ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5;
+                llm170_backend_gpu::f32_to_f16(v)
+            })
+            .collect();
+        // 모드: 0=실스케일·실x · 1=s→1 · 2=x→1 · 3=둘 다 1(가중치만).
+        let mode = mode_ref;
+        let mut s_use = s16.clone();
+        let mut x_use = x16.clone();
+        if mode == 1 || mode == 3 {
+            s_use.fill(0x3C00);
+        }
+        if mode == 2 || mode == 3 {
+            x_use.fill(0x3C00);
+        }
+        // 기대값 — 디퀀트 후 f16(커널과 동일 RNE), 누적은 f64(순서 무관).
+        let mut expect = vec![0f32; t * n];
+        for r in 0..t {
+            for nn in 0..n {
+                let mut acc = 0f64;
+                for kk in 0..k {
+                    let nib = ((q[nn * (k / 8) + kk / 8] >> ((kk % 8) * 4)) & 0xF) as i32 - 8;
+                    let sc = llm170_core::quant::half_to_f32(s_use[nn * (k / 128) + kk / 128]);
+                    let wf =
+                        llm170_backend_gpu::h2f(llm170_backend_gpu::f32_to_f16(nib as f32 * sc));
+                    acc += (wf as f64) * (llm170_backend_gpu::h2f(x_use[r * k + kk]) as f64);
+                }
+                expect[r * n + nn] = acc as f32;
+            }
+        }
+        return dec.marlin_selfcheck(&qm, &s_use, &x_use, &expect, t, n, k);
+    }
+    // [marlin S2] mma 대비 커널 벤치 — 같은 입력·grid·회차(인터리브).
+    if !marlin_bench.is_empty() {
+        let mut out = Vec::new();
+        for (name, t, reps) in &marlin_bench {
+            let w = model
+                .w_raw(name)
+                .ok_or_else(|| format!("--marlin-bench {name}: 무게 없음"))?;
+            if w.ty != llm170_core::wtype::WType::W4a16Split || w.group != 128 || w.scale_bf16 {
+                return Err(format!(
+                    "--marlin-bench {name}: g128·f16 split 전용(ty={:?} group={} bf16={})",
+                    w.ty, w.group, w.scale_bf16
+                ));
+            }
+            let q: Vec<u32> = w
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
+                .collect();
+            let qm = llm170_core::marlin::marlin_repack_q(&q, w.n_out as usize, w.n_in as usize)?;
+            out.push(dec.marlin_bench(name, *t, *reps, &qm)?);
+        }
+        return Ok(out.join("\n"));
     }
     // 마이크로벤치(진단): 플레인 GEMM(t) 반복 — v1/v3 vs mma(LLM170_TC).
     if let Some((name, bt, reps)) = &bench_plain {

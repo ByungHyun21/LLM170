@@ -984,3 +984,215 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64(
 #undef DGRP_M
 #undef DGRP_N
 #undef DGRP_KC
+
+// ── [marlin 스테이지 2 착수 2026-10-12] marlin B 배치 mma GEMM(g128·f16) ──
+// 소비 레이아웃 = core::marlin::marlin_repack_q 산출물 [k/16][n/64][128] u32.
+// 타일 내 u32 index = lane*4 + w (repack.cu의 th_id*4+warp_id 그대로 — lane과
+// th_id의 (tc_col, tc_row) 역할이 동일). u32 w = mma B 프래그먼트 쌍:
+//   니블 {0,4} = k행 {2t,2t+1}·열 n16, 니블 {1,5} = 같은 열 k {2t+8,2t+9},
+//   그리고 q>>8의 니블 {2,6}/{3,7} = 열 n16+8의 같은 k행들 → u32 하나가
+//   프래그먼트 2개(f=2w, 2w+1)를 직결(마린 원문 marlin_template.h의
+//   b_quant_1 = b_quant_0 >> 8과 동형).
+// dequant = marlin 매직 상수(lop3 0xEA + hsub2/hfma2). 값은 종전
+// deq_pair_b와 f16 라운딩 동일 — (n−8)·s의 단일 RNE(exact 곱의 RNE).
+// 스케일 = 열별 f16 hmul2(청크 KC=64 ⊂ g128 그룹 1개 → 청크당 1회 로드).
+// x·k 순서가 기존 w4a16_gemm_g128_mma와 같으므로 출력 비트동일 전제
+// (A/B 게이트가 판정). 레퍼런스 대조: source/GPTQModel/gptqmodel_ext/marlin/
+// {gptq_marlin_repack.cu, dequant.h, marlin_template.h} 실측(2026-10-12).
+
+#define MAR_M 64
+#define MAR_N 128
+#define MAR_KC 32
+#define MAR_STAGES 4
+
+// lop3 = (a & b) | c (lut 0xEA) — 마스크/가산 상수는 imm.
+__device__ __forceinline__ unsigned mar_and_or(unsigned a, unsigned b, unsigned c) {
+    unsigned r;
+    asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+}
+
+// u32 → (lo, hi) half2 2개: lo = (니블0−8, 니블4−8), hi = (니블1−8, 니블5−8).
+// (dequant.h kU4B8 sym: SUB=0x64086408 · MUL=0x2c002c00 · ADD=0xd480d480)
+__device__ __forceinline__ void mar_deq(unsigned q, unsigned* lo, unsigned* hi) {
+    const unsigned sub8 = 0x64086408u;
+    const unsigned mul16 = 0x2c002c00u;
+    const unsigned add72 = 0xd480d480u;
+    const unsigned a = mar_and_or(q, 0x000f000fu, 0x64006400u);
+    const unsigned b = mar_and_or(q, 0x00f000f0u, 0x64006400u);
+    const __half2 la = __hsub2(*reinterpret_cast<const __half2*>(&a),
+                               *reinterpret_cast<const __half2*>(&sub8));
+    const __half2 hb = __hfma2(*reinterpret_cast<const __half2*>(&b),
+                               *reinterpret_cast<const __half2*>(&mul16),
+                               *reinterpret_cast<const __half2*>(&add72));
+    *lo = *reinterpret_cast<const unsigned*>(&la);
+    *hi = *reinterpret_cast<const unsigned*>(&hb);
+}
+
+// f16x2 × {s,s} (hmul2) — s는 u32 = (s|s<<16).
+__device__ __forceinline__ unsigned mar_scale(unsigned v, unsigned s2) {
+    const __half2 a = *reinterpret_cast<const __half2*>(&v);
+    const __half2 b = *reinterpret_cast<const __half2*>(&s2);
+    const __half2 r = __hmul2(a, b);
+    return *reinterpret_cast<const unsigned*>(&r);
+}
+
+__device__ __forceinline__ void mar_mma(float* c, unsigned a0, unsigned a1,
+                                        unsigned a2, unsigned a3,
+                                        unsigned b0, unsigned b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_marlin(
+    const unsigned* __restrict__ qm,      // [k/16][n/64][128] u32 (marlin B)
+    const unsigned short* __restrict__ s, // [n][k/128] f16
+    const unsigned short* __restrict__ x, // [t][k] f16
+    float* __restrict__ out, int n, int k, int t)
+{
+    // 스테이지 크기: A = 64행×72열, B = (KC/16)×2×128 u32.
+    constexpr int A_STAGE = MAR_M * (MAR_KC + 8);
+    constexpr int B_STAGE = (MAR_KC / 16) * 2 * 128;
+    __shared__ __align__(16) unsigned short xs[MAR_STAGES * A_STAGE];
+    __shared__ __align__(16) unsigned wb[MAR_STAGES * B_STAGE];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int wm = warp >> 1; // m16 블록 0..3
+    const int wn = warp & 1;  // n64 블록 0..1
+    const int m0 = blockIdx.x * MAR_M;
+    const int n0 = blockIdx.y * MAR_N;
+    const int nt_n = n >> 6;
+    const int kg = k >> 7;
+    const int n16 = lane >> 2;      // 프래그먼트 열(repack tc_col)
+    const int k2 = (lane & 3) * 2;  // 프래그먼트 k행쌍(repack tc_row)
+
+    // 스테이징 주소·프레디케이트 사전계산(루프 내 정수 연산 제거 —
+    // SASS 실측: 주소/프레디케이트가 지배 비용이었다).
+    const int a_cpr = MAR_KC / 8; // A 행당 16B 청크 수(KC=32 → 4)
+    // B 청크(tid<128): (kl*2+ntl) = tid>>5, j = tid&31.
+    const int b_tl = tid >> 5;
+    const int b_j = tid & 31;
+    const int b_off = b_tl * 128 + b_j * 4;
+    const int b_ntg = (n0 >> 6) + (b_tl & 1);
+    const bool b_ok = b_ntg < nt_n;
+
+    auto stage = [&](int st, int k0) {
+#pragma unroll
+        for (int e = tid; e < MAR_M * a_cpr; e += 256) {
+            const int r = e / a_cpr;
+            const int c8 = (e % a_cpr) * 8;
+            unsigned short* const d = xs + st * A_STAGE + r * (MAR_KC + 8) + c8;
+            if (m0 + r < t) {
+                cp_async16(d, x + (size_t)(m0 + r) * k + k0 + c8);
+            } else {
+                *reinterpret_cast<uint4*>(d) = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        if (tid < 128) {
+            unsigned* const db = wb + st * B_STAGE + b_off;
+            if (b_ok) {
+                cp_async16(db, &qm[((size_t)((k0 >> 4) + (b_tl >> 1)) * nt_n + b_ntg) * 128 + b_j * 4]);
+            } else {
+                *reinterpret_cast<uint4*>(db) =
+                    make_uint4(0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u);
+            }
+        }
+    };
+
+    float c[8][4];
+    unsigned s2lo[4], s2hi[4];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        (&c[0][0])[i] = 0.0f;
+    }
+
+    stage(0, 0);
+    asm volatile("cp.async.commit_group;");
+
+    const int nch = k / MAR_KC;
+    const int cpg = 128 / MAR_KC; // 그룹당 청크 수(KC가 128을 나눔)
+    const int ngroups = k >> 7;
+    int cid = 0; // 전역 청크 index(스테이지 = cid % MAR_STAGES)
+    for (int gi = 0; gi < ngroups; ++gi) {
+        // 그룹 스케일 — 그룹 내 모든 청크가 동일(청크 ⊆ g128 그룹).
+        {
+            const int nb = n0 + wn * 64;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                int cl = nb + 16 * w + n16;
+                cl = cl < n ? cl : n - 1;
+                const unsigned sl = s[(size_t)cl * kg + gi];
+                const unsigned sh = s[(size_t)(cl + 8 < n ? cl + 8 : n - 1) * kg + gi];
+                s2lo[w] = sl | (sl << 16);
+                s2hi[w] = sh | (sh << 16);
+            }
+        }
+#pragma unroll
+        for (int ci = 0; ci < cpg; ++ci, ++cid) {
+            const int k0 = (gi << 7) + ci * MAR_KC;
+            const int stc = cid & (MAR_STAGES - 1);
+            if (cid + 1 < nch) {
+                stage((cid + 1) & (MAR_STAGES - 1), k0 + MAR_KC);
+                asm volatile("cp.async.commit_group;");
+                asm volatile("cp.async.wait_group 1;");
+            } else {
+                asm volatile("cp.async.wait_group 0;");
+            }
+            __syncthreads();
+
+            const unsigned short* const ab =
+                xs + stc * A_STAGE + (wm * 16 + n16) * (MAR_KC + 8) + k2;
+            const unsigned* const bb = wb + stc * B_STAGE + wn * 128;
+#pragma unroll
+            for (int kl = 0; kl < MAR_KC / 16; ++kl) {
+                const int kb = kl * 16;
+                const unsigned short* const ar = ab + kb;
+                const unsigned a0 = *reinterpret_cast<const unsigned*>(ar);
+                const unsigned a1 = *reinterpret_cast<const unsigned*>(ar + 8 * (MAR_KC + 8));
+                const unsigned a2 = *reinterpret_cast<const unsigned*>(ar + 8);
+                const unsigned a3 =
+                    *reinterpret_cast<const unsigned*>(ar + 8 * (MAR_KC + 8) + 8);
+                const uint4 bv = reinterpret_cast<const uint4*>(bb + kl * 256)[lane];
+                const unsigned bq[4] = {bv.x, bv.y, bv.z, bv.w};
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    unsigned lo0, hi0, lo1, hi1;
+                    mar_deq(bq[w], &lo0, &hi0);
+                    mar_deq(bq[w] >> 8, &lo1, &hi1);
+                    mar_mma(c[2 * w], a0, a1, a2, a3, mar_scale(lo0, s2lo[w]),
+                            mar_scale(hi0, s2lo[w]));
+                    mar_mma(c[2 * w + 1], a0, a1, a2, a3, mar_scale(lo1, s2hi[w]),
+                            mar_scale(hi1, s2hi[w]));
+                }
+            }
+        }
+    }
+
+    // 에필로그 — m16n8k16 C 프래그먼트: 행 (g, g+8), 열 (2t, 2t+1).
+#pragma unroll
+    for (int f = 0; f < 8; ++f) {
+        const int col = n0 + wn * 64 + f * 8 + 2 * (lane & 3);
+        const int r0 = m0 + wm * 16 + n16;
+        if (r0 < t) {
+            if (col < n) {
+                out[(size_t)r0 * n + col] = c[f][0];
+            }
+            if (col + 1 < n) {
+                out[(size_t)r0 * n + col + 1] = c[f][1];
+            }
+        }
+        if (r0 + 8 < t) {
+            if (col < n) {
+                out[(size_t)(r0 + 8) * n + col] = c[f][2];
+            }
+            if (col + 1 < n) {
+                out[(size_t)(r0 + 8) * n + col + 1] = c[f][3];
+            }
+        }
+    }
+}

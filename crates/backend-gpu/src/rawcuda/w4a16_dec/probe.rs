@@ -387,6 +387,310 @@ impl W4a16Dec {
         ))
     }
 
+    /// [marlin 스테이지 2, 2026-10-12] marlin B 배치 mma GEMM A/B —
+    /// w4a16_gemm_g128_mma(기준) vs w4a16_gemm_g128_marlin(신규), 같은 f16 x.
+    /// 이론상 비트동일: 디퀀트가 종전 deq_pair_b와 같은 값((n−8)·s의 단일 RNE
+    /// — marlin 매직 상수 경로도 exact 중간값) + k 순서·프래그먼트 분할 동일.
+    /// 불일치면 허용오차·첫불량 (행,열)을 병기한다.
+    /// qm = 호스트 core::marlin::marlin_repack_q 산출([k/16][n/64][128] u32).
+    /// 계약: g128·f16 스케일 split 선형 전용.
+    pub fn marlin_diff_check(
+        &mut self,
+        name: &str,
+        t: usize,
+        qm: &[u32],
+    ) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        let (dq, ds, n, k) = self.lin_spec(name)?;
+        if k % 128 != 0 || n % 64 != 0 {
+            return Err(format!(
+                "marlin-diff {name}: k%128·n%64 계약 위반 k={k} n={n}"
+            ));
+        }
+        let want = (k / 16) * (n / 64) * 128;
+        if qm.len() != want {
+            return Err(format!(
+                "marlin-diff {name}: qm {} != (k/16)(n/64)128 = {want}",
+                qm.len()
+            ));
+        }
+        // x — 결정적 f32 → f16(두 커널 공통 입력; mma 커널 계약 f16).
+        let x16: Vec<u16> = (0..t * k)
+            .map(|i| {
+                let v =
+                    ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5;
+                crate::f32_to_f16(v)
+            })
+            .collect();
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×2).
+        let xb = unsafe { std::slice::from_raw_parts(x16.as_ptr() as *const u8, x16.len() * 2) };
+        let dx = self.cc.alloc(t * k * 2)?;
+        self.cc.h2d(dx, xb)?;
+        let dqm = self.cc.alloc(qm.len() * 4)?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let qb = unsafe { std::slice::from_raw_parts(qm.as_ptr() as *const u8, qm.len() * 4) };
+        self.cc.h2d(dqm, qb)?;
+        let da = self.cc.alloc(t * n * 4)?;
+        let db = self.cc.alloc(t * n * 4)?;
+        let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
+            let gx = t.div_ceil(GEMM_MMA_M) as u32;
+            let gy = n.div_ceil(GEMM_MMA_N) as u32;
+            let f = self.cc.function("w4a16_gemm_g128_mma")?;
+            let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx, da);
+            let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+            self.cc.launch(
+                f,
+                gx,
+                gy,
+                256,
+                &mut crate::rawcuda::args::l7(
+                    &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
+                ),
+            )?;
+            let fm = self.cc.function("w4a16_gemm_g128_marlin")?;
+            let (mut m_q, mut m_s, mut m_x, mut m_y) = (dqm, ds, dx, db);
+            let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
+            self.cc.launch(
+                fm,
+                gx,
+                gy,
+                256,
+                &mut crate::rawcuda::args::l7(
+                    &mut m_q, &mut m_s, &mut m_x, &mut m_y, &mut m_n, &mut m_k, &mut m_t,
+                ),
+            )?;
+            self.cc.sync()?;
+            let mut oa = vec![0u8; t * n * 4];
+            let mut ob = vec![0u8; t * n * 4];
+            self.cc.d2h(&mut oa, da)?;
+            self.cc.d2h(&mut ob, db)?;
+            let fa: Vec<f32> = oa
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            let fb: Vec<f32> = ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            Ok((fa, fb))
+        })();
+        let _ = self.cc.free(dx);
+        let _ = self.cc.free(dqm);
+        let _ = self.cc.free(da);
+        let _ = self.cc.free(db);
+        let (fa, fb) = r?;
+        let mut mism = 0usize;
+        let mut maxd = 0f32;
+        let mut maxr = 0f32;
+        let mut firstbad: Vec<(usize, usize)> = Vec::new();
+        for i in 0..fa.len() {
+            let d = (fa[i] - fb[i]).abs();
+            if fa[i].to_bits() != fb[i].to_bits() {
+                mism += 1;
+                if firstbad.len() < 5 {
+                    firstbad.push((i / n, i % n));
+                }
+            }
+            if d > maxd {
+                maxd = d;
+            }
+            let rl = d / fa[i].abs().max(1e-6);
+            if rl > maxr {
+                maxr = rl;
+            }
+        }
+        Ok(format!(
+            "marlin-diff {name} n={n} k={k} t={t}: 비트불일치={mism}/{} maxabs={maxd:.3e} maxrel={maxr:.3e} 첫불량={:?}",
+            fa.len(),
+            firstbad
+        ))
+    }
+
+    /// [marlin S2 디버그] 소형 합성 케이스 자체 점검 — 커널만 격리 검증.
+    /// 서버가 qm(재패킹됨)·s·x16·기대출력을 만들어 넘긴다. x=1.0·s=1.0·
+    /// 정수 니블 패턴이면 기대값 = 정수(Σ(nib−8))이라 mma f32 누적도 비트정확.
+    pub fn marlin_selfcheck(
+        &mut self,
+        qm: &[u32],
+        s: &[u16],
+        x16: &[u16],
+        expect: &[f32],
+        t: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        if qm.len() != (k / 16) * (n / 64) * 128
+            || s.len() != n * (k / 128)
+            || x16.len() != t * k
+            || expect.len() != t * n
+        {
+            return Err("marlin-selfcheck: 계약 위반(qm/s/x/expect 크기)".into());
+        }
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
+        let qb = unsafe {
+            std::slice::from_raw_parts(qm.as_ptr() as *const u8, std::mem::size_of_val(qm))
+        };
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
+        let sb = unsafe {
+            std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s))
+        };
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
+        let xb = unsafe {
+            std::slice::from_raw_parts(x16.as_ptr() as *const u8, std::mem::size_of_val(x16))
+        };
+        let dqm = self.cc.alloc(qm.len() * 4)?;
+        let ds = self.cc.alloc(s.len() * 2)?;
+        let dx = self.cc.alloc(x16.len() * 2)?;
+        let dout = self.cc.alloc(t * n * 4)?;
+        self.cc.h2d(dqm, qb)?;
+        self.cc.h2d(ds, sb)?;
+        self.cc.h2d(dx, xb)?;
+        let r = (|| -> Result<(), String> {
+            let fm = self.cc.function("w4a16_gemm_g128_marlin")?;
+            let (mut m_q, mut m_s, mut m_x, mut m_y) = (dqm, ds, dx, dout);
+            let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
+            self.cc.launch(
+                fm,
+                t.div_ceil(GEMM_MMA_M) as u32,
+                n.div_ceil(GEMM_MMA_N) as u32,
+                256,
+                &mut crate::rawcuda::args::l7(
+                    &mut m_q, &mut m_s, &mut m_x, &mut m_y, &mut m_n, &mut m_k, &mut m_t,
+                ),
+            )?;
+            self.cc.sync()
+        })();
+        let mut ob = vec![0u8; t * n * 4];
+        let d2h = self.cc.d2h(&mut ob, dout);
+        let _ = self.cc.free(dqm);
+        let _ = self.cc.free(ds);
+        let _ = self.cc.free(dx);
+        let _ = self.cc.free(dout);
+        r?;
+        d2h?;
+        let got: Vec<f32> = ob
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let mut mism = 0usize;
+        let mut first: Vec<(usize, usize, f32, f32)> = Vec::new();
+        let mut maxd = 0f32;
+        for i in 0..got.len() {
+            if got[i].to_bits() != expect[i].to_bits() {
+                mism += 1;
+                if first.len() < 8 {
+                    first.push((i / n, i % n, expect[i], got[i]));
+                }
+                maxd = maxd.max((got[i] - expect[i]).abs());
+            }
+        }
+        Ok(format!(
+            "marlin-selfcheck t={t} n={n} k={k}: 불일치={mism}/{} maxabs={maxd:.3e} (기대,실제)={:?}",
+            got.len(),
+            first
+        ))
+    }
+
+    /// [marlin S2, 2026-10-12] 두 mma GEMM 시간 비교 — 기존 mma vs marlin,
+    /// 같은 f16 x·같은 grid·같은 회차. pp 채택 판정용(골든 전 단계 계측).
+    pub fn marlin_bench(
+        &mut self,
+        name: &str,
+        t: usize,
+        reps: usize,
+        qm: &[u32],
+    ) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        let (dq, ds, n, k) = self.lin_spec(name)?;
+        let want = (k / 16) * (n / 64) * 128;
+        if qm.len() != want {
+            return Err(format!(
+                "marlin-bench {name}: qm {} != (k/16)(n/64)128 = {want}",
+                qm.len()
+            ));
+        }
+        let x16: Vec<u16> = (0..t * k)
+            .map(|i| {
+                let v =
+                    ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5;
+                crate::f32_to_f16(v)
+            })
+            .collect();
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×2).
+        let xb = unsafe { std::slice::from_raw_parts(x16.as_ptr() as *const u8, x16.len() * 2) };
+        let dx = self.cc.alloc(t * k * 2)?;
+        self.cc.h2d(dx, xb)?;
+        let dqm = self.cc.alloc(qm.len() * 4)?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let qb = unsafe { std::slice::from_raw_parts(qm.as_ptr() as *const u8, qm.len() * 4) };
+        self.cc.h2d(dqm, qb)?;
+        let da = self.cc.alloc(t * n * 4)?;
+        let db = self.cc.alloc(t * n * 4)?;
+        let gx = t.div_ceil(GEMM_MMA_M) as u32;
+        let gy = n.div_ceil(GEMM_MMA_N) as u32;
+        let run = |me: &Self, sym: &str, pq: CUdeviceptr, py: CUdeviceptr| -> Result<(), String> {
+            let f = me.cc.function(sym)?;
+            let (mut p_q, mut p_s, mut p_x, mut p_y) = (pq, ds, dx, py);
+            let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+            me.cc.launch(
+                f,
+                gx,
+                gy,
+                256,
+                &mut crate::rawcuda::args::l7(
+                    &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
+                ),
+            )
+        };
+        let r = (|| -> Result<(f64, f64), String> {
+            for _ in 0..3 {
+                run(self, "w4a16_gemm_g128_mma", dq, da)?;
+                run(self, "w4a16_gemm_g128_marlin", dqm, db)?;
+            }
+            self.cc.sync()?;
+            // 인터리브 라운드 — 순서·열 상태 바이어스 제거.
+            let rounds = 4usize;
+            let per = (reps / rounds).max(1);
+            let (mut ta, mut tb) = (0f64, 0f64);
+            for _ in 0..rounds {
+                let t0 = std::time::Instant::now();
+                for _ in 0..per {
+                    run(self, "w4a16_gemm_g128_mma", dq, da)?;
+                }
+                self.cc.sync()?;
+                ta += t0.elapsed().as_secs_f64();
+                let t0 = std::time::Instant::now();
+                for _ in 0..per {
+                    run(self, "w4a16_gemm_g128_marlin", dqm, db)?;
+                }
+                self.cc.sync()?;
+                tb += t0.elapsed().as_secs_f64();
+            }
+            let n = (per * rounds) as f64;
+            Ok((ta * 1e3 / n, tb * 1e3 / n))
+        })();
+        let _ = self.cc.free(dx);
+        let _ = self.cc.free(dqm);
+        let _ = self.cc.free(da);
+        let _ = self.cc.free(db);
+        let (ms_a, ms_b) = r?;
+        let flop = 2.0 * n as f64 * k as f64 * t as f64;
+        Ok(format!(
+            "marlin-bench {name} n={n} k={k} t={t} reps={reps}: \
+             mma {ms_a:.3}ms({:.1}TF) · marlin {ms_b:.3}ms({:.1}TF) · 비율 {:.3}×",
+            flop * 1e-9 / (ms_a * 1e-3),
+            flop * 1e-9 / (ms_b * 1e-3),
+            ms_a / ms_b
+        ))
+    }
+
     /// [진단] ew 커널 독립 벤치 — 순수 커널 처리량(파이프라인 무관).
     pub fn bench_ew(&mut self) -> Result<String, String> {
         let _g = self.cc.guard()?;
