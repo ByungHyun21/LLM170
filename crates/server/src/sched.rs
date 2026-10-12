@@ -744,17 +744,26 @@ fn assign_slot(
         return;
     }
     SCHED.jobs.fetch_add(1, Ordering::Relaxed);
-    // [§3.4 ③] 전역 트리 우선 조회 — 트리 미스 시 슬롯 스캔 폴백.
-    let tree_hit = ptrie.longest_prefix(&j.tokens);
-    if let Some((ti, tl)) = tree_hit
+    // [§3.4 ③] 전역 트리 우선 조회 — 512+ 접두의 슬롯 후보 직접 제시.
+    // 미스(단문/신규)는 슬롯 스캔 폴백. 트리는 슬롯 후보만 제시하고
+    // 실제 l(공통 접두 길이)는 기존 산식과 동일 — 수치 무변.
+    let (i, l) = if let Some((ti, _tl)) = ptrie.longest_prefix(&j.tokens)
         && ti < slots.len()
         && slots[ti].job.is_none()
-        && tl <= slots[ti].cached.len()
+        && !slots[ti].cached.is_empty()
     {
-        // 트리 히트 — 기존 경로 재사용(수치 무변: 트리는 조회뿐).
-    }
-    let Some((i, l)) = pick_prefix_slot(slots, &j.tokens) else {
-        return;
+        let l = slots[ti]
+            .cached
+            .iter()
+            .zip(j.tokens.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        (ti, l)
+    } else {
+        let Some((i, l)) = pick_prefix_slot(slots, &j.tokens) else {
+            return;
+        };
+        (i, l)
     };
     // [A2] 재사용 판정 — 전체 접두(상태가 그 끝 위치와 정합) 우선, 부분은
     // 체크포인트(2048 경계 GDN 상태) ≤ l. 부분은 restore로 상태·pos 복원.
