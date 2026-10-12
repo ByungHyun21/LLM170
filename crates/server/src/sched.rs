@@ -264,6 +264,9 @@ pub static SCHED: Sched = Sched {
     jobs: AtomicU64::new(0),
     queue_wait_us: AtomicU64::new(0),
     prefix_tokens: AtomicU64::new(0),
+    // [K1 2026-10-12] 재사용 분해 — 전체-접두 / 체크포인트(2048 GDN) 히트 횟수.
+    prefix_full_hits: AtomicU64::new(0),
+    prefix_ckpt_hits: AtomicU64::new(0),
     ticks_decode: AtomicU64::new(0),
     ms_decode: AtomicU64::new(0),
     chunks_prefill: AtomicU64::new(0),
@@ -282,6 +285,9 @@ pub struct Sched {
     pub jobs: AtomicU64,
     pub queue_wait_us: AtomicU64,
     pub prefix_tokens: AtomicU64,
+    /// [K1 2026-10-12] 재사용 분해 카운터(횟수) — 히트율 = prefix_tokens/prompt_tokens.
+    pub prefix_full_hits: AtomicU64,
+    pub prefix_ckpt_hits: AtomicU64,
     pub ticks_decode: AtomicU64,
     pub ms_decode: AtomicU64,
     pub chunks_prefill: AtomicU64,
@@ -311,6 +317,10 @@ impl Sched {
         let jobs = self.jobs.load(Ordering::Relaxed);
         let qw = self.queue_wait_us.load(Ordering::Relaxed);
         let px = self.prefix_tokens.load(Ordering::Relaxed);
+        let (fh, ch) = (
+            self.prefix_full_hits.load(Ordering::Relaxed),
+            self.prefix_ckpt_hits.load(Ordering::Relaxed),
+        );
         let td = self.ticks_decode.load(Ordering::Relaxed);
         let md = self.ms_decode.load(Ordering::Relaxed);
         let cp = self.chunks_prefill.load(Ordering::Relaxed);
@@ -320,7 +330,7 @@ impl Sched {
         let sms = self.spec_ms.load(Ordering::Relaxed);
         let qd = self.queue_depth.load(Ordering::Relaxed);
         format!(
-            "[sched] jobs {jobs} | queue {qd} | queue-wait avg {:.0}ms | prefix-reuse {px}tok | decode {td}x avg {:.1}ms | prefill {cp}x avg {:.1}ms | spec {sr}r acc {sa} ({:.2}/r) avg {:.1}ms",
+            "[sched] jobs {jobs} | queue {qd} | queue-wait avg {:.0}ms | prefix-reuse {px}tok(f{fh}/c{ch}) | decode {td}x avg {:.1}ms | prefill {cp}x avg {:.1}ms | spec {sr}r acc {sa} ({:.2}/r) avg {:.1}ms",
             if jobs > 0 {
                 qw as f64 / jobs as f64 / 1e3
             } else {
@@ -660,6 +670,7 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         SCHED
             .prefix_tokens
             .fetch_add(reuse as u64, Ordering::Relaxed);
+        SCHED.prefix_full_hits.fetch_add(1, Ordering::Relaxed);
         eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰(전체)");
     } else {
         match eng.0.restore_gdn(i) {
@@ -667,6 +678,7 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
                 SCHED
                     .prefix_tokens
                     .fetch_add(reuse as u64, Ordering::Relaxed);
+                SCHED.prefix_ckpt_hits.fetch_add(1, Ordering::Relaxed);
                 eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰(체크포인트)");
             }
             _ => {
@@ -954,9 +966,9 @@ fn slot_emit(s: &mut Slot, t: u32) {
 
 /// [I 2026-10-10] 접두 캐시 재사용 슬롯 선택 — **순수 함수**(테스트 표면).
 /// free 슬롯(job 없음) 중 cached와 tokens의 공통 접두가 최장인 곳. 반환
-/// (slot, reuse): reuse > 0은 cached **전체**가 접두이고 토큰이 더 길 때만
-/// (정확히 같은 길이는 상태가 이미 구워져 있으므로 재사용 아님 — reset 생략
-/// 판정은 호출부).
+/// (slot, l): l = 공통 접두 길이(부분 포함 — 전체/체크포인트 판정은 호출부가
+/// 엔진 체크포인트 조회와 함께 수행[A2 2026-10-11]). 정확히 같은 길이도
+/// l = cached 전체(전체 재사용 — 프리필 스킵).
 fn pick_prefix_slot(slots: &[Slot], tokens: &[u32]) -> Option<(usize, usize)> {
     // [A2 2026-10-11] 부분 접두까지 l 반환(순수 함수 유지 — 전체/부분/체크포인트
     // 판정은 호출부가 엔진 체크포인트 조회와 함께 수행).
@@ -1062,11 +1074,12 @@ mod tests {
         assert_eq!(pick_prefix_slot(&[a, b, c], &[1, 2, 3, 4, 5]), Some((0, 4)));
     }
 
-    /// [I] 정확히 같은 길이는 재사용 아님(reuse=0 — 상태가 이미 그 열).
+    /// [I→A2] 정확히 같은 길이 = cached 전체가 접두 → l=3(전체 재사용 —
+    /// 판정은 호출부 full 경로. 구버전 기대(0,0)은 A2 부분-접두 반환 이전 잔존).
     #[test]
-    fn pick_exact_length_no_reuse() {
+    fn pick_exact_length_full_prefix() {
         let a = slot_with(vec![1, 2, 3]);
-        assert_eq!(pick_prefix_slot(&[a], &[1, 2, 3]), Some((0, 0)));
+        assert_eq!(pick_prefix_slot(&[a], &[1, 2, 3]), Some((0, 3)));
     }
 
     /// [I] 접두 0이어도 슬롯은 반환(reuse=0 — reset 경로).
