@@ -1078,8 +1078,17 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
             SCHED.requests_failed.fetch_add(1, Ordering::Relaxed);
             let _ = j.out.send(InferResult {
                 tokens: Vec::new(),
-                error: Some(err),
+                error: Some(err.clone()),
             });
+        }
+        // [K4 2026-10-12] 용량 초과(사전 검증 에러·프리필 미소비) — 엔진
+        // 상태는 이전 cached와 정합이므로 캐시를 버리지 않는다(재요청
+        // 접두 히트 유지). 그 외 런타임 에러는 현행 폐기(신뢰 불가).
+        if err.contains("context overflow") && s.prefilled == 0 && !s.cached.is_empty() {
+            let keep = std::mem::take(&mut s.cached);
+            *s = Slot::free();
+            s.cached = keep;
+            return;
         }
         eng.reset_seq(i);
         *s = Slot::free(); // 접두 캐시 폐기 — 엔진 시퀀스 상태 신뢰 불가
