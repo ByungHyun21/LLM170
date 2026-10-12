@@ -2,55 +2,55 @@ use super::*;
 
 impl W4a16Dec {
     pub fn attn_set_pos(&mut self, slot: usize, pos: u32) -> Result<(), String> {
-        if self.dpp == 0 || slot >= self.n_slots {
+        if self.attn.dpp == 0 || slot >= self.n_slots {
             return Err("attn: pp 미할당/슬롯 범위".into());
         }
-        if self.capture_pinned_src {
+        if self.graph.capture_pinned_src {
             // 캡처 중: dpp 갱신은 replay 전 1회(그래프 밖·같은 스트림)로 옮긴다 —
             // 캡처 중 스택 임시를 소스로 잡으면 replay에서 무효 주소가 된다.
             return Ok(());
         }
         // 비동기 — 층마다 동기 H2D를 걸면 스트림이 매번 배수된다(층당 8ms 실측).
         self.cc
-            .h2d_async(self.dpp + (slot as u64) * 4, &pos.to_le_bytes())
+            .h2d_async(self.attn.dpp + (slot as u64) * 4, &pos.to_le_bytes())
     }
 
     pub(super) fn attn_pp_ptr(&self, slot: usize) -> CUdeviceptr {
-        self.dpp + (slot as u64) * 4
+        self.attn.dpp + (slot as u64) * 4
     }
 
     pub(super) fn attn_kv_ptr(&self, slot: usize) -> CUdeviceptr {
-        match self.attn {
+        match self.attn.attn {
             Some(dm) => {
                 // [KVQ 채택 2026-10-10] int8 KV — 슬롯 오프셋 = 원소 수(1B/원소).
-                self.dkc + dm.kv_slot_elems(slot) as u64
+                self.attn.dkc + dm.kv_slot_elems(slot) as u64
             }
-            None => self.dkc,
+            None => self.attn.dkc,
         }
     }
 
     pub(super) fn attn_vc_ptr(&self, slot: usize) -> CUdeviceptr {
-        match self.attn {
+        match self.attn.attn {
             Some(dm) => {
                 // [KVQ 채택 2026-10-10] int8 KV — 슬롯 오프셋 = 원소 수(1B/원소).
-                self.dvc + dm.kv_slot_elems(slot) as u64
+                self.attn.dvc + dm.kv_slot_elems(slot) as u64
             }
-            None => self.dvc,
+            None => self.attn.dvc,
         }
     }
 
     /// [P13] KV 스케일 포인터(슬롯 기저) — KVQ 전용(f32).
     pub(super) fn attn_ksc_ptr(&self, slot: usize) -> CUdeviceptr {
-        match self.attn {
-            Some(dm) => self.dksc + (slot * dm.n_attn * dm.cap * dm.kv_heads) as u64 * 4,
-            None => self.dksc,
+        match self.attn.attn {
+            Some(dm) => self.attn.dksc + (slot * dm.n_attn * dm.cap * dm.kv_heads) as u64 * 4,
+            None => self.attn.dksc,
         }
     }
 
     pub(super) fn attn_vsc_ptr(&self, slot: usize) -> CUdeviceptr {
-        match self.attn {
-            Some(dm) => self.dvsc + (slot * dm.n_attn * dm.cap * dm.kv_heads) as u64 * 4,
-            None => self.dvsc,
+        match self.attn.attn {
+            Some(dm) => self.attn.dvsc + (slot * dm.n_attn * dm.cap * dm.kv_heads) as u64 * 4,
+            None => self.attn.dvsc,
         }
     }
 
@@ -66,7 +66,7 @@ impl W4a16Dec {
         kin_dev: CUdeviceptr,
         vin_dev: CUdeviceptr,
     ) -> Result<(), String> {
-        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let f = self.cc.function("attn_prep_q")?;
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
@@ -87,9 +87,9 @@ impl W4a16Dec {
             qg_dev,
             kin_dev,
             vin_dev,
-            self.dqnw_a,
-            self.dknw_a,
-            self.dqh_a,
+            self.attn.dqnw_a,
+            self.attn.dknw_a,
+            self.attn.dqh_a,
             self.attn_kv_ptr(slot),
             self.attn_vc_ptr(slot),
             self.attn_ksc_ptr(slot),
@@ -138,11 +138,11 @@ impl W4a16Dec {
         t_len: usize,
         qg_dev: CUdeviceptr,
     ) -> Result<(), String> {
-        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
         if t_len == 0 || t_len > ATTN_F3S_TMAX {
             return Err(format!("attn fwd3s: T={t_len} — 소형 전용 도메인 위반"));
         }
-        if self.dattn_part == 0 {
+        if self.attn.dattn_part == 0 {
             return Err("attn fwd3s: dattn_part 미할당 — ensure_attn_bufs 선행".into());
         }
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
@@ -165,12 +165,12 @@ impl W4a16Dec {
         })?;
         #[allow(clippy::type_complexity)]
         let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
-            self.dqh_a,
+            self.attn.dqh_a,
             self.attn_kv_ptr(slot),
             self.attn_vc_ptr(slot),
             self.attn_ksc_ptr(slot),
             self.attn_vsc_ptr(slot),
-            self.dattn_part,
+            self.attn.dattn_part,
         );
         let mut f6 = self.attn_pp_ptr(slot);
         self.cc.launch(
@@ -187,7 +187,7 @@ impl W4a16Dec {
         let nm = t_len * dm.q_heads * 256;
         let (m32, m16) = (self.ensure_dx32(nm)?, self.ensure_dx16(nm)?);
         let fm = self.cc.function("attn_fwd3s_merge")?;
-        let (mut mp, mut mg, mut mo) = (self.dattn_part, qg_dev, self.doutv_a);
+        let (mut mp, mut mg, mut mo) = (self.attn.dattn_part, qg_dev, self.attn.doutv_a);
         let (mut mo32, mut mo16) = (m32, m16);
         let (mut tl2, mut qh2) = (t_len as i32, dm.q_heads as i32);
         self.cc.launch(
@@ -210,7 +210,7 @@ impl W4a16Dec {
         t_len: usize,
         qg_dev: CUdeviceptr,
     ) -> Result<(), String> {
-        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
         if t_len == 0 || t_len > ATTN_F3S_TMAX {
             return Err(format!("attn fa2: T={t_len} — 도메인 위반"));
         }
@@ -219,13 +219,13 @@ impl W4a16Dec {
         let (m32, m16) = (self.ensure_dx32(nm)?, self.ensure_dx16(nm)?);
         #[allow(clippy::type_complexity)]
         let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8, mut a9) = (
-            self.dqh_a,
+            self.attn.dqh_a,
             self.attn_kv_ptr(slot),
             self.attn_vc_ptr(slot),
             self.attn_ksc_ptr(slot),
             self.attn_vsc_ptr(slot),
             qg_dev,
-            self.doutv_a,
+            self.attn.doutv_a,
             m32,
             m16,
             self.attn_pp_ptr(slot),
@@ -256,7 +256,7 @@ impl W4a16Dec {
         vin: &[f32],
         pos0: u32,
     ) -> Result<Vec<f32>, String> {
-        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
         if layer >= dm.n_attn || slot >= self.n_slots {
             return Err(format!("attn: 범위 위반 layer={layer} slot={slot}"));
         }
@@ -276,15 +276,15 @@ impl W4a16Dec {
         let b =
             // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-        self.cc.h2d(self.dqg_a, b(qg))?;
-        self.cc.h2d(self.dkin_a, b(kin))?;
-        self.cc.h2d(self.dvin_a, b(vin))?;
+        self.cc.h2d(self.attn.dqg_a, b(qg))?;
+        self.cc.h2d(self.attn.dkin_a, b(kin))?;
+        self.cc.h2d(self.attn.dvin_a, b(vin))?;
         self.attn_set_pos(slot, pos0)?;
-        let (aqg, akin, avin) = (self.dqg_a, self.dkin_a, self.dvin_a);
+        let (aqg, akin, avin) = (self.attn.dqg_a, self.attn.dkin_a, self.attn.dvin_a);
         self.attn_prep_launch(slot, layer, t_len, aqg, akin, avin)?;
         self.attn_fwd3s_launch(slot, layer, t_len, aqg)?;
         let mut buf = vec![0u8; t_len * dm.q_dim() * 4];
-        self.cc.d2h(&mut buf, self.doutv_a)?;
+        self.cc.d2h(&mut buf, self.attn.doutv_a)?;
         self.cc.sync()?;
         Ok(
             // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
@@ -305,7 +305,7 @@ impl W4a16Dec {
         kin_dev: CUdeviceptr,
         vin_dev: CUdeviceptr,
     ) -> Result<CUdeviceptr, String> {
-        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
         if t_len == 0 || t_len > ATTN_F3S_TMAX || layer >= dm.n_attn || slot >= self.n_slots {
             return Err("attn dev: 도메인/범위 위반".into());
         }
@@ -318,7 +318,7 @@ impl W4a16Dec {
         // [A3] 스테이징 d2d 3회/층 제거 — 호출자 버퍼를 커널 인자로 직접 소비.
         self.attn_prep_launch(slot, layer, t_len, qg_dev, kin_dev, vin_dev)?;
         self.attn_fwd3s_launch(slot, layer, t_len, qg_dev)?;
-        Ok(self.doutv_a)
+        Ok(self.attn.doutv_a)
     }
 
     /// [A9 2026-10-10] 어텐션 디코드 배치 — 토큰별 슬롯의 KV/pos를 쓰고,
@@ -333,12 +333,12 @@ impl W4a16Dec {
         kin_dev: CUdeviceptr,
         vin_dev: CUdeviceptr,
     ) -> Result<CUdeviceptr, String> {
-        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
         if t_len == 0
             || t_len > BATCH_DEC_MAX
             || t_len != slots.len()
             || layer >= dm.n_attn
-            || self.dattn_part == 0
+            || self.attn.dattn_part == 0
             || slots.iter().any(|&s| s >= self.n_slots)
         {
             return Err("attn batch: 도메인/범위 위반".into());
@@ -368,9 +368,9 @@ impl W4a16Dec {
             let mut a0 = qg_dev + k as u64 * qgd * 4;
             let mut a1 = kin_dev + k as u64 * kvd * 4;
             let mut a2 = vin_dev + k as u64 * kvd * 4;
-            let mut a3 = self.dqnw_a;
-            let mut a4 = self.dknw_a;
-            let mut a5 = self.dqh_a + k as u64 * qdd * 4;
+            let mut a3 = self.attn.dqnw_a;
+            let mut a4 = self.attn.dknw_a;
+            let mut a5 = self.attn.dqh_a + k as u64 * qdd * 4;
             let mut a6 = self.attn_kv_ptr(slot);
             let mut a7 = self.attn_vc_ptr(slot);
             let mut a8 = self.attn_ksc_ptr(slot);
@@ -398,8 +398,8 @@ impl W4a16Dec {
             self.ensure_dx16(nm)?;
         }
         for (k, &slot) in slots.iter().enumerate() {
-            let qhk = self.dqh_a + k as u64 * qdd * 4;
-            let partk = self.dattn_part + k as u64 * pstride * 4;
+            let qhk = self.attn.dqh_a + k as u64 * qdd * 4;
+            let partk = self.attn.dattn_part + k as u64 * pstride * 4;
             {
                 let (mut f0, mut f1, mut f2, mut f3, mut f4, mut f5) = (
                     qhk,
@@ -427,7 +427,7 @@ impl W4a16Dec {
                 let (mut mp, mut mg, mut mo) = (
                     partk,
                     qg_dev + k as u64 * qgd * 4,
-                    self.doutv_a + k as u64 * qdd * 4,
+                    self.attn.doutv_a + k as u64 * qdd * 4,
                 );
                 let (mut mo32, mut mo16) = (
                     self.dx32.ptr + k as u64 * qdd * 4,
@@ -446,6 +446,6 @@ impl W4a16Dec {
                 )?;
             }
         }
-        Ok(self.doutv_a)
+        Ok(self.attn.doutv_a)
     }
 }

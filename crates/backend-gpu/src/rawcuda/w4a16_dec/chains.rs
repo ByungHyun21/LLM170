@@ -9,13 +9,13 @@ impl W4a16Dec {
             return Err("forward: 임베딩 폭/슬롯 계약 위반".into());
         }
         let pos = self.slot_pos[slot];
-        let cap = self.attn.ok_or("attn: 형상 미등록")?.cap;
+        let cap = self.attn.attn.ok_or("attn: 형상 미등록")?.cap;
         if pos as usize >= cap {
             return Err(format!(
                 "context overflow: slot{slot} pos={pos} >= kvcap={cap}"
             ));
         }
-        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.is_none() {
+        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("forward: 디코더 상수 미등록".into());
         }
         let dres = self.cc.alloc(self.hidden * 4)?;
@@ -43,7 +43,7 @@ impl W4a16Dec {
     ) -> Result<Vec<f32>, String> {
         let mut ab = vec![0.0f32; self.hidden];
         let mut gi = 0usize;
-        let interval = self.attn.map(|a| a.interval).unwrap_or(4);
+        let interval = self.attn.attn.map(|a| a.interval).unwrap_or(4);
         for il in 0..self.n_layers {
             let xn = self
                 .norm_resid_staged(2 * il, dres, &ab)
@@ -142,13 +142,13 @@ impl W4a16Dec {
         }
         self.slot_pos[slot] = 0;
         self.attn_set_pos(slot, 0)?;
-        if let Some(dims) = self.gdn {
+        if let Some(dims) = self.gdn.gdn {
             let ring_bytes = dims.n_gdn * 3 * dims.conv_ch() * 4;
             let st_bytes = dims.n_gdn * dims.h_v * 128 * 128 * 4;
             let ring_off = (slot * dims.n_gdn * 3 * dims.conv_ch()) as u64 * 4;
             let st_off = (slot * dims.n_gdn * dims.h_v * 128 * 128) as u64 * 4;
-            Self::zero_dev(&self.cc, self.dring + ring_off, ring_bytes)?;
-            Self::zero_dev(&self.cc, self.dgst + st_off, st_bytes)?;
+            Self::zero_dev(&self.cc, self.gdn.dring + ring_off, ring_bytes)?;
+            Self::zero_dev(&self.cc, self.gdn.dgst + st_off, st_bytes)?;
         }
         Ok(())
     }
@@ -167,21 +167,23 @@ impl W4a16Dec {
             return Err("forward_device: 임베딩 폭/슬롯 계약 위반".into());
         }
         let pos = self.slot_pos[slot];
-        let cap = self.attn.ok_or("attn: 형상 미등록")?.cap;
+        let cap = self.attn.attn.ok_or("attn: 형상 미등록")?.cap;
         if pos as usize >= cap {
             return Err(format!(
                 "context overflow: slot{slot} pos={pos} >= kvcap={cap}"
             ));
         }
-        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.is_none() {
+        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("forward_device: 디코더 상수 미등록".into());
         }
         self.ensure_chain_bufs()?;
-        let row = if self.capture_pinned_src {
+        let row = if self.graph.capture_pinned_src {
             // 캡처 중: pageable async 복사는 캡처 불가 — pinned 버퍼를 소스로
             // 기록하고 replay가 실행 직전에 내용을 채운다.
             // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
-            unsafe { std::slice::from_raw_parts(self.pin_embed as *const u8, self.hidden * 4) }
+            unsafe {
+                std::slice::from_raw_parts(self.graph.pin_embed as *const u8, self.hidden * 4)
+            }
         } else {
             // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             unsafe { std::slice::from_raw_parts(embed_row.as_ptr() as *const u8, self.hidden * 4) }
@@ -203,7 +205,7 @@ impl W4a16Dec {
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, 1, x32)
                 .map_err(|e| format!("L{il} input norm: {e}"))?;
-            let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
+            let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
             let branch = if (il + 1) % interval == 0 {
                 // [S2 2026-10-11] q/k/v 단독 3런치 → 다중세그먼트 1런치(테이블은
                 // ensure_chain_bufs 1회 작성 — 값 비트동일).
@@ -303,7 +305,7 @@ impl W4a16Dec {
     /// [A9] 배치 체인 1회 발사 — 행/pos는 핀드(pin_batch_in/pos)에서 읽어
     /// h2d 노드로 기록된다(캡처 가능). sync·slot_pos 갱신은 호출부 소관.
     pub(super) fn batch_launch(&mut self, slots: &[usize], t: usize) -> Result<(), String> {
-        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.is_none() {
+        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("batch_launch: 디코더 상수 미등록".into());
         }
         self.ensure_chain_bufs()?;
@@ -315,14 +317,17 @@ impl W4a16Dec {
         {
             // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
             let rb = unsafe {
-                std::slice::from_raw_parts(self.pin_batch_in as *const u8, t * self.hidden * 4)
+                std::slice::from_raw_parts(
+                    self.graph.pin_batch_in as *const u8,
+                    t * self.hidden * 4,
+                )
             };
             self.cc.h2d_async(self.dres, rb)?;
             // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
             let pb = unsafe {
-                std::slice::from_raw_parts(self.pin_batch_pos as *const u8, self.n_slots * 4)
+                std::slice::from_raw_parts(self.graph.pin_batch_pos as *const u8, self.n_slots * 4)
             };
-            self.cc.h2d_async(self.dpp, pb)?;
+            self.cc.h2d_async(self.attn.dpp, pb)?;
         }
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let h = self.hidden;
@@ -337,7 +342,7 @@ impl W4a16Dec {
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, t, xh)
                 .map_err(|e| format!("B{il} input norm: {e}"))?;
-            let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
+            let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
             let branch = if (il + 1) % interval == 0 {
                 // [S2 2026-10-11] q/k/v 3런치 → 다중세그먼트 1런치(테이블 공용
                 // — t=1 판과 동일 메타, grid만 Σceil(n/TR)).
@@ -412,7 +417,8 @@ impl W4a16Dec {
             )?;
         }
         // SAFETY: self 소유 pinned 스크래치의 단독 가변 접근(수명=self).
-        let tb = unsafe { std::slice::from_raw_parts_mut(self.pin_batch_tok as *mut u8, t * 4) };
+        let tb =
+            unsafe { std::slice::from_raw_parts_mut(self.graph.pin_batch_tok as *mut u8, t * 4) };
         self.cc.d2h_async(tb.as_mut_ptr(), self.dbatch_am, t * 4)?;
         Ok(())
     }
@@ -420,7 +426,8 @@ impl W4a16Dec {
     /// [A9] 핀드 토큰 판독(sync 후).
     pub(super) fn batch_read_tokens(&self, t: usize) -> Vec<u32> {
         // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
-        let tb = unsafe { std::slice::from_raw_parts(self.pin_batch_tok as *const u8, t * 4) };
+        let tb =
+            unsafe { std::slice::from_raw_parts(self.graph.pin_batch_tok as *const u8, t * 4) };
         (0..t)
             .map(|k| u32::from_le_bytes([tb[k * 4], tb[k * 4 + 1], tb[k * 4 + 2], tb[k * 4 + 3]]))
             .collect()
@@ -439,10 +446,10 @@ impl W4a16Dec {
         let bytes = t * self.head_n * 4;
         // pin_batch_lg는 pinned_alloc 소유 스크래치(수명=self) — d2h가 전량 재기록.
         self.cc
-            .d2h_async(self.pin_batch_lg as *mut u8, self.dbatch_lg, bytes)?;
+            .d2h_async(self.graph.pin_batch_lg as *mut u8, self.dbatch_lg, bytes)?;
         self.cc.sync()?;
         // SAFETY: 방금 d2h로 채운 pinned 버퍼의 바이트 뷰(bytes = 원소수×4).
-        let pb = unsafe { std::slice::from_raw_parts(self.pin_batch_lg as *const u8, bytes) };
+        let pb = unsafe { std::slice::from_raw_parts(self.graph.pin_batch_lg as *const u8, bytes) };
         Ok(pb
             .as_chunks::<4>()
             .0

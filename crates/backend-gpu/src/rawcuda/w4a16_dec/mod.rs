@@ -232,7 +232,7 @@ pub fn f32_to_f16(v: f32) -> u16 {
 }
 
 /// [A8] 캡처 그래프 1개 — (slot, head, argmax)가 캐시 키.
-struct GraphEntry {
+pub(super) struct GraphEntry {
     exec: ffi::CUgraphExec,
     handle: ffi::CUgraph,
     slot: usize,
@@ -240,7 +240,213 @@ struct GraphEntry {
     argmax: bool,
 }
 
+/// [R10 2026-10-12] MoE(전문가 라우팅·스트리밍 캐시) — W4a16Dec 필드 도메인 그룹(순수 이동).
+pub(super) struct MoE {
+    /// MoE 구성 — n_experts=0이면 dense FFN.
+    pub(super) n_experts: usize,
+    pub(super) top_k: usize,
+    pub(super) moe_ffn: usize,
+    pub(super) shared_ffn: usize,
+    pub(super) moe_group: usize,
+    pub(super) moe_scale_bf16: bool,
+    /// 전문가 슬라이스 테이블 — (packed ptr/len, scale ptr/len), 인덱스
+    /// ((il·n_experts + e)·3 + proj) — proj 0/1/2 = gate/up/down.
+    /// 호스트 포인터는 서버 스토어 mmap 수명 계약(set_expert_table).
+    pub(super) moe_tab: Vec<(u64, u64, u64, u64)>,
+    /// 전문가 상주 모드 — moe_tab이 VRAM 포인터(170HX 64GB 등).
+    pub(super) moe_resident: bool,
+    /// 전문가 디바이스 포인터 테이블(상주 — 배치 GEMV 간접 참조, (q,s) 쌍).
+    pub(super) moe_dev_tab: CUdeviceptr,
+    /// 선택 슬롯 인덱스·가중(호스트 → 디바이스, [top_k]).
+    pub(super) moe_idx: CUdeviceptr,
+    pub(super) moe_wt: CUdeviceptr,
+    /// [B-4] 다중 세그먼트 GEMV 테이블(층×3세그먼트×4u64: w,out,n,k) +
+    /// 층별 행 합(그리드). 라우터 게이트 + shared gate/up 1런치용.
+    pub(super) moe_multi_tab: CUdeviceptr,
+    pub(super) moe_multi_rows: Vec<u32>,
+    /// [S10-잔여] t행(≤8) 판 다중세그먼트 grid — 라우터+shared gate/up 3세그먼트
+    /// Σceil(n/GEMV_TR)/층(sgate 제외 — 출력 레이아웃 [t][n] 충돌 회피).
+    pub(super) moe_multi_rows_t3: Vec<u32>,
+    /// [P11] 전문가-우선 슬롯 정렬(프리필 그룹 GEMV) — gslot[n_exp×gmax]+cnt.
+    pub(super) moe_gslot: CUdeviceptr,
+    pub(super) moe_gcnt: CUdeviceptr,
+    pub(super) moe_goff: CUdeviceptr,
+    pub(super) moe_gmax: usize,
+    /// 배치 전문가 출력([top_k][n_ff] · [top_k][hidden]) — act는 ew 전용
+    /// 별도 버퍼(ew 커널 __restrict__ 계약 — 제자리 호출 금지).
+    pub(super) exp: ExpBufs,
+    /// MoE 스테이징 — 전문가 packed/scale(1쌍 재사용, 스트림 순서 안전).
+    pub(super) stg: StgBufs,
+    /// [C2 2026-10-09] 호스트 RAM 스테이징 — 스트리밍 전문가의 mmap 슬라이스
+    /// 1회 복사본(set_expert_table). 스트리밍 업로드가 SSD/페이지캐시 경로에
+    /// 의존하지 않게 한다. Vec 버퍼 주소는 불변이므로 moe_tab이 이 안을
+    /// 가리켜도 안전(용량 추가 변경 금지 — 구축 후 불변).
+    pub(super) host_stage: Vec<u8>,
+    /// [P7-fix 2026-10-10] host_stage 선두에서 cuMemHostRegister에 성공한
+    /// 바이트 수(0 = 미등록). 등록 구간 소스는 h2d DMA가 직행한다.
+    pub(super) host_stage_reg: usize,
+    /// 라우터 로짓/ shared 게이트 스크래치(n_experts ≥ 1).
+    pub(super) drt: Buf,
+    /// MoE 출력(hidden) — 잔차 ab로 소비된다.
+    pub(super) dmo: Buf,
+    pub(super) moe_bufs_ok: bool,
+    /// [B3 2026-10-12] shared 꼬리 포크 전용 sgate 출력 슬롯(t≤8행 f32 —
+    /// 종전 drt 재사용은 topk와의 병렬 경합). 1회 할당·불변(캡처 안전).
+    pub(super) dsg: CUdeviceptr,
+    /// [B3] 층별 이벤트 쌍 [fork, join] — 캡처 중 재기록 회피(층당 고유).
+    pub(super) ev_fork: Vec<ffi::CUevent>,
+    /// [B7 2026-10-12] shared 게이트/업 전용 슬롯 — dchain 재사용은 스트리밍
+    /// 전문가 스크래치와 충돌(게이트/업이 전문가보다 먼저 계산됨).
+    pub(super) dsh: [CUdeviceptr; 2],
+    pub(super) dsh_cap: usize,
+    /// [B4-2 2026-10-12] 스트리밍 전문가 LRU 캐시(층별 K×3proj q/s).
+    /// 가중치 불변 → hit 재사용은 수치 무변화(h2d 생략만). 층별 독립 LRU.
+    pub(super) mcache_q: CUdeviceptr,
+    pub(super) mcache_s: CUdeviceptr,
+    pub(super) mcache_k: usize,
+    pub(super) mcache_ids: Vec<u16>,
+    pub(super) mcache_age: Vec<u32>,
+    pub(super) mcache_tick: u32,
+    pub(super) mcache_hits: u64,
+    pub(super) mcache_miss: u64,
+}
+
+/// [R10 2026-10-12] MTP 초안기 — W4a16Dec 필드 도메인 그룹(순수 이동).
+pub(super) struct Mtp {
+    /// [MTP 2026-10-12] 모델 자체 MTP 초안기 — 가중치는 plain 레지스트리
+    /// (이름 참조), 여기는 버퍼/상태만.
+    pub(super) mtp_ok: bool,
+    pub(super) mtp_nw: CUdeviceptr,
+    pub(super) mtp_zero: CUdeviceptr,
+    pub(super) mtp_buf: CUdeviceptr,
+    pub(super) mtp_off: [usize; 17],
+    pub(super) mtp_prev_off: usize,
+    pub(super) mtp_layer: usize,
+    pub(super) mtp_rows: usize,
+    pub(super) mtp_ffn: usize,
+    /// [MTP-2] 슬롯별 재귀 초안열(0=다음+1 … k-1=다음+k).
+    pub(super) mtp_draft: Vec<Vec<u32>>,
+    pub(super) mtp_pos: Vec<u32>,
+    pub(super) mtp_prev_pos: Vec<u32>,
+    pub(super) mtp_off_slot: Vec<bool>,
+    /// [MTP-GRAPH 2026-10-12] MTP 콜 t(1..=8)별 캡처 — 런치 ~20회 → 1회.
+    pub(super) mtp_graphs: Vec<Option<(ffi::CUgraphExec, ffi::CUgraph)>>,
+    /// 캡처 실패 후 직접 발사 고정(재시도 방지).
+    pub(super) mtp_graph_failed: bool,
+    /// MTP 핀드 — 임베드 스테이징(MTP_TMAX×h×4) + argmax 회수(8×4).
+    pub(super) mtp_pin_emb: *mut std::ffi::c_void,
+    pub(super) mtp_pin_out: *mut std::ffi::c_void,
+    /// [MTP-CHAIN 2026-10-12 §3.3 ②] 체인 부기 — 스텝 카운터(4B)·초안
+    /// 로그(8×4B — w4a16_mtp_chain_step 기록부).
+    pub(super) mtp_chain_ctr: CUdeviceptr,
+    pub(super) mtp_chain_log: CUdeviceptr,
+    /// [MTP-CHAIN] 체인 t=1 그래프 — 슬롯별(KV/dpp 포인터가 커널 인자로
+    /// 베이크되므로 t키 mtp_graphs와 달리 슬롯 키).
+    pub(super) mtp_chain_graphs: Vec<Option<(ffi::CUgraphExec, ffi::CUgraph)>>,
+}
+
+/// [R10 2026-10-12] 어텐션(KV 분할·스케일) — W4a16Dec 필드 도메인 그룹(순수 이동).
+pub(super) struct Attn {
+    // ── attn ──
+    pub(super) attn: Option<AttnDims>,
+    pub(super) dqnw_a: CUdeviceptr,
+    pub(super) dknw_a: CUdeviceptr,
+    pub(super) dkc: CUdeviceptr,
+    pub(super) dvc: CUdeviceptr,
+    /// [P13] int8 KV 스케일(K/V 각각 [n_attn*cap][kv_heads] f32) — KVQ 전용.
+    pub(super) dksc: CUdeviceptr,
+    pub(super) dvsc: CUdeviceptr,
+    pub(super) dpp: CUdeviceptr,
+    pub(super) dqg_a: CUdeviceptr,
+    pub(super) dkin_a: CUdeviceptr,
+    pub(super) dvin_a: CUdeviceptr,
+    pub(super) dqh_a: CUdeviceptr,
+    /// P8-attn-3: KV 분할 attention 부분합 스크래치
+    /// ([T][q_heads][ATTN_SPLITS][258] f32 — m·l·acc256).
+    pub(super) dattn_part: CUdeviceptr,
+    pub(super) doutv_a: CUdeviceptr,
+    pub(super) attn_t_cap: usize,
+}
+
+/// [R10 2026-10-12] GDN(디바이스 상태·검증 스냅샷) — W4a16Dec 필드 도메인 그룹(순수 이동).
+pub(super) struct Gdn {
+    // ── GDN ──
+    pub(super) gdn: Option<GdnDims>,
+    pub(super) dcw: CUdeviceptr,
+    pub(super) dab_c: CUdeviceptr,
+    pub(super) dalog: CUdeviceptr,
+    pub(super) ddtb: CUdeviceptr,
+    pub(super) dnwg: CUdeviceptr,
+    pub(super) dring: CUdeviceptr,
+    pub(super) dgst: CUdeviceptr,
+    pub(super) dqkv: CUdeviceptr,
+    pub(super) dzv: CUdeviceptr,
+    pub(super) dgxn: CUdeviceptr,
+    pub(super) dgq: CUdeviceptr,
+    pub(super) dgk: CUdeviceptr,
+    pub(super) dgv: CUdeviceptr,
+    pub(super) dq2: CUdeviceptr,
+    pub(super) dk2: CUdeviceptr,
+    pub(super) dv2: CUdeviceptr,
+    pub(super) dbg: CUdeviceptr,
+    pub(super) dgo: CUdeviceptr,
+    /// [P9] t=1 GDN 분할 부분합([h_v][4][2][128] f32)과 dc([h_v][128]).
+    pub(super) dgpart: CUdeviceptr,
+    pub(super) dgdc: CUdeviceptr,
+    /// [A5-4] gdn_scan A/KQ prepass 스크래치 — [2][h_v][maxchunks][CS][CS] half.
+    pub(super) dakq: CUdeviceptr,
+    pub(super) dgate: CUdeviceptr,
+    pub(super) gdn_t_cap: usize,
+    /// [A-1] 스펙 검증 — GDN 토큰별 상태 스냅샷([t][L][h_v][d*d]) + conv 링
+    /// 스냅샷([L][t][3][conv_ch]).
+    pub(super) dsnap: CUdeviceptr,
+    pub(super) dsnap_ring: CUdeviceptr,
+    pub(super) dsave: CUdeviceptr,
+    /// [A2 2026-10-11] 접두 재사용 체크포인트(GDN 상태+conv 링, 슬롯별 1개).
+    pub(super) dchk: CUdeviceptr,
+    /// 체크포인트 위치(토큰 수) — 0 = 없음.
+    /// [K3 2026-10-12] 체크포인트 위치 — 슬롯당 512 경계 스택 4개
+    /// (512/1024/1536/2048 — 환형 저장). upto 이하 최대 경계.
+    pub(super) dchk_pos: Vec<[u32; 4]>,
+}
+
+/// [R10 2026-10-12] CUDA Graph 캡처·핀드 버퍼 — W4a16Dec 필드 도메인 그룹(순수 이동).
+pub(super) struct Graph {
+    // ── CUDA Graph(체인 캡처 — 토큰당 1 launch) ──
+    /// [A8 2026-10-09] 슬롯·모드별 캡처 exec 캐시 — 종전 단일 그래프를
+    /// 슬롯/모드 전환마다 destroy+재캡처(다중 슬롯 틱마다 수 ms)했고, 이
+    /// 캐시가 그 비용을 1회 캡처로 상각한다. 키 = (slot, head, argmax).
+    /// 버퍼 재할당(graph_invalidate) 시 전량 폐기(옛 포인터 replay 차단).
+    pub(super) graph_cache: Vec<GraphEntry>,
+    /// 캡처 실패 후 직접 경로 고정(매 토큰 재시도 방지).
+    pub(super) graph_failed: bool,
+    /// 캡처 중 임베딩 복사 소스를 pinned로 고정(캡처는 pageable async 불가).
+    pub(super) capture_pinned_src: bool,
+    pub(super) pin_embed: *mut std::ffi::c_void,
+    pub(super) pin_pos: *mut std::ffi::c_void,
+    pub(super) pin_out: *mut std::ffi::c_void,
+    pub(super) pin_out_len: usize,
+    pub(super) pin_batch_tok: *mut std::ffi::c_void,
+    /// [S11 2026-10-11] 샘플 배치 로짓 핀드 판독 버퍼([t][head_n] f32).
+    pub(super) pin_batch_lg: *mut std::ffi::c_void,
+    pub(super) pin_batch_in: *mut std::ffi::c_void,
+    pub(super) pin_batch_pos: *mut std::ffi::c_void,
+    pub(super) batch_graphs: Vec<(Vec<usize>, ffi::CUgraphExec, ffi::CUgraph)>,
+    /// [A6-1 2026-10-11] 검증 체인 (slot, t) 그래프 캐시 — 캡처 실패 시 비활성.
+    pub(super) spec_graphs: Vec<((usize, usize), ffi::CUgraphExec, ffi::CUgraph)>,
+    pub(super) spec_graph_ok: bool,
+    /// [A6-1] 캡처 본문에서 호스트 갱신(sync·slot_pos·체크포인트) 생략 게이트.
+    pub(super) capture_no_host: bool,
+    /// 캡처 실패 후 직접 발사 고정(재시도 방지 — t=1 graph_failed와 동형).
+    pub(super) batch_capture_failed: bool,
+}
+
 pub struct W4a16Dec {
+    pub(super) moe: MoE,
+    pub(super) mtp: Mtp,
+    pub(super) attn: Attn,
+    pub(super) gdn: Gdn,
+    pub(super) graph: Graph,
     pub cc: CudaCtx,
     pub hidden: usize,
     pub n_layers: usize,
@@ -257,89 +463,6 @@ pub struct W4a16Dec {
     weights_bytes: u64,
     /// 전문가 테이블 바이트 합(불변 — 1Hz 집계의 O(92k) 반복 제거).
     experts_bytes: u64,
-    /// MoE 구성 — n_experts=0이면 dense FFN.
-    n_experts: usize,
-    top_k: usize,
-    moe_ffn: usize,
-    shared_ffn: usize,
-    moe_group: usize,
-    moe_scale_bf16: bool,
-    /// 전문가 슬라이스 테이블 — (packed ptr/len, scale ptr/len), 인덱스
-    /// ((il·n_experts + e)·3 + proj) — proj 0/1/2 = gate/up/down.
-    /// 호스트 포인터는 서버 스토어 mmap 수명 계약(set_expert_table).
-    moe_tab: Vec<(u64, u64, u64, u64)>,
-    /// 전문가 상주 모드 — moe_tab이 VRAM 포인터(170HX 64GB 등).
-    moe_resident: bool,
-    /// 전문가 디바이스 포인터 테이블(상주 — 배치 GEMV 간접 참조, (q,s) 쌍).
-    moe_dev_tab: CUdeviceptr,
-    /// 선택 슬롯 인덱스·가중(호스트 → 디바이스, [top_k]).
-    moe_idx: CUdeviceptr,
-    moe_wt: CUdeviceptr,
-    /// [B-4] 다중 세그먼트 GEMV 테이블(층×3세그먼트×4u64: w,out,n,k) +
-    /// 층별 행 합(그리드). 라우터 게이트 + shared gate/up 1런치용.
-    moe_multi_tab: CUdeviceptr,
-    moe_multi_rows: Vec<u32>,
-    /// [S10-잔여] t행(≤8) 판 다중세그먼트 grid — 라우터+shared gate/up 3세그먼트
-    /// Σceil(n/GEMV_TR)/층(sgate 제외 — 출력 레이아웃 [t][n] 충돌 회피).
-    moe_multi_rows_t3: Vec<u32>,
-    /// [P11] 전문가-우선 슬롯 정렬(프리필 그룹 GEMV) — gslot[n_exp×gmax]+cnt.
-    moe_gslot: CUdeviceptr,
-    moe_gcnt: CUdeviceptr,
-    moe_goff: CUdeviceptr,
-    moe_gmax: usize,
-    /// 배치 전문가 출력([top_k][n_ff] · [top_k][hidden]) — act는 ew 전용
-    /// 별도 버퍼(ew 커널 __restrict__ 계약 — 제자리 호출 금지).
-    exp: ExpBufs,
-    /// MoE 스테이징 — 전문가 packed/scale(1쌍 재사용, 스트림 순서 안전).
-    stg: StgBufs,
-    /// [C2 2026-10-09] 호스트 RAM 스테이징 — 스트리밍 전문가의 mmap 슬라이스
-    /// 1회 복사본(set_expert_table). 스트리밍 업로드가 SSD/페이지캐시 경로에
-    /// 의존하지 않게 한다. Vec 버퍼 주소는 불변이므로 moe_tab이 이 안을
-    /// 가리켜도 안전(용량 추가 변경 금지 — 구축 후 불변).
-    host_stage: Vec<u8>,
-    /// [P7-fix 2026-10-10] host_stage 선두에서 cuMemHostRegister에 성공한
-    /// 바이트 수(0 = 미등록). 등록 구간 소스는 h2d DMA가 직행한다.
-    host_stage_reg: usize,
-    /// 라우터 로짓/ shared 게이트 스크래치(n_experts ≥ 1).
-    drt: Buf,
-    /// MoE 출력(hidden) — 잔차 ab로 소비된다.
-    dmo: Buf,
-    moe_bufs_ok: bool,
-    /// [B3 2026-10-12] shared 꼬리 포크 전용 sgate 출력 슬롯(t≤8행 f32 —
-    /// 종전 drt 재사용은 topk와의 병렬 경합). 1회 할당·불변(캡처 안전).
-    dsg: CUdeviceptr,
-    /// [B3] 층별 이벤트 쌍 [fork, join] — 캡처 중 재기록 회피(층당 고유).
-    ev_fork: Vec<ffi::CUevent>,
-    /// [B7 2026-10-12] shared 게이트/업 전용 슬롯 — dchain 재사용은 스트리밍
-    /// 전문가 스크래치와 충돌(게이트/업이 전문가보다 먼저 계산됨).
-    dsh: [CUdeviceptr; 2],
-    dsh_cap: usize,
-    /// [MTP 2026-10-12] 모델 자체 MTP 초안기 — 가중치는 plain 레지스트리
-    /// (이름 참조), 여기는 버퍼/상태만.
-    mtp_ok: bool,
-    mtp_nw: CUdeviceptr,
-    mtp_zero: CUdeviceptr,
-    mtp_buf: CUdeviceptr,
-    mtp_off: [usize; 17],
-    mtp_prev_off: usize,
-    mtp_layer: usize,
-    mtp_rows: usize,
-    mtp_ffn: usize,
-    /// [MTP-2] 슬롯별 재귀 초안열(0=다음+1 … k-1=다음+k).
-    mtp_draft: Vec<Vec<u32>>,
-    mtp_pos: Vec<u32>,
-    mtp_prev_pos: Vec<u32>,
-    mtp_off_slot: Vec<bool>,
-    /// [B4-2 2026-10-12] 스트리밍 전문가 LRU 캐시(층별 K×3proj q/s).
-    /// 가중치 불변 → hit 재사용은 수치 무변화(h2d 생략만). 층별 독립 LRU.
-    mcache_q: CUdeviceptr,
-    mcache_s: CUdeviceptr,
-    mcache_k: usize,
-    mcache_ids: Vec<u16>,
-    mcache_age: Vec<u32>,
-    mcache_tick: u32,
-    mcache_hits: u64,
-    mcache_miss: u64,
     /// GEMV 스테이징 — x f16 [t][k], y f32 [t][n].
     xh: Buf,
     dy: Buf,
@@ -349,52 +472,6 @@ pub struct W4a16Dec {
     norm: NormBufs,
     // ── ew ──
     ew: EwBufs,
-    // ── GDN ──
-    gdn: Option<GdnDims>,
-    dcw: CUdeviceptr,
-    dab_c: CUdeviceptr,
-    dalog: CUdeviceptr,
-    ddtb: CUdeviceptr,
-    dnwg: CUdeviceptr,
-    dring: CUdeviceptr,
-    dgst: CUdeviceptr,
-    dqkv: CUdeviceptr,
-    dzv: CUdeviceptr,
-    dgxn: CUdeviceptr,
-    dgq: CUdeviceptr,
-    dgk: CUdeviceptr,
-    dgv: CUdeviceptr,
-    dq2: CUdeviceptr,
-    dk2: CUdeviceptr,
-    dv2: CUdeviceptr,
-    dbg: CUdeviceptr,
-    dgo: CUdeviceptr,
-    /// [P9] t=1 GDN 분할 부분합([h_v][4][2][128] f32)과 dc([h_v][128]).
-    dgpart: CUdeviceptr,
-    dgdc: CUdeviceptr,
-    /// [A5-4] gdn_scan A/KQ prepass 스크래치 — [2][h_v][maxchunks][CS][CS] half.
-    dakq: CUdeviceptr,
-    dgate: CUdeviceptr,
-    gdn_t_cap: usize,
-    // ── attn ──
-    attn: Option<AttnDims>,
-    dqnw_a: CUdeviceptr,
-    dknw_a: CUdeviceptr,
-    dkc: CUdeviceptr,
-    dvc: CUdeviceptr,
-    /// [P13] int8 KV 스케일(K/V 각각 [n_attn*cap][kv_heads] f32) — KVQ 전용.
-    dksc: CUdeviceptr,
-    dvsc: CUdeviceptr,
-    dpp: CUdeviceptr,
-    dqg_a: CUdeviceptr,
-    dkin_a: CUdeviceptr,
-    dvin_a: CUdeviceptr,
-    dqh_a: CUdeviceptr,
-    /// P8-attn-3: KV 분할 attention 부분합 스크래치
-    /// ([T][q_heads][ATTN_SPLITS][258] f32 — m·l·acc256).
-    dattn_part: CUdeviceptr,
-    doutv_a: CUdeviceptr,
-    attn_t_cap: usize,
     // ── 디바이스 체인(S10 — 연산별 왕복 제거) ──
     dres: CUdeviceptr,
     dab_dev: CUdeviceptr,
@@ -411,17 +488,6 @@ pub struct W4a16Dec {
     /// [FLA-10 2026-10-10] 플레인(bf16) 경로 A 미러([t][k] bf16) — bf16_mma가
     /// f32 대신 판독(재판독 대역 절반). cast_bf16과 커널 내 변환이 비트동일.
     dabf: Buf,
-    /// [A-1] 스펙 검증 — GDN 토큰별 상태 스냅샷([t][L][h_v][d*d]) + conv 링
-    /// 스냅샷([L][t][3][conv_ch]).
-    dsnap: CUdeviceptr,
-    dsnap_ring: CUdeviceptr,
-    dsave: CUdeviceptr,
-    /// [A2 2026-10-11] 접두 재사용 체크포인트(GDN 상태+conv 링, 슬롯별 1개).
-    dchk: CUdeviceptr,
-    /// 체크포인트 위치(토큰 수) — 0 = 없음.
-    /// [K3 2026-10-12] 체크포인트 위치 — 슬롯당 512 경계 스택 4개
-    /// (512/1024/1536/2048 — 환형 저장). upto 이하 최대 경계.
-    dchk_pos: Vec<[u32; 4]>,
     /// [S2 2026-10-11] 다중세그먼트 테이블(디바이스 u64) — q/k/v·qkv/z·gate/up
     /// 을 1런치로(런치 꼬리 제거). 업로드·dchain 확정 후 ensure_chain_bufs에서
     /// 1회 작성 — 그래프 캡처 정적 계약(리플레이 간 내용 불변).
@@ -444,29 +510,12 @@ pub struct W4a16Dec {
     head_out: CUdeviceptr,
     /// [P3] argmax 결과(u32 1개) — 그래프 4B readback 대상.
     argmax_out: CUdeviceptr,
-    // ── CUDA Graph(체인 캡처 — 토큰당 1 launch) ──
-    /// [A8 2026-10-09] 슬롯·모드별 캡처 exec 캐시 — 종전 단일 그래프를
-    /// 슬롯/모드 전환마다 destroy+재캡처(다중 슬롯 틱마다 수 ms)했고, 이
-    /// 캐시가 그 비용을 1회 캡처로 상각한다. 키 = (slot, head, argmax).
-    /// 버퍼 재할당(graph_invalidate) 시 전량 폐기(옛 포인터 replay 차단).
-    graph_cache: Vec<GraphEntry>,
-    /// 캡처 실패 후 직접 경로 고정(매 토큰 재시도 방지).
-    graph_failed: bool,
-    /// 캡처 중 임베딩 복사 소스를 pinned로 고정(캡처는 pageable async 불가).
-    capture_pinned_src: bool,
-    pin_embed: *mut std::ffi::c_void,
-    pin_pos: *mut std::ffi::c_void,
-    pin_out: *mut std::ffi::c_void,
-    pin_out_len: usize,
     /// [A9 2026-10-10] 배치 디코드 부속 — 로짓[t×head_n]·argmax[t]·핀드
     /// (토큰·임베딩 행·슬롯 pos) + 슬롯집합별 캡처 그래프 캐시.
     dbatch_lg: CUdeviceptr,
     dbatch_am: CUdeviceptr,
     /// [eval] 배치 버퍼 tmax 하한 — 청크 프리필 로짓 회수용(0=기본 공식).
     pub batch_tmax_min: usize,
-    pin_batch_tok: *mut std::ffi::c_void,
-    /// [S11 2026-10-11] 샘플 배치 로짓 핀드 판독 버퍼([t][head_n] f32).
-    pin_batch_lg: *mut std::ffi::c_void,
     /// [S3-1 2026-10-11] 임베딩 gather — token_embd 상주(f16/bf16 원본).
     emb_dev: CUdeviceptr,
     emb_n: usize,
@@ -474,23 +523,6 @@ pub struct W4a16Dec {
     emb_bf16: bool,
     /// 토큰 id 스테이징(디바이스, CHAIN_TMAX×4B — ensure_chain_bufs).
     dtg: CUdeviceptr,
-    pin_batch_in: *mut std::ffi::c_void,
-    pin_batch_pos: *mut std::ffi::c_void,
-    batch_graphs: Vec<(Vec<usize>, ffi::CUgraphExec, ffi::CUgraph)>,
-    /// [A6-1 2026-10-11] 검증 체인 (slot, t) 그래프 캐시 — 캡처 실패 시 비활성.
-    spec_graphs: Vec<((usize, usize), ffi::CUgraphExec, ffi::CUgraph)>,
-    spec_graph_ok: bool,
-    /// [MTP-GRAPH 2026-10-12] MTP 콜 t(1..=8)별 캡처 — 런치 ~20회 → 1회.
-    mtp_graphs: Vec<Option<(ffi::CUgraphExec, ffi::CUgraph)>>,
-    /// 캡처 실패 후 직접 발사 고정(재시도 방지).
-    mtp_graph_failed: bool,
-    /// MTP 핀드 — 임베드 스테이징(MTP_TMAX×h×4) + argmax 회수(8×4).
-    mtp_pin_emb: *mut std::ffi::c_void,
-    mtp_pin_out: *mut std::ffi::c_void,
-    /// [A6-1] 캡처 본문에서 호스트 갱신(sync·slot_pos·체크포인트) 생략 게이트.
-    capture_no_host: bool,
-    /// 캡처 실패 후 직접 발사 고정(재시도 방지 — t=1 graph_failed와 동형).
-    batch_capture_failed: bool,
     /// 층별 잔차 합 덤프(CPU LLM170_DUMP=debug_layers와 대조용).
     pub debug_layers: bool,
 }
@@ -529,6 +561,133 @@ impl W4a16Dec {
             cc.load_fatbin(a.name, &crate::rawcuda::assets::asset_bytes(a)?, a.syms)?;
         }
         Ok(W4a16Dec {
+            moe: MoE {
+                n_experts: 0,
+                top_k: 0,
+                moe_ffn: 0,
+                shared_ffn: 0,
+                moe_group: 32,
+                moe_scale_bf16: true,
+                moe_tab: Vec::new(),
+                moe_resident: false,
+                moe_dev_tab: 0,
+                moe_idx: 0,
+                moe_wt: 0,
+                dsg: 0,
+                ev_fork: Vec::new(),
+                dsh: [0, 0],
+                dsh_cap: 0,
+                mcache_q: 0,
+                mcache_s: 0,
+                mcache_k: 0,
+                mcache_ids: Vec::new(),
+                mcache_age: Vec::new(),
+                mcache_tick: 0,
+                mcache_hits: 0,
+                mcache_miss: 0,
+                moe_multi_tab: 0,
+                moe_multi_rows: Vec::new(),
+                moe_multi_rows_t3: Vec::new(),
+                moe_gslot: 0,
+                moe_gcnt: 0,
+                moe_goff: 0,
+                moe_gmax: 0,
+                exp: ExpBufs::default(),
+                stg: StgBufs::default(),
+                host_stage: Vec::new(),
+                host_stage_reg: 0,
+                drt: Buf::default(),
+                dmo: Buf::default(),
+                moe_bufs_ok: false,
+            },
+            mtp: Mtp {
+                mtp_ok: false,
+                mtp_nw: 0,
+                mtp_zero: 0,
+                mtp_buf: 0,
+                mtp_off: [0; 17],
+                mtp_prev_off: 0,
+                mtp_layer: 0,
+                mtp_rows: 0,
+                mtp_ffn: 0,
+                mtp_draft: Vec::new(),
+                mtp_pos: Vec::new(),
+                mtp_prev_pos: Vec::new(),
+                mtp_off_slot: Vec::new(),
+                mtp_graphs: vec![None; 9],
+                mtp_graph_failed: false,
+                mtp_pin_emb: std::ptr::null_mut(),
+                mtp_pin_out: std::ptr::null_mut(),
+                mtp_chain_ctr: 0,
+                mtp_chain_log: 0,
+                mtp_chain_graphs: Vec::new(),
+            },
+            attn: Attn {
+                attn: None,
+                dqnw_a: 0,
+                dknw_a: 0,
+                dkc: 0,
+                dvc: 0,
+                dksc: 0,
+                dvsc: 0,
+                dpp: 0,
+                dqg_a: 0,
+                dkin_a: 0,
+                dvin_a: 0,
+                dqh_a: 0,
+                doutv_a: 0,
+                dattn_part: 0,
+                attn_t_cap: 0,
+            },
+            gdn: Gdn {
+                gdn: None,
+                dcw: 0,
+                dab_c: 0,
+                dalog: 0,
+                ddtb: 0,
+                dnwg: 0,
+                dring: 0,
+                dgst: 0,
+                dqkv: 0,
+                dzv: 0,
+                dgxn: 0,
+                dgq: 0,
+                dgk: 0,
+                dgv: 0,
+                dq2: 0,
+                dk2: 0,
+                dv2: 0,
+                dbg: 0,
+                dgo: 0,
+                dgpart: 0,
+                dgdc: 0,
+                dakq: 0,
+                dgate: 0,
+                gdn_t_cap: 0,
+                dsnap: 0,
+                dsnap_ring: 0,
+                dsave: 0,
+                dchk: 0,
+                dchk_pos: Vec::new(),
+            },
+            graph: Graph {
+                graph_cache: Vec::new(),
+                graph_failed: false,
+                capture_pinned_src: false,
+                pin_embed: std::ptr::null_mut(),
+                pin_pos: std::ptr::null_mut(),
+                pin_out: std::ptr::null_mut(),
+                pin_out_len: 0,
+                pin_batch_tok: std::ptr::null_mut(),
+                pin_batch_lg: std::ptr::null_mut(),
+                pin_batch_in: std::ptr::null_mut(),
+                pin_batch_pos: std::ptr::null_mut(),
+                batch_graphs: Vec::new(),
+                spec_graphs: Vec::new(),
+                spec_graph_ok: true,
+                capture_no_host: false,
+                batch_capture_failed: false,
+            },
             cc,
             hidden,
             n_layers,
@@ -539,101 +698,12 @@ impl W4a16Dec {
             plain_weights: false,
             weights_bytes: 0,
             experts_bytes: 0,
-            n_experts: 0,
-            top_k: 0,
-            moe_ffn: 0,
-            shared_ffn: 0,
-            moe_group: 32,
-            moe_scale_bf16: true,
-            moe_tab: Vec::new(),
-            moe_resident: false,
-            moe_dev_tab: 0,
-            moe_idx: 0,
-            moe_wt: 0,
-            dsg: 0,
-            ev_fork: Vec::new(),
-            dsh: [0, 0],
-            dsh_cap: 0,
-            mtp_ok: false,
-            mtp_nw: 0,
-            mtp_zero: 0,
-            mtp_buf: 0,
-            mtp_off: [0; 17],
-            mtp_prev_off: 0,
-            mtp_layer: 0,
-            mtp_rows: 0,
-            mtp_ffn: 0,
-            mtp_draft: Vec::new(),
-            mtp_pos: Vec::new(),
-            mtp_prev_pos: Vec::new(),
-            mtp_off_slot: Vec::new(),
-            mcache_q: 0,
-            mcache_s: 0,
-            mcache_k: 0,
-            mcache_ids: Vec::new(),
-            mcache_age: Vec::new(),
-            mcache_tick: 0,
-            mcache_hits: 0,
-            mcache_miss: 0,
-            moe_multi_tab: 0,
-            moe_multi_rows: Vec::new(),
-            moe_multi_rows_t3: Vec::new(),
-            moe_gslot: 0,
-            moe_gcnt: 0,
-            moe_goff: 0,
-            moe_gmax: 0,
-            exp: ExpBufs::default(),
-            stg: StgBufs::default(),
-            host_stage: Vec::new(),
-            host_stage_reg: 0,
-            drt: Buf::default(),
-            dmo: Buf::default(),
-            moe_bufs_ok: false,
             xh: Buf::default(),
             dy: Buf::default(),
             dnw: 0,
             norm_w_rows: 0,
             norm: NormBufs::default(),
             ew: EwBufs::default(),
-            gdn: None,
-            dcw: 0,
-            dab_c: 0,
-            dalog: 0,
-            ddtb: 0,
-            dnwg: 0,
-            dring: 0,
-            dgst: 0,
-            dqkv: 0,
-            dzv: 0,
-            dgxn: 0,
-            dgq: 0,
-            dgk: 0,
-            dgv: 0,
-            dq2: 0,
-            dk2: 0,
-            dv2: 0,
-            dbg: 0,
-            dgo: 0,
-            dgpart: 0,
-            dgdc: 0,
-            dakq: 0,
-            dgate: 0,
-            gdn_t_cap: 0,
-            attn: None,
-            dqnw_a: 0,
-            dknw_a: 0,
-            dkc: 0,
-            dvc: 0,
-            dksc: 0,
-            dvsc: 0,
-            dpp: 0,
-            dqg_a: 0,
-            dkin_a: 0,
-            dvin_a: 0,
-            dqh_a: 0,
-            doutv_a: 0,
-            dattn_part: 0,
-            attn_t_cap: 0,
             dres: 0,
             dab_dev: 0,
             dchain: [0; 5],
@@ -644,11 +714,6 @@ impl W4a16Dec {
             dx32: Buf::default(),
             dx16: Buf::default(),
             dabf: Buf::default(),
-            dsnap: 0,
-            dsnap_ring: 0,
-            dsave: 0,
-            dchk: 0,
-            dchk_pos: Vec::new(),
             dmulti: 0,
             dmulti_meta: Vec::new(),
             spec_on: false,
@@ -660,34 +725,14 @@ impl W4a16Dec {
             head_k: 0,
             head_out: 0,
             argmax_out: 0,
-            graph_cache: Vec::new(),
-            graph_failed: false,
-            capture_pinned_src: false,
-            pin_embed: std::ptr::null_mut(),
-            pin_pos: std::ptr::null_mut(),
-            pin_out: std::ptr::null_mut(),
-            pin_out_len: 0,
             dbatch_lg: 0,
             dbatch_am: 0,
             batch_tmax_min: 0,
-            pin_batch_tok: std::ptr::null_mut(),
-            pin_batch_lg: std::ptr::null_mut(),
             emb_dev: 0,
             emb_n: 0,
             emb_k: 0,
             emb_bf16: false,
             dtg: 0,
-            pin_batch_in: std::ptr::null_mut(),
-            pin_batch_pos: std::ptr::null_mut(),
-            batch_graphs: Vec::new(),
-            spec_graphs: Vec::new(),
-            mtp_graphs: vec![None; 9],
-            mtp_graph_failed: false,
-            mtp_pin_emb: std::ptr::null_mut(),
-            mtp_pin_out: std::ptr::null_mut(),
-            spec_graph_ok: true,
-            capture_no_host: false,
-            batch_capture_failed: false,
             debug_layers: false,
         })
     }
@@ -811,9 +856,9 @@ impl W4a16Dec {
 
     /// MoE 배치 모드 문자열(모니터링) — "none" | "resident" | "streaming".
     pub fn moe_mode(&self) -> &'static str {
-        if self.n_experts == 0 {
+        if self.moe.n_experts == 0 {
             "none"
-        } else if self.moe_resident {
+        } else if self.moe.moe_resident {
             "resident"
         } else {
             "streaming"
@@ -822,12 +867,12 @@ impl W4a16Dec {
 
     /// MoE 모델 여부(프리필 t=1 강제 등).
     pub fn is_moe(&self) -> bool {
-        self.n_experts > 0
+        self.moe.n_experts > 0
     }
 
     /// 전문가 전량 상주 여부 — MoE 배치 프리필(t>1)의 전제.
     pub fn moe_experts_resident(&self) -> bool {
-        self.moe_resident
+        self.moe.moe_resident
     }
 
     fn plain_spec(&self, name: &str) -> Result<(CUdeviceptr, usize, usize), String> {

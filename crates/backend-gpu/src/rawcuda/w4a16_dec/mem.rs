@@ -69,6 +69,7 @@ impl W4a16Dec {
     pub fn mem_stats(&self) -> (u64, u64, u64, u64) {
         let kv = self
             .attn
+            .attn
             .map(|d| {
                 let rows = (self.n_slots as u64) * (d.n_attn as u64) * (d.cap as u64);
                 // [KVQ 채택 2026-10-10] int8 KV + 행×헤드 f32 스케일 2벌.
@@ -76,7 +77,7 @@ impl W4a16Dec {
             })
             .unwrap_or(0);
         let experts = self.experts_bytes;
-        let (w_gpu, w_cpu) = if self.n_experts > 0 && !self.moe_resident {
+        let (w_gpu, w_cpu) = if self.moe.n_experts > 0 && !self.moe.moe_resident {
             (self.weights_bytes, experts)
         } else {
             (self.weights_bytes, 0)
@@ -89,8 +90,9 @@ impl W4a16Dec {
     /// 스트리밍 모드 = 상주 가중치(전문가는 별도 CPU 오프로드로 집계).
     pub fn active_weight_bytes(&self) -> u64 {
         let experts = self.experts_bytes;
-        if self.n_experts > 0 && self.moe_resident {
-            let unsel = experts / self.n_experts as u64 * (self.n_experts - self.top_k) as u64;
+        if self.moe.n_experts > 0 && self.moe.moe_resident {
+            let unsel =
+                experts / self.moe.n_experts as u64 * (self.moe.n_experts - self.moe.top_k) as u64;
             self.weights_bytes.saturating_sub(unsel)
         } else {
             self.weights_bytes

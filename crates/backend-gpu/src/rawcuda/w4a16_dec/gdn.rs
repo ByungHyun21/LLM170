@@ -12,7 +12,7 @@ impl W4a16Dec {
         qkv_dev: CUdeviceptr,
         z_dev: CUdeviceptr,
     ) -> Result<(), String> {
-        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         if layer >= dm.n_gdn || slot >= self.n_slots || t_len == 0 {
             return Err(format!(
                 "GDN: 범위 위반 layer={layer} slot={slot} t={t_len}"
@@ -33,15 +33,15 @@ impl W4a16Dec {
         let f = self.cc.function("gdn_conv")?;
         let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5) = (
             qkv_dev,
-            self.dcw,
-            self.dring + (ring_slot as u64) * 4,
-            self.dgq,
-            self.dgk,
-            self.dgv,
+            self.gdn.dcw,
+            self.gdn.dring + (ring_slot as u64) * 4,
+            self.gdn.dgq,
+            self.gdn.dgk,
+            self.gdn.dgv,
         );
         // [A-1] 스펙 검증이면 토큰별 링 스냅샷 기록(층 슬라이스 = layer×8×3×ch).
         let mut c6 = if self.spec_on && (2..=8).contains(&t_len) {
-            self.dsnap_ring + (layer as u64 * 8 * 3 * dm.conv_ch() as u64) * 4
+            self.gdn.dsnap_ring + (layer as u64 * 8 * 3 * dm.conv_ch() as u64) * 4
         } else {
             0
         };
@@ -71,8 +71,17 @@ impl W4a16Dec {
             mut l9,
             mut l10,
         ) = (
-            self.dgq, self.dgk, self.dgv, xn_dev, self.dab_c, self.dalog, self.ddtb, self.dq2,
-            self.dk2, self.dv2, self.dbg,
+            self.gdn.dgq,
+            self.gdn.dgk,
+            self.gdn.dgv,
+            xn_dev,
+            self.gdn.dab_c,
+            self.gdn.dalog,
+            self.gdn.ddtb,
+            self.gdn.dq2,
+            self.gdn.dk2,
+            self.gdn.dv2,
+            self.gdn.dbg,
         );
         self.cc.launch(
             f,
@@ -91,10 +100,10 @@ impl W4a16Dec {
         if t_len == 1 {
             let fp = self.cc.function("gdn1_part")?;
             let (mut p0, mut p1, mut p2, mut p3) = (
-                self.dq2,
-                self.dk2,
-                self.dgst + (st_slot as u64) * 4,
-                self.dgpart,
+                self.gdn.dq2,
+                self.gdn.dk2,
+                self.gdn.dgst + (st_slot as u64) * 4,
+                self.gdn.dgpart,
             );
             self.cc.launch(
                 fp,
@@ -107,13 +116,13 @@ impl W4a16Dec {
             )?;
             let fc = self.cc.function("gdn1_comb")?;
             let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6) = (
-                self.dq2,
-                self.dk2,
-                self.dv2,
-                self.dbg,
-                self.dgpart,
-                self.dgdc,
-                self.dgo,
+                self.gdn.dq2,
+                self.gdn.dk2,
+                self.gdn.dv2,
+                self.gdn.dbg,
+                self.gdn.dgpart,
+                self.gdn.dgdc,
+                self.gdn.dgo,
             );
             self.cc.launch(
                 fc,
@@ -127,10 +136,10 @@ impl W4a16Dec {
             )?;
             let fu = self.cc.function("gdn1_upd")?;
             let (mut u0, mut u1, mut u2, mut u3) = (
-                self.dk2,
-                self.dbg,
-                self.dgdc,
-                self.dgst + (st_slot as u64) * 4,
+                self.gdn.dk2,
+                self.gdn.dbg,
+                self.gdn.dgdc,
+                self.gdn.dgst + (st_slot as u64) * 4,
             );
             self.cc.launch(
                 fu,
@@ -146,18 +155,18 @@ impl W4a16Dec {
         if !skip_scan && self.spec_on && self.spec_scan_on && (2..=8).contains(&t_len) {
             // [A-1] 스펙 검증 — 토큰 루프 + 토큰별 상태 스냅샷(부분 수용
             // 롤백 지점). 산술은 t=1 trio와 비트동일.
-            if self.dsnap == 0 {
+            if self.gdn.dsnap == 0 {
                 return Err("GDN spec: enable_spec 미호출".into());
             }
             let f = self.cc.function("gdn_spec_scan")?;
             let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6) = (
-                self.dq2,
-                self.dk2,
-                self.dv2,
-                self.dbg,
-                self.dgst + (st_slot as u64) * 4,
-                self.dsnap,
-                self.dgo,
+                self.gdn.dq2,
+                self.gdn.dk2,
+                self.gdn.dv2,
+                self.gdn.dbg,
+                self.gdn.dgst + (st_slot as u64) * 4,
+                self.gdn.dsnap,
+                self.gdn.dgo,
             );
             let (mut tl, mut hk, mut hv, mut dd) =
                 (t_len as i32, dm.h_k as i32, dm.h_v as i32, dm.d as i32);
@@ -182,7 +191,8 @@ impl W4a16Dec {
             // 상태/출력 V-타일 스캔. 스크래치는 dakq(로드 시 확보).
             let nch = t_len.div_ceil(GDN_CS) as u32;
             let fp = self.cc.function("gdn_scan_akq")?;
-            let (mut p0, mut p1, mut p2, mut p3) = (self.dq2, self.dk2, self.dbg, self.dakq);
+            let (mut p0, mut p1, mut p2, mut p3) =
+                (self.gdn.dq2, self.gdn.dk2, self.gdn.dbg, self.gdn.dakq);
             let (mut pt, mut phk, mut phv, mut pd) =
                 (t_len as i32, dm.h_k as i32, dm.h_v as i32, dm.d as i32);
             self.cc.launch(
@@ -198,13 +208,13 @@ impl W4a16Dec {
             let f = self.cc.function("gdn_scan")?;
             self.cc.set_dynamic_smem(f, GDN_SCAN_SMEM)?;
             let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6) = (
-                self.dq2,
-                self.dk2,
-                self.dv2,
-                self.dbg,
-                self.dakq,
-                self.dgst + (st_slot as u64) * 4,
-                self.dgo,
+                self.gdn.dq2,
+                self.gdn.dk2,
+                self.gdn.dv2,
+                self.gdn.dbg,
+                self.gdn.dakq,
+                self.gdn.dgst + (st_slot as u64) * 4,
+                self.gdn.dgo,
             );
             // grid = h_v×NSPLIT(블록 = GDN_NGRP×GDN_VS = 512스레드).
             self.cc.launch_shared(
@@ -225,7 +235,7 @@ impl W4a16Dec {
         let ng = t_len * dm.v_len();
         let (g32, g16) = (self.ensure_dx32(ng)?, self.ensure_dx16(ng)?);
         let f = self.cc.function("gdn_gate")?;
-        let (mut g0, mut g1, mut g2, mut g3) = (self.dgo, z_dev, self.dnwg, self.dgate);
+        let (mut g0, mut g1, mut g2, mut g3) = (self.gdn.dgo, z_dev, self.gdn.dnwg, self.gdn.dgate);
         let (mut g4, mut g5) = (g32, g16);
         self.cc.launch(
             f,
@@ -250,7 +260,7 @@ impl W4a16Dec {
         qkv: &[f32],
         z: &[f32],
     ) -> Result<Vec<f32>, String> {
-        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         if xn.len() != t_len * dm.hidden
             || qkv.len() != t_len * dm.conv_ch()
             || z.len() != t_len * dm.v_len()
@@ -261,13 +271,13 @@ impl W4a16Dec {
         let b =
             // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-        self.cc.h2d(self.dgxn, b(xn))?;
-        self.cc.h2d(self.dqkv, b(qkv))?;
-        self.cc.h2d(self.dzv, b(z))?;
-        let (gxn, gqkv, gzv) = (self.dgxn, self.dqkv, self.dzv);
+        self.cc.h2d(self.gdn.dgxn, b(xn))?;
+        self.cc.h2d(self.gdn.dqkv, b(qkv))?;
+        self.cc.h2d(self.gdn.dzv, b(z))?;
+        let (gxn, gqkv, gzv) = (self.gdn.dgxn, self.gdn.dqkv, self.gdn.dzv);
         self.gdn_chain_dev(slot, layer, t_len, gxn, gqkv, gzv)?;
         let mut ob = vec![0u8; t_len * dm.v_len() * 4];
-        self.cc.d2h(&mut ob, self.dgate)?;
+        self.cc.d2h(&mut ob, self.gdn.dgate)?;
         self.cc.sync()?;
         Ok(
             // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
@@ -290,19 +300,19 @@ impl W4a16Dec {
     pub fn enable_spec(&mut self) -> Result<(), String> {
         // [2026-10-12] 스트리밍(비상주 MoE)은 검증 체인(t>1 체인) 미지원 —
         // 검증 라운드가 실패해 요청이 죽는다(실측 500). 시작 시 명시 비활성.
-        if self.n_experts > 0 && !self.moe_resident {
+        if self.moe.n_experts > 0 && !self.moe.moe_resident {
             return Err("스트리밍(비상주 MoE) — 검증 체인 미지원(t>1 상주 전용)".into());
         }
-        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
-        if self.dsnap != 0 {
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
+        if self.gdn.dsnap != 0 {
             self.spec_on = true;
             return Ok(());
         }
         let elems = 8 * self.n_layers * dm.h_v * dm.d * dm.d;
-        self.dsnap = self.cc.alloc(elems * 4)?;
-        self.dsnap_ring = self.cc.alloc(8 * self.n_layers * 3 * dm.conv_ch() * 4)?;
+        self.gdn.dsnap = self.cc.alloc(elems * 4)?;
+        self.gdn.dsnap_ring = self.cc.alloc(8 * self.n_layers * 3 * dm.conv_ch() * 4)?;
         // [A-1 진단] 슬롯 상태 저장 스크래치(상태 + conv 링) — save/load용.
-        self.dsave = self.cc.alloc(
+        self.gdn.dsave = self.cc.alloc(
             self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4,
         )?;
         // [A2] 접두 재사용 체크포인트 — [K3] 512 경계 스택 4개(환형).
@@ -311,8 +321,8 @@ impl W4a16Dec {
             4 * self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4;
         match self.cc.alloc(chk) {
             Ok(p) => {
-                self.dchk = p;
-                self.dchk_pos = vec![[0u32; 4]; self.n_slots];
+                self.gdn.dchk = p;
+                self.gdn.dchk_pos = vec![[0u32; 4]; self.n_slots];
             }
             Err(e) => {
                 eprintln!("# prefix-ckpt 비활성(VRAM): {e}");
@@ -334,7 +344,7 @@ impl W4a16Dec {
         // [A3] 스테이징 d2d 3회/층 제거 — 호출자 버퍼를 커널 인자로 직접 소비.
         // (gdn_chain_dev가 형상·범위 검증·버퍼 보장을 겸한다.)
         self.gdn_chain_dev(slot, layer, t_len, xn_dev, qkv_dev, z_dev)?;
-        Ok(self.dgate)
+        Ok(self.gdn.dgate)
     }
 
     /// [A9 2026-10-10] GDN 디코드 배치 — 토큰별 슬롯 상태(링·스캔)를 쓴다.
@@ -350,7 +360,7 @@ impl W4a16Dec {
         qkv_dev: CUdeviceptr,
         z_dev: CUdeviceptr,
     ) -> Result<CUdeviceptr, String> {
-        let dm = self.gdn.ok_or("GDN: 형상 미등록")?;
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         if t_len == 0 || t_len != slots.len() || slots.iter().any(|&s| s >= self.n_slots) {
             return Err("GDN batch: 슬롯/토큰 계약 위반".into());
         }
@@ -372,11 +382,11 @@ impl W4a16Dec {
         let f = self.cc.function("gdn_conv")?;
         for (k, &slot) in slots.iter().enumerate() {
             let mut c0 = qkv_dev + k as u64 * cch as u64 * 4;
-            let mut c1 = self.dcw;
-            let mut c2 = self.dring + (slot as u64 * ring_stride) * 4;
-            let mut c3 = self.dgq + k as u64 * kl as u64 * 4;
-            let mut c4 = self.dgk + k as u64 * kl as u64 * 4;
-            let mut c5 = self.dgv + k as u64 * vl as u64 * 4;
+            let mut c1 = self.gdn.dcw;
+            let mut c2 = self.gdn.dring + (slot as u64 * ring_stride) * 4;
+            let mut c3 = self.gdn.dgq + k as u64 * kl as u64 * 4;
+            let mut c4 = self.gdn.dgk + k as u64 * kl as u64 * 4;
+            let mut c5 = self.gdn.dgv + k as u64 * vl as u64 * 4;
             let mut c6 = 0u64;
             self.cc.launch(
                 f,
@@ -393,9 +403,16 @@ impl W4a16Dec {
         {
             let f = self.cc.function("gdn_l2perm")?;
             let (mut l0, mut l1, mut l2, mut l3, mut l4, mut l5, mut l6) = (
-                self.dgq, self.dgk, self.dgv, xn_dev, self.dab_c, self.dalog, self.ddtb,
+                self.gdn.dgq,
+                self.gdn.dgk,
+                self.gdn.dgv,
+                xn_dev,
+                self.gdn.dab_c,
+                self.gdn.dalog,
+                self.gdn.ddtb,
             );
-            let (mut l7, mut l8, mut l9, mut l10) = (self.dq2, self.dk2, self.dv2, self.dbg);
+            let (mut l7, mut l8, mut l9, mut l10) =
+                (self.gdn.dq2, self.gdn.dk2, self.gdn.dv2, self.gdn.dbg);
             let mut tl = t_len as i32;
             self.cc.launch(
                 f,
@@ -417,14 +434,14 @@ impl W4a16Dec {
             self.cc.function("gdn1_upd")?,
         );
         for (k, &slot) in slots.iter().enumerate() {
-            let q2k = self.dq2 + k as u64 * kl as u64 * 4;
-            let k2k = self.dk2 + k as u64 * kl as u64 * 4;
-            let v2k = self.dv2 + k as u64 * vl as u64 * 4;
-            let bgk = self.dbg + k as u64 * bg_stride * 4;
-            let stk = self.dgst + slot as u64 * st_stride * 4;
-            let partk = self.dgpart + k as u64 * part_stride * 4;
-            let dck = self.dgdc + k as u64 * dc_stride * 4;
-            let outk = self.dgo + k as u64 * vl as u64 * 4;
+            let q2k = self.gdn.dq2 + k as u64 * kl as u64 * 4;
+            let k2k = self.gdn.dk2 + k as u64 * kl as u64 * 4;
+            let v2k = self.gdn.dv2 + k as u64 * vl as u64 * 4;
+            let bgk = self.gdn.dbg + k as u64 * bg_stride * 4;
+            let stk = self.gdn.dgst + slot as u64 * st_stride * 4;
+            let partk = self.gdn.dgpart + k as u64 * part_stride * 4;
+            let dck = self.gdn.dgdc + k as u64 * dc_stride * 4;
+            let outk = self.gdn.dgo + k as u64 * vl as u64 * 4;
             {
                 let (mut p0, mut p1, mut p2, mut p3) = (q2k, k2k, stk, partk);
                 self.cc.launch(
@@ -469,7 +486,8 @@ impl W4a16Dec {
             let ng = t_len * dm.v_len();
             let (g32, g16) = (self.ensure_dx32(ng)?, self.ensure_dx16(ng)?);
             let f = self.cc.function("gdn_gate")?;
-            let (mut g0, mut g1, mut g2, mut g3) = (self.dgo, z_dev, self.dnwg, self.dgate);
+            let (mut g0, mut g1, mut g2, mut g3) =
+                (self.gdn.dgo, z_dev, self.gdn.dnwg, self.gdn.dgate);
             let (mut g4, mut g5) = (g32, g16);
             let mut tl = t_len as i32;
             self.cc.launch(
@@ -483,6 +501,6 @@ impl W4a16Dec {
                 ),
             )?;
         }
-        Ok(self.dgate)
+        Ok(self.gdn.dgate)
     }
 }

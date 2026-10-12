@@ -167,14 +167,14 @@ impl W4a16Dec {
     /// MoE 자가 점검 — 직접 GEMV vs 배치(간접) GEMV 비트 비교(층0·전문가0·
     /// gate_proj). 상주 기기 브링업·회귀 판정용.
     pub fn moe_selfcheck(&mut self) -> Result<String, String> {
-        if !self.moe_resident || self.n_experts == 0 {
+        if !self.moe.moe_resident || self.moe.n_experts == 0 {
             return Err("moe_selfcheck: 상주 MoE 구성 필요".into());
         }
         let _g = self.cc.guard()?;
         self.ensure_moe_bufs()?;
         let k = self.hidden;
-        let n = self.moe_ffn;
-        if self.moe_tab.is_empty() {
+        let n = self.moe.moe_ffn;
+        if self.moe.moe_tab.is_empty() {
             return Err("moe_selfcheck: 테이블 부재".into());
         }
         // x — 결정적(splitmix64 계열 상수) ±0.5.
@@ -189,13 +189,13 @@ impl W4a16Dec {
         let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
             self.cc.h2d(dx, xb)?;
             // 직접 — moe_tab[0] = (층0, 전문가0, gate_proj).
-            let e0 = self.moe_tab[0];
+            let e0 = self.moe.moe_tab[0];
             self.gemv_launch_raw(e0.0, e0.2, n, k, dx, da)?;
             // 배치 — idx=[0], base=0, nslots=1.
             let idx = [0u32];
             // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let ib = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, 4) };
-            self.cc.h2d(self.moe_idx, ib)?;
+            self.cc.h2d(self.moe.moe_idx, ib)?;
             self.gemv_experts_launch(0, 1, dx, 0, 1, db, n, k)?;
             self.cc.sync()?;
             let mut a = vec![0u8; n * 4];
@@ -762,7 +762,7 @@ impl W4a16Dec {
         pos0: u32,
     ) -> Result<String, String> {
         let _g = self.cc.guard()?;
-        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
         let (qgd, kvd) = (dm.qg_dim(), dm.kv_dim());
         let mut seed = 0x243F_6A88_85A3_08D3u64 ^ ((t_len as u64) << 32);
         let mut rnd = move || {
@@ -778,11 +778,11 @@ impl W4a16Dec {
         // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
         let b =
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-        self.cc.h2d(self.dqg_a, b(&qg))?;
-        self.cc.h2d(self.dkin_a, b(&kin))?;
-        self.cc.h2d(self.dvin_a, b(&vin))?;
+        self.cc.h2d(self.attn.dqg_a, b(&qg))?;
+        self.cc.h2d(self.attn.dkin_a, b(&kin))?;
+        self.cc.h2d(self.attn.dvin_a, b(&vin))?;
         self.attn_set_pos(slot, pos0)?;
-        let (aq, ak, av) = (self.dqg_a, self.dkin_a, self.dvin_a);
+        let (aq, ak, av) = (self.attn.dqg_a, self.attn.dkin_a, self.attn.dvin_a);
         let r = (|| -> Result<(f64, f64), String> {
             for _ in 0..2 {
                 self.attn_prep_launch(slot, layer, t_len, aq, ak, av)?;
@@ -831,7 +831,7 @@ impl W4a16Dec {
         pos0: u32,
     ) -> Result<String, String> {
         let _g = self.cc.guard()?;
-        let dm = self.attn.ok_or("attn: 형상 미등록")?;
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
         let (qgd, kvd, qdd) = (dm.qg_dim(), dm.kv_dim(), dm.q_dim());
         let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ ((t_len as u64) << 32) ^ (layer as u64);
         let mut rnd = move || {
@@ -848,15 +848,15 @@ impl W4a16Dec {
         // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
         let b =
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-        self.cc.h2d(self.dqg_a, b(&qg))?;
-        self.cc.h2d(self.dkin_a, b(&kin))?;
-        self.cc.h2d(self.dvin_a, b(&vin))?;
+        self.cc.h2d(self.attn.dqg_a, b(&qg))?;
+        self.cc.h2d(self.attn.dkin_a, b(&kin))?;
+        self.cc.h2d(self.attn.dvin_a, b(&vin))?;
         self.attn_set_pos(slot, pos0)?;
-        let (aq, ak, av) = (self.dqg_a, self.dkin_a, self.dvin_a);
+        let (aq, ak, av) = (self.attn.dqg_a, self.attn.dkin_a, self.attn.dvin_a);
         self.attn_prep_launch(slot, layer, t_len, aq, ak, av)?;
         self.attn_fwd3s_legacy_launch(slot, layer, t_len, aq)?;
         let mut obuf = vec![0u8; t_len * qdd * 4];
-        self.cc.d2h(&mut obuf, self.doutv_a)?;
+        self.cc.d2h(&mut obuf, self.attn.doutv_a)?;
         self.cc.sync()?;
         let old: Vec<f32> = obuf
             .as_chunks::<4>()
@@ -866,9 +866,9 @@ impl W4a16Dec {
             .collect();
         self.attn_prep_launch(slot, layer, t_len, aq, ak, av)?;
         // FA2 — prep이 기록한 dqh/KV를 그대로 소비(out32/out16은 dx 버퍼 기록).
-        self.attn_fa2_launch(slot, layer, t_len, self.dqg_a)?;
+        self.attn_fa2_launch(slot, layer, t_len, self.attn.dqg_a)?;
         let mut buf = vec![0u8; t_len * qdd * 4];
-        self.cc.d2h(&mut buf, self.doutv_a)?;
+        self.cc.d2h(&mut buf, self.attn.doutv_a)?;
         self.cc.sync()?;
         let new: Vec<f32> = buf
             .as_chunks::<4>()

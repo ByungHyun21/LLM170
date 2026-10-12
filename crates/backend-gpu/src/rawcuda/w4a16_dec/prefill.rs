@@ -59,11 +59,11 @@ impl W4a16Dec {
             ));
         }
         let pos = self.slot_pos[slot];
-        let cap = self.attn.ok_or("attn: 형상 미등록")?.cap;
+        let cap = self.attn.attn.ok_or("attn: 형상 미등록")?.cap;
         if pos as usize + t > cap {
             return Err(format!("context overflow: pos{pos}+T{t} > kvcap{cap}"));
         }
-        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.is_none() {
+        if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("chain_device_t: 디코더 상수 미등록".into());
         }
         self.ensure_chain_bufs()?;
@@ -107,7 +107,7 @@ impl W4a16Dec {
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, t, xh)
                 .map_err(|e| format!("T{il} input norm: {e}"))?;
-            let interval = self.attn.ok_or("attn: 형상 미등록")?.interval;
+            let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
             let branch = if (il + 1) % interval == 0 {
                 // [R10] 4변형 → lin_forward 단일 디스패치(Gemm 경로).
                 let xin = if plain { xn } else { xh };
@@ -189,7 +189,7 @@ impl W4a16Dec {
         // [A2 2026-10-11] 2048 경계 — 접두 재사용 체크포인트(GDN 상태+conv
         // 링, 순수 복사 — 산술 불변). 실패는 무시(기능만 미제공).
         let endp = pos + t as u32;
-        if !self.capture_no_host && endp.is_multiple_of(512) {
+        if !self.graph.capture_no_host && endp.is_multiple_of(512) {
             let _ = self.checkpoint_gdn(slot, endp);
         }
         if all {
@@ -216,7 +216,7 @@ impl W4a16Dec {
                 let mut ob = vec![0u8; t * self.head_n * 4];
                 self.cc
                     .d2h_async(ob.as_mut_ptr(), self.dbatch_lg, ob.len())?;
-                if !self.capture_no_host {
+                if !self.graph.capture_no_host {
                     self.cc.sync()?;
                     let pos_after = pos + t as u32;
                     self.slot_pos[slot] = pos_after;
@@ -242,10 +242,11 @@ impl W4a16Dec {
                 )?;
             }
             // SAFETY: self 소유 pinned 스크래치 단독 가변 접근(수명=self).
-            let tb =
-                unsafe { std::slice::from_raw_parts_mut(self.pin_batch_tok as *mut u8, t * 4) };
+            let tb = unsafe {
+                std::slice::from_raw_parts_mut(self.graph.pin_batch_tok as *mut u8, t * 4)
+            };
             self.cc.d2h_async(tb.as_mut_ptr(), self.dbatch_am, t * 4)?;
-            if !self.capture_no_host {
+            if !self.graph.capture_no_host {
                 self.cc.sync()?;
                 let pos_after = pos + t as u32;
                 self.slot_pos[slot] = pos_after;

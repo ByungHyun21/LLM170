@@ -47,6 +47,7 @@ impl W4a16Dec {
         Ok(())
     }
 
+    
     // ── norm ──
 
     /// 노름 가중 상주 등록 — nw [rows][hidden] f32(행 포인터 계약 w·hidden).
@@ -102,14 +103,26 @@ impl W4a16Dec {
             return Err("GDN: 상수 형상 계약 위반(cw/ab/alog/dtb/nw)".into());
         }
         for q in [
-            self.dcw, self.dab_c, self.dalog, self.ddtb, self.dnwg, self.dring, self.dgst,
+            self.gdn.dcw,
+            self.gdn.dab_c,
+            self.gdn.dalog,
+            self.gdn.ddtb,
+            self.gdn.dnwg,
+            self.gdn.dring,
+            self.gdn.dgst,
         ] {
             if q != 0 {
                 self.cc.free(q)?;
             }
         }
-        (self.dcw, self.dab_c, self.dalog, self.ddtb, self.dnwg) = (0, 0, 0, 0, 0);
-        (self.dring, self.dgst) = (0, 0);
+        (
+            self.gdn.dcw,
+            self.gdn.dab_c,
+            self.gdn.dalog,
+            self.gdn.ddtb,
+            self.gdn.dnwg,
+        ) = (0, 0, 0, 0, 0);
+        (self.gdn.dring, self.gdn.dgst) = (0, 0);
         let b =
             // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
@@ -128,10 +141,16 @@ impl W4a16Dec {
         Self::zero_dev(&self.cc, dring, slots * n * 3 * cch * 4)?;
         let dgst = self.cc.alloc(slots * n * hv * 128 * 128 * 4)?;
         Self::zero_dev(&self.cc, dgst, slots * n * hv * 128 * 128 * 4)?;
-        (self.dcw, self.dab_c, self.dalog, self.ddtb, self.dnwg) = (dcw, dab, dal, ddt, dnw);
-        self.dring = dring;
-        self.dgst = dgst;
-        self.gdn = Some(dims);
+        (
+            self.gdn.dcw,
+            self.gdn.dab_c,
+            self.gdn.dalog,
+            self.gdn.ddtb,
+            self.gdn.dnwg,
+        ) = (dcw, dab, dal, ddt, dnw);
+        self.gdn.dring = dring;
+        self.gdn.dgst = dgst;
+        self.gdn.gdn = Some(dims);
         Ok(())
     }
 
@@ -146,33 +165,39 @@ impl W4a16Dec {
         // 행×헤드 f32 1개(무시 가능).
         let kv_scales = slots * n * dims.cap * dims.kv_heads;
         for q in [
-            self.dqnw_a,
-            self.dknw_a,
-            self.dkc,
-            self.dvc,
-            self.dksc,
-            self.dvsc,
-            self.dpp,
-            self.dqg_a,
-            self.dkin_a,
-            self.dvin_a,
-            self.dqh_a,
-            self.doutv_a,
+            self.attn.dqnw_a,
+            self.attn.dknw_a,
+            self.attn.dkc,
+            self.attn.dvc,
+            self.attn.dksc,
+            self.attn.dvsc,
+            self.attn.dpp,
+            self.attn.dqg_a,
+            self.attn.dkin_a,
+            self.attn.dvin_a,
+            self.attn.dqh_a,
+            self.attn.doutv_a,
         ] {
             if q != 0 {
                 self.cc.free(q)?;
             }
         }
-        (self.dqnw_a, self.dknw_a, self.dkc, self.dvc, self.dpp) = (0, 0, 0, 0, 0);
-        (self.dksc, self.dvsc) = (0, 0);
         (
-            self.dqg_a,
-            self.dkin_a,
-            self.dvin_a,
-            self.dqh_a,
-            self.doutv_a,
+            self.attn.dqnw_a,
+            self.attn.dknw_a,
+            self.attn.dkc,
+            self.attn.dvc,
+            self.attn.dpp,
         ) = (0, 0, 0, 0, 0);
-        self.attn_t_cap = 0;
+        (self.attn.dksc, self.attn.dvsc) = (0, 0);
+        (
+            self.attn.dqg_a,
+            self.attn.dkin_a,
+            self.attn.dvin_a,
+            self.attn.dqh_a,
+            self.attn.doutv_a,
+        ) = (0, 0, 0, 0, 0);
+        self.attn.attn_t_cap = 0;
         let b =
             // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
@@ -192,18 +217,18 @@ impl W4a16Dec {
             Self::zero_dev(&self.cc, ks, kv_scales * 4)?;
             let vs = self.cc.alloc(kv_scales * 4)?;
             Self::zero_dev(&self.cc, vs, kv_scales * 4)?;
-            self.dksc = ks;
-            self.dvsc = vs;
+            self.attn.dksc = ks;
+            self.attn.dvsc = vs;
             (kc, vc)
         };
         let dpp = self.cc.alloc(slots * 4)?;
         Self::zero_dev(&self.cc, dpp, slots * 4)?;
-        self.dqnw_a = dq;
-        self.dknw_a = dk;
-        self.dkc = dkc;
-        self.dvc = dvc;
-        self.dpp = dpp;
-        self.attn = Some(dims);
+        self.attn.dqnw_a = dq;
+        self.attn.dknw_a = dk;
+        self.attn.dkc = dkc;
+        self.attn.dvc = dvc;
+        self.attn.dpp = dpp;
+        self.attn.attn = Some(dims);
         Ok(())
     }
 
@@ -251,25 +276,25 @@ impl W4a16Dec {
         group: usize,
         scale_bf16: bool,
     ) {
-        self.n_experts = n_experts;
-        self.top_k = top_k;
-        self.moe_ffn = moe_ffn;
-        self.shared_ffn = shared_ffn;
-        self.moe_group = group;
-        self.moe_scale_bf16 = scale_bf16;
+        self.moe.n_experts = n_experts;
+        self.moe.top_k = top_k;
+        self.moe.moe_ffn = moe_ffn;
+        self.moe.shared_ffn = shared_ffn;
+        self.moe.moe_group = group;
+        self.moe.moe_scale_bf16 = scale_bf16;
     }
 
     /// 전문가 슬라이스 테이블 등록 — (packed ptr/len, scale ptr/len) × (il,e,proj).
     /// 포인터는 서버 스토어 mmap 슬라이스 — 서버가 모델을 함께 보유하는 수명 계약.
     pub fn set_expert_table(&mut self, mut tab: Vec<(u64, u64, u64, u64)>) {
         // [P7-fix] 기존 스테이징이 등록돼 있으면 해제(버퍼 해제 전 필수).
-        if self.host_stage_reg > 0 {
+        if self.moe.host_stage_reg > 0 {
             // SAFETY: 등록 성공 상태(host_stage_reg>0)의 host_stage 선두 주소다.
             let _ = unsafe {
                 self.cc
-                    .host_unregister(self.host_stage.as_ptr() as *mut std::ffi::c_void)
+                    .host_unregister(self.moe.host_stage.as_ptr() as *mut std::ffi::c_void)
             };
-            self.host_stage_reg = 0;
+            self.moe.host_stage_reg = 0;
         }
         // [C2 2026-10-09] 호스트 RAM 스테이징(사용자 결정) — 스트리밍 셋을
         // 로드 시 1회 호스트 RAM으로 복사한다(SSD mmap·페이지캐시 경로 의존
@@ -302,7 +327,7 @@ impl W4a16Dec {
                     "[moe] 호스트 RAM 스테이징 {:.2}GiB — 업로드 mmap 의존 제거(C2)",
                     total as f64 / (1u64 << 30) as f64
                 );
-                self.host_stage = buf;
+                self.moe.host_stage = buf;
                 // [P7-fix 2026-10-10] 핀드 DMA — 등록 가능한 선두 구간만
                 // cuMemHostRegister(RLIMIT_MEMLOCK 한도). 등록 구간 소스 복사는
                 // DMA 직행(실측 13.8GB/s), 나머지는 드라이버 스테이징 유지.
@@ -311,9 +336,9 @@ impl W4a16Dec {
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(4096);
                 let budget = budget_mb << 20;
-                if budget > 0 && !self.host_stage.is_empty() {
+                if budget > 0 && !self.moe.host_stage.is_empty() {
                     // memlock 한도가 작은 환경 대비 1/4씩 축소 재시도(하한 4MiB).
-                    let mut bytes = self.host_stage.len().min(budget);
+                    let mut bytes = self.moe.host_stage.len().min(budget);
                     // [2026-10-12 결함수정] 등록 경계가 슬라이스(q/s)를 가르면 그
                     // 슬라이스의 async 복사가 실패한다(실측: 4GiB 경계가 L9
                     // 슬라이스를 관통 — cuMemcpyHtoDAsync INVALID_VALUE, 그
@@ -332,16 +357,16 @@ impl W4a16Dec {
                         // 해제 전까지 포인터 수명이 유지된다(해제는 상단 unregister).
                         match unsafe {
                             self.cc.host_register(
-                                self.host_stage.as_ptr() as *mut std::ffi::c_void,
+                                self.moe.host_stage.as_ptr() as *mut std::ffi::c_void,
                                 bytes,
                             )
                         } {
                             Ok(()) => {
-                                self.host_stage_reg = bytes;
+                                self.moe.host_stage_reg = bytes;
                                 eprintln!(
                                     "# moe: 스테이징 핀드 등록 {:.2}/{}GiB — 구간 DMA 직행(P7-fix)",
                                     bytes as f64 / (1u64 << 30) as f64,
-                                    self.host_stage.len() >> 30
+                                    self.moe.host_stage.len() >> 30
                                 );
                                 break;
                             }
@@ -362,7 +387,7 @@ impl W4a16Dec {
             }
         }
         self.experts_bytes = tab.iter().map(|e| e.1 + e.3).sum();
-        self.moe_tab = tab;
+        self.moe.moe_tab = tab;
     }
 
     /// 전문가 상주 업로드 — 호스트 테이블(mmAP 슬라이스)을 VRAM 아레나
@@ -373,7 +398,7 @@ impl W4a16Dec {
         host_tab: &[(u64, u64, u64, u64)],
     ) -> Result<(), String> {
         let _g = self.cc.guard()?;
-        if self.n_experts == 0 || host_tab.len() != self.n_layers * self.n_experts * 3 {
+        if self.moe.n_experts == 0 || host_tab.len() != self.n_layers * self.moe.n_experts * 3 {
             return Err("upload_experts_resident: 테이블 형상 위반".into());
         }
         let mut pk = [0usize; 3];
@@ -441,20 +466,20 @@ impl W4a16Dec {
         }
         // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let fb = unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 8) };
-        if self.moe_dev_tab != 0 {
-            let _ = self.cc.free(self.moe_dev_tab);
-            self.moe_dev_tab = 0;
+        if self.moe.moe_dev_tab != 0 {
+            let _ = self.cc.free(self.moe.moe_dev_tab);
+            self.moe.moe_dev_tab = 0;
         }
         let dtab = self.cc.alloc(flat.len() * 8)?;
         if let Err(e) = Self::h2d_chunked(&self.cc, dtab, fb) {
             let _ = self.cc.free(dtab);
             return Err(e);
         }
-        self.moe_dev_tab = dtab;
-        self.moe_tab = dev_tab;
+        self.moe.moe_dev_tab = dtab;
+        self.moe.moe_tab = dev_tab;
         self.experts_bytes = host_tab.iter().map(|e| e.1 + e.3).sum();
         self.weights_bytes += self.experts_bytes;
-        self.moe_resident = true;
+        self.moe.moe_resident = true;
         Ok(())
     }
 
@@ -637,7 +662,9 @@ impl W4a16Dec {
     }
 
     /// [S3-1] 임베딩 gather 런치 — toks[t] → out[t][k] f32.
-    fn embed_gather_launch(
+    /// [MTP-CHAIN 2026-10-12 §3.3 ②] pub(super)로 넓힘 — 장치 체인 그래프가
+    /// 토큰 레지스터(dbatch_am)에서 같은 커널로 임베딩 행을 조립한다.
+    pub(super) fn embed_gather_launch(
         &self,
         toks: CUdeviceptr,
         out: CUdeviceptr,

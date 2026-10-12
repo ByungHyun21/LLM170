@@ -13,13 +13,13 @@ impl W4a16Dec {
     pub(super) fn graph_ok(&self) -> bool {
         llm170_diag::flag::ne0("LLM170_GRAPH")
             && !self.debug_layers
-            && !self.graph_failed
+            && !self.graph.graph_failed
             // [2026-10-09 P1] MoE 상주 경로는 캡처 가능해졌다: 라우터 top-k가
             // 디바이스(w4a16_moe_topk_t — 호스트 왕복 0), 전문가 디스패치가
             // 데이터 주도(디바이스 idx 포인터 테이블 — 포인터는 고정), h2d/sync
             // 없음(P1·P2). 스트리밍은 전문가 파일 스테이징(h2d_chunked sync)이라
             // 여전히 불가. 미검증 경로는 직접 경로 폴백(graph_failed)이 덮는다.
-            && (self.n_experts == 0 || self.moe_resident)
+            && (self.moe.n_experts == 0 || self.moe.moe_resident)
     }
 
     /// 캡처 그래프 무효화 — 버퍼 재할당 시 옛 포인터 replay를 차단한다
@@ -28,20 +28,26 @@ impl W4a16Dec {
     /// 재할당 → replay가 해제 주소에 기록(norm_resid OOB) → CUDA 700.
     pub(super) fn graph_invalidate(&mut self) {
         // [A8] 캐시 전량 폐기 — 옛 포인터를 기록한 exec는 replay 금지.
-        for e in self.graph_cache.drain(..) {
+        for e in self.graph.graph_cache.drain(..) {
             let _ = self.cc.graph_destroy(e.exec, e.handle);
         }
         // [A9] 배치(슬롯집합) 그래프도 동일 계약.
-        for (_, e, g) in self.batch_graphs.drain(..) {
+        for (_, e, g) in self.graph.batch_graphs.drain(..) {
             let _ = self.cc.graph_destroy(e, g);
         }
         // [A6-1] 검증 체인 그래프도 동일 계약.
-        for (_, e, g) in self.spec_graphs.drain(..) {
+        for (_, e, g) in self.graph.spec_graphs.drain(..) {
             let _ = self.cc.graph_destroy(e, g);
         }
         // [MTP-GRAPH] MTP 콜 그래프도 동일 계약 — t 인덱스 배열이므로
         // drain 금지(t 키 유지): 슬롯별 take.
-        for g in self.mtp_graphs.iter_mut() {
+        for g in self.mtp.mtp_graphs.iter_mut() {
+            if let Some((e, h)) = g.take() {
+                let _ = self.cc.graph_destroy(e, h);
+            }
+        }
+        // [MTP-CHAIN] 체인 그래프(슬롯 키)도 동일 계약 — take로 무효화.
+        for g in self.mtp.mtp_chain_graphs.iter_mut() {
             if let Some((e, h)) = g.take() {
                 let _ = self.cc.graph_destroy(e, h);
             }
@@ -59,6 +65,7 @@ impl W4a16Dec {
     ) -> Result<ffi::CUgraphExec, String> {
         // [A8] 캐시 히트 — 슬롯/모드 전환 재캡처 제거.
         if let Some(e) = self
+            .graph
             .graph_cache
             .iter()
             .find(|e| e.slot == slot && e.head == head && e.argmax == argmax)
@@ -67,30 +74,30 @@ impl W4a16Dec {
         }
         self.warm_for_capture()?;
         // 2) 실스트림·pinned 1회 준비.
-        if self.pin_embed.is_null() {
+        if self.graph.pin_embed.is_null() {
             self.cc.create_stream()?;
-            self.pin_embed = self.cc.pinned_alloc(self.hidden * 4)?;
-            self.pin_pos = self.cc.pinned_alloc(self.n_slots * 4)?;
+            self.graph.pin_embed = self.cc.pinned_alloc(self.hidden * 4)?;
+            self.graph.pin_pos = self.cc.pinned_alloc(self.n_slots * 4)?;
         }
         let out_len = if head {
             self.head_n * 4
         } else {
             self.hidden * 4
         };
-        if self.pin_out.is_null() || self.pin_out_len < out_len {
+        if self.graph.pin_out.is_null() || self.graph.pin_out_len < out_len {
             // [A8 잠복 수정 2026-10-10] 핀드 출력 재할당 = 기존 exec들의 d2h
             // 목적지 해제 — 캐시된 그래프 전량 폐기(모드 교대에서 해제 주소
             // 기록 UAF, 할당자 재사용으로 잠복했던 실측 결함).
             self.graph_invalidate();
-            if !self.pin_out.is_null() {
-                let _ = self.cc.pinned_free(self.pin_out);
+            if !self.graph.pin_out.is_null() {
+                let _ = self.cc.pinned_free(self.graph.pin_out);
             }
-            self.pin_out = self.cc.pinned_alloc(out_len)?;
-            self.pin_out_len = out_len;
+            self.graph.pin_out = self.cc.pinned_alloc(out_len)?;
+            self.graph.pin_out_len = out_len;
         }
         // 3) 캡처(실행 없음 — 기록만).
         self.cc.capture_begin()?;
-        self.capture_pinned_src = true;
+        self.graph.capture_pinned_src = true;
         let cap = (|| -> Result<(), String> {
             let row = vec![0f32; self.hidden]; // 내용 무의미(캡처는 실행 아님).
             let xn = self.chain_device(slot, &row)?;
@@ -109,18 +116,21 @@ impl W4a16Dec {
                         &mut crate::rawcuda::args::l3(&mut p_l, &mut p_n, &mut p_o),
                     )?;
                     self.cc
-                        .d2h_async(self.pin_out as *mut u8, self.argmax_out, 4)?;
+                        .d2h_async(self.graph.pin_out as *mut u8, self.argmax_out, 4)?;
                 } else {
-                    self.cc
-                        .d2h_async(self.pin_out as *mut u8, self.head_out, self.head_n * 4)?;
+                    self.cc.d2h_async(
+                        self.graph.pin_out as *mut u8,
+                        self.head_out,
+                        self.head_n * 4,
+                    )?;
                 }
             } else {
                 self.cc
-                    .d2h_async(self.pin_out as *mut u8, xn, self.hidden * 4)?;
+                    .d2h_async(self.graph.pin_out as *mut u8, xn, self.hidden * 4)?;
             }
             Ok(())
         })();
-        self.capture_pinned_src = false;
+        self.graph.capture_pinned_src = false;
         if let Err(e) = cap {
             let _ = self.cc.capture_end(); // 캡처 상태 정리(그래프 폐기).
             return Err(format!("캡처 본문: {e}"));
@@ -130,11 +140,11 @@ impl W4a16Dec {
         self.cc.graph_upload(e)?; // [§4.3] implicit upload spin 제거
         // [A8] 캐시 등록 — 상한 = 슬롯×모드 3종(방어적으로 초과 시 최古 폐기).
         let cap = self.n_slots.max(1) * 3;
-        if self.graph_cache.len() >= cap {
-            let old = self.graph_cache.remove(0);
+        if self.graph.graph_cache.len() >= cap {
+            let old = self.graph.graph_cache.remove(0);
             let _ = self.cc.graph_destroy(old.exec, old.handle);
         }
-        self.graph_cache.push(GraphEntry {
+        self.graph.graph_cache.push(GraphEntry {
             exec: e,
             handle: g,
             slot,
@@ -144,7 +154,7 @@ impl W4a16Dec {
         // 캡처 성공 1회 로그 — 경로 가시화(MoE 상주 = P1 개방분 포함).
         eprintln!(
             "[graph] captured slot={slot} head={head} argmax={argmax} moe_resident={}",
-            self.moe_resident
+            self.moe.moe_resident
         );
         Ok(e)
     }
@@ -162,26 +172,28 @@ impl W4a16Dec {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 embed_row.as_ptr() as *const u8,
-                self.pin_embed as *mut u8,
+                self.graph.pin_embed as *mut u8,
                 self.hidden * 4,
             );
             std::ptr::copy_nonoverlapping(
                 pos.to_le_bytes().as_ptr(),
-                (self.pin_pos as *mut u8).add(slot * 4),
+                (self.graph.pin_pos as *mut u8).add(slot * 4),
                 4,
             );
         }
         // dpp 갱신은 그래프 밖·같은 스트림(그래프보다 먼저 실행 — 순서 보장).
         let posb =
             // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
-            unsafe { std::slice::from_raw_parts(self.pin_pos as *const u8, self.n_slots * 4) };
-        self.cc
-            .h2d_async(self.dpp + (slot as u64) * 4, &posb[slot * 4..slot * 4 + 4])?;
+            unsafe { std::slice::from_raw_parts(self.graph.pin_pos as *const u8, self.n_slots * 4) };
+        self.cc.h2d_async(
+            self.attn.dpp + (slot as u64) * 4,
+            &posb[slot * 4..slot * 4 + 4],
+        )?;
         self.cc.graph_launch(exec)?;
         self.cc.sync()?;
         let out =
             // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
-            unsafe { std::slice::from_raw_parts(self.pin_out as *const f32, self.pin_out_len / 4) };
+            unsafe { std::slice::from_raw_parts(self.graph.pin_out as *const f32, self.graph.pin_out_len / 4) };
         let v = out.to_vec();
         self.slot_pos[slot] = pos + 1;
         Ok(v)
@@ -200,24 +212,26 @@ impl W4a16Dec {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 embed_row.as_ptr() as *const u8,
-                self.pin_embed as *mut u8,
+                self.graph.pin_embed as *mut u8,
                 self.hidden * 4,
             );
             std::ptr::copy_nonoverlapping(
                 pos.to_le_bytes().as_ptr(),
-                (self.pin_pos as *mut u8).add(slot * 4),
+                (self.graph.pin_pos as *mut u8).add(slot * 4),
                 4,
             );
         }
         let posb =
             // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
-            unsafe { std::slice::from_raw_parts(self.pin_pos as *const u8, self.n_slots * 4) };
-        self.cc
-            .h2d_async(self.dpp + (slot as u64) * 4, &posb[slot * 4..slot * 4 + 4])?;
+            unsafe { std::slice::from_raw_parts(self.graph.pin_pos as *const u8, self.n_slots * 4) };
+        self.cc.h2d_async(
+            self.attn.dpp + (slot as u64) * 4,
+            &posb[slot * 4..slot * 4 + 4],
+        )?;
         self.cc.graph_launch(exec)?;
         self.cc.sync()?;
         // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
-        let ob = unsafe { std::slice::from_raw_parts(self.pin_out as *const u8, 4) };
+        let ob = unsafe { std::slice::from_raw_parts(self.graph.pin_out as *const u8, 4) };
         self.slot_pos[slot] = pos + 1;
         Ok(u32::from_le_bytes([ob[0], ob[1], ob[2], ob[3]]))
     }
@@ -237,7 +251,7 @@ impl W4a16Dec {
                 Ok(t) => return Ok(t),
                 Err(e) => {
                     eprintln!("[graph] argmax 경로 실패 — 직접 경로 폴백: {e}");
-                    self.graph_failed = true;
+                    self.graph.graph_failed = true;
                 }
             }
         }
@@ -275,13 +289,13 @@ impl W4a16Dec {
         }
         let _g = self.cc.guard()?;
         if rows.len() != t * self.hidden
-            || (self.n_experts > 0 && !self.moe_resident)
+            || (self.moe.n_experts > 0 && !self.moe.moe_resident)
             || self.head_w == 0
             || slots.iter().any(|&s| s >= self.n_slots)
         {
             return Err(format!("batch: 전제 위반 t={t}"));
         }
-        let cap = self.attn.ok_or("attn: 형상 미등록")?.cap;
+        let cap = self.attn.attn.ok_or("attn: 형상 미등록")?.cap;
         for &s in slots {
             if self.slot_pos[s] as usize + 1 > cap {
                 return Err(format!("batch: slot{s} 컨텍스트 초과"));
@@ -293,18 +307,23 @@ impl W4a16Dec {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 rows.as_ptr() as *const u8,
-                self.pin_batch_in as *mut u8,
+                self.graph.pin_batch_in as *mut u8,
                 t * self.hidden * 4,
             );
-            let pp = self.pin_batch_pos as *mut u8;
+            let pp = self.graph.pin_batch_pos as *mut u8;
             for s in 0..self.n_slots {
                 let pos = self.slot_pos[s];
                 std::ptr::copy_nonoverlapping(pos.to_le_bytes().as_ptr(), pp.add(s * 4), 4);
             }
         }
         let key: Vec<usize> = slots.to_vec();
-        if let Some(k) = self.batch_graphs.iter().position(|(ks, _, _)| *ks == key) {
-            let exec = self.batch_graphs[k].1;
+        if let Some(k) = self
+            .graph
+            .batch_graphs
+            .iter()
+            .position(|(ks, _, _)| *ks == key)
+        {
+            let exec = self.graph.batch_graphs[k].1;
             self.cc.graph_launch(exec)?;
             self.cc.sync()?;
             let out = self.batch_read_tokens(t);
@@ -317,12 +336,12 @@ impl W4a16Dec {
         self.batch_launch(slots, t)?;
         self.cc.sync()?;
         let out = self.batch_read_tokens(t);
-        if !self.batch_capture_failed {
+        if !self.graph.batch_capture_failed {
             match self.batch_capture(&key, t) {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("# batch 그래프 캡처 실패 — 직접 발사 유지: {e}");
-                    self.batch_capture_failed = true;
+                    self.graph.batch_capture_failed = true;
                     self.cc.sync().ok();
                 }
             }
@@ -336,8 +355,8 @@ impl W4a16Dec {
     /// [A9] 배치 그래프 캡처 — 슬롯집합 키. 캡처는 실행하지 않는다(상태 불변).
     pub(super) fn batch_capture(&mut self, key: &[usize], t: usize) -> Result<(), String> {
         let _tt = std::time::Instant::now();
-        if self.batch_graphs.len() >= 8 {
-            let (_, e, g) = self.batch_graphs.remove(0);
+        if self.graph.batch_graphs.len() >= 8 {
+            let (_, e, g) = self.graph.batch_graphs.remove(0);
             let _ = self.cc.graph_destroy(e, g);
         }
         self.cc.capture_begin()?;
@@ -348,7 +367,7 @@ impl W4a16Dec {
         let g = self.cc.capture_end()?;
         let e = self.cc.graph_instantiate(g)?;
         self.cc.graph_upload(e)?; // [§4.3]
-        self.batch_graphs.push((key.to_vec(), e, g));
+        self.graph.batch_graphs.push((key.to_vec(), e, g));
         eprintln!(
             "[batch-graph] captured slots={key:?} ({:.2}ms)",
             _tt.elapsed().as_secs_f64() * 1e3
@@ -391,7 +410,7 @@ impl W4a16Dec {
                 }
                 Err(e) => {
                     eprintln!("[graph] xn 경로 실패 — 직접 경로 폴백: {e}");
-                    self.graph_failed = true;
+                    self.graph.graph_failed = true;
                 }
             }
         }
@@ -451,7 +470,7 @@ impl W4a16Dec {
                 }
                 Err(e) => {
                     eprintln!("[graph] head 경로 실패 — 직접 경로 폴백: {e}");
-                    self.graph_failed = true;
+                    self.graph.graph_failed = true;
                 }
             }
         }
