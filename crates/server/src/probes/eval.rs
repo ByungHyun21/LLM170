@@ -272,6 +272,20 @@ fn agree(args: &[String]) -> Result<String, String> {
     if a.is_empty() || b.is_empty() {
         return Err("w4a16-eval agree <a.tsv> <b.tsv>".into());
     }
+    // [Q5 2026-10-12] 마진 컷 — 근접동률(margin<ε) 플립과 실질 발산을 구분.
+    let mut margin_cut = 1.0f32;
+    let mut it = args.iter().skip(2);
+    while let Some(x) = it.next() {
+        match x.as_str() {
+            "--margin-cut" => {
+                margin_cut = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--margin-cut requires a number")?;
+            }
+            other => return Err(format!("unknown flag: {other}")),
+        }
+    }
     let da = read_dump(&a)?;
     let db = read_dump(&b)?;
     if da.rows.len() != db.rows.len() {
@@ -283,6 +297,9 @@ fn agree(args: &[String]) -> Result<String, String> {
     }
     let mut matches = 0usize;
     let mut div = 0usize;
+    let mut real = 0usize;
+    let mut m_min = f32::INFINITY;
+    let mut m_max = 0f32;
     let mut first: Option<(u32, u32, u32, u32)> = None;
     for (x, y) in da.rows.iter().zip(db.rows.iter()) {
         if x.0 != y.0 || x.1 != y.1 {
@@ -295,6 +312,13 @@ fn agree(args: &[String]) -> Result<String, String> {
             matches += 1;
         } else {
             div += 1;
+            // 플립의 대표 마진 = 두 덤프 중 **작은** 쪽(양쪽 모두 확신해야 실질).
+            let m = x.4.min(y.4);
+            m_min = m_min.min(m);
+            m_max = m_max.max(m);
+            if m >= margin_cut {
+                real += 1;
+            }
             if first.is_none() {
                 first = Some((x.0, x.1, x.2, y.2));
             }
@@ -316,8 +340,14 @@ fn agree(args: &[String]) -> Result<String, String> {
         Some((p, t, x, y)) => format!("최초 발산 pos={p} target={t}: a={x} b={y}"),
         None => "발산 없음".into(),
     };
+    let flip_m = if div > 0 {
+        format!("플립 마진 min={m_min:.3} max={m_max:.3}")
+    } else {
+        "플립 없음".into()
+    };
     Ok(format!(
-        "w4a16-eval agree\n  {a}\n  {b}\n  위치 {n} · argmax 일치 {matches} ({rate:.3}%) · 발산 {div}개 · {div_desc}\n  NLL합 a={sum_a:.6} b={sum_b:.6} (델타 {d_nll:+.4}%)\n  PPL a={ppl_a:.6} b={ppl_b:.6} (델타 {d_ppl:+.4}%)"
+        "w4a16-eval agree\n  {a}\n  {b}\n  위치 {n} · argmax 일치 {matches} ({rate:.3}%) · 발산 {div}개(실질 {real}·근접 {}) · {div_desc}\n  {flip_m} (실질 기준 margin≥{margin_cut})\n  NLL합 a={sum_a:.6} b={sum_b:.6} (델타 {d_nll:+.4}%)\n  PPL a={ppl_a:.6} b={ppl_b:.6} (델타 {d_ppl:+.4}%)",
+        div - real
     ))
 }
 
@@ -389,6 +419,35 @@ mod tests {
         // 로짓 [10,0] → p(tgt=0)≈1 → NLL≈0.
         let v = nll_of(&[10.0, 0.0], 0);
         assert!(v < 1e-4, "nll={v}");
+    }
+
+    #[test]
+    fn agree_margin_cut_splits_real_vs_near() {
+        // pos1: argmax 동일 · pos2: 근접 플립(마진 0.01) · pos3: 실질 플립(마진 3.0).
+        let pa = std::env::temp_dir().join(format!("eval-ag-a-{}.tsv", std::process::id()));
+        let pb = std::env::temp_dir().join(format!("eval-ag-b-{}.tsv", std::process::id()));
+        let hdr = "# w4a16-eval dump v1 model=x tokens=4 head=gpu nll_sum=4.0 ppl=2.7\n# cols: pos target argmax nll margin\n";
+        std::fs::write(
+            &pa,
+            format!("{hdr}1\t5\t5\t1.0\t2.0\n2\t7\t7\t1.0\t0.01\n3\t9\t9\t1.0\t3.0\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            &pb,
+            format!("{hdr}1\t5\t5\t1.0\t2.0\n2\t7\t8\t1.0\t0.02\n3\t9\t4\t1.0\t3.5\n"),
+        )
+        .unwrap();
+        let out = agree(&[
+            pa.to_str().unwrap().into(),
+            pb.to_str().unwrap().into(),
+            "--margin-cut".into(),
+            "1.0".into(),
+        ])
+        .unwrap();
+        assert!(out.contains("발산 2개(실질 1·근접 1)"), "{out}");
+        assert!(out.contains("margin≥1"), "{out}");
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
     }
 
     #[test]
