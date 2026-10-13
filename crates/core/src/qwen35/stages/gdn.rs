@@ -149,6 +149,45 @@ pub(crate) fn gdn_layer(
                 dt_rank,
             );
         }
+        // [2.G 진단 2026-10-13] GDN 라이브 상태 크기 통계(LLM170_DUMP=gdst) —
+        // 상태 양자화 후보 판정용: 원소 크기 분포(f16 서브노멀 질량)와 행(kdim)
+        // 별 최대값(행-스케일 설계 여지), 전역 최대(오버플로 여지).
+        // 실측(27B en 64토큰): |S|max≤35·서브노멀(<6e-5) 12~28% — raw f16은
+        // 35B에서 밴드 초과(+1.55%)의 주 원인(채널 스케일 부재, bf16 대조로 확인).
+        if llm170_diag::dump::opts().key("gdst") {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static GDST_N: AtomicUsize = AtomicUsize::new(0);
+            let n = GDST_N.fetch_add(1, Ordering::Relaxed);
+            let dd = d_state * d_state;
+            let (mut gmax, mut nsub, mut nlow, mut ntot) = (0f32, 0usize, 0usize, 0usize);
+            let (mut rmin, mut rmax) = (f32::MAX, 0f32);
+            for hc in st.chunks(dd) {
+                for i in 0..d_state {
+                    let row = &hc[i * d_state..(i + 1) * d_state];
+                    let rm = row.iter().fold(0f32, |a, &x| a.max(x.abs()));
+                    if rm > 0.0 {
+                        rmin = rmin.min(rm);
+                        rmax = rmax.max(rm);
+                    }
+                    for &x in row {
+                        let a = x.abs();
+                        if a > 0.0 {
+                            if a < 6e-5 {
+                                nsub += 1;
+                            }
+                            if a < 1e-4 {
+                                nlow += 1;
+                            }
+                        }
+                        ntot += 1;
+                    }
+                }
+                gmax = hc.iter().fold(gmax, |a, &x| a.max(x.abs()));
+            }
+            eprintln!(
+                "[gdst] n={n} il={il} max={gmax:.4e} row[{rmin:.3e},{rmax:.3e}] sub6e-5={nsub} low1e-4={nlow} tot={ntot}"
+            );
+        }
     }
 
     // norm_gated: rms_norm(core)·silu(z) per head → ssm_out
