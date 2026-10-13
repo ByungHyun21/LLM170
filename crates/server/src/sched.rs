@@ -374,6 +374,7 @@ pub static SCHED: Sched = Sched {
     econ_on: AtomicU64::new(1),
     econ_kidx: AtomicU64::new(1),
     econ_src_cur: AtomicU64::new(0),
+    econ_probe_alt: AtomicU64::new(0),
     econ_gen: AtomicU64::new(0),
     econ_probe_gen: AtomicU64::new(0),
     econ_rounds: AtomicU64::new(0),
@@ -427,6 +428,8 @@ pub struct Sched {
     pub econ_kidx: AtomicU64,
     /// 현재 선택된 소스(0=mtp·1=ngram) — MTP 초안 유지 여부 판정.
     pub econ_src_cur: AtomicU64,
+    /// OFF 재프로브의 소스 교차 토글(0↔1).
+    pub econ_probe_alt: AtomicU64,
     /// 토큰 시계(프로브 주기 판정) — slot_emit이 증가.
     pub econ_gen: AtomicU64,
     /// 마지막 프로브 시점의 토큰 시계.
@@ -621,6 +624,13 @@ fn econ_plan(mtp_avail: bool) -> Option<(u8, usize)> {
             return None;
         }
         // 재프로브 1라운드 — 결과 표본이 다음 판정을 갱신(밴드 밖이면 OFF 복귀).
+        // OFF 동안에는 완료 라운드가 드물어 rounds 기반 소스 교차가 얼어붙는다 —
+        // 프로브마다 소스를 교차해 MTP/ngram 둘 다 주기적으로 재측정한다.
+        if mtp_avail {
+            let alt = SCHED.econ_probe_alt.load(Ordering::Relaxed) ^ 1;
+            SCHED.econ_probe_alt.store(alt, Ordering::Relaxed);
+            src = alt as u8;
+        }
         SCHED.econ_probe_gen.store(gtok, Ordering::Relaxed);
         use_spec = true;
     }
