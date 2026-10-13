@@ -361,9 +361,12 @@ pub(super) struct Attn {
     pub(super) dksc: CUdeviceptr,
     pub(super) dvsc: CUdeviceptr,
     /// [K6-2 2026-10-12] KV 블록 테이블(디바이스 u64 [slot][layer][mb]×4 —
-    /// k, v, ksc, vsc 기저 바이트 주소). set_attn이 연속 할당 기반으로 구축,
-    /// 내용 불변(그래프 캡처 계약 — 캡처는 주소만 베이크).
+    /// k, v, ksc, vsc 기저 바이트 주소). set_attn이 구축, 내용 불변
+    /// (그래프 캡처 계약 — 캡처는 주소만 베이크).
     pub(super) dblk_tab: CUdeviceptr,
+    /// [K6-3 2026-10-13] KV 물리 블록 할당자(호스트) — 테이블 엔트리의 정본.
+    /// 다음 단계에서 온디맨드 성장·회수(입장 보장)의 기반.
+    pub(super) kv_pool: Option<blocktable::KvPool>,
     pub(super) dpp: CUdeviceptr,
     pub(super) dqg_a: CUdeviceptr,
     pub(super) dkin_a: CUdeviceptr,
@@ -686,6 +689,7 @@ impl W4a16Dec {
                 dksc: 0,
                 dvsc: 0,
                 dblk_tab: 0,
+                kv_pool: None,
                 dpp: 0,
                 dqg_a: 0,
                 dkin_a: 0,

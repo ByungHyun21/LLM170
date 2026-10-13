@@ -151,17 +151,9 @@ impl super::W4a16Dec {
             let arena = (buf, buf + total as u64 * 4);
             let nwr = (nw, nw + 5 * h as u64 * 4);
             let zr = (zero, zero + h as u64 * 4);
-            let ksc0 = self.attn_ksc_ptr(0);
-            let kv0 = self.attn_kv_ptr(0);
-            let ksce = ksc0 + (dm.n_attn * dm.cap * dm.kv_heads * 4) as u64;
-            let kve = kv0 + (dm.n_attn * dm.cap * dm.kv_dim()) as u64;
             let dq = self.attn.dqh_a;
             let dqe = dq + (dm.q_dim() * 8) as u64 * 4;
-            eprintln!(
-                "[mtp-ptr] arena={arena:?} nw={nwr:?} zero={zr:?} ksc={ksc0}..{ksce} kv={kv0}..{kve} dqh={dq}..{dqe} ksc_in_arena={} nw_in_ksc={}",
-                arena.0 <= ksc0 && ksc0 < arena.1,
-                ksc0 <= nwr.0 && nwr.0 < ksce
-            );
+            eprintln!("[mtp-ptr] arena={arena:?} nw={nwr:?} zero={zr:?} dqh={dq}..{dqe}");
         }
         Ok(())
     }
@@ -265,13 +257,14 @@ impl super::W4a16Dec {
         }
         let lay = self.mtp.mtp_layer;
         for slot in 0..self.n_slots {
-            let rowoff = (lay * dm.cap + pos) as u64;
-            let kvc = rowoff * dm.kv_dim() as u64;
-            let scc = rowoff * dm.kv_heads as u64 * 4;
-            Self::zero_dev(&self.cc, self.attn_kv_ptr(slot) + kvc, dm.kv_dim())?;
-            Self::zero_dev(&self.cc, self.attn_vc_ptr(slot) + kvc, dm.kv_dim())?;
-            Self::zero_dev(&self.cc, self.attn_ksc_ptr(slot) + scc, dm.kv_heads * 4)?;
-            Self::zero_dev(&self.cc, self.attn_vsc_ptr(slot) + scc, dm.kv_heads * 4)?;
+            // [K6-3] 블록 미할당(온디맨드 경계 밖)이면 무시 — 위생 전용.
+            let Ok((k, v, ks, vs)) = self.attn_row_ptrs(slot, lay, pos) else {
+                continue;
+            };
+            Self::zero_dev(&self.cc, k, dm.kv_dim())?;
+            Self::zero_dev(&self.cc, v, dm.kv_dim())?;
+            Self::zero_dev(&self.cc, ks, dm.kv_heads * 4)?;
+            Self::zero_dev(&self.cc, vs, dm.kv_heads * 4)?;
         }
         Ok(())
     }
@@ -651,22 +644,22 @@ impl super::W4a16Dec {
         }
         let dm = self.attn.attn.ok_or("mtp: attn")?;
         let layer = self.mtp.mtp_layer;
+        let mb = dm.cap.div_ceil(512);
         for slot in 0..self.n_slots {
-            let off = (layer * dm.cap) as u64;
-            let kvc = off * dm.kv_dim() as u64;
-            let scc = off * dm.kv_heads as u64 * 4;
-            Self::zero_dev(&self.cc, self.attn_kv_ptr(slot) + kvc, dm.cap * dm.kv_dim())?;
-            Self::zero_dev(&self.cc, self.attn_vc_ptr(slot) + kvc, dm.cap * dm.kv_dim())?;
-            Self::zero_dev(
-                &self.cc,
-                self.attn_ksc_ptr(slot) + scc,
-                dm.cap * dm.kv_heads * 4,
-            )?;
-            Self::zero_dev(
-                &self.cc,
-                self.attn_vsc_ptr(slot) + scc,
-                dm.cap * dm.kv_heads * 4,
-            )?;
+            // [K6-3] 할당된 블록만 순회 제로화(블록 = 512토큰 × 1층).
+            let pool = self.attn.kv_pool.as_ref().ok_or("mtp: KvPool 미등록")?;
+            for bi in 0..mb {
+                let Some(_) = pool.get(slot, layer, bi) else {
+                    continue;
+                };
+                let pos = bi * 512;
+                let rows = (dm.cap - pos).min(512);
+                let (k, v, ks, vs) = self.attn_row_ptrs(slot, layer, pos)?;
+                Self::zero_dev(&self.cc, k, rows * dm.kv_dim())?;
+                Self::zero_dev(&self.cc, v, rows * dm.kv_dim())?;
+                Self::zero_dev(&self.cc, ks, rows * dm.kv_heads * 4)?;
+                Self::zero_dev(&self.cc, vs, rows * dm.kv_heads * 4)?;
+            }
         }
         Ok(())
     }

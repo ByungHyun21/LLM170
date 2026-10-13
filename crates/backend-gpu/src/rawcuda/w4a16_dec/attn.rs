@@ -19,32 +19,37 @@ impl W4a16Dec {
         self.attn.dpp + (slot as u64) * 4
     }
 
-    pub(super) fn attn_kv_ptr(&self, slot: usize) -> CUdeviceptr {
-        match self.attn.attn {
-            Some(dm) => {
-                // [KVQ 채택 2026-10-10] int8 KV — 슬롯 오프셋 = 원소 수(1B/원소).
-                self.attn.dkc + dm.kv_slot_elems(slot) as u64
-            }
-            None => self.attn.dkc,
+    /// [K6-3 2026-10-13] (slot, layer, pos) 행의 KV 4포인터 — **블록 테이블
+    /// 간접(호스트 정본 = KvPool)**. 종전 슬롯 연속 계산을 대체한다(mtp 위생·
+    /// 리셋 등 직접 주소가 필요했던 지점). 미할당 블록은 Err — 호출부가
+    /// ensure_upto를 선행하거나 회피한다.
+    pub(super) fn attn_row_ptrs(
+        &self,
+        slot: usize,
+        layer: usize,
+        pos: usize,
+    ) -> Result<(CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr), String> {
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
+        let pool = self.attn.kv_pool.as_ref().ok_or("attn: KvPool 미등록")?;
+        if slot >= self.n_slots {
+            return Err(format!("attn row: 슬롯 {slot} ≥ {}", self.n_slots));
         }
-    }
-
-    pub(super) fn attn_vc_ptr(&self, slot: usize) -> CUdeviceptr {
-        match self.attn.attn {
-            Some(dm) => {
-                // [KVQ 채택 2026-10-10] int8 KV — 슬롯 오프셋 = 원소 수(1B/원소).
-                self.attn.dvc + dm.kv_slot_elems(slot) as u64
-            }
-            None => self.attn.dvc,
-        }
-    }
-
-    /// [P13] KV 스케일 포인터(슬롯 기저) — KVQ 전용(f32).
-    pub(super) fn attn_ksc_ptr(&self, slot: usize) -> CUdeviceptr {
-        match self.attn.attn {
-            Some(dm) => self.attn.dksc + (slot * dm.n_attn * dm.cap * dm.kv_heads) as u64 * 4,
-            None => self.attn.dksc,
-        }
+        let bi = pos / 512;
+        let off = (pos % 512) as u64;
+        let id = pool
+            .get(slot, layer, bi)
+            .ok_or_else(|| format!("attn row: KV 블록 미할당 slot={slot} layer={layer} bi={bi}"))?
+            as u64;
+        let kvd = dm.kv_dim() as u64;
+        let kvh = dm.kv_heads as u64;
+        let bk = 512 * kvd;
+        let bs = 512 * kvh * 4;
+        Ok((
+            self.attn.dkc + id * bk + off * kvd,
+            self.attn.dvc + id * bk + off * kvd,
+            self.attn.dksc + id * bs + off * kvh * 4,
+            self.attn.dvsc + id * bs + off * kvh * 4,
+        ))
     }
 
     /// [K6-2 2026-10-12] KV 블록 테이블 포인터(슬롯 기저) — 디바이스 u64
@@ -59,13 +64,6 @@ impl W4a16Dec {
                 self.attn.dblk_tab + (slot * dm.n_attn * mb * 4) as u64 * 8
             }
             None => self.attn.dblk_tab,
-        }
-    }
-
-    pub(super) fn attn_vsc_ptr(&self, slot: usize) -> CUdeviceptr {
-        match self.attn.attn {
-            Some(dm) => self.attn.dvsc + (slot * dm.n_attn * dm.cap * dm.kv_heads) as u64 * 4,
-            None => self.attn.dvsc,
         }
     }
 
