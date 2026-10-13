@@ -729,6 +729,8 @@ pub use crate::matmul::greedy_from as greedy;
 pub struct CtxInfo {
     /// 모델 전역 ctx 상한(max_position_embeddings).
     pub ctx: usize,
+    /// [K6-3] GDN 상태 바이트/슬롯(f32) — 기동 예산 회계(문맥 추가분).
+    pub gdn_state_bytes_per_slot: u64,
     /// KV(int8)+스케일 바이트/토큰 추정 — 엔진 할당과 같은 항
     /// (full층 × kv헤드 × head_dim × 2B(K+V) + full층 × kv헤드 × 2 × 4B 스케일).
     pub kv_bytes_per_token: u64,
@@ -743,6 +745,13 @@ pub fn ctx_info(dir: &std::path::Path) -> Result<CtxInfo, String> {
     let sc = full * c.kv_heads as u64 * 2 * 4;
     Ok(CtxInfo {
         ctx: c.max_pos,
+        // GDN(선형) 층 = 전체 − 전체/간격(=3/4), 상태 [n_gdn][h_v][128×128] f32.
+        gdn_state_bytes_per_slot: (c.layers as u64
+            - c.layers as u64 / c.full_interval.max(1) as u64)
+            * c.linear_num_value_heads as u64
+            * 128
+            * 128
+            * 4,
         kv_bytes_per_token: kv + sc,
         dense: c.n_experts == 0,
     })

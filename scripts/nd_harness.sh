@@ -20,7 +20,7 @@ rm -f "$OUT"/*.json "$OUT"/*.log "$OUT/hashes.tsv"
 port=8100
 for s in $(seq 1 "$RUNS"); do
   port=$((port + 1))
-  env "$@" LLM170_MOE_DBG=1 "$BIN" serve --model "$M" --ctx 4096 --slots 1 --port "$port" \
+  env "$@" LLM170_MOE_DBG=1 "$BIN" serve --model "$M" --ctx 4096 --port "$port" \
     > "$OUT/s$s.log" 2>&1 &
   SPID=$!
   for _ in $(seq 1 60); do

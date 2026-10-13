@@ -1602,7 +1602,9 @@ fn pick_prefix_slot(slots: &[Slot], tokens: &[u32]) -> Option<(usize, usize)> {
                 .count();
             (i, l)
         })
-        .max_by_key(|&(_, l)| l)
+        // [K6-3] 동률(모두 미스)은 최저 인덱스 — 배치 그래프 키(슬롯 조합)
+        // 압축(전형 조합 {0},{0,1},… — 조합 폭발 방지).
+        .max_by_key(|&(i, l)| (l, std::cmp::Reverse(i)))
 }
 
 fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {

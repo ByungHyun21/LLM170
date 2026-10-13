@@ -74,7 +74,7 @@ esac
 # ── 3. C(27B) serve HTTP 종단 ──
 note "[3/10] C(27B) serve HTTP — runtime=cuda + 골든 접두"
 : > "$RUN/c.log"
-"$BIN" serve --model "$M_27B" --ctx 1024 --slots 1 --port "$PORT" > "$RUN/c.log" 2>&1 &
+"$BIN" serve --model "$M_27B" --ctx 1024 --port "$PORT" > "$RUN/c.log" 2>&1 &
 SERVE_PID=$!
 # A2: 기기 전체 pkill 금지 — 이 실행의 서버 PID만 종료(개발 서버 보호).
 trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
@@ -220,7 +220,7 @@ note "[12/12] K(스펙 항등) — 128토큰 서브: 스펙 on/off 토큰 동일
 K_OK=0
 for pair in "on:" "off:LLM170_SPEC_OFF=1"; do
   mode="${pair%%:*}"; envs="${pair#*:}"
-  env $envs "$BIN" serve --model "$M_27B" --ctx 4096 --slots 1 --port "$PORT" \
+  env $envs "$BIN" serve --model "$M_27B" --ctx 4096 --port "$PORT" \
     > "$RUN/k-$mode.log" 2>&1 &
   SERVE_PID=$!
   trap 'kill "$SERVE_PID" 2>/dev/null' EXIT

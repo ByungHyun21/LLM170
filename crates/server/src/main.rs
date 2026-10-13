@@ -30,9 +30,9 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
   llm170 bench --model <w4a16_dir> [--pp N[,N..]] [--tg N[,N..]] [--np N[,N..]]
               [--reps N] [--ctx N]
       llama-bench 규격 PP/TG/NP 측정(엔진 직접 — HTTP 무경유, 합성 LCG 토큰).
-  llm170 serve --model <w4a16_dir> [--port N] [--ctx N|auto] [--slots N] [--queue N]
+  llm170 serve --model <w4a16_dir> [--port N] [--ctx N|auto] [--queue N]
               [--spec auto|mtp|ngram|off] [--moe auto|resident|streaming]
-      OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯.
+      OpenAI/Anthropic 호환 HTTP 서버. 동시성 = min(내부 문맥, 풀 입장) — 슬롯 플래그 없음.
   llm170 w4a16-load <dir>
       W4A16(compressed-tensors int4 sym g128) 로더 완전성 검증 — 트리플·커버리지.
   llm170 w4a16-ref <dir> --prompt-tokens <ids> [--n-predict N] [--ctx N]
@@ -230,11 +230,13 @@ fn run_main() -> ExitCode {
     }
 }
 
-/// llm170 serve --model <dir> [--port N] [--ctx N] [--slots N]
+/// llm170 serve --model <dir> [--port N] [--ctx N|auto] [--queue N] [--spec ..] [--moe ..]
 fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
     let mut queue: Option<usize> = None;
-    let mut slots: Option<usize> = None;
+    // [K6-3 2026-10-13] --slots 폐지 — 동시성 = min(문맥 수, 풀 입장).
+    // 문맥 수는 내부 상수(상태 메모리 = 문맥×gdn_state/슬롯 — 예산 회계 반영).
+    const SERVE_CONTEXTS: usize = 4;
     let mut ctx = 4096usize;
     // [2.J 2026-10-13] --ctx auto = 모델 전역 상한(config 파생).
     let mut ctx_auto = false;
@@ -252,10 +254,6 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                     None => return usage_err("--ctx requires a number or auto"),
                 },
                 None => return usage_err("--ctx requires a number or auto"),
-            },
-            "--slots" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
-                Some(s) => slots = Some(s.clamp(1, 16)),
-                None => return usage_err("--slots requires a number in 1..=16"),
             },
             "--queue" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(q) => queue = Some(q.max(1)),
@@ -335,7 +333,12 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             if let Some((free, _)) = llm170_backend_gpu::cuda_mem_free() {
                 const RESERVE: u64 = 5 * (1 << 30) / 2; // 워크스페이스·스크래치 2.5GiB
                 let wts = if ci.dense { dir_bytes(&model_path) } else { 0 };
-                budget = free.saturating_sub(wts).saturating_sub(RESERVE);
+                // [K6-3] 문맥 추가분 = (문맥−1)×GDN 상태 — KV 예산에서 차감.
+                let ctx_state = (SERVE_CONTEXTS as u64 - 1) * ci.gdn_state_bytes_per_slot;
+                budget = free
+                    .saturating_sub(wts)
+                    .saturating_sub(RESERVE)
+                    .saturating_sub(ctx_state);
                 kv_budget = Some(budget);
                 pool_ctx =
                     (((budget / ci.kv_bytes_per_token.max(1)) as usize) / 512 * 512).min(ci.ctx);
@@ -391,10 +394,18 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             .unwrap_or_default(),
         ctx,
         model_max_ctx,
-        n_slots: slots.unwrap_or(1),
+        n_slots: SERVE_CONTEXTS,
         model_bytes: dir_bytes(&model_path),
     });
-    match http::serve(&format!("127.0.0.1:{port}"), req, slots, queue) {
+    eprintln!(
+        "# serve: 문맥 {SERVE_CONTEXTS}(내부 상수 — --slots 폐지) · 동시성 = min(문맥, 풀 입장)"
+    );
+    match http::serve(
+        &format!("127.0.0.1:{port}"),
+        req,
+        Some(SERVE_CONTEXTS),
+        queue,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
