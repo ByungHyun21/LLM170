@@ -309,50 +309,56 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     // [2.J 2026-10-13] 모델 파생 ctx 검증 — max_position_embeddings(기동 로그).
     // 초과분은 클램프(가드: KV 정적 예산은 아직 엔진 ctx 파생).
     let mut model_max_ctx = 0usize;
-    let mut cinfo = None;
+    let mut kv_budget: Option<u64> = None;
     match llm170_core::qwen35::ctx_info(&model_path) {
         Ok(ci) => {
             model_max_ctx = ci.ctx;
+            // [K6-3 예산 2026-10-13] 풀 예산 = 여유 VRAM − 가중치(dense) − 예약.
+            // 실효 ctx = min(모델 최대, 풀 파생) — 초과 요청은 클램프(로드 전).
+            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            let mut pool_ctx = ci.ctx;
+            let mut budget = 0u64;
+            if let Some((free, _)) = llm170_backend_gpu::cuda_mem_free() {
+                const RESERVE: u64 = 5 * (1 << 30) / 2; // 워크스페이스·스크래치 2.5GiB
+                let wts = if ci.dense { dir_bytes(&model_path) } else { 0 };
+                budget = free.saturating_sub(wts).saturating_sub(RESERVE);
+                kv_budget = Some(budget);
+                pool_ctx =
+                    (((budget / ci.kv_bytes_per_token.max(1)) as usize) / 512 * 512).min(ci.ctx);
+            }
             if ctx_auto {
-                ctx = ci.ctx;
+                ctx = pool_ctx;
             }
             if ctx > ci.ctx {
                 eprintln!("# ctx {ctx} > 모델 최대 {} — 클램프", ci.ctx);
                 ctx = ci.ctx;
             }
-            eprintln!("# ctx: model max={} 사용={ctx}", ci.ctx);
-            cinfo = Some(ci);
+            if ctx > pool_ctx {
+                eprintln!(
+                    "# ctx {ctx} > 풀 파생 {pool_ctx}(예산 {:.1}GiB) — 클램프",
+                    gib(budget)
+                );
+                ctx = pool_ctx;
+            }
+            if ctx < 512 {
+                eprintln!(
+                    "# ctx 가드 거부: 풀 파생 ctx {ctx} < 512 — 가중치 {:.1}GiB + 예약 2.5GiB > 여유 VRAM",
+                    gib(dir_bytes(&model_path))
+                );
+                return ExitCode::FAILURE;
+            }
+            eprintln!(
+                "# ctx: model max={} 풀 파생={pool_ctx} 사용={ctx} (kv 예산 {:.1}GiB)",
+                ci.ctx,
+                gib(budget)
+            );
         }
         Err(e) => eprintln!("# ctx 검증 건너뜀(config 판독 실패): {e}"),
-    }
-    // [2.J] 기동 가드 — VRAM(가중치[dense]+KV+예약) ≤ 여유. 사용 중 할당 실패
-    // 금지 원칙의 사전 거부(기존 preflight는 호스트 RAM을 용량에 포함해
-    // dense 장문 KV 초과를 못 잡는다).
-    if let Some(ci) = &cinfo
-        && let Some((free, _)) = llm170_backend_gpu::cuda_mem_free()
-    {
-        const RESERVE: u64 = 3 * (1 << 30) / 2; // 워크스페이스·스테이징 예약 1.5GiB
-        let wts = if ci.dense {
-            dir_bytes(&model_path)
-        } else {
-            0 // MoE — 전문가 스트리밍 전제(가중치 전량 VRAM 요구 안 함)
-        };
-        let kv = ctx as u64 * ci.kv_bytes_per_token;
-        if wts + kv + RESERVE > free {
-            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-            eprintln!(
-                "# ctx 가드 거부: ctx={ctx} KV {:.1}GiB + 가중치 {:.1}GiB + 예약 {:.1}GiB > 여유 VRAM {:.1}GiB — --ctx 를 줄이세요",
-                gib(kv),
-                gib(wts),
-                gib(RESERVE),
-                gib(free)
-            );
-            return ExitCode::FAILURE;
-        }
     }
     let req = engine::InferRequest {
         model: model_path.clone(),
         ctx,
+        kv_budget,
     };
     // 모니터링 — 정적 정보 등록 + 샘플러 스레드(1Hz; 무시 가능 비용,
     // 최신 스냅샷만 유지 — 시계열 누적은 외부 폴러 몫).

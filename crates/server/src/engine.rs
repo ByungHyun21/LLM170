@@ -98,6 +98,8 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
 pub struct InferRequest {
     pub model: PathBuf,
     pub ctx: usize,
+    /// [K6-3 예산] KV 아레나 예산(바이트, 서버 파생 — None = 종전 총량).
+    pub kv_budget: Option<u64>,
 }
 
 pub struct InferResult {
@@ -159,7 +161,7 @@ fn banner(
 
 pub fn build_slots(req: InferRequest, n_slots: usize) -> Engine {
     // W3-3: GPU 경로 단일 — 가중치 VRAM 상주(호스트 스테이징 체인).
-    let eng = load_gpu_retry(&req.model, n_slots, req.ctx);
+    let eng = load_gpu_retry(&req.model, n_slots, req.ctx, req.kv_budget);
     banner(
         &req.model,
         "w4a16",

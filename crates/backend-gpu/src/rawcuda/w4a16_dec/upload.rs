@@ -153,6 +153,13 @@ impl W4a16Dec {
         Ok(())
     }
 
+    /// [K6-3 예산] KV 아레나 예산 설정 — set_attn 전에 호출(미호출 = 종전 총량).
+    /// 서버가 여유 VRAM에서 파생: 풀 총량 = min(예산/블록비용, 슬롯×ctx). 풀 총량
+    /// ≥ 단일 요청 전역 ctx(입장 하드 보장)는 서버 가드 몫.
+    pub fn set_kv_budget(&mut self, bytes: Option<u64>) {
+        self.attn.kv_budget = bytes;
+    }
+
     pub fn set_attn(&mut self, dims: AttnDims, qnw: &[f32], knw: &[f32]) -> Result<(), String> {
         let n = dims.n_attn;
         if qnw.len() != n * dims.d || knw.len() != n * dims.d {
@@ -164,9 +171,15 @@ impl W4a16Dec {
         // 전량 선할당(동작 보존), 다음 단계에서 예산 기반 온디맨드로 전환.
         let mb = dims.cap.div_ceil(512);
         let (kvd, kvh) = (dims.kv_dim(), dims.kv_heads);
-        let total_blocks = slots * n * mb;
+        let need_blocks = slots * n * mb;
         let block_k = 512 * kvd; // 아레나 k/v 블록 바이트(1B/원소 int8)
         let block_s = 512 * kvh * 4; // 아레나 ksc/vsc 블록 바이트(f32)
+        // [K6-3 예산] 풀 총량 — 예산이 있으면 블록 비용(4아레나 합)으로 환산해 상한.
+        let per_block = 2 * (block_k + block_s) as u64;
+        let total_blocks = match self.attn.kv_budget {
+            Some(b) => ((b / per_block.max(1)) as usize).clamp(1, need_blocks),
+            None => need_blocks,
+        };
         // [§3.4 ②] KV 재등록 — 구 회계 해제(부재 시 무동작: 최초 등록).
         self.ucache.release_if_present("attn:kv");
         for q in [
@@ -249,6 +262,7 @@ impl W4a16Dec {
         // 이므로 등록 실패는 예산 부족(과점유) 경고로 그친다 — 이미
         // 물리 할당이 성공했고 KV 없이는 디코드 자체가 불가능하기 때문.
         let kv_bytes = (total_blocks * (block_k * 2 + block_s * 2)) as u64 + tab.len() as u64 * 8;
+        self.attn.kv_arena_bytes = kv_bytes;
         if let Err(e) = self.ucache.allocate(
             "attn:kv",
             CacheCategory::Kv,
@@ -353,6 +367,11 @@ impl W4a16Dec {
             .as_mut()
             .map(|p| p.release(slot))
             .unwrap_or(0)
+    }
+
+    /// [K6-3 예산] 실 KV 아레나+테이블 바이트(0 = 미등록).
+    pub fn kv_pool_bytes(&self) -> u64 {
+        self.attn.kv_arena_bytes
     }
 
     /// [K6-3] 풀 여유 블록 수(입장 판정·모니터링).

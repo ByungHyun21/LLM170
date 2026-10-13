@@ -298,7 +298,7 @@ pub fn json() -> String {
         })
         .unwrap_or_default();
     format!(
-        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"model_max_ctx\":{},\"effective_ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"cpu\":0}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\"}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"prefix_reuse_ratio\":{:.4},\"prefix_reuse_full\":{},\"prefix_reuse_ckpt\":{},\"trie_boundaries\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{},\"spec_rounds\":{},\"spec_accepted\":{},\"spec_round_ms_avg\":{:.2}}},\"slot_detail\":[{}]}}",
+        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"model_max_ctx\":{},\"effective_ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"cpu\":0}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\"}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"kv_pool_bytes\":{},\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"prefix_reuse_ratio\":{:.4},\"prefix_reuse_full\":{},\"prefix_reuse_ckpt\":{},\"trie_boundaries\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{},\"spec_rounds\":{},\"spec_accepted\":{},\"spec_round_ms_avg\":{:.2}}},\"slot_detail\":[{}]}}",
         esc(&s.info.instance),
         esc(&s.info.model),
         s.info.ctx,
@@ -328,6 +328,7 @@ pub fn json() -> String {
         io.load[0].1 / 1_000_000,
         io.load[1].0,
         io.load[2].0,
+        mem.kv_gpu,
         jobs,
         if jobs > 0 {
             qw as f64 / jobs as f64 / 1e3

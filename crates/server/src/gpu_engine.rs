@@ -33,10 +33,17 @@ pub fn prefill_tmax(is_moe: bool, resident: bool, env: Option<&str>) -> usize {
 
 impl GpuEngine {
     /// 모델 로드 + 가중치 상주 업로드(간헐 ENOENT 재시도는 호출부 소관).
-    pub fn load(dir: &Path, n_slots: usize, ctx: usize) -> Result<Self, String> {
+    pub fn load(
+        dir: &Path,
+        n_slots: usize,
+        ctx: usize,
+        kv_budget: Option<u64>,
+    ) -> Result<Self, String> {
         let model = llm170_core::qwen35::Model::load(dir).map_err(|e| e.to_string())?;
         let hp = model.hp.clone();
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
+        // [K6-3 예산] 풀 예산(여유 VRAM 파생) — upload_model(내부 set_attn) 전에 설정.
+        dec.set_kv_budget(kv_budget);
         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
         // [D2 검수 2026-10-13] 적재 실패 시 부분 할당 정리 — 재시도 루프가
         // VRAM을 되찾지 못하던 문제(첫 시도 실패 후 전부 OOM)의 해소.

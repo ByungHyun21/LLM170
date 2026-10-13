@@ -67,15 +67,19 @@ impl W4a16Dec {
     /// - KV: 어텐션 캐시 2벌(K+V) — 기본 f32, [P13] KVQ 시 int8+스케일.
     /// - PLE: 미구현(W4-2) — 항상 0.
     pub fn mem_stats(&self) -> (u64, u64, u64, u64) {
-        let kv = self
-            .attn
-            .attn
-            .map(|d| {
-                let rows = (self.n_slots as u64) * (d.n_attn as u64) * (d.cap as u64);
-                // [KVQ 채택 2026-10-10] int8 KV + 행×헤드 f32 스케일 2벌.
-                rows * (d.kv_dim() as u64) + rows * (d.kv_heads as u64) * 4 * 2
-            })
-            .unwrap_or(0);
+        // [K6-3 예산] 실할당 아레나+테이블(예산 반영) — 미등록 시 종전 산식.
+        let kv = if self.attn.kv_arena_bytes > 0 {
+            self.attn.kv_arena_bytes
+        } else {
+            self.attn
+                .attn
+                .map(|d| {
+                    let rows = (self.n_slots as u64) * (d.n_attn as u64) * (d.cap as u64);
+                    // [KVQ 채택 2026-10-10] int8 KV + 행×헤드 f32 스케일 2벌.
+                    rows * (d.kv_dim() as u64) + rows * (d.kv_heads as u64) * 4 * 2
+                })
+                .unwrap_or(0)
+        };
         let experts = self.experts_bytes;
         let (w_gpu, w_cpu) = if self.moe.n_experts > 0 && !self.moe.moe_resident {
             (self.weights_bytes, experts)

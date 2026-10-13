@@ -367,6 +367,10 @@ pub(super) struct Attn {
     /// [K6-3 2026-10-13] KV 물리 블록 할당자(호스트) — 테이블 엔트리의 정본.
     /// 다음 단계에서 온디맨드 성장·회수(입장 보장)의 기반.
     pub(super) kv_pool: Option<blocktable::KvPool>,
+    /// [K6-3 예산] KV 아레나 예산(바이트) — set_attn이 소비(풀 총량 = min(예산, 슬롯×ctx)).
+    pub(super) kv_budget: Option<u64>,
+    /// [K6-3 예산] 실할당 아레나+테이블 바이트(관측 — mem_stats/kv_pool_bytes).
+    pub(super) kv_arena_bytes: u64,
     pub(super) dpp: CUdeviceptr,
     pub(super) dqg_a: CUdeviceptr,
     pub(super) dkin_a: CUdeviceptr,
@@ -692,6 +696,8 @@ impl W4a16Dec {
                 dvsc: 0,
                 dblk_tab: 0,
                 kv_pool: None,
+                kv_budget: None,
+                kv_arena_bytes: 0,
                 dpp: 0,
                 dqg_a: 0,
                 dkin_a: 0,
