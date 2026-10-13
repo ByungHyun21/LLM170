@@ -42,6 +42,8 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
       통계 eval — PPL·teacher-forced argmax 일치율(연산 경로 편차 계측기).
   llm170 tokenize --model <dir> (--text <s> | --file <f> | --stdin)
       토크나이저 인코딩 [id, ...] 출력.
+  llm170 plan --model <w4a16_dir> [--cards N] [--vram-gb X] [--host-gb Y] [--ctx N] [--ssd-gb Z]
+      배치 플래너 드라이런(무적재) — 매니페스트 범주 분류 + 사다리 배치안(§2.M).
   llm170 help
 
 단일 트랙(2026-10-08 — 사용자 지시): CUDA W4A16만. 기본 경로는 CUDA(가속
@@ -142,7 +144,10 @@ fn run_main() -> ExitCode {
     // 대상 판정은 resource::guard_target 순수함수(A2/R1 추출) —
     // 서브커맨드×인자 형태 계약은 표 테스트(guard_target_cases)가 고정하고
     // 무가드 적재 프로브 폐쇄(A13)도 같은 표가 담당한다.
-    if !matches!(args.first().map(String::as_str), Some("tokenize")) {
+    if !matches!(
+        args.first().map(String::as_str),
+        Some("tokenize") | Some("plan")
+    ) {
         // 가드 대상 판정은 resource::guard_target 순수함수(A2/R1 추출) —
         // 표 테이블 테스트가 계약을 고정한다(무가드 프로브 폐쇄 A13 포함).
         if let Some(gt) = resource::guard_target(
@@ -219,6 +224,7 @@ fn run_main() -> ExitCode {
         Some("infer") => infer::cmd_infer(&ma.rest, &ma),
         Some("serve") => cmd_serve(&ma.rest, &ma),
         Some("tokenize") => cmd_tokenize(&ma),
+        Some("plan") => cmd_plan(&ma.rest, &ma),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -322,6 +328,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     // 초과분은 클램프(가드: KV 정적 예산은 아직 엔진 ctx 파생).
     let mut model_max_ctx = 0usize;
     let mut kv_budget: Option<u64> = None;
+    let mut plan_txt = String::new();
     match llm170_core::qwen35::ctx_info(&model_path) {
         Ok(ci) => {
             model_max_ctx = ci.ctx;
@@ -330,8 +337,9 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             let mut pool_ctx = ci.ctx;
             let mut budget = 0u64;
-            if let Some((free, _)) = llm170_backend_gpu::cuda_mem_free() {
+            if let Some((free, total)) = llm170_backend_gpu::cuda_mem_free() {
                 const RESERVE: u64 = 5 * (1 << 30) / 2; // 워크스페이스·스크래치 2.5GiB
+                // 폴백 공식(매니페스트 판독 불가 시): 가중치 = dense 전량(디렉터리).
                 let wts = if ci.dense { dir_bytes(&model_path) } else { 0 };
                 // [K6-3] 문맥 추가분 = (문맥−1)×GDN 상태 — KV 예산에서 차감.
                 let ctx_state = (SERVE_CONTEXTS as u64 - 1) * ci.gdn_state_bytes_per_slot;
@@ -339,9 +347,38 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                     .saturating_sub(wts)
                     .saturating_sub(RESERVE)
                     .saturating_sub(ctx_state);
-                kv_budget = Some(budget);
                 pool_ctx =
                     (((budget / ci.kv_bytes_per_token.max(1)) as usize) / 512 * 512).min(ci.ctx);
+                // [2.M 2026-10-13] 배치 플래너 = 예산의 단일 산출원(매니페스트 판독 시).
+                // dense 범주(실상주 — embed는 호스트 mmap)로 가중치를 계상해 embed
+                // 바이트를 KV로 회수한다(구 공식은 dir 전량 — 27B에서 2.4GiB 과소).
+                // 판독 실패·거부 시엔 위 폴백 공식 유지(하위 ctx 가드가 거부 판정).
+                match llm170_core::plan::Manifest::from_dir(&model_path) {
+                    Ok(man) => {
+                        let hw = llm170_core::plan::Hardware {
+                            vram_total: total,
+                            vram_free: Some(free),
+                            host_ram: resource::host_mem_available().unwrap_or(0),
+                            ssd: None,
+                            reserve: RESERVE,
+                        };
+                        let wl = llm170_core::plan::Workload {
+                            model_max_ctx: ci.ctx,
+                            want_ctx: ci.ctx,
+                            kv_bytes_per_token: ci.kv_bytes_per_token,
+                            state_bytes_per_ctx: ci.gdn_state_bytes_per_slot,
+                            contexts: SERVE_CONTEXTS,
+                        };
+                        let p = llm170_core::plan::plan(&man, &hw, &wl);
+                        plan_txt = p.summary();
+                        if p.fits() {
+                            budget = p.kv_budget;
+                            pool_ctx = p.effective_ctx;
+                        }
+                    }
+                    Err(e) => eprintln!("# plan 건너뜀: {e}"),
+                }
+                kv_budget = Some(budget);
             }
             if ctx_auto {
                 ctx = pool_ctx;
@@ -374,6 +411,9 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 crate::engine::spec_name(),
                 crate::engine::moe_name()
             );
+            if !plan_txt.is_empty() {
+                eprintln!("# plan: {plan_txt}");
+            }
         }
         Err(e) => eprintln!("# ctx 검증 건너뜀(config 판독 실패): {e}"),
     }
@@ -394,6 +434,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             .unwrap_or_default(),
         ctx,
         model_max_ctx,
+        plan: plan_txt,
         n_slots: SERVE_CONTEXTS,
         model_bytes: dir_bytes(&model_path),
     });
@@ -412,6 +453,113 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// llm170 plan --model <dir> [--cards N] [--vram-gb X] [--host-gb Y] [--ctx N] [--ssd-gb Z]
+/// 배치 플래너 드라이런(무적재 — safetensors 헤더 + config만 판독): 범주 분류 +
+/// 사다리 배치안. VRAM/호스트 미지정 시 현재 기기(단일 카드·MemTotal) 기준(§2.M).
+fn cmd_plan(args: &[String], ma: &ModelArgs) -> ExitCode {
+    let Some(model_path) = ma.model.clone().map(std::path::PathBuf::from) else {
+        return usage_err("--model required");
+    };
+    let mut cards = 1usize;
+    let mut vram_gb: Option<f64> = None;
+    let mut host_gb: Option<f64> = None;
+    let mut ssd_gb: Option<f64> = None;
+    let mut ctx_opt: Option<usize> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--cards" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(c) if c >= 1 => cards = c,
+                _ => return usage_err("--cards requires a number >= 1"),
+            },
+            "--vram-gb" => match it.next().and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) if v > 0.0 => vram_gb = Some(v),
+                _ => return usage_err("--vram-gb requires a positive number"),
+            },
+            "--host-gb" => match it.next().and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) if v > 0.0 => host_gb = Some(v),
+                _ => return usage_err("--host-gb requires a positive number"),
+            },
+            "--ssd-gb" => match it.next().and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) if v > 0.0 => ssd_gb = Some(v),
+                _ => return usage_err("--ssd-gb requires a positive number"),
+            },
+            "--ctx" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(c) => ctx_opt = Some(c),
+                None => return usage_err("--ctx requires a number"),
+            },
+            other => return usage_err(&format!("unknown flag: {other}")),
+        }
+    }
+    let to_gib = |g: f64| (g * (1u64 << 30) as f64) as u64;
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let man = match llm170_core::plan::Manifest::from_dir(&model_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // 워크로드 — config 파생(ctx·KV/토큰·상태). 실패 시 표준 폴백(무적재 원칙).
+    let (max_ctx, kv_bpt, state_bpc) = match llm170_core::qwen35::ctx_info(&model_path) {
+        Ok(ci) => (ci.ctx, ci.kv_bytes_per_token, ci.gdn_state_bytes_per_slot),
+        Err(e) => {
+            eprintln!("# plan: config 파생 실패({e}) — 폴백(256K·33KiB/tok·151MiB/ctx)");
+            (262_144, 33 * 1024, 151 * (1 << 20))
+        }
+    };
+    // 하드웨어 — 미지정은 실측(단일 카드 조회·MemTotal).
+    let dev_total = llm170_backend_gpu::cuda_mem_free()
+        .map(|(_, t)| t)
+        .unwrap_or(0);
+    let per_card = vram_gb.map(to_gib).unwrap_or(dev_total);
+    if per_card == 0 {
+        eprintln!("error: VRAM 조회 불가 — --vram-gb로 카드당 용량을 지정하라");
+        return ExitCode::FAILURE;
+    }
+    let hw = llm170_core::plan::Hardware {
+        vram_total: per_card.saturating_mul(cards as u64),
+        vram_free: None,
+        host_ram: host_gb
+            .map(to_gib)
+            .unwrap_or_else(|| resource::host_mem_total().unwrap_or(0)),
+        ssd: ssd_gb.map(to_gib),
+        reserve: 5 * (1u64 << 30) / 2,
+    };
+    // 문맥 수 — serve 내부 상수(동시성 = min(문맥, 입장)).
+    const SERVE_CONTEXTS: usize = 4;
+    let wl = llm170_core::plan::Workload {
+        model_max_ctx: max_ctx,
+        want_ctx: ctx_opt.unwrap_or(max_ctx),
+        kv_bytes_per_token: kv_bpt,
+        state_bytes_per_ctx: state_bpc,
+        contexts: SERVE_CONTEXTS,
+    };
+    let p = llm170_core::plan::plan(&man, &hw, &wl);
+    let s = p.sizes;
+    println!(
+        "tensors={} dense={:.1}G experts={:.1}G row_sparse={:.1}G embed={:.1}G total={:.1}G",
+        man.len(),
+        gib(s.dense),
+        gib(s.experts),
+        gib(s.row_sparse),
+        gib(s.embed),
+        gib(s.total())
+    );
+    println!(
+        "vram={:.1}G × {cards} = {:.1}G · host={:.1}G · reserve={:.1}G · ctx 요건={} (KV {:.0}B/tok·상태 {:.0}M/ctx)",
+        gib(per_card),
+        gib(p.vram),
+        gib(hw.host_ram),
+        gib(hw.reserve),
+        wl.want_ctx,
+        wl.kv_bytes_per_token as f64,
+        wl.state_bytes_per_ctx as f64 / (1u64 << 20) as f64
+    );
+    println!("plan: {}", p.summary());
+    ExitCode::SUCCESS
 }
 
 /// 디렉터리 파일 크기 합(모니터링 표시용 — 실패는 0).

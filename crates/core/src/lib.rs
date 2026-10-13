@@ -6,6 +6,7 @@ pub mod json;
 pub mod marlin;
 pub mod matmul;
 pub mod ops;
+pub mod plan;
 pub mod quant;
 pub mod qwen35;
 pub mod sampler;
