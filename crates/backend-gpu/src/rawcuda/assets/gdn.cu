@@ -698,11 +698,16 @@ extern "C" __global__ void gdn_scan(
 //   head(기본 256) = 저장 최대 → 서브노멀 문턱 6e-5·max/head(≈2.3e-7·max),
 //   오버플로 여유 65504/head(≈256× 한-토큰 성장; 기록측은 ±65504 클램프).
 // 행당 1스레드(스레드 간 리덕션 없음 — 결정적·단순).
+// [rescale 통합 2026-10-13] 층 범위 판 — grid (h_v, n_layers), layer0 = 기저.
+// 체인 끝(마지막 GDN 층)에서 전 층을 1회 런치로 정규화(디코드 48런치/토큰 → 1).
+// 층별 수학·히스테리시스는 종전과 동일(비트동일) — 층 L 상태는 같은 체인 안에서
+// 재판독이 없고(다음 토큰이 첫 판독), 체크포인트(청크 끝)는 이 지점 뒤다.
 extern "C" __global__ void gdn_rescale(
     __half* __restrict__ st, float* __restrict__ sc,
-    int h_v, int d, int layer, float head)
+    int h_v, int d, int layer0, float head)
 {
     const int h = blockIdx.x;
+    const int layer = layer0 + (int)blockIdx.y;
     const int i = threadIdx.x; // 행(kdim)
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
     const long sc_h = ((long)layer * h_v + h) * d;

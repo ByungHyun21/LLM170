@@ -281,9 +281,13 @@ impl W4a16Dec {
                 &mut hv,
             ),
         )?;
-        // [행-스케일 2026-10-13] 상태 기록 직후 스케일 정규화(체인 내 — 그래프
-        // 캡처 포함: 포인터·그리드 고정). 히스테리시스 = 커널 내부.
-        self.gdn_rescale_slot(slot, layer)?;
+        // [rescale 통합 2026-10-13] 마지막 GDN 층에서 **전 층 일괄** 정규화 —
+        // 층별 런치(디코드 48회/토큰)를 1회로(그래프 노드 감소 = 채택 비용
+        // 회복). 정합: 층 L 상태는 같은 체인 안 재판독 없음(다음 토큰이 첫
+        // 판독)·체크포인트(청크 끝)는 항상 이 지점 뒤. 히스테리시스 = 커널 내부.
+        if layer == dm.n_gdn - 1 {
+            self.gdn_rescale_all(slot)?;
+        }
         Ok(())
     }
 
@@ -292,18 +296,34 @@ impl W4a16Dec {
     /// ≈ 256× 한-토큰 성장(기록측 ±65504 클램프). 기록 직후 호출(디코드 체인·
     /// 프리필 청크·스펙 스캔·롤백 재구성).
     pub(super) fn gdn_rescale_slot(&self, slot: usize, layer: usize) -> Result<(), String> {
+        self.gdn_rescale_layers(slot, layer, 1)
+    }
+
+    /// [rescale 통합 2026-10-13] 전 층 일괄 — 체인 끝(마지막 GDN 층)에서 1회.
+    /// 층별 수학 동일(비트동일): 층 L 상태는 같은 체인 안에서 재판독이 없다.
+    pub(super) fn gdn_rescale_all(&self, slot: usize) -> Result<(), String> {
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
+        self.gdn_rescale_layers(slot, 0, dm.n_gdn)
+    }
+
+    fn gdn_rescale_layers(
+        &self,
+        slot: usize,
+        layer0: usize,
+        n_layers: usize,
+    ) -> Result<(), String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let f = self.cc.function("gdn_rescale")?;
         let (mut p0, mut p1) = (
             self.gdn.dgst + (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64 * 2,
             self.gdn.dsc + (slot * dm.n_gdn * dm.h_v * 128) as u64 * 4,
         );
-        let (mut hv, mut dd, mut lay) = (dm.h_v as i32, dm.d as i32, layer as i32);
+        let (mut hv, mut dd, mut lay) = (dm.h_v as i32, dm.d as i32, layer0 as i32);
         let mut head = 256.0f32;
         self.cc.launch(
             f,
             dm.h_v as u32,
-            1,
+            n_layers as u32,
             128,
             &mut crate::rawcuda::args::l6(&mut p0, &mut p1, &mut hv, &mut dd, &mut lay, &mut head),
         )
@@ -608,10 +628,11 @@ impl W4a16Dec {
                 )?;
             }
         }
-        // [결함수정 2026-10-13] 상태 기록 직후 스케일 재정규화 — 단일 경로와
-        // 동일(히스테리시스는 커널 내부). 누락 시 배치 디코드 수치가 어긋난다.
-        for &slot in slots {
-            self.gdn_rescale_slot(slot, layer)?;
+        // [rescale 통합 2026-10-13] 마지막 GDN 층에서 전 층·전 슬롯 일괄.
+        if layer == dm.n_gdn - 1 {
+            for &slot in slots {
+                self.gdn_rescale_all(slot)?;
+            }
         }
         // gate — 행 단위 1회. [4.1] x32/미러 융합(배치 cast_x32 노드 제거).
         {
