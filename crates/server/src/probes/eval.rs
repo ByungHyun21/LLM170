@@ -501,6 +501,7 @@ fn needle(args: &[String]) -> Result<String, String> {
     let (mut ctx, mut lens, mut sets, mut json) =
         (16384usize, vec![4096usize, 16384], 1usize, false);
     let mut ngen = 8usize; // greedy 생성 토큰(패스코드 탐색 창)
+    let (mut pf, mut picks_dbg) = (512usize, false); // 프리필 청크 캡·답변 덤프
     while let Some(a) = it.next() {
         match a.as_str() {
             "--ctx" => {
@@ -517,6 +518,12 @@ fn needle(args: &[String]) -> Result<String, String> {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
             }
+            "--pf" => {
+                pf = arg(&mut it, "--pf requires a number")?
+                    .parse()
+                    .map_err(|_| "--pf requires a number".to_string())?;
+            }
+            "--picks" => picks_dbg = true,
             "--gen" => {
                 ngen = arg(&mut it, "--gen requires a number")?
                     .parse()
@@ -597,7 +604,7 @@ fn needle(args: &[String]) -> Result<String, String> {
                 let n_ctx = toks.len() - 1;
                 let mut i = 0usize;
                 while i < n_ctx {
-                    let t = (n_ctx - i).clamp(2, 512);
+                    let t = (n_ctx - i).clamp(2, pf.max(2));
                     let mut rb: Vec<f32> = Vec::with_capacity(t * hp.n_embd);
                     for &tok in &toks[i..i + t] {
                         rb.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);
@@ -622,7 +629,21 @@ fn needle(args: &[String]) -> Result<String, String> {
                     let er = model.embed_row(best.0).map_err(|e| e.to_string())?;
                     row = dec.forward_device_head(0, &er)?;
                 }
-                let hit = picks.windows(word_id.len()).any(|w| w == &word_id[..]);
+                // [하네스 결함수정 2026-10-13] 토큰 id 부분열만으로는 생성-시점
+                // 토큰화가 단독 인코딩과 다를 때 정답을 놓친다(실측: 35B가
+                // "FAR39C"를 정확히 출력했는데도 0/6 — 병합 차이). 조각 문자열
+                // 연결로 패스코드 원문(ASCII)도 함께 찾는다.
+                let mut gen_text = String::new();
+                for &id in &picks {
+                    gen_text.push_str(tk.piece(id).unwrap_or(""));
+                }
+                let hit = picks.windows(word_id.len()).any(|w| w == &word_id[..])
+                    || gen_text.contains(&word);
+                if picks_dbg {
+                    eprintln!(
+                        "[needle] len={l} d={d} word={word} hit={hit} picks={picks:?}"
+                    );
+                }
                 rows.push((l, d, set, hit));
             }
         }

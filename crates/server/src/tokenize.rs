@@ -105,6 +105,12 @@ impl EncodeCache {
 }
 
 impl Tokenizer {
+    /// 조각 문자열 조회(판정 보조 — 바이트-유니코드 표기 그대로, 디코딩 아님).
+    /// needle 문자열 판정(생성 토큰화 변동 대응)이 사용한다.
+    pub fn piece(&self, id: u32) -> Option<&str> {
+        self.vocab.get(id as usize).map(|s| s.as_str())
+    }
+
     pub fn load(path: &Path) -> Result<Self, String> {
         // 모델 = W4A16 디렉터리(2026-10-08 단일 트랙).
         if path.is_dir() {
