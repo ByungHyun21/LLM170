@@ -153,15 +153,16 @@ impl W4a16Dec {
             ATTN_SPLITS
         };
         let mut sp = spv as i32;
-        // [§8.2 2026-10-11] 프리필(t>8)은 GQA 패킹 커널 — kv헤드 그룹의 gq개
-        // q헤드가 K/V 행 판독을 공유(그리드 y = kv_heads×S). 디코드는 종전
-        // part_q(블록 수 = q_heads×S 유지 — 패킹 시 점유 감소).
-        let qgp = t_len > 8;
-        let fp = self.cc.function(if qgp {
-            "attn_fwd3s_part_qg"
-        } else {
-            "attn_fwd3s_part_q"
-        })?;
+        // [KV 읽기 공유 채택 2026-10-13] GQA 패킹 단일 경로 — kv헤드 그룹의
+        // gq개 q헤드가 K/V 행 판독을 공유(그리드 y = kv_heads×S). 종전 디코드는
+        // q헤드별 중복 판독(part_q — gq회). 장문 곡선 실측(27B): 디코드 지연
+        // 기울기 ≈ 컨텍스트 토큰당 146ns(64K에서 tg 35.3) — 실측 분해 결과
+        // **DRAM 대역이 아니라 점유/지연 바운드**(패킹만으로 +2%, 분할 64로
+        // +10%: 실측표는 attn.cu part_qg 주석). part_qg는 AV의 V·vsc 곱 공유와
+        // 행 오름차순 누산을 설계 계약으로 하므로 **비트동일**(§8.2 주석 —
+        // 골든·지문 재판정으로 확인). 전프리필(t>8)은 FA2 담당, 이 커널은
+        // t 도메인 전체(디코드+스펙 검증) 단일 경로.
+        let fp = self.cc.function("attn_fwd3s_part_qg")?;
         // [K6-2] KV 4포인터 → 블록 테이블(attn_blk_ptr) 간접화.
         let (mut f0, mut f1, mut f2, mut f3) = (
             self.attn.dqh_a,
@@ -172,7 +173,7 @@ impl W4a16Dec {
         self.cc.launch(
             fp,
             t_len as u32,
-            (if qgp { dm.kv_heads } else { dm.q_heads } * spv) as u32,
+            (dm.kv_heads * spv) as u32,
             256,
             &mut crate::rawcuda::args::l10(
                 &mut f0, &mut f1, &mut f2, &mut f3, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,

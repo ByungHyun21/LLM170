@@ -21,6 +21,11 @@ impl W4a16Dec {
         self.ensure_gdn_bufs(t_len)?;
         let ring_slot = slot * dm.n_gdn * 3 * dm.conv_ch();
         let st_slot = slot * dm.n_gdn * dm.h_v * 128 * 128;
+        // [결함수정 2026-10-13] 스케일 슬롯 기저 — 스케일 배열은 슬롯당
+        // n_gdn×h_v×128(스칼라 1/행)이므로 st_slot(×128 포함)을 쓰면
+        // 슬롯≥1에서 128× OOB(슬롯 0만 정확해 단일-슬롯 골든·스모크가
+        // 통과했고, np·다중 슬롯 serve가 illegal access로 죽었다).
+        let sc_slot = slot * dm.n_gdn * dm.h_v * 128;
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let (mut hk, mut hv, mut dd) = (dm.h_k as i32, dm.h_v as i32, dm.d as i32);
         let (mut hd, mut kl, mut vl, mut cch) = (
@@ -103,7 +108,7 @@ impl W4a16Dec {
                 self.gdn.dq2,
                 self.gdn.dk2,
                 self.gdn.dgst + (st_slot as u64) * 2,
-                self.gdn.dsc + (st_slot as u64) * 4,
+                self.gdn.dsc + (sc_slot as u64) * 4,
                 self.gdn.dgpart,
             );
             self.cc.launch(
@@ -142,7 +147,7 @@ impl W4a16Dec {
                 self.gdn.dbg,
                 self.gdn.dgdc,
                 self.gdn.dgst + (st_slot as u64) * 2,
-                self.gdn.dsc + (st_slot as u64) * 4,
+                self.gdn.dsc + (sc_slot as u64) * 4,
             );
             self.cc.launch(
                 fu,
@@ -173,7 +178,7 @@ impl W4a16Dec {
                 self.gdn.dgst + (st_slot as u64) * 2,
             );
             let (mut w8, mut w4, mut w5, mut w6, mut w7) = (
-                self.gdn.dsc + (st_slot as u64) * 4,
+                self.gdn.dsc + (sc_slot as u64) * 4,
                 self.gdn.dwy_s0,
                 self.gdn.dwy_dc,
                 self.gdn.dwy_g,
@@ -197,7 +202,7 @@ impl W4a16Dec {
                 self.gdn.dbg,
                 self.gdn.dgst + (st_slot as u64) * 2,
                 self.gdn.dgo,
-                self.gdn.dsc + (st_slot as u64) * 4,
+                self.gdn.dsc + (sc_slot as u64) * 4,
             );
             self.cc.launch(
                 f,
@@ -243,7 +248,7 @@ impl W4a16Dec {
                 self.gdn.dakq,
                 self.gdn.dgst + (st_slot as u64) * 2,
                 self.gdn.dgo,
-                self.gdn.dsc + (st_slot as u64) * 4,
+                self.gdn.dsc + (sc_slot as u64) * 4,
             );
             // grid = h_v×NSPLIT(블록 = GDN_NGRP×GDN_VS = 512스레드).
             self.cc.launch_shared(
@@ -555,18 +560,23 @@ impl W4a16Dec {
             let v2k = self.gdn.dv2 + k as u64 * vl as u64 * 4;
             let bgk = self.gdn.dbg + k as u64 * bg_stride * 4;
             let stk = self.gdn.dgst + slot as u64 * st_stride * 2; // f16 상태
+            // [결함수정 2026-10-13] 스케일 포인터 — 채택(스케일 인자)이 단일
+            // 경로에만 배선돼 배치가 옛 l8(인자 어긋남→OOB)이었다. 단일 경로와
+            // 동일 의미(슬롯당 n_gdn×h_v×128).
+            let sck = self.gdn.dsc + (slot * dm.n_gdn * dm.h_v * 128) as u64 * 4;
             let partk = self.gdn.dgpart + k as u64 * part_stride * 4;
             let dck = self.gdn.dgdc + k as u64 * dc_stride * 4;
             let outk = self.gdn.dgo + k as u64 * vl as u64 * 4;
             {
-                let (mut p0, mut p1, mut p2, mut p3) = (q2k, k2k, stk, partk);
+                let (mut p0, mut p1, mut p2, mut p3, mut p4) = (q2k, k2k, stk, sck, partk);
                 self.cc.launch(
                     fp,
                     dm.h_v as u32,
                     8,
                     128,
-                    &mut crate::rawcuda::args::l8(
-                        &mut p0, &mut p1, &mut p2, &mut p3, &mut hk, &mut hv, &mut dd, &mut lay,
+                    &mut crate::rawcuda::args::l9(
+                        &mut p0, &mut p1, &mut p2, &mut p3, &mut p4, &mut hk, &mut hv, &mut dd,
+                        &mut lay,
                     ),
                 )?;
             }
@@ -585,17 +595,23 @@ impl W4a16Dec {
                 )?;
             }
             {
-                let (mut u0, mut u1, mut u2, mut u3) = (k2k, bgk, dck, stk);
+                let (mut u0, mut u1, mut u2, mut u3, mut u4) = (k2k, bgk, dck, stk, sck);
                 self.cc.launch(
                     fu,
                     dm.h_v as u32,
                     8,
                     128,
-                    &mut crate::rawcuda::args::l8(
-                        &mut u0, &mut u1, &mut u2, &mut u3, &mut hk, &mut hv, &mut dd, &mut lay,
+                    &mut crate::rawcuda::args::l9(
+                        &mut u0, &mut u1, &mut u2, &mut u3, &mut u4, &mut hk, &mut hv, &mut dd,
+                        &mut lay,
                     ),
                 )?;
             }
+        }
+        // [결함수정 2026-10-13] 상태 기록 직후 스케일 재정규화 — 단일 경로와
+        // 동일(히스테리시스는 커널 내부). 누락 시 배치 디코드 수치가 어긋난다.
+        for &slot in slots {
+            self.gdn_rescale_slot(slot, layer)?;
         }
         // gate — 행 단위 1회. [4.1] x32/미러 융합(배치 cast_x32 노드 제거).
         {

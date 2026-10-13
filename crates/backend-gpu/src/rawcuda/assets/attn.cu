@@ -205,6 +205,20 @@ __device__ __forceinline__ AttnKvRowPtrs attn_blk_row(
 // int8(행×헤드 absmax 스케일 = max|x|/127, 0이면 1). 스케일 f32 1개/행헤드.
 // 값 차이는 양자화 오차뿐 — 판정은 토큰(단문 골든 + 장문). fwd3s_part_q가 소비.
 // [K6-2] kc/vc/ksc/vsc 4포인터 → 블록 테이블 1포인터로 간접화(위 블록 참조).
+// [KV 창 상한 실측 기각 2026-10-13] "어텐션 KV 판독을 마지막 W로 한정"(위치만의
+// 함수라 접두 재사용과 정합)을 빌드 상수로 전 배선(FA2: c_start=w0/FA2_BC 청크
+// 스킵 + 행별 cc<nA−W 마스크 · part_q/pg: win_lo=lim−W 스팬 분할)하고 27B 게이트
+// 실측 — **기각**:
+//   · 밴드(비선형 절벽): W=8192 mix **+1.95%@16K·+2.16%@32K**(CI 확실 — 밴드 밖)
+//     vs W=16384@32K **−0.04%[−0.13,+0.01]**(밴드 내) — 손상은 8K↔16K 사이 급변.
+//   · needle(AND 축이 지배): 창 안 ✓/창 밖 ✗ — **GDN 상태는 창 밖 패스코드 회수를
+//     보상하지 못한다**(32K·동일 패스코드: W=16384 d30(거리 22.9K) ✗·d70/d90 ✓;
+//     W=8192 d90(3.3K)만 ✓; 16K/24K도 동일 패턴).
+//   · 장문 문맥(65K): **창 크기와 무관하게 '제거 자체'가 회수 붕괴** — W=32768·
+//     W=16384 모두 깊이 90%(거리 6.6K, 창 안) ✗·전량 KV ✓(반복 루프 퇴화·gen40).
+//   · 함의: 고정-메모리 절감은 검색(RULER/NIAH)에서 먼저 무너진다(정본 R10 #10
+//     예측을 자체 모델로 확증). 재실험 접점 = 위 3곳(빌드 상수) — 1M/CMP 장문
+//     정책 논의 시에만. 수치 전문은 원장(4090-detail) 동일 세션 기록.
 // [저비트 KV 계보 감시 2026-10-13] int4 이하 금지 승계: 회전·코드북 계열(k8v4·
 // TurboQuant·OSCAR·TriAxialKV·SAW-INT4·OffQ) + 2026 신생 lattice-VQ(KakeyaLattice
 // D4/E8·NexusQuant E8·HyperQuant·LLVQ Leech·VQKV) — "2-bit·needle 보존" 주장 포함
@@ -442,7 +456,7 @@ __device__ __forceinline__ void attn_part_step(KDot kdot, VAcc vacc,
 // 골든 구간 비트 동일 계약 보존.
 // [§8.1 2026-10-11] 병합 smem 상한 — 디코드(t≤8) 분할 32까지 수용.
 // 프리필 분할(8)은 호스트 ATTN_SPLITS, 디코드는 ATTN_SPLITS_D(32) 사용.
-#define ATTN_SPLITS_MAX 32
+#define ATTN_SPLITS_MAX 64
 
 
 
@@ -621,7 +635,18 @@ extern "C" __global__ void attn_fwd3s_merge(
 // (gq개 dot이 같은 uint4 워드를 재사용)·V/vsc도 공유(vv 곱 1회). 트리는
 // GQ_MAX 병렬(배리어 수 = 종전 1헤드분). 헤드별 산술 순서·트리 페어링·
 // AV 행 오름차순 전부 동일 — **비트동일 계약**. 그리드 = (t, kv_heads×S).
-// 디코드(t≤8)는 종전 part_q 유지(블록 수 = q_heads×S 필요 — 패킹 시 감소).
+// [디코드 단일 경로 채택 2026-10-13] t 도메인 전체(디코드 t≤8·스펙 검증 포함)로
+// 확대 — 종전 part_q의 q헤드별 K/V·스케일 중복 판독(gq = 27B 6·35B 8회)이 장문
+// 디코드에서 지연 바운드였다(27B 실측: 지연 기울기 ≈ 컨텍스트 토큰당 146ns —
+// 64K tg 35.3 t/s ≈ 고유 KV 바이트의 ~4× DRAM 등가). 패킹 + 디코드 분할
+// 64(ATTN_SPLITS_D) 채택 — 실측 곡선(27B):
+//   tg@64K 35.25(part_q,S32) → 36.05(패킹,S32) → **39.75(채택 S64)** → 40.1(S128)
+//   tg@16K 47.2 → 47.8 → **49.3** → 50.4 · tg@512 53.5 → 53.5 → **53.0** → 52.7
+//   (35B 짧은 창 −0.5%·24K needle 2/3→3/3)
+// 판정: ≤8K는 ATTN_CHUNK 정렬로 분할 수 무관 — 골든·지문 비트동일(4종 골든+장문
+// 골든+지문 2종 확인) · >8K는 분할 경계 반올림류(merge는 수학 동일) — 게이트
+// needle: 27B 16K/24K 6/6·32K 3/3·64K 3/3 (기준선 불변). 빈 분할 블록은 조기
+// 반환 + m/l만 기록(merge가 l≤0 스킵 — 256-float 기록 불요).
 #define ATTN_GQ_MAX 8
 extern "C" __global__ void attn_fwd3s_part_qg(
     const float* __restrict__ qh,
@@ -644,23 +669,26 @@ extern "C" __global__ void attn_fwd3s_part_qg(
     __shared__ float sarr[ATTN_GQ_MAX][ATTN_CHUNK];
     __shared__ float reds[ATTN_GQ_MAX][256];
     __shared__ float mrun[ATTN_GQ_MAX], lrun[ATTN_GQ_MAX], corr[ATTN_GQ_MAX], mnew[ATTN_GQ_MAX];
+    // [빈 분할 최소화 2026-10-13] eff 판정을 qs 스테이징 앞으로 — S=128 디코드
+    // (장문 점유 회복)에서 대부분의 분할이 빈 블록인 단문 구간의 스테이징·동기화
+    // 비용 제거. 빈 분할은 m/l만 기록(merge가 l≤0으로 스킵 — acc 미판독이므로
+    // 256-float 기록 불요: 종전과 결과 비트동일).
+    const int eff = (lim <= 256) ? 1 : splits;
+    if (s >= eff) {
+        if (tid == 0) {
+            for (int h = 0; h < gq; ++h) {
+                float* out = part + (((long)t * q_heads + (h0 + h)) * splits + s) * 258;
+                out[0] = -1e30f;
+                out[1] = 0.0f;
+            }
+        }
+        return;
+    }
     for (int h = 0; h < gq; ++h) {
         const long qrow = (long)t * (q_heads * 256) + (long)(h0 + h) * 256;
         qs[h][tid] = qh[qrow + tid];
     }
     __syncthreads();
-    const int eff = (lim <= 256) ? 1 : splits;
-    if (s >= eff) {
-        for (int h = 0; h < gq; ++h) {
-            float* out = part + (((long)t * q_heads + (h0 + h)) * splits + s) * 258;
-            if (tid == 0) {
-                out[0] = -1e30f;
-                out[1] = 0.0f;
-            }
-            out[2 + tid] = 0.0f;
-        }
-        return;
-    }
     int chunk_rows = (lim + eff - 1) / eff;
     chunk_rows = ((chunk_rows + ATTN_CHUNK - 1) / ATTN_CHUNK) * ATTN_CHUNK;
     int lo = s * chunk_rows;

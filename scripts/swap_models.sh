@@ -5,7 +5,8 @@
 # 판정:
 #   1. A(27B): 참조(CPU) greedy 토큰열 골든 접두 일치 — 오라클.
 #   2. B(27B): GPU 체인(w4a16-gpu) 토큰열 골든 접두 일치.
-#   3. C(27B): serve HTTP 종단 — 배너 runtime=cuda + 골든 접두.
+#   3. C(27B): serve HTTP 종단 — 배너 runtime=cuda + 골든 접두 + 배치 불변성
+#      (동시 2요청 = 슬롯 0·1 배치 체인 토큰 = 단일 경로 골든).
 #   4. D(35B-A3B INT4 g32): 참조(CPU) MoE 오라클 — W4-1(2026-10-08) g32/bf16
 #      전문가 + 라우터 top-8·shared 게이트. 골든 접두 일치 + 로드 완전성.
 #   5. D2(35B) GPU 체인(MoE) — w4a16-gpu 골든 접두(플레인 bf16 + 전문가 상주).
@@ -87,6 +88,17 @@ for i in $(seq 1 100); do
 done
 curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
   -d '{"prompt":[148678,65233,202419],"max_tokens":8,"temperature":0}' > "$RUN/c.json"
+# [배치 불변성 2026-10-13] 동시 2요청 — 슬롯 0·1이 배치 체인으로 묶여도 토큰은
+# 단일 경로와 동일해야 한다. 가드 배경: 상태 f16+스케일 채택이 단일 경로에만
+# 배선돼 np·다중 슬롯이 illegal access로 죽던 회귀(스케일 슬롯 기저 128× OOB +
+# 배치 체인 sc 누락) — 슬롯 0만 검사하던 종전 스모크가 통과시켰다.
+curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
+  -d '{"prompt":[148678,65233,202419],"max_tokens":8,"temperature":0}' > "$RUN/c2a.json" &
+C2A=$!
+curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
+  -d '{"prompt":[148678,65233,202419],"max_tokens":8,"temperature":0}' > "$RUN/c2b.json" &
+C2B=$!
+wait "$C2A" "$C2B"
 kill "$SERVE_PID" 2>/dev/null
 wait "$SERVE_PID" 2>/dev/null
 trap - EXIT
@@ -106,6 +118,21 @@ case "$C" in
   "$GOLDEN"*) note "serve 토큰 OK: $(echo "$C" | head -c 60)";;
   *) echo "[w4a16] FAIL: serve 응답 불일치: $(echo "$C" | head -c 60)"; fail=1;;
 esac
+for J in c2a c2b; do
+  CJ=$(python3 -c "
+import json
+try:
+    d=json.load(open('"$RUN/$J.json"'))
+    t=d.get('tokens') or (d['choices'][0].get('tokens') if 'choices' in d else None)
+    print(','.join(map(str,t)) if t else 'ERR')
+except Exception:
+    print('ERR')
+")
+  case "$CJ" in
+    "$GOLDEN"*) note "배치 불변성 OK($J)";;
+    *) echo "[w4a16] FAIL: 배치 불변성 불일치($J): $(echo "$CJ" | head -c 60)"; fail=1;;
+  esac
+done
 
 # ── 4. D(35B INT4 g32) 참조 오라클(W4-1 MoE) ──
 note "[4/10] D(35B INT4 g32) 참조 실행 — w4a16-ref (MoE g32/bf16)"
