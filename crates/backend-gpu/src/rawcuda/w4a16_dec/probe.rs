@@ -603,6 +603,10 @@ impl W4a16Dec {
 
     /// [marlin S2, 2026-10-12] 두 mma GEMM 시간 비교 — 기존 mma vs marlin,
     /// 같은 f16 x·같은 grid·같은 회차. pp 채택 판정용(골든 전 단계 계측).
+    /// [2.A-② 2026-10-13] `cold=true` — 256MB d2d 플러시를 런치 사이에 끼워
+    /// L2를 비운다(소형-M 표의 "L2 편향" 제거 — 검증/np4 판정은 HBM 조건).
+    /// vs_gemv는 t=1(w4a16_gemv_g128) 외에 t≥2(생산 TR 커널 w4a16_gemv_g128_t)도
+    /// 지원 — 검증 t=5·np4 t=4의 실제 비교 상대.
     pub fn marlin_bench(
         &mut self,
         name: &str,
@@ -614,6 +618,7 @@ impl W4a16Dec {
         mbn: usize,
         mthr: u32,
         vs_gemv: bool,
+        cold: bool,
     ) -> Result<String, String> {
         let _g = self.cc.guard()?;
         let (dq, ds, n, k) = self.lin_spec(name)?;
@@ -680,19 +685,36 @@ impl W4a16Dec {
         };
         let run_cmp = |me: &Self, py: CUdeviceptr| -> Result<(), String> {
             if vs_gemv {
-                // [G4] t=1 행-GEMV(w4a16_gemv_g128 — grid n·64레인·f32 x).
-                let f = me.cc.function("w4a16_gemv_g128")?;
-                let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx32, py);
-                let (mut p_n, mut p_k) = (n as i32, k as i32);
-                me.cc.launch(
-                    f,
-                    n as u32,
-                    1,
-                    64,
-                    &mut crate::rawcuda::args::l6(
-                        &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k,
-                    ),
-                )
+                if t == 1 {
+                    // [G4] t=1 행-GEMV(w4a16_gemv_g128 — grid n·64레인·f32 x).
+                    let f = me.cc.function("w4a16_gemv_g128")?;
+                    let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx32, py);
+                    let (mut p_n, mut p_k) = (n as i32, k as i32);
+                    me.cc.launch(
+                        f,
+                        n as u32,
+                        1,
+                        64,
+                        &mut crate::rawcuda::args::l6(
+                            &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k,
+                        ),
+                    )
+                } else {
+                    // [2.A-②] t≥2 생산 TR 커널(w4a16_gemv_g128_t, 256스레드·
+                    // GEMV_TR 블록) — 검증 t=5/np4 t=4의 실제 상대.
+                    let f = me.cc.function("w4a16_gemv_g128_t")?;
+                    let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx32, py);
+                    let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+                    me.cc.launch(
+                        f,
+                        n.div_ceil(GEMV_TR) as u32,
+                        1,
+                        256,
+                        &mut crate::rawcuda::args::l7(
+                            &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
+                        ),
+                    )
+                }
             } else {
                 run(
                     me,
@@ -705,33 +727,84 @@ impl W4a16Dec {
                 )
             }
         };
-        let r = (|| -> Result<(f64, f64), String> {
-            for _ in 0..3 {
-                run_cmp(self, da)?;
-                run(self, msym, dqm, db, mbm, mbn, mthr)?;
-            }
-            self.cc.sync()?;
-            // 인터리브 라운드 — 순서·열 상태 바이어스 제거.
-            let rounds = 4usize;
-            let per = (reps / rounds).max(1);
-            let (mut ta, mut tb) = (0f64, 0f64);
-            for _ in 0..rounds {
-                let t0 = std::time::Instant::now();
-                for _ in 0..per {
+        let r = if cold {
+            // [2.A-②] 콜드 모드 — 런치마다 L2 플러시(256MB d2d)+sync. 시간 =
+            // (플러시+런치) − (플러시+sync) 베이스라인(호스트 sync 오버헤드
+            // 동일 조건 감산 — 두 상대 공정).
+            let bytes = 256usize << 20;
+            let f0 = self.cc.alloc(bytes)?;
+            let f1 = self.cc.alloc(bytes)?;
+            let flush = |me: &Self| me.cc.d2d(f0, f1, bytes);
+            let r = (|| -> Result<(f64, f64), String> {
+                for _ in 0..3 {
+                    flush(self)?;
                     run_cmp(self, da)?;
-                }
-                self.cc.sync()?;
-                ta += t0.elapsed().as_secs_f64();
-                let t0 = std::time::Instant::now();
-                for _ in 0..per {
+                    flush(self)?;
                     run(self, msym, dqm, db, mbm, mbn, mthr)?;
                 }
                 self.cc.sync()?;
-                tb += t0.elapsed().as_secs_f64();
-            }
-            let n = (per * rounds) as f64;
-            Ok((ta * 1e3 / n, tb * 1e3 / n))
-        })();
+                let rounds = 4usize;
+                let per = (reps / rounds).max(1);
+                let (mut base, mut ta, mut tb) = (0f64, 0f64, 0f64);
+                for _ in 0..rounds {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..per {
+                        flush(self)?;
+                        self.cc.sync()?;
+                    }
+                    base += t0.elapsed().as_secs_f64();
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..per {
+                        flush(self)?;
+                        self.cc.sync()?;
+                        run_cmp(self, da)?;
+                        self.cc.sync()?;
+                    }
+                    ta += t0.elapsed().as_secs_f64();
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..per {
+                        flush(self)?;
+                        self.cc.sync()?;
+                        run(self, msym, dqm, db, mbm, mbn, mthr)?;
+                        self.cc.sync()?;
+                    }
+                    tb += t0.elapsed().as_secs_f64();
+                }
+                let n = (per * rounds) as f64;
+                Ok(((ta - base) * 1e3 / n, (tb - base) * 1e3 / n))
+            })();
+            let _ = self.cc.free(f0);
+            let _ = self.cc.free(f1);
+            r
+        } else {
+            (|| -> Result<(f64, f64), String> {
+                for _ in 0..3 {
+                    run_cmp(self, da)?;
+                    run(self, msym, dqm, db, mbm, mbn, mthr)?;
+                }
+                self.cc.sync()?;
+                // 인터리브 라운드 — 순서·열 상태 바이어스 제거.
+                let rounds = 4usize;
+                let per = (reps / rounds).max(1);
+                let (mut ta, mut tb) = (0f64, 0f64);
+                for _ in 0..rounds {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..per {
+                        run_cmp(self, da)?;
+                    }
+                    self.cc.sync()?;
+                    ta += t0.elapsed().as_secs_f64();
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..per {
+                        run(self, msym, dqm, db, mbm, mbn, mthr)?;
+                    }
+                    self.cc.sync()?;
+                    tb += t0.elapsed().as_secs_f64();
+                }
+                let n = (per * rounds) as f64;
+                Ok((ta * 1e3 / n, tb * 1e3 / n))
+            })()
+        };
         let _ = self.cc.free(dx);
         if vs_gemv {
             let _ = self.cc.free(dx32);
@@ -742,8 +815,9 @@ impl W4a16Dec {
         let (ms_a, ms_b) = r?;
         let flop = 2.0 * n as f64 * k as f64 * t as f64;
         let cmp = if vs_gemv { "gemv" } else { "mma" };
+        let mode = if cold { "cold" } else { "warm" };
         Ok(format!(
-            "marlin-bench {name} n={n} k={k} t={t} reps={reps}: \
+            "marlin-bench {name} n={n} k={k} t={t} reps={reps} [{mode}]: \
              {cmp} {ms_a:.3}ms({:.1}TF) · marlin {ms_b:.3}ms({:.1}TF) · 비율 {:.3}×",
             flop * 1e-9 / (ms_a * 1e-3),
             flop * 1e-9 / (ms_b * 1e-3),
