@@ -490,6 +490,8 @@ pub struct W4a16Dec {
     pub n_layers: usize,
     pub n_slots: usize,
     pub slot_pos: Vec<u32>,
+    /// [K6-3 2026-10-13] 슬롯별 KV 확보 고수위(토큰) — kv_ensure 무비용 no-op용.
+    pub kv_assigned: Vec<usize>,
     /// 선형 상주 — 이름 → (packed, scale, n, k).
     lins: HashMap<String, (CUdeviceptr, CUdeviceptr, usize, usize)>,
     /// 플레인 bf16 상주 — 이름 → ([k][n] 전치 ptr, n, k). MoE 모델(35B)의
@@ -757,6 +759,7 @@ impl W4a16Dec {
             n_layers,
             n_slots: n_slots.max(1),
             slot_pos: vec![0; n_slots.max(1)],
+            kv_assigned: vec![0; n_slots.max(1)],
             lins: HashMap::new(),
             plains: HashMap::new(),
             plain_weights: false,

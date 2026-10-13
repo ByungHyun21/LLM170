@@ -212,6 +212,59 @@ case "$H2" in
   *) echo "[w4a16] FAIL: 35B spec 골든 불일치: $(echo "$H2" | head -c 60)"; fail=1;;
 esac
 
+note "[12/12] K(스펙 항등) — 128토큰 서브: 스펙 on/off 토큰 동일 + 라운드 발화"
+# [비결정성 회귀 가드 2026-10-13·커밋 45ae1b08] 융합(ngram) 보정 롤백 오프바이원이
+# 스펙 발화 시 후속 토큰을 오염시켰다 — 스펙은 무손실이어야 하므로, 같은 요청의
+# 스펙 on/off 출력이 **토큰 단위로 동일**해야 한다. 라운드 미발화면 검사 무효
+# (spec_rounds ≥ 1 확인). SPEC_OFF는 진단 플래그(성능 경로만 끔 — 무손실).
+K_OK=0
+for pair in "on:" "off:LLM170_SPEC_OFF=1"; do
+  mode="${pair%%:*}"; envs="${pair#*:}"
+  env $envs "$BIN" serve --model "$M_27B" --ctx 4096 --slots 1 --port "$PORT" \
+    > "$RUN/k-$mode.log" 2>&1 &
+  SERVE_PID=$!
+  trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
+  for i in $(seq 1 100); do
+    sleep 3
+    grep -m1 "listening" "$RUN/k-$mode.log" >/dev/null 2>&1 && break
+  done
+  curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
+    -d '{"prompt":[148678,65233,202419],"max_tokens":128,"temperature":0}' > "$RUN/k-$mode.json"
+  curl -s "http://127.0.0.1:$PORT/stats" > "$RUN/k-$mode.stats" 2>/dev/null
+  kill "$SERVE_PID" 2>/dev/null
+  wait "$SERVE_PID" 2>/dev/null
+  trap - EXIT
+done
+KK=$(python3 - "$RUN" <<'EOF'
+import json, sys
+run = sys.argv[1]
+def toks(mode):
+    d = json.load(open(f"{run}/k-{mode}.json"))
+    return d.get("tokens") or []
+def rounds(mode):
+    try:
+        d = json.load(open(f"{run}/k-{mode}.stats"))
+        return d["serving"]["spec_rounds"]
+    except Exception:
+        return -1
+t_on, t_off = toks("on"), toks("off")
+r_on = rounds("on")
+if not t_on or not t_off:
+    print("FAIL 출력 없음")
+elif t_on != t_off:
+    i = next((i for i, (a, b) in enumerate(zip(t_on, t_off)) if a != b), min(len(t_on), len(t_off)))
+    print(f"FAIL 스펙 항등 위반 idx {i} on={t_on[i:i+3]} off={t_off[i:i+3]}")
+elif r_on < 1:
+    print("FAIL 라운드 미발화 — 검사 무효")
+else:
+    print(f"OK rounds={r_on} tokens={len(t_on)}")
+EOF
+)
+case "$KK" in
+  OK*) note "27B 스펙 항등 OK ($KK)";;
+  *) echo "[w4a16] FAIL: 스펙 항등 — $KK"; fail=1;;
+esac
+
 note "[11/11] J(수치 지문) — 128토큰 창 PPL 동결 대조 (Q2 · 서브토큰 드리프트)"
 FP="docs/eval/fingerprint.tsv"   # 로컬 원장(docs/ — 푸시 제외)
 for pair in "$M_27B:27B" "$M_35B:35B"; do
@@ -241,7 +294,7 @@ sys.exit(0 if ok else 1)
 done
 
 if [ $fail -eq 0 ]; then
-  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve·장문·spec / 35B MoE 참조+GPU·장문·spec / E 가드 거부 / 수치 지문) — int8 KV 단일 경로"
+  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve·장문·spec / 35B MoE 참조+GPU·장문·spec / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
 else
   echo "[w4a16] smoke: FAILURES PRESENT"
 fi

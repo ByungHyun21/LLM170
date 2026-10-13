@@ -15,6 +15,8 @@ impl W4a16Dec {
                 "context overflow: slot{slot} pos={pos} >= kvcap={cap}"
             ));
         }
+        // [K6-3] KV 온디맨드 확보(슬랙 2행) — t=1 진입 공통.
+        self.kv_ensure(slot, pos as usize + 3)?;
         if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("forward: 디코더 상수 미등록".into());
         }
@@ -173,6 +175,8 @@ impl W4a16Dec {
                 "context overflow: slot{slot} pos={pos} >= kvcap={cap}"
             ));
         }
+        // [K6-3] KV 온디맨드 확보(슬랙 2행) — t=1 진입 공통.
+        self.kv_ensure(slot, pos as usize + 3)?;
         if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("forward_device: 디코더 상수 미등록".into());
         }
@@ -318,6 +322,11 @@ impl W4a16Dec {
     pub(super) fn batch_launch(&mut self, slots: &[usize], t: usize) -> Result<(), String> {
         if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("batch_launch: 디코더 상수 미등록".into());
+        }
+        // [K6-3] 슬롯별 KV 온디맨드 확보(슬랙 2행) — 배치 체인 진입 공통.
+        for &sl in slots {
+            let p = self.slot_pos.get(sl).copied().unwrap_or(0) as usize;
+            self.kv_ensure(sl, p + t + 2)?;
         }
         self.ensure_chain_bufs()?;
         self.ensure_norm_bufs(t)?;

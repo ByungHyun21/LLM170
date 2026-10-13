@@ -323,6 +323,8 @@ impl super::W4a16Dec {
         if pos_end > cap {
             return Err(format!("mtp: pos{pos_start}+{t} > cap{cap}"));
         }
+        // [K6-3] KV 온디맨드 확보(슬랙 2행) — MTP 가상 층 포함.
+        self.kv_ensure(slot, pos_end + 2)?;
         self.ensure_chain_bufs()?;
         self.ensure_attn_bufs(t)?;
         self.ensure_batch_bufs()?; // dbatch_am(argmax d2h 목적지)
@@ -841,6 +843,9 @@ impl super::W4a16Dec {
                 dm.cap
             ));
         }
+        // [K6-3] 체인 리플레이 스팬(base_pos..base_pos+k) KV 확보 — 그래프
+        // 캡처 전(캡처 중 할당 금지 계약과도 정합).
+        self.kv_ensure(slot, base_pos as usize + k + 2)?;
         let exec = self.ensure_mtp_chain_graph(slot)?;
         // 카운터 리셋(라운드당 1회 — 그래프 밖 h2d 4B, sync 불요: 같은 스트림).
         self.cc

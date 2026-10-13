@@ -669,6 +669,8 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     let mut ptrie = crate::tree::PrefixTrie::new();
     // EOS 하드코드 248044 → 모델 메타 파생(Engine::eos).
     let eos = eng.eos();
+    // [K6-3 2026-10-13] 입장 보류열 — 예약이 풀 여유에 안 맞는 요청(FCFS 대기).
+    let mut pending: Vec<SlotJob> = Vec::new();
     // 모니터링 — 복사 계측 기준(가중치 적재분을 load로 분리, 이후는 runtime).
     let copy_base = eng.copy_stats();
     // 기동 워밍업 — 첫 요청이 지연 초기화(raw_init, ctx 비례 수십 초)를
@@ -676,6 +678,10 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     // 503이라 클라이언트가 계측을 시작하지 않는다.
     {
         let warm: Vec<u32> = vec![1u32; 16];
+        // [K6-3 2026-10-13] 온디맨드 풀 — 워밍업 전 슬롯 0 KV 확보(실패는 치명 아님).
+        if let Err(e) = eng.0.kv_grow(0, warm.len() + 8) {
+            eprintln!("# warmup KV 확보 실패(치명 아님): {e}");
+        }
         let w: Result<(), String> = eng.0.prefill(0, &warm).and_then(|l| {
             let t = llm170_core::qwen35::greedy(&l);
             eng.0.decode_greedy(0, t).map(|_| ())
@@ -711,7 +717,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         // 동시 요청이 빈 응랍으로 소실됐다(4동시 중 여럿 drop 실측). 점유 검사를
         // try_recv **앞으로** 옮겨 작업을 큐에 남긴다 — 의도된 원래 계약.
         // [R7] ① 유입 — 큐 drain → 슬롯 배정(헬퍼 분리 · 동작 불변).
-        slot_intake(&mut slots, &mut eng, &rx, tick, &mut ptrie);
+        slot_intake(&mut slots, &mut eng, &rx, tick, &mut ptrie, &mut pending);
         // [§3.4 ③] 트리 동기화 — free 슬롯의 cached를 트리에 등록/해제.
         // 512 경계만 기록되므로 매 틱 재등록은 중복 없음(insert가 슬롯 중복 체크).
         for (i, s) in slots.iter().enumerate() {
@@ -807,7 +813,22 @@ fn slot_intake(
     rx: &std::sync::mpsc::Receiver<SlotJob>,
     tick: u64,
     ptrie: &mut crate::tree::PrefixTrie,
+    pending: &mut Vec<SlotJob>,
 ) {
+    // [K6-3 2026-10-13] 입장 보장 — 예약(프롬프트+생성한도+슬랙)이 풀 여유에
+    // 맞아야 배정. **보류분 우선 재시도(도착 순서 = 기본 FCFS)** 후 신규 수신.
+    let mut i = 0;
+    while i < pending.len() {
+        if !slots.iter().any(|s| s.job.is_none()) {
+            break;
+        }
+        if admit_ok(eng, &pending[i]) {
+            let j = pending.remove(i);
+            assign_slot(slots, eng, j, tick, ptrie);
+        } else {
+            i += 1;
+        }
+    }
     loop {
         if !slots.iter().any(|s| s.job.is_none()) {
             break;
@@ -816,9 +837,22 @@ fn slot_intake(
             break;
         };
         SCHED.queue_depth.fetch_sub(1, Ordering::Relaxed);
-        // 107 W7: 배정 단일 구현으로 위임(접두 캐시 로직 동일).
-        assign_slot(slots, eng, j, tick, ptrie);
+        if admit_ok(eng, &j) {
+            // 107 W7: 배정 단일 구현으로 위임(접두 캐시 로직 동일).
+            assign_slot(slots, eng, j, tick, ptrie);
+        } else {
+            // [K6-3] 용량 대기 — 스케줄러 보류열(HTTP 큐로 안 돌림: FCFS 유지).
+            pending.push(j);
+        }
     }
+}
+
+/// [K6-3 2026-10-13] 입장 판정 — 필요 블록(프롬프트+생성한도+슬랙 2행)이
+/// 풀 여유 이하. 슬롯 보유 접두 블록은 보수적으로 미계상(과대 판정 = 대기
+/// 우선 — 활성 요청 안전). 큐 대기의 단일 기준.
+fn admit_ok(eng: &Engine, j: &SlotJob) -> bool {
+    let need = j.tokens.len() + j.n_predict.max(1) + 2;
+    eng.0.kv_blocks_needed(need) <= eng.0.kv_free_blocks()
 }
 
 /// [R7] 틱 ② 디코드 우선 — prefill 완료 슬롯 전부(슬롯 루프에서 순수 이동).
@@ -1108,6 +1142,22 @@ fn assign_slot(
                 reuse = 0;
             }
         }
+    }
+    // [K6-3 2026-10-13] KV 확보 — 예약(프롬프트+생성한도+슬랙 2)까지 온디맨드
+    // 배정. 입장 판정이 선행하나 재사용 슬롯의 기존 배정과 합산해 부족할 수
+    // 있다(보수 판정) — 실패는 요청 오류로 정직하게(사용 중 실패 금지 정합:
+    // 입장 후에는 배정 성공이 보장된다).
+    let need_tokens = j.tokens.len() + j.n_predict.max(1) + 2;
+    if let Err(e) = eng.0.kv_grow(i, need_tokens) {
+        SCHED.requests_failed.fetch_add(1, Ordering::Relaxed);
+        let _ = j.out.send(InferResult {
+            tokens: Vec::new(),
+            error: Some(format!("kv 입장 실패: {e}")),
+        });
+        let c = std::mem::take(&mut slots[i].cached);
+        slots[i] = Slot::free();
+        slots[i].cached = c;
+        return;
     }
     // [MTP] 접두 재사용 슬롯은 MTP KV 정합이 없다 — 초안 비활성(검증은
     // 정본이라 손실은 없지만, 초안 비용만 지불하게 된다).

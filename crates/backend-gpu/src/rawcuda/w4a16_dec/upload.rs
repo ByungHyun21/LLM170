@@ -213,7 +213,7 @@ impl W4a16Dec {
         Self::h2d_chunked(&self.cc, dq, b(qnw))?;
         let dk = self.cc.alloc(knw.len() * 4)?;
         Self::h2d_chunked(&self.cc, dk, b(knw))?;
-        let mut pool = super::blocktable::KvPool::new(slots, n, mb, total_blocks)?;
+        let pool = super::blocktable::KvPool::new(slots, n, mb, total_blocks)?;
         let (dkc, dvc) = {
             // int8 KV(1B/원소) + 스케일 2벌. 기록 attn_prep_q,
             // 판독 attn_fwd3s_part_q(병합은 f32 그대로).
@@ -235,21 +235,11 @@ impl W4a16Dec {
         Self::zero_dev(&self.cc, dpp, slots * 4)?;
         // [K6-3 2026-10-13] KV 블록 테이블(디바이스 u64 [slot][layer][mb]×4) —
         // 엔트리 = 풀 물리 블록 주소(KvPool 정본). 커널(attn_blk_row)은 테이블만
-        // 보므로 블록 교체(성장/회수/공유)는 호스트 갱신만으로 반영된다.
-        // 현 단계는 전량 선할당(보존) — 슬롯·층·블록 순서로 id 부여.
-        let mut tab = vec![0u64; slots * n * mb * 4];
-        for s in 0..slots {
-            for l in 0..n {
-                for b in 0..mb {
-                    let id = pool.ensure(s, l, b)? as u64;
-                    let e = ((s * n + l) * mb + b) * 4;
-                    tab[e] = dkc + id * block_k as u64;
-                    tab[e + 1] = dvc + id * block_k as u64;
-                    tab[e + 2] = self.attn.dksc + id * block_s as u64;
-                    tab[e + 3] = self.attn.dvsc + id * block_s as u64;
-                }
-            }
-        }
+        // 보므로 블록 배정/회수는 호스트 갱신만으로 반영된다.
+        // **온디맨드**: 초기 테이블은 0(미할당) — 슬롯은 입장(kv_grow)에서 필요한
+        // 블록만 배정받는다(요청별 예약·회수 — K6 3차). 미할당 엔트리는 판독
+        // 전에 반드시 kv_grow가 덮는다(성장 = 사용 직전 +슬랙 2행).
+        let tab = vec![0u64; slots * n * mb * 4];
         let dblk = self.cc.alloc(tab.len() * 8)?;
         // SAFETY: 로컬 Vec<u64>의 유효 수명 내 바이트 뷰(길이 = 원소수×8).
         let tb = unsafe { std::slice::from_raw_parts(tab.as_ptr() as *const u8, tab.len() * 8) };
@@ -283,6 +273,106 @@ impl W4a16Dec {
         // (Kv 범주)이라 이 스윕의 대상이 아니다.
         self.ucache_sweep()?;
         Ok(())
+    }
+
+    /// [K6-3 2026-10-13] 슬롯 KV 블록 확보 — `n_tokens`(+슬랙 2행)까지
+    /// 온디맨드. 신규 블록만 디바이스 테이블에 기입(동기 h2d — 틱 경계
+    /// 호출 계약: 리플레이/커널 실행 중 금지). 반환 = 신규 블록 수.
+    /// 테이블 상한(층당 mb)으로 클램프 — 초과분은 ctx 가드/overflow 몫.
+    pub fn kv_grow(&mut self, slot: usize, n_tokens: usize) -> Result<usize, String> {
+        // [K6-3] 컨텍스트 가드 — 스케줄러/워밍업 등 외부 스레드에서도 h2d 유효.
+        let _g = self.cc.guard()?;
+        let dm = self.attn.attn.ok_or("kv_grow: attn 미등록")?;
+        if slot >= self.n_slots {
+            return Err(format!("kv_grow: 슬롯 {slot} ≥ {}", self.n_slots));
+        }
+        let mb = dm.cap.div_ceil(512);
+        let nb = (n_tokens + 2).div_ceil(512).min(mb);
+        let (kvd, kvh) = (dm.kv_dim(), dm.kv_heads);
+        let (bk, bs) = ((512 * kvd) as u64, (512 * kvh * 4) as u64);
+        let (kc, vc, ks, vs) = (self.attn.dkc, self.attn.dvc, self.attn.dksc, self.attn.dvsc);
+        let n_attn = dm.n_attn;
+        let mut new = 0usize;
+        for l in 0..n_attn {
+            for bi in 0..nb {
+                let have = self
+                    .attn
+                    .kv_pool
+                    .as_ref()
+                    .ok_or("kv_grow: KvPool 미등록")?
+                    .get(slot, l, bi)
+                    .is_some();
+                if have {
+                    continue;
+                }
+                let id = self
+                    .attn
+                    .kv_pool
+                    .as_mut()
+                    .ok_or("kv_grow: KvPool 미등록")?
+                    .ensure(slot, l, bi)? as u64;
+                new += 1;
+                let mut bytes = [0u8; 32];
+                for (i2, v) in [kc + id * bk, vc + id * bk, ks + id * bs, vs + id * bs]
+                    .iter()
+                    .enumerate()
+                {
+                    bytes[i2 * 8..(i2 + 1) * 8].copy_from_slice(&v.to_le_bytes());
+                }
+                let off = (((slot * n_attn + l) * mb + bi) * 4) as u64 * 8;
+                self.cc.h2d(self.attn.dblk_tab + off, &bytes)?;
+            }
+        }
+        if slot < self.kv_assigned.len() {
+            self.kv_assigned[slot] = self.kv_assigned[slot].max(n_tokens);
+        }
+        Ok(new)
+    }
+
+    /// [K6-3] 위치 기반 확보 — `pos_end`(+슬랙 2행)까지. 고수위 캐시로
+    /// 무비용 no-op. 체인/프리필/MTP/검증 **진입 공통** — 직접 호출자
+    /// (프로브·infer 포함)도 안전하다(테이블 미할당 판독 방지).
+    pub(super) fn kv_ensure(&mut self, slot: usize, pos_end: usize) -> Result<(), String> {
+        if slot >= self.n_slots {
+            return Err(format!("kv_ensure: 슬롯 {slot} ≥ {}", self.n_slots));
+        }
+        if pos_end <= self.kv_assigned[slot] {
+            return Ok(());
+        }
+        self.kv_grow(slot, pos_end)?;
+        Ok(())
+    }
+
+    /// [K6-3] 슬롯 KV 반납(리셋 경로 전용 — 정상 완료는 접두 캐시로 유지).
+    pub fn kv_release(&mut self, slot: usize) -> usize {
+        if slot < self.kv_assigned.len() {
+            self.kv_assigned[slot] = 0;
+        }
+        self.attn
+            .kv_pool
+            .as_mut()
+            .map(|p| p.release(slot))
+            .unwrap_or(0)
+    }
+
+    /// [K6-3] 풀 여유 블록 수(입장 판정·모니터링).
+    pub fn kv_free_blocks(&self) -> usize {
+        self.attn
+            .kv_pool
+            .as_ref()
+            .map(|p| p.free_blocks())
+            .unwrap_or(0)
+    }
+
+    /// [K6-3] n_tokens(+슬랙 2행) 예약에 필요한 블록 수 — 입장 판정용.
+    pub fn kv_blocks_needed(&self, n_tokens: usize) -> usize {
+        match self.attn.attn {
+            Some(dm) => {
+                let mb = dm.cap.div_ceil(512);
+                (n_tokens + 2).div_ceil(512).min(mb) * dm.n_attn
+            }
+            None => 0,
+        }
     }
 
     /// 플레인 bf16 [n][k] 상주 업로드 — [n][k] 원본(w4a16_gemv_bf16 계약).

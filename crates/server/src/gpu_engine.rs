@@ -525,9 +525,26 @@ impl GpuEngine {
         self.dec.prof_report(label)
     }
 
-    /// 슬롯 상태 리셋(GDN 링/스캔 + pp + pos).
+    /// 슬롯 상태 리셋(GDN 링/스캔 + pp + pos). [K6-3] KV 블록 반납 포함 —
+    /// 정상 완료(접두 캐시 유지)는 리셋을 부르지 않으므로 영향 없음.
     pub fn reset_seq(&mut self, seq: usize) -> Result<(), String> {
+        self.dec.kv_release(seq);
         self.dec.reset_state(seq)
+    }
+
+    /// [K6-3 2026-10-13] 슬롯 KV 블록 확보(온디맨드·입장) — 신규 블록 수.
+    pub fn kv_grow(&mut self, slot: usize, n_tokens: usize) -> Result<usize, String> {
+        self.dec.kv_grow(slot, n_tokens)
+    }
+
+    /// [K6-3] 풀 여유 블록 수.
+    pub fn kv_free_blocks(&self) -> usize {
+        self.dec.kv_free_blocks()
+    }
+
+    /// [K6-3] n_tokens 예약 필요 블록 수(입장 판정).
+    pub fn kv_blocks_needed(&self, n_tokens: usize) -> usize {
+        self.dec.kv_blocks_needed(n_tokens)
     }
 
     /// [§7.1 2026-10-11] 스펙 서빙 — GDN 토큰별 스냅샷 버퍼 확보(모델당 1회).
