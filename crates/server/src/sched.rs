@@ -598,6 +598,11 @@ fn econ_pick_k(cur: usize, emas: [Option<f64>; 4]) -> usize {
 
 /// [2.A-④] 게이트 판정 — (소스, k). None = 평범(라운드 생략).
 fn econ_plan(mtp_avail: bool) -> Option<(u8, usize)> {
+    // [진단 2026-10-13] 비결정성 격리용 — 스펙 전면 off(평범 전용). 무손실
+    // 경로 선택(성능만) · 운영 진단 한정.
+    if llm170_diag::flag::on_nonzero("LLM170_SPEC_OFF") {
+        return None;
+    }
     let plain = econ_get(&SCHED.econ_plain, &SCHED.econ_plain_n);
     let mtp = econ_get(&SCHED.econ_src[0], &SCHED.econ_src_n[0]);
     let ng = econ_get(&SCHED.econ_src[1], &SCHED.econ_src_n[1]);
@@ -1287,12 +1292,28 @@ fn spec_round_impl(
         eprintln!("# mtp(무시): {err}");
     }
     let last = if acc >= 1 { draft[acc - 1] } else { s.next };
-    if acc >= 1 {
-        e.spec_rollback(i, acc)?;
-        e.spec_rewind_pos(i, (t - acc) as u32)?;
+    // [비결정성 수정 2026-10-13] 상태 재구성 계약 — 검증 행은 [s.next, d0..]이고,
+    // 라운드 후 목표 상태 = "수용 draft 소비 완료 + 보정 토큰 대기"(pos = P+acc+1).
+    //   · 보정 디코드가 있는 경로(MTP·샘플드): 디코드가 마지막 수용 draft를
+    //     재소비/전진시키므로 종전 (acc, t−acc)가 맞다.
+    //   · 융합 경로(ngram 그리디): 디코드가 없다 → keep=acc+1(수용 소비 포함)·
+    //     rewind=t−acc−1로 직접 재구성해야 한다. 종전 (acc, t−acc)는 한 행
+    //     뒤처져 후속 토큰을 오염시켰다(하네스 재현: 동일 요청 idx 83 분기).
+    //   · acc+1>8(전량 수용 t=9): WY 링 상한(8) — 종전 경로 + 보정 디코드
+    //     (반환값 = toks[acc] 동일 계약)로 폴백.
+    let corr_by_decode = spec_mtp || sampled;
+    let fused_keep9 = !corr_by_decode && acc + 1 > 8;
+    if corr_by_decode || fused_keep9 {
+        if acc >= 1 {
+            e.spec_rollback(i, acc)?;
+            e.spec_rewind_pos(i, (t - acc) as u32)?;
+        } else {
+            e.spec_load_state(i)?;
+            e.spec_rewind_pos(i, t as u32)?;
+        }
     } else {
-        e.spec_load_state(i)?;
-        e.spec_rewind_pos(i, t as u32)?;
+        e.spec_rollback(i, acc + 1)?;
+        e.spec_rewind_pos(i, (t - acc - 1) as u32)?;
     }
     if acc == 0 {
         s.spec_miss = (s.spec_miss + 1).min(3);
@@ -1334,6 +1355,16 @@ fn spec_round_impl(
         SCHED.spec_accepted.fetch_add(acc as u64, Ordering::Relaxed);
         // [2.A-④] 경제성 표본(샘플드 = ngram) — 라운드 비용/방출토큰.
         econ_spec_sample(1, draft.len(), acc, rt0.elapsed().as_secs_f64() * 1e3);
+        if dbg {
+            eprintln!(
+                "[spec-dbg] gen={} src=1 k={} t={} acc={} corr={} sampled=1",
+                s.generated,
+                draft.len(),
+                t,
+                acc,
+                corr
+            );
+        }
         return Ok(true);
     }
     // 그리디 보정 — [2026-10-12] 보정 토큰 = 검증 행 acc의 argmax(toks[acc]) —
@@ -1347,7 +1378,7 @@ fn spec_round_impl(
     // 머물러 초안이 붕괴한다(실측: MTP-on 0/508 수용). MTP 활성 경로만
     // 디코드를 유지(토큰 값은 toks[acc]와 동일 — 부수효과가 계약).
     let mut ms_corr = 0.0f64;
-    let corr = if spec_mtp {
+    let corr = if spec_mtp || fused_keep9 {
         let t_corr = std::time::Instant::now();
         let d = e.decode_greedy(i, last)?;
         ms_corr = t_corr.elapsed().as_secs_f64() * 1e3;
@@ -1355,6 +1386,13 @@ fn spec_round_impl(
     } else {
         toks[acc]
     };
+    // [진단 2026-10-13] 라운드 마커 — 비결정성 분기 지점 대조용(토큰 인덱스 포함).
+    if dbg {
+        eprintln!(
+            "[spec-dbg] gen={} src={} k={} t={} acc={} corr={}",
+            s.generated, src, kk, t, acc, corr
+        );
+    }
     let t_mtp = std::time::Instant::now();
     if spec_mtp && let Err(err) = e.mtp_post_round(i, &draft[..acc], corr) {
         eprintln!("# mtp(무시): {err}");
