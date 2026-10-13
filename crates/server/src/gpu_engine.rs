@@ -39,6 +39,7 @@ impl GpuEngine {
         n_slots: usize,
         ctx: usize,
         kv_budget: Option<u64>,
+        kv_reserve: Option<u64>,
     ) -> Result<Self, String> {
         let model = llm170_core::qwen35::Model::load(dir).map_err(|e| e.to_string())?;
         let hp = model.hp.clone();
@@ -48,7 +49,7 @@ impl GpuEngine {
         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
         // [D2 검수 2026-10-13] 적재 실패 시 부분 할당 정리 — 재시도 루프가
         // VRAM을 되찾지 못하던 문제(첫 시도 실패 후 전부 OOM)의 해소.
-        match Self::fill(&mut dec, &model, ctx) {
+        match Self::fill(&mut dec, &model, ctx, kv_reserve.unwrap_or(0)) {
             Ok((head_gpu, mtp)) => Ok(GpuEngine {
                 model,
                 dec,
@@ -69,8 +70,9 @@ impl GpuEngine {
         dec: &mut W4a16Dec,
         model: &llm170_core::qwen35::Model,
         ctx: usize,
+        kv_reserve: u64,
     ) -> Result<(bool, bool), String> {
-        upload_model(dec, model, ctx)?;
+        upload_model(dec, model, ctx, kv_reserve)?;
         // 5) head — bf16 output.weight는 GPU 커널 경로(아니면 CPU 참조).
         let mut head_gpu = false;
         if let Some(w) = model.w("output.weight")
@@ -653,6 +655,7 @@ impl GpuEngine {
 pub(crate) fn upload_moe(
     dec: &mut llm170_backend_gpu::W4a16Dec,
     model: &llm170_core::qwen35::Model,
+    kv_reserve: u64,
 ) -> Result<(), String> {
     let hp = model.hp.clone();
     let t0 = std::time::Instant::now();
@@ -703,13 +706,16 @@ pub(crate) fn upload_moe(
         .map(|(f, _)| f)
         .unwrap_or(0);
     // [2.J] CLI 정책 우선 — 1=resident 강제 · 2=streaming 강제 · 0=auto(env/여유).
+    // [2.M 사다리] auto는 **KV 우선**: KV 풀 몫(kv_reserve — 서버 산출)을 떼고
+    // 남는 VRAM으로만 상주 판정. KV가 ctx를 보장한 뒤 남는 잔여가 전문가 핫셋.
+    // (kv_reserve=0 = 종전 규칙 — 프로브 경로.)
     let resident = match crate::engine::MOE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => match llm170_diag::flag::val("LLM170_MOE_RESIDENT") {
             Some("0") => false,
             Some("1") => true,
-            _ => free > expert_bytes + (1 << 30),
+            _ => free > expert_bytes + kv_reserve + (1 << 30),
         },
     };
     let tab_ms = t1.elapsed().as_secs_f64() * 1e3;
@@ -720,11 +726,12 @@ pub(crate) fn upload_moe(
         dec.set_expert_table(tab);
     }
     eprintln!(
-        "[moe] 플레인 {plain_ms:.0}ms · 테이블 {tab_ms:.0}ms · 전문가 {:.0}ms ({:.1}GB/s) — 전문가 {:.2}GiB · 여유 {:.2}GiB → {}",
+        "[moe] 플레인 {plain_ms:.0}ms · 테이블 {tab_ms:.0}ms · 전문가 {:.0}ms ({:.1}GB/s) — 전문가 {:.2}GiB · 여유 {:.2}GiB − KV 예약 {:.2}GiB → {}",
         t2.elapsed().as_secs_f64() * 1e3,
         (expert_bytes as f64 * 1e-9) / t2.elapsed().as_secs_f64().max(1e-9),
         expert_bytes as f64 / (1u64 << 30) as f64,
         free as f64 / (1u64 << 30) as f64,
+        kv_reserve as f64 / (1u64 << 30) as f64,
         if resident {
             "전량 상주"
         } else {
@@ -740,6 +747,7 @@ pub(crate) fn upload_model(
     dec: &mut llm170_backend_gpu::W4a16Dec,
     model: &llm170_core::qwen35::Model,
     ctx: usize,
+    kv_reserve: u64,
 ) -> Result<(), String> {
     let hp = model.hp.clone();
     let interval = hp.full_attn_interval.max(1);
@@ -751,7 +759,7 @@ pub(crate) fn upload_model(
     let moe = hp.n_experts > 0;
     // 1) 선형 상주 — GPU 체인은 원본(HF) 무게(순열은 커널 내부 처리).
     if moe {
-        upload_moe(dec, model)?;
+        upload_moe(dec, model, kv_reserve)?;
     } else {
         for name in model.engine_names() {
             if let Some(w) = model.w_raw(&name)

@@ -124,7 +124,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
     let hp = model.hp.clone();
     let t0 = std::time::Instant::now();
     let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
-    crate::gpu_engine::upload_model(&mut dec, &model, ctx)?;
+    crate::gpu_engine::upload_model(&mut dec, &model, ctx, 0)?;
     let head = model
         .w("output.weight")
         .ok_or_else(|| "output.weight 부재".to_string())?;
@@ -397,7 +397,7 @@ fn needle(args: &[String]) -> Result<String, String> {
     let tk = crate::tokenize::Tokenizer::load(Path::new(&dir))?;
     let t0 = std::time::Instant::now();
     let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
-    crate::gpu_engine::upload_model(&mut dec, &model, ctx)?;
+    crate::gpu_engine::upload_model(&mut dec, &model, ctx, 0)?;
     let head = model
         .w("output.weight")
         .ok_or_else(|| "output.weight 부재".to_string())?;

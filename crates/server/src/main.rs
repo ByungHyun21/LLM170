@@ -328,6 +328,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     // 초과분은 클램프(가드: KV 정적 예산은 아직 엔진 ctx 파생).
     let mut model_max_ctx = 0usize;
     let mut kv_budget: Option<u64> = None;
+    let mut kv_reserve: Option<u64> = None;
     let mut plan_txt = String::new();
     match llm170_core::qwen35::ctx_info(&model_path) {
         Ok(ci) => {
@@ -414,6 +415,10 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             if !plan_txt.is_empty() {
                 eprintln!("# plan: {plan_txt}");
             }
+            // [2.M 사다리] KV 예약(풀 실할당 추정) = min(예산, ctx×문맥수×KV/토큰)
+            // — 전문가 상주(auto) 판정이 이 몫을 떼고 남는 잔여로만 결정된다.
+            kv_reserve = kv_budget
+                .map(|b| b.min(SERVE_CONTEXTS as u64 * ctx as u64 * ci.kv_bytes_per_token.max(1)));
         }
         Err(e) => eprintln!("# ctx 검증 건너뜀(config 판독 실패): {e}"),
     }
@@ -421,6 +426,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         model: model_path.clone(),
         ctx,
         kv_budget,
+        kv_reserve,
     };
     // 모니터링 — 정적 정보 등록 + 샘플러 스레드(1Hz; 무시 가능 비용,
     // 최신 스냅샷만 유지 — 시계열 누적은 외부 폴러 몫).
