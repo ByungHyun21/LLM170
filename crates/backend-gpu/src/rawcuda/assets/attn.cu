@@ -205,6 +205,12 @@ __device__ __forceinline__ AttnKvRowPtrs attn_blk_row(
 // int8(행×헤드 absmax 스케일 = max|x|/127, 0이면 1). 스케일 f32 1개/행헤드.
 // 값 차이는 양자화 오차뿐 — 판정은 토큰(단문 골든 + 장문). fwd3s_part_q가 소비.
 // [K6-2] kc/vc/ksc/vsc 4포인터 → 블록 테이블 1포인터로 간접화(위 블록 참조).
+// [int8 장문 품질 실측 2026-10-13] needle(합성 패스코드 검색·깊이 10/50/90%) —
+// 27B 16K/24K **6/6 hit** · 35B 8K/16K/24K **8/9**(미스 1 = 24K·깊이 90%).
+// 단문 PPL(밴드 ±0.3%)과 별개의 AND 축 평가(eval.md). 하네스 규율: 판정은
+// 토큰 id 부분열이 아니라 **디토큰화 문자열 포함** — 생성 시점 토큰화는 문맥
+// 의존이라 id 검사는 정답을 놓친다(실측: 35B가 정답 패스코드를 다른 분할로
+// 생성해 0/6 오판 — `w4a16-eval needle`, --gen/--picks 진단 옵션).
 extern "C" __global__ void attn_prep_q(
     const float* __restrict__ qg,    // [T][q_heads*512] q‖gate 인터리브
     const float* __restrict__ kin,   // [T][kv_heads*256]
