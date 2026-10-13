@@ -34,10 +34,11 @@ fn run(args: &[String]) -> Result<String, String> {
     match args.first().map(String::as_str).unwrap_or("") {
         "ppl" => ppl(&args[1..]),
         "agree" => agree(&args[1..]),
+        "ci" => ci(&args[1..]),
         "needle" => needle(&args[1..]),
         "sample" => sample(&args[1..]),
         other => Err(format!(
-            "w4a16-eval: 서브커맨드 '{other}' — 사용법: w4a16-eval ppl <dir> --corpus <txt> [--out dump] | w4a16-eval agree <a> <b>"
+            "w4a16-eval: 서브커맨드 '{other}' — 사용법: w4a16-eval ppl <dir> --corpus <txt> [--out dump] | w4a16-eval agree <a> <b> | w4a16-eval ci <base> <cand> [--reps N] [--block N]"
         )),
     }
 }
@@ -221,6 +222,134 @@ fn ppl(args: &[String]) -> Result<String, String> {
             .as_ref()
             .map(|p| format!("\n  덤프 {p}"))
             .unwrap_or_default()
+    ))
+}
+
+/// ci — 두 덤프의 **쌍대 ΔNLL 블록 부트스트랩 CI**(채택 게이트 계측기, §2.I).
+/// 같은 코퍼스·같은 창의 teacher-forced NLL 두 벌을 토큰별로 짝지어 Δ(후보−기준)
+/// 평균과 95% CI를 낸다. 인접 토큰 자기상관을 반영해 **이동블록 부트스트랩**
+/// (기본 블록 16토큰) — i.i.d. 재표집은 CI를 과소평가한다. 난수는 splitmix64
+/// (rand 크레이트 금지 계약 — seed 고정 시 결정적).
+/// 밴드 판정은 ΔPPL%(= exp(ΔNLL평균)−1)의 CI로: 상한 < 밴드면 통과 등.
+fn ci(args: &[String]) -> Result<String, String> {
+    let a = arg_str(args, 0, "");
+    let b = arg_str(args, 1, "");
+    if a.is_empty() || b.is_empty() {
+        return Err(
+            "w4a16-eval ci <base.tsv> <cand.tsv> [--reps N] [--block N] [--seed S] [--json]".into(),
+        );
+    }
+    let (mut reps, mut block, mut seed, mut json) =
+        (10_000usize, 16usize, 0x1234_5678_9abc_def0u64, false);
+    let mut it = args.iter().skip(2);
+    while let Some(x) = it.next() {
+        match x.as_str() {
+            "--reps" => {
+                reps = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--reps requires a number")?
+            }
+            "--block" => {
+                block = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--block requires a number")?
+            }
+            "--seed" => {
+                seed = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--seed requires a number")?
+            }
+            "--json" => json = true,
+            other => return Err(format!("unknown flag: {other}")),
+        }
+    }
+    if block == 0 || reps == 0 {
+        return Err("--block/--reps는 1 이상".into());
+    }
+    let da = read_dump(&a)?;
+    let db = read_dump(&b)?;
+    if da.rows.len() != db.rows.len() {
+        return Err(format!(
+            "행 수 불일치: {a}={} {b}={}",
+            da.rows.len(),
+            db.rows.len()
+        ));
+    }
+    let n = da.rows.len();
+    let mut d: Vec<f64> = Vec::with_capacity(n);
+    let (mut win, mut loss, mut tie) = (0usize, 0usize, 0usize);
+    let mut worst = (0f64, 0u32);
+    for (x, y) in da.rows.iter().zip(db.rows.iter()) {
+        if x.0 != y.0 || x.1 != y.1 {
+            return Err(format!(
+                "pos/타깃 불일치(pos {} vs {}) — 같은 코퍼스 덤프가 아님",
+                x.0, y.0
+            ));
+        }
+        let delta = y.3 - x.3; // 후보 − 기준(음수 = 후보 우세)
+        if delta < 0.0 {
+            win += 1;
+        } else if delta > 0.0 {
+            loss += 1;
+        } else {
+            tie += 1;
+        }
+        if delta.abs() > worst.0.abs() {
+            worst = (delta, x.0);
+        }
+        d.push(delta);
+    }
+    let mean = d.iter().sum::<f64>() / n as f64;
+    let mean_a = da.rows.iter().map(|r| r.3).sum::<f64>() / n as f64;
+    let mean_b = db.rows.iter().map(|r| r.3).sum::<f64>() / n as f64;
+    // 이동블록 부트스트랩 — 시작 위치 균일 추출, 블록 내 순서 보존(순환).
+    let blk = block.min(n);
+    let nblk = n.div_ceil(blk);
+    let mut rng = seed;
+    let mut next = move || {
+        rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut means: Vec<f64> = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let mut acc = 0f64;
+        for _ in 0..nblk {
+            let start = (next() % n as u64) as usize;
+            for j in 0..blk {
+                acc += d[(start + j) % n];
+            }
+        }
+        means.push(acc / (nblk * blk) as f64);
+    }
+    means.sort_by(|p, q| p.total_cmp(q));
+    let qp = |p: f64| means[((means.len() - 1) as f64 * p).round() as usize];
+    let (lo, hi) = (qp(0.025), qp(0.975));
+    let pos_frac = means.iter().filter(|&&m| m > 0.0).count() as f64 / means.len() as f64;
+    // ΔNLL → ΔPPL% (PPL = exp(nll_mean)).
+    let (ppl_a, ppl_b) = (mean_a.exp(), mean_b.exp());
+    let pct = |x: f64| (x.exp() - 1.0) * 100.0;
+    if json {
+        return Ok(format!(
+            "{{\"n\":{n},\"base_ppl\":{ppl_a:.9},\"cand_ppl\":{ppl_b:.9},\"d_nll_mean\":{mean:.9},\"ci_nll_lo\":{lo:.9},\"ci_nll_hi\":{hi:.9},\"d_ppl_pct\":{:.6},\"ci_ppl_lo\":{:.6},\"ci_ppl_hi\":{:.6},\"win\":{win},\"loss\":{loss},\"tie\":{tie},\"block\":{blk},\"reps\":{reps},\"p_pos\":{pos_frac:.4}}}",
+            pct(mean),
+            pct(lo),
+            pct(hi)
+        ));
+    }
+    Ok(format!(
+        "w4a16-eval ci\n  base: {a} (ppl={ppl_a:.6})\n  cand: {b} (ppl={ppl_b:.6})\n  n={n} · 블록 {blk} · 재표집 {reps}\n  ΔNLL 평균 {mean:+.7} (95% CI [{lo:+.7}, {hi:+.7}])\n  ΔPPL {:+.4}% (95% CI [{:+.4}%, {:+.4}%])\n  토큰 승/패/동 {win}/{loss}/{tie} · 최악 {}{:+.4} @pos {} · P(Δ>0)={pos_frac:.3}",
+        pct(mean),
+        pct(lo),
+        pct(hi),
+        if worst.0 >= 0.0 { "+" } else { "" },
+        worst.0,
+        worst.1
     ))
 }
 
@@ -736,5 +865,65 @@ mod tests {
         assert_eq!(d.rows[0], (1, 5, 5, 1.0, 0.5));
         assert_eq!(d.nll_sum, Some(2.5));
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod ci_tests {
+    use super::*;
+
+    #[test]
+    fn ci_identical_dumps_zero() {
+        let p1 = write_tmp_dump(&[1.0, 1.2, 0.8, 2.0], "ci-a");
+        let p2 = write_tmp_dump(&[1.0, 1.2, 0.8, 2.0], "ci-b");
+        let out = ci(&[p1.clone(), p2.clone(), "--reps".into(), "1000".into()]).unwrap();
+        assert!(out.contains("+0.0000%"), "{out}");
+        assert!(out.contains("P(Δ>0)=0.000"), "{out}");
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn ci_uniform_delta_ppl() {
+        // 균일 Δ=+0.1 NLL → ΔPPL = e^0.1−1 = +10.5171%.
+        let base: Vec<f64> = (0..64).map(|i| 1.0 + 0.001 * i as f64).collect();
+        let cand: Vec<f64> = base.iter().map(|x| x + 0.1).collect();
+        let p1 = write_tmp_dump(&base, "ci-u1");
+        let p2 = write_tmp_dump(&cand, "ci-u2");
+        let out = ci(&[p1.clone(), p2.clone()]).unwrap();
+        assert!(out.contains("+10.5171%"), "{out}");
+        assert!(out.contains("1/0/63") || out.contains("0/64/0"), "{out}");
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn ci_block_bootstrap_orders() {
+        // 혼합 부호 — CI가 평균을 감싼다.
+        let base: Vec<f64> = (0..128).map(|i| 2.0).collect();
+        let mut cand = base.clone();
+        for i in (0..128).step_by(2) {
+            cand[i] += 0.05;
+            cand[i + 1] -= 0.02;
+        }
+        let p1 = write_tmp_dump(&base, "ci-m1");
+        let p2 = write_tmp_dump(&cand, "ci-m2");
+        let out = ci(&[p1.clone(), p2.clone(), "--json".into()]).unwrap();
+        assert!(out.contains("\"ci_nll_lo\"") && out.contains("\"ci_nll_hi\""), "{out}");
+        let lo: f64 = out.split("\"ci_nll_lo\":").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+        let hi: f64 = out.split("\"ci_nll_hi\":").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+        assert!(lo <= hi);
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    fn write_tmp_dump(nlls: &[f64], tag: &str) -> String {
+        let p = std::env::temp_dir().join(format!("eval-{tag}-{}.tsv", std::process::id()));
+        let mut s = String::from("# w4a16-eval dump v1 model=x tokens=0 head=gpu nll_sum=0 ppl=0\n# cols: pos target argmax nll margin\n");
+        for (i, &n) in nlls.iter().enumerate() {
+            s.push_str(&format!("{}\t{}\t0\t{}\t0.5\n", i + 1, 7, n));
+        }
+        std::fs::write(&p, s).unwrap();
+        p.to_string_lossy().into_owned()
     }
 }
