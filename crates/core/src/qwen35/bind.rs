@@ -50,6 +50,9 @@ pub struct QwenCfg {
     pub partial_rotary_factor: f64,
     pub rope_theta: f64,
     pub rms_norm_eps: f64,
+    /// [2.J 2026-10-13] 모델 전역 ctx 상한(config.json max_position_embeddings
+    /// — text_config 중첩이 표준, 평면 키도 허용). 서버 --ctx 검증·실효 ctx 파생.
+    pub max_pos: usize,
     // ── MoE(0이면 dense FFN) ──
     pub n_experts: usize,
     pub top_k: usize,
@@ -109,6 +112,14 @@ impl QwenCfg {
                 .get("rms_norm_eps")
                 .and_then(Json::as_f64)
                 .unwrap_or(1e-6),
+            // [2.J] 전역 ctx 상한 — text_config 우선, 평면 fallback.
+            max_pos: u("max_position_embeddings")
+                .or_else(|| {
+                    v.get("max_position_embeddings")
+                        .and_then(Json::as_f64)
+                        .map(|x| x as usize)
+                })
+                .ok_or_else(|| bad("max_position_embeddings"))?,
             n_experts: u("num_experts").unwrap_or(0),
             top_k: u("num_experts_per_tok").unwrap_or(0),
             moe_ffn: u("moe_intermediate_size").unwrap_or(0),
@@ -134,6 +145,7 @@ impl QwenCfg {
         pos(cfg.linear_num_key_heads, "linear_num_key_heads")?;
         pos(cfg.linear_num_value_heads, "linear_num_value_heads")?;
         pos(cfg.linear_conv_kernel, "linear_conv_kernel_dim")?;
+        pos(cfg.max_pos, "max_position_embeddings")?;
         if !cfg.heads.is_multiple_of(cfg.kv_heads) {
             return Err(W4a16Error::Config(format!(
                 "num_attention_heads={} % num_key_value_heads={} != 0",
@@ -804,7 +816,7 @@ mod tests {
 
     fn cfg_text(heads: usize, kv: usize, nk: usize, nv: usize, conv_k: usize) -> String {
         format!(
-            r#"{{"hidden_size":5120,"num_hidden_layers":4,"num_attention_heads":{heads},"num_key_value_heads":{kv},"head_dim":128,"intermediate_size":17408,"vocab_size":248320,"linear_key_head_dim":128,"linear_num_key_heads":{nk},"linear_num_value_heads":{nv},"linear_conv_kernel_dim":{conv_k}}}"#
+            r#"{{"hidden_size":5120,"num_hidden_layers":4,"num_attention_heads":{heads},"num_key_value_heads":{kv},"head_dim":128,"intermediate_size":17408,"vocab_size":248320,"max_position_embeddings":262144,"linear_key_head_dim":128,"linear_num_key_heads":{nk},"linear_num_value_heads":{nv},"linear_conv_kernel_dim":{conv_k}}}"#
         )
     }
 
@@ -830,6 +842,30 @@ mod tests {
         assert!(e.contains("linear_conv_kernel_dim=0"), "{e}");
     }
 
+    /// [2.J] max_position_embeddings 파생 — 평면/중첩(text_config) 두 경로.
+    #[test]
+    fn cfg_max_pos_parse() {
+        assert_eq!(
+            QwenCfg::parse(&cfg_text(40, 8, 16, 64, 4)).unwrap().max_pos,
+            262144
+        );
+        let nested = r#"{"text_config":{"hidden_size":5120,"num_hidden_layers":4,
+            "num_attention_heads":40,"num_key_value_heads":8,"head_dim":128,
+            "intermediate_size":17408,"vocab_size":248320,
+            "max_position_embeddings":131072,"linear_key_head_dim":128,
+            "linear_num_key_heads":16,"linear_num_value_heads":64,
+            "linear_conv_kernel_dim":4}}"#;
+        assert_eq!(QwenCfg::parse(nested).unwrap().max_pos, 131072);
+        // 부재는 명시 거부.
+        let miss = cfg_text(40, 8, 16, 64, 4).replace(r#","max_position_embeddings":262144"#, "");
+        assert!(
+            QwenCfg::parse(&miss)
+                .unwrap_err()
+                .to_string()
+                .contains("max_position_embeddings")
+        );
+    }
+
     fn cfg_fixture() -> QwenCfg {
         QwenCfg {
             hidden: 5120,
@@ -847,6 +883,7 @@ mod tests {
             partial_rotary_factor: 0.25,
             rope_theta: 1e7,
             rms_norm_eps: 1e-6,
+            max_pos: 262144,
             n_experts: 0,
             top_k: 0,
             moe_ffn: 0,

@@ -235,6 +235,8 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut queue: Option<usize> = None;
     let mut slots: Option<usize> = None;
     let mut ctx = 4096usize;
+    // [2.J 2026-10-13] --ctx auto = 모델 전역 상한(config 파생).
+    let mut ctx_auto = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -242,9 +244,13 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 Some(p) => port = p,
                 None => return usage_err("--port requires a number"),
             },
-            "--ctx" => match it.next().and_then(|v| v.parse().ok()) {
-                Some(c) => ctx = c,
-                None => return usage_err("--ctx requires a number"),
+            "--ctx" => match it.next() {
+                Some(v) if v == "auto" => ctx_auto = true,
+                Some(v) => match v.parse().ok() {
+                    Some(c) => ctx = c,
+                    None => return usage_err("--ctx requires a number or auto"),
+                },
+                None => return usage_err("--ctx requires a number or auto"),
             },
             "--slots" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(s) => slots = Some(s.clamp(1, 16)),
@@ -300,6 +306,50 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let _ = engine::TOKENIZER.set(tok);
+    // [2.J 2026-10-13] 모델 파생 ctx 검증 — max_position_embeddings(기동 로그).
+    // 초과분은 클램프(가드: KV 정적 예산은 아직 엔진 ctx 파생).
+    let mut model_max_ctx = 0usize;
+    let mut cinfo = None;
+    match llm170_core::qwen35::ctx_info(&model_path) {
+        Ok(ci) => {
+            model_max_ctx = ci.ctx;
+            if ctx_auto {
+                ctx = ci.ctx;
+            }
+            if ctx > ci.ctx {
+                eprintln!("# ctx {ctx} > 모델 최대 {} — 클램프", ci.ctx);
+                ctx = ci.ctx;
+            }
+            eprintln!("# ctx: model max={} 사용={ctx}", ci.ctx);
+            cinfo = Some(ci);
+        }
+        Err(e) => eprintln!("# ctx 검증 건너뜀(config 판독 실패): {e}"),
+    }
+    // [2.J] 기동 가드 — VRAM(가중치[dense]+KV+예약) ≤ 여유. 사용 중 할당 실패
+    // 금지 원칙의 사전 거부(기존 preflight는 호스트 RAM을 용량에 포함해
+    // dense 장문 KV 초과를 못 잡는다).
+    if let Some(ci) = &cinfo
+        && let Some((free, _)) = llm170_backend_gpu::cuda_mem_free()
+    {
+        const RESERVE: u64 = 3 * (1 << 30) / 2; // 워크스페이스·스테이징 예약 1.5GiB
+        let wts = if ci.dense {
+            dir_bytes(&model_path)
+        } else {
+            0 // MoE — 전문가 스트리밍 전제(가중치 전량 VRAM 요구 안 함)
+        };
+        let kv = ctx as u64 * ci.kv_bytes_per_token;
+        if wts + kv + RESERVE > free {
+            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            eprintln!(
+                "# ctx 가드 거부: ctx={ctx} KV {:.1}GiB + 가중치 {:.1}GiB + 예약 {:.1}GiB > 여유 VRAM {:.1}GiB — --ctx 를 줄이세요",
+                gib(kv),
+                gib(wts),
+                gib(RESERVE),
+                gib(free)
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     let req = engine::InferRequest {
         model: model_path.clone(),
         ctx,
@@ -315,6 +365,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
         ctx,
+        model_max_ctx,
         n_slots: slots.unwrap_or(1),
         model_bytes: dir_bytes(&model_path),
     });

@@ -78,12 +78,20 @@ pub(crate) fn handle(
                     resp(stream, 503, "application/json", "{\"status\":\"loading\"}")
                 }
             }
-            ("GET", "/v1/models") => resp(
-                stream,
-                200,
-                "application/json",
-                "{\"object\":\"list\",\"data\":[{\"id\":\"llm170\",\"object\":\"model\",\"owned_by\":\"local\"}]}",
-            ),
+            ("GET", "/v1/models") => {
+                // [2.J 2026-10-13] 실효 ctx 광고 — max_model_len = min(모델 최대,
+                // 풀 파생[K6 후]) — 현재는 파생 전이라 엔진 ctx와 동일값.
+                let eff = crate::metrics::effective_ctx();
+                let mmax = crate::metrics::model_max_ctx();
+                resp(
+                    stream,
+                    200,
+                    "application/json",
+                    &format!(
+                        "{{\"object\":\"list\",\"data\":[{{\"id\":\"llm170\",\"object\":\"model\",\"owned_by\":\"local\",\"max_model_len\":{eff},\"model_max_len\":{mmax}}}]}}"
+                    ),
+                )
+            }
             // 모니터링 — 최신 스냅샷 1장(시계열 누적은 외부 폴러 몫).
             // /stats = JSON(주 타깃), /metrics = Prometheus 텍스트(표준 호환).
             ("GET", "/stats") => resp(stream, 200, "application/json", &crate::metrics::json()),

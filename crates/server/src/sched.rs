@@ -117,6 +117,12 @@ pub(crate) fn load_gpu_retry(
                 // ENOPT 계열) 한정 — 계약 오류(텐서 부재 등)는 즉시 실패로
                 // 5회 OOM 연쇄(무의미·오해 소지)를 끊는다. 실패한 시도의
                 // 부분 할당은 GpuEngine::load가 free_all_device로 정리한다.
+                // [2.J] VRAM 부족은 재시도 무의미 — 백트레이스 대신 안내 종료.
+                if err.contains("메모리 부족") || err.contains("OUT_OF_MEMORY") {
+                    eprintln!("# gpu 엔진 로드 실패(VRAM 부족): {err}");
+                    eprintln!("# --ctx 를 줄이세요(예: 32768).");
+                    std::process::exit(1);
+                }
                 if !(err.contains("ENOPT") || err.contains("cuModule")) {
                     panic!("gpu 엔진 로드 실패(재시도 불가): {} — {err}", p.display());
                 }

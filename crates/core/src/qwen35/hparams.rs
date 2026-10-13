@@ -18,6 +18,8 @@ pub struct Hparams {
     pub d_state: usize,
     pub conv_k: usize,
     pub vocab: usize,
+    /// [2.J] 모델 전역 ctx 상한(max_position_embeddings).
+    pub max_pos: usize,
     /// MoE(W4-1, 35B-A3B) — n_experts=0이면 dense FFN(27B).
     pub n_experts: usize,
     pub top_k: usize,
