@@ -142,11 +142,15 @@ impl GdnDims {
 /// KV 분할 attention(P8-attn-3) — 긴 컨텍스트에서 블록 수 = q_heads×S.
 /// lim ≤ 256(단문·골든 구간)은 종전 단일 블록 경로 그대로(비트 동일).
 pub const ATTN_SPLITS: usize = 8; // 프리필(그리드 t×q_heads×8로 충분)
-/// [§8.1 2026-10-11] 디코드(t≤8) 분할 수 — t=1 그리드 192블록(q_heads×8)이
-/// 128SM에서 스케줄러당 3워프·무이슈 79.7%(ncu)라 분할 확대로 점유 회복.
-pub const ATTN_SPLITS_D: usize = 32;
+/// [GQA 패킹 채택 2026-10-13] 디코드(t≤8) 분할 — 종전 32(q_heads×S 그리드로
+/// 점유 회복)에서 64로. part_qg 패킹 후 그리드 = kv_heads×S(27B 4·35B 2)라
+/// 장문에서 지연 바운드가 커져 분할 확대가 유효해졌다 — 실측(27B, bench):
+/// tg@64K 36.05→39.75(+10%)·tg@16K 47.8→49.3(+3%)·tg@512 53.5→53.0(−0.9%)
+/// / 35B 짧은 창 −0.5%. S=128은 장문 +0.4 t/s뿐이고 단문 −3%(빈 분할 블록
+/// 디스패치 비용)라 64가 균형점. 곡선·게이트 수치는 원장(4090-detail).
+pub const ATTN_SPLITS_D: usize = 64;
 /// attn.cu 병합 smem(ATTN_SPLITS_MAX)과 동일해야 함(테스트 대조).
-pub const ATTN_SPLITS_MAX: usize = 32;
+pub const ATTN_SPLITS_MAX: usize = 64;
 
 /// 어텐션 형상(서버 등록 — d=256·rope 64차 고정 계약).
 #[derive(Debug, Clone, Copy, PartialEq)]
