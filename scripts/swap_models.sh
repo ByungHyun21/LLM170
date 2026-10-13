@@ -16,6 +16,9 @@
 #   8. G(27B): 장문 600·4000토큰 — lim>256(attn 분할)·다중 청크 경로 골든.
 #   9. G2(35B): 장문 600·4000토큰 — 동일(35B MoE).
 #  10. H(스펙 옵트인): --spec 4 골든 접두(27B/35B) — 검증=t=1 등가·보정 경로 회귀.
+#  6b. D4(35B): 스트리밍 serve(--moe streaming) 골든 — 전문가 LRU 캐시 경로 판정.
+#      [버그수정 2026-10-13] t≤8 스테이징 삽입이 가중치 업로드를 빠뜨려(유령 슬롯)
+#      스트리밍 출력이 오염됐다(워밍업/프리필 → t=1 디코드까지 전파) — 상시 판정.
 # 장문 골든(600/4000)은 GPU 동결(2회 재현) — CPU 대조는 35토큰 한계(D3).
 # 경로 회귀 검출용(값 변경 시 원인 판정 후 재동결).
 # [KVQ 채택 2026-10-10] int8 KV가 단일 경로 — 구 F(KVQ) 섹션은 기본 경로와
@@ -143,6 +146,35 @@ case "$DB" in
   "$GOLDEN35L"*) note "긴 프롬프트 GPU OK: $(echo "$DB" | head -c 50)";;
   "") echo "[w4a16] FAIL: 긴 GPU 실패 — ${RUN}/d3b.log"; fail=1;;
   *) echo "[w4a16] FAIL: 긴 GPU 골든 불일치: $(echo "$DB" | head -c 50)"; fail=1;;
+esac
+
+# ── 6b. D4(35B) 스트리밍 serve — 전문가 LRU 캐시 경로 골든 ──
+note "[6b] D4(35B) 스트리밍 serve — --moe streaming 골든(캐시 경로)"
+: > "$RUN/d4.log"
+"$BIN" serve --model "$M_35B" --ctx 1024 --moe streaming --spec off --port "$PORT" > "$RUN/d4.log" 2>&1 &
+SERVE_PID=$!
+trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
+for i in $(seq 1 100); do
+  sleep 3
+  grep -m1 "listening" "$RUN/d4.log" >/dev/null 2>&1 && break
+done
+curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
+  -d '{"prompt":[148678,65233,202419],"max_tokens":8,"temperature":0}' > "$RUN/d4.json"
+kill "$SERVE_PID" 2>/dev/null
+wait "$SERVE_PID" 2>/dev/null
+trap - EXIT
+D4=$(python3 -c "
+import json
+try:
+    d=json.load(open('"$RUN/d4.json"'))
+    t=d.get('tokens') or (d['choices'][0].get('tokens') if 'choices' in d else None)
+    print(','.join(map(str,t)) if t else 'ERR')
+except Exception:
+    print('ERR')
+")
+case "$D4" in
+  "$GOLDEN35"*) note "35B 스트리밍 토큰 OK: $(echo "$D4" | head -c 60)";;
+  *) echo "[w4a16] FAIL: 35B 스트리밍 골든 불일치: $(echo "$D4" | head -c 60)"; fail=1;;
 esac
 
 # ── 7. E(FN FP8PLE) 자원 가드 명시 거부 ──
@@ -294,7 +326,7 @@ sys.exit(0 if ok else 1)
 done
 
 if [ $fail -eq 0 ]; then
-  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve·장문·spec / 35B MoE 참조+GPU·장문·spec / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
+  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve·장문·spec / 35B MoE 참조+GPU·장문·spec·스트리밍(D4) / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
 else
   echo "[w4a16] smoke: FAILURES PRESENT"
 fi

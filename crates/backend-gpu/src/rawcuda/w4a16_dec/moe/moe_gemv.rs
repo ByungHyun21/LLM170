@@ -123,7 +123,6 @@ impl W4a16Dec {
         xn: CUdeviceptr,
         sel: &[(usize, f32)],
     ) -> Result<(), String> {
-        let n_exp = self.moe.n_experts;
         let h = self.hidden;
         let n_ff = self.moe.moe_ffn;
         let [s0, s1, _s1b, s2, s3] = self.dchain;
@@ -171,18 +170,10 @@ impl W4a16Dec {
                 (qb, sb, true)
             };
             if need_h2d {
-                let base = (il * n_exp + e) * 3;
-                for p in 0..3 {
-                    let (qp, ql, sp, sl) = self.moe.moe_tab[base + p];
-                    let qdd = qd + (p * qsz) as u64;
-                    let sdd = sd + (p * ssz) as u64;
-                    // SAFETY: tab 항목은 set_expert_table 수명 계약(mmap/호스트
-                    // 스테이징), ql/sl은 위 qsz/ssz 형상 계약을 따른다.
-                    let qb = unsafe { std::slice::from_raw_parts(qp as *const u8, ql as usize) };
-                    let sb = unsafe { std::slice::from_raw_parts(sp as *const u8, sl as usize) };
-                    self.cc.h2d_async(qdd, qb)?;
-                    self.cc.h2d_async(sdd, sb)?;
-                }
+                // [B4-1 결함수정 2026-10-13] 업로드는 공용 헬퍼 — 스테이징(moe_stage_t)
+                // 삽입도 반드시 업로드를 동반한다(종전엔 t=1 경로만 업로드해 t≤8
+                // GEMV가 미업로드 슬롯을 읽었다: 실측 오염 — 워밍업/프리필 유령 슬롯).
+                self.mcache_upload_to(il, e, qd, sd)?;
             }
             qd_list.push((qd, sd));
         }
@@ -212,6 +203,32 @@ impl W4a16Dec {
             self.ew_dev(s0, s1, s2, n_ff)?;
             self.gemv_launch_raw(q2, p2, h, n_ff, s2, s3)?;
             self.axpy_dev(w, s3, self.moe.dmo.ptr, h)?;
+        }
+        Ok(())
+    }
+
+    /// [B4-1 결함수정 2026-10-13] 슬롯 업로드 — (il,e)의 3투영 q/s를 대상
+    /// 포인터 3슬롯(qd/sd, 투영 스트라이드 qsz/ssz)으로 async 복사.
+    /// 스테이징(**moe_stage_t 삽입 포함**)과 t=1 스트리밍이 공용한다.
+    /// 결함 이력: 종전 t≤8 스테이징은 ids/장치 테이블만 갱신하고 업로드를
+    /// 빼먹어 GEMV가 미업로드 슬롯(쓰레기/옛 전문가)을 읽었다 — 워밍업
+    /// 프리필이 유령 슬롯을 남기고 이후 t=1 디코드까지 오염(실측).
+    fn mcache_upload_to(&mut self, il: usize, e: usize, qd: u64, sd: u64) -> Result<(), String> {
+        let h = self.hidden;
+        let n_ff = self.moe.moe_ffn;
+        let qsz = h * n_ff / 2;
+        let ssz = h * n_ff / self.moe.moe_group.max(32) * 2;
+        let base = (il * self.moe.n_experts + e) * 3;
+        for p in 0..3 {
+            let (qp, ql, sp, sl) = self.moe.moe_tab[base + p];
+            let qdd = qd + (p * qsz) as u64;
+            let sdd = sd + (p * ssz) as u64;
+            // SAFETY: tab 항목은 set_expert_table 수명 계약(mmap/호스트
+            // 스테이징), ql/sl은 qsz/ssz 형상 계약을 따른다.
+            let qb = unsafe { std::slice::from_raw_parts(qp as *const u8, ql as usize) };
+            let sb = unsafe { std::slice::from_raw_parts(sp as *const u8, sl as usize) };
+            self.cc.h2d_async(qdd, qb)?;
+            self.cc.h2d_async(sdd, sb)?;
         }
         Ok(())
     }
@@ -291,7 +308,17 @@ impl W4a16Dec {
             }
             seen[e] = true;
             if self.mcache_lookup(il, e).is_none() {
-                self.mcache_insert(il, e)?;
+                // [B4-1 결함수정 2026-10-13] 삽입 = 가중치 업로드 동반(필수).
+                let slot = self.mcache_insert(il, e)?;
+                let h = self.hidden;
+                let n_ff = self.moe.moe_ffn;
+                let qsz = h * n_ff / 2;
+                let ssz = h * n_ff / self.moe.moe_group.max(32) * 2;
+                let qb =
+                    self.moe.mcache_q + ((il * self.moe.mcache_k + slot) * 3) as u64 * qsz as u64;
+                let sb =
+                    self.moe.mcache_s + ((il * self.moe.mcache_k + slot) * 3) as u64 * ssz as u64;
+                self.mcache_upload_to(il, e, qb, sb)?;
             }
         }
         Ok(())
