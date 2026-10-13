@@ -1110,7 +1110,8 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
     dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
     // 1~4) 모델 상주 업로드(GpuEngine 공용 — dense/MoE 분기 포함).
-    crate::gpu_engine::upload_model(&mut dec, &model, a.ctx)?;
+    // kv_reserve 0 = 종전 상주 규칙(프로브 — 서버 사다리 판정과 분리).
+    crate::gpu_engine::upload_model(&mut dec, &model, a.ctx, 0)?;
     // 보고용 split 선형 수(dense 한정 — MoE는 0).
     let n_lin = model
         .engine_names()

@@ -144,8 +144,8 @@ pub struct GuardTarget {
 /// 입력: 서브커맨드, --model, 위치인자. None = 가드 스킵
 /// (메타 서브커맨드 또는 경로 부재 — 로더 에러가 더 정확).
 pub fn guard_target(sub: &str, model: Option<&str>, rest: &[String]) -> Option<GuardTarget> {
-    // 토크나이저 파일만 판독 — 무게 미적재.
-    if matches!(sub, "tokenize") {
+    // 토크나이저 파일만 판독 — 무게 미적재. plan은 매니페스트 헤더만(무적재).
+    if matches!(sub, "tokenize" | "plan") {
         return None;
     }
     let path = model.map(std::path::PathBuf::from).or_else(|| {
@@ -353,8 +353,9 @@ mod tests {
         );
         let g = guard_target("w4a16-ref", None, &s(&["/m/w4a16"]));
         assert_eq!(g.map(|g| g.gpu), Some(false));
-        // 메타 서브커맨드 → None
+        // 메타 서브커맨드 → None (plan = 매니페스트 헤더만 — 무적재)
         assert!(guard_target("tokenize", Some("/m/w4a16"), &s(&[])).is_none());
+        assert!(guard_target("plan", Some("/m/w4a16"), &s(&[])).is_none());
         // 무모델 로딩 창구 → None(로더/CLI 에러가 더 정확)
         assert!(guard_target("infer", None, &s(&[])).is_none());
         assert!(guard_target("serve", None, &s(&[])).is_none());

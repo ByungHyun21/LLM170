@@ -102,9 +102,10 @@ pub(crate) fn load_gpu_retry(
     n_slots: usize,
     ctx: usize,
     kv_budget: Option<u64>,
+    kv_reserve: Option<u64>,
 ) -> crate::gpu_engine::GpuEngine {
     for i in 0..5 {
-        match crate::gpu_engine::GpuEngine::load(p, n_slots, ctx, kv_budget) {
+        match crate::gpu_engine::GpuEngine::load(p, n_slots, ctx, kv_budget, kv_reserve) {
             Ok(mut e) => {
                 // [§7.1] 스펙 스냅샷 버퍼 — 실패(VRAM 부족 등) 시 비활성 로그.
                 if let Err(err) = e.enable_spec() {

@@ -142,6 +142,9 @@ pub struct InferRequest {
     pub ctx: usize,
     /// [K6-3 예산] KV 아레나 예산(바이트, 서버 파생 — None = 종전 총량).
     pub kv_budget: Option<u64>,
+    /// [2.M 사다리] KV 풀 실할당 추정 = min(예산, ctx×문맥수×KV/토큰).
+    /// 전문가 상주(auto) 판정에서 KV 몫을 먼저 떼는 데 쓴다(0/None = 종전 규칙).
+    pub kv_reserve: Option<u64>,
 }
 
 pub struct InferResult {
@@ -203,7 +206,7 @@ fn banner(
 
 pub fn build_slots(req: InferRequest, n_slots: usize) -> Engine {
     // W3-3: GPU 경로 단일 — 가중치 VRAM 상주(호스트 스테이징 체인).
-    let eng = load_gpu_retry(&req.model, n_slots, req.ctx, req.kv_budget);
+    let eng = load_gpu_retry(&req.model, n_slots, req.ctx, req.kv_budget, req.kv_reserve);
     banner(
         &req.model,
         "w4a16",
