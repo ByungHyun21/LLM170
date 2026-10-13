@@ -485,6 +485,45 @@ pub fn prometheus() -> String {
         "speculative verify round wall us (x1000)",
         sc.spec_ms.load(Ordering::Relaxed) / 1000,
     );
+    // [2.A-④ 2026-10-13] 경제성 게이트 — 모드·소스·비용 EMA(ms/토큰).
+    pm_gauge(
+        &mut o,
+        "llm170_spec_econ_on",
+        "spec economics gate (1=spec, 0=plain)",
+        format!("llm170_spec_econ_on {}", sc.econ_on.load(Ordering::Relaxed)),
+    );
+    let econ_cost = |v: &std::sync::atomic::AtomicU64, n: &std::sync::atomic::AtomicU64| -> f64 {
+        if n.load(Ordering::Relaxed) == 0 {
+            0.0
+        } else {
+            f64::from_bits(v.load(Ordering::Relaxed))
+        }
+    };
+    pm_gauge(
+        &mut o,
+        "llm170_spec_cost_ms_tok",
+        "spec round cost EMA (ms per emitted token, best source)",
+        format!(
+            "llm170_spec_cost_ms_tok {:.4}",
+            econ_cost(&sc.econ_src[0], &sc.econ_src_n[0]).min({
+                let n = sc.econ_src_n[1].load(Ordering::Relaxed);
+                if n == 0 {
+                    f64::INFINITY
+                } else {
+                    f64::from_bits(sc.econ_src[1].load(Ordering::Relaxed))
+                }
+            })
+        ),
+    );
+    pm_gauge(
+        &mut o,
+        "llm170_plain_cost_ms_tok",
+        "plain decode cost EMA (ms per token)",
+        format!(
+            "llm170_plain_cost_ms_tok {:.4}",
+            econ_cost(&sc.econ_plain, &sc.econ_plain_n)
+        ),
+    );
     pm_counter(
         &mut o,
         "llm170_decode_ms_total",

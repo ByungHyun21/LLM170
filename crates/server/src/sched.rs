@@ -64,8 +64,6 @@ struct Slot {
     failed: Option<String>,
     /// [§7.5] 스펙 적응 게이트 — 연속 무수용 라운드 수(1 도달 시 256토큰마다 재시도).
     spec_miss: u32,
-    /// [§7.5] 적응 초안 폭 — 전량 수용이면 확대(≤8=TR 도메인), 부진하면 4로 복귀.
-    spec_k: usize,
 }
 
 impl Slot {
@@ -83,7 +81,6 @@ impl Slot {
             err_count: 0,
             failed: None,
             spec_miss: 0,
-            spec_k: SPEC_K,
         }
     }
 }
@@ -197,8 +194,10 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
             uslots.push(i);
             utoks.push(slots[i].next);
         }
+        let _pmm = std::time::Instant::now();
         match e.decode_np_mixed(&uslots, &utoks) {
             Ok((toks, mut flat)) => {
+                econ_plain_sample(_pmm.elapsed().as_secs_f64() * 1e3, uslots.len());
                 let hn = flat.len() / uslots.len();
                 for (row, (chunk, &i)) in flat.chunks_mut(hn).zip(uslots.iter()).enumerate() {
                     let smp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
@@ -216,8 +215,10 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
     }
     if greedy.len() >= 2 {
         let toks: Vec<u32> = greedy.iter().map(|&i| slots[i].next).collect();
+        let _pt = std::time::Instant::now();
         match e.decode_np_greedy(&greedy, &toks) {
             Ok(ts) => {
+                econ_plain_sample(_pt.elapsed().as_secs_f64() * 1e3, greedy.len());
                 for (row, &i) in greedy.iter().enumerate() {
                     slot_emit(&mut slots[i], ts[row]);
                 }
@@ -249,6 +250,7 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
             })
             .unwrap_or(0);
         let k = KSTEP_K.min(rem);
+        let _pt = std::time::Instant::now();
         let kres = if k >= 2 {
             e.decode_greedy_k(i, slots[i].next, k, eos)
         } else {
@@ -256,6 +258,7 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
         };
         match kres {
             Ok(toks) => {
+                econ_plain_sample(_pt.elapsed().as_secs_f64() * 1e3, toks.len());
                 // 방출 루프 — 슬롯 상태(tokn·generated·SSE 프레임)는 기존
                 // 틱당 방출과 동일 경로로 갱신(eos가 로그 끝에 최대 1회).
                 for t in toks {
@@ -264,23 +267,29 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
                 // [MTP] 비-스펙 단독 디코드 후 초안 생성(마지막 방출 토큰 기준
                 // 1회 — 순차 경로의 토큰당 호출과 같은 상태·입력).
                 if e.mtp_drafts_on()
+                    && econ_mtp_maintain()
                     && let Err(err) = e.mtp_single(i, slots[i].next)
                 {
                     eprintln!("# mtp(무시): {err}");
                 }
             }
-            Err(_) => match e.decode_greedy(i, slots[i].next) {
-                Ok(t) => {
-                    // [MTP] 비-스펙 단독 디코드 후 초안 생성(다음 라운드 소비).
-                    if e.mtp_drafts_on()
-                        && let Err(err) = e.mtp_single(i, t)
-                    {
-                        eprintln!("# mtp(무시): {err}");
+            Err(_) => {
+                let _pt2 = std::time::Instant::now();
+                match e.decode_greedy(i, slots[i].next) {
+                    Ok(t) => {
+                        econ_plain_sample(_pt2.elapsed().as_secs_f64() * 1e3, 1);
+                        // [MTP] 비-스펙 단독 디코드 후 초안 생성(다음 라운드 소비).
+                        if e.mtp_drafts_on()
+                            && econ_mtp_maintain()
+                            && let Err(err) = e.mtp_single(i, t)
+                        {
+                            eprintln!("# mtp(무시): {err}");
+                        }
+                        slot_emit(&mut slots[i], t);
                     }
-                    slot_emit(&mut slots[i], t);
+                    Err(err) => slot_fail(&mut slots[i], format!("decode_greedy: {err}")),
                 }
-                Err(err) => slot_fail(&mut slots[i], format!("decode_greedy: {err}")),
-            },
+            }
         }
     }
     if !sampled.is_empty() {
@@ -288,8 +297,10 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
         // [S11 2026-10-11] t≥2 샘플링은 배치 체인 1회(로짓 d2h) — 종전
         // 슬롯별 t=1 직렬(≈19.5ms×N) 대비 대폭 상각. 로짓은 행별 t=1 head와
         // 비트동일이라 호스트 샘플러 토큰열 불변. t=1은 종전 직렬 유지.
+        let _plg = std::time::Instant::now();
         match e.decode_np_logits(&sampled, &toks) {
             Ok(mut flat) => {
+                econ_plain_sample(_plg.elapsed().as_secs_f64() * 1e3, sampled.len());
                 let hn = flat.len() / sampled.len();
                 let mut off = 0usize;
                 for &i in &sampled {
@@ -334,6 +345,38 @@ pub static SCHED: Sched = Sched {
     requests: AtomicU64::new(0),
     requests_failed: AtomicU64::new(0),
     queue_depth: AtomicU64::new(0),
+    // [2.A-④ 2026-10-13] 경제성 게이트 — EMA(f64 bits)·카운트·상태.
+    // 소스별/평범/k밴드 비용(ms/토큰) + 스펙 ON/OFF + 프로브 시계.
+    econ_plain: AtomicU64::new(0),
+    econ_plain_n: AtomicU64::new(0),
+    econ_src: [AtomicU64::new(0), AtomicU64::new(0)],
+    econ_src_n: [AtomicU64::new(0), AtomicU64::new(0)],
+    econ_k: [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
+    econ_k_n: [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
+    econ_on: AtomicU64::new(1),
+    econ_kidx: AtomicU64::new(1),
+    econ_src_cur: AtomicU64::new(0),
+    econ_gen: AtomicU64::new(0),
+    econ_probe_gen: AtomicU64::new(0),
+    econ_rounds: AtomicU64::new(0),
 };
 pub struct Sched {
     pub jobs: AtomicU64,
@@ -368,6 +411,28 @@ pub struct Sched {
     /// [B5/I 2026-10-10] 큐 깊이 게이지 — enqueue 성공 +1, 스케줄러 수신 -1.
     /// 429 어드미션 게이트와 정합(포화 시 try_send 실패라 증가 없음).
     pub queue_depth: AtomicU64,
+    // ── [2.A-④ 2026-10-13] 런타임 경제성 게이트 ──
+    /// 평범 스텝 비용 EMA(ms/토큰 — f64 bits)·표본 수.
+    pub econ_plain: AtomicU64,
+    pub econ_plain_n: AtomicU64,
+    /// 소스별 라운드 비용 EMA(ms/방출토큰) — [0]=mtp·[1]=ngram.
+    pub econ_src: [AtomicU64; 2],
+    pub econ_src_n: [AtomicU64; 2],
+    /// (소스,k) 라운드 비용 EMA — 인덱스 = 소스*4 + k밴드 인덱스.
+    pub econ_k: [AtomicU64; 8],
+    pub econ_k_n: [AtomicU64; 8],
+    /// 스펙 ON(1)/평범(0) — 히스테리시스 상태.
+    pub econ_on: AtomicU64,
+    /// 현재 선택된 k밴드 인덱스({2,4,6,8}).
+    pub econ_kidx: AtomicU64,
+    /// 현재 선택된 소스(0=mtp·1=ngram) — MTP 초안 유지 여부 판정.
+    pub econ_src_cur: AtomicU64,
+    /// 토큰 시계(프로브 주기 판정) — slot_emit이 증가.
+    pub econ_gen: AtomicU64,
+    /// 마지막 프로브 시점의 토큰 시계.
+    pub econ_probe_gen: AtomicU64,
+    /// 스펙 라운드 시계(탐사 주기 — 32라운드마다 밴드 순환 1회).
+    pub econ_rounds: AtomicU64,
 }
 impl Sched {
     pub fn summary(&self) -> String {
@@ -403,6 +468,179 @@ impl Sched {
             },
         )
     }
+}
+
+// ── [2.A-④ 2026-10-13] 런타임 경제성 게이트 ─────────────────────────────
+// 라운드 실측(ms/방출토큰) vs 평범 스텝 실측(ms/토큰) EMA로 3택
+// (mtp/ngram/평범)을 자동 선택한다 — 스펙은 무손실(검증 정본)이라 스위칭은
+// 처리량만 바꾼다(토큰 불변). 히스테리시스(±2%) + OFF 후 주기 재프로브,
+// k는 {2,4,6,8} 밴드 EMA(3% 여유·32라운드 탐사). 판정은 순수 함수(테스트 표면).
+
+/// k 밴드 — 인덱스 ↔ 초안 폭.
+const ECON_KS: [usize; 4] = [2, 4, 6, 8];
+/// 스펙/평범 히스테리시스 여유(±2%).
+const ECON_MARGIN: f64 = 0.02;
+/// k 전환 여유(3%).
+const ECON_K_MARGIN: f64 = 0.03;
+/// OFF 후 재프로브 주기(토큰).
+const ECON_PROBE_TOKENS: u64 = 512;
+
+/// EMA 갱신 — 초기 표본은 1/(n+1)(빠른 수렴), 이후 1/8. x = ms/토큰.
+fn econ_ema(v: &AtomicU64, n: &AtomicU64, x: f64) {
+    let k = n.fetch_add(1, Ordering::Relaxed) + 1;
+    let a = 1.0 / k.min(8) as f64;
+    let old = f64::from_bits(v.load(Ordering::Relaxed));
+    v.store((old + a * (x - old)).to_bits(), Ordering::Relaxed);
+}
+
+fn econ_get(v: &AtomicU64, n: &AtomicU64) -> Option<f64> {
+    (n.load(Ordering::Relaxed) > 0).then(|| f64::from_bits(v.load(Ordering::Relaxed)))
+}
+
+fn econ_kidx(k: usize) -> usize {
+    match k {
+        2 => 0,
+        6 => 2,
+        8 => 3,
+        _ => 1,
+    }
+}
+
+/// 평범 표본 — (ms, 방출 토큰 수).
+fn econ_plain_sample(ms: f64, toks: usize) {
+    if toks > 0 {
+        econ_ema(&SCHED.econ_plain, &SCHED.econ_plain_n, ms / toks as f64);
+    }
+}
+
+/// [2.A-④] MTP 초안 유지 여부 — 게이트가 스펙 ON·현 소스 MTP일 때만.
+/// OFF/ngram 소스에서는 유지비(체인 ~2.5ms/토큰 수준)를 내지 않는다 —
+/// 재선택 시 해당 라운드의 post_round가 초안을 재구축(복귀 지연 1라운드).
+fn econ_mtp_maintain() -> bool {
+    SCHED.econ_on.load(Ordering::Relaxed) == 1 && SCHED.econ_src_cur.load(Ordering::Relaxed) == 0
+}
+
+/// 스펙 라운드 표본 — (소스, 초안 폭, 수용 수, 라운드 ms).
+/// 비용/토큰 = 라운드 ms ÷ 방출 토큰(수용 접두 + 보정/첫 토큰 1).
+fn econ_spec_sample(src: u8, k: usize, acc: usize, ms: f64) {
+    let per_tok = ms / (acc + 1) as f64;
+    econ_ema(
+        &SCHED.econ_src[src as usize],
+        &SCHED.econ_src_n[src as usize],
+        per_tok,
+    );
+    let i = src as usize * 4 + econ_kidx(k);
+    econ_ema(&SCHED.econ_k[i], &SCHED.econ_k_n[i], per_tok);
+    SCHED.econ_rounds.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 소스 선택 — 가용성·측정 반영(둘 다 측정이면 낮은 비용; 미측정이면 MTP부터).
+fn econ_pick_src(mtp: Option<f64>, ng: Option<f64>, mtp_avail: bool) -> u8 {
+    if !mtp_avail {
+        return 1;
+    }
+    match (mtp, ng) {
+        (Some(m), Some(g)) => {
+            if g < m {
+                1
+            } else {
+                0
+            }
+        }
+        (None, Some(_)) => 1,
+        _ => 0,
+    }
+}
+
+/// 스펙/평범 히스테리시스 — ratio = 스펙 비용/평범 비용.
+/// ON 유지: ratio ≤ 1+m · OFF→ON: ratio < 1−m. 스펙 미측정이면 측정 위해 ON.
+fn econ_should_spec(spec: Option<f64>, plain: Option<f64>, on: bool) -> bool {
+    match (spec, plain) {
+        (None, _) | (_, None) => true,
+        (Some(s), Some(p)) => {
+            let r = s / p;
+            if on {
+                r <= 1.0 + ECON_MARGIN
+            } else {
+                r < 1.0 - ECON_MARGIN
+            }
+        }
+    }
+}
+
+/// k 선택 — 미측정 탐색(4→6→2→8) 후 최소 EMA(3% 여유 = 히스테리시스).
+fn econ_pick_k(cur: usize, emas: [Option<f64>; 4]) -> usize {
+    for &j in &[1usize, 2, 0, 3] {
+        if emas[j].is_none() {
+            return j;
+        }
+    }
+    let mut best = cur;
+    let mut best_v = emas[cur].unwrap_or(f64::INFINITY);
+    for (j, v) in emas.iter().enumerate() {
+        let v = v.unwrap(); // 미측정 없음(위 루프)
+        if v < best_v * (1.0 - ECON_K_MARGIN) {
+            best = j;
+            best_v = v;
+        }
+    }
+    best
+}
+
+/// [2.A-④] 게이트 판정 — (소스, k). None = 평범(라운드 생략).
+fn econ_plan(mtp_avail: bool) -> Option<(u8, usize)> {
+    let plain = econ_get(&SCHED.econ_plain, &SCHED.econ_plain_n);
+    let mtp = econ_get(&SCHED.econ_src[0], &SCHED.econ_src_n[0]);
+    let ng = econ_get(&SCHED.econ_src[1], &SCHED.econ_src_n[1]);
+    let mut src = econ_pick_src(mtp, ng, mtp_avail);
+    // 소스 탐사 — 미측정 소스 우선(비교 성립), 이후 32라운드마다 교차 1회.
+    // (스펙이 계속 켜지면 안 뽑힌 소스는 영원히 미측정 — 자기참조 차단.)
+    if mtp_avail {
+        let other = 1 - src;
+        let n_other = SCHED.econ_src_n[other as usize].load(Ordering::Relaxed);
+        if n_other < 3 || SCHED.econ_rounds.load(Ordering::Relaxed) % 32 == 15 {
+            src = other;
+        }
+    }
+    // 평범 프로브 — 초기 3표본 부트스트랩(4라운드마다 1회 스킵) 후 64라운드
+    // 마다 1회 — 스펙이 계속 켜지면 평범 실측이 갱신되지 않는 자기참조 차단.
+    // (상태(econ_on)는 유지 — 스킵 1회 뒤 재판정.)
+    let rounds = SCHED.econ_rounds.load(Ordering::Relaxed);
+    let plain_n = SCHED.econ_plain_n.load(Ordering::Relaxed);
+    if (plain_n < 3 && rounds % 4 == 3) || rounds % 64 == 47 {
+        return None;
+    }
+    let spec = if src == 0 { mtp } else { ng };
+    let on = SCHED.econ_on.load(Ordering::Relaxed) == 1;
+    let mut use_spec = econ_should_spec(spec, plain, on);
+    if !use_spec {
+        let gtok = SCHED.econ_gen.load(Ordering::Relaxed);
+        let last = SCHED.econ_probe_gen.load(Ordering::Relaxed);
+        if gtok.saturating_sub(last) < ECON_PROBE_TOKENS {
+            SCHED.econ_on.store(0, Ordering::Relaxed);
+            return None;
+        }
+        // 재프로브 1라운드 — 결과 표본이 다음 판정을 갱신(밴드 밖이면 OFF 복귀).
+        SCHED.econ_probe_gen.store(gtok, Ordering::Relaxed);
+        use_spec = true;
+    }
+    SCHED.econ_on.store(use_spec as u64, Ordering::Relaxed);
+    SCHED.econ_src_cur.store(src as u64, Ordering::Relaxed);
+    let k = if src == 1 {
+        let emas: [Option<f64>; 4] =
+            std::array::from_fn(|j| econ_get(&SCHED.econ_k[4 + j], &SCHED.econ_k_n[4 + j]));
+        let cur = (SCHED.econ_kidx.load(Ordering::Relaxed) as usize).min(3);
+        let mut idx = econ_pick_k(cur, emas);
+        // 32라운드마다 밴드 순환 1회(탐사 — EMA가 낡은 순위에 갇히지 않게).
+        if SCHED.econ_rounds.load(Ordering::Relaxed) % 32 == 31 {
+            idx = (idx + 1) % 4;
+        }
+        SCHED.econ_kidx.store(idx as u64, Ordering::Relaxed);
+        ECON_KS[idx]
+    } else {
+        4 // MTP 저장 초안 폭 고정(체인 K=4)
+    };
+    Some((src, k))
 }
 
 pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slots: usize) {
@@ -692,6 +930,7 @@ fn slot_prefill(
                 // [MTP] 프리필 완료 — 유예 호출(prev hidden, 첫
                 // 토큰)로 첫 초안 생성(다음 틱 스펙 라운드 소비).
                 if eng.0.mtp_drafts_on()
+                    && econ_mtp_maintain()
                     && let Err(err) = eng.0.mtp_first(i, t)
                 {
                     eprintln!("# mtp(무시): {err}");
@@ -879,18 +1118,15 @@ fn assign_slot(
         err_count: 0,
         failed: None,
         spec_miss: 0,
-        spec_k: SPEC_K,
     };
 }
-/// [§7.1 2026-10-11] 스펙 라운드 — n-gram 초안(4-gram·최대 SPEC_K-1) 발화 시
+/// [§7.1 2026-10-11] 스펙 라운드 — 초안(4-gram 최대 k밴드 {2,4,6,8}-1) 발화 시
 /// 1회. Ok(true)=라운드 수행(토큰 방출), Ok(false)=초안 없음(종전 경로).
 /// 값 보존: 검증 배치가 전 위치 토큰을 내고, 수용분+보정(t=1 재계산)이
 /// 단독 디코드와 동일한 토큰열을 만든다(프로브 [A-1 완화 ①]과 동일 절차 —
-/// 35B/27B 스펙 골든 접두가 판정).
-const SPEC_K: usize = 4;
-
-// [MTP-CHAIN §3.3] 초안 소스 정책(mtp/ngram)은 엔진 메서드
-// GpuEngine::mtp_drafts_on — 프리필 KV 구축 게이트와 단일 정의.
+/// 35B/27B 스펙 골든 접두가 판정). 초안 폭은 k밴드 EMA(2.A-④)가 결정.
+/// [MTP-CHAIN §3.3] 초안 소스 정책(mtp/ngram)은 엔진 메서드
+/// GpuEngine::mtp_drafts_on — 프리필 KV 구축 게이트와 단일 정의.
 fn spec_round(
     i: usize,
     s: &mut Slot,
@@ -931,6 +1167,8 @@ fn spec_round_impl(
     // [MTP-CHAIN §3.3 2026-10-12] 체인(호스트 왕복 0)으로 재귀 치환 후
     // MTP 재활성 — 임계는 서빙 A/B 재실측 전까지 1 유지(선행 실측 근거
     // 80~82%는 순차 경로 기준 — 체인 편입 후 재계측 필요).
+    // [§7.5] 무수용 억제 — 연속 무수용 시 256토큰마다만 재시도(경제성 게이트와
+    // 별개의 빠른 억제기: 수용 0이 반복되는 발화는 비용만 쓰고 수용이 없음).
     if s.spec_miss >= 1 && (s.generated & 255) != 0 {
         return Ok(false);
     }
@@ -938,26 +1176,31 @@ fn spec_round_impl(
     if sampled && s.sampler.is_none() {
         return Ok(false);
     }
+    // [2.A-④ 2026-10-13] 경제성 게이트 — 3택(mtp/ngram/평범). None = 평범.
+    // 스펙 무손실 — 스위칭은 처리량만(토큰 불변). spec_miss 억제 뒤에 둔다
+    // (억제된 라운드는 표본·프로브 시계를 소비하지 않게).
+    let mtp_avail = !sampled && e.mtp_drafts_on();
+    let Some((src, kk)) = econ_plan(mtp_avail) else {
+        return Ok(false);
+    };
     let mut hist: Vec<u32> = Vec::new();
     if let Some(j) = &s.job {
         hist.extend_from_slice(&j.tokens);
     }
     hist.extend_from_slice(&s.tokens);
-    // [§7.5] 적응 폭 — 전량 수용이면 +1(≤8 — 검증 t≤8이 TR GEMV 도메인),
-    // 부진(≤1)이면 4로 복귀. 초안 폭은 수용 판정만 좌우(값 불변).
-    // [MTP 2026-10-12] 초안 소스: 모델 자체 MTP 헤드(현 위치 유효분) 우선,
-    // 없으면 n-gram. 초안은 검증이 정본 — 소스 교체는 정책 계층(무손실).
-    // 샘플드는 종전대로 n-gram 전용(MTP 초안 없음).
-    // [MTP-CHAIN §3.3] mtp_drafts_on = MTP 가용 + 강제 n-gram 아님 — false면
-    // 생산(mtp_first/single/post_round)·소비 모두 스킵(순수 n-gram 경로).
-    let mtp_on = !sampled && e.mtp_drafts_on();
+    // [2.A-④] 소스·폭은 게이트가 결정(위 econ_plan) — MTP는 저장 초안(체인
+    // K=4 고정), n-gram은 k밴드 {2,4,6,8} EMA. 초안은 검증이 정본 — 소스/폭
+    // 교체는 정책 계층(무손실). 샘플드는 n-gram 전용(MTP 초안 없음).
+    // [MTP-CHAIN §3.3] mtp_drafts_on=false(강제 ngram)면 생산(mtp_first/single/
+    // post_round)·소비 모두 스킵(순수 n-gram 경로).
+    let mtp_on = src == 0;
     let draft: Vec<u32> = if mtp_on {
         match e.mtp_take_draft(i) {
             Some(d) => d,
-            None => llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1),
+            None => llm170_core::spec::ngram_draft(&hist, 3, 48, kk - 1),
         }
     } else {
-        llm170_core::spec::ngram_draft(&hist, 3, 48, s.spec_k - 1)
+        llm170_core::spec::ngram_draft(&hist, 3, 48, kk - 1)
     };
     if draft.is_empty() {
         return Ok(false);
@@ -1043,11 +1286,8 @@ fn spec_round_impl(
     if dbg && !sampled {
         s.spec_miss = 0; // 진단: 게이트 우회(수용률 계측) — 증가 뒤에 둬야 유효.
     }
-    if acc == draft.len() {
-        s.spec_k = (s.spec_k + 1).min(8);
-    } else if acc <= 1 {
-        s.spec_k = 4;
-    }
+    // [2.A-④ 2026-10-13] k 적응은 밴드 EMA가 대체(구 "전량 수용 +1/부진 4 복귀"
+    // 휴리스틱 제거) — 수용·비용이 cost/token EMA에 함께 반영된다.
     // 보정 토큰 — 정책 분기.
     if sampled {
         // 거절 시 잔차(≠x 재추출 = 조건분포 정확). 방출 분포 = 표적 분포
@@ -1076,6 +1316,8 @@ fn spec_round_impl(
         slot_emit(s, corr);
         SCHED.spec_rounds.fetch_add(1, Ordering::Relaxed);
         SCHED.spec_accepted.fetch_add(acc as u64, Ordering::Relaxed);
+        // [2.A-④] 경제성 표본(샘플드 = ngram) — 라운드 비용/방출토큰.
+        econ_spec_sample(1, draft.len(), acc, rt0.elapsed().as_secs_f64() * 1e3);
         return Ok(true);
     }
     // 그리디 보정 — [2026-10-12] 보정 토큰 = 검증 행 acc의 argmax(toks[acc]) —
@@ -1117,6 +1359,8 @@ fn spec_round_impl(
     SCHED
         .spec_ms
         .fetch_add(rt0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    // [2.A-④] 경제성 표본 — 라운드 비용/방출토큰(수용 접두 + 보정 1).
+    econ_spec_sample(src, draft.len(), acc, rt0.elapsed().as_secs_f64() * 1e3);
     Ok(true)
 }
 
@@ -1124,6 +1368,8 @@ fn slot_emit(s: &mut Slot, t: u32) {
     s.next = t;
     s.tokens.push(t);
     s.generated += 1;
+    // [2.A-④] 토큰 시계 — 경제성 게이트의 프로브 주기 판정용.
+    SCHED.econ_gen.fetch_add(1, Ordering::Relaxed);
     s.err_count = 0; // QA-1: 성공 — 연속 실패 카운터 리셋
     if let Some(sm) = &mut s.sampler {
         sm.push_tokens([t]);
@@ -1226,7 +1472,7 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Slot, pick_prefix_slot};
+    use super::{Slot, econ_pick_k, econ_pick_src, econ_should_spec, pick_prefix_slot};
 
     fn slot_with(cached: Vec<u32>) -> Slot {
         let mut s = Slot::free();
@@ -1271,7 +1517,7 @@ mod tests {
         assert_eq!(pick_prefix_slot(&[a], &[1, 2, 3]), Some((0, 0)));
     }
 
-    /// [R14] 스펙 적응 게이트 경계 — 무수용 1회 후 256토큰 재시도·전량 수용 시 폭 확대.
+    /// [R14] 스펙 적응 게이트 경계 — 무수용 후 256토큰 재시도 조건.
     #[test]
     fn spec_gate_boundary() {
         let mut s = Slot::free();
@@ -1279,15 +1525,54 @@ mod tests {
         // 무수용 시 spec_miss 증가(게이트 활성화)
         s.spec_miss += 1;
         assert_eq!(s.spec_miss, 1);
-        // 전량 수용 시 폭 확대(spec_k 증가·miss 리셋)
-        s.spec_miss = 0;
-        s.spec_k = 5;
-        assert!(s.spec_k <= 8, "spec_k 상한 8(TR 도메인)");
         // 256토큰마다 재시도 = generated & 255 == 0 조건
         s.generated = 256;
         assert_eq!(s.generated & 255, 0, "256 배수에서 재시도 허용");
         s.generated = 257;
         assert_ne!(s.generated & 255, 0, "256 배수 외 재시도 차단");
+    }
+
+    /// [2.A-④ 2026-10-13] 경제성 게이트 판정 — 소스 선택·히스테리시스·k밴드.
+    #[test]
+    fn econ_gate_decisions() {
+        // 소스: 둘 다 측정 → 낮은 비용. MTP 미가용 → ngram 고정.
+        assert_eq!(econ_pick_src(Some(24.0), Some(17.0), true), 1);
+        assert_eq!(econ_pick_src(Some(17.0), Some(24.0), true), 0);
+        assert_eq!(econ_pick_src(Some(1.0), Some(1.0), false), 1);
+        // 미측정 — MTP 가용이면 MTP로 측정 개시, 아니면 ngram.
+        assert_eq!(econ_pick_src(None, None, true), 0);
+        assert_eq!(econ_pick_src(None, None, false), 1);
+        // 스펙/평범 히스테리시스 — ON 유지(r≤1.02), OFF→ON은 r<0.98 필요.
+        assert!(econ_should_spec(Some(10.0), Some(10.0), true), "동률 유지");
+        assert!(
+            !econ_should_spec(Some(10.3), Some(10.0), true),
+            "ON에서 +3%면 OFF"
+        );
+        assert!(
+            !econ_should_spec(Some(10.0), Some(10.0), false),
+            "OFF에서 동률이면 OFF 유지(밴드)"
+        );
+        assert!(
+            econ_should_spec(Some(9.7), Some(10.0), false),
+            "OFF에서 −3%면 ON"
+        );
+        assert!(
+            econ_should_spec(None, Some(10.0), false),
+            "미측정은 ON(탐색)"
+        );
+        // k밴드: 미측정 탐색(4→6→2→8) → 최소 EMA(3% 여유).
+        assert_eq!(econ_pick_k(1, [None, None, None, None]), 1);
+        assert_eq!(econ_pick_k(1, [None, Some(1.0), None, None]), 2);
+        assert_eq!(
+            econ_pick_k(1, [Some(9.0), Some(10.0), Some(11.0), Some(12.0)]),
+            0,
+            "9.0 < 10.0×0.97 — 전환"
+        );
+        assert_eq!(
+            econ_pick_k(1, [Some(9.8), Some(10.0), Some(10.1), Some(10.2)]),
+            1,
+            "9.8 > 10.0×0.97 — 유지(히스테리시스)"
+        );
     }
 
     /// [R14] 접두 트리 경계 — 512 미만 미스·512 이상 히트·제거 후 미스.
