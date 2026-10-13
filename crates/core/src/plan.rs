@@ -237,12 +237,30 @@ impl Plan {
     }
 }
 
+// ── CMP 170HX 도착 대비(2026-10-13 — plans 미이전 규율: 지식은 코드 옆) ──
+// 실측·문헌(커뮤니티 2026-08): 열=시스템 팬 담당(범위 밖) · 전력 250W=성능 99.3%
+// (200W 95.7%) · PCIe Gen2 x4(≈1.7GB/s)·NVLink/ECC 불가 · **PP4 87.6 > TP4 60.4**
+// (좁은 링크는 레이어 파이프라인) · Flash-Next PLE=호스트 RAM+로컬 디스크.
+// 도착 시 프로브(순서): ① fp32/fp16 마이크로벤치 ② P2P/복사 대역(PcieGen2 확인)
+// ③ 27B 단독 상주 pp/tg ④ 2장 샤드 드라이런 실배치(이 모듈) ⑤ 256K 장문(needle·
+// long-PPL — `w4a16-eval`) ⑥ 전력 캡 재측정(250W). 목표 구성: 1차 2장+호스트 40GB급
+// (100B급 상주) / 2차 4장+80GB(전량 상주·1M ctx) — 배치 판단은 위 샤드 플랜 함수.
+
 /// 층별 정보(샤드 플랜 입력) — 이름의 `layers.N` 파싱.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct LayerInfo {
     pub bytes: u64,
+    /// 행-스파스 임베딩(PLE — SSD 티어) 바이트 — 상주 계산에서 제외.
+    pub row_sparse: u64,
     /// 풀 어텐션 층 여부(`.self_attn.` 포함) — KV 비중 계산용(GDN은 KV 없음).
     pub full_attn: bool,
+}
+
+impl LayerInfo {
+    /// 상주 가중치(VRAM 몫) = 전체 − 행-스파스(PLE SSD 티어).
+    pub fn resident(&self) -> u64 {
+        self.bytes.saturating_sub(self.row_sparse)
+    }
 }
 
 /// 매니페스트의 층 분해 — (층 목록, 층 미소속 가중치, embed(호스트)).
@@ -276,6 +294,9 @@ impl Manifest {
                         layers.resize(li + 1, LayerInfo::default());
                     }
                     layers[li].bytes = layers[li].bytes.saturating_add(*bytes);
+                    if classify(name) == Category::RowSparse {
+                        layers[li].row_sparse = layers[li].row_sparse.saturating_add(*bytes);
+                    }
                     if name.contains(".self_attn.") {
                         layers[li].full_attn = true;
                     }
@@ -329,7 +350,9 @@ pub fn shard_plan(
         .state_bytes_per_ctx
         .saturating_mul(wl.contexts.max(1) as u64);
     // 연속 블록 그리디: 목표 = (가중치 총합 + 비층)/카드수.
-    let weights_total: u64 = layers.iter().map(|l| l.bytes).sum::<u64>() + split.non_layer;
+    // [FN 검증 2026-10-13] 행-스파스(PLE)는 SSD 티어 — 상주 배분에서 제외
+    // (FN: 층1에 PLE 47.7G 몰림 — 포함하면 균형·수용 판정 모두 왜곡, 프로브가 적발).
+    let weights_total: u64 = layers.iter().map(|l| l.resident()).sum::<u64>() + split.non_layer;
     let target = weights_total / cards as u64;
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut per_card_weights = vec![0u64; cards];
@@ -341,13 +364,13 @@ pub fn shard_plan(
             if !last
                 && card < cards
                 && per_card_weights[card] > 0
-                && per_card_weights[card] + l.bytes > target
+                && per_card_weights[card] + l.resident() > target
             {
                 blocks.push((start, i));
                 card += 1;
                 start = i;
             }
-            per_card_weights[card] = per_card_weights[card].saturating_add(l.bytes);
+            per_card_weights[card] = per_card_weights[card].saturating_add(l.resident());
         }
         blocks.push((start, layers.len()));
         while blocks.len() < cards {
@@ -726,6 +749,7 @@ mod tests {
         (0..n)
             .map(|i| LayerInfo {
                 bytes,
+                row_sparse: 0,
                 full_attn: i % 4 == 3, // 하이브리드 3/4 GDN + 1/4 풀어텐션
             })
             .collect()
@@ -814,6 +838,18 @@ mod tests {
             st_sum > 0 && st_sum.abs_diff(st_expect) <= st_expect / 20,
             "st {st_sum}"
         );
+    }
+
+    /// FN류 검증: 한 층에 몰린 PLE(행-스파스)는 상주 배분·수용에서 제외된다
+    /// (프로브가 적발한 왜곡 — 층1 PLE 40G가 균형을 깨고 거부를 만들었다).
+    #[test]
+    fn shard_excludes_row_sparse() {
+        let mut l = shard_layers(8, G); // 층당 상주 1G
+        l[1].bytes += 40 * G;
+        l[1].row_sparse = 40 * G;
+        let p = shard_plan(&l, &shard_split(0), &shard_hw(64 * G, 62 * G, 1), &wl(4096));
+        assert!(p.fits, "{p:?}");
+        assert!(p.per_card_weights[0] <= 9 * G, "{:?}", p.per_card_weights);
     }
 
     /// 층 파싱 — 실명 픽스처(하이브리드 GDN/풀어텐션·expert 가산·embed 분리).
