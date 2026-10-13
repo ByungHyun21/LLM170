@@ -134,6 +134,10 @@ fn ppl(args: &[String]) -> Result<String, String> {
         dec.upload_head(head.data, head.n_out as usize, head.n_in as usize)?;
     }
     dec.reset_state(0)?;
+    // [K6-3 결함수정 2026-10-13] 프로브 직접 경로는 스케줄러가 없어 KV 풀
+    // 블록을 스스로 확보해야 한다 — 미확보 시 512토큰(블록 경계) 초과에서
+    // 테이블 범위 밖 접근(illegal access, 실측). 창 전체(+슬랙)를 1회 보장.
+    dec.kv_grow(0, n + 8)?;
     let vocab = head.n_out as usize;
     let mut rows: Vec<Row> = Vec::with_capacity(n - 1);
     let mut nll_sum = 0f64;
@@ -496,6 +500,7 @@ fn needle(args: &[String]) -> Result<String, String> {
     };
     let (mut ctx, mut lens, mut sets, mut json) =
         (16384usize, vec![4096usize, 16384], 1usize, false);
+    let mut ngen = 8usize; // greedy 생성 토큰(패스코드 탐색 창)
     while let Some(a) = it.next() {
         match a.as_str() {
             "--ctx" => {
@@ -511,6 +516,11 @@ fn needle(args: &[String]) -> Result<String, String> {
                             .map_err(|_| "--lens requires N,N".to_string())
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+            }
+            "--gen" => {
+                ngen = arg(&mut it, "--gen requires a number")?
+                    .parse()
+                    .map_err(|_| "--gen requires a number".to_string())?;
             }
             "--sets" => {
                 sets = arg(&mut it, "--sets requires a number")?
@@ -579,6 +589,9 @@ fn needle(args: &[String]) -> Result<String, String> {
                 toks.extend_from_slice(&hay[cut..hay_need]);
                 toks.extend_from_slice(&q_id);
                 dec.reset_state(0)?;
+                // [K6-3 결함수정] 문맥+답변(8토큰) KV 블록 확보 — 프로브는
+                // 스케줄러 부재(ppl과 동일 계약).
+                dec.kv_grow(0, toks.len() + 16)?;
                 // 문맥 n-1토큰까지 배치 체인 프리필(무로짓·t≥ 2) — 마지막
                 // 토큰은 t=1 head로 예측(프리필/디코드 경계 동일).
                 let n_ctx = toks.len() - 1;
@@ -597,8 +610,8 @@ fn needle(args: &[String]) -> Result<String, String> {
                     0,
                     &model.embed_row(toks[n_ctx]).map_err(|e| e.to_string())?,
                 )?;
-                let mut picks: Vec<u32> = Vec::with_capacity(8);
-                for _ in 0..8 {
+                let mut picks: Vec<u32> = Vec::with_capacity(ngen);
+                for _ in 0..ngen {
                     let mut best = (0u32, f32::MIN);
                     for (j, &v) in row.iter().enumerate() {
                         if v > best.1 {
