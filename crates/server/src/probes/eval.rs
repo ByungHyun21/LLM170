@@ -725,7 +725,9 @@ fn needle(args: &[String]) -> Result<String, String> {
                 }
                 let found: Vec<bool> = (0..needles)
                     .map(|j| {
-                        picks.windows(word_id[j].len()).any(|w| w == &word_id[j][..])
+                        picks
+                            .windows(word_id[j].len())
+                            .any(|w| w == &word_id[j][..])
                             || gen_text.contains(pcs[j].as_str())
                     })
                     .collect();
@@ -1032,7 +1034,7 @@ mod ci_tests {
     #[test]
     fn ci_block_bootstrap_orders() {
         // 혼합 부호 — CI가 평균을 감싼다.
-        let base: Vec<f64> = (0..128).map(|i| 2.0).collect();
+        let base: Vec<f64> = (0..128).map(|_| 2.0).collect();
         let mut cand = base.clone();
         for i in (0..128).step_by(2) {
             cand[i] += 0.05;
@@ -1041,9 +1043,28 @@ mod ci_tests {
         let p1 = write_tmp_dump(&base, "ci-m1");
         let p2 = write_tmp_dump(&cand, "ci-m2");
         let out = ci(&[p1.clone(), p2.clone(), "--json".into()]).unwrap();
-        assert!(out.contains("\"ci_nll_lo\"") && out.contains("\"ci_nll_hi\""), "{out}");
-        let lo: f64 = out.split("\"ci_nll_lo\":").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
-        let hi: f64 = out.split("\"ci_nll_hi\":").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+        assert!(
+            out.contains("\"ci_nll_lo\"") && out.contains("\"ci_nll_hi\""),
+            "{out}"
+        );
+        let lo: f64 = out
+            .split("\"ci_nll_lo\":")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let hi: f64 = out
+            .split("\"ci_nll_hi\":")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
         assert!(lo <= hi);
         let _ = std::fs::remove_file(&p1);
         let _ = std::fs::remove_file(&p2);
@@ -1051,7 +1072,9 @@ mod ci_tests {
 
     fn write_tmp_dump(nlls: &[f64], tag: &str) -> String {
         let p = std::env::temp_dir().join(format!("eval-{tag}-{}.tsv", std::process::id()));
-        let mut s = String::from("# w4a16-eval dump v1 model=x tokens=0 head=gpu nll_sum=0 ppl=0\n# cols: pos target argmax nll margin\n");
+        let mut s = String::from(
+            "# w4a16-eval dump v1 model=x tokens=0 head=gpu nll_sum=0 ppl=0\n# cols: pos target argmax nll margin\n",
+        );
         for (i, &n) in nlls.iter().enumerate() {
             s.push_str(&format!("{}\t{}\t0\t{}\t0.5\n", i + 1, 7, n));
         }

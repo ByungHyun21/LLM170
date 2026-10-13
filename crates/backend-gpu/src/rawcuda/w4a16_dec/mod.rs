@@ -394,6 +394,8 @@ pub(super) struct Gdn {
     pub(super) dnwg: CUdeviceptr,
     pub(super) dring: CUdeviceptr,
     pub(super) dgst: CUdeviceptr,
+    /// [행-스케일 2026-10-13] 상태 행(kdim)별 f32 스케일 [슬롯][n_gdn][h_v][128].
+    pub(super) dsc: CUdeviceptr,
     pub(super) dqkv: CUdeviceptr,
     pub(super) dzv: CUdeviceptr,
     pub(super) dgxn: CUdeviceptr,
@@ -716,6 +718,7 @@ impl W4a16Dec {
                 dnwg: 0,
                 dring: 0,
                 dgst: 0,
+                dsc: 0,
                 dqkv: 0,
                 dzv: 0,
                 dgxn: 0,

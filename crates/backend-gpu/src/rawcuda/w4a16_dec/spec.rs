@@ -168,7 +168,8 @@ impl W4a16Dec {
                 self.gdn.dwy_dc,
                 self.gdn.dwy_g,
             );
-            let mut w4 = self.gdn.dgst + (st_slot as u64) * 4;
+            let mut w4 = self.gdn.dgst + (st_slot as u64) * 2;
+            let mut w5 = self.gdn.dsc + (st_slot as u64) * 4;
             let (mut wm, mut hk, mut hv, mut dd, mut lay) = (
                 keep as i32,
                 dm.h_k as i32,
@@ -181,11 +182,13 @@ impl W4a16Dec {
                 dm.h_v as u32,
                 1,
                 128,
-                &mut crate::rawcuda::args::l10(
-                    &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut wm, &mut hk, &mut hv,
-                    &mut dd, &mut lay,
+                &mut crate::rawcuda::args::l11(
+                    &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5, &mut wm, &mut hk,
+                    &mut hv, &mut dd, &mut lay,
                 ),
             )?;
+            // [행-스케일] 재구성 직후 스케일 정규화.
+            self.gdn_rescale_slot(slot, gi)?;
             let rsrc = self.gdn.dsnap_ring + (gi as u64 * 8 + (keep - 1) as u64) * ring_elems * 4;
             let rdst = self.gdn.dring + (ring_slot as u64 + gi as u64 * ring_elems) * 4;
             self.copy_dev(rdst, rsrc, ring_elems * 4)?;
@@ -243,14 +246,16 @@ impl W4a16Dec {
     pub fn spec_dump_state(&mut self, slot: usize) -> Result<Vec<f32>, String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
-        let bytes = dm.n_gdn * dm.h_v * dm.d * dm.d * 4;
+        // [행-스케일] f16 원시값 디코드 — 스케일 미적용(경로 대조용: 양 경로가
+        // 같은 스케일 계열을 쓰므로 비교 성립). 절대값 해석이 필요하면 ×sc.
+        let bytes = dm.n_gdn * dm.h_v * dm.d * dm.d * 2;
         let mut b = vec![0u8; bytes];
-        self.cc.d2h(&mut b, self.gdn.dgst + st_slot * 4)?;
+        self.cc.d2h(&mut b, self.gdn.dgst + st_slot * 2)?;
         self.cc.sync()?;
-        Ok(b.as_chunks::<4>()
+        Ok(b.as_chunks::<2>()
             .0
             .iter()
-            .map(|c| f32::from_le_bytes(*c))
+            .map(|c| crate::rawcuda::gptq4::h2f(u16::from_le_bytes(*c)))
             .collect())
     }
 
@@ -265,13 +270,20 @@ impl W4a16Dec {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let k = (pos / 512 - 1) as usize % 4;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
-        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
+        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
+        let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;
+        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
-        let per = st_bytes + ring_bytes;
+        let per = st_bytes + sc_bytes + ring_bytes;
         let base = self.gdn.dchk + (slot as u64 * 4 + k as u64) * per;
-        self.copy_dev(base, self.gdn.dgst + st_slot * 4, st_bytes)?;
-        self.copy_dev(base + st_bytes, self.gdn.dring + ring_slot * 4, ring_bytes)?;
+        self.copy_dev(base, self.gdn.dgst + st_slot * 2, st_bytes)?;
+        self.copy_dev(base + st_bytes, self.gdn.dsc + sc_slot * 4, sc_bytes)?;
+        self.copy_dev(
+            base + st_bytes + sc_bytes,
+            self.gdn.dring + ring_slot * 4,
+            ring_bytes,
+        )?;
         self.gdn.dchk_pos[slot][k] = pos;
         // [§3.4 ② 2026-10-12] 사용 갱신 — 512경계 기록 시점 recency 리셋.
         self.ucache.touch("spec:ckpt")?;
@@ -301,13 +313,20 @@ impl W4a16Dec {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let k = (pos / 512 - 1) as usize % 4;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
-        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
+        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
+        let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;
+        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
-        let per = st_bytes + ring_bytes;
+        let per = st_bytes + sc_bytes + ring_bytes;
         let base = self.gdn.dchk + (slot as u64 * 4 + k as u64) * per;
-        self.copy_dev(self.gdn.dgst + st_slot * 4, base, st_bytes)?;
-        self.copy_dev(self.gdn.dring + ring_slot * 4, base + st_bytes, ring_bytes)?;
+        self.copy_dev(self.gdn.dgst + st_slot * 2, base, st_bytes)?;
+        self.copy_dev(self.gdn.dsc + sc_slot * 4, base + st_bytes, sc_bytes)?;
+        self.copy_dev(
+            self.gdn.dring + ring_slot * 4,
+            base + st_bytes + sc_bytes,
+            ring_bytes,
+        )?;
         self.slot_pos[slot] = pos;
         self.attn_set_pos(slot, pos)?;
         // [§3.4 ②] 사용 갱신 — 접두 히트(재사용 성립) 시점.
@@ -324,12 +343,19 @@ impl W4a16Dec {
     pub fn spec_save_state(&mut self, slot: usize) -> Result<(), String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
-        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
+        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
+        let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;
+        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
-        self.copy_dev(self.gdn.dsave, self.gdn.dgst + st_slot * 4, st_bytes)?;
+        self.copy_dev(self.gdn.dsave, self.gdn.dgst + st_slot * 2, st_bytes)?;
         self.copy_dev(
             self.gdn.dsave + st_bytes,
+            self.gdn.dsc + sc_slot * 4,
+            sc_bytes,
+        )?;
+        self.copy_dev(
+            self.gdn.dsave + st_bytes + sc_bytes,
             self.gdn.dring + ring_slot * 4,
             ring_bytes,
         )?;
@@ -341,13 +367,20 @@ impl W4a16Dec {
     pub fn spec_load_state(&mut self, slot: usize) -> Result<(), String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
-        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 4) as u64;
+        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
+        let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;
+        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
-        self.copy_dev(self.gdn.dgst + st_slot * 4, self.gdn.dsave, st_bytes)?;
+        self.copy_dev(self.gdn.dgst + st_slot * 2, self.gdn.dsave, st_bytes)?;
+        self.copy_dev(
+            self.gdn.dsc + sc_slot * 4,
+            self.gdn.dsave + st_bytes,
+            sc_bytes,
+        )?;
         self.copy_dev(
             self.gdn.dring + ring_slot * 4,
-            self.gdn.dsave + st_bytes,
+            self.gdn.dsave + st_bytes + sc_bytes,
             ring_bytes,
         )?;
         // [§3.4 ②] 사용 갱신 — 복원(수용/롤백) 시점.
