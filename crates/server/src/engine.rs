@@ -94,6 +94,48 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
     ))
 }
 
+/// [2.J 2026-10-13] serve 런치 정책 — CLI가 env(진단)보다 우선한다.
+/// spec: 0=auto(경제성 게이트) · 1=mtp · 2=ngram · 3=off(평범).
+/// moe:  0=auto(여유 VRAM으로 상주/스트리밍) · 1=resident 강제 · 2=streaming 강제.
+pub static SPEC_POLICY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MOE_POLICY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn parse_spec_policy(v: &str) -> Option<u8> {
+    match v {
+        "auto" => Some(0),
+        "mtp" => Some(1),
+        "ngram" => Some(2),
+        "off" => Some(3),
+        _ => None,
+    }
+}
+
+pub fn spec_name() -> &'static str {
+    match SPEC_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => "mtp",
+        2 => "ngram",
+        3 => "off",
+        _ => "auto",
+    }
+}
+
+pub fn moe_name() -> &'static str {
+    match MOE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => "resident",
+        2 => "streaming",
+        _ => "auto",
+    }
+}
+
+pub fn parse_moe_policy(v: &str) -> Option<u8> {
+    match v {
+        "auto" => Some(0),
+        "resident" => Some(1),
+        "streaming" => Some(2),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct InferRequest {
     pub model: PathBuf,
@@ -258,5 +300,24 @@ mod tests {
         assert_eq!(complete_utf8_prefix(&[0x80, 0x80]), 0);
         assert_eq!(complete_utf8_prefix(b"abc"), 3);
         assert_eq!(complete_utf8_prefix(b""), 0);
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    /// [2.J] CLI 정책 파서 — 유효값/거부.
+    #[test]
+    fn policy_parsers() {
+        assert_eq!(parse_spec_policy("auto"), Some(0));
+        assert_eq!(parse_spec_policy("mtp"), Some(1));
+        assert_eq!(parse_spec_policy("ngram"), Some(2));
+        assert_eq!(parse_spec_policy("off"), Some(3));
+        assert_eq!(parse_spec_policy("x"), None);
+        assert_eq!(parse_moe_policy("auto"), Some(0));
+        assert_eq!(parse_moe_policy("resident"), Some(1));
+        assert_eq!(parse_moe_policy("streaming"), Some(2));
+        assert_eq!(parse_moe_policy(""), None);
     }
 }

@@ -30,7 +30,8 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
   llm170 bench --model <w4a16_dir> [--pp N[,N..]] [--tg N[,N..]] [--np N[,N..]]
               [--reps N] [--ctx N]
       llama-bench 규격 PP/TG/NP 측정(엔진 직접 — HTTP 무경유, 합성 LCG 토큰).
-  llm170 serve --model <w4a16_dir> [--port N] [--ctx N] [--slots N] [--queue N]
+  llm170 serve --model <w4a16_dir> [--port N] [--ctx N|auto] [--slots N] [--queue N]
+              [--spec auto|mtp|ngram|off] [--moe auto|resident|streaming]
       OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯.
   llm170 w4a16-load <dir>
       W4A16(compressed-tensors int4 sym g128) 로더 완전성 검증 — 트리플·커버리지.
@@ -260,6 +261,19 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 Some(q) => queue = Some(q.max(1)),
                 None => return usage_err("--queue requires a number"),
             },
+            // [2.J 2026-10-13] 런치 정책 2종 (CLI > env 진단).
+            "--spec" => match it.next().map(|v| crate::engine::parse_spec_policy(v)) {
+                Some(Some(p)) => {
+                    crate::engine::SPEC_POLICY.store(p as u64, std::sync::atomic::Ordering::Relaxed)
+                }
+                _ => return usage_err("--spec requires auto|mtp|ngram|off"),
+            },
+            "--moe" => match it.next().map(|v| crate::engine::parse_moe_policy(v)) {
+                Some(Some(p)) => {
+                    crate::engine::MOE_POLICY.store(p as u64, std::sync::atomic::Ordering::Relaxed)
+                }
+                _ => return usage_err("--moe requires auto|resident|streaming"),
+            },
             other => return usage_err(&format!("unknown flag: {other}")),
         }
     }
@@ -351,6 +365,11 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 "# ctx: model max={} 풀 파생={pool_ctx} 사용={ctx} (kv 예산 {:.1}GiB)",
                 ci.ctx,
                 gib(budget)
+            );
+            eprintln!(
+                "# policy: spec={}(CLI) moe={}(CLI) — env 진단(LLM170_SPEC_DRAFT_SOURCE/MOE_RESIDENT)보다 우선",
+                crate::engine::spec_name(),
+                crate::engine::moe_name()
             );
         }
         Err(e) => eprintln!("# ctx 검증 건너뜀(config 판독 실패): {e}"),

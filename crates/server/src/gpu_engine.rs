@@ -305,7 +305,12 @@ impl GpuEngine {
     /// 종전 파킹 경로와 동일). 초안은 검증이 정본이라 이 게이트는 무손실
     /// (운영 정책 — 수치 경로 분기 아님, 단일화 방침 준수).
     pub fn mtp_drafts_on(&self) -> bool {
-        self.mtp && llm170_diag::flag::val("LLM170_SPEC_DRAFT_SOURCE") != Some("ngram")
+        // [2.J] CLI 정책 우선 — 1=mtp 강제(가용 시) · 2=ngram 강제 · 0=auto(env 진단).
+        match crate::engine::SPEC_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => self.mtp,
+            2 => false,
+            _ => self.mtp && llm170_diag::flag::val("LLM170_SPEC_DRAFT_SOURCE") != Some("ngram"),
+        }
     }
 
     /// [MTP] 라운드 전 — 검증 체인 dres의 수용 접두 acc행을 hidden 어셈블리로
@@ -697,10 +702,15 @@ pub(crate) fn upload_moe(
     let free = llm170_backend_gpu::cuda_mem_free()
         .map(|(f, _)| f)
         .unwrap_or(0);
-    let resident = match llm170_diag::flag::val("LLM170_MOE_RESIDENT") {
-        Some("0") => false,
-        Some("1") => true,
-        _ => free > expert_bytes + (1 << 30),
+    // [2.J] CLI 정책 우선 — 1=resident 강제 · 2=streaming 강제 · 0=auto(env/여유).
+    let resident = match crate::engine::MOE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => match llm170_diag::flag::val("LLM170_MOE_RESIDENT") {
+            Some("0") => false,
+            Some("1") => true,
+            _ => free > expert_bytes + (1 << 30),
+        },
     };
     let tab_ms = t1.elapsed().as_secs_f64() * 1e3;
     let t2 = std::time::Instant::now();

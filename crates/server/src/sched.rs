@@ -600,8 +600,10 @@ fn econ_pick_k(cur: usize, emas: [Option<f64>; 4]) -> usize {
 /// [2.A-④] 게이트 판정 — (소스, k). None = 평범(라운드 생략).
 fn econ_plan(mtp_avail: bool) -> Option<(u8, usize)> {
     // [진단 2026-10-13] 비결정성 격리용 — 스펙 전면 off(평범 전용). 무손실
-    // 경로 선택(성능만) · 운영 진단 한정.
-    if llm170_diag::flag::on_nonzero("LLM170_SPEC_OFF") {
+    // 경로 선택(성능만) · 운영 진단 한정. [2.J] CLI `--spec off`(정책) 우선.
+    if crate::engine::SPEC_POLICY.load(Ordering::Relaxed) == 3
+        || llm170_diag::flag::on_nonzero("LLM170_SPEC_OFF")
+    {
         return None;
     }
     let plain = econ_get(&SCHED.econ_plain, &SCHED.econ_plain_n);
