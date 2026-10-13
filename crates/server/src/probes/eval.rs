@@ -20,6 +20,19 @@
 
 use super::{arg, arg_str, finish};
 use llm170_backend_gpu::W4a16Dec;
+// [품질 게이트 규약 2026-10-12/13 — 코드가 정본] 숫자 후보(KV·상태 dtype 등)의
+// 채택/기각 판정(단일 경로 교체제 — 채택 시 골든 재동결+사유·델타 기록):
+// ① 단문 PPL 쌍(창별 en/ko) + `ci` 블록 부트스트랩 CI — 밴드 |ΔPPL| ≤ 0.3%(초과 = 기각).
+// ② 장문 PPL 쌍(mix 8K/16K/32K · chunk16) + `ci` — **단문 창은 장문 손상을 과소평가**
+//    (실측: GDN 상태 bf16·35B — 128창 +0.72% vs 32K창 **+10.8%**, 15×; guide와 무관한
+//    순환 누적형 손상은 장문에서만 드러남).
+// ③ 장문 AND: `needle`(MRCR-lite 다중 바늘·--hard·confused 검출) — PPL이 못 보는 회수
+//    실패 검출(역도 성립: needle이 못 잡는 누적 손상을 PPL 장문이 잡음 — 둘 다 필수).
+// ④ 불변식: 골든(단문·장문)·`agree`(argmax 일치율).
+// 업계 대비(2026-10-13 실코드 조사): vLLM = 태스크 정확도 0.88~0.95±0~8%p · KV는
+// 옵트인 PPL 델타 공개(+1.17~2.71%) · SGLang = "reported GSM8K −5%p" 사전 등록 —
+// 우리 밴드가 10~20× 타이트(폴백 없는 영구 교체의 대가 — 완화 논의는 장문 창+CI 증거로만).
+
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -489,19 +502,26 @@ fn agree(args: &[String]) -> Result<String, String> {
 
 /// argmax + top1-2 마진 — CPU `greedy_from` 규약(엄격 비교, 동률=최저 인덱스).
 /// [Q3 2026-10-12] needle 하네스 — 장문 검색 정확도(플랜 §5 Q3).
-/// 합성 haystack 내 고유 패스코드(결정적 LCG — rand 금지 계약)를 깊이
-/// (10/50/90%)별로 삽입하고, greedy 답변 8토큰에 패스코드 토큰 부분열이
-/// 있는지로 채점한다(토큰 id 기준 — 디코딩 무관·결정적). 문맥 프리필은
-/// ppl 청크 경로와 동일(KV 누적 — 수치 계급 동일).
+/// 장문 검색 게이트 — 합성 haystack(중성 문장 반복)에 고유 패스코드를 심고
+/// greedy 답변이 **그 패스코드를 정확히** 꺼내는지 채점한다(결정적 LCG·greedy).
+/// ① 단일 바늘(기본): --depths(기본 10/50/90%)별 삽입·질의.
+/// ② 다중 바늘 MRCR-lite(--needles N): N개를 균등 분산 삽입, 슬롯별 질의 —
+///    다른 바늘 오답 검출 = confused. --hard면 접두 4자 공유(근접 디스턴트랙터,
+///    접두 매칭으론 못 맞히게).
+/// 판정은 토큰 id 부분열 **또는 디토큰화 문자열 포함** — 생성 토큰화는 문맥
+/// 의존이라 id만 보면 정답을 놓친다(실측: 35B 오판). 문맥 프리필은 ppl 청크
+/// 경로와 동일(KV 누적 — 수치 계급 동일). 판정 결과·프로토콜은 코드 옆이 정본.
 fn needle(args: &[String]) -> Result<String, String> {
     let mut it = args.iter();
     let Some(dir) = it.next().cloned() else {
-        return Err("w4a16-eval needle <dir> [--ctx N] [--lens N,N] [--sets N] [--json] — 예: w4a16-eval needle ../models/Qwen3.8-27B-W4A16-AutoRound --lens 4096,16384".into());
+        return Err("w4a16-eval needle <dir> [--ctx N] [--lens N,N] [--sets N] [--needles N] [--hard] [--depths d,d,..] [--gen N] [--json] — 예: w4a16-eval needle ../models/Qwen3.8-27B-W4A16-AutoRound --lens 16384,24576 --needles 3 --hard".into());
     };
     let (mut ctx, mut lens, mut sets, mut json) =
         (16384usize, vec![4096usize, 16384], 1usize, false);
     let mut ngen = 8usize; // greedy 생성 토큰(패스코드 탐색 창)
     let (mut pf, mut picks_dbg) = (512usize, false); // 프리필 청크 캡·답변 덤프
+    let (mut needles, mut hard) = (1usize, false); // 다중 바늘·근접 디스턴트랙터
+    let mut depths = vec![10usize, 50, 90];
     while let Some(a) = it.next() {
         match a.as_str() {
             "--ctx" => {
@@ -534,6 +554,24 @@ fn needle(args: &[String]) -> Result<String, String> {
                     .parse()
                     .map_err(|_| "--sets requires a number")?;
             }
+            "--needles" => {
+                needles = arg(&mut it, "--needles requires a number")?
+                    .parse()
+                    .map_err(|_| "--needles requires a number".to_string())?;
+                if needles == 0 {
+                    return Err("--needles는 1 이상".into());
+                }
+            }
+            "--hard" => hard = true,
+            "--depths" => {
+                depths = arg(&mut it, "--depths requires d,d,..")?
+                    .split(',')
+                    .map(|v| {
+                        v.parse::<usize>()
+                            .map_err(|_| "--depths requires d,d,..".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
             "--json" => json = true,
             other => return Err(format!("w4a16-eval needle: unknown flag {other}")),
         }
@@ -563,41 +601,89 @@ fn needle(args: &[String]) -> Result<String, String> {
         (seed >> 33) as u32
     };
     let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let depths = [10usize, 50, 90];
-    let mut rows: Vec<(usize, usize, usize, bool)> = Vec::new();
+    let mut rows: Vec<(usize, usize, usize, bool, bool)> = Vec::new(); // len·깊이%·슬롯·hit·confused
     for &l in &lens {
-        if l + 32 > ctx {
+        if l + 64 * needles > ctx {
             return Err(format!("len {l} + 질문 > ctx {ctx} — --ctx 확대 필요"));
         }
-        for set in 0..sets {
-            let word: String = (0..6)
-                .map(|_| alphabet[(lcg() as usize) % alphabet.len()] as char)
+        for _set in 0..sets {
+            // [MRCR-lite 2026-10-13] 패스코드 needles개 — --hard면 접두 4자 공유.
+            let shared: String = if hard && needles > 1 {
+                (0..4)
+                    .map(|_| alphabet[(lcg() as usize) % alphabet.len()] as char)
+                    .collect()
+            } else {
+                String::new()
+            };
+            let mut pcs: Vec<String> = Vec::with_capacity(needles);
+            for _ in 0..needles {
+                let mut w = shared.clone();
+                while w.len() < 6 {
+                    w.push(alphabet[(lcg() as usize) % alphabet.len()] as char);
+                }
+                pcs.push(w);
+            }
+            let m_id: Vec<Vec<u32>> = pcs
+                .iter()
+                .enumerate()
+                .map(|(j, w)| {
+                    tk.encode_opts(
+                        &format!(" The secret passcode for slot {j} is {w}. "),
+                        false,
+                    )
+                })
                 .collect();
-            let n_id = tk.encode_opts(
-                &format!(" The secret passcode for slot {set} is {word}. "),
-                false,
-            );
-            let q_id = tk.encode_opts(
-                &format!(
-                    " What is the secret passcode for slot {set}? Reply with the passcode only:"
-                ),
-                false,
-            );
-            let word_id = tk.encode_opts(&word, false);
-            let hay_need = l.saturating_sub(n_id.len() + q_id.len());
+            let q_id: Vec<Vec<u32>> = (0..needles)
+                .map(|j| {
+                    tk.encode_opts(
+                        &format!(
+                            " What is the secret passcode for slot {j}? Reply with the passcode only:"
+                        ),
+                        false,
+                    )
+                })
+                .collect();
+            let word_id: Vec<Vec<u32>> = pcs.iter().map(|w| tk.encode_opts(w, false)).collect();
+            // 삽입 위치 % — needles=1이면 --depths(호환), N>1이면 균등 분산.
+            let positions: Vec<usize> = if needles == 1 {
+                depths.clone()
+            } else {
+                (1..=needles).map(|j| (j * 100) / (needles + 1)).collect()
+            };
+            let sum_m: usize = m_id.iter().map(|m| m.len()).sum();
+            let max_q = q_id.iter().map(|q| q.len()).max().unwrap_or(0);
+            let hay_need = l.saturating_sub(sum_m + max_q);
             if hay.len() < hay_need {
                 return Err(format!("haystack 부족: {} < {hay_need}", hay.len()));
             }
-            for &d in &depths {
-                let cut = hay_need * d / 100;
-                let mut toks: Vec<u32> = Vec::with_capacity(l + 16);
-                toks.extend_from_slice(&hay[..cut]);
-                toks.extend_from_slice(&n_id);
-                toks.extend_from_slice(&hay[cut..hay_need]);
-                toks.extend_from_slice(&q_id);
+            // 케이스 = (마커 배치 인덱스, 질의 슬롯) — 단일 바늘은 깊이별 슬롯0,
+            // 다중 바늘은 문맥(마커 전부)을 조립한 뒤 슬롯별 질의.
+            let cases: Vec<(usize, usize)> = if needles == 1 {
+                (0..positions.len()).map(|i| (i, 0)).collect()
+            } else {
+                (0..needles).map(|j| (j, j)).collect()
+            };
+            for (pos_i, ask) in cases {
+                let mut toks: Vec<u32> = Vec::with_capacity(l + 64);
+                if needles == 1 {
+                    let cut = hay_need * positions[pos_i] / 100;
+                    toks.extend_from_slice(&hay[..cut]);
+                    toks.extend_from_slice(&m_id[0]);
+                    toks.extend_from_slice(&hay[cut..hay_need]);
+                } else {
+                    let mut prev = 0usize;
+                    for (j, m) in m_id.iter().enumerate() {
+                        let cut = hay_need * positions[j] / 100;
+                        toks.extend_from_slice(&hay[prev..cut]);
+                        toks.extend_from_slice(m);
+                        prev = cut;
+                    }
+                    toks.extend_from_slice(&hay[prev..hay_need]);
+                }
+                toks.extend_from_slice(&q_id[ask]);
                 dec.reset_state(0)?;
-                // [K6-3 결함수정] 문맥+답변(8토큰) KV 블록 확보 — 프로브는
-                // 스케줄러 부재(ppl과 동일 계약).
+                // [K6-3 결함수정] 문맥+답변 KV 블록 확보 — 프로브는 스케줄러
+                // 부재(ppl과 동일 계약).
                 dec.kv_grow(0, toks.len() + 16)?;
                 // 문맥 n-1토큰까지 배치 체인 프리필(무로짓·t≥ 2) — 마지막
                 // 토큰은 t=1 head로 예측(프리필/디코드 경계 동일).
@@ -612,7 +698,7 @@ fn needle(args: &[String]) -> Result<String, String> {
                     dec.forward_prefill(0, &rb, t, false)?;
                     i += t;
                 }
-                // greedy 8토큰 — 마지막 문맥 토큰에서 시작.
+                // greedy ngen토큰 — 마지막 문맥 토큰에서 시작.
                 let mut row: Vec<f32> = dec.forward_device_head(
                     0,
                     &model.embed_row(toks[n_ctx]).map_err(|e| e.to_string())?,
@@ -637,40 +723,52 @@ fn needle(args: &[String]) -> Result<String, String> {
                 for &id in &picks {
                     gen_text.push_str(tk.piece(id).unwrap_or(""));
                 }
-                let hit = picks.windows(word_id.len()).any(|w| w == &word_id[..])
-                    || gen_text.contains(&word);
+                let found: Vec<bool> = (0..needles)
+                    .map(|j| {
+                        picks.windows(word_id[j].len()).any(|w| w == &word_id[j][..])
+                            || gen_text.contains(pcs[j].as_str())
+                    })
+                    .collect();
+                let hit = found[ask];
+                let confused = found.iter().enumerate().any(|(i, &h)| i != ask && h);
+                let d = positions[pos_i];
                 if picks_dbg {
                     eprintln!(
-                        "[needle] len={l} d={d} word={word} hit={hit} picks={picks:?}"
+                        "[needle] len={l} d={d}% ask={ask} pcs={pcs:?} hit={hit} confused={confused} picks={picks:?}"
                     );
                 }
-                rows.push((l, d, set, hit));
+                rows.push((l, d, ask, hit, confused));
             }
         }
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     let hits = rows.iter().filter(|r| r.3).count();
+    let conf = rows.iter().filter(|r| r.4).count();
     if json {
         let cells: Vec<String> = rows
             .iter()
-            .map(|(l, d, s, h)| {
-                format!("{{\"len\":{l},\"depth_pct\":{d},\"set\":{s},\"hit\":{h}}}")
+            .map(|(l, d, s, h, c)| {
+                format!(
+                    "{{\"len\":{l},\"depth_pct\":{d},\"slot\":{s},\"hit\":{h},\"confused\":{c}}}"
+                )
             })
             .collect();
         return Ok(format!(
-            "{{\"model\":\"{dir}\",\"cases\":{},\"hits\":{hits},\"acc\":{:.4},\"elapsed_ms\":{ms:.0},\"rows\":[{}]}}",
+            "{{\"model\":\"{dir}\",\"cases\":{},\"hits\":{hits},\"confused\":{conf},\"acc\":{:.4},\"elapsed_ms\":{ms:.0},\"rows\":[{}]}}",
             rows.len(),
             hits as f64 / rows.len().max(1) as f64,
             cells.join(",")
         ));
     }
     let mut s = format!(
-        "needle {dir}: {hits}/{} hits ({:.1}%)\n",
+        "needle {dir}: {hits}/{} hits ({:.1}%) · confused {conf}\n",
         rows.len(),
         100.0 * hits as f64 / rows.len().max(1) as f64
     );
-    for (l, d, set, h) in &rows {
-        s.push_str(&format!("  len={l} depth={d}% set={set} hit={h}\n"));
+    for (l, d, set, h, c) in &rows {
+        s.push_str(&format!(
+            "  len={l} depth={d}% slot={set} hit={h} confused={c}\n"
+        ));
     }
     s.push_str(&format!("  elapsed {ms:.0}ms\n"));
     Ok(s)
