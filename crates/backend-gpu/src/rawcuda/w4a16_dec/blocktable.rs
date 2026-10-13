@@ -18,6 +18,8 @@ pub struct KvPool {
     mb_max: usize,
     /// 자유 블록 id(스택 — 할당 O(1)).
     free: Vec<u32>,
+    /// 총 블록 수(용량 — 입장 불가 판정).
+    total: usize,
     /// slot_map[slot][layer * mb_max + bi] = 물리 id (u32::MAX = 미할당).
     slot_map: Vec<Vec<u32>>,
     used: Vec<usize>,
@@ -42,6 +44,7 @@ impl KvPool {
             n_layers,
             mb_max,
             free: (0..total_blocks as u32).rev().collect(),
+            total: total_blocks,
             slot_map: vec![vec![u32::MAX; n_layers * mb_max]; n_slots],
             used: vec![0; n_slots],
         })
@@ -113,6 +116,11 @@ impl KvPool {
     #[allow(dead_code)] // [K6-3] 다음 단계(입장 보장·실효 ctx) 배선 전
     pub fn free_blocks(&self) -> usize {
         self.free.len()
+    }
+
+    /// 총 블록 수 — 예약이 용량 자체를 넘는 요청의 조기 거부(무한 대기 방지).
+    pub fn total_blocks(&self) -> usize {
+        self.total
     }
 
     #[allow(dead_code)] // [K6-3] 다음 단계(입장 보장·실효 ctx) 배선 전

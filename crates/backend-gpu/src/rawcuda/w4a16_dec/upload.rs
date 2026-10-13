@@ -374,6 +374,15 @@ impl W4a16Dec {
         self.attn.kv_arena_bytes
     }
 
+    /// [K6-3] 풀 총 블록 수(용량 — 초과 예약 조기 거부).
+    pub fn kv_total_blocks(&self) -> usize {
+        self.attn
+            .kv_pool
+            .as_ref()
+            .map(|p| p.total_blocks())
+            .unwrap_or(0)
+    }
+
     /// [K6-3] 풀 여유 블록 수(입장 판정·모니터링).
     pub fn kv_free_blocks(&self) -> usize {
         self.attn

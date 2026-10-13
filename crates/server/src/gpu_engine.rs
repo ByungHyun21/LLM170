@@ -11,6 +11,7 @@ use std::path::Path;
 pub struct GpuEngine {
     model: llm170_core::qwen35::Model,
     dec: W4a16Dec,
+    #[allow(dead_code)] // reset_states(진단/복구) 전용
     n_slots: usize,
     /// GPU head 상주 여부(bf16 output.weight 업로드 성공).
     head_gpu: bool,
@@ -549,6 +550,16 @@ impl GpuEngine {
         self.dec.kv_free_blocks()
     }
 
+    /// [K6-3] 풀 총 블록 수(용량).
+    pub fn kv_total_blocks(&self) -> usize {
+        self.dec.kv_total_blocks()
+    }
+
+    /// [K6-3] 슬롯 KV 반납(유휴 슬롯 접두 캐시 회수 — 압박 사다리 1단계).
+    pub fn kv_release_slot(&mut self, slot: usize) -> usize {
+        self.dec.kv_release(slot)
+    }
+
     /// [K6-3] n_tokens 예약 필요 블록 수(입장 판정).
     pub fn kv_blocks_needed(&self, n_tokens: usize) -> usize {
         self.dec.kv_blocks_needed(n_tokens)
@@ -607,6 +618,7 @@ impl GpuEngine {
     }
 
     /// 전 슬롯 리셋(서버 워밍업 종료 후).
+    #[allow(dead_code)] // [K6-3] 워밍업은 reset_seq(0)(KV 반납 포함)로 대체 — 진단/복구용 유지
     pub fn reset_states(&mut self) -> Result<(), String> {
         for s in 0..self.n_slots {
             self.dec.reset_state(s)?;
