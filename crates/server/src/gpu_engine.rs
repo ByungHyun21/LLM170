@@ -350,6 +350,10 @@ impl GpuEngine {
         let t = toks.len() as u32;
         let pos_start = self.dec.slot_pos_of(slot).saturating_sub(t);
         let draft = self.dec.mtp_run(slot, &toks, &embeds, pos_start)?;
+        // [2.A-③ 2026-10-13] 재귀 시드 = 앵커 마지막 행(t-1)의 fin — 체인/순차
+        // 재귀의 "ptr5 행 0 복사" 계약에 맞춰 정규화한다(종전 t≥2에서 행 0을
+        // 읽어 d_2+가 스테일 조건에서 생성되던 결함). t=1은 무연산.
+        self.dec.mtp_fin_seed(t as usize - 1)?;
         // [MTP-CHAIN §3.3] 재귀 k-1스텝 = 체인 1회(호스트 왕복 0 — 종전
         // 4콜 ≈10.4ms/라운드 → 그래프 리플레이). base_pos = 앵커 마지막 행
         // 위치(pos_start+t-1): 리플레이의 dpp+1 → 첫 스텝 pos_start+t =

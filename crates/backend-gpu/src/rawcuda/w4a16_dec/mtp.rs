@@ -227,6 +227,31 @@ impl super::W4a16Dec {
         self.mtp_run_h(slot, &[tok], embed, pos, true)
     }
 
+    /// [2.A-③ 2026-10-13] 재귀 시드 정규화 — 앵커가 t행(t=수용+1)이면
+    /// 재귀의 피드백 hidden은 **마지막 행(t-1)의 fin**이다(fin[i] = (hidden_i,
+    /// toks[i]) 소비 후 — 마지막 행 = 보정 토큰 소비 후 피드백). 체인·순차
+    /// 재귀 모두 "ptr5 행 0"을 복사하므로 진입 전에 행 t-1 → 행 0으로 옮긴다.
+    /// [결함] 종전 t≥2에서 행 0(첫 수용 행의 fin)을 읽어 d_2+가 스테일
+    /// 조건에서 생성됐다(수용률만 저해 — 검증이 정본이라 출력 무손실).
+    /// t=1 앵커는 행 0이 곧 마지막 행 — 무연산(체인 계약 그대로).
+    pub fn mtp_fin_seed(&mut self, last_row: usize) -> Result<(), String> {
+        if !self.mtp.mtp_ok {
+            return Err("mtp: 미등록".into());
+        }
+        if last_row == 0 {
+            return Ok(());
+        }
+        if last_row >= MTP_TMAX {
+            return Err(format!("mtp fin seed: row={last_row} >= {MTP_TMAX}"));
+        }
+        let h = self.hidden;
+        self.copy_dev(
+            self.mtp_ptr(5),
+            self.mtp_ptr(5) + (last_row * h) as u64 * 4,
+            (h * 4) as u64,
+        )
+    }
+
     /// [MTP-2] 미래 잔존 행 위생 — pos+1 행(lim 슬랙이 읽는 한 행)의
     /// k/v/스케일을 0으로(이전 라운드 재귀 잔존분이 lim=pos+t+1 판독에
     /// 섞이는 것 차단). 초안 정확도만 영향(검증이 정본).
