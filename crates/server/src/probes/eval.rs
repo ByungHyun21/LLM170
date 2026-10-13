@@ -592,7 +592,9 @@ fn needle(args: &[String]) -> Result<String, String> {
 
     // 합성 haystack — 중성 산책 문장 반복(코퍼스 의존 없음·결정적).
     const HAY: &str = "The narrow alpine trail bends past the old stone bridge and continues through the quiet valley below the snow line. ";
-    let hay: Vec<u32> = tk.encode_opts(&HAY.repeat(1400), false);
+    // [장거리 렌즈 2026-10-13] 1400→4000(≈88K토큰) — 32K/64K 렌즈 지원
+    // (KV 창·장문 회수 실험이 30K에서 막혔던 것을 확장).
+    let hay: Vec<u32> = tk.encode_opts(&HAY.repeat(4000), false);
     let mut seed = 0x5EED_C0DE_1234_5678u64;
     let mut lcg = || {
         seed = seed
