@@ -751,7 +751,12 @@ mod tests {
     fn shard_dry_run_examples() {
         // 100B급 ≈52G(64층×0.8125G), 2×64G(총 128G).
         let l = shard_layers(64, 812 * G / 1000);
-        let p = shard_plan(&l, &shard_split(0), &shard_hw(128 * G, 62 * G, 2), &wl(262_144));
+        let p = shard_plan(
+            &l,
+            &shard_split(0),
+            &shard_hw(128 * G, 62 * G, 2),
+            &wl(262_144),
+        );
         assert_eq!(p.cards, 2);
         assert!(p.fits, "{p:?}");
         // 블록 균형 — 최대/최소 카드 가중치 ≤ 1.15×.
@@ -762,14 +767,30 @@ mod tests {
         assert!(mx * 100 <= mn * 115, "불균형 {mx} vs {mn}");
         // 300B급 ≈155G, 2장 초과·4장 상주.
         let l3 = shard_layers(64, 2422 * G / 1000);
-        let p2 = shard_plan(&l3, &shard_split(0), &shard_hw(128 * G, 62 * G, 2), &wl(262_144));
+        let p2 = shard_plan(
+            &l3,
+            &shard_split(0),
+            &shard_hw(128 * G, 62 * G, 2),
+            &wl(262_144),
+        );
         assert!(!p2.fits);
-        let p4 = shard_plan(&l3, &shard_split(0), &shard_hw(256 * G, 62 * G, 4), &wl(262_144));
+        let p4 = shard_plan(
+            &l3,
+            &shard_split(0),
+            &shard_hw(256 * G, 62 * G, 4),
+            &wl(262_144),
+        );
         assert!(p4.fits, "{p4:?}");
         // 500B급 ≈258G — 4장에서도 초과(오프로드 레짐).
         let l5 = shard_layers(64, 4032 * G / 1000);
         assert!(
-            !shard_plan(&l5, &shard_split(0), &shard_hw(256 * G, 62 * G, 4), &wl(262_144)).fits
+            !shard_plan(
+                &l5,
+                &shard_split(0),
+                &shard_hw(256 * G, 62 * G, 4),
+                &wl(262_144)
+            )
+            .fits
         );
     }
 
@@ -789,7 +810,10 @@ mod tests {
         // 상태 총량 = state_bytes_per_ctx × contexts(=4) — 전 GDN 카드 합과 일치.
         let st_sum: u64 = p.per_card_state.iter().sum();
         let st_expect = 4 * 151 * (1 << 20);
-        assert!(st_sum > 0 && st_sum.abs_diff(st_expect) <= st_expect / 20, "st {st_sum}");
+        assert!(
+            st_sum > 0 && st_sum.abs_diff(st_expect) <= st_expect / 20,
+            "st {st_sum}"
+        );
     }
 
     /// 층 파싱 — 실명 픽스처(하이브리드 GDN/풀어텐션·expert 가산·embed 분리).
