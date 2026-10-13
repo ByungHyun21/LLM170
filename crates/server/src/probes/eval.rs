@@ -20,6 +20,19 @@
 
 use super::{arg, arg_str, finish};
 use llm170_backend_gpu::W4a16Dec;
+// [품질 게이트 규약 2026-10-12/13 — 코드가 정본] 숫자 후보(KV·상태 dtype 등)의
+// 채택/기각 판정(단일 경로 교체제 — 채택 시 골든 재동결+사유·델타 기록):
+// ① 단문 PPL 쌍(창별 en/ko) + `ci` 블록 부트스트랩 CI — 밴드 |ΔPPL| ≤ 0.3%(초과 = 기각).
+// ② 장문 PPL 쌍(mix 8K/16K/32K · chunk16) + `ci` — **단문 창은 장문 손상을 과소평가**
+//    (실측: GDN 상태 bf16·35B — 128창 +0.72% vs 32K창 **+10.8%**, 15×; guide와 무관한
+//    순환 누적형 손상은 장문에서만 드러남).
+// ③ 장문 AND: `needle`(MRCR-lite 다중 바늘·--hard·confused 검출) — PPL이 못 보는 회수
+//    실패 검출(역도 성립: needle이 못 잡는 누적 손상을 PPL 장문이 잡음 — 둘 다 필수).
+// ④ 불변식: 골든(단문·장문)·`agree`(argmax 일치율).
+// 업계 대비(2026-10-13 실코드 조사): vLLM = 태스크 정확도 0.88~0.95±0~8%p · KV는
+// 옵트인 PPL 델타 공개(+1.17~2.71%) · SGLang = "reported GSM8K −5%p" 사전 등록 —
+// 우리 밴드가 10~20× 타이트(폴백 없는 영구 교체의 대가 — 완화 논의는 장문 창+CI 증거로만).
+
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -34,10 +47,11 @@ fn run(args: &[String]) -> Result<String, String> {
     match args.first().map(String::as_str).unwrap_or("") {
         "ppl" => ppl(&args[1..]),
         "agree" => agree(&args[1..]),
+        "ci" => ci(&args[1..]),
         "needle" => needle(&args[1..]),
         "sample" => sample(&args[1..]),
         other => Err(format!(
-            "w4a16-eval: 서브커맨드 '{other}' — 사용법: w4a16-eval ppl <dir> --corpus <txt> [--out dump] | w4a16-eval agree <a> <b>"
+            "w4a16-eval: 서브커맨드 '{other}' — 사용법: w4a16-eval ppl <dir> --corpus <txt> [--out dump] | w4a16-eval agree <a> <b> | w4a16-eval ci <base> <cand> [--reps N] [--block N]"
         )),
     }
 }
@@ -133,6 +147,10 @@ fn ppl(args: &[String]) -> Result<String, String> {
         dec.upload_head(head.data, head.n_out as usize, head.n_in as usize)?;
     }
     dec.reset_state(0)?;
+    // [K6-3 결함수정 2026-10-13] 프로브 직접 경로는 스케줄러가 없어 KV 풀
+    // 블록을 스스로 확보해야 한다 — 미확보 시 512토큰(블록 경계) 초과에서
+    // 테이블 범위 밖 접근(illegal access, 실측). 창 전체(+슬랙)를 1회 보장.
+    dec.kv_grow(0, n + 8)?;
     let vocab = head.n_out as usize;
     let mut rows: Vec<Row> = Vec::with_capacity(n - 1);
     let mut nll_sum = 0f64;
@@ -221,6 +239,134 @@ fn ppl(args: &[String]) -> Result<String, String> {
             .as_ref()
             .map(|p| format!("\n  덤프 {p}"))
             .unwrap_or_default()
+    ))
+}
+
+/// ci — 두 덤프의 **쌍대 ΔNLL 블록 부트스트랩 CI**(채택 게이트 계측기, §2.I).
+/// 같은 코퍼스·같은 창의 teacher-forced NLL 두 벌을 토큰별로 짝지어 Δ(후보−기준)
+/// 평균과 95% CI를 낸다. 인접 토큰 자기상관을 반영해 **이동블록 부트스트랩**
+/// (기본 블록 16토큰) — i.i.d. 재표집은 CI를 과소평가한다. 난수는 splitmix64
+/// (rand 크레이트 금지 계약 — seed 고정 시 결정적).
+/// 밴드 판정은 ΔPPL%(= exp(ΔNLL평균)−1)의 CI로: 상한 < 밴드면 통과 등.
+fn ci(args: &[String]) -> Result<String, String> {
+    let a = arg_str(args, 0, "");
+    let b = arg_str(args, 1, "");
+    if a.is_empty() || b.is_empty() {
+        return Err(
+            "w4a16-eval ci <base.tsv> <cand.tsv> [--reps N] [--block N] [--seed S] [--json]".into(),
+        );
+    }
+    let (mut reps, mut block, mut seed, mut json) =
+        (10_000usize, 16usize, 0x1234_5678_9abc_def0u64, false);
+    let mut it = args.iter().skip(2);
+    while let Some(x) = it.next() {
+        match x.as_str() {
+            "--reps" => {
+                reps = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--reps requires a number")?
+            }
+            "--block" => {
+                block = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--block requires a number")?
+            }
+            "--seed" => {
+                seed = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--seed requires a number")?
+            }
+            "--json" => json = true,
+            other => return Err(format!("unknown flag: {other}")),
+        }
+    }
+    if block == 0 || reps == 0 {
+        return Err("--block/--reps는 1 이상".into());
+    }
+    let da = read_dump(&a)?;
+    let db = read_dump(&b)?;
+    if da.rows.len() != db.rows.len() {
+        return Err(format!(
+            "행 수 불일치: {a}={} {b}={}",
+            da.rows.len(),
+            db.rows.len()
+        ));
+    }
+    let n = da.rows.len();
+    let mut d: Vec<f64> = Vec::with_capacity(n);
+    let (mut win, mut loss, mut tie) = (0usize, 0usize, 0usize);
+    let mut worst = (0f64, 0u32);
+    for (x, y) in da.rows.iter().zip(db.rows.iter()) {
+        if x.0 != y.0 || x.1 != y.1 {
+            return Err(format!(
+                "pos/타깃 불일치(pos {} vs {}) — 같은 코퍼스 덤프가 아님",
+                x.0, y.0
+            ));
+        }
+        let delta = y.3 - x.3; // 후보 − 기준(음수 = 후보 우세)
+        if delta < 0.0 {
+            win += 1;
+        } else if delta > 0.0 {
+            loss += 1;
+        } else {
+            tie += 1;
+        }
+        if delta.abs() > worst.0.abs() {
+            worst = (delta, x.0);
+        }
+        d.push(delta);
+    }
+    let mean = d.iter().sum::<f64>() / n as f64;
+    let mean_a = da.rows.iter().map(|r| r.3).sum::<f64>() / n as f64;
+    let mean_b = db.rows.iter().map(|r| r.3).sum::<f64>() / n as f64;
+    // 이동블록 부트스트랩 — 시작 위치 균일 추출, 블록 내 순서 보존(순환).
+    let blk = block.min(n);
+    let nblk = n.div_ceil(blk);
+    let mut rng = seed;
+    let mut next = move || {
+        rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut means: Vec<f64> = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let mut acc = 0f64;
+        for _ in 0..nblk {
+            let start = (next() % n as u64) as usize;
+            for j in 0..blk {
+                acc += d[(start + j) % n];
+            }
+        }
+        means.push(acc / (nblk * blk) as f64);
+    }
+    means.sort_by(|p, q| p.total_cmp(q));
+    let qp = |p: f64| means[((means.len() - 1) as f64 * p).round() as usize];
+    let (lo, hi) = (qp(0.025), qp(0.975));
+    let pos_frac = means.iter().filter(|&&m| m > 0.0).count() as f64 / means.len() as f64;
+    // ΔNLL → ΔPPL% (PPL = exp(nll_mean)).
+    let (ppl_a, ppl_b) = (mean_a.exp(), mean_b.exp());
+    let pct = |x: f64| (x.exp() - 1.0) * 100.0;
+    if json {
+        return Ok(format!(
+            "{{\"n\":{n},\"base_ppl\":{ppl_a:.9},\"cand_ppl\":{ppl_b:.9},\"d_nll_mean\":{mean:.9},\"ci_nll_lo\":{lo:.9},\"ci_nll_hi\":{hi:.9},\"d_ppl_pct\":{:.6},\"ci_ppl_lo\":{:.6},\"ci_ppl_hi\":{:.6},\"win\":{win},\"loss\":{loss},\"tie\":{tie},\"block\":{blk},\"reps\":{reps},\"p_pos\":{pos_frac:.4}}}",
+            pct(mean),
+            pct(lo),
+            pct(hi)
+        ));
+    }
+    Ok(format!(
+        "w4a16-eval ci\n  base: {a} (ppl={ppl_a:.6})\n  cand: {b} (ppl={ppl_b:.6})\n  n={n} · 블록 {blk} · 재표집 {reps}\n  ΔNLL 평균 {mean:+.7} (95% CI [{lo:+.7}, {hi:+.7}])\n  ΔPPL {:+.4}% (95% CI [{:+.4}%, {:+.4}%])\n  토큰 승/패/동 {win}/{loss}/{tie} · 최악 {}{:+.4} @pos {} · P(Δ>0)={pos_frac:.3}",
+        pct(mean),
+        pct(lo),
+        pct(hi),
+        if worst.0 >= 0.0 { "+" } else { "" },
+        worst.0,
+        worst.1
     ))
 }
 
@@ -356,17 +502,26 @@ fn agree(args: &[String]) -> Result<String, String> {
 
 /// argmax + top1-2 마진 — CPU `greedy_from` 규약(엄격 비교, 동률=최저 인덱스).
 /// [Q3 2026-10-12] needle 하네스 — 장문 검색 정확도(플랜 §5 Q3).
-/// 합성 haystack 내 고유 패스코드(결정적 LCG — rand 금지 계약)를 깊이
-/// (10/50/90%)별로 삽입하고, greedy 답변 8토큰에 패스코드 토큰 부분열이
-/// 있는지로 채점한다(토큰 id 기준 — 디코딩 무관·결정적). 문맥 프리필은
-/// ppl 청크 경로와 동일(KV 누적 — 수치 계급 동일).
+/// 장문 검색 게이트 — 합성 haystack(중성 문장 반복)에 고유 패스코드를 심고
+/// greedy 답변이 **그 패스코드를 정확히** 꺼내는지 채점한다(결정적 LCG·greedy).
+/// ① 단일 바늘(기본): --depths(기본 10/50/90%)별 삽입·질의.
+/// ② 다중 바늘 MRCR-lite(--needles N): N개를 균등 분산 삽입, 슬롯별 질의 —
+///    다른 바늘 오답 검출 = confused. --hard면 접두 4자 공유(근접 디스턴트랙터,
+///    접두 매칭으론 못 맞히게).
+/// 판정은 토큰 id 부분열 **또는 디토큰화 문자열 포함** — 생성 토큰화는 문맥
+/// 의존이라 id만 보면 정답을 놓친다(실측: 35B 오판). 문맥 프리필은 ppl 청크
+/// 경로와 동일(KV 누적 — 수치 계급 동일). 판정 결과·프로토콜은 코드 옆이 정본.
 fn needle(args: &[String]) -> Result<String, String> {
     let mut it = args.iter();
     let Some(dir) = it.next().cloned() else {
-        return Err("w4a16-eval needle <dir> [--ctx N] [--lens N,N] [--sets N] [--json] — 예: w4a16-eval needle ../models/Qwen3.8-27B-W4A16-AutoRound --lens 4096,16384".into());
+        return Err("w4a16-eval needle <dir> [--ctx N] [--lens N,N] [--sets N] [--needles N] [--hard] [--depths d,d,..] [--gen N] [--json] — 예: w4a16-eval needle ../models/Qwen3.8-27B-W4A16-AutoRound --lens 16384,24576 --needles 3 --hard".into());
     };
     let (mut ctx, mut lens, mut sets, mut json) =
         (16384usize, vec![4096usize, 16384], 1usize, false);
+    let mut ngen = 8usize; // greedy 생성 토큰(패스코드 탐색 창)
+    let (mut pf, mut picks_dbg) = (512usize, false); // 프리필 청크 캡·답변 덤프
+    let (mut needles, mut hard) = (1usize, false); // 다중 바늘·근접 디스턴트랙터
+    let mut depths = vec![10usize, 50, 90];
     while let Some(a) = it.next() {
         match a.as_str() {
             "--ctx" => {
@@ -383,10 +538,39 @@ fn needle(args: &[String]) -> Result<String, String> {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
             }
+            "--pf" => {
+                pf = arg(&mut it, "--pf requires a number")?
+                    .parse()
+                    .map_err(|_| "--pf requires a number".to_string())?;
+            }
+            "--picks" => picks_dbg = true,
+            "--gen" => {
+                ngen = arg(&mut it, "--gen requires a number")?
+                    .parse()
+                    .map_err(|_| "--gen requires a number".to_string())?;
+            }
             "--sets" => {
                 sets = arg(&mut it, "--sets requires a number")?
                     .parse()
                     .map_err(|_| "--sets requires a number")?;
+            }
+            "--needles" => {
+                needles = arg(&mut it, "--needles requires a number")?
+                    .parse()
+                    .map_err(|_| "--needles requires a number".to_string())?;
+                if needles == 0 {
+                    return Err("--needles는 1 이상".into());
+                }
+            }
+            "--hard" => hard = true,
+            "--depths" => {
+                depths = arg(&mut it, "--depths requires d,d,..")?
+                    .split(',')
+                    .map(|v| {
+                        v.parse::<usize>()
+                            .map_err(|_| "--depths requires d,d,..".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
             }
             "--json" => json = true,
             other => return Err(format!("w4a16-eval needle: unknown flag {other}")),
@@ -417,45 +601,96 @@ fn needle(args: &[String]) -> Result<String, String> {
         (seed >> 33) as u32
     };
     let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let depths = [10usize, 50, 90];
-    let mut rows: Vec<(usize, usize, usize, bool)> = Vec::new();
+    let mut rows: Vec<(usize, usize, usize, bool, bool)> = Vec::new(); // len·깊이%·슬롯·hit·confused
     for &l in &lens {
-        if l + 32 > ctx {
+        if l + 64 * needles > ctx {
             return Err(format!("len {l} + 질문 > ctx {ctx} — --ctx 확대 필요"));
         }
-        for set in 0..sets {
-            let word: String = (0..6)
-                .map(|_| alphabet[(lcg() as usize) % alphabet.len()] as char)
+        for _set in 0..sets {
+            // [MRCR-lite 2026-10-13] 패스코드 needles개 — --hard면 접두 4자 공유.
+            let shared: String = if hard && needles > 1 {
+                (0..4)
+                    .map(|_| alphabet[(lcg() as usize) % alphabet.len()] as char)
+                    .collect()
+            } else {
+                String::new()
+            };
+            let mut pcs: Vec<String> = Vec::with_capacity(needles);
+            for _ in 0..needles {
+                let mut w = shared.clone();
+                while w.len() < 6 {
+                    w.push(alphabet[(lcg() as usize) % alphabet.len()] as char);
+                }
+                pcs.push(w);
+            }
+            let m_id: Vec<Vec<u32>> = pcs
+                .iter()
+                .enumerate()
+                .map(|(j, w)| {
+                    tk.encode_opts(
+                        &format!(" The secret passcode for slot {j} is {w}. "),
+                        false,
+                    )
+                })
                 .collect();
-            let n_id = tk.encode_opts(
-                &format!(" The secret passcode for slot {set} is {word}. "),
-                false,
-            );
-            let q_id = tk.encode_opts(
-                &format!(
-                    " What is the secret passcode for slot {set}? Reply with the passcode only:"
-                ),
-                false,
-            );
-            let word_id = tk.encode_opts(&word, false);
-            let hay_need = l.saturating_sub(n_id.len() + q_id.len());
+            let q_id: Vec<Vec<u32>> = (0..needles)
+                .map(|j| {
+                    tk.encode_opts(
+                        &format!(
+                            " What is the secret passcode for slot {j}? Reply with the passcode only:"
+                        ),
+                        false,
+                    )
+                })
+                .collect();
+            let word_id: Vec<Vec<u32>> = pcs.iter().map(|w| tk.encode_opts(w, false)).collect();
+            // 삽입 위치 % — needles=1이면 --depths(호환), N>1이면 균등 분산.
+            let positions: Vec<usize> = if needles == 1 {
+                depths.clone()
+            } else {
+                (1..=needles).map(|j| (j * 100) / (needles + 1)).collect()
+            };
+            let sum_m: usize = m_id.iter().map(|m| m.len()).sum();
+            let max_q = q_id.iter().map(|q| q.len()).max().unwrap_or(0);
+            let hay_need = l.saturating_sub(sum_m + max_q);
             if hay.len() < hay_need {
                 return Err(format!("haystack 부족: {} < {hay_need}", hay.len()));
             }
-            for &d in &depths {
-                let cut = hay_need * d / 100;
-                let mut toks: Vec<u32> = Vec::with_capacity(l + 16);
-                toks.extend_from_slice(&hay[..cut]);
-                toks.extend_from_slice(&n_id);
-                toks.extend_from_slice(&hay[cut..hay_need]);
-                toks.extend_from_slice(&q_id);
+            // 케이스 = (마커 배치 인덱스, 질의 슬롯) — 단일 바늘은 깊이별 슬롯0,
+            // 다중 바늘은 문맥(마커 전부)을 조립한 뒤 슬롯별 질의.
+            let cases: Vec<(usize, usize)> = if needles == 1 {
+                (0..positions.len()).map(|i| (i, 0)).collect()
+            } else {
+                (0..needles).map(|j| (j, j)).collect()
+            };
+            for (pos_i, ask) in cases {
+                let mut toks: Vec<u32> = Vec::with_capacity(l + 64);
+                if needles == 1 {
+                    let cut = hay_need * positions[pos_i] / 100;
+                    toks.extend_from_slice(&hay[..cut]);
+                    toks.extend_from_slice(&m_id[0]);
+                    toks.extend_from_slice(&hay[cut..hay_need]);
+                } else {
+                    let mut prev = 0usize;
+                    for (j, m) in m_id.iter().enumerate() {
+                        let cut = hay_need * positions[j] / 100;
+                        toks.extend_from_slice(&hay[prev..cut]);
+                        toks.extend_from_slice(m);
+                        prev = cut;
+                    }
+                    toks.extend_from_slice(&hay[prev..hay_need]);
+                }
+                toks.extend_from_slice(&q_id[ask]);
                 dec.reset_state(0)?;
+                // [K6-3 결함수정] 문맥+답변 KV 블록 확보 — 프로브는 스케줄러
+                // 부재(ppl과 동일 계약).
+                dec.kv_grow(0, toks.len() + 16)?;
                 // 문맥 n-1토큰까지 배치 체인 프리필(무로짓·t≥ 2) — 마지막
                 // 토큰은 t=1 head로 예측(프리필/디코드 경계 동일).
                 let n_ctx = toks.len() - 1;
                 let mut i = 0usize;
                 while i < n_ctx {
-                    let t = (n_ctx - i).clamp(2, 512);
+                    let t = (n_ctx - i).clamp(2, pf.max(2));
                     let mut rb: Vec<f32> = Vec::with_capacity(t * hp.n_embd);
                     for &tok in &toks[i..i + t] {
                         rb.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);
@@ -463,13 +698,13 @@ fn needle(args: &[String]) -> Result<String, String> {
                     dec.forward_prefill(0, &rb, t, false)?;
                     i += t;
                 }
-                // greedy 8토큰 — 마지막 문맥 토큰에서 시작.
+                // greedy ngen토큰 — 마지막 문맥 토큰에서 시작.
                 let mut row: Vec<f32> = dec.forward_device_head(
                     0,
                     &model.embed_row(toks[n_ctx]).map_err(|e| e.to_string())?,
                 )?;
-                let mut picks: Vec<u32> = Vec::with_capacity(8);
-                for _ in 0..8 {
+                let mut picks: Vec<u32> = Vec::with_capacity(ngen);
+                for _ in 0..ngen {
                     let mut best = (0u32, f32::MIN);
                     for (j, &v) in row.iter().enumerate() {
                         if v > best.1 {
@@ -480,34 +715,62 @@ fn needle(args: &[String]) -> Result<String, String> {
                     let er = model.embed_row(best.0).map_err(|e| e.to_string())?;
                     row = dec.forward_device_head(0, &er)?;
                 }
-                let hit = picks.windows(word_id.len()).any(|w| w == &word_id[..]);
-                rows.push((l, d, set, hit));
+                // [하네스 결함수정 2026-10-13] 토큰 id 부분열만으로는 생성-시점
+                // 토큰화가 단독 인코딩과 다를 때 정답을 놓친다(실측: 35B가
+                // "FAR39C"를 정확히 출력했는데도 0/6 — 병합 차이). 조각 문자열
+                // 연결로 패스코드 원문(ASCII)도 함께 찾는다.
+                let mut gen_text = String::new();
+                for &id in &picks {
+                    gen_text.push_str(tk.piece(id).unwrap_or(""));
+                }
+                let found: Vec<bool> = (0..needles)
+                    .map(|j| {
+                        picks
+                            .windows(word_id[j].len())
+                            .any(|w| w == &word_id[j][..])
+                            || gen_text.contains(pcs[j].as_str())
+                    })
+                    .collect();
+                let hit = found[ask];
+                let confused = found.iter().enumerate().any(|(i, &h)| i != ask && h);
+                let d = positions[pos_i];
+                if picks_dbg {
+                    eprintln!(
+                        "[needle] len={l} d={d}% ask={ask} pcs={pcs:?} hit={hit} confused={confused} picks={picks:?}"
+                    );
+                }
+                rows.push((l, d, ask, hit, confused));
             }
         }
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     let hits = rows.iter().filter(|r| r.3).count();
+    let conf = rows.iter().filter(|r| r.4).count();
     if json {
         let cells: Vec<String> = rows
             .iter()
-            .map(|(l, d, s, h)| {
-                format!("{{\"len\":{l},\"depth_pct\":{d},\"set\":{s},\"hit\":{h}}}")
+            .map(|(l, d, s, h, c)| {
+                format!(
+                    "{{\"len\":{l},\"depth_pct\":{d},\"slot\":{s},\"hit\":{h},\"confused\":{c}}}"
+                )
             })
             .collect();
         return Ok(format!(
-            "{{\"model\":\"{dir}\",\"cases\":{},\"hits\":{hits},\"acc\":{:.4},\"elapsed_ms\":{ms:.0},\"rows\":[{}]}}",
+            "{{\"model\":\"{dir}\",\"cases\":{},\"hits\":{hits},\"confused\":{conf},\"acc\":{:.4},\"elapsed_ms\":{ms:.0},\"rows\":[{}]}}",
             rows.len(),
             hits as f64 / rows.len().max(1) as f64,
             cells.join(",")
         ));
     }
     let mut s = format!(
-        "needle {dir}: {hits}/{} hits ({:.1}%)\n",
+        "needle {dir}: {hits}/{} hits ({:.1}%) · confused {conf}\n",
         rows.len(),
         100.0 * hits as f64 / rows.len().max(1) as f64
     );
-    for (l, d, set, h) in &rows {
-        s.push_str(&format!("  len={l} depth={d}% set={set} hit={h}\n"));
+    for (l, d, set, h, c) in &rows {
+        s.push_str(&format!(
+            "  len={l} depth={d}% slot={set} hit={h} confused={c}\n"
+        ));
     }
     s.push_str(&format!("  elapsed {ms:.0}ms\n"));
     Ok(s)
@@ -736,5 +999,86 @@ mod tests {
         assert_eq!(d.rows[0], (1, 5, 5, 1.0, 0.5));
         assert_eq!(d.nll_sum, Some(2.5));
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod ci_tests {
+    use super::*;
+
+    #[test]
+    fn ci_identical_dumps_zero() {
+        let p1 = write_tmp_dump(&[1.0, 1.2, 0.8, 2.0], "ci-a");
+        let p2 = write_tmp_dump(&[1.0, 1.2, 0.8, 2.0], "ci-b");
+        let out = ci(&[p1.clone(), p2.clone(), "--reps".into(), "1000".into()]).unwrap();
+        assert!(out.contains("+0.0000%"), "{out}");
+        assert!(out.contains("P(Δ>0)=0.000"), "{out}");
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn ci_uniform_delta_ppl() {
+        // 균일 Δ=+0.1 NLL → ΔPPL = e^0.1−1 = +10.5171%.
+        let base: Vec<f64> = (0..64).map(|i| 1.0 + 0.001 * i as f64).collect();
+        let cand: Vec<f64> = base.iter().map(|x| x + 0.1).collect();
+        let p1 = write_tmp_dump(&base, "ci-u1");
+        let p2 = write_tmp_dump(&cand, "ci-u2");
+        let out = ci(&[p1.clone(), p2.clone()]).unwrap();
+        assert!(out.contains("+10.5171%"), "{out}");
+        assert!(out.contains("1/0/63") || out.contains("0/64/0"), "{out}");
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn ci_block_bootstrap_orders() {
+        // 혼합 부호 — CI가 평균을 감싼다.
+        let base: Vec<f64> = (0..128).map(|_| 2.0).collect();
+        let mut cand = base.clone();
+        for i in (0..128).step_by(2) {
+            cand[i] += 0.05;
+            cand[i + 1] -= 0.02;
+        }
+        let p1 = write_tmp_dump(&base, "ci-m1");
+        let p2 = write_tmp_dump(&cand, "ci-m2");
+        let out = ci(&[p1.clone(), p2.clone(), "--json".into()]).unwrap();
+        assert!(
+            out.contains("\"ci_nll_lo\"") && out.contains("\"ci_nll_hi\""),
+            "{out}"
+        );
+        let lo: f64 = out
+            .split("\"ci_nll_lo\":")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let hi: f64 = out
+            .split("\"ci_nll_hi\":")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(lo <= hi);
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    fn write_tmp_dump(nlls: &[f64], tag: &str) -> String {
+        let p = std::env::temp_dir().join(format!("eval-{tag}-{}.tsv", std::process::id()));
+        let mut s = String::from(
+            "# w4a16-eval dump v1 model=x tokens=0 head=gpu nll_sum=0 ppl=0\n# cols: pos target argmax nll margin\n",
+        );
+        for (i, &n) in nlls.iter().enumerate() {
+            s.push_str(&format!("{}\t{}\t0\t{}\t0.5\n", i + 1, 7, n));
+        }
+        std::fs::write(&p, s).unwrap();
+        p.to_string_lossy().into_owned()
     }
 }

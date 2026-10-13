@@ -721,9 +721,16 @@ fn wy_reconstruct_matches_sequential() {
         cc.alloc(t_len * 2 * h_v * 4).unwrap(),
     );
     let (dst_, dout) = (
-        cc.alloc(h_v * d * d * 4).unwrap(),
+        // [행-스케일] 상태 = f16(2B/원소) + 행별 스케일 f32(초기 1.0 — 값 O(0.5)).
+        cc.alloc(h_v * d * d * 2).unwrap(),
         cc.alloc(t_len * v_len * 4).unwrap(),
     );
+    let dsc = cc.alloc(h_v * d * 4).unwrap();
+    {
+        let ones = vec![1.0f32; h_v * d];
+        let onesb: Vec<u8> = ones.iter().flat_map(|v| v.to_le_bytes()).collect();
+        cc.h2d(dsc, &onesb).unwrap();
+    }
     let (ws0, wdc, wg, wk) = (
         cc.alloc(h_v * d * d * 4).unwrap(),
         cc.alloc(8 * h_v * d * 4).unwrap(),
@@ -739,9 +746,15 @@ fn wy_reconstruct_matches_sequential() {
     // 참조 S_m — gdn_spec_scan(t=m) 최종 상태(순차 = 정답).
     let mut refs = vec![Vec::new(); t_len + 1];
     for m in 1..=t_len {
-        cc.h2d(dst_, b(&s0_host)).unwrap();
+        // [행-스케일] s0는 s=1 계약 — f16으로 업로드.
+        let s0b: Vec<u8> = s0_host
+            .iter()
+            .flat_map(|&x| f32_to_f16(x).to_le_bytes())
+            .collect();
+        cc.h2d(dst_, &s0b).unwrap();
         let f = cc.function("gdn_spec_scan").unwrap();
         let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) = (dq, dk, dv, dbg, dst_, dout);
+        let mut a6 = dsc;
         let (mut tl, mut hk, mut hv, mut dd, mut lay) =
             (m as i32, h_k as i32, h_v as i32, d as i32, 0i32);
         cc.launch(
@@ -749,26 +762,35 @@ fn wy_reconstruct_matches_sequential() {
             h_v as u32,
             1,
             128,
-            &mut crate::rawcuda::args::l11(
-                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut tl, &mut hk, &mut hv,
-                &mut dd, &mut lay,
+            &mut crate::rawcuda::args::l12(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a6, &mut a5, &mut tl, &mut hk,
+                &mut hv, &mut dd, &mut lay,
             ),
         )
         .unwrap();
         cc.sync().unwrap();
-        let mut ob = vec![0u8; h_v * d * d * 4];
+        let mut ob = vec![0u8; h_v * d * d * 2];
         cc.d2h(&mut ob, dst_).unwrap();
-        // SAFETY: d2h로 채운 버퍼의 f32 재해석(길이 = 원소수).
-        refs[m] =
-            unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, h_v * d * d) }.to_vec();
+        refs[m] = ob
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| crate::rawcuda::gptq4::h2f(u16::from_le_bytes(*c)))
+            .collect();
     }
 
     // WY — solve 1회(t=4) + 재구성 m=1..4.
-    cc.h2d(dst_, b(&s0_host)).unwrap();
+    // [행-스케일] s0는 s=1 계약 — f16으로 업로드.
+    let s0b: Vec<u8> = s0_host
+        .iter()
+        .flat_map(|&x| f32_to_f16(x).to_le_bytes())
+        .collect();
+    cc.h2d(dst_, &s0b).unwrap();
     {
         let f = cc.function("gdn_wy_solve").unwrap();
         let (mut a0, mut a1, mut a2, mut a3) = (dk, dv, dbg, dst_);
         let (mut a4, mut a5, mut a6, mut a7) = (ws0, wdc, wg, wk);
+        let mut a8 = dsc;
         let (mut tl, mut hk, mut hv, mut dd, mut lay) =
             (t_len as i32, h_k as i32, h_v as i32, d as i32, 0i32);
         cc.launch(
@@ -776,14 +798,15 @@ fn wy_reconstruct_matches_sequential() {
             h_v as u32,
             1,
             128,
-            &mut crate::rawcuda::args::l13(
-                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7, &mut tl,
-                &mut hk, &mut hv, &mut dd, &mut lay,
+            &mut crate::rawcuda::args::l14(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a8, &mut a4, &mut a5, &mut a6, &mut a7,
+                &mut tl, &mut hk, &mut hv, &mut dd, &mut lay,
             ),
         )
         .unwrap();
         let f = cc.function("gdn_spec_scan").unwrap();
         let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5) = (dq, dk, dv, dbg, dst_, dout);
+        let mut b6 = dsc;
         let (mut tl2, mut hk2, mut hv2, mut dd2, mut lay2) =
             (t_len as i32, h_k as i32, h_v as i32, d as i32, 0i32);
         cc.launch(
@@ -791,9 +814,9 @@ fn wy_reconstruct_matches_sequential() {
             h_v as u32,
             1,
             128,
-            &mut crate::rawcuda::args::l11(
-                &mut b0, &mut b1, &mut b2, &mut b3, &mut b4, &mut b5, &mut tl2, &mut hk2, &mut hv2,
-                &mut dd2, &mut lay2,
+            &mut crate::rawcuda::args::l12(
+                &mut b0, &mut b1, &mut b2, &mut b3, &mut b4, &mut b6, &mut b5, &mut tl2, &mut hk2,
+                &mut hv2, &mut dd2, &mut lay2,
             ),
         )
         .unwrap();
@@ -802,6 +825,7 @@ fn wy_reconstruct_matches_sequential() {
         let f = cc.function("gdn_wy_reconstruct").unwrap();
         let (mut a0, mut a1, mut a2, mut a3) = (wk, ws0, wdc, wg);
         let mut a4 = dst_;
+        let mut a5 = dsc;
         let (mut am, mut hk, mut hv, mut dd, mut lay) =
             (m as i32, h_k as i32, h_v as i32, d as i32, 0i32);
         cc.launch(
@@ -809,25 +833,30 @@ fn wy_reconstruct_matches_sequential() {
             h_v as u32,
             1,
             128,
-            &mut crate::rawcuda::args::l10(
-                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut am, &mut hk, &mut hv, &mut dd,
-                &mut lay,
+            &mut crate::rawcuda::args::l11(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut am, &mut hk, &mut hv,
+                &mut dd, &mut lay,
             ),
         )
         .unwrap();
         cc.sync().unwrap();
-        let mut ob = vec![0u8; h_v * d * d * 4];
+        let mut ob = vec![0u8; h_v * d * d * 2];
         cc.d2h(&mut ob, dst_).unwrap();
-        // SAFETY: d2h로 채운 버퍼의 f32 재해석(길이 = 원소수).
-        let wy = unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, h_v * d * d) };
+        let wy: Vec<f32> = ob
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| crate::rawcuda::gptq4::h2f(u16::from_le_bytes(*c)))
+            .collect();
         let mut mx = 0.0f32;
         for i in 0..wy.len() {
             mx = mx.max((wy[i] - refs[m][i]).abs());
         }
         eprintln!("[wy-test] m={m} maxdiff(seq-wy) = {mx:.6e}");
+        // [행-스케일] 원시 Ŝ 비교(양 경로가 같은 스케일 계열) — f16 반올림 수 ulp.
         assert!(
-            mx < 1e-4,
-            "WY 재구성 m={m} 순차 스캔 초과 편차: {mx:.6e}(기대 ≤1e-4)"
+            mx < 2e-3,
+            "WY 재구성 m={m} 순차 스캔 초과 편차: {mx:.6e}(f16 기대 ≤2e-3)"
         );
     }
 }

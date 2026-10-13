@@ -99,10 +99,11 @@ impl W4a16Dec {
         let mut skip_scan = false;
         if t_len == 1 {
             let fp = self.cc.function("gdn1_part")?;
-            let (mut p0, mut p1, mut p2, mut p3) = (
+            let (mut p0, mut p1, mut p2, mut p3, mut p4) = (
                 self.gdn.dq2,
                 self.gdn.dk2,
-                self.gdn.dgst + (st_slot as u64) * 4,
+                self.gdn.dgst + (st_slot as u64) * 2,
+                self.gdn.dsc + (st_slot as u64) * 4,
                 self.gdn.dgpart,
             );
             self.cc.launch(
@@ -110,8 +111,9 @@ impl W4a16Dec {
                 dm.h_v as u32,
                 8,
                 128,
-                &mut crate::rawcuda::args::l8(
-                    &mut p0, &mut p1, &mut p2, &mut p3, &mut hk, &mut hv, &mut dd, &mut lay,
+                &mut crate::rawcuda::args::l9(
+                    &mut p0, &mut p1, &mut p2, &mut p3, &mut p4, &mut hk, &mut hv, &mut dd,
+                    &mut lay,
                 ),
             )?;
             let fc = self.cc.function("gdn1_comb")?;
@@ -135,19 +137,21 @@ impl W4a16Dec {
                 ),
             )?;
             let fu = self.cc.function("gdn1_upd")?;
-            let (mut u0, mut u1, mut u2, mut u3) = (
+            let (mut u0, mut u1, mut u2, mut u3, mut u4) = (
                 self.gdn.dk2,
                 self.gdn.dbg,
                 self.gdn.dgdc,
-                self.gdn.dgst + (st_slot as u64) * 4,
+                self.gdn.dgst + (st_slot as u64) * 2,
+                self.gdn.dsc + (st_slot as u64) * 4,
             );
             self.cc.launch(
                 fu,
                 dm.h_v as u32,
                 8,
                 128,
-                &mut crate::rawcuda::args::l8(
-                    &mut u0, &mut u1, &mut u2, &mut u3, &mut hk, &mut hv, &mut dd, &mut lay,
+                &mut crate::rawcuda::args::l9(
+                    &mut u0, &mut u1, &mut u2, &mut u3, &mut u4, &mut hk, &mut hv, &mut dd,
+                    &mut lay,
                 ),
             )?;
             skip_scan = true;
@@ -166,9 +170,10 @@ impl W4a16Dec {
                 self.gdn.dk2,
                 self.gdn.dv2,
                 self.gdn.dbg,
-                self.gdn.dgst + (st_slot as u64) * 4,
+                self.gdn.dgst + (st_slot as u64) * 2,
             );
-            let (mut w4, mut w5, mut w6, mut w7) = (
+            let (mut w8, mut w4, mut w5, mut w6, mut w7) = (
+                self.gdn.dsc + (st_slot as u64) * 4,
                 self.gdn.dwy_s0,
                 self.gdn.dwy_dc,
                 self.gdn.dwy_g,
@@ -179,28 +184,29 @@ impl W4a16Dec {
                 dm.h_v as u32,
                 1,
                 128,
-                &mut crate::rawcuda::args::l13(
-                    &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5, &mut w6, &mut w7,
-                    &mut tl, &mut hk, &mut hv, &mut dd, &mut lay,
+                &mut crate::rawcuda::args::l14(
+                    &mut w0, &mut w1, &mut w2, &mut w3, &mut w8, &mut w4, &mut w5, &mut w6,
+                    &mut w7, &mut tl, &mut hk, &mut hv, &mut dd, &mut lay,
                 ),
             )?;
             let f = self.cc.function("gdn_spec_scan")?;
-            let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5) = (
+            let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6) = (
                 self.gdn.dq2,
                 self.gdn.dk2,
                 self.gdn.dv2,
                 self.gdn.dbg,
-                self.gdn.dgst + (st_slot as u64) * 4,
+                self.gdn.dgst + (st_slot as u64) * 2,
                 self.gdn.dgo,
+                self.gdn.dsc + (st_slot as u64) * 4,
             );
             self.cc.launch(
                 f,
                 dm.h_v as u32,
                 1,
                 128,
-                &mut crate::rawcuda::args::l11(
-                    &mut s0, &mut s1, &mut s2, &mut s3, &mut s4, &mut s5, &mut tl, &mut hk,
-                    &mut hv, &mut dd, &mut lay,
+                &mut crate::rawcuda::args::l12(
+                    &mut s0, &mut s1, &mut s2, &mut s3, &mut s4, &mut s6, &mut s5, &mut tl,
+                    &mut hk, &mut hv, &mut dd, &mut lay,
                 ),
             )?;
             // [결함수정] return으로 gdn_chain_dev 전체를 빠져나가면 **게이트가
@@ -229,14 +235,15 @@ impl W4a16Dec {
 
             let f = self.cc.function("gdn_scan")?;
             self.cc.set_dynamic_smem(f, GDN_SCAN_SMEM)?;
-            let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6) = (
+            let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6, mut s7) = (
                 self.gdn.dq2,
                 self.gdn.dk2,
                 self.gdn.dv2,
                 self.gdn.dbg,
                 self.gdn.dakq,
-                self.gdn.dgst + (st_slot as u64) * 4,
+                self.gdn.dgst + (st_slot as u64) * 2,
                 self.gdn.dgo,
+                self.gdn.dsc + (st_slot as u64) * 4,
             );
             // grid = h_v×NSPLIT(블록 = GDN_NGRP×GDN_VS = 512스레드).
             self.cc.launch_shared(
@@ -245,9 +252,9 @@ impl W4a16Dec {
                 1,
                 (GDN_NGRP * (128 / GDN_NSPLIT)) as u32,
                 GDN_SCAN_SMEM,
-                &mut crate::rawcuda::args::l12(
-                    &mut s0, &mut s1, &mut s2, &mut s3, &mut s4, &mut s5, &mut s6, &mut tl,
-                    &mut hk, &mut hv, &mut dd, &mut lay,
+                &mut crate::rawcuda::args::l13(
+                    &mut s0, &mut s1, &mut s2, &mut s3, &mut s4, &mut s5, &mut s7, &mut s6,
+                    &mut tl, &mut hk, &mut hv, &mut dd, &mut lay,
                 ),
             )?;
         }
@@ -269,7 +276,32 @@ impl W4a16Dec {
                 &mut hv,
             ),
         )?;
+        // [행-스케일 2026-10-13] 상태 기록 직후 스케일 정규화(체인 내 — 그래프
+        // 캡처 포함: 포인터·그리드 고정). 히스테리시스 = 커널 내부.
+        self.gdn_rescale_slot(slot, layer)?;
         Ok(())
+    }
+
+    /// [행-스케일 2026-10-13] 상태 행별 스케일 재정규화 — 행당 1스레드.
+    /// head(256) = 저장 최대 → 서브노멀 문턱 ≈ 2.3e-7·행max · 오버플로 여유
+    /// ≈ 256× 한-토큰 성장(기록측 ±65504 클램프). 기록 직후 호출(디코드 체인·
+    /// 프리필 청크·스펙 스캔·롤백 재구성).
+    pub(super) fn gdn_rescale_slot(&self, slot: usize, layer: usize) -> Result<(), String> {
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
+        let f = self.cc.function("gdn_rescale")?;
+        let (mut p0, mut p1) = (
+            self.gdn.dgst + (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64 * 2,
+            self.gdn.dsc + (slot * dm.n_gdn * dm.h_v * 128) as u64 * 4,
+        );
+        let (mut hv, mut dd, mut lay) = (dm.h_v as i32, dm.d as i32, layer as i32);
+        let mut head = 256.0f32;
+        self.cc.launch(
+            f,
+            dm.h_v as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l6(&mut p0, &mut p1, &mut hv, &mut dd, &mut lay, &mut head),
+        )
     }
 
     /// GDN 체인 호스트 진입 — xn·qkv·z 업로드 → 4커널 → gated 판독.
@@ -346,8 +378,12 @@ impl W4a16Dec {
         let ring_snap = 8 * dm.n_gdn * 3 * dm.conv_ch() * 4;
         self.gdn.dsnap_ring = self.cc.alloc(ring_snap)?;
         // [A-1 진단] 슬롯 상태 저장 스크래치(상태 + conv 링) — save/load용.
+        // [행-스케일] 상태 f16(×2) + 스케일 f32(×4) + conv 링 f32(×4).
         self.gdn.dsave = self.cc.alloc(
-            self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4,
+            self.n_slots
+                * (dm.n_gdn * dm.h_v * dm.d * dm.d * 2
+                    + dm.n_gdn * dm.h_v * dm.d * 4
+                    + dm.n_gdn * 3 * dm.conv_ch() * 4),
         )?;
         // [§3.4 ② 2026-10-12] 통합 캐시 회계 — 스펙 상태(WY+dsnap_ring+
         // dsave). 트랜셰 2: 예산 압박 시 이 등록 자체가 ckpt·expert-lru를
@@ -357,8 +393,10 @@ impl W4a16Dec {
             + 8 * dm.n_gdn * dm.h_v * 4
             + 8 * dm.n_gdn * dm.k_len() * 4
             + ring_snap
-            + self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4)
-            as u64;
+            + self.n_slots
+                * (dm.n_gdn * dm.h_v * dm.d * dm.d * 2
+                    + dm.n_gdn * dm.h_v * dm.d * 4
+                    + dm.n_gdn * 3 * dm.conv_ch() * 4)) as u64;
         if let Err(e) = self.ucache.allocate(
             "spec:state",
             CacheCategory::SpecState,
@@ -372,8 +410,11 @@ impl W4a16Dec {
         }
         // [A2] 접두 재사용 체크포인트 — [K3] 512 경계 스택 4개(환형).
         // 실패(VRAM 부족) 시 비활성(기능만 off).
-        let chk =
-            4 * self.n_slots * (dm.n_gdn * dm.h_v * dm.d * dm.d + dm.n_gdn * 3 * dm.conv_ch()) * 4;
+        let chk = 4
+            * self.n_slots
+            * (dm.n_gdn * dm.h_v * dm.d * dm.d * 2
+                + dm.n_gdn * dm.h_v * dm.d * 4
+                + dm.n_gdn * 3 * dm.conv_ch() * 4);
         match self.cc.alloc(chk) {
             Ok(p) => {
                 self.gdn.dchk = p;
@@ -513,7 +554,7 @@ impl W4a16Dec {
             let k2k = self.gdn.dk2 + k as u64 * kl as u64 * 4;
             let v2k = self.gdn.dv2 + k as u64 * vl as u64 * 4;
             let bgk = self.gdn.dbg + k as u64 * bg_stride * 4;
-            let stk = self.gdn.dgst + slot as u64 * st_stride * 4;
+            let stk = self.gdn.dgst + slot as u64 * st_stride * 2; // f16 상태
             let partk = self.gdn.dgpart + k as u64 * part_stride * 4;
             let dck = self.gdn.dgdc + k as u64 * dc_stride * 4;
             let outk = self.gdn.dgo + k as u64 * vl as u64 * 4;

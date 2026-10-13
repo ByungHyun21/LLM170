@@ -362,6 +362,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                             host_ram: resource::host_mem_available().unwrap_or(0),
                             ssd: None,
                             reserve: RESERVE,
+                            cards: 1,
                         };
                         let wl = llm170_core::plan::Workload {
                             model_max_ctx: ci.ctx,
@@ -533,6 +534,7 @@ fn cmd_plan(args: &[String], ma: &ModelArgs) -> ExitCode {
             .unwrap_or_else(|| resource::host_mem_total().unwrap_or(0)),
         ssd: ssd_gb.map(to_gib),
         reserve: 5 * (1u64 << 30) / 2,
+        cards,
     };
     // 문맥 수 — serve 내부 상수(동시성 = min(문맥, 입장)).
     const SERVE_CONTEXTS: usize = 4;
@@ -565,6 +567,29 @@ fn cmd_plan(args: &[String], ma: &ModelArgs) -> ExitCode {
         wl.state_bytes_per_ctx as f64 / (1u64 << 20) as f64
     );
     println!("plan: {}", p.summary());
+    // [2.M 샤드 플랜] 다중 카드 요청 시 — 레이어 파이프라인 배분·수용 판정.
+    if cards > 1 {
+        let split = man.layer_split();
+        let sp = llm170_core::plan::shard_plan(&split.layers, &split, &hw, &wl);
+        println!(
+            "shard: cards={} blocks={:?} fits={} · 최악 카드={} need {:.1}G ≤ cap {:.1}G",
+            sp.cards,
+            sp.blocks,
+            sp.fits,
+            sp.worst_card,
+            gib(sp.per_card_need[sp.worst_card]),
+            gib(sp.per_card_cap)
+        );
+        for (c, ((s, e), need)) in sp.blocks.iter().zip(&sp.per_card_need).enumerate() {
+            println!(
+                "  card{c}: layers {s}..{e} · w {:.1}G · kv {:.1}G · state {:.1}G · need {:.1}G",
+                gib(sp.per_card_weights[c]),
+                gib(sp.per_card_kv[c]),
+                gib(sp.per_card_state[c]),
+                gib(*need)
+            );
+        }
+    }
     ExitCode::SUCCESS
 }
 

@@ -407,7 +407,8 @@ extern "C" __global__ void gdn_scan(
     const float* __restrict__ v,     // [T][h_v*128] lc
     const float* __restrict__ bg,    // [T][2*h_v]
     const __half* __restrict__ akq,  // [2][h_v][n_chunks][CS][CS] — A5-4 prepass
-    float* __restrict__ st,          // [L][h_v][128*128] r/w — S0≠0 경로 의무
+    __half* __restrict__ st,         // [L][h_v][d²] r/w — f16(행-스케일)
+    const float* __restrict__ sc,    // [L][h_v][d] — 행별 스케일
     float* __restrict__ outv,        // [T][h_v*128] o_lc
     int t_len, int h_k, int h_v, int d, int layer)
 {
@@ -435,8 +436,8 @@ extern "C" __global__ void gdn_scan(
     __half* KS = KQ + GDN_CS * GDN_CS;                 // [CS*GDN_VS]
     __half* QS = KS + GDN_CS * GDN_VS;                 // [CS*GDN_VS]
     float* dc = (float*)(QS + GDN_CS * GDN_VS);        // [CS*GDN_VS]
-    float* Stile = dc + GDN_CS * GDN_VS;               // [2*TILE*GDN_VS] (더블 버퍼)
-    float* bp = Stile + 2 * GDN_TILE * GDN_VS;         // [CS]
+    __half* Stile = (__half*)(dc + GDN_CS * GDN_VS);   // [2*TILE*GDN_VS] f16 상태 타일
+    float* bp = (float*)(Stile + 2 * GDN_TILE * GDN_VS); // [CS]
     float* gcs = bp + GDN_CS;                          // [CS+1]
     float* wsm = gcs + (GDN_CS + 1);                   // [CS]
     float* e = wsm + GDN_CS;                           // [CS] exp(gcs) 사전값
@@ -451,6 +452,7 @@ extern "C" __global__ void gdn_scan(
     // 비트동일(양측 sqrt.rn·div.rn).
     float qscale = 1.0f / sqrtf((float)d);
     long st_h = (long)layer * h_v * d * d + (long)h * d * d + vs;
+    const long sc_h = ((long)layer * h_v + h) * d;
 
     for (int c = 0; c < n_chunks; c++) {
         int t0 = c * GDN_CS;
@@ -519,36 +521,28 @@ extern "C" __global__ void gdn_scan(
             // pass 0 타일 선적재(buf 0) — cp.async(레지스터 경유 제거).
             for (int e = threadIdx.x; e < GDN_TILE * GDN_VS; e += blockDim.x) {
                 int r = e / GDN_VS, cl = e % GDN_VS;
-                unsigned sa = (unsigned)__cvta_generic_to_shared(&Stile[e]);
-                const float* src = &st[st_h + (long)r * d + cl];
-                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(sa),
-                             "l"(src));
+                // [행-스케일] cp.async(4B)는 2B 원소 불가 — 직접 f16 적재.
+                Stile[e] = st[st_h + (long)r * d + cl];
             }
-            asm volatile("cp.async.commit_group;");
-            asm volatile("cp.async.wait_group 0;");
         }
         __syncthreads();
         for (int pass_ = 0; pass_ < 8; pass_++) {
             int s2b = pass_ * GDN_TILE;
             // 다음 타일을 반대 버퍼에 cp.async 프리페치(소비와 완전 중첩).
             if (pass_ + 1 < 8) {
-                float* nxt = Stile + ((pass_ & 1) ^ 1) * (GDN_TILE * GDN_VS);
+                __half* nxt = Stile + ((pass_ & 1) ^ 1) * (GDN_TILE * GDN_VS);
                 const int nb = s2b + GDN_TILE;
                 for (int e = threadIdx.x; e < GDN_TILE * GDN_VS; e += blockDim.x) {
                     int r = e / GDN_VS, cl = e % GDN_VS;
-                    unsigned sa = (unsigned)__cvta_generic_to_shared(&nxt[e]);
-                    const float* src = &st[st_h + (long)(nb + r) * d + cl];
-                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(sa),
-                                 "l"(src));
+                    nxt[e] = st[st_h + (long)(nb + r) * d + cl];
                 }
-                asm volatile("cp.async.commit_group;");
             }
-            const float* cur = Stile + (pass_ & 1) * (GDN_TILE * GDN_VS);
+            const __half* cur = Stile + (pass_ & 1) * (GDN_TILE * GDN_VS);
             // [A5-3] 타일 16값을 레지스터로 1회 로드(그룹 내 i들이 재사용).
             float sv0[GDN_TILE];
 #pragma unroll
             for (int r = 0; r < GDN_TILE; ++r) {
-                sv0[r] = cur[r * GDN_VS + tid];
+                sv0[r] = __half2float(cur[r * GDN_VS + tid]) * sc[sc_h + s2b + r];
             }
             // [A5] i축 워크그룹 분배 — i별 누적 순서(pass·s2p)는 원序 그대로.
             for (int k = 0; k < IK; ++k) {
@@ -576,9 +570,7 @@ extern "C" __global__ void gdn_scan(
                 rks[k] = __half2float(__float2half_rn(rks[k] + ak));
                 rqs[k] = __half2float(__float2half_rn(rqs[k] + aq * qscale));
             }
-            // 프리페치 완료 대기(그룹 0) — 이후 배리어가 가시화.
-            asm volatile("cp.async.wait_group 0;");
-            __syncthreads();
+            __syncthreads(); // f16 직접 적재 — 비동기 프리페치 없음
         }
         for (int k = 0; k < IK; ++k) {
             const int i = grp + k * GDN_NGRP;
@@ -656,10 +648,13 @@ extern "C" __global__ void gdn_scan(
             }
             // [A5] 상태 갱신 행(s2) 워크그룹 분배 — 행별 j 순서는 원序 그대로.
             for (int s2 = grp; s2 < 128; s2 += GDN_NGRP) {
-                float acc = st[st_h + (long)s2 * d + tid] * gt_exp;
+                const float s_i = sc[sc_h + s2];
+                float acc = __half2float(st[st_h + (long)s2 * d + tid]) * s_i * gt_exp;
                 for (int j = 0; j < n; j++)
                     acc += __half2float(sk[j * 128 + s2]) * wsm[j] * dcr[j];
-                st[st_h + (long)s2 * d + tid] = acc;
+                float y = acc / s_i;
+                y = fminf(fmaxf(y, -65504.0f), 65504.0f);
+                st[st_h + (long)s2 * d + tid] = __float2half_rn(y);
             }
             __syncthreads();
         }
@@ -685,9 +680,61 @@ extern "C" __global__ void gdn_scan(
 // (spec_scan 구조 — t≤8 배치 전용 설계)이라 trio의 8분할 병렬도
 // (part/upd grid h_v×8)를 잃는다. 런치 −2/층 이득을 병렬도 손실이 초과.
 // trio 유지(spec_scan은 t≥2 배치·스펙 전용 — 역할 불변).
+// [상태 저장 정밀도 실측 2026-10-13 — 현재 = f32 유지(원복)]
+// 라이브 GDN 상태([n_gdn][h_v][128²]/슬롯)를 2바이트 float으로 저장하는 후보 2형식을
+// 전 배선·평가했다(골든 8토큰 불변·WY 재구성 테스트 f16 통과):
+//  · 27B: 단문 밴드 내(f16 −0.09%·bf16 −0.11%)이고 **장문도 평탄**(8K/16K/32K ±0.03%).
+//  · 35B: 단문 초과(f16 +1.55%·bf16 +0.72% @en128) + **장문에서 폭증** — bf16
+//    +2.2%(8K)·+6.8%(16K)·**+10.8%(32K)**, CI [+9.1,+12.5]. needle은 이 손상을 못 잡음
+//    (35B 9/9) — **PPL 장문 창이 결정적**(단문 단독 판정 금지의 실증).
+//  · 원인 = 채널 스케일 부재의 서브노멀 손실(정밀도 8× 열세인 bf16이 35B에서 f16보다
+//    2.2× 우세한 역전이 증거 · 진단 `LLM170_DUMP=gdst`: |S|max≤35·서브노멀 질량 12~28%).
+//  · 차기 후보 = **행(kdim)별 스케일 저장**(f16/int8+scale): ① 스케일 표(캘리브레이션
+//    데이터 의존 해소 방식 확정) ② 읽기 q·s / 갱신 k÷s 폴딩(A행렬·kq 무접촉)
+//    ③ WY는 스케일 곱으로 복원(무접촉 의미) ④ eval = 규약 ①②③ 전부.
+// [상태 행-스케일 2026-10-13] 라이브 상태 = f16 + 행(kdim)별 f32 스케일.
+//   S[i][j] = sc[h·d+i] × Ŝ[i][j], Ŝ = __half. 기록 커널은 ÷s로 저장,
+//   판독 커널은 ×s — 본 커널이 기록 직후 행 max로 스케일을 재정규화한다.
+//   head(기본 256) = 저장 최대 → 서브노멀 문턱 6e-5·max/head(≈2.3e-7·max),
+//   오버플로 여유 65504/head(≈256× 한-토큰 성장; 기록측은 ±65504 클램프).
+// 행당 1스레드(스레드 간 리덕션 없음 — 결정적·단순).
+extern "C" __global__ void gdn_rescale(
+    __half* __restrict__ st, float* __restrict__ sc,
+    int h_v, int d, int layer, float head)
+{
+    const int h = blockIdx.x;
+    const int i = threadIdx.x; // 행(kdim)
+    const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    const long sc_h = ((long)layer * h_v + h) * d;
+    __half* row = &st[st_h + (long)i * d];
+    const float s = sc[sc_h + i];
+    float mx = 0.0f;
+    for (int j = 0; j < d; ++j) {
+        const float a = fabsf(__half2float(row[j]) * s);
+        if (a > mx) mx = a;
+    }
+    if (mx > 0.0f) {
+        // [히스테리시스 2026-10-13] 재기록은 저장 최대가 [head/8, head*8] 밖일
+        // 때만 — 매-토큰 재정규화는 이중 반올림(기록+재기록)으로 손상 가중
+        // (실측: 35B 128창 +2.41% vs raw f16 +1.55%). 대역 유지로 서브노멀·
+        // 오버플로 마진은 그대로.
+        const float sm = mx / s;
+        if (sm > head * 8.0f || sm < head / 8.0f) {
+            float ns = mx / head;
+            if (ns < 1e-30f) ns = 1e-30f;
+            const float r = s / ns;
+            for (int j = 0; j < d; ++j) {
+                row[j] = __float2half_rn(__half2float(row[j]) * r);
+            }
+            sc[sc_h + i] = ns;
+        }
+    }
+}
+
 extern "C" __global__ void gdn1_part(
     const float* __restrict__ q, const float* __restrict__ k,
-    const float* __restrict__ st, float* __restrict__ part,
+    const __half* __restrict__ st, const float* __restrict__ sc,
+    float* __restrict__ part,
     int h_k, int h_v, int d, int layer)
 {
     const int h = blockIdx.x;
@@ -697,10 +744,11 @@ extern "C" __global__ void gdn1_part(
     const int ch = 128 / GDN1_SPLIT;
     const int i0 = s * ch;
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    const long sc_h = ((long)layer * h_v + h) * d;
     float ks = 0.0f, qs = 0.0f;
     for (int ii = 0; ii < ch; ++ii) {
         const int i = i0 + ii;
-        const float stv = st[st_h + (long)i * d + tid];
+        const float stv = __half2float(st[st_h + (long)i * d + tid]) * sc[sc_h + i];
         ks += __half2float(__float2half_rn(k[kh * 128 + i])) * stv;
         qs += q[kh * 128 + i] * stv;
     }
@@ -746,7 +794,8 @@ extern "C" __global__ void gdn1_comb(
 
 extern "C" __global__ void gdn1_upd(
     const float* __restrict__ k, const float* __restrict__ bg,
-    const float* __restrict__ dc, float* __restrict__ st,
+    const float* __restrict__ dc, __half* __restrict__ st,
+    const float* __restrict__ sc,
     int h_k, int h_v, int d, int layer)
 {
     const int h = blockIdx.x;
@@ -756,13 +805,17 @@ extern "C" __global__ void gdn1_upd(
     const int ch = 128 / GDN1_SPLIT;
     const int i0 = s * ch;
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    const long sc_h = ((long)layer * h_v + h) * d;
     const float e = gdn_expf(bg[h_v + h]);
     const float dcv = dc[h * 128 + tid];
     for (int ii = 0; ii < ch; ++ii) {
         const int i = i0 + ii;
         const float kv = __half2float(__float2half_rn(k[kh * 128 + i]));
-        float* p = &st[st_h + (long)i * d + tid];
-        *p = *p * e + kv * dcv;
+        const float s_i = sc[sc_h + i];
+        __half* p = &st[st_h + (long)i * d + tid];
+        float y = __half2float(*p) * e + (kv / s_i) * dcv;
+        y = fminf(fmaxf(y, -65504.0f), 65504.0f);
+        *p = __float2half_rn(y);
     }
 }
 
@@ -781,7 +834,8 @@ extern "C" __global__ void gdn_spec_scan(
     const float* __restrict__ k,     // [T][k_len]
     const float* __restrict__ v,     // [T][h_v*128]
     const float* __restrict__ bg,    // [T][2*h_v]
-    float* __restrict__ st,          // [L][h_v][d*d] r/w — 최종 상태
+    __half* __restrict__ st,         // [L][h_v][d²] r/w — 최종 상태(f16 행-스케일)
+    const float* __restrict__ sc,    // [L][h_v][d]
     float* __restrict__ outv,        // [T][h_v*128]
     int t_len, int h_k, int h_v, int d, int layer)
 {
@@ -789,6 +843,7 @@ extern "C" __global__ void gdn_spec_scan(
     const int tid = threadIdx.x; // = d 인덱스
     const int kh = h % h_k;
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    const long sc_h = ((long)layer * h_v + h) * d;
     __shared__ float red[128];
     const float qscale = 1.0f / sqrtf((float)d);
     for (int t = 0; t < t_len; ++t) {
@@ -801,7 +856,7 @@ extern "C" __global__ void gdn_spec_scan(
             float pks = 0.0f, pqs = 0.0f;
             for (int ii = 0; ii < 128 / GDN1_SPLIT; ++ii) {
                 const int i = i0 + ii;
-                const float stv = st[st_h + (long)i * d + tid];
+                const float stv = __half2float(st[st_h + (long)i * d + tid]) * sc[sc_h + i];
                 pks += __half2float(__float2half_rn(kt[kh * 128 + i])) * stv;
                 pqs += qt[kh * 128 + i] * stv;
             }
@@ -825,11 +880,14 @@ extern "C" __global__ void gdn_spec_scan(
         const float rhs = beta * (sv - e * ks);
         outv[t * (h_v * 128) + h * 128 + tid] = e * qs * qscale + kq00 * rhs;
         // 상태 갱신(trio gdn1_upd 미러) — 스냅샷 기록은 TreeWY 폐지.
-        float* sst = st + st_h;
+        __half* sst = st + st_h;
         for (int i = 0; i < 128; ++i) {
             const float kv = __half2float(__float2half_rn(kt[kh * 128 + i]));
-            float* p = &sst[(long)i * d + tid];
-            *p = *p * e + kv * rhs;
+            const float s_i = sc[sc_h + i];
+            __half* p = &sst[(long)i * d + tid];
+            float y = __half2float(*p) * e + (kv / s_i) * rhs;
+            y = fminf(fmaxf(y, -65504.0f), 65504.0f);
+            *p = __float2half_rn(y);
         }
         __syncthreads(); // 다음 토큰 kq00 트리 전 정리
     }
@@ -857,7 +915,8 @@ extern "C" __global__ void gdn_wy_solve(
     const float* __restrict__ k,   // [T][k_len] L2 완료
     const float* __restrict__ v,   // [T][h_v*128]
     const float* __restrict__ bg,  // [T][2*h_v]
-    const float* __restrict__ st,  // 슬롯 상태 [n_gdn][h_v][d*d] — S_0(읽기 전용)
+    const __half* __restrict__ st, // 슬롯 상태 f16 [n_gdn][h_v][d²] — S_0(읽기 전용)
+    const float* __restrict__ sc,  // [n_gdn][h_v][d] — 행별 스케일
     float* __restrict__ wy_s0,     // [n_gdn][h_v][d*d] — S_0 저장
     float* __restrict__ wy_dc,     // [n_gdn][8][h_v][128]
     float* __restrict__ wy_g,      // [n_gdn][8][h_v]
@@ -869,6 +928,7 @@ extern "C" __global__ void gdn_wy_solve(
     const int kh = h % h_k;
     const int k_len = h_k * 128;
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    const long sc_h = ((long)layer * h_v + h) * d;
     __shared__ float G[8];
     __shared__ float A[8][8];
 
@@ -910,7 +970,8 @@ extern "C" __global__ void gdn_wy_solve(
     // S_0 저장(열 tid) — 호스트가 본 커널을 gdn_spec_scan 앞에 발사하므로
     // st는 아직 라운드 시작 상태다.
     for (int i2 = 0; i2 < 128; ++i2) {
-        wy_s0[st_h + (long)i2 * d + tid] = st[st_h + (long)i2 * d + tid];
+        wy_s0[st_h + (long)i2 * d + tid] =
+            __half2float(st[st_h + (long)i2 * d + tid]) * sc[sc_h + i2];
     }
     // KS0·rhs0 → 순전대입 → dc(i·j 고정 8 전개 — dcr 레지스터 상주).
     float dcr[8];
@@ -922,7 +983,7 @@ extern "C" __global__ void gdn_wy_solve(
         float ks0 = 0.0f;
         for (int s2 = 0; s2 < 128; ++s2) {
             ks0 += __half2float(__float2half_rn(k[(long)i * k_len + kh * 128 + s2]))
-                 * st[st_h + (long)s2 * d + tid];
+                 * (__half2float(st[st_h + (long)s2 * d + tid]) * sc[sc_h + s2]);
         }
         const float sv =
             __half2float(__float2half_rn(v[(long)i * (h_v * 128) + h * 128 + tid]));
@@ -947,7 +1008,8 @@ extern "C" __global__ void gdn_wy_reconstruct(
     const float* __restrict__ wy_s0, // [n_gdn][h_v][d*d]
     const float* __restrict__ wy_dc, // [n_gdn][8][h_v][128]
     const float* __restrict__ wy_g,  // [n_gdn][8][h_v]
-    float* __restrict__ st,          // 슬롯 상태 [n_gdn][h_v][d*d] — 기록 대상
+    __half* __restrict__ st,         // 슬롯 상태 f16 [n_gdn][h_v][d²] — 기록 대상
+    const float* __restrict__ sc,    // [n_gdn][h_v][d] — 행별 스케일
     int m, int h_k, int h_v, int d, int layer)
 {
     const int h = blockIdx.x;
@@ -955,6 +1017,7 @@ extern "C" __global__ void gdn_wy_reconstruct(
     const int kh = h % h_k;
     const int k_len = h_k * 128;
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
+    const long sc_h = ((long)layer * h_v + h) * d;
     __shared__ float w[9]; // w[0]=exp(G_{m-1}), w[1+j]=exp(G_{m-1}−G_j)
     if (tid == 0) {
         const float gm = wy_g[((long)layer * 8 + (m - 1)) * h_v + h];
@@ -971,7 +1034,12 @@ extern "C" __global__ void gdn_wy_reconstruct(
                  * wy_k[((long)layer * 8 + j) * k_len + kh * 128 + i2]
                  * wy_dc[((long)layer * 8 + j) * (h_v * 128) + (long)h * 128 + tid];
         }
-        st[st_h + (long)i2 * d + tid] = acc;
+        {
+            const float s_i = sc[sc_h + i2];
+            float y = acc / s_i;
+            y = fminf(fmaxf(y, -65504.0f), 65504.0f);
+            st[st_h + (long)i2 * d + tid] = __float2half_rn(y);
+        }
     }
 }
 

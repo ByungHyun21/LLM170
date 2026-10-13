@@ -106,6 +106,7 @@ pub const ASSETS: &[Asset] = &[
             "gdn1_part",
             "gdn1_comb",
             "gdn1_upd",
+            "gdn_rescale",
             "gdn_gate",
         ],
         boot: true,

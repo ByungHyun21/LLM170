@@ -145,6 +145,8 @@ pub struct Hardware {
     pub ssd: Option<u64>,
     /// 워크스페이스·스크래치 예약(운영 상수).
     pub reserve: u64,
+    /// [2.M 샤드] 카드 수(1 = 단일). vram은 전 카드 합(또는 총 가용).
+    pub cards: usize,
 }
 
 /// 워크로드 — 목표 문맥·문맥 수.
@@ -232,6 +234,182 @@ impl Plan {
             gib(self.host_ram_need),
             gib(self.ssd_need),
         )
+    }
+}
+
+// ── CMP 170HX 도착 대비(2026-10-13 — plans 미이전 규율: 지식은 코드 옆) ──
+// 실측·문헌(커뮤니티 2026-08): 열=시스템 팬 담당(범위 밖) · 전력 250W=성능 99.3%
+// (200W 95.7%) · PCIe Gen2 x4(≈1.7GB/s)·NVLink/ECC 불가 · **PP4 87.6 > TP4 60.4**
+// (좁은 링크는 레이어 파이프라인) · Flash-Next PLE=호스트 RAM+로컬 디스크.
+// 도착 시 프로브(순서): ① fp32/fp16 마이크로벤치 ② P2P/복사 대역(PcieGen2 확인)
+// ③ 27B 단독 상주 pp/tg ④ 2장 샤드 드라이런 실배치(이 모듈) ⑤ 256K 장문(needle·
+// long-PPL — `w4a16-eval`) ⑥ 전력 캡 재측정(250W). 목표 구성: 1차 2장+호스트 40GB급
+// (100B급 상주) / 2차 4장+80GB(전량 상주·1M ctx) — 배치 판단은 위 샤드 플랜 함수.
+
+/// 층별 정보(샤드 플랜 입력) — 이름의 `layers.N` 파싱.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct LayerInfo {
+    pub bytes: u64,
+    /// 행-스파스 임베딩(PLE — SSD 티어) 바이트 — 상주 계산에서 제외.
+    pub row_sparse: u64,
+    /// 풀 어텐션 층 여부(`.self_attn.` 포함) — KV 비중 계산용(GDN은 KV 없음).
+    pub full_attn: bool,
+}
+
+impl LayerInfo {
+    /// 상주 가중치(VRAM 몫) = 전체 − 행-스파스(PLE SSD 티어).
+    pub fn resident(&self) -> u64 {
+        self.bytes.saturating_sub(self.row_sparse)
+    }
+}
+
+/// 매니페스트의 층 분해 — (층 목록, 층 미소속 가중치, embed(호스트)).
+#[derive(Clone, Debug, Default)]
+pub struct LayerSplit {
+    pub layers: Vec<LayerInfo>,
+    pub non_layer: u64,
+    pub embed: u64,
+}
+
+impl Manifest {
+    /// 텐서명 → 층 분해(`layers.{N}.`; 그룹은 embed(호스트)·비층(헤드 등)).
+    pub fn layer_split(&self) -> LayerSplit {
+        let layer_of = |name: &str| -> Option<usize> {
+            let pos = name
+                .find(".layers.")
+                .map(|p| p + 8)
+                .or_else(|| name.find("layers.").map(|p| p + 7))?;
+            let digits: String = name[pos..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.parse().ok()
+        };
+        let mut layers: Vec<LayerInfo> = Vec::new();
+        let mut split = LayerSplit::default();
+        for (name, bytes) in &self.items {
+            match (classify(name), layer_of(name)) {
+                (_, Some(li)) => {
+                    if layers.len() <= li {
+                        layers.resize(li + 1, LayerInfo::default());
+                    }
+                    layers[li].bytes = layers[li].bytes.saturating_add(*bytes);
+                    if classify(name) == Category::RowSparse {
+                        layers[li].row_sparse = layers[li].row_sparse.saturating_add(*bytes);
+                    }
+                    if name.contains(".self_attn.") {
+                        layers[li].full_attn = true;
+                    }
+                }
+                (Category::Embed, None) => split.embed = split.embed.saturating_add(*bytes),
+                (_, None) => split.non_layer = split.non_layer.saturating_add(*bytes),
+            }
+        }
+        split.layers = layers;
+        split
+    }
+}
+
+/// 다중 카드 레이어 파이프라인 샤드 플랜 (§2.M — 좁은 링크에서 PP 우선:
+/// CMP 실측 PP4 87.6 > TP4 60.4 t/s). 층 연속 블록 배분(링크 통과 = 경계 활성만),
+/// KV·상태는 카드 로컬(층 비중만큼). **v0 = 배분·수용 계산**(실행 배선은 다중
+/// GPU 도착 후 — 카드=층 블록+로컬 KV). 케이스 하드코딩 없음(층 크기·카드 수 함수).
+#[derive(Clone, Debug)]
+pub struct ShardPlan {
+    pub cards: usize,
+    /// 카드별 [start, end) 층 범위.
+    pub blocks: Vec<(usize, usize)>,
+    pub per_card_weights: Vec<u64>,
+    pub per_card_kv: Vec<u64>,
+    pub per_card_state: Vec<u64>,
+    /// 필요량 = 가중치 + 로컬 KV + 상태 (+비층 가중치는 마지막 카드).
+    pub per_card_need: Vec<u64>,
+    /// 카드 유효 용량(예약 차감).
+    pub per_card_cap: u64,
+    pub worst_card: usize,
+    pub fits: bool,
+    pub notes: Vec<String>,
+}
+
+/// 샤드 플랜 — 순수 함수.
+pub fn shard_plan(
+    layers: &[LayerInfo],
+    split: &LayerSplit,
+    hw: &Hardware,
+    wl: &Workload,
+) -> ShardPlan {
+    let cards = hw.cards.max(1);
+    let notes = Vec::new();
+    let v = hw.vram_free.unwrap_or(hw.vram_total);
+    let per_card_cap = (v / cards as u64).saturating_sub(hw.reserve);
+    let n_full = layers.iter().filter(|l| l.full_attn).count().max(1) as u64;
+    let n_gdn = layers.iter().filter(|l| !l.full_attn).count().max(1) as u64;
+    let ctx = wl.want_ctx.min(wl.model_max_ctx) as u64;
+    let kv_total = wl.kv_bytes_per_token.saturating_mul(ctx);
+    let state_total = wl
+        .state_bytes_per_ctx
+        .saturating_mul(wl.contexts.max(1) as u64);
+    // 연속 블록 그리디: 목표 = (가중치 총합 + 비층)/카드수.
+    // [FN 검증 2026-10-13] 행-스파스(PLE)는 SSD 티어 — 상주 배분에서 제외
+    // (FN: 층1에 PLE 47.7G 몰림 — 포함하면 균형·수용 판정 모두 왜곡, 프로브가 적발).
+    let weights_total: u64 = layers.iter().map(|l| l.resident()).sum::<u64>() + split.non_layer;
+    let target = weights_total / cards as u64;
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut per_card_weights = vec![0u64; cards];
+    {
+        let mut card = 0usize;
+        let mut start = 0usize;
+        for (i, l) in layers.iter().enumerate() {
+            let last = card + 1 == cards;
+            if !last
+                && card < cards
+                && per_card_weights[card] > 0
+                && per_card_weights[card] + l.resident() > target
+            {
+                blocks.push((start, i));
+                card += 1;
+                start = i;
+            }
+            per_card_weights[card] = per_card_weights[card].saturating_add(l.resident());
+        }
+        blocks.push((start, layers.len()));
+        while blocks.len() < cards {
+            let end = blocks.last().map(|b| b.1).unwrap_or(0);
+            blocks.push((end, end));
+        }
+    }
+    // 비층(헤드 등)은 마지막 카드에 가산. KV·상태는 층 비중만큼.
+    if cards > 0 {
+        per_card_weights[cards - 1] = per_card_weights[cards - 1].saturating_add(split.non_layer);
+    }
+    let mut per_card_kv = vec![0u64; cards];
+    let mut per_card_state = vec![0u64; cards];
+    for (c, &(s, e)) in blocks.iter().enumerate() {
+        let nf = layers[s.min(e)..e].iter().filter(|l| l.full_attn).count() as u64;
+        let ng = layers[s.min(e)..e].iter().filter(|l| !l.full_attn).count() as u64;
+        per_card_kv[c] = kv_total.saturating_mul(nf) / n_full;
+        per_card_state[c] = state_total.saturating_mul(ng) / n_gdn;
+    }
+    let per_card_need: Vec<u64> = (0..cards)
+        .map(|c| {
+            per_card_weights[c]
+                .saturating_add(per_card_kv[c])
+                .saturating_add(per_card_state[c])
+        })
+        .collect();
+    let worst_card = (0..cards).max_by_key(|&c| per_card_need[c]).unwrap_or(0);
+    let fits = per_card_need[worst_card] <= per_card_cap;
+    ShardPlan {
+        cards,
+        blocks,
+        per_card_weights,
+        per_card_kv,
+        per_card_state,
+        per_card_need,
+        per_card_cap,
+        worst_card,
+        fits,
+        notes,
     }
 }
 
@@ -431,6 +609,7 @@ mod tests {
             host_ram: host,
             ssd: None,
             reserve: 5 * G / 2, // 2.5GiB 운영 예약
+            cards: 1,
         }
     }
 
@@ -563,5 +742,142 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert_eq!(m.sums().dense, 6);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── §2.M 샤드 플랜 (다중 카드 레이어 파이프라인) ──
+    fn shard_layers(n: usize, bytes: u64) -> Vec<LayerInfo> {
+        (0..n)
+            .map(|i| LayerInfo {
+                bytes,
+                row_sparse: 0,
+                full_attn: i % 4 == 3, // 하이브리드 3/4 GDN + 1/4 풀어텐션
+            })
+            .collect()
+    }
+
+    fn shard_hw(vram: u64, host: u64, cards: usize) -> Hardware {
+        let mut h = hw(vram, host);
+        h.cards = cards;
+        h
+    }
+
+    fn shard_split(non_layer: u64) -> LayerSplit {
+        LayerSplit {
+            layers: Vec::new(),
+            non_layer,
+            embed: 0,
+        }
+    }
+
+    /// 드라이런 예시(§2.M — 함수 출력의 검증 픽스처): 100B급@2 상주 /
+    /// 300B급@2 초과·@4 상주 / 500B급@4 초과(오프로드 레짐).
+    #[test]
+    fn shard_dry_run_examples() {
+        // 100B급 ≈52G(64층×0.8125G), 2×64G(총 128G).
+        let l = shard_layers(64, 812 * G / 1000);
+        let p = shard_plan(
+            &l,
+            &shard_split(0),
+            &shard_hw(128 * G, 62 * G, 2),
+            &wl(262_144),
+        );
+        assert_eq!(p.cards, 2);
+        assert!(p.fits, "{p:?}");
+        // 블록 균형 — 최대/최소 카드 가중치 ≤ 1.15×.
+        let (mx, mn) = (
+            *p.per_card_weights.iter().max().unwrap(),
+            *p.per_card_weights.iter().min().unwrap(),
+        );
+        assert!(mx * 100 <= mn * 115, "불균형 {mx} vs {mn}");
+        // 300B급 ≈155G, 2장 초과·4장 상주.
+        let l3 = shard_layers(64, 2422 * G / 1000);
+        let p2 = shard_plan(
+            &l3,
+            &shard_split(0),
+            &shard_hw(128 * G, 62 * G, 2),
+            &wl(262_144),
+        );
+        assert!(!p2.fits);
+        let p4 = shard_plan(
+            &l3,
+            &shard_split(0),
+            &shard_hw(256 * G, 62 * G, 4),
+            &wl(262_144),
+        );
+        assert!(p4.fits, "{p4:?}");
+        // 500B급 ≈258G — 4장에서도 초과(오프로드 레짐).
+        let l5 = shard_layers(64, 4032 * G / 1000);
+        assert!(
+            !shard_plan(
+                &l5,
+                &shard_split(0),
+                &shard_hw(256 * G, 62 * G, 4),
+                &wl(262_144)
+            )
+            .fits
+        );
+    }
+
+    /// KV·상태가 카드 층 비중만큼 국소화되고, 경계 케이스를 뒤집을 수 있다.
+    #[test]
+    fn shard_kv_local_accounting() {
+        // 64층×3.2G = 204.8G + 비층 40G = 244.8G, 4×64=256G — KV(256K·33.8KB=8.86G)+
+        // 상태(0.6G) 포함 판정에서 경계적.
+        let l = shard_layers(64, 32 * G / 10);
+        let hw4 = shard_hw(256 * G, 512 * G, 4);
+        let p = shard_plan(&l, &shard_split(40 * G), &hw4, &wl(262_144));
+        assert_eq!(p.cards, 4);
+        // 풀어텐션 층(1/4)은 해당 카드에만 KV 귀속 — KV 합 = 전체.
+        let kv_sum: u64 = p.per_card_kv.iter().sum();
+        let kv_expect = (33 * 1024u64) * 262_144;
+        assert!(kv_sum.abs_diff(kv_expect) <= kv_expect / 100, "kv {kv_sum}");
+        // 상태 총량 = state_bytes_per_ctx × contexts(=4) — 전 GDN 카드 합과 일치.
+        let st_sum: u64 = p.per_card_state.iter().sum();
+        let st_expect = 4 * 151 * (1 << 20);
+        assert!(
+            st_sum > 0 && st_sum.abs_diff(st_expect) <= st_expect / 20,
+            "st {st_sum}"
+        );
+    }
+
+    /// FN류 검증: 한 층에 몰린 PLE(행-스파스)는 상주 배분·수용에서 제외된다
+    /// (프로브가 적발한 왜곡 — 층1 PLE 40G가 균형을 깨고 거부를 만들었다).
+    #[test]
+    fn shard_excludes_row_sparse() {
+        let mut l = shard_layers(8, G); // 층당 상주 1G
+        l[1].bytes += 40 * G;
+        l[1].row_sparse = 40 * G;
+        let p = shard_plan(&l, &shard_split(0), &shard_hw(64 * G, 62 * G, 1), &wl(4096));
+        assert!(p.fits, "{p:?}");
+        assert!(p.per_card_weights[0] <= 9 * G, "{:?}", p.per_card_weights);
+    }
+
+    /// 층 파싱 — 실명 픽스처(하이브리드 GDN/풀어텐션·expert 가산·embed 분리).
+    #[test]
+    fn layer_split_parses_real_names() {
+        let m = Manifest::from_items(vec![
+            (
+                "model.language_model.layers.0.linear_attn.A_log".into(),
+                100,
+            ),
+            (
+                "model.language_model.layers.0.mlp.experts.0.down_proj.weight_packed".into(),
+                900,
+            ),
+            (
+                "model.language_model.layers.1.self_attn.q_proj.weight_packed".into(),
+                500,
+            ),
+            ("model.language_model.embed_tokens.weight".into(), 700),
+            ("lm_head.weight".into(), 300),
+        ]);
+        let sp = m.layer_split();
+        assert_eq!(sp.layers.len(), 2);
+        assert_eq!(sp.layers[0].bytes, 1000);
+        assert!(!sp.layers[0].full_attn);
+        assert_eq!(sp.layers[1].bytes, 500);
+        assert!(sp.layers[1].full_attn);
+        assert_eq!(sp.embed, 700);
+        assert_eq!(sp.non_layer, 300);
     }
 }

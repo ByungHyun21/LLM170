@@ -146,9 +146,9 @@ impl W4a16Dec {
         self.attn_set_pos(slot, 0)?;
         if let Some(dims) = self.gdn.gdn {
             let ring_bytes = dims.n_gdn * 3 * dims.conv_ch() * 4;
-            let st_bytes = dims.n_gdn * dims.h_v * 128 * 128 * 4;
+            let st_bytes = dims.n_gdn * dims.h_v * 128 * 128 * 2; // f16 행-스케일
             let ring_off = (slot * dims.n_gdn * 3 * dims.conv_ch()) as u64 * 4;
-            let st_off = (slot * dims.n_gdn * dims.h_v * 128 * 128) as u64 * 4;
+            let st_off = (slot * dims.n_gdn * dims.h_v * 128 * 128) as u64 * 2;
             Self::zero_dev(&self.cc, self.gdn.dring + ring_off, ring_bytes)?;
             Self::zero_dev(&self.cc, self.gdn.dgst + st_off, st_bytes)?;
         }

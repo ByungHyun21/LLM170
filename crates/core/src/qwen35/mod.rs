@@ -745,13 +745,13 @@ pub fn ctx_info(dir: &std::path::Path) -> Result<CtxInfo, String> {
     let sc = full * c.kv_heads as u64 * 2 * 4;
     Ok(CtxInfo {
         ctx: c.max_pos,
-        // GDN(선형) 층 = 전체 − 전체/간격(=3/4), 상태 [n_gdn][h_v][128×128] f32.
-        gdn_state_bytes_per_slot: (c.layers as u64
-            - c.layers as u64 / c.full_interval.max(1) as u64)
-            * c.linear_num_value_heads as u64
-            * 128
-            * 128
-            * 4,
+        // GDN(선형) 층 = 전체 − 전체/간격(=3/4). [상태 채택 2026-10-13]
+        // 라이브 상태 = f16(2B) + 행별 스케일 f32(128/층헤드) — 예산 회계 동일 항.
+        gdn_state_bytes_per_slot: {
+            let n_gdn = c.layers as u64 - c.layers as u64 / c.full_interval.max(1) as u64;
+            let hv = c.linear_num_value_heads as u64;
+            n_gdn * hv * 128 * 128 * 2 + n_gdn * hv * 128 * 4
+        },
         kv_bytes_per_token: kv + sc,
         dense: c.n_experts == 0,
     })

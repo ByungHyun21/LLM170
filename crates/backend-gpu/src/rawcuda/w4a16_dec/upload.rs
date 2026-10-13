@@ -138,8 +138,15 @@ impl W4a16Dec {
         let slots = self.n_slots;
         let dring = self.cc.alloc(slots * n * 3 * cch * 4)?;
         Self::zero_dev(&self.cc, dring, slots * n * 3 * cch * 4)?;
-        let dgst = self.cc.alloc(slots * n * hv * 128 * 128 * 4)?;
-        Self::zero_dev(&self.cc, dgst, slots * n * hv * 128 * 128 * 4)?;
+        // [행-스케일 2026-10-13] 라이브 상태 = f16(2B) + 행별 스케일 f32.
+        let dgst = self.cc.alloc(slots * n * hv * 128 * 128 * 2)?;
+        Self::zero_dev(&self.cc, dgst, slots * n * hv * 128 * 128 * 2)?;
+        let dsc = self.cc.alloc(slots * n * hv * 128 * 4)?;
+        let ones = vec![1.0f32; slots * n * hv * 128];
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let onesb =
+            unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, ones.len() * 4) };
+        Self::h2d_chunked(&self.cc, dsc, onesb)?;
         (
             self.gdn.dcw,
             self.gdn.dab_c,
@@ -149,6 +156,7 @@ impl W4a16Dec {
         ) = (dcw, dab, dal, ddt, dnw);
         self.gdn.dring = dring;
         self.gdn.dgst = dgst;
+        self.gdn.dsc = dsc;
         self.gdn.gdn = Some(dims);
         Ok(())
     }
