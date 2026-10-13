@@ -22,11 +22,13 @@ struct GpuArgs {
     marlin_selfcheck: Option<(usize, usize, usize, bool)>, // (t, k, n, m16)
     marlin_selfcheck32: Option<(usize, usize, usize)>, // [marlin g32] bf16 자체점검
     marlin_bench: Vec<(String, usize, usize, String)>, // [marlin S2] mma 대비 벤치
-    marlin_ref: Option<(String, usize)>,  // [marlin S2] 실무게 64행 참조 대조
-    attn_fa2: Vec<(usize, usize, u32)>,   // [FA2] A/B (t, layer, pos0)
+    /// [2.A-② 2026-10-13] marlin-bench 콜드 모드(L2 플러시 — HBM 조건 근사).
+    marlin_cold: bool,
+    marlin_ref: Option<(String, usize)>, // [marlin S2] 실무게 64행 참조 대조
+    attn_fa2: Vec<(usize, usize, u32)>,  // [FA2] A/B (t, layer, pos0)
     attn_fa2_bench: Vec<(usize, usize, usize, u32)>, // [FA2] (t, layer, reps, pos0)
-    mode_ref: u8,                         // 0 실값, 1 s→1, 2 x→1, 3 둘 다 1
-    kcap: usize,                          // ref k 상한(이분탐색용)
+    mode_ref: u8,                        // 0 실값, 1 s→1, 2 x→1, 3 둘 다 1
+    kcap: usize,                         // ref k 상한(이분탐색용)
     moe_topk_check: Option<(usize, usize, usize)>,
     h2d_mb: usize,
     bench: Option<(String, usize, usize)>, // (lin, t, reps)
@@ -59,6 +61,7 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
         marlin_selfcheck: None,
         marlin_selfcheck32: None,
         marlin_bench: Vec::new(),
+        marlin_cold: false,
         marlin_ref: None,
         attn_fa2: Vec::new(),
         attn_fa2_bench: Vec::new(),
@@ -228,6 +231,7 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
                 }
                 a.marlin_bench.push((name, t, reps, kern));
             }
+            "--marlin-cold" => a.marlin_cold = true,
             "--bench-plain" => {
                 let name = arg(&mut it, "--bench-plain requires a name")?.to_string();
                 let t = it
@@ -550,6 +554,7 @@ fn run_marlin_bench(
     dec: &mut llm170_backend_gpu::W4a16Dec,
     model: &llm170_core::qwen35::Model,
     bench: &[(String, usize, usize, String)],
+    cold: bool,
 ) -> Result<String, String> {
     let mut out = Vec::new();
     for (name, t, reps, kern) in bench {
@@ -590,7 +595,7 @@ fn run_marlin_bench(
             ),
             _ => ("w4a16_gemm_g128_marlin", 64, 128, 256, false),
         };
-        out.push(dec.marlin_bench(name, *t, *reps, &qm, msym, mbm, mbn, mthr, vs_gemv)?);
+        out.push(dec.marlin_bench(name, *t, *reps, &qm, msym, mbm, mbn, mthr, vs_gemv, cold)?);
     }
     Ok(out.join("\n"))
 }
@@ -1158,7 +1163,7 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
         return run_marlin_ref(&mut dec, &model, name, *t, a.mode_ref, a.kcap);
     }
     if !a.marlin_bench.is_empty() {
-        return run_marlin_bench(&mut dec, &model, &a.marlin_bench);
+        return run_marlin_bench(&mut dec, &model, &a.marlin_bench, a.marlin_cold);
     }
     if let Some((name, bt, reps)) = &a.bench_plain {
         return run_bench_plain(&mut dec, &model, name, *bt, *reps);

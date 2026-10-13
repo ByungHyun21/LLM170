@@ -78,12 +78,20 @@ pub(crate) fn handle(
                     resp(stream, 503, "application/json", "{\"status\":\"loading\"}")
                 }
             }
-            ("GET", "/v1/models") => resp(
-                stream,
-                200,
-                "application/json",
-                "{\"object\":\"list\",\"data\":[{\"id\":\"llm170\",\"object\":\"model\",\"owned_by\":\"local\"}]}",
-            ),
+            ("GET", "/v1/models") => {
+                // [2.J 2026-10-13] 실효 ctx 광고 — max_model_len = min(모델 최대,
+                // 풀 파생[K6 후]) — 현재는 파생 전이라 엔진 ctx와 동일값.
+                let eff = crate::metrics::effective_ctx();
+                let mmax = crate::metrics::model_max_ctx();
+                resp(
+                    stream,
+                    200,
+                    "application/json",
+                    &format!(
+                        "{{\"object\":\"list\",\"data\":[{{\"id\":\"llm170\",\"object\":\"model\",\"owned_by\":\"local\",\"max_model_len\":{eff},\"model_max_len\":{mmax}}}]}}"
+                    ),
+                )
+            }
             // 모니터링 — 최신 스냅샷 1장(시계열 누적은 외부 폴러 몫).
             // /stats = JSON(주 타깃), /metrics = Prometheus 텍스트(표준 호환).
             ("GET", "/stats") => resp(stream, 200, "application/json", &crate::metrics::json()),
@@ -324,22 +332,31 @@ fn run_and_emit(
         );
         return;
     }
-    // ctx 검증 — 프롬프트+생성이 컨텍스트를 넘으면 400 (context-shift v1:
-    // 슬롯 무상태라 이동 없이 거절 — 이동 재배치는 접두 캐시 도입 시).
+    // [K6 입장 규약 2026-10-13] 프롬프트 초과 = 입장 전 거부(context_length_exceeded);
+    // 프롬프트는 들어가나 생성한도가 넘으면 **클램프**(경고) — 사용 중 실패 금지.
     let ctx = *SERVER_CTX.get().unwrap_or(&4096);
-    if ids.len() + n_predict + 8 >= ctx {
+    let mut n_predict = n_predict;
+    if ids.len() + 8 >= ctx {
         resp(
             stream,
             400,
             "application/json",
             &format!(
-                "{{\"error\":\"context too small: prompt {} + n_predict {} >= ctx {}\"}}",
+                "{{\"error\":\"context_length_exceeded: prompt {} + 8 >= ctx {}\"}}",
                 ids.len(),
-                n_predict,
                 ctx
             ),
         );
         return;
+    }
+    if ids.len() + n_predict + 8 >= ctx {
+        let lim = ctx.saturating_sub(ids.len() + 8).max(1);
+        eprintln!(
+            "# max_tokens 클램프: {} → {lim} (prompt {} + 여유 8 vs ctx {ctx})",
+            n_predict,
+            ids.len()
+        );
+        n_predict = lim;
     }
     let prompt_len = ids.len();
     let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, stops, sampler) else {
@@ -572,21 +589,31 @@ fn run_and_emit_anthropic(
         );
         return;
     }
-    // A14: ctx 사전 검증 — run_and_emit과 동일(엔진 Err→500보다 400이 정확).
+    // [K6 입장 규약 2026-10-13] 프롬프트 초과 = 거부(context_length_exceeded);
+    // 생성한도 초과(프롬프트는 들어감) = 클램프(경고) — run_and_emit과 동일.
     let ctx = *SERVER_CTX.get().unwrap_or(&4096);
-    if ids.len() + n_predict + 8 >= ctx {
+    let mut n_predict = n_predict;
+    if ids.len() + 8 >= ctx {
         resp(
             stream,
             400,
             "application/json",
             &format!(
-                "{{\"type\":\"error\",\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"context too small: prompt {} + max_tokens {} >= ctx {}\"}}}}",
+                "{{\"type\":\"error\",\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"context_length_exceeded: prompt {} + 8 >= ctx {}\"}}}}",
                 ids.len(),
-                n_predict,
                 ctx
             ),
         );
         return;
+    }
+    if ids.len() + n_predict + 8 >= ctx {
+        let lim = ctx.saturating_sub(ids.len() + 8).max(1);
+        eprintln!(
+            "# max_tokens 클램프(anthropic): {} → {lim} (prompt {} + 여유 8 vs ctx {ctx})",
+            n_predict,
+            ids.len()
+        );
+        n_predict = lim;
     }
     let prompt_len = ids.len();
     let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, vec![STOP_EOT], sampler) else {

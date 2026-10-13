@@ -361,9 +361,16 @@ pub(super) struct Attn {
     pub(super) dksc: CUdeviceptr,
     pub(super) dvsc: CUdeviceptr,
     /// [K6-2 2026-10-12] KV 블록 테이블(디바이스 u64 [slot][layer][mb]×4 —
-    /// k, v, ksc, vsc 기저 바이트 주소). set_attn이 연속 할당 기반으로 구축,
-    /// 내용 불변(그래프 캡처 계약 — 캡처는 주소만 베이크).
+    /// k, v, ksc, vsc 기저 바이트 주소). set_attn이 구축, 내용 불변
+    /// (그래프 캡처 계약 — 캡처는 주소만 베이크).
     pub(super) dblk_tab: CUdeviceptr,
+    /// [K6-3 2026-10-13] KV 물리 블록 할당자(호스트) — 테이블 엔트리의 정본.
+    /// 다음 단계에서 온디맨드 성장·회수(입장 보장)의 기반.
+    pub(super) kv_pool: Option<blocktable::KvPool>,
+    /// [K6-3 예산] KV 아레나 예산(바이트) — set_attn이 소비(풀 총량 = min(예산, 슬롯×ctx)).
+    pub(super) kv_budget: Option<u64>,
+    /// [K6-3 예산] 실할당 아레나+테이블 바이트(관측 — mem_stats/kv_pool_bytes).
+    pub(super) kv_arena_bytes: u64,
     pub(super) dpp: CUdeviceptr,
     pub(super) dqg_a: CUdeviceptr,
     pub(super) dkin_a: CUdeviceptr,
@@ -487,6 +494,8 @@ pub struct W4a16Dec {
     pub n_layers: usize,
     pub n_slots: usize,
     pub slot_pos: Vec<u32>,
+    /// [K6-3 2026-10-13] 슬롯별 KV 확보 고수위(토큰) — kv_ensure 무비용 no-op용.
+    pub kv_assigned: Vec<usize>,
     /// 선형 상주 — 이름 → (packed, scale, n, k).
     lins: HashMap<String, (CUdeviceptr, CUdeviceptr, usize, usize)>,
     /// 플레인 bf16 상주 — 이름 → ([k][n] 전치 ptr, n, k). MoE 모델(35B)의
@@ -686,6 +695,9 @@ impl W4a16Dec {
                 dksc: 0,
                 dvsc: 0,
                 dblk_tab: 0,
+                kv_pool: None,
+                kv_budget: None,
+                kv_arena_bytes: 0,
                 dpp: 0,
                 dqg_a: 0,
                 dkin_a: 0,
@@ -753,6 +765,7 @@ impl W4a16Dec {
             n_layers,
             n_slots: n_slots.max(1),
             slot_pos: vec![0; n_slots.max(1)],
+            kv_assigned: vec![0; n_slots.max(1)],
             lins: HashMap::new(),
             plains: HashMap::new(),
             plain_weights: false,

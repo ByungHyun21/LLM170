@@ -37,6 +37,8 @@ pub struct Info {
     pub instance: String,
     pub model: String,
     pub ctx: usize,
+    /// [2.J] 모델 전역 ctx 상한(0 = 미상) — /v1/models·/stats 노출.
+    pub model_max_ctx: usize,
     pub n_slots: usize,
     /// 모델 파일 총합(디스크 — 분류의 기준점).
     pub model_bytes: u64,
@@ -220,6 +222,14 @@ fn esc(s: &str) -> String {
 
 /// JSON 스냅샷 — 외부 폴러용(수 KB). 메모리는 **모델 중심 분류**:
 /// 각 컴포넌트가 gpu/cpu 어디에 얼마나 있는지(현행 KV·PLE는 gpu 전량/미구현).
+/// [2.J] 실효/모델 최대 ctx — /v1/models·외부 폴러용(풀 도입 시 실효가 pool-파생으로 대체).
+pub fn effective_ctx() -> usize {
+    SNAP.get().map(|s| s.info.ctx).unwrap_or(0)
+}
+pub fn model_max_ctx() -> usize {
+    SNAP.get().map(|s| s.info.model_max_ctx).unwrap_or(0)
+}
+
 pub fn json() -> String {
     let Some(s) = SNAP.get() else {
         return "{\"error\":\"metrics uninitialized\"}".to_string();
@@ -288,9 +298,11 @@ pub fn json() -> String {
         })
         .unwrap_or_default();
     format!(
-        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"cpu\":0}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\"}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"prefix_reuse_ratio\":{:.4},\"prefix_reuse_full\":{},\"prefix_reuse_ckpt\":{},\"trie_boundaries\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{},\"spec_rounds\":{},\"spec_accepted\":{},\"spec_round_ms_avg\":{:.2}}},\"slot_detail\":[{}]}}",
+        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"model_max_ctx\":{},\"effective_ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"cpu\":0}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\"}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"kv_pool_bytes\":{},\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"prefix_reuse_ratio\":{:.4},\"prefix_reuse_full\":{},\"prefix_reuse_ckpt\":{},\"trie_boundaries\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{},\"spec_rounds\":{},\"spec_accepted\":{},\"spec_round_ms_avg\":{:.2}}},\"slot_detail\":[{}]}}",
         esc(&s.info.instance),
         esc(&s.info.model),
+        s.info.ctx,
+        s.info.model_max_ctx,
         s.info.ctx,
         s.info.n_slots,
         s.started.elapsed().as_secs_f64(),
@@ -316,6 +328,7 @@ pub fn json() -> String {
         io.load[0].1 / 1_000_000,
         io.load[1].0,
         io.load[2].0,
+        mem.kv_gpu,
         jobs,
         if jobs > 0 {
             qw as f64 / jobs as f64 / 1e3
@@ -484,6 +497,45 @@ pub fn prometheus() -> String {
         "llm170_spec_round_ms_total",
         "speculative verify round wall us (x1000)",
         sc.spec_ms.load(Ordering::Relaxed) / 1000,
+    );
+    // [2.A-④ 2026-10-13] 경제성 게이트 — 모드·소스·비용 EMA(ms/토큰).
+    pm_gauge(
+        &mut o,
+        "llm170_spec_econ_on",
+        "spec economics gate (1=spec, 0=plain)",
+        format!("llm170_spec_econ_on {}", sc.econ_on.load(Ordering::Relaxed)),
+    );
+    let econ_cost = |v: &std::sync::atomic::AtomicU64, n: &std::sync::atomic::AtomicU64| -> f64 {
+        if n.load(Ordering::Relaxed) == 0 {
+            0.0
+        } else {
+            f64::from_bits(v.load(Ordering::Relaxed))
+        }
+    };
+    pm_gauge(
+        &mut o,
+        "llm170_spec_cost_ms_tok",
+        "spec round cost EMA (ms per emitted token, best source)",
+        format!(
+            "llm170_spec_cost_ms_tok {:.4}",
+            econ_cost(&sc.econ_src[0], &sc.econ_src_n[0]).min({
+                let n = sc.econ_src_n[1].load(Ordering::Relaxed);
+                if n == 0 {
+                    f64::INFINITY
+                } else {
+                    f64::from_bits(sc.econ_src[1].load(Ordering::Relaxed))
+                }
+            })
+        ),
+    );
+    pm_gauge(
+        &mut o,
+        "llm170_plain_cost_ms_tok",
+        "plain decode cost EMA (ms per token)",
+        format!(
+            "llm170_plain_cost_ms_tok {:.4}",
+            econ_cost(&sc.econ_plain, &sc.econ_plain_n)
+        ),
     );
     pm_counter(
         &mut o,

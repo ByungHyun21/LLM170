@@ -11,6 +11,7 @@ use std::path::Path;
 pub struct GpuEngine {
     model: llm170_core::qwen35::Model,
     dec: W4a16Dec,
+    #[allow(dead_code)] // reset_states(진단/복구) 전용
     n_slots: usize,
     /// GPU head 상주 여부(bf16 output.weight 업로드 성공).
     head_gpu: bool,
@@ -33,10 +34,17 @@ pub fn prefill_tmax(is_moe: bool, resident: bool, env: Option<&str>) -> usize {
 
 impl GpuEngine {
     /// 모델 로드 + 가중치 상주 업로드(간헐 ENOENT 재시도는 호출부 소관).
-    pub fn load(dir: &Path, n_slots: usize, ctx: usize) -> Result<Self, String> {
+    pub fn load(
+        dir: &Path,
+        n_slots: usize,
+        ctx: usize,
+        kv_budget: Option<u64>,
+    ) -> Result<Self, String> {
         let model = llm170_core::qwen35::Model::load(dir).map_err(|e| e.to_string())?;
         let hp = model.hp.clone();
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
+        // [K6-3 예산] 풀 예산(여유 VRAM 파생) — upload_model(내부 set_attn) 전에 설정.
+        dec.set_kv_budget(kv_budget);
         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
         // [D2 검수 2026-10-13] 적재 실패 시 부분 할당 정리 — 재시도 루프가
         // VRAM을 되찾지 못하던 문제(첫 시도 실패 후 전부 OOM)의 해소.
@@ -297,7 +305,12 @@ impl GpuEngine {
     /// 종전 파킹 경로와 동일). 초안은 검증이 정본이라 이 게이트는 무손실
     /// (운영 정책 — 수치 경로 분기 아님, 단일화 방침 준수).
     pub fn mtp_drafts_on(&self) -> bool {
-        self.mtp && llm170_diag::flag::val("LLM170_SPEC_DRAFT_SOURCE") != Some("ngram")
+        // [2.J] CLI 정책 우선 — 1=mtp 강제(가용 시) · 2=ngram 강제 · 0=auto(env 진단).
+        match crate::engine::SPEC_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => self.mtp,
+            2 => false,
+            _ => self.mtp && llm170_diag::flag::val("LLM170_SPEC_DRAFT_SOURCE") != Some("ngram"),
+        }
     }
 
     /// [MTP] 라운드 전 — 검증 체인 dres의 수용 접두 acc행을 hidden 어셈블리로
@@ -350,6 +363,10 @@ impl GpuEngine {
         let t = toks.len() as u32;
         let pos_start = self.dec.slot_pos_of(slot).saturating_sub(t);
         let draft = self.dec.mtp_run(slot, &toks, &embeds, pos_start)?;
+        // [2.A-③ 2026-10-13] 재귀 시드 = 앵커 마지막 행(t-1)의 fin — 체인/순차
+        // 재귀의 "ptr5 행 0 복사" 계약에 맞춰 정규화한다(종전 t≥2에서 행 0을
+        // 읽어 d_2+가 스테일 조건에서 생성되던 결함). t=1은 무연산.
+        self.dec.mtp_fin_seed(t as usize - 1)?;
         // [MTP-CHAIN §3.3] 재귀 k-1스텝 = 체인 1회(호스트 왕복 0 — 종전
         // 4콜 ≈10.4ms/라운드 → 그래프 리플레이). base_pos = 앵커 마지막 행
         // 위치(pos_start+t-1): 리플레이의 dpp+1 → 첫 스텝 pos_start+t =
@@ -521,9 +538,36 @@ impl GpuEngine {
         self.dec.prof_report(label)
     }
 
-    /// 슬롯 상태 리셋(GDN 링/스캔 + pp + pos).
+    /// 슬롯 상태 리셋(GDN 링/스캔 + pp + pos). [K6-3] KV 블록 반납 포함 —
+    /// 정상 완료(접두 캐시 유지)는 리셋을 부르지 않으므로 영향 없음.
     pub fn reset_seq(&mut self, seq: usize) -> Result<(), String> {
+        self.dec.kv_release(seq);
         self.dec.reset_state(seq)
+    }
+
+    /// [K6-3 2026-10-13] 슬롯 KV 블록 확보(온디맨드·입장) — 신규 블록 수.
+    pub fn kv_grow(&mut self, slot: usize, n_tokens: usize) -> Result<usize, String> {
+        self.dec.kv_grow(slot, n_tokens)
+    }
+
+    /// [K6-3] 풀 여유 블록 수.
+    pub fn kv_free_blocks(&self) -> usize {
+        self.dec.kv_free_blocks()
+    }
+
+    /// [K6-3] 풀 총 블록 수(용량).
+    pub fn kv_total_blocks(&self) -> usize {
+        self.dec.kv_total_blocks()
+    }
+
+    /// [K6-3] 슬롯 KV 반납(유휴 슬롯 접두 캐시 회수 — 압박 사다리 1단계).
+    pub fn kv_release_slot(&mut self, slot: usize) -> usize {
+        self.dec.kv_release(slot)
+    }
+
+    /// [K6-3] n_tokens 예약 필요 블록 수(입장 판정).
+    pub fn kv_blocks_needed(&self, n_tokens: usize) -> usize {
+        self.dec.kv_blocks_needed(n_tokens)
     }
 
     /// [§7.1 2026-10-11] 스펙 서빙 — GDN 토큰별 스냅샷 버퍼 확보(모델당 1회).
@@ -579,6 +623,7 @@ impl GpuEngine {
     }
 
     /// 전 슬롯 리셋(서버 워밍업 종료 후).
+    #[allow(dead_code)] // [K6-3] 워밍업은 reset_seq(0)(KV 반납 포함)로 대체 — 진단/복구용 유지
     pub fn reset_states(&mut self) -> Result<(), String> {
         for s in 0..self.n_slots {
             self.dec.reset_state(s)?;
@@ -657,10 +702,15 @@ pub(crate) fn upload_moe(
     let free = llm170_backend_gpu::cuda_mem_free()
         .map(|(f, _)| f)
         .unwrap_or(0);
-    let resident = match llm170_diag::flag::val("LLM170_MOE_RESIDENT") {
-        Some("0") => false,
-        Some("1") => true,
-        _ => free > expert_bytes + (1 << 30),
+    // [2.J] CLI 정책 우선 — 1=resident 강제 · 2=streaming 강제 · 0=auto(env/여유).
+    let resident = match crate::engine::MOE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => match llm170_diag::flag::val("LLM170_MOE_RESIDENT") {
+            Some("0") => false,
+            Some("1") => true,
+            _ => free > expert_bytes + (1 << 30),
+        },
     };
     let tab_ms = t1.elapsed().as_secs_f64() * 1e3;
     let t2 = std::time::Instant::now();

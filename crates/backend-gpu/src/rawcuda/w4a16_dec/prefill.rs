@@ -63,6 +63,8 @@ impl W4a16Dec {
         if pos as usize + t > cap {
             return Err(format!("context overflow: pos{pos}+T{t} > kvcap{cap}"));
         }
+        // [K6-3] KV 온디맨드 확보(슬랙 2행) — t≥2 진입 공통(프리필·검증).
+        self.kv_ensure(slot, pos as usize + t + 2)?;
         if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("chain_device_t: 디코더 상수 미등록".into());
         }

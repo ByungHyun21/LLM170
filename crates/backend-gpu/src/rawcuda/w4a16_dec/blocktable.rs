@@ -1,77 +1,136 @@
-//! [§3.4/§4.1 K6 2026-10-12] 블록 해시 paged KV — 블록 테이블 관리(호스트).
+//! [K6 3차 2026-10-13] KV 블록 풀 — 호스트 측 물리 블록 할당자.
 //!
-//! 설계 원칙:
-//! - **블록 = 512 토큰**(K3 체크포인트·tree.rs 노드와 정합).
-//! - 슬롯별 연속 KV(`dkc + slot*cap*kv_dim`)를 블록 단위 분할 할당으로
-//!   교체 — 블록 테이블`(slot, block_idx) → device ptr`이 주소 체계.
-//! - **간접 참조 계층만 제공**(호스트 관리) — 커널 수정은 다음 트랜셰.
-//! - 블록 공유(동일 접두 = 동일 블록 참조·refcount)가 최종 목적(②).
+//! 설계:
+//! - **블록 = 512 토큰 × 1층**(K3 체크포인트·tree.rs 노드와 정합).
+//! - 물리 = 평탄 아레나 4종(k/v/ksc/vsc, 같은 블록 수) — 블록 주소 =
+//!   `arena + id × block_bytes`. 커널은 디바이스 블록 테이블(dblk_tab)만
+//!   보므로, 호스트가 (slot, layer, block) → 물리 id를 바꾸면 그대로 반영된다.
+//! - **현 단계(보존 커밋)**: 총 블록 수 = 종전 용량(slots × 층수 × mb)과 동일,
+//!   set_attn이 전량 선할당(주소 체계는 종전과 동형 — 슬롯 메이저).
+//! - **다음 단계(입장 보장)**: 예산 기반 풀 + 온디맨드 `ensure_upto`(성장)·
+//!   `release`(반납) — 슬롯 정적 예약 제거.
 
-use super::CUdeviceptr;
-
-/// 블록 테이블 — 슬롯별 블록 포인터 목록.
-/// [K6-2차 진행 중] attn.cu 간접 참조 통합 전까지 미사용 — 통합 시 활성화.
-/// 블록 크기 = 512 토큰 × kv_dim 바이트(int8 KV 기준).
-#[allow(dead_code)] // K6-2차 통합 대기
-pub struct BlockTable {
-    /// 슬롯별 블록 포인터(블록 순서 = 토큰 순서).
-    pub blocks: Vec<Vec<CUdeviceptr>>,
-    /// 전체 블록 풀(할당된 블록 — 회수/재사용 관리).
-    pub pool: Vec<CUdeviceptr>,
-    /// 블록 크기(바이트).
-    pub block_bytes: usize,
-    /// 슬롯 수.
-    pub n_slots: usize,
+/// 물리 블록 할당자 — (slot, layer, block) → 물리 블록 id.
+pub struct KvPool {
+    n_slots: usize,
+    n_layers: usize,
+    /// 층당 블록 수(테이블 크기 = cap/512).
+    mb_max: usize,
+    /// 자유 블록 id(스택 — 할당 O(1)).
+    free: Vec<u32>,
+    /// 총 블록 수(용량 — 입장 불가 판정).
+    total: usize,
+    /// slot_map[slot][layer * mb_max + bi] = 물리 id (u32::MAX = 미할당).
+    slot_map: Vec<Vec<u32>>,
+    used: Vec<usize>,
 }
 
-#[allow(dead_code)] // K6-2차 통합 대기
-impl BlockTable {
-    pub fn new(n_slots: usize, kv_dim: usize) -> Self {
-        BlockTable {
-            blocks: vec![Vec::new(); n_slots],
-            pool: Vec::new(),
-            block_bytes: 512 * kv_dim,
+impl KvPool {
+    /// `total_blocks` ≤ u32::MAX-1(센티널) 계약.
+    pub fn new(
+        n_slots: usize,
+        n_layers: usize,
+        mb_max: usize,
+        total_blocks: usize,
+    ) -> Result<Self, String> {
+        if n_slots == 0 || n_layers == 0 || mb_max == 0 {
+            return Err("KvPool: 0 차원".into());
+        }
+        if total_blocks >= u32::MAX as usize {
+            return Err(format!("KvPool: 블록 {total_blocks} ≥ u32 센티널"));
+        }
+        Ok(KvPool {
             n_slots,
-        }
+            n_layers,
+            mb_max,
+            free: (0..total_blocks as u32).rev().collect(),
+            total: total_blocks,
+            slot_map: vec![vec![u32::MAX; n_layers * mb_max]; n_slots],
+            used: vec![0; n_slots],
+        })
     }
 
-    /// 슬롯에 블록 추가 — pos 위치의 블록 포인터 등록.
-    pub fn push(&mut self, slot: usize, ptr: CUdeviceptr) -> Result<(), String> {
-        if slot >= self.n_slots {
-            return Err(format!("BlockTable: 슬롯 {slot} ≥ {}", self.n_slots));
+    /// (slot, layer, bi) 블록 확보 — 있으면 그 id, 없으면 할당.
+    pub fn ensure(&mut self, slot: usize, layer: usize, bi: usize) -> Result<u32, String> {
+        if slot >= self.n_slots || layer >= self.n_layers || bi >= self.mb_max {
+            return Err(format!(
+                "KvPool: 범위 밖 slot={slot} layer={layer} bi={bi} \
+                 ({}/{}/{})",
+                self.n_slots, self.n_layers, self.mb_max
+            ));
         }
-        self.blocks[slot].push(ptr);
-        Ok(())
+        let e = layer * self.mb_max + bi;
+        let cur = self.slot_map[slot][e];
+        if cur != u32::MAX {
+            return Ok(cur);
+        }
+        let id = self
+            .free
+            .pop()
+            .ok_or_else(|| format!("KvPool: 블록 소진(자유 0) — slot={slot}"))?;
+        self.slot_map[slot][e] = id;
+        self.used[slot] += 1;
+        Ok(id)
     }
 
-    /// 슬롯 블록 전체 해제 — 슬롯 반환 시.
-    pub fn clear(&mut self, slot: usize) {
+    /// n_tokens까지 필요한 모든 (층,블록)을 확보 — 새로 할당된 물리 id 목록
+    /// (호출부가 디바이스 테이블 엔트리를 갱신). 멱등.
+    #[allow(dead_code)] // [K6-3] 다음 단계(온디맨드 성장·입장 보장) 배선 전
+    pub fn ensure_upto(&mut self, slot: usize, n_tokens: usize) -> Result<Vec<u32>, String> {
+        let nb = n_tokens.div_ceil(512).min(self.mb_max);
+        let mut new = Vec::new();
+        for l in 0..self.n_layers {
+            for bi in 0..nb {
+                let e = l * self.mb_max + bi;
+                if self.slot_map[slot][e] == u32::MAX {
+                    new.push(self.ensure(slot, l, bi)?);
+                }
+            }
+        }
+        Ok(new)
+    }
+
+    pub fn get(&self, slot: usize, layer: usize, bi: usize) -> Option<u32> {
+        let id = self.slot_map.get(slot)?.get(layer * self.mb_max + bi)?;
+        (*id != u32::MAX).then_some(*id)
+    }
+
+    /// 슬롯 반납 — 사용 블록 수 반환.
+    #[allow(dead_code)] // [K6-3] 다음 단계(입장 보장·실효 ctx) 배선 전
+    pub fn release(&mut self, slot: usize) -> usize {
+        let mut n = 0usize;
         if slot < self.n_slots {
-            self.blocks[slot].clear();
+            for e in 0..self.slot_map[slot].len() {
+                let id = self.slot_map[slot][e];
+                if id != u32::MAX {
+                    self.slot_map[slot][e] = u32::MAX;
+                    self.free.push(id);
+                    n += 1;
+                }
+            }
+            self.used[slot] = 0;
         }
+        n
     }
 
-    /// 위치 → 블록 인덱스·블록 내 오프셋.
-    pub fn locate(&self, pos: usize) -> (usize, usize) {
-        (pos / 512, pos % 512)
+    #[allow(dead_code)] // [K6-3] 다음 단계(입장 보장·실효 ctx) 배선 전
+    pub fn free_blocks(&self) -> usize {
+        self.free.len()
     }
 
-    /// 슬롯·위치 → 장치 주소(블록 기반).
-    pub fn addr(&self, slot: usize, pos: usize) -> Result<CUdeviceptr, String> {
-        let (bi, off) = self.locate(pos);
-        let blks = self.blocks.get(slot).ok_or("BlockTable: 슬롯 범위")?;
-        let base = blks.get(bi).ok_or("BlockTable: 블록 범위")?;
-        Ok(base + (off * self.block_bytes / 512) as u64)
-    }
-
-    /// 슬롯별 사용 중 블록 수.
-    pub fn n_blocks(&self, slot: usize) -> usize {
-        self.blocks.get(slot).map_or(0, |b| b.len())
-    }
-
-    /// 전체 사용 중 블록 수(VRAM 사용량 계측).
+    /// 총 블록 수 — 예약이 용량 자체를 넘는 요청의 조기 거부(무한 대기 방지).
     pub fn total_blocks(&self) -> usize {
-        self.blocks.iter().map(|b| b.len()).sum()
+        self.total
+    }
+
+    #[allow(dead_code)] // [K6-3] 다음 단계(입장 보장·실효 ctx) 배선 전
+    pub fn used_blocks(&self, slot: usize) -> usize {
+        self.used.get(slot).copied().unwrap_or(0)
+    }
+
+    #[allow(dead_code)] // [K6-3] 다음 단계(입장 보장·실효 ctx) 배선 전
+    pub fn mb_max(&self) -> usize {
+        self.mb_max
     }
 }
 
@@ -80,33 +139,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn locate_512_boundary() {
-        let bt = BlockTable::new(2, 128);
-        assert_eq!(bt.locate(0), (0, 0));
-        assert_eq!(bt.locate(511), (0, 511));
-        assert_eq!(bt.locate(512), (1, 0));
-        assert_eq!(bt.locate(1024), (2, 0));
+    fn ensure_idempotent_and_upto() {
+        let mut p = KvPool::new(2, 3, 4, 100).unwrap();
+        let a = p.ensure(0, 1, 1).unwrap();
+        assert_eq!(p.ensure(0, 1, 1).unwrap(), a, "멱등");
+        let new = p.ensure_upto(0, 1024).unwrap();
+        // 층 3 × 블록 2 = 6칸 중 (1,1)은 이미 있음 → 신규 5.
+        assert_eq!(new.len(), 5);
+        assert_eq!(p.used_blocks(0), 6);
+        // 재호출은 신규 0(멱등).
+        assert_eq!(p.ensure_upto(0, 1024).unwrap().len(), 0);
     }
 
     #[test]
-    fn push_clear_count() {
-        let mut bt = BlockTable::new(2, 128);
-        bt.push(0, 0x1000).unwrap();
-        bt.push(0, 0x2000).unwrap();
-        bt.push(1, 0x3000).unwrap();
-        assert_eq!(bt.n_blocks(0), 2);
-        assert_eq!(bt.n_blocks(1), 1);
-        assert_eq!(bt.total_blocks(), 3);
-        bt.clear(0);
-        assert_eq!(bt.n_blocks(0), 0);
-        assert_eq!(bt.total_blocks(), 1);
+    fn release_and_reuse() {
+        let mut p = KvPool::new(1, 2, 4, 8).unwrap();
+        p.ensure_upto(0, 2048).unwrap();
+        assert_eq!(p.free_blocks(), 0);
+        assert_eq!(p.release(0), 8);
+        assert_eq!(p.free_blocks(), 8);
+        // 반납 뒤 재할당 — 같은 풀에서 다시 8칸.
+        p.ensure_upto(0, 2048).unwrap();
+        assert_eq!(p.free_blocks(), 0);
     }
 
     #[test]
-    fn addr_block_offset() {
-        let mut bt = BlockTable::new(1, 128);
-        bt.push(0, 0x1000).unwrap();
-        assert_eq!(bt.addr(0, 0).unwrap(), 0x1000);
-        assert_eq!(bt.addr(0, 1).unwrap(), 0x1000 + 128);
+    fn exhausted_is_error() {
+        let mut p = KvPool::new(1, 2, 4, 3).unwrap();
+        let e = p.ensure_upto(0, 2048).unwrap_err();
+        assert!(e.contains("블록 소진"), "{e}");
+    }
+
+    #[test]
+    fn upto_clamps_to_mb_max() {
+        let mut p = KvPool::new(1, 1, 4, 4).unwrap();
+        // 요청 토큰이 테이블 범위를 넘어도 mb_max로 클램프(테이블 밖 엔트리 금지).
+        let new = p.ensure_upto(0, 99999).unwrap();
+        assert_eq!(new.len(), 4);
     }
 }

@@ -25,6 +25,11 @@ impl W4a16Dec {
         if !(2..=8).contains(&t) {
             return Err(format!("spec_verify: t={t} 계약(2..=8)"));
         }
+        // [K6-3] KV 온디맨드 확보 — 검증 행 t(+슬랙 2행) 포함(그래프 경로 공통).
+        {
+            let pos0 = self.slot_pos[slot] as usize;
+            self.kv_ensure(slot, pos0 + t + 2)?;
+        }
         // [A6-1 2026-10-11] 검증 체인 (slot,t) 그래프 캐시 — 런치 오버헤드 제거.
         // 행은 핀드 고정 버퍼(캡처 h2d 소스 고정), pos는 replay 직전 그래프
         // 밖 h2d(같은 스트림 순서). 미스 = 직접 발사(정답·호스트 갱신 포함)

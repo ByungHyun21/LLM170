@@ -107,6 +107,7 @@ impl Model {
             d_state,
             conv_k: c.linear_conv_kernel,
             vocab: c.vocab,
+            max_pos: c.max_pos,
             n_experts: c.n_experts,
             top_k: c.top_k,
             moe_ffn: c.moe_ffn,
@@ -723,3 +724,35 @@ impl Engine {
 /// greedy argmax — `matmul::greedy_from`과 동일 의미(동률 최저인덱스).
 /// 구현 중복 제거: 단일 구현 재수출.
 pub use crate::matmul::greedy_from as greedy;
+
+/// [2.J 2026-10-13] serve의 ctx 파생·기동 가드 입력 — config만 판독(전체 로드 없음).
+pub struct CtxInfo {
+    /// 모델 전역 ctx 상한(max_position_embeddings).
+    pub ctx: usize,
+    /// [K6-3] GDN 상태 바이트/슬롯(f32) — 기동 예산 회계(문맥 추가분).
+    pub gdn_state_bytes_per_slot: u64,
+    /// KV(int8)+스케일 바이트/토큰 추정 — 엔진 할당과 같은 항
+    /// (full층 × kv헤드 × head_dim × 2B(K+V) + full층 × kv헤드 × 2 × 4B 스케일).
+    pub kv_bytes_per_token: u64,
+    /// dense FFN(전문가 0) — VRAM 가드에서 가중치 전량 요구 판단.
+    pub dense: bool,
+}
+
+pub fn ctx_info(dir: &std::path::Path) -> Result<CtxInfo, String> {
+    let c = bind::QwenCfg::load(dir).map_err(|e| e.to_string())?;
+    let full = (c.layers as u64).div_ceil(c.full_interval.max(1) as u64);
+    let kv = full * c.kv_heads as u64 * c.head_dim as u64 * 2;
+    let sc = full * c.kv_heads as u64 * 2 * 4;
+    Ok(CtxInfo {
+        ctx: c.max_pos,
+        // GDN(선형) 층 = 전체 − 전체/간격(=3/4), 상태 [n_gdn][h_v][128×128] f32.
+        gdn_state_bytes_per_slot: (c.layers as u64
+            - c.layers as u64 / c.full_interval.max(1) as u64)
+            * c.linear_num_value_heads as u64
+            * 128
+            * 128
+            * 4,
+        kv_bytes_per_token: kv + sc,
+        dense: c.n_experts == 0,
+    })
+}

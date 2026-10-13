@@ -30,8 +30,9 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
   llm170 bench --model <w4a16_dir> [--pp N[,N..]] [--tg N[,N..]] [--np N[,N..]]
               [--reps N] [--ctx N]
       llama-bench 규격 PP/TG/NP 측정(엔진 직접 — HTTP 무경유, 합성 LCG 토큰).
-  llm170 serve --model <w4a16_dir> [--port N] [--ctx N] [--slots N] [--queue N]
-      OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯.
+  llm170 serve --model <w4a16_dir> [--port N] [--ctx N|auto] [--queue N]
+              [--spec auto|mtp|ngram|off] [--moe auto|resident|streaming]
+      OpenAI/Anthropic 호환 HTTP 서버. 동시성 = min(내부 문맥, 풀 입장) — 슬롯 플래그 없음.
   llm170 w4a16-load <dir>
       W4A16(compressed-tensors int4 sym g128) 로더 완전성 검증 — 트리플·커버리지.
   llm170 w4a16-ref <dir> --prompt-tokens <ids> [--n-predict N] [--ctx N]
@@ -229,12 +230,16 @@ fn run_main() -> ExitCode {
     }
 }
 
-/// llm170 serve --model <dir> [--port N] [--ctx N] [--slots N]
+/// llm170 serve --model <dir> [--port N] [--ctx N|auto] [--queue N] [--spec ..] [--moe ..]
 fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
     let mut queue: Option<usize> = None;
-    let mut slots: Option<usize> = None;
+    // [K6-3 2026-10-13] --slots 폐지 — 동시성 = min(문맥 수, 풀 입장).
+    // 문맥 수는 내부 상수(상태 메모리 = 문맥×gdn_state/슬롯 — 예산 회계 반영).
+    const SERVE_CONTEXTS: usize = 4;
     let mut ctx = 4096usize;
+    // [2.J 2026-10-13] --ctx auto = 모델 전역 상한(config 파생).
+    let mut ctx_auto = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -242,17 +247,30 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 Some(p) => port = p,
                 None => return usage_err("--port requires a number"),
             },
-            "--ctx" => match it.next().and_then(|v| v.parse().ok()) {
-                Some(c) => ctx = c,
-                None => return usage_err("--ctx requires a number"),
-            },
-            "--slots" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
-                Some(s) => slots = Some(s.clamp(1, 16)),
-                None => return usage_err("--slots requires a number in 1..=16"),
+            "--ctx" => match it.next() {
+                Some(v) if v == "auto" => ctx_auto = true,
+                Some(v) => match v.parse().ok() {
+                    Some(c) => ctx = c,
+                    None => return usage_err("--ctx requires a number or auto"),
+                },
+                None => return usage_err("--ctx requires a number or auto"),
             },
             "--queue" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(q) => queue = Some(q.max(1)),
                 None => return usage_err("--queue requires a number"),
+            },
+            // [2.J 2026-10-13] 런치 정책 2종 (CLI > env 진단).
+            "--spec" => match it.next().map(|v| crate::engine::parse_spec_policy(v)) {
+                Some(Some(p)) => {
+                    crate::engine::SPEC_POLICY.store(p as u64, std::sync::atomic::Ordering::Relaxed)
+                }
+                _ => return usage_err("--spec requires auto|mtp|ngram|off"),
+            },
+            "--moe" => match it.next().map(|v| crate::engine::parse_moe_policy(v)) {
+                Some(Some(p)) => {
+                    crate::engine::MOE_POLICY.store(p as u64, std::sync::atomic::Ordering::Relaxed)
+                }
+                _ => return usage_err("--moe requires auto|resident|streaming"),
             },
             other => return usage_err(&format!("unknown flag: {other}")),
         }
@@ -300,9 +318,69 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let _ = engine::TOKENIZER.set(tok);
+    // [2.J 2026-10-13] 모델 파생 ctx 검증 — max_position_embeddings(기동 로그).
+    // 초과분은 클램프(가드: KV 정적 예산은 아직 엔진 ctx 파생).
+    let mut model_max_ctx = 0usize;
+    let mut kv_budget: Option<u64> = None;
+    match llm170_core::qwen35::ctx_info(&model_path) {
+        Ok(ci) => {
+            model_max_ctx = ci.ctx;
+            // [K6-3 예산 2026-10-13] 풀 예산 = 여유 VRAM − 가중치(dense) − 예약.
+            // 실효 ctx = min(모델 최대, 풀 파생) — 초과 요청은 클램프(로드 전).
+            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            let mut pool_ctx = ci.ctx;
+            let mut budget = 0u64;
+            if let Some((free, _)) = llm170_backend_gpu::cuda_mem_free() {
+                const RESERVE: u64 = 5 * (1 << 30) / 2; // 워크스페이스·스크래치 2.5GiB
+                let wts = if ci.dense { dir_bytes(&model_path) } else { 0 };
+                // [K6-3] 문맥 추가분 = (문맥−1)×GDN 상태 — KV 예산에서 차감.
+                let ctx_state = (SERVE_CONTEXTS as u64 - 1) * ci.gdn_state_bytes_per_slot;
+                budget = free
+                    .saturating_sub(wts)
+                    .saturating_sub(RESERVE)
+                    .saturating_sub(ctx_state);
+                kv_budget = Some(budget);
+                pool_ctx =
+                    (((budget / ci.kv_bytes_per_token.max(1)) as usize) / 512 * 512).min(ci.ctx);
+            }
+            if ctx_auto {
+                ctx = pool_ctx;
+            }
+            if ctx > ci.ctx {
+                eprintln!("# ctx {ctx} > 모델 최대 {} — 클램프", ci.ctx);
+                ctx = ci.ctx;
+            }
+            if ctx > pool_ctx {
+                eprintln!(
+                    "# ctx {ctx} > 풀 파생 {pool_ctx}(예산 {:.1}GiB) — 클램프",
+                    gib(budget)
+                );
+                ctx = pool_ctx;
+            }
+            if ctx < 512 {
+                eprintln!(
+                    "# ctx 가드 거부: 풀 파생 ctx {ctx} < 512 — 가중치 {:.1}GiB + 예약 2.5GiB > 여유 VRAM",
+                    gib(dir_bytes(&model_path))
+                );
+                return ExitCode::FAILURE;
+            }
+            eprintln!(
+                "# ctx: model max={} 풀 파생={pool_ctx} 사용={ctx} (kv 예산 {:.1}GiB)",
+                ci.ctx,
+                gib(budget)
+            );
+            eprintln!(
+                "# policy: spec={}(CLI) moe={}(CLI) — env 진단(LLM170_SPEC_DRAFT_SOURCE/MOE_RESIDENT)보다 우선",
+                crate::engine::spec_name(),
+                crate::engine::moe_name()
+            );
+        }
+        Err(e) => eprintln!("# ctx 검증 건너뜀(config 판독 실패): {e}"),
+    }
     let req = engine::InferRequest {
         model: model_path.clone(),
         ctx,
+        kv_budget,
     };
     // 모니터링 — 정적 정보 등록 + 샘플러 스레드(1Hz; 무시 가능 비용,
     // 최신 스냅샷만 유지 — 시계열 누적은 외부 폴러 몫).
@@ -315,10 +393,19 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
         ctx,
-        n_slots: slots.unwrap_or(1),
+        model_max_ctx,
+        n_slots: SERVE_CONTEXTS,
         model_bytes: dir_bytes(&model_path),
     });
-    match http::serve(&format!("127.0.0.1:{port}"), req, slots, queue) {
+    eprintln!(
+        "# serve: 문맥 {SERVE_CONTEXTS}(내부 상수 — --slots 폐지) · 동시성 = min(문맥, 풀 입장)"
+    );
+    match http::serve(
+        &format!("127.0.0.1:{port}"),
+        req,
+        Some(SERVE_CONTEXTS),
+        queue,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");

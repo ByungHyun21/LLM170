@@ -56,6 +56,11 @@ impl W4a16Dec {
         if !(2..=KSTEP_KMAX).contains(&k) {
             return Err(format!("kstep: k={k} — 2..={KSTEP_KMAX} 전용"));
         }
+        // [K6-3] K스텝 스팬 KV 온디맨드 확보(슬랙 2행).
+        {
+            let p = self.slot_pos.get(slot).copied().unwrap_or(0) as usize;
+            self.kv_ensure(slot, p + k + 2)?;
+        }
         if !self.embed_ready() {
             return Err("kstep: 임베딩 미등록(upload_embed 선행)".into());
         }
