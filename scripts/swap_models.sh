@@ -448,6 +448,57 @@ except Exception:
   esac
 fi
 
+# ── G4e. 접두 재사용 정합 — 콜드↔웜 토큰 동일 + 부분 재사용 발화 ──
+# [2026-10-14] 재사용 Stage 1(엔진 pos 복원·finish 불변식 클램프·빈 프리필
+# 가드)의 상시 그물: 동일 프롬프트를 (콜드 B1) → (절단 A·max8) → (웜 B2)
+# 순서로 보내 B1==B2(토큰열)와 `# prefix-cache` 발화를 판정한다. qwen 동반
+# (체크포인트 부분 경로 — 공유 assign_slot 편집의 무영향 확인).
+cat > "$RUN/g4e_cmp.py" <<'PYCMP'
+import json, sys
+def toks(p):
+    with open(p) as f:
+        return json.load(f).get("tokens", [])
+t1, t2 = toks(sys.argv[1]), toks(sys.argv[2])
+sys.exit(0 if t1 and t1 == t2 else 1)
+PYCMP
+python3 - "$RUN" <<'PYG4E'
+import json, sys
+run = sys.argv[1]
+t = open('docs/eval/corpus-long.txt', encoding='utf-8').read()[:6000]
+for name, mt in [("rB", 16), ("rA", 8)]:
+    body = {"model": "m", "messages": [{"role": "user", "content": t}],
+            "max_tokens": mt, "temperature": 0}
+    open(f'{run}/reuse-{name}.json', 'w', encoding='utf-8').write(json.dumps(body))
+PYG4E
+for pair in "$M_G4:gemma4:18101" "$M_27B:qwen27:18102"; do
+  d="${pair%%:*}"; rest="${pair#*:}"; n="${rest%%:*}"; port="${rest#*:}"
+  "$BIN" serve --model "$d" --ctx 4096 --port "$port" > "$RUN/g4e-$n.log" 2>&1 &
+  G4E_PID=$!
+  trap 'kill "$G4E_PID" 2>/dev/null' EXIT
+  for i in $(seq 1 100); do
+    sleep 3
+    grep -m1 "listening" "$RUN/g4e-$n.log" >/dev/null 2>&1 && break
+  done
+  curl -s -m 600 "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' \
+    --data-binary "@$RUN/reuse-rB.json" > "$RUN/g4e-$n-b1.json"
+  curl -s -m 600 "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' \
+    --data-binary "@$RUN/reuse-rA.json" > "$RUN/g4e-$n-a.json"
+  curl -s -m 600 "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' \
+    --data-binary "@$RUN/reuse-rB.json" > "$RUN/g4e-$n-b2.json"
+  kill "$G4E_PID" 2>/dev/null
+  wait "$G4E_PID" 2>/dev/null
+  trap - EXIT
+  if python3 "$RUN/g4e_cmp.py" "$RUN/g4e-$n-b1.json" "$RUN/g4e-$n-b2.json"; then
+    if grep -q "# prefix-cache: slot" "$RUN/g4e-$n.log"; then
+      note "G4e $n 재사용 정합 OK($(grep -c '# prefix-cache' "$RUN/g4e-$n.log")회 발화)"
+    else
+      echo "[w4a16] FAIL: G4e $n — 콜드==웜이나 재사용 미발화(캐시 경로 미진입)"; fail=1
+    fi
+  else
+    echo "[w4a16] FAIL: G4e $n — 콜드↔웜 토큰 불일치"; fail=1
+  fi
+done
+
 echo "[w4a16] ── 검수 요약(${#SUMMARY[@]}항목) ──"
 for s in "${SUMMARY[@]}"; do echo "[w4a16]   $s"; done
 if [ $fail -eq 0 ]; then
