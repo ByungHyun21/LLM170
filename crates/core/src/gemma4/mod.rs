@@ -510,17 +510,21 @@ pub use crate::matmul::greedy_from as greedy;
 /// [P3 2026-10-14] 서빙 계획 파생 — **층별 KV 일반화**(이종 dims: 슬라이딩
 /// kv_local×head_dim_local·풀 kv_global×head_dim_global). kv_bpt = int8
 /// K+V(1B/원소) + 행×헤드 스케일 f32(4B). 순수 어텐션이므로 GDN 상태 0.
+/// [ⓑ 2026-10-14 정합] 보고값 = **아레나 실청구** — KV 아레나는 층별 테이블이
+/// 아니라 **최대 클래스**(kv_heads×d 최대)로 전 층을 청구한다(block_k=512·kvd
+/// ×K/V 2아레나 + ksc/vsc f32). 정확 층별 클래스 = −8.4%(124,800→114,320
+/// B/token) 여지지만 업로드 계약 변경이라 차기 최적화. 풀 산정·ctx 가드는
+/// 실청구를 봐야 한다(과소보고 금지).
 pub fn ctx_info(dir: &std::path::Path) -> Result<crate::qwen35::CtxInfo, String> {
     let cfg = bind::GemmaCfg::load(dir).map_err(|e| e.to_string())?;
-    let n_full = cfg.layer_full.iter().filter(|&&f| f).count() as u64;
-    let n_slide = cfg.layers as u64 - n_full;
-    let kv = n_slide * (cfg.kv_local as u64 * cfg.head_dim_local as u64) * 2
-        + n_full * (cfg.kv_global as u64 * cfg.head_dim_global as u64) * 2;
-    let sc = n_slide * cfg.kv_local as u64 * 4 + n_full * cfg.kv_global as u64 * 4;
+    let kvd = (cfg.kv_local as u64 * cfg.head_dim_local as u64)
+        .max(cfg.kv_global as u64 * cfg.head_dim_global as u64);
+    let kvh = (cfg.kv_local as u64).max(cfg.kv_global as u64);
+    let per_layer = 2 * (kvd + kvh * 4); // K+V int8 + ksc/vsc f32
     Ok(crate::qwen35::CtxInfo {
         ctx: cfg.max_pos,
         gdn_state_bytes_per_slot: 0,
-        kv_bytes_per_token: kv + sc,
+        kv_bytes_per_token: cfg.layers as u64 * per_layer,
         dense: !cfg.moe,
     })
 }
