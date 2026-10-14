@@ -456,12 +456,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     eprintln!(
         "# serve: 문맥 {SERVE_CONTEXTS}(내부 상수 — --slots 폐지) · 동시성 = min(문맥, 풀 입장)"
     );
-    match http::serve(
-        &format!("127.0.0.1:{port}"),
-        req,
-        Some(SERVE_CONTEXTS),
-        queue,
-    ) {
+    match http::serve(&format!("127.0.0.1:{port}"), req, SERVE_CONTEXTS, queue) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
