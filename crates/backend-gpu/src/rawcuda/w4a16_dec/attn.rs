@@ -95,14 +95,16 @@ impl W4a16Dec {
             self.attn_blk_ptr(slot),
             self.attn_pp_ptr(slot),
         );
+        // [행 퓨전 2026-10-14] 단일 체인은 행별 배열 불요(null).
+        let (mut n0, mut n1) = (0u64, 0u64);
         self.cc.launch(
             f,
             t_len as u32,
             (dm.q_heads + dm.kv_heads) as u32,
             128,
-            &mut crate::rawcuda::args::l13(
-                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut aa, &mut tl,
-                &mut lay, &mut qh, &mut kvh, &mut cp,
+            &mut crate::rawcuda::args::l15(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut aa, &mut n0,
+                &mut n1, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
             ),
         )
     }
@@ -146,6 +148,8 @@ impl W4a16Dec {
         }
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
+        // [행 퓨전 2026-10-14] 단일 체인은 행별 배열 불요(null).
+        let (mut n0, mut n1) = (0u64, 0u64);
         // [§8.1] 디코드(t≤8)는 분할 32 — 점유 회복(ncu: 192블록 25%).
         let spv = if t_len <= 8 {
             ATTN_SPLITS_D
@@ -175,9 +179,9 @@ impl W4a16Dec {
             t_len as u32,
             (dm.kv_heads * spv) as u32,
             256,
-            &mut crate::rawcuda::args::l10(
-                &mut f0, &mut f1, &mut f2, &mut f3, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
-                &mut sp,
+            &mut crate::rawcuda::args::l12(
+                &mut f0, &mut f1, &mut f2, &mut f3, &mut n0, &mut n1, &mut tl, &mut lay, &mut qh,
+                &mut kvh, &mut cp, &mut sp,
             ),
         )?;
         // [4.1 2026-10-11] merge가 x32/미러 동시 기록 — cast_x32 노드 제거.
@@ -348,45 +352,53 @@ impl W4a16Dec {
         }
         self.ensure_attn_bufs(t_len)?;
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
-        let (qgd, kvd, qdd) = (dm.qg_dim() as u64, dm.kv_dim() as u64, dm.q_dim() as u64);
         // [§8.1] 배치 디코드도 분할 32(t_len=슬롯 수 ≤ 8).
         let spv = if t_len <= 8 {
             ATTN_SPLITS_D
         } else {
             ATTN_SPLITS
         };
-        let pstride = (dm.q_heads * spv * 258) as u64;
         let mut sp = spv as i32;
-        // prep — 토큰별.
-        let f = self.cc.function("attn_prep_q")?;
-        for (k, &slot) in slots.iter().enumerate() {
-            let mut a0 = qg_dev + k as u64 * qgd * 4;
-            let mut a1 = kin_dev + k as u64 * kvd * 4;
-            let mut a2 = vin_dev + k as u64 * kvd * 4;
-            let mut a3 = self.attn.dqnw_a;
-            let mut a4 = self.attn.dknw_a;
-            let mut a5 = self.attn.dqh_a + k as u64 * qdd * 4;
-            let mut a6 = self.attn_blk_ptr(slot);
-            let mut aa = self.attn_pp_ptr(slot);
-            let (mut tl, mut lay, mut qh2, mut kvh2, mut cp2) = (1i32, layer as i32, qh, kvh, cp);
+        // [배치 행 퓨전 2026-10-14] 층당 3런치(행 퓨전 = PersistentKV 워크큐류)
+        // — 종전 토큰별 3t런치. 행별 blk/pp는 drow_blk/drow_pp(캡처 h2d 노드가
+        // 기록) · 인자 베이스 + 커널 내 행 인덱스(row=t) — 주소·산술은 종전
+        // 토큰별 발사와 동일(비트동일 계약: 같은 lim·같은 K/V 행·같은 누산 순서).
+        // part는 행 퓨전으로 그리드가 (t, q_heads×S)가 되어 점유가 회복되므로
+        // 패킹(part_qg — 그리드 (t, kv_heads×S))도 성립한다: 종전 "토큰별 패킹
+        // 기각"(−2%, 2026-10-14 원장)은 런치당 t=1(256블록 25% 점유) 한정 실측.
+        let (row_blk, row_pp) = (self.drow_blk, self.drow_pp);
+        // prep — 1런치: 그리드 (t, q+kv) · 행 = t.
+        {
+            let f = self.cc.function("attn_prep_q")?;
+            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut aa) = (
+                qg_dev,
+                kin_dev,
+                vin_dev,
+                self.attn.dqnw_a,
+                self.attn.dknw_a,
+                self.attn.dqh_a,
+                self.attn.dblk_tab,
+                self.attn.dpp,
+            );
+            let (mut tl, mut lay, mut qh2, mut kvh2, mut cp2) =
+                (t_len as i32, layer as i32, qh, kvh, cp);
+            let (mut rb, mut rp) = (row_blk, row_pp);
             self.cc.launch(
                 f,
-                1,
+                t_len as u32,
                 (dm.q_heads + dm.kv_heads) as u32,
                 128,
-                &mut crate::rawcuda::args::l13(
+                &mut crate::rawcuda::args::l15(
                     &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut aa,
-                    &mut tl, &mut lay, &mut qh2, &mut kvh2, &mut cp2,
+                    &mut rb, &mut rp, &mut tl, &mut lay, &mut qh2, &mut kvh2, &mut cp2,
                 ),
             )?;
         }
-        // fwd3s part + merge — 토큰별.
-        // [2026-10-14 실측 기각 — 배치 패킹] 단일 디코드 경로의 part_qg(GQA 패킹)
-        // 를 배치에도 적용해 A/B했다: 27B np2/4/8 tg1024 = 83.0/119.6/127.3 vs
-        // part_q 84.9/122.9/130.7(−2.1/−2.4/−2.6%)·np4 tg4096 −1.4%(C2 재측정으로
-        // 순서 효과 배제). 배치 디코드(런치당 t=1)는 점유/지연 바운드라 그리드
-        // 축소(q_heads×S 1536블록 → kv_heads×S 256블록)가 KV 바이트 절감(6×)을
-        // 상회 — 배치는 part_q 유지(단일 경로는 part_qg 유지 — 2026-10-13 채택).
+        // fwd3s part + merge — 2런치(행 퓨전).
+        // [2026-10-14 실측 노트] 토큰별(비퓨전) part_qg 전환은 −2%로 기각됐고
+        // (배치 점유/지연 바운드), 퓨전 후에는 그리드 (t, kv_heads×S) = t×256
+        // 블록으로 점유가 회복된다 — 그래도 배치 기본은 part_q(그리드 t×1536)
+        // 유지: 초기 채택은 보수적으로, 곡선 재측정은 차기.
         let fp = self.cc.function("attn_fwd3s_part_q")?;
         let fm = self.cc.function("attn_fwd3s_merge")?;
         // [4.1] 배치 merge 융합 기록 — dx32/dx16 = t_len×q_heads×256 보장.
@@ -395,48 +407,39 @@ impl W4a16Dec {
             self.ensure_dx32(nm)?;
             self.ensure_dx16(nm)?;
         }
-        for (k, &slot) in slots.iter().enumerate() {
-            let qhk = self.attn.dqh_a + k as u64 * qdd * 4;
-            let partk = self.attn.dattn_part + k as u64 * pstride * 4;
-            {
-                // [K6-2] KV 4포인터 → 블록 테이블(attn_blk_ptr) 간접화.
-                let (mut f0, mut f1, mut f2, mut f3) =
-                    (qhk, self.attn_blk_ptr(slot), partk, self.attn_pp_ptr(slot));
-                let (mut tl, mut lay) = (1i32, layer as i32);
-                self.cc.launch(
-                    fp,
-                    1,
-                    (dm.q_heads * spv) as u32,
-                    256,
-                    &mut crate::rawcuda::args::l10(
-                        &mut f0, &mut f1, &mut f2, &mut f3, &mut tl, &mut lay, &mut qh, &mut kvh,
-                        &mut cp, &mut sp,
-                    ),
-                )?;
-            }
-            {
-                // [4.1] merge x32/미러 융합(배치 cast_x32 노드 제거) — 슬롯 오프셋.
-                let (mut mp, mut mg, mut mo) = (
-                    partk,
-                    qg_dev + k as u64 * qgd * 4,
-                    self.attn.doutv_a + k as u64 * qdd * 4,
-                );
-                let (mut mo32, mut mo16) = (
-                    self.dx32.ptr + k as u64 * qdd * 4,
-                    self.dx16.ptr + k as u64 * qdd * 2,
-                );
-                let (mut tl2, mut qh2) = (1i32, dm.q_heads as i32);
-                self.cc.launch(
-                    fm,
-                    1,
-                    dm.q_heads as u32,
-                    256,
-                    &mut crate::rawcuda::args::l8(
-                        &mut mp, &mut mg, &mut mo, &mut mo32, &mut mo16, &mut tl2, &mut qh2,
-                        &mut sp,
-                    ),
-                )?;
-            }
+        {
+            let (mut f0, mut f1, mut f2, mut f3) = (
+                self.attn.dqh_a,
+                self.attn.dblk_tab,
+                self.attn.dattn_part,
+                self.attn.dpp,
+            );
+            let (mut tl, mut lay) = (t_len as i32, layer as i32);
+            let (mut rb, mut rp) = (row_blk, row_pp);
+            self.cc.launch(
+                fp,
+                t_len as u32,
+                (dm.q_heads * spv) as u32,
+                256,
+                &mut crate::rawcuda::args::l12(
+                    &mut f0, &mut f1, &mut f2, &mut f3, &mut rb, &mut rp, &mut tl, &mut lay,
+                    &mut qh, &mut kvh, &mut cp, &mut sp,
+                ),
+            )?;
+        }
+        {
+            let (mut mp, mut mg, mut mo) = (self.attn.dattn_part, qg_dev, self.attn.doutv_a);
+            let (mut mo32, mut mo16) = (self.dx32.ptr, self.dx16.ptr);
+            let (mut tl2, mut qh2) = (t_len as i32, dm.q_heads as i32);
+            self.cc.launch(
+                fm,
+                t_len as u32,
+                dm.q_heads as u32,
+                256,
+                &mut crate::rawcuda::args::l8(
+                    &mut mp, &mut mg, &mut mo, &mut mo32, &mut mo16, &mut tl2, &mut qh2, &mut sp,
+                ),
+            )?;
         }
         Ok(self.attn.doutv_a)
     }

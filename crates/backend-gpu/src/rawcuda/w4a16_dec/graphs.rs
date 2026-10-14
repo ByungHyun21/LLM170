@@ -332,6 +332,39 @@ impl W4a16Dec {
                 std::ptr::copy_nonoverlapping(pos.to_le_bytes().as_ptr(), pp.add(s * 4), 4);
             }
         }
+        // [배치 행 퓨전 2026-10-14] 행별 메타 기입(blk/pp/ring/st/sc) — 퓨전
+        // 런치가 drow_*(h2d 노드가 replay마다 기록)로 소비. 슬롯 고정 키 =
+        // 값 일정(그래프 캡처에 안전 — 주소만 베이크, 내용은 매 replay 복사).
+        if let (Some(gd), Some(ad)) = (self.gdn.gdn, self.attn.attn) {
+            let ring_stride = (gd.n_gdn * 3 * gd.conv_ch()) as u64;
+            let st_stride = (gd.n_gdn * gd.h_v * 128 * 128) as u64;
+            let sc_stride = (gd.n_gdn * gd.h_v * 128) as u64;
+            let blk_stride = (ad.n_attn * ad.cap.div_ceil(512) * 4) as u64;
+            // SAFETY: 핀드 5종은 ensure_batch_bufs가 tmax*8로 할당(t ≤ tmax 계약
+            // — 위 도메인 검사) · 비중첩 기입.
+            unsafe {
+                for (k, &s) in slots.iter().enumerate() {
+                    let blk = self.attn.dblk_tab + s as u64 * blk_stride * 8;
+                    let pp = self.attn.dpp + s as u64 * 4;
+                    let ring = self.gdn.dring + s as u64 * ring_stride * 4;
+                    let st = self.gdn.dgst + s as u64 * st_stride * 2;
+                    let sc = self.gdn.dsc + s as u64 * sc_stride * 4;
+                    for (pin, v) in [
+                        (self.graph.pin_row_blk, blk),
+                        (self.graph.pin_row_pp, pp),
+                        (self.graph.pin_row_ring, ring),
+                        (self.graph.pin_row_st, st),
+                        (self.graph.pin_row_sc, sc),
+                    ] {
+                        std::ptr::copy_nonoverlapping(
+                            v.to_le_bytes().as_ptr(),
+                            (pin as *mut u8).add(k * 8),
+                            8,
+                        );
+                    }
+                }
+            }
+        }
         let key: Vec<usize> = slots.to_vec();
         let hit = self
             .graph

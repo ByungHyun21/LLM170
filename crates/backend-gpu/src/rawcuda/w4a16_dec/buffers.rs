@@ -692,6 +692,19 @@ impl W4a16Dec {
             self.graph.pin_batch_pos = self.cc.pinned_alloc(self.n_slots * 4)?;
             // [S11] 샘플 로짓 판독 핀드 — pageable 대비 d2h 가속.
             self.graph.pin_batch_lg = self.cc.pinned_alloc(tmax * self.head_n * 4)?;
+            // [배치 행 퓨전 2026-10-14] 행별 메타 핀드(blk/pp/ring/st/sc — u64×t).
+            self.graph.pin_row_blk = self.cc.pinned_alloc(tmax * 8)?;
+            self.graph.pin_row_pp = self.cc.pinned_alloc(tmax * 8)?;
+            self.graph.pin_row_ring = self.cc.pinned_alloc(tmax * 8)?;
+            self.graph.pin_row_st = self.cc.pinned_alloc(tmax * 8)?;
+            self.graph.pin_row_sc = self.cc.pinned_alloc(tmax * 8)?;
+        }
+        if self.drow_blk == 0 {
+            self.drow_blk = self.cc.alloc(tmax * 8)?;
+            self.drow_pp = self.cc.alloc(tmax * 8)?;
+            self.drow_ring = self.cc.alloc(tmax * 8)?;
+            self.drow_st = self.cc.alloc(tmax * 8)?;
+            self.drow_sc = self.cc.alloc(tmax * 8)?;
         }
         Ok(())
     }

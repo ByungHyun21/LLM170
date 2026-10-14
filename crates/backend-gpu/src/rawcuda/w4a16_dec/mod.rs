@@ -479,6 +479,13 @@ pub(super) struct Graph {
     pub(super) pin_out: *mut std::ffi::c_void,
     pub(super) pin_out_len: usize,
     pub(super) pin_batch_tok: *mut std::ffi::c_void,
+    /// [배치 행 퓨전 2026-10-14] 행별 메타 핀드(blk/pp/ring/st/sc — u64×t).
+    /// 호스트가 호출부에서 기입, 캡처 h2d 노드가 replay 시점에 소비.
+    pub(super) pin_row_blk: *mut std::ffi::c_void,
+    pub(super) pin_row_pp: *mut std::ffi::c_void,
+    pub(super) pin_row_ring: *mut std::ffi::c_void,
+    pub(super) pin_row_st: *mut std::ffi::c_void,
+    pub(super) pin_row_sc: *mut std::ffi::c_void,
     /// [S11 2026-10-11] 샘플 배치 로짓 핀드 판독 버퍼([t][head_n] f32).
     pub(super) pin_batch_lg: *mut std::ffi::c_void,
     pub(super) pin_batch_in: *mut std::ffi::c_void,
@@ -573,6 +580,13 @@ pub struct W4a16Dec {
     /// (토큰·임베딩 행·슬롯 pos) + 슬롯집합별 캡처 그래프 캐시.
     dbatch_lg: CUdeviceptr,
     dbatch_am: CUdeviceptr,
+    /// [배치 행 퓨전 2026-10-14] 행별 메타 디바이스 배열(u64×t) — 배치 체인
+    /// 퓨전 런치가 읽는다(캡처는 주소만 베이크, 내용은 h2d 노드가 기록).
+    drow_blk: CUdeviceptr,
+    drow_pp: CUdeviceptr,
+    drow_ring: CUdeviceptr,
+    drow_st: CUdeviceptr,
+    drow_sc: CUdeviceptr,
     /// [eval] 배치 버퍼 tmax 하한 — 청크 프리필 로짓 회수용(0=기본 공식).
     pub batch_tmax_min: usize,
     /// [S3-1 2026-10-11] 임베딩 gather — token_embd 상주(f16/bf16 원본).
@@ -767,6 +781,11 @@ impl W4a16Dec {
                 pin_out: std::ptr::null_mut(),
                 pin_out_len: 0,
                 pin_batch_tok: std::ptr::null_mut(),
+                pin_row_blk: std::ptr::null_mut(),
+                pin_row_pp: std::ptr::null_mut(),
+                pin_row_ring: std::ptr::null_mut(),
+                pin_row_st: std::ptr::null_mut(),
+                pin_row_sc: std::ptr::null_mut(),
                 pin_batch_lg: std::ptr::null_mut(),
                 pin_batch_in: std::ptr::null_mut(),
                 pin_batch_pos: std::ptr::null_mut(),
@@ -817,6 +836,11 @@ impl W4a16Dec {
             argmax_out: 0,
             dbatch_lg: 0,
             dbatch_am: 0,
+            drow_blk: 0,
+            drow_pp: 0,
+            drow_ring: 0,
+            drow_st: 0,
+            drow_sc: 0,
             batch_tmax_min: 0,
             emb_dev: 0,
             emb_n: 0,

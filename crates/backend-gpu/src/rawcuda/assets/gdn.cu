@@ -157,6 +157,8 @@ extern "C" __global__ void gdn_conv(
                                      // (스펙 롤백용, 0이면 생략)
     float* __restrict__ ring_pre,    // [L][3][conv_ch] 층 슬라이스 — 배치 시작
                                      // (라운드 전) 링(acc==0 복원용, 0=생략)
+    const unsigned long long* __restrict__ row_ring, // [행 퓨전 2026-10-14] nullable
+                                     // (행별 슬롯 링 베이스 — 배치 전용)
     int t_len, int layer, int k_len, int v_len, int conv_ch)
 {
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
@@ -165,6 +167,29 @@ extern "C" __global__ void gdn_conv(
     float w1 = convw[layer * conv_ch * 4 + ch * 4 + 1];
     float w2 = convw[layer * conv_ch * 4 + ch * 4 + 2];
     float w3 = convw[layer * conv_ch * 4 + ch * 4 + 3];
+    // [배치 행 퓨전 2026-10-14] 행 = z(행당 1토큰) · 링 = 행별 슬롯 베이스.
+    // 배치 디코드 전용 — 원자 1토큰 산술은 종전(t_len=1 발사)과 동일(주소·순서).
+    if (row_ring != (const unsigned long long*)0) {
+        const int row = blockIdx.y;
+        float* rr = (float*)row_ring[row] + (long)layer * 3 * conv_ch;
+        const float xt = qkv[(long)row * conv_ch + ch];
+        const float a0 = rr[ch];
+        const float a1 = rr[conv_ch + ch];
+        const float a2 = rr[2 * conv_ch + ch];
+        float o = w3 * xt + w0 * a0 + w1 * a1 + w2 * a2;
+        o = o / (1.0f + gdn_expf(-o));
+        if (ch < k_len) {
+            q_out[(long)row * k_len + ch] = o;
+        } else if (ch < 2 * k_len) {
+            k_out[(long)row * k_len + (ch - k_len)] = o;
+        } else {
+            v_out[(long)row * v_len + (ch - 2 * k_len)] = o;
+        }
+        rr[ch] = a1;
+        rr[conv_ch + ch] = a2;
+        rr[2 * conv_ch + ch] = xt;
+        return;
+    }
     const int t0 = blockIdx.y * CONV_TC;
     const int t1 = min(t_len, t0 + CONV_TC);
     float h0, h1, h2;
@@ -749,12 +774,25 @@ extern "C" __global__ void gdn1_part(
     const float* __restrict__ q, const float* __restrict__ k,
     const __half* __restrict__ st, const float* __restrict__ sc,
     float* __restrict__ part,
+    const unsigned long long* __restrict__ row_st, // [행 퓨전] nullable
+    const unsigned long long* __restrict__ row_sc,
     int h_k, int h_v, int d, int layer)
 {
     const int h = blockIdx.x;
-    const int s = blockIdx.y;
+    int s = blockIdx.y;
     const int tid = threadIdx.x; // = d 인덱스
     const int kh = h % h_k;
+    // [배치 행 퓨전 2026-10-14] 퓨전이면 y = 행×SPLIT + 분할 — 상태·입력 행별
+    // 베이스(주소는 종전 토큰별 발사와 동일: 행 k → k번째 토큰).
+    if (row_st != (const unsigned long long*)0) {
+        const int row = blockIdx.y / GDN1_SPLIT;
+        s = blockIdx.y - row * GDN1_SPLIT;
+        st = (const __half*)row_st[row];
+        sc = (const float*)row_sc[row];
+        q = q + (long)row * h_k * 128;
+        k = k + (long)row * h_k * 128;
+        part = part + (long)row * h_v * GDN1_SPLIT * 256;
+    }
     const int ch = 128 / GDN1_SPLIT;
     const int i0 = s * ch;
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
@@ -780,6 +818,16 @@ extern "C" __global__ void gdn1_comb(
     const int h = blockIdx.x;
     const int tid = threadIdx.x;
     const int kh = h % h_k;
+    // [배치 행 퓨전 2026-10-14] 행 = blockIdx.y(단일 경로는 y=1 → 행 0 = 종전
+    // 발사와 동일 주소). 호스트는 베이스를 전달한다.
+    const int row = blockIdx.y;
+    q = q + (long)row * h_k * 128;
+    k = k + (long)row * h_k * 128;
+    v = v + (long)row * h_v * 128;
+    bg = bg + (long)row * 2 * h_v;
+    part = part + (long)row * h_v * GDN1_SPLIT * 256;
+    dc = dc + (long)row * h_v * 128;
+    outv = outv + (long)row * h_v * 128;
     float ks = 0.0f, qs = 0.0f;
     for (int s = 0; s < GDN1_SPLIT; ++s) {
         const float* p = part + ((long)h * GDN1_SPLIT + s) * 256;
@@ -810,12 +858,24 @@ extern "C" __global__ void gdn1_upd(
     const float* __restrict__ k, const float* __restrict__ bg,
     const float* __restrict__ dc, __half* __restrict__ st,
     const float* __restrict__ sc,
+    const unsigned long long* __restrict__ row_st, // [행 퓨전] nullable
+    const unsigned long long* __restrict__ row_sc,
     int h_k, int h_v, int d, int layer)
 {
     const int h = blockIdx.x;
-    const int s = blockIdx.y;
+    int s = blockIdx.y;
     const int tid = threadIdx.x;
     const int kh = h % h_k;
+    // [배치 행 퓨전 2026-10-14] 퓨전이면 y = 행×SPLIT + 분할(주소는 종전 동일).
+    if (row_st != (const unsigned long long*)0) {
+        const int row = blockIdx.y / GDN1_SPLIT;
+        s = blockIdx.y - row * GDN1_SPLIT;
+        st = (__half*)row_st[row];
+        sc = (const float*)row_sc[row];
+        k = k + (long)row * h_k * 128;
+        bg = bg + (long)row * 2 * h_v;
+        dc = dc + (long)row * h_v * 128;
+    }
     const int ch = 128 / GDN1_SPLIT;
     const int i0 = s * ch;
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;

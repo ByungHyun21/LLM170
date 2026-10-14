@@ -931,6 +931,7 @@ fn conv_ring_pre_snapshot_is_pre_update_state() {
     let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5) = (dq, dw, dr, dqo, dko, dvo);
     let mut c6 = 0u64; // ring_snap(토큰별) 생략
     let mut c7 = dpre; // 라운드 전 링 스냅샷
+    let mut c8 = 0u64; // [행 퓨전] 행별 링 배열(null — 단일 발사)
     let (mut tl, mut lay, mut kl, mut vl, mut cch) = (
         t_len as i32,
         0i32,
@@ -943,9 +944,9 @@ fn conv_ring_pre_snapshot_is_pre_update_state() {
         (conv_ch / 128) as u32,
         (t_len.div_ceil(16)) as u32,
         128,
-        &mut crate::rawcuda::args::l13(
-            &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut c7, &mut tl,
-            &mut lay, &mut kl, &mut vl, &mut cch,
+        &mut crate::rawcuda::args::l14(
+            &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut c7, &mut c8,
+            &mut tl, &mut lay, &mut kl, &mut vl, &mut cch,
         ),
     )
     .unwrap();
