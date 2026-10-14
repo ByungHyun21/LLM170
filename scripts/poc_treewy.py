@@ -5,7 +5,7 @@
 # 질문: 스펙 검증 경로(gdn.cu gdn_spec_scan — 토큰 순차 스캔 + 토큰별 상태
 # 스냅샷 dsnap[8][n_layers][h_v][128²], 27B 1.50GiB·35B 640MiB)를 WY 표현
 # 「solve 1회 + 유사값(pseudo-value) dc」으로 바꿔도 수치가 같은가?
-# (plans/plan-2026-10-12.md §4.3 2.B — TreeWY 2608.20961, fp32 ~1e-7)
+# (2.B 트랙 — TreeWY 2608.20961 정리 §4.3, fp32 ~1e-7 기대)
 #
 # GDN 상태 갱신(gdn.cu gdn_spec_scan / gdn1 trio — 헤드·층별, d=128,
 # S=[key행 128][value열 128], qscale=1/sqrt(128)):

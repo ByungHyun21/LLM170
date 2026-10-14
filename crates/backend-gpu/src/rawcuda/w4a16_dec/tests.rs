@@ -661,7 +661,7 @@ fn ucache_enforcement_frees_device_memory() {
 
 // ═══ [TreeWY 2.B 2026-10-12] WY solve/reconstruct 커널 대조(합성) ═══
 // gdn_wy_solve(+gdn_wy_reconstruct m) 상태 ≈ gdn_spec_scan(t=m) 순차 최종
-// 상태 — PoC(evidence/TreeWY) eval 클래스 검증의 커널 버전. 헤드별 게이트
+// 상태 — PoC(scripts/poc_treewy.py) eval 클래스 검증의 커널 버전. 헤드별 게이트
 // 도메인 혼합: h0=무감쇠(g=−1e-5)·k토큰 상관, h1=강감쇠(g=−91.6 — 35B
 // 헤드11 부류), h2=현실적 softplus 감쇠, h3=강폭 현실적. k는 L2 정규화
 // (l2perm 계약), S_0는 randn·0.3.

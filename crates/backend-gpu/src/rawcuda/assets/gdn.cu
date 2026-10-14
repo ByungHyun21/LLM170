@@ -901,7 +901,7 @@ extern "C" __global__ void gdn_spec_scan(
 // ── [TreeWY 2.B 2026-10-12] WY 표현 — 유사값 solve + 접두 상태 재구성 ──
 // 스펙 롤백의 토큰별 상태 스냅샷(dsnap, 27B 1.50GiB·35B 640MiB)을
 // S_0 1개 + 유사값 dc + 누적감쇠 G + k행(27B 약 164MB)으로 대체한다.
-// 수치 검증 = evidence/TreeWY/poc_treewy.py(fp32 |ΔS_m| ≤1.2e-7 — eval
+// 수치 검증 = scripts/poc_treewy.py(fp32 |ΔS_m| ≤1.2e-7 — eval
 // 클래스 판정, 2026-10-12). 규약은 PoC 그대로 — (I+A)dc=rhs0 순전대입
 // (논문 TreeWY 2608.20961의 W=(I−tril(βxxᵀ))⁻¹와는 부호 규약 차이만:
 // L=−A. 항 이동 시 +). 수식:

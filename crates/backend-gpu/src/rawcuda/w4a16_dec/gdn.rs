@@ -391,7 +391,7 @@ impl W4a16Dec {
         // [TreeWY 2.B 2026-10-12] 토큰별 상태 스냅샷 dsnap(8×n_layers×
         // h_v×128²×4B — 27B 1.50GiB·35B 640MiB) 폐지 → WY 표현: S_0 1개 +
         // 유사값 dc + 누적감쇠 G + k행. 롤백은 gdn_wy_reconstruct 재구성
-        // (spec_rollback). 수치 판정 = PoC(evidence/TreeWY — fp32
+        // (spec_rollback). 수치 판정 = PoC(scripts/poc_treewy.py — fp32
         // |ΔS_m| ≤1.2e-7, eval 클래스 채택 기준).
         let st_elems = dm.n_gdn * dm.h_v * dm.d * dm.d;
         self.gdn.dwy_s0 = self.cc.alloc(st_elems * 4)?;
