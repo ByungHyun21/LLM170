@@ -22,10 +22,12 @@ impl GemmaEngine {
         let hp = model.hp.clone();
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
         let cfg = upload_model_g4(&mut dec, &model, ctx)?;
-        // 층별 pes(μ_e) 디바이스 상주(t행 MoE 경로용 — 1회).
+        // 층별 pes(μ_e) 디바이스 상주(t행 MoE 경로용 — 1회) + layer_scalar
+        // (디바이스 청크 스칼라 인자 — 1회 등록).
         for il in 0..model.hp.n_layer {
             dec.set_g4_pes(il, cfg.pes_row(il, model.hp.n_experts))?;
         }
+        dec.set_g4_layer_scalar(&cfg.layer_scalar)?;
         Ok(GemmaEngine {
             model,
             cfg,
@@ -38,7 +40,7 @@ impl GemmaEngine {
     /// 클래스 — t행 GEMV는 t=1 GEMV와 같은 산술 순서). 호스트 체인의 층당
     /// ~14왕복(h2d/launch/d2h/sync)이 청크에선 ~8로 줄어든다.
     /// **전문가 비상주(스트리밍)에선 v0 호스트 체인(g4_step)으로 폴백** — t행
-    /// MoE(g4_moe_host_t)가 스트리밍 미지원이라, 배치·프리필의 비상주 분기가
+    /// MoE(g4_moe_dev_t)가 스트리밍 미지원이라, 배치·프리필의 비상주 분기가
     /// 모두 수렴하는 이 스텝이 저하 사다리의 단일 통로다.
     fn step(&mut self, seq: usize, tok: u32) -> Result<Vec<f32>, String> {
         let pos = self.dec.slot_pos[seq];

@@ -536,6 +536,10 @@ pub(super) struct Graph {
     pub(super) pin_row_sc: *mut std::ffi::c_void,
     /// [S11 2026-10-11] 샘플 배치 로짓 핀드 판독 버퍼([t][head_n] f32).
     pub(super) pin_batch_lg: *mut std::ffi::c_void,
+    /// [gemma4 P3 2026-10-14] 청크 head 로짓 핀드 판독 버퍼([t][head_n] f32).
+    /// 캡처 그래프의 d2h 목적지(고정 주소) — 재할당 시 그래프 전량 폐기.
+    pub(super) pin_g4_out: *mut std::ffi::c_void,
+    pub(super) pin_g4_out_len: usize,
     pub(super) pin_batch_in: *mut std::ffi::c_void,
     pub(super) pin_batch_pos: *mut std::ffi::c_void,
     pub(super) batch_graphs: Vec<(Vec<usize>, ffi::CUgraphExec, ffi::CUgraph)>,
@@ -573,6 +577,9 @@ pub struct W4a16Dec {
     g4_y: Buf,
     /// [gemma4 P3] 층별 pes(μ_e) 디바이스 상주(0 = 미등록).
     g4_pes: Vec<CUdeviceptr>,
+    /// [gemma4 P3 2026-10-14] 층별 layer_scalar(디바이스 청크 — 커널 스칼라
+    /// 인자로 소비). set_g4_layer_scalar 선행 계약.
+    g4_ls: Vec<f32>,
     /// [gemma4 P3] 청크 디바이스 체인 스크래치 풀(슬롯별 1회 할당·재사용).
     g4_pool: Vec<Buf>,
     /// [gemma4 P3] 어텐션 행 테이블 업로드 캐시 — (슬롯, pos) 동일 시 생략.
@@ -852,6 +859,8 @@ impl W4a16Dec {
                 pin_row_st: std::ptr::null_mut(),
                 pin_row_sc: std::ptr::null_mut(),
                 pin_batch_lg: std::ptr::null_mut(),
+                pin_g4_out: std::ptr::null_mut(),
+                pin_g4_out_len: 0,
                 pin_batch_in: std::ptr::null_mut(),
                 pin_batch_pos: std::ptr::null_mut(),
                 batch_graphs: Vec::new(),
@@ -871,6 +880,7 @@ impl W4a16Dec {
             g4_a: Buf { ptr: 0, cap: 0 },
             g4_y: Buf { ptr: 0, cap: 0 },
             g4_pes: Vec::new(),
+            g4_ls: Vec::new(),
             g4_pool: Vec::new(),
             g4_atab: (Vec::new(), Vec::new()),
             lin_grp: HashMap::new(),
