@@ -177,19 +177,19 @@ impl Model {
         e: usize,
         proj: &str,
     ) -> Option<(&[u8], &[u8], usize, usize)> {
-        self.w4.expert_slice(il, e, proj)
+        self.w4.expert_at(&bind::expert_base(il, e, proj))
     }
 
     /// MoE 전문가 양자 파라미터 — (group, scale_bf16) 실측.
     pub fn expert_quant(&self) -> (usize, bool) {
-        let base = crate::w4a16::W4a16Model::expert_base(0, 0, "gate_proj");
+        let base = bind::expert_base(0, 0, "gate_proj");
         (self.w4.group(), self.w4.scale_is_bf16(&base))
     }
 
     /// MoE 전문가 Weight(W4-1) — 스토어 트리플에서 직접 구성(30k 이름맵 무경유).
     pub fn expert_w(&self, il: usize, e: usize, proj: &str) -> Option<Weight<'_>> {
-        let base = crate::w4a16::W4a16Model::expert_base(il, e, proj);
-        let (data, scale, n, k) = self.w4.expert_slice(il, e, proj)?;
+        let base = bind::expert_base(il, e, proj);
+        let (data, scale, n, k) = self.w4.expert_at(&base)?;
         Some(Weight {
             data,
             aux: Some(scale),

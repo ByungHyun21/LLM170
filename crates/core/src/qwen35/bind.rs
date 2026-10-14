@@ -30,6 +30,12 @@ pub fn dir_arch(dir: &Path) -> Option<String> {
     v.get("model_type").and_then(Json::as_str).map(String::from)
 }
 
+/// 전문가 텐서 베이스 이름 — qwen3_5 계열(`...layers.{l}.mlp.experts.{e}.{proj}`).
+/// 스토어는 경로를 모른다(무경유 접근자 `W4a16Model::expert_at(base)`에 전달).
+pub fn expert_base(layer: usize, e: usize, proj: &str) -> String {
+    format!("model.language_model.layers.{layer}.mlp.experts.{e}.{proj}")
+}
+
 /// qwen3_5 계열 하이퍼파라미터(config.json 발췌).
 #[derive(Debug, Clone)]
 pub struct QwenCfg {
@@ -610,7 +616,6 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
     // MoE 전문가 트리플 구조(W4-1) — 층당 n_experts×3, 형상 계약 포함.
     // 이름맵·커버리지에 30,720개를 싣지 않고 여기서 구조로 검증한다.
     if cfg.n_experts > 0 {
-        let lp = "model.language_model.layers.";
         for il in 0..cfg.layers {
             for e in 0..cfg.n_experts {
                 for (proj, n, k) in [
@@ -618,7 +623,7 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
                     ("up_proj", cfg.moe_ffn, cfg.hidden),
                     ("down_proj", cfg.hidden, cfg.moe_ffn),
                 ] {
-                    let base = format!("{lp}{il}.mlp.experts.{e}.{proj}");
+                    let base = expert_base(il, e, proj);
                     match store.lin_shape(&base) {
                         Some((nn, kk)) if nn == n && kk == k => {}
                         Some((nn, kk)) => {

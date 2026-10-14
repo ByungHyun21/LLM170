@@ -19,7 +19,8 @@ use std::path::Path;
 pub enum Category {
     /// 매-토큰 밀집(어텐션·GDN·라우터·head·shared_expert·PLE conv 등) — VRAM.
     Dense,
-    /// 전문가 은행(`.mlp.experts.`) — 잔여 VRAM 핫셋/스트리밍.
+    /// 전문가 은행(`.experts.` — qwen3.5 `.mlp.experts.`, gemma4 `.experts.`)
+    /// — 잔여 VRAM 핫셋/스트리밍.
     Experts,
     /// 행-스파스 임베딩(PLE `ple_embedding`) — 기본 SSD.
     RowSparse,
@@ -32,7 +33,7 @@ pub fn classify(name: &str) -> Category {
     if name.contains("shared_expert") {
         return Category::Dense;
     }
-    if name.contains(".mlp.experts.") {
+    if name.contains(".experts.") {
         return Category::Experts;
     }
     if name.contains("ple_embedding") || name.contains("ngram_embedding") {
@@ -565,6 +566,20 @@ mod tests {
             ),
             (
                 "model.language_model.layers.0.mlp.gate.weight",
+                Category::Dense,
+            ),
+            // Gemma4 MoE — `.mlp.` 없이 `.experts.`(경로 일반화 2026-10-14).
+            (
+                "model.language_model.layers.0.experts.0.down_proj.weight_packed",
+                Category::Experts,
+            ),
+            (
+                "model.language_model.layers.29.experts.127.up_proj.weight_scale",
+                Category::Experts,
+            ),
+            // 비전 타워는 `.mlp.` 보유하나 expert 은행 아님 — Dense(오분류 가드).
+            (
+                "model.vision_tower.encoder.layers.0.mlp.gate_proj.linear.weight",
                 Category::Dense,
             ),
             // FN PLE(행-스파스) + PLE dense 모듈

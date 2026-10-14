@@ -12,6 +12,16 @@ pub(super) fn load(args: &[String]) -> Result<String, String> {
     }
     let store = llm170_core::w4a16::W4a16Model::open(std::path::Path::new(&dir))
         .map_err(|e| e.to_string())?;
+    // 아치 바인딩이 등록된 모델만 커버리지(완전성)까지 검증한다 — 미등록
+    // 아치(신규 모델 도입 중)는 포맷 계층(트리플 구조·형상 값·양자 파라미터)만.
+    // 바인딩 등록 시(예: gemma4 모듈) 자동으로 완전성 경로로 승격된다.
+    let arch = llm170_core::qwen35::bind::dir_arch(std::path::Path::new(&dir));
+    if !arch
+        .as_deref()
+        .is_some_and(llm170_core::qwen35::bind::arch_supported)
+    {
+        return format_store_level(&dir, &store, arch.as_deref());
+    }
     let cfg = llm170_core::qwen35::bind::QwenCfg::load(std::path::Path::new(&dir))
         .map_err(|e| e.to_string())?;
     let rep = llm170_core::qwen35::bind::validate(&store, &cfg).map_err(|e| e.to_string())?;
@@ -34,6 +44,37 @@ pub(super) fn load(args: &[String]) -> Result<String, String> {
         Ok(format!("{head}\n{body}  판정: 완전성 검증 통과"))
     } else {
         Err(format!("{head}\n{body}  판정: 검증 실패"))
+    }
+}
+
+/// 포맷 계층 리포트 — 아치 바인딩 미등록 모델(신규 도입 트랙).
+/// 검증 = 트리플 구조(open) + weight_shape 값 대조 + 양자 파라미터 표기.
+fn format_store_level(
+    dir: &str,
+    store: &llm170_core::w4a16::W4a16Model,
+    arch: Option<&str>,
+) -> Result<String, String> {
+    let head = format!(
+        "w4a16-load {dir}\n  양자화=compressed-tensors pack-quantized int4 sym g{} (zp=8 상수) · 선형 {}개",
+        store.group(),
+        store.n_lins()
+    );
+    let bad = store.check_shape_values().map_err(|e| e.to_string())?;
+    let body = format!(
+        "  트리플 {}개 — 구조 계약 통과 · weight_shape 값 대조 불일치 {}건",
+        store.n_lins(),
+        bad.len()
+    );
+    if bad.is_empty() {
+        Ok(format!(
+            "{head}\n{body}\n  판정: 포맷 계층 통과 — 아치 바인딩 미등록({}): 커버리지(완전성)·엔진 검증은 도입 트랙",
+            arch.unwrap_or("판별 불가")
+        ))
+    } else {
+        Err(format!(
+            "{head}\n{body}: {:?}\n  판정: 검증 실패",
+            &bad[..bad.len().min(4)]
+        ))
     }
 }
 

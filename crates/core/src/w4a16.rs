@@ -6,9 +6,10 @@
 //! `.weight_scale` F16[n, k/group] · `.weight_shape` I64[2]=(n,k). 행=출력(n),
 //! 열=입력(k). 대칭(sym)이라 zero-point 미저장 — zp=8 고정(4bit 중심).
 //! 니블 순서 lsb-first **확정**(2026-10-08 — lane.rs §3.6).
-//! group은 quantization_config에서 읽는다 — **현행 g128 전용**(C3: 스토어·lane·
-//! 커널·bind 순열이 전부 g128 가정이라 g32는 check_quant가 명시 거부. g32 정식
-//! 지원은 W4-1에서 네 지점 동시 일반화).
+//! group은 quantization_config에서 읽는다 — **g32/g64/g128 수용**(g32 = 35B
+//! MoE, g64 = Gemma4(2026-10-14), g128 = 27B). 그 외 그룹은 check_quant가
+//! 명시 거부. 소비자(lane·matmul·커널)는 group을 인자로 받는다 — 커널
+//! SHIFT 확장 전에는 해당 모델의 GPU 경로가 형상 계약에서 거부된다.
 //!
 //! [계약] 헤더 인덱스(StArchive) + 행 단위 pread — 전체 적재 금지.
 //! 트리플 구조 정합은 open이, 기대 집합 대조는 바인딩의 validate가 판정한다.
@@ -68,7 +69,7 @@ pub type R<T> = Result<T, W4a16Error>;
 #[derive(Debug, Clone, Copy)]
 pub struct QuantSpec {
     pub bits: usize,
-    /// 그룹 크기 — 현행 128 고정(g32는 W4-1 — check_quant 게이트).
+    /// 그룹 크기 — g32(35B)/g64(Gemma4)/g128(27B) — check_quant 게이트.
     pub group: usize,
 }
 
@@ -223,9 +224,8 @@ impl W4a16Model {
         })
     }
 
-    /// quantization_config 계약: compressed-tensors pack-quantized int4 sym g128.
-    /// g32는 스토어·lane·커널·bind가 전부 g128 가정이라 명시 거부(패닉 예방 —
-    /// W4-1에서 일반화 예정).
+    /// quantization_config 계약: compressed-tensors pack-quantized int4 sym
+    /// (그룹 = g32/g64/g128만 수용 — 그 외는 명시 거부, 패닉 예방).
     fn check_quant(text: &str) -> R<QuantSpec> {
         let v = Json::parse(text)
             .map_err(|e| W4a16Error::Quant(format!("quantization_config.json: {e}")))?;
@@ -256,36 +256,28 @@ impl W4a16Model {
                 "bits={bits} sym={sym} — int4 sym 전용"
             )));
         }
-        // E3: g128(27B)·g32(35B MoE) 수용 — 소비자 일반화는 W4-1 진행 중.
-        if group != 128 && group != 32 {
+        // E3: g128(27B)·g32(35B MoE)·g64(Gemma4) 수용 — 그 외는 명시 거부.
+        if group != 128 && group != 32 && group != 64 {
             return Err(W4a16Error::Quant(format!(
-                "group={group} — g128/g32만 지원"
+                "group={group} — g32/g64/g128만 지원"
             )));
         }
         Ok(QuantSpec { bits, group })
     }
 
-    /// 전문가 텐서 베이스 이름(HF 규약) — 이름맵 무경유 접근자와 동일.
-    pub fn expert_base(layer: usize, e: usize, proj: &str) -> String {
-        format!("model.language_model.layers.{layer}.mlp.experts.{e}.{proj}")
-    }
-
-    /// 스케일 dtype이 BF16인가(35B 전문가 실측) — Weight 구성용.
+    /// 스케일 dtype이 BF16인가(모델별 실측) — Weight 구성용.
     pub fn scale_is_bf16(&self, base: &str) -> bool {
         self.entry(&format!("{base}.weight_scale"))
             .is_some_and(|e| e.dtype == crate::st::StDtype::Bf16)
     }
 
-    /// MoE 전문가 트리플 슬라이스(W4-1) — (packed, scale, n, k).
-    /// 인덱스 기반 접근자: 이름맵에 30,720개를 넣지 않는다(로더 계약).
-    pub fn expert_slice(
-        &self,
-        layer: usize,
-        e: usize,
-        proj: &str,
-    ) -> Option<(&[u8], &[u8], usize, usize)> {
-        let base = Self::expert_base(layer, e, proj);
-        let (n, k) = *self.lins.get(&base)?;
+    /// MoE 전문가 트리플 슬라이스 — (packed, scale, n, k). `base` 전체 이름은
+    /// **바인딩이 조립**한다(스토어는 경로 규칙을 모른다 — 아키텍처 무지;
+    /// qwen3.5 = `...layers.{l}.mlp.experts.{e}.{proj}`, Gemma4 =
+    /// `...layers.{l}.experts.{e}.{proj}`). 인덱스 기반 접근자: 이름맵에
+    /// 3만+ 항목을 넣지 않는다(로더 계약).
+    pub fn expert_at(&self, base: &str) -> Option<(&[u8], &[u8], usize, usize)> {
+        let (n, k) = *self.lins.get(base)?;
         let q = self.tensor_slice(&format!("{base}.weight_packed"))?;
         let s = self.tensor_slice(&format!("{base}.weight_scale"))?;
         Some((q, s, n, k))
@@ -332,7 +324,7 @@ impl W4a16Model {
         v
     }
 
-    /// 그룹 크기(현행 g128) — 커널 계약의 입력.
+    /// 그룹 크기(g32/g64/g128) — 커널 계약의 입력.
     pub fn group(&self) -> usize {
         self.quant.group
     }
@@ -598,14 +590,16 @@ mod tests {
     }
 
     #[test]
-    fn quant_g32_accept_other_groups_reject() {
-        // W4-1(2026-10-08): g32(35B MoE) 수용 — g128/g32 외 그룹은 명시 거부.
+    fn quant_g32_g64_accept_other_groups_reject() {
+        // g32(35B MoE)·g64(Gemma4 — 2026-10-14) 수용 — 그 외 그룹은 명시 거부.
         let q = W4a16Model::check_quant(&qtext(4, true, 32)).expect("g32 계약");
         assert_eq!(q.group, 32);
-        let e = W4a16Model::check_quant(&qtext(4, true, 64))
-            .expect_err("g64 거부")
+        let q = W4a16Model::check_quant(&qtext(4, true, 64)).expect("g64 계약");
+        assert_eq!(q.group, 64);
+        let e = W4a16Model::check_quant(&qtext(4, true, 16))
+            .expect_err("g16 거부")
             .to_string();
-        assert!(e.contains("g128/g32"), "{e}");
+        assert!(e.contains("g32/g64/g128"), "{e}");
     }
 
     #[test]
