@@ -994,10 +994,8 @@ fn run_generate(
                 for &tk in &draft {
                     rows.extend_from_slice(&model.embed_row(tk).map_err(|e| e.to_string())?);
                 }
-                // [A-1 완화 ①] 검증 전 상태 저장 — 보정 토큰을 t=1로 재계산
-                // (배치 검증의 근접 동률 argmax 플립이 오거부/오보정을 만들던
-                // 구조적 한계 해소: 수용 판정만 배치, 방출 토큰은 정확 수치).
-                dec.spec_save_state(0)?;
+                // [dsave 대체 2026-10-14] 라운드 전 저장 폐지 — 롤백 재료는
+                // WY solve + conv 링 스냅샷(프로덕션 sched와 동일 계약).
                 let toks = dec.spec_verify(0, &rows, t)?;
                 let mut acc = 0usize;
                 while acc < draft.len() && toks[acc] == draft[acc] {
@@ -1012,7 +1010,7 @@ fn run_generate(
                     dec.spec_rollback(0, acc)?;
                     dec.spec_rewind_pos(0, (t - acc) as u32)?;
                 } else {
-                    dec.spec_load_state(0)?;
+                    dec.spec_rollback(0, 0)?;
                     dec.spec_rewind_pos(0, t as u32)?;
                 }
                 let lrow = model.embed_row(last).map_err(|e| e.to_string())?;

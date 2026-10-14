@@ -1378,9 +1378,9 @@ fn spec_round_impl(
         rows.extend_from_slice(&e.embed_row(tk)?);
     }
     let rt0 = std::time::Instant::now();
-    let t_save = std::time::Instant::now();
-    e.spec_save_state(i)?;
-    let ms_save = t_save.elapsed().as_secs_f64() * 1e3;
+    // [dsave 대체 2026-10-14] 라운드 전 상태 저장 호출 폐지 — 롤백 재료는
+    // WY 표현(검증 체인이 solve 실행)과 conv가 기록하는 라운드 전 링
+    // (dring0)이다. 저장 비용·VRAM(dsave 27B/4슬롯 약 315MiB) 소멸.
     let dbg = llm170_diag::flag::on_nonzero("LLM170_MOE_DBG");
     // 검증 + 수용(acc) 판정 — 정책 분기.
     // 그리디: 확정 일치 접두(토큰열). 샘플드: target-only 거절샘플링 —
@@ -1453,7 +1453,9 @@ fn spec_round_impl(
             e.spec_rollback(i, acc)?;
             e.spec_rewind_pos(i, (t - acc) as u32)?;
         } else {
-            e.spec_load_state(i)?;
+            // [dsave 대체 2026-10-14] 전량 거절 복원 = keep=0 (m=0 재구성 +
+            // dring0) — 종전 spec_load_state(dsave 정밀 스냅샷) 대체.
+            e.spec_rollback(i, 0)?;
             e.spec_rewind_pos(i, t as u32)?;
         }
     } else {
@@ -1545,7 +1547,7 @@ fn spec_round_impl(
     let ms_mtp = t_mtp.elapsed().as_secs_f64() * 1e3;
     if dbg {
         eprintln!(
-            "[spec-ms] save={ms_save:.2} verify={ms_ver:.2} corr={ms_corr:.2} mtp={ms_mtp:.2} tot={:.2}",
+            "[spec-ms] verify={ms_ver:.2} corr={ms_corr:.2} mtp={ms_mtp:.2} tot={:.2}",
             rt0.elapsed().as_secs_f64() * 1e3
         );
     }

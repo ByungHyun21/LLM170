@@ -50,15 +50,22 @@ impl W4a16Dec {
         } else {
             0
         };
+        // [dsave 대체 2026-10-14] 라운드 전 링 스냅샷(층 슬라이스 [3][ch]) —
+        // acc==0 복원(spec_rollback keep=0)의 S_0 동반 상태. 같은 조건에서만.
+        let mut c7 = if c6 != 0 && self.gdn.dring0 != 0 {
+            self.gdn.dring0 + (layer as u64 * 3 * dm.conv_ch() as u64) * 4
+        } else {
+            0
+        };
         self.cc.launch(
             f,
             (dm.conv_ch() / 128) as u32,
             // [토큰축 병렬] y = ceil(t_len/16) — 4탭은 입력 이력만 필요.
             (t_len.div_ceil(16)) as u32,
             128,
-            &mut crate::rawcuda::args::l12(
-                &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut tl, &mut lay,
-                &mut kl, &mut vl, &mut cch,
+            &mut crate::rawcuda::args::l13(
+                &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut c7, &mut tl,
+                &mut lay, &mut kl, &mut vl, &mut cch,
             ),
         )?;
 
@@ -402,26 +409,21 @@ impl W4a16Dec {
         // (layer·gi)라 n_gdn 스트라이드가 정확(종전 n_layers 할당은 여유분).
         let ring_snap = 8 * dm.n_gdn * 3 * dm.conv_ch() * 4;
         self.gdn.dsnap_ring = self.cc.alloc(ring_snap)?;
-        // [A-1 진단] 슬롯 상태 저장 스크래치(상태 + conv 링) — save/load용.
-        // [행-스케일] 상태 f16(×2) + 스케일 f32(×4) + conv 링 f32(×4).
-        self.gdn.dsave = self.cc.alloc(
-            self.n_slots
-                * (dm.n_gdn * dm.h_v * dm.d * dm.d * 2
-                    + dm.n_gdn * dm.h_v * dm.d * 4
-                    + dm.n_gdn * 3 * dm.conv_ch() * 4),
-        )?;
-        // [§3.4 ② 2026-10-12] 통합 캐시 회계 — 스펙 상태(WY+dsnap_ring+
-        // dsave). 트랜셰 2: 예산 압박 시 이 등록 자체가 ckpt·expert-lru를
-        // 퇴거시킬 수 있다(실제 해제는 함수 끝 ucache_sweep).
+        // [dsave 대체 2026-10-14] 라운드 전 conv 링 1벌([n_gdn][3][conv_ch]) —
+        // acc==0(전량 거절) 복원용(라운드 conv가 갱신 전 링을 기록). 종전
+        // dsave(슬롯×[상태 f16+스케일+링] — 27B/4슬롯 약 315MiB)는 **프로브
+        // 전용 지연 할당**(spec_save_state)으로 이동 — serve 경로 VRAM 회수.
+        let ring_pre = dm.n_gdn * 3 * dm.conv_ch() * 4;
+        self.gdn.dring0 = self.cc.alloc(ring_pre)?;
+        // [§3.4 ② 2026-10-12] 통합 캐시 회계 — 스펙 상태(WY+dsnap_ring+dring0).
+        // 트랜셰 2: 예산 압박 시 이 등록 자체가 ckpt·expert-lru를 퇴거시킬 수
+        // 있다(실제 해제는 함수 끝 ucache_sweep).
         let spec_bytes = (st_elems * 4
             + 8 * dm.n_gdn * dm.h_v * dm.d * 4
             + 8 * dm.n_gdn * dm.h_v * 4
             + 8 * dm.n_gdn * dm.k_len() * 4
             + ring_snap
-            + self.n_slots
-                * (dm.n_gdn * dm.h_v * dm.d * dm.d * 2
-                    + dm.n_gdn * dm.h_v * dm.d * 4
-                    + dm.n_gdn * 3 * dm.conv_ch() * 4)) as u64;
+            + ring_pre) as u64;
         if let Err(e) = self.ucache.allocate(
             "spec:state",
             CacheCategory::SpecState,
@@ -532,14 +534,15 @@ impl W4a16Dec {
             let mut c4 = self.gdn.dgk + k as u64 * kl as u64 * 4;
             let mut c5 = self.gdn.dgv + k as u64 * vl as u64 * 4;
             let mut c6 = 0u64;
+            let mut c7 = 0u64;
             self.cc.launch(
                 f,
                 (dm.conv_ch() / 128) as u32,
                 1,
                 128,
-                &mut crate::rawcuda::args::l12(
-                    &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut one,
-                    &mut lay, &mut kl, &mut vl, &mut cch,
+                &mut crate::rawcuda::args::l13(
+                    &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut c7,
+                    &mut one, &mut lay, &mut kl, &mut vl, &mut cch,
                 ),
             )?;
         }

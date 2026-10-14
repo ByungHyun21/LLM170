@@ -8,6 +8,11 @@
 //!   기록 — 부분 수용 시 gdn_wy_reconstruct가 상태를 재구성하고 conv 링은
 //!   dsnap_ring D2D로 복원(종전 토큰별 상태 스냅샷 dsnap 폐지 — 27B
 //!   1.50GiB→약 164MB, PoC fp32 |ΔS_m|≤1.2e-7 eval 클래스).
+//!   [dsave 대체 2026-10-14] 전량 거절(keep=0) 복원도 같은 재구성 클래스
+//!   (m=0 = S_0) + 라운드 전 conv 링 1벌(dring0 — 라운드 conv가 갱신 전
+//!   링 기록). 종전 dsave(slot×[f16 상태+스케일+링] — 27B/4슬롯 약
+//!   315MiB)는 프로브 전용 지연 할당으로 강등 — serve VRAM 회수분은 예약
+//!   재산정으로 컨텍스트에 환원.
 //! - KV/pos는 위치 카운터만 되감으면 됨(스테일 엔트리는 다음 쓰기가 덮음).
 
 use super::*;
@@ -142,17 +147,24 @@ impl W4a16Dec {
     /// 슬롯 GDN 상태·conv 링 복원. 상태는 WY 재구성
     /// (S_keep = exp(G_{keep-1})·S_0 + Σ_{j≤keep-1} exp(G_{keep-1}−G_j)·
     /// k_j·dc_j^T — gdn_wy_reconstruct 런치, 종전 dsnap[keep-1] D2D 대체),
-    /// conv 링은 여전히 dsnap_ring D2D(입력 이력 — WY 대상 아님, 층당
-    /// 61KB급). pos 되감기는 spec_rewind_pos 소관.
+    /// conv 링은 dsnap_ring D2D(keep≥1)·dring0(keep=0 — 라운드 전 1벌).
+    /// pos 되감기는 spec_rewind_pos 소관.
+    /// [dsave 대체 2026-10-14] keep=0 = **라운드 전 상태 복원**(m=0 재구성 =
+    /// S_0, 감쇠 없음) + dring0(라운드 conv가 갱신 전 링을 기록). 종전
+    /// spec_load_state(dsave 516MiB급 스크래치) 경로 대체 — 수치 클래스는
+    /// keep≥1 재구성과 동일(eval — f16 반올림 경유, PoC ΔS≤1.2e-7급).
     /// [결함수정 2026-10-11 계약 승계] 상태·링 모두 GDN 서수(n_gdn)
     /// 스트라이드 — 모델 층(n_layers) 아님.
     pub fn spec_rollback(&mut self, slot: usize, keep: usize) -> Result<(), String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
-        if !self.spec_on || !(1..=8).contains(&keep) {
+        if !self.spec_on || keep > 8 {
             return Err(format!("spec_rollback: 계약 위반 keep={keep}"));
         }
         if self.gdn.dwy_s0 == 0 {
             return Err("spec_rollback: WY 버퍼 미확보(enable_spec)".into());
+        }
+        if keep == 0 && self.gdn.dring0 == 0 {
+            return Err("spec_rollback: 링 스냅샷 미확보(enable_spec)".into());
         }
         let _g = self.cc.guard()?;
         let st_slot = slot * dm.n_gdn * dm.h_v * 128 * 128;
@@ -160,8 +172,9 @@ impl W4a16Dec {
         let ring_elems = (3 * dm.conv_ch()) as u64;
         let f = self.cc.function("gdn_wy_reconstruct")?;
         for gi in 0..dm.n_gdn {
-            // [TreeWY] 상태 재구성 — 스냅샷 복사 대신 S_0+dc+G+k에서 조립.
-            // st는 슬롯 베이스(커널이 layer 오프셋을 더한다 — spec_scan 계약).
+            // [TreeWY] 상태 재구성 — 스냅샷 복사 대신 S_0+dc+G+k에서 조립
+            // (keep=0은 m=0 — S_0만). st는 슬롯 베이스(커널이 layer 오프셋을
+            // 더한다 — spec_scan 계약).
             let (mut w0, mut w1, mut w2, mut w3) = (
                 self.gdn.dwy_k,
                 self.gdn.dwy_s0,
@@ -189,7 +202,11 @@ impl W4a16Dec {
             )?;
             // [행-스케일] 재구성 직후 스케일 정규화.
             self.gdn_rescale_slot(slot, gi)?;
-            let rsrc = self.gdn.dsnap_ring + (gi as u64 * 8 + (keep - 1) as u64) * ring_elems * 4;
+            let rsrc = if keep == 0 {
+                self.gdn.dring0 + gi as u64 * ring_elems * 4
+            } else {
+                self.gdn.dsnap_ring + (gi as u64 * 8 + (keep - 1) as u64) * ring_elems * 4
+            };
             let rdst = self.gdn.dring + (ring_slot as u64 + gi as u64 * ring_elems) * 4;
             self.copy_dev(rdst, rsrc, ring_elems * 4)?;
         }
@@ -361,9 +378,20 @@ impl W4a16Dec {
         self.ck_pick(slot, upto)
     }
 
-    /// [A-1 진단] 슬롯 GDN 상태 저장/복원(전 층·헤드) — 검증 대조용.
+    /// [A-1 진단 → 프로브 전용 2026-10-14] 슬롯 상태 저장/복원(전 층·헤드).
+    /// 프로덕션 롤백은 WY 재구성(spec_rollback) 단일 경로 — 이 dsave 정밀
+    /// 스냅샷은 **프로브(--spec-check)의 대조 실험**(라운드 전 상태로 정확
+    /// 복원)에서만 필요하므로 **지연 할당**한다(serve 경로 VRAM 무증가.
+    /// 회계 미등록 — 프로브 수명 한정, ucache 퇴거 시 sweep이 해제).
+    /// [행-스케일] 상태 f16(×2) + 스케일 f32(×4) + conv 링 f32(×4).
     pub fn spec_save_state(&mut self, slot: usize) -> Result<(), String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
+        if self.gdn.dsave == 0 {
+            let per = dm.n_gdn * dm.h_v * dm.d * dm.d * 2
+                + dm.n_gdn * dm.h_v * dm.d * 4
+                + dm.n_gdn * 3 * dm.conv_ch() * 4;
+            self.gdn.dsave = self.cc.alloc(self.n_slots * per)?;
+        }
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
         let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;
@@ -385,9 +413,14 @@ impl W4a16Dec {
         self.ucache.touch("spec:state")
     }
 
-    /// [A-1 진단] 저장 상태 복원(스냅샷 기반 롤백과 별개 — 대조 실험용).
+    /// [A-1 진단 → 프로브 전용 2026-10-14] 저장 상태 복원(프로브 대조 실험용
+    /// — 프로덕션 롤백은 spec_rollback). spec_save_state가 지연 할당한
+    /// dsave 필요.
     pub fn spec_load_state(&mut self, slot: usize) -> Result<(), String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
+        if self.gdn.dsave == 0 {
+            return Err("spec_load_state: 저장본 없음(spec_save_state 미호출)".into());
+        }
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
         let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;

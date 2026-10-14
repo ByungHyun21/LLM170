@@ -597,11 +597,13 @@ fn ucache_enforcement_frees_device_memory() {
     };
     dec.set_attn(ad, &vec![1f32; ad.n_attn * d], &vec![1f32; ad.n_attn * d])
         .expect("set_attn");
-    // 스펙 상태(WY s0/dc/g/k + dsnap_ring/dsave) + 체크포인트(dchk) 등록.
+    // 스펙 상태(WY s0/dc/g/k + dsnap_ring + 라운드 전 링 dring0) + 체크포인트
+    // (dchk) 등록. dsave는 프로브 전용 지연 할당(serve 경로 상주 없음).
     dec.enable_spec().expect("enable_spec");
     assert!(dec.spec_on(), "스펙 활성 전제(압박 전)");
     assert!(!dec.gdn.dchk.is_null(), "체크포인트 등록 전제");
     assert_ne!(dec.gdn.dwy_s0, 0, "스펙 상태(WY S_0) 등록 전제");
+    assert_ne!(dec.gdn.dring0, 0, "라운드 전 링 스냅샷(dring0) 등록 전제");
 
     let ckpt = dec.ucache.entry("spec:ckpt").expect("ckpt 등록부").bytes;
     let state = dec.ucache.entry("spec:state").expect("state 등록부").bytes;
@@ -641,7 +643,10 @@ fn ucache_enforcement_frees_device_memory() {
     assert_eq!(dec.gdn.dwy_g, 0, "WY g 해제 후 0화");
     assert_eq!(dec.gdn.dwy_k, 0, "WY k 해제 후 0화");
     assert_eq!(dec.gdn.dsnap_ring, 0, "dsnap_ring 해제 후 0화");
-    assert_eq!(dec.gdn.dsave, 0, "dsave 해제 후 0화");
+    assert_eq!(dec.gdn.dring0, 0, "dring0 해제 후 0화");
+    // [dsave 대체 2026-10-14] 프로브 전용 지연 할당 — enable_spec 경로는
+    // 애초에 만들지 않는다(serve VRAM 회수의 근거).
+    assert_eq!(dec.gdn.dsave, 0, "dsave는 serve 경로에서 0(프로브 전용)");
     assert!(!dec.spec_on(), "해제 상태로 라운드 시도 차단");
     assert!(
         dec.ucache.entry("attn:kv").is_some(),
@@ -759,6 +764,12 @@ fn wy_reconstruct_matches_sequential() {
 
     // 참조 S_m — gdn_spec_scan(t=m) 최종 상태(순차 = 정답).
     let mut refs = vec![Vec::new(); t_len + 1];
+    // [dsave 대체 2026-10-14] m=0 기준 = 업로드된 S_0의 f16 비트 그대로
+    // (keep=0 복원 = 이 상태로 복귀. sc=1 → 곱/나눗셈 왕복이 정확해 비트동일).
+    refs[0] = s0_host
+        .iter()
+        .map(|&x| crate::rawcuda::gptq4::h2f(f32_to_f16(x)))
+        .collect();
     for m in 1..=t_len {
         // [행-스케일] s0는 s=1 계약 — f16으로 업로드.
         let s0b: Vec<u8> = s0_host
@@ -835,7 +846,7 @@ fn wy_reconstruct_matches_sequential() {
         )
         .unwrap();
     }
-    for m in 1..=t_len {
+    for m in 0..=t_len {
         let f = cc.function("gdn_wy_reconstruct").unwrap();
         let (mut a0, mut a1, mut a2, mut a3) = (wk, ws0, wdc, wg);
         let mut a4 = dst_;
@@ -868,9 +879,102 @@ fn wy_reconstruct_matches_sequential() {
         }
         eprintln!("[wy-test] m={m} maxdiff(seq-wy) = {mx:.6e}");
         // [행-스케일] 원시 Ŝ 비교(양 경로가 같은 스케일 계열) — f16 반올림 수 ulp.
-        assert!(
-            mx < 2e-3,
-            "WY 재구성 m={m} 순차 스캔 초과 편차: {mx:.6e}(f16 기대 ≤2e-3)"
+        if m == 0 {
+            // [dsave 대체] keep=0 복원(S_0)은 왕복 무손실 — 비트동일 계약.
+            assert_eq!(mx, 0.0, "m=0 복원이 S_0와 다름: {mx:.6e}");
+        } else {
+            assert!(
+                mx < 2e-3,
+                "WY 재구성 m={m} 순차 스캔 초과 편차: {mx:.6e}(f16 기대 ≤2e-3)"
+            );
+        }
+    }
+}
+
+// ═══ [dsave 대체 2026-10-14] conv 라운드 전 링 스냅샷(ring_pre) ═══
+// gdn_conv(ring_pre≠0)가 **갱신 전** 링을 그대로 보존하는지 — acc==0
+// 복원(spec_rollback keep=0)의 링 재료. 상태 링 자체는 정상 갱신됨도 판정
+// (스냅샷이 갱신을 막지 않는다).
+#[test]
+fn conv_ring_pre_snapshot_is_pre_update_state() {
+    let _cuda = CUDA_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (h_k, h_v, d) = (1usize, 2usize, 128usize);
+    let conv_ch = (2 * h_k + h_v) * d;
+    let (k_len, v_len) = (h_k * d, h_v * d);
+    let t_len = 2usize;
+    let dec = super::W4a16Dec::new(1, conv_ch, 1).expect("CUDA 컨텍스트/fatbin");
+    let cc = &dec.cc;
+    let mut s = 0x0D5A_7E00_0C0D_0C0Fu64;
+    let qkv: Vec<f32> = (0..t_len * conv_ch)
+        .map(|_| sm_f32(&mut s, -2.0, 2.0))
+        .collect();
+    let convw: Vec<f32> = (0..conv_ch * 4)
+        .map(|_| sm_f32(&mut s, -0.5, 0.5))
+        .collect();
+    // 초기 링 = 고유값(스냅샷 비교 대상이자 '갱신 전' 기준).
+    let ring0: Vec<f32> = (0..3 * conv_ch).map(|i| 1000.0 + i as f32).collect();
+    let (dq, dw, dr, dqo, dko, dvo, dpre) = (
+        cc.alloc(t_len * conv_ch * 4).unwrap(),
+        cc.alloc(conv_ch * 4 * 4).unwrap(),
+        cc.alloc(3 * conv_ch * 4).unwrap(),
+        cc.alloc(t_len * k_len * 4).unwrap(),
+        cc.alloc(t_len * k_len * 4).unwrap(),
+        cc.alloc(t_len * v_len * 4).unwrap(),
+        cc.alloc(3 * conv_ch * 4).unwrap(),
+    );
+    let b = |x: &[f32]| unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
+    cc.h2d(dq, b(&qkv)).unwrap();
+    cc.h2d(dw, b(&convw)).unwrap();
+    cc.h2d(dr, b(&ring0)).unwrap();
+    cc.h2d(dpre, b(&vec![0f32; 3 * conv_ch])).unwrap();
+    let f = cc.function("gdn_conv").unwrap();
+    let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5) = (dq, dw, dr, dqo, dko, dvo);
+    let mut c6 = 0u64; // ring_snap(토큰별) 생략
+    let mut c7 = dpre; // 라운드 전 링 스냅샷
+    let (mut tl, mut lay, mut kl, mut vl, mut cch) = (
+        t_len as i32,
+        0i32,
+        k_len as i32,
+        v_len as i32,
+        conv_ch as i32,
+    );
+    cc.launch(
+        f,
+        (conv_ch / 128) as u32,
+        (t_len.div_ceil(16)) as u32,
+        128,
+        &mut crate::rawcuda::args::l13(
+            &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut c7, &mut tl,
+            &mut lay, &mut kl, &mut vl, &mut cch,
+        ),
+    )
+    .unwrap();
+    cc.sync().unwrap();
+    let mut pb = vec![0u8; 3 * conv_ch * 4];
+    cc.d2h(&mut pb, dpre).unwrap();
+    let pre: Vec<f32> = pb
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect();
+    assert_eq!(pre, ring0, "ring_pre가 라운드 전 링과 불일치(비트)");
+    let mut rb = vec![0u8; 3 * conv_ch * 4];
+    cc.d2h(&mut rb, dr).unwrap();
+    let ring: Vec<f32> = rb
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect();
+    for ch in 0..conv_ch {
+        // 토큰 2개 처리 후 링 = (구 h2, x0, x1) — 갱신 정상(스냅샷 무간섭).
+        assert_eq!(ring[ch], ring0[2 * conv_ch + ch], "링 h0 갱신 오류 ch={ch}");
+        assert_eq!(ring[conv_ch + ch], qkv[ch], "링 h1 갱신 오류 ch={ch}");
+        assert_eq!(
+            ring[2 * conv_ch + ch],
+            qkv[conv_ch + ch],
+            "링 h2 갱신 오류 ch={ch}"
         );
     }
 }

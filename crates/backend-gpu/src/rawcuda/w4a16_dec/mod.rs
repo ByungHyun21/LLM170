@@ -429,6 +429,12 @@ pub(super) struct Gdn {
     pub(super) dwy_k: CUdeviceptr,
     /// conv 링 스냅샷([n_gdn][8][3][conv_ch]) — 입력 이력(WY 대상 아님).
     pub(super) dsnap_ring: CUdeviceptr,
+    /// [dsave 대체 2026-10-14] 라운드 전 conv 링 1벌([n_gdn][3][conv_ch]) —
+    /// acc==0(전량 거절) 복원용. 라운드 conv가 **갱신 전** 링을 기록한다.
+    pub(super) dring0: CUdeviceptr,
+    /// [프로브 전용 2026-10-14] 정밀 상태 저장 스크래치 — spec_save_state가
+    /// 지연 할당. serve 경로는 0(종전 enable_spec 상주분 — 27B/4슬롯 약
+    /// 315MiB — 을 회수해 예약·컨텍스트로 환원).
     pub(super) dsave: CUdeviceptr,
     /// [A2 2026-10-11] 접두 재사용 체크포인트(GDN 상태+conv 링, 슬롯별 1개).
     /// [호스트 이관 2026-10-14] 접두 재사용 체크포인트 링 = **pinned 호스트
@@ -747,6 +753,7 @@ impl W4a16Dec {
                 dwy_g: 0,
                 dwy_k: 0,
                 dsnap_ring: 0,
+                dring0: 0,
                 dsave: 0,
                 dchk: std::ptr::null_mut(),
                 dchk_pos: Vec::new(),

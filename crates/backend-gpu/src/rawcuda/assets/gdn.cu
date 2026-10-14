@@ -155,6 +155,8 @@ extern "C" __global__ void gdn_conv(
     float* __restrict__ v_out,       // [T][v_len]
     float* __restrict__ ring_snap,   // [T][L][3][conv_ch] — 토큰 i 처리 후 링
                                      // (스펙 롤백용, 0이면 생략)
+    float* __restrict__ ring_pre,    // [L][3][conv_ch] 층 슬라이스 — 배치 시작
+                                     // (라운드 전) 링(acc==0 복원용, 0=생략)
     int t_len, int layer, int k_len, int v_len, int conv_ch)
 {
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
@@ -170,6 +172,13 @@ extern "C" __global__ void gdn_conv(
         h0 = ring[layer * 3 * conv_ch + 0 * conv_ch + ch];
         h1 = ring[layer * 3 * conv_ch + 1 * conv_ch + ch];
         h2 = ring[layer * 3 * conv_ch + 2 * conv_ch + ch];
+        if (ring_pre != (float*)0) {
+            // [dsave 대체 2026-10-14] 갱신 전 링 보존 — acc==0(전량 거절)
+            // 복원의 S_0 동반 상태(링은 WY 대상이 아니라 스냅샷 1벌).
+            ring_pre[0 * conv_ch + ch] = h0;
+            ring_pre[conv_ch + ch] = h1;
+            ring_pre[2 * conv_ch + ch] = h2;
+        }
     } else {
         // 내부 청크 헤일로 = 같은 qkv의 앞 3행(CONV_TC ≥ 4 전제).
         h0 = qkv[(t0 - 3) * conv_ch + ch];
@@ -1008,6 +1017,8 @@ extern "C" __global__ void gdn_wy_solve(
 // 발사(그리드 h_v, 블록 128 — solve와 동일 열 소유 구조).
 // S_m = exp(G_{m-1})·S_0 + Σ_{j<m} exp(G_{m-1}−G_j)·k_j·dc_j^T
 // (j 오름차순 — PoC wy_state와 동일 순서).
+// [dsave 대체 2026-10-14] m=0 = 라운드 전 상태 복원(S_m = S_0 — 감쇠 없음):
+// wy_g[-1] 판독 없이 S_0만 스케일 나눗셈으로 되쓴다(acc==0 경로).
 extern "C" __global__ void gdn_wy_reconstruct(
     const float* __restrict__ wy_k,  // [n_gdn][8][k_len]
     const float* __restrict__ wy_s0, // [n_gdn][h_v][d*d]
@@ -1025,10 +1036,14 @@ extern "C" __global__ void gdn_wy_reconstruct(
     const long sc_h = ((long)layer * h_v + h) * d;
     __shared__ float w[9]; // w[0]=exp(G_{m-1}), w[1+j]=exp(G_{m-1}−G_j)
     if (tid == 0) {
-        const float gm = wy_g[((long)layer * 8 + (m - 1)) * h_v + h];
-        w[0] = gdn_expf(gm);
-        for (int j = 0; j < m; ++j) {
-            w[1 + j] = gdn_expf(gm - wy_g[((long)layer * 8 + j) * h_v + h]);
+        if (m == 0) {
+            w[0] = 1.0f;
+        } else {
+            const float gm = wy_g[((long)layer * 8 + (m - 1)) * h_v + h];
+            w[0] = gdn_expf(gm);
+            for (int j = 0; j < m; ++j) {
+                w[1 + j] = gdn_expf(gm - wy_g[((long)layer * 8 + j) * h_v + h]);
+            }
         }
     }
     __syncthreads();

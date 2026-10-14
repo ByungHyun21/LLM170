@@ -537,10 +537,10 @@ impl W4a16Dec {
     ///      회복, 사이 디코드는 stg 폴백·t≤8 프리필은 재구성 후 진행).
     ///    - spec:ckpt → dchk 해제. checkpoint/restore 경로는 dchk==0
     ///      가드로 자동 비활성(재계산 가능한 순수 최적화 — 기능 무손실).
-    ///    - spec:state → WY(dwy_s0/dc/g/k)+dsnap_ring/dsave 해제 +
+    ///    - spec:state → WY(dwy_s0/dc/g/k)+dsnap_ring/dring0 해제 +
     ///      spec_on=false. 검증 라운드는 라운드 사이(호스트 순차 지점)에서만
     ///      끊기므로 실행 중 라운드 부패는 없다(스케줄러는 spec_on()으로
-    ///      선판정).
+    ///      선판정). dsave(프로브 전용 지연 할당)가 있으면 함께 해제.
     ///    - attn:kv → **올 수 없다**(Kv 범주 고정) — 오면 부기 정합성
     ///      오류로 거부(활성 KV 해제는 요청 파괴).
     ///
@@ -579,6 +579,7 @@ impl W4a16Dec {
                         self.gdn.dwy_g,
                         self.gdn.dwy_k,
                         self.gdn.dsnap_ring,
+                        self.gdn.dring0,
                         self.gdn.dsave,
                     ] {
                         if p != 0 {
@@ -591,7 +592,7 @@ impl W4a16Dec {
                         self.gdn.dwy_g,
                         self.gdn.dwy_k,
                     ) = (0, 0, 0, 0);
-                    (self.gdn.dsnap_ring, self.gdn.dsave) = (0, 0);
+                    (self.gdn.dsnap_ring, self.gdn.dring0, self.gdn.dsave) = (0, 0, 0);
                     self.spec_on = false; // 검증 라운드 차단
                 }
                 id => {
