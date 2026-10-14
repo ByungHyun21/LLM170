@@ -449,6 +449,17 @@ pub(crate) fn chat_spec(arch: &str) -> Option<ChatSpec> {
     }
 }
 
+/// [P3 gemma4 2026-10-14] 아치별 메시지 렌더 — chat_spec 레지스트리 경유.
+/// 종전 oai 핸들러가 jmessages_render(qwen)를 직접 호출해 gemma4에 qwen
+/// 템플릿이 주입됐다(실측: <|im_end|> 반복·prompt_tokens 24≠14).
+pub(crate) fn messages_render(body: &str) -> String {
+    let arch = crate::engine::arch();
+    match chat_spec(&arch) {
+        Some(spec) => (spec.render)(body),
+        None => jmessages_render(body),
+    }
+}
+
 /// messages 배열에 내용 있는 메시지가 하나라도 있는가(H 2026-10-09).
 /// 종전엔 빈 messages가 렌더 후 assistant 접두만 남아 200으로 진행됐다 —
 /// completions의 빈 prompt 400과 표면 불일치(빈 프롬프트 붕괴).

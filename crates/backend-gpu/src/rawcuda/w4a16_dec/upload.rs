@@ -30,6 +30,8 @@ impl W4a16Dec {
         group: usize,
         scale_bf16: bool,
     ) -> Result<(), String> {
+        // 워커 스레드 대비 컨텍스트 가드(할당·h2d — 종전 upload_lin 무가드 클래스).
+        let _g = self.cc.guard()?;
         // 커널 표에 없는 조합은 등록 단계에서 거른다(런타임 심볼 실패 방지).
         crate::rawcuda::gptq4::kernel_sym(false, group, scale_bf16)?;
         if q.len() != n * (k / 2) || s.len() != n * (k / group) * 2 {

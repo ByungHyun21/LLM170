@@ -1078,6 +1078,8 @@ impl W4a16Dec {
         if g.is_empty() || g.len() != u.len() {
             return Err(format!("{kernel}: g={} u={} 계약 위반", g.len(), u.len()));
         }
+        // [P3 2026-10-14] 워커 스레드 대비 — ensure_ew_bufs(할당)·h2d는 컨텍스트 필수.
+        let _g = self.cc.guard()?;
         self.ensure_ew_bufs(g.len())?;
         // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let gb = unsafe { std::slice::from_raw_parts(g.as_ptr() as *const u8, g.len() * 4) };

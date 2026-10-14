@@ -277,6 +277,14 @@ use crate::sched::load_gpu_retry;
 pub use crate::sched::{SlotJob, slot_loop};
 
 pub static TOKENIZER: std::sync::OnceLock<crate::tokenize::Tokenizer> = std::sync::OnceLock::new();
+/// [P3 gemma4 2026-10-14] 서빙 아치(config.json architectures) — oai 렌더·정지
+/// 토큰 레지스트리(chat_spec) 키. 로드 시 1회 확정(load_gpu_retry).
+pub static ARCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// 현재 아치(미설정 = 빈 문자열 — 레지스트리 미등록 기본 경로).
+pub fn arch() -> String {
+    ARCH.get().cloned().unwrap_or_default()
+}
 
 pub fn greedy_encode(text: &str) -> Vec<u32> {
     TOKENIZER.get().map(|t| t.encode(text)).unwrap_or_default()

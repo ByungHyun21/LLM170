@@ -406,6 +406,9 @@ impl W4a16Dec {
         splits: usize,
         pos0: u32,
     ) -> Result<Vec<f32>, String> {
+        // [P3 2026-10-14] 워커 스레드(서빙) 대비 — 할당·h2d는 현재 컨텍스트 필수
+        // (qwen 경로는 사전 할당이라 잠복했던 클래스: HTTP 서브에서 CUresult=201).
+        let _g = self.cc.guard()?;
         let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
         if self.attn.g4_rp == 0 || layer >= dm.n_attn {
             return Err(format!(
