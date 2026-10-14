@@ -136,7 +136,11 @@ impl W4a16Dec {
         Ok(xn)
     }
 
-    /// 슬롯 상태 0화(GDN 링/스캔 + pp + pos).
+    /// 슬롯 상태 0화(GDN 링/스캔 + pp + pos + 행 스케일).
+    /// [검수 통합 2026-10-14] 행 스케일(sc)도 부팅 상태(1.0)로 재초기화 — 종전엔
+    /// 잔류해 같은 요청의 f16 반올림이 슬롯 이력에 따라 달라졌다(실측: 35B 4K
+    /// 골든 근접동률 198↔271이 직전 시나리오 유무로 플립). 상태 0이므로 스케일
+    /// 값 자체는 무해하지만, 반올림 기준이 달라지는 계약 갭이었다.
     pub fn reset_state(&mut self, slot: usize) -> Result<(), String> {
         let _g = self.cc.guard()?;
         if slot >= self.n_slots {
