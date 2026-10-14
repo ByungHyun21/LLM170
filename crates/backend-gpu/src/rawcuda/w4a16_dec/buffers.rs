@@ -344,6 +344,25 @@ impl W4a16Dec {
         Ok(self.dy.ptr)
     }
 
+    /// [gemma4 스트리밍 2026-10-14] 스트리밍 MoE 스테이징 체인 보장 — 공용
+    /// `moe_experts_streaming`은 GEMV 출력 스테이징으로 dchain[0/1/3/4]
+    /// (s0/s1/s2/s3)를 쓴다. qwen은 `ensure_chain_bufs`가 담당하지만 gemma4
+    /// (순수 어텐션 체인)는 그 경로가 없어 0인 채로 남는다 — 그대로 쓰면
+    /// 주소 0에 GEMV 출력을 써 illegal access(실측 CUresult=700). 등록 시 1회.
+    pub fn ensure_moe_stage_chain(&mut self) -> Result<(), String> {
+        if self.dchain[0] != 0 {
+            return Ok(());
+        }
+        // 폭 = max(전문가 중간 n_ff, hidden)행 × f32(두 GEMV 출력 최대치).
+        let w = self.hidden.max(self.moe.moe_ffn).max(1) * 4;
+        self.graph_invalidate(); // [P10]
+        self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
+        for p in [0usize, 1, 3, 4] {
+            self.dchain[p] = self.cc.alloc(w)?;
+        }
+        Ok(())
+    }
+
     /// MoE 버퍼 보장(전문가 스테이징·라우터·출력).
     pub(super) fn ensure_moe_bufs(&mut self) -> Result<(), String> {
         if self.moe.moe_bufs_ok {

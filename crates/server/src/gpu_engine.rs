@@ -949,6 +949,9 @@ pub(crate) fn upload_model_g4(
             scale_bf16,
             true,
         );
+        // 스트리밍 MoE 스테이징(dchain) — gemma4 체인엔 qwen의 ensure_chain_bufs
+        // 경로가 없어 여기서 보장(비상주 시 moe_experts_streaming이 사용).
+        dec.ensure_moe_stage_chain()?;
         let mut tab: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(hp.n_layer * hp.n_experts * 3);
         for il in 0..hp.n_layer {
             for e in 0..hp.n_experts {
@@ -969,10 +972,14 @@ pub(crate) fn upload_model_g4(
         let free = llm170_backend_gpu::cuda_mem_free()
             .map(|(f, _)| f)
             .unwrap_or(0);
-        let resident = match llm170_diag::flag::val("LLM170_MOE_RESIDENT") {
-            Some("0") => false,
-            Some("1") => true,
-            _ => free > expert_bytes + (1 << 30),
+        let resident = match crate::engine::MOE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => match llm170_diag::flag::val("LLM170_MOE_RESIDENT") {
+                Some("0") => false,
+                Some("1") => true,
+                _ => free > expert_bytes + (1 << 30),
+            },
         };
         if resident {
             dec.upload_experts_resident(&tab)?;
@@ -1634,9 +1641,17 @@ impl GemmaEngine {
     /// 1토큰 스텝 — **t행 청크 t=1**(단일 경로: 배치·프리필·spec과 동일 커널·
     /// 클래스 — t행 GEMV는 t=1 GEMV와 같은 산술 순서). 호스트 체인의 층당
     /// ~14왕복(h2d/launch/d2h/sync)이 청크에선 ~8로 줄어든다.
+    /// **전문가 비상주(스트리밍)에선 v0 호스트 체인(g4_step)으로 폴백** — t행
+    /// MoE(g4_moe_host_t)가 스트리밍 미지원이라, 배치·프리필의 비상주 분기가
+    /// 모두 수렴하는 이 스텝이 저하 사다리의 단일 통로다.
     fn step(&mut self, seq: usize, tok: u32) -> Result<Vec<f32>, String> {
         let pos = self.dec.slot_pos[seq];
         self.dec.kv_grow(seq, pos as usize + 1)?;
+        if !self.dec.moe_experts_resident() {
+            let lg = g4_step(&mut self.dec, &self.model, &self.cfg, seq, tok, pos)?;
+            self.dec.slot_pos[seq] = pos + 1;
+            return Ok(lg);
+        }
         let rows = self.model.embed_row(tok).map_err(|e| e.to_string())?;
         let lgs = g4_chunk(
             &mut self.dec,
