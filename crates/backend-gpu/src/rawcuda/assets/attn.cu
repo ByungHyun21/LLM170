@@ -200,11 +200,15 @@ __device__ __forceinline__ AttnKvRowPtrs attn_blk_row(
     const unsigned long long* bt =
         tab + ((long)layer * ((cap + 511) >> 9) + (row >> 9)) * 4;
     const unsigned long long ro = (unsigned long long)(row & 511);
+    // [gemma4 P2-3 2026-10-14] 헤드 보폭 = d = kv_dim/kv_heads — 종전 256
+    // 하드코딩은 d=512 풀층에서 헤드가 겹쳤다. qwen(전층 d=256)은 동일값
+    // (kv_dim/kv_heads = 8*256/8 = 256) — 비트 불변.
+    const long hstride = (kv_heads > 0) ? (kv_dim / kv_heads) : 256;
     AttnKvRowPtrs p;
     p.k = reinterpret_cast<signed char*>(bt[0]) +
-          ro * (unsigned long long)kv_dim + (long)kh * 256;
+          ro * (unsigned long long)kv_dim + (long)kh * hstride;
     p.v = reinterpret_cast<signed char*>(bt[1]) +
-          ro * (unsigned long long)kv_dim + (long)kh * 256;
+          ro * (unsigned long long)kv_dim + (long)kh * hstride;
     p.ks = reinterpret_cast<float*>(
         bt[2] + (ro * (unsigned long long)kv_heads + (unsigned long long)kh) * 4ULL);
     p.vs = reinterpret_cast<float*>(
@@ -532,7 +536,10 @@ extern "C" __global__ void attn_prep_g4(
         }
         const float inv = 1.0f / sqrtf(red[0] / (float)d + 1e-6f);
         for (int i = tid; i < d; i += 128) {
-            hd[i] = hd[i] * inv * qnw[(long)layer * d + i];
+            // [gemma4 P2-3 2026-10-14] qnw = **이 층**의 행(d개) — 종전
+            // layer*d 전개는 호스트가 층별 행을 주는 계약과 어긋나 범위 밖을
+            // 읽었다(층0만 우연 일치 — 검증 체크 통과·체인 NaN). 행 포인터 계약.
+            hd[i] = hd[i] * inv * qnw[i];
         }
         __syncthreads();
         if (tid < npairs) {
@@ -565,7 +572,7 @@ extern "C" __global__ void attn_prep_g4(
     }
     const float inv = 1.0f / sqrtf(red[0] / (float)d + 1e-6f);
     for (int i = tid; i < d; i += 128) {
-        hd[i] = hd[i] * inv * knw[(long)layer * d + i];
+        hd[i] = hd[i] * inv * knw[i]; // 이 층 행(위 Q 주석 참조)
     }
     __syncthreads();
     if (tid < npairs) {
