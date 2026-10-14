@@ -381,6 +381,7 @@ fn mtp_device_chain_matches_sequential() {
     };
     dec.set_attn(
         ad,
+        Vec::new(), // 균일 모델(층별 테이블 없음)
         &(0..ad.n_attn * d)
             .map(|_| sm_f32(&mut s, 0.5, 1.5))
             .collect::<Vec<_>>(),
@@ -514,6 +515,7 @@ fn kstep_decode_matches_sequential() {
     };
     dec.set_attn(
         ad,
+        Vec::new(), // 균일 모델(층별 테이블 없음)
         &(0..ad.n_attn * d)
             .map(|_| sm_f32(&mut s, 0.5, 1.5))
             .collect::<Vec<_>>(),
@@ -598,8 +600,13 @@ fn ucache_enforcement_frees_device_memory() {
         interval: 1,
         sliding_window: 0, // qwen35 = 슬라이딩 없음(gemma4 배선 시 창 설정)
     };
-    dec.set_attn(ad, &vec![1f32; ad.n_attn * d], &vec![1f32; ad.n_attn * d])
-        .expect("set_attn");
+    dec.set_attn(
+        ad,
+        Vec::new(),
+        &vec![1f32; ad.n_attn * d],
+        &vec![1f32; ad.n_attn * d],
+    )
+    .expect("set_attn");
     // 스펙 상태(WY s0/dc/g/k + dsnap_ring + 라운드 전 링 dring0) + 체크포인트
     // (dchk) 등록. dsave는 프로브 전용 지연 할당(serve 경로 상주 없음).
     dec.enable_spec().expect("enable_spec");

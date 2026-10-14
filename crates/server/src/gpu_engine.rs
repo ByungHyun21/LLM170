@@ -907,7 +907,7 @@ pub(crate) fn upload_model(
                 .map_err(|e| e.to_string())?,
         );
     }
-    dec.set_attn(ad, &qnw, &knw)?;
+    dec.set_attn(ad, Vec::new(), &qnw, &knw)?;
     Ok(())
 }
 

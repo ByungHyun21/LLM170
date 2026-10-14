@@ -57,6 +57,41 @@ impl W4a16Dec {
     /// (내용 불변 — 그래프 캡처 계약: 캡처는 테이블 주소만 베이크).
     /// 어텐션 커널 4종(prep_q·part_q·part_qg·fa2_qg)이 기존 KV 4포인터를
     /// 대신해 이 1포인터로 간접 어드레싱한다(merge는 KV 무판독 — 무관).
+    /// [gemma4 2026-10-14] 아레나·블록 크기용 최대 KV 클래스 — 층별 테이블이
+    /// 비면 균일 스칼라(무해).
+    pub(super) fn attn_max_kv(&self) -> Result<(usize, usize), String> {
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
+        if self.attn.layers.is_empty() {
+            return Ok((dm.kv_dim(), dm.kv_heads));
+        }
+        Ok((
+            self.attn
+                .layers
+                .iter()
+                .map(|l| l.kv_heads * l.d)
+                .max()
+                .unwrap_or(dm.kv_dim()),
+            self.attn
+                .layers
+                .iter()
+                .map(|l| l.kv_heads)
+                .max()
+                .unwrap_or(dm.kv_heads),
+        ))
+    }
+
+    /// 층별 어텐션 파라미터(테이블 비면 균일 합성).
+    #[allow(dead_code)] // gemma4 체인 배선(차기 P2-3)에서 발사 인자로 사용.
+    pub(super) fn attn_layer_of(&self, il: usize) -> Result<AttnLayer, String> {
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
+        Ok(self
+            .attn
+            .layers
+            .get(il)
+            .copied()
+            .unwrap_or_else(|| dm.layer(il)))
+    }
+
     pub(super) fn attn_blk_ptr(&self, slot: usize) -> CUdeviceptr {
         match self.attn.attn {
             Some(dm) => {

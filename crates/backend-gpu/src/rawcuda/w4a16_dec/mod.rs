@@ -397,6 +397,8 @@ pub(super) struct Mtp {
 
 /// [R10 2026-10-12] 어텐션(KV 분할·스케일) — W4a16Dec 필드 도메인 그룹(순수 이동).
 pub(super) struct Attn {
+    /// [gemma4 2026-10-14] 층별 어텐션 파라미터(비면 균일 = `attn`).
+    pub(super) layers: Vec<AttnLayer>,
     // ── attn ──
     pub(super) attn: Option<AttnDims>,
     pub(super) dqnw_a: CUdeviceptr,
@@ -759,6 +761,7 @@ impl W4a16Dec {
                 failed: false,
             },
             attn: Attn {
+                layers: Vec::new(),
                 attn: None,
                 dqnw_a: 0,
                 dknw_a: 0,
