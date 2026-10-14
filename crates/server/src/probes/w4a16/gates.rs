@@ -140,13 +140,25 @@ pub(super) fn gemm_gate(args: &[String], default_t: usize) -> Result<String, Str
                 }
             }
         }
-        let ok = mism == 0;
+        // [gemma4 2026-10-14] 판정 클래스 — t=1 GEMV는 FMA 기반 float4/스칼라
+        // 본체(파일 계약: "비트동일 아님 — 비트 게이트 진단용")라 **허용오차
+        // 클래스**(1e-5)로 판정, t≥2 GEMM은 비트 계약. 실결함(꼬리 누락 0.158
+        // 실측)은 허용오차로도 잡힌다.
+        let ok = if default_t == 1 {
+            maxd <= 1e-5
+        } else {
+            mism == 0
+        };
         all_ok &= ok;
         lines.push(format!(
             "  n={n:<6} k={k:<6} g{group}{} rows={r} t={t}  {}",
             if bf16 { "/bf16" } else { "/f16" },
             if ok {
-                "PASS(비트일치)".to_string()
+                if default_t == 1 {
+                    format!("PASS(수치 클래스 maxdiff={maxd:.3e})")
+                } else {
+                    "PASS(비트일치)".to_string()
+                }
             } else {
                 format!("FAIL mism={mism} maxdiff={maxd:.3e}")
             }
@@ -158,11 +170,23 @@ pub(super) fn gemm_gate(args: &[String], default_t: usize) -> Result<String, Str
         "w4a16-gemm"
     };
     let head = format!(
-        "{name} {dir}\n  형상 {n_shape}종 × rows≤{rows_limit} × t={t} — 커널 vs dot_row_w4a16_lane(비트 판정)"
+        "{name} {dir}\n  형상 {n_shape}종 × rows≤{rows_limit} × t={t} — 커널 vs dot_row_w4a16_lane({})",
+        if default_t == 1 {
+            "t=1 수치 클래스(허용오차 1e-5) 판정"
+        } else {
+            "비트 판정"
+        }
     );
     let body = lines.join("\n");
     if all_ok {
-        Ok(format!("{head}\n{body}\n  판정: 전 형상 비트일치"))
+        Ok(format!(
+            "{head}\n{body}\n  판정: 전 형상 {}",
+            if default_t == 1 {
+                "수치 클래스 허용(≤1e-5)"
+            } else {
+                "비트일치"
+            }
+        ))
     } else {
         Err(format!("{head}\n{body}\n  판정: 불일치"))
     }

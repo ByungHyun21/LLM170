@@ -260,6 +260,15 @@ __device__ __forceinline__ void gemv_body4(
     if (o >= n) {
         return;
     }
+    // [gemma4 2026-10-14] float4 본체는 256폭 청크 전제 — k가 256 배수가
+    // 아니면 꼬리가 누락된다(실측 0.158: gemma4 dense down_proj k=2176 =
+    // 8.5×256, w4a16-gemv 게이트 적발). 해당 형상은 **스칼라 본체**로
+    // (128폭 청크 — k%128==0이면 정확, 전문가 경로가 쓰는 검증된 경로).
+    // 수치 클래스: 양쪽 모두 FMA(t=1 GEMV = 비트 계약 아님, 진단 게이트).
+    if ((k & 255) != 0) {
+        gemv_row_body<SHIFT, BF16>(q, s, x, out, o, k);
+        return;
+    }
     gemv_row_body4<SHIFT, BF16>(q, s, x, out, o, k);
 }
 
