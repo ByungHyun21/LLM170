@@ -51,7 +51,8 @@ M_35B=../models/Qwen3.6-35B-A3B-INT4-W4A16
 M_FN=../models/Qwen3.8-Flash-Next-W4A16-FP8PLE
 
 fail=0
-note() { echo "[w4a16] $*"; }
+SUMMARY=()
+note() { echo "[w4a16] $*"; SUMMARY+=("$*"); }
 
 # ── 1. A(27B) 참조 토큰 ──
 note "[1/10] A(27B) 참조 실행 — w4a16-ref"
@@ -64,16 +65,9 @@ case "$A" in
   *) echo "[w4a16] FAIL: 골든 접두 불일치: $(echo "$A" | head -c 60)"; fail=1;;
 esac
 
-# ── 2. B(27B) GPU 체인 ──
-note "[2/10] B(27B) GPU 체인 — w4a16-gpu"
-timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
-  > "$RUN/b.out" 2> "$RUN/b.log"
-B=$(grep -m1 '^ tokens:' "$RUN/b.out" | sed 's/^ tokens: //')
-case "$B" in
-  "$GOLDEN"*) note "GPU 토큰 OK: $(echo "$B" | head -c 60)";;
-  "") echo "[w4a16] FAIL: GPU 체인 실패 — ${RUN}/b.log"; fail=1;;
-  *) echo "[w4a16] FAIL: GPU 골든 불일치: $(echo "$B" | head -c 60)"; fail=1;;
-esac
+# ── 2. B(27B) GPU 체인 — [검수 통합 2026-10-14] [3b]의 600토큰 프로브가 같은
+# 골든 접두를 판정한다(모델 로드 1회 절감) — 별도 8토큰 런 제거.
+note "[2/10] B(27B) GPU 체인 — [3b] 600토큰 런에 흡수(골든 접두 동일 계약)"
 
 # ── 3. C(27B) serve HTTP 종단 ──
 note "[3/10] C(27B) serve HTTP — runtime=cuda + 골든 접두"
@@ -134,6 +128,28 @@ except Exception:
   esac
 done
 
+# ── 3b. 그래프 replay KV 블록(512) 경계 교차 — 디코드 중 성장 경로 ──
+# [2026-10-14] 그래프 경로가 kv_ensure(온디맨드 성장)를 우회해 경계 교차 시
+# 미할당 테이블 엔트리를 판독(illegal access — np2 tg768 실측)하던 결함의 가드.
+# 프리필이 블록을 선확보하는 장문 배터리·스모크 경로에서는 잠복했던 클래스.
+note "[3b] 그래프 경로 KV 경계 교차 — 단문→600토큰(단일 그래프+배치 그래프)"
+timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 600 --ctx 1024 \
+  > "$RUN/c3.out" 2> "$RUN/c3.log"
+C3=$(grep -m1 '^ tokens:' "$RUN/c3.out" | sed 's/^ tokens: //')
+case "$C3" in
+  "$GOLDEN"*) note "단일 그래프 교차 OK + GPU 골든 접두([2] 흡수) ($(echo "$C3" | awk -F, '{print NF}')토큰)";;
+  "") echo "[w4a16] FAIL: 단일 그래프 교차 실패(크래시?) — ${RUN}/c3.log"; fail=1;;
+  *) echo "[w4a16] FAIL: 단일 그래프 교차 골든 불일치: $(echo "$C3" | head -c 60)"; fail=1;;
+esac
+timeout 900 "$BIN" bench --model "$M_27B" --np 2 --tg 600 --reps 1 --ctx 2048 --np-check 600 \
+  > "$RUN/c3b.out" 2> "$RUN/c3b.log"
+if grep -q "^np2(tg600)" "$RUN/c3b.out" && grep -q "^np2-check | 단일 경로 등가 OK" "$RUN/c3b.out"; then
+  note "배치 그래프 교차 OK + np 자체 검증(단일 등가) OK ($(grep -m1 '^np2' "$RUN/c3b.out" | cut -d'|' -f3 | sed 's/^ *//'))"
+  note "  np2 해시: $(grep -m1 '^np2-hash' "$RUN/c3b.out" | cut -d'|' -f2 | sed 's/^ *//')"
+else
+  echo "[w4a16] FAIL: 배치 그래프 교차/자체 검증 실패(크래시?) — ${RUN}/c3b.log"; fail=1
+fi
+
 # ── 4. D(35B INT4 g32) 참조 오라클(W4-1 MoE) ──
 note "[4/10] D(35B INT4 g32) 참조 실행 — w4a16-ref (MoE g32/bf16)"
 timeout 2400 "$BIN" w4a16-ref "$M_35B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
@@ -145,19 +161,26 @@ case "$D" in
   *) echo "[w4a16] FAIL: 35B 골든 불일치: $(echo "$D" | head -c 60)"; fail=1;;
 esac
 
-# ── 5. D2(35B INT4 g32) GPU 체인(MoE) ──
-note "[5/10] D2(35B) GPU 체인 — w4a16-gpu (MoE)"
-timeout 1800 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
-  > "$RUN/d2.out" 2> "$RUN/d2.log"
-D2=$(grep -m1 '^ tokens:' "$RUN/d2.out" | sed 's/^ tokens: //')
+# ── 5. D2+D3(35B) GPU 체인 + 다중 청크(GPU) — [검수 통합 2026-10-14] 시나리오
+# 2종(단문·P35L)을 모델 로드 1회로. 시나리오별 `s0/s1-tokens:` 판정.
+note "[5/10] D2+D3(35B) GPU 체인 — 다중 시나리오(단문+P35L·MoE)"
+timeout 1800 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens 148678,65233,202419 --prompt-tokens "$P35L" \
+  --n-predict 8 --ctx 1024 > "$RUN/d2.out" 2> "$RUN/d2.log"
+D2=$(grep -m1 '^ s0-tokens:' "$RUN/d2.out" | sed 's/^ s0-tokens: //')
+D3G=$(grep -m1 '^ s1-tokens:' "$RUN/d2.out" | sed 's/^ s1-tokens: //')
 case "$D2" in
   "$GOLDEN35"*) note "35B GPU 토큰 OK: $(echo "$D2" | head -c 60)";;
   "") echo "[w4a16] FAIL: 35B GPU 실패 — ${RUN}/d2.log"; fail=1;;
   *) echo "[w4a16] FAIL: 35B GPU 골든 불일치: $(echo "$D2" | head -c 60)"; fail=1;;
 esac
+case "$D3G" in
+  "$GOLDEN35L"*) note "긴 프롬프트 GPU OK: $(echo "$D3G" | head -c 50)";;
+  "") echo "[w4a16] FAIL: 긴 GPU 실패 — ${RUN}/d2.log"; fail=1;;
+  *) echo "[w4a16] FAIL: 긴 GPU 골든 불일치: $(echo "$D3G" | head -c 50)"; fail=1;;
+esac
 
-# ── 6. D3(35B) 다중 청크(35토큰) — 배치 프리필 t≤32 CPU/GPU 골든 ──
-note "[6/10] D3(35B) 다중 청크 — 참조(CPU) + GPU (배치 t≤32)"
+# ── 6. D3(35B) 다중 청크(35토큰) 참조(CPU) ──
+note "[6/10] D3(35B) 다중 청크 참조(CPU) — 배치 프리필 t≤32 골든"
 timeout 2400 "$BIN" w4a16-ref "$M_35B" --prompt-tokens "$P35L" --n-predict 8 --ctx 1024 \
   > "$RUN/d3a.out" 2> "$RUN/d3a.log"
 DA=$(grep -m1 '^tokens:' "$RUN/d3a.out" | sed 's/^tokens: //')
@@ -165,14 +188,6 @@ case "$DA" in
   "$GOLDEN35L"*) note "긴 프롬프트 참조 OK: $(echo "$DA" | head -c 50)";;
   "") echo "[w4a16] FAIL: 긴 참조 실패 — ${RUN}/d3a.log"; fail=1;;
   *) echo "[w4a16] FAIL: 긴 참조 골든 불일치: $(echo "$DA" | head -c 50)"; fail=1;;
-esac
-timeout 900 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens "$P35L" --n-predict 8 --ctx 1024 \
-  > "$RUN/d3b.out" 2> "$RUN/d3b.log"
-DB=$(grep -m1 '^ tokens:' "$RUN/d3b.out" | sed 's/^ tokens: //')
-case "$DB" in
-  "$GOLDEN35L"*) note "긴 프롬프트 GPU OK: $(echo "$DB" | head -c 50)";;
-  "") echo "[w4a16] FAIL: 긴 GPU 실패 — ${RUN}/d3b.log"; fail=1;;
-  *) echo "[w4a16] FAIL: 긴 GPU 골든 불일치: $(echo "$DB" | head -c 50)"; fail=1;;
 esac
 
 # ── 6b. D4(35B) 스트리밍 serve — 전문가 LRU 캐시 경로 골든 ──
@@ -214,41 +229,38 @@ else
   echo "[w4a16] FAIL: 가드 외 사유 — ${RUN}/e.log"; fail=1
 fi
 
-# ── 9. G(27B) 장문 600·4000토큰 — lim>256·다중 청크 ──
-note "[8/10] G(27B) 장문 600/4000토큰 GPU 골든"
-timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens "$P600" --n-predict 8 --ctx 4096 \
-  > "$RUN/g1.out" 2> "$RUN/g1.log"
-G1=$(grep -m1 '^ tokens:' "$RUN/g1.out" | sed 's/^ tokens: //')
+# ── 8. G(27B) 장문 600·4000토큰 — lim>256·다중 청크
+# [검수 통합 2026-10-14] 2시나리오 1런(모델 로드 1회) — s0=600·s1=4000.
+note "[8/10] G(27B) 장문 600/4000토큰 GPU 골든(2시나리오 1런)"
+timeout 1800 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens "$P600" --prompt-tokens "$P4000" \
+  --n-predict 8 --ctx 8192 > "$RUN/g.out" 2> "$RUN/g.log"
+G1=$(grep -m1 '^ s0-tokens:' "$RUN/g.out" | sed 's/^ s0-tokens: //')
+G2=$(grep -m1 '^ s1-tokens:' "$RUN/g.out" | sed 's/^ s1-tokens: //')
 case "$G1" in
   "$GOLDEN27_600"*) note "27B 600 토큰 OK";;
-  "") echo "[w4a16] FAIL: 27B 600 실패 — ${RUN}/g1.log"; fail=1;;
+  "") echo "[w4a16] FAIL: 27B 600 실패 — ${RUN}/g.log"; fail=1;;
   *) echo "[w4a16] FAIL: 27B 600 골든 불일치: $(echo "$G1" | head -c 50)"; fail=1;;
 esac
-timeout 1200 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens "$P4000" --n-predict 8 --ctx 8192 \
-  > "$RUN/g2.out" 2> "$RUN/g2.log"
-G2=$(grep -m1 '^ tokens:' "$RUN/g2.out" | sed 's/^ tokens: //')
 case "$G2" in
   "$GOLDEN27_4K"*) note "27B 4000 토큰 OK";;
-  "") echo "[w4a16] FAIL: 27B 4000 실패 — ${RUN}/g2.log"; fail=1;;
+  "") echo "[w4a16] FAIL: 27B 4000 실패 — ${RUN}/g.log"; fail=1;;
   *) echo "[w4a16] FAIL: 27B 4000 골든 불일치: $(echo "$G2" | head -c 50)"; fail=1;;
 esac
 
-# ── 10. G2(35B) 장문 600·4000토큰 ──
-note "[9/10] G2(35B) 장문 600/4000토큰 GPU 골든"
-timeout 900 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens "$P600" --n-predict 8 --ctx 4096 \
-  > "$RUN/g3.out" 2> "$RUN/g3.log"
-G3=$(grep -m1 '^ tokens:' "$RUN/g3.out" | sed 's/^ tokens: //')
+# ── 10. G2(35B) 장문 600·4000토큰 — [검수 통합] 2시나리오 1런.
+note "[9/10] G2(35B) 장문 600/4000토큰 GPU 골든(2시나리오 1런)"
+timeout 1800 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens "$P600" --prompt-tokens "$P4000" \
+  --n-predict 8 --ctx 8192 > "$RUN/g2.out" 2> "$RUN/g2.log"
+G3=$(grep -m1 '^ s0-tokens:' "$RUN/g2.out" | sed 's/^ s0-tokens: //')
+G4=$(grep -m1 '^ s1-tokens:' "$RUN/g2.out" | sed 's/^ s1-tokens: //')
 case "$G3" in
   "$GOLDEN35_600"*) note "35B 600 토큰 OK";;
-  "") echo "[w4a16] FAIL: 35B 600 실패 — ${RUN}/g3.log"; fail=1;;
+  "") echo "[w4a16] FAIL: 35B 600 실패 — ${RUN}/g2.log"; fail=1;;
   *) echo "[w4a16] FAIL: 35B 600 골든 불일치: $(echo "$G3" | head -c 50)"; fail=1;;
 esac
-timeout 1200 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens "$P4000" --n-predict 8 --ctx 8192 \
-  > "$RUN/g4.out" 2> "$RUN/g4.log"
-G4=$(grep -m1 '^ tokens:' "$RUN/g4.out" | sed 's/^ tokens: //')
 case "$G4" in
   "$GOLDEN35_4K"*) note "35B 4000 토큰 OK";;
-  "") echo "[w4a16] FAIL: 35B 4000 실패 — ${RUN}/g4.log"; fail=1;;
+  "") echo "[w4a16] FAIL: 35B 4000 실패 — ${RUN}/g2.log"; fail=1;;
   *) echo "[w4a16] FAIL: 35B 4000 골든 불일치: $(echo "$G4" | head -c 50)"; fail=1;;
 esac
 
@@ -352,8 +364,10 @@ sys.exit(0 if ok else 1)
   fi
 done
 
+echo "[w4a16] ── 검수 요약(${#SUMMARY[@]}항목) ──"
+for s in "${SUMMARY[@]}"; do echo "[w4a16]   $s"; done
 if [ $fail -eq 0 ]; then
-  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve·장문·spec / 35B MoE 참조+GPU·장문·spec·스트리밍(D4) / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
+  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU(600 흡수)·serve·장문(2시나리오 1런)·spec·경계 교차+np 자체 검증 / 35B MoE 참조+GPU(2시나리오)·장문(2시나리오)·spec·스트리밍(D4) / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
 else
   echo "[w4a16] smoke: FAILURES PRESENT"
 fi

@@ -240,6 +240,8 @@ extern "C" __global__ void attn_prep_q(
     float* __restrict__ qh,          // [T][q_heads*256]
     const unsigned long long* __restrict__ dblk_tab, // [K6-2] [layer][mb][4]
     const unsigned* __restrict__ pp, // [1] pos0 — 디바이스 판독(결함 4호)
+    const unsigned long long* __restrict__ row_blk, // [행 퓨전 2026-10-14] nullable
+    const unsigned long long* __restrict__ row_pp,  //   행별(테이블, pos) 포인터
     int t_len, int layer, int q_heads, int kv_heads, int cap)
 {
     __shared__ float red[128];
@@ -247,7 +249,16 @@ extern "C" __global__ void attn_prep_q(
     int t = blockIdx.x;
     int j = blockIdx.y;
     int tid = threadIdx.x;
-    int pos = (int)pp[0] + t;
+    // [배치 행 퓨전 2026-10-14] 퓨전이면 행별 blk/pos(그리드 x = 행) — null이면
+    // 종전 단일 슬롯 계약(pos = pp[0] + t). 주소·산술 동일(행별 값).
+    const unsigned long long* blk = dblk_tab;
+    int pos;
+    if (row_blk != (const unsigned long long*)0) {
+        blk = (const unsigned long long*)row_blk[t];
+        pos = (int)((const unsigned*)row_pp[t])[0];
+    } else {
+        pos = (int)pp[0] + t;
+    }
     long kv_dim = (long)kv_heads * 256;
 
     if (j < q_heads) {
@@ -304,7 +315,7 @@ extern "C" __global__ void attn_prep_q(
         }
         __syncthreads();
         // [K6-2] 블록 테이블 간접화 — 종전 dst/sr 전개와 동일 주소(구성 증명).
-        AttnKvRowPtrs rp = attn_blk_row(dblk_tab, layer, cap, pos, kv_dim, kv_heads, m);
+        AttnKvRowPtrs rp = attn_blk_row(blk, layer, cap, pos, kv_dim, kv_heads, m);
         // K absmax → int8
         red[tid] = fmaxf(fabsf(hd[tid]), fabsf(hd[tid + 128]));
         __syncthreads();
@@ -469,6 +480,8 @@ extern "C" __global__ void attn_fwd3s_part_q(
     const unsigned long long* __restrict__ dblk_tab, // [K6-2] [layer][mb][4]
     float* __restrict__ part,   // [T][q_heads][S][258]: m, l, acc[256]
     const unsigned* __restrict__ pp,
+    const unsigned long long* __restrict__ row_blk, // [행 퓨전] nullable
+    const unsigned long long* __restrict__ row_pp,
     int t_len, int layer, int q_heads, int kv_heads, int cap, int splits)
 {
     int t = blockIdx.x;
@@ -479,7 +492,15 @@ extern "C" __global__ void attn_fwd3s_part_q(
     int gq = q_heads / kv_heads;
     int kh = h / gq;
     float scale = 0.0625f;
-    int lim = (int)pp[0] + t + 1;
+    // [배치 행 퓨전 2026-10-14] 행별 blk/pos — null이면 단일 슬롯 계약.
+    const unsigned long long* blk = dblk_tab;
+    int lim;
+    if (row_blk != (const unsigned long long*)0) {
+        blk = (const unsigned long long*)row_blk[t];
+        lim = (int)((const unsigned*)row_pp[t])[0] + 1;
+    } else {
+        lim = (int)pp[0] + t + 1;
+    }
     long kv_dim = (long)kv_heads * 256;
     long qrow = (long)t * (q_heads * 256) + (long)h * 256;
     __shared__ float qs[256];
@@ -515,7 +536,7 @@ extern "C" __global__ void attn_fwd3s_part_q(
                 // 그대로(4B 시절과 동일) — **비트동일 계약 유지**.
                 // [K6-2] 행 기저 = 블록 테이블(종전 kc+… 전개와 동일 주소).
                 const AttnKvRowPtrs rp =
-                    attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                    attn_blk_row(blk, layer, cap, row, kv_dim, kv_heads, kh);
                 const uint4* k16 = reinterpret_cast<const uint4*>(rp.k);
                 const float4* q4 = reinterpret_cast<const float4*>(qs);
                 float p0 = 0.0f;
@@ -548,7 +569,7 @@ extern "C" __global__ void attn_fwd3s_part_q(
             [&](int i) -> float {
                 const int row = base + i;
                 const AttnKvRowPtrs rp =
-                    attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                    attn_blk_row(blk, layer, cap, row, kv_dim, kv_heads, kh);
                 return (float)rp.v[tid] * rp.vs[0];
             },
             sarr, reds, nch, tid, m_run, l_run, acc);
@@ -653,6 +674,8 @@ extern "C" __global__ void attn_fwd3s_part_qg(
     const unsigned long long* __restrict__ dblk_tab, // [K6-2] [layer][mb][4]
     float* __restrict__ part,   // [T][q_heads][S][258]
     const unsigned* __restrict__ pp,
+    const unsigned long long* __restrict__ row_blk, // [행 퓨전] nullable
+    const unsigned long long* __restrict__ row_pp,
     int t_len, int layer, int q_heads, int kv_heads, int cap, int splits)
 {
     int t = blockIdx.x;
@@ -663,7 +686,16 @@ extern "C" __global__ void attn_fwd3s_part_qg(
     int gq = q_heads / kv_heads;
     int h0 = kh * gq;
     float scale = 0.0625f;
-    int lim = (int)pp[0] + t + 1;
+    // [배치 행 퓨전 2026-10-14] 행별 blk/pos — null이면 단일 슬롯 계약
+    // (lim = pp[0]+t+1 · t=행=토큰 순번). 값·주소 동일.
+    const unsigned long long* blk = dblk_tab;
+    int lim;
+    if (row_blk != (const unsigned long long*)0) {
+        blk = (const unsigned long long*)row_blk[t];
+        lim = (int)((const unsigned*)row_pp[t])[0] + 1;
+    } else {
+        lim = (int)pp[0] + t + 1;
+    }
     long kv_dim = (long)kv_heads * 256;
     __shared__ float qs[ATTN_GQ_MAX][256];
     __shared__ float sarr[ATTN_GQ_MAX][ATTN_CHUNK];
@@ -722,7 +754,7 @@ extern "C" __global__ void attn_fwd3s_part_qg(
             const int row = base + tid;
             // [K6-2] 행 기저 = 블록 테이블(종전 kc+… 전개와 동일 주소).
             const AttnKvRowPtrs rp =
-                attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                attn_blk_row(blk, layer, cap, row, kv_dim, kv_heads, kh);
             const uint4* k16 = reinterpret_cast<const uint4*>(rp.k);
             float p[ATTN_GQ_MAX];
 #pragma unroll
@@ -833,13 +865,13 @@ extern "C" __global__ void attn_fwd3s_part_qg(
             const int r0 = base + i;
             // [K6-2] 4행 분할 기저 = 블록 테이블(종전 vc/vsc 전개와 동일 주소).
             const AttnKvRowPtrs r0p =
-                attn_blk_row(dblk_tab, layer, cap, r0, kv_dim, kv_heads, kh);
+                attn_blk_row(blk, layer, cap, r0, kv_dim, kv_heads, kh);
             const AttnKvRowPtrs r1p =
-                attn_blk_row(dblk_tab, layer, cap, r0 + 1, kv_dim, kv_heads, kh);
+                attn_blk_row(blk, layer, cap, r0 + 1, kv_dim, kv_heads, kh);
             const AttnKvRowPtrs r2p =
-                attn_blk_row(dblk_tab, layer, cap, r0 + 2, kv_dim, kv_heads, kh);
+                attn_blk_row(blk, layer, cap, r0 + 2, kv_dim, kv_heads, kh);
             const AttnKvRowPtrs r3p =
-                attn_blk_row(dblk_tab, layer, cap, r0 + 3, kv_dim, kv_heads, kh);
+                attn_blk_row(blk, layer, cap, r0 + 3, kv_dim, kv_heads, kh);
             const float v0 = (float)r0p.v[tid] * r0p.vs[0];
             const float v1 = (float)r1p.v[tid] * r1p.vs[0];
             const float v2 = (float)r2p.v[tid] * r2p.vs[0];
@@ -858,7 +890,7 @@ extern "C" __global__ void attn_fwd3s_part_qg(
         for (; i < nch; i++) {
             const int row = base + i;
             const AttnKvRowPtrs rp =
-                attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                attn_blk_row(blk, layer, cap, row, kv_dim, kv_heads, kh);
             const float vv = (float)rp.v[tid] * rp.vs[0];
 #pragma unroll
             for (int h = 0; h < ATTN_GQ_MAX; ++h) {

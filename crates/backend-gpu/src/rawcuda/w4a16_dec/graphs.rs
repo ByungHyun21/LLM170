@@ -168,6 +168,9 @@ impl W4a16Dec {
 
     /// 그래프 replay — pinned 입력 기입 → dpp 1회 갱신 → launch 1회 → sync →
     /// pinned 출력 회수. 반환: head 모드면 로짓, 아니면 xn.
+    /// [장문 디코드 읽기 경로 2026-10-14] KV 온디맨드는 replay 몫도 있다 —
+    /// 직접 경로(chain 편입)와 동일 계약, 블록 경계 교차 시 미할당 엔트리
+    /// 판독(illegal access) 차단.
     pub(super) fn graph_replay(
         &mut self,
         exec: ffi::CUgraphExec,
@@ -175,6 +178,7 @@ impl W4a16Dec {
         embed_row: &[f32],
     ) -> Result<Vec<f32>, String> {
         let pos = self.slot_pos[slot];
+        self.kv_ensure(slot, pos as usize + 3)?;
         // SAFETY: pinned 버퍼는 hidden*4/n_slots*4 크기 계약(ensure_graph 할당).
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -215,6 +219,11 @@ impl W4a16Dec {
         embed_row: &[f32],
     ) -> Result<u32, String> {
         let pos = self.slot_pos[slot];
+        // [장문 디코드 읽기 경로 2026-10-14] 직접 경로와 동일 계약 — replay도
+        // KV 온디맨드를 건너뛰면 블록 경계(512) 교차에서 미할당 테이블
+        // 엔트리(주소 센티널)를 판독해 illegal access(실측: np2 tg768 —
+        // 프리필이 블록을 미리 확보한 배터리 경로에서만 잠복했던 결함).
+        self.kv_ensure(slot, pos as usize + 3)?;
         // SAFETY: pinned 버퍼는 hidden*4/n_slots*4 크기 계약(ensure_graph 할당).
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -323,13 +332,51 @@ impl W4a16Dec {
                 std::ptr::copy_nonoverlapping(pos.to_le_bytes().as_ptr(), pp.add(s * 4), 4);
             }
         }
+        // [배치 행 퓨전 2026-10-14] 행별 메타 기입(blk/pp/ring/st/sc) — 퓨전
+        // 런치가 drow_*(h2d 노드가 replay마다 기록)로 소비. 슬롯 고정 키 =
+        // 값 일정(그래프 캡처에 안전 — 주소만 베이크, 내용은 매 replay 복사).
+        if let (Some(gd), Some(ad)) = (self.gdn.gdn, self.attn.attn) {
+            let ring_stride = (gd.n_gdn * 3 * gd.conv_ch()) as u64;
+            let st_stride = (gd.n_gdn * gd.h_v * 128 * 128) as u64;
+            let sc_stride = (gd.n_gdn * gd.h_v * 128) as u64;
+            let blk_stride = (ad.n_attn * ad.cap.div_ceil(512) * 4) as u64;
+            // SAFETY: 핀드 5종은 ensure_batch_bufs가 tmax*8로 할당(t ≤ tmax 계약
+            // — 위 도메인 검사) · 비중첩 기입.
+            unsafe {
+                for (k, &s) in slots.iter().enumerate() {
+                    let blk = self.attn.dblk_tab + s as u64 * blk_stride * 8;
+                    let pp = self.attn.dpp + s as u64 * 4;
+                    let ring = self.gdn.dring + s as u64 * ring_stride * 4;
+                    let st = self.gdn.dgst + s as u64 * st_stride * 2;
+                    let sc = self.gdn.dsc + s as u64 * sc_stride * 4;
+                    for (pin, v) in [
+                        (self.graph.pin_row_blk, blk),
+                        (self.graph.pin_row_pp, pp),
+                        (self.graph.pin_row_ring, ring),
+                        (self.graph.pin_row_st, st),
+                        (self.graph.pin_row_sc, sc),
+                    ] {
+                        std::ptr::copy_nonoverlapping(
+                            v.to_le_bytes().as_ptr(),
+                            (pin as *mut u8).add(k * 8),
+                            8,
+                        );
+                    }
+                }
+            }
+        }
         let key: Vec<usize> = slots.to_vec();
-        if let Some(k) = self
+        let hit = self
             .graph
             .batch_graphs
             .iter()
-            .position(|(ks, _, _)| *ks == key)
-        {
+            .position(|(ks, _, _)| *ks == key);
+        if let Some(k) = hit {
+            // [장문 디코드 읽기 경로 2026-10-14] 배치 replay도 KV 온디맨드 —
+            // 단일 그래프와 동일 계약(미스 경로 batch_launch가 이미 확보).
+            for &s in slots {
+                self.kv_ensure(s, self.slot_pos[s] as usize + 3)?;
+            }
             let exec = self.graph.batch_graphs[k].1;
             self.cc.graph_launch(exec)?;
             self.cc.sync()?;

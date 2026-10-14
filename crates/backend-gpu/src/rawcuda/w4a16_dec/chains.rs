@@ -136,7 +136,11 @@ impl W4a16Dec {
         Ok(xn)
     }
 
-    /// 슬롯 상태 0화(GDN 링/스캔 + pp + pos).
+    /// 슬롯 상태 0화(GDN 링/스캔 + pp + pos + 행 스케일).
+    /// [검수 통합 2026-10-14] 행 스케일(sc)도 부팅 상태(1.0)로 재초기화 — 종전엔
+    /// 잔류해 같은 요청의 f16 반올림이 슬롯 이력에 따라 달라졌다(실측: 35B 4K
+    /// 골든 근접동률 198↔271이 직전 시나리오 유무로 플립). 상태 0이므로 스케일
+    /// 값 자체는 무해하지만, 반올림 기준이 달라지는 계약 갭이었다.
     pub fn reset_state(&mut self, slot: usize) -> Result<(), String> {
         let _g = self.cc.guard()?;
         if slot >= self.n_slots {
@@ -147,10 +151,16 @@ impl W4a16Dec {
         if let Some(dims) = self.gdn.gdn {
             let ring_bytes = dims.n_gdn * 3 * dims.conv_ch() * 4;
             let st_bytes = dims.n_gdn * dims.h_v * 128 * 128 * 2; // f16 행-스케일
+            let sc_n = dims.n_gdn * dims.h_v * 128;
             let ring_off = (slot * dims.n_gdn * 3 * dims.conv_ch()) as u64 * 4;
             let st_off = (slot * dims.n_gdn * dims.h_v * 128 * 128) as u64 * 2;
+            let sc_off = (slot * sc_n) as u64 * 4;
             Self::zero_dev(&self.cc, self.gdn.dring + ring_off, ring_bytes)?;
             Self::zero_dev(&self.cc, self.gdn.dgst + st_off, st_bytes)?;
+            let ones = vec![1.0f32; sc_n];
+            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+            let b = unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, sc_n * 4) };
+            self.cc.h2d(self.gdn.dsc + sc_off, b)?;
         }
         Ok(())
     }
@@ -348,6 +358,20 @@ impl W4a16Dec {
                 std::slice::from_raw_parts(self.graph.pin_batch_pos as *const u8, self.n_slots * 4)
             };
             self.cc.h2d_async(self.attn.dpp, pb)?;
+            // [배치 행 퓨전 2026-10-14] 행별 메타 5종 상향(캡처 시 노드로 기록 —
+            // replay마다 핀드 내용을 복사). 호출부(forward_device_argmax_batch)가
+            // 핀드를 슬롯에서 기입한다.
+            for (pin, dev) in [
+                (self.graph.pin_row_blk, self.drow_blk),
+                (self.graph.pin_row_pp, self.drow_pp),
+                (self.graph.pin_row_ring, self.drow_ring),
+                (self.graph.pin_row_st, self.drow_st),
+                (self.graph.pin_row_sc, self.drow_sc),
+            ] {
+                // SAFETY: 핀드 5종 = pinned_alloc(tmax*8) — t ≤ tmax(호출 전제).
+                let b = unsafe { std::slice::from_raw_parts(pin as *const u8, t * 8) };
+                self.cc.h2d_async(dev, b)?;
+            }
         }
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let h = self.hidden;

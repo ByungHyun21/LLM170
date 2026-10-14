@@ -50,15 +50,24 @@ impl W4a16Dec {
         } else {
             0
         };
+        // [dsave 대체 2026-10-14] 라운드 전 링 스냅샷(층 슬라이스 [3][ch]) —
+        // acc==0 복원(spec_rollback keep=0)의 S_0 동반 상태. 같은 조건에서만.
+        let mut c7 = if c6 != 0 && self.gdn.dring0 != 0 {
+            self.gdn.dring0 + (layer as u64 * 3 * dm.conv_ch() as u64) * 4
+        } else {
+            0
+        };
+        // [행 퓨전 2026-10-14] 단일 체인은 행별 링 배열 불요(null).
+        let mut c8 = 0u64;
         self.cc.launch(
             f,
             (dm.conv_ch() / 128) as u32,
             // [토큰축 병렬] y = ceil(t_len/16) — 4탭은 입력 이력만 필요.
             (t_len.div_ceil(16)) as u32,
             128,
-            &mut crate::rawcuda::args::l12(
-                &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut tl, &mut lay,
-                &mut kl, &mut vl, &mut cch,
+            &mut crate::rawcuda::args::l14(
+                &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut c7, &mut c8,
+                &mut tl, &mut lay, &mut kl, &mut vl, &mut cch,
             ),
         )?;
 
@@ -103,6 +112,8 @@ impl W4a16Dec {
         // gdn_scan 점유 8.3%(지연 바운드) → 분할로 병렬도 확보. t>1은 종전.
         let mut skip_scan = false;
         if t_len == 1 {
+            // [행 퓨전 2026-10-14] 행별 배열 인자(null — 단일 체인) ×2.
+            let (mut n0, mut n1) = (0u64, 0u64);
             let fp = self.cc.function("gdn1_part")?;
             let (mut p0, mut p1, mut p2, mut p3, mut p4) = (
                 self.gdn.dq2,
@@ -116,9 +127,9 @@ impl W4a16Dec {
                 dm.h_v as u32,
                 8,
                 128,
-                &mut crate::rawcuda::args::l9(
-                    &mut p0, &mut p1, &mut p2, &mut p3, &mut p4, &mut hk, &mut hv, &mut dd,
-                    &mut lay,
+                &mut crate::rawcuda::args::l11(
+                    &mut p0, &mut p1, &mut p2, &mut p3, &mut p4, &mut n0, &mut n1, &mut hk,
+                    &mut hv, &mut dd, &mut lay,
                 ),
             )?;
             let fc = self.cc.function("gdn1_comb")?;
@@ -154,9 +165,9 @@ impl W4a16Dec {
                 dm.h_v as u32,
                 8,
                 128,
-                &mut crate::rawcuda::args::l9(
-                    &mut u0, &mut u1, &mut u2, &mut u3, &mut u4, &mut hk, &mut hv, &mut dd,
-                    &mut lay,
+                &mut crate::rawcuda::args::l11(
+                    &mut u0, &mut u1, &mut u2, &mut u3, &mut u4, &mut n0, &mut n1, &mut hk,
+                    &mut hv, &mut dd, &mut lay,
                 ),
             )?;
             skip_scan = true;
@@ -402,26 +413,21 @@ impl W4a16Dec {
         // (layer·gi)라 n_gdn 스트라이드가 정확(종전 n_layers 할당은 여유분).
         let ring_snap = 8 * dm.n_gdn * 3 * dm.conv_ch() * 4;
         self.gdn.dsnap_ring = self.cc.alloc(ring_snap)?;
-        // [A-1 진단] 슬롯 상태 저장 스크래치(상태 + conv 링) — save/load용.
-        // [행-스케일] 상태 f16(×2) + 스케일 f32(×4) + conv 링 f32(×4).
-        self.gdn.dsave = self.cc.alloc(
-            self.n_slots
-                * (dm.n_gdn * dm.h_v * dm.d * dm.d * 2
-                    + dm.n_gdn * dm.h_v * dm.d * 4
-                    + dm.n_gdn * 3 * dm.conv_ch() * 4),
-        )?;
-        // [§3.4 ② 2026-10-12] 통합 캐시 회계 — 스펙 상태(WY+dsnap_ring+
-        // dsave). 트랜셰 2: 예산 압박 시 이 등록 자체가 ckpt·expert-lru를
-        // 퇴거시킬 수 있다(실제 해제는 함수 끝 ucache_sweep).
+        // [dsave 대체 2026-10-14] 라운드 전 conv 링 1벌([n_gdn][3][conv_ch]) —
+        // acc==0(전량 거절) 복원용(라운드 conv가 갱신 전 링을 기록). 종전
+        // dsave(슬롯×[상태 f16+스케일+링] — 27B/4슬롯 약 315MiB)는 **프로브
+        // 전용 지연 할당**(spec_save_state)으로 이동 — serve 경로 VRAM 회수.
+        let ring_pre = dm.n_gdn * 3 * dm.conv_ch() * 4;
+        self.gdn.dring0 = self.cc.alloc(ring_pre)?;
+        // [§3.4 ② 2026-10-12] 통합 캐시 회계 — 스펙 상태(WY+dsnap_ring+dring0).
+        // 트랜셰 2: 예산 압박 시 이 등록 자체가 ckpt·expert-lru를 퇴거시킬 수
+        // 있다(실제 해제는 함수 끝 ucache_sweep).
         let spec_bytes = (st_elems * 4
             + 8 * dm.n_gdn * dm.h_v * dm.d * 4
             + 8 * dm.n_gdn * dm.h_v * 4
             + 8 * dm.n_gdn * dm.k_len() * 4
             + ring_snap
-            + self.n_slots
-                * (dm.n_gdn * dm.h_v * dm.d * dm.d * 2
-                    + dm.n_gdn * dm.h_v * dm.d * 4
-                    + dm.n_gdn * 3 * dm.conv_ch() * 4)) as u64;
+            + ring_pre) as u64;
         if let Err(e) = self.ucache.allocate(
             "spec:state",
             CacheCategory::SpecState,
@@ -519,27 +525,31 @@ impl W4a16Dec {
         let (mut hk, mut dd) = (dm.h_k as i32, dm.d as i32);
         let mut lay = layer as i32;
         let mut one = 1i32;
-        let st_stride = (dm.n_gdn * dm.h_v * 128 * 128) as u64;
-        let ring_stride = (dm.n_gdn * 3 * dm.conv_ch()) as u64;
-        let bg_stride = dm.bg_len() as u64;
-        // conv — 토큰별(링 = 슬롯).
+        // [배치 행 퓨전 2026-10-14] 층당 4런치(행 퓨전 = PersistentKV 워크큐류) —
+        // 종전 토큰별 6t런치. 행별 슬롯 링/상태는 drow_ring/drow_st/drow_sc
+        // (캡처 h2d 노드가 기록), k-스트라이드 인자는 베이스 + 커널 내 행 인덱스
+        // — 주소·산술은 종전 토큰별 발사와 동일(행 k = k번째 토큰). 비트동일 계약.
+        let (row_ring, row_st, row_sc) = (self.drow_ring, self.drow_st, self.drow_sc);
+        // conv — 1런치: 그리드 (ch/128, t) · 행 = y.
         let f = self.cc.function("gdn_conv")?;
-        for (k, &slot) in slots.iter().enumerate() {
-            let mut c0 = qkv_dev + k as u64 * cch as u64 * 4;
-            let mut c1 = self.gdn.dcw;
-            let mut c2 = self.gdn.dring + (slot as u64 * ring_stride) * 4;
-            let mut c3 = self.gdn.dgq + k as u64 * kl as u64 * 4;
-            let mut c4 = self.gdn.dgk + k as u64 * kl as u64 * 4;
-            let mut c5 = self.gdn.dgv + k as u64 * vl as u64 * 4;
-            let mut c6 = 0u64;
+        {
+            let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5) = (
+                qkv_dev,
+                self.gdn.dcw,
+                self.gdn.dring,
+                self.gdn.dgq,
+                self.gdn.dgk,
+                self.gdn.dgv,
+            );
+            let (mut c6, mut c7, mut c8) = (0u64, 0u64, row_ring);
             self.cc.launch(
                 f,
                 (dm.conv_ch() / 128) as u32,
-                1,
+                t_len as u32,
                 128,
-                &mut crate::rawcuda::args::l12(
-                    &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut one,
-                    &mut lay, &mut kl, &mut vl, &mut cch,
+                &mut crate::rawcuda::args::l14(
+                    &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut c7,
+                    &mut c8, &mut one, &mut lay, &mut kl, &mut vl, &mut cch,
                 ),
             )?;
         }
@@ -569,67 +579,76 @@ impl W4a16Dec {
                 ),
             )?;
         }
-        // t=1 트리오 — 토큰별(상태 = 슬롯).
-        let part_stride = (dm.h_v * 8 * 256) as u64;
-        let dc_stride = (dm.h_v * 128) as u64;
+        // t=1 트리오 — 층당 3런치(행 = y: part/upd는 행×분할 인코딩).
         let (fp, fc, fu) = (
             self.cc.function("gdn1_part")?,
             self.cc.function("gdn1_comb")?,
             self.cc.function("gdn1_upd")?,
         );
-        for (k, &slot) in slots.iter().enumerate() {
-            let q2k = self.gdn.dq2 + k as u64 * kl as u64 * 4;
-            let k2k = self.gdn.dk2 + k as u64 * kl as u64 * 4;
-            let v2k = self.gdn.dv2 + k as u64 * vl as u64 * 4;
-            let bgk = self.gdn.dbg + k as u64 * bg_stride * 4;
-            let stk = self.gdn.dgst + slot as u64 * st_stride * 2; // f16 상태
-            // [결함수정 2026-10-13] 스케일 포인터 — 채택(스케일 인자)이 단일
-            // 경로에만 배선돼 배치가 옛 l8(인자 어긋남→OOB)이었다. 단일 경로와
-            // 동일 의미(슬롯당 n_gdn×h_v×128).
-            let sck = self.gdn.dsc + (slot * dm.n_gdn * dm.h_v * 128) as u64 * 4;
-            let partk = self.gdn.dgpart + k as u64 * part_stride * 4;
-            let dck = self.gdn.dgdc + k as u64 * dc_stride * 4;
-            let outk = self.gdn.dgo + k as u64 * vl as u64 * 4;
-            {
-                let (mut p0, mut p1, mut p2, mut p3, mut p4) = (q2k, k2k, stk, sck, partk);
-                self.cc.launch(
-                    fp,
-                    dm.h_v as u32,
-                    8,
-                    128,
-                    &mut crate::rawcuda::args::l9(
-                        &mut p0, &mut p1, &mut p2, &mut p3, &mut p4, &mut hk, &mut hv, &mut dd,
-                        &mut lay,
-                    ),
-                )?;
-            }
-            {
-                let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6) =
-                    (q2k, k2k, v2k, bgk, partk, dck, outk);
-                self.cc.launch(
-                    fc,
-                    dm.h_v as u32,
-                    1,
-                    128,
-                    &mut crate::rawcuda::args::l10(
-                        &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut hk,
-                        &mut hv, &mut dd,
-                    ),
-                )?;
-            }
-            {
-                let (mut u0, mut u1, mut u2, mut u3, mut u4) = (k2k, bgk, dck, stk, sck);
-                self.cc.launch(
-                    fu,
-                    dm.h_v as u32,
-                    8,
-                    128,
-                    &mut crate::rawcuda::args::l9(
-                        &mut u0, &mut u1, &mut u2, &mut u3, &mut u4, &mut hk, &mut hv, &mut dd,
-                        &mut lay,
-                    ),
-                )?;
-            }
+        {
+            // part — 그리드 (h_v, 8·t).
+            let (mut p0, mut p1, mut p2, mut p3, mut p4) = (
+                self.gdn.dq2,
+                self.gdn.dk2,
+                self.gdn.dgst,
+                self.gdn.dsc,
+                self.gdn.dgpart,
+            );
+            let (mut p5, mut p6) = (row_st, row_sc);
+            self.cc.launch(
+                fp,
+                dm.h_v as u32,
+                (8 * t_len) as u32,
+                128,
+                &mut crate::rawcuda::args::l11(
+                    &mut p0, &mut p1, &mut p2, &mut p3, &mut p4, &mut p5, &mut p6, &mut hk,
+                    &mut hv, &mut dd, &mut lay,
+                ),
+            )?;
+        }
+        {
+            // comb — 그리드 (h_v, t) · 상태 무접촉(베이스 전달 — 커널이 행 인덱스).
+            let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6) = (
+                self.gdn.dq2,
+                self.gdn.dk2,
+                self.gdn.dv2,
+                self.gdn.dbg,
+                self.gdn.dgpart,
+                self.gdn.dgdc,
+                self.gdn.dgo,
+            );
+            // comb은 행 인자를 받지 않는다(blockIdx.y = 행).
+            self.cc.launch(
+                fc,
+                dm.h_v as u32,
+                t_len as u32,
+                128,
+                &mut crate::rawcuda::args::l10(
+                    &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut hk,
+                    &mut hv, &mut dd,
+                ),
+            )?;
+        }
+        {
+            // upd — 그리드 (h_v, 8·t).
+            let (mut u0, mut u1, mut u2, mut u3, mut u4) = (
+                self.gdn.dk2,
+                self.gdn.dbg,
+                self.gdn.dgdc,
+                self.gdn.dgst,
+                self.gdn.dsc,
+            );
+            let (mut u5, mut u6) = (row_st, row_sc);
+            self.cc.launch(
+                fu,
+                dm.h_v as u32,
+                (8 * t_len) as u32,
+                128,
+                &mut crate::rawcuda::args::l11(
+                    &mut u0, &mut u1, &mut u2, &mut u3, &mut u4, &mut u5, &mut u6, &mut hk,
+                    &mut hv, &mut dd, &mut lay,
+                ),
+            )?;
         }
         // [rescale 통합 2026-10-13] 마지막 GDN 층에서 전 층·전 슬롯 일괄.
         if layer == dm.n_gdn - 1 {

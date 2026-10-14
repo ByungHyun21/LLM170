@@ -429,6 +429,12 @@ pub(super) struct Gdn {
     pub(super) dwy_k: CUdeviceptr,
     /// conv 링 스냅샷([n_gdn][8][3][conv_ch]) — 입력 이력(WY 대상 아님).
     pub(super) dsnap_ring: CUdeviceptr,
+    /// [dsave 대체 2026-10-14] 라운드 전 conv 링 1벌([n_gdn][3][conv_ch]) —
+    /// acc==0(전량 거절) 복원용. 라운드 conv가 **갱신 전** 링을 기록한다.
+    pub(super) dring0: CUdeviceptr,
+    /// [프로브 전용 2026-10-14] 정밀 상태 저장 스크래치 — spec_save_state가
+    /// 지연 할당. serve 경로는 0(종전 enable_spec 상주분 — 27B/4슬롯 약
+    /// 315MiB — 을 회수해 예약·컨텍스트로 환원).
     pub(super) dsave: CUdeviceptr,
     /// [A2 2026-10-11] 접두 재사용 체크포인트(GDN 상태+conv 링, 슬롯별 1개).
     /// [호스트 이관 2026-10-14] 접두 재사용 체크포인트 링 = **pinned 호스트
@@ -473,6 +479,13 @@ pub(super) struct Graph {
     pub(super) pin_out: *mut std::ffi::c_void,
     pub(super) pin_out_len: usize,
     pub(super) pin_batch_tok: *mut std::ffi::c_void,
+    /// [배치 행 퓨전 2026-10-14] 행별 메타 핀드(blk/pp/ring/st/sc — u64×t).
+    /// 호스트가 호출부에서 기입, 캡처 h2d 노드가 replay 시점에 소비.
+    pub(super) pin_row_blk: *mut std::ffi::c_void,
+    pub(super) pin_row_pp: *mut std::ffi::c_void,
+    pub(super) pin_row_ring: *mut std::ffi::c_void,
+    pub(super) pin_row_st: *mut std::ffi::c_void,
+    pub(super) pin_row_sc: *mut std::ffi::c_void,
     /// [S11 2026-10-11] 샘플 배치 로짓 핀드 판독 버퍼([t][head_n] f32).
     pub(super) pin_batch_lg: *mut std::ffi::c_void,
     pub(super) pin_batch_in: *mut std::ffi::c_void,
@@ -567,6 +580,13 @@ pub struct W4a16Dec {
     /// (토큰·임베딩 행·슬롯 pos) + 슬롯집합별 캡처 그래프 캐시.
     dbatch_lg: CUdeviceptr,
     dbatch_am: CUdeviceptr,
+    /// [배치 행 퓨전 2026-10-14] 행별 메타 디바이스 배열(u64×t) — 배치 체인
+    /// 퓨전 런치가 읽는다(캡처는 주소만 베이크, 내용은 h2d 노드가 기록).
+    drow_blk: CUdeviceptr,
+    drow_pp: CUdeviceptr,
+    drow_ring: CUdeviceptr,
+    drow_st: CUdeviceptr,
+    drow_sc: CUdeviceptr,
     /// [eval] 배치 버퍼 tmax 하한 — 청크 프리필 로짓 회수용(0=기본 공식).
     pub batch_tmax_min: usize,
     /// [S3-1 2026-10-11] 임베딩 gather — token_embd 상주(f16/bf16 원본).
@@ -747,6 +767,7 @@ impl W4a16Dec {
                 dwy_g: 0,
                 dwy_k: 0,
                 dsnap_ring: 0,
+                dring0: 0,
                 dsave: 0,
                 dchk: std::ptr::null_mut(),
                 dchk_pos: Vec::new(),
@@ -760,6 +781,11 @@ impl W4a16Dec {
                 pin_out: std::ptr::null_mut(),
                 pin_out_len: 0,
                 pin_batch_tok: std::ptr::null_mut(),
+                pin_row_blk: std::ptr::null_mut(),
+                pin_row_pp: std::ptr::null_mut(),
+                pin_row_ring: std::ptr::null_mut(),
+                pin_row_st: std::ptr::null_mut(),
+                pin_row_sc: std::ptr::null_mut(),
                 pin_batch_lg: std::ptr::null_mut(),
                 pin_batch_in: std::ptr::null_mut(),
                 pin_batch_pos: std::ptr::null_mut(),
@@ -810,6 +836,11 @@ impl W4a16Dec {
             argmax_out: 0,
             dbatch_lg: 0,
             dbatch_am: 0,
+            drow_blk: 0,
+            drow_pp: 0,
+            drow_ring: 0,
+            drow_st: 0,
+            drow_sc: 0,
             batch_tmax_min: 0,
             emb_dev: 0,
             emb_n: 0,

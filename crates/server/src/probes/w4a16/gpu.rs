@@ -747,6 +747,7 @@ fn run_generate(
     upload_ms: f64,
     dir: &str,
     n_lin: usize,
+    head_ready: bool,
 ) -> Result<String, String> {
     let hp = model.hp.clone();
     let head = model
@@ -762,8 +763,9 @@ fn run_generate(
         lg
     };
     // GPU head — bf16 output.weight를 상주 업로드(--no-head는 CPU 참조).
-    let mut head_gpu = false;
-    if !no_head && head.ty == llm170_core::wtype::WType::Bf16 {
+    // [검수 통합 2026-10-14] head_ready(다중 시나리오 2회차+)면 재업로드 생략.
+    let mut head_gpu = head_ready;
+    if !no_head && !head_ready && head.ty == llm170_core::wtype::WType::Bf16 {
         dec.upload_head(head.data, head.n_out as usize, head.n_in as usize)?;
         head_gpu = true;
     }
@@ -994,10 +996,8 @@ fn run_generate(
                 for &tk in &draft {
                     rows.extend_from_slice(&model.embed_row(tk).map_err(|e| e.to_string())?);
                 }
-                // [A-1 완화 ①] 검증 전 상태 저장 — 보정 토큰을 t=1로 재계산
-                // (배치 검증의 근접 동률 argmax 플립이 오거부/오보정을 만들던
-                // 구조적 한계 해소: 수용 판정만 배치, 방출 토큰은 정확 수치).
-                dec.spec_save_state(0)?;
+                // [dsave 대체 2026-10-14] 라운드 전 저장 폐지 — 롤백 재료는
+                // WY solve + conv 링 스냅샷(프로덕션 sched와 동일 계약).
                 let toks = dec.spec_verify(0, &rows, t)?;
                 let mut acc = 0usize;
                 while acc < draft.len() && toks[acc] == draft[acc] {
@@ -1012,7 +1012,7 @@ fn run_generate(
                     dec.spec_rollback(0, acc)?;
                     dec.spec_rewind_pos(0, (t - acc) as u32)?;
                 } else {
-                    dec.spec_load_state(0)?;
+                    dec.spec_rollback(0, 0)?;
                     dec.spec_rewind_pos(0, t as u32)?;
                 }
                 let lrow = model.embed_row(last).map_err(|e| e.to_string())?;
@@ -1096,8 +1096,8 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     use llm170_backend_gpu::W4a16Dec;
     let dir = arg_str(args, 0, "");
     let a = parse_args(args)?;
-    if a.bench.is_none() && a.prompts.len() != 1 {
-        return Err("w4a16-gpu: 단일 프롬프트 전용(v1)".into());
+    if a.bench.is_none() && a.prompts.is_empty() {
+        return Err("w4a16-gpu: 프롬프트 필요(--prompt-tokens)".into());
     }
     let prompt: Vec<u32> = a.prompts.first().cloned().unwrap_or_default();
     if a.bench.is_none() && prompt.len() + a.n_predict + 1 > a.ctx {
@@ -1181,6 +1181,38 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     if let Some((name, bt, reps)) = &a.bench {
         return run_bench_gemm(&mut dec, &model, name, *bt, *reps);
     }
+    // [검수 통합 2026-10-14] 다중 프롬프트 = 시나리오 순차(모델 로드 1회) —
+    // 골든·경계·장문 판정을 한 런에. 시나리오 사이 슬롯 리셋(= reset_seq 동형:
+    // kv_release + reset_state). 출력: 시나리오별 `s{i}-tokens:` 줄.
+    if a.prompts.len() > 1 {
+        let mut rep = String::new();
+        for (i, p) in a.prompts.iter().enumerate() {
+            if p.len() + a.n_predict + 1 > a.ctx {
+                return Err(format!("ctx({}) too small for scenario{i}", a.ctx));
+            }
+            if i > 0 {
+                dec.kv_release(0);
+                dec.reset_state(0)?;
+            }
+            let r = run_generate(
+                &mut dec,
+                &model,
+                p,
+                a.no_head,
+                a.n_predict,
+                a.spec_k,
+                a.spec_check,
+                upload_ms,
+                &dir,
+                n_lin,
+                i > 0, // head 등록 1회(이후 재사용 — 재양자화/재할당 방지)
+            )?;
+            rep.push_str(&format!("# scenario{i} (프롬프트 {}토큰)\n", p.len()));
+            rep.push_str(&r.replace("\n tokens: ", &format!("\n s{i}-tokens: ")));
+            rep.push('\n');
+        }
+        return Ok(rep);
+    }
     run_generate(
         &mut dec,
         &model,
@@ -1192,6 +1224,7 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
         upload_ms,
         &dir,
         n_lin,
+        false,
     )
 }
 
