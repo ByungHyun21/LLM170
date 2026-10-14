@@ -13,9 +13,28 @@ impl W4a16Dec {
         n: usize,
         k: usize,
     ) -> Result<(), String> {
-        if q.len() != n * (k / 2) || s.len() != n * (k / 64) {
+        self.upload_lin_g(name, q, s, n, k, 128, false)
+    }
+
+    /// [gemma4 P2-3 2026-10-14] 그룹·스케일 dtype 지정 상주 업로드 —
+    /// packed u32 [n][k/8] · scale [n][k/group]×2B(f16/bf16). GEMV/GEMM 런처는
+    /// `gptq4::kernel_sym`이 (group, scale_bf16)로 심볼을 고른다(런치 구성 동일 —
+    /// `w4a16-gemv`/`w4a16-gemm` 게이트와 동일 표).
+    pub fn upload_lin_g(
+        &mut self,
+        name: &str,
+        q: &[u8],
+        s: &[u8],
+        n: usize,
+        k: usize,
+        group: usize,
+        scale_bf16: bool,
+    ) -> Result<(), String> {
+        // 커널 표에 없는 조합은 등록 단계에서 거른다(런타임 심볼 실패 방지).
+        crate::rawcuda::gptq4::kernel_sym(false, group, scale_bf16)?;
+        if q.len() != n * (k / 2) || s.len() != n * (k / group) * 2 {
             return Err(format!(
-                "upload_lin {name}: q={} s={} != n{n} k{k} 계약",
+                "upload_lin_g {name}: q={} s={} != n{n} k{k} g{group} 계약",
                 q.len(),
                 s.len()
             ));
@@ -43,6 +62,11 @@ impl W4a16Dec {
         if let Some((oq, os, _, _)) = self.lins.insert(name.to_string(), (dq, ds, n, k)) {
             let _ = self.cc.free(oq);
             let _ = self.cc.free(os);
+        }
+        if group == 128 && !scale_bf16 {
+            self.lin_grp.remove(name); // 기본값 — 기재 불요
+        } else {
+            self.lin_grp.insert(name.to_string(), (group, scale_bf16));
         }
         Ok(())
     }

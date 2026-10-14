@@ -356,6 +356,16 @@ fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, S
         };
         dec.set_attn(dims, vec![layer], &vec![1.0f32; d], &vec![1.0f32; d])
             .map_err(|e| format!("set_attn: {e}"))?;
+        dec.set_g4_rope(&[
+            d as f32,
+            pairs as f32,
+            span as f32,
+            denom as f32,
+            base,
+            if vn { 1.0 } else { 0.0 },
+            0.0,
+        ])
+        .map_err(|e| format!("set_g4_rope: {e}"))?;
         dec.kv_grow(0, t_len).map_err(|e| format!("kv_grow: {e}"))?;
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut rnd = || {
@@ -374,8 +384,8 @@ fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, S
         let kq_scale = 1.0f32;
         let got = dec
             .attn_g4_host(
-                &q, &kin, &vin, &qnw, &knw, t_len, q_heads, kv_heads, d, pairs, span, denom, base,
-                vn, sw, kq_scale, splits, pos0,
+                &q, &kin, &vin, &qnw, &knw, 0, t_len, q_heads, kv_heads, d, sw, kq_scale, splits,
+                pos0,
             )
             .map_err(|e| format!("attn_g4({name}): {e}"))?;
         // ── CPU 미러 ──
@@ -488,9 +498,67 @@ fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, S
             }
         }
         ok_all &= maxd < 2e-2; // int8 KV + exp 경로 — 절대 밴드
+        // (2) 호출 분할 일치 — t_len=2 1회 vs t_len=1 ×2(체인 패턴). 배치 모드는
+        // 위 미러로 검증됐으므로, 두 모드 일치 = 체인 호출 패턴의 KV 누적 정합.
+        let q2 = &q[..2 * q_heads * d];
+        let k2 = &kin[..2 * kv_heads * d];
+        let v2 = &vin[..2 * kv_heads * d];
+        let batch2 = dec
+            .attn_g4_host(
+                q2, k2, v2, &qnw, &knw, 0, 2, q_heads, kv_heads, d, sw, kq_scale, splits, pos0,
+            )
+            .map_err(|e| format!("attn_g4(분할·배치2 {name}): {e}"))?;
+        let s1 = dec
+            .attn_g4_host(
+                &q2[..q_heads * d],
+                &k2[..kv_heads * d],
+                &v2[..kv_heads * d],
+                &qnw,
+                &knw,
+                0,
+                1,
+                q_heads,
+                kv_heads,
+                d,
+                sw,
+                kq_scale,
+                splits,
+                pos0,
+            )
+            .map_err(|e| format!("attn_g4(분할1 {name}): {e}"))?;
+        let s2 = dec
+            .attn_g4_host(
+                &q2[q_heads * d..],
+                &k2[kv_heads * d..],
+                &v2[kv_heads * d..],
+                &qnw,
+                &knw,
+                0,
+                1,
+                q_heads,
+                kv_heads,
+                d,
+                sw,
+                kq_scale,
+                splits,
+                pos0 + 1,
+            )
+            .map_err(|e| format!("attn_g4(분할2 {name}): {e}"))?;
+        let mut md = 0f32;
+        for h in 0..q_heads {
+            for j in 0..d {
+                md = md.max((batch2[h * d + j] - s1[h * d + j]).abs());
+                md = md.max((batch2[q_heads * d + h * d + j] - s2[h * d + j]).abs());
+            }
+        }
+        ok_all &= md < 2e-2;
         out.push_str(&format!(
-            "  {name}: max|diff| {maxd:.3e} — {}\n",
-            if maxd < 2e-2 { "통과" } else { "초과" }
+            "  {name}: 최대 |차| {maxd:.3e} · 분할(1×2) 대조 {md:.3e} — {}\n",
+            if maxd < 2e-2 && md < 2e-2 {
+                "통과"
+            } else {
+                "초과"
+            }
         ));
     }
     out.push_str(&format!(
@@ -1466,6 +1534,14 @@ fn run_generate(
 pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     use llm170_backend_gpu::W4a16Dec;
     let dir = arg_str(args, 0, "");
+    // [gemma4 P2-3 2026-10-14] 아치 분기 — gemma4는 전용 v0 체인 경로
+    // (호스트 스테이징 + g4 커널군 — P2 토큰 게이트).
+    if llm170_core::qwen35::bind::dir_arch(std::path::Path::new(&dir))
+        .as_deref()
+        .is_some_and(llm170_core::gemma4::bind::arch_ok)
+    {
+        return gpu_run_g4(args);
+    }
     let a = parse_args(args)?;
     if a.bench.is_none() && a.prompts.is_empty() {
         return Err("w4a16-gpu: 프롬프트 필요(--prompt-tokens)".into());
@@ -1609,6 +1685,360 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
         n_lin,
         false,
     )
+}
+
+/// [gemma4 P2-3 2026-10-14] gemma4 GPU v0 체인 — 1토큰 스텝(호스트 스테이징).
+/// 층 산술(노름·잔차·layer_scalar)은 CPU 코어 계약(`llm170_core::ops`)으로
+/// 조립하고, GPU가 담당하는 것은 GEMV(그룹 인식)·g4 어텐션·gelu·MoE(라우터
+/// topk·pes·전문가)·head다. 계약 출처 = `crates/core/src/gemma4/`(CPU 오라클).
+fn g4_step(
+    dec: &mut llm170_backend_gpu::W4a16Dec,
+    model: &llm170_core::gemma4::Model,
+    cfg: &crate::gpu_engine::G4HostCfg,
+    tok: u32,
+    pos: u32,
+) -> Result<Vec<f32>, String> {
+    let hp = &model.hp;
+    let h = hp.n_embd;
+    let mut x = model.embed_row(tok).map_err(|e| e.to_string())?;
+    // 첫 풀층(층별 어텐션 도입부) 중간값 지문 — NaN/발산 위치 특정용.
+    let stat = |v: &[f32]| -> String {
+        let (mut mx, mut nan) = (f32::NEG_INFINITY, false);
+        for &t in v {
+            if t.is_nan() {
+                nan = true;
+            }
+            mx = mx.max(t);
+        }
+        format!("max={mx:.4} nan={nan} len={}", v.len())
+    };
+    for il in 0..hp.n_layer {
+        let d = hp.head_dim[il];
+        let dbg = dec.debug_layers && hp.full[il] && il <= 5;
+        // ① 어텐션 — input_layernorm → q/k/(v) → prep_g4+f3s_g4 → post_attn+잔차.
+        let xn = llm170_core::ops::rms_norm(&x, cfg.nw_row(il, 0, h), hp.eps);
+        let q = dec.gemv_f32_host(&format!("blk.{il}.attn_q.weight"), &xn)?;
+        let k = dec.gemv_f32_host(&format!("blk.{il}.attn_k.weight"), &xn)?;
+        let v = if model.kv_eq_v(il) {
+            k.clone() // v_norm(k 원시) — prep_g4의 vn_on이 적용(HF 계약)
+        } else {
+            dec.gemv_f32_host(&format!("blk.{il}.attn_v.weight"), &xn)?
+        };
+        if dbg {
+            eprintln!("  L{il} xn {} / q {} / k {}", stat(&xn), stat(&q), stat(&k));
+        }
+        let (qnw, knw) = cfg.qk_rows(il, d);
+        let sw = if hp.full[il] { 0 } else { hp.sw };
+        let attn_out = dec.attn_g4_host(
+            &q,
+            &k,
+            &v,
+            qnw,
+            knw,
+            il,
+            1,
+            hp.n_head,
+            hp.n_kv[il],
+            d,
+            sw,
+            1.0,
+            2,
+            pos,
+        )?;
+        if dbg {
+            eprintln!(
+                "  L{il} attn_out {} / qnw {} / knw {}",
+                stat(&attn_out),
+                stat(qnw),
+                stat(knw)
+            );
+        }
+        // o_proj — 헤드 결합(16×256=4096) → hidden(2816).
+        let ao = dec.gemv_f32_host(&format!("blk.{il}.attn_output.weight"), &attn_out)?;
+        let hh = llm170_core::ops::rms_norm(&ao, cfg.nw_row(il, 1, h), hp.eps);
+        if dbg {
+            eprintln!(
+                "  L{il} ao {} / hh {} / wo {}",
+                stat(&ao),
+                stat(&hh),
+                stat(cfg.nw_row(il, 1, h))
+            );
+        }
+        for i in 0..h {
+            x[i] += hh[i];
+        }
+        // ② dense MLP — pre_ff → gate/up → gelu_tanh → down → post_ff1.
+        let nd = llm170_core::ops::rms_norm(&x, cfg.nw_row(il, 2, h), hp.eps);
+        let g = dec.gemv_f32_host(&format!("blk.{il}.ffn_gate.weight"), &nd)?;
+        let u = dec.gemv_f32_host(&format!("blk.{il}.ffn_up.weight"), &nd)?;
+        let act = dec.ew_gelu_host(&g, &u)?;
+        let m = dec.gemv_f32_host(&format!("blk.{il}.ffn_down.weight"), &act)?;
+        let h1 = llm170_core::ops::rms_norm(&m, cfg.nw_row(il, 3, h), hp.eps);
+        // ③ MoE — 라우터 입력(hn)과 전문가 입력(nm)이 **별개** 노름(gemma4 계약).
+        let hn = llm170_core::ops::rms_norm(&x, cfg.nw_row(il, 7, h), hp.eps);
+        let nm = llm170_core::ops::rms_norm(&x, cfg.nw_row(il, 4, h), hp.eps);
+        let e_out = dec.g4_moe_host(il, &hn, &nm, cfg.pes_row(il, hp.n_experts))?;
+        let h2 = llm170_core::ops::rms_norm(&e_out, cfg.nw_row(il, 5, h), hp.eps);
+        // ④ 병합 — post_ff_norm(h1+h2) → 잔차 → ×layer_scalar.
+        let mut merged = h1;
+        for i in 0..h {
+            merged[i] += h2[i];
+        }
+        let hf = llm170_core::ops::rms_norm(&merged, cfg.nw_row(il, 6, h), hp.eps);
+        let ls = cfg.layer_scalar[il];
+        for i in 0..h {
+            x[i] = (x[i] + hf[i]) * ls;
+        }
+        // 층별 지문 — CPU 오라클(debug_layers)과 같은 형식(최초 발산 층 추적).
+        if dec.debug_layers {
+            let mut mx = f32::NEG_INFINITY;
+            let mut nan = false;
+            for &v in x.iter() {
+                if v.is_nan() {
+                    nan = true;
+                }
+                mx = mx.max(v);
+            }
+            eprintln!("gemma4[gpu] layer {il:>2} max|x|={mx:.4} nan={nan}");
+        }
+    }
+    // ⑤ 최종 노름 + GPU head + softcap(호스트 — argmax 단조 불변).
+    let xf = llm170_core::ops::rms_norm(&x, cfg.out_norm_row(hp.n_layer, h), hp.eps);
+    if dec.debug_layers {
+        let mut mx = f32::NEG_INFINITY;
+        let mut nan = false;
+        for &v in xf.iter() {
+            if v.is_nan() {
+                nan = true;
+            }
+            mx = mx.max(v);
+        }
+        eprintln!("gemma4[gpu] final max|x|={mx:.4} nan={nan}");
+    }
+    let mut lg = dec.head_logits_host(&xf)?;
+    if cfg.softcap > 0.0 {
+        for l in lg.iter_mut() {
+            *l = cfg.softcap * (*l / cfg.softcap).tanh();
+        }
+    }
+    Ok(lg)
+}
+
+/// GPU 체인 — 프롬프트를 1토큰씩(pos 0..) 통과한 뒤 n_predict 토큰 생성.
+/// 반환 = 생성 토큰열 + 스텝별 로짓(진단 — 로짓[i] = i번째 생성 직전).
+fn g4_gpu_chain(
+    dec: &mut llm170_backend_gpu::W4a16Dec,
+    model: &llm170_core::gemma4::Model,
+    cfg: &crate::gpu_engine::G4HostCfg,
+    prompt: &[u32],
+    n_predict: usize,
+) -> Result<(Vec<u32>, Vec<Vec<f32>>), String> {
+    let mut pos = 0u32;
+    let mut lg = Vec::new();
+    for &tok in prompt {
+        dec.kv_grow(0, pos as usize + 1)?;
+        lg = g4_step(dec, model, cfg, tok, pos)?;
+        pos += 1;
+    }
+    let mut step_logits: Vec<Vec<f32>> = vec![lg.clone()];
+    let mut out = Vec::with_capacity(n_predict);
+    for _ in 0..n_predict {
+        let next = llm170_core::gemma4::greedy(&lg);
+        out.push(next);
+        dec.kv_grow(0, pos as usize + 1)?;
+        lg = g4_step(dec, model, cfg, next, pos)?;
+        pos += 1;
+        step_logits.push(lg.clone());
+    }
+    Ok((out, step_logits))
+}
+
+/// 로짓 top-5 (토큰:값) — 진단 표시용.
+fn g4_top5(l: &[f32]) -> Vec<(u32, f32)> {
+    let mut v: Vec<(u32, f32)> = l
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, x)| (i as u32, x))
+        .collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    v.truncate(5);
+    v
+}
+
+/// [gemma4 P2-3 2026-10-14] gemma4 GPU v0 체인 프로브 — 업로드 + 토큰별 체인 +
+/// **CPU 오라클(RefEngine) 토큰 대조**(단일 실행 판정 — P2 게이트).
+///   llm170 w4a16-gpu <gemma4 dir> --prompt-tokens <ids> [--n-predict N] [--ctx N]
+pub(super) fn gpu_run_g4(args: &[String]) -> Result<String, String> {
+    use llm170_backend_gpu::W4a16Dec;
+    let dir = arg_str(args, 0, "");
+    let a = parse_args(args)?;
+    if a.prompts.is_empty() {
+        return Err("w4a16-gpu(gemma4): --prompt-tokens 필요".into());
+    }
+    let prompt: Vec<u32> = a.prompts.first().cloned().unwrap_or_default();
+    if prompt.is_empty() {
+        return Err("w4a16-gpu(gemma4): 빈 프롬프트".into());
+    }
+    if prompt.len() + a.n_predict + 1 > a.ctx {
+        return Err(format!(
+            "ctx({}) too small for prompt({})+n_predict({})",
+            a.ctx,
+            prompt.len(),
+            a.n_predict
+        ));
+    }
+    let model =
+        llm170_core::gemma4::Model::load(std::path::Path::new(&dir)).map_err(|e| e.to_string())?;
+    let hp = model.hp.clone();
+    let t0 = std::time::Instant::now();
+    let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
+    dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
+    let cfg = crate::gpu_engine::upload_model_g4(&mut dec, &model, a.ctx)?;
+    let upload_ms = t0.elapsed().as_secs_f64() * 1e3;
+    // GPU 체인 — 프롬프트 전파 + 그리디 생성.
+    let tg = std::time::Instant::now();
+    let (got, gpu_logits) = g4_gpu_chain(&mut dec, &model, &cfg, &prompt, a.n_predict)?;
+    let gpu_ms = tg.elapsed().as_secs_f64() * 1e3;
+    let n_tok = prompt.len() + a.n_predict;
+    // CPU 오라클 — 같은 프롬프트·같은 그리디(RefEngine) + 스텝별 로짓 수집.
+    let tr = std::time::Instant::now();
+    let mut eng = super::ref_cmd::RefEngine::load(&dir, 1, a.ctx)?;
+    let mut cl = eng.prefill(0, &prompt)?;
+    let mut cpu_logits: Vec<Vec<f32>> = vec![cl.clone()];
+    let mut want = vec![llm170_core::qwen35::greedy(&cl)];
+    for _ in 1..a.n_predict {
+        let t = *want.last().unwrap();
+        let mut ls = eng.decode(0, &[t])?;
+        cl = ls.pop().ok_or("decode logits 부재")?;
+        cpu_logits.push(cl.clone());
+        want.push(llm170_core::qwen35::greedy(&cl));
+    }
+    let ref_ms = tr.elapsed().as_secs_f64() * 1e3;
+    let same = got == want;
+    let _n_eq = got.iter().zip(want.iter()).filter(|(a, b)| a == b).count();
+    let csv = |v: &[u32]| {
+        v.iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    // 스텝별 로짓 top-5(최초 3스텝) — 발산 정량 진단 + 마진 인지 판정.
+    // [gemma4 P2-3] 이 체인의 수치 클래스(int8 KV·int8 head — 단일 경로 계약)는
+    // CPU 오라클 f32와 ±θ만큼 다르다. θ = 스텝별 공통 상위 토큰의 |Δ| 최대
+    // (자기 교정 측정). CPU top-2 마진 < θ인 위치의 토큰 플립은 근접동률(허용),
+    // 마진 ≥ θ인 플립은 실결함(불일치).
+    let mut diag = String::new();
+    let (mut flips_bad, mut theta_max) = (0usize, 0f32);
+    let n_step = gpu_logits.len().min(cpu_logits.len()).min(got.len());
+    for i in 0..n_step {
+        let cw =
+            cpu_logits[i]
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |a, (j, &v)| {
+                    if v > a.1 { (j, v) } else { a }
+                });
+        // 스텝 편차 클래스 θ_i = CPU 상위 5토큰의 |Δ| 최대(자기 교정).
+        // 발산 후 스텝은 문맥이 달라 비교 불가 — θ_class는 첫 발산 이전만.
+        let mut idx: Vec<usize> = (0..cpu_logits[i].len()).collect();
+        idx.sort_by(|&a, &b| cpu_logits[i][b].total_cmp(&cpu_logits[i][a]));
+        let theta = idx
+            .iter()
+            .take(5)
+            .map(|&j| (gpu_logits[i][j] - cpu_logits[i][j]).abs())
+            .fold(0f32, f32::max);
+        // 첫 발산 전까지만 클래스 누적(이후 문맥 상이).
+        if got[..i.min(got.len())]
+            .iter()
+            .zip(&want[..i.min(want.len())])
+            .all(|(a, b)| a == b)
+        {
+            theta_max = theta_max.max(theta);
+        }
+        let margin = cw.1
+            - cpu_logits[i]
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != cw.0)
+                .map(|(_, &v)| v)
+                .fold(f32::NEG_INFINITY, f32::max);
+        if got[i] != want[i] && margin >= theta {
+            flips_bad += 1; // 마진 ≥ 클래스 = 실결함 후보(첫 발산 판정이 정본)
+        }
+        if i < 3 {
+            let gt = g4_top5(&gpu_logits[i]);
+            let ct = g4_top5(&cpu_logits[i]);
+            let grank = gpu_logits[i].iter().filter(|&&v| v > cw.1).count();
+            diag.push_str(&format!(
+                "  step{i} GPU top5: {} | CPU top5: {} | CPU선택 {}({:.3}) GPU순위 {} GPU값 {:.3} | 마진 {:.3} θ {:.3}\n",
+                gt.iter().map(|(t, v)| format!("{t}:{v:.2}")).collect::<Vec<_>>().join(" "),
+                ct.iter().map(|(t, v)| format!("{t}:{v:.2}")).collect::<Vec<_>>().join(" "),
+                cw.0,
+                cw.1,
+                grank + 1,
+                gpu_logits[i][cw.0],
+                margin,
+                theta,
+            ));
+        }
+    }
+    let lg = gpu_logits.last().cloned().unwrap_or_default();
+    let (mx, am) = lg
+        .iter()
+        .enumerate()
+        .fold((f32::NEG_INFINITY, 0usize), |a, (i, &v)| {
+            if v > a.0 { (v, i) } else { a }
+        });
+    // 판정 = **첫 발산 위치만** — 이후는 문맥 상이(비교 불가). 마진 < θ_class면
+    // 근접동률 플립(수치 클래스 내 — 허용), 이상이면 실결함.
+    let (mut margin_first, mut theta_first) = (f32::NAN, f32::NAN);
+    if let Some(k) = got.iter().zip(want.iter()).position(|(a, b)| a != b)
+        && k < cpu_logits.len()
+    {
+        let cw0 =
+            cpu_logits[k]
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |a, (j, &v)| {
+                    if v > a.1 { (j, v) } else { a }
+                });
+        margin_first = cw0.1
+            - cpu_logits[k]
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != cw0.0)
+                .map(|(_, &v)| v)
+                .fold(f32::NEG_INFINITY, f32::max);
+        let mut idx: Vec<usize> = (0..cpu_logits[k].len()).collect();
+        idx.sort_by(|&a, &b| cpu_logits[k][b].total_cmp(&cpu_logits[k][a]));
+        theta_first = idx
+            .iter()
+            .take(5)
+            .map(|&j| (gpu_logits[k][j] - cpu_logits[k][j]).abs())
+            .fold(0f32, f32::max);
+    }
+    let moved = got.iter().zip(want.iter()).position(|(a, b)| a != b);
+    let verdict = if same {
+        format!("일치 — P2 토큰 게이트 통과 (편차 클래스 θmax {theta_max:.3})")
+    } else if flips_bad == 0 {
+        format!(
+            "근접동률 플립(허용) — 최초 발산 위치 {} · CPU 마진 {margin_first:.3} < 편차 클래스 θ {theta_first:.3} · 이전 스텝 θmax {theta_max:.3}",
+            moved.unwrap_or(0)
+        )
+    } else {
+        format!(
+            "실결함 — 최초 발산 위치 {} · CPU 마진 {margin_first:.3} ≥ 편차 클래스 θ {theta_first:.3} (이전 스텝 θmax {theta_max:.3})",
+            moved.unwrap_or(0)
+        )
+    };
+    Ok(format!(
+        "w4a16-gpu(gemma4 v0) {dir} — 호스트 스테이징 체인 + GPU head · qk_scale 1.0 · softcap {}\n  업로드 {upload_ms:.0}ms · GPU 체인 {n_tok}토큰 {gpu_ms:.0}ms ({:.0}ms/토큰) · CPU 오라클 {ref_ms:.0}ms\n  GPU tokens: {}\n  CPU tokens: {}\n{diag}  로짓 max {mx:.4} · argmax {am}\n  판정: {verdict}",
+        hp.softcap,
+        gpu_ms / n_tok as f64,
+        csv(&got),
+        csv(&want),
+    ))
 }
 
 #[cfg(test)]

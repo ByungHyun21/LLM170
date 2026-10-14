@@ -403,6 +403,10 @@ pub(super) struct Attn {
     pub(super) attn: Option<AttnDims>,
     pub(super) dqnw_a: CUdeviceptr,
     pub(super) dknw_a: CUdeviceptr,
+    /// [gemma4 P2-3 2026-10-14] g4 rope 파라미터 테이블(디바이스 f32
+    /// [n_attn][7] — {d, pairs, span, denom, base, vn_on, k_eq_v}).
+    /// `set_g4_rope`가 업로드 · g4 체인(prep/part_g4)이 층 인덱스로 소비.
+    pub(super) g4_rp: CUdeviceptr,
     pub(super) dkc: CUdeviceptr,
     pub(super) dvc: CUdeviceptr,
     /// [P13] int8 KV 스케일(K/V 각각 [n_attn*cap][kv_heads] f32) — KVQ 전용.
@@ -564,6 +568,10 @@ pub struct W4a16Dec {
     pub kv_assigned: Vec<usize>,
     /// 선형 상주 — 이름 → (packed, scale, n, k).
     lins: HashMap<String, (CUdeviceptr, CUdeviceptr, usize, usize)>,
+    /// [gemma4 P2-3 2026-10-14] 선형 그룹·스케일 dtype — 이름 → (group, scale_bf16).
+    /// `upload_lin`(g128/f16) 등록분은 미기재(디스패치 기본값) · `upload_lin_g`가
+    /// 기재한다. GEMV 심볼 선택(g128 vs g32_bf16)만 가른다.
+    lin_grp: HashMap<String, (usize, bool)>,
     /// 플레인 bf16 상주 — 이름 → ([k][n] 전치 ptr, n, k). MoE 모델(35B)의
     /// 비양자화 선형(GDN·어텐션·라우터·shared) — head_bf16 GEMV 재사용.
     plains: HashMap<String, (CUdeviceptr, usize, usize)>,
@@ -654,6 +662,7 @@ mod attn;
 mod blocktable;
 mod buffers;
 mod chains;
+mod g4;
 mod gdn;
 mod graphs;
 mod kernels;
@@ -765,6 +774,7 @@ impl W4a16Dec {
                 attn: None,
                 dqnw_a: 0,
                 dknw_a: 0,
+                g4_rp: 0,
                 dkc: 0,
                 dvc: 0,
                 dksc: 0,
@@ -849,6 +859,7 @@ impl W4a16Dec {
             slot_pos: vec![0; n_slots.max(1)],
             kv_assigned: vec![0; n_slots.max(1)],
             lins: HashMap::new(),
+            lin_grp: HashMap::new(),
             plains: HashMap::new(),
             plain_weights: false,
             weights_bytes: 0,
@@ -958,7 +969,11 @@ impl W4a16Dec {
         // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         self.cc.h2d(self.dx32.ptr, xb)?;
-        let f = self.cc.function("w4a16_gemm_g128")?;
+        // [gemma4 P2-3 2026-10-14] 그룹별 심볼 — g128/f16(기본) vs g32/bf16.
+        // 런치 구성은 동일(게이트 `w4a16-gemm`와 같은 표) — 심볼만 교체.
+        let (grp, sbf) = self.lin_grp.get(name).copied().unwrap_or((128, false));
+        let sym = crate::rawcuda::gptq4::kernel_sym(true, grp, sbf)?;
+        let f = self.cc.function(sym)?;
         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx32.ptr, self.dy.ptr);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, 1i32);
         // 스테이징 폴백(t=1)도 신 GEMM 커널 계약(8행/블록·512스레드)으로 —
@@ -974,6 +989,73 @@ impl W4a16Dec {
         )?;
         let mut ob = vec![0u8; n * 4];
         self.cc.d2h_async(ob.as_mut_ptr(), self.dy.ptr, n * 4)?; // 커스텀 스트림 대비
+        self.cc.sync()?;
+        Ok(ob
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    }
+
+    /// [gemma4 P2-3 2026-10-14] 상주 선형 GEMV — **원시 f32 x**(f16 왕복 없음).
+    /// gemma4 v0 검증 체인의 수치 클래스: 커널 자체는 f32 x 계약이므로 왕복은
+    /// 순수 주입 오차다(체인 검증 = CPU 오라클 f32와 동일 계급). qwen 스테이징
+    /// 체인의 f16 클래스(`gemv_host`)와 달리 gemma4는 f32 단일 클래스 —
+    /// 서빙 체인(P3)의 클래스 선택은 도입 시 A/B·골든 재동결 소관.
+    pub fn gemv_f32_host(&mut self, name: &str, x: &[f32]) -> Result<Vec<f32>, String> {
+        let _g = self.cc.guard()?;
+        let Some(&(dq, ds, n, k)) = self.lins.get(name) else {
+            return Err(format!("gemv_f32: 상주 선형 없음: {name}"));
+        };
+        if x.len() != k {
+            return Err(format!("gemv_f32 {name}: x={} != k={k}", x.len()));
+        }
+        if n > self.dy.cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?;
+            if self.dy.ptr != 0 {
+                self.cc.free(self.dy.ptr)?;
+            }
+            self.dy.ptr = self.cc.alloc(n * 4)?;
+            self.dy.cap = n;
+        }
+        if k > self.dx32.cap {
+            self.graph_invalidate(); // [P10]
+            self.cc.sync()?;
+            if self.dx32.ptr != 0 {
+                self.cc.free(self.dx32.ptr)?;
+            }
+            self.dx32.ptr = self.cc.alloc(k * 4)?;
+            self.dx32.cap = k;
+        }
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
+        self.cc.h2d(self.dx32.ptr, xb)?;
+        // 그룹별 심볼(gemv_launch와 동일 표) — 런치 구성은 t=1 GEMV(행=블록/64레인).
+        let (grp, sbf) = self.lin_grp.get(name).copied().unwrap_or((128, false));
+        if k > grp * 256 {
+            return Err(format!(
+                "gemv_f32 {name}: k={k} > {} (t=1 smem sc 계약, g{grp})",
+                grp * 256
+            ));
+        }
+        let f = self
+            .cc
+            .function(crate::rawcuda::gptq4::kernel_sym(false, grp, sbf)?)?;
+        let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx32.ptr, self.dy.ptr);
+        let (mut p_n, mut p_k) = (n as i32, k as i32);
+        self.cc.launch(
+            f,
+            n as u32,
+            1,
+            64,
+            &mut crate::rawcuda::args::l6(
+                &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k,
+            ),
+        )?;
+        let mut ob = vec![0u8; n * 4];
+        self.cc.d2h_async(ob.as_mut_ptr(), self.dy.ptr, n * 4)?;
         self.cc.sync()?;
         Ok(ob
             .as_chunks::<4>()

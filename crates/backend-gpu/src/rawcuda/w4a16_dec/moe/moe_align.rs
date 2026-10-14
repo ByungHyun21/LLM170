@@ -62,7 +62,9 @@ impl W4a16Dec {
     /// [B6/B7 2026-10-12] 디바이스 top-k(id/wt, moe_idx/moe_wt) → 호스트 목록.
     /// 스트리밍 스테이징은 id 선택만 필요 — 종전 라우터 로짓 128 d2h+호스트
     /// 정렬(moe_route)을 대체한다(시맨틱은 topk_t가 미러 — 골든 판정).
-    pub(super) fn moe_read_selection(&mut self) -> Result<Vec<(usize, f32)>, String> {
+    pub(in crate::rawcuda::w4a16_dec) fn moe_read_selection(
+        &mut self,
+    ) -> Result<Vec<(usize, f32)>, String> {
         let tk = self.moe.top_k.max(1);
         let mut ib = vec![0u8; tk * 4];
         let mut wb = vec![0u8; tk * 4];

@@ -251,13 +251,14 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
 }
 
 /// 참조 엔진 — 아치별 CPU 엔진(qwen35·gemma4) 디스패치(병렬 미러·trait 없음).
-enum RefEngine {
+/// [gemma4 P2-3 2026-10-14] GPU 프로브의 오라클 대조가 쓰도록 공개(super).
+pub(super) enum RefEngine {
     Qwen(llm170_core::qwen35::Engine),
     Gemma(llm170_core::gemma4::Engine),
 }
 
 impl RefEngine {
-    fn load(dir: &str, n_seqs: usize, ctx: usize) -> Result<Self, String> {
+    pub(super) fn load(dir: &str, n_seqs: usize, ctx: usize) -> Result<Self, String> {
         let path = std::path::Path::new(dir);
         let arch = llm170_core::qwen35::bind::dir_arch(path).unwrap_or_default();
         if llm170_core::gemma4::bind::arch_ok(&arch) {
@@ -273,21 +274,21 @@ impl RefEngine {
         }
     }
 
-    fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
+    pub(super) fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
         match self {
             RefEngine::Qwen(e) => e.prefill(seq, tokens).map_err(|x| x.to_string()),
             RefEngine::Gemma(e) => e.prefill(seq, tokens).map_err(|x| x.to_string()),
         }
     }
 
-    fn decode(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
+    pub(super) fn decode(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
         match self {
             RefEngine::Qwen(e) => e.decode(&[seq], tokens).map_err(|x| x.to_string()),
             RefEngine::Gemma(e) => e.decode(&[seq], tokens).map_err(|x| x.to_string()),
         }
     }
 
-    fn decode_greedy(&mut self, seq: usize, token: u32) -> Result<u32, String> {
+    pub(super) fn decode_greedy(&mut self, seq: usize, token: u32) -> Result<u32, String> {
         match self {
             RefEngine::Qwen(e) => e.decode_greedy(seq, token).map_err(|x| x.to_string()),
             RefEngine::Gemma(e) => e.decode_greedy(seq, token).map_err(|x| x.to_string()),

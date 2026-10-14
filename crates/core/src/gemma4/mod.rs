@@ -107,6 +107,23 @@ impl Model {
         self.cfg.kv_eq_v(il)
     }
 
+    /// MoE 전문가 슬라이스 — (packed ptr/len, scale ptr/len) × (il,e,proj).
+    /// qwen35 `expert_slice` 미러(업로드 테이블 조립용).
+    pub fn expert_slice(
+        &self,
+        il: usize,
+        e: usize,
+        proj: &str,
+    ) -> Option<(&[u8], &[u8], usize, usize)> {
+        self.w4.expert_at(&bind::expert_base(il, e, proj))
+    }
+
+    /// MoE 전문가 양자 파라미터 — (group, scale_bf16) 실측.
+    pub fn expert_quant(&self) -> (usize, bool) {
+        let base = bind::expert_base(0, 0, "gate_proj");
+        (self.w4.group(), self.w4.scale_is_bf16(&base))
+    }
+
     /// 엔진 접점 이름 전수(업로드·체인 배선용) — qwen35 engine_names 미러.
     /// 층 접미사는 gemma4 바인딩(`bind::eng`)과 1:1.
     pub fn engine_names(&self) -> Vec<String> {

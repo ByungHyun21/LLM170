@@ -363,8 +363,27 @@ impl W4a16Dec {
         rr
     }
 
-    /// [gemma4 P2 2026-10-14] g4 어텐션 통합 런처(검증 전용 — `--attn-g4-check`,
-    /// 차기 체인 배선의 기반): prep_g4 → f3s part_g4 → merge_g4 → outv.
+    /// [gemma4 P2-3 2026-10-14] g4 rope 파라미터 테이블 등록 — 디바이스 f32
+    /// [n_attn][7] = {d, pairs, span, denom, base, vn_on, k_eq_v}. `attn_g4_host`가
+    /// 층 인덱스로 소비(prep_g4·part_g4 커널의 rp[층*7+·] 계약).
+    pub fn set_g4_rope(&mut self, rp: &[f32]) -> Result<(), String> {
+        if rp.is_empty() || !rp.len().is_multiple_of(7) {
+            return Err(format!("set_g4_rope: len={} — 7의 배수 계약", rp.len()));
+        }
+        let _g = self.cc.guard()?;
+        let bytes: Vec<u8> = rp.iter().flat_map(|x| x.to_le_bytes()).collect();
+        if self.attn.g4_rp == 0 || self.attn.attn.map(|d| d.n_attn) != Some(rp.len() / 7) {
+            if self.attn.g4_rp != 0 {
+                self.cc.free(self.attn.g4_rp)?;
+            }
+            self.attn.g4_rp = self.cc.alloc(bytes.len())?;
+        }
+        self.cc.h2d(self.attn.g4_rp, &bytes)
+    }
+
+    /// [gemma4 P2 2026-10-14] g4 어텐션 통합 런처(`--attn-g4-check` 검증 완료 ·
+    /// 체인 v0 경로): prep_g4 → f3s part_g4 → merge_g4 → outv. `layer` = 층
+    /// 인덱스(rope 파라미터 = `set_g4_rope` 테이블 · KV = 블록 테이블의 그 층).
     /// KV 아레나·블록 테이블은 `set_attn`(+`kv_grow`)이 준비돼 있어야 한다(slot 0).
     #[allow(clippy::too_many_arguments)]
     pub fn attn_g4_host(
@@ -374,21 +393,23 @@ impl W4a16Dec {
         vin: &[f32],
         qnw: &[f32],
         knw: &[f32],
+        layer: usize,
         t_len: usize,
         q_heads: usize,
         kv_heads: usize,
         d: usize,
-        pairs: usize,
-        span: usize,
-        denom: usize,
-        base: f32,
-        vn_on: bool,
         sw: usize,
         kq_scale: f32,
         splits: usize,
         pos0: u32,
     ) -> Result<Vec<f32>, String> {
         let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
+        if self.attn.g4_rp == 0 || layer >= dm.n_attn {
+            return Err(format!(
+                "attn_g4: rope 테이블 부재/층 초과 — layer={layer} n_attn={}",
+                dm.n_attn
+            ));
+        }
         if q.len() != t_len * q_heads * d
             || kin.len() != t_len * kv_heads * d
             || vin.len() != t_len * kv_heads * d
@@ -407,16 +428,7 @@ impl W4a16Dec {
         let npart = t_len * q_heads * splits;
         let dpart = self.cc.alloc(npart * (d + 2) * 4)?;
         let dout = self.cc.alloc(t_len * q_heads * d * 4)?;
-        let rp: Vec<f32> = vec![
-            d as f32,
-            pairs as f32,
-            span as f32,
-            denom as f32,
-            base,
-            if vn_on { 1.0 } else { 0.0 },
-            0.0,
-        ];
-        let drp = self.cc.alloc(rp.len() * 4)?;
+        let drp = self.attn.g4_rp;
         let dpp = self.cc.alloc(4)?;
         let rr = (|| -> Result<Vec<f32>, String> {
             self.cc.h2d(dq, &f32b(q))?;
@@ -424,7 +436,6 @@ impl W4a16Dec {
             self.cc.h2d(dv, &f32b(vin))?;
             self.cc.h2d(dqnw, &f32b(qnw))?;
             self.cc.h2d(dknw, &f32b(knw))?;
-            self.cc.h2d(drp, &f32b(&rp))?;
             self.cc.h2d(dpp, &pos0.to_le_bytes())?;
             // ① prep_g4 — grid (t, q_heads + kv_heads), 블록 128(§커널 계약)
             {
@@ -433,7 +444,7 @@ impl W4a16Dec {
                     (dq, dk, dv, dqnw, dknw, dqh, self.attn.dblk_tab, dpp, drp);
                 let (mut tl, mut lay, mut qh, mut kvh, mut cp) = (
                     t_len as i32,
-                    0i32,
+                    layer as i32,
                     q_heads as i32,
                     kv_heads as i32,
                     dm.cap as i32,
@@ -455,7 +466,7 @@ impl W4a16Dec {
                 let (mut a0, mut a1, mut a2, mut a3) = (dqh, self.attn.dblk_tab, dpart, dpp);
                 let (mut tl, mut lay, mut qh, mut kvh, mut cp) = (
                     t_len as i32,
-                    0i32,
+                    layer as i32,
                     q_heads as i32,
                     kv_heads as i32,
                     dm.cap as i32,
@@ -499,7 +510,8 @@ impl W4a16Dec {
                 .map(|c| f32::from_le_bytes(*c))
                 .collect())
         })();
-        for p in [dq, dk, dv, dqnw, dknw, dqh, dpart, dout, drp, dpp] {
+        // 주의: drp(= self.attn.g4_rp)는 **영속**(set_g4_rope 소유) — 해제 금지.
+        for p in [dq, dk, dv, dqnw, dknw, dqh, dpart, dout, dpp] {
             let _ = self.cc.free(p);
         }
         rr

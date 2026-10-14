@@ -513,8 +513,13 @@ impl W4a16Dec {
             }
         }
         // [B-4] 다중 세그먼트 GEMV 테이블(drt/dchain 포인터 참조 — 재할당 시 재작성).
-        self.ensure_chain_bufs()?;
-        self.build_moe_multi_tab()?;
+        // [gemma4 P2-3 2026-10-14] GDN 미등록(어텐션 전용 아치)은 qwen 체인 버퍼·
+        // 다중 세그먼트 테이블이 불요 — gemma4 g4 경로는 전문가 개별 런치 +
+        // accum만 쓴다(테이블은 qwen 체인 전용 소비).
+        if self.gdn.gdn.is_some() {
+            self.ensure_chain_bufs()?;
+            self.build_moe_multi_tab()?;
+        }
         self.moe.moe_bufs_ok = true;
         // [§3.4 ② 트랜셰 2] 등록(allocate) 중 퇴거가 결정됐을 수 있다 —
         // 여기서 실제 해제까지 완료(구성 확정 후 소비 — 순서 계약).
