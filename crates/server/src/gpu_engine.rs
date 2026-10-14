@@ -634,10 +634,12 @@ impl QwenEngine {
     }
     /// [A2→K3 2026-10-12] 접두 재사용 체크포인트 — upto 이하 최대 경계
     /// 조회(0=없음)/복원(512 경계 스택 4개).
-    pub fn checkpoint_pos(&self, slot: usize, upto: u32) -> u32 {
-        self.dec.checkpoint_pos(slot, upto)
+    /// [접두 재사용 2026-10-14] 엔진이 실제로 소비한 위치 — 재사용 상한의 정본.
+    pub fn seq_pos(&self, slot: usize) -> u32 {
+        self.dec.slot_pos_of(slot)
     }
-    pub fn restore_gdn(&mut self, slot: usize, upto: u32) -> Result<u32, String> {
+    /// 부분 접두 복원 — GDN 체크포인트(≤ upto)로 상태·pos 복원. 반환 = 복원 pos.
+    pub fn restore_prefix(&mut self, slot: usize, upto: u32) -> Result<u32, String> {
         self.dec.restore_gdn(slot, upto)
     }
     pub fn embed_row(&self, tok: u32) -> Result<Vec<f32>, String> {
@@ -1879,10 +1881,26 @@ impl GemmaEngine {
         false
     }
 
-    /// 접두 재사용 체크포인트 — v0 미구현(순수 어텐션의 KV 절단 재사용은
-    /// 후속 트랙). 반환 = 0(재사용 없음 — 전체 재프리필).
-    pub fn checkpoint_pos(&self, _slot: usize, _upto: u32) -> u32 {
-        0
+    /// [접두 재사용 2026-10-14] 엔진 소비 위치 — 순수 어텐션은 상태가 pos뿐.
+    pub fn seq_pos(&self, slot: usize) -> u32 {
+        self.dec.slot_pos.get(slot).copied().unwrap_or(0)
+    }
+    /// 부분 접두 복원 — 순수 어텐션: 상태 = KV + pos뿐이라 pos만 되돌린다
+    /// (KV 잔존 행은 다음 쓰기가 덮고, 판독은 pos까지 — spec_rollback과 동일
+    /// 계약). upto > pos는 불가(호출부가 콜드 경로로). 반환 = 복원 pos.
+    pub fn restore_prefix(&mut self, slot: usize, upto: u32) -> Result<u32, String> {
+        if slot >= self.n_slots {
+            return Err(format!(
+                "gemma4: slot {slot} 범위 밖(문맥 {})",
+                self.n_slots
+            ));
+        }
+        let p = self.dec.slot_pos[slot];
+        if upto == 0 || upto > p {
+            return Err(format!("gemma4: restore_prefix {upto} > pos {p}"));
+        }
+        self.dec.slot_pos[slot] = upto;
+        Ok(upto)
     }
     pub fn kv_grow(&mut self, slot: usize, n_tokens: usize) -> Result<usize, String> {
         self.dec.kv_grow(slot, n_tokens)
@@ -1910,11 +1928,8 @@ impl GemmaEngine {
     pub fn prof_report(&mut self, _label: &str) -> Result<String, String> {
         Err("gemma4: prof_report 미지원(v0)".into())
     }
-    // MTP·GDN·spec 계열 — gemma4 v0 미지원(호출부는 spec/mtp 비활성 게이트로
+    // MTP·spec 계열 — gemma4 v0 미지원(호출부는 spec/mtp 비활성 게이트로
     // 진입 자체가 없다. 시그니처 정합용 명시 거부).
-    pub fn restore_gdn(&mut self, _slot: usize, _upto: u32) -> Result<u32, String> {
-        Err("gemma4: GDN 없음(순수 어텐션)".into())
-    }
     pub fn spec_rollback(&mut self, _slot: usize, _keep: usize) -> Result<(), String> {
         // 순수 어텐션 — 복원할 상태 없음. 수용 접두 이후 KV 행은 다음 쓰기가
         // 덮는다(판독은 pos까지 — 잔존 행 무해). pos는 spec_rewind_pos 소관.
@@ -2023,7 +2038,7 @@ engine_delegate_mut! {
     kv_grow(slot: usize, n_tokens: usize) -> Result<usize, String>;
     kv_release_slot(slot: usize) -> usize;
     prof_report(label: &str) -> Result<String, String>;
-    restore_gdn(slot: usize, upto: u32) -> Result<u32, String>;
+    restore_prefix(slot: usize, upto: u32) -> Result<u32, String>;
     spec_rollback(slot: usize, keep: usize) -> Result<(), String>;
     spec_rewind_pos(slot: usize, n: u32) -> Result<(), String>;
     spec_verify(slot: usize, rows: &[f32], t: usize) -> Result<Vec<u32>, String>;
@@ -2048,7 +2063,7 @@ engine_delegate_mut! {
 
 engine_delegate_ref! {
     spec_on() -> bool;
-    checkpoint_pos(slot: usize, upto: u32) -> u32;
+    seq_pos(slot: usize) -> u32;
     kv_total_blocks() -> usize;
     kv_free_blocks() -> usize;
     kv_blocks_needed(n_tokens: usize) -> usize;
