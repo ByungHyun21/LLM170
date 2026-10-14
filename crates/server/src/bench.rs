@@ -28,6 +28,16 @@ fn parse_list(v: &str) -> Option<Vec<usize>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// [검수 통합 2026-10-14] 토큰 스트림 지문(FNV-1a) — 빌드 간 np 스트림 대조용.
+fn fnv1a_u32(v: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &x in v {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let model: Option<String> = ma.model.clone();
     let mut pps = vec![512usize];
@@ -35,6 +45,9 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let mut nps: Vec<usize> = Vec::new();
     let mut reps = 1usize;
     let mut ctx = 4096usize;
+    // [검수 통합 2026-10-14] np 단일 경로 등가 검사 폭(K토큰) — 0=끔.
+    // 기본 64: np 측정 런이 곧 배치 불변성 판정(해시는 상시 출력).
+    let mut np_check = 64usize;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -49,6 +62,10 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             "--np" => match it.next().and_then(|v| parse_list(v)) {
                 Some(v) if v.iter().all(|&n| (2..=8).contains(&n)) => nps = v,
                 _ => return usage_err_bench("--np requires N[,N..] (2..=8)"),
+            },
+            "--np-check" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(v) => np_check = v.min(8192),
+                None => return usage_err_bench("--np-check requires a number"),
             },
             "--reps" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(v) => reps = v.clamp(1, 20),
@@ -127,6 +144,9 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             }
         }
         // NP — 슬롯별 짧은 프리필(비계측) 후 배치 디코드 합산.
+        // [검수 통합 2026-10-14] 슬롯별 스트림 해시 상시 + 단일 경로 등가
+        // 검사(--np-check K, 기본 64) — 측정 런이 곧 배치 불변성 판정. 해시는
+        // 빌드 간 A/B 대조용(경로 변경이 토큰을 바꾸면 해시 불일치).
         for &np in &nps {
             let mut toks: Vec<u32> = Vec::with_capacity(np);
             for s in 0..np {
@@ -137,12 +157,16 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 toks.push(llm170_core::qwen35::greedy(&l));
             }
             let seqs: Vec<usize> = (0..np).collect();
+            let mut streams: Vec<Vec<u32>> = vec![Vec::new(); np];
             let t0 = Instant::now();
             let mut total = 0usize;
             while total < max_tg * np {
                 toks = eng
                     .decode_np_greedy(&seqs, &toks)
                     .map_err(|e| e.to_string())?;
+                for (s, &tk) in toks.iter().enumerate() {
+                    streams[s].push(tk);
+                }
                 total += np;
             }
             let ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -150,6 +174,39 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 "np{np}(tg{max_tg}) | 합산 {total}토큰 | {ms:9.1} ms | {:8.2} t/s",
                 total as f64 / (ms / 1e3)
             ));
+            let hh: Vec<String> = streams
+                .iter()
+                .enumerate()
+                .map(|(s, v)| format!("s{s}=0x{:016x}", fnv1a_u32(v)))
+                .collect();
+            lines.push(format!("np{np}-hash | {}", hh.join(" ")));
+            if np_check > 0 {
+                let k = np_check.min(max_tg);
+                let mut bad: Option<(usize, usize)> = None;
+                'slots: for (s, stream) in streams.iter().enumerate() {
+                    eng.reset_seq(s).map_err(|e| e.to_string())?;
+                    let l = eng
+                        .prefill(s, &prompt[..64.min(max_pp)])
+                        .map_err(|e| e.to_string())?;
+                    // 배치 스트림의 선행 토큰 = 프리필 그리디(루프 밖 소비) —
+                    // 단일 경로도 같은 토큰을 먹인 뒤의 출력과 비교(오프바이원 주의).
+                    let mut next = llm170_core::qwen35::greedy(&l);
+                    for (i, &bt) in stream.iter().take(k).enumerate() {
+                        let single = eng.decode_greedy(s, next).map_err(|e| e.to_string())?;
+                        if bt != single {
+                            bad = Some((s, i));
+                            break 'slots;
+                        }
+                        next = single;
+                    }
+                }
+                match bad {
+                    None => lines.push(format!("np{np}-check | 단일 경로 등가 OK (K={k})")),
+                    Some((s, i)) => lines.push(format!(
+                        "np{np}-check | FAIL 불일치 slot{s} @idx{i} — 배치 불변성 위반"
+                    )),
+                }
+            }
         }
         Ok(lines)
     })();
