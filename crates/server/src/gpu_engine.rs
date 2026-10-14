@@ -181,11 +181,8 @@ impl GpuEngine {
     ) -> Result<Self, String> {
         let arch = llm170_core::qwen35::bind::dir_arch(dir).unwrap_or_default();
         if llm170_core::gemma4::bind::arch_ok(&arch) {
-            if kv_budget.is_some() || kv_reserve.is_some() {
-                eprintln!("# gemma4: kv_budget/kv_reserve는 v0 미지원 — 기본 전량 할당");
-            }
             return Ok(GpuEngine::Gemma(Box::new(GemmaEngine::load(
-                dir, n_slots, ctx,
+                dir, n_slots, ctx, kv_budget, kv_reserve,
             )?)));
         }
         Ok(GpuEngine::Qwen(Box::new(QwenEngine::load(

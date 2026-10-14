@@ -211,6 +211,9 @@ pub(crate) fn upload_model_g4(
             _ => match llm170_diag::flag::val("LLM170_MOE_RESIDENT") {
                 Some("0") => false,
                 Some("1") => true,
+                // qwen upload_moe와 달리 KV 차감 없음 — 여기는 set_attn(KV 실할당)이
+                // 판정보다 먼저라 free가 이미 KV 풀을 제외한 값이다. kv_reserve를
+                // 또 빼면 이중차감(상주→스트리밍 오판)이라 고의로 더하지 않는다.
                 _ => free > expert_bytes + (1 << 30),
             },
         };

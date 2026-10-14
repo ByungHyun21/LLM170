@@ -17,22 +17,51 @@ pub struct GemmaEngine {
 impl GemmaEngine {
     /// 모델 로드 + 상주 업로드(upload_model_g4 — 선형·노름 8행/층·어텐션
     /// 테이블·rope·MoE(g32/전문가)·head(원문 embed 행별 int8)).
-    pub fn load(dir: &Path, n_slots: usize, ctx: usize) -> Result<Self, String> {
+    /// kv_reserve는 시그니처 통일용으로 받고 소비하지 않는다 — gemma4는 KV
+    /// 실할당(set_attn)이 MoE 판정보다 먼저라 여유가 이미 KV를 제외한 값이다
+    /// (차감 추가 = 이중차감. qwen은 반대 순서라 reserve를 쓴다).
+    pub fn load(
+        dir: &Path,
+        n_slots: usize,
+        ctx: usize,
+        kv_budget: Option<u64>,
+        kv_reserve: Option<u64>,
+    ) -> Result<Self, String> {
+        let _ = kv_reserve;
         let model = llm170_core::gemma4::Model::load(dir).map_err(|e| e.to_string())?;
         let hp = model.hp.clone();
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
-        let cfg = upload_model_g4(&mut dec, &model, ctx)?;
+        // [K6-3 예산] 풀 예산(여유 VRAM 파생) — upload_model_g4(내부 set_attn) 전에 설정.
+        dec.set_kv_budget(kv_budget);
+        // [D2 검수] 적재 실패 시 부분 할당 정리 — qwen load와 동일 위생.
+        match Self::fill(&mut dec, &model, ctx) {
+            Ok(cfg) => Ok(GemmaEngine {
+                model,
+                cfg,
+                dec,
+                n_slots,
+            }),
+            Err(e) => {
+                dec.free_all_device();
+                Err(e)
+            }
+        }
+    }
+
+    /// 컨텍스트 생성 **후** 적재 본체(upload_model_g4 + 층별 pes).
+    /// 실패는 호출부(load)가 `dec.free_all_device()`로 정리한다.
+    fn fill(
+        dec: &mut W4a16Dec,
+        model: &llm170_core::gemma4::Model,
+        ctx: usize,
+    ) -> Result<G4HostCfg, String> {
+        let cfg = upload_model_g4(dec, model, ctx)?;
         // 층별 pes(μ_e) 디바이스 상주(t행 MoE 경로용 — 1회). layer_scalar는
         // upload_model_g4가 등록(엔진·eval·프로브 공용 단일 계약).
         for il in 0..model.hp.n_layer {
             dec.set_g4_pes(il, cfg.pes_row(il, model.hp.n_experts))?;
         }
-        Ok(GemmaEngine {
-            model,
-            cfg,
-            dec,
-            n_slots,
-        })
+        Ok(cfg)
     }
 
     /// 1토큰 스텝 — **t행 청크 t=1**(단일 경로: 배치·프리필·spec과 동일 커널·
