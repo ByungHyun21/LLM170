@@ -453,24 +453,33 @@ impl W4a16Dec {
         let part = self.g4_scratch_slot(part_slot, t * q_heads * splits * (d + 2) * 4)?;
         let outv = self.g4_scratch_slot(out_slot, qn * 4)?;
         // 행별 (pos, 블록 테이블) 포인터 테이블 — 커널 row_blk/row_pp 계약.
+        // 행별 (pos, 블록 테이블) 포인터 테이블 — 커널 row_blk/row_pp 계약.
+        // **층 무관**(커널이 층 오프셋 가산) — (slots,pos) 동일하면 업로드 생략.
+        // 층당 동기 h2d 4회(pageable = 디바이스 전체 동기화)가 파이프라인을
+        // 층마다 드레인했다 — 청크당 1회로 축소. [주의] 테이블 슬롯(10/11/12)은
+        // 청크 데이터 슬롯(0..9)과 **분리 유지** — 재사용하면 청크 중간값이
+        // 테이블을 덮어 불법 접근(전면 상주 실험에서 실측).
         let mb = dm.cap.div_ceil(512);
         let pos_dev = self.g4_scratch_slot(10, t * 4)?;
         let rpp_dev = self.g4_scratch_slot(11, t * 8)?;
         let rblk_dev = self.g4_scratch_slot(12, t * 8)?;
-        let mut pb: Vec<u8> = Vec::with_capacity(t * 4);
-        for &pv in pos {
-            pb.extend_from_slice(&pv.to_le_bytes());
+        if self.g4_atab.0 != slots || self.g4_atab.1 != pos {
+            let mut pb: Vec<u8> = Vec::with_capacity(t * 4);
+            for &pv in pos {
+                pb.extend_from_slice(&pv.to_le_bytes());
+            }
+            self.cc.h2d(pos_dev, &pb)?;
+            let mut rppb: Vec<u8> = Vec::with_capacity(t * 8);
+            let mut rblkb: Vec<u8> = Vec::with_capacity(t * 8);
+            for (i, &sl) in slots.iter().enumerate() {
+                rppb.extend_from_slice(&(pos_dev + (i * 4) as u64).to_le_bytes());
+                let base = self.attn.dblk_tab + (sl * dm.n_attn * mb * 4 * 8) as u64;
+                rblkb.extend_from_slice(&base.to_le_bytes());
+            }
+            self.cc.h2d(rpp_dev, &rppb)?;
+            self.cc.h2d(rblk_dev, &rblkb)?;
+            self.g4_atab = (slots.to_vec(), pos.to_vec());
         }
-        self.cc.h2d(pos_dev, &pb)?;
-        let mut rppb: Vec<u8> = Vec::with_capacity(t * 8);
-        let mut rblkb: Vec<u8> = Vec::with_capacity(t * 8);
-        for (i, &sl) in slots.iter().enumerate() {
-            rppb.extend_from_slice(&(pos_dev + (i * 4) as u64).to_le_bytes());
-            let base = self.attn.dblk_tab + (sl * dm.n_attn * mb * 4 * 8) as u64;
-            rblkb.extend_from_slice(&base.to_le_bytes());
-        }
-        self.cc.h2d(rpp_dev, &rppb)?;
-        self.cc.h2d(rblk_dev, &rblkb)?;
         let dpp = pos_dev; // null 경로 비사용(호환 인자)
         let d_max = self.attn.layers.iter().map(|l| l.d).max().unwrap_or(d);
         let qnw = self.attn.dqnw_a + (layer * d_max * 4) as u64;
