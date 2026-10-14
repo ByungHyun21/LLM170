@@ -174,6 +174,21 @@ pub(super) fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
                 tokens: toks.clone(),
                 error: None,
             });
+            // [관측 2026-10-14] 요청별 TTFT/처리량 — ttft = 큐 진입→첫 토큰.
+            let total_ms = j.queued.elapsed().as_secs_f64() * 1e3;
+            let ttft_ms = s
+                .t_first
+                .map(|t| t.saturating_duration_since(j.queued).as_secs_f64() * 1e3)
+                .unwrap_or(total_ms);
+            SCHED
+                .ttft_us
+                .fetch_add((ttft_ms * 1e3) as u64, Ordering::Relaxed);
+            eprintln!(
+                "# req: slot{i} ttft={ttft_ms:.1}ms total={total_ms:.1}ms toks={} ({:.1} tok/s) reuse={}",
+                toks.len(),
+                toks.len() as f64 / (total_ms / 1e3).max(1e-9),
+                s.prefilled
+            );
             // 접두 캐시 — 상태 유지 (프롬프트+생성 = 구워진 열).
             let mut full = j.tokens.clone();
             full.extend(toks);

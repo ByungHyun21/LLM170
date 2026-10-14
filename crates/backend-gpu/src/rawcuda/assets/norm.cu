@@ -77,6 +77,67 @@ extern "C" __global__ void norm_resid(
     }
 }
 
+// ── rms_rows — 잔차 없는 순수 행별 RMS (gemma4 디바이스 상주 청크, 2026-10-14) ──
+// gemma4 청크의 호스트 노름(ops::rms_norm)을 디바이스로 옮기기 위한 커널.
+// norm_resid 계열과 달리 ① 잔차 가산이 없고 ② **누적 순서가 CPU 계약**
+// (core/src/ops.rs sq_sum)이다 — 32세그먼트 f32 순차 누산 → f64 순차 결합.
+// norm_resid의 1024스레드 트리 누적은 다른 산술이라 호스트 경로 대체가 못 된다
+// (청크는 호스트 산술 계약 — 토큰 골든·np 해시가 이 비트에 걸려 있다).
+// 스케일: 1/sqrt(f64(sum/hidden + eps)) → f32 → f32 역수(정밀 sqrtf 계약).
+// [빌드 계약] norm.cu는 기본 fmad — __fmul_rn/__fadd_rn으로 수축을 막아
+// CPU의 개별 반올림(mul·add 각 1회)과 비트동일하게 만든다. nw 곱도 좌결합
+// 개별 반올림(v*scale, 그 결과*nw) — Rust의 `v * scale * g`와 동일.
+// smem = [hidden]x + [32]세그먼트 + [1]스케일(동적, (hidden+33)*4B).
+// 블록 256(coalesce 적재·기록) · 그리드 = 행 수(t_len).
+extern "C" __global__ void rms_rows(
+    const float* __restrict__ x,  // [T][hidden]
+    const float* __restrict__ nw, // [rows][hidden]
+    float* __restrict__ xn,       // [T][hidden]
+    int t_len, int w_off, int hidden, float eps)
+{
+    extern __shared__ float sm[];
+    float* sx = sm;             // 행 스테이징(공유)
+    float* sp = sm + hidden;    // [SEG] 세그먼트 부분합 + [SEG] 스케일
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nth = blockDim.x;
+    if (t >= t_len) return;
+    const int base = t * hidden;
+    for (int e = tid; e < hidden; e += nth) {
+        sx[e] = x[base + e];
+    }
+    __syncthreads();
+    // ① 32세그먼트 f32 순차 누산 (ops.rs sq_sum 미러).
+    const int SEG = 32;
+    const int chunk = (hidden + SEG - 1) / SEG;
+    if (tid < SEG) {
+        int lo = tid * chunk;
+        int hi = lo + chunk < hidden ? lo + chunk : hidden;
+        float part = 0.0f;
+        for (int i = lo; i < hi; i++) {
+            float v = sx[i];
+            part = __fadd_rn(part, __fmul_rn(v, v));
+        }
+        sp[tid] = part;
+    }
+    __syncthreads();
+    // ② f64 순차 결합(세그먼트 순서 그대로) → 스케일.
+    if (tid == 0) {
+        double dsum = 0.0;
+        for (int u = 0; u < SEG; u++) {
+            if (u * chunk >= hidden) break;
+            dsum += (double)sp[u];
+        }
+        double mean = dsum / (double)hidden + (double)eps;
+        sp[SEG] = 1.0f / (float)sqrt(mean);
+    }
+    __syncthreads();
+    const float scale = sp[SEG];
+    for (int e = tid; e < hidden; e += nth) {
+        xn[base + e] = __fmul_rn(__fmul_rn(sx[e], scale), nw[w_off + e]);
+    }
+}
+
 // ── norm_resid_g — 임의 hidden(≤8192) 가드 변형 (gemma4 2816, 2026-10-14) ──
 // norm_resid는 hidden이 블록폭(1024)의 배수임을 가정한다(nper 스트라이드가
 // 행 경계를 넘어 다음 행을 오독). gemma4 hidden=2816(2.75×1024)에는 행

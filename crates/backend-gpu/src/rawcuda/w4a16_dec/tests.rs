@@ -1000,6 +1000,101 @@ fn conv_ring_pre_snapshot_is_pre_update_state() {
     }
 }
 
+// ═══ [gemma4 2026-10-14] rms_rows — 호스트 노름(ops::rms_norm) 비트 미러 ═══
+/// 디바이스 순수 RMS(32세그먼트 f32 누산 → f64 결합 → 정밀 sqrt)가 CPU
+/// 계약과 **비트동일**인지 판정한다(허용오차 아님 — 토큰 골든·np 해시가
+/// 이 비트에 걸린 청크 노름 경로). 미러는 core/src/ops.rs sq_sum/rms_norm을
+/// 이 테스트에 그대로 옮긴 것(backend-gpu는 core에 의존하지 않는다).
+/// 실패 모드: 수축(FMA)·트리 누적·스케일 순서가 섞이면 즉시 불일치.
+#[test]
+fn rms_rows_matches_host_norm_bit_exact() {
+    let _cuda = CUDA_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let hidden = 2816usize;
+    let t_len = 3usize;
+    let eps = 1e-6f32;
+    let mut dec = match super::W4a16Dec::new(1, hidden, 1) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip(CUDA 없음): {e}");
+            return;
+        }
+    };
+    let n = t_len * hidden;
+    let mut seed = 0x51ed_2701_9e37_79b9u64;
+    let mut rnd = || {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let pm1 = |r: u64| ((r >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
+    // 지수 스케일 혼입 — 세그먼트 누산 반올림 차이가 드러나게(비트 판정은
+    // 스케일 무관하지만 자릿수 다양성이 결함 검출력을 올린다).
+    let xs: Vec<f32> = (0..n)
+        .map(|_| pm1(rnd()) * (1.0 + (rnd() % 8) as f32))
+        .collect();
+    let nw: Vec<f32> = (0..hidden).map(|e| 1.0 + e as f32 * 1e-6).collect();
+    dec.set_norm_weights(&nw, 1).expect("norm 가중 등록");
+    let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let dx = dec.cc.alloc(n * 4).unwrap();
+    dec.cc.h2d(dx, &f32b(&xs)).expect("x h2d");
+    let dy = dec.cc.alloc(n * 4).unwrap();
+    dec.rms_rows_dev(0, dx, dy, t_len, eps)
+        .expect("rms_rows 발사");
+    dec.cc.sync().unwrap();
+    let mut ob = vec![0u8; n * 4];
+    dec.cc.d2h(&mut ob, dy).expect("d2h");
+    let got: Vec<f32> = ob
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect();
+    // CPU 미러 — ops.rs와 같은 순서(같은 연산, 같은 반올림).
+    let host_norm = |x: &[f32]| -> Vec<f32> {
+        const SEG: usize = 32;
+        let n = x.len();
+        let chunk = n.div_ceil(SEG);
+        let mut sum = 0.0f64;
+        for u in 0..SEG {
+            let lo = u * chunk;
+            if lo >= n {
+                break;
+            }
+            let hi = (lo + chunk).min(n);
+            let mut part = 0.0f32;
+            for &v in &x[lo..hi] {
+                part += v * v;
+            }
+            sum += part as f64;
+        }
+        let scale = 1.0 / ((sum / n as f64 + eps as f64).sqrt() as f32);
+        x.iter().zip(&nw).map(|(&v, &g)| v * scale * g).collect()
+    };
+    let mut bad = 0usize;
+    let mut first = None;
+    for t in 0..t_len {
+        let row = &xs[t * hidden..(t + 1) * hidden];
+        let want = host_norm(row);
+        for e in 0..hidden {
+            if got[t * hidden + e].to_bits() != want[e].to_bits() {
+                bad += 1;
+                if first.is_none() {
+                    first = Some((t, e, got[t * hidden + e], want[e]));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        bad, 0,
+        "rms_rows 비트 불일치 {bad}건 (첫 사례 {:?}) — 수축/누적순서/스케일 점검",
+        first
+    );
+    let _ = dec.cc.free(dx);
+    let _ = dec.cc.free(dy);
+}
+
 // ═══ [gemma4 2026-10-14] norm_resid_g(2816) — 행 경계 가드 변형 수치 검증 ═══
 /// 가드 변형 vs CPU 미러(동일 누적 순서 재현). **비트 아님**: norm은 기본
 /// fmad(수축 허용)라 f32 반올림이 미러와 다를 수 있다 — 상대오차 밴드 판정.

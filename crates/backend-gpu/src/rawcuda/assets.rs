@@ -89,7 +89,7 @@ pub const ASSETS: &[Asset] = &[
             "crates/backend-gpu/src/rawcuda/assets/norm.fatbin",
             "src/rawcuda/assets/norm.fatbin",
         ],
-        syms: &["norm_resid", "norm_resid_g"],
+        syms: &["norm_resid", "norm_resid_g", "rms_rows"],
         boot: true,
     },
     Asset {

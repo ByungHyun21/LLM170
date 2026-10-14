@@ -157,197 +157,31 @@ impl W4a16Dec {
             .collect())
     }
 
-    /// [gemma4 P3 2026-10-14] t행(≤8) MoE 스텝 호스트 래퍼 — 라우터(hn)·
-    /// 전문가(xn) 입력 분리 + pes + 무 shared. 반환 = [t][h] (토큰별 누적).
-    /// 전문가 = 상주 GEMV 융합(gate+up+GLU_gelu) + down + accum(sp=top_k) —
-    /// t=1 경로와 동일 커널 계열. 스트리밍(t행)은 미지원 → 호출부가 t=1 폴백.
-    pub fn g4_moe_host_t(
-        &mut self,
-        il: usize,
-        hn: &[f32],
-        xn: &[f32],
-        pes: &[f32],
-        t: usize,
-        pes_dev: CUdeviceptr,
-    ) -> Result<Vec<f32>, String> {
-        let h = self.hidden;
-        let n_exp = self.moe.n_experts;
-        let tk = self.moe.top_k.max(1);
-        let n_ff = self.moe.moe_ffn;
-        if t == 0 || t > 8 || hn.len() != t * h || xn.len() != t * h || pes.len() != n_exp {
-            return Err(format!(
-                "g4_moe_t: 계약 위반 t={t} hn={} xn={} pes={} (h={h} n_exp={n_exp})",
-                hn.len(),
-                xn.len(),
-                pes.len()
-            ));
-        }
-        if !self.moe.moe_resident {
-            return Err("g4_moe_t: 스트리밍 t행 미지원(호출부 t=1 폴백)".into());
-        }
-        let _g = self.cc.guard()?;
-        self.ensure_moe_bufs()?;
-        // t행 입력 스크래치(g4_a/g4_y 재사용 — gemm 래퍼와 상호배타 순차).
-        let need = t * h;
-        if self.g4_a.cap < need {
-            if self.g4_a.ptr != 0 {
-                self.cc.free(self.g4_a.ptr)?;
-            }
-            self.g4_a.ptr = self.cc.alloc(need * 4)?;
-            self.g4_a.cap = need;
-        }
-        if self.g4_y.cap < need {
-            if self.g4_y.ptr != 0 {
-                self.cc.free(self.g4_y.ptr)?;
-            }
-            self.g4_y.ptr = self.cc.alloc(need * 4)?;
-            self.g4_y.cap = need;
-        }
-        let (dhn, dxn) = (self.g4_a.ptr, self.g4_y.ptr);
-        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-        self.cc.h2d(dhn, &f32b(hn))?;
-        self.cc.h2d(dxn, &f32b(xn))?;
-        let _ = pes; // pes는 디바이스에 이미 있다(pes_dev — 층별 1회 업로드)
-        // ① 라우터 → drt [t][n_exp].
-        let rn = format!("blk.{il}.moe_gate.weight");
-        if self.lins.contains_key(&rn) {
-            self.gemv_t_launch(&rn, dhn, self.moe.drt.ptr, t)?;
-        } else {
-            // 플레인 라우터 — t행 플레인 GEMV(행별 산술 = t=1 GEMV와 비트동일).
-            self.plain_gemv_t_launch(&rn, dhn, self.moe.drt.ptr, t)?;
-        }
-        // ② top-k(디바이스, t행) — softmax 전체 → top-k → 재정규화.
-        {
-            let f = self.cc.function("w4a16_moe_topk_t")?;
-            let (mut p_lg, mut p_ix, mut p_wt) =
-                (self.moe.drt.ptr, self.moe.moe_idx, self.moe.moe_wt);
-            let (mut p_t, mut p_n, mut p_k) = (t as i32, n_exp as i32, tk as i32);
-            self.cc.launch(
-                f,
-                t.div_ceil(8) as u32,
-                1,
-                256,
-                &mut crate::rawcuda::args::l6(
-                    &mut p_lg, &mut p_ix, &mut p_wt, &mut p_t, &mut p_n, &mut p_k,
-                ),
-            )?;
-        }
-        // ③ pes(μ_e) — 인플레이스(가중 [t][top_k] 전량).
-        {
-            let ns = t * tk;
-            let f = self.cc.function("w4a16_moe_pes_scale")?;
-            let (mut p_w, mut p_i, mut p_p) = (self.moe.moe_wt, self.moe.moe_idx, pes_dev);
-            let mut p_n = ns as i32;
-            self.cc.launch(
-                f,
-                (ns as u32).div_ceil(256).max(1),
-                1,
-                256,
-                &mut crate::rawcuda::args::l4(&mut p_w, &mut p_i, &mut p_p, &mut p_n),
-            )?;
-        }
-        // ④ 전문가 — 상주 GEMV 융합(gate+up+GLU) + down + 누적(sp=tk).
-        let ns = t * tk;
-        let base = il * n_exp * 3;
-        self.gemv_experts_glu_launch(base, ns, dxn, h, tk, self.moe.exp.act, n_ff, h)?;
-        self.gemv_experts_launch(
-            base + 2,
-            ns,
-            self.moe.exp.act,
-            n_ff,
-            1,
-            self.moe.exp.dn,
-            h,
-            n_ff,
-        )?;
-        self.moe_accum_dev(
-            self.moe.moe_wt,
-            self.moe.exp.dn,
-            self.moe.dmo.ptr,
-            tk,
-            ns,
-            h,
-        )?;
-        self.cc.sync()?;
-        let mut ob = vec![0u8; t * h * 4];
-        self.cc
-            .d2h_async(ob.as_mut_ptr(), self.moe.dmo.ptr, t * h * 4)?;
-        self.cc.sync()?;
-        Ok(ob
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect())
-    }
-
-    /// [gemma4 P3 2026-10-14] t행(≤8) head 로짓 — 가중 1판독 t행 공유(TR 커널).
-    /// [t][head_n] 평탄 반환.
-    pub fn g4_head_host_t(&mut self, xn: &[f32], t: usize) -> Result<Vec<f32>, String> {
-        if self.head_w == 0 {
-            return Err("g4_head_t: head 미등록".into());
-        }
-        let (h, n) = (self.hidden, self.head_n);
-        if t == 0 || t > 8 || xn.len() != t * h {
-            return Err(format!("g4_head_t: 계약 위반 t={t} xn={}", xn.len()));
-        }
-        let _g = self.cc.guard()?;
-        if self.g4_a.cap < t * h {
-            if self.g4_a.ptr != 0 {
-                self.cc.free(self.g4_a.ptr)?;
-            }
-            self.g4_a.ptr = self.cc.alloc(t * h * 4)?;
-            self.g4_a.cap = t * h;
-        }
-        // t행 출력 전용 버퍼(head_out은 1행 크기 — t행 d2h 범위 밖 결함 수정).
-        if self.g4_y.cap < t * n {
-            if self.g4_y.ptr != 0 {
-                self.cc.free(self.g4_y.ptr)?;
-            }
-            self.g4_y.ptr = self.cc.alloc(t * n * 4)?;
-            self.g4_y.cap = t * n;
-        }
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
-        let xb = unsafe { std::slice::from_raw_parts(xn.as_ptr() as *const u8, xn.len() * 4) };
-        self.cc.h2d(self.g4_a.ptr, xb)?;
-        self.head_gemv_t_launch(self.g4_a.ptr, self.g4_y.ptr, t)?;
-        self.cc.sync()?;
-        let mut ob = vec![0u8; t * n * 4];
-        self.cc
-            .d2h_async(ob.as_mut_ptr(), self.g4_y.ptr, t * n * 4)?;
-        self.cc.sync()?;
-        Ok(ob
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect())
-    }
-
     /// [gemma4 P3 2026-10-14] 청크 디바이스 체인 — 스크래치 슬롯 확보.
+    /// 재할당 시 캡처 그래프 전량 폐기(옛 포인터 replay 차단 — realloc_buf 동형).
     pub fn g4_scratch_slot(&mut self, idx: usize, bytes: usize) -> Result<CUdeviceptr, String> {
         if self.g4_pool.len() <= idx {
             self.g4_pool.resize(idx + 1, Buf { ptr: 0, cap: 0 });
         }
-        let b = &mut self.g4_pool[idx];
-        if b.cap < bytes {
-            if b.ptr != 0 {
-                self.cc.free(b.ptr)?;
-            }
-            b.ptr = self.cc.alloc(bytes)?;
-            b.cap = bytes;
+        let (ptr, cap) = {
+            let b = &self.g4_pool[idx];
+            (b.ptr, b.cap)
+        };
+        if cap >= bytes {
+            return Ok(ptr);
         }
-        Ok(b.ptr)
-    }
-
-    /// 슬롯 f32 행렬 업로드 — [t][k] f32 → 슬롯(반환 = 디바이스 포인터).
-    pub fn g4_dev_in(&mut self, slot: usize, x: &[f32]) -> Result<CUdeviceptr, String> {
-        let _g = self.cc.guard()?;
-        let p = self.g4_scratch_slot(slot, x.len() * 4)?;
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
-        let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
-        self.cc.h2d(p, xb)?;
-        Ok(p)
+        self.cc.capture_guard("g4_slot"); // 캡처 중 재할당 = warm 누락(즉시 실패)
+        self.graph_invalidate(); // [P10] 재할당 — 캡처 옛 포인터 차단.
+        self.cc.sync()?; // [P10] 비행 커널의 해제 버퍼 사용 차단.
+        let newp = self.cc.alloc(bytes)?;
+        if ptr != 0 {
+            self.cc.free(ptr)?;
+        }
+        self.g4_pool[idx] = Buf {
+            ptr: newp,
+            cap: bytes,
+        };
+        Ok(newp)
     }
 
     /// t행 GEMM → 지정 슬롯(디바이스 in/out — 중간 왕복 0). 반환 = 슬롯 포인터.
@@ -370,22 +204,6 @@ impl W4a16Dec {
         // ncu 실측: FFMA는 DRAM 4.4%·SM 49.4% 지연 정체).
         self.gemv_t_launch(name, x_dev, y, t)?;
         Ok(y)
-    }
-
-    /// 슬롯 → 호스트 f32 회수(동기 1회).
-    pub fn g4_dev_out(&mut self, slot: usize, elems: usize) -> Result<Vec<f32>, String> {
-        let _g = self.cc.guard()?;
-        let p = self.g4_scratch_slot(slot, elems * 4)?;
-        self.cc.sync()?;
-        let mut ob = vec![0u8; elems * 4];
-        self.cc.d2h_async(ob.as_mut_ptr(), p, elems * 4)?;
-        self.cc.sync()?;
-        Ok(ob
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect())
     }
 
     /// [gemma4 P3 2026-10-14] ew_gelu 디바이스 — act = gelu(g)·u → y(슬롯).
@@ -457,33 +275,16 @@ impl W4a16Dec {
         let part = self.g4_scratch_slot(part_slot, t * q_heads * splits * (d + 2) * 4)?;
         let outv = self.g4_scratch_slot(out_slot, qn * 4)?;
         // 행별 (pos, 블록 테이블) 포인터 테이블 — 커널 row_blk/row_pp 계약.
-        // 행별 (pos, 블록 테이블) 포인터 테이블 — 커널 row_blk/row_pp 계약.
         // **층 무관**(커널이 층 오프셋 가산) — (slots,pos) 동일하면 업로드 생략.
-        // 층당 동기 h2d 4회(pageable = 디바이스 전체 동기화)가 파이프라인을
-        // 층마다 드레인했다 — 청크당 1회로 축소. [주의] 테이블 슬롯(10/11/12)은
-        // 청크 데이터 슬롯(0..9)과 **분리 유지** — 재사용하면 청크 중간값이
-        // 테이블을 덮어 불법 접근(전면 상주 실험에서 실측).
-        let mb = dm.cap.div_ceil(512);
-        let pos_dev = self.g4_scratch_slot(10, t * 4)?;
-        let rpp_dev = self.g4_scratch_slot(11, t * 8)?;
-        let rblk_dev = self.g4_scratch_slot(12, t * 8)?;
-        if self.g4_atab.0 != slots || self.g4_atab.1 != pos {
-            let mut pb: Vec<u8> = Vec::with_capacity(t * 4);
-            for &pv in pos {
-                pb.extend_from_slice(&pv.to_le_bytes());
-            }
-            self.cc.h2d(pos_dev, &pb)?;
-            let mut rppb: Vec<u8> = Vec::with_capacity(t * 8);
-            let mut rblkb: Vec<u8> = Vec::with_capacity(t * 8);
-            for (i, &sl) in slots.iter().enumerate() {
-                rppb.extend_from_slice(&(pos_dev + (i * 4) as u64).to_le_bytes());
-                let base = self.attn.dblk_tab + (sl * dm.n_attn * mb * 4 * 8) as u64;
-                rblkb.extend_from_slice(&base.to_le_bytes());
-            }
-            self.cc.h2d(rpp_dev, &rppb)?;
-            self.cc.h2d(rblk_dev, &rblkb)?;
-            self.g4_atab = (slots.to_vec(), pos.to_vec());
-        }
+        // [주의] 테이블 슬롯(10/11/12)은 청크 데이터 슬롯과 **분리 유지** —
+        // 재사용하면 청크 중간값이 테이블을 덮어 불법 접근(전면 상주 실험 실측).
+        // [gemma4 P3 v2 2026-10-14] 업로드 자체는 g4_atab_prepare로 분리
+        // (청크 프롤로그 1회 · h2d_async — pageable 동기 h2d의 파이프라인
+        // 드레인 회피). 그래프 캡처에서도 테이블 갱신은 캡처 밖 몫이다.
+        self.g4_atab_prepare(slots, pos)?;
+        let pos_dev = self.g4_scratch_slot(Self::G4_ATAB_POS, t * 4)?;
+        let rpp_dev = self.g4_scratch_slot(Self::G4_ATAB_RPP, t * 8)?;
+        let rblk_dev = self.g4_scratch_slot(Self::G4_ATAB_RBLK, t * 8)?;
         let dpp = pos_dev; // null 경로 비사용(호환 인자)
         let d_max = self.attn.layers.iter().map(|l| l.d).max().unwrap_or(d);
         let qnw = self.attn.dqnw_a + (layer * d_max * 4) as u64;
@@ -576,6 +377,517 @@ impl W4a16Dec {
     /// 층 pes 디바이스 포인터(0 = 미등록).
     pub fn g4_pes_dev(&self, il: usize) -> CUdeviceptr {
         self.g4_pes.get(il).copied().unwrap_or(0)
+    }
+
+    /// [gemma4 P3 v2 2026-10-14] 층별 layer_scalar 등록(디바이스 청크 전용 —
+    /// 호스트 스칼라 인자, 디바이스 버퍼 아님).
+    pub fn set_g4_layer_scalar(&mut self, ls: &[f32]) -> Result<(), String> {
+        if ls.len() != self.n_layers {
+            return Err(format!(
+                "g4 layer_scalar: {} != n_layer={}",
+                ls.len(),
+                self.n_layers
+            ));
+        }
+        self.g4_ls = ls.to_vec();
+        Ok(())
+    }
+
+    /// [gemma4 P3 v2 2026-10-14] 어텐션 행별 (pos, 블록 테이블) 포인터 테이블
+    /// (슬롯 10/11/12) 준비 — (slots,pos) 동일 시 무동작. 층 무관(커널이 층
+    /// 오프셋 가산)이라 **청크당 1회**. h2d_async(같은 스트림 순서) —
+    /// pageable 동기 복사는 디바이스 전체를 드레인한다(전면 상주 실험 실측).
+    /// 그래프 캡처에서도 갱신은 캡처 밖(프롤로그) 몫 — 본문은 값만 읽는다.
+    pub fn g4_atab_prepare(&mut self, slots: &[usize], pos: &[u32]) -> Result<(), String> {
+        let t = slots.len();
+        if t == 0 || pos.len() != t || t > BATCH_DEC_MAX {
+            return Err(format!("g4_atab: t={t} pos={} (1..=8)", pos.len()));
+        }
+        if self.g4_atab.0 == slots && self.g4_atab.1 == pos {
+            return Ok(());
+        }
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
+        if slots.iter().any(|&sl| sl >= self.n_slots) {
+            return Err("g4_atab: 슬롯 범위 밖".into());
+        }
+        let mb = dm.cap.div_ceil(512);
+        let pos_dev = self.g4_scratch_slot(Self::G4_ATAB_POS, t * 4)?;
+        let rpp_dev = self.g4_scratch_slot(Self::G4_ATAB_RPP, t * 8)?;
+        let rblk_dev = self.g4_scratch_slot(Self::G4_ATAB_RBLK, t * 8)?;
+        // 캡처 중 업로드 = 프롤로그 누락(캡처엔 pageable 복사 노드가 못 들어간다).
+        self.cc.capture_guard("g4_atab");
+        let mut pb: Vec<u8> = Vec::with_capacity(t * 4);
+        for &pv in pos {
+            pb.extend_from_slice(&pv.to_le_bytes());
+        }
+        self.cc.h2d_async(pos_dev, &pb)?;
+        let mut rppb: Vec<u8> = Vec::with_capacity(t * 8);
+        let mut rblkb: Vec<u8> = Vec::with_capacity(t * 8);
+        for (i, &sl) in slots.iter().enumerate() {
+            rppb.extend_from_slice(&(pos_dev + (i * 4) as u64).to_le_bytes());
+            let base = self.attn.dblk_tab + (sl * dm.n_attn * mb * 4 * 8) as u64;
+            rblkb.extend_from_slice(&base.to_le_bytes());
+        }
+        self.cc.h2d_async(rpp_dev, &rppb)?;
+        self.cc.h2d_async(rblk_dev, &rblkb)?;
+        self.g4_atab = (slots.to_vec(), pos.to_vec());
+        Ok(())
+    }
+
+    /// [gemma4 P3 v2 2026-10-14] 청크 슬롯 지도 — g4_scratch_slot 인덱스.
+    /// 데이터 슬롯과 어텐션 테이블(10/11/12)은 분리(위 g4_atab_prepare 주석).
+    const G4_X: usize = 0;
+    const G4_A: usize = 1;
+    const G4_B1: usize = 2;
+    const G4_B2: usize = 3;
+    const G4_B3: usize = 4;
+    const G4_ATAB_POS: usize = 10;
+    const G4_ATAB_RPP: usize = 11;
+    const G4_ATAB_RBLK: usize = 12;
+    const G4_HN: usize = 13;
+    const G4_NM: usize = 14;
+    const G4_MOE: usize = 15;
+    const G4_H2: usize = 16;
+    const G4_HF: usize = 17;
+    const G4_HEADX: usize = 18;
+    const G4_HEADOUT: usize = 19;
+
+    /// 슬롯 전량을 t_max 행 기준으로 선할당 — 청크 중 재할당(캡처 무효화·
+    /// 도중 alloc 금지)을 막는다. 크기 = 층 최대 형상(어텐션 qd/분할 포함).
+    pub fn g4_warm_slots(&mut self, t_max: usize) -> Result<(), String> {
+        let h = self.hidden;
+        let dm = self.attn.attn.ok_or("g4_warm: attn 미등록")?;
+        let mut qd_max = 0usize;
+        let mut part_max = 0usize;
+        for l in &self.attn.layers {
+            qd_max = qd_max.max(dm.q_heads * l.d);
+            part_max = part_max.max(dm.q_heads * 2 * (l.d + 2)); // splits=2
+        }
+        let th = t_max * h * 4;
+        for s in [
+            Self::G4_X,
+            Self::G4_A,
+            Self::G4_HEADX,
+            Self::G4_HN,
+            Self::G4_NM,
+            Self::G4_MOE,
+            Self::G4_H2,
+            Self::G4_HF,
+        ] {
+            self.g4_scratch_slot(s, th)?;
+        }
+        // 어텐션 중간(o·hh·h1 = h 폭)은 A/B 슬롯과 같은 폭을 쓴다.
+        for s in [Self::G4_B1, Self::G4_B2, Self::G4_B3] {
+            self.g4_scratch_slot(s, t_max * qd_max.max(h) * 4)?;
+        }
+        self.g4_scratch_slot(5, t_max * qd_max * 4)?; // qh
+        self.g4_scratch_slot(6, t_max * part_max * 4)?; // part
+        self.g4_scratch_slot(7, t_max * qd_max * 4)?; // outv
+        self.g4_scratch_slot(8, th)?; // E(o_proj / ffn_down — h 폭)
+        self.g4_scratch_slot(9, th)?; // F(hh→h1→merged — h 폭)
+        self.g4_scratch_slot(Self::G4_HEADOUT, t_max * self.head_n * 4)?;
+        Ok(())
+    }
+
+    /// [gemma4 P3 v2 2026-10-14] 청크 본문 — 층 루프 전량 디바이스(중간 왕복 0).
+    /// x = 슬롯 0(G4_X)의 잔차 스트림. head_last = 프리필(마지막 행 로짓만).
+    /// 캡처 대상 몫: 호스트 왕복·할당·동기 없음(전부 같은 스트림 발사).
+    fn g4_chunk_body(
+        &mut self,
+        slots: &[usize],
+        pos: &[u32],
+        t: usize,
+        head_last: bool,
+        nw_per_layer: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        let h = self.hidden;
+        let n = t * h;
+        let dm = self.attn.attn.ok_or("g4_chunk_dev: attn 미등록")?;
+        let x = self.g4_scratch_slot(Self::G4_X, n * 4)?;
+        for il in 0..self.n_layers {
+            let l = self.attn.layers[il];
+            let d = l.d;
+            let qd = dm.q_heads * d;
+            let nb = il * nw_per_layer;
+            let sw = if l.sliding { dm.sliding_window } else { 0 };
+            // ① input_layernorm(디바이스) → q/k/(v) GEMV.
+            let a = self.g4_scratch_slot(Self::G4_A, n * 4)?;
+            self.rms_rows_dev(nb, x, a, t, eps)?;
+            let q = self.g4_dev_gemm(&format!("blk.{il}.attn_q.weight"), a, t, h, Self::G4_B1)?;
+            let k = self.g4_dev_gemm(&format!("blk.{il}.attn_k.weight"), a, t, h, Self::G4_B2)?;
+            let v = if l.k_eq_v {
+                k // v = k 원시(prep_g4 vn_on 계약 — 호스트 경로와 동일)
+            } else {
+                self.g4_dev_gemm(&format!("blk.{il}.attn_v.weight"), a, t, h, Self::G4_B3)?
+            };
+            // ② 어텐션(디바이스 — 행별 pos/테이블) → o_proj → post_attn 잔차.
+            let outv = self.attn_g4_dev(
+                slots, pos, il, q, k, v, dm.q_heads, l.kv_heads, d, sw, l.kq_scale, 2, 5, 6, 7,
+            )?;
+            let o = self.g4_dev_gemm(&format!("blk.{il}.attn_output.weight"), outv, t, qd, 8)?;
+            let hh = self.g4_scratch_slot(9, n * 4)?;
+            self.rms_rows_dev(nb + 1, o, hh, t, eps)?;
+            self.axpy_dev(1.0, hh, x, n)?;
+            // ③ dense MLP — pre_ff 노름 → gate/up → gelu → down → post_ff1.
+            self.rms_rows_dev(nb + 2, x, a, t, eps)?;
+            let g = self.g4_dev_gemm(&format!("blk.{il}.ffn_gate.weight"), a, t, h, Self::G4_B1)?;
+            let u = self.g4_dev_gemm(&format!("blk.{il}.ffn_up.weight"), a, t, h, Self::G4_B2)?;
+            let (_, _, _, n_ff) = self.lin_spec(&format!("blk.{il}.ffn_down.weight"))?;
+            let act = self.g4_dev_gelu(g, u, Self::G4_B3, t * n_ff)?;
+            let m = self.g4_dev_gemm(&format!("blk.{il}.ffn_down.weight"), act, t, n_ff, 8)?;
+            let h1 = self.g4_scratch_slot(9, n * 4)?; // hh 소비 후 재사용
+            self.rms_rows_dev(nb + 3, m, h1, t, eps)?;
+            // ④ MoE — 라우터(hn)·전문가(nm) 입력 분리 노름 → 디바이스 MoE.
+            let hn = self.g4_scratch_slot(Self::G4_HN, n * 4)?;
+            let nm = self.g4_scratch_slot(Self::G4_NM, n * 4)?;
+            self.rms_rows_dev(nb + 7, x, hn, t, eps)?;
+            self.rms_rows_dev(nb + 4, x, nm, t, eps)?;
+            let pes = self.g4_pes_dev(il);
+            if pes == 0 {
+                return Err(format!("g4_chunk_dev: L{il} pes 미등록(set_g4_pes 선행)"));
+            }
+            let moe = self.g4_moe_dev_t(il, hn, nm, pes, t, Self::G4_MOE)?;
+            let h2 = self.g4_scratch_slot(Self::G4_H2, n * 4)?;
+            self.rms_rows_dev(nb + 5, moe, h2, t, eps)?;
+            // ⑤ 병합(h1+h2) → post_ff 노름 → 잔차 → layer_scalar.
+            self.axpy_dev(1.0, h2, h1, n)?;
+            let hf = self.g4_scratch_slot(Self::G4_HF, n * 4)?;
+            self.rms_rows_dev(nb + 6, h1, hf, t, eps)?;
+            self.axpy_dev(1.0, hf, x, n)?;
+            let ls = *self
+                .g4_ls
+                .get(il)
+                .ok_or("g4_chunk_dev: layer_scalar 미등록(set_g4_layer_scalar)")?;
+            self.scale_dev(x, ls, n)?;
+        }
+        // ⑥ 최종 노름 + head(TR t행) — 프리필은 마지막 행만(호스트 경로 계약).
+        let hx = self.g4_scratch_slot(Self::G4_HEADX, n * 4)?;
+        let out_row = self.n_layers * nw_per_layer;
+        if head_last {
+            let xr = x + ((t - 1) * h * 4) as u64;
+            self.rms_rows_dev(out_row, xr, hx, 1, eps)?;
+            self.g4_head_dev_t(hx, 1, Self::G4_HEADOUT)?;
+        } else {
+            self.rms_rows_dev(out_row, x, hx, t, eps)?;
+            self.g4_head_dev_t(hx, t, Self::G4_HEADOUT)?;
+        }
+        Ok(())
+    }
+
+    /// x = x·s (제자리 — gemma4 layer_scalar, `w4a16_scale`).
+    fn scale_dev(&mut self, y: CUdeviceptr, s: f32, n: usize) -> Result<(), String> {
+        let f = self.cc.function("w4a16_scale")?;
+        let mut ss = s;
+        let mut p_y = y;
+        let mut nn = n as i32;
+        self.cc.launch(
+            f,
+            n.div_ceil(256) as u32,
+            1,
+            256,
+            &mut crate::rawcuda::args::l3(&mut p_y, &mut ss, &mut nn),
+        )
+    }
+
+    /// t행 MoE(≤8)·전량 디바이스 — `g4_moe_host_t`의 디바이스 i/o 판.
+    /// 입력(라우터 hn·전문가 nm)이 이미 디바이스에 있고(상주 청크 노름 출력),
+    /// 출력은 지정 슬롯에 남는다(h2d/d2h 0). 커널 시퀀스·상주 계약은
+    /// `g4_moe_host_t`와 동일(라우터 → topk_t → pes → glu전문가 → down → accum).
+    pub fn g4_moe_dev_t(
+        &mut self,
+        il: usize,
+        dhn: CUdeviceptr,
+        dxn: CUdeviceptr,
+        pes_dev: CUdeviceptr,
+        t: usize,
+        out_slot: usize,
+    ) -> Result<CUdeviceptr, String> {
+        let h = self.hidden;
+        let n_exp = self.moe.n_experts;
+        let tk = self.moe.top_k.max(1);
+        let n_ff = self.moe.moe_ffn;
+        if t == 0 || t > BATCH_DEC_MAX || dhn == 0 || dxn == 0 || pes_dev == 0 {
+            return Err(format!(
+                "g4_moe_dev: 계약 위반 t={t} dhn={dhn} dxn={dxn} pes={pes_dev}"
+            ));
+        }
+        if n_exp == 0 || !self.moe.moe_resident {
+            return Err("g4_moe_dev: 전문가 비상주(스트리밍) — t행 미지원(호출부 t=1 폴백)".into());
+        }
+        let _g = self.cc.guard()?;
+        self.ensure_moe_bufs()?;
+        // ① 라우터 → drt [t][n_exp].
+        let rn = format!("blk.{il}.moe_gate.weight");
+        if self.lins.contains_key(&rn) {
+            self.gemv_t_launch(&rn, dhn, self.moe.drt.ptr, t)?;
+        } else {
+            // 플레인 라우터 — t행 플레인 GEMV(행별 산술 = t=1 GEMV와 비트동일).
+            self.plain_gemv_t_launch(&rn, dhn, self.moe.drt.ptr, t)?;
+        }
+        // ② top-k(디바이스, t행) — softmax 전체 → top-k → 재정규화.
+        {
+            let f = self.cc.function("w4a16_moe_topk_t")?;
+            let (mut p_lg, mut p_ix, mut p_wt) =
+                (self.moe.drt.ptr, self.moe.moe_idx, self.moe.moe_wt);
+            let (mut p_t, mut p_n, mut p_k) = (t as i32, n_exp as i32, tk as i32);
+            self.cc.launch(
+                f,
+                t.div_ceil(8) as u32,
+                1,
+                256,
+                &mut crate::rawcuda::args::l6(
+                    &mut p_lg, &mut p_ix, &mut p_wt, &mut p_t, &mut p_n, &mut p_k,
+                ),
+            )?;
+        }
+        // ③ pes(μ_e) — 인플레이스(가중 [t][top_k] 전량).
+        {
+            let ns = t * tk;
+            let f = self.cc.function("w4a16_moe_pes_scale")?;
+            let (mut p_w, mut p_i, mut p_p) = (self.moe.moe_wt, self.moe.moe_idx, pes_dev);
+            let mut p_n = ns as i32;
+            self.cc.launch(
+                f,
+                (ns as u32).div_ceil(256).max(1),
+                1,
+                256,
+                &mut crate::rawcuda::args::l4(&mut p_w, &mut p_i, &mut p_p, &mut p_n),
+            )?;
+        }
+        // ④ 전문가 — 상주 GEMV 융합(gate+up+GLU) + down + 누적(sp=tk).
+        let ns = t * tk;
+        let base = il * n_exp * 3;
+        self.gemv_experts_glu_launch(base, ns, dxn, h, tk, self.moe.exp.act, n_ff, h)?;
+        self.gemv_experts_launch(
+            base + 2,
+            ns,
+            self.moe.exp.act,
+            n_ff,
+            1,
+            self.moe.exp.dn,
+            h,
+            n_ff,
+        )?;
+        let out = self.g4_scratch_slot(out_slot, t * h * 4)?;
+        self.moe_accum_dev(self.moe.moe_wt, self.moe.exp.dn, out, tk, ns, h)?;
+        Ok(out)
+    }
+
+    /// t행 head(TR int8) → 슬롯 — 입력 디바이스(xn [t][hidden]), d2h는 호출부.
+    pub fn g4_head_dev_t(
+        &mut self,
+        x_dev: CUdeviceptr,
+        t: usize,
+        out_slot: usize,
+    ) -> Result<CUdeviceptr, String> {
+        if self.head_w == 0 {
+            return Err("g4_head_dev: head 미등록".into());
+        }
+        if t == 0 || t > BATCH_DEC_MAX || x_dev == 0 {
+            return Err(format!("g4_head_dev: t={t} x={x_dev}"));
+        }
+        let y = self.g4_scratch_slot(out_slot, t * self.head_n * 4)?;
+        self.head_gemv_t_launch(x_dev, y, t)?;
+        Ok(y)
+    }
+
+    /// [gemma4 P3 v2 2026-10-14] 청크 진입 — 디바이스 상주 경로(프롤로그 →
+    /// 본문 → head d2h). 반환 = 행별 로짓(raw — softcap은 호출부 계약).
+    /// 프롤로그: 스트림·핀드 출력 확보, 슬롯 선할당, x 업로드, 어텐션 테이블.
+    /// 본문: 전부 같은 스트림 발사(중간 d2h 0) — **그래프 캡처 대상**.
+    /// 그래프 히트면 본문+head d2h가 리플레이 1런치로 붕괴한다(캡처 키 =
+    /// t·슬롯집합·head_last — pos는 테이블(프롤로그)로 매 청크 갱신).
+    pub fn g4_chunk_dev(
+        &mut self,
+        slots: &[usize],
+        pos: &[u32],
+        rows: &[f32],
+        t: usize,
+        head_last: bool,
+        nw_per_layer: usize,
+        eps: f32,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let h = self.hidden;
+        if t == 0 || t > BATCH_DEC_MAX || slots.len() != t || pos.len() != t || rows.len() != t * h
+        {
+            return Err(format!(
+                "g4_chunk_dev: t={t} rows={} slots={} pos={} (1..=8 · t*h 계약)",
+                rows.len(),
+                slots.len(),
+                pos.len()
+            ));
+        }
+        if self.head_w == 0 {
+            return Err("g4_chunk_dev: head 미등록(upload_head 선행)".into());
+        }
+        let _g = self.cc.guard()?;
+        // ① 프롤로그 — 그래프 밖(할당·복사·캐시 준비).
+        if self.cc.stream.is_null() {
+            self.cc.create_stream()?; // 그래프 캡처는 기본 스트림 불가
+        }
+        self.g4_warm_slots(BATCH_DEC_MAX)?;
+        self.ensure_moe_bufs()?;
+        self.g4_atab_prepare(slots, pos)?;
+        let x = self.g4_scratch_slot(Self::G4_X, t * h * 4)?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let xb = unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, rows.len() * 4) };
+        self.cc.h2d_async(x, xb)?;
+        self.g4_ensure_pin_out(BATCH_DEC_MAX * self.head_n * 4)?;
+        // ② 본문(디바이스 — 캡처/리플레이 또는 직접 발사).
+        if self.g4_graph_ok() {
+            if let Err(e) = self.g4_graph_run(slots, pos, t, head_last, nw_per_layer, eps) {
+                eprintln!("[g4-graph] 실패 — 직접 경로 폴백: {e}");
+                self.graph.g4_capture_failed = true;
+                let _ = self.cc.sync();
+                self.g4_run_direct(slots, pos, t, head_last, nw_per_layer, eps)?;
+            }
+        } else {
+            self.g4_run_direct(slots, pos, t, head_last, nw_per_layer, eps)?;
+        }
+        self.cc.sync()?;
+        // SAFETY: pin_g4_out는 g4_ensure_pin_out의 할당 계약(≥ nrow*head_n*4).
+        let nrow = if head_last { 1 } else { t };
+        let flat = unsafe {
+            std::slice::from_raw_parts(self.graph.pin_g4_out as *const f32, nrow * self.head_n)
+        };
+        Ok(flat
+            .chunks(self.head_n)
+            .map(|r| r.to_vec())
+            .collect::<Vec<_>>())
+    }
+
+    /// 그래프 모드 가능 여부 — LLM170_GRAPH(기본 ON)·debug_layers 아님·
+    /// 상주 MoE(비상주는 g4_moe_dev_t가 거부)·캡처 실패 후 고정.
+    fn g4_graph_ok(&self) -> bool {
+        llm170_diag::flag::ne0("LLM170_GRAPH")
+            && !self.debug_layers
+            && !self.graph.g4_capture_failed
+            && self.moe.n_experts > 0
+            && self.moe.moe_resident
+    }
+
+    /// 본문 + head d2h(핀드) — 직접 발사 몫(캡처 히트/미스 공용 조각).
+    fn g4_run_direct(
+        &mut self,
+        slots: &[usize],
+        pos: &[u32],
+        t: usize,
+        head_last: bool,
+        nw_per_layer: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        self.g4_chunk_body(slots, pos, t, head_last, nw_per_layer, eps)?;
+        self.g4_out_d2h(t, head_last)
+    }
+
+    /// head 로짓 d2h(핀드 목적지 — 캡처 노드로 기록 가능).
+    fn g4_out_d2h(&mut self, t: usize, head_last: bool) -> Result<(), String> {
+        let nrow = if head_last { 1 } else { t };
+        let hd = self.g4_scratch_slot(Self::G4_HEADOUT, t * self.head_n * 4)?;
+        self.cc
+            .d2h_async(self.graph.pin_g4_out as *mut u8, hd, nrow * self.head_n * 4)
+    }
+
+    /// 그래프 히트면 리플레이(1런치), 미스면 직접 실행 + 캡처 등록(미실행).
+    fn g4_graph_run(
+        &mut self,
+        slots: &[usize],
+        pos: &[u32],
+        t: usize,
+        head_last: bool,
+        nw_per_layer: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        if let Some(k) = self
+            .graph
+            .g4_graphs
+            .iter()
+            .position(|e| e.t == t && e.head_last == head_last && e.slots == slots)
+        {
+            let exec = self.graph.g4_graphs[k].exec;
+            return self.cc.graph_launch(exec);
+        }
+        // 미스 — 직접 실행이 정답(KV·pos 소비) → 캡처(실행 아님) 등록.
+        self.g4_run_direct(slots, pos, t, head_last, nw_per_layer, eps)?;
+        self.cc.sync()?; // 캡처 전 파이프라인 정리(캡처는 유휴 스트림에서).
+        if !self.graph.g4_capture_failed {
+            match self.g4_capture(slots, pos, t, head_last, nw_per_layer, eps) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("# g4 그래프 캡처 실패 — 직접 발사 유지: {e}");
+                    self.graph.g4_capture_failed = true;
+                    let _ = self.cc.capture_end(); // 캡처 상태 정리(멱등 아님 — 실패 시에만)
+                    let _ = self.cc.sync();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 청크 본문 캡처 — 슬롯집합·t·head_last 키. 캡처는 **실행하지 않는다**
+    /// (상태 불변 — KV/pos/출력은 직전 직접 실행분이 이미 반영).
+    fn g4_capture(
+        &mut self,
+        slots: &[usize],
+        pos: &[u32],
+        t: usize,
+        head_last: bool,
+        nw_per_layer: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        let tt = std::time::Instant::now();
+        if self.graph.g4_graphs.len() >= 32 {
+            let old = self.graph.g4_graphs.remove(0);
+            let _ = self.cc.graph_destroy(old.exec, old.handle);
+        }
+        self.cc.capture_begin()?;
+        let r = self
+            .g4_chunk_body(slots, pos, t, head_last, nw_per_layer, eps)
+            .and_then(|_| self.g4_out_d2h(t, head_last));
+        if let Err(e) = r {
+            let _ = self.cc.capture_end();
+            return Err(e);
+        }
+        let g = self.cc.capture_end()?;
+        let e = match self.cc.graph_instantiate(g) {
+            Ok(e) => e,
+            Err(err) => {
+                // 핸들 유실 방지(캡처 1회·실패 시 재시도 없음 — 고정 플래그).
+                let _ = self.cc.graph_destroy(std::ptr::null_mut(), g);
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.cc.graph_upload(e) {
+            let _ = self.cc.graph_destroy(e, g);
+            return Err(err);
+        }
+        self.graph.g4_graphs.push(G4GraphEntry {
+            t,
+            slots: slots.to_vec(),
+            head_last,
+            exec: e,
+            handle: g,
+        });
+        eprintln!(
+            "[g4-graph] captured t={t} slots={slots:?} head_last={head_last} ({:.2}ms)",
+            tt.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(())
+    }
+
+    /// 청크 head 판독 핀드 버퍼 확보 — 부족 시 재할당(캡처 그래프 전량 폐기).
+    fn g4_ensure_pin_out(&mut self, bytes: usize) -> Result<(), String> {
+        if !self.graph.pin_g4_out.is_null() && self.graph.pin_g4_out_len >= bytes {
+            return Ok(());
+        }
+        self.graph_invalidate();
+        if !self.graph.pin_g4_out.is_null() {
+            let _ = self.cc.pinned_free(self.graph.pin_g4_out);
+        }
+        self.graph.pin_g4_out = self.cc.pinned_alloc(bytes)?;
+        self.graph.pin_g4_out_len = bytes;
+        Ok(())
     }
 
     /// 최종 노름 hidden → GPU head 로짓(호스트 회수). `upload_head` 선행 계약

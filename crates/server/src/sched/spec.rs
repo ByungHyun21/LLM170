@@ -284,6 +284,10 @@ fn spec_round_impl(
 }
 
 pub(super) fn slot_emit(s: &mut Slot, t: u32) {
+    // [관측 2026-10-14] 첫 emit 시각 — TTFT 원료(큐 진입은 job.queued).
+    if s.t_first.is_none() {
+        s.t_first = Some(std::time::Instant::now());
+    }
     s.next = t;
     s.tokens.push(t);
     s.generated += 1;

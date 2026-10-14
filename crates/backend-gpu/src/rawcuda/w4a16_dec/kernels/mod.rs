@@ -190,6 +190,48 @@ impl W4a16Dec {
         )
     }
 
+    /// [gemma4 P3 2026-10-14] 잔차 없는 순수 행별 RMS — `rms_rows` 커널
+    /// (호스트 `ops::rms_norm` **비트 미러**: 32세그먼트 f32 순차 누산 →
+    /// f64 결합 → 정밀 sqrt). gemma4 디바이스 상주 청크의 노름 대체 —
+    /// `norm_resid*`(잔차 융합·1024트리)와는 다른 산술이라 호스트 경로
+    /// 교체에 쓸 수 없다. x·y 비중첩(제자리 불가 — 부모 행을 읽는다).
+    pub(in crate::rawcuda::w4a16_dec) fn rms_rows_dev(
+        &mut self,
+        w: usize,
+        x_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        t_len: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        if self.dnw == 0 {
+            return Err("rms_rows: 노름 가중 미등록".into());
+        }
+        if w >= self.norm_w_rows {
+            return Err(format!("rms_rows: w={w} >= rows={}", self.norm_w_rows));
+        }
+        if t_len == 0 || x_dev == 0 || y_dev == 0 {
+            return Err("rms_rows: t=0/포인터 0 계약 위반".into());
+        }
+        let f = self.cc.function("rms_rows")?;
+        // 동적 smem = [hidden]x + [32]세그먼트 + [1]스케일 (2816 = 11.4KB).
+        let smem = ((self.hidden + 33) * 4) as u32;
+        let mut tl = t_len as i32;
+        let mut wo = (w * self.hidden) as i32;
+        let mut hd = self.hidden as i32;
+        let mut ep = eps;
+        let (mut a0, mut a1, mut a2) = (x_dev, self.dnw, y_dev);
+        self.cc.launch_shared(
+            f,
+            t_len as u32,
+            1,
+            256,
+            smem,
+            &mut crate::rawcuda::args::l7(
+                &mut a0, &mut a1, &mut a2, &mut tl, &mut wo, &mut hd, &mut ep,
+            ),
+        )
+    }
+
     /// 노름 1회(디바이스 x·ab) — xn은 self.norm.dxn(다음 노름이 덮는다).
     pub(in crate::rawcuda::w4a16_dec) fn norm_resid_dev(
         &mut self,
