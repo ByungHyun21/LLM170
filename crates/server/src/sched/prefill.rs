@@ -1,6 +1,6 @@
 //! sched.rs에서 분해(순수 이동 — 코드 무변).
+use super::decode::pick;
 use super::econ::econ_mtp_maintain;
-use super::pick;
 use super::spec::slot_emit;
 use super::{
     Engine, InferResult, PF_BUDGET_TOKENS, PF_CHUNK_MAX, PF_CHUNK_MIN, PF_CHUNK_MIXED,
