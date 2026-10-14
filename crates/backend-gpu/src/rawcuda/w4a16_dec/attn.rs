@@ -384,10 +384,13 @@ impl W4a16Dec {
     /// [gemma4 P2 2026-10-14] g4 어텐션 통합 런처(`--attn-g4-check` 검증 완료 ·
     /// 체인 v0 경로): prep_g4 → f3s part_g4 → merge_g4 → outv. `layer` = 층
     /// 인덱스(rope 파라미터 = `set_g4_rope` 테이블 · KV = 블록 테이블의 그 층).
-    /// KV 아레나·블록 테이블은 `set_attn`(+`kv_grow`)이 준비돼 있어야 한다(slot 0).
+    /// KV 아레나·블록 테이블은 `set_attn`(+`kv_grow`)이 준비돼 있어야 한다.
+    /// `slot` = 블록 테이블 슬롯 오프셋(다중 슬롯 서빙 정합 — 종전 슬롯 0 고정
+    /// 결함 수정).
     #[allow(clippy::too_many_arguments)]
     pub fn attn_g4_host(
         &mut self,
+        slot: usize,
         q: &[f32],
         kin: &[f32],
         vin: &[f32],
@@ -429,6 +432,9 @@ impl W4a16Dec {
         let dpart = self.cc.alloc(npart * (d + 2) * 4)?;
         let dout = self.cc.alloc(t_len * q_heads * d * 4)?;
         let drp = self.attn.g4_rp;
+        // [P3 2026-10-14] 슬롯별 블록 테이블 기저 — 테이블 = [slot][layer][mb]×4(u64).
+        let mb = dm.cap.div_ceil(512);
+        let dblk = self.attn.dblk_tab + (slot * dm.n_attn * mb * 4 * 8) as u64;
         let dpp = self.cc.alloc(4)?;
         let rr = (|| -> Result<Vec<f32>, String> {
             self.cc.h2d(dq, &f32b(q))?;
@@ -441,7 +447,7 @@ impl W4a16Dec {
             {
                 let f = self.cc.function("attn_prep_g4")?;
                 let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) =
-                    (dq, dk, dv, dqnw, dknw, dqh, self.attn.dblk_tab, dpp, drp);
+                    (dq, dk, dv, dqnw, dknw, dqh, dblk, dpp, drp);
                 let (mut tl, mut lay, mut qh, mut kvh, mut cp) = (
                     t_len as i32,
                     layer as i32,
@@ -463,7 +469,7 @@ impl W4a16Dec {
             // ② f3s part_g4 — grid (t, q_heads×splits), 블록 d
             {
                 let f = self.cc.function("attn_fwd3s_part_g4")?;
-                let (mut a0, mut a1, mut a2, mut a3) = (dqh, self.attn.dblk_tab, dpart, dpp);
+                let (mut a0, mut a1, mut a2, mut a3) = (dqh, dblk, dpart, dpp);
                 let (mut tl, mut lay, mut qh, mut kvh, mut cp) = (
                     t_len as i32,
                     layer as i32,

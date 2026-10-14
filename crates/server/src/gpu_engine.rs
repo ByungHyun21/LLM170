@@ -1328,6 +1328,7 @@ pub(crate) fn g4_step(
     dec: &mut llm170_backend_gpu::W4a16Dec,
     model: &llm170_core::gemma4::Model,
     cfg: &crate::gpu_engine::G4HostCfg,
+    slot: usize,
     tok: u32,
     pos: u32,
 ) -> Result<Vec<f32>, String> {
@@ -1363,6 +1364,7 @@ pub(crate) fn g4_step(
         let (qnw, knw) = cfg.qk_rows(il, d);
         let sw = if hp.full[il] { 0 } else { hp.sw };
         let attn_out = dec.attn_g4_host(
+            slot,
             &q,
             &k,
             &v,
@@ -1491,7 +1493,7 @@ impl GemmaEngine {
     fn step(&mut self, seq: usize, tok: u32) -> Result<Vec<f32>, String> {
         let pos = self.dec.slot_pos[seq];
         self.dec.kv_grow(seq, pos as usize + 1)?;
-        let lg = g4_step(&mut self.dec, &self.model, &self.cfg, tok, pos)?;
+        let lg = g4_step(&mut self.dec, &self.model, &self.cfg, seq, tok, pos)?;
         self.dec.slot_pos[seq] = pos + 1;
         Ok(lg)
     }

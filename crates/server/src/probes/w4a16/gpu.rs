@@ -385,8 +385,8 @@ fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, S
         let kq_scale = 1.0f32;
         let got = dec
             .attn_g4_host(
-                &q, &kin, &vin, &qnw, &knw, 0, t_len, q_heads, kv_heads, d, sw, kq_scale, splits,
-                pos0,
+                0, &q, &kin, &vin, &qnw, &knw, 0, t_len, q_heads, kv_heads, d, sw, kq_scale,
+                splits, pos0,
             )
             .map_err(|e| format!("attn_g4({name}): {e}"))?;
         // ── CPU 미러 ──
@@ -506,11 +506,12 @@ fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, S
         let v2 = &vin[..2 * kv_heads * d];
         let batch2 = dec
             .attn_g4_host(
-                q2, k2, v2, &qnw, &knw, 0, 2, q_heads, kv_heads, d, sw, kq_scale, splits, pos0,
+                0, q2, k2, v2, &qnw, &knw, 0, 2, q_heads, kv_heads, d, sw, kq_scale, splits, pos0,
             )
             .map_err(|e| format!("attn_g4(분할·배치2 {name}): {e}"))?;
         let s1 = dec
             .attn_g4_host(
+                0,
                 &q2[..q_heads * d],
                 &k2[..kv_heads * d],
                 &v2[..kv_heads * d],
@@ -529,6 +530,7 @@ fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, S
             .map_err(|e| format!("attn_g4(분할1 {name}): {e}"))?;
         let s2 = dec
             .attn_g4_host(
+                0,
                 &q2[q_heads * d..],
                 &k2[kv_heads * d..],
                 &v2[kv_heads * d..],
@@ -1701,7 +1703,7 @@ fn g4_gpu_chain(
     let mut lg = Vec::new();
     for &tok in prompt {
         dec.kv_grow(0, pos as usize + 1)?;
-        lg = g4_step(dec, model, cfg, tok, pos)?;
+        lg = g4_step(dec, model, cfg, 0, tok, pos)?;
         pos += 1;
     }
     let mut step_logits: Vec<Vec<f32>> = vec![lg.clone()];
@@ -1710,7 +1712,7 @@ fn g4_gpu_chain(
         let next = llm170_core::gemma4::greedy(&lg);
         out.push(next);
         dec.kv_grow(0, pos as usize + 1)?;
-        lg = g4_step(dec, model, cfg, next, pos)?;
+        lg = g4_step(dec, model, cfg, 0, next, pos)?;
         pos += 1;
         step_logits.push(lg.clone());
     }
