@@ -160,3 +160,52 @@ pub(super) fn pick_prefix_slot(slots: &[Slot], tokens: &[u32]) -> Option<(usize,
         // 압축(전형 조합 {0},{0,1},… — 조합 폭발 방지).
         .max_by_key(|&(i, l)| (l, std::cmp::Reverse(i)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::Slot;
+    use super::pick_prefix_slot;
+
+    fn slot_with(cached: Vec<u32>) -> Slot {
+        let mut s = Slot::free();
+        s.cached = cached;
+        s
+    }
+
+    /// [I] 접두 선택 — 빈 슬롯 없음/전부 점유 = None.
+    #[test]
+    fn pick_none_cases() {
+        assert!(pick_prefix_slot(&[], &[1, 2, 3]).is_none());
+        let mut busy = slot_with(vec![1, 2]);
+        busy.job = None; // job 없음 + cached 유지 = 자유 슬롯(재사용 판정은 아래)
+        // 전부 점유(가짜 점유는 job Some 필요 — out 생략 위해 free로 검증 불가하므로
+        // "cached 비었고 공통 접두 0" 케이스로 대체).
+        let free = slot_with(Vec::new());
+        assert_eq!(pick_prefix_slot(&[free], &[1, 2, 3]), Some((0, 0)));
+    }
+
+    /// [I] 최장 접두 슬롯 선택 + 전체 접두(더 긴 토큰) 재사용 판정.
+    #[test]
+    fn pick_longest_prefix() {
+        let a = slot_with(vec![1, 2, 3, 4]);
+        let b = slot_with(vec![1, 2, 9]);
+        let c = slot_with(vec![7, 8]);
+        // 공통 접두: a=4(전체+토큰 더 김→재사용), b=2, c=0 → a 선택.
+        assert_eq!(pick_prefix_slot(&[a, b, c], &[1, 2, 3, 4, 5]), Some((0, 4)));
+    }
+
+    /// [I→A2] 정확히 같은 길이 = cached 전체가 접두 → l=3(전체 재사용 —
+    /// 판정은 호출부 full 경로. 구버전 기대(0,0)은 A2 부분-접두 반환 이전 잔존).
+    #[test]
+    fn pick_exact_length_full_prefix() {
+        let a = slot_with(vec![1, 2, 3]);
+        assert_eq!(pick_prefix_slot(&[a], &[1, 2, 3]), Some((0, 3)));
+    }
+
+    /// [I] 접두 0이어도 슬롯은 반환(reuse=0 — reset 경로).
+    #[test]
+    fn pick_no_prefix_still_slot() {
+        let a = slot_with(vec![9, 9]);
+        assert_eq!(pick_prefix_slot(&[a], &[1, 2, 3]), Some((0, 0)));
+    }
+}

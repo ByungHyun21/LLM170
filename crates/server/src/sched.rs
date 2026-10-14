@@ -585,51 +585,6 @@ fn admit_ok(eng: &Engine, j: &SlotJob) -> bool {
 #[cfg(test)]
 mod tests {
     use super::Slot;
-    use super::assign::pick_prefix_slot;
-    use super::econ::{econ_pick_k, econ_pick_src, econ_should_spec};
-
-    fn slot_with(cached: Vec<u32>) -> Slot {
-        let mut s = Slot::free();
-        s.cached = cached;
-        s
-    }
-
-    /// [I] 접두 선택 — 빈 슬롯 없음/전부 점유 = None.
-    #[test]
-    fn pick_none_cases() {
-        assert!(pick_prefix_slot(&[], &[1, 2, 3]).is_none());
-        let mut busy = slot_with(vec![1, 2]);
-        busy.job = None; // job 없음 + cached 유지 = 자유 슬롯(재사용 판정은 아래)
-        // 전부 점유(가짜 점유는 job Some 필요 — out 생략 위해 free로 검증 불가하므로
-        // "cached 비었고 공통 접두 0" 케이스로 대체).
-        let free = slot_with(Vec::new());
-        assert_eq!(pick_prefix_slot(&[free], &[1, 2, 3]), Some((0, 0)));
-    }
-
-    /// [I] 최장 접두 슬롯 선택 + 전체 접두(더 긴 토큰) 재사용 판정.
-    #[test]
-    fn pick_longest_prefix() {
-        let a = slot_with(vec![1, 2, 3, 4]);
-        let b = slot_with(vec![1, 2, 9]);
-        let c = slot_with(vec![7, 8]);
-        // 공통 접두: a=4(전체+토큰 더 김→재사용), b=2, c=0 → a 선택.
-        assert_eq!(pick_prefix_slot(&[a, b, c], &[1, 2, 3, 4, 5]), Some((0, 4)));
-    }
-
-    /// [I→A2] 정확히 같은 길이 = cached 전체가 접두 → l=3(전체 재사용 —
-    /// 판정은 호출부 full 경로. 구버전 기대(0,0)은 A2 부분-접두 반환 이전 잔존).
-    #[test]
-    fn pick_exact_length_full_prefix() {
-        let a = slot_with(vec![1, 2, 3]);
-        assert_eq!(pick_prefix_slot(&[a], &[1, 2, 3]), Some((0, 3)));
-    }
-
-    /// [I] 접두 0이어도 슬롯은 반환(reuse=0 — reset 경로).
-    #[test]
-    fn pick_no_prefix_still_slot() {
-        let a = slot_with(vec![9, 9]);
-        assert_eq!(pick_prefix_slot(&[a], &[1, 2, 3]), Some((0, 0)));
-    }
 
     /// [R14] 스펙 적응 게이트 경계 — 무수용 후 256토큰 재시도 조건.
     #[test]
@@ -644,49 +599,6 @@ mod tests {
         assert_eq!(s.generated & 255, 0, "256 배수에서 재시도 허용");
         s.generated = 257;
         assert_ne!(s.generated & 255, 0, "256 배수 외 재시도 차단");
-    }
-
-    /// [2.A-④ 2026-10-13] 경제성 게이트 판정 — 소스 선택·히스테리시스·k밴드.
-    #[test]
-    fn econ_gate_decisions() {
-        // 소스: 둘 다 측정 → 낮은 비용. MTP 미가용 → ngram 고정.
-        assert_eq!(econ_pick_src(Some(24.0), Some(17.0), true), 1);
-        assert_eq!(econ_pick_src(Some(17.0), Some(24.0), true), 0);
-        assert_eq!(econ_pick_src(Some(1.0), Some(1.0), false), 1);
-        // 미측정 — MTP 가용이면 MTP로 측정 개시, 아니면 ngram.
-        assert_eq!(econ_pick_src(None, None, true), 0);
-        assert_eq!(econ_pick_src(None, None, false), 1);
-        // 스펙/평범 히스테리시스 — ON 유지(r≤1.02), OFF→ON은 r<0.98 필요.
-        assert!(econ_should_spec(Some(10.0), Some(10.0), true), "동률 유지");
-        assert!(
-            !econ_should_spec(Some(10.3), Some(10.0), true),
-            "ON에서 +3%면 OFF"
-        );
-        assert!(
-            !econ_should_spec(Some(10.0), Some(10.0), false),
-            "OFF에서 동률이면 OFF 유지(밴드)"
-        );
-        assert!(
-            econ_should_spec(Some(9.7), Some(10.0), false),
-            "OFF에서 −3%면 ON"
-        );
-        assert!(
-            econ_should_spec(None, Some(10.0), false),
-            "미측정은 ON(탐색)"
-        );
-        // k밴드: 미측정 탐색(4→6→2→8) → 최소 EMA(3% 여유).
-        assert_eq!(econ_pick_k(1, [None, None, None, None]), 1);
-        assert_eq!(econ_pick_k(1, [None, Some(1.0), None, None]), 2);
-        assert_eq!(
-            econ_pick_k(1, [Some(9.0), Some(10.0), Some(11.0), Some(12.0)]),
-            0,
-            "9.0 < 10.0×0.97 — 전환"
-        );
-        assert_eq!(
-            econ_pick_k(1, [Some(9.8), Some(10.0), Some(10.1), Some(10.2)]),
-            1,
-            "9.8 > 10.0×0.97 — 유지(히스테리시스)"
-        );
     }
 
     /// [R14] 접두 트리 경계 — 512 미만 미스·512 이상 히트·제거 후 미스.

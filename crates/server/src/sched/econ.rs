@@ -188,3 +188,51 @@ pub(super) fn econ_plan(mtp_avail: bool) -> Option<(u8, usize)> {
     };
     Some((src, k))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{econ_pick_k, econ_pick_src, econ_should_spec};
+
+    /// [2.A-④ 2026-10-13] 경제성 게이트 판정 — 소스 선택·히스테리시스·k밴드.
+    #[test]
+    fn econ_gate_decisions() {
+        // 소스: 둘 다 측정 → 낮은 비용. MTP 미가용 → ngram 고정.
+        assert_eq!(econ_pick_src(Some(24.0), Some(17.0), true), 1);
+        assert_eq!(econ_pick_src(Some(17.0), Some(24.0), true), 0);
+        assert_eq!(econ_pick_src(Some(1.0), Some(1.0), false), 1);
+        // 미측정 — MTP 가용이면 MTP로 측정 개시, 아니면 ngram.
+        assert_eq!(econ_pick_src(None, None, true), 0);
+        assert_eq!(econ_pick_src(None, None, false), 1);
+        // 스펙/평범 히스테리시스 — ON 유지(r≤1.02), OFF→ON은 r<0.98 필요.
+        assert!(econ_should_spec(Some(10.0), Some(10.0), true), "동률 유지");
+        assert!(
+            !econ_should_spec(Some(10.3), Some(10.0), true),
+            "ON에서 +3%면 OFF"
+        );
+        assert!(
+            !econ_should_spec(Some(10.0), Some(10.0), false),
+            "OFF에서 동률이면 OFF 유지(밴드)"
+        );
+        assert!(
+            econ_should_spec(Some(9.7), Some(10.0), false),
+            "OFF에서 −3%면 ON"
+        );
+        assert!(
+            econ_should_spec(None, Some(10.0), false),
+            "미측정은 ON(탐색)"
+        );
+        // k밴드: 미측정 탐색(4→6→2→8) → 최소 EMA(3% 여유).
+        assert_eq!(econ_pick_k(1, [None, None, None, None]), 1);
+        assert_eq!(econ_pick_k(1, [None, Some(1.0), None, None]), 2);
+        assert_eq!(
+            econ_pick_k(1, [Some(9.0), Some(10.0), Some(11.0), Some(12.0)]),
+            0,
+            "9.0 < 10.0×0.97 — 전환"
+        );
+        assert_eq!(
+            econ_pick_k(1, [Some(9.8), Some(10.0), Some(10.1), Some(10.2)]),
+            1,
+            "9.8 > 10.0×0.97 — 유지(히스테리시스)"
+        );
+    }
+}
