@@ -134,6 +134,27 @@ except Exception:
   esac
 done
 
+# ── 3b. 그래프 replay KV 블록(512) 경계 교차 — 디코드 중 성장 경로 ──
+# [2026-10-14] 그래프 경로가 kv_ensure(온디맨드 성장)를 우회해 경계 교차 시
+# 미할당 테이블 엔트리를 판독(illegal access — np2 tg768 실측)하던 결함의 가드.
+# 프리필이 블록을 선확보하는 장문 배터리·스모크 경로에서는 잠복했던 클래스.
+note "[3b] 그래프 경로 KV 경계 교차 — 단문→600토큰(단일 그래프+배치 그래프)"
+timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 600 --ctx 1024 \
+  > "$RUN/c3.out" 2> "$RUN/c3.log"
+C3=$(grep -m1 '^ tokens:' "$RUN/c3.out" | sed 's/^ tokens: //')
+case "$C3" in
+  "$GOLDEN"*) note "단일 그래프 교차 OK ($(echo "$C3" | awk -F, '{print NF}')토큰)";;
+  "") echo "[w4a16] FAIL: 단일 그래프 교차 실패(크래시?) — ${RUN}/c3.log"; fail=1;;
+  *) echo "[w4a16] FAIL: 단일 그래프 교차 골든 불일치: $(echo "$C3" | head -c 60)"; fail=1;;
+esac
+timeout 900 "$BIN" bench --model "$M_27B" --np 2 --tg 600 --reps 1 --ctx 2048 \
+  > "$RUN/c3b.out" 2> "$RUN/c3b.log"
+if grep -q "^np2(tg600)" "$RUN/c3b.out"; then
+  note "배치 그래프 교차 OK ($(grep -m1 '^np2' "$RUN/c3b.out" | cut -d'|' -f3 | sed 's/^ *//'))"
+else
+  echo "[w4a16] FAIL: 배치 그래프 교차 실패(크래시?) — ${RUN}/c3b.log"; fail=1
+fi
+
 # ── 4. D(35B INT4 g32) 참조 오라클(W4-1 MoE) ──
 note "[4/10] D(35B INT4 g32) 참조 실행 — w4a16-ref (MoE g32/bf16)"
 timeout 2400 "$BIN" w4a16-ref "$M_35B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
@@ -353,7 +374,7 @@ sys.exit(0 if ok else 1)
 done
 
 if [ $fail -eq 0 ]; then
-  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve·장문·spec / 35B MoE 참조+GPU·장문·spec·스트리밍(D4) / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
+  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU·serve·장문·spec·경계 교차 / 35B MoE 참조+GPU·장문·spec·스트리밍(D4) / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
 else
   echo "[w4a16] smoke: FAILURES PRESENT"
 fi

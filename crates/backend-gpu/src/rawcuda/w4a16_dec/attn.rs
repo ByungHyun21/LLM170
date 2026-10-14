@@ -381,6 +381,12 @@ impl W4a16Dec {
             )?;
         }
         // fwd3s part + merge — 토큰별.
+        // [2026-10-14 실측 기각 — 배치 패킹] 단일 디코드 경로의 part_qg(GQA 패킹)
+        // 를 배치에도 적용해 A/B했다: 27B np2/4/8 tg1024 = 83.0/119.6/127.3 vs
+        // part_q 84.9/122.9/130.7(−2.1/−2.4/−2.6%)·np4 tg4096 −1.4%(C2 재측정으로
+        // 순서 효과 배제). 배치 디코드(런치당 t=1)는 점유/지연 바운드라 그리드
+        // 축소(q_heads×S 1536블록 → kv_heads×S 256블록)가 KV 바이트 절감(6×)을
+        // 상회 — 배치는 part_q 유지(단일 경로는 part_qg 유지 — 2026-10-13 채택).
         let fp = self.cc.function("attn_fwd3s_part_q")?;
         let fm = self.cc.function("attn_fwd3s_merge")?;
         // [4.1] 배치 merge 융합 기록 — dx32/dx16 = t_len×q_heads×256 보장.
