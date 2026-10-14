@@ -874,36 +874,6 @@ impl W4a16Dec {
         self.emb_dev != 0 && self.emb_k == self.hidden
     }
 
-    /// [S3-1] 프리필(t≥2) — 토큰 id 배열 직접 진입. id h2d → gather(dres) →
-    /// 체인. 값은 forward_prefill(행 경로)와 동일(골든 계약).
-    pub fn forward_prefill_toks(
-        &mut self,
-        slot: usize,
-        toks: &[u32],
-        t: usize,
-        head: bool,
-    ) -> Result<Vec<f32>, String> {
-        let _g = self.cc.guard()?;
-        if !self.embed_ready() {
-            return Err("forward_prefill_toks: 임베딩 미등록".into());
-        }
-        if !(2..=CHAIN_TMAX).contains(&t) || toks.len() != t || slot >= self.n_slots {
-            return Err(format!(
-                "forward_prefill_toks: t={t} toks={} 계약 위반",
-                toks.len()
-            ));
-        }
-        if let Some(&bad) = toks.iter().find(|&&x| x as usize >= self.emb_n) {
-            return Err(format!("forward_prefill_toks: 토큰 범위 위반 {bad}"));
-        }
-        self.ensure_chain_bufs()?;
-        // SAFETY: toks 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
-        let tb = unsafe { std::slice::from_raw_parts(toks.as_ptr() as *const u8, t * 4) };
-        self.cc.h2d_async(self.dtg, tb)?;
-        self.embed_gather_launch(self.dtg, self.dres, t)?;
-        self.chain_t_sel(slot, None, t, head, false, false)
-    }
-
     /// [S3-1] 임베딩 gather 런치 — toks[t] → out[t][k] f32.
     /// [MTP-CHAIN 2026-10-12 §3.3 ②] pub(super)로 넓힘 — 장치 체인 그래프가
     /// 토큰 레지스터(dbatch_am)에서 같은 커널로 임베딩 행을 조립한다.
