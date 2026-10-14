@@ -247,6 +247,85 @@ impl W4a16Dec {
         )
     }
 
+    /// [gemma4 P2 2026-10-14] attn_prep_g4 Q 경로 직접 런처 — 검증 전용
+    /// (`--prep-g4-check`). K/V 경로는 블록 테이블이 필요해 호출하지 않는다
+    /// (grid.y = q_heads만). CPU 미러와 허용오차 대조용.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prep_g4_q_host(
+        &mut self,
+        q: &[f32],
+        qnw: &[f32],
+        t_len: usize,
+        q_heads: usize,
+        d: usize,
+        pairs: usize,
+        span: usize,
+        denom: usize,
+        base: f32,
+        pos0: u32,
+    ) -> Result<Vec<f32>, String> {
+        if q.len() != t_len * q_heads * d || qnw.len() != d {
+            return Err(format!(
+                "prep_g4: q={} qnw={} 계약 위반",
+                q.len(),
+                qnw.len()
+            ));
+        }
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let dq = self.cc.alloc(q.len() * 4)?;
+        let dqnw = self.cc.alloc(qnw.len() * 4)?;
+        let dqh = self.cc.alloc(q.len() * 4)?;
+        // rp[층*7 + {d, pairs, span, denom, base, vn_on, k_eq_v}]
+        let rp: Vec<f32> = vec![
+            d as f32,
+            pairs as f32,
+            span as f32,
+            denom as f32,
+            base,
+            1.0,
+            0.0,
+        ];
+        let drp = self.cc.alloc(rp.len() * 4)?;
+        let dpp = self.cc.alloc(4)?;
+        let rr = (|| -> Result<Vec<f32>, String> {
+            self.cc.h2d(dq, &f32b(q))?;
+            self.cc.h2d(dqnw, &f32b(qnw))?;
+            self.cc.h2d(drp, &f32b(&rp))?;
+            // pp는 커널에서 unsigned* — 비트 패턴 그대로 기록(f32 캐스트 금지).
+            self.cc.h2d(dpp, &pos0.to_le_bytes())?;
+            let f = self.cc.function("attn_prep_g4")?;
+            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) =
+                (dq, 0u64, 0u64, dqnw, 0u64, dqh, 0u64, dpp, drp);
+            let (mut tl, mut lay, mut qh, mut kvh, mut cp) =
+                (t_len as i32, 0i32, q_heads as i32, 0i32, 32i32);
+            self.cc.launch(
+                f,
+                t_len as u32,
+                q_heads as u32,
+                128,
+                &mut crate::rawcuda::args::l14(
+                    &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
+                    &mut a8, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
+                ),
+            )?;
+            self.cc.sync()?;
+            let mut ob = vec![0u8; q.len() * 4];
+            self.cc.d2h(&mut ob, dqh)?;
+            Ok(ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect())
+        })();
+        let _ = self.cc.free(dq);
+        let _ = self.cc.free(dqnw);
+        let _ = self.cc.free(dqh);
+        let _ = self.cc.free(drp);
+        let _ = self.cc.free(dpp);
+        rr
+    }
+
     /// 어텐션 체인 호스트 진입 — qg·kin·vin 업로드 → pp=pos0 → prep → fwd3s
     /// → outv 판독.
     pub fn attn_chain_host(

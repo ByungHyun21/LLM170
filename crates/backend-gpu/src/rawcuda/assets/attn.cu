@@ -111,6 +111,17 @@ __device__ __forceinline__ float attn_theta(int tid)
     return (float)th;
 }
 
+// [gemma4 P2 2026-10-14] θ_p = base^(−2p/denom) — f64 재구성.
+// (denom=64·base=1e7)는 기존 attn_theta와 동일 리터럴(비트동일) — gemma4
+// 전용 커널에서만 쓰인다(qwen 무접촉). 참조: HF proportional rope(0-패딩
+// 주파수)·llama.cpp rope_freqs와 동치(2026-10-14 대조).
+__device__ __forceinline__ float attn_theta_p(int p, int denom, float base)
+{
+    double e = -(2.0 * (double)p) / (double)denom;
+    double lnb = (denom == 64 && base == 1e7f) ? 16.11809565095832 : log((double)base);
+    return (float)attn_exp_d(lnb * e);
+}
+
 // sincos f64 트윈: Cody-Waite 2분할 환원(k≤2^20에서 k·pio2_1은 53비트 내
 // 정확 — pio2_1은 하위 20비트가 0) + 테일러 z⁶ Horner(차 오차 ~3e-13,
 // f32 ulp 6e-8의 5자리수 아래). 사분면 매핑 n=k&3. 도메인 0 ≤ a ≤ 2^20
@@ -470,6 +481,175 @@ __device__ __forceinline__ void attn_part_step(KDot kdot, VAcc vacc,
 #define ATTN_SPLITS_MAX 64
 
 
+
+// ── [gemma4 P2 2026-10-14] attn_prep_g4 — gemma4 어텐션 입력측 변형군 ──
+// attn_prep_q와의 차이(참조 llama.cpp src/models/gemma4.cpp 대조 2026-10-14):
+//  ① 게이트 없음 — q 입력 = [T][q_heads*d](q‖gate 512 아님)
+//  ② d 파라미터(슬라이딩 256 / 풀 512) — 동적 smem + stride 루프
+//  ③ V = 무가중 RMS(v_norm, eps 1e-6) — k_eq_v면 호스트가 vin=kin 전달
+//     (= llama.cpp `Vcur = wv ? … : Kcur` 후 `ggml_rms_norm(Vcur)`와 동일 순서:
+//      k_norm·rope 이전 원시값)
+//  ④ rope = rp[층*7 + {d, pairs, span, denom, base, vn_on, k_eq_v}]
+//     θ_p = base^(−2p/denom), 페어 (p, p+span) — qwen 무접촉(신설 커널)
+//  int8 KV 기록은 기존 attn_blk_row(블록 테이블) 경로 그대로(층 kv_dim=kv_heads*d).
+extern "C" __global__ void attn_prep_g4(
+    const float* __restrict__ q,     // [T][q_heads*d]
+    const float* __restrict__ kin,   // [T][kv_heads*d]
+    const float* __restrict__ vin,   // [T][kv_heads*d] (k_eq_v면 kin 재사용)
+    const float* __restrict__ qnw,   // [n_attn][d]
+    const float* __restrict__ knw,   // [n_attn][d]
+    float* __restrict__ qh,          // [T][q_heads*d]
+    const unsigned long long* __restrict__ dblk_tab,
+    const unsigned* __restrict__ pp,
+    const float* __restrict__ rp,
+    int t_len, int layer, int q_heads, int kv_heads, int cap)
+{
+    __shared__ float hd[512];   // d ≤ 512(풀층) — 128스레드 stride 루프
+    __shared__ float red[128];
+    const int d = (int)rp[layer * 7 + 0];
+    const int npairs = (int)rp[layer * 7 + 1];
+    const int span = (int)rp[layer * 7 + 2];
+    const int denom = (int)rp[layer * 7 + 3];
+    const float rbase = rp[layer * 7 + 4];
+    const int vn_on = (int)rp[layer * 7 + 5];
+    const int t = blockIdx.x;
+    const int j = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int pos = (int)pp[0] + t;
+    const long kv_dim = (long)kv_heads * d;
+    if (j < q_heads) {
+        const float* src = q + (long)t * q_heads * d + (long)j * d;
+        float ss = 0.0f;
+        for (int i = tid; i < d; i += 128) {
+            hd[i] = src[i];
+            ss += hd[i] * hd[i];
+        }
+        red[tid] = ss;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        const float inv = 1.0f / sqrtf(red[0] / (float)d + 1e-6f);
+        for (int i = tid; i < d; i += 128) {
+            hd[i] = hd[i] * inv * qnw[(long)layer * d + i];
+        }
+        __syncthreads();
+        if (tid < npairs) {
+            const float theta = attn_theta_p(tid, denom, rbase);
+            const float ang = (float)pos * theta;
+            const float c = attn_cosf(ang), s2 = attn_sinf(ang);
+            const float x0 = hd[tid], x1 = hd[tid + span];
+            hd[tid] = x0 * c - x1 * s2;
+            hd[tid + span] = x0 * s2 + x1 * c;
+        }
+        __syncthreads();
+        float* dst = qh + (long)t * q_heads * d + (long)j * d;
+        for (int i = tid; i < d; i += 128) {
+            dst[i] = hd[i];
+        }
+        return;
+    }
+    const int m = j - q_heads;
+    const float* ksrc = kin + (long)t * kv_dim + (long)m * d;
+    float ss = 0.0f;
+    for (int i = tid; i < d; i += 128) {
+        hd[i] = ksrc[i];
+        ss += hd[i] * hd[i];
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(red[0] / (float)d + 1e-6f);
+    for (int i = tid; i < d; i += 128) {
+        hd[i] = hd[i] * inv * knw[(long)layer * d + i];
+    }
+    __syncthreads();
+    if (tid < npairs) {
+        const float theta = attn_theta_p(tid, denom, rbase);
+        const float ang = (float)pos * theta;
+        const float c = attn_cosf(ang), s2 = attn_sinf(ang);
+        const float x0 = hd[tid], x1 = hd[tid + span];
+        hd[tid] = x0 * c - x1 * s2;
+        hd[tid + span] = x0 * s2 + x1 * c;
+    }
+    AttnKvRowPtrs row = attn_blk_row(dblk_tab, layer, cap, pos, kv_dim, kv_heads, m);
+    // K absmax → int8
+    float amax = 0.0f;
+    for (int i = tid; i < d; i += 128) {
+        amax = fmaxf(amax, fabsf(hd[i]));
+    }
+    red[tid] = amax;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    float ks = red[0] * (1.0f / 127.0f);
+    if (ks == 0.0f) {
+        ks = 1.0f;
+    }
+    const float ik = 1.0f / ks;
+    __syncthreads();
+    for (int i = tid; i < d; i += 128) {
+        const int qv = __float2int_rn(hd[i] * ik);
+        row.k[i] = (signed char)max(-127, min(127, qv));
+    }
+    if (tid == 0) {
+        row.ks[0] = ks;
+    }
+    // ── V: (vn_on) 무가중 RMS → absmax → int8 ──
+    const float* vsrc = vin + (long)t * kv_dim + (long)m * d;
+    __syncthreads();
+    if (vn_on) {
+        float vss = 0.0f;
+        for (int i = tid; i < d; i += 128) {
+            const float v = vsrc[i];
+            hd[i] = v;
+            vss += v * v;
+        }
+        red[tid] = vss;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        const float vinv = 1.0f / sqrtf(red[0] / (float)d + 1e-6f);
+        for (int i = tid; i < d; i += 128) {
+            hd[i] *= vinv;
+        }
+    } else {
+        for (int i = tid; i < d; i += 128) {
+            hd[i] = vsrc[i];
+        }
+    }
+    __syncthreads();
+    float vam = 0.0f;
+    for (int i = tid; i < d; i += 128) {
+        vam = fmaxf(vam, fabsf(hd[i]));
+    }
+    red[tid] = vam;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    float vs = red[0] * (1.0f / 127.0f);
+    if (vs == 0.0f) {
+        vs = 1.0f;
+    }
+    const float iv = 1.0f / vs;
+    for (int i = tid; i < d; i += 128) {
+        const int wv = __float2int_rn(hd[i] * iv);
+        row.v[i] = (signed char)max(-127, min(127, wv));
+    }
+    if (tid == 0) {
+        row.vs[0] = vs;
+    }
+}
 
 // [P13] int8 KV 판독 — attn_fwd3s_part와 구조/환원 순서 동일(온라인 소프트맥스·
 // 분할 결정), K/V 로드만 int8 + 스케일 곱. 스코어 (q·k_i8)·(0.0625·ks),

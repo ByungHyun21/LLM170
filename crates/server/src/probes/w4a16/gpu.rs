@@ -15,6 +15,7 @@ struct GpuArgs {
     bench_ew: bool,
     ew_gelu_check: bool,
     moe_pes_check: bool,
+    prep_g4_check: bool,
     mma_smoke: bool,
     bench_gemv: Option<(String, usize)>,
     bench_gemv_t: Option<(String, usize, usize)>,
@@ -56,6 +57,7 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
         bench_ew: false,
         ew_gelu_check: false,
         moe_pes_check: false,
+        prep_g4_check: false,
         mma_smoke: false,
         bench_gemv: None,
         bench_gemv_t: None,
@@ -117,6 +119,7 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
             "--bench-ew" => a.bench_ew = true,
             "--ew-gelu-check" => a.ew_gelu_check = true,
             "--moe-pes-check" => a.moe_pes_check = true,
+            "--prep-g4-check" => a.prep_g4_check = true,
             "--mma-smoke" => a.mma_smoke = true,
             "--h2d-bench" => {
                 let mb = it
@@ -296,6 +299,88 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
 }
 
 /// h2d 대역폭 실측 — (a) 핀드 소스, (b) 페이지러블 소스(드라이버 스테이징).
+/// [gemma4 P2 2026-10-14] attn_prep_g4 Q 경로 대조 — 가중 RMS + rope 파라미터
+/// (pairs·span·denom·base) 3구성: qwen 등가(32/32/64/1e7)·gemma4 슬라이딩
+/// (128/128/256/1e4)·gemma4 풀(64/256/512/1e6). CPU 미러와 허용오차 대조
+/// (누적 순서 상이 — 비트 아님).
+fn run_prep_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, String> {
+    let (t_len, q_heads) = (2usize, 2usize);
+    let pos0 = 3u32;
+    let configs: [(&str, usize, usize, usize, usize, f32); 3] = [
+        ("qwen 등가(256/32/32/64)", 256, 32, 32, 64, 1e7),
+        ("gemma4 슬라이딩(256/128/128/256)", 256, 128, 128, 256, 1e4),
+        ("gemma4 풀(512/64/256/512)", 512, 64, 256, 512, 1e6),
+    ];
+    let mut out = String::from("prep_g4 Q 경로 — CPU 미러(가중 RMS+rope 파라미터) 대조\n");
+    let (mut ok_all, mut maxr_all) = (true, 0f32);
+    for (name, d, pairs, span, denom, base) in configs {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = || {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let pm1 = |r: u64| ((r >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
+        let q: Vec<f32> = (0..t_len * q_heads * d).map(|_| pm1(rnd())).collect();
+        let qnw: Vec<f32> = (0..d)
+            .map(|_| 0.5 + (rnd() >> 40) as f32 / (1u32 << 25) as f32)
+            .collect();
+        let got = dec
+            .attn_prep_g4_q_host(&q, &qnw, t_len, q_heads, d, pairs, span, denom, base, pos0)
+            .map_err(|e| format!("prep_g4({name}): {e}"))?;
+        let (mut maxd, mut maxr) = (0f32, 0f32);
+        for t in 0..t_len {
+            for j in 0..q_heads {
+                let row = &q[(t * q_heads + j) * d..(t * q_heads + j) * d + d];
+                let ss: f32 = row.iter().map(|v| v * v).sum();
+                let inv = 1.0f32 / (ss / d as f32 + 1e-6).sqrt();
+                let mut h: Vec<f32> = row
+                    .iter()
+                    .zip(qnw.iter())
+                    .map(|(v, w)| v * inv * w)
+                    .collect();
+                let pos = pos0 + t as u32;
+                for p in 0..pairs {
+                    let theta = base.powf(-(2.0 * p as f32) / denom as f32);
+                    let ang = pos as f32 * theta;
+                    let (c, s) = (ang.cos(), ang.sin());
+                    let (x0, x1) = (h[p] as f64, h[p + span] as f64);
+                    let (cf, sf) = (c as f64, s as f64);
+                    h[p] = (x0 * cf - x1 * sf) as f32;
+                    h[p + span] = (x0 * sf + x1 * cf) as f32;
+                }
+                let base_i = (t * q_heads + j) * d;
+                for i in 0..d {
+                    let dd = (got[base_i + i] - h[i]).abs();
+                    maxd = maxd.max(dd);
+                    if h[i].abs() > 1e-3 {
+                        maxr = maxr.max(dd / h[i].abs());
+                    }
+                }
+            }
+        }
+        // 판정 = 절대오차(값 ~O(1)에서 커널/CPU 누적 순서 차 ~1e-7). 상대는
+        // |h|≈0 원소에서 부풀려지는 지표 아티팩트 — 정보 기록만.
+        ok_all &= maxd < 1e-5;
+        maxr_all = maxr_all.max(maxd);
+        out.push_str(&format!(
+            "  {name}: max|diff| {maxd:.3e} 최대상대 {maxr:.3e} — {}\n",
+            if maxd < 1e-5 { "통과" } else { "초과" }
+        ));
+    }
+    out.push_str(&format!(
+        "  판정: {} (최대절대 {maxr_all:.3e})",
+        if ok_all {
+            "전 구성 허용(≤1e-5)"
+        } else {
+            "초과"
+        }
+    ));
+    Ok(out)
+}
+
 /// [gemma4 P2 2026-10-14] per-expert 사전 스케일 커널 검증 — 합성 idx/pes로
 /// wt' = wt·pes[idx] (f32 곱 — 비트 판정). HF 라우터 순서(재정규화 후 곱)의
 /// 커널 구현 대조.
@@ -1215,6 +1300,9 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     }
     if a.moe_pes_check {
         return run_moe_pes_check(&mut dec);
+    }
+    if a.prep_g4_check {
+        return run_prep_g4_check(&mut dec);
     }
     if a.plain_check {
         return dec.plain_gemm_selfcheck();
