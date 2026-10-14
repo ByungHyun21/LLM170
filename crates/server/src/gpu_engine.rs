@@ -1333,6 +1333,7 @@ pub(crate) fn g4_chunk(
     pos: &[u32],
     rows: &[f32],
     t: usize,
+    head_last: bool,
 ) -> Result<Vec<Vec<f32>>, String> {
     let hp = &model.hp;
     let h = hp.n_embd;
@@ -1418,7 +1419,19 @@ pub(crate) fn g4_chunk(
             x[i] = (x[i] + hf[i]) * ls;
         }
     }
-    // ⑦ 최종 노름 + t행 head(TR — 가중 1판독) + softcap.
+    // ⑦ 최종 노름 + head + softcap. head_last(프리필) = **마지막 행만**
+    // (nsys: t행 head가 청크당 1.6ms = 7.7% — 프리필은 마지막 로짓만 소비).
+    if head_last {
+        let last = &x[(t - 1) * h..t * h];
+        let xf = llm170_core::ops::rms_norm(last, cfg.out_norm_row(hp.n_layer, h), hp.eps);
+        let mut lg = dec.g4_head_host_t(&xf, 1)?;
+        if cfg.softcap > 0.0 {
+            for l in lg.iter_mut() {
+                *l = cfg.softcap * (*l / cfg.softcap).tanh();
+            }
+        }
+        return Ok(vec![lg]);
+    }
     let xf = g4_norm_rows(&x, cfg.out_norm_row(hp.n_layer, h), hp.eps, t);
     let flat = dec.g4_head_host_t(&xf, t)?;
     let n_vocab = hp.vocab;
@@ -1633,6 +1646,7 @@ impl GemmaEngine {
             &[pos],
             &rows,
             1,
+            false,
         )?;
         self.dec.slot_pos[seq] = pos + 1;
         Ok(lgs.into_iter().next().unwrap_or_default())
@@ -1670,6 +1684,7 @@ impl GemmaEngine {
                     &cpos,
                     &rows,
                     chunk.len(),
+                    true, // 프리필 — 마지막 행 로짓만
                 )?;
                 self.dec.slot_pos[seq] = pos + chunk.len() as u32;
                 last = lgs.into_iter().last().unwrap_or_default();
@@ -1719,6 +1734,7 @@ impl GemmaEngine {
             &pos,
             &rows,
             t,
+            false,
         )?;
         for (i, &s) in seq_ids.iter().enumerate() {
             self.dec.slot_pos[s] = pos[i] + 1;
@@ -1822,7 +1838,16 @@ impl GemmaEngine {
         self.dec.kv_grow(slot, pos0 as usize + t)?;
         let csv: Vec<usize> = vec![slot; t];
         let cpos: Vec<u32> = (0..t).map(|i| pos0 + i as u32).collect();
-        let lgs = g4_chunk(&mut self.dec, &self.model, &self.cfg, &csv, &cpos, rows, t)?;
+        let lgs = g4_chunk(
+            &mut self.dec,
+            &self.model,
+            &self.cfg,
+            &csv,
+            &cpos,
+            rows,
+            t,
+            false,
+        )?;
         self.dec.slot_pos[slot] = pos0 + t as u32;
         Ok(lgs)
     }

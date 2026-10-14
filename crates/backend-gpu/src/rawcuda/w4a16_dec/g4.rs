@@ -211,9 +211,10 @@ impl W4a16Dec {
         // ① 라우터 → drt [t][n_exp].
         let rn = format!("blk.{il}.moe_gate.weight");
         if self.lins.contains_key(&rn) {
-            self.gemm_launch(&rn, dhn, self.moe.drt.ptr, t)?;
+            self.gemv_t_launch(&rn, dhn, self.moe.drt.ptr, t)?;
         } else {
-            self.plain_gemm_launch(&rn, dhn, self.moe.drt.ptr, t)?;
+            // 플레인 라우터 — t행 플레인 GEMV(행별 산술 = t=1 GEMV와 비트동일).
+            self.plain_gemv_t_launch(&rn, dhn, self.moe.drt.ptr, t)?;
         }
         // ② top-k(디바이스, t행) — softmax 전체 → top-k → 재정규화.
         {
