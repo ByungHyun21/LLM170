@@ -12,6 +12,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use self::json::chat_spec;
 use self::json::*;
 use self::stream::*;
 

@@ -50,6 +50,9 @@ type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<MulHasher>>;
 enum Pre {
     Qwen35,
     Qwen2,
+    /// gemma4 — normalizer `Replace(" "→"▁")` + 문자 단위 BPE + `<0xXX>` 바이트
+    /// 폴백(pre_tokenizer `Split(" ")`는 정규화 후 무효과 — HF 실측).
+    Gemma,
     Other,
 }
 
@@ -412,6 +415,7 @@ impl Tokenizer {
             pre = match mt {
                 "qwen3_5" => Pre::Qwen35,
                 "qwen2" | "qwen3" => Pre::Qwen2,
+                "gemma4" | "gemma4_text" => Pre::Gemma,
                 _ => Pre::Other,
             };
         }
@@ -432,6 +436,10 @@ impl Tokenizer {
         let Some(p) = self.vocab.get(tok as usize) else {
             return;
         };
+        if self.pre == Pre::Gemma {
+            self.piece_bytes_gemma(p, out);
+            return;
+        }
         for c in p.chars() {
             match self.c2b.get(&c) {
                 Some(&b) => out.push(b),
@@ -439,6 +447,27 @@ impl Tokenizer {
                     let mut tmp = [0u8; 4];
                     out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
                 }
+            }
+        }
+    }
+
+    /// gemma4 디토크 — `<0xXX>` → 원바이트, `▁` → 공백, 그 외 원문.
+    /// (GPT-2 c2b 역표는 gemma4에서 U+0100.. 문자를 오매핑 — 사용 금지.)
+    fn piece_bytes_gemma(&self, p: &str, out: &mut Vec<u8>) {
+        if p.len() == 6
+            && p.starts_with("<0x")
+            && p.ends_with('>')
+            && let Ok(b) = u8::from_str_radix(&p[3..5], 16)
+        {
+            out.push(b);
+            return;
+        }
+        for c in p.chars() {
+            if c == '▁' {
+                out.push(b' ');
+            } else {
+                let mut tmp = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
             }
         }
     }
@@ -467,7 +496,13 @@ impl Tokenizer {
         for f in self.partition_special(text, parse_special) {
             match f {
                 Frag::Tok(id) => out.push(id),
-                Frag::Text(s) => self.bpe_fragment(s, &mut out),
+                Frag::Text(s) => {
+                    if self.pre == Pre::Gemma {
+                        self.bpe_fragment_gemma(s, &mut out);
+                    } else {
+                        self.bpe_fragment(s, &mut out);
+                    }
+                }
             }
         }
         out
@@ -627,6 +662,105 @@ impl Tokenizer {
                         if let Some(&id) = self.text_to_id.get(&piece[j..j + 1]) {
                             out.push(id);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── gemma4 조각 BPE (HF tokenizers BPE · byte_fallback) ──
+    //
+    // 정규화: 공백 → `▁`. pre_tokenizer `Split(" ")`는 정규화 후 공백이 남지
+    // 않아 무효과 — 병합은 문자 단위 심볼열 전체에 적용된다(HF 실측:
+    // "x  y" → ['x','▁▁','y']). 단일 문자가 어휘에 없으면 그 문자의 UTF-8
+    // 바이트를 `<0xXX>` 토큰으로 즉시 방출 — 바이트 토큰은 병합에 참여하지
+    // 않으므로(HF BPE 동일) 병합 런을 그 지점에서 끊는다.
+    fn bpe_fragment_gemma(&self, text: &str, out: &mut Vec<u32>) {
+        if text.contains(' ') {
+            let norm = text.replace(' ', "▁");
+            self.bpe_runs_gemma(&norm, out);
+        } else {
+            self.bpe_runs_gemma(text, out);
+        }
+    }
+
+    /// 문자 단위 런 분할 + 바이트 폴백 방출.
+    fn bpe_runs_gemma(&self, s: &str, out: &mut Vec<u32>) {
+        let mut run_lo = 0usize;
+        for (b, ch) in s.char_indices() {
+            let mut buf = [0u8; 4];
+            let piece = ch.encode_utf8(&mut buf);
+            if self.text_to_id.contains_key(piece.as_bytes()) {
+                continue;
+            }
+            if b > run_lo {
+                self.bpe_run_gemma(&s[run_lo..b], out);
+            }
+            for byte in piece.as_bytes() {
+                let name = format!("<0x{byte:02X}>");
+                if let Some(&id) = self.text_to_id.get(name.as_bytes()) {
+                    out.push(id);
+                }
+            }
+            run_lo = b + ch.len_utf8();
+        }
+        if run_lo < s.len() {
+            self.bpe_run_gemma(&s[run_lo..], out);
+        }
+    }
+
+    /// 병합 런 — 심볼 = 문자(어휘 조각), 병합 키 = 조각 바이트열(기존 랭크 규칙).
+    fn bpe_run_gemma(&self, run: &str, out: &mut Vec<u32>) {
+        let eb = run.as_bytes();
+        if self.ignore_merges
+            && let Some(&id) = self.text_to_id.get(eb)
+        {
+            out.push(id);
+            return;
+        }
+        let mut syms: Vec<(usize, usize)> = Vec::new();
+        for (b, ch) in run.char_indices() {
+            syms.push((b, ch.len_utf8()));
+        }
+        let mut heap: BinaryHeap<Bigram> = BinaryHeap::new();
+        let mut key = Vec::new();
+        for i in 1..syms.len() {
+            self.push_bigram(&mut heap, &syms, i - 1, i, eb, &mut key);
+        }
+        while let Some(b) = heap.pop() {
+            if syms[b.li].1 != b.ln || syms[b.ri].1 != b.rn {
+                continue; // 갱신된 bigram
+            }
+            syms[b.li].1 += syms[b.ri].1;
+            syms[b.ri].1 = 0;
+            let mut p = b.li;
+            while p > 0 && syms[p - 1].1 == 0 {
+                p -= 1;
+            }
+            if p > 0 {
+                self.push_bigram(&mut heap, &syms, p - 1, b.li, eb, &mut key);
+            }
+            let mut q = b.ri + 1;
+            while q < syms.len() && syms[q].1 == 0 {
+                q += 1;
+            }
+            if q < syms.len() {
+                self.push_bigram(&mut heap, &syms, b.li, q, eb, &mut key);
+            }
+        }
+        for &(st, n) in &syms {
+            if n == 0 {
+                continue;
+            }
+            let piece = &eb[st..st + n];
+            if let Some(&id) = self.text_to_id.get(piece) {
+                out.push(id);
+            } else {
+                // 바이트 폴백 — `<0xXX>` 조각.
+                for &byte in piece {
+                    let name = format!("<0x{byte:02X}>");
+                    if let Some(&id) = self.text_to_id.get(name.as_bytes()) {
+                        out.push(id);
                     }
                 }
             }
@@ -881,5 +1015,44 @@ mod tests {
             vec!["LONG", "A"],
             "길이 내림차순 1회 정렬"
         );
+    }
+
+    /// gemma4 모드 — 정규화(공백→▁)·문자 BPE·바이트 폴백·디토크.
+    #[test]
+    fn gemma_mode_normalize_merge_fallback_decode() {
+        let pieces = [
+            "▁", "a", "b", "▁a", "▁b", "ab", "<0xF0>", "<0x9F>", "<0x98>", "<0x80>",
+        ];
+        let vocab: Vec<String> = pieces.iter().map(|s| s.to_string()).collect();
+        // 병합: (▁,a)·(▁,b)·(a,b) — 키 = len_le32 ++ first ++ second.
+        let mut ranks: FastMap<Vec<u8>, u32> = FastMap::default();
+        for (rank, (f, s)) in [("▁", "a"), ("▁", "b"), ("a", "b")].into_iter().enumerate() {
+            let mut key = Vec::new();
+            key.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            key.extend_from_slice(f.as_bytes());
+            key.extend_from_slice(s.as_bytes());
+            ranks.insert(key, rank as u32);
+        }
+        let t = Tokenizer::from_parts(&vocab, ranks, Vec::new(), Vec::new(), Pre::Gemma, false)
+            .unwrap();
+        // "a b" → 정규화 "a▁b" → ['a','▁b'] (▁+b 병합).
+        assert_eq!(t.encode_opts("a b", false), vec![1, 4]);
+        // 연속 공백 → '▁▁'는 단일 문자 아님(어휘에 없음) → 바이트 폴백 불가
+        // (▁는 어휘에 있으므로 런 2개 심볼) — 병합 없음 → ['▁','▁'].
+        assert_eq!(t.encode_opts("  ", false), vec![0, 0]);
+        // 어휘에 없는 문자(😀 = F0 9F 98 80) → 바이트 폴백 4토큰.
+        assert_eq!(t.encode_opts("😀", false), vec![6, 7, 8, 9]);
+        // 디토크 왕복 — ▁→공백·바이트 조각 복원.
+        let mut bytes = Vec::new();
+        for id in t.encode_opts("a b", false) {
+            t.piece_bytes_into(id, &mut bytes);
+        }
+        assert_eq!(String::from_utf8(bytes).unwrap(), "a b");
+        let mut one = Vec::new();
+        t.piece_bytes_into(6, &mut one);
+        assert_eq!(one, vec![0xF0], "<0x..> → 원바이트");
+        let mut sp = Vec::new();
+        t.piece_bytes_into(0, &mut sp);
+        assert_eq!(sp, vec![b' '], "▁ → 공백");
     }
 }

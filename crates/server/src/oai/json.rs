@@ -364,6 +364,91 @@ pub(super) fn jmessages_render(body: &str) -> String {
     out
 }
 
+/// gemma4 챗 렌더 — 최소 턴 렌더(2026-10-14 HF `chat_template.jinja` 대조).
+/// 구조: `<bos>` + (system 있으면) `<|turn>system\n{sys}<turn|>\n` +
+/// 턴별 `<|turn>{role}\n{content}<turn|>\n`(assistant→model) + 생성 프롬프트
+/// `<|turn>model\n<|channel>thought\n<channel|>`(thinking 비활성 — 즉답 모드).
+/// 정규화: 각 content는 trim(템플릿 `| trim`). tools·reasoning 파서·jinja 전체는
+/// 비범위(서빙 배선은 P3).
+pub(crate) fn gmessages_render(body: &str) -> String {
+    let Some(mpos) = body.find("\"messages\"") else {
+        return String::new();
+    };
+    let seg = &body[mpos..];
+    let Some(ob) = seg.find('[') else {
+        return String::new();
+    };
+    let objs = jblocks(&seg[ob..]);
+    let mut out = String::from("<bos>");
+    // system 블록 — Anthropic 최상위 `system`(messages 밖) 또는
+    // messages[0]의 system/developer(HF 템플릿은 첫 system 하나만 낸다).
+    let mut rest: &[&str] = &objs;
+    let mut sys: Option<String> = None;
+    if let Some(s) = jstr(body, "system") {
+        let t = s.trim();
+        if !t.is_empty() {
+            sys = Some(t.to_string());
+        }
+    }
+    if sys.is_none()
+        && let Some(first) = objs.first()
+    {
+        let r = jstr(first, "role").unwrap_or_default();
+        if r == "system" || r == "developer" {
+            let c = jcontent(first).unwrap_or_default();
+            let t = c.trim();
+            if !t.is_empty() {
+                sys = Some(t.to_string());
+            }
+            rest = &objs[1..];
+        }
+    }
+    if let Some(s) = sys {
+        out.push_str("<|turn>system\n");
+        out.push_str(&s);
+        out.push_str("<turn|>\n");
+    }
+    for o in rest {
+        let role = jstr(o, "role").unwrap_or_else(|| "user".into());
+        let role = if role == "assistant" {
+            "model".to_string()
+        } else {
+            role
+        };
+        let content = jcontent(o).unwrap_or_default();
+        out.push_str(&format!("<|turn>{role}\n"));
+        out.push_str(content.trim());
+        out.push_str("<turn|>\n");
+    }
+    out.push_str("<|turn>model\n<|channel>thought\n<channel|>");
+    out
+}
+
+/// 아치별 챗 스펙 — 렌더 함수 + 정지 토큰(EOS 집합).
+/// EOS 출처: qwen = 어휘 상수(`EOS_EOT`), gemma4 = generation_config
+/// `eos_token_id=[1,106,50]`. 서빙(sched·HTTP 스트림) 소비는 P3 — 지금은
+/// `tokenize --chat` 프로브가 렌더·토큰화 검증에 쓴다.
+pub(crate) struct ChatSpec {
+    pub render: fn(&str) -> String,
+    pub eos: &'static [u32],
+}
+
+pub(crate) fn chat_spec(arch: &str) -> Option<ChatSpec> {
+    if llm170_core::gemma4::bind::arch_ok(arch) {
+        Some(ChatSpec {
+            render: gmessages_render,
+            eos: &[1, 106, 50],
+        })
+    } else if llm170_core::qwen35::bind::arch_supported(arch) {
+        Some(ChatSpec {
+            render: jmessages_render,
+            eos: &[llm170_core::qwen35::EOS_EOT],
+        })
+    } else {
+        None
+    }
+}
+
 /// messages 배열에 내용 있는 메시지가 하나라도 있는가(H 2026-10-09).
 /// 종전엔 빈 messages가 렌더 후 assistant 접두만 남아 200으로 진행됐다 —
 /// completions의 빈 prompt 400과 표면 불일치(빈 프롬프트 붕괴).

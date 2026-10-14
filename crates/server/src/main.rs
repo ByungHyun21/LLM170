@@ -40,8 +40,9 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
   llm170 w4a16-eval ppl <dir> --corpus <txt> [--ctx N] [--limit N] [--out dump.tsv] [--json]
   llm170 w4a16-eval agree <a.tsv> <b.tsv>
       통계 eval — PPL·teacher-forced argmax 일치율(연산 경로 편차 계측기).
-  llm170 tokenize --model <dir> (--text <s> | --file <f> | --stdin)
-      토크나이저 인코딩 [id, ...] 출력.
+  llm170 tokenize --model <dir> (--text <s> | --file <f> | --stdin) [--no-special] [--chat]
+      토크나이저 인코딩 [id, ...] 출력. --chat: messages JSON을 아치별
+      최소 턴 렌더로 변환해 토큰화(렌더·BOS·EOS 검증).
   llm170 plan --model <w4a16_dir> [--cards N] [--vram-gb X] [--host-gb Y] [--ctx N] [--ssd-gb Z]
       배치 플래너 드라이런(무적재) — 매니페스트 범주 분류 + 사다리 배치안(§2.M).
   llm170 help
@@ -668,6 +669,33 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
         }
         buf
     };
+    // [P1 gemma4 2026-10-14] --chat: messages JSON을 아치별 최소 턴 렌더로
+    // 바꿔 토큰화 — 렌더·BOS·EOS 레지스트리 검증 경로.
+    if ma.rest.iter().any(|a| a == "--chat") {
+        let arch = llm170_core::qwen35::bind::dir_arch(&model_path).unwrap_or_default();
+        let Some(spec) = crate::oai::chat_spec(&arch) else {
+            eprintln!("error: 아치 챗 스펙 없음({arch})");
+            return ExitCode::FAILURE;
+        };
+        let rendered = (spec.render)(&text);
+        let ids = tok.encode_opts(&rendered, true);
+        let csv = |v: &[u32]| {
+            v.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut dec = Vec::new();
+        for id in &ids {
+            tok.piece_bytes_into(*id, &mut dec);
+        }
+        println!("arch: {arch}");
+        println!("render: {rendered:?}");
+        println!("ids: [{}]", csv(&ids));
+        println!("decode: {:?}", String::from_utf8_lossy(&dec));
+        println!("eos: [{}]", csv(spec.eos));
+        return ExitCode::SUCCESS;
+    }
     let ids = tok.encode_opts(&text, !no_special);
     println!(
         "[{}]",
