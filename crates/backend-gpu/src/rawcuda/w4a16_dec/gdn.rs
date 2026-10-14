@@ -281,9 +281,13 @@ impl W4a16Dec {
                 &mut hv,
             ),
         )?;
-        // [행-스케일 2026-10-13] 상태 기록 직후 스케일 정규화(체인 내 — 그래프
-        // 캡처 포함: 포인터·그리드 고정). 히스테리시스 = 커널 내부.
-        self.gdn_rescale_slot(slot, layer)?;
+        // [rescale 통합 2026-10-13] 마지막 GDN 층에서 **전 층 일괄** 정규화 —
+        // 층별 런치(디코드 48회/토큰)를 1회로(그래프 노드 감소 = 채택 비용
+        // 회복). 정합: 층 L 상태는 같은 체인 안 재판독 없음(다음 토큰이 첫
+        // 판독)·체크포인트(청크 끝)는 항상 이 지점 뒤. 히스테리시스 = 커널 내부.
+        if layer == dm.n_gdn - 1 {
+            self.gdn_rescale_all(slot)?;
+        }
         Ok(())
     }
 
@@ -292,18 +296,34 @@ impl W4a16Dec {
     /// ≈ 256× 한-토큰 성장(기록측 ±65504 클램프). 기록 직후 호출(디코드 체인·
     /// 프리필 청크·스펙 스캔·롤백 재구성).
     pub(super) fn gdn_rescale_slot(&self, slot: usize, layer: usize) -> Result<(), String> {
+        self.gdn_rescale_layers(slot, layer, 1)
+    }
+
+    /// [rescale 통합 2026-10-13] 전 층 일괄 — 체인 끝(마지막 GDN 층)에서 1회.
+    /// 층별 수학 동일(비트동일): 층 L 상태는 같은 체인 안에서 재판독이 없다.
+    pub(super) fn gdn_rescale_all(&self, slot: usize) -> Result<(), String> {
+        let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
+        self.gdn_rescale_layers(slot, 0, dm.n_gdn)
+    }
+
+    fn gdn_rescale_layers(
+        &self,
+        slot: usize,
+        layer0: usize,
+        n_layers: usize,
+    ) -> Result<(), String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let f = self.cc.function("gdn_rescale")?;
         let (mut p0, mut p1) = (
             self.gdn.dgst + (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64 * 2,
             self.gdn.dsc + (slot * dm.n_gdn * dm.h_v * 128) as u64 * 4,
         );
-        let (mut hv, mut dd, mut lay) = (dm.h_v as i32, dm.d as i32, layer as i32);
+        let (mut hv, mut dd, mut lay) = (dm.h_v as i32, dm.d as i32, layer0 as i32);
         let mut head = 256.0f32;
         self.cc.launch(
             f,
             dm.h_v as u32,
-            1,
+            n_layers as u32,
             128,
             &mut crate::rawcuda::args::l6(&mut p0, &mut p1, &mut hv, &mut dd, &mut lay, &mut head),
         )
@@ -371,7 +391,7 @@ impl W4a16Dec {
         // [TreeWY 2.B 2026-10-12] 토큰별 상태 스냅샷 dsnap(8×n_layers×
         // h_v×128²×4B — 27B 1.50GiB·35B 640MiB) 폐지 → WY 표현: S_0 1개 +
         // 유사값 dc + 누적감쇠 G + k행. 롤백은 gdn_wy_reconstruct 재구성
-        // (spec_rollback). 수치 판정 = PoC(evidence/TreeWY — fp32
+        // (spec_rollback). 수치 판정 = PoC(scripts/poc_treewy.py — fp32
         // |ΔS_m| ≤1.2e-7, eval 클래스 채택 기준).
         let st_elems = dm.n_gdn * dm.h_v * dm.d * dm.d;
         self.gdn.dwy_s0 = self.cc.alloc(st_elems * 4)?;
@@ -420,16 +440,19 @@ impl W4a16Dec {
             * (dm.n_gdn * dm.h_v * dm.d * dm.d * 2
                 + dm.n_gdn * dm.h_v * dm.d * 4
                 + dm.n_gdn * 3 * dm.conv_ch() * 4);
-        match self.cc.alloc(chk) {
+        // [호스트 이관 2026-10-14] 콜드 백업 — VRAM 대신 pinned 호스트 RAM.
+        // 체크포인트 기록 = d2h(청크당 ~77MB)·복원 = h2d — 스트림 순서 보존,
+        // 수치(바이트)는 d2d 시절과 동일. VRAM −1.26GiB = 컨텍스트 +37K토큰급.
+        match self.cc.pinned_alloc(chk) {
             Ok(p) => {
                 self.gdn.dchk = p;
                 self.gdn.dchk_pos = vec![[0u32; 4]; self.n_slots];
-                // [§3.4 ②] 체크포인트 회계 — 슬롯×4환형 전체. 실패(VRAM)
+                // [§3.4 ②] 체크포인트 회계 — 슬롯×4환형 전체. 실패(호스트)
                 // 경로는 미등록(기능 off와 정합).
                 if let Err(e) = self.ucache.allocate(
                     "spec:ckpt",
                     CacheCategory::Checkpoint,
-                    Tier::Hbm,
+                    Tier::HostRam,
                     chk as u64,
                     base_util::CKPT,
                 ) {
@@ -608,10 +631,11 @@ impl W4a16Dec {
                 )?;
             }
         }
-        // [결함수정 2026-10-13] 상태 기록 직후 스케일 재정규화 — 단일 경로와
-        // 동일(히스테리시스는 커널 내부). 누락 시 배치 디코드 수치가 어긋난다.
-        for &slot in slots {
-            self.gdn_rescale_slot(slot, layer)?;
+        // [rescale 통합 2026-10-13] 마지막 GDN 층에서 전 층·전 슬롯 일괄.
+        if layer == dm.n_gdn - 1 {
+            for &slot in slots {
+                self.gdn_rescale_all(slot)?;
+            }
         }
         // gate — 행 단위 1회. [4.1] x32/미러 융합(배치 cast_x32 노드 제거).
         {

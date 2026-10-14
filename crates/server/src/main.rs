@@ -46,8 +46,7 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
       배치 플래너 드라이런(무적재) — 매니페스트 범주 분류 + 사다리 배치안(§2.M).
   llm170 help
 
-단일 트랙(2026-10-08 — 사용자 지시): CUDA W4A16만. 기본 경로는 CUDA(가속
-커널 W2/W3 개발 중 — 착륙 전 기본 실행은 안내 에러). 경로는 CUDA 고정이며,
+단일 트랙(2026-10-08 — 사용자 지시): CUDA W4A16만. 경로는 CUDA 고정이며,
 참조(CPU) 실행은 프로브(w4a16-ref — 오라클·커널 판정 기준)로만 가능하다.
 "#;
 
@@ -339,7 +338,11 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             let mut pool_ctx = ci.ctx;
             let mut budget = 0u64;
             if let Some((free, total)) = llm170_backend_gpu::cuda_mem_free() {
-                const RESERVE: u64 = 5 * (1 << 30) / 2; // 워크스페이스·스크래치 2.5GiB
+                // [예약 재산정 2026-10-14] 워크스페이스·스크래치 + 스펙 VRAM
+                // (dsave 0.5·WY 0.16·MTP 아레나 등 ≈0.75GiB — 체크포인트 링은
+                // 핀드 호스트 RAM으로 이관돼 VRAM 몫이 아니다). 종전 2.5GiB는
+                // 체크포인트(1.26GiB)를 이 예약의 여유로 먹던 시절 값.
+                const RESERVE: u64 = 9 * (1 << 30) / 4; // 2.25GiB — 실측 마진
                 // 폴백 공식(매니페스트 판독 불가 시): 가중치 = dense 전량(디렉터리).
                 let wts = if ci.dense { dir_bytes(&model_path) } else { 0 };
                 // [K6-3] 문맥 추가분 = (문맥−1)×GDN 상태 — KV 예산에서 차감.

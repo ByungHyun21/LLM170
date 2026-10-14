@@ -264,7 +264,7 @@ impl W4a16Dec {
     /// (512/1024/1536/2048 — k=(pos/512-1)%4)에 최근 4경계 유지.
     /// 값은 순수 복사(산술 불변).
     pub fn checkpoint_gdn(&mut self, slot: usize, pos: u32) -> Result<(), String> {
-        if self.gdn.dchk == 0 || slot >= self.gdn.dchk_pos.len() || !pos.is_multiple_of(512) {
+        if self.gdn.dchk.is_null() || slot >= self.gdn.dchk_pos.len() || !pos.is_multiple_of(512) {
             return Ok(());
         }
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
@@ -276,14 +276,27 @@ impl W4a16Dec {
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
         let per = st_bytes + sc_bytes + ring_bytes;
-        let base = self.gdn.dchk + (slot as u64 * 4 + k as u64) * per;
-        self.copy_dev(base, self.gdn.dgst + st_slot * 2, st_bytes)?;
-        self.copy_dev(base + st_bytes, self.gdn.dsc + sc_slot * 4, sc_bytes)?;
-        self.copy_dev(
-            base + st_bytes + sc_bytes,
-            self.gdn.dring + ring_slot * 4,
-            ring_bytes,
-        )?;
+        let off = ((slot as u64 * 4 + k as u64) * per) as isize;
+        // SAFETY: dchk = pinned_alloc(4·slots·per) — (slot,k)는 위 가드가 보장,
+        // 오프셋 합계 ≤ 할당. 호스트는 이 영역을 직접 읽지 않는다(복원=h2d).
+        unsafe {
+            let base = self.gdn.dchk as *mut u8;
+            self.cc.d2h_async(
+                base.offset(off),
+                self.gdn.dgst + st_slot * 2,
+                st_bytes as usize,
+            )?;
+            self.cc.d2h_async(
+                base.offset(off + st_bytes as isize),
+                self.gdn.dsc + sc_slot * 4,
+                sc_bytes as usize,
+            )?;
+            self.cc.d2h_async(
+                base.offset(off + (st_bytes + sc_bytes) as isize),
+                self.gdn.dring + ring_slot * 4,
+                ring_bytes as usize,
+            )?;
+        }
         self.gdn.dchk_pos[slot][k] = pos;
         // [§3.4 ② 2026-10-12] 사용 갱신 — 512경계 기록 시점 recency 리셋.
         self.ucache.touch("spec:ckpt")?;
@@ -307,7 +320,7 @@ impl W4a16Dec {
     /// 되돌리고 pos를 해당 위치로(절대 설정). 반환 = 복원 위치(0 = 없음).
     pub fn restore_gdn(&mut self, slot: usize, upto: u32) -> Result<u32, String> {
         let pos = self.ck_pick(slot, upto);
-        if self.gdn.dchk == 0 || pos == 0 {
+        if self.gdn.dchk.is_null() || pos == 0 {
             return Ok(0);
         }
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
@@ -319,13 +332,22 @@ impl W4a16Dec {
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
         let per = st_bytes + sc_bytes + ring_bytes;
-        let base = self.gdn.dchk + (slot as u64 * 4 + k as u64) * per;
-        self.copy_dev(self.gdn.dgst + st_slot * 2, base, st_bytes)?;
-        self.copy_dev(self.gdn.dsc + sc_slot * 4, base + st_bytes, sc_bytes)?;
-        self.copy_dev(
+        let off = ((slot as u64 * 4 + k as u64) * per) as isize;
+        let total = (st_bytes + sc_bytes + ring_bytes) as usize;
+        // SAFETY: dchk = pinned_alloc(4·slots·per) 소유 — 위 가드(pos>0)가
+        // 기록 완료를 보장. h2d_async는 이 슬라이스를 즉시 읽지 않고 스트림이
+        // 순서대로 소비(핀드라 비동기 성립).
+        let host =
+            unsafe { std::slice::from_raw_parts((self.gdn.dchk as *const u8).offset(off), total) };
+        self.cc
+            .h2d_async(self.gdn.dgst + st_slot * 2, &host[..st_bytes as usize])?;
+        self.cc.h2d_async(
+            self.gdn.dsc + sc_slot * 4,
+            &host[st_bytes as usize..(st_bytes + sc_bytes) as usize],
+        )?;
+        self.cc.h2d_async(
             self.gdn.dring + ring_slot * 4,
-            base + st_bytes + sc_bytes,
-            ring_bytes,
+            &host[(st_bytes + sc_bytes) as usize..],
         )?;
         self.slot_pos[slot] = pos;
         self.attn_set_pos(slot, pos)?;

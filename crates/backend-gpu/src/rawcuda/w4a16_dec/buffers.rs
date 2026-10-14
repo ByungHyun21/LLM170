@@ -567,10 +567,10 @@ impl W4a16Dec {
                     self.moe.moe_bufs_ok = false; // 자가 재구성 유도
                 }
                 "spec:ckpt" => {
-                    if self.gdn.dchk != 0 {
-                        self.cc.free(self.gdn.dchk)?;
+                    if !self.gdn.dchk.is_null() {
+                        self.cc.pinned_free(self.gdn.dchk)?;
                     }
-                    self.gdn.dchk = 0; // dchk==0 가드로 체크포인트 자동 비활성
+                    self.gdn.dchk = std::ptr::null_mut(); // null 가드로 체크포인트 자동 비활성
                 }
                 "spec:state" => {
                     for p in [

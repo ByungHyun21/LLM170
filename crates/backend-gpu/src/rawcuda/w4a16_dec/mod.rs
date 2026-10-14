@@ -431,7 +431,10 @@ pub(super) struct Gdn {
     pub(super) dsnap_ring: CUdeviceptr,
     pub(super) dsave: CUdeviceptr,
     /// [A2 2026-10-11] 접두 재사용 체크포인트(GDN 상태+conv 링, 슬롯별 1개).
-    pub(super) dchk: CUdeviceptr,
+    /// [호스트 이관 2026-10-14] 접두 재사용 체크포인트 링 = **pinned 호스트
+    /// RAM**(콜드 백업 — VRAM 상주 불필요). 복원 = h2d 수 ms(개발기)로 포크
+    /// 도달·지연 불변, VRAM −1.26GiB(27B/4슬롯) ≈ 컨텍스트 +37K토큰.
+    pub(super) dchk: *mut std::ffi::c_void,
     /// 체크포인트 위치(토큰 수) — 0 = 없음.
     /// [K3 2026-10-12] 체크포인트 위치 — 슬롯당 512 경계 스택 4개
     /// (512/1024/1536/2048 — 환형 저장). upto 이하 최대 경계.
@@ -745,7 +748,7 @@ impl W4a16Dec {
                 dwy_k: 0,
                 dsnap_ring: 0,
                 dsave: 0,
-                dchk: 0,
+                dchk: std::ptr::null_mut(),
                 dchk_pos: Vec::new(),
             },
             graph: Graph {
