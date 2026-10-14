@@ -136,17 +136,20 @@ impl W4a16Dec {
         t: usize,
     ) -> Result<(), String> {
         let (dq, ds, n, k) = self.lin_spec(name)?;
-        // [gemma4 P2-3 2026-10-14] t행 GEMV는 g128 전용 — 비기본 그룹(예: gemma4
-        // g32)은 조용한 오값 대신 명시 거부(커널 미비, 후속 트랙).
-        if let Some(&(g, sb)) = self.lin_grp.get(name)
-            && (g != 128 || sb)
-        {
-            return Err(format!(
-                "gemv_t {name}: g{g}/{} 커널 미비 — t행 프리필 미지원",
-                if sb { "bf16" } else { "f16" }
-            ));
-        }
-        let f = self.cc.function("w4a16_gemv_g128_t")?;
+        // [gemma4 P3 2026-10-14] 그룹별 t행 심볼 — g128/f16(기본) vs g32/bf16.
+        // 행별 산술 순서는 각 t=1 GEMV와 동일 클래스(디코드 배치 = 단독 디코드).
+        let (g, sb) = self.lin_grp.get(name).copied().unwrap_or((128, false));
+        let sym = match (g, sb) {
+            (128, false) => "w4a16_gemv_g128_t",
+            (32, true) => "w4a16_gemv_g32_bf16_t",
+            _ => {
+                return Err(format!(
+                    "gemv_t {name}: g{g}/{} 커널 미비",
+                    if sb { "bf16" } else { "f16" }
+                ));
+            }
+        };
+        let f = self.cc.function(sym)?;
         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, x_dev, y_dev);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
         self.cc.launch(

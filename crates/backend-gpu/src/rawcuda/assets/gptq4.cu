@@ -612,6 +612,107 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g128_t(
     }
 }
 
+template <int T>
+__device__ __forceinline__ void gemv_g32_t_body(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k, int o0,
+    double (*red)[32], float (*sc)[G4_SCMAX])
+{
+    const int l = threadIdx.x & 31;
+    const int g = threadIdx.x >> 5; // 행 그룹 0..GEMV_TR-1
+    const int o = o0 + g;
+    const bool live = o < n;
+    const int k8 = k >> 3;
+    const int kg = k >> 5;
+    if (live) {
+        for (int gg = l; gg < kg; gg += 32) {
+            sc[g][gg] = ld_scale<true>(s + (size_t)o * kg, gg);
+        }
+    }
+    __syncthreads();
+    const int jn = k >> 7;
+    float acc[T];
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        acc[r] = 0.0f;
+    }
+    // 청크 j의 레인별 u16 = 바이트 64j+2l,64j+2l+1 — 워프 전량 코얼레싱.
+    const unsigned short* qh =
+        reinterpret_cast<const unsigned short*>(q + (size_t)o * k8) + l;
+    const float4* xp[T];
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        xp[r] = reinterpret_cast<const float4*>(x) + (size_t)r * (k >> 2) + l;
+    }
+#pragma unroll 32
+    for (int jj = 0; jj < jn; ++jj) {
+        const unsigned qw = (unsigned)qh[jj * 32];
+        // [g32 포트] 레인당 4니블 = 한 32그룹 내부(4l..4l+3 ⊂ [32⌊l/8⌋, +32)).
+        const float scv = sc[g][(l >> 3) + (jj << 2)];
+        const float w0 = fmaf((float)(qw & 0xFu), scv, -8.0f * scv);
+        const float w1 = fmaf((float)((qw >> 4) & 0xFu), scv, -8.0f * scv);
+        const float w2 = fmaf((float)((qw >> 8) & 0xFu), scv, -8.0f * scv);
+        const float w3 = fmaf((float)(qw >> 12), scv, -8.0f * scv);
+#pragma unroll
+        for (int r = 0; r < T; ++r) {
+            const float4 xv = *xp[r];
+            acc[r] = fmaf(w0, xv.x, acc[r]);
+            acc[r] = fmaf(w1, xv.y, acc[r]);
+            acc[r] = fmaf(w2, xv.z, acc[r]);
+            acc[r] = fmaf(w3, xv.w, acc[r]);
+            xp[r] += 32;
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < T; ++rr) {
+        red[g][l] = (double)acc[rr];
+        __syncthreads();
+        // [A-float4] 전 워프 참여 셔플(마스크 0xffffffff 계약 — l≥16도 참여),
+        // 합산·기록은 하위 레인만(첫 결합 l<16, 셔플 8..1).
+        double v = (l < 16) ? (red[g][l] + red[g][l + 16]) : 0.0;
+#pragma unroll
+        for (int off = 8; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(v, off);
+            if (l < off) {
+                v += oth;
+            }
+        }
+        if (l == 0 && live) {
+            out[(size_t)rr * n + o] = (float)v;
+        }
+        __syncthreads();
+    }
+}
+
+// [gemma4 P3 2026-10-14] g32·bf16 스케일 t행 GEMV — gemv_g128_t_body의 g32 포트
+// (차이 3곳: kg = k>>5 · 스케일 인덱스 (l>>3)+4j · ld_scale<true>). 행별 산술
+// 순서는 g128_t와 동일 — 디코드 배치(t≤8)가 t=1 GEMV와 같은 클래스.
+#define GEMV_T_CASE_G32(N) \
+    case N: gemv_g32_t_body<N>(q, s, x, out, n, k, o0, red, sc); break;
+
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g32_bf16_t(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k, int t)
+{
+    const int o0 = blockIdx.x * GEMV_TR;
+    if (o0 >= n) {
+        return;
+    }
+    __shared__ double red[GEMV_TR][32];
+    __shared__ float sc[GEMV_TR][G4_SCMAX];
+    switch (t) {
+        GEMV_T_CASE_G32(1)
+        GEMV_T_CASE_G32(2)
+        GEMV_T_CASE_G32(3)
+        GEMV_T_CASE_G32(4)
+        GEMV_T_CASE_G32(5)
+        GEMV_T_CASE_G32(6)
+        GEMV_T_CASE_G32(7)
+        GEMV_T_CASE_G32(8)
+        default: break; // 호스트 계약 밖(t≤8)
+    }
+}
+
 // [S2 2026-10-11] 다중 세그먼트 t행 GEMV(배치 디코드·검증 t≤8) — 테이블은
 // t=1 판 w4a16_gemv_g128_multi와 공용((q,s,out,n,k)). 세그먼트 블록수는
 // ceil(n/GEMV_TR), 호스트 grid = Σceil(n_s/GEMV_TR). 행별 산술은

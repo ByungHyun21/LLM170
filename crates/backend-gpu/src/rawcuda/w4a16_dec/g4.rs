@@ -364,7 +364,10 @@ impl W4a16Dec {
             return Err(format!("g4_dev_gemm: {name} k={k} != {kk}"));
         }
         let y = self.g4_scratch_slot(y_slot, t * n * 4)?;
-        self.gemm_launch(name, x_dev, y, t)?;
+        // [gemma4 P3 2026-10-14] t행 GEMV(그룹 디스패치 — g32/bf16 포함):
+        // t≤8에서 가중 판독 1회 공유 + t=1 GEMV와 동일 클래스(FFMA gemm 대체 —
+        // ncu 실측: FFMA는 DRAM 4.4%·SM 49.4% 지연 정체).
+        self.gemv_t_launch(name, x_dev, y, t)?;
         Ok(y)
     }
 
