@@ -5,6 +5,53 @@ mod moe_gemm;
 mod moe_gemv;
 
 impl W4a16Dec {
+    /// [gemma4 P2 2026-10-14] per-expert 사전 스케일 — top-k 가중치(재정규화 후)에
+    /// μ_e를 곱한다(HF Gemma4TextRouter 순서). 호스트 검증용 직접 런처
+    /// (`--moe-pes-check` — ew_gelu_host와 동일 패턴).
+    pub fn moe_pes_scale_host(
+        &mut self,
+        wt: &[f32],
+        idx: &[i32],
+        pes: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        if wt.is_empty() || wt.len() != idx.len() {
+            return Err(format!("pes: wt={} idx={} 계약 위반", wt.len(), idx.len()));
+        }
+        let n = wt.len();
+        let dwt = self.cc.alloc(n * 4)?;
+        let dix = self.cc.alloc(n * 4)?;
+        let dpes = self.cc.alloc(pes.len().max(1) * 4)?;
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i32b = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let r = (|| -> Result<Vec<f32>, String> {
+            self.cc.h2d(dwt, &f32b(wt))?;
+            self.cc.h2d(dix, &i32b(idx))?;
+            self.cc.h2d(dpes, &f32b(pes))?;
+            let f = self.cc.function("w4a16_moe_pes_scale")?;
+            let (mut a0, mut a1, mut a2, mut a3) = (dwt, dix, dpes, n as i32);
+            self.cc.launch(
+                f,
+                1,
+                1,
+                256,
+                &mut crate::rawcuda::args::l4(&mut a0, &mut a1, &mut a2, &mut a3),
+            )?;
+            self.cc.sync()?;
+            let mut ob = vec![0u8; n * 4];
+            self.cc.d2h(&mut ob, dwt)?;
+            Ok(ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect())
+        })();
+        let _ = self.cc.free(dwt);
+        let _ = self.cc.free(dix);
+        let _ = self.cc.free(dpes);
+        r
+    }
+
     /// 선택 순서 가중 누적 — y[ti] = Σ_{s∈ti} w[s]·d[s][i] (sp = 토큰당 슬롯).
     pub(in crate::rawcuda::w4a16_dec) fn moe_accum_dev(
         &mut self,

@@ -574,6 +574,21 @@ extern "C" __global__ void w4a16_axpy(float w, const float* __restrict__ x,
     }
 }
 
+// [gemma4 P2 2026-10-14] per-expert 사전 스케일 — top-k 가중치(전문가 전체
+// softmax → top-k → 재정규화(합 1) **후**)에 μ_e = per_expert_scale[idx[i]]를
+// 곱한다. HF Gemma4TextRouter 순서 미러(사전 정규화 후 곱 — CPU core gemma4
+// stages::route와 동일). top_k(≤1024) 한 런치, nslots = t×top_k.
+extern "C" __global__ void w4a16_moe_pes_scale(
+    float* __restrict__ wt, const int* __restrict__ idx,
+    const float* __restrict__ pes, int nslots)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nslots) {
+        return;
+    }
+    wt[i] *= pes[idx[i]];
+}
+
 // 전문가 가중 누적 — y[row][i] = Σ_{s∈row} w[s]·d[s][i] (선택 순서 가산 — CPU 미러).
 // [FLA-6 2026-10-10] 행(토큰) 병렬 — grid.y = 출력 행. 종전엔 열만 병렬(그리드
 // n/256 = 8블록)로 토큰 루프가 스레드당 4096회 직렬(실측 GPU 99% 유휴,

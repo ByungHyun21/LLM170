@@ -68,6 +68,7 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_gemm_bf16_t",
             "w4a16_axpy",
             "w4a16_moe_accum",
+            "w4a16_moe_pes_scale",
             "w4a16_moe_topk_t",
             "w4a16_moe_topk256",
             "w4a16_shared_add",

@@ -14,6 +14,7 @@ struct GpuArgs {
     plain_check: bool,
     bench_ew: bool,
     ew_gelu_check: bool,
+    moe_pes_check: bool,
     mma_smoke: bool,
     bench_gemv: Option<(String, usize)>,
     bench_gemv_t: Option<(String, usize, usize)>,
@@ -54,6 +55,7 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
         plain_check: false,
         bench_ew: false,
         ew_gelu_check: false,
+        moe_pes_check: false,
         mma_smoke: false,
         bench_gemv: None,
         bench_gemv_t: None,
@@ -114,6 +116,7 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
             "--plain-gemm-check" => a.plain_check = true,
             "--bench-ew" => a.bench_ew = true,
             "--ew-gelu-check" => a.ew_gelu_check = true,
+            "--moe-pes-check" => a.moe_pes_check = true,
             "--mma-smoke" => a.mma_smoke = true,
             "--h2d-bench" => {
                 let mb = it
@@ -293,6 +296,42 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
 }
 
 /// h2d 대역폭 실측 — (a) 핀드 소스, (b) 페이지러블 소스(드라이버 스테이징).
+/// [gemma4 P2 2026-10-14] per-expert 사전 스케일 커널 검증 — 합성 idx/pes로
+/// wt' = wt·pes[idx] (f32 곱 — 비트 판정). HF 라우터 순서(재정규화 후 곱)의
+/// 커널 구현 대조.
+fn run_moe_pes_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, String> {
+    let n = 8usize;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = || {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let wt: Vec<f32> = (0..n)
+        .map(|_| (rnd() >> 40) as f32 / (1u32 << 24) as f32)
+        .collect();
+    let idx: Vec<i32> = (0..n).map(|_| ((rnd() >> 50) as i32) % 16).collect();
+    let pes: Vec<f32> = (0..16).map(|i| 0.5 + i as f32 * 0.1).collect();
+    let got = dec.moe_pes_scale_host(&wt, &idx, &pes)?;
+    let mut bad = 0usize;
+    for i in 0..n {
+        let want = wt[i] * pes[idx[i] as usize];
+        if got[i].to_bits() != want.to_bits() {
+            bad += 1;
+        }
+    }
+    Ok(format!(
+        "moe_pes_scale vs wt·pes[idx] — n={n} 불일치 {bad}건 · 판정: {}",
+        if bad == 0 {
+            "비트일치"
+        } else {
+            "불일치"
+        }
+    ))
+}
+
 /// [gemma4 P2 2026-10-14] ew_gelu 커널 vs CPU 계약(core::ops::gelu_tanh) —
 /// 커널 대조 검증(트랜센던털 등급 — tanhf, 비트 아님). 결정적 입력(splitmix64).
 fn run_ew_gelu_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, String> {
@@ -1173,6 +1212,9 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     }
     if a.ew_gelu_check {
         return run_ew_gelu_check(&mut dec);
+    }
+    if a.moe_pes_check {
+        return run_moe_pes_check(&mut dec);
     }
     if a.plain_check {
         return dec.plain_gemm_selfcheck();
