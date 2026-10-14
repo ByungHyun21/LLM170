@@ -482,7 +482,8 @@ extern "C" __global__ void attn_fwd3s_part_q(
     const unsigned* __restrict__ pp,
     const unsigned long long* __restrict__ row_blk, // [행 퓨전] nullable
     const unsigned long long* __restrict__ row_pp,
-    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits)
+    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits,
+    float kq_scale)
 {
     int t = blockIdx.x;
     int hs = blockIdx.y;
@@ -491,7 +492,8 @@ extern "C" __global__ void attn_fwd3s_part_q(
     int tid = threadIdx.x;
     int gq = q_heads / kv_heads;
     int kh = h / gq;
-    float scale = 0.0625f;
+    // [gemma4 P2 2026-10-14] kq_scale = 인자(qwen 1/√d = 0.0625 동일값 — 비트 불변).
+    float scale = kq_scale;
     // [배치 행 퓨전 2026-10-14] 행별 blk/pos — null이면 단일 슬롯 계약.
     const unsigned long long* blk = dblk_tab;
     int lim;
@@ -676,7 +678,8 @@ extern "C" __global__ void attn_fwd3s_part_qg(
     const unsigned* __restrict__ pp,
     const unsigned long long* __restrict__ row_blk, // [행 퓨전] nullable
     const unsigned long long* __restrict__ row_pp,
-    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits)
+    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits,
+    float kq_scale)
 {
     int t = blockIdx.x;
     int hs = blockIdx.y;
@@ -685,7 +688,8 @@ extern "C" __global__ void attn_fwd3s_part_qg(
     int tid = threadIdx.x;
     int gq = q_heads / kv_heads;
     int h0 = kh * gq;
-    float scale = 0.0625f;
+    // [gemma4 P2 2026-10-14] kq_scale = 인자(qwen 1/√d = 0.0625 동일값 — 비트 불변).
+    float scale = kq_scale;
     // [배치 행 퓨전 2026-10-14] 행별 blk/pos — null이면 단일 슬롯 계약
     // (lim = pp[0]+t+1 · t=행=토큰 순번). 값·주소 동일.
     const unsigned long long* blk = dblk_tab;
@@ -962,7 +966,7 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
     float* __restrict__ out32,
     unsigned short* __restrict__ out16,
     const unsigned* __restrict__ pp,
-    int t_len, int layer, int q_heads, int kv_heads, int cap)
+    int t_len, int layer, int q_heads, int kv_heads, int cap, float kq_scale)
 {
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -1132,8 +1136,8 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
 #pragma unroll
             for (int f = 0; f < 4; ++f) {
                 const int cc = f * 8 + 2 * tt;
-                const float s0 = 0.0625f * ksc_s[cc] * iqsc;
-                const float s1 = 0.0625f * ksc_s[cc + 1] * iqsc;
+                const float s0 = kq_scale * ksc_s[cc] * iqsc;
+                const float s1 = kq_scale * ksc_s[cc + 1] * iqsc;
                 sa[f][0] *= s0;
                 sa[f][1] *= s1;
                 sa[f][2] *= s0;

@@ -174,14 +174,17 @@ impl W4a16Dec {
             self.attn.dattn_part,
             self.attn_pp_ptr(slot),
         );
+        // [gemma4 P2 2026-10-14] q·k 스케일 인자화 — qwen = 1/√d(0.0625 동일값,
+        // 비트 불변), gemma4 = 1.0. 층별 테이블 폴백 포함(`AttnLayer::scale`).
+        let mut scl = dm.layer(layer).scale();
         self.cc.launch(
             fp,
             t_len as u32,
             (dm.kv_heads * spv) as u32,
             256,
-            &mut crate::rawcuda::args::l12(
+            &mut crate::rawcuda::args::l13(
                 &mut f0, &mut f1, &mut f2, &mut f3, &mut n0, &mut n1, &mut tl, &mut lay, &mut qh,
-                &mut kvh, &mut cp, &mut sp,
+                &mut kvh, &mut cp, &mut sp, &mut scl,
             ),
         )?;
         // [4.1 2026-10-11] merge가 x32/미러 동시 기록 — cast_x32 노드 제거.
@@ -231,14 +234,15 @@ impl W4a16Dec {
         );
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
+        let mut scl = dm.layer(layer).scale(); // [gemma4] q·k 스케일 인자
         self.cc.launch(
             f,
             t_len.div_ceil(32) as u32,
             dm.q_heads as u32,
             128,
-            &mut crate::rawcuda::args::l12(
+            &mut crate::rawcuda::args::l13(
                 &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut tl, &mut lay,
-                &mut qh, &mut kvh, &mut cp,
+                &mut qh, &mut kvh, &mut cp, &mut scl,
             ),
         )
     }
@@ -416,14 +420,15 @@ impl W4a16Dec {
             );
             let (mut tl, mut lay) = (t_len as i32, layer as i32);
             let (mut rb, mut rp) = (row_blk, row_pp);
+            let mut scl = dm.layer(layer).scale(); // [gemma4] q·k 스케일 인자
             self.cc.launch(
                 fp,
                 t_len as u32,
                 (dm.q_heads * spv) as u32,
                 256,
-                &mut crate::rawcuda::args::l12(
+                &mut crate::rawcuda::args::l13(
                     &mut f0, &mut f1, &mut f2, &mut f3, &mut rb, &mut rp, &mut tl, &mut lay,
-                    &mut qh, &mut kvh, &mut cp, &mut sp,
+                    &mut qh, &mut kvh, &mut cp, &mut sp, &mut scl,
                 ),
             )?;
         }

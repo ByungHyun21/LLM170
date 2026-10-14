@@ -207,6 +207,18 @@ impl AttnDims {
     pub fn kv_slot_elems(&self, slot: usize) -> usize {
         slot * self.n_attn * self.cap * self.kv_dim()
     }
+    /// [gemma4 P2 2026-10-14] 층별 파라미터 — 현재는 균일 스칼라 합성
+    /// (kq_scale 0.0 = 1/√d 유도 → qwen 0.0625 동일값·비트 불변). 층별
+    /// 테이블(슬라이딩/풀 혼합) 도입 시 여기서 오버라이드 조회로 확장.
+    pub fn layer(&self, _il: usize) -> AttnLayer {
+        AttnLayer {
+            kv_heads: self.kv_heads,
+            d: self.d,
+            sliding: false,
+            k_eq_v: false,
+            kq_scale: 0.0,
+        }
+    }
 }
 
 /// f32 → f16 비트(RN-even, 서브노멀·inf/nan 처리) — GEMV 활성 캐스팅 계약.
