@@ -573,6 +573,8 @@ pub struct W4a16Dec {
     g4_y: Buf,
     /// [gemma4 P3] 층별 pes(μ_e) 디바이스 상주(0 = 미등록).
     g4_pes: Vec<CUdeviceptr>,
+    /// [gemma4 P3] 청크 디바이스 체인 스크래치 풀(슬롯별 1회 할당·재사용).
+    g4_pool: Vec<Buf>,
     /// [gemma4 P2-3 2026-10-14] 선형 그룹·스케일 dtype — 이름 → (group, scale_bf16).
     /// `upload_lin`(g128/f16) 등록분은 미기재(디스패치 기본값) · `upload_lin_g`가
     /// 기재한다. GEMV 심볼 선택(g128 vs g32_bf16)만 가른다.
@@ -867,6 +869,7 @@ impl W4a16Dec {
             g4_a: Buf { ptr: 0, cap: 0 },
             g4_y: Buf { ptr: 0, cap: 0 },
             g4_pes: Vec::new(),
+            g4_pool: Vec::new(),
             lin_grp: HashMap::new(),
             plains: HashMap::new(),
             plain_weights: false,

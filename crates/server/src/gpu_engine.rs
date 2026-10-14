@@ -1348,54 +1348,55 @@ pub(crate) fn g4_chunk(
         let d = hp.head_dim[il];
         // ① input_layernorm → t행 q/k/(v) GEMM.
         let xn = g4_norm_rows(&x, cfg.nw_row(il, 0, h), hp.eps, t);
-        let q = dec.g4_gemm_host(&format!("blk.{il}.attn_q.weight"), &xn, t, h)?;
-        let k = dec.g4_gemm_host(&format!("blk.{il}.attn_k.weight"), &xn, t, h)?;
-        let v = if model.kv_eq_v(il) {
-            k.clone() // v_norm(k 원시) — prep_g4 vn_on 계약
-        } else {
-            dec.g4_gemm_host(&format!("blk.{il}.attn_v.weight"), &xn, t, h)?
-        };
-        // ② 어텐션 — 토큰별 g4 경로(검증 완료) · KV 누적 = t=1과 동일.
-        let (qnw, knw) = cfg.qk_rows(il, d);
+        // ② q/k/v GEMM + 어텐션 + o_proj 전부 **디바이스**(중간 d2h 0 —
+        // 토큰별 호스트 경로의 왕복을 청크당 3런치로). KV 누적 = t=1과 동일.
         let sw = if hp.full[il] { 0 } else { hp.sw };
         let qd = hp.n_head * d;
-        let kd = hp.n_kv[il] * d;
-        let mut ao: Vec<f32> = Vec::with_capacity(t * qd);
-        for kk in 0..t {
-            let out = dec.attn_g4_host(
-                slot,
-                &q[kk * qd..(kk + 1) * qd],
-                &k[kk * kd..(kk + 1) * kd],
-                &v[kk * kd..(kk + 1) * kd],
-                qnw,
-                knw,
-                il,
-                1,
-                hp.n_head,
-                hp.n_kv[il],
-                d,
-                sw,
-                1.0,
-                2,
-                pos0 + kk as u32,
-            )?;
-            ao.extend_from_slice(&out);
-        }
-        // ③ o_proj(t행) → post_attn_norm + 잔차.
-        let aop = dec.g4_gemm_host(&format!("blk.{il}.attn_output.weight"), &ao, t, qd)?;
+        let dxn = dec.g4_dev_in(0, &xn)?;
+        let q = dec.g4_dev_gemm(&format!("blk.{il}.attn_q.weight"), dxn, t, h, 1)?;
+        let k = dec.g4_dev_gemm(&format!("blk.{il}.attn_k.weight"), dxn, t, h, 2)?;
+        let v = if model.kv_eq_v(il) {
+            k // v_norm(k 원시) — prep_g4 vn_on 계약
+        } else {
+            dec.g4_dev_gemm(&format!("blk.{il}.attn_v.weight"), dxn, t, h, 3)?
+        };
+        let outv = dec.attn_g4_dev(
+            slot,
+            il,
+            q,
+            k,
+            v,
+            t,
+            hp.n_head,
+            hp.n_kv[il],
+            d,
+            sw,
+            1.0,
+            2,
+            pos0,
+            6,
+            7,
+            8,
+        )?;
+        // ③ o_proj(t행 — 디바이스) → d2h → post_attn_norm + 잔차.
+        let o = dec.g4_dev_gemm(&format!("blk.{il}.attn_output.weight"), outv, t, qd, 9)?;
+        let _ = o;
+        let aop = dec.g4_dev_out(9, t * h)?;
         let hh = g4_norm_rows(&aop, cfg.nw_row(il, 1, h), hp.eps, t);
         for i in 0..t * h {
             x[i] += hh[i];
         }
-        // ④ dense MLP — pre_ff → gate/up → gelu_tanh(호스트 = 커널 비트동일) → down.
+        // ④ dense MLP — 디바이스 체인(pre_ff → gate/up GEMM → ew_gelu 커널 →
+        // down GEMM) + d2h 1회. gelu = t=1 경로와 동일 커널 심볼(수치 정합).
         let nd = g4_norm_rows(&x, cfg.nw_row(il, 2, h), hp.eps, t);
-        let g = dec.g4_gemm_host(&format!("blk.{il}.ffn_gate.weight"), &nd, t, h)?;
-        let u = dec.g4_gemm_host(&format!("blk.{il}.ffn_up.weight"), &nd, t, h)?;
-        let mut act = vec![0f32; g.len()];
-        for i in 0..g.len() {
-            act[i] = llm170_core::ops::gelu_tanh(g[i]) * u[i];
-        }
-        let m = dec.g4_gemm_host(&format!("blk.{il}.ffn_down.weight"), &act, t, hp.n_ff)?;
+        let dnd = dec.g4_dev_in(0, &nd)?;
+        let g = dec.g4_dev_gemm(&format!("blk.{il}.ffn_gate.weight"), dnd, t, h, 1)?;
+        let u = dec.g4_dev_gemm(&format!("blk.{il}.ffn_up.weight"), dnd, t, h, 2)?;
+        let act = dec.g4_dev_gelu(g, u, 3, t * hp.n_ff)?;
+        let _ = act;
+        let dm_ = dec.g4_dev_gemm(&format!("blk.{il}.ffn_down.weight"), act, t, hp.n_ff, 4)?;
+        let _ = dm_;
+        let m = dec.g4_dev_out(4, t * h)?;
         let h1 = g4_norm_rows(&m, cfg.nw_row(il, 3, h), hp.eps, t);
         // ⑤ MoE — 라우터 입력(hn)·전문가 입력(nm) 분리 · pes 디바이스.
         let hn = g4_norm_rows(&x, cfg.nw_row(il, 7, h), hp.eps, t);

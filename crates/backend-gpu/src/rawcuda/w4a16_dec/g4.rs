@@ -323,6 +323,206 @@ impl W4a16Dec {
             .collect())
     }
 
+    /// [gemma4 P3 2026-10-14] 청크 디바이스 체인 — 스크래치 슬롯 확보.
+    pub fn g4_scratch_slot(&mut self, idx: usize, bytes: usize) -> Result<CUdeviceptr, String> {
+        if self.g4_pool.len() <= idx {
+            self.g4_pool.resize(idx + 1, Buf { ptr: 0, cap: 0 });
+        }
+        let b = &mut self.g4_pool[idx];
+        if b.cap < bytes {
+            if b.ptr != 0 {
+                self.cc.free(b.ptr)?;
+            }
+            b.ptr = self.cc.alloc(bytes)?;
+            b.cap = bytes;
+        }
+        Ok(b.ptr)
+    }
+
+    /// 슬롯 f32 행렬 업로드 — [t][k] f32 → 슬롯(반환 = 디바이스 포인터).
+    pub fn g4_dev_in(&mut self, slot: usize, x: &[f32]) -> Result<CUdeviceptr, String> {
+        let _g = self.cc.guard()?;
+        let p = self.g4_scratch_slot(slot, x.len() * 4)?;
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
+        self.cc.h2d(p, xb)?;
+        Ok(p)
+    }
+
+    /// t행 GEMM → 지정 슬롯(디바이스 in/out — 중간 왕복 0). 반환 = 슬롯 포인터.
+    pub fn g4_dev_gemm(
+        &mut self,
+        name: &str,
+        x_dev: CUdeviceptr,
+        t: usize,
+        k: usize,
+        y_slot: usize,
+    ) -> Result<CUdeviceptr, String> {
+        let _g = self.cc.guard()?;
+        let (_, _, n, kk) = self.lin_spec(name)?;
+        if t == 0 || k != kk {
+            return Err(format!("g4_dev_gemm: {name} k={k} != {kk}"));
+        }
+        let y = self.g4_scratch_slot(y_slot, t * n * 4)?;
+        self.gemm_launch(name, x_dev, y, t)?;
+        Ok(y)
+    }
+
+    /// 슬롯 → 호스트 f32 회수(동기 1회).
+    pub fn g4_dev_out(&mut self, slot: usize, elems: usize) -> Result<Vec<f32>, String> {
+        let _g = self.cc.guard()?;
+        let p = self.g4_scratch_slot(slot, elems * 4)?;
+        self.cc.sync()?;
+        let mut ob = vec![0u8; elems * 4];
+        self.cc.d2h_async(ob.as_mut_ptr(), p, elems * 4)?;
+        self.cc.sync()?;
+        Ok(ob
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    }
+
+    /// [gemma4 P3 2026-10-14] ew_gelu 디바이스 — act = gelu(g)·u → y(슬롯).
+    /// t=1 경로(`ew_gelu_host`)와 동일 커널 심볼(수치 정합).
+    pub fn g4_dev_gelu(
+        &mut self,
+        g_dev: CUdeviceptr,
+        u_dev: CUdeviceptr,
+        y_slot: usize,
+        n: usize,
+    ) -> Result<CUdeviceptr, String> {
+        if n == 0 {
+            return Err("g4_dev_gelu: n=0".into());
+        }
+        let _g = self.cc.guard()?;
+        let y = self.g4_scratch_slot(y_slot, n * 4)?;
+        let f = self.cc.function("ew_gelu")?;
+        let mut nn = n as i32;
+        let (mut a0, mut a1, mut a2, mut a3, mut a4) = (g_dev, u_dev, y, 0u64, 0u64);
+        self.cc.launch(
+            f,
+            n.div_ceil(128) as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l6(&mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut nn),
+        )?;
+        Ok(y)
+    }
+
+    /// 슬롯 포인터(할당 보장 없음 — g4_scratch_slot 선행 계약).
+    pub fn g4_dev_ptr(&self, slot: usize) -> CUdeviceptr {
+        self.g4_pool.get(slot).map(|b| b.ptr).unwrap_or(0)
+    }
+
+    /// [gemma4 P3 2026-10-14] g4 어텐션 **디바이스** 런처 — q/k/v·출력 모두
+    /// 디바이스(중간 d2h 0). KV는 아레나 기록. 반환 = outv 슬롯 포인터
+    /// ([t][q_heads*d]). qnw/knw = set_attn의 d_max 패딩 배열에서 이 층 행
+    /// (커널이 qnw[i] 행 포인터 계약 — 패딩 오프셋 정합).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_g4_dev(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        q_dev: CUdeviceptr,
+        k_dev: CUdeviceptr,
+        v_dev: CUdeviceptr,
+        t: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        d: usize,
+        sw: usize,
+        kq_scale: f32,
+        splits: usize,
+        pos0: u32,
+        qh_slot: usize,
+        part_slot: usize,
+        out_slot: usize,
+    ) -> Result<CUdeviceptr, String> {
+        let _g = self.cc.guard()?;
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
+        if self.attn.g4_rp == 0 || layer >= dm.n_attn {
+            return Err(format!("attn_g4_dev: layer={layer} n_attn={}", dm.n_attn));
+        }
+        let qn = t * q_heads * d;
+        let qh = self.g4_scratch_slot(qh_slot, qn * 4)?;
+        let part = self.g4_scratch_slot(part_slot, t * q_heads * splits * (d + 2) * 4)?;
+        let outv = self.g4_scratch_slot(out_slot, qn * 4)?;
+        let dpp = self.g4_scratch_slot(5, 4)?;
+        self.cc.h2d(dpp, &pos0.to_le_bytes())?;
+        let d_max = self.attn.layers.iter().map(|l| l.d).max().unwrap_or(d);
+        let qnw = self.attn.dqnw_a + (layer * d_max * 4) as u64;
+        let knw = self.attn.dknw_a + (layer * d_max * 4) as u64;
+        let mb = dm.cap.div_ceil(512);
+        let dblk = self.attn.dblk_tab + (slot * dm.n_attn * mb * 4 * 8) as u64;
+        let drp = self.attn.g4_rp;
+        // ① prep_g4 — grid (t, q_heads+kv_heads) · 128스레드.
+        {
+            let f = self.cc.function("attn_prep_g4")?;
+            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) =
+                (q_dev, k_dev, v_dev, qnw, knw, qh, dblk, dpp, drp);
+            let (mut tl, mut lay, mut qh_, mut kvh, mut cp) = (
+                t as i32,
+                layer as i32,
+                q_heads as i32,
+                kv_heads as i32,
+                dm.cap as i32,
+            );
+            self.cc.launch(
+                f,
+                t as u32,
+                (q_heads + kv_heads) as u32,
+                128,
+                &mut crate::rawcuda::args::l14(
+                    &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
+                    &mut a8, &mut tl, &mut lay, &mut qh_, &mut kvh, &mut cp,
+                ),
+            )?;
+        }
+        // ② f3s part_g4 — grid (t, q_heads×splits) · d스레드.
+        {
+            let f = self.cc.function("attn_fwd3s_part_g4")?;
+            let (mut a0, mut a1, mut a2, mut a3) = (qh, dblk, part, dpp);
+            let (mut tl, mut lay, mut qh_, mut kvh, mut cp) = (
+                t as i32,
+                layer as i32,
+                q_heads as i32,
+                kv_heads as i32,
+                dm.cap as i32,
+            );
+            let (mut sp, mut dd, mut swv) = (splits as i32, d as i32, sw as i32);
+            let mut scl = kq_scale;
+            self.cc.launch(
+                f,
+                t as u32,
+                (q_heads * splits) as u32,
+                d as u32,
+                &mut crate::rawcuda::args::l13(
+                    &mut a0, &mut a1, &mut a2, &mut a3, &mut tl, &mut lay, &mut qh_, &mut kvh,
+                    &mut cp, &mut sp, &mut dd, &mut swv, &mut scl,
+                ),
+            )?;
+        }
+        // ③ merge_g4 — grid (t, q_heads) · d스레드.
+        {
+            let f = self.cc.function("attn_fwd3s_merge_g4")?;
+            let (mut a0, mut a1, mut a2, mut a3) = (part, outv, 0u64, 0u64);
+            let (mut tl, mut qh_, mut sp, mut dd) =
+                (t as i32, q_heads as i32, splits as i32, d as i32);
+            self.cc.launch(
+                f,
+                t as u32,
+                q_heads as u32,
+                d as u32,
+                &mut crate::rawcuda::args::l8(
+                    &mut a0, &mut a1, &mut a2, &mut a3, &mut tl, &mut qh_, &mut sp, &mut dd,
+                ),
+            )?;
+        }
+        Ok(outv)
+    }
+
     /// [gemma4 P3 2026-10-14] 층별 pes(μ_e) 디바이스 상주 — 1회 업로드 캐시.
     pub fn set_g4_pes(&mut self, il: usize, pes: &[f32]) -> Result<(), String> {
         let _g = self.cc.guard()?;
