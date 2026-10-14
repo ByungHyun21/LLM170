@@ -382,6 +382,32 @@ if [ -d "$M_G4" ]; then
     "판정: 일치") note "G4 판정 OK(일치)";;
     *) echo "[w4a16] FAIL: G4 판정 — $(echo "$A" | grep '판정:')"; fail=1;;
   esac
+  echo "=== G4c. gemma4 HTTP 서브(채팅 · 아치 렌더·정지 토큰) ==="
+  "$BIN" serve --model "$M_G4" --ctx 256 --port 18099 > "$RUN/g4c.log" 2>&1 &
+  G4_PID=$!
+  # A2 규율: 이 실행의 PID만 종료(전역 pkill 금지).
+  trap 'kill "$G4_PID" 2>/dev/null' EXIT
+  for i in $(seq 1 100); do
+    sleep 3
+    grep -m1 "listening" "$RUN/g4c.log" >/dev/null 2>&1 && break
+  done
+  curl -s -m 600 "http://127.0.0.1:18099/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model":"gemma4","messages":[{"role":"user","content":"안녕하세요"}],"max_tokens":12,"temperature":0}' > "$RUN/g4c.json"
+  kill "$G4_PID" 2>/dev/null
+  wait "$G4_PID" 2>/dev/null
+  trap - EXIT
+  D=$(python3 -c "
+import json
+try:
+    d=json.load(open('"$RUN/g4c.json"'))
+    print(','.join(map(str,d['tokens'])) if d.get('tokens') else 'ERR')
+except Exception:
+    print('ERR')
+")
+  case "$D" in
+    "$G4_GOLDEN"*) note "G4c HTTP 골든 OK: $(echo "$D" | head -c 60)";;
+    *) echo "[w4a16] FAIL: G4c HTTP 토큰 — $(echo "$D" | head -c 60)"; fail=1;;
+  esac
   echo "=== G4b. gemma4 infer(서빙 경로) ==="
   B=$(timeout 900 "$BIN" infer --model "$M_G4" --prompt-tokens "$G4_PROMPT" --n-predict 9 --ctx 128 2>&1)
   C=$(echo "$B" | grep -o '"token":[0-9]*' | cut -d: -f2 | paste -sd, -)
