@@ -1320,6 +1320,128 @@ mod tests {
     }
 }
 
+/// [gemma4 P3 2026-10-14] t행 청크(≤8) — 프리필·검증 스텝.
+/// 하이브리드: 노름·gelu·잔차·layer_scalar는 호스트(f32 = CPU 오라클 계약),
+/// GEMM(t행)·어텐션(g4 호스트 경로 — 토큰별)·MoE(t행 디바이스)·head(t행 TR)는
+/// GPU(전부 기존 검증 커널). KV = t=1 경로와 동일 슬롯·연속위치.
+/// 반환 = 행별 로짓(t개, softcap 적용).
+pub(crate) fn g4_chunk(
+    dec: &mut llm170_backend_gpu::W4a16Dec,
+    model: &llm170_core::gemma4::Model,
+    cfg: &G4HostCfg,
+    slot: usize,
+    toks: &[u32],
+    pos0: u32,
+) -> Result<Vec<Vec<f32>>, String> {
+    let hp = &model.hp;
+    let (h, t) = (hp.n_embd, toks.len());
+    if t == 0 || t > 8 {
+        return Err(format!("g4_chunk: t={t} (1..=8 계약)"));
+    }
+    let mut x: Vec<f32> = Vec::with_capacity(t * h);
+    for &tk in toks {
+        x.extend_from_slice(&model.embed_row(tk).map_err(|e| e.to_string())?);
+    }
+    for il in 0..hp.n_layer {
+        let d = hp.head_dim[il];
+        // ① input_layernorm → t행 q/k/(v) GEMM.
+        let xn = g4_norm_rows(&x, cfg.nw_row(il, 0, h), hp.eps, t);
+        let q = dec.g4_gemm_host(&format!("blk.{il}.attn_q.weight"), &xn, t, h)?;
+        let k = dec.g4_gemm_host(&format!("blk.{il}.attn_k.weight"), &xn, t, h)?;
+        let v = if model.kv_eq_v(il) {
+            k.clone() // v_norm(k 원시) — prep_g4 vn_on 계약
+        } else {
+            dec.g4_gemm_host(&format!("blk.{il}.attn_v.weight"), &xn, t, h)?
+        };
+        // ② 어텐션 — 토큰별 g4 경로(검증 완료) · KV 누적 = t=1과 동일.
+        let (qnw, knw) = cfg.qk_rows(il, d);
+        let sw = if hp.full[il] { 0 } else { hp.sw };
+        let qd = hp.n_head * d;
+        let kd = hp.n_kv[il] * d;
+        let mut ao: Vec<f32> = Vec::with_capacity(t * qd);
+        for kk in 0..t {
+            let out = dec.attn_g4_host(
+                slot,
+                &q[kk * qd..(kk + 1) * qd],
+                &k[kk * kd..(kk + 1) * kd],
+                &v[kk * kd..(kk + 1) * kd],
+                qnw,
+                knw,
+                il,
+                1,
+                hp.n_head,
+                hp.n_kv[il],
+                d,
+                sw,
+                1.0,
+                2,
+                pos0 + kk as u32,
+            )?;
+            ao.extend_from_slice(&out);
+        }
+        // ③ o_proj(t행) → post_attn_norm + 잔차.
+        let aop = dec.g4_gemm_host(&format!("blk.{il}.attn_output.weight"), &ao, t, qd)?;
+        let hh = g4_norm_rows(&aop, cfg.nw_row(il, 1, h), hp.eps, t);
+        for i in 0..t * h {
+            x[i] += hh[i];
+        }
+        // ④ dense MLP — pre_ff → gate/up → gelu_tanh(호스트 = 커널 비트동일) → down.
+        let nd = g4_norm_rows(&x, cfg.nw_row(il, 2, h), hp.eps, t);
+        let g = dec.g4_gemm_host(&format!("blk.{il}.ffn_gate.weight"), &nd, t, h)?;
+        let u = dec.g4_gemm_host(&format!("blk.{il}.ffn_up.weight"), &nd, t, h)?;
+        let mut act = vec![0f32; g.len()];
+        for i in 0..g.len() {
+            act[i] = llm170_core::ops::gelu_tanh(g[i]) * u[i];
+        }
+        let m = dec.g4_gemm_host(&format!("blk.{il}.ffn_down.weight"), &act, t, hp.n_ff)?;
+        let h1 = g4_norm_rows(&m, cfg.nw_row(il, 3, h), hp.eps, t);
+        // ⑤ MoE — 라우터 입력(hn)·전문가 입력(nm) 분리 · pes 디바이스.
+        let hn = g4_norm_rows(&x, cfg.nw_row(il, 7, h), hp.eps, t);
+        let nm = g4_norm_rows(&x, cfg.nw_row(il, 4, h), hp.eps, t);
+        let pes_dev = dec.g4_pes_dev(il);
+        if pes_dev == 0 {
+            return Err(format!("g4_chunk: L{il} pes 미등록(set_g4_pes 선행)"));
+        }
+        let e_out = dec.g4_moe_host_t(il, &hn, &nm, cfg.pes_row(il, hp.n_experts), t, pes_dev)?;
+        let h2 = g4_norm_rows(&e_out, cfg.nw_row(il, 5, h), hp.eps, t);
+        // ⑥ 병합 → post_ff_norm → 잔차 → layer_scalar.
+        let mut merged = h1;
+        for i in 0..t * h {
+            merged[i] += h2[i];
+        }
+        let hf = g4_norm_rows(&merged, cfg.nw_row(il, 6, h), hp.eps, t);
+        let ls = cfg.layer_scalar[il];
+        for i in 0..t * h {
+            x[i] = (x[i] + hf[i]) * ls;
+        }
+    }
+    // ⑦ 최종 노름 + t행 head(TR — 가중 1판독) + softcap.
+    let xf = g4_norm_rows(&x, cfg.out_norm_row(hp.n_layer, h), hp.eps, t);
+    let flat = dec.g4_head_host_t(&xf, t)?;
+    let n_vocab = hp.vocab;
+    let mut out = Vec::with_capacity(t);
+    for kk in 0..t {
+        let mut lg = flat[kk * n_vocab..(kk + 1) * n_vocab].to_vec();
+        if cfg.softcap > 0.0 {
+            for l in lg.iter_mut() {
+                *l = cfg.softcap * (*l / cfg.softcap).tanh();
+            }
+        }
+        out.push(lg);
+    }
+    Ok(out)
+}
+
+/// [t][h] 행렬 행별 가중 RMS — CPU 계약(ops::rms_norm)과 동일 함수.
+fn g4_norm_rows(x: &[f32], w: &[f32], eps: f32, t: usize) -> Vec<f32> {
+    let h = w.len();
+    let mut out = Vec::with_capacity(t * h);
+    for r in 0..t {
+        out.extend_from_slice(&llm170_core::ops::rms_norm(&x[r * h..(r + 1) * h], w, eps));
+    }
+    out
+}
+
 /// [gemma4 P2-3 2026-10-14] gemma4 v0 체인 1토큰 스텝(프로브·GemmaEngine 공용).
 /// 층 산술(노름·잔차·layer_scalar)은 CPU 코어 계약(`llm170_core::ops`)으로
 /// 조립하고, GPU가 담당하는 것은 GEMV(그룹 인식)·g4 어텐션·gelu·MoE(라우터
@@ -1481,6 +1603,10 @@ impl GemmaEngine {
         let hp = model.hp.clone();
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
         let cfg = upload_model_g4(&mut dec, &model, ctx)?;
+        // 층별 pes(μ_e) 디바이스 상주(t행 MoE 경로용 — 1회).
+        for il in 0..model.hp.n_layer {
+            dec.set_g4_pes(il, cfg.pes_row(il, model.hp.n_experts))?;
+        }
         Ok(GemmaEngine {
             model,
             cfg,
@@ -1498,14 +1624,28 @@ impl GemmaEngine {
         Ok(lg)
     }
 
-    /// 프리필 — 토큰별 스텝(위치 전진). 반환 = 마지막 로짓.
+    /// 프리필 — t행 청크(≤8) 경로(가중 상각). 반환 = 마지막 로짓.
+    /// 스트리밍(비상주 전문가)은 t행 미지원 → t=1 스텝 폴백.
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
         if tokens.is_empty() {
             return Err("prefill: 빈 프롬프트 — 토큰 1개 이상 필요".into());
         }
         let mut last = Vec::new();
-        for &tok in tokens {
-            last = self.step(seq, tok)?;
+        let t_chunk = if self.dec.moe_experts_resident() {
+            8
+        } else {
+            1
+        };
+        for chunk in tokens.chunks(t_chunk) {
+            let pos = self.dec.slot_pos[seq];
+            self.dec.kv_grow(seq, pos as usize + chunk.len())?;
+            if chunk.len() == 1 {
+                last = self.step(seq, chunk[0])?;
+            } else {
+                let lgs = g4_chunk(&mut self.dec, &self.model, &self.cfg, seq, chunk, pos)?;
+                self.dec.slot_pos[seq] = pos + chunk.len() as u32;
+                last = lgs.into_iter().last().unwrap_or_default();
+            }
         }
         Ok(last)
     }
