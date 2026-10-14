@@ -457,7 +457,9 @@ impl W4a16Dec {
         shared_ffn: usize,
         group: usize,
         scale_bf16: bool,
+        glu_gelu: bool,
     ) {
+        self.moe.glu_gelu = glu_gelu;
         self.moe.n_experts = n_experts;
         self.moe.top_k = top_k;
         self.moe.moe_ffn = moe_ffn;

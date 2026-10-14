@@ -255,6 +255,8 @@ pub(super) struct MoE {
     pub(super) top_k: usize,
     pub(super) moe_ffn: usize,
     pub(super) shared_ffn: usize,
+    /// [gemma4 P2 2026-10-14] 전문가 GLU 활성 = gelu_tanh(모델별 — 기본 silu).
+    pub(super) glu_gelu: bool,
     pub(super) moe_group: usize,
     pub(super) moe_scale_bf16: bool,
     /// 전문가 슬라이스 테이블 — (packed ptr/len, scale ptr/len), 인덱스
@@ -654,6 +656,7 @@ impl W4a16Dec {
                 top_k: 0,
                 moe_ffn: 0,
                 shared_ffn: 0,
+                glu_gelu: false,
                 moe_group: 32,
                 moe_scale_bf16: true,
                 moe_tab: Vec::new(),

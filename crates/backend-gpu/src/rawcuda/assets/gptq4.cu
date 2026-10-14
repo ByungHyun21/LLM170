@@ -329,6 +329,39 @@ extern "C" __global__ void w4a16_gemv_experts_glu(
     }
 }
 
+// [gemma4 P2 2026-10-14] 전문가 gate+up+활성 융합 — gelu_tanh판.
+// 구조·행별 산술은 w4a16_gemv_experts_glu와 동일(gemv_row_body) — 활성만
+// silu → gelu_pytorch_tanh(0.5x(1+tanh(√(2/π)(x+0.044715x³)))). tanhf는
+// 트랜센던털 등급(eval 판정 — ew_gelu와 동일 클래스). gemma4 전용(모델별 선택).
+extern "C" __global__ void w4a16_gemv_experts_glu_gelu(
+    const unsigned long long* __restrict__ tab, int base,
+    const int* __restrict__ idx, int nslots,
+    const float* __restrict__ x, int xstride, int sp,
+    float* __restrict__ act, int n, int k)
+{
+    const int sl = blockIdx.x / n;
+    if (sl >= nslots) {
+        return;
+    }
+    const int o = blockIdx.x - sl * n;
+    const unsigned long long* eg = tab + (size_t)(base + idx[sl] * 3) * 2;
+    const unsigned long long* eu = tab + (size_t)(base + 1 + idx[sl] * 3) * 2;
+    const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
+    float* slot = act + (size_t)sl * n;
+    gemv_row_body<5, true>((const unsigned*)eg[0], (const unsigned short*)eg[1],
+                           x + xoff, slot, o, k);
+    __syncthreads();
+    const float g = slot[o];
+    gemv_row_body<5, true>((const unsigned*)eu[0], (const unsigned short*)eu[1],
+                           x + xoff, slot, o, k);
+    __syncthreads();
+    const float u = slot[o];
+    if (threadIdx.x == 0) {
+        const float x3 = g * g * g;
+        slot[o] = (0.5f * g * (1.0f + tanhf(0.7978846f * (g + 0.044715f * x3)))) * u;
+    }
+}
+
 // t=1 GEMV 래퍼 — g128·f16(27B) / g32·bf16(35B 전문가).
 // [P11] 전문가-우선 슬롯 순열 — 같은 전문가의 슬롯을 연속 배치. 목적:
 // 전문가 GEMV 블록의 실행 순서를 전문가 단위로 묶어 같은 가중치 행을 L2에서

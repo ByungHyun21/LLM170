@@ -31,6 +31,7 @@ pub const ASSETS: &[Asset] = &[
         syms: &[
             "w4a16_copy",
             "w4a16_gemv_experts_glu",
+            "w4a16_gemv_experts_glu_gelu",
             "w4a16_gemm_g128",
             "w4a16_gemv_g128",
             "w4a16_gemv_g128_multi",

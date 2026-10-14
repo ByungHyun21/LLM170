@@ -701,6 +701,9 @@ pub(crate) fn upload_moe(
         hp.shared_ffn,
         group,
         scale_bf16,
+        // [gemma4 P2 2026-10-14] 전문가 GLU 활성 — qwen은 silu(기본), gemma4는
+        // gelu_tanh(배선 시 true). 모델별 단일 경로(런타임 수치 플래그 아님).
+        false,
     );
     let mut tab: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(hp.n_layer * hp.n_experts * 3);
     for il in 0..hp.n_layer {
