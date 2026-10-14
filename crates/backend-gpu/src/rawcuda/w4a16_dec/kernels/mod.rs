@@ -29,7 +29,12 @@ impl W4a16Dec {
         } else {
             0
         };
-        let f = self.cc.function("norm_resid")?;
+        let f = self.cc.function(if self.hidden.is_multiple_of(1024) {
+            "norm_resid"
+        } else {
+            // [gemma4 2026-10-14] hidden 2816(1024 배수 아님) — 행 경계 가드 변형.
+            "norm_resid_g"
+        })?;
         let mut tl = t_len as i32;
         let mut wo = (w * self.hidden) as i32;
         let mut hd = self.hidden as i32;

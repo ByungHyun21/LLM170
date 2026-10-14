@@ -76,3 +76,60 @@ extern "C" __global__ void norm_resid(
         x[e] = v[j];
     }
 }
+
+// ── norm_resid_g — 임의 hidden(≤8192) 가드 변형 (gemma4 2816, 2026-10-14) ──
+// norm_resid는 hidden이 블록폭(1024)의 배수임을 가정한다(nper 스트라이드가
+// 행 경계를 넘어 다음 행을 오독). gemma4 hidden=2816(2.75×1024)에는 행
+// 경계 마스크가 필요하다 — 마지막 스트라이드를 lim에서 자른다.
+// 1024 배수 입력에서는 가드가 발동하지 않아 norm_resid와 동일 산술(호스트가
+// 배수면 원 커널을 선택 — 기존 경로 코드젠 불변).
+// 산술 순서·정밀 sqrtf 계약·융합 캐스트(xn32/xn16)는 norm_resid와 동일.
+extern "C" __global__ void norm_resid_g(
+    float* __restrict__ x,
+    const float* __restrict__ nw,
+    const float* __restrict__ ab,
+    float* __restrict__ xn,
+    float* __restrict__ xn32,
+    unsigned short* __restrict__ xn16,
+    int t_len, int w_off, int hidden)
+{
+    __shared__ float red[1024];
+    int t = blockIdx.x;
+    int tid = threadIdx.x;
+    if (t >= t_len) return;
+    int base = t * hidden;
+    int lim = base + hidden;
+    int nper = (hidden + 1023) >> 10;
+    if (nper > 8) return; // 계약: hidden ≤ 8192(v[8] 레지스터 상한)
+    float v[8];
+    float ss = 0.0f;
+    for (int j = 0; j < nper; j++) {
+        int e = base + (j << 10) + tid;
+        if (e < lim) {
+            v[j] = x[e] + ab[e];
+            ss += v[j] * v[j];
+        } else {
+            v[j] = 0.0f;
+        }
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int st = 512; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float inv = 1.0f / sqrtf(red[0] / (float)hidden + 1e-6f);
+    for (int j = 0; j < nper; j++) {
+        int e = base + (j << 10) + tid;
+        if (e >= lim) continue;
+        float y = v[j] * inv * nw[w_off + (j << 10) + tid];
+        xn[e] = y;
+        if (xn32 != (float*)0) {
+            xn32[e] = h2f(f2h(y));
+        }
+        if (xn16 != (unsigned short*)0) {
+            xn16[e] = f2h(y);
+        }
+        x[e] = v[j];
+    }
+}
