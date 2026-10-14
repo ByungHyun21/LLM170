@@ -1,25 +1,10 @@
 # LLM170
 
-A pure-Rust LLM inference engine. Single track: **CUDA + W4A16** — int4 sym
-g128 group quantization with f16 activations — built for the NVIDIA CMP 170HX
-64GB (GA100-class HBM2e, headless, sm_80); also runs on RTX 4090 (sm_89).
-
-W4A16 fits the 170HX: no NVIDIA GPU before Blackwell has int4×fp16 tensor
-cores, so every 4-bit format runs dequant → fp16 mma anyway; the split
-packed/scale layout (4.125 bits/weight) keeps HBM pressure low.
-
-`serve`/`infer` run the CUDA chain end-to-end on W4A16 directories
-(compressed-tensors / AutoRound): the chain stays device-resident (per-token
-round trips are only the embedding upload and the logits read) and is captured
-as a CUDA graph (`LLM170_GRAPH=0` disables). 27B dense runs g128 (t=1 GEMV
-decode, mma prefill); 35B-A3B MoE runs g32 experts behind a device router top-k
-(experts can stream from host RAM). KV cache is int8 (single path). Every
-numeric change passes CPU-oracle goldens, a frozen PPL fingerprint, and a
-ΔPPL/needle gate (`w4a16-eval`) — then replaces the single path or is deleted;
-runtime flags never select arithmetic.
-
-Bit contract: CUDA kernel outputs must match the CPU reference
-(`crates/core/src/quant/lane.rs` — `dot_row_w4a16_lane`).
+Pure-Rust LLM inference engine — single track **CUDA + W4A16** (int4 sym g128,
+f16 activations) for the NVIDIA CMP 170HX 64GB (sm_80); also runs on RTX 4090
+(sm_89). `serve`/`infer` run W4A16 directories (compressed-tensors / AutoRound)
+end-to-end on GPU with an int8 KV cache and CUDA-graph decode — 27B dense
+(g128) and 35B-A3B MoE (g32).
 
 ## Benchmarks
 
@@ -62,5 +47,7 @@ crates/server      CLI + HTTP server (continuous batching)
 benchmark/         measurement ledgers (dev machine: 4090.md)
 ```
 
-Kernel assets: `scripts/build_cuda_kernels.sh` (nvcc, sm_80+sm_89).
-Pre-commit gate: `scripts/preflight.sh`.
+Kernel assets: `scripts/build_cuda_kernels.sh` (nvcc, sm_80+sm_89); kernel
+outputs must match the CPU reference (`crates/core/src/quant/lane.rs`).
+Pre-commit gate: `scripts/preflight.sh` · numeric gate: `w4a16-eval`
+(goldens · ΔPPL band · needle).
