@@ -107,6 +107,43 @@ impl Model {
         self.cfg.kv_eq_v(il)
     }
 
+    /// 엔진 접점 이름 전수(업로드·체인 배선용) — qwen35 engine_names 미러.
+    /// 층 접미사는 gemma4 바인딩(`bind::eng`)과 1:1.
+    pub fn engine_names(&self) -> Vec<String> {
+        let mut v = vec![
+            "token_embd.weight".to_string(),
+            "output.weight".to_string(),
+            "output_norm.weight".to_string(),
+        ];
+        for il in 0..self.hp.n_layer {
+            for suf in [
+                "attn_norm.weight",
+                "post_attn_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "attn_q_norm.weight",
+                "attn_k_norm.weight",
+                "pre_ff_norm.weight",
+                "pre_ff_norm2.weight",
+                "post_ff_norm.weight",
+                "post_ff_norm1.weight",
+                "post_ff_norm2.weight",
+                "ffn_gate.weight",
+                "ffn_up.weight",
+                "ffn_down.weight",
+                "moe_gate.weight",
+                "moe_scale",
+                "moe_per_expert_scale",
+                "layer_scalar",
+            ] {
+                v.push(format!("blk.{il}.{suf}"));
+            }
+        }
+        v
+    }
+
     /// 임베딩 √h 스케일(병렬 프리필용).
     pub fn embed_scale(&self) -> f32 {
         self.embed_scale
