@@ -75,6 +75,8 @@ struct Slot {
     failed: Option<String>,
     /// [§7.5] 스펙 적응 게이트 — 연속 무수용 라운드 수(1 도달 시 256토큰마다 재시도).
     spec_miss: u32,
+    /// [관측 2026-10-14] 첫 emit 시각(TTFT 원료 — 큐 진입은 job.queued).
+    t_first: Option<std::time::Instant>,
 }
 
 impl Slot {
@@ -91,6 +93,7 @@ impl Slot {
             sampler: None,
             err_count: 0,
             failed: None,
+            t_first: None,
             spec_miss: 0,
         }
     }
@@ -159,6 +162,7 @@ pub static SCHED: Sched = Sched {
     prefix_full_hits: AtomicU64::new(0),
     prefix_ckpt_hits: AtomicU64::new(0),
     trie_boundaries: AtomicU64::new(0),
+    ttft_us: AtomicU64::new(0),
     ticks_decode: AtomicU64::new(0),
     ms_decode: AtomicU64::new(0),
     chunks_prefill: AtomicU64::new(0),
@@ -216,6 +220,8 @@ pub struct Sched {
     /// [§3.4 ③ 2026-10-12] 접두 트리 512 경계 등록 수(모니터링 — metrics json
     /// trie_boundaries). metrics 표기가 선행 반영됨(계측 배선은 병렬 작업분).
     pub trie_boundaries: AtomicU64,
+    /// [관측 2026-10-14] 요청별 TTFT(큐 진입→첫 토큰) 누적 µs — /stats avg.
+    pub ttft_us: AtomicU64,
     pub ticks_decode: AtomicU64,
     pub ms_decode: AtomicU64,
     pub chunks_prefill: AtomicU64,
@@ -361,6 +367,10 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         for (i, s) in slots.iter().enumerate() {
             if s.job.is_none() && s.cached.len() >= 512 {
                 ptrie.insert(&s.cached, i);
+                // [관측 2026-10-14] 트라이 경계 계측 배선(§2.C — /stats 노출 재료).
+                SCHED
+                    .trie_boundaries
+                    .store(ptrie.n_boundaries as u64, Ordering::Relaxed);
             }
         }
         // [R7] 게시 스로틀(≤1Hz — 헬퍼 분리 · 동작 불변).
