@@ -330,7 +330,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut kv_budget: Option<u64> = None;
     let mut kv_reserve: Option<u64> = None;
     let mut plan_txt = String::new();
-    match llm170_core::qwen35::ctx_info(&model_path) {
+    match model_ctx_info(&model_path) {
         Ok(ci) => {
             model_max_ctx = ci.ctx;
             // [K6-3 예산 2026-10-13] 풀 예산 = 여유 VRAM − 가중치(dense) − 예약.
@@ -518,7 +518,7 @@ fn cmd_plan(args: &[String], ma: &ModelArgs) -> ExitCode {
         }
     };
     // 워크로드 — config 파생(ctx·KV/토큰·상태). 실패 시 표준 폴백(무적재 원칙).
-    let (max_ctx, kv_bpt, state_bpc) = match llm170_core::qwen35::ctx_info(&model_path) {
+    let (max_ctx, kv_bpt, state_bpc) = match model_ctx_info(&model_path) {
         Ok(ci) => (ci.ctx, ci.kv_bytes_per_token, ci.gdn_state_bytes_per_slot),
         Err(e) => {
             eprintln!("# plan: config 파생 실패({e}) — 폴백(256K·33KiB/tok·151MiB/ctx)");
@@ -705,6 +705,16 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
             .join(", ")
     );
     ExitCode::SUCCESS
+}
+
+/// [P3 gemma4 2026-10-14] 아치별 계획 파생 — ctx_info 레지스트리 디스패치.
+fn model_ctx_info(p: &std::path::Path) -> Result<llm170_core::qwen35::CtxInfo, String> {
+    let arch = llm170_core::qwen35::bind::dir_arch(p).unwrap_or_default();
+    if llm170_core::gemma4::bind::arch_ok(&arch) {
+        llm170_core::gemma4::ctx_info(p)
+    } else {
+        llm170_core::qwen35::ctx_info(p)
+    }
 }
 
 fn usage_err(msg: &str) -> ExitCode {
