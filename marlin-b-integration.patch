@@ -1,3 +1,11 @@
+# [보존 패치 — 2.B 마린 m16 배선] 구현 커밋 18eeefeb · 실측 판정 커밋 7ac00c9a.
+# 결론: 개발기(24GB, sm_89) 기각 · **64GB 재개 후보** — 콜드(HBM)에서 t>=4 marlin
+#   이득은 n>>k 형상 한정(ffn_gate t=4/5/8 1.40/1.91/3.19x · attn_q 1.29/1.55x;
+#   ffn_down·o_proj 등 소형-n/N256 타일은 0.28~0.75x 패배, t=1도 열세).
+# 전제: gate/up/q 이중 레이아웃(+7.7GB) — 24GB 불가, 64GB급에서만.
+# 적용성: 이후 캠페인(상태 f16+스케일·GQA 패킹·체크포인트 호스트 이관 등)으로
+#   **현재 트리에 클린 적용 불가** — 기계적 적용이 아니라 참조 구현으로 사용.
+#   (이 헤더는 git apply가 무시함 — 기록용.)
 diff --git a/crates/backend-gpu/src/rawcuda/w4a16_dec/chains.rs b/crates/backend-gpu/src/rawcuda/w4a16_dec/chains.rs
 index e86b1a86..30eb64c8 100644
 --- a/crates/backend-gpu/src/rawcuda/w4a16_dec/chains.rs
