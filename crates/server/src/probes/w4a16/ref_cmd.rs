@@ -135,6 +135,10 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
     let mut ctx = 4096usize;
     // [Q1 2026-10-12] 오라클 NLL 모드 — 코퍼스 순회 CPU teacher-forced NLL.
     let (mut corpus, mut limit) = (None::<String>, usize::MAX);
+    // [gemma4 2026-10-14] --bos <id>: 코퍼스 선두에 BOS 부착. gemma4처럼
+    // 채팅 템플릿·BOS 의존이 큰 모델은 raw 텍스트 NLL이 프로토콜 아티팩트로
+    // 폭발한다(HF 대조로 확인) — 품질 게이트는 BOS 부착 프로토콜을 쓴다.
+    let mut bos: Option<u32> = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -165,6 +169,13 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
             "--eval-corpus" => {
                 corpus = Some(arg(&mut it, "--eval-corpus requires a path")?.to_string())
             }
+            "--bos" => {
+                bos = Some(
+                    it.next()
+                        .and_then(|v| v.parse().ok())
+                        .ok_or("--bos requires an id")?,
+                );
+            }
             "--limit" => {
                 limit = it
                     .next()
@@ -181,7 +192,10 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
         // [Q1] CPU 오라클 NLL — 전 위치 teacher-forced, 전 어휘 logsumexp(f64).
         let text = std::fs::read_to_string(c).map_err(|e| format!("corpus {c}: {e}"))?;
         let tk = crate::tokenize::Tokenizer::load(std::path::Path::new(&dir))?;
-        let toks = tk.encode_opts(&text, false);
+        let mut toks = tk.encode_opts(&text, false);
+        if let Some(b) = bos {
+            toks.insert(0, b);
+        }
         let n = toks.len().min(limit);
         if n < 2 {
             return Err(format!("토큰 {n}개 — NLL에는 2개 이상 필요"));
@@ -199,7 +213,8 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
         let ppl = mean.exp();
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         return Ok(format!(
-            "w4a16-ref {dir} — CPU 오라클 NLL (teacher-forced · logsumexp f64)\n  corpus {c} · 토큰 {n} (NLL {}위치) · {ms:.0}ms ({:.0}ms/토큰)\n  NLL평균 {mean:.9} · PPL {ppl:.9}\n",
+            "w4a16-ref {dir} — CPU 오라클 NLL (teacher-forced · logsumexp f64)\n  corpus {c}{} · 토큰 {n} (NLL {}위치) · {ms:.0}ms ({:.0}ms/토큰)\n  NLL평균 {mean:.9} · PPL {ppl:.9}\n",
+            bos.map(|b| format!(" · BOS {b}")).unwrap_or_default(),
             n - 1,
             ms / (n - 1) as f64
         ));
