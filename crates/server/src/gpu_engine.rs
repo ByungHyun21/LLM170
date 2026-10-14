@@ -1618,13 +1618,24 @@ impl GemmaEngine {
         })
     }
 
-    /// 1토큰 스텝 — KV 확보 + 체인 + pos 전진. 반환 = 로짓(softcap 적용됨).
+    /// 1토큰 스텝 — **t행 청크 t=1**(단일 경로: 배치·프리필·spec과 동일 커널·
+    /// 클래스 — t행 GEMV는 t=1 GEMV와 같은 산술 순서). 호스트 체인의 층당
+    /// ~14왕복(h2d/launch/d2h/sync)이 청크에선 ~8로 줄어든다.
     fn step(&mut self, seq: usize, tok: u32) -> Result<Vec<f32>, String> {
         let pos = self.dec.slot_pos[seq];
         self.dec.kv_grow(seq, pos as usize + 1)?;
-        let lg = g4_step(&mut self.dec, &self.model, &self.cfg, seq, tok, pos)?;
+        let rows = self.model.embed_row(tok).map_err(|e| e.to_string())?;
+        let lgs = g4_chunk(
+            &mut self.dec,
+            &self.model,
+            &self.cfg,
+            &[seq],
+            &[pos],
+            &rows,
+            1,
+        )?;
         self.dec.slot_pos[seq] = pos + 1;
-        Ok(lg)
+        Ok(lgs.into_iter().next().unwrap_or_default())
     }
 
     /// 프리필 — t행 청크(≤8) 경로(가중 상각). 반환 = 마지막 로짓.
