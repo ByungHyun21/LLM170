@@ -440,16 +440,19 @@ impl W4a16Dec {
             * (dm.n_gdn * dm.h_v * dm.d * dm.d * 2
                 + dm.n_gdn * dm.h_v * dm.d * 4
                 + dm.n_gdn * 3 * dm.conv_ch() * 4);
-        match self.cc.alloc(chk) {
+        // [호스트 이관 2026-10-14] 콜드 백업 — VRAM 대신 pinned 호스트 RAM.
+        // 체크포인트 기록 = d2h(청크당 ~77MB)·복원 = h2d — 스트림 순서 보존,
+        // 수치(바이트)는 d2d 시절과 동일. VRAM −1.26GiB = 컨텍스트 +37K토큰급.
+        match self.cc.pinned_alloc(chk) {
             Ok(p) => {
                 self.gdn.dchk = p;
                 self.gdn.dchk_pos = vec![[0u32; 4]; self.n_slots];
-                // [§3.4 ②] 체크포인트 회계 — 슬롯×4환형 전체. 실패(VRAM)
+                // [§3.4 ②] 체크포인트 회계 — 슬롯×4환형 전체. 실패(호스트)
                 // 경로는 미등록(기능 off와 정합).
                 if let Err(e) = self.ucache.allocate(
                     "spec:ckpt",
                     CacheCategory::Checkpoint,
-                    Tier::Hbm,
+                    Tier::HostRam,
                     chk as u64,
                     base_util::CKPT,
                 ) {

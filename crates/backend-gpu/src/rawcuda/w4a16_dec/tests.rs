@@ -600,33 +600,42 @@ fn ucache_enforcement_frees_device_memory() {
     // 스펙 상태(WY s0/dc/g/k + dsnap_ring/dsave) + 체크포인트(dchk) 등록.
     dec.enable_spec().expect("enable_spec");
     assert!(dec.spec_on(), "스펙 활성 전제(압박 전)");
-    assert_ne!(dec.gdn.dchk, 0, "체크포인트 등록 전제");
+    assert!(!dec.gdn.dchk.is_null(), "체크포인트 등록 전제");
     assert_ne!(dec.gdn.dwy_s0, 0, "스펙 상태(WY S_0) 등록 전제");
 
     let ckpt = dec.ucache.entry("spec:ckpt").expect("ckpt 등록부").bytes;
     let state = dec.ucache.entry("spec:state").expect("state 등록부").bytes;
     let kv = dec.ucache.entry("attn:kv").expect("kv 등록부").bytes;
+    // [호스트 이관 2026-10-14] 체크포인트 링 = pinned 호스트 RAM(HostRam 티어)
+    // — HBM 회계에서 제외(회수 대상은 state만), 호스트 티어에 청구.
     let total = dec.ucache.total(super::unified_cache::Tier::Hbm);
-    assert_eq!(total, ckpt + state + kv, "등록부 회계 정합");
-
-    // 압박: 예산 = KV 단독으로 축소 → ckpt(u10) → state(u20) 순 퇴거,
-    // kv(고정) 생존 후 총점유 = 예산과 정확히 일치.
-    let free0 = crate::cuda_mem_free().expect("VRAM 프로브").0;
-    let freed = dec.ucache_pressure(kv).expect("압박 스윕");
-    assert_eq!(freed, ckpt + state, "퇴거분 전량 실해제");
-    assert_eq!(dec.ucache.evict_count(), 2, "ckpt+state 2건 퇴거");
-
-    // 실측 회수 판정 — 해제분만큼 여유 VRAM 증가(드라이버 산정 ≥ 청구).
-    let free1 = crate::cuda_mem_free().expect("VRAM 프로브").0;
-    assert!(
-        free1 >= free0 && free1 - free0 >= ckpt + state,
-        "VRAM 회수 없음: +{}B (기대 ≥ {}B)",
-        free1.saturating_sub(free0),
-        ckpt + state
+    assert_eq!(total, state + kv, "등록부 HBM 회계 정합(ckpt 제외)");
+    assert_eq!(
+        dec.ucache.total(super::unified_cache::Tier::HostRam),
+        ckpt,
+        "ckpt는 호스트 티어"
     );
 
-    // 기능 정합 — 해제 버퍼 0화 + 스펙 차단, KV 생존(퇴거 금지 계약).
-    assert_eq!(dec.gdn.dchk, 0, "dchk 해제 후 0화");
+    // 압박: 예산 = KV 단독으로 축소 → state(u20) 퇴거, kv(고정) 생존.
+    // [호스트 이관 2026-10-14] ckpt는 HostRam 티어 — HBM 압박 대상이 아니다
+    // (호스트 버퍼를 해제해도 VRAM이 안 늘어나므로). 잔존 = 접두 재사용 유지.
+    let free0 = crate::cuda_mem_free().expect("VRAM 프로브").0;
+    let freed = dec.ucache_pressure(kv).expect("압박 스윕");
+    assert_eq!(freed, state, "퇴거분 HBM 실해제(state만)");
+    assert_eq!(dec.ucache.evict_count(), 1, "state 1건 퇴거");
+
+    // 실측 회수 판정 — HBM 해제분(state)만큼 여유 VRAM 증가(드라이버 산정 ≥
+    // 청구). ckpt(호스트)는 VRAM 델타에 안 잡힌다.
+    let free1 = crate::cuda_mem_free().expect("VRAM 프로브").0;
+    assert!(
+        free1 >= free0 && free1 - free0 >= state,
+        "VRAM 회수 없음: +{}B (기대 ≥ {}B)",
+        free1.saturating_sub(free0),
+        state
+    );
+
+    // 기능 정합 — state 해제 0화 + 스펙 차단, ckpt(호스트) 잔존, KV 생존.
+    assert!(!dec.gdn.dchk.is_null(), "ckpt(호스트) 잔존 — HBM 압박 무관");
     assert_eq!(dec.gdn.dwy_s0, 0, "WY S_0 해제 후 0화");
     assert_eq!(dec.gdn.dwy_dc, 0, "WY dc 해제 후 0화");
     assert_eq!(dec.gdn.dwy_g, 0, "WY g 해제 후 0화");
@@ -641,7 +650,12 @@ fn ucache_enforcement_frees_device_memory() {
     assert_eq!(
         dec.ucache.total(super::unified_cache::Tier::Hbm),
         kv,
-        "퇴거 후 잔여 = KV 단독"
+        "퇴거 후 잔여 = HBM KV 단독"
+    );
+    assert_eq!(
+        dec.ucache.total(super::unified_cache::Tier::HostRam),
+        ckpt,
+        "호스트 티어 = ckpt 잔존"
     );
 }
 

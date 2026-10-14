@@ -57,10 +57,25 @@ else:
 PY
 }
 
+gpu_busy() { # idle 사용률 중앙값(%) — 데스크톱 점유(Xorg·nautilus·tracker 등) 탐지
+    local v=()
+    for _ in 1 2 3 4 5; do
+        v+=("$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits)")
+        sleep 0.4
+    done
+    printf '%s\n' "${v[@]}" | sort -n | sed -n 3p
+}
+
 run_model() { # 이름 모델경로
     local name=$1 model=$2
     pkill -x llm170 2>/dev/null || true
     sleep 2
+    # [점유 가드 2026-10-14] 데스크톱 GPU 점유 실측 사례: idle 30~37%(nautilus·
+    # tracker·Xorg)에서 전 축 −8~12% 오염(A/B로 코드 무죄 확인). ≥10%면 경고 —
+    # 청정 수치가 필요하면 데스크톱을 조용히 한 뒤 재실행.
+    local busy
+    busy=$(gpu_busy)
+    echo "# GPU idle util ${busy}%$([ "${busy:-0}" -ge 10 ] && echo ' — 경고: 데스크톱 점유 의심(수치 오염 가능)' || echo ' (청정)')" >&2
     if [ "$LONG" = 1 ]; then
         echo "## $name"
         echo
