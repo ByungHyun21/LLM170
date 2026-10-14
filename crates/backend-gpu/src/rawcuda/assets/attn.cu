@@ -505,6 +505,8 @@ extern "C" __global__ void attn_prep_g4(
     float* __restrict__ qh,          // [T][q_heads*d]
     const unsigned long long* __restrict__ dblk_tab,
     const unsigned* __restrict__ pp,
+    const unsigned long long* __restrict__ row_blk, // [배치 2026-10-14] nullable
+    const unsigned long long* __restrict__ row_pp,  //   행별(테이블, pos)
     const float* __restrict__ rp,
     int t_len, int layer, int q_heads, int kv_heads, int cap)
 {
@@ -519,7 +521,15 @@ extern "C" __global__ void attn_prep_g4(
     const int t = blockIdx.x;
     const int j = blockIdx.y;
     const int tid = threadIdx.x;
-    const int pos = (int)pp[0] + t;
+    // [배치 행 퓨전] 행별 blk/pos — null이면 종전 단일 슬롯(pos = pp[0]+t).
+    const unsigned long long* blk = dblk_tab;
+    int pos;
+    if (row_blk != (const unsigned long long*)0) {
+        blk = (const unsigned long long*)row_blk[t];
+        pos = (int)((const unsigned*)row_pp[t])[0];
+    } else {
+        pos = (int)pp[0] + t;
+    }
     const long kv_dim = (long)kv_heads * d;
     if (j < q_heads) {
         const float* src = q + (long)t * q_heads * d + (long)j * d;
@@ -583,7 +593,7 @@ extern "C" __global__ void attn_prep_g4(
         hd[tid] = x0 * c - x1 * s2;
         hd[tid + span] = x0 * s2 + x1 * c;
     }
-    AttnKvRowPtrs row = attn_blk_row(dblk_tab, layer, cap, pos, kv_dim, kv_heads, m);
+    AttnKvRowPtrs row = attn_blk_row(blk, layer, cap, pos, kv_dim, kv_heads, m);
     // K absmax → int8
     float amax = 0.0f;
     for (int i = tid; i < d; i += 128) {
@@ -845,6 +855,8 @@ extern "C" __global__ void attn_fwd3s_part_g4(
     const unsigned long long* __restrict__ dblk_tab,
     float* __restrict__ part,   // [T][q_heads][S][d+2]
     const unsigned* __restrict__ pp,
+    const unsigned long long* __restrict__ row_blk, // [배치] nullable
+    const unsigned long long* __restrict__ row_pp,  //   행별(테이블, pos)
     int t_len, int layer, int q_heads, int kv_heads, int cap, int splits,
     int d, int sw, float kq_scale)
 {
@@ -856,7 +868,15 @@ extern "C" __global__ void attn_fwd3s_part_g4(
     int gq = q_heads / kv_heads;
     int kh = h / gq;
     float scale = kq_scale;
-    int lim = (int)pp[0] + t + 1;
+    // [배치] 행별 blk/lim — null이면 종전 단일 슬롯.
+    const unsigned long long* blk = dblk_tab;
+    int lim;
+    if (row_blk != (const unsigned long long*)0) {
+        blk = (const unsigned long long*)row_blk[t];
+        lim = (int)((const unsigned*)row_pp[t])[0] + 1;
+    } else {
+        lim = (int)pp[0] + t + 1;
+    }
     int start = (sw > 0 && lim > sw) ? (lim - sw) : 0;
     long kv_dim = (long)kv_heads * d;
     long qrow = (long)t * (q_heads * d) + (long)h * d;
@@ -893,7 +913,7 @@ extern "C" __global__ void attn_fwd3s_part_g4(
             [&](int i) -> float {
                 const int row = base + i;
                 const AttnKvRowPtrs rp =
-                    attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                    attn_blk_row(blk, layer, cap, row, kv_dim, kv_heads, kh);
                 const uint4* k16 = reinterpret_cast<const uint4*>(rp.k);
                 const float4* q4 = reinterpret_cast<const float4*>(qs);
                 float p0 = 0.0f;
@@ -925,7 +945,7 @@ extern "C" __global__ void attn_fwd3s_part_g4(
             [&](int i) -> float {
                 const int row = base + i;
                 const AttnKvRowPtrs rp =
-                    attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                    attn_blk_row(blk, layer, cap, row, kv_dim, kv_heads, kh);
                 return (float)rp.v[tid] * rp.vs[0];
             },
             sarr, reds, nch, tid, m_run, l_run, acc);

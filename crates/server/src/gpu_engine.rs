@@ -1329,18 +1329,19 @@ pub(crate) fn g4_chunk(
     dec: &mut llm170_backend_gpu::W4a16Dec,
     model: &llm170_core::gemma4::Model,
     cfg: &G4HostCfg,
-    slot: usize,
+    slots: &[usize],
+    pos: &[u32],
     rows: &[f32],
     t: usize,
-    pos0: u32,
 ) -> Result<Vec<Vec<f32>>, String> {
     let hp = &model.hp;
     let h = hp.n_embd;
-    if t == 0 || t > 8 || rows.len() != t * h {
+    if t == 0 || t > 8 || rows.len() != t * h || slots.len() != t || pos.len() != t {
         return Err(format!(
-            "g4_chunk: t={t} rows={} != t*h={} (1..=8 계약)",
+            "g4_chunk: t={t} rows={} slots={} pos={} (1..=8 · t*h 계약)",
             rows.len(),
-            t * h
+            slots.len(),
+            pos.len()
         ));
     }
     let mut x: Vec<f32> = rows.to_vec();
@@ -1361,19 +1362,18 @@ pub(crate) fn g4_chunk(
             dec.g4_dev_gemm(&format!("blk.{il}.attn_v.weight"), dxn, t, h, 3)?
         };
         let outv = dec.attn_g4_dev(
-            slot,
+            slots,
+            pos,
             il,
             q,
             k,
             v,
-            t,
             hp.n_head,
             hp.n_kv[il],
             d,
             sw,
             1.0,
             2,
-            pos0,
             6,
             7,
             8,
@@ -1649,14 +1649,16 @@ impl GemmaEngine {
                 for &tk in chunk {
                     rows.extend_from_slice(&self.model.embed_row(tk).map_err(|e| e.to_string())?);
                 }
+                let csv: Vec<usize> = vec![seq; chunk.len()];
+                let cpos: Vec<u32> = (0..chunk.len()).map(|i| pos + i as u32).collect();
                 let lgs = g4_chunk(
                     &mut self.dec,
                     &self.model,
                     &self.cfg,
-                    seq,
+                    &csv,
+                    &cpos,
                     &rows,
                     chunk.len(),
-                    pos,
                 )?;
                 self.dec.slot_pos[seq] = pos + chunk.len() as u32;
                 last = lgs.into_iter().last().unwrap_or_default();
@@ -1665,7 +1667,8 @@ impl GemmaEngine {
         Ok(last)
     }
 
-    /// 슬롯 배치 1토큰 — 행별 로짓(평탄 아님: 행 백터).
+    /// 슬롯 배치 1토큰 — **이종 슬롯·위치 t행 청크**(가중 상각) + 행별 로짓.
+    /// 스트리밍 전문가·t>8은 슬롯별 t=1 폴백.
     pub fn decode(&mut self, seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
         if seq_ids.len() != tokens.len() {
             return Err(format!(
@@ -1674,11 +1677,42 @@ impl GemmaEngine {
                 tokens.len()
             ));
         }
-        let mut out = Vec::with_capacity(seq_ids.len());
-        for (&s, &tok) in seq_ids.iter().zip(tokens.iter()) {
-            out.push(self.step(s, tok)?);
+        if seq_ids.is_empty() {
+            return Err("decode: 빈 배치".into());
         }
-        Ok(out)
+        let t = seq_ids.len();
+        if t == 1 {
+            return Ok(vec![self.step(seq_ids[0], tokens[0])?]);
+        }
+        if t > 8 || !self.dec.moe_experts_resident() {
+            let mut out = Vec::with_capacity(t);
+            for (&s, &tok) in seq_ids.iter().zip(tokens.iter()) {
+                out.push(self.step(s, tok)?);
+            }
+            return Ok(out);
+        }
+        // 배치 청크 — 행 = 슬롯(임베딩·pos·KV 확보) → 디바이스 t행 체인.
+        let mut rows = Vec::with_capacity(t * self.model.hp.n_embd);
+        let mut pos: Vec<u32> = Vec::with_capacity(t);
+        for (&s, &tok) in seq_ids.iter().zip(tokens.iter()) {
+            rows.extend_from_slice(&self.model.embed_row(tok).map_err(|e| e.to_string())?);
+            let p = self.dec.slot_pos[s];
+            self.dec.kv_grow(s, p as usize + 1)?;
+            pos.push(p);
+        }
+        let lgs = g4_chunk(
+            &mut self.dec,
+            &self.model,
+            &self.cfg,
+            seq_ids,
+            &pos,
+            &rows,
+            t,
+        )?;
+        for (i, &s) in seq_ids.iter().enumerate() {
+            self.dec.slot_pos[s] = pos[i] + 1;
+        }
+        Ok(lgs)
     }
 
     /// 슬롯 배치 greedy — step + argmax.
@@ -1773,10 +1807,12 @@ impl GemmaEngine {
         if !(2..=8).contains(&t) {
             return Err(format!("g4 spec: t={t} (2..=8 계약)"));
         }
-        let pos = self.dec.slot_pos[slot];
-        self.dec.kv_grow(slot, pos as usize + t)?;
-        let lgs = g4_chunk(&mut self.dec, &self.model, &self.cfg, slot, rows, t, pos)?;
-        self.dec.slot_pos[slot] = pos + t as u32;
+        let pos0 = self.dec.slot_pos[slot];
+        self.dec.kv_grow(slot, pos0 as usize + t)?;
+        let csv: Vec<usize> = vec![slot; t];
+        let cpos: Vec<u32> = (0..t).map(|i| pos0 + i as u32).collect();
+        let lgs = g4_chunk(&mut self.dec, &self.model, &self.cfg, &csv, &cpos, rows, t)?;
+        self.dec.slot_pos[slot] = pos0 + t as u32;
         Ok(lgs)
     }
     pub fn decode_greedy_k(

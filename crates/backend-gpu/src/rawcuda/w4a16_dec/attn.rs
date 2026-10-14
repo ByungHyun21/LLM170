@@ -333,6 +333,7 @@ impl W4a16Dec {
             let f = self.cc.function("attn_prep_g4")?;
             let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) =
                 (dq, 0u64, 0u64, dqnw, 0u64, dqh, 0u64, dpp, drp);
+            let (mut rblk, mut rpp) = (0u64, 0u64); // 단일 슬롯(null)
             let (mut tl, mut lay, mut qh, mut kvh, mut cp) =
                 (t_len as i32, 0i32, q_heads as i32, 0i32, 32i32);
             self.cc.launch(
@@ -340,9 +341,9 @@ impl W4a16Dec {
                 t_len as u32,
                 q_heads as u32,
                 128,
-                &mut crate::rawcuda::args::l14(
+                &mut crate::rawcuda::args::l16(
                     &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
-                    &mut a8, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
+                    &mut rblk, &mut rpp, &mut a8, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
                 ),
             )?;
             self.cc.sync()?;
@@ -451,6 +452,7 @@ impl W4a16Dec {
                 let f = self.cc.function("attn_prep_g4")?;
                 let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) =
                     (dq, dk, dv, dqnw, dknw, dqh, dblk, dpp, drp);
+                let (mut rblk, mut rpp) = (0u64, 0u64); // 단일 슬롯(null)
                 let (mut tl, mut lay, mut qh, mut kvh, mut cp) = (
                     t_len as i32,
                     layer as i32,
@@ -463,9 +465,10 @@ impl W4a16Dec {
                     t_len as u32,
                     (q_heads + kv_heads) as u32,
                     128,
-                    &mut crate::rawcuda::args::l14(
+                    &mut crate::rawcuda::args::l16(
                         &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
-                        &mut a8, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
+                        &mut rblk, &mut rpp, &mut a8, &mut tl, &mut lay, &mut qh, &mut kvh,
+                        &mut cp,
                     ),
                 )?;
             }
@@ -473,6 +476,7 @@ impl W4a16Dec {
             {
                 let f = self.cc.function("attn_fwd3s_part_g4")?;
                 let (mut a0, mut a1, mut a2, mut a3) = (dqh, dblk, dpart, dpp);
+                let (mut rblk, mut rpp) = (0u64, 0u64); // 단일 슬롯(null)
                 let (mut tl, mut lay, mut qh, mut kvh, mut cp) = (
                     t_len as i32,
                     layer as i32,
@@ -487,9 +491,9 @@ impl W4a16Dec {
                     t_len as u32,
                     (q_heads * splits) as u32,
                     d as u32,
-                    &mut crate::rawcuda::args::l13(
-                        &mut a0, &mut a1, &mut a2, &mut a3, &mut tl, &mut lay, &mut qh, &mut kvh,
-                        &mut cp, &mut sp, &mut dd, &mut swv, &mut scl,
+                    &mut crate::rawcuda::args::l15(
+                        &mut a0, &mut a1, &mut a2, &mut a3, &mut rblk, &mut rpp, &mut tl, &mut lay,
+                        &mut qh, &mut kvh, &mut cp, &mut sp, &mut dd, &mut swv, &mut scl,
                     ),
                 )?;
             }

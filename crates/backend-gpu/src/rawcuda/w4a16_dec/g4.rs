@@ -416,30 +416,33 @@ impl W4a16Dec {
         self.g4_pool.get(slot).map(|b| b.ptr).unwrap_or(0)
     }
 
-    /// [gemma4 P3 2026-10-14] g4 어텐션 **디바이스** 런처 — q/k/v·출력 모두
-    /// 디바이스(중간 d2h 0). KV는 아레나 기록. 반환 = outv 슬롯 포인터
-    /// ([t][q_heads*d]). qnw/knw = set_attn의 d_max 패딩 배열에서 이 층 행
-    /// (커널이 qnw[i] 행 포인터 계약 — 패딩 오프셋 정합).
+    /// [gemma4 P3 2026-10-14] g4 어텐션 **디바이스·행별 테이블** 런처 — q/k/v·
+    /// 출력 모두 디바이스(중간 d2h 0). 행 i = 슬롯 slots[i]·위치 pos[i](연속일
+    /// 필요 없음 — 배치 디코드 지원). KV는 각 슬롯 아레나 기록. 반환 = outv 슬롯.
+    /// qnw/knw = set_attn d_max 패딩 배열의 이 층 행(커널 행 포인터 계약 정합).
     #[allow(clippy::too_many_arguments)]
     pub fn attn_g4_dev(
         &mut self,
-        slot: usize,
+        slots: &[usize],
+        pos: &[u32],
         layer: usize,
         q_dev: CUdeviceptr,
         k_dev: CUdeviceptr,
         v_dev: CUdeviceptr,
-        t: usize,
         q_heads: usize,
         kv_heads: usize,
         d: usize,
         sw: usize,
         kq_scale: f32,
         splits: usize,
-        pos0: u32,
         qh_slot: usize,
         part_slot: usize,
         out_slot: usize,
     ) -> Result<CUdeviceptr, String> {
+        let t = slots.len();
+        if t == 0 || pos.len() != t {
+            return Err(format!("attn_g4_dev: t={t} pos={}", pos.len()));
+        }
         let _g = self.cc.guard()?;
         let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
         if self.attn.g4_rp == 0 || layer >= dm.n_attn {
@@ -449,19 +452,37 @@ impl W4a16Dec {
         let qh = self.g4_scratch_slot(qh_slot, qn * 4)?;
         let part = self.g4_scratch_slot(part_slot, t * q_heads * splits * (d + 2) * 4)?;
         let outv = self.g4_scratch_slot(out_slot, qn * 4)?;
-        let dpp = self.g4_scratch_slot(5, 4)?;
-        self.cc.h2d(dpp, &pos0.to_le_bytes())?;
+        // 행별 (pos, 블록 테이블) 포인터 테이블 — 커널 row_blk/row_pp 계약.
+        let mb = dm.cap.div_ceil(512);
+        let pos_dev = self.g4_scratch_slot(10, t * 4)?;
+        let rpp_dev = self.g4_scratch_slot(11, t * 8)?;
+        let rblk_dev = self.g4_scratch_slot(12, t * 8)?;
+        let mut pb: Vec<u8> = Vec::with_capacity(t * 4);
+        for &pv in pos {
+            pb.extend_from_slice(&pv.to_le_bytes());
+        }
+        self.cc.h2d(pos_dev, &pb)?;
+        let mut rppb: Vec<u8> = Vec::with_capacity(t * 8);
+        let mut rblkb: Vec<u8> = Vec::with_capacity(t * 8);
+        for (i, &sl) in slots.iter().enumerate() {
+            rppb.extend_from_slice(&(pos_dev + (i * 4) as u64).to_le_bytes());
+            let base = self.attn.dblk_tab + (sl * dm.n_attn * mb * 4 * 8) as u64;
+            rblkb.extend_from_slice(&base.to_le_bytes());
+        }
+        self.cc.h2d(rpp_dev, &rppb)?;
+        self.cc.h2d(rblk_dev, &rblkb)?;
+        let dpp = pos_dev; // null 경로 비사용(호환 인자)
         let d_max = self.attn.layers.iter().map(|l| l.d).max().unwrap_or(d);
         let qnw = self.attn.dqnw_a + (layer * d_max * 4) as u64;
         let knw = self.attn.dknw_a + (layer * d_max * 4) as u64;
-        let mb = dm.cap.div_ceil(512);
-        let dblk = self.attn.dblk_tab + (slot * dm.n_attn * mb * 4 * 8) as u64;
+        let dblk = self.attn.dblk_tab; // 비사용(행 테이블 우선) — 호환 인자
         let drp = self.attn.g4_rp;
         // ① prep_g4 — grid (t, q_heads+kv_heads) · 128스레드.
         {
             let f = self.cc.function("attn_prep_g4")?;
             let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) =
                 (q_dev, k_dev, v_dev, qnw, knw, qh, dblk, dpp, drp);
+            let (mut rblk, mut rpp) = (rblk_dev, rpp_dev); // 행별 테이블
             let (mut tl, mut lay, mut qh_, mut kvh, mut cp) = (
                 t as i32,
                 layer as i32,
@@ -474,9 +495,9 @@ impl W4a16Dec {
                 t as u32,
                 (q_heads + kv_heads) as u32,
                 128,
-                &mut crate::rawcuda::args::l14(
+                &mut crate::rawcuda::args::l16(
                     &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
-                    &mut a8, &mut tl, &mut lay, &mut qh_, &mut kvh, &mut cp,
+                    &mut rblk, &mut rpp, &mut a8, &mut tl, &mut lay, &mut qh_, &mut kvh, &mut cp,
                 ),
             )?;
         }
@@ -484,6 +505,7 @@ impl W4a16Dec {
         {
             let f = self.cc.function("attn_fwd3s_part_g4")?;
             let (mut a0, mut a1, mut a2, mut a3) = (qh, dblk, part, dpp);
+            let (mut rblk, mut rpp) = (rblk_dev, rpp_dev); // 행별 테이블
             let (mut tl, mut lay, mut qh_, mut kvh, mut cp) = (
                 t as i32,
                 layer as i32,
@@ -498,9 +520,9 @@ impl W4a16Dec {
                 t as u32,
                 (q_heads * splits) as u32,
                 d as u32,
-                &mut crate::rawcuda::args::l13(
-                    &mut a0, &mut a1, &mut a2, &mut a3, &mut tl, &mut lay, &mut qh_, &mut kvh,
-                    &mut cp, &mut sp, &mut dd, &mut swv, &mut scl,
+                &mut crate::rawcuda::args::l15(
+                    &mut a0, &mut a1, &mut a2, &mut a3, &mut rblk, &mut rpp, &mut tl, &mut lay,
+                    &mut qh_, &mut kvh, &mut cp, &mut sp, &mut dd, &mut swv, &mut scl,
                 ),
             )?;
         }
