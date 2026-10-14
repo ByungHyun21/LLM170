@@ -376,9 +376,16 @@ impl W4a16Dec {
         let (bk, bs) = ((512 * kvd) as u64, (512 * kvh * 4) as u64);
         let (kc, vc, ks, vs) = (self.attn.dkc, self.attn.dvc, self.attn.dksc, self.attn.dvsc);
         let n_attn = dm.n_attn;
+        // [2.N Stage 2] 슬롯 플로어(행) — 슬라이딩 층에서 이 행 미만 블록은
+        // 확보하지 않는다(해제 유지). 풀층·qwen(균일 layers 빈 벡터)은 무영향.
+        let floor = self.kv_floor.get(slot).copied().unwrap_or(0) as usize;
         let mut new = 0usize;
         for l in 0..n_attn {
+            let sliding = self.attn.layers.get(l).map(|x| x.sliding).unwrap_or(false);
             for bi in 0..nb {
+                if sliding && bi * 512 + 512 <= floor {
+                    continue;
+                }
                 let have = self
                     .attn
                     .kv_pool
@@ -432,11 +439,65 @@ impl W4a16Dec {
         if slot < self.kv_assigned.len() {
             self.kv_assigned[slot] = 0;
         }
+        if slot < self.kv_floor.len() {
+            self.kv_floor[slot] = 0;
+        }
         self.attn
             .kv_pool
             .as_mut()
             .map(|p| p.release(slot))
             .unwrap_or(0)
+    }
+
+    /// 슬롯 플로어(행) 조회 — 0 = 미트림. 엔진 재사용 가드(reuse_valid) 입력.
+    pub fn kv_floor_of(&self, slot: usize) -> u32 {
+        self.kv_floor.get(slot).copied().unwrap_or(0)
+    }
+
+    /// [2.N Stage 2] 플로어 전진 — 슬라이딩 층의 `floor_rows` 미만 블록을
+    /// 풀에 반납하고 디바이스 테이블 엔트리를 0으로 지운다(틱 경계 호출 계약:
+    /// 커널 실행 중 금지 — kv_grow와 동일). 단조(전진만 — 후퇴 요청은 무시).
+    /// 풀층은 손대지 않는다. 반환 = 해제 블록 수.
+    ///
+    /// 해제 행 판독 안전: 디코드 part는 `[lim−sw, lim)`만 읽고(커널이 하한을
+    /// 강제), FA2 프리필은 타일 전 열을 읽되 마스크 밖 점수는 무조건 −1e30
+    /// 대입이라 기여 0이다. 단 해제 행이 **미래에 비마스크로 읽히면** 오염 —
+    /// 엔진 복원 가드(`floor ≤ l`·`floor ≤ prompt−sw`)가 그 경우를 콜드로
+    /// 돌리므로 이 함수는 가드 통과 전제다. 기록도 접미사 행(≥ l ≥ floor)에만
+    /// 닿는다.
+    pub fn kv_release_below(&mut self, slot: usize, floor_rows: u32) -> Result<usize, String> {
+        let _g = self.cc.guard()?;
+        let dm = self.attn.attn.ok_or("kv_release_below: attn 미등록")?;
+        if slot >= self.n_slots {
+            return Err(format!("kv_release_below: 슬롯 {slot} ≥ {}", self.n_slots));
+        }
+        if floor_rows <= self.kv_floor_of(slot) {
+            return Ok(0);
+        }
+        let mb = dm.cap.div_ceil(512);
+        let n_attn = dm.n_attn;
+        // 완전 포함 블록만(내림) — 비양자화 입력에도 행 손실 없음(엔진은 512 양자화 전달).
+        let floor_bi = (floor_rows as usize) / 512;
+        let sliding: Vec<bool> = (0..n_attn)
+            .map(|l| self.attn.layers.get(l).map(|x| x.sliding).unwrap_or(false))
+            .collect();
+        let rel = self
+            .attn
+            .kv_pool
+            .as_mut()
+            .ok_or("kv_release_below: KvPool 미등록")?
+            .release_below(slot, floor_bi, &sliding);
+        if rel.is_empty() {
+            self.kv_floor[slot] = floor_rows;
+            return Ok(0);
+        }
+        let zero = [0u8; 32];
+        for (l, bi) in &rel {
+            let off = (((slot * n_attn + l) * mb + bi) * 4) as u64 * 8;
+            self.cc.h2d(self.attn.dblk_tab + off, &zero)?;
+        }
+        self.kv_floor[slot] = floor_rows;
+        Ok(rel.len())
     }
 
     /// [K6-3 예산] 실 KV 아레나+테이블 바이트(0 = 미등록).

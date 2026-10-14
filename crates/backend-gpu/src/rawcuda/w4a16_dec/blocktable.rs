@@ -113,6 +113,39 @@ impl KvPool {
         n
     }
 
+    /// [2.N Stage 2] 플로어 미만 해제 — 슬라이딩 층(`sliding[l]==true`)에서
+    /// `bi < floor_bi`인 확보 블록을 자유 풀로 되돌린다. 풀층은 손대지 않는다
+    /// (장거리 검색은 풀층이 담당 — 고정 창 기각과 달리 네이티브 SW층만
+    /// 윈도+여유로 유지라 출력 불변). 해제된 (층, 블록) 목록 반환(호출부가
+    /// 디바이스 테이블 엔트리를 0으로 지운다). 멱등·단조(플로어 전진만).
+    pub fn release_below(
+        &mut self,
+        slot: usize,
+        floor_bi: usize,
+        sliding: &[bool],
+    ) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        if slot >= self.n_slots || floor_bi == 0 {
+            return out;
+        }
+        for l in 0..self.n_layers {
+            if !sliding.get(l).copied().unwrap_or(false) {
+                continue;
+            }
+            for bi in 0..floor_bi.min(self.mb_max) {
+                let e = l * self.mb_max + bi;
+                let id = self.slot_map[slot][e];
+                if id != u32::MAX {
+                    self.slot_map[slot][e] = u32::MAX;
+                    self.free.push(id);
+                    self.used[slot] = self.used[slot].saturating_sub(1);
+                    out.push((l, bi));
+                }
+            }
+        }
+        out
+    }
+
     #[allow(dead_code)] // [K6-3] 다음 단계(입장 보장·실효 ctx) 배선 전
     pub fn free_blocks(&self) -> usize {
         self.free.len()
@@ -176,5 +209,29 @@ mod tests {
         // 요청 토큰이 테이블 범위를 넘어도 mb_max로 클램프(테이블 밖 엔트리 금지).
         let new = p.ensure_upto(0, 99999).unwrap();
         assert_eq!(new.len(), 4);
+    }
+
+    /// [2.N Stage 2] 플로어 미만 해제 — 슬라이딩층만, 풀층 보존, 멱등.
+    #[test]
+    fn release_below_sliding_only() {
+        // 2층(0=풀·1=슬라이딩) × 4블록, 전량 확보(8칸).
+        let mut p = KvPool::new(1, 2, 4, 8).unwrap();
+        p.ensure_upto(0, 2048).unwrap();
+        assert_eq!(p.free_blocks(), 0);
+        let rel = p.release_below(0, 2, &[false, true]);
+        // 슬라이딩층 블록 0·1만 해제(2칸).
+        assert_eq!(rel, vec![(1, 0), (1, 1)]);
+        assert_eq!(p.free_blocks(), 2);
+        assert_eq!(p.used_blocks(0), 6);
+        // 풀층(0,0)은 그대로 배정 유지.
+        assert!(p.get(0, 0, 0).is_some());
+        assert!(p.get(0, 1, 0).is_none());
+        // 멱등 — 재호출 신규 0.
+        assert!(p.release_below(0, 2, &[false, true]).is_empty());
+        // 플로어 0 = 무동작.
+        assert!(p.release_below(0, 0, &[false, true]).is_empty());
+        // 해제분 재할당 가능.
+        p.ensure(0, 1, 0).unwrap();
+        assert_eq!(p.free_blocks(), 1);
     }
 }

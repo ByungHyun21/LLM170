@@ -61,7 +61,10 @@ pub(super) fn assign_slot(
     // (플레이스홀더)을 투입한다(실측: gemma4가 턴 종료 마커 출력). qwen은
     // 체크포인트가 512 경계로 양자화돼 이 구멍을 비껴갔다.
     let l = l.min(epos).min(j.tokens.len().saturating_sub(1));
-    let full = l > 0 && l == slots[i].cached.len() && l == epos;
+    // [2.N Stage 2] 트림 슬롯 재사용 가드 — 해제 행이 미래 판독·기록에 닿으면
+    // 콜드(전량 재계산). qwen·미트림 슬롯은 항상 true(동작 보존).
+    let reok = eng.0.reuse_valid(i, l, j.tokens.len());
+    let full = reok && l > 0 && l == slots[i].cached.len() && l == epos;
     let mut reuse = 0usize;
     if full {
         reuse = l;
@@ -70,7 +73,7 @@ pub(super) fn assign_slot(
             .fetch_add(reuse as u64, Ordering::Relaxed);
         SCHED.prefix_full_hits.fetch_add(1, Ordering::Relaxed);
         eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰(전체)");
-    } else if l > 0 {
+    } else if reok && l > 0 {
         match eng.0.restore_prefix(i, l as u32) {
             Ok(p) if p > 0 && p as usize <= l => {
                 reuse = p as usize;

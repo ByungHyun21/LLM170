@@ -515,16 +515,24 @@ pub use crate::matmul::greedy_from as greedy;
 /// ×K/V 2아레나 + ksc/vsc f32). 정확 층별 클래스 = −8.4%(124,800→114,320
 /// B/token) 여지지만 업로드 계약 변경이라 차기 최적화. 풀 산정·ctx 가드는
 /// 실청구를 봐야 한다(과소보고 금지).
+/// [2.N Stage 2] 플로어 트림은 이 보고를 바꾸지 않는다 — 풀 산정은 전량 기준
+/// (보수적), 트림은 런타임 자유 풀에만 반영된다.
 pub fn ctx_info(dir: &std::path::Path) -> Result<crate::qwen35::CtxInfo, String> {
     let cfg = bind::GemmaCfg::load(dir).map_err(|e| e.to_string())?;
+    Ok(ctx_info_from_cfg(&cfg))
+}
+
+/// ⓑ 마감 — ctx 산식 순수 분리(테스트 표면). 아레나 set_attn의 최대 클래스
+/// 청구와 동일식이어야 한다(어긋나면 풀 과소 산정).
+pub fn ctx_info_from_cfg(cfg: &bind::GemmaCfg) -> crate::qwen35::CtxInfo {
     let kvd = (cfg.kv_local as u64 * cfg.head_dim_local as u64)
         .max(cfg.kv_global as u64 * cfg.head_dim_global as u64);
     let kvh = (cfg.kv_local as u64).max(cfg.kv_global as u64);
     let per_layer = 2 * (kvd + kvh * 4); // K+V int8 + ksc/vsc f32
-    Ok(crate::qwen35::CtxInfo {
+    crate::qwen35::CtxInfo {
         ctx: cfg.max_pos,
         gdn_state_bytes_per_slot: 0,
         kv_bytes_per_token: cfg.layers as u64 * per_layer,
         dense: !cfg.moe,
-    })
+    }
 }

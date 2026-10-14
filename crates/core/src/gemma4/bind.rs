@@ -493,4 +493,14 @@ mod tests {
         assert!(q.contains(&format!("{LP}2.self_attn.v_proj")));
         assert!(p.contains(&"model.language_model.embed_tokens.weight".to_string()));
     }
+
+    /// [ⓑ] ctx 보고 = 아레나 실청구(최대 클래스) — 픽스처 3층 = 3×4160.
+    /// 실모델(30층 동일 dims) = 124,800 B/token. 어긋나면 풀 과소 산정.
+    #[test]
+    fn ctx_reports_arena_max_class() {
+        let c = GemmaCfg::parse(&cfg_text(true, true)).expect("계약");
+        let ci = crate::gemma4::ctx_info_from_cfg(&c);
+        assert_eq!(ci.kv_bytes_per_token, 3 * 4160, "최대 클래스 전층 청구");
+        assert_eq!(ci.gdn_state_bytes_per_slot, 0, "순수 어텐션");
+    }
 }

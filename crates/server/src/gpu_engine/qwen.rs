@@ -416,6 +416,11 @@ impl QwenEngine {
     pub fn restore_prefix(&mut self, slot: usize, upto: u32) -> Result<u32, String> {
         self.dec.restore_gdn(slot, upto)
     }
+    /// [2.N Stage 2] 재사용 유효 — qwen은 KV 트림을 하지 않아 항상 유효
+    /// (Stage-1 동작 보존 — 유효 판정은 restore_prefix/체크포인트가 수행).
+    pub fn reuse_valid(&self, _slot: usize, _l: usize, _prompt_len: usize) -> bool {
+        true
+    }
     pub fn embed_row(&self, tok: u32) -> Result<Vec<f32>, String> {
         self.model.embed_row(tok).map_err(|e| e.to_string())
     }

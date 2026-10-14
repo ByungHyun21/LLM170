@@ -585,6 +585,10 @@ pub struct W4a16Dec {
     pub slot_pos: Vec<u32>,
     /// [K6-3 2026-10-13] 슬롯별 KV 확보 고수위(토큰) — kv_ensure 무비용 no-op용.
     pub kv_assigned: Vec<usize>,
+    /// [2.N Stage 2 2026-10-15] 슬롯별 KV 플로어(행) — 슬라이딩 층에서 이 행
+    /// 미만 블록은 미보유(해제)해도 된다. 0 = 미트림(종전 동작). 풀층은 트림
+    /// 대상이 아니라 플로어와 무관하다. kv_release(리셋)가 0으로 되돌린다.
+    pub kv_floor: Vec<u32>,
     /// 선형 상주 — 이름 → (packed, scale, n, k).
     lins: HashMap<String, (CUdeviceptr, CUdeviceptr, usize, usize)>,
     /// [gemma4 P3 2026-10-14] t행 청크 스크래치 — A 입력([t][k] f32)·Y 출력.
@@ -893,6 +897,7 @@ impl W4a16Dec {
             n_slots: n_slots.max(1),
             slot_pos: vec![0; n_slots.max(1)],
             kv_assigned: vec![0; n_slots.max(1)],
+            kv_floor: vec![0; n_slots.max(1)],
             lins: HashMap::new(),
             g4_a: Buf { ptr: 0, cap: 0 },
             g4_y: Buf { ptr: 0, cap: 0 },

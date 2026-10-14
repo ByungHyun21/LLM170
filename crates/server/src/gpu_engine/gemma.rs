@@ -76,6 +76,8 @@ impl GemmaEngine {
         if !self.dec.moe_experts_resident() {
             let lg = g4_step(&mut self.dec, &self.model, &self.cfg, seq, tok, pos)?;
             self.dec.slot_pos[seq] = pos + 1;
+            // [2.N Stage 2] 스트리밍 경로도 확정 위치 — KV 트림은 MoE 상주와 무관.
+            self.maybe_trim(seq)?;
             return Ok(lg);
         }
         let rows = self.model.embed_row(tok).map_err(|e| e.to_string())?;
@@ -90,6 +92,8 @@ impl GemmaEngine {
             false,
         )?;
         self.dec.slot_pos[seq] = pos + 1;
+        // [2.N Stage 2] 확정 1토큰 — 플로어 전진 가능.
+        self.maybe_trim(seq)?;
         Ok(lgs.into_iter().next().unwrap_or_default())
     }
 
@@ -131,6 +135,8 @@ impl GemmaEngine {
                 last = lgs.into_iter().last().unwrap_or_default();
             }
         }
+        // [2.N Stage 2] 프리필 확정 — 플로어 전진 가능.
+        self.maybe_trim(seq)?;
         Ok(last)
     }
 
@@ -179,6 +185,10 @@ impl GemmaEngine {
         )?;
         for (i, &s) in seq_ids.iter().enumerate() {
             self.dec.slot_pos[s] = pos[i] + 1;
+        }
+        // [2.N Stage 2] 배치 확정 — 슬롯별 플로어 전진 가능.
+        for &s in seq_ids {
+            self.maybe_trim(s)?;
         }
         Ok(lgs)
     }
@@ -312,6 +322,9 @@ impl GemmaEngine {
     /// 부분 접두 복원 — 순수 어텐션: 상태 = KV + pos뿐이라 pos만 되돌린다
     /// (KV 잔존 행은 다음 쓰기가 덮고, 판독은 pos까지 — spec_rollback과 동일
     /// 계약). upto > pos는 불가(호출부가 콜드 경로로). 반환 = 복원 pos.
+    /// [2.N Stage 2] 플로어 백스톱 — `floor > upto`면 해제 행이 접미사 재기록
+    /// 아래에 있어 복원 불가(호출부는 콜드 경로로). prompt−sw 조건은 스케줄러
+    /// 측 reuse_valid가 본다(여기에 prompt 길이가 없다).
     pub fn restore_prefix(&mut self, slot: usize, upto: u32) -> Result<u32, String> {
         if slot >= self.n_slots {
             return Err(format!(
@@ -322,6 +335,12 @@ impl GemmaEngine {
         let p = self.dec.slot_pos[slot];
         if upto == 0 || upto > p {
             return Err(format!("gemma4: restore_prefix {upto} > pos {p}"));
+        }
+        if self.dec.kv_floor_of(slot) > upto {
+            return Err(format!(
+                "gemma4: restore_prefix {upto} < floor {}",
+                self.dec.kv_floor_of(slot)
+            ));
         }
         self.dec.slot_pos[slot] = upto;
         Ok(upto)
@@ -415,5 +434,84 @@ impl GemmaEngine {
     }
     pub fn n_embd(&self) -> usize {
         self.model.hp.n_embd
+    }
+
+    /// [2.N Stage 2] 접두 재사용 유효 판정 — 스케줄러가 restore_prefix 호출
+    /// 전에 문의한다(전체·부분 공용). 조건(둘 다 필요):
+    /// ① `floor ≤ l` — 접미사 프리필이 l부터 전부 재기록하므로 floor 미만
+    /// 행은 다시 기록되지 않는다. l이 floor보다 낮으면 그 행들은 해제된
+    /// 채로 남아 이후 판독을 오염시킨다 → 콜드(전량 재계산).
+    /// ② `floor ≤ prompt_len − sw` — 디코드는 `[lim−sw, lim)`만 읽고 lim은
+    /// prompt_len부터 커지므로, 이 조건이 floor 미만 행의 비마스크 판독을
+    /// 원천 차단한다(FA2의 마스크 밖 물리 판독은 무조건 −1e30 대입이라 무해).
+    /// 풀층은 트림 대상이 아니라 조건과 무관하다.
+    pub fn reuse_valid(&self, slot: usize, l: usize, prompt_len: usize) -> bool {
+        reuse_valid(
+            self.dec.kv_floor_of(slot),
+            l as u32,
+            prompt_len as u32,
+            self.model.hp.sw as u32,
+        )
+    }
+
+    /// [2.N Stage 2] 확정 위치 기준 플로어 전진 — 커밋 경로(step·prefill·
+    /// decode) 꼬리에서만 호출한다. spec 검증(spec_run)은 투기 위치라 트림
+    /// 금지(되감기 시 플로어가 위치를 앞지르면 오염).
+    fn maybe_trim(&mut self, slot: usize) -> Result<(), String> {
+        let pos = self.dec.slot_pos.get(slot).copied().unwrap_or(0);
+        let f = floor_for_pos(pos, self.model.hp.sw as u32);
+        if f > self.dec.kv_floor_of(slot) {
+            let n = self.dec.kv_release_below(slot, f)?;
+            eprintln!("# g4-trim: slot{slot} floor {f}행(해제 {n}블록)");
+        }
+        Ok(())
+    }
+}
+
+/// [2.N Stage 2] 위치→플로어(행) — `pos−sw−여유`를 512 경계로 내림.
+/// 여유 512(1블록)는 spec 되감기(≤8)·청크 정렬을 흡수한다. pos가 짧으면 0.
+fn floor_for_pos(pos: u32, sw: u32) -> u32 {
+    const SLACK: u32 = 512;
+    if pos > sw + SLACK {
+        ((pos - sw - SLACK) / 512) * 512
+    } else {
+        0
+    }
+}
+
+/// [2.N Stage 2] 재사용 유효 순수 판정(테스트 표면).
+fn reuse_valid(floor: u32, l: u32, prompt_len: u32, sw: u32) -> bool {
+    floor <= l && floor <= prompt_len.saturating_sub(sw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{floor_for_pos, reuse_valid};
+
+    /// 플로어 양자화 — 512 경계 내림·단조·짧으면 0.
+    #[test]
+    fn floor_quantized_monotone() {
+        let sw = 1024;
+        assert_eq!(floor_for_pos(0, sw), 0);
+        assert_eq!(floor_for_pos(1536, sw), 0, "sw+여유 이하는 미트림");
+        assert_eq!(floor_for_pos(1537, sw), 0, "512 미만 내림");
+        assert_eq!(floor_for_pos(2048, sw), 512);
+        assert_eq!(floor_for_pos(8192, sw), 6656, "(8192−1536)/512 내림");
+        assert!(floor_for_pos(9000, sw) >= floor_for_pos(8192, sw), "단조");
+    }
+
+    /// 재사용 가드 — 트림 슬롯의 짧은 접두 복원은 콜드.
+    #[test]
+    fn reuse_guard_needs_floor_below_l_and_window() {
+        let sw = 1024;
+        assert!(reuse_valid(0, 0, 100, sw), "미트림은 항상 유효");
+        assert!(reuse_valid(0, 512, 600, sw), "미트림 단문 유효");
+        assert!(reuse_valid(6500, 8000, 8500, sw), "장문 계속 유효");
+        assert!(!reuse_valid(6500, 512, 8000, sw), "l이 floor 미만 → 콜드");
+        assert!(
+            !reuse_valid(6500, 7000, 7000, sw),
+            "prompt−sw가 floor 미만 → 콜드"
+        );
+        assert!(reuse_valid(6500, 7000, 8000, sw), "둘 다 만족 → 유효");
     }
 }
