@@ -226,6 +226,8 @@ impl W4a16Model {
 
     /// quantization_config 계약: compressed-tensors pack-quantized int4 sym
     /// (그룹 = g32/g64/g128만 수용 — 그 외는 명시 거부, 패닉 예방).
+    /// config_groups 키 이름은 배포별로 다르다(group_0·config_group_0) — 단일
+    /// 스킴이면 키 무관 수용.
     fn check_quant(text: &str) -> R<QuantSpec> {
         let v = Json::parse(text)
             .map_err(|e| W4a16Error::Quant(format!("quantization_config.json: {e}")))?;
@@ -233,10 +235,20 @@ impl W4a16Model {
         if method != "compressed-tensors" {
             return Err(W4a16Error::Quant(format!("quant_method={method:?}")));
         }
-        let g0 = v
+        // 그룹 키 이름은 배포마다 다르다 — llm-compressor 원본 = `group_0`,
+        // 재배포 미러 = `config_group_0`(2026-10-14 실측). config_groups가
+        // **단일 스킴**이면 키 무관 수용, 다중 스킴은 엔진 계약 밖(명시 거부).
+        let cgs = v
             .get("config_groups")
-            .and_then(|x| x.get("group_0"))
-            .ok_or_else(|| W4a16Error::Quant("config_groups.group_0 부재".into()))?;
+            .and_then(Json::as_object)
+            .ok_or_else(|| W4a16Error::Quant("config_groups 부재".into()))?;
+        if cgs.len() != 1 {
+            return Err(W4a16Error::Quant(format!(
+                "config_groups {}개 — 단일 스킴만 지원",
+                cgs.len()
+            )));
+        }
+        let g0 = &cgs.first().expect("len == 1").1;
         let fmt = g0
             .get("format")
             .and_then(Json::as_str)
@@ -600,6 +612,20 @@ mod tests {
             .expect_err("g16 거부")
             .to_string();
         assert!(e.contains("g32/g64/g128"), "{e}");
+    }
+
+    /// [gemma4 2026-10-14] 재배포 미러 키 `config_group_0` 수용 — 단일 스킴이면
+    /// 키 이름 무관. 다중 스킴은 명시 거부.
+    #[test]
+    fn quant_group_key_name_agnostic_single_scheme() {
+        let alt = r#"{"quant_method":"compressed-tensors","config_groups":{"config_group_0":{"format":"pack-quantized","weights":{"num_bits":4,"symmetric":true,"group_size":32}}}}"#;
+        let q = W4a16Model::check_quant(alt).expect("config_group_0 수용");
+        assert_eq!(q.group, 32);
+        let multi = r#"{"quant_method":"compressed-tensors","config_groups":{"a":{"format":"pack-quantized","weights":{"num_bits":4,"symmetric":true,"group_size":32}},"b":{"format":"pack-quantized","weights":{"num_bits":4,"symmetric":true,"group_size":32}}}}"#;
+        let e = W4a16Model::check_quant(multi)
+            .expect_err("다중 스킴 거부")
+            .to_string();
+        assert!(e.contains("단일 스킴"), "{e}");
     }
 
     #[test]
