@@ -49,6 +49,7 @@ PORT=$((18210 + ($$ % 400)))
 M_27B=../models/Qwen3.8-27B-W4A16-AutoRound
 M_35B=../models/Qwen3.6-35B-A3B-INT4-W4A16
 M_FN=../models/Qwen3.8-Flash-Next-W4A16-FP8PLE
+M_G4=../models/Gemma-4-26B-A4B-it-QAT-W4A16
 
 fail=0
 SUMMARY=()
@@ -338,10 +339,11 @@ esac
 
 note "[11/11] J(수치 지문) — 128토큰 창 PPL 동결 대조 (Q2 · 서브토큰 드리프트)"
 FP="docs/eval/fingerprint.tsv"   # 로컬 원장(docs/ — 푸시 제외)
-for pair in "$M_27B:27B" "$M_35B:35B"; do
-  d="${pair%:*}"; n="${pair#*:}"
+# [gemma4 2026-10-14] 세 번째 = gemma4 — 비채팅 프로토콜(add_bos 강제 → --bos 2).
+for pair in "$M_27B:27B:" "$M_35B:35B:" "$M_G4:gemma4:--bos 2"; do
+  d="${pair%%:*}"; rest="${pair#*:}"; n="${rest%%:*}"; extra="${rest#*:}"
   jout=$(timeout 900 "$BIN" w4a16-eval ppl "$d" --corpus docs/eval/corpus-en.txt \
-          --limit 128 --json 2> "$RUN/j-$n.log" | tail -1)
+          --limit 128 $extra --json 2> "$RUN/j-$n.log" | tail -1)
   if [ -z "$jout" ]; then
     echo "[w4a16] FAIL: $n 수치 지문 실행 실패 — ${RUN}/j-$n.log"; fail=1; continue
   fi
@@ -367,7 +369,6 @@ done
 # ── G4. gemma4-26B-A4B(QAT W4A16 g32) — P3 v0 서빙 경로 ──
 # [gemma4 P3 2026-10-14] CPU 오라클 동일 실행 대조(마진 인지 게이트) + infer 골든.
 # 프롬프트 = tokenize --chat '{"messages":[{"role":"user","content":"안녕하세요"}]}'.
-M_G4=../models/Gemma-4-26B-A4B-it-QAT-W4A16
 G4_PROMPT="2,105,2364,107,61659,106,107,105,4368,107,100,45518,107,101"
 G4_GOLDEN="61659,236888,131147,237372,199825,236761,94485,237293,220757"
 if [ -d "$M_G4" ]; then
