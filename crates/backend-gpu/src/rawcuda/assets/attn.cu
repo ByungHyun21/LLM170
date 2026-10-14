@@ -1306,7 +1306,8 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
     float* __restrict__ out32,
     unsigned short* __restrict__ out16,
     const unsigned* __restrict__ pp,
-    int t_len, int layer, int q_heads, int kv_heads, int cap, float kq_scale)
+    int t_len, int layer, int q_heads, int kv_heads, int cap, float kq_scale,
+    int sw, int no_gate)
 {
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -1473,6 +1474,10 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
             const int rB = rA + 8;
             const int nA = pos0 + rb + rA + 1 - base; // 행 rA의 유효 열 수
             const int nB = pos0 + rb + rB + 1 - base;
+            // [gemma4 2026-10-14] SW 창 하한 — 창 밖(오래된) 열 마스크.
+            // sw=0(qwen)이면 0 = 무마스크(비트 불변).
+            const int loA = (sw > 0) ? (pos0 + rb + rA + 1 - sw - base) : 0;
+            const int loB = (sw > 0) ? (pos0 + rb + rB + 1 - sw - base) : 0;
 #pragma unroll
             for (int f = 0; f < 4; ++f) {
                 const int cc = f * 8 + 2 * tt;
@@ -1492,6 +1497,18 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
                     sa[f][2] = -1e30f;
                 }
                 if (cc + 1 >= nB) {
+                    sa[f][3] = -1e30f;
+                }
+                if (cc < loA) {
+                    sa[f][0] = -1e30f;
+                }
+                if (cc + 1 < loA) {
+                    sa[f][1] = -1e30f;
+                }
+                if (cc < loB) {
+                    sa[f][2] = -1e30f;
+                }
+                if (cc + 1 < loB) {
                     sa[f][3] = -1e30f;
                 }
             }
@@ -1603,10 +1620,14 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
                 const int r0 = (e < 2) ? rowA : rowB;
                 const int d2 = d_ + (e & 1);
                 if (r0 < t_len) {
-                    const float gv = qg[(size_t)r0 * (q_heads * 512) + (size_t)h * 512 +
-                                        256 + d2];
-                    const float sg = 1.0f / (1.0f + attn_expf(-gv));
-                    const float ov = o[f][e] * ((e < 2) ? invlA : invlB) * sg;
+                    // [gemma4 2026-10-14] no_gate면 게이트 판독·⊙sigmoid 생략
+                    // (qwen=0 — 종전 산식 그대로).
+                    float ov = o[f][e] * ((e < 2) ? invlA : invlB);
+                    if (!no_gate) {
+                        const float gv = qg[(size_t)r0 * (q_heads * 512) + (size_t)h * 512 +
+                                            256 + d2];
+                        ov *= 1.0f / (1.0f + attn_expf(-gv));
+                    }
                     const long oi = (size_t)r0 * (q_heads * 256) + (size_t)h * 256 + d2;
                     outv[oi] = ov;
                     if (out32 != (float*)0) {

@@ -270,14 +270,16 @@ impl W4a16Dec {
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
         let mut scl = dm.layer(layer).scale(); // [gemma4] q·k 스케일 인자
+        // [gemma4 2026-10-14] SW 창·게이트 스킵 인자(qwen=0/0 — 종전 산식).
+        let (mut swv, mut ngate) = (0i32, 0i32);
         self.cc.launch(
             f,
             t_len.div_ceil(32) as u32,
             dm.q_heads as u32,
             128,
-            &mut crate::rawcuda::args::l13(
+            &mut crate::rawcuda::args::l15(
                 &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut tl, &mut lay,
-                &mut qh, &mut kvh, &mut cp, &mut scl,
+                &mut qh, &mut kvh, &mut cp, &mut scl, &mut swv, &mut ngate,
             ),
         )
     }
