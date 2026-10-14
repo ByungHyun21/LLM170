@@ -13,9 +13,14 @@ pub(super) fn load(args: &[String]) -> Result<String, String> {
     let store = llm170_core::w4a16::W4a16Model::open(std::path::Path::new(&dir))
         .map_err(|e| e.to_string())?;
     // 아치 바인딩이 등록된 모델만 커버리지(완전성)까지 검증한다 — 미등록
-    // 아치(신규 모델 도입 중)는 포맷 계층(트리플 구조·형상 값·양자 파라미터)만.
-    // 바인딩 등록 시(예: gemma4 모듈) 자동으로 완전성 경로로 승격된다.
+    // 아치는 포맷 계층(트리플 구조·형상 값·양자 파라미터)만.
     let arch = llm170_core::qwen35::bind::dir_arch(std::path::Path::new(&dir));
+    if arch
+        .as_deref()
+        .is_some_and(llm170_core::gemma4::bind::arch_ok)
+    {
+        return load_gemma4(&dir, &store);
+    }
     if !arch
         .as_deref()
         .is_some_and(llm170_core::qwen35::bind::arch_supported)
@@ -37,6 +42,43 @@ pub(super) fn load(args: &[String]) -> Result<String, String> {
         c.vocab,
         c.full_interval,
         store.group(),
+        store.n_lins()
+    );
+    let body = rep.summary();
+    if rep.ok() {
+        Ok(format!("{head}\n{body}  판정: 완전성 검증 통과"))
+    } else {
+        Err(format!("{head}\n{body}  판정: 검증 실패"))
+    }
+}
+
+/// gemma4 로더 완전성 — 바인딩 validate(형상 계약·커버리지·전문가 구조).
+fn load_gemma4(dir: &str, store: &llm170_core::w4a16::W4a16Model) -> Result<String, String> {
+    let cfg = llm170_core::gemma4::bind::GemmaCfg::load(std::path::Path::new(dir))
+        .map_err(|e| e.to_string())?;
+    let rep = llm170_core::gemma4::bind::validate(store, &cfg).map_err(|e| e.to_string())?;
+    let n_full = cfg.layer_full.iter().filter(|&&f| f).count();
+    let head = format!(
+        "w4a16-load {dir}\n  hidden={} layers={} heads={} (슬라이딩 {}×{}·풀 {}×{} — k_eq_v {}) ffn={} vocab={}\n  MoE: {}전문가×{} top-{} (dense {} 병렬) · SW {} · softcap {} · g{} (zp=8 상수)\n  슬라이딩 {}/{}층 · 선형 {}개",
+        cfg.hidden,
+        cfg.layers,
+        cfg.heads,
+        cfg.kv_local,
+        cfg.head_dim_local,
+        cfg.kv_global,
+        cfg.head_dim_global,
+        cfg.k_eq_v,
+        cfg.ffn,
+        cfg.vocab,
+        cfg.n_experts,
+        cfg.moe_ffn,
+        cfg.top_k,
+        cfg.ffn,
+        cfg.sw,
+        cfg.softcap,
+        store.group(),
+        cfg.layers - n_full,
+        cfg.layers,
         store.n_lins()
     );
     let body = rep.summary();
@@ -135,8 +177,6 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
     if prompts.is_empty() && corpus.is_none() {
         return Err("at least one --prompt-tokens 또는 --eval-corpus required".into());
     }
-    let model =
-        llm170_core::qwen35::Model::load(std::path::Path::new(&dir)).map_err(|e| e.to_string())?;
     if let Some(c) = &corpus {
         // [Q1] CPU 오라클 NLL — 전 위치 teacher-forced, 전 어휘 logsumexp(f64).
         let text = std::fs::read_to_string(c).map_err(|e| format!("corpus {c}: {e}"))?;
@@ -146,13 +186,13 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
         if n < 2 {
             return Err(format!("토큰 {n}개 — NLL에는 2개 이상 필요"));
         }
-        let mut eng = llm170_core::qwen35::Engine::new(model, 1, ctx);
+        let mut eng = RefEngine::load(&dir, 1, ctx)?;
         let t0 = std::time::Instant::now();
-        let mut l = eng.prefill(0, &toks[..1]).map_err(|e| e.to_string())?;
+        let mut l = eng.prefill(0, &toks[..1])?;
         let mut nll_sum = 0f64;
         for i in 1..n {
             nll_sum += crate::probes::eval::nll_of(&l, toks[i]);
-            let mut ls = eng.decode(&[0], &[toks[i]]).map_err(|e| e.to_string())?;
+            let mut ls = eng.decode(0, &[toks[i]])?;
             l = ls.pop().ok_or("decode logits 부재")?;
         }
         let mean = nll_sum / (n - 1) as f64;
@@ -165,16 +205,16 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
         ));
     }
     let n = prompts.len();
-    let mut eng = llm170_core::qwen35::Engine::new(model, n, ctx);
+    let mut eng = RefEngine::load(&dir, n, ctx)?;
     let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
     for (s, p) in prompts.iter().enumerate() {
-        let l = eng.prefill(s, p).map_err(|e| e.to_string())?;
+        let l = eng.prefill(s, p)?;
         out[s].push(llm170_core::qwen35::greedy(&l));
     }
     for _ in 0..n_predict {
         for s in 0..n {
             let t = *out[s].last().expect("시드 토큰");
-            let nt = eng.decode_greedy(s, t).map_err(|e| e.to_string())?;
+            let nt = eng.decode_greedy(s, t)?;
             out[s].push(nt);
         }
     }
@@ -193,4 +233,49 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
         }
     }
     Ok(r)
+}
+
+/// 참조 엔진 — 아치별 CPU 엔진(qwen35·gemma4) 디스패치(병렬 미러·trait 없음).
+enum RefEngine {
+    Qwen(llm170_core::qwen35::Engine),
+    Gemma(llm170_core::gemma4::Engine),
+}
+
+impl RefEngine {
+    fn load(dir: &str, n_seqs: usize, ctx: usize) -> Result<Self, String> {
+        let path = std::path::Path::new(dir);
+        let arch = llm170_core::qwen35::bind::dir_arch(path).unwrap_or_default();
+        if llm170_core::gemma4::bind::arch_ok(&arch) {
+            let m = llm170_core::gemma4::Model::load(path).map_err(|e| e.to_string())?;
+            Ok(RefEngine::Gemma(llm170_core::gemma4::Engine::new(
+                m, n_seqs, ctx,
+            )))
+        } else {
+            let m = llm170_core::qwen35::Model::load(path).map_err(|e| e.to_string())?;
+            Ok(RefEngine::Qwen(llm170_core::qwen35::Engine::new(
+                m, n_seqs, ctx,
+            )))
+        }
+    }
+
+    fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        match self {
+            RefEngine::Qwen(e) => e.prefill(seq, tokens).map_err(|x| x.to_string()),
+            RefEngine::Gemma(e) => e.prefill(seq, tokens).map_err(|x| x.to_string()),
+        }
+    }
+
+    fn decode(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
+        match self {
+            RefEngine::Qwen(e) => e.decode(&[seq], tokens).map_err(|x| x.to_string()),
+            RefEngine::Gemma(e) => e.decode(&[seq], tokens).map_err(|x| x.to_string()),
+        }
+    }
+
+    fn decode_greedy(&mut self, seq: usize, token: u32) -> Result<u32, String> {
+        match self {
+            RefEngine::Qwen(e) => e.decode_greedy(seq, token).map_err(|x| x.to_string()),
+            RefEngine::Gemma(e) => e.decode_greedy(seq, token).map_err(|x| x.to_string()),
+        }
+    }
 }
