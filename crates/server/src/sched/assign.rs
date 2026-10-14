@@ -131,6 +131,7 @@ pub(super) fn assign_slot(
         sampler: sampler_new,
         err_count: 0,
         failed: None,
+        t_first: None,
         spec_miss: 0,
     };
 }
