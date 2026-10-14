@@ -593,6 +593,17 @@ extern "C" __global__ void w4a16_moe_pes_scale(
 // [FLA-6 2026-10-10] 행(토큰) 병렬 — grid.y = 출력 행. 종전엔 열만 병렬(그리드
 // n/256 = 8블록)로 토큰 루프가 스레드당 4096회 직렬(실측 GPU 99% 유휴,
 // 343µs/런치 = DRAM의 1/10). 가산 순서·값 불변(비트동일).
+// [gemma4 P2 2026-10-14] 층 스칼라 곱 — y[i] = y[i] * s (gemma4 `layer_scalar`).
+// axpy(w=s-1, x=y, y=y)와 수치적으로 동일하지 않다(1회 반올림 vs 2회) —
+// 전용 커널로 정확히 x*s (HF `hidden_states *= self.layer_scalar`).
+extern "C" __global__ void w4a16_scale(float* __restrict__ y, float s, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] *= s;
+    }
+}
+
 extern "C" __global__ void w4a16_moe_accum(const float* __restrict__ w,
                                            const float* __restrict__ d,
                                            float* __restrict__ y, int sp, int nslots,
