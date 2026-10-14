@@ -13,6 +13,7 @@ struct GpuArgs {
     moe_check: bool,
     plain_check: bool,
     bench_ew: bool,
+    ew_gelu_check: bool,
     mma_smoke: bool,
     bench_gemv: Option<(String, usize)>,
     bench_gemv_t: Option<(String, usize, usize)>,
@@ -52,6 +53,7 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
         moe_check: false,
         plain_check: false,
         bench_ew: false,
+        ew_gelu_check: false,
         mma_smoke: false,
         bench_gemv: None,
         bench_gemv_t: None,
@@ -111,6 +113,7 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
             "--moe-check" => a.moe_check = true,
             "--plain-gemm-check" => a.plain_check = true,
             "--bench-ew" => a.bench_ew = true,
+            "--ew-gelu-check" => a.ew_gelu_check = true,
             "--mma-smoke" => a.mma_smoke = true,
             "--h2d-bench" => {
                 let mb = it
@@ -290,6 +293,45 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
 }
 
 /// h2d 대역폭 실측 — (a) 핀드 소스, (b) 페이지러블 소스(드라이버 스테이징).
+/// [gemma4 P2 2026-10-14] ew_gelu 커널 vs CPU 계약(core::ops::gelu_tanh) —
+/// 커널 대조 검증(트랜센던털 등급 — tanhf, 비트 아님). 결정적 입력(splitmix64).
+fn run_ew_gelu_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, String> {
+    let n = 4096usize;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = || {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mk = |rnd: &mut dyn FnMut() -> u64| -> Vec<f32> {
+        (0..n)
+            .map(|_| ((rnd() >> 40) as f32 / (1u32 << 24) as f32) * 6.0 - 3.0)
+            .collect()
+    };
+    let g = mk(&mut rnd);
+    let u = mk(&mut rnd);
+    let got = dec.ew_gelu_host(&g, &u)?;
+    let (mut maxd, mut rel) = (0f32, 0f32);
+    for i in 0..n {
+        let want = llm170_core::ops::gelu_tanh(g[i]) * u[i];
+        let d = (got[i] - want).abs();
+        maxd = maxd.max(d);
+        if want.abs() > 1e-3 {
+            rel = rel.max(d / want.abs());
+        }
+    }
+    Ok(format!(
+        "ew_gelu vs core::ops::gelu_tanh — n={n} max|diff|={maxd:.3e} 최대상대={rel:.3e} · 판정: {}",
+        if maxd < 1e-5 {
+            "일치(허용)"
+        } else {
+            "초과"
+        }
+    ))
+}
+
 fn run_h2d_bench(dec: &mut llm170_backend_gpu::W4a16Dec, h2d_mb: usize) -> Result<String, String> {
     let bytes = h2d_mb << 20;
     let src = vec![0x5Au8; bytes];
@@ -1128,6 +1170,9 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     }
     if a.bench_ew {
         return dec.bench_ew();
+    }
+    if a.ew_gelu_check {
+        return run_ew_gelu_check(&mut dec);
     }
     if a.plain_check {
         return dec.plain_gemm_selfcheck();

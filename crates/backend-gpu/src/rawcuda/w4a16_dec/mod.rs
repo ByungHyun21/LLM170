@@ -938,8 +938,17 @@ impl W4a16Dec {
     }
 
     pub fn ew_host(&mut self, g: &[f32], u: &[f32]) -> Result<Vec<f32>, String> {
+        self.ew_act_host("ew", g, u)
+    }
+
+    /// [gemma4 P2 2026-10-14] gelu_tanh 게이트·업 곱 — ew_gelu 커널(동일 버퍼).
+    pub fn ew_gelu_host(&mut self, g: &[f32], u: &[f32]) -> Result<Vec<f32>, String> {
+        self.ew_act_host("ew_gelu", g, u)
+    }
+
+    fn ew_act_host(&mut self, kernel: &str, g: &[f32], u: &[f32]) -> Result<Vec<f32>, String> {
         if g.is_empty() || g.len() != u.len() {
-            return Err(format!("ew: g={} u={} 계약 위반", g.len(), u.len()));
+            return Err(format!("{kernel}: g={} u={} 계약 위반", g.len(), u.len()));
         }
         self.ensure_ew_bufs(g.len())?;
         // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
@@ -948,7 +957,7 @@ impl W4a16Dec {
         let ub = unsafe { std::slice::from_raw_parts(u.as_ptr() as *const u8, u.len() * 4) };
         self.cc.h2d(self.ew.dewg, gb)?;
         self.cc.h2d(self.ew.dewu, ub)?;
-        let f = self.cc.function("ew")?;
+        let f = self.cc.function(kernel)?;
         let mut nn = g.len() as i32;
         // [결함수정 2026-10-11] 6-param 커널에 l4(4인자) 발사 — y32/y16 파라미터가
         // 스택 잔여값을 읽는 미정의 동작이었다. 널 명시(l6).

@@ -149,7 +149,7 @@ pub const ASSETS: &[Asset] = &[
             "crates/backend-gpu/src/rawcuda/assets/ew.fatbin",
             "src/rawcuda/assets/ew.fatbin",
         ],
-        syms: &["ew"],
+        syms: &["ew", "ew_gelu"],
         boot: true,
     },
     Asset {
