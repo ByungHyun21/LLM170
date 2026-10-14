@@ -550,6 +550,21 @@ pub(super) struct Graph {
     pub(super) capture_no_host: bool,
     /// 캡처 실패 후 직접 발사 고정(재시도 방지 — t=1 graph_failed와 동형).
     pub(super) batch_capture_failed: bool,
+    /// [gemma4 P3 v2 2026-10-14] t행 청크 그래프 캐시 — 키 = (t, 슬롯집합,
+    /// head_last). 청크 본문(층 루프+head+d2h)이 전부 같은 스트림 발사라
+    /// 1그래프로 붙는다(호스트 왕복 0 — 프롤로그/에필로그는 캡처 밖).
+    pub(super) g4_graphs: Vec<G4GraphEntry>,
+    /// [gemma4 P3 v2] g4 청크 캡처 실패 후 직접 발사 고정(재시도 방지).
+    pub(super) g4_capture_failed: bool,
+}
+
+/// [gemma4 P3 v2 2026-10-14] 청크 그래프 1개 — 캐시 키와 exec 핸들.
+pub(super) struct G4GraphEntry {
+    pub(super) t: usize,
+    pub(super) slots: Vec<usize>,
+    pub(super) head_last: bool,
+    pub(super) exec: ffi::CUgraphExec,
+    pub(super) handle: ffi::CUgraph,
 }
 
 pub struct W4a16Dec {
@@ -868,6 +883,8 @@ impl W4a16Dec {
                 spec_graph_ok: true,
                 capture_no_host: false,
                 batch_capture_failed: false,
+                g4_graphs: Vec::new(),
+                g4_capture_failed: false,
             },
             cc,
             ucache,

@@ -411,9 +411,11 @@ impl W4a16Dec {
             return Err("g4_atab: 슬롯 범위 밖".into());
         }
         let mb = dm.cap.div_ceil(512);
-        let pos_dev = self.g4_scratch_slot(10, t * 4)?;
-        let rpp_dev = self.g4_scratch_slot(11, t * 8)?;
-        let rblk_dev = self.g4_scratch_slot(12, t * 8)?;
+        let pos_dev = self.g4_scratch_slot(Self::G4_ATAB_POS, t * 4)?;
+        let rpp_dev = self.g4_scratch_slot(Self::G4_ATAB_RPP, t * 8)?;
+        let rblk_dev = self.g4_scratch_slot(Self::G4_ATAB_RBLK, t * 8)?;
+        // 캡처 중 업로드 = 프롤로그 누락(캡처엔 pageable 복사 노드가 못 들어간다).
+        self.cc.capture_guard("g4_atab");
         let mut pb: Vec<u8> = Vec::with_capacity(t * 4);
         for &pv in pos {
             pb.extend_from_slice(&pv.to_le_bytes());
@@ -693,7 +695,9 @@ impl W4a16Dec {
     /// [gemma4 P3 v2 2026-10-14] 청크 진입 — 디바이스 상주 경로(프롤로그 →
     /// 본문 → head d2h). 반환 = 행별 로짓(raw — softcap은 호출부 계약).
     /// 프롤로그: 스트림·핀드 출력 확보, 슬롯 선할당, x 업로드, 어텐션 테이블.
-    /// 본문: 전부 같은 스트림 발사(중간 d2h 0) — 그래프 캡처 대상.
+    /// 본문: 전부 같은 스트림 발사(중간 d2h 0) — **그래프 캡처 대상**.
+    /// 그래프 히트면 본문+head d2h가 리플레이 1런치로 붕괴한다(캡처 키 =
+    /// t·슬롯집합·head_last — pos는 테이블(프롤로그)로 매 청크 갱신).
     pub fn g4_chunk_dev(
         &mut self,
         slots: &[usize],
@@ -730,14 +734,20 @@ impl W4a16Dec {
         let xb = unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, rows.len() * 4) };
         self.cc.h2d_async(x, xb)?;
         self.g4_ensure_pin_out(BATCH_DEC_MAX * self.head_n * 4)?;
-        // ② 본문(디바이스) + ③ head d2h(핀드) → 회수.
-        self.g4_chunk_body(slots, pos, t, head_last, nw_per_layer, eps)?;
-        let nrow = if head_last { 1 } else { t };
-        let hd = self.g4_scratch_slot(Self::G4_HEADOUT, t * self.head_n * 4)?;
-        self.cc
-            .d2h_async(self.graph.pin_g4_out as *mut u8, hd, nrow * self.head_n * 4)?;
+        // ② 본문(디바이스 — 캡처/리플레이 또는 직접 발사).
+        if self.g4_graph_ok() {
+            if let Err(e) = self.g4_graph_run(slots, pos, t, head_last, nw_per_layer, eps) {
+                eprintln!("[g4-graph] 실패 — 직접 경로 폴백: {e}");
+                self.graph.g4_capture_failed = true;
+                let _ = self.cc.sync();
+                self.g4_run_direct(slots, pos, t, head_last, nw_per_layer, eps)?;
+            }
+        } else {
+            self.g4_run_direct(slots, pos, t, head_last, nw_per_layer, eps)?;
+        }
         self.cc.sync()?;
         // SAFETY: pin_g4_out는 g4_ensure_pin_out의 할당 계약(≥ nrow*head_n*4).
+        let nrow = if head_last { 1 } else { t };
         let flat = unsafe {
             std::slice::from_raw_parts(self.graph.pin_g4_out as *const f32, nrow * self.head_n)
         };
@@ -745,6 +755,125 @@ impl W4a16Dec {
             .chunks(self.head_n)
             .map(|r| r.to_vec())
             .collect::<Vec<_>>())
+    }
+
+    /// 그래프 모드 가능 여부 — LLM170_GRAPH(기본 ON)·debug_layers 아님·
+    /// 상주 MoE(비상주는 g4_moe_dev_t가 거부)·캡처 실패 후 고정.
+    fn g4_graph_ok(&self) -> bool {
+        llm170_diag::flag::ne0("LLM170_GRAPH")
+            && !self.debug_layers
+            && !self.graph.g4_capture_failed
+            && self.moe.n_experts > 0
+            && self.moe.moe_resident
+    }
+
+    /// 본문 + head d2h(핀드) — 직접 발사 몫(캡처 히트/미스 공용 조각).
+    fn g4_run_direct(
+        &mut self,
+        slots: &[usize],
+        pos: &[u32],
+        t: usize,
+        head_last: bool,
+        nw_per_layer: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        self.g4_chunk_body(slots, pos, t, head_last, nw_per_layer, eps)?;
+        self.g4_out_d2h(t, head_last)
+    }
+
+    /// head 로짓 d2h(핀드 목적지 — 캡처 노드로 기록 가능).
+    fn g4_out_d2h(&mut self, t: usize, head_last: bool) -> Result<(), String> {
+        let nrow = if head_last { 1 } else { t };
+        let hd = self.g4_scratch_slot(Self::G4_HEADOUT, t * self.head_n * 4)?;
+        self.cc
+            .d2h_async(self.graph.pin_g4_out as *mut u8, hd, nrow * self.head_n * 4)
+    }
+
+    /// 그래프 히트면 리플레이(1런치), 미스면 직접 실행 + 캡처 등록(미실행).
+    fn g4_graph_run(
+        &mut self,
+        slots: &[usize],
+        pos: &[u32],
+        t: usize,
+        head_last: bool,
+        nw_per_layer: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        if let Some(k) = self
+            .graph
+            .g4_graphs
+            .iter()
+            .position(|e| e.t == t && e.head_last == head_last && e.slots == slots)
+        {
+            let exec = self.graph.g4_graphs[k].exec;
+            return self.cc.graph_launch(exec);
+        }
+        // 미스 — 직접 실행이 정답(KV·pos 소비) → 캡처(실행 아님) 등록.
+        self.g4_run_direct(slots, pos, t, head_last, nw_per_layer, eps)?;
+        self.cc.sync()?; // 캡처 전 파이프라인 정리(캡처는 유휴 스트림에서).
+        if !self.graph.g4_capture_failed {
+            match self.g4_capture(slots, pos, t, head_last, nw_per_layer, eps) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("# g4 그래프 캡처 실패 — 직접 발사 유지: {e}");
+                    self.graph.g4_capture_failed = true;
+                    let _ = self.cc.capture_end(); // 캡처 상태 정리(멱등 아님 — 실패 시에만)
+                    let _ = self.cc.sync();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 청크 본문 캡처 — 슬롯집합·t·head_last 키. 캡처는 **실행하지 않는다**
+    /// (상태 불변 — KV/pos/출력은 직전 직접 실행분이 이미 반영).
+    fn g4_capture(
+        &mut self,
+        slots: &[usize],
+        pos: &[u32],
+        t: usize,
+        head_last: bool,
+        nw_per_layer: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        let tt = std::time::Instant::now();
+        if self.graph.g4_graphs.len() >= 32 {
+            let old = self.graph.g4_graphs.remove(0);
+            let _ = self.cc.graph_destroy(old.exec, old.handle);
+        }
+        self.cc.capture_begin()?;
+        let r = self
+            .g4_chunk_body(slots, pos, t, head_last, nw_per_layer, eps)
+            .and_then(|_| self.g4_out_d2h(t, head_last));
+        if let Err(e) = r {
+            let _ = self.cc.capture_end();
+            return Err(e);
+        }
+        let g = self.cc.capture_end()?;
+        let e = match self.cc.graph_instantiate(g) {
+            Ok(e) => e,
+            Err(err) => {
+                // 핸들 유실 방지(캡처 1회·실패 시 재시도 없음 — 고정 플래그).
+                let _ = self.cc.graph_destroy(std::ptr::null_mut(), g);
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.cc.graph_upload(e) {
+            let _ = self.cc.graph_destroy(e, g);
+            return Err(err);
+        }
+        self.graph.g4_graphs.push(G4GraphEntry {
+            t,
+            slots: slots.to_vec(),
+            head_last,
+            exec: e,
+            handle: g,
+        });
+        eprintln!(
+            "[g4-graph] captured t={t} slots={slots:?} head_last={head_last} ({:.2}ms)",
+            tt.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(())
     }
 
     /// 청크 head 판독 핀드 버퍼 확보 — 부족 시 재할당(캡처 그래프 전량 폐기).

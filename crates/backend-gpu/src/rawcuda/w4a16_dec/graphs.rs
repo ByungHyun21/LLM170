@@ -59,6 +59,10 @@ impl W4a16Dec {
                 let _ = self.cc.graph_destroy(e, h);
             }
         }
+        // [gemma4 P3 v2 2026-10-14] 청크 그래프도 동일 계약 — 전량 폐기.
+        for e in self.graph.g4_graphs.drain(..) {
+            let _ = self.cc.graph_destroy(e.exec, e.handle);
+        }
     }
 
     /// 그래프 준비 — 캐시 히트면 즉시 exec 반환(A8, 슬롯/모드별 1회 캡처).
