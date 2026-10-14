@@ -13,7 +13,7 @@
 //!
 //! 사용법:
 //!   llm170 w4a16-eval ppl <w4a16_dir> --corpus <txt> [--ctx N] [--limit N]
-//!                           [--out dump.tsv] [--json]
+//!                           [--chunk N] [--bos <id>] [--out dump.tsv] [--json]
 //!   llm170 w4a16-eval ppl <w4a16_dir> --from-tokens <file> [...]
 //!   llm170 w4a16-eval agree <a.tsv> <b.tsv>
 //!   llm170 w4a16-eval needle <w4a16_dir> [--ctx N] [--lens N,N] [--sets N] [--json]
@@ -71,6 +71,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
         (None::<String>, None::<String>, None::<String>);
     let (mut ctx, mut limit, mut json) = (8192usize, usize::MAX, false);
     let mut chunk = 1usize;
+    let mut bos: Option<u32> = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -94,6 +95,15 @@ fn ppl(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--ctx requires a number")?;
             }
+            // [gemma4 2026-10-14] --bos <id>: 코퍼스 선두 BOS 부착 — ref 명령
+            // (`--bos`)과 동일 프로토콜(gemma4는 add_bos 강제 — HF 914/870 대조).
+            "--bos" => {
+                bos = Some(
+                    it.next()
+                        .and_then(|v| v.parse().ok())
+                        .ok_or("--bos requires an id")?,
+                );
+            }
             "--limit" => {
                 limit = it
                     .next()
@@ -107,7 +117,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
     if corpus.is_none() == from_tokens.is_none() {
         return Err("--corpus 또는 --from-tokens 중 정확히 하나 필요".into());
     }
-    let toks: Vec<u32> = if let Some(c) = &corpus {
+    let mut toks: Vec<u32> = if let Some(c) = &corpus {
         let text = std::fs::read_to_string(c).map_err(|e| format!("corpus {c}: {e}"))?;
         let tk = crate::tokenize::Tokenizer::load(Path::new(&dir))?;
         // 특수 토큰 미해석 — 코퍼스 원문 그대로(결정적).
@@ -127,12 +137,23 @@ fn ppl(args: &[String]) -> Result<String, String> {
         }
         v
     };
+    // [gemma4 2026-10-14] BOS 선두 부착(--bos) — ref 명령(`--bos`)과 동일 순서
+    // (삽입 후 limit). gemma4는 add_bos 강제(프로토콜 정합 — 상대 편차가 게이트).
+    if let Some(b) = bos {
+        toks.insert(0, b);
+    }
     let n = toks.len().min(limit);
     if n < 2 {
         return Err(format!("토큰 {n}개 — NLL 계산에는 2개 이상 필요"));
     }
     if n - 1 > ctx {
         return Err(format!("토큰 {n} > ctx {ctx} — --ctx 확대 필요"));
+    }
+    // [gemma4 2026-10-14] 아치 분기 — gemma4는 서빙 단일 경로(청크 t≤8·1..8
+    // 동일 클래스)로 전 위치 로짓을 회수한다(경로 계측기 — 채택/기각 판정).
+    let arch = llm170_core::qwen35::bind::dir_arch(Path::new(&dir)).unwrap_or_default();
+    if llm170_core::gemma4::bind::arch_ok(&arch) {
+        return ppl_g4(&dir, &toks, n, ctx, chunk, &out_path, json);
     }
     let model = llm170_core::qwen35::Model::load(Path::new(&dir)).map_err(|e| e.to_string())?;
     let hp = model.hp.clone();
@@ -205,16 +226,34 @@ fn ppl(args: &[String]) -> Result<String, String> {
         }
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3;
+    eval_report(
+        &dir, n, chunk, head_gpu, &rows, nll_sum, ms, &out_path, json,
+    )
+}
+
+/// 덤프·요약 공용 — qwen·gemma4 경로가 같은 형식을 낸다(동결 — agree/ci 소비).
+#[allow(clippy::too_many_arguments)]
+fn eval_report(
+    dir: &str,
+    n: usize,
+    chunk: usize,
+    head_gpu: bool,
+    rows: &[Row],
+    nll_sum: f64,
+    ms: f64,
+    out_path: &Option<String>,
+    json: bool,
+) -> Result<String, String> {
     let mean = nll_sum / rows.len() as f64;
     let ppl = mean.exp();
-    if let Some(p) = &out_path {
+    if let Some(p) = out_path {
         let mut s = String::with_capacity(rows.len() * 40 + 256);
         s.push_str(&format!(
             "# w4a16-eval dump v1 model={dir} tokens={n} head={} chunk={chunk} nll_sum={nll_sum:.9} ppl={ppl:.9}\n",
             if head_gpu { "gpu" } else { "cpu" }
         ));
         s.push_str("# cols: pos target argmax nll margin\n");
-        for &(pos, tgt, am, nll, margin) in &rows {
+        for &(pos, tgt, am, nll, margin) in rows {
             s.push_str(&format!("{pos}\t{tgt}\t{am}\t{nll:.9}\t{margin:.9}\n"));
         }
         std::fs::write(p, s).map_err(|e| format!("dump {p}: {e}"))?;
@@ -240,6 +279,58 @@ fn ppl(args: &[String]) -> Result<String, String> {
             .map(|p| format!("\n  덤프 {p}"))
             .unwrap_or_default()
     ))
+}
+
+/// ppl — gemma4 아치 분기(서빙 청크 경로 = 단일 클래스). 헤드·softcap은 청크
+/// 내부(원문 embed 행별 int8 W8A16) — 청크 t는 1..=8로 클램프(경로 상한).
+fn ppl_g4(
+    dir: &str,
+    toks: &[u32],
+    n: usize,
+    ctx: usize,
+    chunk: usize,
+    out_path: &Option<String>,
+    json: bool,
+) -> Result<String, String> {
+    let t0 = std::time::Instant::now();
+    let model = llm170_core::gemma4::Model::load(Path::new(dir)).map_err(|e| e.to_string())?;
+    let hp = model.hp.clone();
+    let h = hp.n_embd;
+    let mut dec = W4a16Dec::new(1, h, hp.n_layer)?;
+    let cfg = crate::gpu_engine::upload_model_g4(&mut dec, &model, ctx)?;
+    for il in 0..hp.n_layer {
+        dec.set_g4_pes(il, cfg.pes_row(il, hp.n_experts))?;
+    }
+    dec.kv_grow(0, n + 8)?;
+    let chunk = chunk.clamp(1, 8);
+    let mut rows: Vec<Row> = Vec::with_capacity(n - 1);
+    let mut nll_sum = 0f64;
+    let mut i = 0usize;
+    while i + 1 < n {
+        let t = (n - i).min(chunk);
+        let mut rb: Vec<f32> = Vec::with_capacity(t * h);
+        for &tok in &toks[i..i + t] {
+            rb.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);
+        }
+        let csv: Vec<usize> = vec![0; t];
+        let cpos: Vec<u32> = (0..t).map(|r| (i + r) as u32).collect();
+        let lgs = crate::gpu_engine::g4_chunk(&mut dec, &model, &cfg, &csv, &cpos, &rb, t, false)?;
+        for (r, lr) in lgs.iter().enumerate() {
+            let g = i + r;
+            if g + 1 >= n {
+                break;
+            }
+            let (am, margin) = argmax_margin(lr);
+            let tgt = toks[g + 1];
+            let nll = nll_of(lr, tgt);
+            nll_sum += nll;
+            rows.push((g as u32 + 1, tgt, am, nll, margin));
+        }
+        dec.slot_pos[0] = (i + t) as u32;
+        i += t;
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    eval_report(dir, n, chunk, true, &rows, nll_sum, ms, out_path, json)
 }
 
 /// ci — 두 덤프의 **쌍대 ΔNLL 블록 부트스트랩 CI**(채택 게이트 계측기, §2.I).
