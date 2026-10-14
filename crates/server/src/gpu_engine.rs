@@ -879,6 +879,7 @@ pub(crate) fn upload_model(
         cap: ctx,
         // [A11] 모델 config에서 동적(종전 하드코딩 4) — 신규 비율 모델 대응.
         interval,
+        sliding_window: 0,
     };
     let (mut qnw, mut knw): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
     for ai in 0..n_attn - usize::from(mtp_attn) {

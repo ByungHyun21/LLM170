@@ -152,6 +152,32 @@ pub const ATTN_SPLITS_D: usize = 64;
 /// attn.cu 병합 smem(ATTN_SPLITS_MAX)과 동일해야 함(테스트 대조).
 pub const ATTN_SPLITS_MAX: usize = 64;
 
+/// 층별 어텐션 파라미터 — gemma4처럼 층마다 dims·종류가 다른 모델용.
+/// `AttnDims.layers`(디코더 보관)가 비어 있으면 균일 스칼라 필드로 합성 —
+/// qwen35 현행 경로는 완전히 동일하다.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttnLayer {
+    pub kv_heads: usize,
+    pub d: usize,
+    /// 슬라이딩 창 어텐션(마스크) — 창 크기는 `AttnDims.sliding_window`.
+    pub sliding: bool,
+    /// k_eq_v — v_proj 없이 v = v_norm(k 투영 원시값).
+    pub k_eq_v: bool,
+    /// q·k 스케일 — 0.0 = 1/√d 유도(qwen35), gemma4 = 1.0 명시.
+    pub kq_scale: f32,
+}
+
+impl AttnLayer {
+    /// 유효 q·k 스케일 — 0.0이면 1/√d.
+    pub fn scale(&self) -> f32 {
+        if self.kq_scale > 0.0 {
+            self.kq_scale
+        } else {
+            1.0 / (self.d as f32).sqrt()
+        }
+    }
+}
+
 /// 어텐션 형상(서버 등록 — d=256·rope 64차 고정 계약).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AttnDims {
@@ -164,6 +190,8 @@ pub struct AttnDims {
     /// 종전 4 하드코딩. 체인 분기 `(il+1) % interval == 0`과 `il/interval`이
     /// 이 값을 쓴다(신규 비율 모델 대응).
     pub interval: usize,
+    /// [gemma4 P2 2026-10-14] 슬라이딩 창(자기 포함) — sliding 층 마스크 폭. 0 = 미사용.
+    pub sliding_window: usize,
 }
 
 impl AttnDims {

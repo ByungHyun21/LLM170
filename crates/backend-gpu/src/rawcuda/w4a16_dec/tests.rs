@@ -377,6 +377,7 @@ fn mtp_device_chain_matches_sequential() {
         d,
         cap,
         interval: 1,
+        sliding_window: 0, // qwen35 = 슬라이딩 없음(gemma4 배선 시 창 설정)
     };
     dec.set_attn(
         ad,
@@ -509,6 +510,7 @@ fn kstep_decode_matches_sequential() {
         d,
         cap,
         interval: 1,
+        sliding_window: 0, // qwen35 = 슬라이딩 없음(gemma4 배선 시 창 설정)
     };
     dec.set_attn(
         ad,
@@ -594,6 +596,7 @@ fn ucache_enforcement_frees_device_memory() {
         d,
         cap,
         interval: 1,
+        sliding_window: 0, // qwen35 = 슬라이딩 없음(gemma4 배선 시 창 설정)
     };
     dec.set_attn(ad, &vec![1f32; ad.n_attn * d], &vec![1f32; ad.n_attn * d])
         .expect("set_attn");
