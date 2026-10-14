@@ -404,11 +404,8 @@ impl Engine {
             let h = crate::ops::rms_norm(last, &out_norm, hp.eps);
             let mut logits = vec![0.0f32; head.n_out as usize];
             crate::matmul::cpu::matmul(&h, &head, &mut logits);
-            if hp.softcap > 0.0 {
-                let c = hp.softcap;
-                for l in logits.iter_mut() {
-                    *l = c * (*l / c).tanh();
-                }
+            for l in logits.iter_mut() {
+                *l = crate::ops::logit_softcap(*l, hp.softcap);
             }
             result.push(logits);
         }

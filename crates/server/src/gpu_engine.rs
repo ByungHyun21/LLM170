@@ -15,6 +15,10 @@ pub struct GpuEngine {
     n_slots: usize,
     /// GPU head 상주 여부(bf16 output.weight 업로드 성공).
     head_gpu: bool,
+    /// [gemma4 P2 2026-10-14] 최종 로짓 softcap(0=미적용) — 장치 argmax는
+    /// 단조 불변이라 커널 무접촉, **호스트로 나오는 로짓**(샘플링·PPL/eval·
+    /// 검증)에만 적용한다. 값은 config.json 파생(모델별).
+    softcap: f32,
     /// [MTP 2026-10-12] 모델 자체 MTP 초안기 활성(27B dense v1).
     mtp: bool,
 }
@@ -55,6 +59,7 @@ impl GpuEngine {
                 dec,
                 n_slots: n_slots.max(1),
                 head_gpu,
+                softcap: llm170_core::qwen35::bind::final_logit_softcap(dir),
                 mtp,
             }),
             Err(e) => {
@@ -137,10 +142,23 @@ impl GpuEngine {
 
     fn logits(&mut self, slot: usize, row: &[f32]) -> Result<Vec<f32>, String> {
         if self.head_gpu {
-            return self.dec.forward_device_head(slot, row);
+            let mut lg = self.dec.forward_device_head(slot, row)?;
+            self.softcap_row(&mut lg);
+            return Ok(lg);
         }
         let xn = self.forward(slot, row)?;
-        self.head_logits(&xn)
+        let mut lg = self.head_logits(&xn)?;
+        self.softcap_row(&mut lg);
+        Ok(lg)
+    }
+
+    /// 최종 로짓 softcap 적용(0 = 무연산) — 호스트 로짓 경로 단일 지점.
+    fn softcap_row(&self, lg: &mut [f32]) {
+        if self.softcap > 0.0 {
+            for v in lg.iter_mut() {
+                *v = llm170_core::ops::logit_softcap(*v, self.softcap);
+            }
+        }
     }
 
     /// head 로짓 — CPU 참조 경로(bf16 디퀀트 f32 내적, 골든과 동일 계급).
@@ -522,7 +540,10 @@ impl GpuEngine {
             .is_some()
         {
             match self.dec.batch_read_logits(seq_ids.len()) {
-                Ok(lg) => return Ok(lg),
+                Ok(mut lg) => {
+                    self.softcap_row(&mut lg);
+                    return Ok(lg);
+                }
                 Err(e) => eprintln!("# np-logits 판독 폴백(직렬): {e}"),
             }
         }
@@ -594,7 +615,9 @@ impl GpuEngine {
         rows: &[f32],
         t: usize,
     ) -> Result<Vec<f32>, String> {
-        self.dec.spec_verify_logits(slot, rows, t)
+        let mut lg = self.dec.spec_verify_logits(slot, rows, t)?;
+        self.softcap_row(&mut lg);
+        Ok(lg)
     }
     pub fn vocab(&self) -> usize {
         self.model.hp.vocab

@@ -187,6 +187,14 @@ pub fn gelu_tanh(x: f32) -> f32 {
     0.5 * x * (1.0 + (C * (x + 0.044_715 * x3)).tanh())
 }
 
+/// 최종 로짓 softcap — HF `final_logit_softcapping`(c>0: c·tanh(x/c), 그 외 항등).
+/// **argmax 단조 불변**(그리디 토큰 무영향) — PPL·샘플링·검증 로짓에만 의미.
+/// (gemma4 c=30 — CPU 오라클·GPU 호스트 로짓 경로가 같은 식을 쓴다.)
+#[inline]
+pub fn logit_softcap(x: f32, c: f32) -> f32 {
+    if c > 0.0 { c * (x / c).tanh() } else { x }
+}
+
 /// f32 → BF16 라운드(RNE) → f32 — 임베딩 √h 베이크(CPU·GPU 동일 바이트 계약).
 pub fn bf16_rne(v: f32) -> f32 {
     let bits = v.to_bits();
@@ -213,5 +221,19 @@ mod tests {
         for v in y {
             assert!((v - 1.0).abs() < 1e-5, "{v}");
         }
+    }
+
+    /// 로짓 softcap — 항등(c=0)·고정값·단조·포화(HF final_logit_softcapping).
+    #[test]
+    fn logit_softcap_identity_monotone_saturates() {
+        assert_eq!(logit_softcap(3.5, 0.0), 3.5, "c=0 항등");
+        assert_eq!(logit_softcap(0.0, 30.0), 0.0);
+        let y = logit_softcap(30.0, 30.0);
+        assert!((y - 30.0 * 1.0f32.tanh()).abs() < 1e-6, "{y}");
+        // 단조(그리디 argmax 불변 근거).
+        assert!(logit_softcap(-10.0, 30.0) < logit_softcap(10.0, 30.0));
+        // 큰 x는 ±30으로 포화(f32에서 tanh→1.0 = 정확히 30 반올림).
+        let big = logit_softcap(1000.0, 30.0);
+        assert!(big > 29.9 && big <= 30.0, "{big}");
     }
 }
