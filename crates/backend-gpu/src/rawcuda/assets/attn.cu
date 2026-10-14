@@ -827,6 +827,166 @@ extern "C" __global__ void attn_fwd3s_merge(
     }
 }
 
+// ── [gemma4 P2 2026-10-14] f3s g4 변형군 — d 파라미터·no-gate·SW 창 ──
+// attn_fwd3s_part_q/merge와의 차이:
+//  ① d 파라미터(256/512 — 블록 = d스레드, qs[d], K dot d/16 uint4, part 보폭 d+2)
+//  ② 게이트 없음(merge가 qg를 읽지 않는다 — gemma4 q는 플레인)
+//  ③ SW 창(sw>0이면 행 범위 시작 = max(0, lim−sw) — 창 밖 KV 미판독)
+//  산술(온라인 소프트맥스·청크·트리·행 오름차순)은 원본과 동일 순서.
+extern "C" __global__ void attn_fwd3s_part_g4(
+    const float* __restrict__ qh,
+    const unsigned long long* __restrict__ dblk_tab,
+    float* __restrict__ part,   // [T][q_heads][S][d+2]
+    const unsigned* __restrict__ pp,
+    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits,
+    int d, int sw, float kq_scale)
+{
+    int t = blockIdx.x;
+    int hs = blockIdx.y;
+    int h = hs / splits;
+    int s = hs - h * splits;
+    int tid = threadIdx.x;
+    int gq = q_heads / kv_heads;
+    int kh = h / gq;
+    float scale = kq_scale;
+    int lim = (int)pp[0] + t + 1;
+    int start = (sw > 0 && lim > sw) ? (lim - sw) : 0;
+    long kv_dim = (long)kv_heads * d;
+    long qrow = (long)t * (q_heads * d) + (long)h * d;
+    __shared__ float qs[512];
+    __shared__ float sarr[ATTN_CHUNK];
+    __shared__ float reds[256];
+    if (tid < d) {
+        qs[tid] = qh[qrow + tid];
+    }
+    __syncthreads();
+    int span = lim - start;
+    const int eff = (span <= 256) ? 1 : splits;
+    float* out = part + (((long)t * q_heads + h) * splits + s) * (d + 2);
+    if (s >= eff) {
+        if (tid == 0) {
+            out[0] = -1e30f;
+            out[1] = 0.0f;
+        }
+        if (tid < d) {
+            out[2 + tid] = 0.0f;
+        }
+        return;
+    }
+    int chunk_rows = (span + eff - 1) / eff;
+    chunk_rows = ((chunk_rows + ATTN_CHUNK - 1) / ATTN_CHUNK) * ATTN_CHUNK;
+    int lo = start + s * chunk_rows;
+    int hi = min(lim, lo + chunk_rows);
+    float m_run = -1e30f;
+    float l_run = 0.0f;
+    float acc = 0.0f;
+    for (int base = lo; base < hi; base += ATTN_CHUNK) {
+        const int nch = min(ATTN_CHUNK, hi - base);
+        attn_part_step(
+            [&](int i) -> float {
+                const int row = base + i;
+                const AttnKvRowPtrs rp =
+                    attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                const uint4* k16 = reinterpret_cast<const uint4*>(rp.k);
+                const float4* q4 = reinterpret_cast<const float4*>(qs);
+                float p0 = 0.0f;
+                for (int d16 = 0; d16 < (d >> 4); d16++) {
+                    const uint4 w = k16[d16];
+                    const float4 qa = q4[d16 * 4 + 0];
+                    const float4 qb = q4[d16 * 4 + 1];
+                    const float4 qc = q4[d16 * 4 + 2];
+                    const float4 qd = q4[d16 * 4 + 3];
+                    p0 += qa.x * (float)(signed char)(w.x & 0xffu);
+                    p0 += qa.y * (float)(signed char)((w.x >> 8) & 0xffu);
+                    p0 += qa.z * (float)(signed char)((w.x >> 16) & 0xffu);
+                    p0 += qa.w * (float)(signed char)(w.x >> 24);
+                    p0 += qb.x * (float)(signed char)(w.y & 0xffu);
+                    p0 += qb.y * (float)(signed char)((w.y >> 8) & 0xffu);
+                    p0 += qb.z * (float)(signed char)((w.y >> 16) & 0xffu);
+                    p0 += qb.w * (float)(signed char)(w.y >> 24);
+                    p0 += qc.x * (float)(signed char)(w.z & 0xffu);
+                    p0 += qc.y * (float)(signed char)((w.z >> 8) & 0xffu);
+                    p0 += qc.z * (float)(signed char)((w.z >> 16) & 0xffu);
+                    p0 += qc.w * (float)(signed char)(w.z >> 24);
+                    p0 += qd.x * (float)(signed char)(w.w & 0xffu);
+                    p0 += qd.y * (float)(signed char)((w.w >> 8) & 0xffu);
+                    p0 += qd.z * (float)(signed char)((w.w >> 16) & 0xffu);
+                    p0 += qd.w * (float)(signed char)(w.w >> 24);
+                }
+                return p0 * (scale * rp.ks[0]);
+            },
+            [&](int i) -> float {
+                const int row = base + i;
+                const AttnKvRowPtrs rp =
+                    attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                return (float)rp.v[tid] * rp.vs[0];
+            },
+            sarr, reds, nch, tid, m_run, l_run, acc);
+    }
+    if (tid == 0) {
+        out[0] = m_run;
+        out[1] = l_run;
+    }
+    if (tid < d) {
+        out[2 + tid] = acc;
+    }
+}
+
+// ── [gemma4] f3s 병합 g4 — 게이트 없음(⊙sigmoid 미적용) · d 파라미터 ──
+extern "C" __global__ void attn_fwd3s_merge_g4(
+    const float* __restrict__ part,
+    float* __restrict__ outv,
+    float* __restrict__ out32,
+    unsigned short* __restrict__ out16,
+    int t_len, int q_heads, int splits, int d)
+{
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    const float* pb = part + ((long)t * q_heads + h) * splits * (d + 2);
+    __shared__ float ms[ATTN_SPLITS_MAX];
+    __shared__ float ws[ATTN_SPLITS_MAX];
+    __shared__ float mred[1];
+    if (tid < splits) {
+        ms[tid] = pb[tid * (d + 2)];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float m0 = -1e30f;
+        for (int s = 0; s < splits; s++) {
+            m0 = fmaxf(m0, ms[s]);
+        }
+        mred[0] = m0;
+    }
+    __syncthreads();
+    const float m = mred[0];
+    if (tid < splits) {
+        const float* ps = pb + tid * (d + 2);
+        ws[tid] = (ps[1] <= 0.0f) ? 0.0f : attn_expf(ps[0] - m);
+    }
+    __syncthreads();
+    float l = 0.0f;
+    float acc = 0.0f;
+    for (int s = 0; s < splits; s++) {
+        const float* ps = pb + s * (d + 2);
+        if (ps[1] <= 0.0f) {
+            continue;
+        }
+        l += ps[1] * ws[s];
+        acc += ps[2 + tid] * ws[s];
+    }
+    // gemma4 = 출력 게이트 없음 — ov = acc/l (⊙sigmoid 제거).
+    float ov = acc / l;
+    const long oi = (long)t * (q_heads * d) + (long)h * d + tid;
+    outv[oi] = ov;
+    if (out32 != (float*)0) {
+        out32[oi] = h2f(f2h(ov));
+    }
+    if (out16 != (unsigned short*)0) {
+        out16[oi] = f2h(ov);
+    }
+}
+
 // 마커 f3sc
 
 // [R3 2026-10-10] attn_pos_bump 제거 — 미사용(호스트가 attn_set_pos의

@@ -127,6 +127,8 @@ pub const ASSETS: &[Asset] = &[
             "attn_fwd3s_merge",
             "attn_fa2_qg",
             "attn_prep_g4",
+            "attn_fwd3s_part_g4",
+            "attn_fwd3s_merge_g4",
         ],
         boot: true,
     },

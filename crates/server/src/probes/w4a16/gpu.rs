@@ -16,6 +16,7 @@ struct GpuArgs {
     ew_gelu_check: bool,
     moe_pes_check: bool,
     prep_g4_check: bool,
+    attn_g4_check: bool,
     mma_smoke: bool,
     bench_gemv: Option<(String, usize)>,
     bench_gemv_t: Option<(String, usize, usize)>,
@@ -58,6 +59,7 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
         ew_gelu_check: false,
         moe_pes_check: false,
         prep_g4_check: false,
+        attn_g4_check: false,
         mma_smoke: false,
         bench_gemv: None,
         bench_gemv_t: None,
@@ -120,6 +122,7 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
             "--ew-gelu-check" => a.ew_gelu_check = true,
             "--moe-pes-check" => a.moe_pes_check = true,
             "--prep-g4-check" => a.prep_g4_check = true,
+            "--attn-g4-check" => a.attn_g4_check = true,
             "--mma-smoke" => a.mma_smoke = true,
             "--h2d-bench" => {
                 let mb = it
@@ -299,6 +302,208 @@ fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
 }
 
 /// h2d 대역폭 실측 — (a) 핀드 소스, (b) 페이지러블 소스(드라이버 스테이징).
+/// [gemma4 P2 2026-10-14] g4 어텐션 통합 대조 — prep_g4 → part_g4 → merge_g4
+/// 전 경로를 CPU 미러(int8 KV 양자화 + rope + SW 창 + 소프트맥스 + AV)와
+/// 허용오차 판정. 슬라이딩(d=256, 창)·풀(d=512, 전역) 2구성.
+fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, String> {
+    use llm170_backend_gpu::AttnDims;
+    // (이름, d, q_heads, kv_heads, pairs, span, denom, base, vn, sw)
+    let configs: [(
+        &str,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        f32,
+        bool,
+        usize,
+    ); 2] = [
+        (
+            "슬라이딩(d=256 창 sw=8)",
+            256,
+            4,
+            2,
+            128,
+            128,
+            256,
+            1e4,
+            true,
+            8,
+        ),
+        ("풀(d=512 전역)", 512, 4, 1, 64, 256, 512, 1e6, true, 0),
+    ];
+    let (t_len, pos0, splits) = (16usize, 0u32, 2usize); // pos0=0 — KV 캐시가 t_len행분만 기록(미러 정합)
+    let mut out = String::from("attn_g4 통합(prep→part→merge) — CPU 미러 대조\n");
+    let mut ok_all = true;
+    for (name, d, q_heads, kv_heads, pairs, span, denom, base, vn, sw) in configs {
+        let dims = AttnDims {
+            n_attn: 1,
+            q_heads,
+            kv_heads,
+            d,
+            cap: 64,
+            interval: 1,
+            sliding_window: sw,
+        };
+        let layer = llm170_backend_gpu::AttnLayer {
+            kv_heads,
+            d,
+            sliding: sw > 0,
+            k_eq_v: false,
+            kq_scale: 1.0,
+        };
+        dec.set_attn(dims, vec![layer], &vec![1.0f32; d], &vec![1.0f32; d])
+            .map_err(|e| format!("set_attn: {e}"))?;
+        dec.kv_grow(0, t_len).map_err(|e| format!("kv_grow: {e}"))?;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = || {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let pm1 = |r: u64| ((r >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
+        let q: Vec<f32> = (0..t_len * q_heads * d).map(|_| pm1(rnd())).collect();
+        let kin: Vec<f32> = (0..t_len * kv_heads * d).map(|_| pm1(rnd())).collect();
+        let vin: Vec<f32> = (0..t_len * kv_heads * d).map(|_| pm1(rnd())).collect();
+        let qnw: Vec<f32> = (0..d).map(|_| 0.9 + pm1(rnd()) * 0.1).collect();
+        let knw: Vec<f32> = (0..d).map(|_| 0.9 + pm1(rnd()) * 0.1).collect();
+        let kq_scale = 1.0f32;
+        let got = dec
+            .attn_g4_host(
+                &q, &kin, &vin, &qnw, &knw, t_len, q_heads, kv_heads, d, pairs, span, denom, base,
+                vn, sw, kq_scale, splits, pos0,
+            )
+            .map_err(|e| format!("attn_g4({name}): {e}"))?;
+        // ── CPU 미러 ──
+        // (a) prep 미러: 가중 RMS + rope → qh, k_raw(원시), v_raw
+        let rope = |h: &mut [f32], pos: u32| {
+            for p in 0..pairs {
+                let theta = base.powf(-(2.0 * p as f32) / denom as f32);
+                let ang = pos as f32 * theta;
+                let (c, sn) = (ang.cos(), ang.sin());
+                let (x0, x1) = (h[p] as f64, h[p + span] as f64);
+                let (cf, sf) = (c as f64, sn as f64);
+                h[p] = (x0 * cf - x1 * sf) as f32;
+                h[p + span] = (x0 * sf + x1 * cf) as f32;
+            }
+        };
+        let rms = |x: &[f32], w: Option<&[f32]>| -> Vec<f32> {
+            let ss: f32 = x.iter().map(|v| v * v).sum();
+            let inv = 1.0f32 / (ss / x.len() as f32 + 1e-6).sqrt();
+            match w {
+                Some(w) => x.iter().zip(w.iter()).map(|(v, g)| v * inv * g).collect(),
+                None => x.iter().map(|v| v * inv).collect(),
+            }
+        };
+        let mut qh = vec![0f32; t_len * q_heads * d];
+        for t in 0..t_len {
+            for h in 0..q_heads {
+                let src = &q[(t * q_heads + h) * d..(t * q_heads + h) * d + d];
+                let mut hd = rms(src, Some(&qnw));
+                rope(&mut hd, pos0 + t as u32);
+                qh[(t * q_heads + h) * d..(t * q_heads + h) * d + d].copy_from_slice(&hd);
+            }
+        }
+        // K/V int8 양자화(커널과 동일: absmax/127 · ks=0→1 · round-half-even · clamp)
+        let quant = |hd: &[f32]| -> (Vec<i8>, f32) {
+            let amax = hd.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let mut ks = amax * (1.0f32 / 127.0);
+            if ks == 0.0 {
+                ks = 1.0;
+            }
+            let iv = 1.0 / ks;
+            (
+                hd.iter()
+                    .map(|v| {
+                        let q = (v * iv).round_ties_even() as i32;
+                        q.clamp(-127, 127) as i8
+                    })
+                    .collect(),
+                ks,
+            )
+        };
+        let mut k8 = vec![Vec::new(); t_len * kv_heads];
+        let mut ks8 = vec![0f32; t_len * kv_heads];
+        let mut v8 = vec![Vec::new(); t_len * kv_heads];
+        let mut vs8 = vec![0f32; t_len * kv_heads];
+        for t in 0..t_len {
+            for kh in 0..kv_heads {
+                let src = &kin[(t * kv_heads + kh) * d..(t * kv_heads + kh) * d + d];
+                let mut hd = rms(src, Some(&knw));
+                rope(&mut hd, pos0 + t as u32);
+                let (qq, ss) = quant(&hd);
+                k8[t * kv_heads + kh] = qq;
+                ks8[t * kv_heads + kh] = ss;
+                let vsrc = &vin[(t * kv_heads + kh) * d..(t * kv_heads + kh) * d + d];
+                let hd2 = rms(vsrc, None); // v_norm(무가중) — gemma4
+                let (qq2, ss2) = quant(&hd2);
+                v8[t * kv_heads + kh] = qq2;
+                vs8[t * kv_heads + kh] = ss2;
+            }
+        }
+        // 어텐션(dim별 softmax — 창 적용)
+        let mut maxd = 0f32;
+        for t in 0..t_len {
+            let lim = pos0 as usize + t + 1;
+            let start = if sw > 0 && lim > sw { lim - sw } else { 0 };
+            for h in 0..q_heads {
+                let kvh = h / (q_heads / kv_heads);
+                let qrow = &qh[(t * q_heads + h) * d..(t * q_heads + h) * d + d];
+                let mut sc = Vec::new();
+                for row in start..lim {
+                    let kk = &k8[row * kv_heads + kvh];
+                    let kss = ks8[row * kv_heads + kvh];
+                    let mut acc = 0f32;
+                    for j in 0..d {
+                        acc += qrow[j] * (kk[j] as f32 * kss);
+                    }
+                    sc.push(acc * kq_scale);
+                }
+                let mx = sc.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+                let mut sum = 0f32;
+                for v in sc.iter_mut() {
+                    *v = (*v - mx).exp();
+                    sum += *v;
+                }
+                let mut o = vec![0f32; d];
+                for (i, &p) in sc.iter().enumerate() {
+                    let row = start + i;
+                    let vv = &v8[row * kv_heads + kvh];
+                    let vss = vs8[row * kv_heads + kvh];
+                    for j in 0..d {
+                        o[j] += p * (vv[j] as f32 * vss);
+                    }
+                }
+                for j in 0..d {
+                    o[j] /= sum;
+                }
+                let base_i = (t * q_heads + h) * d;
+                for j in 0..d {
+                    maxd = maxd.max((got[base_i + j] - o[j]).abs());
+                }
+            }
+        }
+        ok_all &= maxd < 2e-2; // int8 KV + exp 경로 — 절대 밴드
+        out.push_str(&format!(
+            "  {name}: max|diff| {maxd:.3e} — {}\n",
+            if maxd < 2e-2 { "통과" } else { "초과" }
+        ));
+    }
+    out.push_str(&format!(
+        "  판정: {}",
+        if ok_all {
+            "전 구성 허용(절대 ≤2e-2 — int8 KV 밴드)"
+        } else {
+            "초과"
+        }
+    ));
+    Ok(out)
+}
+
 /// [gemma4 P2 2026-10-14] attn_prep_g4 Q 경로 대조 — 가중 RMS + rope 파라미터
 /// (pairs·span·denom·base) 3구성: qwen 등가(32/32/64/1e7)·gemma4 슬라이딩
 /// (128/128/256/1e4)·gemma4 풀(64/256/512/1e6). CPU 미러와 허용오차 대조
@@ -1303,6 +1508,9 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     }
     if a.prep_g4_check {
         return run_prep_g4_check(&mut dec);
+    }
+    if a.attn_g4_check {
+        return run_attn_g4_check(&mut dec);
     }
     if a.plain_check {
         return dec.plain_gemm_selfcheck();

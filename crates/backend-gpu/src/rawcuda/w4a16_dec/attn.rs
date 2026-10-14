@@ -361,6 +361,148 @@ impl W4a16Dec {
         rr
     }
 
+    /// [gemma4 P2 2026-10-14] g4 어텐션 통합 런처(검증 전용 — `--attn-g4-check`,
+    /// 차기 체인 배선의 기반): prep_g4 → f3s part_g4 → merge_g4 → outv.
+    /// KV 아레나·블록 테이블은 `set_attn`(+`kv_grow`)이 준비돼 있어야 한다(slot 0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_g4_host(
+        &mut self,
+        q: &[f32],
+        kin: &[f32],
+        vin: &[f32],
+        qnw: &[f32],
+        knw: &[f32],
+        t_len: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        d: usize,
+        pairs: usize,
+        span: usize,
+        denom: usize,
+        base: f32,
+        vn_on: bool,
+        sw: usize,
+        kq_scale: f32,
+        splits: usize,
+        pos0: u32,
+    ) -> Result<Vec<f32>, String> {
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
+        if q.len() != t_len * q_heads * d
+            || kin.len() != t_len * kv_heads * d
+            || vin.len() != t_len * kv_heads * d
+            || qnw.len() != d
+            || knw.len() != d
+        {
+            return Err("attn_g4: 입력 형상 계약 위반".into());
+        }
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let dq = self.cc.alloc(q.len() * 4)?;
+        let dk = self.cc.alloc(kin.len() * 4)?;
+        let dv = self.cc.alloc(vin.len() * 4)?;
+        let dqnw = self.cc.alloc(qnw.len() * 4)?;
+        let dknw = self.cc.alloc(knw.len() * 4)?;
+        let dqh = self.cc.alloc(q.len() * 4)?;
+        let npart = t_len * q_heads * splits;
+        let dpart = self.cc.alloc(npart * (d + 2) * 4)?;
+        let dout = self.cc.alloc(t_len * q_heads * d * 4)?;
+        let rp: Vec<f32> = vec![
+            d as f32,
+            pairs as f32,
+            span as f32,
+            denom as f32,
+            base,
+            if vn_on { 1.0 } else { 0.0 },
+            0.0,
+        ];
+        let drp = self.cc.alloc(rp.len() * 4)?;
+        let dpp = self.cc.alloc(4)?;
+        let rr = (|| -> Result<Vec<f32>, String> {
+            self.cc.h2d(dq, &f32b(q))?;
+            self.cc.h2d(dk, &f32b(kin))?;
+            self.cc.h2d(dv, &f32b(vin))?;
+            self.cc.h2d(dqnw, &f32b(qnw))?;
+            self.cc.h2d(dknw, &f32b(knw))?;
+            self.cc.h2d(drp, &f32b(&rp))?;
+            self.cc.h2d(dpp, &pos0.to_le_bytes())?;
+            // ① prep_g4 — grid (t, q_heads + kv_heads), 블록 128(§커널 계약)
+            {
+                let f = self.cc.function("attn_prep_g4")?;
+                let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) =
+                    (dq, dk, dv, dqnw, dknw, dqh, self.attn.dblk_tab, dpp, drp);
+                let (mut tl, mut lay, mut qh, mut kvh, mut cp) = (
+                    t_len as i32,
+                    0i32,
+                    q_heads as i32,
+                    kv_heads as i32,
+                    dm.cap as i32,
+                );
+                self.cc.launch(
+                    f,
+                    t_len as u32,
+                    (q_heads + kv_heads) as u32,
+                    128,
+                    &mut crate::rawcuda::args::l14(
+                        &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
+                        &mut a8, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
+                    ),
+                )?;
+            }
+            // ② f3s part_g4 — grid (t, q_heads×splits), 블록 d
+            {
+                let f = self.cc.function("attn_fwd3s_part_g4")?;
+                let (mut a0, mut a1, mut a2, mut a3) = (dqh, self.attn.dblk_tab, dpart, dpp);
+                let (mut tl, mut lay, mut qh, mut kvh, mut cp) = (
+                    t_len as i32,
+                    0i32,
+                    q_heads as i32,
+                    kv_heads as i32,
+                    dm.cap as i32,
+                );
+                let (mut sp, mut dd, mut swv) = (splits as i32, d as i32, sw as i32);
+                let mut scl = kq_scale;
+                self.cc.launch(
+                    f,
+                    t_len as u32,
+                    (q_heads * splits) as u32,
+                    d as u32,
+                    &mut crate::rawcuda::args::l13(
+                        &mut a0, &mut a1, &mut a2, &mut a3, &mut tl, &mut lay, &mut qh, &mut kvh,
+                        &mut cp, &mut sp, &mut dd, &mut swv, &mut scl,
+                    ),
+                )?;
+            }
+            // ③ merge_g4 — grid (t, q_heads), 블록 d
+            {
+                let f = self.cc.function("attn_fwd3s_merge_g4")?;
+                let (mut a0, mut a1, mut a2, mut a3) = (dpart, dout, 0u64, 0u64);
+                let (mut tl, mut qh, mut sp, mut dd) =
+                    (t_len as i32, q_heads as i32, splits as i32, d as i32);
+                self.cc.launch(
+                    f,
+                    t_len as u32,
+                    q_heads as u32,
+                    d as u32,
+                    &mut crate::rawcuda::args::l8(
+                        &mut a0, &mut a1, &mut a2, &mut a3, &mut tl, &mut qh, &mut sp, &mut dd,
+                    ),
+                )?;
+            }
+            self.cc.sync()?;
+            let mut ob = vec![0u8; t_len * q_heads * d * 4];
+            self.cc.d2h(&mut ob, dout)?;
+            Ok(ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect())
+        })();
+        for p in [dq, dk, dv, dqnw, dknw, dqh, dpart, dout, drp, dpp] {
+            let _ = self.cc.free(p);
+        }
+        rr
+    }
+
     /// 어텐션 체인 호스트 진입 — qg·kin·vin 업로드 → pp=pos0 → prep → fwd3s
     /// → outv 판독.
     pub fn attn_chain_host(
