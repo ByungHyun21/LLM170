@@ -364,10 +364,37 @@ sys.exit(0 if ok else 1)
   fi
 done
 
+# ── G4. gemma4-26B-A4B(QAT W4A16 g32) — P3 v0 서빙 경로 ──
+# [gemma4 P3 2026-10-14] CPU 오라클 동일 실행 대조(마진 인지 게이트) + infer 골든.
+# 프롬프트 = tokenize --chat '{"messages":[{"role":"user","content":"안녕하세요"}]}'.
+M_G4=../models/Gemma-4-26B-A4B-it-QAT-W4A16
+G4_PROMPT="2,105,2364,107,61659,106,107,105,4368,107,100,45518,107,101"
+G4_GOLDEN="61659,236888,131147,237372,199825,236761,94485,237293,220757"
+if [ -d "$M_G4" ]; then
+  echo "=== G4. gemma4-26B-A4B v0 체인(GPU↔CPU 동일 실행 · 채팅) ==="
+  A=$(timeout 1800 "$BIN" w4a16-gpu "$M_G4" --prompt-tokens "$G4_PROMPT" --n-predict 9 --ctx 128 2>&1)
+  echo "$A" | grep -E "GPU tokens|판정:" | sed 's/^/  /'
+  case "$(echo "$A" | grep -o 'GPU tokens: [0-9,]*')" in
+    "GPU tokens: $G4_GOLDEN"*) note "G4 게이트 골든 OK";;
+    *) echo "[w4a16] FAIL: G4 게이트 토큰 — $(echo "$A" | grep -o 'GPU tokens: [0-9,]*')"; fail=1;;
+  esac
+  case "$(echo "$A" | grep -o '판정: 일치')" in
+    "판정: 일치") note "G4 판정 OK(일치)";;
+    *) echo "[w4a16] FAIL: G4 판정 — $(echo "$A" | grep '판정:')"; fail=1;;
+  esac
+  echo "=== G4b. gemma4 infer(서빙 경로) ==="
+  B=$(timeout 900 "$BIN" infer --model "$M_G4" --prompt-tokens "$G4_PROMPT" --n-predict 9 --ctx 128 2>&1)
+  C=$(echo "$B" | grep -o '"token":[0-9]*' | cut -d: -f2 | paste -sd, -)
+  case "$C" in
+    "$G4_GOLDEN"*) note "G4b infer 골든 OK: $(echo "$C" | head -c 60)";;
+    *) echo "[w4a16] FAIL: G4b infer 토큰 — $(echo "$C" | head -c 60)"; fail=1;;
+  esac
+fi
+
 echo "[w4a16] ── 검수 요약(${#SUMMARY[@]}항목) ──"
 for s in "${SUMMARY[@]}"; do echo "[w4a16]   $s"; done
 if [ $fail -eq 0 ]; then
-  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU(600 흡수)·serve·장문(2시나리오 1런)·spec·경계 교차+np 자체 검증 / 35B MoE 참조+GPU(2시나리오)·장문(2시나리오)·spec·스트리밍(D4) / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
+  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU(600 흡수)·serve·장문(2시나리오 1런)·spec·경계 교차+np 자체 검증 / 35B MoE 참조+GPU(2시나리오)·장문(2시나리오)·spec·스트리밍(D4) / gemma4 v0 게이트+infer(G4) / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
 else
   echo "[w4a16] smoke: FAILURES PRESENT"
 fi

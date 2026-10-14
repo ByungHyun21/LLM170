@@ -53,7 +53,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let n = prompts.len();
     let mut eng = crate::sched::load_gpu_retry(&model_path, n, ctx, None, None);
     crate::resource::release_load_lock();
-    let eos = llm170_core::qwen35::EOS_EOT;
+    let eos = eng.eos();
     let mut last_logits = Vec::with_capacity(n);
     for (s, p) in prompts.iter().enumerate() {
         match eng.prefill(s, p) {
