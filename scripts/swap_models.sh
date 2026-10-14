@@ -383,7 +383,9 @@ if [ -d "$M_G4" ]; then
     *) echo "[w4a16] FAIL: G4 판정 — $(echo "$A" | grep '판정:')"; fail=1;;
   esac
   echo "=== G4c. gemma4 HTTP 서브(채팅 · 아치 렌더·정지 토큰) ==="
-  "$BIN" serve --model "$M_G4" --ctx 256 --port 18099 > "$RUN/g4c.log" 2>&1 &
+  # [ctx 하한 512] serve 가드(main.rs) — 256은 거부. 36ba1d4e(ctx_info 배선)
+  # 이후 가드가 활성화돼 이 엔트리 작성 시점(가드 생략)과 조건이 달라졌다.
+  "$BIN" serve --model "$M_G4" --ctx 512 --port 18099 > "$RUN/g4c.log" 2>&1 &
   G4_PID=$!
   # A2 규율: 이 실행의 PID만 종료(전역 pkill 금지).
   trap 'kill "$G4_PID" 2>/dev/null' EXIT
@@ -414,6 +416,34 @@ except Exception:
   case "$C" in
     "$G4_GOLDEN"*) note "G4b infer 골든 OK: $(echo "$C" | head -c 60)";;
     *) echo "[w4a16] FAIL: G4b infer 토큰 — $(echo "$C" | head -c 60)"; fail=1;;
+  esac
+  # G4d: 스트리밍 전문가(비상주 — 저하 사다리) HTTP 경로. [2026-10-14] t=1
+  # 단일 청크 전환이 t행 MoE(g4_moe_host_t — 스트리밍 미지원)로 폴백을
+  # 오염시킨 회귀를 잡는 그물 — 비상주 구성은 v0 호스트 체인(g4_step)이 정본.
+  echo "=== G4d. gemma4 HTTP 서브(--moe streaming — 저하 사다리) ==="
+  "$BIN" serve --model "$M_G4" --ctx 512 --moe streaming --port 18100 > "$RUN/g4d.log" 2>&1 &
+  G4_PID=$!
+  trap 'kill "$G4_PID" 2>/dev/null' EXIT
+  for i in $(seq 1 100); do
+    sleep 3
+    grep -m1 "listening" "$RUN/g4d.log" >/dev/null 2>&1 && break
+  done
+  curl -s -m 600 "http://127.0.0.1:18100/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model":"gemma4","messages":[{"role":"user","content":"안녕하세요"}],"max_tokens":12,"temperature":0}' > "$RUN/g4d.json"
+  kill "$G4_PID" 2>/dev/null
+  wait "$G4_PID" 2>/dev/null
+  trap - EXIT
+  D=$(python3 -c "
+import json
+try:
+    d=json.load(open('"$RUN/g4d.json"'))
+    print(','.join(map(str,d['tokens'])) if d.get('tokens') else 'ERR')
+except Exception:
+    print('ERR')
+")
+  case "$D" in
+    "$G4_GOLDEN"*) note "G4d 스트리밍 골든 OK: $(echo "$D" | head -c 60)";;
+    *) echo "[w4a16] FAIL: G4d 스트리밍 토큰 — $(echo "$D" | head -c 60)"; fail=1;;
   esac
 fi
 
