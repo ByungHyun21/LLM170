@@ -1330,18 +1330,20 @@ pub(crate) fn g4_chunk(
     model: &llm170_core::gemma4::Model,
     cfg: &G4HostCfg,
     slot: usize,
-    toks: &[u32],
+    rows: &[f32],
+    t: usize,
     pos0: u32,
 ) -> Result<Vec<Vec<f32>>, String> {
     let hp = &model.hp;
-    let (h, t) = (hp.n_embd, toks.len());
-    if t == 0 || t > 8 {
-        return Err(format!("g4_chunk: t={t} (1..=8 계약)"));
+    let h = hp.n_embd;
+    if t == 0 || t > 8 || rows.len() != t * h {
+        return Err(format!(
+            "g4_chunk: t={t} rows={} != t*h={} (1..=8 계약)",
+            rows.len(),
+            t * h
+        ));
     }
-    let mut x: Vec<f32> = Vec::with_capacity(t * h);
-    for &tk in toks {
-        x.extend_from_slice(&model.embed_row(tk).map_err(|e| e.to_string())?);
-    }
+    let mut x: Vec<f32> = rows.to_vec();
     for il in 0..hp.n_layer {
         let d = hp.head_dim[il];
         // ① input_layernorm → t행 q/k/(v) GEMM.
@@ -1642,7 +1644,19 @@ impl GemmaEngine {
             if chunk.len() == 1 {
                 last = self.step(seq, chunk[0])?;
             } else {
-                let lgs = g4_chunk(&mut self.dec, &self.model, &self.cfg, seq, chunk, pos)?;
+                let mut rows: Vec<f32> = Vec::with_capacity(chunk.len() * self.model.hp.n_embd);
+                for &tk in chunk {
+                    rows.extend_from_slice(&self.model.embed_row(tk).map_err(|e| e.to_string())?);
+                }
+                let lgs = g4_chunk(
+                    &mut self.dec,
+                    &self.model,
+                    &self.cfg,
+                    seq,
+                    &rows,
+                    chunk.len(),
+                    pos,
+                )?;
                 self.dec.slot_pos[seq] = pos + chunk.len() as u32;
                 last = lgs.into_iter().last().unwrap_or_default();
             }
@@ -1726,20 +1740,43 @@ impl GemmaEngine {
         Ok(())
     }
 
-    /// spec·kstep·MTP는 v0 미지원(순수 어텐션 롤백 = KV 절단 — 후속 트랙).
+    /// spec 활성 — 순수 어텐션 롤백 = **pos 되감기**(KV는 다음 쓰기가 덮고,
+    /// 판독은 pos까지만 — 상태 스냅샷 불요). 초안 = n-gram(스케줄러 측).
     pub fn enable_spec(&mut self) -> Result<(), String> {
-        Err("gemma4: spec 미지원(v0 — KV 절단 롤백 트랙)".into())
+        Ok(())
     }
     pub fn spec_on(&self) -> bool {
-        false
+        true
     }
+    /// 검증 라운드 — [last]+drafts 행(연속 위치)을 t행 청크로 통과 → 행별 그리디.
+    pub fn spec_verify(&mut self, slot: usize, rows: &[f32], t: usize) -> Result<Vec<u32>, String> {
+        let lgs = self.spec_run(slot, rows, t)?;
+        Ok(lgs.iter().map(|l| llm170_core::gemma4::greedy(l)).collect())
+    }
+    /// 검증 행별 로짓(샘플드 거절샘플링 — 평탄 [t][vocab]).
     pub fn spec_verify_logits(
         &mut self,
-        _slot: usize,
-        _rows: &[f32],
-        _t: usize,
+        slot: usize,
+        rows: &[f32],
+        t: usize,
     ) -> Result<Vec<f32>, String> {
-        Err("gemma4: spec 미지원".into())
+        let lgs = self.spec_run(slot, rows, t)?;
+        let mut flat = Vec::with_capacity(t * self.model.hp.vocab);
+        for l in &lgs {
+            flat.extend_from_slice(l);
+        }
+        Ok(flat)
+    }
+    /// 검증 공용 — t행 청크 + KV 확보(pos 전진은 청크가 수행).
+    fn spec_run(&mut self, slot: usize, rows: &[f32], t: usize) -> Result<Vec<Vec<f32>>, String> {
+        if !(2..=8).contains(&t) {
+            return Err(format!("g4 spec: t={t} (2..=8 계약)"));
+        }
+        let pos = self.dec.slot_pos[slot];
+        self.dec.kv_grow(slot, pos as usize + t)?;
+        let lgs = g4_chunk(&mut self.dec, &self.model, &self.cfg, slot, rows, t, pos)?;
+        self.dec.slot_pos[slot] = pos + t as u32;
+        Ok(lgs)
     }
     pub fn decode_greedy_k(
         &mut self,
@@ -1791,18 +1828,14 @@ impl GemmaEngine {
         Err("gemma4: GDN 없음(순수 어텐션)".into())
     }
     pub fn spec_rollback(&mut self, _slot: usize, _keep: usize) -> Result<(), String> {
-        Err("gemma4: spec 미지원(v0)".into())
+        // 순수 어텐션 — 복원할 상태 없음. 수용 접두 이후 KV 행은 다음 쓰기가
+        // 덮는다(판독은 pos까지 — 잔존 행 무해). pos는 spec_rewind_pos 소관.
+        Ok(())
     }
-    pub fn spec_rewind_pos(&mut self, _slot: usize, _n: u32) -> Result<(), String> {
-        Err("gemma4: spec 미지원(v0)".into())
-    }
-    pub fn spec_verify(
-        &mut self,
-        _slot: usize,
-        _rows: &[f32],
-        _t: usize,
-    ) -> Result<Vec<u32>, String> {
-        Err("gemma4: spec 미지원(v0)".into())
+    pub fn spec_rewind_pos(&mut self, slot: usize, n: u32) -> Result<(), String> {
+        let p = self.dec.slot_pos[slot];
+        self.dec.slot_pos[slot] = p.saturating_sub(n);
+        Ok(())
     }
     pub fn mtp_first(&mut self, _slot: usize, _tok: u32) -> Result<(), String> {
         Err("gemma4: MTP 미지원".into())
