@@ -989,3 +989,100 @@ fn conv_ring_pre_snapshot_is_pre_update_state() {
         );
     }
 }
+
+// ═══ [gemma4 2026-10-14] norm_resid_g(2816) — 행 경계 가드 변형 수치 검증 ═══
+/// 가드 변형 vs CPU 미러(동일 누적 순서 재현). **비트 아님**: norm은 기본
+/// fmad(수축 허용)라 f32 반올림이 미러와 다를 수 있다 — 상대오차 밴드 판정.
+/// 인덱싱·가드 결함이면 오차가 ~1로 폭발한다(2816은 1024 배수 아님 —
+/// 마지막 스트라이드 768스레드가 경계 밖).
+#[test]
+fn norm_2816_guard_variant_matches_cpu_mirror() {
+    let _cuda = CUDA_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let hidden = 2816usize;
+    let t_len = 2usize;
+    let mut dec = match super::W4a16Dec::new(1, hidden, 1) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip(CUDA 없음): {e}");
+            return;
+        }
+    };
+    let n = t_len * hidden;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = || {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let pm1 = |r: u64| ((r >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
+    let xs: Vec<f32> = (0..n).map(|_| pm1(rnd())).collect();
+    let ab: Vec<f32> = (0..n).map(|_| pm1(rnd()) * 0.5).collect();
+    let nw: Vec<f32> = (0..hidden).map(|e| 1.0 + e as f32 * 1e-6).collect();
+    dec.set_norm_weights(&nw, 1).expect("norm 가중 등록");
+    let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let dx = dec.cc.alloc(n * 4).unwrap();
+    dec.cc.h2d(dx, &f32b(&xs)).expect("x h2d");
+    let dab = dec.cc.alloc(n * 4).unwrap();
+    dec.cc.h2d(dab, &f32b(&ab)).expect("ab h2d");
+    let dxn = dec.norm_resid_dev(0, dx, dab, t_len, 0).expect("norm 발사");
+    let d2h = |dec: &super::W4a16Dec, p: CUdeviceptr| -> Vec<f32> {
+        let mut b = vec![0u8; n * 4];
+        dec.cc.d2h(&mut b, p).expect("d2h");
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect()
+    };
+    let got = d2h(&dec, dxn);
+    let xgot = d2h(&dec, dx);
+    // CPU 미러 — 커널과 동일 순서(스레드별 nper조각 f32 누적 → smem 512..1 트리).
+    let mut maxd = 0f32;
+    let mut maxr = 0f32;
+    let nper = hidden.div_ceil(1024);
+    for t in 0..t_len {
+        let base = t * hidden;
+        let lim = base + hidden;
+        let mut red = [0f32; 1024];
+        // 스레드별 v — 커널과 같이 tid×nper(전 tid의 값이 서로 덮이지 않게).
+        let mut vals = vec![0f32; 1024 * nper];
+        for tid in 0..1024 {
+            let mut ss = 0f32;
+            for j in 0..nper {
+                let e = base + (j << 10) + tid;
+                let vj = if e < lim { xs[e] + ab[e] } else { 0.0 };
+                vals[tid * nper + j] = vj;
+                ss += vj * vj;
+            }
+            red[tid] = ss;
+        }
+        let mut st = 512usize;
+        while st > 0 {
+            for tid in 0..st {
+                red[tid] += red[tid + st];
+            }
+            st >>= 1;
+        }
+        let inv = 1.0f32 / (red[0] / hidden as f32 + 1e-6).sqrt();
+        for tid in 0..1024 {
+            for j in 0..nper {
+                let eo = (j << 10) + tid; // 행-로컬(커널 nw 오프셋 계약)
+                let e = base + eo;
+                if e >= lim {
+                    continue;
+                }
+                let want = vals[tid * nper + j] * inv * nw[eo];
+                let d = (got[e] - want).abs();
+                maxd = maxd.max(d);
+                if want.abs() > 1e-3 {
+                    maxr = maxr.max(d / want.abs());
+                }
+                maxd = maxd.max((xgot[e] - (xs[e] + ab[e])).abs());
+            }
+        }
+    }
+    eprintln!("[norm2816] max|diff| {maxd:.3e} · 최대상대 {maxr:.3e}");
+    assert!(maxr < 1e-5 && maxd < 1e-4, "norm2816 오차 초과: {maxr:.3e}");
+}

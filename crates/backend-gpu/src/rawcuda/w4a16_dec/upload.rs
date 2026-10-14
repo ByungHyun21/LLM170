@@ -50,10 +50,13 @@ impl W4a16Dec {
     // ── norm ──
 
     /// 노름 가중 상주 등록 — nw [rows][hidden] f32(행 포인터 계약 w·hidden).
+    /// hidden 계약 = (0, 8192] — 커널이 1024 배수면 `norm_resid`, 아니면
+    /// 행 경계 가드 변형(`norm_resid_g`, gemma4 2816)을 쓴다(선택은
+    /// `norm_resid_at`). 종전 1024 배수 강제는 스트라이드 커널 전용 가정이었다.
     pub fn set_norm_weights(&mut self, nw: &[f32], rows: usize) -> Result<(), String> {
-        if self.hidden == 0 || !self.hidden.is_multiple_of(1024) || self.hidden > 8192 {
+        if self.hidden == 0 || self.hidden > 8192 {
             return Err(format!(
-                "norm: hidden={} — 1024 배수·8192 이하 계약",
+                "norm: hidden={} — (0, 8192] 계약(v[8] 레지스터 상한)",
                 self.hidden
             ));
         }
