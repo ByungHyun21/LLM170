@@ -22,12 +22,11 @@ impl GemmaEngine {
         let hp = model.hp.clone();
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
         let cfg = upload_model_g4(&mut dec, &model, ctx)?;
-        // 층별 pes(μ_e) 디바이스 상주(t행 MoE 경로용 — 1회) + layer_scalar
-        // (디바이스 청크 스칼라 인자 — 1회 등록).
+        // 층별 pes(μ_e) 디바이스 상주(t행 MoE 경로용 — 1회). layer_scalar는
+        // upload_model_g4가 등록(엔진·eval·프로브 공용 단일 계약).
         for il in 0..model.hp.n_layer {
             dec.set_g4_pes(il, cfg.pes_row(il, model.hp.n_experts))?;
         }
-        dec.set_g4_layer_scalar(&cfg.layer_scalar)?;
         Ok(GemmaEngine {
             model,
             cfg,
