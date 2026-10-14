@@ -2,6 +2,7 @@
 
 pub mod gdn;
 pub mod gdn_norm;
+pub mod gemma4;
 pub mod json;
 pub mod marlin;
 pub mod matmul;

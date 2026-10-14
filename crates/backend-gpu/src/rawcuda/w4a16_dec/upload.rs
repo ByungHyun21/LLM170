@@ -13,9 +13,30 @@ impl W4a16Dec {
         n: usize,
         k: usize,
     ) -> Result<(), String> {
-        if q.len() != n * (k / 2) || s.len() != n * (k / 64) {
+        self.upload_lin_g(name, q, s, n, k, 128, false)
+    }
+
+    /// [gemma4 P2-3 2026-10-14] 그룹·스케일 dtype 지정 상주 업로드 —
+    /// packed u32 [n][k/8] · scale [n][k/group]×2B(f16/bf16). GEMV/GEMM 런처는
+    /// `gptq4::kernel_sym`이 (group, scale_bf16)로 심볼을 고른다(런치 구성 동일 —
+    /// `w4a16-gemv`/`w4a16-gemm` 게이트와 동일 표).
+    pub fn upload_lin_g(
+        &mut self,
+        name: &str,
+        q: &[u8],
+        s: &[u8],
+        n: usize,
+        k: usize,
+        group: usize,
+        scale_bf16: bool,
+    ) -> Result<(), String> {
+        // 워커 스레드 대비 컨텍스트 가드(할당·h2d — 종전 upload_lin 무가드 클래스).
+        let _g = self.cc.guard()?;
+        // 커널 표에 없는 조합은 등록 단계에서 거른다(런타임 심볼 실패 방지).
+        crate::rawcuda::gptq4::kernel_sym(false, group, scale_bf16)?;
+        if q.len() != n * (k / 2) || s.len() != n * (k / group) * 2 {
             return Err(format!(
-                "upload_lin {name}: q={} s={} != n{n} k{k} 계약",
+                "upload_lin_g {name}: q={} s={} != n{n} k{k} g{group} 계약",
                 q.len(),
                 s.len()
             ));
@@ -44,16 +65,24 @@ impl W4a16Dec {
             let _ = self.cc.free(oq);
             let _ = self.cc.free(os);
         }
+        if group == 128 && !scale_bf16 {
+            self.lin_grp.remove(name); // 기본값 — 기재 불요
+        } else {
+            self.lin_grp.insert(name.to_string(), (group, scale_bf16));
+        }
         Ok(())
     }
 
     // ── norm ──
 
     /// 노름 가중 상주 등록 — nw [rows][hidden] f32(행 포인터 계약 w·hidden).
+    /// hidden 계약 = (0, 8192] — 커널이 1024 배수면 `norm_resid`, 아니면
+    /// 행 경계 가드 변형(`norm_resid_g`, gemma4 2816)을 쓴다(선택은
+    /// `norm_resid_at`). 종전 1024 배수 강제는 스트라이드 커널 전용 가정이었다.
     pub fn set_norm_weights(&mut self, nw: &[f32], rows: usize) -> Result<(), String> {
-        if self.hidden == 0 || !self.hidden.is_multiple_of(1024) || self.hidden > 8192 {
+        if self.hidden == 0 || self.hidden > 8192 {
             return Err(format!(
-                "norm: hidden={} — 1024 배수·8192 이하 계약",
+                "norm: hidden={} — (0, 8192] 계약(v[8] 레지스터 상한)",
                 self.hidden
             ));
         }
@@ -168,17 +197,48 @@ impl W4a16Dec {
         self.attn.kv_budget = bytes;
     }
 
-    pub fn set_attn(&mut self, dims: AttnDims, qnw: &[f32], knw: &[f32]) -> Result<(), String> {
+    /// [gemma4 2026-10-14] `layers` = 층별 어텐션 파라미터(빈 벡터 = 균일
+    /// 모델 — qwen35 종전 경로와 완전 동일). QK 노름 가중은 층별 head_dim의
+    /// **최대치 보폭**(d_max)으로 패딩된 배열을 받는다(균일 모델은 n×d 동일).
+    pub fn set_attn(
+        &mut self,
+        dims: AttnDims,
+        layers: Vec<AttnLayer>,
+        qnw: &[f32],
+        knw: &[f32],
+    ) -> Result<(), String> {
         let n = dims.n_attn;
-        if qnw.len() != n * dims.d || knw.len() != n * dims.d {
-            return Err(format!("attn: qnw/knw != {n}x{}", dims.d));
+        if !layers.is_empty() && layers.len() != n {
+            return Err(format!("attn: layers {} != n_attn {n}", layers.len()));
+        }
+        let d_max = layers.iter().map(|l| l.d).max().unwrap_or(dims.d);
+        if qnw.len() != n * d_max || knw.len() != n * d_max {
+            return Err(format!("attn: qnw/knw != {n}x{d_max}"));
         }
         let slots = self.n_slots;
         // [K6-3 2026-10-13] KV 물리 풀 — 평탄 아레나 4종(k/v/ksc/vsc).
         // 블록 = 512토큰 × 1층. 현 단계: 총량 = 종전 용량(slots×n×mb)과 동일·
         // 전량 선할당(동작 보존), 다음 단계에서 예산 기반 온디맨드로 전환.
+        // [gemma4 2026-10-14] 아레나·블록 = **층별 최대 클래스**(층별 크기 혼합
+        // 모델 대응 — 여유분 미사용. 정확 크기 클래스화는 후속 최적화).
+        // 균일 모델은 스칼라 필드와 동일(무해).
+        let (kvd, kvh) = if layers.is_empty() {
+            (dims.kv_dim(), dims.kv_heads)
+        } else {
+            (
+                layers
+                    .iter()
+                    .map(|l| l.kv_heads * l.d)
+                    .max()
+                    .unwrap_or(dims.kv_dim()),
+                layers
+                    .iter()
+                    .map(|l| l.kv_heads)
+                    .max()
+                    .unwrap_or(dims.kv_heads),
+            )
+        };
         let mb = dims.cap.div_ceil(512);
-        let (kvd, kvh) = (dims.kv_dim(), dims.kv_heads);
         let need_blocks = slots * n * mb;
         let block_k = 512 * kvd; // 아레나 k/v 블록 바이트(1B/원소 int8)
         let block_s = 512 * kvh * 4; // 아레나 ksc/vsc 블록 바이트(f32)
@@ -289,6 +349,7 @@ impl W4a16Dec {
         self.attn.dkc = dkc;
         self.attn.dvc = dvc;
         self.attn.dpp = dpp;
+        self.attn.layers = layers;
         self.attn.attn = Some(dims);
         // [§3.4 ② 트랜셰 2] 등록 중 퇴거(ckpt·spec·expert-lru)가 결정됐을
         // 수 있다 — KV 필드 확정 후 실제 해제까지 완료. KV 자체는 고정
@@ -310,7 +371,8 @@ impl W4a16Dec {
         }
         let mb = dm.cap.div_ceil(512);
         let nb = (n_tokens + 2).div_ceil(512).min(mb);
-        let (kvd, kvh) = (dm.kv_dim(), dm.kv_heads);
+        // [gemma4 2026-10-14] 최대 KV 클래스(층별 혼합 — 등록 시와 동일 규칙).
+        let (kvd, kvh) = self.attn_max_kv()?;
         let (bk, bs) = ((512 * kvd) as u64, (512 * kvh * 4) as u64);
         let (kc, vc, ks, vs) = (self.attn.dkc, self.attn.dvc, self.attn.dksc, self.attn.dvsc);
         let n_attn = dm.n_attn;
@@ -454,7 +516,9 @@ impl W4a16Dec {
         shared_ffn: usize,
         group: usize,
         scale_bf16: bool,
+        glu_gelu: bool,
     ) {
+        self.moe.glu_gelu = glu_gelu;
         self.moe.n_experts = n_experts;
         self.moe.top_k = top_k;
         self.moe.moe_ffn = moe_ffn;

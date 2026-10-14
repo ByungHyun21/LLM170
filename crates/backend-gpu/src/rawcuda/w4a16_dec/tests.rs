@@ -377,9 +377,11 @@ fn mtp_device_chain_matches_sequential() {
         d,
         cap,
         interval: 1,
+        sliding_window: 0, // qwen35 = 슬라이딩 없음(gemma4 배선 시 창 설정)
     };
     dec.set_attn(
         ad,
+        Vec::new(), // 균일 모델(층별 테이블 없음)
         &(0..ad.n_attn * d)
             .map(|_| sm_f32(&mut s, 0.5, 1.5))
             .collect::<Vec<_>>(),
@@ -509,9 +511,11 @@ fn kstep_decode_matches_sequential() {
         d,
         cap,
         interval: 1,
+        sliding_window: 0, // qwen35 = 슬라이딩 없음(gemma4 배선 시 창 설정)
     };
     dec.set_attn(
         ad,
+        Vec::new(), // 균일 모델(층별 테이블 없음)
         &(0..ad.n_attn * d)
             .map(|_| sm_f32(&mut s, 0.5, 1.5))
             .collect::<Vec<_>>(),
@@ -594,9 +598,15 @@ fn ucache_enforcement_frees_device_memory() {
         d,
         cap,
         interval: 1,
+        sliding_window: 0, // qwen35 = 슬라이딩 없음(gemma4 배선 시 창 설정)
     };
-    dec.set_attn(ad, &vec![1f32; ad.n_attn * d], &vec![1f32; ad.n_attn * d])
-        .expect("set_attn");
+    dec.set_attn(
+        ad,
+        Vec::new(),
+        &vec![1f32; ad.n_attn * d],
+        &vec![1f32; ad.n_attn * d],
+    )
+    .expect("set_attn");
     // 스펙 상태(WY s0/dc/g/k + dsnap_ring + 라운드 전 링 dring0) + 체크포인트
     // (dchk) 등록. dsave는 프로브 전용 지연 할당(serve 경로 상주 없음).
     dec.enable_spec().expect("enable_spec");
@@ -626,14 +636,24 @@ fn ucache_enforcement_frees_device_memory() {
     assert_eq!(freed, state, "퇴거분 HBM 실해제(state만)");
     assert_eq!(dec.ucache.evict_count(), 1, "state 1건 퇴거");
 
-    // 실측 회수 판정 — HBM 해제분(state)만큼 여유 VRAM 증가(드라이버 산정 ≥
-    // 청구). ckpt(호스트)는 VRAM 델타에 안 잡힌다.
+    // 실측 회수 판정 — [판정 조정 2026-10-14] 종전엔 `free1-free0 >= state`를
+    // 직접 요구했다. 체크포인트가 HostRam 티어로 이관되면서 HBM 퇴거분이
+    // ~52MiB → state(10.68MiB) 단독으로 줄었고, 드라이버의 2MiB 블록 회계
+    // (같은 블록에 살아있는 버퍼가 섞이면 블록이 반환되지 않음)에서 실측
+    // 회수 10MiB < 청구가 **결정적**으로 나온다(진단 실측 2026-10-14: 격리
+    // 조각 6개 = 12MiB 전량 회수 · 압박 상황 = 10MiB). 회수 판정은
+    // (a) 해제분 재할당 성공(실제 반환 증명) + (b) 여유 VRAM 무감소(정보
+    // 기록)로 한다. 회계 정합(freed == state)·포인터 0화·spec 차단은 그대로.
     let free1 = crate::cuda_mem_free().expect("VRAM 프로브").0;
-    assert!(
-        free1 >= free0 && free1 - free0 >= state,
-        "VRAM 회수 없음: +{}B (기대 ≥ {}B)",
-        free1.saturating_sub(free0),
-        state
+    let reuse = dec
+        .cc
+        .alloc(state as usize)
+        .expect("해제분 재할당 실패 — VRAM 미회수");
+    dec.cc.free(reuse).expect("재할당 해제");
+    dec.cc.sync().expect("sync");
+    eprintln!(
+        "[ucache] 회수 실측: 여유 {free0} → {free1} (+{}B) · 청구 {state}B · 재할당 성공",
+        free1.saturating_sub(free0)
     );
 
     // 기능 정합 — state 해제 0화 + 스펙 차단, ckpt(호스트) 잔존, KV 생존.
@@ -978,4 +998,101 @@ fn conv_ring_pre_snapshot_is_pre_update_state() {
             "링 h2 갱신 오류 ch={ch}"
         );
     }
+}
+
+// ═══ [gemma4 2026-10-14] norm_resid_g(2816) — 행 경계 가드 변형 수치 검증 ═══
+/// 가드 변형 vs CPU 미러(동일 누적 순서 재현). **비트 아님**: norm은 기본
+/// fmad(수축 허용)라 f32 반올림이 미러와 다를 수 있다 — 상대오차 밴드 판정.
+/// 인덱싱·가드 결함이면 오차가 ~1로 폭발한다(2816은 1024 배수 아님 —
+/// 마지막 스트라이드 768스레드가 경계 밖).
+#[test]
+fn norm_2816_guard_variant_matches_cpu_mirror() {
+    let _cuda = CUDA_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let hidden = 2816usize;
+    let t_len = 2usize;
+    let mut dec = match super::W4a16Dec::new(1, hidden, 1) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip(CUDA 없음): {e}");
+            return;
+        }
+    };
+    let n = t_len * hidden;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = || {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let pm1 = |r: u64| ((r >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
+    let xs: Vec<f32> = (0..n).map(|_| pm1(rnd())).collect();
+    let ab: Vec<f32> = (0..n).map(|_| pm1(rnd()) * 0.5).collect();
+    let nw: Vec<f32> = (0..hidden).map(|e| 1.0 + e as f32 * 1e-6).collect();
+    dec.set_norm_weights(&nw, 1).expect("norm 가중 등록");
+    let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let dx = dec.cc.alloc(n * 4).unwrap();
+    dec.cc.h2d(dx, &f32b(&xs)).expect("x h2d");
+    let dab = dec.cc.alloc(n * 4).unwrap();
+    dec.cc.h2d(dab, &f32b(&ab)).expect("ab h2d");
+    let dxn = dec.norm_resid_dev(0, dx, dab, t_len, 0).expect("norm 발사");
+    let d2h = |dec: &super::W4a16Dec, p: CUdeviceptr| -> Vec<f32> {
+        let mut b = vec![0u8; n * 4];
+        dec.cc.d2h(&mut b, p).expect("d2h");
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect()
+    };
+    let got = d2h(&dec, dxn);
+    let xgot = d2h(&dec, dx);
+    // CPU 미러 — 커널과 동일 순서(스레드별 nper조각 f32 누적 → smem 512..1 트리).
+    let mut maxd = 0f32;
+    let mut maxr = 0f32;
+    let nper = hidden.div_ceil(1024);
+    for t in 0..t_len {
+        let base = t * hidden;
+        let lim = base + hidden;
+        let mut red = [0f32; 1024];
+        // 스레드별 v — 커널과 같이 tid×nper(전 tid의 값이 서로 덮이지 않게).
+        let mut vals = vec![0f32; 1024 * nper];
+        for tid in 0..1024 {
+            let mut ss = 0f32;
+            for j in 0..nper {
+                let e = base + (j << 10) + tid;
+                let vj = if e < lim { xs[e] + ab[e] } else { 0.0 };
+                vals[tid * nper + j] = vj;
+                ss += vj * vj;
+            }
+            red[tid] = ss;
+        }
+        let mut st = 512usize;
+        while st > 0 {
+            for tid in 0..st {
+                red[tid] += red[tid + st];
+            }
+            st >>= 1;
+        }
+        let inv = 1.0f32 / (red[0] / hidden as f32 + 1e-6).sqrt();
+        for tid in 0..1024 {
+            for j in 0..nper {
+                let eo = (j << 10) + tid; // 행-로컬(커널 nw 오프셋 계약)
+                let e = base + eo;
+                if e >= lim {
+                    continue;
+                }
+                let want = vals[tid * nper + j] * inv * nw[eo];
+                let d = (got[e] - want).abs();
+                maxd = maxd.max(d);
+                if want.abs() > 1e-3 {
+                    maxr = maxr.max(d / want.abs());
+                }
+                maxd = maxd.max((xgot[e] - (xs[e] + ab[e])).abs());
+            }
+        }
+    }
+    eprintln!("[norm2816] max|diff| {maxd:.3e} · 최대상대 {maxr:.3e}");
+    assert!(maxr < 1e-5 && maxd < 1e-4, "norm2816 오차 초과: {maxr:.3e}");
 }

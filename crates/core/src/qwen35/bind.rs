@@ -30,6 +30,28 @@ pub fn dir_arch(dir: &Path) -> Option<String> {
     v.get("model_type").and_then(Json::as_str).map(String::from)
 }
 
+/// 모델 전역 로짓 softcap(config.json — arch 중립 메타데이터).
+/// `text_config.final_logit_softcapping` 우선, 평면 키 fallback, 부재 = 0(미적용).
+/// gemma4 = 30.0 · qwen3.5 = 부재.
+pub fn final_logit_softcap(dir: &Path) -> f32 {
+    let Ok(txt) = std::fs::read_to_string(dir.join("config.json")) else {
+        return 0.0;
+    };
+    let Ok(v) = Json::parse(&txt) else {
+        return 0.0;
+    };
+    let tc = v.get("text_config").unwrap_or(&v);
+    tc.get("final_logit_softcapping")
+        .and_then(Json::as_f64)
+        .unwrap_or(0.0) as f32
+}
+
+/// 전문가 텐서 베이스 이름 — qwen3_5 계열(`...layers.{l}.mlp.experts.{e}.{proj}`).
+/// 스토어는 경로를 모른다(무경유 접근자 `W4a16Model::expert_at(base)`에 전달).
+pub fn expert_base(layer: usize, e: usize, proj: &str) -> String {
+    format!("model.language_model.layers.{layer}.mlp.experts.{e}.{proj}")
+}
+
 /// qwen3_5 계열 하이퍼파라미터(config.json 발췌).
 #[derive(Debug, Clone)]
 pub struct QwenCfg {
@@ -610,7 +632,6 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
     // MoE 전문가 트리플 구조(W4-1) — 층당 n_experts×3, 형상 계약 포함.
     // 이름맵·커버리지에 30,720개를 싣지 않고 여기서 구조로 검증한다.
     if cfg.n_experts > 0 {
-        let lp = "model.language_model.layers.";
         for il in 0..cfg.layers {
             for e in 0..cfg.n_experts {
                 for (proj, n, k) in [
@@ -618,7 +639,7 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
                     ("up_proj", cfg.moe_ffn, cfg.hidden),
                     ("down_proj", cfg.hidden, cfg.moe_ffn),
                 ] {
-                    let base = format!("{lp}{il}.mlp.experts.{e}.{proj}");
+                    let base = expert_base(il, e, proj);
                     match store.lin_shape(&base) {
                         Some((nn, kk)) if nn == n && kk == k => {}
                         Some((nn, kk)) => {
@@ -840,6 +861,28 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("linear_conv_kernel_dim=0"), "{e}");
+    }
+
+    /// [gemma4] 최종 로짓 softcap 파생 — text_config 중첩·평면·부재(0).
+    #[test]
+    fn final_logit_softcap_from_config() {
+        let dir = std::env::temp_dir().join(format!("llm170_softcap_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"text_config":{"final_logit_softcapping":30.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(final_logit_softcap(&dir), 30.0, "중첩(text_config)");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"final_logit_softcapping":12.5}"#,
+        )
+        .unwrap();
+        assert_eq!(final_logit_softcap(&dir), 12.5, "평면 키");
+        std::fs::write(dir.join("config.json"), r#"{"hidden_size":1}"#).unwrap();
+        assert_eq!(final_logit_softcap(&dir), 0.0, "부재 = 미적용");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// [2.J] max_position_embeddings 파생 — 평면/중첩(text_config) 두 경로.

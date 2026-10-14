@@ -73,9 +73,11 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
                 path.display()
             ));
         };
-        if !llm170_core::qwen35::bind::arch_supported(&arch) {
+        if !llm170_core::qwen35::bind::arch_supported(&arch)
+            && !llm170_core::gemma4::bind::arch_ok(&arch)
+        {
             return Err(format!(
-                "미지원 아키텍처: {arch} (지원: {:?}) — {}",
+                "미지원 아키텍처: {arch} (지원: {:?} + gemma4) — {}",
                 llm170_core::qwen35::bind::ARCHES,
                 path.display()
             ));
@@ -177,9 +179,10 @@ impl Engine {
         self.0.copy_stats()
     }
 
-    /// 정지 토큰(F5 — 하드코드 248044 일반화): Q35는 아키텍처 상수.
+    /// 정지 토큰(F5 — 하드코드 248044 일반화): 아치별 상수(엔진 위임 —
+    /// gemma4는 [1,106,50] 중 대표 1, 전체 목록은 서빙 스톱 레지스트리).
     pub fn eos(&self) -> u32 {
-        llm170_core::qwen35::EOS_EOT
+        self.0.eos()
     }
 }
 
@@ -274,6 +277,14 @@ use crate::sched::load_gpu_retry;
 pub use crate::sched::{SlotJob, slot_loop};
 
 pub static TOKENIZER: std::sync::OnceLock<crate::tokenize::Tokenizer> = std::sync::OnceLock::new();
+/// [P3 gemma4 2026-10-14] 서빙 아치(config.json architectures) — oai 렌더·정지
+/// 토큰 레지스트리(chat_spec) 키. 로드 시 1회 확정(load_gpu_retry).
+pub static ARCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// 현재 아치(미설정 = 빈 문자열 — 레지스트리 미등록 기본 경로).
+pub fn arch() -> String {
+    ARCH.get().cloned().unwrap_or_default()
+}
 
 pub fn greedy_encode(text: &str) -> Vec<u32> {
     TOKENIZER.get().map(|t| t.encode(text)).unwrap_or_default()

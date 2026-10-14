@@ -40,8 +40,9 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
   llm170 w4a16-eval ppl <dir> --corpus <txt> [--ctx N] [--limit N] [--out dump.tsv] [--json]
   llm170 w4a16-eval agree <a.tsv> <b.tsv>
       통계 eval — PPL·teacher-forced argmax 일치율(연산 경로 편차 계측기).
-  llm170 tokenize --model <dir> (--text <s> | --file <f> | --stdin)
-      토크나이저 인코딩 [id, ...] 출력.
+  llm170 tokenize --model <dir> (--text <s> | --file <f> | --stdin) [--no-special] [--chat]
+      토크나이저 인코딩 [id, ...] 출력. --chat: messages JSON을 아치별
+      최소 턴 렌더로 변환해 토큰화(렌더·BOS·EOS 검증).
   llm170 plan --model <w4a16_dir> [--cards N] [--vram-gb X] [--host-gb Y] [--ctx N] [--ssd-gb Z]
       배치 플래너 드라이런(무적재) — 매니페스트 범주 분류 + 사다리 배치안(§2.M).
   llm170 help
@@ -329,7 +330,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut kv_budget: Option<u64> = None;
     let mut kv_reserve: Option<u64> = None;
     let mut plan_txt = String::new();
-    match llm170_core::qwen35::ctx_info(&model_path) {
+    match model_ctx_info(&model_path) {
         Ok(ci) => {
             model_max_ctx = ci.ctx;
             // [K6-3 예산 2026-10-13] 풀 예산 = 여유 VRAM − 가중치(dense) − 예약.
@@ -455,12 +456,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     eprintln!(
         "# serve: 문맥 {SERVE_CONTEXTS}(내부 상수 — --slots 폐지) · 동시성 = min(문맥, 풀 입장)"
     );
-    match http::serve(
-        &format!("127.0.0.1:{port}"),
-        req,
-        Some(SERVE_CONTEXTS),
-        queue,
-    ) {
+    match http::serve(&format!("127.0.0.1:{port}"), req, SERVE_CONTEXTS, queue) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -517,7 +513,7 @@ fn cmd_plan(args: &[String], ma: &ModelArgs) -> ExitCode {
         }
     };
     // 워크로드 — config 파생(ctx·KV/토큰·상태). 실패 시 표준 폴백(무적재 원칙).
-    let (max_ctx, kv_bpt, state_bpc) = match llm170_core::qwen35::ctx_info(&model_path) {
+    let (max_ctx, kv_bpt, state_bpc) = match model_ctx_info(&model_path) {
         Ok(ci) => (ci.ctx, ci.kv_bytes_per_token, ci.gdn_state_bytes_per_slot),
         Err(e) => {
             eprintln!("# plan: config 파생 실패({e}) — 폴백(256K·33KiB/tok·151MiB/ctx)");
@@ -668,6 +664,33 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
         }
         buf
     };
+    // [P1 gemma4 2026-10-14] --chat: messages JSON을 아치별 최소 턴 렌더로
+    // 바꿔 토큰화 — 렌더·BOS·EOS 레지스트리 검증 경로.
+    if ma.rest.iter().any(|a| a == "--chat") {
+        let arch = llm170_core::qwen35::bind::dir_arch(&model_path).unwrap_or_default();
+        let Some(spec) = crate::oai::chat_spec(&arch) else {
+            eprintln!("error: 아치 챗 스펙 없음({arch})");
+            return ExitCode::FAILURE;
+        };
+        let rendered = (spec.render)(&text);
+        let ids = tok.encode_opts(&rendered, true);
+        let csv = |v: &[u32]| {
+            v.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut dec = Vec::new();
+        for id in &ids {
+            tok.piece_bytes_into(*id, &mut dec);
+        }
+        println!("arch: {arch}");
+        println!("render: {rendered:?}");
+        println!("ids: [{}]", csv(&ids));
+        println!("decode: {:?}", String::from_utf8_lossy(&dec));
+        println!("eos: [{}]", csv(spec.eos));
+        return ExitCode::SUCCESS;
+    }
     let ids = tok.encode_opts(&text, !no_special);
     println!(
         "[{}]",
@@ -677,6 +700,16 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
             .join(", ")
     );
     ExitCode::SUCCESS
+}
+
+/// [P3 gemma4 2026-10-14] 아치별 계획 파생 — ctx_info 레지스트리 디스패치.
+fn model_ctx_info(p: &std::path::Path) -> Result<llm170_core::qwen35::CtxInfo, String> {
+    let arch = llm170_core::qwen35::bind::dir_arch(p).unwrap_or_default();
+    if llm170_core::gemma4::bind::arch_ok(&arch) {
+        llm170_core::gemma4::ctx_info(p)
+    } else {
+        llm170_core::qwen35::ctx_info(p)
+    }
 }
 
 fn usage_err(msg: &str) -> ExitCode {

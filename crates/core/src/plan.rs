@@ -19,7 +19,8 @@ use std::path::Path;
 pub enum Category {
     /// 매-토큰 밀집(어텐션·GDN·라우터·head·shared_expert·PLE conv 등) — VRAM.
     Dense,
-    /// 전문가 은행(`.mlp.experts.`) — 잔여 VRAM 핫셋/스트리밍.
+    /// 전문가 은행(`.experts.` — qwen3.5 `.mlp.experts.`, gemma4 `.experts.`)
+    /// — 잔여 VRAM 핫셋/스트리밍.
     Experts,
     /// 행-스파스 임베딩(PLE `ple_embedding`) — 기본 SSD.
     RowSparse,
@@ -32,7 +33,7 @@ pub fn classify(name: &str) -> Category {
     if name.contains("shared_expert") {
         return Category::Dense;
     }
-    if name.contains(".mlp.experts.") {
+    if name.contains(".experts.") {
         return Category::Experts;
     }
     if name.contains("ple_embedding") || name.contains("ngram_embedding") {
@@ -279,6 +280,16 @@ impl Manifest {
     /// 텐서명 → 층 분해(`layers.{N}.`; 그룹은 embed(호스트)·비층(헤드 등)).
     pub fn layer_split(&self) -> LayerSplit {
         let layer_of = |name: &str| -> Option<usize> {
+            // 비전·오디오 타워는 텍스트 층이 아니다 — gemma4는 타워 내부에도
+            // `.layers.`가 있어(encoder.layers.N) 그대로 두면 텍스트 층 0에
+            // 합산된다. 타워 접두는 층 판정에서 배제(비층으로 계상).
+            if name.contains("vision_tower.")
+                || name.contains("embed_vision.")
+                || name.contains("audio_tower.")
+                || name.contains(".visual.")
+            {
+                return None;
+            }
             let pos = name
                 .find(".layers.")
                 .map(|p| p + 8)
@@ -565,6 +576,20 @@ mod tests {
             ),
             (
                 "model.language_model.layers.0.mlp.gate.weight",
+                Category::Dense,
+            ),
+            // Gemma4 MoE — `.mlp.` 없이 `.experts.`(경로 일반화 2026-10-14).
+            (
+                "model.language_model.layers.0.experts.0.down_proj.weight_packed",
+                Category::Experts,
+            ),
+            (
+                "model.language_model.layers.29.experts.127.up_proj.weight_scale",
+                Category::Experts,
+            ),
+            // 비전 타워는 `.mlp.` 보유하나 expert 은행 아님 — Dense(오분류 가드).
+            (
+                "model.vision_tower.encoder.layers.0.mlp.gate_proj.linear.weight",
                 Category::Dense,
             ),
             // FN PLE(행-스파스) + PLE dense 모듈
@@ -883,5 +908,40 @@ mod tests {
         assert!(sp.layers[1].full_attn);
         assert_eq!(sp.embed, 700);
         assert_eq!(sp.non_layer, 300);
+    }
+
+    /// gemma4 이름 패턴 — 층 파싱(전문가·어텐션)·타워 배제(비층)·embed 분리.
+    #[test]
+    fn layer_split_parses_gemma4_names() {
+        let m = Manifest::from_items(vec![
+            (
+                "model.language_model.layers.0.experts.0.gate_proj.weight_packed".into(),
+                800,
+            ),
+            (
+                "model.language_model.layers.0.self_attn.q_proj.weight_packed".into(),
+                200,
+            ),
+            (
+                "model.language_model.layers.5.self_attn.q_proj.weight_packed".into(),
+                300,
+            ),
+            ("model.language_model.embed_tokens.weight".into(), 700),
+            ("model.language_model.norm.weight".into(), 50),
+            // 타워 내부 `.layers.` — 텍스트 층에 합산 금지(비층).
+            (
+                "model.vision_tower.encoder.layers.0.input_layernorm.weight".into(),
+                111,
+            ),
+            ("model.embed_vision.embedding_projection.weight".into(), 60),
+        ]);
+        let sp = m.layer_split();
+        assert_eq!(sp.layers.len(), 6);
+        assert_eq!(sp.layers[0].bytes, 1000, "전문가(800)+어텐션(200)");
+        assert_eq!(sp.layers[1].bytes, 0);
+        assert_eq!(sp.layers[5].bytes, 300);
+        assert_eq!(sp.embed, 700);
+        // norm + 비전 타워 2건 = 비층.
+        assert_eq!(sp.non_layer, 50 + 111 + 60);
     }
 }

@@ -260,6 +260,15 @@ __device__ __forceinline__ void gemv_body4(
     if (o >= n) {
         return;
     }
+    // [gemma4 2026-10-14] float4 본체는 256폭 청크 전제 — k가 256 배수가
+    // 아니면 꼬리가 누락된다(실측 0.158: gemma4 dense down_proj k=2176 =
+    // 8.5×256, w4a16-gemv 게이트 적발). 해당 형상은 **스칼라 본체**로
+    // (128폭 청크 — k%128==0이면 정확, 전문가 경로가 쓰는 검증된 경로).
+    // 수치 클래스: 양쪽 모두 FMA(t=1 GEMV = 비트 계약 아님, 진단 게이트).
+    if ((k & 255) != 0) {
+        gemv_row_body<SHIFT, BF16>(q, s, x, out, o, k);
+        return;
+    }
     gemv_row_body4<SHIFT, BF16>(q, s, x, out, o, k);
 }
 
@@ -317,6 +326,39 @@ extern "C" __global__ void w4a16_gemv_experts_glu(
     if (threadIdx.x == 0) {
         const float e = __expf(-g);
         slot[o] = (g / (1.0f + e)) * u;
+    }
+}
+
+// [gemma4 P2 2026-10-14] 전문가 gate+up+활성 융합 — gelu_tanh판.
+// 구조·행별 산술은 w4a16_gemv_experts_glu와 동일(gemv_row_body) — 활성만
+// silu → gelu_pytorch_tanh(0.5x(1+tanh(√(2/π)(x+0.044715x³)))). tanhf는
+// 트랜센던털 등급(eval 판정 — ew_gelu와 동일 클래스). gemma4 전용(모델별 선택).
+extern "C" __global__ void w4a16_gemv_experts_glu_gelu(
+    const unsigned long long* __restrict__ tab, int base,
+    const int* __restrict__ idx, int nslots,
+    const float* __restrict__ x, int xstride, int sp,
+    float* __restrict__ act, int n, int k)
+{
+    const int sl = blockIdx.x / n;
+    if (sl >= nslots) {
+        return;
+    }
+    const int o = blockIdx.x - sl * n;
+    const unsigned long long* eg = tab + (size_t)(base + idx[sl] * 3) * 2;
+    const unsigned long long* eu = tab + (size_t)(base + 1 + idx[sl] * 3) * 2;
+    const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
+    float* slot = act + (size_t)sl * n;
+    gemv_row_body<5, true>((const unsigned*)eg[0], (const unsigned short*)eg[1],
+                           x + xoff, slot, o, k);
+    __syncthreads();
+    const float g = slot[o];
+    gemv_row_body<5, true>((const unsigned*)eu[0], (const unsigned short*)eu[1],
+                           x + xoff, slot, o, k);
+    __syncthreads();
+    const float u = slot[o];
+    if (threadIdx.x == 0) {
+        const float x3 = g * g * g;
+        slot[o] = (0.5f * g * (1.0f + tanhf(0.7978846f * (g + 0.044715f * x3)))) * u;
     }
 }
 
@@ -566,6 +608,107 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g128_t(
         GEMV_T_CASE(6) // gemv_g128_t_body<6>
         GEMV_T_CASE(7) // gemv_g128_t_body<7>
         GEMV_T_CASE(8) // gemv_g128_t_body<8>
+        default: break; // 호스트 계약 밖(t≤8)
+    }
+}
+
+template <int T>
+__device__ __forceinline__ void gemv_g32_t_body(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k, int o0,
+    double (*red)[32], float (*sc)[G4_SCMAX])
+{
+    const int l = threadIdx.x & 31;
+    const int g = threadIdx.x >> 5; // 행 그룹 0..GEMV_TR-1
+    const int o = o0 + g;
+    const bool live = o < n;
+    const int k8 = k >> 3;
+    const int kg = k >> 5;
+    if (live) {
+        for (int gg = l; gg < kg; gg += 32) {
+            sc[g][gg] = ld_scale<true>(s + (size_t)o * kg, gg);
+        }
+    }
+    __syncthreads();
+    const int jn = k >> 7;
+    float acc[T];
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        acc[r] = 0.0f;
+    }
+    // 청크 j의 레인별 u16 = 바이트 64j+2l,64j+2l+1 — 워프 전량 코얼레싱.
+    const unsigned short* qh =
+        reinterpret_cast<const unsigned short*>(q + (size_t)o * k8) + l;
+    const float4* xp[T];
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        xp[r] = reinterpret_cast<const float4*>(x) + (size_t)r * (k >> 2) + l;
+    }
+#pragma unroll 32
+    for (int jj = 0; jj < jn; ++jj) {
+        const unsigned qw = (unsigned)qh[jj * 32];
+        // [g32 포트] 레인당 4니블 = 한 32그룹 내부(4l..4l+3 ⊂ [32⌊l/8⌋, +32)).
+        const float scv = sc[g][(l >> 3) + (jj << 2)];
+        const float w0 = fmaf((float)(qw & 0xFu), scv, -8.0f * scv);
+        const float w1 = fmaf((float)((qw >> 4) & 0xFu), scv, -8.0f * scv);
+        const float w2 = fmaf((float)((qw >> 8) & 0xFu), scv, -8.0f * scv);
+        const float w3 = fmaf((float)(qw >> 12), scv, -8.0f * scv);
+#pragma unroll
+        for (int r = 0; r < T; ++r) {
+            const float4 xv = *xp[r];
+            acc[r] = fmaf(w0, xv.x, acc[r]);
+            acc[r] = fmaf(w1, xv.y, acc[r]);
+            acc[r] = fmaf(w2, xv.z, acc[r]);
+            acc[r] = fmaf(w3, xv.w, acc[r]);
+            xp[r] += 32;
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < T; ++rr) {
+        red[g][l] = (double)acc[rr];
+        __syncthreads();
+        // [A-float4] 전 워프 참여 셔플(마스크 0xffffffff 계약 — l≥16도 참여),
+        // 합산·기록은 하위 레인만(첫 결합 l<16, 셔플 8..1).
+        double v = (l < 16) ? (red[g][l] + red[g][l + 16]) : 0.0;
+#pragma unroll
+        for (int off = 8; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(v, off);
+            if (l < off) {
+                v += oth;
+            }
+        }
+        if (l == 0 && live) {
+            out[(size_t)rr * n + o] = (float)v;
+        }
+        __syncthreads();
+    }
+}
+
+// [gemma4 P3 2026-10-14] g32·bf16 스케일 t행 GEMV — gemv_g128_t_body의 g32 포트
+// (차이 3곳: kg = k>>5 · 스케일 인덱스 (l>>3)+4j · ld_scale<true>). 행별 산술
+// 순서는 g128_t와 동일 — 디코드 배치(t≤8)가 t=1 GEMV와 같은 클래스.
+#define GEMV_T_CASE_G32(N) \
+    case N: gemv_g32_t_body<N>(q, s, x, out, n, k, o0, red, sc); break;
+
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g32_bf16_t(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out, int n, int k, int t)
+{
+    const int o0 = blockIdx.x * GEMV_TR;
+    if (o0 >= n) {
+        return;
+    }
+    __shared__ double red[GEMV_TR][32];
+    __shared__ float sc[GEMV_TR][G4_SCMAX];
+    switch (t) {
+        GEMV_T_CASE_G32(1)
+        GEMV_T_CASE_G32(2)
+        GEMV_T_CASE_G32(3)
+        GEMV_T_CASE_G32(4)
+        GEMV_T_CASE_G32(5)
+        GEMV_T_CASE_G32(6)
+        GEMV_T_CASE_G32(7)
+        GEMV_T_CASE_G32(8)
         default: break; // 호스트 계약 밖(t≤8)
     }
 }

@@ -104,6 +104,7 @@ pub(crate) fn load_gpu_retry(
     kv_budget: Option<u64>,
     kv_reserve: Option<u64>,
 ) -> crate::gpu_engine::GpuEngine {
+    let _ = crate::engine::ARCH.set(llm170_core::qwen35::bind::dir_arch(p).unwrap_or_default());
     for i in 0..5 {
         match crate::gpu_engine::GpuEngine::load(p, n_slots, ctx, kv_budget, kv_reserve) {
             Ok(mut e) => {

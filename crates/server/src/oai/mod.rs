@@ -12,6 +12,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use self::json::chat_spec;
 use self::json::*;
 use self::stream::*;
 
@@ -55,6 +56,23 @@ struct EmitFmt {
 
 /// qwen 어휘 <end_of_turn> — chat/anthropic 조기 정지 토큰 (EOS 248044와 구분).
 const STOP_EOT: u32 = 248046;
+
+/// [P3 gemma4 2026-10-14] 아치별 정지 토큰 — chat_spec 레지스트리 eos(+qwen
+/// 채널 정지 248046 보존·미등록 기본 STOP_EOT).
+fn stops_for_arch() -> Vec<u32> {
+    use llm170_core::qwen35::bind as q;
+    let arch = crate::engine::arch();
+    let mut v: Vec<u32> = json::chat_spec(&arch)
+        .map(|s| s.eos.to_vec())
+        .unwrap_or_default();
+    if q::arch_supported(&arch) && !v.contains(&STOP_EOT) {
+        v.push(STOP_EOT); // 종전 qwen 동작 보존(채널 정지)
+    }
+    if v.is_empty() {
+        v.push(STOP_EOT);
+    }
+    v
+}
 
 pub(crate) fn handle(
     stream: TcpStream,
@@ -174,7 +192,7 @@ pub(crate) fn handle(
                     continue;
                 }
                 // role 인지 멀티턴 렌더링(시스템 프롬프트 보존).
-                let text = jmessages_render(&req.body);
+                let text = json::messages_render(&req.body);
                 let ids = crate::engine::greedy_encode(&text);
                 run_and_emit(
                     stream,
@@ -188,7 +206,7 @@ pub(crate) fn handle(
                         stop_strs: jstop(&req.body),
                         include_stop: jbool(&req.body, "include_stop_str_in_output"),
                     },
-                    vec![STOP_EOT],
+                    stops_for_arch(),
                     parse_sampler(&req.body),
                 );
             }
@@ -205,7 +223,7 @@ pub(crate) fn handle(
                     );
                     continue;
                 }
-                let text = jmessages_render(&req.body);
+                let text = json::messages_render(&req.body);
                 let ids = crate::engine::greedy_encode(&text);
                 run_and_emit_anthropic(
                     stream,
@@ -616,7 +634,7 @@ fn run_and_emit_anthropic(
         n_predict = lim;
     }
     let prompt_len = ids.len();
-    let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, vec![STOP_EOT], sampler) else {
+    let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, stops_for_arch(), sampler) else {
         return;
     };
     if stream_mode {

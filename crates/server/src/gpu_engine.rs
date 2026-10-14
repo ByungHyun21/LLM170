@@ -8,13 +8,17 @@
 use llm170_backend_gpu::{AttnDims, GdnDims, W4a16Dec};
 use std::path::Path;
 
-pub struct GpuEngine {
+pub struct QwenEngine {
     model: llm170_core::qwen35::Model,
     dec: W4a16Dec,
     #[allow(dead_code)] // reset_states(진단/복구) 전용
     n_slots: usize,
     /// GPU head 상주 여부(bf16 output.weight 업로드 성공).
     head_gpu: bool,
+    /// [gemma4 P2 2026-10-14] 최종 로짓 softcap(0=미적용) — 장치 argmax는
+    /// 단조 불변이라 커널 무접촉, **호스트로 나오는 로짓**(샘플링·PPL/eval·
+    /// 검증)에만 적용한다. 값은 config.json 파생(모델별).
+    softcap: f32,
     /// [MTP 2026-10-12] 모델 자체 MTP 초안기 활성(27B dense v1).
     mtp: bool,
 }
@@ -32,7 +36,7 @@ pub fn prefill_tmax(is_moe: bool, resident: bool, env: Option<&str>) -> usize {
         .clamp(1, 512)
 }
 
-impl GpuEngine {
+impl QwenEngine {
     /// 모델 로드 + 가중치 상주 업로드(간헐 ENOENT 재시도는 호출부 소관).
     pub fn load(
         dir: &Path,
@@ -50,11 +54,12 @@ impl GpuEngine {
         // [D2 검수 2026-10-13] 적재 실패 시 부분 할당 정리 — 재시도 루프가
         // VRAM을 되찾지 못하던 문제(첫 시도 실패 후 전부 OOM)의 해소.
         match Self::fill(&mut dec, &model, ctx, kv_reserve.unwrap_or(0)) {
-            Ok((head_gpu, mtp)) => Ok(GpuEngine {
+            Ok((head_gpu, mtp)) => Ok(QwenEngine {
                 model,
                 dec,
                 n_slots: n_slots.max(1),
                 head_gpu,
+                softcap: llm170_core::qwen35::bind::final_logit_softcap(dir),
                 mtp,
             }),
             Err(e) => {
@@ -137,10 +142,23 @@ impl GpuEngine {
 
     fn logits(&mut self, slot: usize, row: &[f32]) -> Result<Vec<f32>, String> {
         if self.head_gpu {
-            return self.dec.forward_device_head(slot, row);
+            let mut lg = self.dec.forward_device_head(slot, row)?;
+            self.softcap_row(&mut lg);
+            return Ok(lg);
         }
         let xn = self.forward(slot, row)?;
-        self.head_logits(&xn)
+        let mut lg = self.head_logits(&xn)?;
+        self.softcap_row(&mut lg);
+        Ok(lg)
+    }
+
+    /// 최종 로짓 softcap 적용(0 = 무연산) — 호스트 로짓 경로 단일 지점.
+    fn softcap_row(&self, lg: &mut [f32]) {
+        if self.softcap > 0.0 {
+            for v in lg.iter_mut() {
+                *v = llm170_core::ops::logit_softcap(*v, self.softcap);
+            }
+        }
     }
 
     /// head 로짓 — CPU 참조 경로(bf16 디퀀트 f32 내적, 골든과 동일 계급).
@@ -522,7 +540,10 @@ impl GpuEngine {
             .is_some()
         {
             match self.dec.batch_read_logits(seq_ids.len()) {
-                Ok(lg) => return Ok(lg),
+                Ok(mut lg) => {
+                    self.softcap_row(&mut lg);
+                    return Ok(lg);
+                }
                 Err(e) => eprintln!("# np-logits 판독 폴백(직렬): {e}"),
             }
         }
@@ -581,6 +602,10 @@ impl GpuEngine {
     pub fn spec_on(&self) -> bool {
         self.dec.spec_on()
     }
+    /// 정지 토큰 — Q35 아키텍처 상수.
+    pub fn eos(&self) -> u32 {
+        llm170_core::qwen35::EOS_EOT
+    }
     pub fn enable_spec(&mut self) -> Result<(), String> {
         self.dec.enable_spec()
     }
@@ -594,7 +619,9 @@ impl GpuEngine {
         rows: &[f32],
         t: usize,
     ) -> Result<Vec<f32>, String> {
-        self.dec.spec_verify_logits(slot, rows, t)
+        let mut lg = self.dec.spec_verify_logits(slot, rows, t)?;
+        self.softcap_row(&mut lg);
+        Ok(lg)
     }
     pub fn vocab(&self) -> usize {
         self.model.hp.vocab
@@ -678,6 +705,9 @@ pub(crate) fn upload_moe(
         hp.shared_ffn,
         group,
         scale_bf16,
+        // [gemma4 P2 2026-10-14] 전문가 GLU 활성 — qwen은 silu(기본), gemma4는
+        // gelu_tanh(배선 시 true). 모델별 단일 경로(런타임 수치 플래그 아님).
+        false,
     );
     let mut tab: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(hp.n_layer * hp.n_experts * 3);
     for il in 0..hp.n_layer {
@@ -735,6 +765,287 @@ pub(crate) fn upload_moe(
         }
     );
     Ok(())
+}
+
+/// [gemma4 P2-3 2026-10-14] gemma4 v0 체인(호스트 스테이징) 호스트 설정 —
+/// 서버 프로브가 층 산술(노름·잔차·layer_scalar)을 조립하는 데 필요한 것 전부.
+/// 행 순서·계약 출처 = CPU 오라클(`crates/core/src/gemma4/`).
+pub(crate) struct G4HostCfg {
+    pub softcap: f32,
+    /// 노름 행 8L+1 × hidden — [input, post_attn, pre_ff, post_ff1, pre_ff2,
+    /// post_ff2, post_ff, router(=moe_scale·h^-0.5)] × 층 + output_norm.
+    pub nw: Vec<f32>,
+    /// 층별 layer_scalar(출력 곱).
+    pub layer_scalar: Vec<f32>,
+    /// [L][n_experts] per-expert 사전 스케일(μ_e).
+    pub pes: Vec<f32>,
+    /// QK 노름 [L][d_max](층별 d까지 유효 — 나머지 0 패딩).
+    pub qnw: Vec<f32>,
+    pub knw: Vec<f32>,
+    pub d_max: usize,
+}
+
+impl G4HostCfg {
+    pub fn nw_row(&self, il: usize, k: usize, hidden: usize) -> &[f32] {
+        &self.nw[(il * 8 + k) * hidden..(il * 8 + k + 1) * hidden]
+    }
+
+    pub fn out_norm_row(&self, n_layer: usize, hidden: usize) -> &[f32] {
+        &self.nw[n_layer * 8 * hidden..(n_layer * 8 + 1) * hidden]
+    }
+
+    pub fn qk_rows(&self, il: usize, d: usize) -> (&[f32], &[f32]) {
+        let b = il * self.d_max;
+        (&self.qnw[b..b + d], &self.knw[b..b + d])
+    }
+
+    pub fn pes_row(&self, il: usize, n_exp: usize) -> &[f32] {
+        &self.pes[il * n_exp..(il + 1) * n_exp]
+    }
+}
+
+/// [gemma4 P2-3 2026-10-14] gemma4 상주 업로드 — qwen35 `upload_model` 미러.
+/// ① 양자화 선형(층별 q/k/(v)/o + dense gate/up/down + 라우터) ② 노름 8행/층
+/// (라우터 입력 행 = moe_scale·h^-0.5 — CPU route의 가중 RMS와 동일 산식)
+/// ③ QK 노름(d_max 패딩) + AttnLayer 테이블(층별 d/kv/sliding/k_eq_v)
+/// ④ MoE(무 shared·gelu 전문가·g32 테이블) ⑤ head(원본 embed — 행별 int8)
+/// ⑥ 호스트 설정 반환(노름 사본·rope·layer_scalar·pes).
+pub(crate) fn upload_model_g4(
+    dec: &mut llm170_backend_gpu::W4a16Dec,
+    model: &llm170_core::gemma4::Model,
+    ctx: usize,
+) -> Result<G4HostCfg, String> {
+    use llm170_core::wtype::WType;
+    let hp = model.hp.clone();
+    let h = hp.n_embd;
+    let t0 = std::time::Instant::now();
+    // ① 선형 — 밀집(양자화) + 라우터(플레인/양자화 무관 분기).
+    for il in 0..hp.n_layer {
+        for suf in [
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+            "moe_gate.weight",
+        ] {
+            let name = format!("blk.{il}.{suf}");
+            let Some(w) = model.w(&name) else {
+                continue; // k_eq_v 층의 v_proj 부재
+            };
+            match w.ty {
+                WType::W4a16Split => {
+                    let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
+                    dec.upload_lin_g(
+                        &name,
+                        w.data,
+                        s,
+                        w.n_out as usize,
+                        w.n_in as usize,
+                        w.group,
+                        w.scale_bf16,
+                    )?;
+                }
+                WType::Bf16 => {
+                    dec.upload_plain(&name, w.data, w.n_out as usize, w.n_in as usize)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    // ② 노름 nw — 8행/층 + 최종 1행. 라우터 행 = moe_scale·h^-0.5(가중 RMS).
+    let inv_h = 1.0f32 / (h as f32).sqrt();
+    let mut nw: Vec<f32> = Vec::with_capacity((8 * hp.n_layer + 1) * h);
+    for il in 0..hp.n_layer {
+        for suf in [
+            "attn_norm.weight",
+            "post_attn_norm.weight",
+            "pre_ff_norm.weight",
+            "post_ff_norm1.weight",
+            "pre_ff_norm2.weight",
+            "post_ff_norm2.weight",
+            "post_ff_norm.weight",
+        ] {
+            let v = model
+                .f32_vec(&format!("blk.{il}.{suf}"))
+                .map_err(|e| e.to_string())?;
+            if v.len() != h {
+                return Err(format!("g4 노름 형상 위반 blk.{il}.{suf}: {}", v.len()));
+            }
+            nw.extend(v);
+        }
+        let sc = model
+            .f32_vec(&format!("blk.{il}.moe_scale"))
+            .map_err(|e| e.to_string())?;
+        if sc.len() != h {
+            return Err(format!("g4 moe_scale 형상 위반 L{il}: {}", sc.len()));
+        }
+        nw.extend(sc.iter().map(|v| v * inv_h));
+    }
+    nw.extend(
+        model
+            .f32_vec("output_norm.weight")
+            .map_err(|e| e.to_string())?,
+    );
+    dec.set_norm_weights(&nw, 8 * hp.n_layer + 1)?;
+    // ③ QK 노름(d_max 패딩) + 어텐션 층 테이블(KV 아레나 = 층별 최대 클래스).
+    let d_max = hp.head_dim.iter().copied().max().unwrap_or(0);
+    let mut qnw = vec![0f32; hp.n_layer * d_max];
+    let mut knw = vec![0f32; hp.n_layer * d_max];
+    for il in 0..hp.n_layer {
+        let d = hp.head_dim[il];
+        let q = model
+            .f32_vec(&format!("blk.{il}.attn_q_norm.weight"))
+            .map_err(|e| e.to_string())?;
+        let k = model
+            .f32_vec(&format!("blk.{il}.attn_k_norm.weight"))
+            .map_err(|e| e.to_string())?;
+        if q.len() != d || k.len() != d {
+            return Err(format!(
+                "g4 QK 노름 형상 L{il}: q={} k={} d={d}",
+                q.len(),
+                k.len()
+            ));
+        }
+        qnw[il * d_max..il * d_max + d].copy_from_slice(&q);
+        knw[il * d_max..il * d_max + d].copy_from_slice(&k);
+    }
+    let layers: Vec<llm170_backend_gpu::AttnLayer> = (0..hp.n_layer)
+        .map(|il| llm170_backend_gpu::AttnLayer {
+            kv_heads: hp.n_kv[il],
+            d: hp.head_dim[il],
+            sliding: !hp.full[il],
+            k_eq_v: model.kv_eq_v(il),
+            kq_scale: 1.0, // gemma4 = 1/√d 없음(노름이 스케일 흡수)
+        })
+        .collect();
+    dec.set_attn(
+        llm170_backend_gpu::AttnDims {
+            n_attn: hp.n_layer,
+            q_heads: hp.n_head,
+            kv_heads: hp.n_kv[0],
+            d: hp.head_dim[0],
+            cap: ctx,
+            interval: 1,
+            sliding_window: hp.sw,
+        },
+        layers,
+        &qnw,
+        &knw,
+    )?;
+    let attn_ms = t0.elapsed().as_secs_f64() * 1e3;
+    // ④ MoE — 전문가 테이블(무 shared·gelu GLU) + 상주/스트리밍 판정.
+    let t1 = std::time::Instant::now();
+    if hp.n_experts > 0 {
+        let (group, scale_bf16) = model.expert_quant();
+        dec.set_moe(
+            hp.n_experts,
+            hp.top_k,
+            hp.moe_ffn,
+            0,
+            group,
+            scale_bf16,
+            true,
+        );
+        // 스트리밍 MoE 스테이징(dchain) — gemma4 체인엔 qwen의 ensure_chain_bufs
+        // 경로가 없어 여기서 보장(비상주 시 moe_experts_streaming이 사용).
+        dec.ensure_moe_stage_chain()?;
+        let mut tab: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(hp.n_layer * hp.n_experts * 3);
+        for il in 0..hp.n_layer {
+            for e in 0..hp.n_experts {
+                for proj in ["gate_proj", "up_proj", "down_proj"] {
+                    let (q, s, _, _) = model
+                        .expert_slice(il, e, proj)
+                        .ok_or_else(|| format!("전문가 슬라이스 부재: L{il} e{e} {proj}"))?;
+                    tab.push((
+                        q.as_ptr() as u64,
+                        q.len() as u64,
+                        s.as_ptr() as u64,
+                        s.len() as u64,
+                    ));
+                }
+            }
+        }
+        let expert_bytes: u64 = tab.iter().map(|e| e.1 + e.3).sum();
+        let free = llm170_backend_gpu::cuda_mem_free()
+            .map(|(f, _)| f)
+            .unwrap_or(0);
+        let resident = match crate::engine::MOE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => match llm170_diag::flag::val("LLM170_MOE_RESIDENT") {
+                Some("0") => false,
+                Some("1") => true,
+                _ => free > expert_bytes + (1 << 30),
+            },
+        };
+        if resident {
+            dec.upload_experts_resident(&tab)?;
+        } else {
+            dec.set_expert_table(tab);
+        }
+        eprintln!(
+            "[g4-moe] 전문가 {:.2}GiB · 여유 {:.2}GiB → {} (g{group}{})",
+            expert_bytes as f64 / (1u64 << 30) as f64,
+            free as f64 / (1u64 << 30) as f64,
+            if resident {
+                "전량 상주"
+            } else {
+                "호스트 스트리밍"
+            },
+            if scale_bf16 { "/bf16" } else { "" }
+        );
+    }
+    let moe_ms = t1.elapsed().as_secs_f64() * 1e3;
+    // ⑤ head — 원본 embed(tied) 행별 int8 W8A16(단일 head 계약).
+    let t2 = std::time::Instant::now();
+    {
+        let hw = model.wchk("output.weight").map_err(|e| e.to_string())?;
+        dec.upload_head(hw.data, hw.n_out as usize, hw.n_in as usize)?;
+    }
+    let head_ms = t2.elapsed().as_secs_f64() * 1e3;
+    // ⑥ 호스트 설정(rope·scalar·pes — 층 산술 조립용) + rope 테이블 등록.
+    let mut layer_scalar = Vec::with_capacity(hp.n_layer);
+    let mut pes: Vec<f32> = Vec::with_capacity(hp.n_layer * hp.n_experts);
+    let mut rp: Vec<f32> = Vec::with_capacity(hp.n_layer * 7);
+    for il in 0..hp.n_layer {
+        let ls = model
+            .f32_vec(&format!("blk.{il}.layer_scalar"))
+            .map_err(|e| e.to_string())?;
+        layer_scalar.push(
+            *ls.first()
+                .ok_or_else(|| format!("layer_scalar 부재 L{il}"))?,
+        );
+        pes.extend(
+            model
+                .f32_vec(&format!("blk.{il}.moe_per_expert_scale"))
+                .map_err(|e| e.to_string())?,
+        );
+        // 커널 rp 규약: {d, pairs, span, denom, base, vn_on, k_eq_v}.
+        let d = hp.head_dim[il];
+        rp.extend([
+            d as f32,
+            (hp.n_rot[il] / 2) as f32,
+            (d / 2) as f32,
+            d as f32,
+            hp.rope_base[il],
+            1.0, // v_norm(무가중) — gemma4 전 층
+            if model.kv_eq_v(il) { 1.0 } else { 0.0 },
+        ]);
+    }
+    dec.set_g4_rope(&rp)?;
+    eprintln!("[g4] 업로드 — 선형·노름 {attn_ms:.0}ms · MoE {moe_ms:.0}ms · head {head_ms:.0}ms");
+    Ok(G4HostCfg {
+        softcap: hp.softcap,
+        nw,
+        layer_scalar,
+        pes,
+        qnw,
+        knw,
+        d_max,
+    })
 }
 
 /// 모델 상주 업로드(1~4단계) — GpuEngine·w4a16-gpu 프로브 공용.
@@ -853,6 +1164,7 @@ pub(crate) fn upload_model(
         cap: ctx,
         // [A11] 모델 config에서 동적(종전 하드코딩 4) — 신규 비율 모델 대응.
         interval,
+        sliding_window: 0,
     };
     let (mut qnw, mut knw): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
     for ai in 0..n_attn - usize::from(mtp_attn) {
@@ -880,7 +1192,7 @@ pub(crate) fn upload_model(
                 .map_err(|e| e.to_string())?,
         );
     }
-    dec.set_attn(ad, &qnw, &knw)?;
+    dec.set_attn(ad, Vec::new(), &qnw, &knw)?;
     Ok(())
 }
 
@@ -1012,5 +1324,766 @@ mod tests {
             512,
             "파싱 실패 = 기본"
         );
+    }
+}
+
+/// [gemma4 P3 2026-10-14] t행 청크(≤8) — 프리필·검증 스텝.
+/// 하이브리드: 노름·gelu·잔차·layer_scalar는 호스트(f32 = CPU 오라클 계약),
+/// GEMM(t행)·어텐션(g4 호스트 경로 — 토큰별)·MoE(t행 디바이스)·head(t행 TR)는
+/// GPU(전부 기존 검증 커널). KV = t=1 경로와 동일 슬롯·연속위치.
+/// 반환 = 행별 로짓(t개, softcap 적용).
+pub(crate) fn g4_chunk(
+    dec: &mut llm170_backend_gpu::W4a16Dec,
+    model: &llm170_core::gemma4::Model,
+    cfg: &G4HostCfg,
+    slots: &[usize],
+    pos: &[u32],
+    rows: &[f32],
+    t: usize,
+    head_last: bool,
+) -> Result<Vec<Vec<f32>>, String> {
+    let hp = &model.hp;
+    let h = hp.n_embd;
+    if t == 0 || t > 8 || rows.len() != t * h || slots.len() != t || pos.len() != t {
+        return Err(format!(
+            "g4_chunk: t={t} rows={} slots={} pos={} (1..=8 · t*h 계약)",
+            rows.len(),
+            slots.len(),
+            pos.len()
+        ));
+    }
+    let mut x: Vec<f32> = rows.to_vec();
+    for il in 0..hp.n_layer {
+        let d = hp.head_dim[il];
+        // ① input_layernorm → t행 q/k/(v) GEMM.
+        let xn = g4_norm_rows(&x, cfg.nw_row(il, 0, h), hp.eps, t);
+        // ② q/k/v GEMM + 어텐션 + o_proj 전부 **디바이스**(중간 d2h 0 —
+        // 토큰별 호스트 경로의 왕복을 청크당 3런치로). KV 누적 = t=1과 동일.
+        let sw = if hp.full[il] { 0 } else { hp.sw };
+        let qd = hp.n_head * d;
+        let dxn = dec.g4_dev_in(0, &xn)?;
+        let q = dec.g4_dev_gemm(&format!("blk.{il}.attn_q.weight"), dxn, t, h, 1)?;
+        let k = dec.g4_dev_gemm(&format!("blk.{il}.attn_k.weight"), dxn, t, h, 2)?;
+        let v = if model.kv_eq_v(il) {
+            k // v_norm(k 원시) — prep_g4 vn_on 계약
+        } else {
+            dec.g4_dev_gemm(&format!("blk.{il}.attn_v.weight"), dxn, t, h, 3)?
+        };
+        let outv = dec.attn_g4_dev(
+            slots,
+            pos,
+            il,
+            q,
+            k,
+            v,
+            hp.n_head,
+            hp.n_kv[il],
+            d,
+            sw,
+            1.0,
+            2,
+            6,
+            7,
+            8,
+        )?;
+        // ③ o_proj(t행 — 디바이스) → d2h → post_attn_norm + 잔차.
+        let o = dec.g4_dev_gemm(&format!("blk.{il}.attn_output.weight"), outv, t, qd, 9)?;
+        let _ = o;
+        let aop = dec.g4_dev_out(9, t * h)?;
+        let hh = g4_norm_rows(&aop, cfg.nw_row(il, 1, h), hp.eps, t);
+        for i in 0..t * h {
+            x[i] += hh[i];
+        }
+        // ④ dense MLP — 디바이스 체인(pre_ff → gate/up GEMM → ew_gelu 커널 →
+        // down GEMM) + d2h 1회. gelu = t=1 경로와 동일 커널 심볼(수치 정합).
+        let nd = g4_norm_rows(&x, cfg.nw_row(il, 2, h), hp.eps, t);
+        let dnd = dec.g4_dev_in(0, &nd)?;
+        let g = dec.g4_dev_gemm(&format!("blk.{il}.ffn_gate.weight"), dnd, t, h, 1)?;
+        let u = dec.g4_dev_gemm(&format!("blk.{il}.ffn_up.weight"), dnd, t, h, 2)?;
+        let act = dec.g4_dev_gelu(g, u, 3, t * hp.n_ff)?;
+        let _ = act;
+        let dm_ = dec.g4_dev_gemm(&format!("blk.{il}.ffn_down.weight"), act, t, hp.n_ff, 4)?;
+        let _ = dm_;
+        let m = dec.g4_dev_out(4, t * h)?;
+        let h1 = g4_norm_rows(&m, cfg.nw_row(il, 3, h), hp.eps, t);
+        // ⑤ MoE — 라우터 입력(hn)·전문가 입력(nm) 분리 · pes 디바이스.
+        let hn = g4_norm_rows(&x, cfg.nw_row(il, 7, h), hp.eps, t);
+        let nm = g4_norm_rows(&x, cfg.nw_row(il, 4, h), hp.eps, t);
+        let pes_dev = dec.g4_pes_dev(il);
+        if pes_dev == 0 {
+            return Err(format!("g4_chunk: L{il} pes 미등록(set_g4_pes 선행)"));
+        }
+        let e_out = dec.g4_moe_host_t(il, &hn, &nm, cfg.pes_row(il, hp.n_experts), t, pes_dev)?;
+        let h2 = g4_norm_rows(&e_out, cfg.nw_row(il, 5, h), hp.eps, t);
+        // ⑥ 병합 → post_ff_norm → 잔차 → layer_scalar.
+        let mut merged = h1;
+        for i in 0..t * h {
+            merged[i] += h2[i];
+        }
+        let hf = g4_norm_rows(&merged, cfg.nw_row(il, 6, h), hp.eps, t);
+        let ls = cfg.layer_scalar[il];
+        for i in 0..t * h {
+            x[i] = (x[i] + hf[i]) * ls;
+        }
+    }
+    // ⑦ 최종 노름 + head + softcap. head_last(프리필) = **마지막 행만**
+    // (nsys: t행 head가 청크당 1.6ms = 7.7% — 프리필은 마지막 로짓만 소비).
+    if head_last {
+        let last = &x[(t - 1) * h..t * h];
+        let xf = llm170_core::ops::rms_norm(last, cfg.out_norm_row(hp.n_layer, h), hp.eps);
+        let mut lg = dec.g4_head_host_t(&xf, 1)?;
+        if cfg.softcap > 0.0 {
+            for l in lg.iter_mut() {
+                *l = cfg.softcap * (*l / cfg.softcap).tanh();
+            }
+        }
+        return Ok(vec![lg]);
+    }
+    let xf = g4_norm_rows(&x, cfg.out_norm_row(hp.n_layer, h), hp.eps, t);
+    let flat = dec.g4_head_host_t(&xf, t)?;
+    let n_vocab = hp.vocab;
+    let mut out = Vec::with_capacity(t);
+    for kk in 0..t {
+        let mut lg = flat[kk * n_vocab..(kk + 1) * n_vocab].to_vec();
+        if cfg.softcap > 0.0 {
+            for l in lg.iter_mut() {
+                *l = cfg.softcap * (*l / cfg.softcap).tanh();
+            }
+        }
+        out.push(lg);
+    }
+    Ok(out)
+}
+
+/// [t][h] 행렬 행별 가중 RMS — CPU 계약(ops::rms_norm)과 동일 함수.
+fn g4_norm_rows(x: &[f32], w: &[f32], eps: f32, t: usize) -> Vec<f32> {
+    let h = w.len();
+    let mut out = Vec::with_capacity(t * h);
+    for r in 0..t {
+        out.extend_from_slice(&llm170_core::ops::rms_norm(&x[r * h..(r + 1) * h], w, eps));
+    }
+    out
+}
+
+/// [gemma4 P2-3 2026-10-14] gemma4 v0 체인 1토큰 스텝(프로브·GemmaEngine 공용).
+/// 층 산술(노름·잔차·layer_scalar)은 CPU 코어 계약(`llm170_core::ops`)으로
+/// 조립하고, GPU가 담당하는 것은 GEMV(그룹 인식)·g4 어텐션·gelu·MoE(라우터
+/// topk·pes·전문가)·head다. 계약 출처 = `crates/core/src/gemma4/`(CPU 오라클).
+pub(crate) fn g4_step(
+    dec: &mut llm170_backend_gpu::W4a16Dec,
+    model: &llm170_core::gemma4::Model,
+    cfg: &crate::gpu_engine::G4HostCfg,
+    slot: usize,
+    tok: u32,
+    pos: u32,
+) -> Result<Vec<f32>, String> {
+    let hp = &model.hp;
+    let h = hp.n_embd;
+    let mut x = model.embed_row(tok).map_err(|e| e.to_string())?;
+    // 첫 풀층(층별 어텐션 도입부) 중간값 지문 — NaN/발산 위치 특정용.
+    let stat = |v: &[f32]| -> String {
+        let (mut mx, mut nan) = (f32::NEG_INFINITY, false);
+        for &t in v {
+            if t.is_nan() {
+                nan = true;
+            }
+            mx = mx.max(t);
+        }
+        format!("max={mx:.4} nan={nan} len={}", v.len())
+    };
+    for il in 0..hp.n_layer {
+        let d = hp.head_dim[il];
+        let dbg = dec.debug_layers && hp.full[il] && il <= 5;
+        // ① 어텐션 — input_layernorm → q/k/(v) → prep_g4+f3s_g4 → post_attn+잔차.
+        let xn = llm170_core::ops::rms_norm(&x, cfg.nw_row(il, 0, h), hp.eps);
+        let q = dec.gemv_f32_host(&format!("blk.{il}.attn_q.weight"), &xn)?;
+        let k = dec.gemv_f32_host(&format!("blk.{il}.attn_k.weight"), &xn)?;
+        let v = if model.kv_eq_v(il) {
+            k.clone() // v_norm(k 원시) — prep_g4의 vn_on이 적용(HF 계약)
+        } else {
+            dec.gemv_f32_host(&format!("blk.{il}.attn_v.weight"), &xn)?
+        };
+        if dbg {
+            eprintln!("  L{il} xn {} / q {} / k {}", stat(&xn), stat(&q), stat(&k));
+        }
+        let (qnw, knw) = cfg.qk_rows(il, d);
+        let sw = if hp.full[il] { 0 } else { hp.sw };
+        let attn_out = dec.attn_g4_host(
+            slot,
+            &q,
+            &k,
+            &v,
+            qnw,
+            knw,
+            il,
+            1,
+            hp.n_head,
+            hp.n_kv[il],
+            d,
+            sw,
+            1.0,
+            2,
+            pos,
+        )?;
+        if dbg {
+            eprintln!(
+                "  L{il} attn_out {} / qnw {} / knw {}",
+                stat(&attn_out),
+                stat(qnw),
+                stat(knw)
+            );
+        }
+        // o_proj — 헤드 결합(16×256=4096) → hidden(2816).
+        let ao = dec.gemv_f32_host(&format!("blk.{il}.attn_output.weight"), &attn_out)?;
+        let hh = llm170_core::ops::rms_norm(&ao, cfg.nw_row(il, 1, h), hp.eps);
+        if dbg {
+            eprintln!(
+                "  L{il} ao {} / hh {} / wo {}",
+                stat(&ao),
+                stat(&hh),
+                stat(cfg.nw_row(il, 1, h))
+            );
+        }
+        for i in 0..h {
+            x[i] += hh[i];
+        }
+        // ② dense MLP — pre_ff → gate/up → gelu_tanh → down → post_ff1.
+        let nd = llm170_core::ops::rms_norm(&x, cfg.nw_row(il, 2, h), hp.eps);
+        let g = dec.gemv_f32_host(&format!("blk.{il}.ffn_gate.weight"), &nd)?;
+        let u = dec.gemv_f32_host(&format!("blk.{il}.ffn_up.weight"), &nd)?;
+        let act = dec.ew_gelu_host(&g, &u)?;
+        let m = dec.gemv_f32_host(&format!("blk.{il}.ffn_down.weight"), &act)?;
+        let h1 = llm170_core::ops::rms_norm(&m, cfg.nw_row(il, 3, h), hp.eps);
+        // ③ MoE — 라우터 입력(hn)과 전문가 입력(nm)이 **별개** 노름(gemma4 계약).
+        let hn = llm170_core::ops::rms_norm(&x, cfg.nw_row(il, 7, h), hp.eps);
+        let nm = llm170_core::ops::rms_norm(&x, cfg.nw_row(il, 4, h), hp.eps);
+        let e_out = dec.g4_moe_host(il, &hn, &nm, cfg.pes_row(il, hp.n_experts))?;
+        let h2 = llm170_core::ops::rms_norm(&e_out, cfg.nw_row(il, 5, h), hp.eps);
+        // ④ 병합 — post_ff_norm(h1+h2) → 잔차 → ×layer_scalar.
+        let mut merged = h1;
+        for i in 0..h {
+            merged[i] += h2[i];
+        }
+        let hf = llm170_core::ops::rms_norm(&merged, cfg.nw_row(il, 6, h), hp.eps);
+        let ls = cfg.layer_scalar[il];
+        for i in 0..h {
+            x[i] = (x[i] + hf[i]) * ls;
+        }
+        // 층별 지문 — CPU 오라클(debug_layers)과 같은 형식(최초 발산 층 추적).
+        if dec.debug_layers {
+            let mut mx = f32::NEG_INFINITY;
+            let mut nan = false;
+            for &v in x.iter() {
+                if v.is_nan() {
+                    nan = true;
+                }
+                mx = mx.max(v);
+            }
+            eprintln!("gemma4[gpu] layer {il:>2} max|x|={mx:.4} nan={nan}");
+        }
+    }
+    // ⑤ 최종 노름 + GPU head + softcap(호스트 — argmax 단조 불변).
+    let xf = llm170_core::ops::rms_norm(&x, cfg.out_norm_row(hp.n_layer, h), hp.eps);
+    if dec.debug_layers {
+        let mut mx = f32::NEG_INFINITY;
+        let mut nan = false;
+        for &v in xf.iter() {
+            if v.is_nan() {
+                nan = true;
+            }
+            mx = mx.max(v);
+        }
+        eprintln!("gemma4[gpu] final max|x|={mx:.4} nan={nan}");
+    }
+    let mut lg = dec.head_logits_host(&xf)?;
+    if cfg.softcap > 0.0 {
+        for l in lg.iter_mut() {
+            *l = cfg.softcap * (*l / cfg.softcap).tanh();
+        }
+    }
+    Ok(lg)
+}
+
+// ──────────────────── [gemma4 P3 2026-10-14] 서빙 아치 디스패치 ────────────────────
+// qwen(QwenEngine)·gemma4(GemmaEngine)를 단일 타입으로 — P2-3 v0 체인 그대로
+// (호스트 스테이징·f32 활성 클래스·g4 커널군·g32 GEMV·int8 KV/head).
+
+/// gemma4 서빙 엔진 — v0 체인(P2-3). spec·kstep·배치 체인은 후속 트랙
+/// (순수 어텐션 롤백 = KV 절단 — v0는 슬롯 직렬).
+pub struct GemmaEngine {
+    model: llm170_core::gemma4::Model,
+    cfg: G4HostCfg,
+    dec: W4a16Dec,
+    #[allow(dead_code)]
+    n_slots: usize,
+}
+
+impl GemmaEngine {
+    /// 모델 로드 + 상주 업로드(upload_model_g4 — 선형·노름 8행/층·어텐션
+    /// 테이블·rope·MoE(g32/전문가)·head(원문 embed 행별 int8)).
+    pub fn load(dir: &Path, n_slots: usize, ctx: usize) -> Result<Self, String> {
+        let model = llm170_core::gemma4::Model::load(dir).map_err(|e| e.to_string())?;
+        let hp = model.hp.clone();
+        let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
+        let cfg = upload_model_g4(&mut dec, &model, ctx)?;
+        // 층별 pes(μ_e) 디바이스 상주(t행 MoE 경로용 — 1회).
+        for il in 0..model.hp.n_layer {
+            dec.set_g4_pes(il, cfg.pes_row(il, model.hp.n_experts))?;
+        }
+        Ok(GemmaEngine {
+            model,
+            cfg,
+            dec,
+            n_slots,
+        })
+    }
+
+    /// 1토큰 스텝 — **t행 청크 t=1**(단일 경로: 배치·프리필·spec과 동일 커널·
+    /// 클래스 — t행 GEMV는 t=1 GEMV와 같은 산술 순서). 호스트 체인의 층당
+    /// ~14왕복(h2d/launch/d2h/sync)이 청크에선 ~8로 줄어든다.
+    /// **전문가 비상주(스트리밍)에선 v0 호스트 체인(g4_step)으로 폴백** — t행
+    /// MoE(g4_moe_host_t)가 스트리밍 미지원이라, 배치·프리필의 비상주 분기가
+    /// 모두 수렴하는 이 스텝이 저하 사다리의 단일 통로다.
+    fn step(&mut self, seq: usize, tok: u32) -> Result<Vec<f32>, String> {
+        let pos = self.dec.slot_pos[seq];
+        self.dec.kv_grow(seq, pos as usize + 1)?;
+        if !self.dec.moe_experts_resident() {
+            let lg = g4_step(&mut self.dec, &self.model, &self.cfg, seq, tok, pos)?;
+            self.dec.slot_pos[seq] = pos + 1;
+            return Ok(lg);
+        }
+        let rows = self.model.embed_row(tok).map_err(|e| e.to_string())?;
+        let lgs = g4_chunk(
+            &mut self.dec,
+            &self.model,
+            &self.cfg,
+            &[seq],
+            &[pos],
+            &rows,
+            1,
+            false,
+        )?;
+        self.dec.slot_pos[seq] = pos + 1;
+        Ok(lgs.into_iter().next().unwrap_or_default())
+    }
+
+    /// 프리필 — t행 청크(≤8) 경로(가중 상각). 반환 = 마지막 로짓.
+    /// 스트리밍(비상주 전문가)은 t행 미지원 → t=1 스텝 폴백.
+    pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        if tokens.is_empty() {
+            return Err("prefill: 빈 프롬프트 — 토큰 1개 이상 필요".into());
+        }
+        let mut last = Vec::new();
+        let t_chunk = if self.dec.moe_experts_resident() {
+            8
+        } else {
+            1
+        };
+        for chunk in tokens.chunks(t_chunk) {
+            let pos = self.dec.slot_pos[seq];
+            self.dec.kv_grow(seq, pos as usize + chunk.len())?;
+            if chunk.len() == 1 {
+                last = self.step(seq, chunk[0])?;
+            } else {
+                let mut rows: Vec<f32> = Vec::with_capacity(chunk.len() * self.model.hp.n_embd);
+                for &tk in chunk {
+                    rows.extend_from_slice(&self.model.embed_row(tk).map_err(|e| e.to_string())?);
+                }
+                let csv: Vec<usize> = vec![seq; chunk.len()];
+                let cpos: Vec<u32> = (0..chunk.len()).map(|i| pos + i as u32).collect();
+                let lgs = g4_chunk(
+                    &mut self.dec,
+                    &self.model,
+                    &self.cfg,
+                    &csv,
+                    &cpos,
+                    &rows,
+                    chunk.len(),
+                    true, // 프리필 — 마지막 행 로짓만
+                )?;
+                self.dec.slot_pos[seq] = pos + chunk.len() as u32;
+                last = lgs.into_iter().last().unwrap_or_default();
+            }
+        }
+        Ok(last)
+    }
+
+    /// 슬롯 배치 1토큰 — **이종 슬롯·위치 t행 청크**(가중 상각) + 행별 로짓.
+    /// 스트리밍 전문가·t>8은 슬롯별 t=1 폴백.
+    pub fn decode(&mut self, seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
+        if seq_ids.len() != tokens.len() {
+            return Err(format!(
+                "decode: seqs={} toks={} 불일치",
+                seq_ids.len(),
+                tokens.len()
+            ));
+        }
+        if seq_ids.is_empty() {
+            return Err("decode: 빈 배치".into());
+        }
+        let t = seq_ids.len();
+        if t == 1 {
+            return Ok(vec![self.step(seq_ids[0], tokens[0])?]);
+        }
+        if t > 8 || !self.dec.moe_experts_resident() {
+            let mut out = Vec::with_capacity(t);
+            for (&s, &tok) in seq_ids.iter().zip(tokens.iter()) {
+                out.push(self.step(s, tok)?);
+            }
+            return Ok(out);
+        }
+        // 배치 청크 — 행 = 슬롯(임베딩·pos·KV 확보) → 디바이스 t행 체인.
+        let mut rows = Vec::with_capacity(t * self.model.hp.n_embd);
+        let mut pos: Vec<u32> = Vec::with_capacity(t);
+        for (&s, &tok) in seq_ids.iter().zip(tokens.iter()) {
+            rows.extend_from_slice(&self.model.embed_row(tok).map_err(|e| e.to_string())?);
+            let p = self.dec.slot_pos[s];
+            self.dec.kv_grow(s, p as usize + 1)?;
+            pos.push(p);
+        }
+        let lgs = g4_chunk(
+            &mut self.dec,
+            &self.model,
+            &self.cfg,
+            seq_ids,
+            &pos,
+            &rows,
+            t,
+            false,
+        )?;
+        for (i, &s) in seq_ids.iter().enumerate() {
+            self.dec.slot_pos[s] = pos[i] + 1;
+        }
+        Ok(lgs)
+    }
+
+    /// 슬롯 배치 greedy — step + argmax.
+    pub fn decode_np_greedy(
+        &mut self,
+        seq_ids: &[usize],
+        tokens: &[u32],
+    ) -> Result<Vec<u32>, String> {
+        Ok(self
+            .decode(seq_ids, tokens)?
+            .iter()
+            .map(|l| llm170_core::matmul::greedy_from(l))
+            .collect())
+    }
+
+    pub fn decode_greedy(&mut self, seq: usize, token: u32) -> Result<u32, String> {
+        let lg = self.step(seq, token)?;
+        Ok(llm170_core::matmul::greedy_from(&lg))
+    }
+
+    /// 혼합 배치 — (그리디 토큰, 평탄 로짓). v0는 슬롯 직렬(그리디 행=토큰,
+    /// 샘플 행=로짓 소비 — qwen 계약과 동일 의미).
+    pub fn decode_np_mixed(
+        &mut self,
+        seq_ids: &[usize],
+        tokens: &[u32],
+    ) -> Result<(Vec<u32>, Vec<f32>), String> {
+        let rows = self.decode(seq_ids, tokens)?;
+        let toks = rows
+            .iter()
+            .map(|l| llm170_core::matmul::greedy_from(l))
+            .collect();
+        let mut flat = Vec::with_capacity(rows.len() * self.model.hp.vocab);
+        for l in &rows {
+            flat.extend_from_slice(l);
+        }
+        Ok((toks, flat))
+    }
+
+    /// 배치 로짓(샘플링 슬롯) — 평탄 [t][head_n].
+    pub fn decode_np_logits(
+        &mut self,
+        seq_ids: &[usize],
+        tokens: &[u32],
+    ) -> Result<Vec<f32>, String> {
+        let rows = self.decode(seq_ids, tokens)?;
+        let mut flat = Vec::with_capacity(rows.len() * self.model.hp.vocab);
+        for l in &rows {
+            flat.extend_from_slice(l);
+        }
+        Ok(flat)
+    }
+
+    /// 슬롯 리셋 — KV 블록 회수 + pos 0(새 요청).
+    pub fn reset_seq(&mut self, seq: usize) -> Result<(), String> {
+        let _ = self.dec.kv_release(seq);
+        if seq < self.dec.slot_pos.len() {
+            self.dec.slot_pos[seq] = 0;
+        }
+        Ok(())
+    }
+
+    /// spec 활성 — 순수 어텐션 롤백 = **pos 되감기**(KV는 다음 쓰기가 덮고,
+    /// 판독은 pos까지만 — 상태 스냅샷 불요). 초안 = n-gram(스케줄러 측).
+    pub fn enable_spec(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    pub fn spec_on(&self) -> bool {
+        true
+    }
+    /// 검증 라운드 — [last]+drafts 행(연속 위치)을 t행 청크로 통과 → 행별 그리디.
+    pub fn spec_verify(&mut self, slot: usize, rows: &[f32], t: usize) -> Result<Vec<u32>, String> {
+        let lgs = self.spec_run(slot, rows, t)?;
+        Ok(lgs.iter().map(|l| llm170_core::gemma4::greedy(l)).collect())
+    }
+    /// 검증 행별 로짓(샘플드 거절샘플링 — 평탄 [t][vocab]).
+    pub fn spec_verify_logits(
+        &mut self,
+        slot: usize,
+        rows: &[f32],
+        t: usize,
+    ) -> Result<Vec<f32>, String> {
+        let lgs = self.spec_run(slot, rows, t)?;
+        let mut flat = Vec::with_capacity(t * self.model.hp.vocab);
+        for l in &lgs {
+            flat.extend_from_slice(l);
+        }
+        Ok(flat)
+    }
+    /// 검증 공용 — t행 청크 + KV 확보(pos 전진은 청크가 수행).
+    fn spec_run(&mut self, slot: usize, rows: &[f32], t: usize) -> Result<Vec<Vec<f32>>, String> {
+        if !(2..=8).contains(&t) {
+            return Err(format!("g4 spec: t={t} (2..=8 계약)"));
+        }
+        let pos0 = self.dec.slot_pos[slot];
+        self.dec.kv_grow(slot, pos0 as usize + t)?;
+        let csv: Vec<usize> = vec![slot; t];
+        let cpos: Vec<u32> = (0..t).map(|i| pos0 + i as u32).collect();
+        let lgs = g4_chunk(
+            &mut self.dec,
+            &self.model,
+            &self.cfg,
+            &csv,
+            &cpos,
+            rows,
+            t,
+            false,
+        )?;
+        self.dec.slot_pos[slot] = pos0 + t as u32;
+        Ok(lgs)
+    }
+    pub fn decode_greedy_k(
+        &mut self,
+        _seq: usize,
+        _token: u32,
+        _k: usize,
+        _eos: u32,
+    ) -> Result<Vec<u32>, String> {
+        Err("gemma4: kstep 미지원(v0)".into())
+    }
+    pub fn mtp_drafts_on(&self) -> bool {
+        false
+    }
+
+    /// 접두 재사용 체크포인트 — v0 미구현(순수 어텐션의 KV 절단 재사용은
+    /// 후속 트랙). 반환 = 0(재사용 없음 — 전체 재프리필).
+    pub fn checkpoint_pos(&self, _slot: usize, _upto: u32) -> u32 {
+        0
+    }
+    pub fn kv_grow(&mut self, slot: usize, n_tokens: usize) -> Result<usize, String> {
+        self.dec.kv_grow(slot, n_tokens)
+    }
+    pub fn kv_total_blocks(&self) -> usize {
+        self.dec.kv_total_blocks()
+    }
+    pub fn kv_free_blocks(&self) -> usize {
+        self.dec.kv_free_blocks()
+    }
+    pub fn kv_blocks_needed(&self, n_tokens: usize) -> usize {
+        self.dec.kv_blocks_needed(n_tokens)
+    }
+    pub fn kv_release_slot(&mut self, slot: usize) -> usize {
+        self.dec.kv_release(slot)
+    }
+    /// 표시용 조각(gemma4 모델 조각표 — ▁→공백).
+    pub fn piece(&self, tok: u32) -> String {
+        self.model
+            .token_pieces
+            .get(tok as usize)
+            .map(|s| s.replace('▁', " "))
+            .unwrap_or_default()
+    }
+    pub fn prof_report(&mut self, _label: &str) -> Result<String, String> {
+        Err("gemma4: prof_report 미지원(v0)".into())
+    }
+    // MTP·GDN·spec 계열 — gemma4 v0 미지원(호출부는 spec/mtp 비활성 게이트로
+    // 진입 자체가 없다. 시그니처 정합용 명시 거부).
+    pub fn restore_gdn(&mut self, _slot: usize, _upto: u32) -> Result<u32, String> {
+        Err("gemma4: GDN 없음(순수 어텐션)".into())
+    }
+    pub fn spec_rollback(&mut self, _slot: usize, _keep: usize) -> Result<(), String> {
+        // 순수 어텐션 — 복원할 상태 없음. 수용 접두 이후 KV 행은 다음 쓰기가
+        // 덮는다(판독은 pos까지 — 잔존 행 무해). pos는 spec_rewind_pos 소관.
+        Ok(())
+    }
+    pub fn spec_rewind_pos(&mut self, slot: usize, n: u32) -> Result<(), String> {
+        let p = self.dec.slot_pos[slot];
+        self.dec.slot_pos[slot] = p.saturating_sub(n);
+        Ok(())
+    }
+    pub fn mtp_first(&mut self, _slot: usize, _tok: u32) -> Result<(), String> {
+        Err("gemma4: MTP 미지원".into())
+    }
+    pub fn mtp_single(&mut self, _slot: usize, _tok: u32) -> Result<(), String> {
+        Err("gemma4: MTP 미지원".into())
+    }
+    pub fn mtp_pre_round(&mut self, _acc: usize) -> Result<(), String> {
+        Err("gemma4: MTP 미지원".into())
+    }
+    pub fn mtp_post_round(
+        &mut self,
+        _slot: usize,
+        _accepted: &[u32],
+        _corrected: u32,
+    ) -> Result<(), String> {
+        Err("gemma4: MTP 미지원".into())
+    }
+    pub fn mtp_slot_kv_reset(&mut self) -> Result<(), String> {
+        Err("gemma4: MTP 미지원".into())
+    }
+    pub fn mtp_slot_fresh(&mut self, _slot: usize) {}
+    pub fn mtp_slot_reused(&mut self, _slot: usize) {}
+    pub fn mtp_take_draft(&mut self, _slot: usize) -> Option<Vec<u32>> {
+        None
+    }
+
+    pub fn mem_stats(&self) -> (u64, u64, u64, u64) {
+        self.dec.mem_stats()
+    }
+    pub fn active_weight_bytes(&self) -> u64 {
+        self.dec.active_weight_bytes()
+    }
+    pub fn moe_mode(&self) -> &'static str {
+        self.dec.moe_mode()
+    }
+    pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
+        self.dec.copy_stats()
+    }
+    /// 정지 토큰 — gemma4 EOS는 [1,106,50], 대표 1(<eos>). 전체 목록은
+    /// 서빙 스톱 레지스트리(oai chat_spec)·스모크가 소유.
+    pub fn eos(&self) -> u32 {
+        1
+    }
+    pub fn embed_row(&self, tok: u32) -> Result<Vec<f32>, String> {
+        self.model.embed_row(tok).map_err(|e| e.to_string())
+    }
+    pub fn vocab(&self) -> usize {
+        self.model.hp.vocab
+    }
+    pub fn n_embd(&self) -> usize {
+        self.model.hp.n_embd
+    }
+}
+
+/// 서빙 엔진 — 아치 디스패치 단일 타입(호출부는 이 타입만 쓴다).
+pub enum GpuEngine {
+    Qwen(Box<QwenEngine>),
+    Gemma(Box<GemmaEngine>),
+}
+
+/// 위임 매크로 — &mut self 메서드.
+macro_rules! engine_delegate_mut {
+    ($($name:ident($($a:ident: $t:ty),*) -> $r:ty;)*) => {
+        impl GpuEngine {
+            $(
+                pub fn $name(&mut self $(, $a: $t)*) -> $r {
+                    match self {
+                        GpuEngine::Qwen(e) => e.$name($($a),*),
+                        GpuEngine::Gemma(e) => e.$name($($a),*),
+                    }
+                }
+            )*
+        }
+    };
+}
+
+/// 위임 매크로 — &self 메서드.
+macro_rules! engine_delegate_ref {
+    ($($name:ident($($a:ident: $t:ty),*) -> $r:ty;)*) => {
+        impl GpuEngine {
+            $(
+                #[allow(dead_code)]
+                pub fn $name(&self $(, $a: $t)*) -> $r {
+                    match self {
+                        GpuEngine::Qwen(e) => e.$name($($a),*),
+                        GpuEngine::Gemma(e) => e.$name($($a),*),
+                    }
+                }
+            )*
+        }
+    };
+}
+
+engine_delegate_mut! {
+    prefill(seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String>;
+    kv_grow(slot: usize, n_tokens: usize) -> Result<usize, String>;
+    kv_release_slot(slot: usize) -> usize;
+    prof_report(label: &str) -> Result<String, String>;
+    restore_gdn(slot: usize, upto: u32) -> Result<u32, String>;
+    spec_rollback(slot: usize, keep: usize) -> Result<(), String>;
+    spec_rewind_pos(slot: usize, n: u32) -> Result<(), String>;
+    spec_verify(slot: usize, rows: &[f32], t: usize) -> Result<Vec<u32>, String>;
+    mtp_first(slot: usize, tok: u32) -> Result<(), String>;
+    mtp_single(slot: usize, tok: u32) -> Result<(), String>;
+    mtp_pre_round(acc: usize) -> Result<(), String>;
+    mtp_post_round(slot: usize, accepted: &[u32], corrected: u32) -> Result<(), String>;
+    mtp_slot_kv_reset() -> Result<(), String>;
+    mtp_slot_fresh(slot: usize) -> ();
+    mtp_slot_reused(slot: usize) -> ();
+    mtp_take_draft(slot: usize) -> Option<Vec<u32>>;
+    decode(seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<Vec<f32>>, String>;
+    decode_np_greedy(seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<u32>, String>;
+    decode_greedy(seq: usize, token: u32) -> Result<u32, String>;
+    decode_greedy_k(seq: usize, token: u32, k: usize, eos: u32) -> Result<Vec<u32>, String>;
+    decode_np_mixed(seq_ids: &[usize], tokens: &[u32]) -> Result<(Vec<u32>, Vec<f32>), String>;
+    decode_np_logits(seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<f32>, String>;
+    reset_seq(seq: usize) -> Result<(), String>;
+    enable_spec() -> Result<(), String>;
+    spec_verify_logits(slot: usize, rows: &[f32], t: usize) -> Result<Vec<f32>, String>;
+}
+
+engine_delegate_ref! {
+    spec_on() -> bool;
+    checkpoint_pos(slot: usize, upto: u32) -> u32;
+    kv_total_blocks() -> usize;
+    kv_free_blocks() -> usize;
+    kv_blocks_needed(n_tokens: usize) -> usize;
+    piece(tok: u32) -> String;
+    mtp_drafts_on() -> bool;
+    mem_stats() -> (u64, u64, u64, u64);
+    active_weight_bytes() -> u64;
+    moe_mode() -> &'static str;
+    copy_stats() -> [(u64, u64, u64); 3];
+    eos() -> u32;
+    embed_row(tok: u32) -> Result<Vec<f32>, String>;
+    vocab() -> usize;
+    n_embd() -> usize;
+}
+
+impl GpuEngine {
+    /// 아치 스니핑 후 해당 엔진 로드 — 서빙 진입 단일 경로.
+    pub fn load(
+        dir: &Path,
+        n_slots: usize,
+        ctx: usize,
+        kv_budget: Option<u64>,
+        kv_reserve: Option<u64>,
+    ) -> Result<Self, String> {
+        let arch = llm170_core::qwen35::bind::dir_arch(dir).unwrap_or_default();
+        if llm170_core::gemma4::bind::arch_ok(&arch) {
+            if kv_budget.is_some() || kv_reserve.is_some() {
+                eprintln!("# gemma4: kv_budget/kv_reserve는 v0 미지원 — 기본 전량 할당");
+            }
+            return Ok(GpuEngine::Gemma(Box::new(GemmaEngine::load(
+                dir, n_slots, ctx,
+            )?)));
+        }
+        Ok(GpuEngine::Qwen(Box::new(QwenEngine::load(
+            dir, n_slots, ctx, kv_budget, kv_reserve,
+        )?)))
     }
 }

@@ -34,22 +34,13 @@ pub static SERVER_CTX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 pub fn serve(
     addr: &str,
     req: InferRequest,
-    slots_flag: Option<usize>,
+    slots: usize,
     queue_flag: Option<usize>,
 ) -> Result<(), String> {
     let _ = SERVER_CTX.set(req.ctx);
-    // 107 P0-9: 슬롯 수 소스 계통 가시화 — 플래그 > env > 기본 1.
-    // 이전엔 env 기본 1이 조용히 직렬 서버를 만들었다(np4 10.5 t/s 정체).
-    let (slots, src) = if let Some(n) = slots_flag {
-        (n.clamp(1, 16), "flag")
-    } else if let Some(n) =
-        llm170_diag::flag::val("LLM170_SLOTS").and_then(|v| v.parse::<usize>().ok())
-    {
-        (n.clamp(1, 16), "env LLM170_SLOTS")
-    } else {
-        (1, "default")
-    };
-    eprintln!("# serve: slots={slots} (source: {src}) — 복수 동시 요청 배치 디코드에는 --slots N");
+    // [K6-3 --slots 폐지 2026-10-13] 문맥 수는 호출자(main)의 내부 상수 —
+    // 구 "플래그 > env > 기본 1" 계통은 제거됐다(env 기본 1이 조용히 직렬
+    // 서버를 만들던 함정도 함께 소멸). 동시성 = min(문맥, 풀 입장).
     // 대기열 기본 512(2026-09-16, 사용자 지시): 대기 작업은 토큰 배열+채널뿐인
     // 호스트 객체(건당 수백 바이트)라 넉넉해도 비용이 없고, 동시 요청 폭주 시
     let qcap = match queue_flag {

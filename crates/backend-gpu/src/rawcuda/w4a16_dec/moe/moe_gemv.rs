@@ -57,7 +57,13 @@ impl W4a16Dec {
         n: usize,
         k: usize,
     ) -> Result<(), String> {
-        let f = self.cc.function("w4a16_gemv_experts_glu")?;
+        // [gemma4 P2 2026-10-14] 활성 선택 — 기본 silu, gemma4는 gelu_tanh
+        // (모델별 단일 경로 — 런타임 수치 플래그 아님: 로드 시 확정).
+        let f = self.cc.function(if self.moe.glu_gelu {
+            "w4a16_gemv_experts_glu_gelu"
+        } else {
+            "w4a16_gemv_experts_glu"
+        })?;
         let (mut p_t, mut p_b, mut p_i, mut p_ns) = (
             self.moe.moe_dev_tab,
             base as i32,

@@ -57,6 +57,41 @@ impl W4a16Dec {
     /// (내용 불변 — 그래프 캡처 계약: 캡처는 테이블 주소만 베이크).
     /// 어텐션 커널 4종(prep_q·part_q·part_qg·fa2_qg)이 기존 KV 4포인터를
     /// 대신해 이 1포인터로 간접 어드레싱한다(merge는 KV 무판독 — 무관).
+    /// [gemma4 2026-10-14] 아레나·블록 크기용 최대 KV 클래스 — 층별 테이블이
+    /// 비면 균일 스칼라(무해).
+    pub(super) fn attn_max_kv(&self) -> Result<(usize, usize), String> {
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
+        if self.attn.layers.is_empty() {
+            return Ok((dm.kv_dim(), dm.kv_heads));
+        }
+        Ok((
+            self.attn
+                .layers
+                .iter()
+                .map(|l| l.kv_heads * l.d)
+                .max()
+                .unwrap_or(dm.kv_dim()),
+            self.attn
+                .layers
+                .iter()
+                .map(|l| l.kv_heads)
+                .max()
+                .unwrap_or(dm.kv_heads),
+        ))
+    }
+
+    /// 층별 어텐션 파라미터(테이블 비면 균일 합성).
+    #[allow(dead_code)] // gemma4 체인 배선(차기 P2-3)에서 발사 인자로 사용.
+    pub(super) fn attn_layer_of(&self, il: usize) -> Result<AttnLayer, String> {
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
+        Ok(self
+            .attn
+            .layers
+            .get(il)
+            .copied()
+            .unwrap_or_else(|| dm.layer(il)))
+    }
+
     pub(super) fn attn_blk_ptr(&self, slot: usize) -> CUdeviceptr {
         match self.attn.attn {
             Some(dm) => {
@@ -174,14 +209,17 @@ impl W4a16Dec {
             self.attn.dattn_part,
             self.attn_pp_ptr(slot),
         );
+        // [gemma4 P2 2026-10-14] q·k 스케일 인자화 — qwen = 1/√d(0.0625 동일값,
+        // 비트 불변), gemma4 = 1.0. 층별 테이블 폴백 포함(`AttnLayer::scale`).
+        let mut scl = dm.layer(layer).scale();
         self.cc.launch(
             fp,
             t_len as u32,
             (dm.kv_heads * spv) as u32,
             256,
-            &mut crate::rawcuda::args::l12(
+            &mut crate::rawcuda::args::l13(
                 &mut f0, &mut f1, &mut f2, &mut f3, &mut n0, &mut n1, &mut tl, &mut lay, &mut qh,
-                &mut kvh, &mut cp, &mut sp,
+                &mut kvh, &mut cp, &mut sp, &mut scl,
             ),
         )?;
         // [4.1 2026-10-11] merge가 x32/미러 동시 기록 — cast_x32 노드 제거.
@@ -231,16 +269,265 @@ impl W4a16Dec {
         );
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
+        let mut scl = dm.layer(layer).scale(); // [gemma4] q·k 스케일 인자
+        // [gemma4 2026-10-14] SW 창·게이트 스킵 인자(qwen=0/0 — 종전 산식).
+        let (mut swv, mut ngate) = (0i32, 0i32);
         self.cc.launch(
             f,
             t_len.div_ceil(32) as u32,
             dm.q_heads as u32,
             128,
-            &mut crate::rawcuda::args::l12(
+            &mut crate::rawcuda::args::l15(
                 &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut tl, &mut lay,
-                &mut qh, &mut kvh, &mut cp,
+                &mut qh, &mut kvh, &mut cp, &mut scl, &mut swv, &mut ngate,
             ),
         )
+    }
+
+    /// [gemma4 P2 2026-10-14] attn_prep_g4 Q 경로 직접 런처 — 검증 전용
+    /// (`--prep-g4-check`). K/V 경로는 블록 테이블이 필요해 호출하지 않는다
+    /// (grid.y = q_heads만). CPU 미러와 허용오차 대조용.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prep_g4_q_host(
+        &mut self,
+        q: &[f32],
+        qnw: &[f32],
+        t_len: usize,
+        q_heads: usize,
+        d: usize,
+        pairs: usize,
+        span: usize,
+        denom: usize,
+        base: f32,
+        pos0: u32,
+    ) -> Result<Vec<f32>, String> {
+        if q.len() != t_len * q_heads * d || qnw.len() != d {
+            return Err(format!(
+                "prep_g4: q={} qnw={} 계약 위반",
+                q.len(),
+                qnw.len()
+            ));
+        }
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let dq = self.cc.alloc(q.len() * 4)?;
+        let dqnw = self.cc.alloc(qnw.len() * 4)?;
+        let dqh = self.cc.alloc(q.len() * 4)?;
+        // rp[층*7 + {d, pairs, span, denom, base, vn_on, k_eq_v}]
+        let rp: Vec<f32> = vec![
+            d as f32,
+            pairs as f32,
+            span as f32,
+            denom as f32,
+            base,
+            1.0,
+            0.0,
+        ];
+        let drp = self.cc.alloc(rp.len() * 4)?;
+        let dpp = self.cc.alloc(4)?;
+        let rr = (|| -> Result<Vec<f32>, String> {
+            self.cc.h2d(dq, &f32b(q))?;
+            self.cc.h2d(dqnw, &f32b(qnw))?;
+            self.cc.h2d(drp, &f32b(&rp))?;
+            // pp는 커널에서 unsigned* — 비트 패턴 그대로 기록(f32 캐스트 금지).
+            self.cc.h2d(dpp, &pos0.to_le_bytes())?;
+            let f = self.cc.function("attn_prep_g4")?;
+            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) =
+                (dq, 0u64, 0u64, dqnw, 0u64, dqh, 0u64, dpp, drp);
+            let (mut rblk, mut rpp) = (0u64, 0u64); // 단일 슬롯(null)
+            let (mut tl, mut lay, mut qh, mut kvh, mut cp) =
+                (t_len as i32, 0i32, q_heads as i32, 0i32, 32i32);
+            self.cc.launch(
+                f,
+                t_len as u32,
+                q_heads as u32,
+                128,
+                &mut crate::rawcuda::args::l16(
+                    &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
+                    &mut rblk, &mut rpp, &mut a8, &mut tl, &mut lay, &mut qh, &mut kvh, &mut cp,
+                ),
+            )?;
+            self.cc.sync()?;
+            let mut ob = vec![0u8; q.len() * 4];
+            self.cc.d2h(&mut ob, dqh)?;
+            Ok(ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect())
+        })();
+        let _ = self.cc.free(dq);
+        let _ = self.cc.free(dqnw);
+        let _ = self.cc.free(dqh);
+        let _ = self.cc.free(drp);
+        let _ = self.cc.free(dpp);
+        rr
+    }
+
+    /// [gemma4 P2-3 2026-10-14] g4 rope 파라미터 테이블 등록 — 디바이스 f32
+    /// [n_attn][7] = {d, pairs, span, denom, base, vn_on, k_eq_v}. `attn_g4_host`가
+    /// 층 인덱스로 소비(prep_g4·part_g4 커널의 rp[층*7+·] 계약).
+    pub fn set_g4_rope(&mut self, rp: &[f32]) -> Result<(), String> {
+        if rp.is_empty() || !rp.len().is_multiple_of(7) {
+            return Err(format!("set_g4_rope: len={} — 7의 배수 계약", rp.len()));
+        }
+        let _g = self.cc.guard()?;
+        let bytes: Vec<u8> = rp.iter().flat_map(|x| x.to_le_bytes()).collect();
+        if self.attn.g4_rp == 0 || self.attn.attn.map(|d| d.n_attn) != Some(rp.len() / 7) {
+            if self.attn.g4_rp != 0 {
+                self.cc.free(self.attn.g4_rp)?;
+            }
+            self.attn.g4_rp = self.cc.alloc(bytes.len())?;
+        }
+        self.cc.h2d(self.attn.g4_rp, &bytes)
+    }
+
+    /// [gemma4 P2 2026-10-14] g4 어텐션 통합 런처(`--attn-g4-check` 검증 완료 ·
+    /// 체인 v0 경로): prep_g4 → f3s part_g4 → merge_g4 → outv. `layer` = 층
+    /// 인덱스(rope 파라미터 = `set_g4_rope` 테이블 · KV = 블록 테이블의 그 층).
+    /// KV 아레나·블록 테이블은 `set_attn`(+`kv_grow`)이 준비돼 있어야 한다.
+    /// `slot` = 블록 테이블 슬롯 오프셋(다중 슬롯 서빙 정합 — 종전 슬롯 0 고정
+    /// 결함 수정).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_g4_host(
+        &mut self,
+        slot: usize,
+        q: &[f32],
+        kin: &[f32],
+        vin: &[f32],
+        qnw: &[f32],
+        knw: &[f32],
+        layer: usize,
+        t_len: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        d: usize,
+        sw: usize,
+        kq_scale: f32,
+        splits: usize,
+        pos0: u32,
+    ) -> Result<Vec<f32>, String> {
+        // [P3 2026-10-14] 워커 스레드(서빙) 대비 — 할당·h2d는 현재 컨텍스트 필수
+        // (qwen 경로는 사전 할당이라 잠복했던 클래스: HTTP 서브에서 CUresult=201).
+        let _g = self.cc.guard()?;
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
+        if self.attn.g4_rp == 0 || layer >= dm.n_attn {
+            return Err(format!(
+                "attn_g4: rope 테이블 부재/층 초과 — layer={layer} n_attn={}",
+                dm.n_attn
+            ));
+        }
+        if q.len() != t_len * q_heads * d
+            || kin.len() != t_len * kv_heads * d
+            || vin.len() != t_len * kv_heads * d
+            || qnw.len() != d
+            || knw.len() != d
+        {
+            return Err("attn_g4: 입력 형상 계약 위반".into());
+        }
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let dq = self.cc.alloc(q.len() * 4)?;
+        let dk = self.cc.alloc(kin.len() * 4)?;
+        let dv = self.cc.alloc(vin.len() * 4)?;
+        let dqnw = self.cc.alloc(qnw.len() * 4)?;
+        let dknw = self.cc.alloc(knw.len() * 4)?;
+        let dqh = self.cc.alloc(q.len() * 4)?;
+        let npart = t_len * q_heads * splits;
+        let dpart = self.cc.alloc(npart * (d + 2) * 4)?;
+        let dout = self.cc.alloc(t_len * q_heads * d * 4)?;
+        let drp = self.attn.g4_rp;
+        // [P3 2026-10-14] 슬롯별 블록 테이블 기저 — 테이블 = [slot][layer][mb]×4(u64).
+        let mb = dm.cap.div_ceil(512);
+        let dblk = self.attn.dblk_tab + (slot * dm.n_attn * mb * 4 * 8) as u64;
+        let dpp = self.cc.alloc(4)?;
+        let rr = (|| -> Result<Vec<f32>, String> {
+            self.cc.h2d(dq, &f32b(q))?;
+            self.cc.h2d(dk, &f32b(kin))?;
+            self.cc.h2d(dv, &f32b(vin))?;
+            self.cc.h2d(dqnw, &f32b(qnw))?;
+            self.cc.h2d(dknw, &f32b(knw))?;
+            self.cc.h2d(dpp, &pos0.to_le_bytes())?;
+            // ① prep_g4 — grid (t, q_heads + kv_heads), 블록 128(§커널 계약)
+            {
+                let f = self.cc.function("attn_prep_g4")?;
+                let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut a8) =
+                    (dq, dk, dv, dqnw, dknw, dqh, dblk, dpp, drp);
+                let (mut rblk, mut rpp) = (0u64, 0u64); // 단일 슬롯(null)
+                let (mut tl, mut lay, mut qh, mut kvh, mut cp) = (
+                    t_len as i32,
+                    layer as i32,
+                    q_heads as i32,
+                    kv_heads as i32,
+                    dm.cap as i32,
+                );
+                self.cc.launch(
+                    f,
+                    t_len as u32,
+                    (q_heads + kv_heads) as u32,
+                    128,
+                    &mut crate::rawcuda::args::l16(
+                        &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
+                        &mut rblk, &mut rpp, &mut a8, &mut tl, &mut lay, &mut qh, &mut kvh,
+                        &mut cp,
+                    ),
+                )?;
+            }
+            // ② f3s part_g4 — grid (t, q_heads×splits), 블록 d
+            {
+                let f = self.cc.function("attn_fwd3s_part_g4")?;
+                let (mut a0, mut a1, mut a2, mut a3) = (dqh, dblk, dpart, dpp);
+                let (mut rblk, mut rpp) = (0u64, 0u64); // 단일 슬롯(null)
+                let (mut tl, mut lay, mut qh, mut kvh, mut cp) = (
+                    t_len as i32,
+                    layer as i32,
+                    q_heads as i32,
+                    kv_heads as i32,
+                    dm.cap as i32,
+                );
+                let (mut sp, mut dd, mut swv) = (splits as i32, d as i32, sw as i32);
+                let mut scl = kq_scale;
+                self.cc.launch(
+                    f,
+                    t_len as u32,
+                    (q_heads * splits) as u32,
+                    d as u32,
+                    &mut crate::rawcuda::args::l15(
+                        &mut a0, &mut a1, &mut a2, &mut a3, &mut rblk, &mut rpp, &mut tl, &mut lay,
+                        &mut qh, &mut kvh, &mut cp, &mut sp, &mut dd, &mut swv, &mut scl,
+                    ),
+                )?;
+            }
+            // ③ merge_g4 — grid (t, q_heads), 블록 d
+            {
+                let f = self.cc.function("attn_fwd3s_merge_g4")?;
+                let (mut a0, mut a1, mut a2, mut a3) = (dpart, dout, 0u64, 0u64);
+                let (mut tl, mut qh, mut sp, mut dd) =
+                    (t_len as i32, q_heads as i32, splits as i32, d as i32);
+                self.cc.launch(
+                    f,
+                    t_len as u32,
+                    q_heads as u32,
+                    d as u32,
+                    &mut crate::rawcuda::args::l8(
+                        &mut a0, &mut a1, &mut a2, &mut a3, &mut tl, &mut qh, &mut sp, &mut dd,
+                    ),
+                )?;
+            }
+            self.cc.sync()?;
+            let mut ob = vec![0u8; t_len * q_heads * d * 4];
+            self.cc.d2h(&mut ob, dout)?;
+            Ok(ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect())
+        })();
+        // 주의: drp(= self.attn.g4_rp)는 **영속**(set_g4_rope 소유) — 해제 금지.
+        for p in [dq, dk, dv, dqnw, dknw, dqh, dpart, dout, dpp] {
+            let _ = self.cc.free(p);
+        }
+        rr
     }
 
     /// 어텐션 체인 호스트 진입 — qg·kin·vin 업로드 → pp=pos0 → prep → fwd3s
@@ -416,14 +703,15 @@ impl W4a16Dec {
             );
             let (mut tl, mut lay) = (t_len as i32, layer as i32);
             let (mut rb, mut rp) = (row_blk, row_pp);
+            let mut scl = dm.layer(layer).scale(); // [gemma4] q·k 스케일 인자
             self.cc.launch(
                 fp,
                 t_len as u32,
                 (dm.q_heads * spv) as u32,
                 256,
-                &mut crate::rawcuda::args::l12(
+                &mut crate::rawcuda::args::l13(
                     &mut f0, &mut f1, &mut f2, &mut f3, &mut rb, &mut rp, &mut tl, &mut lay,
-                    &mut qh, &mut kvh, &mut cp, &mut sp,
+                    &mut qh, &mut kvh, &mut cp, &mut sp, &mut scl,
                 ),
             )?;
         }

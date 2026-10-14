@@ -111,6 +111,17 @@ __device__ __forceinline__ float attn_theta(int tid)
     return (float)th;
 }
 
+// [gemma4 P2 2026-10-14] θ_p = base^(−2p/denom) — f64 재구성.
+// (denom=64·base=1e7)는 기존 attn_theta와 동일 리터럴(비트동일) — gemma4
+// 전용 커널에서만 쓰인다(qwen 무접촉). 참조: HF proportional rope(0-패딩
+// 주파수)·llama.cpp rope_freqs와 동치(2026-10-14 대조).
+__device__ __forceinline__ float attn_theta_p(int p, int denom, float base)
+{
+    double e = -(2.0 * (double)p) / (double)denom;
+    double lnb = (denom == 64 && base == 1e7f) ? 16.11809565095832 : log((double)base);
+    return (float)attn_exp_d(lnb * e);
+}
+
 // sincos f64 트윈: Cody-Waite 2분할 환원(k≤2^20에서 k·pio2_1은 53비트 내
 // 정확 — pio2_1은 하위 20비트가 0) + 테일러 z⁶ Horner(차 오차 ~3e-13,
 // f32 ulp 6e-8의 5자리수 아래). 사분면 매핑 n=k&3. 도메인 0 ≤ a ≤ 2^20
@@ -189,11 +200,15 @@ __device__ __forceinline__ AttnKvRowPtrs attn_blk_row(
     const unsigned long long* bt =
         tab + ((long)layer * ((cap + 511) >> 9) + (row >> 9)) * 4;
     const unsigned long long ro = (unsigned long long)(row & 511);
+    // [gemma4 P2-3 2026-10-14] 헤드 보폭 = d = kv_dim/kv_heads — 종전 256
+    // 하드코딩은 d=512 풀층에서 헤드가 겹쳤다. qwen(전층 d=256)은 동일값
+    // (kv_dim/kv_heads = 8*256/8 = 256) — 비트 불변.
+    const long hstride = (kv_heads > 0) ? (kv_dim / kv_heads) : 256;
     AttnKvRowPtrs p;
     p.k = reinterpret_cast<signed char*>(bt[0]) +
-          ro * (unsigned long long)kv_dim + (long)kh * 256;
+          ro * (unsigned long long)kv_dim + (long)kh * hstride;
     p.v = reinterpret_cast<signed char*>(bt[1]) +
-          ro * (unsigned long long)kv_dim + (long)kh * 256;
+          ro * (unsigned long long)kv_dim + (long)kh * hstride;
     p.ks = reinterpret_cast<float*>(
         bt[2] + (ro * (unsigned long long)kv_heads + (unsigned long long)kh) * 4ULL);
     p.vs = reinterpret_cast<float*>(
@@ -471,6 +486,188 @@ __device__ __forceinline__ void attn_part_step(KDot kdot, VAcc vacc,
 
 
 
+// ── [gemma4 P2 2026-10-14] attn_prep_g4 — gemma4 어텐션 입력측 변형군 ──
+// attn_prep_q와의 차이(참조 llama.cpp src/models/gemma4.cpp 대조 2026-10-14):
+//  ① 게이트 없음 — q 입력 = [T][q_heads*d](q‖gate 512 아님)
+//  ② d 파라미터(슬라이딩 256 / 풀 512) — 동적 smem + stride 루프
+//  ③ V = 무가중 RMS(v_norm, eps 1e-6) — k_eq_v면 호스트가 vin=kin 전달
+//     (= llama.cpp `Vcur = wv ? … : Kcur` 후 `ggml_rms_norm(Vcur)`와 동일 순서:
+//      k_norm·rope 이전 원시값)
+//  ④ rope = rp[층*7 + {d, pairs, span, denom, base, vn_on, k_eq_v}]
+//     θ_p = base^(−2p/denom), 페어 (p, p+span) — qwen 무접촉(신설 커널)
+//  int8 KV 기록은 기존 attn_blk_row(블록 테이블) 경로 그대로(층 kv_dim=kv_heads*d).
+extern "C" __global__ void attn_prep_g4(
+    const float* __restrict__ q,     // [T][q_heads*d]
+    const float* __restrict__ kin,   // [T][kv_heads*d]
+    const float* __restrict__ vin,   // [T][kv_heads*d] (k_eq_v면 kin 재사용)
+    const float* __restrict__ qnw,   // [n_attn][d]
+    const float* __restrict__ knw,   // [n_attn][d]
+    float* __restrict__ qh,          // [T][q_heads*d]
+    const unsigned long long* __restrict__ dblk_tab,
+    const unsigned* __restrict__ pp,
+    const unsigned long long* __restrict__ row_blk, // [배치 2026-10-14] nullable
+    const unsigned long long* __restrict__ row_pp,  //   행별(테이블, pos)
+    const float* __restrict__ rp,
+    int t_len, int layer, int q_heads, int kv_heads, int cap)
+{
+    __shared__ float hd[512];   // d ≤ 512(풀층) — 128스레드 stride 루프
+    __shared__ float red[128];
+    const int d = (int)rp[layer * 7 + 0];
+    const int npairs = (int)rp[layer * 7 + 1];
+    const int span = (int)rp[layer * 7 + 2];
+    const int denom = (int)rp[layer * 7 + 3];
+    const float rbase = rp[layer * 7 + 4];
+    const int vn_on = (int)rp[layer * 7 + 5];
+    const int t = blockIdx.x;
+    const int j = blockIdx.y;
+    const int tid = threadIdx.x;
+    // [배치 행 퓨전] 행별 blk/pos — null이면 종전 단일 슬롯(pos = pp[0]+t).
+    const unsigned long long* blk = dblk_tab;
+    int pos;
+    if (row_blk != (const unsigned long long*)0) {
+        blk = (const unsigned long long*)row_blk[t];
+        pos = (int)((const unsigned*)row_pp[t])[0];
+    } else {
+        pos = (int)pp[0] + t;
+    }
+    const long kv_dim = (long)kv_heads * d;
+    if (j < q_heads) {
+        const float* src = q + (long)t * q_heads * d + (long)j * d;
+        float ss = 0.0f;
+        for (int i = tid; i < d; i += 128) {
+            hd[i] = src[i];
+            ss += hd[i] * hd[i];
+        }
+        red[tid] = ss;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        const float inv = 1.0f / sqrtf(red[0] / (float)d + 1e-6f);
+        for (int i = tid; i < d; i += 128) {
+            // [gemma4 P2-3 2026-10-14] qnw = **이 층**의 행(d개) — 종전
+            // layer*d 전개는 호스트가 층별 행을 주는 계약과 어긋나 범위 밖을
+            // 읽었다(층0만 우연 일치 — 검증 체크 통과·체인 NaN). 행 포인터 계약.
+            hd[i] = hd[i] * inv * qnw[i];
+        }
+        __syncthreads();
+        if (tid < npairs) {
+            const float theta = attn_theta_p(tid, denom, rbase);
+            const float ang = (float)pos * theta;
+            const float c = attn_cosf(ang), s2 = attn_sinf(ang);
+            const float x0 = hd[tid], x1 = hd[tid + span];
+            hd[tid] = x0 * c - x1 * s2;
+            hd[tid + span] = x0 * s2 + x1 * c;
+        }
+        __syncthreads();
+        float* dst = qh + (long)t * q_heads * d + (long)j * d;
+        for (int i = tid; i < d; i += 128) {
+            dst[i] = hd[i];
+        }
+        return;
+    }
+    const int m = j - q_heads;
+    const float* ksrc = kin + (long)t * kv_dim + (long)m * d;
+    float ss = 0.0f;
+    for (int i = tid; i < d; i += 128) {
+        hd[i] = ksrc[i];
+        ss += hd[i] * hd[i];
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(red[0] / (float)d + 1e-6f);
+    for (int i = tid; i < d; i += 128) {
+        hd[i] = hd[i] * inv * knw[i]; // 이 층 행(위 Q 주석 참조)
+    }
+    __syncthreads();
+    if (tid < npairs) {
+        const float theta = attn_theta_p(tid, denom, rbase);
+        const float ang = (float)pos * theta;
+        const float c = attn_cosf(ang), s2 = attn_sinf(ang);
+        const float x0 = hd[tid], x1 = hd[tid + span];
+        hd[tid] = x0 * c - x1 * s2;
+        hd[tid + span] = x0 * s2 + x1 * c;
+    }
+    AttnKvRowPtrs row = attn_blk_row(blk, layer, cap, pos, kv_dim, kv_heads, m);
+    // K absmax → int8
+    float amax = 0.0f;
+    for (int i = tid; i < d; i += 128) {
+        amax = fmaxf(amax, fabsf(hd[i]));
+    }
+    red[tid] = amax;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    float ks = red[0] * (1.0f / 127.0f);
+    if (ks == 0.0f) {
+        ks = 1.0f;
+    }
+    const float ik = 1.0f / ks;
+    __syncthreads();
+    for (int i = tid; i < d; i += 128) {
+        const int qv = __float2int_rn(hd[i] * ik);
+        row.k[i] = (signed char)max(-127, min(127, qv));
+    }
+    if (tid == 0) {
+        row.ks[0] = ks;
+    }
+    // ── V: (vn_on) 무가중 RMS → absmax → int8 ──
+    const float* vsrc = vin + (long)t * kv_dim + (long)m * d;
+    __syncthreads();
+    if (vn_on) {
+        float vss = 0.0f;
+        for (int i = tid; i < d; i += 128) {
+            const float v = vsrc[i];
+            hd[i] = v;
+            vss += v * v;
+        }
+        red[tid] = vss;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        const float vinv = 1.0f / sqrtf(red[0] / (float)d + 1e-6f);
+        for (int i = tid; i < d; i += 128) {
+            hd[i] *= vinv;
+        }
+    } else {
+        for (int i = tid; i < d; i += 128) {
+            hd[i] = vsrc[i];
+        }
+    }
+    __syncthreads();
+    float vam = 0.0f;
+    for (int i = tid; i < d; i += 128) {
+        vam = fmaxf(vam, fabsf(hd[i]));
+    }
+    red[tid] = vam;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    float vs = red[0] * (1.0f / 127.0f);
+    if (vs == 0.0f) {
+        vs = 1.0f;
+    }
+    const float iv = 1.0f / vs;
+    for (int i = tid; i < d; i += 128) {
+        const int wv = __float2int_rn(hd[i] * iv);
+        row.v[i] = (signed char)max(-127, min(127, wv));
+    }
+    if (tid == 0) {
+        row.vs[0] = vs;
+    }
+}
+
 // [P13] int8 KV 판독 — attn_fwd3s_part와 구조/환원 순서 동일(온라인 소프트맥스·
 // 분할 결정), K/V 로드만 int8 + 스케일 곱. 스코어 (q·k_i8)·(0.0625·ks),
 // AV acc += e·(v_i8·vs). 병합은 f32 part 그대로(attn_fwd3s_merge).
@@ -482,7 +679,8 @@ extern "C" __global__ void attn_fwd3s_part_q(
     const unsigned* __restrict__ pp,
     const unsigned long long* __restrict__ row_blk, // [행 퓨전] nullable
     const unsigned long long* __restrict__ row_pp,
-    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits)
+    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits,
+    float kq_scale)
 {
     int t = blockIdx.x;
     int hs = blockIdx.y;
@@ -491,7 +689,8 @@ extern "C" __global__ void attn_fwd3s_part_q(
     int tid = threadIdx.x;
     int gq = q_heads / kv_heads;
     int kh = h / gq;
-    float scale = 0.0625f;
+    // [gemma4 P2 2026-10-14] kq_scale = 인자(qwen 1/√d = 0.0625 동일값 — 비트 불변).
+    float scale = kq_scale;
     // [배치 행 퓨전 2026-10-14] 행별 blk/pos — null이면 단일 슬롯 계약.
     const unsigned long long* blk = dblk_tab;
     int lim;
@@ -645,6 +844,176 @@ extern "C" __global__ void attn_fwd3s_merge(
     }
 }
 
+// ── [gemma4 P2 2026-10-14] f3s g4 변형군 — d 파라미터·no-gate·SW 창 ──
+// attn_fwd3s_part_q/merge와의 차이:
+//  ① d 파라미터(256/512 — 블록 = d스레드, qs[d], K dot d/16 uint4, part 보폭 d+2)
+//  ② 게이트 없음(merge가 qg를 읽지 않는다 — gemma4 q는 플레인)
+//  ③ SW 창(sw>0이면 행 범위 시작 = max(0, lim−sw) — 창 밖 KV 미판독)
+//  산술(온라인 소프트맥스·청크·트리·행 오름차순)은 원본과 동일 순서.
+extern "C" __global__ void attn_fwd3s_part_g4(
+    const float* __restrict__ qh,
+    const unsigned long long* __restrict__ dblk_tab,
+    float* __restrict__ part,   // [T][q_heads][S][d+2]
+    const unsigned* __restrict__ pp,
+    const unsigned long long* __restrict__ row_blk, // [배치] nullable
+    const unsigned long long* __restrict__ row_pp,  //   행별(테이블, pos)
+    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits,
+    int d, int sw, float kq_scale)
+{
+    int t = blockIdx.x;
+    int hs = blockIdx.y;
+    int h = hs / splits;
+    int s = hs - h * splits;
+    int tid = threadIdx.x;
+    int gq = q_heads / kv_heads;
+    int kh = h / gq;
+    float scale = kq_scale;
+    // [배치] 행별 blk/lim — null이면 종전 단일 슬롯.
+    const unsigned long long* blk = dblk_tab;
+    int lim;
+    if (row_blk != (const unsigned long long*)0) {
+        blk = (const unsigned long long*)row_blk[t];
+        lim = (int)((const unsigned*)row_pp[t])[0] + 1;
+    } else {
+        lim = (int)pp[0] + t + 1;
+    }
+    int start = (sw > 0 && lim > sw) ? (lim - sw) : 0;
+    long kv_dim = (long)kv_heads * d;
+    long qrow = (long)t * (q_heads * d) + (long)h * d;
+    __shared__ float qs[512];
+    __shared__ float sarr[ATTN_CHUNK];
+    __shared__ float reds[256];
+    if (tid < d) {
+        qs[tid] = qh[qrow + tid];
+    }
+    __syncthreads();
+    int span = lim - start;
+    const int eff = (span <= 256) ? 1 : splits;
+    float* out = part + (((long)t * q_heads + h) * splits + s) * (d + 2);
+    if (s >= eff) {
+        if (tid == 0) {
+            out[0] = -1e30f;
+            out[1] = 0.0f;
+        }
+        if (tid < d) {
+            out[2 + tid] = 0.0f;
+        }
+        return;
+    }
+    int chunk_rows = (span + eff - 1) / eff;
+    chunk_rows = ((chunk_rows + ATTN_CHUNK - 1) / ATTN_CHUNK) * ATTN_CHUNK;
+    int lo = start + s * chunk_rows;
+    int hi = min(lim, lo + chunk_rows);
+    float m_run = -1e30f;
+    float l_run = 0.0f;
+    float acc = 0.0f;
+    for (int base = lo; base < hi; base += ATTN_CHUNK) {
+        const int nch = min(ATTN_CHUNK, hi - base);
+        attn_part_step(
+            [&](int i) -> float {
+                const int row = base + i;
+                const AttnKvRowPtrs rp =
+                    attn_blk_row(blk, layer, cap, row, kv_dim, kv_heads, kh);
+                const uint4* k16 = reinterpret_cast<const uint4*>(rp.k);
+                const float4* q4 = reinterpret_cast<const float4*>(qs);
+                float p0 = 0.0f;
+                for (int d16 = 0; d16 < (d >> 4); d16++) {
+                    const uint4 w = k16[d16];
+                    const float4 qa = q4[d16 * 4 + 0];
+                    const float4 qb = q4[d16 * 4 + 1];
+                    const float4 qc = q4[d16 * 4 + 2];
+                    const float4 qd = q4[d16 * 4 + 3];
+                    p0 += qa.x * (float)(signed char)(w.x & 0xffu);
+                    p0 += qa.y * (float)(signed char)((w.x >> 8) & 0xffu);
+                    p0 += qa.z * (float)(signed char)((w.x >> 16) & 0xffu);
+                    p0 += qa.w * (float)(signed char)(w.x >> 24);
+                    p0 += qb.x * (float)(signed char)(w.y & 0xffu);
+                    p0 += qb.y * (float)(signed char)((w.y >> 8) & 0xffu);
+                    p0 += qb.z * (float)(signed char)((w.y >> 16) & 0xffu);
+                    p0 += qb.w * (float)(signed char)(w.y >> 24);
+                    p0 += qc.x * (float)(signed char)(w.z & 0xffu);
+                    p0 += qc.y * (float)(signed char)((w.z >> 8) & 0xffu);
+                    p0 += qc.z * (float)(signed char)((w.z >> 16) & 0xffu);
+                    p0 += qc.w * (float)(signed char)(w.z >> 24);
+                    p0 += qd.x * (float)(signed char)(w.w & 0xffu);
+                    p0 += qd.y * (float)(signed char)((w.w >> 8) & 0xffu);
+                    p0 += qd.z * (float)(signed char)((w.w >> 16) & 0xffu);
+                    p0 += qd.w * (float)(signed char)(w.w >> 24);
+                }
+                return p0 * (scale * rp.ks[0]);
+            },
+            [&](int i) -> float {
+                const int row = base + i;
+                const AttnKvRowPtrs rp =
+                    attn_blk_row(blk, layer, cap, row, kv_dim, kv_heads, kh);
+                return (float)rp.v[tid] * rp.vs[0];
+            },
+            sarr, reds, nch, tid, m_run, l_run, acc);
+    }
+    if (tid == 0) {
+        out[0] = m_run;
+        out[1] = l_run;
+    }
+    if (tid < d) {
+        out[2 + tid] = acc;
+    }
+}
+
+// ── [gemma4] f3s 병합 g4 — 게이트 없음(⊙sigmoid 미적용) · d 파라미터 ──
+extern "C" __global__ void attn_fwd3s_merge_g4(
+    const float* __restrict__ part,
+    float* __restrict__ outv,
+    float* __restrict__ out32,
+    unsigned short* __restrict__ out16,
+    int t_len, int q_heads, int splits, int d)
+{
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    const float* pb = part + ((long)t * q_heads + h) * splits * (d + 2);
+    __shared__ float ms[ATTN_SPLITS_MAX];
+    __shared__ float ws[ATTN_SPLITS_MAX];
+    __shared__ float mred[1];
+    if (tid < splits) {
+        ms[tid] = pb[tid * (d + 2)];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float m0 = -1e30f;
+        for (int s = 0; s < splits; s++) {
+            m0 = fmaxf(m0, ms[s]);
+        }
+        mred[0] = m0;
+    }
+    __syncthreads();
+    const float m = mred[0];
+    if (tid < splits) {
+        const float* ps = pb + tid * (d + 2);
+        ws[tid] = (ps[1] <= 0.0f) ? 0.0f : attn_expf(ps[0] - m);
+    }
+    __syncthreads();
+    float l = 0.0f;
+    float acc = 0.0f;
+    for (int s = 0; s < splits; s++) {
+        const float* ps = pb + s * (d + 2);
+        if (ps[1] <= 0.0f) {
+            continue;
+        }
+        l += ps[1] * ws[s];
+        acc += ps[2 + tid] * ws[s];
+    }
+    // gemma4 = 출력 게이트 없음 — ov = acc/l (⊙sigmoid 제거).
+    float ov = acc / l;
+    const long oi = (long)t * (q_heads * d) + (long)h * d + tid;
+    outv[oi] = ov;
+    if (out32 != (float*)0) {
+        out32[oi] = h2f(f2h(ov));
+    }
+    if (out16 != (unsigned short*)0) {
+        out16[oi] = f2h(ov);
+    }
+}
+
 // 마커 f3sc
 
 // [R3 2026-10-10] attn_pos_bump 제거 — 미사용(호스트가 attn_set_pos의
@@ -676,7 +1045,8 @@ extern "C" __global__ void attn_fwd3s_part_qg(
     const unsigned* __restrict__ pp,
     const unsigned long long* __restrict__ row_blk, // [행 퓨전] nullable
     const unsigned long long* __restrict__ row_pp,
-    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits)
+    int t_len, int layer, int q_heads, int kv_heads, int cap, int splits,
+    float kq_scale)
 {
     int t = blockIdx.x;
     int hs = blockIdx.y;
@@ -685,7 +1055,8 @@ extern "C" __global__ void attn_fwd3s_part_qg(
     int tid = threadIdx.x;
     int gq = q_heads / kv_heads;
     int h0 = kh * gq;
-    float scale = 0.0625f;
+    // [gemma4 P2 2026-10-14] kq_scale = 인자(qwen 1/√d = 0.0625 동일값 — 비트 불변).
+    float scale = kq_scale;
     // [배치 행 퓨전 2026-10-14] 행별 blk/pos — null이면 단일 슬롯 계약
     // (lim = pp[0]+t+1 · t=행=토큰 순번). 값·주소 동일.
     const unsigned long long* blk = dblk_tab;
@@ -962,7 +1333,8 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
     float* __restrict__ out32,
     unsigned short* __restrict__ out16,
     const unsigned* __restrict__ pp,
-    int t_len, int layer, int q_heads, int kv_heads, int cap)
+    int t_len, int layer, int q_heads, int kv_heads, int cap, float kq_scale,
+    int sw, int no_gate)
 {
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -1129,11 +1501,15 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
             const int rB = rA + 8;
             const int nA = pos0 + rb + rA + 1 - base; // 행 rA의 유효 열 수
             const int nB = pos0 + rb + rB + 1 - base;
+            // [gemma4 2026-10-14] SW 창 하한 — 창 밖(오래된) 열 마스크.
+            // sw=0(qwen)이면 0 = 무마스크(비트 불변).
+            const int loA = (sw > 0) ? (pos0 + rb + rA + 1 - sw - base) : 0;
+            const int loB = (sw > 0) ? (pos0 + rb + rB + 1 - sw - base) : 0;
 #pragma unroll
             for (int f = 0; f < 4; ++f) {
                 const int cc = f * 8 + 2 * tt;
-                const float s0 = 0.0625f * ksc_s[cc] * iqsc;
-                const float s1 = 0.0625f * ksc_s[cc + 1] * iqsc;
+                const float s0 = kq_scale * ksc_s[cc] * iqsc;
+                const float s1 = kq_scale * ksc_s[cc + 1] * iqsc;
                 sa[f][0] *= s0;
                 sa[f][1] *= s1;
                 sa[f][2] *= s0;
@@ -1148,6 +1524,18 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
                     sa[f][2] = -1e30f;
                 }
                 if (cc + 1 >= nB) {
+                    sa[f][3] = -1e30f;
+                }
+                if (cc < loA) {
+                    sa[f][0] = -1e30f;
+                }
+                if (cc + 1 < loA) {
+                    sa[f][1] = -1e30f;
+                }
+                if (cc < loB) {
+                    sa[f][2] = -1e30f;
+                }
+                if (cc + 1 < loB) {
                     sa[f][3] = -1e30f;
                 }
             }
@@ -1259,10 +1647,14 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
                 const int r0 = (e < 2) ? rowA : rowB;
                 const int d2 = d_ + (e & 1);
                 if (r0 < t_len) {
-                    const float gv = qg[(size_t)r0 * (q_heads * 512) + (size_t)h * 512 +
-                                        256 + d2];
-                    const float sg = 1.0f / (1.0f + attn_expf(-gv));
-                    const float ov = o[f][e] * ((e < 2) ? invlA : invlB) * sg;
+                    // [gemma4 2026-10-14] no_gate면 게이트 판독·⊙sigmoid 생략
+                    // (qwen=0 — 종전 산식 그대로).
+                    float ov = o[f][e] * ((e < 2) ? invlA : invlB);
+                    if (!no_gate) {
+                        const float gv = qg[(size_t)r0 * (q_heads * 512) + (size_t)h * 512 +
+                                            256 + d2];
+                        ov *= 1.0f / (1.0f + attn_expf(-gv));
+                    }
                     const long oi = (size_t)r0 * (q_heads * 256) + (size_t)h * 256 + d2;
                     outv[oi] = ov;
                     if (out32 != (float*)0) {

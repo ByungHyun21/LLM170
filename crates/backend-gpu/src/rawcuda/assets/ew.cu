@@ -49,3 +49,31 @@ extern "C" __global__ void ew(
 }
 
 // 마커 ewc
+
+// ── ew_gelu — gemma4 FFN 게이트(gelu tanh 근사)·업 곱 (2026-10-14) ──
+// HF `gelu_pytorch_tanh`: 0.5x(1+tanh(√(2/π)(x+0.044715x³))).
+// 산술: CPU 참조(core/ops.rs gelu_tanh)와 동일 식. tanhf는 트랜센던털
+// 등급(eval 판정 — 비트 아님; ew silu의 __expf 완화와 동일 클래스).
+// y32/y16 생산자 융합은 ew와 동일 규약(선택 출력 — null이면 미기록).
+extern "C" __global__ void ew_gelu(
+    const float* __restrict__ g,
+    const float* __restrict__ u,
+    float* __restrict__ y,
+    float* __restrict__ y32,
+    unsigned short* __restrict__ y16,
+    int n)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    float v = g[j];
+    float x3 = v * v * v;
+    float act = 0.5f * v * (1.0f + tanhf(0.7978846f * (v + 0.044715f * x3))) * u[j];
+    y[j] = act;
+    if (y32 != (float*)0) {
+        y32[j] = h2f(f2h(act));
+    }
+    if (y16 != (unsigned short*)0) {
+        y16[j] = f2h(act);
+    }
+}
+

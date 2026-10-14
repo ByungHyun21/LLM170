@@ -149,9 +149,20 @@ pub fn softplus(x: f32) -> f32 {
 /// FMA 수축 무영향), 최종 1회 f32 반올림. GPU ew::qk_norm_rope와 동일
 /// 연산열 (2026-09-02 브리지 제거 — P1 수축 RCA의 해법).
 pub fn rope_head(head: &mut [f32], pos: u32, n_rot: usize, base: f32) {
-    let half = n_rot / 2;
-    for p in 0..half {
-        let theta = base.powf(-(2.0 * p as f32) / n_rot as f32);
+    rope_head_dim(head, pos, n_rot, n_rot, base);
+}
+
+/// HF RoPE 일반형(rotate_half·emb=cat(freqs,freqs)) — 부분 회전 + head_dim 분모.
+/// θ_p = base^(−2p/head_dim) (p = 0..n_rot/2), 페어 = (p, p + head_dim/2).
+/// n_rot == head_dim이면 연속 전차원 회전(rope_head와 동일 수식 — Gemma4
+/// 슬라이딩층). n_rot < head_dim이면 **비연속 두 블록**(앞 n_rot/2 + 뒤 n_rot/2)
+/// — Gemma4 풀층(512차원 중 128만 회전 — HF proportional RoPE의 0-패딩
+/// cat(f,f)와 동치).
+pub fn rope_head_dim(head: &mut [f32], pos: u32, n_rot: usize, head_dim: usize, base: f32) {
+    let half = head_dim / 2;
+    let pairs = n_rot / 2;
+    for p in 0..pairs {
+        let theta = base.powf(-(2.0 * p as f32) / head_dim as f32);
         let angle = pos as f32 * theta;
         let (c, s) = (angle.cos(), angle.sin());
         let (x0, x1) = (head[p] as f64, head[p + half] as f64);
@@ -159,6 +170,37 @@ pub fn rope_head(head: &mut [f32], pos: u32, n_rot: usize, base: f32) {
         head[p] = (x0 * cf - x1 * sf) as f32;
         head[p + half] = (x0 * sf + x1 * cf) as f32;
     }
+}
+
+/// 가중 없는 RMS 정규화 — Gemma4 v_norm·router.norm(감마 없음). sq_sum 공유.
+pub fn rms_norm_plain(x: &[f32], eps: f32) -> Vec<f32> {
+    let sum = sq_sum(x);
+    let scale = 1.0 / ((sum / x.len() as f64 + eps as f64).sqrt() as f32);
+    x.iter().map(|&v| v * scale).collect()
+}
+
+/// gelu tanh 근사 — HF `gelu_pytorch_tanh`(0.5x(1+tanh(√(2/π)(x+0.044715x³)))).
+#[inline]
+pub fn gelu_tanh(x: f32) -> f32 {
+    const C: f32 = 0.797_884_6; // √(2/π)
+    let x3 = x * x * x;
+    0.5 * x * (1.0 + (C * (x + 0.044_715 * x3)).tanh())
+}
+
+/// 최종 로짓 softcap — HF `final_logit_softcapping`(c>0: c·tanh(x/c), 그 외 항등).
+/// **argmax 단조 불변**(그리디 토큰 무영향) — PPL·샘플링·검증 로짓에만 의미.
+/// (gemma4 c=30 — CPU 오라클·GPU 호스트 로짓 경로가 같은 식을 쓴다.)
+#[inline]
+pub fn logit_softcap(x: f32, c: f32) -> f32 {
+    if c > 0.0 { c * (x / c).tanh() } else { x }
+}
+
+/// f32 → BF16 라운드(RNE) → f32 — 임베딩 √h 베이크(CPU·GPU 동일 바이트 계약).
+pub fn bf16_rne(v: f32) -> f32 {
+    let bits = v.to_bits();
+    let lsb = (bits >> 16) & 1;
+    let rounded = bits.wrapping_add(0x7FFF + lsb);
+    f32::from_bits(rounded & 0xFFFF_0000)
 }
 
 #[cfg(test)]
@@ -179,5 +221,19 @@ mod tests {
         for v in y {
             assert!((v - 1.0).abs() < 1e-5, "{v}");
         }
+    }
+
+    /// 로짓 softcap — 항등(c=0)·고정값·단조·포화(HF final_logit_softcapping).
+    #[test]
+    fn logit_softcap_identity_monotone_saturates() {
+        assert_eq!(logit_softcap(3.5, 0.0), 3.5, "c=0 항등");
+        assert_eq!(logit_softcap(0.0, 30.0), 0.0);
+        let y = logit_softcap(30.0, 30.0);
+        assert!((y - 30.0 * 1.0f32.tanh()).abs() < 1e-6, "{y}");
+        // 단조(그리디 argmax 불변 근거).
+        assert!(logit_softcap(-10.0, 30.0) < logit_softcap(10.0, 30.0));
+        // 큰 x는 ±30으로 포화(f32에서 tanh→1.0 = 정확히 30 반올림).
+        let big = logit_softcap(1000.0, 30.0);
+        assert!(big > 29.9 && big <= 30.0, "{big}");
     }
 }
