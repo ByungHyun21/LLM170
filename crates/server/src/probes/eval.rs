@@ -612,6 +612,7 @@ fn needle(args: &[String]) -> Result<String, String> {
     let mut ngen = 8usize; // greedy 생성 토큰(패스코드 탐색 창)
     let (mut pf, mut picks_dbg) = (512usize, false); // 프리필 청크 캡·답변 덤프
     let (mut needles, mut hard) = (1usize, false); // 다중 바늘·근접 디스턴트랙터
+    let mut bos: Option<u32> = None; // [gemma4] 선두 BOS(ref·ppl --bos와 동일 프로토콜)
     let mut depths = vec![10usize, 50, 90];
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -663,23 +664,129 @@ fn needle(args: &[String]) -> Result<String, String> {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
             }
+            "--bos" => {
+                bos = Some(
+                    arg(&mut it, "--bos requires an id")?
+                        .parse()
+                        .map_err(|_| "--bos requires an id")?,
+                );
+            }
             "--json" => json = true,
             other => return Err(format!("w4a16-eval needle: unknown flag {other}")),
         }
     }
-    let model = llm170_core::qwen35::Model::load(Path::new(&dir)).map_err(|e| e.to_string())?;
-    let hp = model.hp.clone();
+    // [gemma4 2026-10-14] 아치 분기 — 케이스 생성(프로토콜)은 공용, 실행만
+    // 분리(클로저). gemma4 = 서빙 청크 경로(프리필 ≤8·그리디 t=1).
+    let arch = llm170_core::qwen35::bind::dir_arch(Path::new(&dir)).unwrap_or_default();
+    let is_g4 = llm170_core::gemma4::bind::arch_ok(&arch);
     let tk = crate::tokenize::Tokenizer::load(Path::new(&dir))?;
     let t0 = std::time::Instant::now();
-    let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
-    crate::gpu_engine::upload_model(&mut dec, &model, ctx, 0)?;
-    let head = model
-        .w("output.weight")
-        .ok_or_else(|| "output.weight 부재".to_string())?;
-    if head.ty != llm170_core::wtype::WType::Bf16 {
-        return Err("needle은 GPU head 전제(Bf16 head 필요)".into());
-    }
-    dec.upload_head(head.data, head.n_out as usize, head.n_in as usize)?;
+    let mut run_case: Box<dyn FnMut(&[u32]) -> Result<Vec<u32>, String>> = if is_g4 {
+        let model = llm170_core::gemma4::Model::load(Path::new(&dir)).map_err(|e| e.to_string())?;
+        let hp = model.hp.clone();
+        let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
+        let cfg = crate::gpu_engine::upload_model_g4(&mut dec, &model, ctx)?;
+        for il in 0..hp.n_layer {
+            dec.set_g4_pes(il, cfg.pes_row(il, hp.n_experts))?;
+        }
+        Box::new(move |toks: &[u32]| -> Result<Vec<u32>, String> {
+            dec.reset_state(0)?;
+            // [K6-3 결함수정] 문맥+답변 KV 블록 확보 — 프로브는 스케줄러 부재.
+            dec.kv_grow(0, toks.len() + 16)?;
+            // 청크 프리필(≤8) — 마지막 청크만 마지막 행 로짓(서빙 프리필 동일).
+            let mut i = 0usize;
+            let mut lg: Vec<f32> = Vec::new();
+            while i < toks.len() {
+                let t = (toks.len() - i).min(8);
+                let last = i + t == toks.len();
+                let mut rb: Vec<f32> = Vec::with_capacity(t * hp.n_embd);
+                for &tok in &toks[i..i + t] {
+                    rb.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);
+                }
+                let csv: Vec<usize> = vec![0; t];
+                let cpos: Vec<u32> = (0..t).map(|r| (i + r) as u32).collect();
+                let out =
+                    crate::gpu_engine::g4_chunk(&mut dec, &model, &cfg, &csv, &cpos, &rb, t, last)?;
+                if last {
+                    lg = out.into_iter().next().unwrap_or_default();
+                }
+                i += t;
+            }
+            // 그리디 ngen — 마지막 문맥 위치에서 이어감.
+            let mut picks: Vec<u32> = Vec::with_capacity(ngen);
+            let mut row = lg;
+            let base = toks.len() as u32;
+            for step in 0..ngen {
+                let mut best = (0u32, f32::MIN);
+                for (j, &v) in row.iter().enumerate() {
+                    if v > best.1 {
+                        best = (j as u32, v);
+                    }
+                }
+                picks.push(best.0);
+                let er = model.embed_row(best.0).map_err(|e| e.to_string())?;
+                let cpos = [base + step as u32];
+                let out = crate::gpu_engine::g4_chunk(
+                    &mut dec,
+                    &model,
+                    &cfg,
+                    &[0],
+                    &cpos,
+                    &er,
+                    1,
+                    false,
+                )?;
+                row = out.into_iter().next().unwrap_or_default();
+            }
+            Ok(picks)
+        })
+    } else {
+        let model = llm170_core::qwen35::Model::load(Path::new(&dir)).map_err(|e| e.to_string())?;
+        let hp = model.hp.clone();
+        let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
+        crate::gpu_engine::upload_model(&mut dec, &model, ctx, 0)?;
+        let head = model
+            .w("output.weight")
+            .ok_or_else(|| "output.weight 부재".to_string())?;
+        if head.ty != llm170_core::wtype::WType::Bf16 {
+            return Err("needle은 GPU head 전제(Bf16 head 필요)".into());
+        }
+        dec.upload_head(head.data, head.n_out as usize, head.n_in as usize)?;
+        Box::new(move |toks: &[u32]| -> Result<Vec<u32>, String> {
+            dec.reset_state(0)?;
+            let n_ctx = toks.len() - 1;
+            dec.kv_grow(0, toks.len() + 16)?;
+            // 문맥 n-1토큰까지 배치 체인 프리필(무로짓·t≥2) — 마지막 토큰은
+            // t=1 head로 예측(프리필/디코드 경계 동일).
+            let mut i = 0usize;
+            while i < n_ctx {
+                let t = (n_ctx - i).clamp(2, pf.max(2));
+                let mut rb: Vec<f32> = Vec::with_capacity(t * hp.n_embd);
+                for &tok in &toks[i..i + t] {
+                    rb.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);
+                }
+                dec.forward_prefill(0, &rb, t, false)?;
+                i += t;
+            }
+            let mut row: Vec<f32> = dec.forward_device_head(
+                0,
+                &model.embed_row(toks[n_ctx]).map_err(|e| e.to_string())?,
+            )?;
+            let mut picks: Vec<u32> = Vec::with_capacity(ngen);
+            for _ in 0..ngen {
+                let mut best = (0u32, f32::MIN);
+                for (j, &v) in row.iter().enumerate() {
+                    if v > best.1 {
+                        best = (j as u32, v);
+                    }
+                }
+                picks.push(best.0);
+                let er = model.embed_row(best.0).map_err(|e| e.to_string())?;
+                row = dec.forward_device_head(0, &er)?;
+            }
+            Ok(picks)
+        })
+    };
 
     // 합성 haystack — 중성 산책 문장 반복(코퍼스 의존 없음·결정적).
     const HAY: &str = "The narrow alpine trail bends past the old stone bridge and continues through the quiet valley below the snow line. ";
@@ -696,7 +803,7 @@ fn needle(args: &[String]) -> Result<String, String> {
     let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut rows: Vec<(usize, usize, usize, bool, bool)> = Vec::new(); // len·깊이%·슬롯·hit·confused
     for &l in &lens {
-        if l + 64 * needles > ctx {
+        if l + 64 * needles + usize::from(bos.is_some()) > ctx {
             return Err(format!("len {l} + 질문 > ctx {ctx} — --ctx 확대 필요"));
         }
         for _set in 0..sets {
@@ -774,40 +881,11 @@ fn needle(args: &[String]) -> Result<String, String> {
                     toks.extend_from_slice(&hay[prev..hay_need]);
                 }
                 toks.extend_from_slice(&q_id[ask]);
-                dec.reset_state(0)?;
-                // [K6-3 결함수정] 문맥+답변 KV 블록 확보 — 프로브는 스케줄러
-                // 부재(ppl과 동일 계약).
-                dec.kv_grow(0, toks.len() + 16)?;
-                // 문맥 n-1토큰까지 배치 체인 프리필(무로짓·t≥ 2) — 마지막
-                // 토큰은 t=1 head로 예측(프리필/디코드 경계 동일).
-                let n_ctx = toks.len() - 1;
-                let mut i = 0usize;
-                while i < n_ctx {
-                    let t = (n_ctx - i).clamp(2, pf.max(2));
-                    let mut rb: Vec<f32> = Vec::with_capacity(t * hp.n_embd);
-                    for &tok in &toks[i..i + t] {
-                        rb.extend_from_slice(&model.embed_row(tok).map_err(|e| e.to_string())?);
-                    }
-                    dec.forward_prefill(0, &rb, t, false)?;
-                    i += t;
+                // [gemma4 2026-10-14] --bos: 선두 BOS(ref·ppl과 동일 순서).
+                if let Some(b) = bos {
+                    toks.insert(0, b);
                 }
-                // greedy ngen토큰 — 마지막 문맥 토큰에서 시작.
-                let mut row: Vec<f32> = dec.forward_device_head(
-                    0,
-                    &model.embed_row(toks[n_ctx]).map_err(|e| e.to_string())?,
-                )?;
-                let mut picks: Vec<u32> = Vec::with_capacity(ngen);
-                for _ in 0..ngen {
-                    let mut best = (0u32, f32::MIN);
-                    for (j, &v) in row.iter().enumerate() {
-                        if v > best.1 {
-                            best = (j as u32, v);
-                        }
-                    }
-                    picks.push(best.0);
-                    let er = model.embed_row(best.0).map_err(|e| e.to_string())?;
-                    row = dec.forward_device_head(0, &er)?;
-                }
+                let picks = run_case(&toks)?;
                 // [하네스 결함수정 2026-10-13] 토큰 id 부분열만으로는 생성-시점
                 // 토큰화가 단독 인코딩과 다를 때 정답을 놓친다(실측: 35B가
                 // "FAR39C"를 정확히 출력했는데도 0/6 — 병합 차이). 조각 문자열
