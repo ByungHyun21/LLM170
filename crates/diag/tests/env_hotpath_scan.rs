@@ -8,8 +8,8 @@
 //! 허용 목록(위반 아니고, 사유와 함께):
 //! - `crates/diag/src/**` — 스냅샷·덤프 메커니즘 자체(flag VALUES·dump OPTS·
 //!   fp·watchdog가 env를 읽는 유일한 곳이어야 한다).
-//! - `crates/server/src/main.rs` — 부트스트랩: LLM170_FRAME 기본값 set_var(스냅샷
-//!   이전에 env를 *써야* 한다)·watchdog 초 파싱·OOM adj. 1회 판독 비핫패스.
+//! - `crates/server/src/main.rs` — 부트스트랩: watchdog 초 파싱·OOM adj.
+//!   1회 판독 비핫패스.
 //! - `crates/server/src/probes/` — 검증층(3층 분리: 하네스는 프로덕션 계약 밖).
 //! - server의 tests/·examples — 이 스캔은 src 트리만 본다.
 //!

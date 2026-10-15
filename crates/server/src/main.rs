@@ -189,13 +189,6 @@ fn run_main() -> ExitCode {
     if std::env::var_os("LLM170_NO_OOM_ADJ").is_none() {
         let _ = std::fs::write("/proc/self/oom_score_adj", b"1000");
     }
-    // 프레임(활성 상주 디코드) 기본 ON — 게이트는 qwen4exp layers에 있어
-    // qwen35·CPU는 무영향. 상주 불가(작은 GTT 등)면 decode1이 value 경로로
-    // 자동 폴백. LLM170_FRAME=0으로 명시적 해제.
-    if std::env::var_os("LLM170_FRAME").is_none() {
-        // SAFETY: main 스레드 초기화 경로 — 다른 스레드 시작 전
-        unsafe { std::env::set_var("LLM170_FRAME", "1") };
-    }
     // [H 2026-10-09] 로그 레벨 개방 — 기본 Error(종전 고정값 동일),
     // LLM170_LOG=off|error|warn|info|debug|trace로 상향(진단 로그 확인 수단).
     // 주의: flag 스냅샷을 FRAME 기본값 set_var 이후로 미룬다 — 여기서 처음

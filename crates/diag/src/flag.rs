@@ -35,8 +35,8 @@ pub fn val(name: &str) -> Option<&str> {
 }
 
 /// `존재 && 값 != "0"` — `var(name).is_ok_and(|v| v != "0")` 대응.
-/// 부재 시 false(ne0와 반대 — 옵트인 값 게이트: LLM170_FRAME35·
-/// LLM170_FRAME 등 "설정돼 있고 0이 아니면 ON" 관례). A6.
+/// 부재 시 false(ne0와 반대 — 옵트인 값 게이트: LLM170_MOE_DBG·LLM170_TIME
+/// 등 "설정돼 있고 0이 아니면 ON" 관례). A6.
 pub fn on_nonzero(name: &str) -> bool {
     VALUES.get(name).is_some_and(|v| v != "0")
 }
