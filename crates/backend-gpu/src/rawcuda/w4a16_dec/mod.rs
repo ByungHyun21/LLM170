@@ -49,11 +49,21 @@ pub const GDN_NGRP: usize = 16;
 pub const GDN_CS: usize = 32;
 /// [A9 2026-10-10] 배치 디코드 최대 토큰(커널 head.cu HEAD_TMAX 미러).
 pub const BATCH_DEC_MAX: usize = 8;
-/// [2.N A2 2026-10-15] gemma4 청크 상한 — 전문가·topk·attn은 t 직지원
+/// [2.N A2→A3 2026-10-15] gemma4 청크 상한 — 전문가·topk·attn은 t 직지원
 /// (MoE 버퍼 = CHAIN_TMAX, attn.cu TMAX 512)이고 **t행 GEMV 계열만** t≤16
 /// 스위치 계약이라 호스트가 행 분할 호출한다(행별 산술 독립 — 비트동일).
 /// qwen 배치 상한(BATCH_DEC_MAX)과 분리 — qwen 경로 동작 불변.
-pub const G4_CHUNK_MAX: usize = 64;
+/// [A3 2026-10-15 채택 — 64→512] 같은 세션 교차 A/B(Gemma-4-26B, SM
+/// 2520/2790MHz 기록, reps3·의심 구간 라운드2 교차): pp256 64→128
+/// **+19.2%** · 128→256 **+12.4%** · pp1024 256→512 **+6.6~7.2%** ·
+/// pp4096 **+6.5%**(누적 ≈+43%) · tg·np 불변. 정합 = 청크 경계 무관
+/// 토큰 스트림 비트동일(300토큰 프롬프트 64 vs 512 md5 일치 · np4 해시
+/// 일치 — 행분할 비트동일 계약의 실증). 512 = 구조 상한 3종 정렬
+/// (CHAIN_TMAX · attn TMAX · sched PF_CHUNK_MAX — 서빙 외부 청크와 정합,
+/// 혼합 부하 캡 PF_CHUNK_MIXED=128은 그대로). 잔여 바닥 = dense 가중치
+/// t/16회 재판독(~56MB/token 고정 — 512에서 전문가 판독과 공동 지배):
+/// 비트계약 FFMA 타일 GEMM(dense mma 재도전 조건)의 실측 동기.
+pub const G4_CHUNK_MAX: usize = 512;
 /// [2.N t≤16 2026-10-15] t행 GEMV 계열 커널의 t 상한 — moe.cu G4_TMAX·
 /// gptq4(GEMV_T_CASE…)·head.cu i8_t 스위치 미러(정적검사 trow_switch_coverage).
 pub const G4_TROW_MAX: usize = 16;
