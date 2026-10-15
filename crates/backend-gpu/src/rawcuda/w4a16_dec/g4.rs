@@ -202,6 +202,8 @@ impl W4a16Dec {
         // [gemma4 P3 2026-10-14] t행 GEMV(그룹 디스패치 — g32/bf16 포함):
         // t≤8에서 가중 판독 1회 공유 + t=1 GEMV와 동일 클래스(FFMA gemm 대체 —
         // ncu 실측: FFMA는 DRAM 4.4%·SM 49.4% 지연 정체).
+        // [2.N 2026-10-15] t≥16 mma 대체 후보는 실측 기각(pp −6.7/−8.9% —
+        // `kernels/gemm.rs` 기록) — t행 GEMV 유지.
         self.gemv_t_launch(name, x_dev, y, t)?;
         Ok(y)
     }
