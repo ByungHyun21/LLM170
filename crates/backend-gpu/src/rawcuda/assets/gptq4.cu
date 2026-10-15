@@ -608,7 +608,15 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g128_t(
         GEMV_T_CASE(6) // gemv_g128_t_body<6>
         GEMV_T_CASE(7) // gemv_g128_t_body<7>
         GEMV_T_CASE(8) // gemv_g128_t_body<8>
-        default: break; // 호스트 계약 밖(t≤8)
+        GEMV_T_CASE(9)
+        GEMV_T_CASE(10)
+        GEMV_T_CASE(11)
+        GEMV_T_CASE(12)
+        GEMV_T_CASE(13)
+        GEMV_T_CASE(14)
+        GEMV_T_CASE(15)
+        GEMV_T_CASE(16)
+        default: break; // 호스트 계약 밖(t≤16)
     }
 }
 
@@ -709,7 +717,15 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g32_bf16_t(
         GEMV_T_CASE_G32(6)
         GEMV_T_CASE_G32(7)
         GEMV_T_CASE_G32(8)
-        default: break; // 호스트 계약 밖(t≤8)
+        GEMV_T_CASE_G32(9)
+        GEMV_T_CASE_G32(10)
+        GEMV_T_CASE_G32(11)
+        GEMV_T_CASE_G32(12)
+        GEMV_T_CASE_G32(13)
+        GEMV_T_CASE_G32(14)
+        GEMV_T_CASE_G32(15)
+        GEMV_T_CASE_G32(16)
+        default: break; // 호스트 계약 밖(t≤16)
     }
 }
 
@@ -754,7 +770,15 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g128_multi_t(
         GEMV_T_CASE(6)
         GEMV_T_CASE(7)
         GEMV_T_CASE(8)
-        default: break; // 호스트 계약 밖(t≤8)
+        GEMV_T_CASE(9)
+        GEMV_T_CASE(10)
+        GEMV_T_CASE(11)
+        GEMV_T_CASE(12)
+        GEMV_T_CASE(13)
+        GEMV_T_CASE(14)
+        GEMV_T_CASE(15)
+        GEMV_T_CASE(16)
+        default: break; // 호스트 계약 밖(t≤16)
     }
 }
 

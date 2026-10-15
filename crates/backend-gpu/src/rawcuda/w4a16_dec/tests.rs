@@ -218,6 +218,33 @@ fn batch_dec_max_mirror() {
     assert_eq!(t, G4_CHUNK_MAX, "moe.cu G4_TMAX ↔ G4_CHUNK_MAX");
 }
 
+/// [2.N t≤16] t-row GEMV 스위치 케이스 커버리지 — 호스트 상한과 동기.
+/// 15ba3702 누락(gptq4.cu 미확장) 재발 방지: 케이스 부재는 조용한 no-op
+/// (미기록 리턴)이라 비트 게이트 이전에 정적으로 잡는다.
+#[test]
+fn trow_switch_coverage() {
+    let gptq4 = include_str!("../assets/gptq4.cu");
+    let moe = include_str!("../assets/moe.cu");
+    let head = include_str!("../assets/head.cu");
+    // (소스, 매크로, 심볼 수): g128_t·g128_multi_t·g32_t, bf16_t·multi_t, i8_t.
+    let groups: &[(&str, &str, usize)] = &[
+        (gptq4, "GEMV_T_CASE(", 2),      // g128_t + multi_t
+        (gptq4, "GEMV_T_CASE_G32(", 1),  // g32_bf16_t
+        (moe, "GEMV_T_CASE_BF(", 2),     // bf16_t + multi_t
+        (head, "GEMV_I8_TROW_CASE(", 1), // i8_t head
+    ];
+    for (src, mac, nsyms) in groups {
+        for n in 1..=G4_CHUNK_MAX {
+            let pat = format!("{mac}{n})");
+            let hits = src.matches(&pat).count();
+            assert_eq!(
+                hits, *nsyms,
+                "{mac}{n}) = {hits}곳(기대 {nsyms} — t-row 스위치 누락?)"
+            );
+        }
+    }
+}
+
 // ═══ [MTP-CHAIN 2026-10-12 §3.3 ②] 장치 체인 패리티 — CUDA 필요 ═══
 // 순차 호스트 경로(앵커 + mtp_recur_step ×3)와 장치 체인(앵커 +
 // mtp_chain_drafts)의 초안열 동일성. 모델은 합성 미니(플레인 bf16 MTP
