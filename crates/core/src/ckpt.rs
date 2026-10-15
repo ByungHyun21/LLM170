@@ -124,7 +124,7 @@ mod tests {
     /// 손상·오타입 거부.
     #[test]
     fn rejects_corrupt() {
-        let a = vec![1.0f32];
+        let a = [1.0f32];
         let mut blob = encode(ARCH_QWEN, 128, vec![(0, vec![&a[..]])]);
         assert!(decode(&blob[..blob.len() - 2]).is_err(), "잘림 거부");
         blob[0] = b'X';
