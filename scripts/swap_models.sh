@@ -383,6 +383,16 @@ if [ -d "$M_G4" ]; then
     "판정: 일치") note "G4 판정 OK(일치)";;
     *) echo "[w4a16] FAIL: G4 판정 — $(echo "$A" | grep '판정:')"; fail=1;;
   esac
+  echo "=== G4f. gemma4 np16 배치 등가 — t≤16 커널 상시 그물 ==="
+  # [2.N 2026-10-15] 15ba3702가 호스트 청크 상한만 올리고 gptq4의 t-row GEMV
+  # 케이스(9..16)를 빠뜨린 회귀의 검출 그물 — 케이스 부재면 t=16 조건 커널이
+  # 조용히 무기록(no-op)되어 np16-check가 단일 경로 등가 FAIL로 터진다.
+  # 디코드 배치 t=16은 서빙(다중 슬롯 동시 배치)에서 실제로 타는 경로다.
+  A=$(timeout 900 "$BIN" bench --model "$M_G4" --pp 16 --tg 8 --np 16 --ctx 1024 2>&1)
+  case "$A" in
+    *"np16-check | 단일 경로 등가 OK"*) note "G4f np16 등가 OK";;
+    *) echo "[w4a16] FAIL: G4f np16 — $(echo "$A" | grep -o 'np16-check.*' | head -1)"; fail=1;;
+  esac
   echo "=== G4c. gemma4 HTTP 서브(채팅 · 아치 렌더·정지 토큰) ==="
   # [ctx 하한 512] serve 가드(main.rs) — 256은 거부. 36ba1d4e(ctx_info 배선)
   # 이후 가드가 활성화돼 이 엔트리 작성 시점(가드 생략)과 조건이 달라졌다.
@@ -502,7 +512,7 @@ done
 echo "[w4a16] ── 검수 요약(${#SUMMARY[@]}항목) ──"
 for s in "${SUMMARY[@]}"; do echo "[w4a16]   $s"; done
 if [ $fail -eq 0 ]; then
-  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU(600 흡수)·serve·장문(2시나리오 1런)·spec·경계 교차+np 자체 검증 / 35B MoE 참조+GPU(2시나리오)·장문(2시나리오)·spec·스트리밍(D4) / gemma4 v0 게이트+infer(G4) / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
+  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU(600 흡수)·serve·장문(2시나리오 1런)·spec·경계 교차+np 자체 검증 / 35B MoE 참조+GPU(2시나리오)·장문(2시나리오)·spec·스트리밍(D4) / gemma4 v0 게이트+infer(G4)+np16 등가 / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
 else
   echo "[w4a16] smoke: FAILURES PRESENT"
 fi
