@@ -284,7 +284,7 @@ case "$H2" in
   *) echo "[w4a16] FAIL: 35B spec 골든 불일치: $(echo "$H2" | head -c 60)"; fail=1;;
 esac
 
-note "[12/12] K(스펙 항등) — 128토큰 서브: 스펙 on/off 토큰 동일 + 라운드 발화"
+note "[12/12] K(스펙 항등) — 128토큰 서브: 스펙 on/off 토큰 동일 + 라운드 발화 + 골든 접두"
 # [비결정성 회귀 가드 2026-10-13·커밋 45ae1b08] 융합(ngram) 보정 롤백 오프바이원이
 # 스펙 발화 시 후속 토큰을 오염시켰다 — 스펙은 무손실이어야 하므로, 같은 요청의
 # 스펙 on/off 출력이 **토큰 단위로 동일**해야 한다. 라운드 미발화면 검사 무효
@@ -307,9 +307,10 @@ for pair in "on:" "off:LLM170_SPEC_OFF=1"; do
   wait "$SERVE_PID" 2>/dev/null
   trap - EXIT
 done
-KK=$(python3 - "$RUN" <<'EOF'
+KK=$(python3 - "$RUN" "$GOLDEN" <<'EOF'
 import json, sys
 run = sys.argv[1]
+gold = [int(x) for x in sys.argv[2].split(",")]
 def toks(mode):
     d = json.load(open(f"{run}/k-{mode}.json"))
     return d.get("tokens") or []
@@ -328,8 +329,13 @@ elif t_on != t_off:
     print(f"FAIL 스펙 항등 위반 idx {i} on={t_on[i:i+3]} off={t_off[i:i+3]}")
 elif r_on < 1:
     print("FAIL 라운드 미발화 — 검사 무효")
+elif t_on[:len(gold)] != gold:
+    # [무료 다중 검증 2026-10-15] on==off만으로는 둘이 함께 드리프트해도 통과한다 —
+    # 접두를 동결 골든과 대조(이미 수집된 토큰 — 추가 로드 0; H는 프로브 경로,
+    # 여기는 서브+스펙 경로의 골든 셀).
+    print(f"FAIL 골든 접두 불일치(스펙 on): got={t_on[:len(gold)]} want={gold}")
 else:
-    print(f"OK rounds={r_on} tokens={len(t_on)}")
+    print(f"OK rounds={r_on} tokens={len(t_on)} golden-prefix OK")
 EOF
 )
 case "$KK" in
