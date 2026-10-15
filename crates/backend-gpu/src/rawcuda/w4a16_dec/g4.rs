@@ -223,8 +223,9 @@ impl W4a16Dec {
         Ok(y)
     }
 
-    /// [A2 2026-10-15] t행 GEMV 행 분할 — t≤G4_TROW_MAX면 단일 호출.
-    /// 분할 오프셋 = 행 인덱스×k/n(바이트) — x [t][k]·y [t][n] 레이아웃 계약.
+    /// [A2→P8 2026-10-15] t행 GEMV — t>16은 gemv_t_launch 내부의 tall 단일
+    /// 런치(+tail 스위치)가 처리(가중 DRAM 스트림 1회). 종전의 16행 선분할
+    /// 루프는 t≤16 폴백만 — 행별 산술 비트동일(레인·j-시퀀스·tree64 행 독립).
     fn gemv_t_rows(
         &mut self,
         name: &str,
@@ -232,19 +233,7 @@ impl W4a16Dec {
         y_dev: CUdeviceptr,
         t: usize,
     ) -> Result<(), String> {
-        let (_, _, n, k) = self.lin_spec(name)?;
-        let mut r0 = 0usize;
-        while r0 < t {
-            let rows = G4_TROW_MAX.min(t - r0);
-            self.gemv_t_launch(
-                name,
-                x_dev + (r0 * k * 4) as u64,
-                y_dev + (r0 * n * 4) as u64,
-                rows,
-            )?;
-            r0 += rows;
-        }
-        Ok(())
+        self.gemv_t_launch(name, x_dev, y_dev, t)
     }
 
     /// [A2 2026-10-15] 플레인(bf16) t행 GEMV 행 분할 — 라우터 전용(행별 비트동일).

@@ -149,6 +149,45 @@ impl W4a16Dec {
                 ));
             }
         };
+        // [P8 2026-10-15] t>16(g32/bf16) = 타일 루프 단일 런치 — 가중 DRAM
+        // 스트림 1회(종전 16행 호출 t/16회 재스트림 — 청크512 dense 61.7%의
+        // 원인). 16 배수분을 tall로, 잔여 tail(<16)은 기존 스위치로(오프셋
+        // 이동). 행별 산술 비트동일(레인·j-시퀀스·tree64가 행 독립).
+        if t > 16 && g == 32 && sb {
+            let t16 = t & !15;
+            let ft = self.cc.function("w4a16_gemv_g32_bf16_tall")?;
+            let (mut aq, mut as_, mut ax, mut ay) = (dq, ds, x_dev, y_dev);
+            let (mut an, mut ak, mut at) = (n as i32, k as i32, t16 as i32);
+            self.cc.launch(
+                ft,
+                n.div_ceil(GEMV_TR) as u32,
+                1,
+                (32 * GEMV_TR) as u32,
+                &mut crate::rawcuda::args::l7(
+                    &mut aq, &mut as_, &mut ax, &mut ay, &mut an, &mut ak, &mut at,
+                ),
+            )?;
+            if t == t16 {
+                return Ok(());
+            }
+            let f = self.cc.function(sym)?;
+            let (mut p_q, mut p_s, mut p_x, mut p_y) = (
+                dq,
+                ds,
+                x_dev + (t16 * k * 4) as u64,
+                y_dev + (t16 * n * 4) as u64,
+            );
+            let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, (t - t16) as i32);
+            return self.cc.launch(
+                f,
+                n.div_ceil(GEMV_TR) as u32,
+                1,
+                (32 * GEMV_TR) as u32,
+                &mut crate::rawcuda::args::l7(
+                    &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
+                ),
+            );
+        }
         let f = self.cc.function(sym)?;
         let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, x_dev, y_dev);
         let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);

@@ -735,6 +735,86 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g32_bf16_t(
     }
 }
 
+// ── [P8 2026-10-15] 타일 루프 t행 GEMV(g32·bf16) — dense 청크 전체를 1런치로 ──
+// 동기: 청크512에서 dense t행 GEMV가 GPU 예산 61.7%(프로파일 실측) — 16행
+// 호출 t/16회가 **가중 행렬 전체를 매 호출 재스트림**한다. 본 커널은 블록당
+// 출력행(종전과 동일 그리드 = ceil(n/GEMV_TR)×256)에서 t0 타일(16행) 루프로
+// 청크를 전부 소비 — 가중 DRAM 스트림 1회(32× 절감, L2 재사용은 타일 간).
+// 행별 산술은 gemv_g32_t_body<16>과 **비트동일**: 레인 l·j-시퀀스·f32 acc·
+// tree64 환원이 행 독립이라 t0 그룹화와 무관(잔여 tail<16행은 호스트가
+// 기존 ≤16 스위치로 발사 — 핫루프에 가드 없음).
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g32_bf16_tall(
+    const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
+    const float* __restrict__ x, float* __restrict__ out,
+    int n, int k, int t16) // t16 = 16의 배수(호스트 계약 — tail은 별도 발사)
+{
+    const int o0 = blockIdx.x * GEMV_TR;
+    if (o0 >= n) {
+        return;
+    }
+    __shared__ double red[GEMV_TR][32];
+    __shared__ float sc[GEMV_TR][G4_SCMAX];
+    constexpr int T = 16;
+    const int l = threadIdx.x & 31;
+    const int g = threadIdx.x >> 5;
+    const int o = o0 + g;
+    const bool live = o < n;
+    const int k8 = k >> 3;
+    const int kg = k >> 5;
+    if (live) {
+        for (int gg = l; gg < kg; gg += 32) {
+            sc[g][gg] = ld_scale<true>(s + (size_t)o * kg, gg);
+        }
+    }
+    __syncthreads();
+    const int jn = k >> 7;
+    const unsigned short* qh =
+        reinterpret_cast<const unsigned short*>(q + (size_t)o * k8) + l;
+    const float4* xb = reinterpret_cast<const float4*>(x) + l;
+    const int k4 = k >> 2;
+    for (int t0 = 0; t0 < t16; t0 += T) {
+        float acc[T];
+#pragma unroll
+        for (int r = 0; r < T; ++r) {
+            acc[r] = 0.0f;
+        }
+#pragma unroll 32
+        for (int jj = 0; jj < jn; ++jj) {
+            const unsigned qw = (unsigned)qh[jj * 32];
+            const float scv = sc[g][(l >> 3) + (jj << 2)];
+            const float w0 = fmaf((float)(qw & 0xFu), scv, -8.0f * scv);
+            const float w1 = fmaf((float)((qw >> 4) & 0xFu), scv, -8.0f * scv);
+            const float w2 = fmaf((float)((qw >> 8) & 0xFu), scv, -8.0f * scv);
+            const float w3 = fmaf((float)((qw >> 12) & 0xFu), scv, -8.0f * scv);
+#pragma unroll
+            for (int r = 0; r < T; ++r) {
+                const float4 xv = xb[(size_t)(t0 + r) * k4 + jj * 32];
+                acc[r] = fmaf(w0, xv.x, acc[r]);
+                acc[r] = fmaf(w1, xv.y, acc[r]);
+                acc[r] = fmaf(w2, xv.z, acc[r]);
+                acc[r] = fmaf(w3, xv.w, acc[r]);
+            }
+        }
+#pragma unroll
+        for (int rr = 0; rr < T; ++rr) {
+            red[g][l] = (double)acc[rr];
+            __syncthreads();
+            double v = (l < 16) ? (red[g][l] + red[g][l + 16]) : 0.0;
+#pragma unroll
+            for (int off = 8; off >= 1; off >>= 1) {
+                const double oth = shfl_down_f64(v, off);
+                if (l < off) {
+                    v += oth;
+                }
+            }
+            if (l == 0 && live) {
+                out[(size_t)(t0 + rr) * n + o] = (float)v;
+            }
+            __syncthreads();
+        }
+    }
+}
+
 // [S2 2026-10-11] 다중 세그먼트 t행 GEMV(배치 디코드·검증 t≤8) — 테이블은
 // t=1 판 w4a16_gemv_g128_multi와 공용((q,s,out,n,k)). 세그먼트 블록수는
 // ceil(n/GEMV_TR), 호스트 grid = Σceil(n_s/GEMV_TR). 행별 산술은
