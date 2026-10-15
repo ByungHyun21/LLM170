@@ -204,8 +204,57 @@ impl W4a16Dec {
         // ncu 실측: FFMA는 DRAM 4.4%·SM 49.4% 지연 정체).
         // [2.N 2026-10-15] t≥16 mma 대체 후보는 실측 기각(pp −6.7/−8.9% —
         // `kernels/gemm.rs` 기록) — t행 GEMV 유지.
-        self.gemv_t_launch(name, x_dev, y, t)?;
+        // [A2 2026-10-15] 청크 t>G4_TROW_MAX = **행 분할 호출**(t행 커널은 ≤16
+        // 스위치 계약) — 행별 산술 독립이라 단일 호출과 비트동일.
+        self.gemv_t_rows(name, x_dev, y, t)?;
         Ok(y)
+    }
+
+    /// [A2 2026-10-15] t행 GEMV 행 분할 — t≤G4_TROW_MAX면 단일 호출.
+    /// 분할 오프셋 = 행 인덱스×k/n(바이트) — x [t][k]·y [t][n] 레이아웃 계약.
+    fn gemv_t_rows(
+        &mut self,
+        name: &str,
+        x_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let (_, _, n, k) = self.lin_spec(name)?;
+        let mut r0 = 0usize;
+        while r0 < t {
+            let rows = G4_TROW_MAX.min(t - r0);
+            self.gemv_t_launch(
+                name,
+                x_dev + (r0 * k * 4) as u64,
+                y_dev + (r0 * n * 4) as u64,
+                rows,
+            )?;
+            r0 += rows;
+        }
+        Ok(())
+    }
+
+    /// [A2 2026-10-15] 플레인(bf16) t행 GEMV 행 분할 — 라우터 전용(행별 비트동일).
+    fn plain_gemv_t_rows(
+        &mut self,
+        name: &str,
+        x_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let (_, n, k) = self.plain_spec(name)?;
+        let mut r0 = 0usize;
+        while r0 < t {
+            let rows = G4_TROW_MAX.min(t - r0);
+            self.plain_gemv_t_launch(
+                name,
+                x_dev + (r0 * k * 4) as u64,
+                y_dev + (r0 * n * 4) as u64,
+                rows,
+            )?;
+            r0 += rows;
+        }
+        Ok(())
     }
 
     /// [gemma4 P3 2026-10-14] ew_gelu 디바이스 — act = gelu(g)·u → y(슬롯).
@@ -637,13 +686,13 @@ impl W4a16Dec {
         }
         let _g = self.cc.guard()?;
         self.ensure_moe_bufs()?;
-        // ① 라우터 → drt [t][n_exp].
+        // ① 라우터 → drt [t][n_exp]. [A2 2026-10-15] t>16은 행 분할(위 동형).
         let rn = format!("blk.{il}.moe_gate.weight");
         if self.lins.contains_key(&rn) {
-            self.gemv_t_launch(&rn, dhn, self.moe.drt.ptr, t)?;
+            self.gemv_t_rows(&rn, dhn, self.moe.drt.ptr, t)?;
         } else {
             // 플레인 라우터 — t행 플레인 GEMV(행별 산술 = t=1 GEMV와 비트동일).
-            self.plain_gemv_t_launch(&rn, dhn, self.moe.drt.ptr, t)?;
+            self.plain_gemv_t_rows(&rn, dhn, self.moe.drt.ptr, t)?;
         }
         // ② top-k(디바이스, t행) — softmax 전체 → top-k → 재정규화.
         {
@@ -676,6 +725,8 @@ impl W4a16Dec {
             )?;
         }
         // ④ 전문가 — 상주 GEMV 융합(gate+up+GLU) + down + 누적(sp=tk).
+        // [A2 2026-10-15] 그룹드 mma(CMP 방향)는 hi/lo 3-pass 정밀도 회수와
+        // 함께 재도입한다(현 슬롯당 GEMV = f32 비트동일 기준선).
         let ns = t * tk;
         let base = il * n_exp * 3;
         self.gemv_experts_glu_launch(base, ns, dxn, h, tk, self.moe.exp.act, n_ff, h)?;
@@ -708,7 +759,19 @@ impl W4a16Dec {
             return Err(format!("g4_head_dev: t={t} x={x_dev}"));
         }
         let y = self.g4_scratch_slot(out_slot, t * self.head_n * 4)?;
-        self.head_gemv_t_launch(x_dev, y, t)?;
+        // [A2 2026-10-15] t>G4_TROW_MAX = 행 분할(head i8_t 스위치 ≤16 계약) —
+        // 프리필은 t=1(마지막 행)·디코드는 t≤8이라 실사용은 단일 호출뿐이지만,
+        // 청크 상한 상향(64)에 대비해 계약을 지킨다.
+        let mut r0 = 0usize;
+        while r0 < t {
+            let rows = G4_TROW_MAX.min(t - r0);
+            self.head_gemv_t_launch(
+                x_dev + (r0 * self.hidden * 4) as u64,
+                y + (r0 * self.head_n * 4) as u64,
+                rows,
+            )?;
+            r0 += rows;
+        }
         Ok(y)
     }
 

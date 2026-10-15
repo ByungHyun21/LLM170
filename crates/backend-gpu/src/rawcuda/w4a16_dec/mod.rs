@@ -49,10 +49,14 @@ pub const GDN_NGRP: usize = 16;
 pub const GDN_CS: usize = 32;
 /// [A9 2026-10-10] 배치 디코드 최대 토큰(커널 head.cu HEAD_TMAX 미러).
 pub const BATCH_DEC_MAX: usize = 8;
-/// [2.N t≤16 2026-10-15] gemma4 t행 청크 상한(moe.cu G4_TMAX·head.cu i8_t
-/// 16 미러 — 정적검사 head_attn_ffma_mirrors). qwen 배치 상한(BATCH_DEC_MAX)
-/// 과 분리 — qwen 경로 동작 불변.
-pub const G4_CHUNK_MAX: usize = 16;
+/// [2.N A2 2026-10-15] gemma4 청크 상한 — 전문가·topk·attn은 t 직지원
+/// (MoE 버퍼 = CHAIN_TMAX, attn.cu TMAX 512)이고 **t행 GEMV 계열만** t≤16
+/// 스위치 계약이라 호스트가 행 분할 호출한다(행별 산술 독립 — 비트동일).
+/// qwen 배치 상한(BATCH_DEC_MAX)과 분리 — qwen 경로 동작 불변.
+pub const G4_CHUNK_MAX: usize = 64;
+/// [2.N t≤16 2026-10-15] t행 GEMV 계열 커널의 t 상한 — moe.cu G4_TMAX·
+/// gptq4(GEMV_T_CASE…)·head.cu i8_t 스위치 미러(정적검사 trow_switch_coverage).
+pub const G4_TROW_MAX: usize = 16;
 /// [K-STEP 2026-10-12 §3.4 ①] K-스텝 디코드 로그 폭(커널 w4a16_kstep_ctrl
 /// out[kmax] 계약). 서빙 k=4 — 상한 8(mtp 체인 로그와 동일 철학).
 pub const KSTEP_KMAX: usize = 8;

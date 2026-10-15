@@ -120,8 +120,11 @@ impl GemmaEngine {
             return Err("prefill: 빈 프롬프트 — 토큰 1개 이상 필요".into());
         }
         let mut last = Vec::new();
+        // [A2 2026-10-15] **청크 64 실험** — A1 귀속(전문가 bytes/토큰 = 11.4GB/t)
+        // 검증: 전문가·topk·attn은 t 직지원, t행 GEMV 계열(선형·라우터)은 호스트
+        // 행 분할(≤16 스위치 — 행별 비트동일). 상한 = G4_CHUNK_MAX(단일 출처).
         let t_chunk = if self.dec.moe_experts_resident() {
-            16
+            llm170_backend_gpu::G4_CHUNK_MAX
         } else {
             1
         };

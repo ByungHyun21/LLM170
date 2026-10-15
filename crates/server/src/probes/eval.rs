@@ -81,8 +81,11 @@ fn ppl(args: &[String]) -> Result<String, String> {
                     .next()
                     .and_then(|v| v.parse().ok())
                     .ok_or("--chunk requires a number")?;
-                if !(1..=32).contains(&chunk) {
-                    return Err(format!("--chunk {chunk}: 1..=32(GEMM_FFMA_TMAX)"));
+                if !(1..=llm170_backend_gpu::G4_CHUNK_MAX).contains(&chunk) {
+                    return Err(format!(
+                        "--chunk {chunk}: 1..=G4_CHUNK_MAX({})",
+                        llm170_backend_gpu::G4_CHUNK_MAX
+                    ));
                 }
             }
             "--from-tokens" => {
@@ -176,6 +179,14 @@ fn ppl(args: &[String]) -> Result<String, String> {
     let mut rows: Vec<Row> = Vec::with_capacity(n - 1);
     let mut nll_sum = 0f64;
     if chunk >= 2 {
+        // [A2 2026-10-15] qwen 배치 청크 = FFMA GEMM 경로(≤GEMM_FFMA_TMAX) —
+        // gemma4(ppl_g4)만 G4_CHUNK_MAX(64)까지 허용한다.
+        if chunk > llm170_backend_gpu::GEMM_FFMA_TMAX {
+            return Err(format!(
+                "--chunk {chunk}: qwen 배치 ≤ GEMM_FFMA_TMAX({})",
+                llm170_backend_gpu::GEMM_FFMA_TMAX
+            ));
+        }
         // [2026-10-10] 청크 경로 — t행 배치 프리필 + 전 위치 로짓 회수
         // (GEMM t≥2 — t=1 GEMV와 수치 계급이 다름: 방법 B, eval.md 참조).
         if !head_gpu {
