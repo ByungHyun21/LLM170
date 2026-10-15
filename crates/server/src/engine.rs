@@ -174,6 +174,11 @@ impl Engine {
         self.0.moe_mode()
     }
 
+    /// [§2.M ①] 스트리밍 전문가 LRU 캐시 계측 — (hits, miss, k).
+    pub fn mcache_stats(&self) -> (u64, u64, usize) {
+        self.0.mcache_stats()
+    }
+
     /// 복사 계측 — [h2d, d2h, d2d] × (바이트, ns, 호출).
     pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
         self.0.copy_stats()

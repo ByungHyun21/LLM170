@@ -331,6 +331,7 @@ impl W4a16Dec {
                 continue;
             }
             if self.mcache_lookup(il, e).is_none() {
+                self.moe.mcache_miss += 1;
                 // [B4-1 결함수정 2026-10-13] 삽입 = 가중치 업로드 동반(필수).
                 let slot = self.mcache_insert(il, e)?;
                 let h = self.hidden;
@@ -342,6 +343,10 @@ impl W4a16Dec {
                 let sb =
                     self.moe.mcache_s + ((il * self.moe.mcache_k + slot) * 3) as u64 * ssz as u64;
                 self.mcache_upload_to(il, e, qb, sb)?;
+            } else {
+                // [§2.M ① 2026-10-15] 프리필 스테이징 히트율 계측(t=1 경로와 동일
+                // 계수기 — /stats moe_cache 노출).
+                self.moe.mcache_hits += 1;
             }
         }
         Ok(())

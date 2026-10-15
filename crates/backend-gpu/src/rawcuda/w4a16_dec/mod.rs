@@ -979,6 +979,7 @@ impl W4a16Dec {
             emb_bf16: false,
             dtg: 0,
             debug_layers: false,
+
             route_capture: false,
             route_out: Vec::new(),
         })
@@ -1199,6 +1200,16 @@ impl W4a16Dec {
         } else {
             "streaming"
         }
+    }
+
+    /// [§2.M ① 2026-10-15] 스트리밍 전문가 LRU 캐시 계측 — (hits, misses, k).
+    /// 프리필 스테이징 + t=1 경로 공용 계수기(핫스위칭 판정 원료).
+    pub fn mcache_stats(&self) -> (u64, u64, usize) {
+        (
+            self.moe.mcache_hits,
+            self.moe.mcache_miss,
+            self.moe.mcache_k,
+        )
     }
 
     /// MoE 모델 여부(프리필 t=1 강제 등).

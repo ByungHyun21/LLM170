@@ -437,6 +437,11 @@ impl GemmaEngine {
     pub fn moe_mode(&self) -> &'static str {
         self.dec.moe_mode()
     }
+
+    /// [§2.M ①] 스트리밍 전문가 LRU 캐시 계측 위임.
+    pub fn mcache_stats(&self) -> (u64, u64, usize) {
+        self.dec.mcache_stats()
+    }
     pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
         self.dec.copy_stats()
     }

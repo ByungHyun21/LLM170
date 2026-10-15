@@ -181,6 +181,7 @@ engine_delegate_ref! {
     mem_stats() -> (u64, u64, u64, u64);
     active_weight_bytes() -> u64;
     moe_mode() -> &'static str;
+    mcache_stats() -> (u64, u64, usize);
     copy_stats() -> [(u64, u64, u64); 3];
     eos() -> u32;
     embed_row(tok: u32) -> Result<Vec<f32>, String>;

@@ -28,6 +28,7 @@ pub(super) fn publish_stats(eng: &Engine, base: [(u64, u64, u64); 3]) {
         ple_cpu,
         active_per_token: eng.active_weight_bytes(),
         moe_mode: eng.moe_mode().to_string(),
+        moe_cache: eng.mcache_stats(),
     });
     let now = eng.copy_stats();
     let sub = |i: usize| -> (u64, u64, u64) {
