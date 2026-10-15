@@ -729,6 +729,16 @@ impl W4a16Dec {
                 ),
             )?;
         }
+        // [P4 2026-10-15] 라우팅 캡처(eval 진단 전용) — top-k 선택(id)을 층마다
+        // 호스트로 복사(판독만 — 수치 불변). 세그먼트 = [t][k] u32, 청크×층
+        // 실행 순서로 append(소비자 = w4a16-eval --route).
+        if self.route_capture {
+            let mut buf = vec![0u32; t * tk];
+            self.cc
+                .d2h_async(buf.as_mut_ptr() as *mut u8, self.moe.moe_idx, buf.len() * 4)?;
+            self.cc.sync()?;
+            self.route_out.extend_from_slice(&buf);
+        }
         // ③ pes(μ_e) — 인플레이스(가중 [t][top_k] 전량).
         {
             let ns = t * tk;
@@ -889,6 +899,7 @@ impl W4a16Dec {
     fn g4_graph_ok(&self) -> bool {
         llm170_diag::flag::ne0("LLM170_GRAPH")
             && !self.debug_layers
+            && !self.route_capture
             && !self.graph.g4_capture_failed
             && self.moe.n_experts > 0
             && self.moe.moe_resident

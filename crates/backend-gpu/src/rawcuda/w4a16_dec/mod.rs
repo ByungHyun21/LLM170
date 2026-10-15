@@ -706,6 +706,12 @@ pub struct W4a16Dec {
     dtg: CUdeviceptr,
     /// 층별 잔차 합 덤프(CPU LLM170_DUMP=debug_layers와 대조용).
     pub debug_layers: bool,
+    /// [P4 2026-10-15] 라우팅 top-k 캡처(eval 진단 전용) — g4_moe_dev가 층마다
+    /// moe_idx [t][k]를 route_out으로 복사(판독만 — 수치 불변). 그래프 캡처와
+    /// 양립 불가(g4_graph_ok 차단) — 켜면 직접 발사 경로로만 동작.
+    pub route_capture: bool,
+    /// 캡처 수집부(청크×층 순서로 t·k원소씩 append — 소비자가 재구성).
+    pub route_out: Vec<u32>,
 }
 
 // SAFETY: CUDA 핸들(*mut c_void)은 Send가 아니지만, 이 디코더는 서버
@@ -973,6 +979,8 @@ impl W4a16Dec {
             emb_bf16: false,
             dtg: 0,
             debug_layers: false,
+            route_capture: false,
+            route_out: Vec::new(),
         })
     }
 
