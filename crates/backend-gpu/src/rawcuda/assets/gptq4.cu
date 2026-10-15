@@ -366,9 +366,14 @@ extern "C" __global__ void w4a16_gemv_experts_glu_gelu(
 // [P11] 전문가-우선 슬롯 순열 — 같은 전문가의 슬롯을 연속 배치. 목적:
 // 전문가 GEMV 블록의 실행 순서를 전문가 단위로 묶어 같은 가중치 행을 L2에서
 // 재사용(토큰-우선 순서는 매 슬롯이 전문가 집합 전체를 재판독 — t=128 프리필
-// gemv 47%의 원인). 1블록·스레드 병렬: 카운트(원자) → 접두합(스레드 0) →
-// 스캐터(커서 원자). 슬롯 내부 순서는 비결정이나 **슬롯별 산술이 독립**이라
-// 결과는 순서 무관(비트 동일). n_exp ≤ 1024 계약(호스트 가드).
+// gemv 47%의 원인). 1블록·스레드 병렬: 카운트(원자 — 합은 결정론) → 접두합
+// (스레드 0) → **결정론 스캐터**. n_exp ≤ 1024 계약(호스트 가드).
+// [C4 2026-10-15] 구 스캐터는 원자 커서(atomicAdd(&off[e]))라 **그룹 내
+// 슬롯 순서가 원자 획득 순을 따라 런마다 흔들렸다**(실측 1e-7급 노이즈 —
+// TreeWY 검증 중 관측·실재 확인). 대체 = 슬롯 j의 그룹 내 순위를 j'<j 중
+// 동일 전문가 수(슬롯 순서 프리픽스)로 직접 계산 — 어떤 실행에서도 그룹 내
+// 오름차순 j로 고정(재현성 = 골든·그래프 캡처·지문의 전제). 비용 = O(nslots²/2)
+// 스캔이나 ns ≤ 4096(청크512×top8)에서 전체 예산 <0.2%, 소형(ns≤1024)은 µs급.
 extern "C" __global__ void w4a16_moe_align(
     const int* __restrict__ idx, int nslots,
     unsigned* __restrict__ gslot, unsigned* __restrict__ gcnt,
@@ -397,9 +402,12 @@ extern "C" __global__ void w4a16_moe_align(
     }
     __syncthreads();
     for (int j = tid; j < nslots; j += nt) {
-        const unsigned e = (unsigned)idx[j];
-        const unsigned p = atomicAdd(&off[e], 1u);
-        gslot[p] = (unsigned)j;
+        const int e = idx[j];
+        unsigned r = 0;
+        for (int jp = 0; jp < j; ++jp) {
+            r += (idx[jp] == e) ? 1u : 0u;
+        }
+        gslot[off[e] + r] = (unsigned)j; // 결정론 위치 = 기저 + 슬롯 순위
     }
 }
 
