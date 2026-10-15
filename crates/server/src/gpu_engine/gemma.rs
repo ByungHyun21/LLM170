@@ -97,15 +97,21 @@ impl GemmaEngine {
         Ok(lgs.into_iter().next().unwrap_or_default())
     }
 
-    /// 프리필 — t행 청크(≤16) 경로(가중 상각). 반환 = 마지막 로짓.
+    /// 프리필 — t행 청크 경로(가중 상각). 반환 = 마지막 로짓.
     /// 스트리밍(비상주 전문가)은 t행 미지원 → t=1 스텝 폴백.
+    /// [2.N 2026-10-15 실측] 청크 16은 8보다 프리필이 느리다 — 동일 세션 교차
+    /// A/B(3회 중앙값): pp16 385.8→332.4(−13.8%·chunk16), pp256 380.1→326.9
+    /// (−14%), 디코드 불변. 원인 = T=16 인스턴스 레지스터 압박(cuobjdump -res-usage:
+    /// gptq4 g32_t STACK 64→256B 스필 · moe bf16_t REG 48→94 · head i8_t 65→90;
+    /// 커널 쪽 한계 — t≤16 케이스 자체는 정상·np/bench/eval ≤16 능력 유지).
+    /// 커널 T=16 레지스터 최적화 전까지 서빙 기본 = 8.
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
         if tokens.is_empty() {
             return Err("prefill: 빈 프롬프트 — 토큰 1개 이상 필요".into());
         }
         let mut last = Vec::new();
         let t_chunk = if self.dec.moe_experts_resident() {
-            16
+            8
         } else {
             1
         };
