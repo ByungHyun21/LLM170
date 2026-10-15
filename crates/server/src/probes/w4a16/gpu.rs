@@ -235,7 +235,12 @@ pub(super) fn gpu_run_g4(args: &[String]) -> Result<String, String> {
     // (자기 교정 측정). CPU top-2 마진 < θ인 위치의 토큰 플립은 근접동률(허용),
     // 마진 ≥ θ인 플립은 실결함(불일치).
     let mut diag = String::new();
-    let (mut flips_bad, mut theta_max) = (0usize, 0f32);
+    // [판정 보정 2026-10-15] 실결함 계수는 **첫 발산 위치만** 유효 — 발산 후
+    // 스텝의 margin/θ는 문맥이 달라 비교 불가(아래 verdict 주석의 의도와 동기).
+    // 종전 구현은 이후 스텝까지 margin≥θ를 세어 니어타이 케이스를 실결함으로
+    // 오분류했다(실측: 9토큰 절단 프롬프트 — 첫 발산 마진 0.369 < θ 0.830인데
+    // step1 문맥 상이 비교 15.363≥15.238로 실결함 오표기).
+    let mut theta_max = 0f32;
     let n_step = gpu_logits.len().min(cpu_logits.len()).min(got.len());
     for i in 0..n_step {
         let cw =
@@ -269,9 +274,6 @@ pub(super) fn gpu_run_g4(args: &[String]) -> Result<String, String> {
                 .filter(|&(j, _)| j != cw.0)
                 .map(|(_, &v)| v)
                 .fold(f32::NEG_INFINITY, f32::max);
-        if got[i] != want[i] && margin >= theta {
-            flips_bad += 1; // 마진 ≥ 클래스 = 실결함 후보(첫 발산 판정이 정본)
-        }
         if i < 3 {
             let gt = g4_top5(&gpu_logits[i]);
             let ct = g4_top5(&cpu_logits[i]);
@@ -327,7 +329,7 @@ pub(super) fn gpu_run_g4(args: &[String]) -> Result<String, String> {
     let moved = got.iter().zip(want.iter()).position(|(a, b)| a != b);
     let verdict = if same {
         format!("일치 — P2 토큰 게이트 통과 (편차 클래스 θmax {theta_max:.3})")
-    } else if flips_bad == 0 {
+    } else if margin_first < theta_first {
         format!(
             "근접동률 플립(허용) — 최초 발산 위치 {} · CPU 마진 {margin_first:.3} < 편차 클래스 θ {theta_first:.3} · 이전 스텝 θmax {theta_max:.3}",
             moved.unwrap_or(0)
