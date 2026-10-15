@@ -73,10 +73,8 @@ struct Slot {
     err_count: u32,
     /// QA-1: 연속 실패 상한(3) 도달 시 확정 실패 사유.
     failed: Option<String>,
-    /// [§7.5] 스펙 적응 게이트 — 연속 무수용 라운드 수(1 도달 시 재시도 주기마다 재시도).
+    /// [§7.5] 스펙 적응 게이트 — 연속 무수용 라운드 수(1 도달 시 256토큰마다 재시도).
     spec_miss: u32,
-    /// [P5 2026-10-15 커버리지] 라운드 수용 EMA(억제기 재시도 주기 적응용) —
-    /// 높으면(깊은 수용 워크로드) 주기 단축, 낮으면(산문) 종전 256 유지.
     /// [관측 2026-10-14] 첫 emit 시각(TTFT 원료 — 큐 진입은 job.queued).
     t_first: Option<std::time::Instant>,
 }
@@ -207,10 +205,9 @@ pub static SCHED: Sched = Sched {
     econ_on: AtomicU64::new(1),
     econ_kidx: AtomicU64::new(1),
     econ_src_cur: AtomicU64::new(0),
-    econ_probe_gen: AtomicU64::new(0),
-    econ_probe_mark: AtomicU64::new(0),
     econ_probe_alt: AtomicU64::new(0),
     econ_gen: AtomicU64::new(0),
+    econ_probe_gen: AtomicU64::new(0),
     econ_rounds: AtomicU64::new(0),
 };
 pub struct Sched {
@@ -267,11 +264,9 @@ pub struct Sched {
     /// OFF 재프로브의 소스 교차 토글(0↔1).
     pub econ_probe_alt: AtomicU64,
     /// 토큰 시계(프로브 주기 판정) — slot_emit이 증가.
-    pub econ_probe_gen: AtomicU64,
-    /// [P5 재부트스트랩] 직전 라운드가 OFF 재프로브였음 표시(소비 = econ_spec_sample).
-    pub econ_probe_mark: AtomicU64,
-    /// 토큰 시계(프로브 주기 판정) — slot_emit이 증가.
     pub econ_gen: AtomicU64,
+    /// 마지막 프로브 시점의 토큰 시계.
+    pub econ_probe_gen: AtomicU64,
     /// 스펙 라운드 시계(탐사 주기 — 32라운드마다 밴드 순환 1회).
     pub econ_rounds: AtomicU64,
 }
