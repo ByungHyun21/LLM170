@@ -108,6 +108,13 @@ impl GemmaEngine {
     /// 컴파일타임 오프셋으로 제거한 뒤 동일 세션 교차 A/B(수정 fatbin, 2라운드·
     /// SM 2805MHz): **pp16 +13.5% · pp256 +16.2%**(대 chunk8) · 디코드 불변 —
     /// 방향 역전으로 청크 16이 정본.
+    /// [A1 2026-10-15 nsys/ncu 직측 — 차기 t 확대 근거] pp 갭(vLLM 30~58×)의
+    /// 지배 항 = **청크 t 상각**: 전문가 가중치 = 청크당 ~11.4GB 고정(union
+    /// 포화·L2 부분 상쇄 — t 무관) → bytes/토큰 = 11.4GB/t: t16 712MB vs
+    /// vLLM(배치≈1024) 13.7MB = 52×(잔차 포함 실측 pp1024 갭 57.9×). glu/down은
+    /// DRAM 87%/48% 포화(커널 개선 여지 없음)·dense t행 GEMV는 DRAM 8~11%·
+    /// SM 38~41% 지연(청크 예산 33%)·head는 청크당 고정 738MB. 차기 = t=64
+    /// (dense는 mma 재개 조건 — M64 타일 포화).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
         if tokens.is_empty() {
             return Err("prefill: 빈 프롬프트 — 토큰 1개 이상 필요".into());
