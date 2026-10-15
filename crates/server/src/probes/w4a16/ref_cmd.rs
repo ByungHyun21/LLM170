@@ -120,19 +120,26 @@ fn format_store_level(
     }
 }
 
-/// 참조 러너 — CPU qwen35 greedy. 프롬프트 prefill → 시드 1토큰 + `--n-predict`
-/// 디코드(총 n_predict+1 토큰). 출력: `tokens: a,b,c`(단일 프롬프트).
+/// 참조 러너 — CPU qwen35/gemma4 greedy. 프롬프트 prefill → 시드 1토큰 +
+/// `--n-predict` 디코드(총 n_predict+1 토큰). 출력: `tokens: a,b,c`(단일 프롬프트).
+/// `--ckpt <경로>`: NLL·토큰열 진행을 주기 저장(원자 기록). `--resume <경로>`:
+/// 체크포인트부터 계속(`--n-predict`는 추가 토큰 수). 프롬프트가 바이트
+/// 단위로 같아야 한다(다르면 거부). 진행률은 stderr `# ref:` 줄로 나온다
+/// (stdout `tokens:` 계약 불변).
 pub(super) fn reference(args: &[String]) -> Result<String, String> {
     let dir = arg_str(args, 0, "");
     if dir.is_empty() {
         return Err(
-            "w4a16-ref <dir> --prompt-tokens <ids> [--n-predict N] [--ctx N] — 참조(CPU) greedy"
+            "w4a16-ref <dir> --prompt-tokens <ids> [--n-predict N] [--ctx N] [--ckpt <p> [--ckpt-every K]] [--resume <p>] — 참조(CPU) greedy"
                 .into(),
         );
     }
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     let mut n_predict = 32usize;
     let mut ctx = 4096usize;
+    let mut ckpt_path: Option<String> = None;
+    let mut resume_path: Option<String> = None;
+    let mut ckpt_every: usize = 512;
     // [Q1 2026-10-12] 오라클 NLL 모드 — 코퍼스 순회 CPU teacher-forced NLL.
     let (mut corpus, mut limit) = (None::<String>, usize::MAX);
     // [gemma4 2026-10-14] --bos <id>: 코퍼스 선두에 BOS 부착. gemma4처럼
@@ -182,6 +189,18 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--limit requires a number")?;
             }
+            "--ckpt" => {
+                ckpt_path = Some(arg(&mut it, "--ckpt requires a path")?.to_string());
+            }
+            "--resume" => {
+                resume_path = Some(arg(&mut it, "--resume requires a path")?.to_string());
+            }
+            "--ckpt-every" => {
+                ckpt_every = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--ckpt-every requires a number")?;
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
     }
@@ -208,6 +227,9 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
             nll_sum += crate::probes::eval::nll_of(&l, toks[i]);
             let mut ls = eng.decode(0, &[toks[i]])?;
             l = ls.pop().ok_or("decode logits 부재")?;
+            if i % 128 == 0 {
+                progress(&format!("# ref: nll {i}/{n}"));
+            }
         }
         let mean = nll_sum / (n - 1) as f64;
         let ppl = mean.exp();
@@ -221,16 +243,83 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
     }
     let n = prompts.len();
     let mut eng = RefEngine::load(&dir, n, ctx)?;
+    // 재개 — 체크포인트 검증(프롬프트 일치) + 상태 복원 + 그간 출력 복원.
+    // `--n-predict`는 재개 지점부터 추가 토큰 수다.
     let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for (s, p) in prompts.iter().enumerate() {
-        let l = eng.prefill(s, p)?;
-        out[s].push(llm170_core::qwen35::greedy(&l));
-    }
-    for _ in 0..n_predict {
+    if let Some(rp) = &resume_path {
+        let (saved_prompts, saved_out) = ckpt_read(rp, &mut eng)?;
+        if saved_prompts != prompts {
+            return Err(format!(
+                "resume: 프롬프트 불일치(체크포인트 {}시퀀스)",
+                saved_prompts.len()
+            ));
+        }
+        out = saved_out;
         for s in 0..n {
+            progress(&format!(
+                "# ref: resume {rp} s{s} pos={} 대체출 {}토큰",
+                eng.seq_pos(s),
+                out[s].len()
+            ));
+        }
+    }
+    // 시퀀스별: 잔여 프리필(128 청크·진행률) → 시드 → 디코드(진행률·주기 저장).
+    // 재개면 out에 이미 나온 토큰이 있고 pos가 그만큼 전진해 있다. n_predict는
+    // 추가 토큰 수다. 청크 분할 프리필은 수치 불변(양쪽 아치 append 규율).
+    for (s, p) in prompts.iter().enumerate() {
+        let mut pos = eng.seq_pos(s) as usize;
+        if pos > p.len() && out[s].is_empty() {
+            return Err(format!(
+                "s{s}: pos {pos} > 프롬프트 {}(출력 없음 — 손상)",
+                p.len()
+            ));
+        }
+        let save_now = |eng: &RefEngine, out: &[Vec<u32>]| -> Result<(), String> {
+            if let Some(cp) = &ckpt_path {
+                ckpt_write(cp, &prompts, out, eng)?;
+            }
+            Ok(())
+        };
+        const PCH: usize = 128;
+        let mut last: Option<Vec<f32>> = None;
+        let mut consumed = 0usize;
+        while pos < p.len() {
+            let nx = (pos + PCH).min(p.len());
+            last = Some(eng.prefill(s, &p[pos..nx])?);
+            consumed += nx - pos;
+            pos = nx;
+            progress(&format!("# ref: prefill s{s} {pos}/{}", p.len()));
+            if ckpt_path.is_some() && consumed >= ckpt_every.max(1) {
+                save_now(&eng, &out)?;
+                consumed = 0;
+            }
+        }
+        if out[s].is_empty() {
+            let l = last.ok_or_else(|| format!("s{s}: 시드 없음(빈 출력+잔여 프리필 없음)"))?;
+            out[s].push(llm170_core::qwen35::greedy(&l));
+            progress(&format!("# ref: seed s{s} tok={}", out[s][0]));
+        }
+        if ckpt_path.is_some() {
+            save_now(&eng, &out)?;
+        }
+        let target = out[s].len() + n_predict;
+        let mut made = 0usize;
+        while out[s].len() < target {
             let t = *out[s].last().expect("시드 토큰");
             let nt = eng.decode_greedy(s, t)?;
             out[s].push(nt);
+            made += 1;
+            progress(&format!(
+                "# ref: decode s{s} {}/{} tok={nt}",
+                out[s].len(),
+                target
+            ));
+            if ckpt_path.is_some() && made.is_multiple_of(8) {
+                save_now(&eng, &out)?;
+            }
+        }
+        if ckpt_path.is_some() {
+            save_now(&eng, &out)?;
         }
     }
     let csv = |ts: &[u32]| {
@@ -294,4 +383,127 @@ impl RefEngine {
             RefEngine::Gemma(e) => e.decode_greedy(seq, token).map_err(|x| x.to_string()),
         }
     }
+
+    /// 시퀀스 소비 위치(프리필+디코드 누적) — 재개 잔여 계산용.
+    pub(super) fn seq_pos(&self, seq: usize) -> u32 {
+        match self {
+            RefEngine::Qwen(e) => e.seqs.get(seq).map(|s| s.pos).unwrap_or(0),
+            RefEngine::Gemma(e) => e.seqs.get(seq).map(|s| s.pos).unwrap_or(0),
+        }
+    }
+
+    /// 엔진 상태 직렬화(전 시퀀스) — 서버 래퍼가 프롬프트·출력과 함께 저장.
+    pub(super) fn ckpt_save(&self) -> Result<Vec<u8>, String> {
+        match self {
+            RefEngine::Qwen(e) => e.ckpt_save().map_err(|x| x.to_string()),
+            RefEngine::Gemma(e) => e.ckpt_save().map_err(|x| x.to_string()),
+        }
+    }
+
+    /// 엔진 상태 복원(형상 대조 — 불일치 거부).
+    pub(super) fn ckpt_load(&mut self, blob: &[u8]) -> Result<(), String> {
+        match self {
+            RefEngine::Qwen(e) => e.ckpt_load(blob).map_err(|x| x.to_string()),
+            RefEngine::Gemma(e) => e.ckpt_load(blob).map_err(|x| x.to_string()),
+        }
+    }
+}
+
+/// 진행률 1줄(stderr — 줄 단위 플러시라 리다이렉트해도 실시간으로 보인다).
+fn progress(msg: &str) {
+    eprintln!("{msg}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+}
+
+/// 체크포인트 파일 형식(전부 LE):
+/// ```text
+/// magic 8B "REFCKP01" · n_seqs u32
+/// per seq: prompt_len u32 + prompt · out_len u32 + out · core_len u32 + core blob
+/// ```
+/// 프롬프트를 통째로 저장해 재개 시 바이트 단위로 대조한다(다른 입력에
+/// 옛 상태를 얹는 조용한 오염 방지).
+const CK_MAGIC: &[u8; 8] = b"REFCKP01";
+
+fn put_u32(v: &mut Vec<u8>, x: u32) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+
+fn get_u32(b: &[u8], p: &mut usize) -> Result<u32, String> {
+    if *p + 4 > b.len() {
+        return Err(format!("resume: 파일 잘림(offset {p})"));
+    }
+    let x = u32::from_le_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
+    *p += 4;
+    Ok(x)
+}
+
+/// 원자 기록 — tmp 후 rename(중단 시 반쪽 파일이 본 파일을 덮지 않는다).
+fn ckpt_write(
+    path: &str,
+    prompts: &[Vec<u32>],
+    out: &[Vec<u32>],
+    eng: &RefEngine,
+) -> Result<(), String> {
+    let core = eng.ckpt_save()?;
+    let mut v = Vec::new();
+    v.extend_from_slice(CK_MAGIC);
+    put_u32(&mut v, prompts.len() as u32);
+    for (p, o) in prompts.iter().zip(out.iter()) {
+        put_u32(&mut v, p.len() as u32);
+        for t in p {
+            put_u32(&mut v, *t);
+        }
+        put_u32(&mut v, o.len() as u32);
+        for t in o {
+            put_u32(&mut v, *t);
+        }
+    }
+    put_u32(&mut v, core.len() as u32);
+    v.extend_from_slice(&core);
+    let tmp = format!("{path}.tmp{}", std::process::id());
+    std::fs::write(&tmp, &v).map_err(|e| format!("ckpt 기록 실패 {tmp}: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("ckpt 확정 실패 {path}: {e}"))?;
+    progress(&format!("# ref: ckpt 저장 {path} ({}B)", v.len()));
+    Ok(())
+}
+
+/// 읽기 — (프롬프트열, 출력열) 반환 + 엔진 상태 복원.
+fn ckpt_read(path: &str, eng: &mut RefEngine) -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>), String> {
+    let b = std::fs::read(path).map_err(|e| format!("resume 읽기 실패 {path}: {e}"))?;
+    if b.len() < 8 || &b[..8] != CK_MAGIC {
+        return Err(format!("resume: 매직 불일치 {path}"));
+    }
+    let mut p = 8usize;
+    let n = get_u32(&b, &mut p)? as usize;
+    if n == 0 || n > 1024 {
+        return Err(format!("resume: 시퀀스 수 {n} 비정상"));
+    }
+    let mut prompts = Vec::with_capacity(n);
+    let mut outs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let pl = get_u32(&b, &mut p)? as usize;
+        if pl > 1 << 24 || p + pl * 4 > b.len() {
+            return Err("resume: 프롬프트 길이 비정상".into());
+        }
+        let mut pr = Vec::with_capacity(pl);
+        for _ in 0..pl {
+            pr.push(get_u32(&b, &mut p)?);
+        }
+        let ol = get_u32(&b, &mut p)? as usize;
+        if ol > 1 << 24 || p + ol * 4 > b.len() {
+            return Err("resume: 출력 길이 비정상".into());
+        }
+        let mut ov = Vec::with_capacity(ol);
+        for _ in 0..ol {
+            ov.push(get_u32(&b, &mut p)?);
+        }
+        prompts.push(pr);
+        outs.push(ov);
+    }
+    let cl = get_u32(&b, &mut p)? as usize;
+    if p + cl > b.len() {
+        return Err("resume: 엔진 상태 잘림".into());
+    }
+    eng.ckpt_load(&b[p..p + cl])?;
+    Ok((prompts, outs))
 }
