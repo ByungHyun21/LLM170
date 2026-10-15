@@ -6,6 +6,7 @@
 
 #include <cuda_fp16.h>
 
+#include "cast_common.cuh"
 #include "g4_common.cuh"
 
 // ── MoE(W4-1, 35B-A3B) 보조 커널 ──
@@ -288,6 +289,26 @@ extern "C" __global__ void w4a16_cast_bf16(const float* __restrict__ in,
     } else {
         for (int j = i4 * 4; j < n; ++j) {
             out[j] = f2bf16(in[j]);
+        }
+    }
+}
+
+// [A2b 2026-10-15] f32 → (hi|lo) f16 쌍 패킹 — 그룹 mma 2-pass의 A 미러.
+// 4B/원소(f32와 동일 바이트)라 스테이징·cp.async 16B 정렬 계약이 그대로다.
+// float4 벡터(캐스트_bf16 동형).
+extern "C" __global__ void w4a16_cast_hilo(const float* __restrict__ in,
+                                           unsigned* __restrict__ out, int n) {
+    const int i4 = blockIdx.x * blockDim.x + threadIdx.x;
+    if ((i4 + 1) * 4 <= n) {
+        const float4 v = *reinterpret_cast<const float4*>(in + i4 * 4);
+        unsigned* o = out + i4 * 4;
+        o[0] = hilo_pack(v.x);
+        o[1] = hilo_pack(v.y);
+        o[2] = hilo_pack(v.z);
+        o[3] = hilo_pack(v.w);
+    } else {
+        for (int j = i4 * 4; j < n; ++j) {
+            out[j] = hilo_pack(in[j]);
         }
     }
 }
@@ -879,11 +900,16 @@ __device__ __forceinline__ unsigned deq_pair_b_d(unsigned qw, int tt, float sc) 
 #define DGRP_N 64
 #define DGRP_KC 32
 
+// [A2b 2026-10-15] 2-pass 정밀도 회수: A = (hi|lo) f16 쌍 packed u32(4B/원소),
+// B = f16 단일 — mma 2회(hi·B + lo·B). A의 f32→f16 반올림(지배 오차원)을
+// ~2^-22로 낮춰 f32 FFMA 클래스에 근접시킨다(잔여 = B 반올림·누산 순서).
+// B hi/lo 3-pass는 en/ko 비트동일·+26% 비용으로 기각(실측 — g4_common 주석).
+// A 스테이징만 2×(packed) — cp.async 16B = 4원소, 정렬 계약 동일.
 extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64(
     const unsigned long long* __restrict__ tab, int base,
     const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
     const unsigned* __restrict__ goff,
-    const unsigned short* __restrict__ x, int xstride, int sp,
+    const unsigned* __restrict__ x, int xstride, int sp,
     float* __restrict__ out, int n, int k)
 {
     const int e = blockIdx.x;
@@ -905,7 +931,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64(
     const int ntw = (warp & 1) * 32; // 2 n워프 × 32 = N64
     const int k8 = k >> 3;
     const int kg = k >> 5; // g32
-    __shared__ __align__(16) unsigned short xs[2][DGRP_M][DGRP_KC + 8];
+    __shared__ __align__(16) unsigned xs[2][DGRP_M][DGRP_KC + 8]; // packed hi|lo
     __shared__ unsigned short ws[2][DGRP_N][DGRP_KC + 8];
     const unsigned mtiles = (cnt + DGRP_M - 1) / DGRP_M;
     for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
@@ -916,27 +942,28 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64(
             ((float*)c)[i] = 0.0f;
         }
         auto stage_ab = [&](int st, int kn) {
-            for (int ee = tid; ee < DGRP_M * DGRP_KC / 8; ee += 256) {
-                const int r = ee / (DGRP_KC / 8);
-                const int c8 = ee % (DGRP_KC / 8);
-                const int gi = kn + c8 * 8;
+            for (int ee = tid; ee < DGRP_M * DGRP_KC / 4; ee += 256) {
+                const int r = ee / (DGRP_KC / 4);
+                const int c4 = ee % (DGRP_KC / 4);
+                const int gi = kn + c4 * 4;
                 if (rbase + r < cnt) {
                     const unsigned sl = gs[rbase + r];
                     const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
-                    if (gi + 7 < k) {
-                        cp_async16(&xs[st][r][c8 * 8], &x[xoff + gi]);
+                    if (gi + 3 < k) {
+                        cp_async16(&xs[st][r][c4 * 4], &x[xoff + gi]);
                     } else {
-                        unsigned short t8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-                        for (int j = 0; j < 8; ++j) {
+                        unsigned t4[4] = {0u, 0u, 0u, 0u};
+                        for (int j = 0; j < 4; ++j) {
                             if (gi + j < k) {
-                                t8[j] = x[xoff + gi + j];
+                                t4[j] = x[xoff + gi + j];
                             }
                         }
-                        *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) =
-                            *reinterpret_cast<const uint4*>(t8);
+                        *reinterpret_cast<uint4*>(&xs[st][r][c4 * 4]) =
+                            *reinterpret_cast<const uint4*>(t4);
                     }
                 } else {
-                    *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) = make_uint4(0u, 0u, 0u, 0u);
+                    *reinterpret_cast<uint4*>(&xs[st][r][c4 * 4]) =
+                        make_uint4(0u, 0u, 0u, 0u);
                 }
             }
             for (int ee = tid; ee < DGRP_N * DGRP_KC / 8; ee += 256) {
@@ -953,9 +980,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64(
                 const unsigned qw = live ? __ldcs(&q[(size_t)rr * k8 + (gi >> 3)]) : 0u;
                 if (live) {
 #pragma unroll
-                    for (int jp = 0; jp < 4; ++jp) {
-                        *reinterpret_cast<unsigned*>(&ws[st][r][c8 * 8 + jp * 2]) =
-                            deq_pair_b_d(qw, jp, scf);
+                    for (int j = 0; j < 8; ++j) {
+                        ws[st][r][c8 * 8 + j] = deq_hi_e(qw, j, scf);
                     }
                 } else {
 #pragma unroll
@@ -979,20 +1005,29 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64(
 #pragma unroll
             for (int ks = 0; ks < DGRP_KC / 16; ++ks) {
                 const int kb = ks * 16;
-                const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
-                const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
-                const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
-                const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
+                const unsigned p00 = xs[cur][mt + g][kb + 2 * tt];
+                const unsigned p01 = xs[cur][mt + g][kb + 2 * tt + 1];
+                const unsigned p10 = xs[cur][mt + g + 8][kb + 2 * tt];
+                const unsigned p11 = xs[cur][mt + g + 8][kb + 2 * tt + 1];
+                const unsigned p20 = xs[cur][mt + g][kb + 2 * tt + 8];
+                const unsigned p21 = xs[cur][mt + g][kb + 2 * tt + 9];
+                const unsigned p30 = xs[cur][mt + g + 8][kb + 2 * tt + 8];
+                const unsigned p31 = xs[cur][mt + g + 8][kb + 2 * tt + 9];
+                const unsigned ah0 = hilo_hi(p00, p01);
+                const unsigned al0 = hilo_lo(p00, p01);
+                const unsigned ah1 = hilo_hi(p10, p11);
+                const unsigned al1 = hilo_lo(p10, p11);
+                const unsigned ah2 = hilo_hi(p20, p21);
+                const unsigned al2 = hilo_lo(p20, p21);
+                const unsigned ah3 = hilo_hi(p30, p31);
+                const unsigned al3 = hilo_lo(p30, p31);
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt) {
                     const int nb = ntw + nt * 8;
                     const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
                     const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                        : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                    mma_f16(c[nt], ah0, ah1, ah2, ah3, b0, b1);
+                    mma_f16(c[nt], al0, al1, al2, al3, b0, b1);
                 }
             }
             __syncthreads();

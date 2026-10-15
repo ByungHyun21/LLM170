@@ -61,6 +61,15 @@ impl W4a16Dec {
         Ok(self.dx16.ptr)
     }
 
+    /// [A2b 2026-10-15] 그룹 mma A의 (hi|lo) packed 미러(u32/원소 = 4B) —
+    /// `w4a16_cast_hilo` 산출 전용. 3-pass(A hi/lo)의 스테이징 소스.
+    pub(super) fn ensure_dxp(&mut self, n: usize) -> Result<CUdeviceptr, String> {
+        if n > self.dxp.cap {
+            self.dxp = self.realloc_buf(self.dxp, n * 4, n, "dxp_cap")?;
+        }
+        Ok(self.dxp.ptr)
+    }
+
     pub(super) fn ensure_ew_bufs(&mut self, n: usize) -> Result<(), String> {
         if n > self.ew.cap {
             self.cc.capture_guard("ew_cap"); // [R12]

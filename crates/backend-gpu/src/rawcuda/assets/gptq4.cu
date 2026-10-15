@@ -1193,14 +1193,17 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
 // A = 슬롯→토큰 매핑으로 모은 x 행(f16 스테이징), B = g32 디퀀트(f16).
 // 프래그먼트·타일 계약은 T1과 동일(명시 판독 — ldmatrix 전치 불일치 회피).
 // 판정은 토큰 골든(계약 완화 — 허용오차 등급).
-// [S5-lite 채택 2026-10-11] GRP_KC 32→64 — grp/grp2 전용(공용 MMA_KC는
-// dense mma 계약·점유 실측으로 32 유지 — marlin-A3 기각 이력). 근거: grp
-// 병목 = 청크당 배리어 2회 스톨 41%(§1.2 ncu) — KC 2배 = 배리어·스테이징
-// 횟수 절반. 값 비트동일(mma k순서 불변 — 35B 골든 일치 실측). 실측: pp512
+// [S5-lite 채택 2026-10-11] GRP_KC 32→64 이력 — 근거: grp 병목 = 청크당
+// 배리어 2회 스톨 41%(§1.2 ncu) — KC 2배 = 배리어·스테이징 횟수 절반. 값
+// 비트동일(mma k순서 불변 — 35B 골든 일치 실측). 실측: pp512
 // 4520→4695(+3.7%)·pp4096 4110→4240(+3.2%). smem 27.6KB·스필 0.
 // (라우팅 분포 실측 부기: 256전문가·4096슬롯 → 전문가당 1-16 다수 —
 // M타일 축소(M32/16)는 B 디큐트 타일 중복 때문에 역효과로 모델링됨.)
-#define GRP_KC 64
+// [A2b 2026-10-15] 2-pass(A packed hi/lo + B f16 단일)로 smem이 늘어 **32로
+// 환원** — A 20.5KB + B 10.2KB = 30.7KB(2~3블록/SM). KC=64면 55KB(블록 1개)
+// 로 점유가 반감 — 배리어 상각(위 실측)보다 점유를 우선한다. (B hi/lo
+// 3-pass 실측 = en/ko 비트동일·비용 +26% — 기각.)
+#define GRP_KC 32
 extern "C" __global__ void w4a16_gemm_g32_mma_grp(
     const unsigned long long* __restrict__ tab, int base,
     const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
@@ -1381,11 +1384,14 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp(
 // mma 파이프 유휴) — 청크당 작업을 2배로 해 배리어·스테이징을 상각한다.
 // A 스테이징 1회 공유(발사 1회로 게이트+업 동시), B만 2벌. 워프 n매핑
 // ntw=(warp&1)*32·nt 0..3. 요소별 mma 누산 순서 동일 — 토큰 골든 판정.
+// [A2b 2026-10-15] 2-pass 정밀도 회수(아래 grp_d64와 동형): A = (hi|lo) packed
+// u32, B = f16 단일, mma 2회(A_hi·B + A_lo·B — A 반올림 제거, f32 클래스 근접).
+// 활성은 gemma4·35B 공용(모델별 선택 아님). B hi/lo 3-pass는 실측 기각.
 extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
     const unsigned long long* __restrict__ tab, int base,
     const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
     const unsigned* __restrict__ goff,
-    const unsigned short* __restrict__ x, int xstride, int sp,
+    const unsigned* __restrict__ x, int xstride, int sp,
     float* __restrict__ out, float* __restrict__ out2, int n, int k)
 {
     const int e = blockIdx.x;
@@ -1410,7 +1416,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
     const int ntw = (warp & 1) * 32; // 2 n워프 × 32 = N64(게이트 32+업 32)
     const int k8 = k >> 3;
     const int kg = k >> 5; // g32
-    __shared__ __align__(16) unsigned short xs[2][GRP_M][GRP_KC + 8];
+    __shared__ __align__(16) unsigned xs[2][GRP_M][GRP_KC + 8]; // packed hi|lo
     __shared__ unsigned short ws[2][2 * GRP_N][GRP_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
     for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
@@ -1421,27 +1427,28 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
             ((float*)c)[i] = 0.0f;
         }
         auto stage_ab = [&](int st, int kn) {
-            for (int ee = tid; ee < GRP_M * GRP_KC / 8; ee += 256) {
-                const int r = ee / (GRP_KC / 8);
-                const int c8 = ee % (GRP_KC / 8);
-                const int gi = kn + c8 * 8;
+            for (int ee = tid; ee < GRP_M * GRP_KC / 4; ee += 256) {
+                const int r = ee / (GRP_KC / 4);
+                const int c4 = ee % (GRP_KC / 4);
+                const int gi = kn + c4 * 4;
                 if (rbase + r < cnt) {
                     const unsigned sl = gs[rbase + r];
                     const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
-                    if (gi + 7 < k) {
-                        cp_async16(&xs[st][r][c8 * 8], &x[xoff + gi]);
+                    if (gi + 3 < k) {
+                        cp_async16(&xs[st][r][c4 * 4], &x[xoff + gi]);
                     } else {
-                        unsigned short t8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-                        for (int j = 0; j < 8; ++j) {
+                        unsigned t4[4] = {0u, 0u, 0u, 0u};
+                        for (int j = 0; j < 4; ++j) {
                             if (gi + j < k) {
-                                t8[j] = x[xoff + gi + j];
+                                t4[j] = x[xoff + gi + j];
                             }
                         }
-                        *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) =
-                            *reinterpret_cast<const uint4*>(t8);
+                        *reinterpret_cast<uint4*>(&xs[st][r][c4 * 4]) =
+                            *reinterpret_cast<const uint4*>(t4);
                     }
                 } else {
-                    *reinterpret_cast<uint4*>(&xs[st][r][c8 * 8]) = make_uint4(0u, 0u, 0u, 0u);
+                    *reinterpret_cast<uint4*>(&xs[st][r][c4 * 4]) =
+                        make_uint4(0u, 0u, 0u, 0u);
                 }
             }
             for (int ee = tid; ee < 2 * GRP_N * GRP_KC / 8; ee += 256) {
@@ -1461,14 +1468,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
                 // L2를 A(x16) 재사용에 남긴다.
                 const unsigned qw = live ? __ldcs(&q[(size_t)rr * k8 + (gi >> 3)]) : 0u;
                 if (live) {
-                    // [half2 비트매직 2026-10-11] 원소별 (float)nib*scf+f2h
-                    // (ALU ~7/elem·STS.16×8) → deq_pair_b 쌍 처리(hsub2 정확
-                    // 경로 — 비트동일, g128 mma 입증 부품 재사용·STS.32×4).
-                    // 실측 35B pp512/4096 +0.3%(골든 유지).
 #pragma unroll
-                    for (int jp = 0; jp < 4; ++jp) {
-                        *reinterpret_cast<unsigned*>(&ws[st][r][c8 * 8 + jp * 2]) =
-                            deq_pair_b(qw, jp, scf);
+                    for (int j = 0; j < 8; ++j) {
+                        ws[st][r][c8 * 8 + j] = deq_hi_e(qw, j, scf);
                     }
                 } else {
 #pragma unroll
@@ -1492,20 +1494,29 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
 #pragma unroll
             for (int ks = 0; ks < GRP_KC / 16; ++ks) {
                 const int kb = ks * 16;
-                const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
-                const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
-                const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
-                const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
+                const unsigned p00 = xs[cur][mt + g][kb + 2 * tt];
+                const unsigned p01 = xs[cur][mt + g][kb + 2 * tt + 1];
+                const unsigned p10 = xs[cur][mt + g + 8][kb + 2 * tt];
+                const unsigned p11 = xs[cur][mt + g + 8][kb + 2 * tt + 1];
+                const unsigned p20 = xs[cur][mt + g][kb + 2 * tt + 8];
+                const unsigned p21 = xs[cur][mt + g][kb + 2 * tt + 9];
+                const unsigned p30 = xs[cur][mt + g + 8][kb + 2 * tt + 8];
+                const unsigned p31 = xs[cur][mt + g + 8][kb + 2 * tt + 9];
+                const unsigned ah0 = hilo_hi(p00, p01);
+                const unsigned al0 = hilo_lo(p00, p01);
+                const unsigned ah1 = hilo_hi(p10, p11);
+                const unsigned al1 = hilo_lo(p10, p11);
+                const unsigned ah2 = hilo_hi(p20, p21);
+                const unsigned al2 = hilo_lo(p20, p21);
+                const unsigned ah3 = hilo_hi(p30, p31);
+                const unsigned al3 = hilo_lo(p30, p31);
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt) {
                     const int nb = ntw + nt * 8;
                     const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
                     const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                        : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                    mma_f16(c[nt], ah0, ah1, ah2, ah3, b0, b1);
+                    mma_f16(c[nt], al0, al1, al2, al3, b0, b1);
                 }
             }
             __syncthreads();

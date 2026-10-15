@@ -77,27 +77,52 @@ impl W4a16Dec {
         )
     }
 
-    /// [marlin-A5] f32 → dx16(f16) 캐스트만 — MoE 그룹 GEMM의 A(xn/act)용.
-    /// 값은 cast_x32와 동일 반올림(비트 동일) — GEMM A 대역 절반.
-    pub(in crate::rawcuda::w4a16_dec) fn cast_x16(
+    /// [A2b 2026-10-15] ew_gelu를 명시 f32 버퍼에 기록(슬롯 비경유) — 그룹 mma
+    /// 경로의 act(전문가 활성) 산출. `ew_dev`(silu)의 gelu판, 미러 없음
+    /// (A 미러는 `cast_hilo_dev`가 packed로 만든다).
+    pub(in crate::rawcuda::w4a16_dec) fn ew_gelu_dev(
+        &mut self,
+        g_dev: CUdeviceptr,
+        u_dev: CUdeviceptr,
+        y_dev: CUdeviceptr,
+        n: usize,
+    ) -> Result<(), String> {
+        if n == 0 {
+            return Err("ew_gelu: n=0".into());
+        }
+        let f = self.cc.function("ew_gelu")?;
+        let mut nn = n as i32;
+        let (mut a0, mut a1, mut a2, mut a3, mut a4) = (g_dev, u_dev, y_dev, 0u64, 0u64);
+        self.cc.launch(
+            f,
+            n.div_ceil(128) as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l6(&mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut nn),
+        )
+    }
+
+    /// [A2b 2026-10-15] f32 → (hi|lo) f16 packed(A 미러 4B/원소) — 그룹 mma
+    /// 3-pass의 A 소스. 캡처 중 재할당은 capture_guard로 즉시 실패(사전 warm 계약).
+    pub(in crate::rawcuda::w4a16_dec) fn cast_hilo_dev(
         &mut self,
         x_dev: CUdeviceptr,
         n: usize,
     ) -> Result<CUdeviceptr, String> {
-        if n > self.dx16.cap {
-            self.dx16 = self.realloc_buf(self.dx16, n * 2, n, "dx16_cap")?;
+        if n == 0 {
+            return Err("cast_hilo: n=0".into());
         }
-        let f = self.cc.function("w4a16_cast_x32")?;
-        let mut nn = n as i32;
-        let (mut c0, mut c1, mut c2) = (x_dev, 0u64, self.dx16.ptr);
+        let p = self.ensure_dxp(n)?;
+        let f = self.cc.function("w4a16_cast_hilo")?;
+        let (mut a0, mut a1, mut nn) = (x_dev, p, n as i32);
         self.cc.launch(
             f,
-            n.div_ceil(256) as u32,
+            n.div_ceil(1024) as u32,
             1,
             256,
-            &mut crate::rawcuda::args::l4(&mut c0, &mut c1, &mut c2, &mut nn),
+            &mut crate::rawcuda::args::l3(&mut a0, &mut a1, &mut nn),
         )?;
-        Ok(self.dx16.ptr)
+        Ok(p)
     }
 
     /// [R10 2026-10-10] 체인 선형 경로 — 3체인(단독 t=1 / 프리필 t≥2 /
@@ -311,27 +336,6 @@ impl W4a16Dec {
         )
     }
 
-    /// [4.1 2026-10-11] ew + f16 미러만 — MoE 그룹 GEMM A(cast_x16 대체).
-    pub(in crate::rawcuda::w4a16_dec) fn ew_dev_mirror(
-        &mut self,
-        g_dev: CUdeviceptr,
-        u_dev: CUdeviceptr,
-        y_dev: CUdeviceptr,
-        n: usize,
-    ) -> Result<(), String> {
-        if n == 0 {
-            return Err("ew: n=0".into());
-        }
-        self.ensure_dx16(n)?;
-        let f = self.cc.function("ew")?;
-        let mut nn = n as i32;
-        let (mut a0, mut a1, mut a2, mut a3, mut a4) = (g_dev, u_dev, y_dev, 0u64, self.dx16.ptr);
-        self.cc.launch(
-            f,
-            n.div_ceil(128) as u32,
-            1,
-            128,
-            &mut crate::rawcuda::args::l6(&mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut nn),
-        )
-    }
+    // [A2b 2026-10-15] (구 ew_dev_mirror 삭제 — A 미러는 cast_hilo_dev의
+    // packed(hi|lo)로 대체. 3-pass가 f16 미러를 소비하지 않는다.)
 }

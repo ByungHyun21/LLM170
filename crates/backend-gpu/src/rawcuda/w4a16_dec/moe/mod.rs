@@ -449,8 +449,9 @@ impl W4a16Dec {
                     "[moe-cnt] il={il} slots={ns} sum={sum} tiles M64={t64} M32={t32} M16={t16} hist[0|1-8|9-16|17-32|33-48|49-64|65-96|97+]={hist:?}"
                 );
             }
-            // [marlin-A5] A는 f16(xn 미러) — 그룹 GEMM A 재판독 절반.
-            let x16 = self.cast_x16(xn, t * h)?;
+            // [A2b 2026-10-15] A = (hi|lo) packed 미러 — 3-pass(f16 반올림
+            // 회수). 종전 f16 미러(cast_x16)를 대체(grp 커널 A 계약 변경).
+            let x16 = self.cast_hilo_dev(xn, t * h)?;
             // [§1.2 2026-10-11] 게이트·업 2N 융합 — 발사 1회(A 스테이징·배리어 상각).
             self.gemm_g32_mma_grp2_launch(
                 base,
@@ -466,22 +467,14 @@ impl W4a16Dec {
             self.gemv_experts_launch(base, ns, xn, h, tk, self.moe.exp.gate, n_ff, h)?;
             self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.moe.exp.up, n_ff, h)?;
         }
-        if group {
-            // [4.1 2026-10-11] ew가 f16 미러 동시 기록 — cast_x16 노드 제거.
-            self.ew_dev_mirror(
-                self.moe.exp.gate,
-                self.moe.exp.up,
-                self.moe.exp.act,
-                ns * n_ff,
-            )?;
-        } else {
-            self.ew_dev(
-                self.moe.exp.gate,
-                self.moe.exp.up,
-                self.moe.exp.act,
-                ns * n_ff,
-            )?;
-        }
+        // [A2b 2026-10-15] act는 f32 기록(미러 없음) — down A packed 미러는
+        // cast_hilo가 만든다(3-pass). 종전 ew_dev_mirror(grp 전용)는 삭제 경로.
+        self.ew_dev(
+            self.moe.exp.gate,
+            self.moe.exp.up,
+            self.moe.exp.act,
+            ns * n_ff,
+        )?;
         if llm170_diag::flag::on_nonzero("LLM170_MOE_DBG") {
             let mut vb = vec![0u8; ns * n_ff * 4];
             self.cc
@@ -499,16 +492,9 @@ impl W4a16Dec {
             eprintln!("[t-dbg] act nan-slots={bad:?} ns={ns}");
         }
         if group {
-            // [B2 2026-10-12] down N64 변형 — grp 배리어 상각(골든 판정).
-            self.gemm_g32_mma_grp_d64_launch(
-                base + 2,
-                self.dx16.ptr,
-                n_ff,
-                1,
-                self.moe.exp.dn,
-                h,
-                n_ff,
-            )?;
+            // [A2b 2026-10-15] down N64 변형 — A는 packed(hi|lo) 미러(3-pass).
+            let ap = self.cast_hilo_dev(self.moe.exp.act, ns * n_ff)?;
+            self.gemm_g32_mma_grp_d64_launch(base + 2, ap, n_ff, 1, self.moe.exp.dn, h, n_ff)?;
         } else {
             self.gemv_experts_launch(
                 base + 2,

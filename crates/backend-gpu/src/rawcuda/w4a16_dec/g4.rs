@@ -537,6 +537,12 @@ impl W4a16Dec {
         self.g4_scratch_slot(8, th)?; // E(o_proj / ffn_down — h 폭)
         self.g4_scratch_slot(9, th)?; // F(hh→h1→merged — h 폭)
         self.g4_scratch_slot(Self::G4_HEADOUT, t_max * self.head_n * 4)?;
+        // [A2b 2026-10-15] 그룹 mma A packed(hi|lo) 미러 상한 — cast_hilo가
+        // 캡처 중 재할당하면 capture_guard로 즉시 실패(g4_capture_failed 고정).
+        if self.moe.moe_ffn > 0 && self.moe.n_experts > 0 {
+            let ns_max = t_max * self.moe.top_k.max(1);
+            self.ensure_dxp(ns_max * self.moe.moe_ffn.max(h))?;
+        }
         Ok(())
     }
 
@@ -724,22 +730,48 @@ impl W4a16Dec {
                 &mut crate::rawcuda::args::l4(&mut p_w, &mut p_i, &mut p_p, &mut p_n),
             )?;
         }
-        // ④ 전문가 — 상주 GEMV 융합(gate+up+GLU) + down + 누적(sp=tk).
-        // [A2 2026-10-15] 그룹드 mma(CMP 방향)는 hi/lo 3-pass 정밀도 회수와
-        // 함께 재도입한다(현 슬롯당 GEMV = f32 비트동일 기준선).
+        // ④ 전문가 — 상주 경로 2종:
+        //  [A2b 2026-10-15] t>G4_TROW_MAX(프리필 청크) = **그룹드 mma 3-pass**
+        //  (CMP 방향 — GA100-class는 FP32 약·TC 강·HBM 넓음): 전문가-우선
+        //  정렬 후 가중을 전문가당 1회만 판독하고, A·B의 f16 반올림을 hi/lo
+        //  2분해로 회수한다(잔여 = f32 누산 순서 — eval 밴드 판정).
+        //  t≤16(디코드 배치·단문 청크) = 융합 GEMV(f32 비트동일 기준선).
         let ns = t * tk;
         let base = il * n_exp * 3;
-        self.gemv_experts_glu_launch(base, ns, dxn, h, tk, self.moe.exp.act, n_ff, h)?;
-        self.gemv_experts_launch(
-            base + 2,
-            ns,
-            self.moe.exp.act,
-            n_ff,
-            1,
-            self.moe.exp.dn,
-            h,
-            n_ff,
-        )?;
+        if t > G4_TROW_MAX && n_exp <= 1024 {
+            self.moe_align_launch(ns)?;
+            let xp = self.cast_hilo_dev(dxn, t * h)?;
+            self.gemm_g32_mma_grp2_launch(
+                base,
+                xp,
+                h,
+                tk,
+                self.moe.exp.gate,
+                self.moe.exp.up,
+                n_ff,
+                h,
+            )?;
+            self.ew_gelu_dev(
+                self.moe.exp.gate,
+                self.moe.exp.up,
+                self.moe.exp.act,
+                ns * n_ff,
+            )?;
+            let ap = self.cast_hilo_dev(self.moe.exp.act, ns * n_ff)?;
+            self.gemm_g32_mma_grp_d64_launch(base + 2, ap, n_ff, 1, self.moe.exp.dn, h, n_ff)?;
+        } else {
+            self.gemv_experts_glu_launch(base, ns, dxn, h, tk, self.moe.exp.act, n_ff, h)?;
+            self.gemv_experts_launch(
+                base + 2,
+                ns,
+                self.moe.exp.act,
+                n_ff,
+                1,
+                self.moe.exp.dn,
+                h,
+                n_ff,
+            )?;
+        }
         let out = self.g4_scratch_slot(out_slot, t * h * 4)?;
         self.moe_accum_dev(self.moe.moe_wt, self.moe.exp.dn, out, tk, ns, h)?;
         Ok(out)
