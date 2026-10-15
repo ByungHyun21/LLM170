@@ -11,6 +11,7 @@ pub mod ops;
 pub mod plan;
 pub mod quant;
 pub mod qwen35;
+pub mod qwen4exp;
 pub mod sampler;
 pub mod spec;
 pub mod st;

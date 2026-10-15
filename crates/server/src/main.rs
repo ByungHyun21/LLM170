@@ -700,6 +700,10 @@ fn model_ctx_info(p: &std::path::Path) -> Result<llm170_core::qwen35::CtxInfo, S
     let arch = llm170_core::qwen35::bind::dir_arch(p).unwrap_or_default();
     if llm170_core::gemma4::bind::arch_ok(&arch) {
         llm170_core::gemma4::ctx_info(p)
+    } else if llm170_core::qwen4exp::arch_ok(&arch) {
+        // [P7 2026-10-15] FN(qwen4_exp) 골격 — ctx 파생·가드 입력만 등록
+        // (엔진 브링업은 §2.M 트랙 — 가중치 로드 불가 상태 그대로).
+        llm170_core::qwen4exp::ctx_info(p)
     } else {
         llm170_core::qwen35::ctx_info(p)
     }
