@@ -73,6 +73,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
     let mut chunk = 1usize;
     let mut bos: Option<u32> = None;
     let mut route = false;
+    let mut kld = false;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -111,6 +112,8 @@ fn ppl(args: &[String]) -> Result<String, String> {
             // [P4 2026-10-15] 라우팅 top-k 캡처(gemma4 전용 — MoE 진단·agree
             // Jaccard 소스). 그래프 캡처 비활성 직접 발사 경로(수치 불변).
             "--route" => route = true,
+            // [§2.I 2026-10-16] top-k 로짓 덤프 — agree KLD 근사 소스.
+            "--kld" => kld = true,
             "--limit" => {
                 limit = it
                     .next()
@@ -160,10 +163,13 @@ fn ppl(args: &[String]) -> Result<String, String> {
     // 동일 클래스)로 전 위치 로짓을 회수한다(경로 계측기 — 채택/기각 판정).
     let arch = llm170_core::qwen35::bind::dir_arch(Path::new(&dir)).unwrap_or_default();
     if llm170_core::gemma4::bind::arch_ok(&arch) {
-        return ppl_g4(&dir, &toks, n, ctx, chunk, &out_path, json, route);
+        return ppl_g4(&dir, &toks, n, ctx, chunk, &out_path, json, route, kld);
     }
     if route {
         return Err("--route는 gemma4(MoE 라우팅) 전용".into());
+    }
+    if kld {
+        return Err("--kld는 gemma4 전용(현 계측 축)".into());
     }
     let model = llm170_core::qwen35::Model::load(Path::new(&dir)).map_err(|e| e.to_string())?;
     let hp = model.hp.clone();
@@ -245,7 +251,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     eval_report(
-        &dir, n, chunk, head_gpu, &rows, nll_sum, ms, &out_path, json, None,
+        &dir, n, chunk, head_gpu, &rows, nll_sum, ms, &out_path, json, None, None,
     )
 }
 
@@ -262,6 +268,7 @@ fn eval_report(
     out_path: &Option<String>,
     json: bool,
     route: Option<(&[String], usize, usize)>,
+    kld: Option<&[String]>,
 ) -> Result<String, String> {
     let mean = nll_sum / rows.len() as f64;
     let ppl = mean.exp();
@@ -271,14 +278,32 @@ fn eval_report(
         // top-k id 16진 — agree 자카드 소스). 형식 v1 호환(무route는 5열).
         if let Some((rs, nl, tk)) = route {
             s.push_str(&format!(
-                "# w4a16-eval dump v1 model={dir} tokens={n} head={} chunk={chunk} nll_sum={nll_sum:.9} ppl={ppl:.9} route=L{nl}k{tk}\n",
-                if head_gpu { "gpu" } else { "cpu" }
+                "# w4a16-eval dump v1 model={dir} tokens={n} head={} chunk={chunk} nll_sum={nll_sum:.9} ppl={ppl:.9} route=L{nl}k{tk}{}\n",
+                if head_gpu { "gpu" } else { "cpu" },
+                if kld.is_some() { " kld=16" } else { "" }
             ));
-            s.push_str("# cols: pos target argmax nll margin route\n");
-            for (&(pos, tgt, am, nll, margin), rt) in rows.iter().zip(rs) {
-                s.push_str(&format!(
-                    "{pos}\t{tgt}\t{am}\t{nll:.9}\t{margin:.9}\t{rt}\n"
-                ));
+            s.push_str(if kld.is_some() {
+                "# cols: pos target argmax nll margin route kld\n"
+            } else {
+                "# cols: pos target argmax nll margin route\n"
+            });
+            match kld {
+                Some(ks) if ks.len() == rows.len() => {
+                    for (&(pos, tgt, am, nll, margin), (rt, kt)) in
+                        rows.iter().zip(rs.iter().zip(ks.iter()))
+                    {
+                        s.push_str(&format!(
+                            "{pos}\t{tgt}\t{am}\t{nll:.9}\t{margin:.9}\t{rt}\t{kt}\n"
+                        ));
+                    }
+                }
+                _ => {
+                    for (&(pos, tgt, am, nll, margin), rt) in rows.iter().zip(rs) {
+                        s.push_str(&format!(
+                            "{pos}\t{tgt}\t{am}\t{nll:.9}\t{margin:.9}\t{rt}\n"
+                        ));
+                    }
+                }
             }
         } else {
             s.push_str(&format!(
@@ -327,6 +352,7 @@ fn ppl_g4(
     out_path: &Option<String>,
     json: bool,
     route: bool,
+    kld: bool,
 ) -> Result<String, String> {
     let t0 = std::time::Instant::now();
     let model = llm170_core::gemma4::Model::load(Path::new(dir)).map_err(|e| e.to_string())?;
@@ -342,6 +368,9 @@ fn ppl_g4(
     // 차단 → 직접 발사). 수치 불변(디바이스 moe_idx 판독만).
     let (nl, tk) = (hp.n_layer, hp.top_k.max(1));
     let mut routes: Vec<String> = Vec::new();
+    // [§2.I 2026-10-16] KLD 근사 — top-16 로짓(id:f32비트) 열. 전어휘 저장
+    // 과다(248k×4B/토큰), 합집합 top-k KL로 agree가 근사 판정.
+    let mut klds: Vec<String> = Vec::new();
     if route {
         if hp.n_experts > 256 {
             return Err(format!(
@@ -400,6 +429,13 @@ fn ppl_g4(
             let tgt = toks[g + 1];
             let nll = nll_of(lr, tgt);
             nll_sum += nll;
+            if kld {
+                let mut s = String::with_capacity(16 * 14);
+                for (id, v) in topk_logits(lr, 16) {
+                    s.push_str(&format!("{id:06x}{:08x}", v.to_bits()));
+                }
+                klds.push(s);
+            }
             rows.push((g as u32 + 1, tgt, am, nll, margin));
         }
         dec.slot_pos[0] = (i + t) as u32;
@@ -417,6 +453,7 @@ fn ppl_g4(
         out_path,
         json,
         if route { Some((&routes, nl, tk)) } else { None },
+        if kld { Some(&klds) } else { None },
     )
 }
 
@@ -555,6 +592,9 @@ struct Dump {
     /// [P4 2026-10-15] 라우팅 캡처 덤프 — (n_layer, top_k)와 행별 hex 열.
     route: Option<(usize, usize)>,
     routes: Vec<String>,
+    /// [§2.I 2026-10-16] top-16 로짓 덤프(헤더 kld=16) — agree KLD 소스.
+    kld: bool,
+    klds: Vec<String>,
 }
 
 fn read_dump(path: &str) -> Result<Dump, String> {
@@ -563,12 +603,18 @@ fn read_dump(path: &str) -> Result<Dump, String> {
     let mut nll_sum = None;
     let mut route = None;
     let mut routes = Vec::new();
+    let mut kld = false;
+    let mut klds = Vec::new();
     for (ln, line) in s.lines().enumerate() {
         if line.starts_with('#') {
             if let Some(v) = line.split("nll_sum=").nth(1)
                 && let Some(tok) = v.split_whitespace().next()
             {
                 nll_sum = tok.parse::<f64>().ok();
+            }
+            // [§2.I] kld=16 플래그(라우트 행과 동일 헤더 라인 끝).
+            if line.contains("kld=16") {
+                kld = true;
             }
             // [P4] route=L{층}k{k} — 마지막 헤더 토큰(층·k 메타).
             if let Some(v) = line.split("route=").nth(1)
@@ -589,7 +635,12 @@ fn read_dump(path: &str) -> Result<Dump, String> {
             continue;
         }
         let f: Vec<&str> = line.split_whitespace().collect();
-        let want = if route.is_some() { 6 } else { 5 };
+        let want = match (route.is_some(), kld) {
+            (true, true) => 7,
+            (true, false) => 6,
+            (false, true) => 6,
+            (false, false) => 5,
+        };
         if f.len() != want {
             return Err(format!("{path}:{}: 필드 {want}개 아님: {line}", ln + 1));
         }
@@ -607,9 +658,19 @@ fn read_dump(path: &str) -> Result<Dump, String> {
         if route.is_some() {
             routes.push(f[5].to_string());
         }
+        if kld {
+            klds.push(f[if route.is_some() { 6 } else { 5 }].to_string());
+        }
     }
     if rows.is_empty() {
         return Err(format!("{path}: 유효 행 없음"));
+    }
+    if kld && klds.len() != rows.len() {
+        return Err(format!(
+            "{path}: kld 열 {} != 행 {}",
+            klds.len(),
+            rows.len()
+        ));
     }
     if route.is_some() && routes.len() != rows.len() {
         return Err(format!(
@@ -623,6 +684,8 @@ fn read_dump(path: &str) -> Result<Dump, String> {
         nll_sum,
         route,
         routes,
+        kld,
+        klds,
     })
 }
 
@@ -754,6 +817,27 @@ fn agree(args: &[String]) -> Result<String, String> {
             jflip as f64 / jn as f64 * 100.0,
             wj
         );
+        // [§2.I 2026-10-16] top-16 근사 KL — 로짓 분포 편차의 직접 계측.
+        if da.kld && db.kld {
+            let mut ksum = 0f64;
+            let mut kn = 0usize;
+            let mut kmax = 0f64;
+            for (ra, rb) in da.klds.iter().zip(db.klds.iter()) {
+                let (ta, tb) = (dec_topk(ra), dec_topk(rb));
+                if let (Some(ta), Some(tb)) = (ta, tb) {
+                    let k = kld_topk(&ta, &tb);
+                    ksum += k;
+                    kmax = kmax.max(k);
+                    kn += 1;
+                }
+            }
+            if kn > 0 {
+                route_desc.push_str(&format!(
+                    "\n  로짓 KL(top-16 근사): 쌍 {kn} · 평균 {:.4} · 최대 {kmax:.4}",
+                    ksum / kn as f64
+                ));
+            }
+        }
     }
     Ok(format!(
         "w4a16-eval agree\n  {a}\n  {b}\n  위치 {n} · argmax 일치 {matches} ({rate:.3}%) · 발산 {div}개(실질 {real}·근접 {}) · {div_desc}\n  {flip_m} (실질 기준 margin≥{margin_cut})\n  NLL합 a={sum_a:.6} b={sum_b:.6} (델타 {d_nll:+.4}%)\n  PPL a={ppl_a:.6} b={ppl_b:.6} (델타 {d_ppl:+.4}%){route_desc}",
@@ -772,6 +856,22 @@ fn route_ids(hex: &str) -> Result<Vec<u32>, String> {
             u32::from_str_radix(p, 16).map_err(|e| format!("route: {e}"))
         })
         .collect()
+}
+
+/// [§2.I] kld 열 디코드 — (id, f32비트) 16쌍.
+fn dec_topk(h: &str) -> Option<Vec<(u32, f32)>> {
+    let b = h.as_bytes();
+    if b.len() != 16 * 14 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(16);
+    for i in 0..16 {
+        let id = u32::from_str_radix(std::str::from_utf8(&b[i * 14..i * 14 + 6]).ok()?, 16).ok()?;
+        let bits =
+            u32::from_str_radix(std::str::from_utf8(&b[i * 14 + 6..i * 14 + 14]).ok()?, 16).ok()?;
+        out.push((id, f32::from_bits(bits)));
+    }
+    Some(out)
 }
 
 /// top-k 집합 자카드 = |∩| / |A∪B| (동일 k 전제). 플립 정의 = J < 1.
@@ -1273,6 +1373,45 @@ fn argmax_margin(lg: &[f32]) -> (u32, f32) {
         best - second
     };
     (bi, margin)
+}
+
+/// [§2.I 2026-10-16] top-k 로짓 쌍(id, 값) — KLD 근사 덤프용(전어휘 저장
+/// 과다: 248k×4B/토큰). k=16: 질량 대부분 커버, agree에서 두 덤프의
+/// 합집합 기준 근사 KL 계산.
+fn topk_logits(lg: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let mut idx: Vec<u32> = (0..lg.len() as u32).collect();
+    idx.sort_by(|&a, &b| lg[b as usize].total_cmp(&lg[a as usize]));
+    idx.truncate(k);
+    idx.into_iter().map(|i| (i, lg[i as usize])).collect()
+}
+
+/// 합집합 top-k 근사 KL(P‖Q) — 로그확도 정규화(전합 대신 top-k 합) 후
+/// 누락 토큰은 하한(최소 로짓)으로 채움. 근사 계측(판정 보조).
+fn kld_topk(a: &[(u32, f32)], b: &[(u32, f32)]) -> f64 {
+    const FLOOR: f64 = -30.0;
+    let la = |id: u32| {
+        a.iter()
+            .find(|x| x.0 == id)
+            .map(|x| x.1 as f64)
+            .unwrap_or(FLOOR)
+    };
+    let lb = |id: u32| {
+        b.iter()
+            .find(|x| x.0 == id)
+            .map(|x| x.1 as f64)
+            .unwrap_or(FLOOR)
+    };
+    // 정규화 상수(합집합).
+    let ids: Vec<u32> = a.iter().map(|x| x.0).chain(b.iter().map(|x| x.0)).collect();
+    let za = ids.iter().map(|&i| la(i).exp()).sum::<f64>().ln();
+    let zb = ids.iter().map(|&i| lb(i).exp()).sum::<f64>().ln();
+    ids.iter()
+        .map(|&i| {
+            let pa = (la(i) - za).exp();
+            let qb = (lb(i) - zb).exp().max(1e-30);
+            pa * ((pa / qb).ln())
+        })
+        .sum()
 }
 
 /// -ln p(target) — logsumexp(전 어휘) f64 누적, max 차감.
