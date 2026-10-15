@@ -16,6 +16,18 @@ mkdir -p /tmp/opencode
 NVCC=${NVCC:-nvcc}
 command -v "$NVCC" >/dev/null || { echo "nvcc 없음: $NVCC" >&2; exit 1; }
 A=crates/backend-gpu/src/rawcuda/assets
+# [2.N 2026-10-15] 내용 무결성 매니페스트 — mtime 가드는 "외부 복원이 mtime만
+# 갱신" 사고를 못 잡는다(실측: 옛 fatbin + 새 mtime → 신선도 스킵이 리빌드
+# 누락). 자산별 (소스해시, fatbin해시) 쌍을 기록하고 preflight가 대조한다.
+MAN=$A/FATBINS.manifest
+man_src() { cat "$A/$1.cu" "$A/cast_common.cuh" "$A/g4_common.cuh" | sha256sum | cut -d' ' -f1; }
+man_fb() { sha256sum "$A/$1.fatbin" | cut -d' ' -f1; }
+declare -A MAN_SRC=() MAN_FB=()
+if [ -f "$MAN" ]; then
+    while read -r s f n; do
+        [ -n "${n:-}" ] && { MAN_SRC[$n]=$s; MAN_FB[$n]=$f; }
+    done < "$MAN"
+fi
 
 # [경고 2026-10-11] gptq4.cu(대형·mma)는 nvcc 13.0.48에서 **비결정 컴파일**
 # (동일 플래그 재컴파일 시 SASS 상이 — 코드젠 추첨). 실측 드로우 간 27B
@@ -42,6 +54,7 @@ build() { # name fmad_flag("" | "-fmad=false")
         -gencode arch=compute_89,code=sm_89 \
         -o "$tmp" "$src"
     mv "$tmp" "$out"
+    MAN_SRC[$name]=$(man_src "$name"); MAN_FB[$name]=$(man_fb "$name")
     echo "CUDA $name sm_80+sm_89 fatbin 갱신: $out ${fmad:+($fmad)}"
 }
 
@@ -54,3 +67,17 @@ build embed -fmad=false
 build gptq4 -fmad=false
 build moe   -fmad=false
 build head  -fmad=false
+
+# 매니페스트 갱신 — 리빌드분은 새 쌍, 스킵분은 기존 엔트리 유지(부재 시 현재
+# 상태를 시드 — 최초 도입/매니페스트 삭제 시에만). preflight 5단계가 대조한다.
+for name in smoke norm gdn attn ew embed gptq4 moe head; do
+    if [ -z "${MAN_SRC[$name]:-}" ]; then
+        MAN_SRC[$name]=$(man_src "$name"); MAN_FB[$name]=$(man_fb "$name")
+    fi
+done
+{
+    for name in smoke norm gdn attn ew embed gptq4 moe head; do
+        echo "${MAN_SRC[$name]} ${MAN_FB[$name]} $name"
+    done
+} > "$MAN.tmp" && mv "$MAN.tmp" "$MAN"
+echo "매니페스트 갱신: $MAN"

@@ -64,6 +64,24 @@ for n in gptq4 moe; do
         echo "FAIL — g4_common.cuh 가 $n.fatbin보다 새로움(리빌드 필요)"; stale=1
     fi
 done
+# [2.N 2026-10-15] 내용 무결성 — FATBINS.manifest 대조(build_cuda_kernels.sh가
+# 갱신). mtime 가드만으로는 "소스 변경 + 재빌드 누락(mtime 역전)"과 "fatbin
+# 바이트 외부 복원" 사고를 못 잡는다(실측).
+if [ ! -f "$A/FATBINS.manifest" ]; then
+    echo "FAIL — FATBINS.manifest 부재(scripts/build_cuda_kernels.sh로 생성)"; stale=1
+else
+    while read -r s f n; do
+        [ -n "${n:-}" ] || continue
+        cs=$(cat "$A/$n.cu" "$A/cast_common.cuh" "$A/g4_common.cuh" | sha256sum | cut -d' ' -f1)
+        cf=$(sha256sum "$A/$n.fatbin" | cut -d' ' -f1)
+        if [ "$cs" != "$s" ]; then
+            echo "FAIL — $n: 소스가 매니페스트 빌드와 다름(리빌드: scripts/build_cuda_kernels.sh)"; stale=1
+        fi
+        if [ "$cf" != "$f" ]; then
+            echo "FAIL — $n: fatbin 내용이 매니페스트 기록과 다름(외부 변경/복원?)"; stale=1
+        fi
+    done < "$A/FATBINS.manifest"
+fi
 if [[ "$stale" -eq 0 ]]; then echo "OK"; else fail=1; fi
 
 if [[ "$fail" -eq 0 ]]; then echo "== 프리플라이트 PASS =="; else echo "== 프리플라이트 FAIL =="; exit 1; fi
