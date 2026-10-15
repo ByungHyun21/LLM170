@@ -282,7 +282,8 @@ fn eval_report(
 }
 
 /// ppl — gemma4 아치 분기(서빙 청크 경로 = 단일 클래스). 헤드·softcap은 청크
-/// 내부(원문 embed 행별 int8 W8A16) — 청크 t는 1..=8로 클램프(경로 상한).
+/// 내부(원문 embed 행별 int8 W8A16) — 청크 t는 1..=G4_CHUNK_MAX로 클램프
+/// ([2.N t≤16 2026-10-15] 승격 상한과 동기 — 청크 8/16 동등성 계측용).
 fn ppl_g4(
     dir: &str,
     toks: &[u32],
@@ -302,7 +303,7 @@ fn ppl_g4(
         dec.set_g4_pes(il, cfg.pes_row(il, hp.n_experts))?;
     }
     dec.kv_grow(0, n + 8)?;
-    let chunk = chunk.clamp(1, 8);
+    let chunk = chunk.clamp(1, llm170_backend_gpu::G4_CHUNK_MAX);
     let mut rows: Vec<Row> = Vec::with_capacity(n - 1);
     let mut nll_sum = 0f64;
     let mut i = 0usize;
