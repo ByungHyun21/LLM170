@@ -15,7 +15,10 @@ const ECON_MARGIN: f64 = 0.02;
 /// k 전환 여유(3%).
 const ECON_K_MARGIN: f64 = 0.03;
 /// OFF 후 재프로브 주기(토큰).
-const ECON_PROBE_TOKENS: u64 = 512;
+/// [P5 2026-10-15 512→128 단축] 재프로브가 요청 프리앰블(구조적 저수용)에만
+/// 착륙해 복사/반복 구간 표본이 영영 안 들어오는 교착 실측 — 128이면 요청
+/// 내 복사 구간에 도달한다. 산문 비용 = OFF 중 1라운드/128토큰(≈0.27ms/tok).
+const ECON_PROBE_TOKENS: u64 = 128;
 
 /// EMA 갱신 — 초기 표본은 1/(n+1)(빠른 수렴), 이후 1/8. x = ms/토큰.
 fn econ_ema(v: &AtomicU64, n: &AtomicU64, x: f64) {
@@ -56,6 +59,30 @@ pub(super) fn econ_mtp_maintain() -> bool {
 /// 비용/토큰 = 라운드 ms ÷ 방출 토큰(수용 접두 + 보정/첫 토큰 1).
 pub(super) fn econ_spec_sample(src: u8, k: usize, acc: usize, ms: f64) {
     let per_tok = ms / (acc + 1) as f64;
+    // [P5 2026-10-15 재프로브 재부트스트랩] OFF 상태에서 온 재프로브 라운드가
+    // 확실히 우수(평범 대비 2% 여유 하회)하면 해당 소스 EMA를 그 표본으로
+    // 리셋(n=1). 근거(실측): 복사 워크로드에서 초반 저수용 표본(acc 1·0)이
+    // EMA를 오염시키면 OFF→512토큰 재프로브가 1표본/주기로만 들어와 가중치
+    // 1/8로는 EMA가 회복 불가 — 좋은 재프로브를 봐도 사실상 영구 OFF(라운드
+    // 4↔47 요동의 원인). 레짐 전환 감지용이며 ON/OFF 판정 자체(±2% 히스테리시스)는
+    // 불변 — 산문에서 나쁜 재프로브는 EMA를 낮추지 못해 OFF 유지. 마커 소비 =
+    // swap(0) — 재프로브 여부는 econ_plan이 표시(econ_on은 재프로브 전에 1로
+    // 저장되므로 상태로 판별 불가 — 실측).
+    let probe = SCHED.econ_probe_mark.swap(0, Ordering::Relaxed) == 1;
+    if probe {
+        let plain = econ_get(&SCHED.econ_plain, &SCHED.econ_plain_n);
+        if let Some(p) = plain
+            && per_tok < p * (1.0 - ECON_MARGIN)
+        {
+            SCHED.econ_src[src as usize].store(per_tok.to_bits(), Ordering::Relaxed);
+            SCHED.econ_src_n[src as usize].store(1, Ordering::Relaxed);
+            let i = src as usize * 4 + econ_kidx(k);
+            SCHED.econ_k[i].store(per_tok.to_bits(), Ordering::Relaxed);
+            SCHED.econ_k_n[i].store(1, Ordering::Relaxed);
+            SCHED.econ_rounds.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
     econ_ema(
         &SCHED.econ_src[src as usize],
         &SCHED.econ_src_n[src as usize],
@@ -168,6 +195,7 @@ pub(super) fn econ_plan(mtp_avail: bool) -> Option<(u8, usize)> {
             src = alt as u8;
         }
         SCHED.econ_probe_gen.store(gtok, Ordering::Relaxed);
+        SCHED.econ_probe_mark.store(1, Ordering::Relaxed);
         use_spec = true;
     }
     SCHED.econ_on.store(use_spec as u64, Ordering::Relaxed);

@@ -51,9 +51,20 @@ fn spec_round_impl(
     // [MTP-CHAIN §3.3 2026-10-12] 체인(호스트 왕복 0)으로 재귀 치환 후
     // MTP 재활성 — 임계는 서빙 A/B 재실측 전까지 1 유지(선행 실측 근거
     // 80~82%는 순차 경로 기준 — 체인 편입 후 재계측 필요).
-    // [§7.5] 무수용 억제 — 연속 무수용 시 256토큰마다만 재시도(경제성 게이트와
+    // [§7.5] 무수용 억제 — 연속 무수용 시 재시도 주기마다만 재시도(경제성 게이트와
     // 별개의 빠른 억제기: 수용 0이 반복되는 발화는 비용만 쓰고 수용이 없음).
-    if s.spec_miss >= 1 && (s.generated & 255) != 0 {
+    // [P5 2026-10-15 백오프] 주기 = miss 단계별 32/128/256. 근거(실측): 고정
+    // 256은 요청 프리앰블(구조적 저수용 — 모델 자기 서술)의 미스 1~2개로
+    // 스펙 황금지(복사·반복 구간) 시작 전에 요청을 잠가버렸다(512토큰 중
+    // 라운드 2~3). 단계 백오프는 프리앰블 미스를 빠르게 벗어나게 하고,
+    // 산문(연속 미스)은 종전 256으로 수렴 — 산문 튜닝(§7.5)의 안정 상태 불변.
+    let retry_mask: u32 = match s.spec_miss {
+        0 => 0,
+        1 => 31,
+        2 => 127,
+        _ => 255,
+    };
+    if s.spec_miss >= 1 && (s.generated & retry_mask) != 0 {
         return Ok(false);
     }
     // 샘플드 정책 한정 — 비greedy는 샘플러 필수(종전 조건 그대로).
@@ -254,8 +265,16 @@ fn spec_round_impl(
     // [진단 2026-10-13] 라운드 마커 — 비결정성 분기 지점 대조용(토큰 인덱스 포함).
     if dbg {
         eprintln!(
-            "[spec-dbg] gen={} src={} k={} t={} acc={} corr={}",
-            s.generated, src, kk, t, acc, corr
+            "[spec-dbg] gen={} src={} k={} t={} acc={} corr={} tail={:?} draft={:?} verify={:?}",
+            s.generated,
+            src,
+            kk,
+            t,
+            acc,
+            corr,
+            &s.tokens[s.tokens.len().saturating_sub(4)..],
+            &draft[..draft.len().min(4)],
+            &toks[..toks.len().min(4)]
         );
     }
     let t_mtp = std::time::Instant::now();
