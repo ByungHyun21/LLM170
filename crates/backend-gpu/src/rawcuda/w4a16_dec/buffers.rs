@@ -496,11 +496,14 @@ impl W4a16Dec {
             let ssz = h * n_ff / self.moe.moe_group.max(32) * 2;
             let per_slot = 3 * (qsz + ssz);
             let free = crate::cuda_mem_free().map(|(f, _)| f).unwrap_or(0);
-            // [P6 2026-10-15] free/4 유지 — /2 실험(k=96·t=12)에서 그룹 경로 t>8이
-            // illegal access(128B DtoH)로 실패해 파킹(재현: --moe streaming +
-            // 캐시 k=96 + t=12). k=70(본기 35B)에서 구조 안전 t=8(8·top8=64≤70).
-            // 슬롯 수가 청크 t 상한을 결정 = 상각의 벽(원장 기록).
-            let kmax = ((free / 4) / (self.n_layers * per_slot).max(1) as u64) as usize;
+            // [P6 2026-10-15 채택] free/4 → free/2 — 스트리밍 슬롯 예산이 상각의
+            // 벽이었다(같은 세션 실측: k 70→96만으로 pp512 34.1→52.3 t/s
+            // = +53%·t 8↔12은 무차 — 이득 전부 캐시 크기에서 온다). 비용 =
+            // KV 풀 여유 −1.75GiB(본기). 종전 /4 시절의 t>8 illegal access는
+            // 2패스 스테이징 재작성(80972389)에서 소멸 — t>8 능력은 가드와
+            // 함께 유지하되 운용점은 t=8(무차). FN/CMP에서는 링크(Gen2 x4)가
+            // 병목 — 이 비율은 개발기 기준값(CMP 재실측 필요).
+            let kmax = ((free / 2) / (self.n_layers * per_slot).max(1) as u64) as usize;
             let k = 96usize.min(kmax);
             if k > 0 {
                 let qb = self.n_layers * k * 3 * qsz;
