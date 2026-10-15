@@ -176,6 +176,9 @@ impl W4a16Dec {
         let onesb =
             unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, ones.len() * 4) };
         Self::h2d_chunked(&self.cc, dsc, onesb)?;
+        // [P1 2026-10-16] 단일 슬롯분 ones — reset_state의 d2d 원본(적재 1회).
+        let dsc_ones = self.cc.alloc(n * hv * 128 * 4)?;
+        Self::h2d_chunked(&self.cc, dsc_ones, &onesb[..n * hv * 128 * 4])?;
         (
             self.gdn.dcw,
             self.gdn.dab_c,
@@ -186,6 +189,7 @@ impl W4a16Dec {
         self.gdn.dring = dring;
         self.gdn.dgst = dgst;
         self.gdn.dsc = dsc;
+        self.gdn.dsc_ones = dsc_ones;
         self.gdn.gdn = Some(dims);
         Ok(())
     }

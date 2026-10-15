@@ -466,6 +466,9 @@ pub(super) struct Gdn {
     pub(super) dgst: CUdeviceptr,
     /// [행-스케일 2026-10-13] 상태 행(kdim)별 f32 스케일 [슬롯][n_gdn][h_v][128].
     pub(super) dsc: CUdeviceptr,
+    /// [P1 2026-10-16] 스케일 초기값(1.0) 단일 슬롯분 — reset_state가 동기
+    /// 페이지어블 h2d 대신 d2d(스트림 비동기)로 복사(드레인 제거).
+    pub(super) dsc_ones: CUdeviceptr,
     pub(super) dqkv: CUdeviceptr,
     pub(super) dzv: CUdeviceptr,
     pub(super) dgxn: CUdeviceptr,
@@ -864,6 +867,7 @@ impl W4a16Dec {
                 dring: 0,
                 dgst: 0,
                 dsc: 0,
+                dsc_ones: 0,
                 dqkv: 0,
                 dzv: 0,
                 dgxn: 0,

@@ -157,10 +157,12 @@ impl W4a16Dec {
             let sc_off = (slot * sc_n) as u64 * 4;
             Self::zero_dev(&self.cc, self.gdn.dring + ring_off, ring_bytes)?;
             Self::zero_dev(&self.cc, self.gdn.dgst + st_off, st_bytes)?;
-            let ones = vec![1.0f32; sc_n];
-            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
-            let b = unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, sc_n * 4) };
-            self.cc.h2d(self.gdn.dsc + sc_off, b)?;
+            // [P1 2026-10-16] 스케일 초기화 = d2d(스트림 비동기) — 종전 동기
+            // 페이지어블 h2d(sc_n×4B, 35B 884KB)가 파이프라인을 정지시켰다
+            // (reset은 타 슬롯 디코드 진행 중 호출 — ITL 드레인). 원본
+            // dsc_ones는 set_gdn이 1회 적재.
+            self.cc
+                .d2d(self.gdn.dsc + sc_off, self.gdn.dsc_ones, sc_n * 4)?;
         }
         Ok(())
     }
