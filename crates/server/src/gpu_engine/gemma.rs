@@ -31,6 +31,9 @@ impl GemmaEngine {
         let model = llm170_core::gemma4::Model::load(dir).map_err(|e| e.to_string())?;
         let hp = model.hp.clone();
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
+        // [디버그 배선 2026-10-15] qwen과 동형 — 층별 지문(dump 키) + 그래프 자동 OFF
+        // (g4_graph_ok). 종전엔 GemmaEngine이 세팅하지 않아 서빙에선 무출력이었다.
+        dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
         // [K6-3 예산] 풀 예산(여유 VRAM 파생) — upload_model_g4(내부 set_attn) 전에 설정.
         dec.set_kv_budget(kv_budget);
         // [D2 검수] 적재 실패 시 부분 할당 정리 — qwen load와 동일 위생.

@@ -560,6 +560,24 @@ impl W4a16Dec {
                 .get(il)
                 .ok_or("g4_chunk_dev: layer_scalar 미등록(set_g4_layer_scalar)")?;
             self.scale_dev(x, ls, n)?;
+            // [디버그 배선 2026-10-15] 층별 지문 — CPU 오라클(`gemma4 layer`)·
+            // 호스트 체인(`gemma4[gpu]`)과 같은 형식으로 최초 발산 층을 추적한다.
+            // 행 0 = 청크 첫 토큰(CPU xs[0] 기준과 동일 계보). debug_layers가
+            // 켜지면 g4_graph_ok가 그래프를 끄므로 직접 경로에서만 실행된다.
+            if self.debug_layers {
+                let mut rb = vec![0u8; h * 4];
+                self.cc.d2h_async(rb.as_mut_ptr(), x, h * 4)?;
+                self.cc.sync()?;
+                let row: Vec<f32> = rb
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                let mx = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let nan = row.iter().any(|v| v.is_nan());
+                eprintln!("gemma4[gpu-chunk] layer {il:>2} max|x|={mx:.4} nan={nan}");
+            }
         }
         // ⑥ 최종 노름 + head(TR t행) — 프리필은 마지막 행만(호스트 경로 계약).
         let hx = self.g4_scratch_slot(Self::G4_HEADX, n * 4)?;
