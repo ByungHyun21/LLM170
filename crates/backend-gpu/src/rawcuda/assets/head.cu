@@ -137,11 +137,11 @@ __device__ __forceinline__ void gemv_i8_trow_body(
     for (int r = 0; r < T; ++r) {
         acc[r] = 0.0f;
     }
-    const float4* xp[T];
-#pragma unroll
-    for (int r = 0; r < T; ++r) {
-        xp[r] = reinterpret_cast<const float4*>(x) + (size_t)r * k4 + l;
-    }
+    // [T16-reg 2026-10-15] 행별 x 포인터 배열 제거 — T=16에서 REG 65→90 상승분의
+    // 주 원인이었다(cuobjdump). 단일 베이스 + (r·k4) 오프셋 — 값·순서 불변.
+    // 주의: 루프 인덱스 i가 l로 시작하므로 **베이스에 l을 더하지 않는다**
+    // (초판 이중 가산 버그 — 골든 붕괴로 검출).
+    const float4* xb = reinterpret_cast<const float4*>(x);
 #pragma unroll 16
     for (int i = l; i < k4; i += 64) {
         const unsigned qw = q32[i];
@@ -151,12 +151,11 @@ __device__ __forceinline__ void gemv_i8_trow_body(
         const float q3 = (float)(signed char)(qw >> 24);
 #pragma unroll
         for (int r = 0; r < T; ++r) {
-            const float4 xv = *xp[r];
+            const float4 xv = xb[(size_t)r * k4 + i];
             acc[r] += q0 * xv.x;
             acc[r] += q1 * xv.y;
             acc[r] += q2 * xv.z;
             acc[r] += q3 * xv.w;
-            xp[r] += 64;
         }
     }
 #pragma unroll

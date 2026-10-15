@@ -494,11 +494,12 @@ __device__ __forceinline__ void gemv_g128_t_body(
     // 청크 j의 레인별 u16 = 바이트 64j+2l,64j+2l+1 — 워프 전량 코얼레싱.
     const unsigned short* qh =
         reinterpret_cast<const unsigned short*>(q + (size_t)o * k8) + l;
-    const float4* xp[T];
-#pragma unroll
-    for (int r = 0; r < T; ++r) {
-        xp[r] = reinterpret_cast<const float4*>(x) + (size_t)r * (k >> 2) + l;
-    }
+    // [T16-reg 2026-10-15] 행별 x 포인터 배열(xp[T]) 제거 — T=16에서 레지스터
+    // 32개를 추가로 먹어 스필(STACK 256B·점유 4블록, ncu: Block Limit
+    // Registers=4 vs SM 24)을 유발했다. 단일 베이스 + (r·k4) 루프 불변 오프셋
+    // 로드로 전환 — 적재 값·FMA 순서 불변(행별 산술 비트동일).
+    const float4* xb = reinterpret_cast<const float4*>(x) + l;
+    const int k4 = k >> 2;
 #pragma unroll 32
     for (int jj = 0; jj < jn; ++jj) {
         const unsigned qw = (unsigned)qh[jj * 32];
@@ -509,12 +510,11 @@ __device__ __forceinline__ void gemv_g128_t_body(
         const float w3 = fmaf((float)(qw >> 12), scv, -8.0f * scv);
 #pragma unroll
         for (int r = 0; r < T; ++r) {
-            const float4 xv = *xp[r];
+            const float4 xv = xb[(size_t)r * k4 + jj * 32];
             acc[r] = fmaf(w0, xv.x, acc[r]);
             acc[r] = fmaf(w1, xv.y, acc[r]);
             acc[r] = fmaf(w2, xv.z, acc[r]);
             acc[r] = fmaf(w3, xv.w, acc[r]);
-            xp[r] += 32;
         }
     }
 #pragma unroll
@@ -647,11 +647,10 @@ __device__ __forceinline__ void gemv_g32_t_body(
     // 청크 j의 레인별 u16 = 바이트 64j+2l,64j+2l+1 — 워프 전량 코얼레싱.
     const unsigned short* qh =
         reinterpret_cast<const unsigned short*>(q + (size_t)o * k8) + l;
-    const float4* xp[T];
-#pragma unroll
-    for (int r = 0; r < T; ++r) {
-        xp[r] = reinterpret_cast<const float4*>(x) + (size_t)r * (k >> 2) + l;
-    }
+    // [T16-reg 2026-10-15] 행별 x 포인터 배열 제거(위 g128_t_body 동형 — T=16
+    // 스필/점유 원인). 단일 베이스 + (r·k4) 오프셋 — 값·순서 불변.
+    const float4* xb = reinterpret_cast<const float4*>(x) + l;
+    const int k4 = k >> 2;
 #pragma unroll 32
     for (int jj = 0; jj < jn; ++jj) {
         const unsigned qw = (unsigned)qh[jj * 32];
@@ -663,12 +662,11 @@ __device__ __forceinline__ void gemv_g32_t_body(
         const float w3 = fmaf((float)(qw >> 12), scv, -8.0f * scv);
 #pragma unroll
         for (int r = 0; r < T; ++r) {
-            const float4 xv = *xp[r];
+            const float4 xv = xb[(size_t)r * k4 + jj * 32];
             acc[r] = fmaf(w0, xv.x, acc[r]);
             acc[r] = fmaf(w1, xv.y, acc[r]);
             acc[r] = fmaf(w2, xv.z, acc[r]);
             acc[r] = fmaf(w3, xv.w, acc[r]);
-            xp[r] += 32;
         }
     }
 #pragma unroll

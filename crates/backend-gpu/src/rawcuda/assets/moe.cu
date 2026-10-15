@@ -127,18 +127,18 @@ __device__ __forceinline__ void gemv_bf16_t_body(
     for (int r = 0; r < T; ++r) {
         acc[r] = 0.0f;
     }
-    const float* xp[T];
-#pragma unroll
-    for (int r = 0; r < T; ++r) {
-        xp[r] = x + (size_t)r * k + l;
-    }
+    // [T16-reg 2026-10-15] 행별 x 포인터 배열(xp[T]) 제거 — T=16에서 REG가
+    // 48→94까지 올라 점유가 절반으로 떨어졌다(cuobjdump 실측). 단일 베이스 +
+    // (r·k) 오프셋 로드로 전환 — 적재 값·순서 불변(행별 산술 비트동일).
+    // 주의: 루프 인덱스 i가 l로 시작하므로 **베이스에 l을 더하지 않는다**
+    // (초판 이중 가산 버그 — 골든 붕괴로 검출).
+    const float* xb = x;
 #pragma unroll 32
     for (int i = l; i < k; i += G4_LANES) {
         const float wv = b2f(wrow[i]);
 #pragma unroll
         for (int r = 0; r < T; ++r) {
-            acc[r] += wv * *xp[r];
-            xp[r] += G4_LANES;
+            acc[r] += wv * xb[(size_t)r * k + i];
         }
     }
 #pragma unroll
