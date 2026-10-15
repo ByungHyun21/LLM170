@@ -5,7 +5,11 @@
 # 사용: scripts/ab-bench.sh <model_dir> <binA> <binB> [bench 인자...]
 #   예: scripts/ab-bench.sh ../models/Qwen3.8-27B-W4A16-AutoRound \
 #         /tmp/baseline/llm170 ./target/release/llm170 --pp 512 --tg 32 --ctx 2048
-# 기본 bench 인자 = --pp 512 --tg 32 --ctx 2048 · 반복 = AB_REPS(기본 3).
+# 기본 bench 인자 = --pp 512 --tg 32 --ctx 2048.
+# [주기 단축 2026-10-15] 로드 절반화 — 프로세스 교차 1라운드 × bench 인프로세스
+# 반복(기본 3회, 벤치 자체 워밍업 포함). 로드가 긴 모델(gemma4 MoE 6s+head 2.4s)일수록
+# 이득. 의심 구간은 AB_ROUNDS=2로 교차 라운드 추가.
+#   AB_REPS(기본 3) = 라운드 내 프로세스-내 반복 · AB_ROUNDS(기본 1) = 프로세스 교차 라운드
 #
 # 가드: (1) 두 바이너리 실행 가능 검사.
 #       (2) profile feature 계측 빌드 **거부** — [실측 2026-10-15] 계측 포함
@@ -24,6 +28,7 @@ shift 3
 ARGS=("$@")
 [ ${#ARGS[@]} -eq 0 ] && ARGS=(--pp 512 --tg 32 --ctx 2048)
 REPS=${AB_REPS:-3}
+ROUNDS=${AB_ROUNDS:-1}
 mkdir -p /tmp/opencode
 RUN=$(mktemp -d /tmp/opencode/ab-bench.XXXXXX)
 
@@ -38,20 +43,20 @@ for b in "$BIN_A" "$BIN_B"; do
 done
 
 clk() { nvidia-smi --query-gpu=clocks.sm --format=csv,noheader 2>/dev/null | head -1 | tr -dc '0-9'; }
-echo "# ab-bench: A=$BIN_A B=$BIN_B reps=$REPS args=${ARGS[*]}"
-echo "# 워밍업(양쪽 1회 — 클럭 승압 후 측정)"
-"$BIN_A" bench --model "$MODEL" "${ARGS[@]}" >/dev/null 2>&1
-"$BIN_B" bench --model "$MODEL" "${ARGS[@]}" >/dev/null 2>&1
+echo "# ab-bench: A=$BIN_A B=$BIN_B rounds=$ROUNDS reps=$REPS args=${ARGS[*]}"
 rc=0
-for i in $(seq 1 "$REPS"); do
+for r in $(seq 1 "$ROUNDS"); do
+    echo "# 라운드 $r — 워밍업(양쪽 1회) 후 인프로세스 반복 계측"
+    "$BIN_A" bench --model "$MODEL" "${ARGS[@]}" >/dev/null 2>&1
+    "$BIN_B" bench --model "$MODEL" "${ARGS[@]}" >/dev/null 2>&1
     c=$(clk)
-    timeout 1800 "$BIN_A" bench --model "$MODEL" "${ARGS[@]}" >"$RUN/a$i.out" 2>/dev/null
+    timeout 1800 "$BIN_A" bench --model "$MODEL" "${ARGS[@]}" --reps "$REPS" >"$RUN/a$r.out" 2>/dev/null
     ra=$?; [ "$ra" -ne 0 ] && rc=1
-    echo "A$i rc=$ra sm=${c}MHz"
+    echo "A$r rc=$ra sm=${c}MHz (in-process reps=$REPS)"
     c=$(clk)
-    timeout 1800 "$BIN_B" bench --model "$MODEL" "${ARGS[@]}" >"$RUN/b$i.out" 2>/dev/null
+    timeout 1800 "$BIN_B" bench --model "$MODEL" "${ARGS[@]}" --reps "$REPS" >"$RUN/b$r.out" 2>/dev/null
     rb=$?; [ "$rb" -ne 0 ] && rc=1
-    echo "B$i rc=$rb sm=${c}MHz"
+    echo "B$r rc=$rb sm=${c}MHz (in-process reps=$REPS)"
 done
 python3 - "$RUN" <<'PY'
 import glob, statistics, sys
