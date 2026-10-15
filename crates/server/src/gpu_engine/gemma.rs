@@ -97,7 +97,7 @@ impl GemmaEngine {
         Ok(lgs.into_iter().next().unwrap_or_default())
     }
 
-    /// 프리필 — t행 청크(≤8) 경로(가중 상각). 반환 = 마지막 로짓.
+    /// 프리필 — t행 청크(≤16) 경로(가중 상각). 반환 = 마지막 로짓.
     /// 스트리밍(비상주 전문가)은 t행 미지원 → t=1 스텝 폴백.
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
         if tokens.is_empty() {
@@ -105,7 +105,7 @@ impl GemmaEngine {
         }
         let mut last = Vec::new();
         let t_chunk = if self.dec.moe_experts_resident() {
-            8
+            16
         } else {
             1
         };
@@ -141,7 +141,7 @@ impl GemmaEngine {
     }
 
     /// 슬롯 배치 1토큰 — **이종 슬롯·위치 t행 청크**(가중 상각) + 행별 로짓.
-    /// 스트리밍 전문가·t>8은 슬롯별 t=1 폴백.
+    /// 스트리밍 전문가·t>16은 슬롯별 t=1 폴백.
     pub fn decode(&mut self, seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
         if seq_ids.len() != tokens.len() {
             return Err(format!(
@@ -157,7 +157,7 @@ impl GemmaEngine {
         if t == 1 {
             return Ok(vec![self.step(seq_ids[0], tokens[0])?]);
         }
-        if t > 8 || !self.dec.moe_experts_resident() {
+        if t > 16 || !self.dec.moe_experts_resident() {
             let mut out = Vec::with_capacity(t);
             for (&s, &tok) in seq_ids.iter().zip(tokens.iter()) {
                 out.push(self.step(s, tok)?);

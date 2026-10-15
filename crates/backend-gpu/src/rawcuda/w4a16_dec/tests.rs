@@ -62,7 +62,7 @@ fn realloc_fields_partial_failure_retry_safe() {
 }
 
 use super::{
-    ATTN_F3S_TMAX, ATTN_SPLITS, BATCH_DEC_MAX, CHAIN_TMAX, GDN_CS, GDN_NGRP, GDN_NSPLIT,
+    ATTN_F3S_TMAX, ATTN_SPLITS, CHAIN_TMAX, G4_CHUNK_MAX, GDN_CS, GDN_NGRP, GDN_NSPLIT,
     GDN_SCAN_SMEM, GEMM_BMMA_M, GEMM_BMMA_N, GEMM_FFMA_TMAX, GEMM_GRP_M, GEMM_GRP_N, GEMM_MMA_M,
     GEMM_MMA_N, GEMV_TR,
 };
@@ -72,8 +72,8 @@ use super::{
 fn head_attn_ffma_mirrors() {
     assert_eq!(
         define(include_str!("../assets/moe.cu"), "G4_TMAX") as usize,
-        BATCH_DEC_MAX,
-        "moe.cu G4_TMAX ↔ BATCH_DEC_MAX(디코드 배치 상한 — head 이관 후)"
+        G4_CHUNK_MAX,
+        "moe.cu G4_TMAX ↔ G4_CHUNK_MAX(gemma4 t행 청크 상한)"
     );
     assert_eq!(
         define(include_str!("../assets/attn.cu"), "ATTN_SPLITS_MAX") as usize,
@@ -213,8 +213,9 @@ fn gemm_ffma_tmax_mirror() {
 #[test]
 fn batch_dec_max_mirror() {
     // [R5] G4_TMAX는 moe.cu 단일 정의(재정의 통합 — 배치 GEMV·플레인 v1 GEMM).
+    // [2.N t≤16] g4 청크 상한으로 승격 — qwen 배치 상한(BATCH_DEC_MAX)과 분리.
     let t = define(include_str!("../assets/moe.cu"), "G4_TMAX") as usize;
-    assert_eq!(t, BATCH_DEC_MAX, "moe.cu G4_TMAX ↔ BATCH_DEC_MAX");
+    assert_eq!(t, G4_CHUNK_MAX, "moe.cu G4_TMAX ↔ G4_CHUNK_MAX");
 }
 
 // ═══ [MTP-CHAIN 2026-10-12 §3.3 ②] 장치 체인 패리티 — CUDA 필요 ═══

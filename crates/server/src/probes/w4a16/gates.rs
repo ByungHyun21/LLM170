@@ -5,7 +5,7 @@ use super::super::{arg, arg_str};
 /// 모듈 게이트 — 커널 vs core `dot_row_w4a16_lane` 비트 판정.
 /// 형상은 스토어에서 자동 열거(distinct (n,k) → 첫 base), x는 결정적 생성.
 ///   w4a16-gemv <dir> [--rows N] [--seed X]          (t=1)
-///   w4a16-gemm <dir> [--rows N] [--t N≤8] [--seed X]
+///   w4a16-gemm <dir> [--rows N] [--t N≤16] [--seed X]
 pub(super) fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
     let dir = arg_str(args, 0, "");
     if dir.is_empty() {
@@ -44,8 +44,8 @@ pub(super) fn gemm_gate(args: &[String], default_t: usize) -> Result<String, Str
             other => return Err(format!("unknown flag: {other}")),
         }
     }
-    if t == 0 || t > 8 {
-        return Err(format!("--t {t}: 1..=8"));
+    if t == 0 || t > 16 {
+        return Err(format!("--t {t}: 1..=16"));
     }
     let g4 = llm170_backend_gpu::Gptq4::new()?;
     // 형상 열거 — --lin이면 model.w()(순열 사본 포함) 단일, 아니면 store 전수.

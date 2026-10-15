@@ -60,8 +60,8 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 _ => return usage_err_bench("--tg requires N[,N..] (1..=4096)"),
             },
             "--np" => match it.next().and_then(|v| parse_list(v)) {
-                Some(v) if v.iter().all(|&n| (2..=8).contains(&n)) => nps = v,
-                _ => return usage_err_bench("--np requires N[,N..] (2..=8)"),
+                Some(v) if v.iter().all(|&n| (2..=16).contains(&n)) => nps = v,
+                _ => return usage_err_bench("--np requires N[,N..] (2..=16)"),
             },
             "--np-check" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(v) => np_check = v.min(8192),

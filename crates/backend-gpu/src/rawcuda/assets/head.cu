@@ -187,7 +187,7 @@ extern "C" __global__ void w4a16_gemv_i8_t(
     const float* __restrict__ x, float* __restrict__ out, int n, int k, int t)
 {
     const int o = blockIdx.x;
-    if (o >= n || t <= 0 || t > 8) {
+    if (o >= n || t <= 0 || t > 16) {
         return;
     }
     __shared__ double red[64];
@@ -200,7 +200,15 @@ extern "C" __global__ void w4a16_gemv_i8_t(
         GEMV_I8_TROW_CASE(6)
         GEMV_I8_TROW_CASE(7)
         GEMV_I8_TROW_CASE(8)
-        default: break;
+        GEMV_I8_TROW_CASE(9)
+        GEMV_I8_TROW_CASE(10)
+        GEMV_I8_TROW_CASE(11)
+        GEMV_I8_TROW_CASE(12)
+        GEMV_I8_TROW_CASE(13)
+        GEMV_I8_TROW_CASE(14)
+        GEMV_I8_TROW_CASE(15)
+        GEMV_I8_TROW_CASE(16)
+        default: break; // 호스트 계약 밖(t≤16)
     }
 }
 

@@ -400,8 +400,8 @@ impl W4a16Dec {
     /// 그래프 캡처에서도 갱신은 캡처 밖(프롤로그) 몫 — 본문은 값만 읽는다.
     pub fn g4_atab_prepare(&mut self, slots: &[usize], pos: &[u32]) -> Result<(), String> {
         let t = slots.len();
-        if t == 0 || pos.len() != t || t > BATCH_DEC_MAX {
-            return Err(format!("g4_atab: t={t} pos={} (1..=8)", pos.len()));
+        if t == 0 || pos.len() != t || t > G4_CHUNK_MAX {
+            return Err(format!("g4_atab: t={t} pos={} (1..=16)", pos.len()));
         }
         if self.g4_atab.0 == slots && self.g4_atab.1 == pos {
             return Ok(());
@@ -590,7 +590,7 @@ impl W4a16Dec {
         )
     }
 
-    /// t행 MoE(≤8)·전량 디바이스 — `g4_moe_host_t`의 디바이스 i/o 판.
+    /// t행 MoE(≤16)·전량 디바이스 — `g4_moe_host_t`의 디바이스 i/o 판.
     /// 입력(라우터 hn·전문가 nm)이 이미 디바이스에 있고(상주 청크 노름 출력),
     /// 출력은 지정 슬롯에 남는다(h2d/d2h 0). 커널 시퀀스·상주 계약은
     /// `g4_moe_host_t`와 동일(라우터 → topk_t → pes → glu전문가 → down → accum).
@@ -607,7 +607,7 @@ impl W4a16Dec {
         let n_exp = self.moe.n_experts;
         let tk = self.moe.top_k.max(1);
         let n_ff = self.moe.moe_ffn;
-        if t == 0 || t > BATCH_DEC_MAX || dhn == 0 || dxn == 0 || pes_dev == 0 {
+        if t == 0 || t > G4_CHUNK_MAX || dhn == 0 || dxn == 0 || pes_dev == 0 {
             return Err(format!(
                 "g4_moe_dev: 계약 위반 t={t} dhn={dhn} dxn={dxn} pes={pes_dev}"
             ));
@@ -684,7 +684,7 @@ impl W4a16Dec {
         if self.head_w == 0 {
             return Err("g4_head_dev: head 미등록".into());
         }
-        if t == 0 || t > BATCH_DEC_MAX || x_dev == 0 {
+        if t == 0 || t > G4_CHUNK_MAX || x_dev == 0 {
             return Err(format!("g4_head_dev: t={t} x={x_dev}"));
         }
         let y = self.g4_scratch_slot(out_slot, t * self.head_n * 4)?;
@@ -709,10 +709,9 @@ impl W4a16Dec {
         eps: f32,
     ) -> Result<Vec<Vec<f32>>, String> {
         let h = self.hidden;
-        if t == 0 || t > BATCH_DEC_MAX || slots.len() != t || pos.len() != t || rows.len() != t * h
-        {
+        if t == 0 || t > G4_CHUNK_MAX || slots.len() != t || pos.len() != t || rows.len() != t * h {
             return Err(format!(
-                "g4_chunk_dev: t={t} rows={} slots={} pos={} (1..=8 · t*h 계약)",
+                "g4_chunk_dev: t={t} rows={} slots={} pos={} (1..=16 · t*h 계약)",
                 rows.len(),
                 slots.len(),
                 pos.len()
@@ -726,14 +725,14 @@ impl W4a16Dec {
         if self.cc.stream.is_null() {
             self.cc.create_stream()?; // 그래프 캡처는 기본 스트림 불가
         }
-        self.g4_warm_slots(BATCH_DEC_MAX)?;
+        self.g4_warm_slots(G4_CHUNK_MAX)?;
         self.ensure_moe_bufs()?;
         self.g4_atab_prepare(slots, pos)?;
         let x = self.g4_scratch_slot(Self::G4_X, t * h * 4)?;
         // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, rows.len() * 4) };
         self.cc.h2d_async(x, xb)?;
-        self.g4_ensure_pin_out(BATCH_DEC_MAX * self.head_n * 4)?;
+        self.g4_ensure_pin_out(G4_CHUNK_MAX * self.head_n * 4)?;
         // ② 본문(디바이스 — 캡처/리플레이 또는 직접 발사).
         if self.g4_graph_ok() {
             if let Err(e) = self.g4_graph_run(slots, pos, t, head_last, nw_per_layer, eps) {

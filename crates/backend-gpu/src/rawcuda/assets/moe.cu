@@ -162,10 +162,10 @@ __device__ __forceinline__ void gemv_bf16_t_body(
     }
 }
 
-// t 상한 — 호스트 BATCH_DEC_MAX 미러(디코드 배치 상한; GEMV_T_CASE_BF 1..8).
+// t 상한 — 호스트 G4_CHUNK_MAX 미러(gemma4 t행 청크 상한; GEMV_T_CASE_BF 1..16).
 // [R5 2026-10-10] 플레인 v1 GEMM(gemm_bf16)과 공유 — 종전 재정의 2곳을
 // 단일 정의로 통합(값 8 불변).
-#define G4_TMAX 8
+#define G4_TMAX 16
 
 extern "C" __global__ void w4a16_gemv_bf16_t(
     const unsigned short* __restrict__ w, // [n][k] bf16
@@ -187,7 +187,15 @@ extern "C" __global__ void w4a16_gemv_bf16_t(
         GEMV_T_CASE_BF(6)
         GEMV_T_CASE_BF(7)
         GEMV_T_CASE_BF(8)
-        default: break; // 호스트 계약 밖(t≤8)
+        GEMV_T_CASE_BF(9)
+        GEMV_T_CASE_BF(10)
+        GEMV_T_CASE_BF(11)
+        GEMV_T_CASE_BF(12)
+        GEMV_T_CASE_BF(13)
+        GEMV_T_CASE_BF(14)
+        GEMV_T_CASE_BF(15)
+        GEMV_T_CASE_BF(16)
+        default: break; // 호스트 계약 밖(t≤16)
     }
 }
 
@@ -228,7 +236,15 @@ extern "C" __global__ void w4a16_gemv_bf16_multi_t(
         GEMV_T_CASE_BF(6)
         GEMV_T_CASE_BF(7)
         GEMV_T_CASE_BF(8)
-        default: break; // 호스트 계약 밖(t≤8)
+        GEMV_T_CASE_BF(9)
+        GEMV_T_CASE_BF(10)
+        GEMV_T_CASE_BF(11)
+        GEMV_T_CASE_BF(12)
+        GEMV_T_CASE_BF(13)
+        GEMV_T_CASE_BF(14)
+        GEMV_T_CASE_BF(15)
+        GEMV_T_CASE_BF(16)
+        default: break; // 호스트 계약 밖(t≤16)
     }
 }
 

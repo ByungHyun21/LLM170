@@ -11,7 +11,9 @@ pub use rawcuda::ctx::{DeviceCaps, VramSampler};
 /// 커널 게이트는 독립 판정자여야 하므로 런처를 공유하지 않는다([R19]).
 pub use rawcuda::gptq4::Gptq4;
 pub use rawcuda::gptq4::h2f;
-pub use rawcuda::w4a16_dec::{AttnDims, AttnLayer, BATCH_DEC_MAX, GdnDims, W4a16Dec, f32_to_f16};
+pub use rawcuda::w4a16_dec::{
+    AttnDims, AttnLayer, BATCH_DEC_MAX, G4_CHUNK_MAX, GdnDims, W4a16Dec, f32_to_f16,
+};
 
 /// VRAM 프로브 — 가드 preflight가 사용(미측정 시 B17 거부).
 pub fn cuda_mem_free() -> Option<(u64, u64)> {
