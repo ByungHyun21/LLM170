@@ -46,7 +46,11 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
     // 그리디/샘플링 분할.
     let (mut greedy, mut sampled): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
     for &i in seqs {
-        if slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy()) {
+        // [P8] 제약 슬롯 = 로그짓 판 경로(pick이 마스킹). GPU argmax/스펙은
+        // 마스크를 모른다.
+        if slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy())
+            || slots[i].constraint.is_some()
+        {
             sampled.push(i);
         } else {
             greedy.push(i);
@@ -224,6 +228,41 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
 
 /// 슬롯 로짓 → 토큰: 활성 샘플러면 sample, 아니면 greedy (동률 최저 인덱스).
 pub(super) fn pick(s: &mut Slot, logits: &mut [f32]) -> u32 {
+    // [P8 2026-10-16] json_schema 제약 — 허용 토큰 집합으로 마스킹 후 greedy.
+    // 완결 시 EOS(자연 종결). 토큰 텍스트는 전역 TOKENIZER로 디코드.
+    if let Some(c) = &mut s.constraint {
+        let tok = crate::engine::TOKENIZER.get();
+        let vocab = logits.len() as u32;
+        let allowed: Vec<u32> = match tok {
+            Some(t) => c
+                .allowed(|id| t.piece(id).unwrap_or("").to_string(), vocab)
+                .to_vec(),
+            None => Vec::new(),
+        };
+        if allowed.is_empty() {
+            // 완결 — 채팅 종결자로 정지(스케줄러 stop 계약). 부재 시 id 0.
+            return s
+                .job
+                .as_ref()
+                .and_then(|j| j.stops.first().copied())
+                .unwrap_or(0);
+        }
+        let mut best = f32::NEG_INFINITY;
+        let mut bt = allowed[0];
+        for &t in &allowed {
+            let v = logits[t as usize];
+            if v > best {
+                best = v;
+                bt = t;
+            }
+        }
+        if let Some(t) = tok
+            && let Some(txt) = t.piece(bt)
+        {
+            c.commit(txt);
+        }
+        return bt;
+    }
     match &mut s.sampler {
         Some(sm) if !sm.is_greedy() => sm.sample(logits),
         _ => llm170_core::qwen35::greedy(logits),

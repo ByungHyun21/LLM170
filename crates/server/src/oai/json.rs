@@ -496,3 +496,111 @@ pub(super) fn parse_sampler(body: &str) -> Option<llm170_core::sampler::SamplerP
     };
     if !p.is_greedy() { Some(p) } else { None }
 }
+
+/// [P8 2026-10-16] 위치 지정 블록 — at(절대 인덱스의 '{')부터 대응 닫기까지.
+pub(super) fn jblock_at(s: &str, at: usize) -> Option<&str> {
+    let b = s.as_bytes();
+    if at >= b.len() || b[at] != b'{' {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_s = false;
+    let mut esc = false;
+    for i in at..b.len() {
+        match (b[i], in_s, esc) {
+            (b'\\', true, false) => esc = true,
+            (b'"', true, false) => in_s = false,
+            (b'"', false, _) => in_s = true,
+            (b'{', false, _) => depth += 1,
+            (b'}', false, _) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[at..=i]);
+                }
+            }
+            _ => {}
+        }
+        if b[i] != b'\\' {
+            esc = false;
+        }
+    }
+    None
+}
+
+/// [P8] object의 properties (키, 값 블록) — 순서 보존.
+pub(super) fn jobject_props(b: &str) -> Option<Vec<(String, String)>> {
+    let pp = b.find("\"properties\"")?;
+    let ob = b[pp..].find('{')? + pp;
+    let blk = jblock_at(b, ob)?;
+    // 블록 내부: "키": {노드} — 문자열 스캔.
+    let mut out = Vec::new();
+    let bytes = blk.as_bytes();
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            // 키 문자열.
+            let ks = i + 1;
+            let mut j = ks;
+            while j < bytes.len() && bytes[j] != b'"' {
+                if bytes[j] == b'\\' {
+                    j += 1;
+                }
+                j += 1;
+            }
+            let key = blk[ks..j].to_string();
+            // 콜론 + 노드 블록.
+            let mut k = j + 1;
+            while k < bytes.len() && (bytes[k] as char).is_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b':' {
+                k += 1;
+                while k < bytes.len() && (bytes[k] as char).is_whitespace() {
+                    k += 1;
+                }
+                if k < bytes.len()
+                    && bytes[k] == b'{'
+                    && let Some(node) = jblock_at(blk, k)
+                {
+                    out.push((key, node.to_string()));
+                    i = k + node.len();
+                    continue;
+                }
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// [P8] 문자열 배열 값 파싱(enum).
+pub(super) fn jstrs(b: &str, key: &str) -> Option<Vec<String>> {
+    let pat = format!("\"{key}\"");
+    let kp = b.find(&pat)?;
+    let ob = b[kp..].find('[')? + kp;
+    let seg = &b[ob..];
+    let cl = seg.find(']')?;
+    let inner = &seg[1..cl];
+    let mut out = Vec::new();
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let st = i + 1;
+            let mut j = st;
+            while j < bytes.len() && bytes[j] != b'"' {
+                if bytes[j] == b'\\' {
+                    j += 1;
+                }
+                j += 1;
+            }
+            out.push(inner[st..j].to_string());
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    Some(out).filter(|v| !v.is_empty())
+}

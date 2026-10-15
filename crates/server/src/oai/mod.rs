@@ -8,6 +8,7 @@ use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 
 mod json;
+pub(crate) mod schema;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -48,6 +49,8 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
 
 /// 응답 포맷 컨텍스트 — 엔드포인트별 조립에 필요한 최소값.
 struct EmitFmt {
+    /// [P8] 원본 요청 tools 원문(tool_calls 래핑 판정 — 있으면 Some).
+    tools_req: Option<String>,
     chat: bool,
     model: String,
     stop_strs: Vec<String>,
@@ -166,6 +169,7 @@ pub(crate) fn handle(
                     stream_mode,
                     // completions는 text_completion 포맷.
                     &EmitFmt {
+                        tools_req: None,
                         chat: false,
                         model: jstr(&req.body, "model").unwrap_or_else(|| "local_llm".into()),
                         stop_strs: jstop(&req.body),
@@ -173,6 +177,7 @@ pub(crate) fn handle(
                     },
                     Vec::new(),
                     parse_sampler(&req.body),
+                    schema_constraint(&req.body),
                 );
             }
             ("POST", "/v1/chat/completions") => {
@@ -201,6 +206,11 @@ pub(crate) fn handle(
                     n_predict,
                     stream_mode,
                     &EmitFmt {
+                        tools_req: if req.body.contains("\"tools\"") {
+                            Some(req.body.clone())
+                        } else {
+                            None
+                        },
                         chat: true,
                         model: jstr(&req.body, "model").unwrap_or_else(|| "local_llm".into()),
                         stop_strs: jstop(&req.body),
@@ -208,6 +218,7 @@ pub(crate) fn handle(
                     },
                     stops_for_arch(),
                     parse_sampler(&req.body),
+                    schema_constraint(&req.body),
                 );
             }
             ("POST", "/v1/messages") => {
@@ -251,6 +262,7 @@ fn enqueue_job(
     n_predict: usize,
     stops: Vec<u32>,
     sampler: Option<llm170_core::sampler::SamplerParams>,
+    constraint: Option<crate::oai::schema::Schema>,
 ) -> Result<
     (
         std::sync::mpsc::Receiver<TokOut>,
@@ -273,6 +285,7 @@ fn enqueue_job(
     let job = SlotJob {
         tokens: ids,
         n_predict,
+        constraint,
         sampler,
         stops,
         // QA-3: 비스트림도 progress 채널 부여 — 핸들러가 prx를 잡고 폴링
@@ -328,6 +341,93 @@ fn peer_gone(stream: &mut TcpStream) -> bool {
     }
 }
 
+/// [P8] 제약 출력 → tool_calls 배열 JSON(조각). {name,arguments} 단일 또는
+/// 배열(병렬). 파싱 불가 = None.
+fn wrap_tool_calls(_tools_req: &str, acc: &str) -> Option<String> {
+    let t = acc.trim();
+    let objs: Vec<&str> = if t.starts_with('[') {
+        crate::oai::json::jblocks(t)
+    } else if t.starts_with('{') {
+        vec![t]
+    } else {
+        return None;
+    };
+    let mut calls = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        let name = crate::oai::json::jstr(o, "name")?;
+        // arguments 값 = 중첩 객체/배열 원문(jblock) 또는 문자열 JSON.
+        let args = raw_value(o, "arguments").unwrap_or_else(|| "{}".into());
+        calls.push(format!(
+            "{{\"id\":\"call_{i}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}",
+            crate::json::esc(&name),
+            crate::json::esc(&args)
+        ));
+    }
+    Some(calls.join(","))
+}
+
+/// [P8] 객체의 값 원문 추출(중첩 {} / [] / 스칼라 문자열).
+fn raw_value(o: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":");
+    let kp = o.find(&pat)? + pat.len();
+    let b = o.as_bytes();
+    let mut i = kp;
+    while i < b.len() && (b[i] as char).is_whitespace() {
+        i += 1;
+    }
+    if i >= b.len() {
+        return None;
+    }
+    match b[i] {
+        b'{' | b'[' => {
+            let open = b[i];
+            let close = if open == b'{' { b'}' } else { b']' };
+            let mut depth = 0usize;
+            let mut in_s = false;
+            let mut esc = false;
+            let mut j = i;
+            while j < b.len() {
+                match (b[j], in_s, esc) {
+                    (b'\\', true, false) => esc = true,
+                    (b'"', true, false) => in_s = false,
+                    (b'"', false, _) => in_s = true,
+                    (c, false, _) if c == open => depth += 1,
+                    (c, false, _) if c == close => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(o[i..=j].to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                if b[j] != b'\\' {
+                    esc = false;
+                }
+                j += 1;
+            }
+            None
+        }
+        b'"' => crate::oai::json::jstr(o, key).map(|s| s.to_string()),
+        _ => {
+            // 따옴표 없는 스칼라 — 콤마/닫기까지.
+            let mut j = i;
+            while j < b.len() && b[j] != b',' && b[j] != b'}' {
+                j += 1;
+            }
+            Some(o[i..j].trim().to_string())
+        }
+    }
+}
+
+/// [P8] 요청 → Schema(없음 None).
+fn schema_constraint(body: &str) -> Option<schema::Schema> {
+    let sch = schema::schema_from_request(body);
+    if sch.is_none() && body.contains("\"json_schema\"") {
+        eprintln!("# json_schema: 미지원/파싱 실패 — 무제약 폴백");
+    }
+    sch
+}
+
 fn run_and_emit(
     stream: &mut TcpStream,
     tx: std::sync::mpsc::SyncSender<SlotJob>,
@@ -337,6 +437,7 @@ fn run_and_emit(
     fmt: &EmitFmt,
     stops: Vec<u32>,
     sampler: Option<llm170_core::sampler::SamplerParams>,
+    constraint: Option<crate::oai::schema::Schema>,
 ) {
     // [H 2026-10-09] 빈 프롬프트는 전 엔드포인트 동일 400 — 종전엔 빈 배열은
     // 400인데 빈 문자열 prompt·빈 chat 렌더는 통과해 스케줄러가 0번 토큰에서
@@ -377,7 +478,8 @@ fn run_and_emit(
         n_predict = lim;
     }
     let prompt_len = ids.len();
-    let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, stops, sampler) else {
+    let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, stops, sampler, constraint)
+    else {
         return;
     };
     if !stream_mode {
@@ -446,7 +548,25 @@ fn run_and_emit(
         let esc = crate::json::esc(&acc);
         let arr: Vec<String> = toks[..ntok].iter().map(|t| t.to_string()).collect();
         let (id, created) = (oai_id(), now_secs());
-        let body = if fmt.chat {
+        // [P8 2026-10-16] tool_calls 래핑 — 제약 출력이 {name,arguments}(배열
+        // 허용 = 병렬)이면 tool_calls 포맷으로 재구성(원문 content 보존 아님 —
+        // 함수 호출 응답은 arguments가 본체). 파싱 실패 시 통과(일반 JSON).
+        let tool_wrap = fmt
+            .tools_req
+            .as_deref()
+            .and_then(|tr| wrap_tool_calls(tr, &acc));
+        let body = if let Some(tc) = tool_wrap {
+            format!(
+                "{{\"id\":\"{id}\",\"created\":{created},\"model\":\"{}\",\"object\":\"chat.completion\",\"\
+             choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{tc}]}},\"finish_reason\":\"tool_calls\"}}],\
+             \"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}},\"tokens\":[{}]}}",
+                crate::json::esc(&fmt.model),
+                prompt_len,
+                ntok,
+                prompt_len + ntok,
+                arr.join(",")
+            )
+        } else if fmt.chat {
             format!(
                 "{{\"id\":\"{id}\",\"created\":{created},\"model\":\"{}\",\"object\":\"chat.completion\",\"\
                  choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{esc}\"}},\"finish_reason\":\"{finish}\"}}],\
@@ -634,7 +754,15 @@ fn run_and_emit_anthropic(
         n_predict = lim;
     }
     let prompt_len = ids.len();
-    let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, stops_for_arch(), sampler) else {
+    let Ok((orx, prx)) = enqueue_job(
+        stream,
+        &tx,
+        ids,
+        n_predict,
+        stops_for_arch(),
+        sampler,
+        None, // anthropic — json_schema 미지원(P8 범위: OpenAI 경로)
+    ) else {
         return;
     };
     if stream_mode {

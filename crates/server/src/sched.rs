@@ -45,6 +45,9 @@ pub enum ProgressFrame {
 pub struct SlotJob {
     pub tokens: Vec<u32>,
     pub n_predict: usize,
+    /// [P8 2026-10-16] json_schema 제약(response_format) — 컴파일된 NFA.
+    /// 있으면 greedy-로그짓 경로 + 스펙 비활성 + pick 마스킹.
+    pub constraint: Option<crate::oai::schema::Schema>,
     /// 샘플링 파라미터 (기본 greedy — None이면 GPU argmax 경로 유지).
     pub sampler: Option<llm170_core::sampler::SamplerParams>,
     /// 조기 종료 토큰 (EOS + 채팅 템플릿 종결자).
@@ -73,6 +76,8 @@ struct Slot {
     err_count: u32,
     /// QA-1: 연속 실패 상한(3) 도달 시 확정 실패 사유.
     failed: Option<String>,
+    /// [P8] 런타임 json_schema 제약기(상태 NFA) — pick에서 마스킹.
+    constraint: Option<crate::oai::schema::Constraint>,
     /// [§7.5] 스펙 적응 게이트 — 연속 무수용 라운드 수(1 도달 시 256토큰마다 재시도).
     spec_miss: u32,
     /// [관측 2026-10-14] 첫 emit 시각(TTFT 원료 — 큐 진입은 job.queued).
@@ -95,6 +100,7 @@ impl Slot {
             failed: None,
             t_first: None,
             spec_miss: 0,
+            constraint: None,
         }
     }
 }

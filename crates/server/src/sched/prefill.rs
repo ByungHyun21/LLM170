@@ -60,8 +60,11 @@ pub(super) fn slot_prefill(
         // 샘플링 슬롯은 로짓 판(마지막 청크만 판정에 사용) — Q4도
         // prefill_greedy 대신 prefill. greedy는 종전 최적 경로.
         let samp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
+        // [P8] 제약 슬롯은 prefill 마지막 로짓도 pick(마스킹) 경유 — 첫
+        // 토큰부터 스키마 강제(실측: 우회 시 1토큰 프리앰블 새는 결함).
+        let cons = slots[i].constraint.is_some();
         let r: Result<u32, String> = eng.0.prefill(i, &part).map(|mut l| {
-            if samp {
+            if samp || cons {
                 pick(&mut slots[i], &mut l)
             } else {
                 llm170_core::qwen35::greedy(&l)

@@ -122,6 +122,10 @@ pub(super) fn assign_slot(
     {
         sm.push_tokens(j.tokens.iter().copied());
     }
+    let constraint = j
+        .constraint
+        .as_ref()
+        .map(crate::oai::schema::Constraint::new);
     slots[i] = Slot {
         job: Some(j),
         prefilled: reuse,
@@ -136,6 +140,7 @@ pub(super) fn assign_slot(
         failed: None,
         t_first: None,
         spec_miss: 0,
+        constraint,
     };
 }
 

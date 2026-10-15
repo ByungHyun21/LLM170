@@ -60,6 +60,10 @@ fn spec_round_impl(
     if sampled && s.sampler.is_none() {
         return Ok(false);
     }
+    // [P8] json_schema 제약 슬롯 — 초안이 마스크를 모른다(무손실 계약 위험).
+    if s.constraint.is_some() {
+        return Ok(false);
+    }
     // [2.A-④ 2026-10-13] 경제성 게이트 — 3택(mtp/ngram/평범). None = 평범.
     // 스펙 무손실 — 스위칭은 처리량만(토큰 불변). spec_miss 억제 뒤에 둔다
     // (억제된 라운드는 표본·프로브 시계를 소비하지 않게).
