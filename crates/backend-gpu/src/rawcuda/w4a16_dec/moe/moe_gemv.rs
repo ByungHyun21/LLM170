@@ -307,12 +307,29 @@ impl W4a16Dec {
             .d2h_async(ib.as_mut_ptr(), self.moe.moe_idx, ns * 4)?;
         self.cc.sync()?;
         let mut seen = vec![false; self.moe.n_experts];
+        let mut distinct = 0usize;
         for j in 0..ns {
             let e = u32::from_le_bytes(ib[j * 4..j * 4 + 4].try_into().unwrap()) as usize;
             if e >= self.moe.n_experts || seen[e] {
                 continue;
             }
             seen[e] = true;
+            distinct += 1;
+        }
+        // [P6 2026-10-15] union 가드 — 청크 distinct > 캐시 슬롯이면 스테이징이
+        // 캐시를 스래싱해 디바이스 테이블 항목을 무효화한다(조용한 오염 방지 —
+        // 즉시 실패). 운용 tmax는 통계적으로 여유를 두고 산출(호스트 prefill_tmax).
+        if distinct > self.moe.mcache_k {
+            return Err(format!(
+                "moe streaming: 청크 distinct {distinct} > 캐시 {} — t 상한 초과",
+                self.moe.mcache_k
+            ));
+        }
+        for j in 0..ns {
+            let e = u32::from_le_bytes(ib[j * 4..j * 4 + 4].try_into().unwrap()) as usize;
+            if e >= self.moe.n_experts || !seen[e] {
+                continue;
+            }
             if self.mcache_lookup(il, e).is_none() {
                 // [B4-1 결함수정 2026-10-13] 삽입 = 가중치 업로드 동반(필수).
                 let slot = self.mcache_insert(il, e)?;

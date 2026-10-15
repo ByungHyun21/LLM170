@@ -41,7 +41,14 @@ pub struct QwenEngine {
 /// (가중치 상각), 1..=512.
 pub fn prefill_tmax(is_moe: bool, resident: bool, env: Option<&str>) -> usize {
     if is_moe && !resident {
-        return 8;
+        // [P6 2026-10-15] 8 유지 — t>8 실험: ①union 가드 실효(distinct 71 >
+        // 캐시 70 — 구조 상한 8·top_k ≤ k) ②캐시 확대(k=96)+t=12는 그룹 경로
+        // illegal access로 파킹. env(≤12)는 허용 — moe_stage_t 가드가 상한을
+        // 지킨다(실패는 즉시·명시).
+        return env
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, 12);
     }
     env.and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(512)
@@ -58,7 +65,17 @@ mod tests {
         assert_eq!(
             prefill_tmax(true, false, None),
             8,
-            "MoE 스트리밍 = t=1 폴백"
+            "MoE 스트리밍 = 구조 안전 8"
+        );
+        assert_eq!(
+            prefill_tmax(true, false, Some("8")),
+            8,
+            "MoE 스트리밍 env 오버라이드"
+        );
+        assert_eq!(
+            prefill_tmax(true, false, Some("999")),
+            12,
+            "MoE 스트리밍 env 상한 클램프(가드가 지킴)"
         );
         assert_eq!(prefill_tmax(true, true, None), 512, "MoE 상주 = 기본 512");
         assert_eq!(prefill_tmax(false, false, None), 512, "dense = 기본 512");

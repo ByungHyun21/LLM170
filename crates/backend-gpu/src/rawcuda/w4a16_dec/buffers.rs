@@ -496,6 +496,10 @@ impl W4a16Dec {
             let ssz = h * n_ff / self.moe.moe_group.max(32) * 2;
             let per_slot = 3 * (qsz + ssz);
             let free = crate::cuda_mem_free().map(|(f, _)| f).unwrap_or(0);
+            // [P6 2026-10-15] free/4 유지 — /2 실험(k=96·t=12)에서 그룹 경로 t>8이
+            // illegal access(128B DtoH)로 실패해 파킹(재현: --moe streaming +
+            // 캐시 k=96 + t=12). k=70(본기 35B)에서 구조 안전 t=8(8·top8=64≤70).
+            // 슬롯 수가 청크 t 상한을 결정 = 상각의 벽(원장 기록).
             let kmax = ((free / 4) / (self.n_layers * per_slot).max(1) as u64) as usize;
             let k = 96usize.min(kmax);
             if k > 0 {

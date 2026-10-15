@@ -325,12 +325,13 @@ impl W4a16Dec {
         if n_exp == 0 || self.moe.moe_tab.len() < (il + 1) * n_exp * 3 {
             return Err("moe: 구성/전문가 테이블 미등록".into());
         }
-        // [B4-1 2026-10-12] 스트리밍도 t≤8(BATCH_DEC_MAX)은 캐시 스테이징 +
-        // 장치 테이블로 융합 경로 사용(종전 t=1 폴백 — 512토큰 ~9.3s). t>8은
-        // 청크 전문가 스테이징 미구현.
-        if !self.moe.moe_resident && t > BATCH_DEC_MAX {
-            return Err("moe t>8: 스트리밍 프리필 미구현(청크 ≤8)".into());
-        }
+        // [B4-1 2026-10-12 → P6 2026-10-15] 스트리밍 t≤8은 캐시 스테이징 + 장치
+        // 테이블 융합 경로(종전 t=1 폴백 — 512토큰 ~9.3s). **t>8 해제** — 그룹
+        // 경로(grp2/grp_d64)는 moe_dev_tab 간접 판독이라 스트리밍 캐시 테이블과
+        // 동일 계약(레이아웃 [il][n_exp][3쌍] — mcache_insert가 갱신). 정확성
+        // 상한 = 청크 distinct 전문가 ≤ 캐시 슬롯(moe_stage_t 가드) — 초과 시
+        // 스테이징 스래싱이 테이블을 무효화하므로 가드가 즉시 실패시킨다.
+        // tmax 운용점(호스트 prefill_tmax STREAM=12)은 가드와 함께 산출됨.
         self.ensure_moe_bufs()?;
         // [S10-잔여 2026-10-11] t≤8(디코드 배치·검증): 라우터+shared 게이트/
         // 업/sgate를 multi_t 1런치로 융합(종전 4런치). t>8(프리필)은 종전 유지.

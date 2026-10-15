@@ -75,6 +75,14 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 Some(v) => ctx = v,
                 None => return usage_err_bench("--ctx requires a number"),
             },
+            // [P6 2026-10-15] --moe 강제(serve와 동일 파서) — C20: auto 상주
+            // 판정이 환경으로 뒤집히지 않게 스트리밍 레짐 실험을 고정한다.
+            "--moe" => match it.next().and_then(|v| crate::engine::parse_moe_policy(v)) {
+                Some(p) => {
+                    crate::engine::MOE_POLICY.store(p as u64, std::sync::atomic::Ordering::Relaxed)
+                }
+                None => return usage_err_bench("--moe requires auto|resident|streaming"),
+            },
             other => return usage_err_bench(&format!("unknown flag: {other}")),
         }
     }
