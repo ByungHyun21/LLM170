@@ -338,14 +338,21 @@ fn peer_gone(stream: &mut TcpStream) -> bool {
 }
 
 /// [P0-D3] 요청 tools[].function.name 집합 — 빈/파싱 실패 = None.
-fn parse_tool_names(body: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_tool_names(body: &str) -> Option<Vec<String>> {
+    // [P0-D7 2026-10-16] 배열 경계 = 문자열 인식 매칭(jarr_span) — 종전
+    // find(']')는 중첩 배열(required·enum·type:array)에서 절단해 첫 블록을
+    // 미완결로 폐기 → 래핑 전면 비활성(기능 회귀)했다.
     let tp = body.find("\"tools\"")?;
-    let arr = body[tp..].find('[')? + tp;
-    let seg = &body[arr..];
-    let close = seg.find(']')?;
-    let names: Vec<String> = crate::oai::json::jblocks(&seg[..=close])
+    let ob = body[tp..].find('[')? + tp;
+    let close = crate::oai::json::jarr_span(body, ob)?;
+    let names: Vec<String> = crate::oai::json::jblocks(&body[ob..=close])
         .iter()
-        .filter_map(|blk| crate::oai::json::jstr(blk, "name"))
+        .filter_map(|blk| {
+            // name은 function 객체 내부에 중첩 — jmember는 최상위만 읽는다.
+            let fval = crate::oai::json::jmember(blk, "function")?;
+            let fobj = fval.trim_start().strip_prefix('{')?;
+            crate::oai::json::jstr(&format!("{{{fobj}"), "name")
+        })
         .collect();
     (!names.is_empty()).then_some(names)
 }

@@ -529,6 +529,82 @@ pub(super) fn jblock_at(s: &str, at: usize) -> Option<&str> {
     None
 }
 
+/// [P0-D7 2026-10-16] 배열 구간 경계(시작 '[' 인덱스 → 대응 ']') — 문자열
+/// 인식 깊이 카운트. 종전 `find(']')`는 중첩 배열(required·enum)에서 절단해
+/// tools 파싱을 전면 비활성화했다.
+pub(super) fn jarr_span(s: &str, open_idx: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    if open_idx >= b.len() || b[open_idx] != b'[' {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_s = false;
+    let mut esc = false;
+    for i in open_idx..b.len() {
+        if esc {
+            esc = false;
+        } else if b[i] == b'\\' && in_s {
+            esc = true;
+        } else if b[i] == b'"' {
+            in_s = !in_s;
+        } else if !in_s {
+            if b[i] == b'[' {
+                depth += 1;
+            } else if b[i] == b']' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// [P0-D6] 키의 배열 값 구간 원문('[..]' 경계 포함) — jarr_span 결합.
+pub(super) fn jstrs_span(b: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":");
+    let kp = b.find(&pat)? + pat.len();
+    let ob = b[kp..].find('[')? + kp;
+    let cl = jarr_span(b, ob)?;
+    Some(b[ob..=cl].to_string())
+}
+
+/// [P0-D6] enum 값 배열이 **순수 문자열 배열**인지 판정(비문자열 혼재 = 미지원).
+pub(super) fn jarr_pure_strings(s: &str) -> Option<Vec<String>> {
+    // s = '[' ... ']' 전체 구간.
+    let close = jarr_span(s, 0)?;
+    let inner = &s[1..close];
+    if inner.trim().is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let b = inner.as_bytes();
+    let mut i = 0usize;
+    let mut saw_any = false;
+    while i < b.len() {
+        if b[i] == b'"' {
+            saw_any = true;
+            let st = i + 1;
+            let mut j = st;
+            while j < b.len() && !(b[j] == b'"' && b[j - 1] != b'\\') {
+                j += 1;
+            }
+            if j >= b.len() {
+                return None;
+            }
+            out.push(inner[st..j].to_string());
+            i = j + 1;
+        } else if b[i] == b',' || (b[i] as char).is_whitespace() {
+            i += 1;
+        } else {
+            // 따옴표 없는 원소(숫자·true 등) = 혼재.
+            return None;
+        }
+    }
+    saw_any.then_some(out)
+}
+
 /// [P8] object의 properties (키, 값 블록) — 순서 보존.
 pub(super) fn jobject_props(b: &str) -> Option<Vec<(String, String)>> {
     let pp = b.find("\"properties\"")?;
@@ -575,34 +651,4 @@ pub(super) fn jobject_props(b: &str) -> Option<Vec<(String, String)>> {
         }
     }
     if out.is_empty() { None } else { Some(out) }
-}
-
-/// [P8] 문자열 배열 값 파싱(enum).
-pub(super) fn jstrs(b: &str, key: &str) -> Option<Vec<String>> {
-    let pat = format!("\"{key}\"");
-    let kp = b.find(&pat)?;
-    let ob = b[kp..].find('[')? + kp;
-    let seg = &b[ob..];
-    let cl = seg.find(']')?;
-    let inner = &seg[1..cl];
-    let mut out = Vec::new();
-    let bytes = inner.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'"' {
-            let st = i + 1;
-            let mut j = st;
-            while j < bytes.len() && bytes[j] != b'"' {
-                if bytes[j] == b'\\' {
-                    j += 1;
-                }
-                j += 1;
-            }
-            out.push(inner[st..j].to_string());
-            i = j + 1;
-        } else {
-            i += 1;
-        }
-    }
-    Some(out).filter(|v| !v.is_empty())
 }

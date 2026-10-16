@@ -219,9 +219,14 @@ fn parse_schema_node(b: &str) -> Option<Schema> {
             let props = crate::oai::json::jobject_props(b)?;
             let mut out = Vec::new();
             for (k, v) in props {
-                if let Some(e) = crate::oai::json::jstrs(&v, "enum")
-                    && !e.is_empty()
-                {
+                // [P0-D6 2026-10-16] "enum" 키가 있으면 순수 문자열 배열만 Enum —
+                // 비문자열(integer enum)·혼재는 전체 폴백(조용한 약화 금지).
+                if v.contains("\"enum\"") {
+                    let arr = crate::oai::json::jstrs_span(&v, "enum");
+                    let e = match arr.as_deref().and_then(crate::oai::json::jarr_pure_strings) {
+                        Some(e) if !e.is_empty() => e,
+                        _ => return None,
+                    };
                     out.push((k, Schema::Enum(e)));
                 } else {
                     // [P0-D2] 미지원 프로퍼티 = 전체 폴백(None 전파).
@@ -408,6 +413,26 @@ mod tests {
         assert!(crate::oai::wrap_tool_calls(&names, acc).is_none());
         let names2 = vec!["good".to_string(), "evil".to_string()];
         assert!(crate::oai::wrap_tool_calls(&names2, acc).is_some());
+    }
+
+    #[test]
+    fn d6_integer_and_mixed_enum_fallback() {
+        // integer enum = 전체 폴백(모든 정수 허용하는 약화 금지).
+        let body = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"lv":{"type":"integer","enum":[1,2]}}}}}}"#;
+        assert!(crate::oai::schema::schema_from_request(body).is_none());
+        // 혼재 enum도 폴백.
+        let mixed = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"x":{"type":"string","enum":["a",1]}}}}}}"#;
+        assert!(crate::oai::schema::schema_from_request(mixed).is_none());
+        // 순수 문자열 enum은 통과.
+        let pure = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"x":{"type":"string","enum":["a","b"]}}}}}}"#;
+        assert!(crate::oai::schema::schema_from_request(pure).is_some());
+    }
+
+    #[test]
+    fn d7_nested_array_tools_parse() {
+        let body = r#"{"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}},{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"tz":{"type":"string","enum":["KST","UTC"]}}}}}]}"#;
+        let names = crate::oai::parse_tool_names(body).unwrap();
+        assert_eq!(names, vec!["get_weather", "get_time"]);
     }
 
     #[test]
