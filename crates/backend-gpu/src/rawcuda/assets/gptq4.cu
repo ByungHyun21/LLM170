@@ -743,7 +743,7 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g32_bf16_t(
 // 행별 산술은 gemv_g32_t_body<16>과 **비트동일**: 레인 l·j-시퀀스·f32 acc·
 // tree64 환원이 행 독립이라 t0 그룹화와 무관(잔여 tail<16행은 호스트가
 // 기존 ≤16 스위치로 발사 — 핫루프에 가드 없음).
-extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g32_bf16_tall(
+extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_g32_bf16_tall(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x, float* __restrict__ out,
     int n, int k, int t16) // t16 = 16의 배수(호스트 계약 — tail은 별도 발사)
