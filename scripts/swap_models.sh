@@ -70,31 +70,53 @@ esac
 # 골든 접두를 판정한다(모델 로드 1회 절감) — 별도 8토큰 런 제거.
 note "[2/10] B(27B) GPU 체인 — [3b] 600토큰 런에 흡수(골든 접두 동일 계약)"
 
-# ── 3a. serve kv-mem 가드 (W1 — 필수·최소·상한·--ctx 폐지) ──
-note "[3a/10] serve --kv-mem 가드 — 무 auto·최소 블록·상한 거부·--ctx 폐지"
-if "$BIN" serve --model "$M_27B" --port 18098 > "$RUN/sv0.log" 2>&1; then
+# ── 3a. serve kv-mem 가드 (W1+W3 — 필수·최소·호스트 여유 상한·--ctx 폐지) ──
+note "[3a/10] serve --kv-mem 가드 — 무 auto·최소·호스트 여유 상한 거부·--ctx 폐지"
+# [2026-10-16 수정] 종전 "23G 거부" 기대는 W1(VRAM 단일 풀) 시절 값 — W3 호스트
+# 2계층에서 kv-mem > VRAM은 정상(초과분 = 핀드 호스트 아레나). 그 검사가
+# timeout 없이 serve 대기에 물려 W1 작성 후 첫 실행에서 스모크가 정지했다.
+# 새 계약: ① 실제 상한 = 호스트부 ≤ 가용 RAM − 예약(100G 그물) ② VRAM 초과분은
+# 호스트 분할 수용(기동 확인 후 종료) ③ 모든 프로브 timeout.
+if timeout 120 "$BIN" serve --model "$M_27B" --port 18098 > "$RUN/sv0.log" 2>&1; then
   echo "[w4a16] FAIL: --kv-mem 누락이 통과됨"; fail=1
 elif grep -q -- "--kv-mem" "$RUN/sv0.log"; then note "kv-mem 필수 거부 OK: $(head -1 "$RUN/sv0.log")"
 else
   echo "[w4a16] FAIL: kv-mem 누락 사유 불명 — ${RUN}/sv0.log"; fail=1
 fi
-if "$BIN" serve --model "$M_27B" --kv-mem 1M --port 18098 > "$RUN/sv1.log" 2>&1; then
+if timeout 120 "$BIN" serve --model "$M_27B" --kv-mem 1M --port 18098 > "$RUN/sv1.log" 2>&1; then
   echo "[w4a16] FAIL: --kv-mem 1M(블록 미만)이 통과됨"; fail=1
 elif grep -q "kv-mem 가드 거부" "$RUN/sv1.log"; then note "kv-mem 최소 거부 OK"
 else
   echo "[w4a16] FAIL: kv-mem 최소 거부 사유 불명 — ${RUN}/sv1.log"; fail=1
 fi
-if "$BIN" serve --model "$M_27B" --kv-mem 23G --port 18098 > "$RUN/sv3.log" 2>&1; then
-  echo "[w4a16] FAIL: --kv-mem 23G(여유 초과)가 통과됨"; fail=1
-elif grep -q "kv-mem 가드 거부" "$RUN/sv3.log"; then note "kv-mem 상한 거부 OK"
+if timeout 120 "$BIN" serve --model "$M_27B" --kv-mem 100G --port 18098 > "$RUN/sv4.log" 2>&1; then
+  echo "[w4a16] FAIL: --kv-mem 100G(호스트 여유 초과)가 통과됨"; fail=1
+elif grep -q "kv-mem 가드 거부" "$RUN/sv4.log"; then note "kv-mem 상한(호스트 여유) 거부 OK: $(grep -m1 'kv-mem 가드 거부' "$RUN/sv4.log" | cut -c1-80)"
 else
-  echo "[w4a16] FAIL: kv-mem 상한 거부 사유 불명 — ${RUN}/sv3.log"; fail=1
+  echo "[w4a16] FAIL: kv-mem 상한 거부 사유 불명 — ${RUN}/sv4.log"; fail=1
 fi
-if "$BIN" serve --model "$M_27B" --kv-mem 8G --ctx 4096 --port 18098 > "$RUN/sv2.log" 2>&1; then
+if timeout 120 "$BIN" serve --model "$M_27B" --kv-mem 8G --ctx 4096 --port 18098 > "$RUN/sv2.log" 2>&1; then
   echo "[w4a16] FAIL: serve --ctx가 통과됨(폐지 계약 위반)"; fail=1
 elif grep -q "ctx는 폐지" "$RUN/sv2.log"; then note "--ctx 폐지 거부 OK"
 else
   echo "[w4a16] FAIL: --ctx 폐지 사유 불명 — ${RUN}/sv2.log"; fail=1
+fi
+# ② W3 분할 수용 — kv-mem 12G(VRAM부 상한 2.7G, 초과분 = 호스트 2계층).
+: > "$RUN/sv3.log"
+"$BIN" serve --model "$M_27B" --kv-mem 12G --port 18103 > "$RUN/sv3.log" 2>&1 &
+SERVE_PID=$!
+trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
+for i in $(seq 1 100); do
+  sleep 3
+  grep -m1 "listening" "$RUN/sv3.log" >/dev/null 2>&1 && break
+done
+kill "$SERVE_PID" 2>/dev/null
+wait "$SERVE_PID" 2>/dev/null
+trap - EXIT
+if grep -m1 "listening" "$RUN/sv3.log" >/dev/null 2>&1 && grep -q "# kv-tier:" "$RUN/sv3.log"; then
+  note "kv-mem 초과분 호스트 분할 수용 OK: $(grep -m1 '# kv-tier:' "$RUN/sv3.log" | cut -c1-80)"
+else
+  echo "[w4a16] FAIL: kv-mem 12G 호스트 분할 수용 — ${RUN}/sv3.log"; fail=1
 fi
 
 # ── 3. C(27B) serve HTTP 종단 ──
