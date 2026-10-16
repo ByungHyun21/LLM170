@@ -369,7 +369,9 @@ impl W4a16Dec {
                 }
             }
         }
-        let key: Vec<usize> = slots.to_vec();
+        // 키 = (t, 슬롯집합) — t는 현재 호출부에서 slots.len() 파생(계약을 키에
+        // 명시: 미래 마스크/가변 t 확장 시 다른 형상의 조용한 replay 차단).
+        let key: (usize, Vec<usize>) = (t, slots.to_vec());
         let hit = self
             .graph
             .batch_graphs
@@ -410,24 +412,30 @@ impl W4a16Dec {
         Ok(out)
     }
 
-    /// [A9] 배치 그래프 캡처 — 슬롯집합 키. 캡처는 실행하지 않는다(상태 불변).
-    pub(super) fn batch_capture(&mut self, key: &[usize], t: usize) -> Result<(), String> {
+    /// [A9] 배치 그래프 캡처 — (t, 슬롯집합) 키. 캡처는 실행하지 않는다(상태 불변).
+    pub(super) fn batch_capture(
+        &mut self,
+        key: &(usize, Vec<usize>),
+        t: usize,
+    ) -> Result<(), String> {
         let _tt = std::time::Instant::now();
         if self.graph.batch_graphs.len() >= 8 {
             let (_, e, g) = self.graph.batch_graphs.remove(0);
             let _ = self.cc.graph_destroy(e, g);
         }
         self.cc.capture_begin()?;
-        if let Err(e) = self.batch_launch(key, t) {
+        if let Err(e) = self.batch_launch(&key.1, t) {
             let _ = self.cc.capture_end();
             return Err(e);
         }
         let g = self.cc.capture_end()?;
         let e = self.cc.graph_instantiate(g)?;
         self.cc.graph_upload(e)?; // [§4.3]
-        self.graph.batch_graphs.push((key.to_vec(), e, g));
+        self.graph.batch_graphs.push((key.clone(), e, g));
         eprintln!(
-            "[batch-graph] captured slots={key:?} ({:.2}ms)",
+            "[batch-graph] captured t={} slots={:?} ({:.2}ms)",
+            key.0,
+            key.1,
             _tt.elapsed().as_secs_f64() * 1e3
         );
         Ok(())

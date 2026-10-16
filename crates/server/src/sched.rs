@@ -450,12 +450,34 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             &mut aging,
             tps,
         );
-        // [§3.4 ③] 트리 동기화 — free 슬롯의 cached를 트리에 등록/해제.
+        // [§3.4 ③] 트리 동기화 — free 슬롯의 cached를 트리에 등록(정리 = 재구축).
         // 512 경계만 기록되므로 매 틱 재등록은 중복 없음(insert가 슬롯 중복 체크).
+        // [2026-10-16] 생산 경로는 슬롯 제거를 호출하지 않아 스테일 노드가
+        // 누적 — 노드가 살아있는 cached 총량의 2배(+슬랙)를 넘으면 재구축한다.
+        // 상각: 트리거 시점의 스테일 ≈ live → 재구축 비용이 삽입당 O(1).
+        let live_tokens: usize = slots
+            .iter()
+            .filter(|s| s.job.is_none() && s.cached.len() >= 512)
+            .map(|s| s.cached.len())
+            .sum();
+        if ptrie.n_nodes > live_tokens.saturating_mul(2).saturating_add(4096) {
+            let before = ptrie.n_nodes;
+            ptrie.rebuild(
+                slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.job.is_none() && s.cached.len() >= 512)
+                    .map(|(i, s)| (i, s.cached.as_slice())),
+            );
+            eprintln!(
+                "# prefix-trie: 재구축 {before}→{}노드 (live {live_tokens}토큰)",
+                ptrie.n_nodes
+            );
+        }
         for (i, s) in slots.iter().enumerate() {
             if s.job.is_none() && s.cached.len() >= 512 {
                 ptrie.insert(&s.cached, i);
-                // [관측 2026-10-14] 트라이 경계 계측 배선(§2.C — /stats 노출 재료).
+                // [관측 2026-10-14] 트라이 경계 계측 배선(/stats 노출 재료).
                 SCHED
                     .trie_boundaries
                     .store(ptrie.n_boundaries as u64, Ordering::Relaxed);

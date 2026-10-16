@@ -321,6 +321,10 @@ impl W4a16Dec {
         }
         self.gdn.dchk_pos[slot][k] = pos;
         self.gdn.dchk_use[slot][k] = tick;
+        // [2026-10-16] 새 체크포인트는 절약 0에서 시작 — 퇴거된 것의 누적 절약
+        // (dchk_saved)을 승계하면 세대 간 가치가 누적돼 FLOP-aware 퇴거가 최근성
+        // 순으로 퇴화한다(정확성 정본은 dchk_pos — 무영향).
+        self.gdn.dchk_saved[slot][k] = 0;
         // [§3.4 ② 2026-10-12] 사용 갱신 — 512경계 기록 시점 recency 리셋.
         self.ucache.touch("spec:ckpt")?;
         Ok(())

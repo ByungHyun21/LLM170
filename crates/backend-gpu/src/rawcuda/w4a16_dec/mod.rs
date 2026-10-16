@@ -335,6 +335,10 @@ pub(super) struct MoE {
     /// 전문가 상주 모드 — moe_tab이 VRAM 포인터(170HX 64GB 등).
     pub(super) moe_resident: bool,
     /// 전문가 디바이스 포인터 테이블(상주 — 배치 GEMV 간접 참조, (q,s) 쌍).
+    /// **판독 계약(2026-10-16)**: t≤8 융합 GEMV·grp mma 경로는 그 청크의
+    /// distinct 전문가가 **전수 스테이징**(mcache_insert가 이 표를 갱신)된 뒤에만
+    /// 표를 소비한다. 퇴거된 전문가의 항목은 다음 갱신 전까지 남으므로 스테이징을
+    /// 건너뛰는 신규 판독 경로 = 조용한 오염(커널은 검사 불가 — 호스트가 유일 게이트).
     pub(super) moe_dev_tab: CUdeviceptr,
     /// 선택 슬롯 인덱스·가중(호스트 → 디바이스, [top_k]).
     pub(super) moe_idx: CUdeviceptr,
@@ -603,7 +607,9 @@ pub(super) struct Graph {
     pub(super) pin_g4_out_len: usize,
     pub(super) pin_batch_in: *mut std::ffi::c_void,
     pub(super) pin_batch_pos: *mut std::ffi::c_void,
-    pub(super) batch_graphs: Vec<(Vec<usize>, ffi::CUgraphExec, ffi::CUgraph)>,
+    /// [A9] 배치 그래프 캐시 — 키 = (t, 슬롯집합). t도 캡처 형상의 일부이므로
+    /// 키에 명시(호출부 현재 계약 = t = slots.len() — 미래 확장 안전).
+    pub(super) batch_graphs: Vec<((usize, Vec<usize>), ffi::CUgraphExec, ffi::CUgraph)>,
     /// [A6-1 2026-10-11] 검증 체인 (slot, t) 그래프 캐시 — 캡처 실패 시 비활성.
     pub(super) spec_graphs: Vec<((usize, usize), ffi::CUgraphExec, ffi::CUgraph)>,
     pub(super) spec_graph_ok: bool,

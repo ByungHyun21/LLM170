@@ -204,10 +204,18 @@ pub fn schema_from_request(body: &str) -> Option<Schema> {
     let ks = seg.find("\"schema\"")?;
     let ob = seg[ks..].find('{')? + ks;
     let block = crate::oai::json::jblock_at(seg, ob)?;
-    parse_schema_node(block)
+    parse_schema_node(block, 0)
 }
 
-fn parse_schema_node(b: &str) -> Option<Schema> {
+/// [2026-10-16] 중첩 상한 — 외부 입력(요청 본문)의 object 스키마 중첩에 상한이
+/// 없으면 핸들러 스레드 스택이 터진다(스택 오버플로는 catch 불가 — 거절 응답도
+/// 못 남). 초과 노드는 미지원과 동일하게 None(전체 무제약 폴백) — 기존 정책 경로.
+const MAX_SCHEMA_DEPTH: usize = 64;
+
+fn parse_schema_node(b: &str, depth: usize) -> Option<Schema> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return None;
+    }
     let ty = crate::oai::json::jstr(b, "type")?;
     match ty.as_str() {
         "string" => Some(Schema::Str),
@@ -230,7 +238,7 @@ fn parse_schema_node(b: &str) -> Option<Schema> {
                     out.push((k, Schema::Enum(e)));
                 } else {
                     // [P0-D2] 미지원 프로퍼티 = 전체 폴백(None 전파).
-                    let sub = parse_schema_node(&v)?;
+                    let sub = parse_schema_node(&v, depth + 1)?;
                     out.push((k, sub));
                 }
             }
@@ -456,5 +464,20 @@ mod tests {
         c.commit("42");
         c.commit("}");
         assert!(c.done());
+    }
+
+    /// [2026-10-16] 중첩 상한 — 깊이 8은 파싱, 상한(64) 초과는 None(무제약
+    /// 폴백)으로 흘려 핸들러 스택을 지킨다(미지원 정책 경로 그대로).
+    #[test]
+    fn depth_cap_nested_schema() {
+        let nest = |n: usize| {
+            let mut s = String::from("{\"type\":\"integer\"}");
+            for _ in 0..n {
+                s = format!("{{\"type\":\"object\",\"properties\":{{\"k\":{s}}}}}");
+            }
+            s
+        };
+        assert!(parse_schema_node(&nest(8), 0).is_some());
+        assert!(parse_schema_node(&nest(200), 0).is_none());
     }
 }

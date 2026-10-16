@@ -825,6 +825,10 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
 /// VRAM에 올린다(prefill gather 가속 — upload_embed). gemma4는 호스트
 /// embed_row 유지(청크 체인). dtype만으로는 구분 불가(둘 다 BF16)이므로 실행
 /// 경로(아치 로더)가 플래너에 정책을 넘긴다 — 플래너 회계 실정합.
+/// [검토 2026-10-16] qwen4exp(FN)는 현재 "gemma4 아님 = 상주"로 계상된다 —
+/// FN 로더 브링업에서 embed 실행 경로(PLE n-gram 임베딩 = 대형·호스트 예상)를
+/// 확정한 뒤 이 판정을 재검할 것. 미검 상태로 두면 플래너가 VRAM을 과대계상해
+/// 정당한 구성을 오거부할 수 있다(가중치 로드 불가라 현재 실해 없음).
 fn embed_resident(dir: &std::path::Path) -> bool {
     let arch = llm170_core::qwen35::bind::dir_arch(dir).unwrap_or_default();
     !llm170_core::gemma4::bind::arch_ok(&arch)

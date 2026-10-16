@@ -218,6 +218,11 @@ fn spec_round_impl(
                 corr = s.sampler.as_mut().unwrap().sample(&mut l);
                 guard += 1;
             }
+            // [2026-10-16] 가드 소진(64회 연속 x)은 표적이 준결정적일 때만 도달 —
+            // 방출은 유지(유한 보장)하되 조용한 계약 이탈 금지(관측).
+            if corr == x {
+                eprintln!("# spec(샘플): 보정 재추출 가드 소진 — corr == x 방출");
+            }
         }
         slot_emit(s, corr);
         SCHED.spec_rounds.fetch_add(1, Ordering::Relaxed);

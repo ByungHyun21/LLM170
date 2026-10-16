@@ -239,9 +239,20 @@ impl W4a16Dec {
         Ok(())
     }
 
+    /// [2026-10-16] 나이 틱 전진 — u32 래핑(2^32회) 시 전체 나이 0 리셋.
+    /// 퇴거 비교가 직접 `<`이므로 래핑 후에는 신규(작은 나이)가 최고령으로
+    /// 보이고 기존(큰 나이)이 영속한다 — 리셋이 순서를 복원(히트율 전용,
+    /// 정확성 무관).
+    fn mcache_tick_bump(&mut self) {
+        self.moe.mcache_tick = self.moe.mcache_tick.wrapping_add(1);
+        if self.moe.mcache_tick == 0 {
+            self.moe.mcache_age.fill(0);
+        }
+    }
+
     /// [B4-2] 캐시 조회 — hit이면 슬롯 반환 + 나이 갱신.
     fn mcache_lookup(&mut self, il: usize, e: usize) -> Option<usize> {
-        self.moe.mcache_tick = self.moe.mcache_tick.wrapping_add(1);
+        self.mcache_tick_bump();
         let base = il * self.moe.mcache_k;
         for slot in 0..self.moe.mcache_k {
             if self.moe.mcache_ids[base + slot] == e as u16 {
@@ -257,7 +268,7 @@ impl W4a16Dec {
     /// [B4-1] 삽입 시 장치 테이블 엔트리((q,s)쌍 ×3투영, 48B)도 갱신한다 —
     /// t≤8 프리필 경로가 테이블 간접 참조로 이 슬롯을 소비한다.
     fn mcache_insert(&mut self, il: usize, e: usize) -> Result<usize, String> {
-        self.moe.mcache_tick = self.moe.mcache_tick.wrapping_add(1);
+        self.mcache_tick_bump();
         let base = il * self.moe.mcache_k;
         let mut slot = 0usize;
         let mut best = u32::MAX;
