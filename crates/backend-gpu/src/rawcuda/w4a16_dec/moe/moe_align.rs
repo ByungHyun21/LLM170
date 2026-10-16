@@ -3,6 +3,9 @@ use super::super::*;
 impl W4a16Dec {
     /// [P11] 전문가-우선 슬롯 순열 발사(프리필 전용) — w4a16_moe_align.
     /// n_exp ≤ 1024 계약(초과 시 호출부가 종전 경로로 폴백).
+    /// [A/B 2026-10-16] O(n) 스캐터(1612ad35)+핀드 idx 스테이징(24c3b395) 결합의
+    /// 35B 스트리밍 동일 세션 A/B(교차 2R·중앙값): pp512 +3.5% · pp2048 +2.4%
+    /// (ns=4096 구간; tg는 노이즈로 미확정).
     pub(in crate::rawcuda::w4a16_dec) fn moe_align_launch(
         &self,
         nslots: usize,
