@@ -32,8 +32,9 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
       llama-bench 규격 PP/TG/NP 측정(엔진 직접 — HTTP 무경유, 합성 LCG 토큰).
   llm170 serve --model <w4a16_dir> --kv-mem <총량> [--port N] [--queue N]
               [--ple ssd|ram|vram] [--spec auto|mtp|ngram|off] [--moe auto|resident|streaming]
-      OpenAI/Anthropic 호환 HTTP 서버. KV 총량 = --kv-mem(필수·무 auto — 권고는 `llm170 plan`),
-      요청 상한 = min(모델 최대, 풀) — 초과 요청은 거부(클램프·드롭 없음).
+      OpenAI/Anthropic 호환 HTTP 서버. KV 총량 = --kv-mem(필수·무 auto — 권고는 `llm170 plan`).
+      요청 상한 = min(모델 최대, 풀) — 모델 ctx 초과분은 출력 클램프(vLLM식·기동 로그에 기록),
+      풀 초과는 거부, 잔여 부족은 대기(드롭 없음).
   llm170 w4a16-load <dir>
       W4A16(compressed-tensors int4 sym g128) 로더 완전성 검증 — 트리플·커버리지.
   llm170 w4a16-ref <dir> --prompt-tokens <ids> [--n-predict N] [--ctx N]

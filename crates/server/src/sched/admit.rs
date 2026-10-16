@@ -10,8 +10,9 @@
 //!   넘으면 신규 입장을 동결(선두 1건만 허용). 실행 중 요청은 건드리지 않는다
 //!   (비선점 — "사용 중 실패 금지"). 선두 입장 시 해제(다음 틱 재판정).
 //! - **D 적응**: 부트스트랩 30s → β×P50(요청 예상 지속) 자동 스케일 +
-//!   비용 피드백(동결 중 유휴↑·차단>0 = 실손해 → ×0.5 / 선두 대기 P95 > 2D =
-//!   보호 부족 → ×1.5), 창 30s·1회·클램프 5~120s. D는 공정성↔스루풋 노브.
+//!   비용 피드백(트리거 히스테리시스 ±20%: 동결 중 유휴 60%+ & 차단>0 = 실손해
+//!   → ×0.5 / 선두 대기 P95 > 2.4×D = 보호 부족 → ×1.5), 창 30s·1회·클램프
+//!   5~120s. D는 공정성↔스루풋 노브.
 //!   `LLM170_AGING_D`(초) 지정 시 고정 D·적응 OFF(운영 노브·A/B).
 
 use std::collections::VecDeque;
@@ -31,9 +32,8 @@ pub fn need_tokens(prompt: usize, n_predict: usize) -> usize {
 /// 예(512×층 가정 아님 — 테스트는 blocks_needed로 환산): 큐 100k·200k·50k,
 /// 여유 150k → [0, 2](200k는 이후). 큐 200k·100k·50k, 여유 250k → [0, 2].
 ///
-/// 소비처 = 계약 테스트(런타임 스캔은 slot_intake가 동일 규칙을 집행 —
-/// 이 함수가 명세·회귀 그물).
-#[allow(dead_code)]
+/// **소비처 = slot_intake 런타임**(매 반복 첫 후보 선택 — 검토 반영 2026-10-16,
+/// 인라인 이원 구현 제거) · 계약 회귀 = 이 모듈 테스트.
 pub fn binpack_order(
     needs: &[usize],
     free_blocks: usize,
@@ -234,19 +234,20 @@ impl Aging {
             self.boot_d_s
         };
         let mut d = base;
-        // 2) 비용 피드백(이산·히스테리시스 = 창당 1회).
+        // 2) 비용 피드백(이산 조정 — **트리거 히스테리시스 ±20%**: 명목 임계의
+        //    1.2배를 넘어야 발화한다. 창당 1회 — 플래핑 방지, 설계 §10.5).
         let idle_ratio = if self.win_freeze_ms > 0 {
             self.win_idle_ms as f64 / self.win_freeze_ms as f64
         } else {
             0.0
         };
-        if self.win_blocked_tokens > 0 && idle_ratio > 0.5 {
-            // 동결이 스루풋 실손해 — 보호 완화.
+        if self.win_blocked_tokens > 0 && idle_ratio > 0.6 {
+            // 동결이 스루풋 실손해(동결 중 유휴 60%+) — 보호 완화.
             d = (d * 0.5).max(5.0);
         } else if self.head_waits.len() >= 16
-            && self.head_wait_p95().map(|p| p > 2.0 * old).unwrap_or(false)
+            && self.head_wait_p95().map(|p| p > 2.4 * old).unwrap_or(false)
         {
-            // 선두 대기가 목표(2×D) 초과 — 보호 강화.
+            // 선두 대기가 목표(2×D)의 20% 초과 — 보호 강화.
             d = (d * 1.5).min(120.0);
         }
         self.d_s = d;
@@ -372,6 +373,37 @@ mod tests {
         a.last_adapt = Instant::now() - Duration::from_secs(31);
         let _ = a.maybe_adapt(Instant::now());
         assert!((a.stats().d_s - 30.0).abs() < 1e-6);
+    }
+
+    /// [검토 반영 2026-10-16] 트리거 히스테리시스 ±20% — 명목 임계 미달 신호는
+    /// 발화하지 않는다(유휴 55%는 ×0.5 미발화, p95 2.2×D는 ×1.5 미발화).
+    #[test]
+    fn aging_hysteresis_margin() {
+        let mut a = Aging::new(30.0, None);
+        for _ in 0..20 {
+            a.observe_est(60.0); // P50 60s → base 60s
+        }
+        // 유휴 55%(0.5 초과·0.6 미만) = 데드밴드 — 조정 없음(60s 유지).
+        a.win_blocked_tokens = 1000;
+        a.win_freeze_ms = 1000;
+        a.win_idle_ms = 550;
+        a.last_adapt = Instant::now() - Duration::from_secs(31);
+        let _ = a.maybe_adapt(Instant::now());
+        assert!((a.stats().d_s - 60.0).abs() < 1e-6, "{:?}", a.stats());
+        // p95 = 2.2×D(2.0 초과·2.4 미만) = 데드밴드 — 조정 없음.
+        for _ in 0..20 {
+            a.note_head_wait(132.0); // 2.2 × 60
+        }
+        a.last_adapt = Instant::now() - Duration::from_secs(31);
+        let _ = a.maybe_adapt(Instant::now());
+        assert!((a.stats().d_s - 60.0).abs() < 1e-6, "{:?}", a.stats());
+        // 유휴 65% = 발화(×0.5).
+        a.win_blocked_tokens = 1000;
+        a.win_freeze_ms = 1000;
+        a.win_idle_ms = 650;
+        a.last_adapt = Instant::now() - Duration::from_secs(31);
+        let _ = a.maybe_adapt(Instant::now());
+        assert!((a.stats().d_s - 30.0).abs() < 1e-6, "{:?}", a.stats());
     }
 
     /// D 적응 — 클램프 경계(자동 상한 120·하한 5).

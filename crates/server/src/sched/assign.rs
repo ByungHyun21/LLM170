@@ -102,7 +102,15 @@ pub(super) fn assign_slot(
             tokens: Vec::new(),
             error: Some(format!("kv 입장 실패: {e}")),
         });
-        let c = std::mem::take(&mut slots[i].cached);
+        // [검토 반영 2026-10-16] 부분 할당 잔존 금지 — 실패 슬롯은 전량 반납하고
+        // 접두 캐시를 무효화한다(블록이 사라진 cached는 재사용 불가 — reclaim_idle와
+        // 동일 의미). freed=0(아무 블록도 없었음)이면 캐시 유지(기존 동작).
+        let freed = eng.0.kv_release_slot(i);
+        let c = if freed > 0 {
+            Vec::new()
+        } else {
+            std::mem::take(&mut slots[i].cached)
+        };
         slots[i] = Slot::free();
         slots[i].cached = c;
         return;

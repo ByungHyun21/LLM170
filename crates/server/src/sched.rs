@@ -591,52 +591,71 @@ fn slot_intake(
 ) {
     // [K6-3 2026-10-13] 입장 보장 — 예약(프롬프트+생성한도+슬랙)이 풀 여유에
     // 맞아야 배정. **보류분 우선 재시도(도착 순서 = 기본 FCFS)** 후 신규 수신.
-    // [W2 2026-10-16] bin-pack(스킵어헤드) = 설계 계약(§8-4): 뒤의 소형이
-    // '지금 들어갈 수 있으면' 입장. freeze = EASY 동결 — 선두(0)만 허용.
-    let mut i = 0;
-    while i < pending.len() {
+    // [W2+검토 2026-10-16] 순서 규칙의 **단일 출처 = admit::binpack_order**(순수).
+    // 런타임은 후보 선택만 위임하고(인라인 스캔 제거 — 이원 구현 drift 금지),
+    // 부작용(회수·조기 거부·동결 계측)만 이 층이 집행한다. 매 반복 재계산(소비 반영).
+    loop {
         if !slots.iter().any(|s| s.job.is_none()) {
             break;
         }
-        if freeze && i > 0 {
-            // [W2] 백필 차단 — 작업당 1회 계측(동결이 스루풋에 준 비용).
-            if !pending[i].aging_blocked {
-                pending[i].aging_blocked = true;
-                aging.note_blocked(j_need_tokens(&pending[i]));
+        let needs: Vec<usize> = pending.iter().map(j_need_tokens).collect();
+        // 동결 비용 계측 — 동결 중 비선두 대기(입장 가능분만; 작업당 1회).
+        if freeze {
+            for (k, j) in pending.iter_mut().enumerate().skip(1) {
+                if !j.aging_blocked && eng.0.kv_blocks_needed(needs[k]) <= eng.0.kv_total_blocks() {
+                    j.aging_blocked = true;
+                    aging.note_blocked(needs[k]);
+                }
             }
-            i += 1;
-            continue;
         }
-        if admit_ok(eng, &pending[i]) {
-            let head = i == 0;
-            let j = pending.remove(i);
-            if head {
-                aging.note_head_wait(j.queued.elapsed().as_secs_f64());
-            }
-            if tps > 0.0 {
-                aging.observe_est(j_need_tokens(&j) as f64 / tps);
-            }
-            assign_slot(slots, eng, j, tick, ptrie);
-        } else {
-            // [K6-3] 용량 자체 초과(무슨 수로도 불가) = 조기 거부(무한 대기 방지).
-            let need = j_need_tokens(&pending[i]);
-            if eng.0.kv_blocks_needed(need) > eng.0.kv_total_blocks() {
+        let pick = admit::binpack_order(&needs, eng.0.kv_free_blocks(), freeze, |n| {
+            eng.0.kv_blocks_needed(n)
+        })
+        .first()
+        .copied();
+        match pick {
+            Some(i) => {
+                let head = i == 0;
                 let j = pending.remove(i);
-                SCHED.requests_failed.fetch_add(1, Ordering::Relaxed);
-                let _ = j.out.send(InferResult {
-                    tokens: Vec::new(),
-                    error: Some(format!(
-                        "request exceeds the KV pool: need {need} tokens (prompt + max_tokens) > pool capacity"
-                    )),
-                });
-                continue;
+                if head {
+                    aging.note_head_wait(j.queued.elapsed().as_secs_f64());
+                }
+                if tps > 0.0 {
+                    aging.observe_est(j_need_tokens(&j) as f64 / tps);
+                }
+                assign_slot(slots, eng, j, tick, ptrie);
             }
-            // [K6-3] 유휴 슬롯 접두 캐시 회수(1개) 후 재시도 — 비활성 슬롯은
-            // 캐시일 뿐이므로 압박 시 양보(사다리 1단계).
-            if reclaim_idle(eng, slots) {
-                continue;
+            None => {
+                // ① 용량 자체 초과(무슨 수로도 불가) = 조기 거부(무한 대기 방지).
+                let mut rejected = false;
+                let mut k = 0;
+                while k < pending.len() {
+                    let need = j_need_tokens(&pending[k]);
+                    if eng.0.kv_blocks_needed(need) > eng.0.kv_total_blocks() {
+                        let j = pending.remove(k);
+                        SCHED.requests_failed.fetch_add(1, Ordering::Relaxed);
+                        let _ = j.out.send(InferResult {
+                            tokens: Vec::new(),
+                            error: Some(format!(
+                                "request exceeds the KV pool: need {need} tokens (prompt + max_tokens) > pool capacity"
+                            )),
+                        });
+                        rejected = true;
+                    } else {
+                        k += 1;
+                    }
+                }
+                if rejected {
+                    continue;
+                }
+                // ② 유휴 슬롯 접두 캐시 회수(1개) 후 재시도 — 비활성 슬롯은
+                // 캐시일 뿐이므로 압박 시 양보(사다리 1단계).
+                if reclaim_idle(eng, slots) {
+                    continue;
+                }
+                // ③ 전원 대기 유지(동결 중엔 선두만 남는다 — 선두 보호).
+                break;
             }
-            i += 1;
         }
     }
     loop {
@@ -711,9 +730,9 @@ fn reclaim_idle(eng: &mut Engine, slots: &mut [Slot]) -> bool {
     }
 }
 
-/// [K6-3 2026-10-13] 입장 판정 — 필요 블록(프롬프트+생성한도+슬랙 2행)이
-/// 풀 여유 이하. 슬롯 보유 접두 블록은 보수적으로 미계상(과대 판정 = 대기
-/// 우선 — 활성 요청 안전). 큐 대기의 단일 기준.
+/// [K6-3 2026-10-13] 입장 판정 — 필요 블록(예약 토큰 = 프롬프트+생성한도+
+/// 슬랙 8 — `admit::need_tokens`)이 풀 여유 이하. 슬롯 보유 접두 블록은
+/// 보수적으로 미계상(과대 판정 = 대기 우선 — 활성 요청 안전). 큐 대기의 단일 기준.
 fn admit_ok(eng: &Engine, j: &SlotJob) -> bool {
     let need = j_need_tokens(j);
     eng.0.kv_blocks_needed(need) <= eng.0.kv_free_blocks()

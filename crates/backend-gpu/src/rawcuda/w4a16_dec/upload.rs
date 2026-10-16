@@ -323,7 +323,7 @@ impl W4a16Dec {
         // 보므로 블록 배정/회수는 호스트 갱신만으로 반영된다.
         // **온디맨드**: 초기 테이블은 0(미할당) — 슬롯은 입장(kv_grow)에서 필요한
         // 블록만 배정받는다(요청별 예약·회수 — K6 3차). 미할당 엔트리는 판독
-        // 전에 반드시 kv_grow가 덮는다(성장 = 사용 직전 +슬랙 2행).
+        // 전에 반드시 kv_grow가 덮는다(성장 = 사용 직전 +2 정렬 여유).
         let tab = vec![0u64; slots * n * mb * 4];
         let dblk = self.cc.alloc(tab.len() * 8)?;
         // SAFETY: 로컬 Vec<u64>의 유효 수명 내 바이트 뷰(길이 = 원소수×8).
@@ -362,7 +362,7 @@ impl W4a16Dec {
         Ok(())
     }
 
-    /// [K6-3 2026-10-13] 슬롯 KV 블록 확보 — `n_tokens`(+슬랙 2행)까지
+    /// [K6-3 2026-10-13] 슬롯 KV 블록 확보 — `n_tokens`(+2 정렬 여유)까지
     /// 온디맨드. 신규 블록만 디바이스 테이블에 기입(동기 h2d — 틱 경계
     /// 호출 계약: 리플레이/커널 실행 중 금지). 반환 = 신규 블록 수.
     /// 테이블 상한(층당 mb)으로 클램프 — 초과분은 ctx 가드/overflow 몫.
@@ -424,7 +424,7 @@ impl W4a16Dec {
         Ok(new)
     }
 
-    /// [K6-3] 위치 기반 확보 — `pos_end`(+슬랙 2행)까지. 고수위 캐시로
+    /// [K6-3] 위치 기반 확보 — `pos_end`(+2 정렬 여유)까지. 고수위 캐시로
     /// 무비용 no-op. 체인/프리필/MTP/검증 **진입 공통** — 직접 호출자
     /// (프로브·infer 포함)도 안전하다(테이블 미할당 판독 방지).
     pub(super) fn kv_ensure(&mut self, slot: usize, pos_end: usize) -> Result<(), String> {
@@ -527,7 +527,9 @@ impl W4a16Dec {
             .unwrap_or(0)
     }
 
-    /// [K6-3] n_tokens(+슬랙 2행) 예약에 필요한 블록 수 — 입장 판정용.
+    /// [K6-3] n_tokens(+2 정렬 여유) 예약에 필요한 블록 수 — 입장 판정용.
+    /// 예약 슬랙(8 — 스펙 전방 tmax−1)은 호출부 예약 몫(`sched::admit::RESERVE_SLACK`,
+    /// `need_tokens`가 포함) — 여기의 +2는 정렬 여유일 뿐 이중 계상이 아니다.
     pub fn kv_blocks_needed(&self, n_tokens: usize) -> usize {
         match self.attn.attn {
             Some(dm) => {
