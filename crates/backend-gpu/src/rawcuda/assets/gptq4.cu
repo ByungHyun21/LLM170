@@ -401,13 +401,20 @@ extern "C" __global__ void w4a16_moe_align(
         }
     }
     __syncthreads();
-    for (int j = tid; j < nslots; j += nt) {
-        const int e = idx[j];
-        unsigned r = 0;
-        for (int jp = 0; jp < j; ++jp) {
-            r += (idx[jp] == e) ? 1u : 0u;
+    // [P2 2026-10-16] O(n²/nt) 선행 검색 → O(n) 단일 스레드 순회 — 순위 =
+    // "같은 전문가가 이전에 몇 번 나왔나"는 앞 슬롯을 전부 훑지 않고 실행
+    // 카운터(shared cnt 재사용 — 프리픽스 후 0으로 리셋)로 직접 추적.
+    // ns≤4096 → 4096 회 = 수 µs(기존 8.4M 비교)·완전 결정론(순회 순서 고정).
+    // 병렬화가 필요해지면 워프별 프리픽스 2패스로 확장(결정론 유지 조건).
+    if (tid == 0) {
+        for (int i = 0; i < n_exp; ++i) {
+            cnt[i] = 0; // 실행 카운터로 전환(합은 이미 gcnt에 기록됨)
         }
-        gslot[off[e] + r] = (unsigned)j; // 결정론 위치 = 기저 + 슬롯 순위
+        for (int j = 0; j < nslots; ++j) {
+            const int e = idx[j];
+            gslot[off[e] + cnt[e]] = (unsigned)j;
+            cnt[e] += 1;
+        }
     }
 }
 
