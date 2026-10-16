@@ -645,6 +645,11 @@ pub(super) struct G4GraphEntry {
 
 pub struct W4a16Dec {
     pub(super) moe: MoE,
+    /// [tuning-sweep W2 2026-10-16] 스트리밍 전문가 LRU 재구성 노브(bench
+    /// --sweep 전용) — None = 상수 경로(cap 96·예산 free/2). serve/infer는
+    /// 항상 기본값(단일 경로 원칙 — ensure_moe_bufs가 소비).
+    pub(super) tuning_lru_cap: Option<usize>,
+    pub(super) tuning_lru_frac: Option<u64>,
     pub(super) mtp: Mtp,
     pub(super) kstep: Kstep,
     pub(super) attn: Attn,
@@ -867,6 +872,8 @@ impl W4a16Dec {
                 dmo: Buf::default(),
                 moe_bufs_ok: false,
             },
+            tuning_lru_cap: None,
+            tuning_lru_frac: None,
             mtp: Mtp {
                 mtp_ok: false,
                 mtp_nw: 0,

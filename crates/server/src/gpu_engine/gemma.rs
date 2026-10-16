@@ -10,6 +10,8 @@ pub struct GemmaEngine {
     model: llm170_core::gemma4::Model,
     cfg: G4HostCfg,
     dec: W4a16Dec,
+    /// [tuning-sweep W1/W2 2026-10-16] bench --sweep 노브 — serve는 항상 Default.
+    pub tuning: super::Tuning,
     #[allow(dead_code)]
     n_slots: usize,
 }
@@ -45,6 +47,7 @@ impl GemmaEngine {
                 model,
                 cfg,
                 dec,
+                tuning: super::Tuning::default(),
                 n_slots,
             }),
             Err(e) => {
@@ -52,6 +55,20 @@ impl GemmaEngine {
                 Err(e)
             }
         }
+    }
+
+    /// [tuning-sweep W1/W2 2026-10-16] --sweep 노브 적용(qwen과 동일 계약).
+    pub fn apply_tuning(&mut self, t: super::Tuning) -> Result<(), String> {
+        self.tuning = t;
+        self.dec.set_lru_tuning(t.lru_cap, t.lru_frac)
+    }
+
+    /// sched/spec.rs n-gram 초안 노브(기본 3/48).
+    pub fn ngram_knobs(&self) -> (usize, usize) {
+        (
+            self.tuning.ngram_n.unwrap_or(3),
+            self.tuning.ngram_m.unwrap_or(48),
+        )
     }
 
     /// 컨텍스트 생성 **후** 적재 본체(upload_model_g4 + 층별 pes).
@@ -127,7 +144,11 @@ impl GemmaEngine {
         // 검증: 전문가·topk·attn은 t 직지원, t행 GEMV 계열(선형·라우터)은 호스트
         // 행 분할(≤16 스위치 — 행별 비트동일). 상한 = G4_CHUNK_MAX(단일 출처).
         let t_chunk = if self.dec.moe_experts_resident() {
-            llm170_backend_gpu::G4_CHUNK_MAX
+            // [tuning-sweep W2] 청크 노브 — 상한은 G4_CHUNK_MAX로 클램프(계약 보존).
+            self.tuning
+                .chunk_t
+                .unwrap_or(llm170_backend_gpu::G4_CHUNK_MAX)
+                .min(llm170_backend_gpu::G4_CHUNK_MAX)
         } else {
             1
         };

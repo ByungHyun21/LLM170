@@ -509,12 +509,12 @@ impl W4a16Dec {
                 // (핫+캐시+KV+마진 ≤ 로드 시 여유). 여기선 가용 한도만 재확인.
                 (free / per_total) as usize
             } else {
-                ((free / 2) / per_total) as usize
+                ((free / self.tuning_lru_frac.unwrap_or(2)) / per_total) as usize
             };
             let k = if self.moe.mcache_k_plan > 0 {
                 self.moe.mcache_k_plan.min(96).min(kmax)
             } else {
-                96usize.min(kmax)
+                self.tuning_lru_cap.unwrap_or(96).min(kmax)
             };
             if k > 0 {
                 let qb = self.n_layers * k * 3 * qsz;
@@ -570,6 +570,30 @@ impl W4a16Dec {
         // [§3.4 ② 트랜셰 2] 등록(allocate) 중 퇴거가 결정됐을 수 있다 —
         // 여기서 실제 해제까지 완료(구성 확정 후 소비 — 순서 계약).
         self.ucache_sweep()?;
+        Ok(())
+    }
+
+    /// [tuning-sweep W2 2026-10-16] LRU 노브 적용 + 기존 캐시 해제 — ensure가
+    /// 다음 접근에서 재구성한다(moe_bufs_ok=false). 회계 해제(ucache)·그래프
+    /// 무효화는 ucache_sweep의 "moe:expert-lru" 퇴거 경로와 동일 계약(캡처된
+    /// 옛 포인터 replay 차단).
+    pub fn set_lru_tuning(&mut self, cap: Option<usize>, frac: Option<u64>) -> Result<(), String> {
+        self.tuning_lru_cap = cap;
+        self.tuning_lru_frac = frac;
+        if self.moe.mcache_k > 0 {
+            self.graph_invalidate();
+            self.cc.sync()?;
+            self.ucache.release_if_present("moe:expert-lru");
+            for p in [self.moe.mcache_q, self.moe.mcache_s] {
+                if p != 0 {
+                    self.cc.free(p)?;
+                }
+            }
+            (self.moe.mcache_q, self.moe.mcache_s, self.moe.mcache_k) = (0, 0, 0);
+            self.moe.mcache_ids.clear();
+            self.moe.mcache_age.clear();
+            self.moe.moe_bufs_ok = false; // 자가 재구성 유도
+        }
         Ok(())
     }
 

@@ -33,8 +33,25 @@ pub struct QwenEngine {
     softcap: f32,
     /// [MTP 2026-10-12] 모델 자체 MTP 초안기 활성(27B dense v1).
     mtp: bool,
+    /// [tuning-sweep W1/W2 2026-10-16] bench --sweep 노브 — serve/infer는 항상
+    /// Default(프로덕션 단일 값 불변). 전부 None = 상수 경로와 동일.
+    pub tuning: Tuning,
 }
 
+/// [tuning-sweep W1/W2 2026-10-16] bench --sweep 조작 노브(플랜 tuning-sweep §2).
+/// - A계층(인자화): ngram n/m — sched/spec.rs 초안 경로(bench 직접 경로엔 미기여, serve 측정은 2차 스윕)
+/// - B계층(재구성): chunk_t(프리필 청크 — prefill_tmax 클램프 경유)·LRU(cap·frac)
+/// - GEMV_TR 등 .cu 미러 상수는 런타임 노브 금지(커널 레이아웃 미러 — 2차 재빌드 스윕 소관)
+///
+/// 무결성 = W0 해시 실드: 노브 값이 달라도 측정 스트림 해시는 불변이어야 한다.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Tuning {
+    pub ngram_n: Option<usize>,
+    pub ngram_m: Option<usize>,
+    pub chunk_t: Option<usize>,
+    pub lru_cap: Option<usize>,
+    pub lru_frac: Option<u64>,
+}
 /// [R16] 프리필 청크 tmax 정책 — 순수 함수(테스트 표면).
 /// 규칙: MoE 스트리밍은 캐시 스테이징 기반 t≤8 청크(종전 t=1 폴백 — 512토큰
 /// ~9.3s), 그 외는 `LLM170_PREFILL_T`(진단 오버라이드) 또는 기본 512
@@ -166,6 +183,7 @@ engine_delegate_mut! {
     decode_np_logits(seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<f32>, String>;
     reset_seq(seq: usize) -> Result<(), String>;
     enable_spec() -> Result<(), String>;
+    apply_tuning(t: Tuning) -> Result<(), String>;
     spec_verify_logits(slot: usize, rows: &[f32], t: usize) -> Result<Vec<f32>, String>;
 }
 
@@ -182,6 +200,7 @@ engine_delegate_ref! {
     reuse_valid(slot: usize, l: usize, prompt_len: usize) -> bool;
     piece(tok: u32) -> String;
     mtp_drafts_on() -> bool;
+    ngram_knobs() -> (usize, usize);
     mem_stats() -> (u64, u64, u64, u64);
     active_weight_bytes() -> u64;
     moe_mode() -> &'static str;
