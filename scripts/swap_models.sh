@@ -273,10 +273,12 @@ esac
 note "[7/10] E(FN FP8PLE) 자원 가드 명시 거부 판정"
 if timeout 60 "$BIN" w4a16-load "$M_FN" > "$RUN/e.log" 2>&1; then
   echo "[w4a16] FAIL: 가드가 통과시킴(120GiB) — ${RUN}/e.log"; fail=1
-elif grep -qE "insufficient resources|rsrc-guard" "$RUN/e.log"; then
+elif grep -q "insufficient resources" "$RUN/e.log"; then
+  # [2026-10-16] 'rsrc-guard' 광역 매칭 제거 — 적재 락 대기("…대기(B20)")도
+  # rsrc-guard 접두를 달고 있어 타 llm170 동시 실행 시 false-pass였다.
   note "가드 거부 OK: $(head -1 "$RUN/e.log")"
 else
-  echo "[w4a16] FAIL: 가드 외 사유 — ${RUN}/e.log"; fail=1
+  echo "[w4a16] FAIL: 가드 외 사유(락 대기 포함) — ${RUN}/e.log"; fail=1
 fi
 
 # ── 8. G(27B) 장문 600·4000토큰 — lim>256·다중 청크
@@ -534,9 +536,14 @@ for name, mt in [("rB", 16), ("rA", 8)]:
             "max_tokens": mt, "temperature": 0}
     open(f'{run}/reuse-{name}.json', 'w', encoding='utf-8').write(json.dumps(body))
 PYG4E
-for pair in "$M_G4:gemma4:18101" "$M_27B:qwen27:18102"; do
-  d="${pair%%:*}"; rest="${pair#*:}"; n="${rest%%:*}"; port="${rest#*:}"
-  "$BIN" serve --model "$d" --kv-mem 512M --port "$port" > "$RUN/g4e-$n.log" 2>&1 &
+# [2026-10-16 수정] gemma4 KV ≈128KiB/토큰 — kv-mem 512M(4096토큰 풀)에서는
+# 2242토큰 프롬프트의 2번째 요청부터 kv 압박이 접두 캐시를 회수해 재사용이
+# 소멸했다(전 요청 콜드 — 스모크 G4e 실패로 적발. 회수 자체는 요청 우선
+# 원칙상 정상 동작 = 테스트 구성 문제). gemma4 1G(8192토큰)·qwen27 512M로
+# 모델별 여유를 준다.
+for pair in "$M_G4:gemma4:18101:1G" "$M_27B:qwen27:18102:512M"; do
+  d="${pair%%:*}"; rest="${pair#*:}"; n="${rest%%:*}"; rest="${rest#*:}"; port="${rest%%:*}"; kv="${rest#*:}"
+  "$BIN" serve --model "$d" --kv-mem "$kv" --port "$port" > "$RUN/g4e-$n.log" 2>&1 &
   G4E_PID=$!
   trap 'kill "$G4E_PID" 2>/dev/null' EXIT
   for i in $(seq 1 100); do
