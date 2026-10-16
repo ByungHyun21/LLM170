@@ -1,5 +1,106 @@
 //! gpu_engine.rs에서 분해(순수 이동 — 코드 무변).
 use llm170_backend_gpu::{AttnDims, GdnDims};
+use llm170_core::w4a16::{DirectReader, W4a16Model};
+
+/// [W4 2026-10-16] 상주 적재 바이트 소스 — O_DIRECT 직접 리더(샤드별 lazy).
+/// mmap 우회로 **페이지 캐시 잔류 0**(모델 > RAM도 성립) — 백엔드 핀드 링이
+/// `read_into`를 fill로 소비해 VRAM으로 스트리밍한다. CPU 참조·MoE 스트리밍
+/// (비상주) 소스는 호스트가 계층이라 mmap을 유지한다(캐시가 자산).
+///
+/// 진단 폴백: `LLM170_LOAD_MMAP=1` = mmap 슬라이스 경로(§7.3 폴백 — A/B·회귀
+/// 비교용. 적재 바이트·수치 불변).
+pub(crate) struct DirectLoad<'m> {
+    store: &'m W4a16Model,
+    paths: Vec<&'m std::path::Path>,
+    readers: Vec<Option<DirectReader>>,
+    direct: bool,
+    /// 진단 누적 — reads/chunks 바이트.
+    pub chunks: u64,
+    pub bytes: u64,
+    logged: bool,
+}
+
+impl<'m> DirectLoad<'m> {
+    pub(crate) fn new(store: &'m W4a16Model) -> Self {
+        Self {
+            store,
+            paths: store.shard_paths(),
+            readers: (0..store.shard_count()).map(|_| None).collect(),
+            direct: llm170_diag::flag::val("LLM170_LOAD_MMAP").is_none(),
+            chunks: 0,
+            bytes: 0,
+            logged: false,
+        }
+    }
+
+    fn reader(&mut self, shard: usize) -> Result<&mut DirectReader, String> {
+        if self.readers[shard].is_none() {
+            let p = *self
+                .paths
+                .get(shard)
+                .ok_or_else(|| format!("샤드 {shard} 경로 부재"))?;
+            self.readers[shard] = Some(DirectReader::open(p).map_err(|e| e.to_string())?);
+        }
+        Ok(self.readers[shard].as_mut().expect("직전에 채움"))
+    }
+
+    /// 텐서 전체 길이(바이트) — 스트림 호출의 len 인자.
+    pub(crate) fn tensor_len(&self, name: &str) -> Result<u64, String> {
+        self.store
+            .tensor_range(name)
+            .map(|(_, _, len)| len)
+            .ok_or_else(|| format!("W4 적재: 텐서 범위 부재 {name}"))
+    }
+
+    /// 텐서 `[off, off+buf.len())` 채움 — 백엔드 fill 계약(전량 기록).
+    pub(crate) fn read_into(&mut self, name: &str, off: u64, buf: &mut [u8]) -> Result<(), String> {
+        let (shard, base, len) = self
+            .store
+            .tensor_range(name)
+            .ok_or_else(|| format!("W4 적재: 텐서 범위 부재 {name}"))?;
+        if off + buf.len() as u64 > len {
+            return Err(format!(
+                "W4 적재: 범위 밖 {name} off={off} len={} 텐서={len}",
+                buf.len()
+            ));
+        }
+        self.chunks += 1;
+        self.bytes += buf.len() as u64;
+        if !self.direct {
+            let sl = self
+                .store
+                .tensor_slice(name)
+                .ok_or_else(|| format!("W4 적재(mmap 폴백): 슬라이스 부재 {name}"))?;
+            buf.copy_from_slice(&sl[off as usize..off as usize + buf.len()]);
+            return Ok(());
+        }
+        let r = self.reader(shard)?;
+        r.read_into(base + off, buf).map_err(|e| e.to_string())
+    }
+
+    /// 로드 종료 1회 로그 — 직결/폴백·누적(운영 가시화).
+    pub(crate) fn log_summary(&mut self) {
+        if self.logged {
+            return;
+        }
+        self.logged = true;
+        if self.chunks == 0 {
+            return;
+        }
+        let align = self.readers.iter().flatten().map(|r| r.align()).max();
+        eprintln!(
+            "# load: {} 텐서청크 {}·{:.2}GiB{}",
+            if self.direct {
+                "O_DIRECT 직결(mmapped 슬라이스 우회)"
+            } else {
+                "mmap 폴백(LLM170_LOAD_MMAP)"
+            },
+            self.chunks,
+            self.bytes as f64 / (1u64 << 30) as f64,
+            align.map(|a| format!(" · align {a}B")).unwrap_or_default(),
+        );
+    }
+}
 
 /// MoE(35B-A3B) 상주 배선 — 플레인 bf16 업로드 + 전문가 슬라이스 테이블.
 /// GpuEngine·w4a16-gpu 프로브 공용.
@@ -13,6 +114,8 @@ pub(crate) fn upload_moe(
 ) -> Result<(), String> {
     let hp = model.hp.clone();
     let t0 = std::time::Instant::now();
+    // [W4 2026-10-16] 플레인 가중 — O_DIRECT 직결 스트림(mmap 슬라이스 우회).
+    let mut ld = DirectLoad::new(model.store());
     for name in model.engine_names() {
         // token_embd(호스트 embed_row)·output(head 전용 업로드)는 체인이
         // 선형으로 쓰지 않는다 — VRAM 절약(각 ~970MiB @35B).
@@ -22,7 +125,12 @@ pub(crate) fn upload_moe(
         if let Some(w) = model.w_raw(&name)
             && w.ty == llm170_core::wtype::WType::Bf16
         {
-            dec.upload_plain(&name, w.data, w.n_out as usize, w.n_in as usize)?;
+            let (tn, _) = model
+                .w_raw_names(&name)
+                .ok_or_else(|| format!("{name}: 원시 텐서 이름 부재"))?;
+            let len = ld.tensor_len(&tn)? as usize;
+            let mut f = |off: u64, buf: &mut [u8]| ld.read_into(&tn, off, buf);
+            dec.upload_plain_stream(&name, w.n_out as usize, w.n_in as usize, len, &mut f)?;
         }
     }
     let plain_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -78,10 +186,33 @@ pub(crate) fn upload_moe(
     let tab_ms = t1.elapsed().as_secs_f64() * 1e3;
     let t2 = std::time::Instant::now();
     if resident {
-        dec.upload_experts_resident(&tab)?;
+        // [W4 2026-10-16] 전문가 상주 — O_DIRECT 직결 스트림(셀 단위).
+        // 셀 이름·길이는 expert_slice와 동일 규칙(bind::expert_base).
+        let mut lens: Vec<(usize, usize)> = Vec::with_capacity(tab.len());
+        let mut names: Vec<(String, String)> = Vec::with_capacity(tab.len());
+        for il in 0..hp.n_layer {
+            for e in 0..hp.n_experts {
+                for proj in ["gate_proj", "up_proj", "down_proj"] {
+                    let (qn, sn) = model.expert_names(il, e, proj);
+                    lens.push((ld.tensor_len(&qn)? as usize, ld.tensor_len(&sn)? as usize));
+                    names.push((qn, sn));
+                }
+            }
+        }
+        let mut f = |cell: usize, which: usize, off: u64, buf: &mut [u8]| {
+            let n = if which == 0 {
+                &names[cell].0
+            } else {
+                &names[cell].1
+            };
+            ld.read_into(n, off, buf)
+        };
+        dec.upload_experts_resident_streamed(&lens, &mut f)?;
     } else {
+        // 비상주 = 호스트 mmap 스트리밍(설계: 스트리밍 소스는 캐시가 자산).
         dec.set_expert_table(tab);
     }
+    ld.log_summary();
     eprintln!(
         "[moe] 플레인 {plain_ms:.0}ms · 테이블 {tab_ms:.0}ms · 전문가 {:.0}ms ({:.1}GB/s) — 전문가 {:.2}GiB · 여유 {:.2}GiB − KV 예약 {:.2}GiB → {}",
         t2.elapsed().as_secs_f64() * 1e3,
@@ -118,14 +249,34 @@ pub(crate) fn upload_model(
     if moe {
         upload_moe(dec, model, kv_reserve)?;
     } else {
+        // [W4 2026-10-16] 양자화 선형 — O_DIRECT 직결 스트림(핀드 링).
+        let mut ld = DirectLoad::new(model.store());
         for name in model.engine_names() {
             if let Some(w) = model.w_raw(&name)
                 && w.ty == llm170_core::wtype::WType::W4a16Split
             {
-                let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
-                dec.upload_lin(&name, w.data, s, w.n_out as usize, w.n_in as usize)?;
+                let (qn, sn) = model
+                    .w_raw_names(&name)
+                    .ok_or_else(|| format!("{name}: 원시 텐서 이름 부재"))?;
+                let sn = sn.ok_or_else(|| format!("{name}: scale 이름 부재"))?;
+                let (ql, sl) = (ld.tensor_len(&qn)? as usize, ld.tensor_len(&sn)? as usize);
+                let mut f = |which: usize, off: u64, buf: &mut [u8]| {
+                    let n = if which == 0 { qn.as_str() } else { sn.as_str() };
+                    ld.read_into(n, off, buf)
+                };
+                dec.upload_lin_g_stream(
+                    &name,
+                    w.n_out as usize,
+                    w.n_in as usize,
+                    w.group,
+                    w.scale_bf16,
+                    ql,
+                    sl,
+                    &mut f,
+                )?;
             }
         }
+        ld.log_summary();
     }
     // 2) 노름 nw [2L+1][hidden] (+1 보정 — f32_vec).
     let mut nw: Vec<f32> = Vec::new();

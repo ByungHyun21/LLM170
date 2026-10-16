@@ -53,6 +53,8 @@ pub(crate) fn upload_model_g4(
     let h = hp.n_embd;
     let t0 = std::time::Instant::now();
     // ① 선형 — 밀집(양자화) + 라우터(플레인/양자화 무관 분기).
+    // [W4 2026-10-16] O_DIRECT 직결 스트림(핀드 링 — mmap 슬라이스 우회).
+    let mut ld = super::upload::DirectLoad::new(model.store());
     for il in 0..hp.n_layer {
         for suf in [
             "attn_q.weight",
@@ -68,21 +70,32 @@ pub(crate) fn upload_model_g4(
             let Some(w) = model.w(&name) else {
                 continue; // k_eq_v 층의 v_proj 부재
             };
+            let (tn, sn) = model
+                .w_names(&name)
+                .ok_or_else(|| format!("{name}: 원시 텐서 이름 부재"))?;
             match w.ty {
                 WType::W4a16Split => {
-                    let s = w.aux.ok_or_else(|| format!("{name}: aux 부재"))?;
-                    dec.upload_lin_g(
+                    let sn = sn.ok_or_else(|| format!("{name}: scale 이름 부재"))?;
+                    let (ql, sl) = (ld.tensor_len(&tn)? as usize, ld.tensor_len(&sn)? as usize);
+                    let mut f = |which: usize, off: u64, buf: &mut [u8]| {
+                        let n = if which == 0 { tn.as_str() } else { sn.as_str() };
+                        ld.read_into(n, off, buf)
+                    };
+                    dec.upload_lin_g_stream(
                         &name,
-                        w.data,
-                        s,
                         w.n_out as usize,
                         w.n_in as usize,
                         w.group,
                         w.scale_bf16,
+                        ql,
+                        sl,
+                        &mut f,
                     )?;
                 }
                 WType::Bf16 => {
-                    dec.upload_plain(&name, w.data, w.n_out as usize, w.n_in as usize)?;
+                    let len = ld.tensor_len(&tn)? as usize;
+                    let mut f = |off: u64, buf: &mut [u8]| ld.read_into(&tn, off, buf);
+                    dec.upload_plain_stream(&name, w.n_out as usize, w.n_in as usize, len, &mut f)?;
                 }
                 _ => {}
             }
@@ -218,7 +231,27 @@ pub(crate) fn upload_model_g4(
             },
         };
         if resident {
-            dec.upload_experts_resident(&tab)?;
+            // [W4 2026-10-16] 전문가 상주 — O_DIRECT 직결 스트림(셀 단위).
+            let mut lens: Vec<(usize, usize)> = Vec::with_capacity(tab.len());
+            let mut names: Vec<(String, String)> = Vec::with_capacity(tab.len());
+            for il in 0..hp.n_layer {
+                for e in 0..hp.n_experts {
+                    for proj in ["gate_proj", "up_proj", "down_proj"] {
+                        let (qn, sn) = model.expert_names(il, e, proj);
+                        lens.push((ld.tensor_len(&qn)? as usize, ld.tensor_len(&sn)? as usize));
+                        names.push((qn, sn));
+                    }
+                }
+            }
+            let mut f = |cell: usize, which: usize, off: u64, buf: &mut [u8]| {
+                let n = if which == 0 {
+                    &names[cell].0
+                } else {
+                    &names[cell].1
+                };
+                ld.read_into(n, off, buf)
+            };
+            dec.upload_experts_resident_streamed(&lens, &mut f)?;
         } else {
             dec.set_expert_table(tab);
         }
@@ -236,11 +269,18 @@ pub(crate) fn upload_model_g4(
     }
     let moe_ms = t1.elapsed().as_secs_f64() * 1e3;
     // ⑤ head — 원본 embed(tied) 행별 int8 W8A16(단일 head 계약).
+    // [W4] O_DIRECT 직결 스트림(행-블록 양자화 — 호스트 RAM 상수).
     let t2 = std::time::Instant::now();
     {
         let hw = model.wchk("output.weight").map_err(|e| e.to_string())?;
-        dec.upload_head(hw.data, hw.n_out as usize, hw.n_in as usize)?;
+        let (tn, _) = model
+            .w_names("output.weight")
+            .ok_or_else(|| "output.weight: 원시 텐서 이름 부재".to_string())?;
+        let len = ld.tensor_len(&tn)? as usize;
+        let mut f = |off: u64, buf: &mut [u8]| ld.read_into(&tn, off, buf);
+        dec.upload_head_stream(hw.n_out as usize, hw.n_in as usize, len, &mut f)?;
     }
+    ld.log_summary();
     let head_ms = t2.elapsed().as_secs_f64() * 1e3;
     // ⑥ 호스트 설정(rope·scalar·pes — 층 산술 조립용) + rope 테이블 등록.
     let mut layer_scalar = Vec::with_capacity(hp.n_layer);

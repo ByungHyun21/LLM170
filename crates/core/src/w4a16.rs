@@ -315,6 +315,24 @@ impl W4a16Model {
         m.get(s..t)
     }
 
+    /// [W4 2026-10-16] 텐서 파일 범위 — (샤드, 데이터 섹션 기준 오프셋, 길이).
+    /// O_DIRECT 직접 리더가 mmap 우회로 같은 바이트를 읽는 좌표.
+    pub fn tensor_range(&self, name: &str) -> Option<(usize, u64, u64)> {
+        let e = self.ar.entry(name)?;
+        let base = self.ar.shard_data_base(e.shard)?;
+        Some((e.shard, base + e.begin, e.end - e.begin))
+    }
+
+    /// [W4] 샤드 수(리더 배열 크기).
+    pub fn shard_count(&self) -> usize {
+        self.mmaps.len()
+    }
+
+    /// [W4] 샤드 경로(리더 생성용 — mmap과 동일 순서).
+    pub fn shard_paths(&self) -> Vec<&std::path::Path> {
+        self.ar.shard_paths()
+    }
+
     /// 양자화 선형 형상 (n, k) — base는 HF 텐서명(접미사 제외).
     pub fn lin_shape(&self, base: &str) -> Option<(usize, usize)> {
         self.lins.get(base).copied()
@@ -585,6 +603,148 @@ fn extract_embedded_quant(cfg: &str) -> R<String> {
     Err(W4a16Error::Quant("quantization_config 객체 미종결".into()))
 }
 
+// ── [W4 2026-10-16] 상주 적재용 O_DIRECT 직접 리더 ──────────────────────────
+
+/// 정렬 버퍼 — Vec + 주소 정렬 오프셋. Vec 할당은 주소 정렬을 보장하지 않는데
+/// (O_DIRECT는 버퍼 주소 정렬이 필수 계약) 앞 여유를 두고 잘라 쓴다.
+struct AlignedBuf {
+    buf: Vec<u8>,
+    off: usize,
+    len: usize,
+}
+
+impl AlignedBuf {
+    fn new(len: usize, align: usize) -> Self {
+        let buf = vec![0u8; len + align];
+        let rem = buf.as_ptr() as usize % align;
+        let off = if rem == 0 { align } else { align - rem };
+        Self { buf, off, len }
+    }
+
+    fn slice_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[self.off..self.off + self.len]
+    }
+}
+
+/// Linux O_DIRECT 플래그(0o40000) — libc 의존 없이 상수 단일 출처. 값이 틀린
+/// 플랫폼에서도 open 실패 → 버퍼 폴백이라 안전하다.
+const O_DIRECT: i32 = 0o40000;
+
+/// [W4] 상주 적재용 O_DIRECT 직접 리더 — mmap 페이지 캐시 잔류 없이 VRAM 상주
+/// 적재 바이트를 스트리밍한다(모델 > RAM 성립). 정렬 계약(파일 오프셋·길이 =
+/// 블록 배수, 버퍼 주소 정렬)을 리더가 흡수한다: **정렬 창 + 선두/말미 부분
+/// 복원**(바운스 memcpy) — safetensors 텐서 오프셋은 512B/4KB 정렬이 아닌 것이
+/// 단골 함정이다. O_DIRECT 미지원 FS(tmpfs 등)는 버퍼 읽기로 폴백하고
+/// `direct=false`로 알린다(페이지 캐시 잔류는 폴백 시에만 남는다).
+///
+/// 적용 범위 = **VRAM 상주 적재**(서버/프로브 로더). CPU 참조(`w4a16-ref`)·
+/// MoE 스트리밍 소스는 호스트가 계층이라 mmap을 유지한다(캐시가 자산).
+pub struct DirectReader {
+    file: std::fs::File,
+    /// 정렬 단위 — st_blksize의 2거듭제곱 올림, [4096, 1MiB] 클램프.
+    align: usize,
+    /// 재사용 정렬 창(align 배수).
+    win: AlignedBuf,
+    file_size: u64,
+    /// O_DIRECT 활성 여부(false = 폴백 — 진단·로그).
+    pub direct: bool,
+    /// 누적 읽기 바이트(진단).
+    pub bytes_read: u64,
+}
+
+impl DirectReader {
+    /// 기본 창 8MiB.
+    pub fn open(path: &std::path::Path) -> R<Self> {
+        Self::open_with_window(path, 8 << 20)
+    }
+
+    /// 창 크기 지정(테스트·프로파일링 — 창은 정렬 배수로 올림).
+    pub fn open_with_window(path: &std::path::Path, win: usize) -> R<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let meta = std::fs::metadata(path)?;
+        let align = (meta.blksize() as usize)
+            .next_power_of_two()
+            .clamp(4096, 1 << 20);
+        let win_len = win.max(align).div_ceil(align) * align;
+        let oo = |flags: i32| {
+            let mut o = std::fs::OpenOptions::new();
+            o.read(true).custom_flags(flags);
+            o.open(path)
+        };
+        let (file, direct) = match oo(O_DIRECT) {
+            Ok(f) => (f, true),
+            Err(e) => {
+                eprintln!(
+                    "# load: O_DIRECT 불가({e}) — 버퍼 읽기 폴백(페이지 캐시 잔류): {}",
+                    path.display()
+                );
+                (oo(0)?, false)
+            }
+        };
+        Ok(Self {
+            file,
+            align,
+            win: AlignedBuf::new(win_len, align),
+            file_size: meta.len(),
+            direct,
+            bytes_read: 0,
+        })
+    }
+
+    /// 정렬 단위(바이트) — 진단.
+    pub fn align(&self) -> usize {
+        self.align
+    }
+
+    /// `[off, off + out.len())`을 채운다. 정렬 무관(창 경유 — 선두/말미 복원
+    /// memcpy). EOF 초과·짧은 읽기 = Err(정직 중단 — 부분 바이트 금지).
+    pub fn read_into(&mut self, off: u64, out: &mut [u8]) -> R<()> {
+        use std::os::unix::fs::FileExt;
+        let len = out.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let align = self.align as u64;
+        let win_len = self.win.len as u64;
+        let mut done = 0usize;
+        while done < len {
+            let cur = off + done as u64;
+            let wstart = cur / align * align;
+            let remaining = (len - done) as u64;
+            // 창 = 정렬 경계로만 자른다(O_DIRECT 오프셋 계약), 창 크기 상한.
+            let wend = (cur + remaining)
+                .next_multiple_of(align)
+                .min(wstart + win_len);
+            let take = wend - wstart;
+            // 이번 창에서 복사할 구간 [cur, to).
+            let to = (cur + remaining).min(wend);
+            let need = (to - cur) as usize;
+            let from = (cur - wstart) as usize;
+            let buf = self.win.slice_mut();
+            let want = take as usize;
+            let got = self
+                .file
+                .read_at(&mut buf[..want], wstart)
+                .map_err(W4a16Error::Io)?;
+            if got < from + need {
+                return Err(W4a16Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "O_DIRECT 읽기 부족: off={wstart} want={want} got={got} \
+                         need={} (파일 {})",
+                        from + need,
+                        self.file_size
+                    ),
+                )));
+            }
+            out[done..done + need].copy_from_slice(&buf[from..from + need]);
+            done += need;
+        }
+        self.bytes_read += len as u64;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +818,54 @@ mod tests {
         let p = load_pieces(&dir).unwrap();
         assert_eq!(p, vec!["a".to_string(), "b".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [W4 2026-10-16] O_DIRECT 리더 — 정렬 창+선두/말미 복원의 경계 판정.
+    /// 합성 파일(결정론 패턴)로: 정렬·비정렬 오프셋/길이·다중 창·EOF 경계·
+    /// EOF 초과 거부. O_DIRECT 폴백(FS 미지원)이어도 바이트 동일이 계약.
+    #[test]
+    fn direct_reader_boundaries() {
+        let path = std::env::temp_dir().join(format!("llm170_direct_{}", std::process::id()));
+        let size = 300 * 1024 + 123; // 창(64KiB) 여러 개 + 비정렬 꼬리
+        let data: Vec<u8> = (0..size).map(|i| (i as u64 % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        let mut r = DirectReader::open_with_window(&path, 64 << 10).unwrap();
+        assert_eq!(r.align() % 4096, 0, "정렬 하한 4096");
+        assert!(r.align().is_power_of_two());
+        // 참고 로그용: direct 여부는 FS 의존 — 양쪽 모두 바이트 동일 계약.
+        let _ = r.direct;
+
+        let check = |r: &mut DirectReader, off: usize, len: usize| {
+            let mut out = vec![0u8; len];
+            r.read_into(off as u64, &mut out).unwrap();
+            assert_eq!(&out[..], &data[off..off + len], "off={off} len={len}");
+        };
+        // (a) 정렬 오프셋·정렬 길이.
+        check(&mut r, 0, 64 << 10);
+        // (b) 비정렬 오프셋·비정렬 길이(선두/말미 복원).
+        check(&mut r, 1234, 5000);
+        // (c) 다중 창 스팬(3창 초과) — 임의 창 경계.
+        check(&mut r, 7, 200_000);
+        // (d) EOF 직전까지.
+        check(&mut r, size - 1000, 1000);
+        // (e) 길이 0은 무동작.
+        check(&mut r, size, 0);
+        // (f) EOF 초과 = 명시 Err(부분 바이트 금지).
+        let mut out = vec![0u8; 200];
+        let e = r.read_into((size - 100) as u64, &mut out).unwrap_err();
+        assert!(format!("{e}").contains("읽기 부족"), "{e}");
+        // 누적 계측.
+        assert_eq!(r.bytes_read, (64 << 10) + 5000 + 200_000 + 1000);
+
+        // 빈/부재 파일 — 읽기 Err(정직).
+        let empty =
+            std::env::temp_dir().join(format!("llm170_direct_empty_{}", std::process::id()));
+        std::fs::write(&empty, b"").unwrap();
+        let mut r2 = DirectReader::open(&empty).unwrap();
+        let mut o = [0u8; 16];
+        assert!(r2.read_into(0, &mut o).is_err());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&empty);
     }
 }

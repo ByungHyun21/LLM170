@@ -736,27 +736,9 @@ impl W4a16Dec {
             pk[i % 3] += e.1 as usize;
             sk[i % 3] += e.3 as usize;
         }
-        let mut dpk = [0 as CUdeviceptr; 3];
-        let mut dsk = [0 as CUdeviceptr; 3];
-        let mut opk = [0usize; 3];
-        let mut osk = [0usize; 3];
-        let mut allocd = Vec::new();
-        let setup = (|| -> Result<(), String> {
-            for p in 0..3 {
-                dpk[p] = self.cc.alloc(pk[p])?;
-                allocd.push(dpk[p]);
-                dsk[p] = self.cc.alloc(sk[p])?;
-                allocd.push(dsk[p]);
-            }
-            Ok(())
-        })();
-        if let Err(e) = setup {
-            for p in allocd {
-                let _ = self.cc.free(p);
-            }
-            return Err(e);
-        }
+        let (dpk, dsk, allocd) = self.alloc_expert_arenas(pk, sk)?;
         let mut dev_tab = Vec::with_capacity(host_tab.len());
+        let (mut opk, mut osk) = ([0usize; 3], [0usize; 3]);
         // 1) 디바이스 테이블(아레나 오프셋) — 복사 없이 주소만 계산.
         for (i, e) in host_tab.iter().enumerate() {
             let p = i % 3;
@@ -788,12 +770,51 @@ impl W4a16Dec {
             return Err(err);
         }
         // 디바이스 포인터 테이블 — (q,s) 쌍 평탄 배열(커널 간접 참조).
+        let experts_bytes: u64 = host_tab.iter().map(|e| e.1 + e.3).sum();
+        self.register_moe_resident(dev_tab, experts_bytes)
+    }
+
+    /// [W4 2026-10-16] 전문가 아레나 3종×2(q/s) 할당 — (아레나, 정리용 목록).
+    /// 업로드 본체(호스트 슬라이스)·스트림(_streamed) 공용.
+    fn alloc_expert_arenas(
+        &mut self,
+        pk: [usize; 3],
+        sk: [usize; 3],
+    ) -> Result<([CUdeviceptr; 3], [CUdeviceptr; 3], Vec<CUdeviceptr>), String> {
+        let mut dpk = [0 as CUdeviceptr; 3];
+        let mut dsk = [0 as CUdeviceptr; 3];
+        let mut allocd = Vec::new();
+        let setup = (|| -> Result<(), String> {
+            for p in 0..3 {
+                dpk[p] = self.cc.alloc(pk[p])?;
+                allocd.push(dpk[p]);
+                dsk[p] = self.cc.alloc(sk[p])?;
+                allocd.push(dsk[p]);
+            }
+            Ok(())
+        })();
+        if let Err(e) = setup {
+            for p in allocd {
+                let _ = self.cc.free(p);
+            }
+            return Err(e);
+        }
+        Ok((dpk, dsk, allocd))
+    }
+
+    /// [W4 2026-10-16] 전문가 상주 마감 — 디바이스 테이블 업로드 + 등록.
+    /// 아레나 할당·전송은 호출부(본체/스트림) 몫.
+    fn register_moe_resident(
+        &mut self,
+        dev_tab: Vec<(u64, u64, u64, u64)>,
+        experts_bytes: u64,
+    ) -> Result<(), String> {
         let mut flat: Vec<u64> = Vec::with_capacity(dev_tab.len() * 2);
         for e in &dev_tab {
             flat.push(e.0);
             flat.push(e.2);
         }
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×8).
         let fb = unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 8) };
         if self.moe.moe_dev_tab != 0 {
             let _ = self.cc.free(self.moe.moe_dev_tab);
@@ -806,10 +827,73 @@ impl W4a16Dec {
         }
         self.moe.moe_dev_tab = dtab;
         self.moe.moe_tab = dev_tab;
-        self.experts_bytes = host_tab.iter().map(|e| e.1 + e.3).sum();
-        self.weights_bytes += self.experts_bytes;
+        self.experts_bytes = experts_bytes;
+        self.weights_bytes += experts_bytes;
         self.moe.moe_resident = true;
         Ok(())
+    }
+
+    /// [W4 2026-10-16] 전문가 상주 업로드(스트림) — `lens[i] = (q,s)` 셀 길이
+    /// (i%3 = proj: gate/up/down). `fill(cell, which, off, buf)`가 핀드 버퍼를
+    /// 채운다(예: O_DIRECT 직결) — 호스트 물질화 없이 VRAM 아레나로.
+    pub fn upload_experts_resident_streamed(
+        &mut self,
+        lens: &[(usize, usize)],
+        fill: &mut dyn FnMut(usize, usize, u64, &mut [u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        if self.moe.n_experts == 0 || lens.len() != self.n_layers * self.moe.n_experts * 3 {
+            return Err("upload_experts_resident_streamed: 테이블 형상 위반".into());
+        }
+        let mut pk = [0usize; 3];
+        let mut sk = [0usize; 3];
+        for (i, &(ql, sl)) in lens.iter().enumerate() {
+            pk[i % 3] += ql;
+            sk[i % 3] += sl;
+        }
+        let (dpk, dsk, allocd) = self.alloc_expert_arenas(pk, sk)?;
+        let mut dev_tab = Vec::with_capacity(lens.len());
+        let (mut opk, mut osk) = ([0usize; 3], [0usize; 3]);
+        for (i, &(ql, sl)) in lens.iter().enumerate() {
+            let p = i % 3;
+            dev_tab.push((
+                dpk[p] + opk[p] as u64,
+                ql as u64,
+                dsk[p] + osk[p] as u64,
+                sl as u64,
+            ));
+            opk[p] += ql;
+            osk[p] += sl;
+        }
+        let r = (|| -> Result<(), String> {
+            let mut ring = super::mem::PinnedRing::new(&self.cc, STREAM_CHUNK)?;
+            let (mut cpk, mut csk) = ([0usize; 3], [0usize; 3]);
+            for (i, &(ql, sl)) in lens.iter().enumerate() {
+                let p = i % 3;
+                if ql > 0 {
+                    ring.send(dpk[p] + cpk[p] as u64, ql, &mut |off, buf| {
+                        fill(i, 0, off, buf)
+                    })?;
+                }
+                if sl > 0 {
+                    ring.send(dsk[p] + csk[p] as u64, sl, &mut |off, buf| {
+                        fill(i, 1, off, buf)
+                    })?;
+                }
+                cpk[p] += ql;
+                csk[p] += sl;
+                llm170_diag::watchdog::bump();
+            }
+            ring.sync()
+        })();
+        if let Err(err) = r {
+            for p in allocd {
+                let _ = self.cc.free(p);
+            }
+            return Err(err);
+        }
+        let experts_bytes: u64 = lens.iter().map(|e| (e.0 + e.1) as u64).sum();
+        self.register_moe_resident(dev_tab, experts_bytes)
     }
 
     /// head(output.weight) 상주 업로드 — [I8head 2026-10-11] bf16 → int8
@@ -987,5 +1071,268 @@ impl W4a16Dec {
                 &mut p_e, &mut p_tk, &mut p_o, &mut p_t, &mut p_k, &mut p_n, &mut p_b,
             ),
         )
+    }
+}
+
+// ── [W4 2026-10-16] 스트림 상주 업로드 — O_DIRECT 직결(핀드 링) ─────────────
+//
+// 서버/프로브 로더가 파일 스트림(예: core::w4a16::DirectReader)을 `fill` 콜백로
+// 공급하면 **핀드 링에 채워 곧바로 h2d_async**로 올린다 — 드라이버 스테이징
+// 왕복이 없고(핀드 소스 = 직접 DMA), 읽기와 PCIe 복사가 창 단위로 겹친다.
+// 호스트 RAM = 상수(링 2×8MiB). 수치는 바이트 동일(적재 경로 — 판정 클래스 아님).
+
+/// 스트림 청크(핀드 버퍼 2벌 = 16MiB 상수).
+const STREAM_CHUNK: usize = 8 << 20;
+
+impl W4a16Dec {
+    /// 선형 상주 업로드(스트림) — `fill(which, off, buf)`가 채운다(0=q·1=s).
+    /// 검증·bookkeeping은 `upload_lin_g`와 동일(성공 시에만 상주 등록 — 부분
+    /// 유실 금지).
+    pub fn upload_lin_g_stream(
+        &mut self,
+        name: &str,
+        n: usize,
+        k: usize,
+        group: usize,
+        scale_bf16: bool,
+        q_len: usize,
+        s_len: usize,
+        fill: &mut dyn FnMut(usize, u64, &mut [u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        crate::rawcuda::gptq4::kernel_sym(false, group, scale_bf16)?;
+        if q_len != n * (k / 2) || s_len != n * (k / group) * 2 {
+            return Err(format!(
+                "upload_lin_g_stream {name}: q={q_len} s={s_len} != n{n} k{k} g{group} 계약"
+            ));
+        }
+        let dq = self.cc.alloc(q_len)?;
+        let ds = match self.cc.alloc(s_len) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.cc.free(dq);
+                return Err(e);
+            }
+        };
+        let r = (|| -> Result<(), String> {
+            let mut ring = super::mem::PinnedRing::new(&self.cc, STREAM_CHUNK)?;
+            ring.send(dq, q_len, &mut |off, buf| fill(0, off, buf))?;
+            ring.send(ds, s_len, &mut |off, buf| fill(1, off, buf))?;
+            ring.sync()
+        })();
+        if let Err(e) = r {
+            let _ = self.cc.free(dq);
+            let _ = self.cc.free(ds);
+            return Err(e);
+        }
+        self.weights_bytes += (q_len + s_len) as u64;
+        if let Some((oq, os, _, _)) = self.lins.insert(name.to_string(), (dq, ds, n, k)) {
+            let _ = self.cc.free(oq);
+            let _ = self.cc.free(os);
+        }
+        if group == 128 && !scale_bf16 {
+            self.lin_grp.remove(name);
+        } else {
+            self.lin_grp.insert(name.to_string(), (group, scale_bf16));
+        }
+        Ok(())
+    }
+
+    /// 플레인 bf16 상주 업로드(스트림) — `upload_plain` 미러.
+    pub fn upload_plain_stream(
+        &mut self,
+        name: &str,
+        n: usize,
+        k: usize,
+        len: usize,
+        fill: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        let need = n * k * 2;
+        if n == 0 || k == 0 || len < need {
+            return Err(format!(
+                "upload_plain_stream({name}): 형상 계약 위반 n={n} k={k} bytes={len} < {need}"
+            ));
+        }
+        let dw = self.cc.alloc(need)?;
+        let r = (|| -> Result<(), String> {
+            let mut ring = super::mem::PinnedRing::new(&self.cc, STREAM_CHUNK)?;
+            ring.send(dw, need, fill)?;
+            ring.sync()
+        })();
+        if let Err(e) = r {
+            let _ = self.cc.free(dw);
+            return Err(e);
+        }
+        self.weights_bytes += need as u64;
+        if let Some((old, _, _)) = self.plains.insert(name.to_string(), (dw, n, k)) {
+            let _ = self.cc.free(old);
+        }
+        Ok(())
+    }
+
+    /// token_embd 상주 업로드(스트림) — `upload_embed` 미러.
+    pub fn upload_embed_stream(
+        &mut self,
+        n: usize,
+        k: usize,
+        bf16: bool,
+        len: usize,
+        fill: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        let need = n * k * 2;
+        if n == 0 || k == 0 || len < need {
+            return Err(format!(
+                "upload_embed_stream: 형상 계약 위반 n={n} k={k} bytes={len} < {need}"
+            ));
+        }
+        if self.emb_dev != 0 {
+            self.cc.free(self.emb_dev)?;
+        }
+        self.emb_dev = 0; // G1: 부분 상태로 소비되지 않게 마지막에 재대입.
+        self.emb_n = 0;
+        self.emb_k = 0;
+        let dw = self.cc.alloc(need)?;
+        let r = (|| -> Result<(), String> {
+            let mut ring = super::mem::PinnedRing::new(&self.cc, STREAM_CHUNK)?;
+            ring.send(dw, need, fill)?;
+            ring.sync()
+        })();
+        if let Err(e) = r {
+            let _ = self.cc.free(dw);
+            return Err(e);
+        }
+        self.emb_dev = dw;
+        self.emb_n = n;
+        self.emb_k = k;
+        self.emb_bf16 = bf16;
+        self.weights_bytes += need as u64;
+        Ok(())
+    }
+
+    /// head(output.weight) 상주 업로드(스트림) — bf16 행을 행-블록(2MiB)으로
+    /// 받아 호스트 int8 양자화(행별 amax/127 — `upload_head`와 동일 산식) 후 h2d.
+    /// 호스트 RAM = 블록 크기 상수(전체 2.4GB 물질화 회피).
+    pub fn upload_head_stream(
+        &mut self,
+        n: usize,
+        k: usize,
+        len: usize,
+        fill: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        let need = n * k * 2;
+        if n == 0 || k == 0 || len < need || !k.is_multiple_of(4) {
+            return Err(format!(
+                "upload_head_stream: 형상 계약 위반 n={n} k={k} bytes={len} < {need}"
+            ));
+        }
+        for p in [self.head_w, self.head_sc, self.head_out] {
+            if p != 0 {
+                self.cc.free(p)?;
+            }
+        }
+        self.head_w = 0; // G1: 부분 상태(head_n=0)로 소비되지 않게 마지막에 대입.
+        self.head_sc = 0;
+        self.head_out = 0;
+        self.head_n = 0;
+        self.head_k = 0;
+        let dw = self.cc.alloc(n * k)?;
+        let dsc = match self.cc.alloc(n * 4) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.cc.free(dw);
+                return Err(e);
+            }
+        };
+        let dout = match self.cc.alloc(n * 4).and_then(|p| {
+            self.cc.alloc(4).map(|a| {
+                self.argmax_out = a;
+                p
+            })
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.cc.free(dw);
+                let _ = self.cc.free(dsc);
+                return Err(e);
+            }
+        };
+        let nt = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(4)
+            .min(16);
+        let rows_blk = ((2 << 20) / (k * 2).max(1)).max(1);
+        let mut raw = vec![0u8; rows_blk * k * 2];
+        let mut q8 = vec![0i8; rows_blk * k];
+        let mut scv = vec![0f32; rows_blk];
+        let mut r0 = 0usize;
+        while r0 < n {
+            let rows = rows_blk.min(n - r0);
+            let blen = rows * k * 2;
+            fill((r0 * k * 2) as u64, &mut raw[..blen])?;
+            {
+                let rows_per = rows.div_ceil(nt).max(1);
+                let qchunks: Vec<_> = q8[..rows * k].chunks_mut(rows_per * k).collect();
+                let schunks: Vec<_> = scv[..rows].chunks_mut(rows_per).collect();
+                std::thread::scope(|sp| {
+                    let mut rr = 0usize;
+                    for (qc, sc_c) in qchunks.into_iter().zip(schunks) {
+                        let base = rr;
+                        let raw_ref = &raw[..blen];
+                        sp.spawn(move || {
+                            let nrows = qc.len() / k;
+                            for r in 0..nrows {
+                                let row = &raw_ref[(base + r) * k * 2..(base + r + 1) * k * 2];
+                                let mut amax = 0.0f32;
+                                for i in 0..k {
+                                    let v = f32::from_bits(
+                                        u32::from(u16::from_le_bytes([row[i * 2], row[i * 2 + 1]]))
+                                            << 16,
+                                    );
+                                    amax = amax.max(v.abs());
+                                }
+                                let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                                sc_c[r] = s;
+                                for i in 0..k {
+                                    let v = f32::from_bits(
+                                        u32::from(u16::from_le_bytes([row[i * 2], row[i * 2 + 1]]))
+                                            << 16,
+                                    );
+                                    qc[r * k + i] = (v / s).round().clamp(-127.0, 127.0) as i8;
+                                }
+                            }
+                        });
+                        rr += rows_per;
+                    }
+                });
+            }
+            // SAFETY: 블록 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수/4배).
+            let qb = unsafe { std::slice::from_raw_parts(q8.as_ptr() as *const u8, rows * k) };
+            if let Err(e) = Self::h2d_chunked(&self.cc, dw + (r0 * k) as u64, qb) {
+                let _ = self.cc.free(dw);
+                let _ = self.cc.free(dsc);
+                let _ = self.cc.free(dout);
+                return Err(e);
+            }
+            // SAFETY: 같은 계약(길이 = 원소수×4).
+            let sb = unsafe { std::slice::from_raw_parts(scv.as_ptr() as *const u8, rows * 4) };
+            if let Err(e) = Self::h2d_chunked(&self.cc, dsc + (r0 * 4) as u64, sb) {
+                let _ = self.cc.free(dw);
+                let _ = self.cc.free(dsc);
+                let _ = self.cc.free(dout);
+                return Err(e);
+            }
+            r0 += rows;
+            llm170_diag::watchdog::bump();
+        }
+        self.head_w = dw;
+        self.head_sc = dsc;
+        self.head_out = dout;
+        self.head_n = n;
+        self.head_k = k;
+        self.weights_bytes += (n * k + n * 4 + n * 4) as u64;
+        Ok(())
     }
 }

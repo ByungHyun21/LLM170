@@ -31,9 +31,17 @@ pub(super) fn run_generate(
     };
     // GPU head — bf16 output.weight를 상주 업로드(--no-head는 CPU 참조).
     // [검수 통합 2026-10-14] head_ready(다중 시나리오 2회차+)면 재업로드 생략.
+    // [W4 2026-10-16] O_DIRECT 직결 스트림(mmap 우회 — 프로브 로드도 캐시 잔류 0).
     let mut head_gpu = head_ready;
     if !no_head && !head_ready && head.ty == llm170_core::wtype::WType::Bf16 {
-        dec.upload_head(head.data, head.n_out as usize, head.n_in as usize)?;
+        let mut ld = crate::gpu_engine::DirectLoad::new(model.store());
+        let (tn, _) = model
+            .w_raw_names("output.weight")
+            .ok_or_else(|| "output.weight: 원시 텐서 이름 부재".to_string())?;
+        let len = ld.tensor_len(&tn)? as usize;
+        let mut f = |off: u64, buf: &mut [u8]| ld.read_into(&tn, off, buf);
+        dec.upload_head_stream(head.n_out as usize, head.n_in as usize, len, &mut f)?;
+        ld.log_summary();
         head_gpu = true;
     }
     let t1 = std::time::Instant::now();

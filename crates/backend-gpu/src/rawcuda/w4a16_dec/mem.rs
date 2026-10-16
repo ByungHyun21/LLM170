@@ -141,3 +141,90 @@ impl W4a16Dec {
         self.cc.prof_report(label)
     }
 }
+
+/// [W4 2026-10-16] 핀드 2벌 링 — 파일 스트림을 VRAM으로 옮긴다.
+/// `send`의 fill이 핀드 버퍼를 채우면(예: O_DIRECT 리더) 곧바로 `h2d_async`로
+/// 복사해 **읽기와 PCIe 복사가 겹친다**(드라이버 스테이징 왕복 제거 — 핀드
+/// 소스는 cuMemcpyHtoDAsync가 직접 DMA한다). 호스트 RAM = 상수(2×chunk).
+/// 링 재사용 안전: 같은 버퍼를 다시 쓰기 전에 2청크마다 sync로 직전 DMA
+/// 완료를 담보한다(이벤트 불요 — 창 단위 파이프라인).
+pub(crate) struct PinnedRing<'a> {
+    cc: &'a CudaCtx,
+    a: *mut std::ffi::c_void,
+    b: *mut std::ffi::c_void,
+    chunk: usize,
+    /// 링 전역 청크 카운터(호출 경계를 넘어 교대 유지).
+    seq: u64,
+}
+
+impl<'a> PinnedRing<'a> {
+    pub(crate) fn new(cc: &'a CudaCtx, chunk: usize) -> Result<Self, String> {
+        let a = cc.pinned_alloc(chunk)?;
+        let b = match cc.pinned_alloc(chunk) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = cc.pinned_free(a);
+                return Err(e);
+            }
+        };
+        // SAFETY: 두 할당 [0, chunk) — fill 전 슬라이스 생성의 UB 회피용 0 초기화
+        // (수 MiB memset, 1회 — 이후 fill이 전량 기록한다).
+        unsafe {
+            std::ptr::write_bytes(a, 0, chunk);
+            std::ptr::write_bytes(b, 0, chunk);
+        }
+        Ok(Self {
+            cc,
+            a,
+            b,
+            chunk,
+            seq: 0,
+        })
+    }
+
+    /// `dst`로 `bytes`만큼 스트리밍 — fill(off, buf)가 buf 전체를 채운다
+    /// (전량 기록 계약). 링은 호출 간 상태를 유지한다(청크 교대 연속).
+    pub(crate) fn send(
+        &mut self,
+        dst: CUdeviceptr,
+        bytes: usize,
+        fill: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut off = 0usize;
+        while off < bytes {
+            let n = self.chunk.min(bytes - off);
+            // 같은 버퍼(2청크 전) 재사용 전 대기 — DMA 완료 담보.
+            if self.seq.is_multiple_of(2) && self.seq > 0 {
+                self.cc.sync()?;
+            }
+            let p = if self.seq.is_multiple_of(2) {
+                self.a
+            } else {
+                self.b
+            };
+            // SAFETY: pinned 할당 [0, n) — 0 초기화 완료 + fill 전량 기록 계약.
+            let buf = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, n) };
+            fill(off as u64, buf)?;
+            // SAFETY: 같은 범위 — fill 완료 후 읽기 전용 뷰.
+            let src = unsafe { std::slice::from_raw_parts(p as *const u8, n) };
+            self.cc.h2d_async(dst + off as u64, src)?;
+            self.seq += 1;
+            off += n;
+            // 업로드는 수 초 — 와치독 심박(로드 스텔 오판 방지).
+            llm170_diag::watchdog::bump();
+        }
+        Ok(())
+    }
+
+    /// 스트림 종료 시 1회 — 잔여 DMA 완료.
+    pub(crate) fn sync(&self) -> Result<(), String> {
+        self.cc.sync()
+    }
+}
+
+impl Drop for PinnedRing<'_> {
+    fn drop(&mut self) {
+        let _ = self.cc.pinned_free(self.a);
+        let _ = self.cc.pinned_free(self.b);
+    }
+}

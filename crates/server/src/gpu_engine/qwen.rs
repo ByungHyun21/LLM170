@@ -49,11 +49,19 @@ impl QwenEngine {
     ) -> Result<(bool, bool), String> {
         upload_model(dec, model, ctx, kv_reserve)?;
         // 5) head — bf16 output.weight는 GPU 커널 경로(아니면 CPU 참조).
+        // [W4 2026-10-16] head/embed — O_DIRECT 직결 스트림(mmap 우회).
+        // head는 행-블록 양자화(호스트 RAM 상수 — 2.4GB 물질화 회피).
+        let mut ld = super::upload::DirectLoad::new(model.store());
         let mut head_gpu = false;
         if let Some(w) = model.w("output.weight")
             && w.ty == llm170_core::wtype::WType::Bf16
         {
-            dec.upload_head(w.data, w.n_out as usize, w.n_in as usize)?;
+            let (tn, _) = model
+                .w_raw_names("output.weight")
+                .ok_or_else(|| "output.weight: 원시 텐서 이름 부재".to_string())?;
+            let len = ld.tensor_len(&tn)? as usize;
+            let mut f = |off: u64, buf: &mut [u8]| ld.read_into(&tn, off, buf);
+            dec.upload_head_stream(w.n_out as usize, w.n_in as usize, len, &mut f)?;
             head_gpu = true;
         }
         // [S3-1 2026-10-11] token_embd 상주 — 프리필 행 조립을 GPU gather로.
@@ -63,13 +71,20 @@ impl QwenEngine {
                 llm170_core::wtype::WType::F16 | llm170_core::wtype::WType::Bf16
             )
         {
-            dec.upload_embed(
-                w.data,
+            let (tn, _) = model
+                .w_raw_names("token_embd.weight")
+                .ok_or_else(|| "token_embd.weight: 원시 텐서 이름 부재".to_string())?;
+            let len = ld.tensor_len(&tn)? as usize;
+            let mut f = |off: u64, buf: &mut [u8]| ld.read_into(&tn, off, buf);
+            dec.upload_embed_stream(
                 w.n_out as usize,
                 w.n_in as usize,
                 w.ty == llm170_core::wtype::WType::Bf16,
+                len,
+                &mut f,
             )?;
         }
+        ld.log_summary();
         let mtp = upload_mtp(dec, model)?;
         Ok((head_gpu, mtp))
     }

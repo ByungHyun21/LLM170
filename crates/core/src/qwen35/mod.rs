@@ -144,6 +144,42 @@ impl Model {
         bind::engine_names(&self.cfg)
     }
 
+    /// [W4 2026-10-16] 스토어 접근(읽기 전용) — 상주 적재의 O_DIRECT 직결 좌표.
+    pub fn store(&self) -> &crate::w4a16::W4a16Model {
+        &self.w4
+    }
+
+    /// [W4] 상주 적재 원시 텐서 이름 — `w4_weight_raw`와 동일 해석(이름만):
+    /// Quant = (packed, Some(scale)) · Plain = (weight, None) · Synth = None.
+    /// (mmap 우회 직독이 필요한 곳 — 바이트는 `store().tensor_range`로.)
+    pub fn w_raw_names(&self, name: &str) -> Option<(String, Option<String>)> {
+        use bind::Eng;
+        match bind::eng(name)? {
+            Eng::Quant { base, .. } => {
+                if self.w4.lin_shape(&base).is_some() {
+                    Some((
+                        format!("{base}.weight_packed"),
+                        Some(format!("{base}.weight_scale")),
+                    ))
+                } else {
+                    Some((format!("{base}.weight"), None))
+                }
+            }
+            Eng::Plain { name: hf, .. } => Some((hf, None)),
+            Eng::Synth { .. } => None,
+        }
+    }
+
+    /// [W4] 전문가 트리플 원시 텐서 이름 — (packed, scale). 바인딩 이름 규칙은
+    /// `expert_at`·`expert_slice`와 동일 단일 출처(bind::expert_base).
+    pub fn expert_names(&self, il: usize, e: usize, proj: &str) -> (String, String) {
+        let base = bind::expert_base(il, e, proj);
+        (
+            format!("{base}.weight_packed"),
+            format!("{base}.weight_scale"),
+        )
+    }
+
     /// 임베딩 행 1개(tok) — W3 GPU 체인 입력(호스트 스테이징).
     pub fn embed_row(&self, tok: u32) -> Result<Vec<f32>, ModelError> {
         let Some(bind::Eng::Plain { name, .. }) = bind::eng("token_embd.weight") else {
