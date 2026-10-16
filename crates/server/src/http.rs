@@ -68,6 +68,18 @@ pub fn serve(
         "# effective cap: {cap} tokens = min(model max {}, kv-mem 풀 실블록 {pool_cap})",
         req.model_max_ctx
     );
+    // [2026-10-16] KV 계층 회계 — VRAM/호스트 실할당·오프로드율(요청 우선 배치의
+    // 관측 요건: 운영자가 보고 kv-mem·링크 부담을 조정).
+    let (kv_vram, kv_host, host_blocks, total_blocks) = eng.kv_tier_bytes();
+    if host_blocks > 0 {
+        eprintln!(
+            "# kv-tier: VRAM {:.2}GiB({}블록) + 호스트 {:.2}GiB({host_blocks}블록) / 전체 {total_blocks}블록 · 오프로드율 {:.1}%",
+            kv_vram as f64 / (1u64 << 30) as f64,
+            total_blocks - host_blocks,
+            kv_host as f64 / (1u64 << 30) as f64,
+            100.0 * host_blocks as f64 / total_blocks.max(1) as f64
+        );
+    }
     // B20: 적재 완료 — 전역 적재 락 해제(다음 기동의 재판정이 이 상주분을 본다).
     crate::resource::release_load_lock();
     // QA-11: 엔진 스레드 패닉 포착 — 종전엔 스레드가 죽어도 큐가 살아

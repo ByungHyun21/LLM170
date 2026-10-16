@@ -127,10 +127,18 @@ pub(crate) fn load_gpu_retry(
     ctx: usize,
     kv_budget: Option<u64>,
     kv_reserve: Option<u64>,
+    kv_vram_cap: Option<u64>,
 ) -> crate::gpu_engine::GpuEngine {
     let _ = crate::engine::ARCH.set(llm170_core::qwen35::bind::dir_arch(p).unwrap_or_default());
     for i in 0..5 {
-        match crate::gpu_engine::GpuEngine::load(p, n_slots, ctx, kv_budget, kv_reserve) {
+        match crate::gpu_engine::GpuEngine::load(
+            p,
+            n_slots,
+            ctx,
+            kv_budget,
+            kv_reserve,
+            kv_vram_cap,
+        ) {
             Ok(mut e) => {
                 // [§7.1] 스펙 스냅샷 버퍼 — 실패(VRAM 부족 등) 시 비활성 로그.
                 if let Err(err) = e.enable_spec() {

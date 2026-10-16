@@ -26,6 +26,7 @@ impl GemmaEngine {
         ctx: usize,
         kv_budget: Option<u64>,
         kv_reserve: Option<u64>,
+        kv_vram_cap: Option<u64>,
     ) -> Result<Self, String> {
         let _ = kv_reserve;
         let model = llm170_core::gemma4::Model::load(dir).map_err(|e| e.to_string())?;
@@ -36,6 +37,8 @@ impl GemmaEngine {
         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
         // [K6-3 예산] 풀 예산(여유 VRAM 파생) — upload_model_g4(내부 set_attn) 전에 설정.
         dec.set_kv_budget(kv_budget);
+        // [2026-10-16] 2계층 — VRAM 상한 초과분은 호스트 아레나.
+        dec.set_kv_vram_cap(kv_vram_cap);
         // [D2 검수] 적재 실패 시 부분 할당 정리 — qwen load와 동일 위생.
         match Self::fill(&mut dec, &model, ctx) {
             Ok(cfg) => Ok(GemmaEngine {
@@ -383,6 +386,10 @@ impl GemmaEngine {
     /// [2026-10-16] 슬롯 점유 블록(aging 예측 입력).
     pub fn kv_used_blocks(&self, slot: usize) -> usize {
         self.dec.kv_used_blocks(slot)
+    }
+    /// [2026-10-16] KV 계층 회계 — (VRAM 바이트, 호스트 바이트, 호스트 블록, 전체 블록).
+    pub fn kv_tier_bytes(&self) -> (u64, u64, usize, usize) {
+        self.dec.kv_tier_bytes()
     }
     pub fn kv_release_slot(&mut self, slot: usize) -> usize {
         self.dec.kv_release(slot)

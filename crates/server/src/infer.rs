@@ -51,7 +51,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     llm170_diag::span::reset();
     let t_start = std::time::Instant::now();
     let n = prompts.len();
-    let mut eng = crate::sched::load_gpu_retry(&model_path, n, ctx, None, None);
+    let mut eng = crate::sched::load_gpu_retry(&model_path, n, ctx, None, None, None);
     crate::resource::release_load_lock();
     let eos = eng.eos();
     let mut last_logits = Vec::with_capacity(n);

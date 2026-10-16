@@ -55,8 +55,13 @@ pub struct Info {
 pub struct MemView {
     /// VRAM 상주 가중치(비전문가 + 상주 전문가).
     pub weights_gpu: u64,
-    /// VRAM KV 캐시(현행 전량 — CPU 오프로드 없음).
+    /// VRAM KV 캐시(호스트 확장분 제외).
     pub kv_gpu: u64,
+    /// [2026-10-16] 호스트 KV 아레나(핀드·디바이스 매핑) 바이트.
+    pub kv_host: u64,
+    /// [2026-10-16] KV 블록 계층 회계 — (호스트 블록, 전체 블록).
+    pub kv_host_blocks: u64,
+    pub kv_blocks_total: u64,
     /// CPU 오프로드 가중치(스트리밍 전문가 — 호스트에서 토큰별 업로드).
     pub offload_cpu: u64,
     /// CPU PLE 오프로드(미구현 W4-2 — 0).
@@ -306,7 +311,7 @@ pub fn json() -> String {
         })
         .unwrap_or_default();
     format!(
-        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"model_max_ctx\":{},\"plan\":\"{}\",\"effective_ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"cpu\":0}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\",\"moe_cache\":{{\"k\":{},\"hits\":{},\"miss\":{},\"hit_rate\":{:.4}}}}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"kv_mem_bytes\":{},\"pool_cap_tokens\":{},\"kv_pool_bytes\":{},\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"prefix_reuse_ratio\":{:.4},\"prefix_reuse_full\":{},\"prefix_reuse_ckpt\":{},\"ttft_ms_avg\":{:.1},\"trie_boundaries\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{},\"spec_rounds\":{},\"spec_accepted\":{},\"spec_round_ms_avg\":{:.2},\"aging\":{{\"frozen\":{},\"d_ms\":{},\"freeze_ms\":{},\"events\":{},\"blocked_jobs\":{},\"blocked_tokens\":{},\"head_wait_p95_ms\":{}}}}},\"slot_detail\":[{}]}}",
+        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"model_max_ctx\":{},\"plan\":\"{}\",\"effective_ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"host\":{},\"cpu\":0,\"host_blocks\":{},\"total_blocks\":{}}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\",\"moe_cache\":{{\"k\":{},\"hits\":{},\"miss\":{},\"hit_rate\":{:.4}}}}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"kv_mem_bytes\":{},\"pool_cap_tokens\":{},\"kv_offload_ratio\":{:.4},\"kv_pool_bytes\":{},\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"prefix_reuse_ratio\":{:.4},\"prefix_reuse_full\":{},\"prefix_reuse_ckpt\":{},\"ttft_ms_avg\":{:.1},\"trie_boundaries\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{},\"spec_rounds\":{},\"spec_accepted\":{},\"spec_round_ms_avg\":{:.2},\"aging\":{{\"frozen\":{},\"d_ms\":{},\"freeze_ms\":{},\"events\":{},\"blocked_jobs\":{},\"blocked_tokens\":{},\"head_wait_p95_ms\":{}}}}},\"slot_detail\":[{}]}}",
         esc(&s.info.instance),
         esc(&s.info.model),
         s.info.ctx,
@@ -319,6 +324,9 @@ pub fn json() -> String {
         mem.weights_gpu,
         mem.offload_cpu,
         mem.kv_gpu,
+        mem.kv_host,
+        mem.kv_host_blocks,
+        mem.kv_blocks_total,
         mem.ple_cpu,
         mem.active_per_token,
         s.rss.load(Ordering::Relaxed),
@@ -347,6 +355,11 @@ pub fn json() -> String {
         io.load[2].0,
         s.info.kv_mem,
         s.info.pool_cap_tokens,
+        if mem.kv_gpu + mem.kv_host > 0 {
+            mem.kv_host as f64 / (mem.kv_gpu + mem.kv_host) as f64
+        } else {
+            0.0
+        },
         mem.kv_gpu,
         jobs,
         if jobs > 0 {

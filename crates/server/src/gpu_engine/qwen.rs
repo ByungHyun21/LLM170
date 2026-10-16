@@ -14,12 +14,15 @@ impl QwenEngine {
         ctx: usize,
         kv_budget: Option<u64>,
         kv_reserve: Option<u64>,
+        kv_vram_cap: Option<u64>,
     ) -> Result<Self, String> {
         let model = llm170_core::qwen35::Model::load(dir).map_err(|e| e.to_string())?;
         let hp = model.hp.clone();
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
         // [K6-3 예산] 풀 예산(여유 VRAM 파생) — upload_model(내부 set_attn) 전에 설정.
         dec.set_kv_budget(kv_budget);
+        // [2026-10-16] 2계층 — VRAM 상한 초과분은 호스트 아레나(set_attn이 분할).
+        dec.set_kv_vram_cap(kv_vram_cap);
         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
         // [D2 검수 2026-10-13] 적재 실패 시 부분 할당 정리 — 재시도 루프가
         // VRAM을 되찾지 못하던 문제(첫 시도 실패 후 전부 OOM)의 해소.
@@ -427,6 +430,11 @@ impl QwenEngine {
     /// [2026-10-16] 슬롯 점유 블록(aging 예측 입력).
     pub fn kv_used_blocks(&self, slot: usize) -> usize {
         self.dec.kv_used_blocks(slot)
+    }
+
+    /// [2026-10-16] KV 계층 회계 — (VRAM 바이트, 호스트 바이트, 호스트 블록, 전체 블록).
+    pub fn kv_tier_bytes(&self) -> (u64, u64, usize, usize) {
+        self.dec.kv_tier_bytes()
     }
 
     /// 정지 토큰 — Q35 아키텍처 상수.

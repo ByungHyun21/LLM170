@@ -445,6 +445,23 @@ pub(super) struct Attn {
     pub(super) kv_pool: Option<blocktable::KvPool>,
     /// [K6-3 예산] KV 아레나 예산(바이트) — set_attn이 소비(풀 총량 = min(예산, 슬롯×ctx)).
     pub(super) kv_budget: Option<u64>,
+    /// [2026-10-16] VRAM 티어 상한(바이트 — 서버 파생). 초과분은 호스트 아레나.
+    /// None = 전량 VRAM(종전 동작).
+    pub(super) kv_vram_cap: Option<u64>,
+    /// [2026-10-16] 호스트 KV 아레나 — 핀드·디바이스 매핑(커널 직접 접근).
+    /// `*_h` = 디바이스 가시 주소(표 기입용), `h*_h` = 해제용 호스트 포인터.
+    pub(super) dkc_h: CUdeviceptr,
+    pub(super) dvc_h: CUdeviceptr,
+    pub(super) dksc_h: CUdeviceptr,
+    pub(super) dvsc_h: CUdeviceptr,
+    pub(super) hkc_h: *mut std::ffi::c_void,
+    pub(super) hvc_h: *mut std::ffi::c_void,
+    pub(super) hksc_h: *mut std::ffi::c_void,
+    pub(super) hvsc_h: *mut std::ffi::c_void,
+    /// VRAM 아레나가 담는 블록 수(블록 id < 이 값 = VRAM, 이후 = 호스트).
+    pub(super) kv_vram_blocks: usize,
+    /// 호스트 아레나 실할당 바이트(계층 회계 — /stats 오프로드율).
+    pub(super) kv_host_bytes: u64,
     /// [K6-3 예산] 실할당 아레나+테이블 바이트(관측 — mem_stats/kv_pool_bytes).
     pub(super) kv_arena_bytes: u64,
     pub(super) dpp: CUdeviceptr,
@@ -855,6 +872,17 @@ impl W4a16Dec {
                 dblk_tab: 0,
                 kv_pool: None,
                 kv_budget: None,
+                kv_vram_cap: None,
+                dkc_h: 0,
+                dvc_h: 0,
+                dksc_h: 0,
+                dvsc_h: 0,
+                hkc_h: std::ptr::null_mut(),
+                hvc_h: std::ptr::null_mut(),
+                hksc_h: std::ptr::null_mut(),
+                hvsc_h: std::ptr::null_mut(),
+                kv_vram_blocks: 0,
+                kv_host_bytes: 0,
                 kv_arena_bytes: 0,
                 dpp: 0,
                 dqg_a: 0,
@@ -1004,7 +1032,9 @@ impl W4a16Dec {
     /// [D2 검수 2026-10-13] **로드 실패 경로 전용** — 이 컨텍스트의 등록된
     /// 디바이스 할당 전량 해제(재시도 루프의 VRAM 회수). 성공 엔진에서는
     /// 절대 호출 금지(버퍼 포인터를 엔진이 계속 소유 — 이중 해제).
-    pub fn free_all_device(&self) {
+    pub fn free_all_device(&mut self) {
+        // 호스트 KV 아레나(핀드) — cc 대장 밖이라 먼저 수동 해제.
+        let _ = self.free_kv_host_arenas();
         self.cc.free_all();
     }
 

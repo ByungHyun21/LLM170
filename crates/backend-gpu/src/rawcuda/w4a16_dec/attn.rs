@@ -44,11 +44,12 @@ impl W4a16Dec {
         let kvh = dm.kv_heads as u64;
         let bk = 512 * kvd;
         let bs = 512 * kvh * 4;
+        let vb = self.attn.kv_vram_blocks;
         Ok((
-            self.attn.dkc + id * bk + off * kvd,
-            self.attn.dvc + id * bk + off * kvd,
-            self.attn.dksc + id * bs + off * kvh * 4,
-            self.attn.dvsc + id * bs + off * kvh * 4,
+            Self::kv_block_addr(self.attn.dkc, self.attn.dkc_h, id, bk, vb) + off * kvd,
+            Self::kv_block_addr(self.attn.dvc, self.attn.dvc_h, id, bk, vb) + off * kvd,
+            Self::kv_block_addr(self.attn.dksc, self.attn.dksc_h, id, bs, vb) + off * kvh * 4,
+            Self::kv_block_addr(self.attn.dvsc, self.attn.dvsc_h, id, bs, vb) + off * kvh * 4,
         ))
     }
 

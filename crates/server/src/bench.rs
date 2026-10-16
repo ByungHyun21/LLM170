@@ -110,8 +110,8 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
 
     let res: Result<Vec<String>, String> = (|| {
         let mut lines = Vec::new();
-        let mut eng =
-            GpuEngine::load(&model_path, max_np, ctx, None, None).map_err(|e| e.to_string())?;
+        let mut eng = GpuEngine::load(&model_path, max_np, ctx, None, None, None)
+            .map_err(|e| e.to_string())?;
         // 워밍업 1회(짧은 프리필+디코드 — 스크래치·그래프 warm).
         {
             eng.reset_seq(0).map_err(|e| e.to_string())?;

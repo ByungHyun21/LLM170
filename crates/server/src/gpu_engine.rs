@@ -177,6 +177,7 @@ engine_delegate_ref! {
     kv_blocks_needed(n_tokens: usize) -> usize;
     kv_cap_tokens() -> usize;
     kv_used_blocks(slot: usize) -> usize;
+    kv_tier_bytes() -> (u64, u64, usize, usize);
     reuse_valid(slot: usize, l: usize, prompt_len: usize) -> bool;
     piece(tok: u32) -> String;
     mtp_drafts_on() -> bool;
@@ -199,15 +200,26 @@ impl GpuEngine {
         ctx: usize,
         kv_budget: Option<u64>,
         kv_reserve: Option<u64>,
+        kv_vram_cap: Option<u64>,
     ) -> Result<Self, String> {
         let arch = llm170_core::qwen35::bind::dir_arch(dir).unwrap_or_default();
         if llm170_core::gemma4::bind::arch_ok(&arch) {
             return Ok(GpuEngine::Gemma(Box::new(GemmaEngine::load(
-                dir, n_slots, ctx, kv_budget, kv_reserve,
+                dir,
+                n_slots,
+                ctx,
+                kv_budget,
+                kv_reserve,
+                kv_vram_cap,
             )?)));
         }
         Ok(GpuEngine::Qwen(Box::new(QwenEngine::load(
-            dir, n_slots, ctx, kv_budget, kv_reserve,
+            dir,
+            n_slots,
+            ctx,
+            kv_budget,
+            kv_reserve,
+            kv_vram_cap,
         )?)))
     }
 }

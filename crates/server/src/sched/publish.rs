@@ -43,9 +43,13 @@ pub(super) fn publish_aging(a: &Aging) {
 /// 모니터링 — 메모리 분류 + 복사 계측 게시(최신값만).
 pub(super) fn publish_stats(eng: &Engine, base: [(u64, u64, u64); 3]) {
     let (weights_gpu, kv_gpu, offload_cpu, ple_cpu) = eng.mem_stats();
+    let (_, kv_host, host_blocks, total_blocks) = eng.kv_tier_bytes();
     crate::metrics::publish_memory(crate::metrics::MemView {
         weights_gpu,
         kv_gpu,
+        kv_host,
+        kv_host_blocks: host_blocks as u64,
+        kv_blocks_total: total_blocks as u64,
         offload_cpu,
         ple_cpu,
         active_per_token: eng.active_weight_bytes(),

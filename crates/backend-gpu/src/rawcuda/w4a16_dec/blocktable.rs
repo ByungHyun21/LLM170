@@ -11,13 +11,21 @@
 //!   `release`(반납) — 슬롯 정적 예약 제거.
 
 /// 물리 블록 할당자 — (slot, layer, block) → 물리 블록 id.
+/// [2026-10-16] 2계층: id < `vram_blocks` = VRAM 아레나, 이후 = 호스트 아레나.
+/// 자유 목록을 티어별 2스택으로 분리 — **VRAM 스택 우선 pop**(해제 LIFO가
+/// 호스트 블록을 스택 꼭대기에 올려 VRAM 여유가 있어도 호스트를 재사용하던
+/// 오프로드 점착을 차단, 2026-10-16 검토 반영).
 pub struct KvPool {
     n_slots: usize,
     n_layers: usize,
     /// 층당 블록 수(테이블 크기 = cap/512).
     mb_max: usize,
-    /// 자유 블록 id(스택 — 할당 O(1)).
-    free: Vec<u32>,
+    /// VRAM 자유 블록 id(먼저 pop — 성능 우선).
+    free_vram: Vec<u32>,
+    /// 호스트 자유 블록 id(VRAM 소진 시).
+    free_host: Vec<u32>,
+    /// VRAM 아레나 블록 수(티어 경계).
+    vram_blocks: usize,
     /// 총 블록 수(용량 — 입장 불가 판정).
     total: usize,
     /// slot_map[slot][layer * mb_max + bi] = 물리 id (u32::MAX = 미할당).
@@ -26,12 +34,13 @@ pub struct KvPool {
 }
 
 impl KvPool {
-    /// `total_blocks` ≤ u32::MAX-1(센티널) 계약.
+    /// `total_blocks` ≤ u32::MAX-1(센티널) 계약. `vram_blocks` = 앞쪽 VRAM 몫.
     pub fn new(
         n_slots: usize,
         n_layers: usize,
         mb_max: usize,
         total_blocks: usize,
+        vram_blocks: usize,
     ) -> Result<Self, String> {
         if n_slots == 0 || n_layers == 0 || mb_max == 0 {
             return Err("KvPool: 0 차원".into());
@@ -39,18 +48,30 @@ impl KvPool {
         if total_blocks >= u32::MAX as usize {
             return Err(format!("KvPool: 블록 {total_blocks} ≥ u32 센티널"));
         }
+        let vb = vram_blocks.min(total_blocks);
         Ok(KvPool {
             n_slots,
             n_layers,
             mb_max,
-            free: (0..total_blocks as u32).rev().collect(),
+            free_vram: (0..vb as u32).rev().collect(),
+            free_host: (vb as u32..total_blocks as u32).rev().collect(),
+            vram_blocks: vb,
             total: total_blocks,
             slot_map: vec![vec![u32::MAX; n_layers * mb_max]; n_slots],
             used: vec![0; n_slots],
         })
     }
 
-    /// (slot, layer, bi) 블록 확보 — 있으면 그 id, 없으면 할당.
+    /// id의 티어 복귀 — VRAM id는 VRAM 스택(우선 재사용).
+    fn push_free(&mut self, id: u32) {
+        if (id as usize) < self.vram_blocks {
+            self.free_vram.push(id);
+        } else {
+            self.free_host.push(id);
+        }
+    }
+
+    /// (slot, layer, bi) 블록 확보 — 있으면 그 id, 없으면 할당(VRAM 우선).
     pub fn ensure(&mut self, slot: usize, layer: usize, bi: usize) -> Result<u32, String> {
         if slot >= self.n_slots || layer >= self.n_layers || bi >= self.mb_max {
             return Err(format!(
@@ -65,8 +86,9 @@ impl KvPool {
             return Ok(cur);
         }
         let id = self
-            .free
+            .free_vram
             .pop()
+            .or_else(|| self.free_host.pop())
             .ok_or_else(|| format!("KvPool: 블록 소진(자유 0) — slot={slot}"))?;
         self.slot_map[slot][e] = id;
         self.used[slot] += 1;
@@ -104,7 +126,7 @@ impl KvPool {
                 let id = self.slot_map[slot][e];
                 if id != u32::MAX {
                     self.slot_map[slot][e] = u32::MAX;
-                    self.free.push(id);
+                    self.push_free(id);
                     n += 1;
                 }
             }
@@ -137,7 +159,7 @@ impl KvPool {
                 let id = self.slot_map[slot][e];
                 if id != u32::MAX {
                     self.slot_map[slot][e] = u32::MAX;
-                    self.free.push(id);
+                    self.push_free(id);
                     self.used[slot] = self.used[slot].saturating_sub(1);
                     out.push((l, bi));
                 }
@@ -148,7 +170,19 @@ impl KvPool {
 
     #[allow(dead_code)] // [K6-3] 다음 단계(입장 보장·실효 ctx) 배선 전
     pub fn free_blocks(&self) -> usize {
-        self.free.len()
+        self.free_vram.len() + self.free_host.len()
+    }
+
+    /// [2026-10-16] VRAM 자유 블록 수(진단 — 오프로드 점착 판정).
+    #[allow(dead_code)]
+    pub fn free_vram_blocks(&self) -> usize {
+        self.free_vram.len()
+    }
+
+    /// [2026-10-16] 호스트 자유 블록 수(진단).
+    #[allow(dead_code)]
+    pub fn free_host_blocks(&self) -> usize {
+        self.free_host.len()
     }
 
     /// 총 블록 수 — 예약이 용량 자체를 넘는 요청의 조기 거부(무한 대기 방지).
@@ -173,7 +207,7 @@ mod tests {
 
     #[test]
     fn ensure_idempotent_and_upto() {
-        let mut p = KvPool::new(2, 3, 4, 100).unwrap();
+        let mut p = KvPool::new(2, 3, 4, 100, 100).unwrap();
         let a = p.ensure(0, 1, 1).unwrap();
         assert_eq!(p.ensure(0, 1, 1).unwrap(), a, "멱등");
         let new = p.ensure_upto(0, 1024).unwrap();
@@ -186,7 +220,7 @@ mod tests {
 
     #[test]
     fn release_and_reuse() {
-        let mut p = KvPool::new(1, 2, 4, 8).unwrap();
+        let mut p = KvPool::new(1, 2, 4, 8, 8).unwrap();
         p.ensure_upto(0, 2048).unwrap();
         assert_eq!(p.free_blocks(), 0);
         assert_eq!(p.release(0), 8);
@@ -198,14 +232,35 @@ mod tests {
 
     #[test]
     fn exhausted_is_error() {
-        let mut p = KvPool::new(1, 2, 4, 3).unwrap();
+        let mut p = KvPool::new(1, 2, 4, 3, 3).unwrap();
         let e = p.ensure_upto(0, 2048).unwrap_err();
         assert!(e.contains("블록 소진"), "{e}");
     }
 
+    /// [2026-10-16] 2계층 자유 목록 — VRAM 우선 pop, 해제 후에도 호스트 점착
+    /// 없음(구 단일 LIFO는 방금 해제한 호스트 id를 꼭대기에 올려 재사용했다).
+    #[test]
+    fn tiers_prefer_vram() {
+        let mut p = KvPool::new(1, 1, 8, 8, 4).unwrap();
+        for bi in 0..4 {
+            assert!(p.ensure(0, 0, bi).unwrap() < 4, "VRAM 선할당");
+        }
+        assert!(p.ensure(0, 0, 4).unwrap() >= 4, "소진 후 호스트");
+        p.release(0);
+        assert_eq!(p.free_vram_blocks(), 4, "VRAM 복귀 = VRAM 스택");
+        assert_eq!(p.free_host_blocks(), 4, "호스트 = 미사용 3 + 복귀 1");
+        // 해제 직후 재할당 = VRAM 우선(호스트 점착 없음).
+        assert!(p.ensure(0, 0, 0).unwrap() < 4, "해제 후에도 VRAM 우선");
+        assert!(p.ensure(0, 0, 1).unwrap() < 4);
+        // VRAM 소진 뒤에야 호스트.
+        assert!(p.ensure(0, 0, 2).unwrap() < 4);
+        assert!(p.ensure(0, 0, 3).unwrap() < 4);
+        assert!(p.ensure(0, 0, 4).unwrap() >= 4);
+    }
+
     #[test]
     fn upto_clamps_to_mb_max() {
-        let mut p = KvPool::new(1, 1, 4, 4).unwrap();
+        let mut p = KvPool::new(1, 1, 4, 4, 4).unwrap();
         // 요청 토큰이 테이블 범위를 넘어도 mb_max로 클램프(테이블 밖 엔트리 금지).
         let new = p.ensure_upto(0, 99999).unwrap();
         assert_eq!(new.len(), 4);
@@ -215,7 +270,7 @@ mod tests {
     #[test]
     fn release_below_sliding_only() {
         // 2층(0=풀·1=슬라이딩) × 4블록, 전량 확보(8칸).
-        let mut p = KvPool::new(1, 2, 4, 8).unwrap();
+        let mut p = KvPool::new(1, 2, 4, 8, 8).unwrap();
         p.ensure_upto(0, 2048).unwrap();
         assert_eq!(p.free_blocks(), 0);
         let rel = p.release_below(0, 2, &[false, true]);

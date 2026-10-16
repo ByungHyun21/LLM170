@@ -201,6 +201,66 @@ impl W4a16Dec {
         self.attn.kv_budget = bytes;
     }
 
+    /// [2026-10-16] VRAM 티어 상한(바이트 — 서버 파생) — kv_budget 초과분은
+    /// 호스트 아레나로 확장(2계층). None = 전량 VRAM(종전 동작).
+    pub fn set_kv_vram_cap(&mut self, bytes: Option<u64>) {
+        self.attn.kv_vram_cap = bytes;
+    }
+
+    /// 블록 id → 아레나 주소(2계층) — `id < vram_blocks` = VRAM 아레나,
+    /// 이후는 호스트 아레나(핀드·디바이스 매핑). 표 기입·직접 참조 공용.
+    pub(super) fn kv_block_addr(
+        base_v: CUdeviceptr,
+        base_h: CUdeviceptr,
+        id: u64,
+        stride: u64,
+        vram_blocks: usize,
+    ) -> u64 {
+        if (id as usize) < vram_blocks {
+            base_v + id * stride
+        } else {
+            base_h + (id - vram_blocks as u64) * stride
+        }
+    }
+
+    /// 호스트 KV 아레나 해제(핀드 — cc 대장 밖이라 수동) + 필드 0화.
+    /// ucache 호스트 항목도 함께 해제(재등록 경로 공용).
+    pub(super) fn free_kv_host_arenas(&mut self) -> Result<(), String> {
+        self.ucache.release_if_present("attn:kv:host");
+        for p in [
+            self.attn.hkc_h,
+            self.attn.hvc_h,
+            self.attn.hksc_h,
+            self.attn.hvsc_h,
+        ] {
+            if !p.is_null() {
+                self.cc.pinned_free(p)?;
+            }
+        }
+        self.attn.hkc_h = std::ptr::null_mut();
+        self.attn.hvc_h = std::ptr::null_mut();
+        self.attn.hksc_h = std::ptr::null_mut();
+        self.attn.hvsc_h = std::ptr::null_mut();
+        (self.attn.dkc_h, self.attn.dvc_h) = (0, 0);
+        (self.attn.dksc_h, self.attn.dvsc_h) = (0, 0);
+        self.attn.kv_host_bytes = 0;
+        self.attn.kv_vram_blocks = 0;
+        Ok(())
+    }
+
+    /// [2026-10-16] KV 계층 회계 — (VRAM 바이트, 호스트 바이트, 호스트 블록,
+    /// 전체 블록). 오프로드율 = 호스트/(VRAM+호스트) — /stats 노출.
+    pub fn kv_tier_bytes(&self) -> (u64, u64, usize, usize) {
+        let total = self
+            .attn
+            .kv_pool
+            .as_ref()
+            .map(|p| p.total_blocks())
+            .unwrap_or(0);
+        let hb = total.saturating_sub(self.attn.kv_vram_blocks);
+        (self.attn.kv_arena_bytes, self.attn.kv_host_bytes, hb, total)
+    }
+
     /// [gemma4 2026-10-14] `layers` = 층별 어텐션 파라미터(빈 벡터 = 균일
     /// 모델 — qwen35 종전 경로와 완전 동일). QK 노름 가중은 층별 head_dim의
     /// **최대치 보폭**(d_max)으로 패딩된 배열을 받는다(균일 모델은 n×d 동일).
@@ -252,8 +312,24 @@ impl W4a16Dec {
             Some(b) => ((b / per_block.max(1)) as usize).clamp(1, need_blocks),
             None => need_blocks,
         };
+        // [2026-10-16] 2계층 분할 — VRAM 상한(서버 파생) 초과분은 호스트 아레나
+        // (핀드·디바이스 매핑 — 커널이 표를 통해 직접 접근). VRAM 선순위(블록 id
+        // 오름차순 + KvPool 티어 스택). 유계 층(슬라이딩 창) 우선 호스트 배치는
+        // 차기(§9.1의 "우선 후보" — 현행은 무계 포함 허용, 요청 우선 규칙).
+        // 진단 강제 = LLM170_KV_VRAM_MB — **압박 테스트 하네스·프로파일 전용**
+        // (배치 파라미터 노브 — 수치 불변, 경로 선택 아님. 하네스가 설정한다).
+        let diag_vram = llm170_diag::flag::val("LLM170_KV_VRAM_MB")
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|mb| mb << 20);
+        let vram_cap = diag_vram.or(self.attn.kv_vram_cap);
+        let vram_blocks = match vram_cap {
+            Some(b) => ((b / per_block.max(1)) as usize).clamp(1, total_blocks),
+            None => total_blocks,
+        };
+        let host_blocks = total_blocks - vram_blocks;
         // [§3.4 ②] KV 재등록 — 구 회계 해제(부재 시 무동작: 최초 등록).
         self.ucache.release_if_present("attn:kv");
+        self.free_kv_host_arenas()?;
         for q in [
             self.attn.dqnw_a,
             self.attn.dknw_a,
@@ -298,16 +374,20 @@ impl W4a16Dec {
         Self::h2d_chunked(&self.cc, dq, b(qnw))?;
         let dk = self.cc.alloc(knw.len() * 4)?;
         Self::h2d_chunked(&self.cc, dk, b(knw))?;
-        let pool = super::blocktable::KvPool::new(slots, n, mb, total_blocks)?;
+        // [2026-10-16 검토 반영] 필드 선점 — 이후 어느 오류경로든 이 두 버퍼는
+        // 필드 소유(재등록 정리·free_all이 회수)로 남는다.
+        self.attn.dqnw_a = dq;
+        self.attn.dknw_a = dk;
+        let pool = super::blocktable::KvPool::new(slots, n, mb, total_blocks, vram_blocks)?;
         let (dkc, dvc) = {
             // int8 KV(1B/원소) + 스케일 2벌. 기록 attn_prep_q,
             // 판독 attn_fwd3s_part_q(병합은 f32 그대로).
-            let kbytes = total_blocks * block_k;
+            let kbytes = vram_blocks * block_k;
             let kc = self.cc.alloc(kbytes)?;
             Self::zero_dev(&self.cc, kc, kbytes)?;
             let vc = self.cc.alloc(kbytes)?;
             Self::zero_dev(&self.cc, vc, kbytes)?;
-            let sbytes = total_blocks * block_s;
+            let sbytes = vram_blocks * block_s;
             let ks = self.cc.alloc(sbytes)?;
             Self::zero_dev(&self.cc, ks, sbytes)?;
             let vs = self.cc.alloc(sbytes)?;
@@ -316,11 +396,79 @@ impl W4a16Dec {
             self.attn.dvsc = vs;
             (kc, vc)
         };
+        // 호스트 확장 아레나(있으면) — 핀드·디바이스 매핑. 실패 시 방금 만든
+        // 장치 아레나까지 회수(부분 상태 금지).
+        if host_blocks > 0 {
+            let hk = host_blocks * block_k;
+            let hs = host_blocks * block_s;
+            // 부분 실패 시 앞선 핀드 할당을 즉시 회수(대장 밖 메모리 — 누수 금지).
+            let alloc4 = || -> Result<_, String> {
+                let (hkc, dkc_h) = self.cc.pinned_alloc_device(hk)?;
+                let (hvc, dvc_h) = match self.cc.pinned_alloc_device(hk) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = self.cc.pinned_free(hkc);
+                        return Err(e);
+                    }
+                };
+                let (hksc, dksc_h) = match self.cc.pinned_alloc_device(hs) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = self.cc.pinned_free(hkc);
+                        let _ = self.cc.pinned_free(hvc);
+                        return Err(e);
+                    }
+                };
+                let (hvsc, dvsc_h) = match self.cc.pinned_alloc_device(hs) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = self.cc.pinned_free(hkc);
+                        let _ = self.cc.pinned_free(hvc);
+                        let _ = self.cc.pinned_free(hksc);
+                        return Err(e);
+                    }
+                };
+                Ok(((hkc, dkc_h), (hvc, dvc_h), (hksc, dksc_h), (hvsc, dvsc_h)))
+            };
+            match alloc4() {
+                Ok(((hkc, dkc_h), (hvc, dvc_h), (hksc, dksc_h), (hvsc, dvsc_h))) => {
+                    // 호스트 0 초기화(커널 기록 전 판독 안전 — 1회).
+                    // SAFETY: 핀드 할당 [0, len) 쓰기.
+                    unsafe {
+                        std::ptr::write_bytes(hkc, 0, hk);
+                        std::ptr::write_bytes(hvc, 0, hk);
+                        std::ptr::write_bytes(hksc, 0, hs);
+                        std::ptr::write_bytes(hvsc, 0, hs);
+                    }
+                    self.attn.hkc_h = hkc;
+                    self.attn.hvc_h = hvc;
+                    self.attn.hksc_h = hksc;
+                    self.attn.hvsc_h = hvsc;
+                    self.attn.dkc_h = dkc_h;
+                    self.attn.dvc_h = dvc_h;
+                    self.attn.dksc_h = dksc_h;
+                    self.attn.dvsc_h = dvsc_h;
+                    self.attn.kv_host_bytes = 2 * (hk + hs) as u64;
+                }
+                Err(e) => {
+                    for q in [dkc, dvc, self.attn.dksc, self.attn.dvsc] {
+                        if q != 0 {
+                            let _ = self.cc.free(q);
+                        }
+                    }
+                    (self.attn.dkc, self.attn.dvc) = (0, 0);
+                    (self.attn.dksc, self.attn.dvsc) = (0, 0);
+                    return Err(e);
+                }
+            }
+        }
+        self.attn.kv_vram_blocks = vram_blocks;
         let dpp = self.cc.alloc(slots * 4)?;
         Self::zero_dev(&self.cc, dpp, slots * 4)?;
         // [K6-3 2026-10-13] KV 블록 테이블(디바이스 u64 [slot][layer][mb]×4) —
         // 엔트리 = 풀 물리 블록 주소(KvPool 정본). 커널(attn_blk_row)은 테이블만
-        // 보므로 블록 배정/회수는 호스트 갱신만으로 반영된다.
+        // 보므로 블록 배정/회수는 호스트 갱신만으로 반영된다(블록 id가 VRAM/호스트
+        // 어느 아레나인지는 표 엔트리 주소가 담는다).
         // **온디맨드**: 초기 테이블은 0(미할당) — 슬롯은 입장(kv_grow)에서 필요한
         // 블록만 배정받는다(요청별 예약·회수 — K6 3차). 미할당 엔트리는 판독
         // 전에 반드시 kv_grow가 덮는다(성장 = 사용 직전 +2 정렬 여유).
@@ -333,7 +481,8 @@ impl W4a16Dec {
         // 행×헤드 스케일 2벌 + 블록 테이블). **Kv 범주는 고정(퇴거 불가)**
         // 이므로 등록 실패는 예산 부족(과점유) 경고로 그친다 — 이미
         // 물리 할당이 성공했고 KV 없이는 디코드 자체가 불가능하기 때문.
-        let kv_bytes = (total_blocks * (block_k * 2 + block_s * 2)) as u64 + tab.len() as u64 * 8;
+        // (VRAM 아레나 = HBM 등록 · 호스트 아레나는 별도 HostRam 항목.)
+        let kv_bytes = (vram_blocks * (block_k * 2 + block_s * 2)) as u64 + tab.len() as u64 * 8;
         self.attn.kv_arena_bytes = kv_bytes;
         if let Err(e) = self.ucache.allocate(
             "attn:kv",
@@ -346,10 +495,25 @@ impl W4a16Dec {
         } else {
             eprintln!("{}", self.ucache.log_line("attn:kv"));
         }
+        // [2026-10-16 검토 반영] 호스트 아레나도 통합 캐시 회계 등록 — 함수/바이트
+        // 단위 소비자(압박 산정)가 레지스트리만 보는 경우의 공백 제거.
+        if self.attn.kv_host_bytes > 0 {
+            self.ucache.release_if_present("attn:kv:host");
+            if let Err(e) = self.ucache.allocate(
+                "attn:kv:host",
+                CacheCategory::Kv,
+                Tier::HostRam,
+                self.attn.kv_host_bytes,
+                base_util::KV,
+            ) {
+                eprintln!("[ucache] attn:kv:host 등록 실패(회계 전용): {e}");
+            } else {
+                eprintln!("{}", self.ucache.log_line("attn:kv:host"));
+            }
+        }
         self.attn.dblk_tab = dblk;
         self.attn.kv_pool = Some(pool);
-        self.attn.dqnw_a = dq;
-        self.attn.dknw_a = dk;
+        // dqnw_a/dknw_a는 alloc 직후 선점(오류경로 회수 — 위 참조).
         self.attn.dkc = dkc;
         self.attn.dvc = dvc;
         self.attn.dpp = dpp;
@@ -379,6 +543,14 @@ impl W4a16Dec {
         let (kvd, kvh) = self.attn_max_kv()?;
         let (bk, bs) = ((512 * kvd) as u64, (512 * kvh * 4) as u64);
         let (kc, vc, ks, vs) = (self.attn.dkc, self.attn.dvc, self.attn.dksc, self.attn.dvsc);
+        // 2계층 주소(블록 id < kv_vram_blocks = VRAM, 이후 = 호스트 아레나).
+        let (kc_h, vc_h, ks_h, vs_h) = (
+            self.attn.dkc_h,
+            self.attn.dvc_h,
+            self.attn.dksc_h,
+            self.attn.dvsc_h,
+        );
+        let vram_blocks = self.attn.kv_vram_blocks;
         let n_attn = dm.n_attn;
         // [2.N Stage 2] 슬롯 플로어(행) — 슬라이딩 층에서 이 행 미만 블록은
         // 확보하지 않는다(해제 유지). 풀층·qwen(균일 layers 빈 벡터)은 무영향.
@@ -408,9 +580,14 @@ impl W4a16Dec {
                     .ensure(slot, l, bi)? as u64;
                 new += 1;
                 let mut bytes = [0u8; 32];
-                for (i2, v) in [kc + id * bk, vc + id * bk, ks + id * bs, vs + id * bs]
-                    .iter()
-                    .enumerate()
+                for (i2, v) in [
+                    Self::kv_block_addr(kc, kc_h, id, bk, vram_blocks),
+                    Self::kv_block_addr(vc, vc_h, id, bk, vram_blocks),
+                    Self::kv_block_addr(ks, ks_h, id, bs, vram_blocks),
+                    Self::kv_block_addr(vs, vs_h, id, bs, vram_blocks),
+                ]
+                .iter()
+                .enumerate()
                 {
                     bytes[i2 * 8..(i2 + 1) * 8].copy_from_slice(&v.to_le_bytes());
                 }
@@ -1355,5 +1532,34 @@ impl W4a16Dec {
         self.head_k = k;
         self.weights_bytes += (n * k + n * 4 + n * 4) as u64;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::W4a16Dec;
+
+    /// KV 2계층 주소 — id < vram_blocks = VRAM 아레나, 이후 = 호스트 아레나
+    /// (핀드·디바이스 매핑). 경계·연속성·스킵 없음.
+    #[test]
+    fn kv_block_addr_tiers() {
+        let (bv, bh, stride) = (0x1_0000u64, 0x2_0000u64, 0x100u64);
+        // VRAM부.
+        assert_eq!(W4a16Dec::kv_block_addr(bv, bh, 0, stride, 10), 0x1_0000);
+        assert_eq!(
+            W4a16Dec::kv_block_addr(bv, bh, 9, stride, 10),
+            0x1_0000 + 9 * 0x100
+        );
+        // 호스트부(경계 = 첫 호스트 블록).
+        assert_eq!(W4a16Dec::kv_block_addr(bv, bh, 10, stride, 10), 0x2_0000);
+        assert_eq!(
+            W4a16Dec::kv_block_addr(bv, bh, 12, stride, 10),
+            0x2_0000 + 2 * 0x100
+        );
+        // 전량 VRAM(호스트 0) — 호스트 기저 미사용.
+        assert_eq!(
+            W4a16Dec::kv_block_addr(bv, bh, 3, stride, 4),
+            0x1_0000 + 3 * 0x100
+        );
     }
 }

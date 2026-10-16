@@ -169,6 +169,8 @@ pub struct InferRequest {
     pub model_max_ctx: usize,
     /// [K6-3 예산] KV 아레나 예산(바이트 — `--kv-mem` 그대로. None = 프로브/null).
     pub kv_budget: Option<u64>,
+    /// [2026-10-16] VRAM 티어 상한(서버 검증 — 초과분은 호스트 아레나 확장).
+    pub kv_vram_cap: Option<u64>,
     /// [2.M 사다리] KV 풀 실할당 추정 = min(예산, ctx×문맥수×KV/토큰).
     /// 전문가 상주(auto) 판정에서 KV 몫을 먼저 떼는 데 쓴다(0/None = 종전 규칙).
     pub kv_reserve: Option<u64>,
@@ -210,6 +212,11 @@ impl Engine {
         self.0.kv_cap_tokens()
     }
 
+    /// [2026-10-16] KV 계층 회계 — (VRAM 바이트, 호스트 바이트, 호스트 블록, 전체 블록).
+    pub fn kv_tier_bytes(&self) -> (u64, u64, usize, usize) {
+        self.0.kv_tier_bytes()
+    }
+
     /// 복사 계측 — [h2d, d2h, d2d] × (바이트, ns, 호출).
     pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
         self.0.copy_stats()
@@ -245,7 +252,14 @@ fn banner(
 
 pub fn build_slots(req: InferRequest, n_slots: usize) -> Engine {
     // W3-3: GPU 경로 단일 — 가중치 VRAM 상주(호스트 스테이징 체인).
-    let eng = load_gpu_retry(&req.model, n_slots, req.ctx, req.kv_budget, req.kv_reserve);
+    let eng = load_gpu_retry(
+        &req.model,
+        n_slots,
+        req.ctx,
+        req.kv_budget,
+        req.kv_reserve,
+        req.kv_vram_cap,
+    );
     banner(
         &req.model,
         "w4a16",

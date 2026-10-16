@@ -337,10 +337,14 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     }
     let _ = engine::TOKENIZER.set(tok);
     // [2026-10-16] kv-mem 검증·파생 — 요청 상한 = min(모델 최대, 풀 총량).
-    let (model_max_ctx, cap, kv_budget, kv_reserve, plan_txt) = match model_ctx_info(&model_path) {
+    let (model_max_ctx, cap, kv_budget, kv_reserve, plan_txt, kv_vram_cap) = match model_ctx_info(
+        &model_path,
+    ) {
         Ok(ci) => {
             let model_max_ctx = ci.ctx;
             let mut plan_txt = String::new();
+            // [2026-10-16] 2계층 분할 결과(VRAM 상한) — 아래 검증에서 확정.
+            let mut vram_cap_opt: Option<u64> = None;
             // [2026-10-16] kv-mem 파생 — 풀 = kv-mem/KV-바이트-토큰(512 블록
             // 정렬), 요청 상한 = min(모델 최대, 풀). 클램프 없음(초과 = 거부).
             let pool_tokens = kv_layout(kv_mem, ci.kv_bytes_per_token, ci.ctx);
@@ -398,31 +402,41 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                     }
                     Err(e) => eprintln!("# plan 건너뜀: {e}"),
                 }
-                // 운영자 값 검증 — 상한 초과 = 거부(무 auto·무 클램프).
-                if kv_mem > max_kv {
-                    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                // [2026-10-16] 2계층 검증 — VRAM부 상한 초과분은 **호스트 확장**
+                // (요청 우선 — 거부하지 않는다). 호스트부는 가용 RAM 검증.
+                let (vram_part, host_part) = kv_split(kv_mem, max_kv);
+                if host_part > 0 {
+                    const HOST_RESERVE: u64 = 8 << 30; // 데스크톱 여유(운영 조정 대상)
+                    let avail = resource::host_mem_available().unwrap_or(0);
+                    if host_part + HOST_RESERVE > avail {
+                        eprintln!(
+                            "# kv-mem 가드 거부: 호스트부 {} > 가용 RAM {} − 예약 {} (VRAM부 {}·상한 {})",
+                            fmt_mem(host_part),
+                            fmt_mem(avail),
+                            fmt_mem(HOST_RESERVE),
+                            fmt_mem(vram_part),
+                            fmt_mem(max_kv)
+                        );
+                        return ExitCode::FAILURE;
+                    }
                     eprintln!(
-                        "# kv-mem 가드 거부: 요청 {} > 최대 {} (여유 VRAM {:.1}G − 가중치 {:.1}G − 예약 {:.1}G − 상태 {:.1}G)",
-                        fmt_mem(kv_mem),
-                        fmt_mem(max_kv),
-                        gib(free),
-                        gib(wts),
-                        gib(RESERVE),
-                        gib(ctx_state)
+                        "# kv-mem 계층: VRAM {} + 호스트 {} (초과분 = 호스트 아레나 — 오프로드율은 /stats)",
+                        fmt_mem(vram_part),
+                        fmt_mem(host_part)
                     );
+                    // 핀드 = 페이지 고정(스왑 회수 불가) — 호스트부만큼 상시 점유.
                     eprintln!(
-                        "#   → 권고 {} (플래너) 이내로 지정. 호스트 확장(KV 오프로드)은 W3(§9.1) 미배선 — 현행 VRAM 한정.",
-                        fmt_mem(max_kv)
+                        "#   주의: 호스트부는 핀드(스왑 회수 불가) — 데스크톱 압박 시 kv-mem 축소 권고"
                     );
-                    return ExitCode::FAILURE;
                 }
+                vram_cap_opt = Some(vram_part);
                 // 권고 = 플래너/폴백 상한(운영자 조정 참고 — 강제 아님).
                 eprintln!("# kv-mem 권고(플래너 상한): {}", fmt_mem(max_kv));
             } else {
                 eprintln!("# kv-mem 검증 건너뜀: VRAM 조회 불가(가드가 거부할 것)");
             }
             eprintln!(
-                "# kv-mem: {} = {pool_tokens} tokens(512 블록) · 요청 상한 = min(model {model_max_ctx}, pool {pool_tokens}) = {pool_tokens} · 계층 = VRAM(호스트 확장 W3)",
+                "# kv-mem: {} = {pool_tokens} tokens(512 블록) · 요청 상한 = min(model {model_max_ctx}, pool {pool_tokens}) = {pool_tokens}",
                 fmt_mem(kv_mem)
             );
             eprintln!(
@@ -441,6 +455,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 Some(kv_mem),
                 Some(kv_mem),
                 plan_txt,
+                vram_cap_opt,
             )
         }
         Err(e) => {
@@ -454,6 +469,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         model_max_ctx,
         kv_budget,
         kv_reserve,
+        kv_vram_cap,
     };
     // 모니터링 — 정적 정보 등록 + 샘플러 스레드(1Hz; 무시 가능 비용,
     // 최신 스냅샷만 유지 — 시계열 누적은 외부 폴러 몫).
@@ -697,6 +713,13 @@ fn kv_layout(kv_mem: u64, kv_bytes_per_token: u64, model_max: usize) -> usize {
     (tokens.min(model_max)) / 512 * 512
 }
 
+/// [2026-10-16] kv-mem 2계층 분할 — (VRAM부, 호스트부). VRAM부 = min(총량,
+/// VRAM 상한 = 여유 VRAM − 가중치·예약·상태), 초과분은 호스트 확장(요청 우선).
+fn kv_split(kv_mem: u64, max_vram_kv: u64) -> (u64, u64) {
+    let vram = kv_mem.min(max_vram_kv);
+    (vram, kv_mem - vram)
+}
+
 /// `llm170 tokenize --model <dir> [--no-special] (--text <s> | --file <f> | --stdin)`
 /// llama-tokenize 대응 출력 `[id, ...]` — 검증·디버깅용.
 fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
@@ -834,6 +857,24 @@ mod tests {
         assert_eq!(parse_mem_bytes("G"), None);
         assert_eq!(parse_mem_bytes(""), None);
         assert_eq!(parse_mem_bytes("12X"), None);
+    }
+
+    /// [2026-10-16] kv-mem → (VRAM부, 호스트부) 2계층 분할 — VRAM 상한
+    /// 이하는 전부 VRAM, 초과분만 호스트. 총량 이하/경계 보존.
+    #[test]
+    fn kv_split_tiers() {
+        assert_eq!(
+            kv_split(4 << 30, 6 << 30),
+            (4 << 30, 0),
+            "VRAM 이하 = 전량 VRAM"
+        );
+        assert_eq!(
+            kv_split(6 << 30, 4 << 30),
+            (4 << 30, 2 << 30),
+            "초과분 = 호스트"
+        );
+        assert_eq!(kv_split(4 << 30, 4 << 30), (4 << 30, 0), "경계 = 호스트 0");
+        assert_eq!(kv_split(1, 0), (0, 1), "VRAM 상한 0 = 전량 호스트");
     }
 
     /// kv_layout — 512 정렬·모델 클램프·최소(블록 미만).

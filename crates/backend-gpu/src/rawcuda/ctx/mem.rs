@@ -43,6 +43,8 @@ impl CudaCtx {
     }
 
     /// 디바이스 메모리 해제(스모크 검증용 — 영속 아레나 도입 전 임시 규칙).
+    /// [2026-10-16] 대장에서도 제거 — 명시 해제 후 free_all이 같은 포인터를
+    /// 다시 해제하던 이중 해제 창(실측: INVALID_VALUE)을 닫는다.
     pub fn free(&self, p: CUdeviceptr) -> Result<(), String> {
         // SAFETY: p는 alloc이 돌려준 유효 핸들(중복 해제 금지 계약).
         unsafe {
@@ -51,6 +53,7 @@ impl CudaCtx {
                 return Err(format!("rawcuda: cuMemFree: {}", ffi::err_text(r)));
             }
         }
+        self.allocs.borrow_mut().retain(|&x| x != p);
         Ok(())
     }
 
@@ -333,6 +336,40 @@ impl CudaCtx {
                 ));
             }
             Ok(p)
+        }
+    }
+
+    /// pinned 호스트 할당 + 디바이스 매핑(DEVICEMAP) — 커널이 표를 통해 직접
+    /// 읽고 쓰는 호스트 KV 티어용. 반환 = (호스트 포인터, 디바이스 가시 주소).
+    /// 해제는 pinned_free(호스트 포인터).
+    pub fn pinned_alloc_device(
+        &self,
+        bytes: usize,
+    ) -> Result<(*mut std::ffi::c_void, CUdeviceptr), String> {
+        // cuMemHostGetDevicePointer는 현재 컨텍스트를 요구한다(실측 2026-10-16:
+        // 가드 없이 호출 시 CUDA_ERROR_INVALID_CONTEXT=201).
+        let _g = self.guard()?;
+        const CU_MEMHOSTALLOC_DEVICEMAP: std::ffi::c_uint = 0x02;
+        // SAFETY: 출력은 스택 로컬 — 실패 시 즉시 해제(부분 상태 금지).
+        unsafe {
+            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+            let r = (self.drv.mem_host_alloc)(&mut p, bytes, CU_MEMHOSTALLOC_DEVICEMAP);
+            if r != CUDA_SUCCESS {
+                return Err(format!(
+                    "rawcuda: cuMemHostAlloc(device-map, {bytes}B): {}",
+                    ffi::err_text(r)
+                ));
+            }
+            let mut dev: CUdeviceptr = 0;
+            let r2 = (self.drv.mem_host_get_device_pointer)(&mut dev, p, 0);
+            if r2 != CUDA_SUCCESS {
+                let _ = (self.drv.mem_free_host)(p);
+                return Err(format!(
+                    "rawcuda: cuMemHostGetDevicePointer({bytes}B): {}",
+                    ffi::err_text(r2)
+                ));
+            }
+            Ok((p, dev))
         }
     }
 

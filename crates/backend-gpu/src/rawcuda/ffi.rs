@@ -120,6 +120,13 @@ pub type CuStreamWaitEventFn =
 pub type CuMemHostAllocFn =
     unsafe extern "system" fn(pp: *mut *mut c_void, bytes: usize, flags: c_uint) -> CUresult;
 pub type CuMemFreeHostFn = unsafe extern "system" fn(p: *mut c_void) -> CUresult;
+/// cuMemHostGetDevicePointer — pinned 호스트 메모리의 디바이스 가시 주소(UVA).
+/// 호스트 KV 티어(커널 직접 접근)의 표 주소 원천.
+pub type CuMemHostGetDevicePointerFn = unsafe extern "system" fn(
+    pdev: *mut CUdeviceptr,
+    phost: *mut c_void,
+    flags: c_uint,
+) -> CUresult;
 /// cuMemcpyDtoHAsync_v2 — 캡처 가능한 비동기 판독(pinned 목적지).
 pub type CuMemcpyDtoHAsyncFn = unsafe extern "system" fn(
     dst: *mut c_void,
@@ -337,6 +344,7 @@ pub(crate) struct Driver {
     pub stream_wait_event: CuStreamWaitEventFn,
     pub mem_host_alloc: CuMemHostAllocFn,
     pub mem_free_host: CuMemFreeHostFn,
+    pub mem_host_get_device_pointer: CuMemHostGetDevicePointerFn,
     pub memcpy_dtoh_async: CuMemcpyDtoHAsyncFn,
     pub stream_begin_capture: CuStreamBeginCaptureFn,
     pub stream_end_capture: CuStreamEndCaptureFn,
@@ -460,6 +468,15 @@ impl Driver {
                 mem_free_host: std::mem::transmute::<*mut c_void, CuMemFreeHostFn>(sym!(
                     "cuMemFreeHost"
                 )),
+                // cuda.h는 이 이름을 `_v2`로 매핑한다(평문 심볼 = 레거시 ABI —
+                // 실측 2026-10-16: 평문 호출이 CUDA_ERROR_INVALID_CONTEXT=201).
+                mem_host_get_device_pointer: std::mem::transmute::<
+                    *mut c_void,
+                    CuMemHostGetDevicePointerFn,
+                >(
+                    loader::sym(lib, "cuMemHostGetDevicePointer_v2")
+                        .or_else(|_| loader::sym(lib, "cuMemHostGetDevicePointer"))?,
+                ),
                 memcpy_dtoh_async: std::mem::transmute::<*mut c_void, CuMemcpyDtoHAsyncFn>(sym!(
                     "cuMemcpyDtoHAsync_v2"
                 )),
