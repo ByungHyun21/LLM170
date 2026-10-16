@@ -364,7 +364,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 // [dsave 대체 2026-10-14] 스펙 정밀 스냅샷(dsave — 27B/4슬롯
                 // 315.0MiB)이 프로브 전용 지연 할당으로 빠지고 dring0
                 // (5.6MiB)이 대신 들어와 순감 309.4MiB — 그 몫만 환원.
-                const RESERVE: u64 = 9 * (1 << 30) / 4 - 309 * (1 << 20); // 1995MiB — 실측 마진
+                const RESERVE: u64 = resource::VRAM_RESERVE;
                 // 폴백 상한(매니페스트 판독 불가 시): 가중치 = dense 전량(디렉터리).
                 let wts = if ci.dense { dir_bytes(&model_path) } else { 0 };
                 // [K6-3] 문맥 추가분 = (문맥−1)×GDN 상태 — KV 상한에서 차감.
@@ -393,6 +393,9 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                             kv_bytes_per_token: ci.kv_bytes_per_token,
                             state_bytes_per_ctx: ci.gdn_state_bytes_per_slot,
                             contexts: SERVE_CONTEXTS,
+                            // [2026-10-16] embed 상주 정책(실행 경로) — qwen 계열
+                            // true(VRAM 업로드), gemma4 false(호스트 embed_row).
+                            embed_resident: embed_resident(&model_path),
                         };
                         let p = llm170_core::plan::plan(&man, &hw, &wl);
                         plan_txt = p.summary();
@@ -583,6 +586,8 @@ fn cmd_plan(args: &[String], ma: &ModelArgs) -> ExitCode {
         kv_bytes_per_token: kv_bpt,
         state_bytes_per_ctx: state_bpc,
         contexts: SERVE_CONTEXTS,
+        // [2026-10-16] embed 상주 정책(실행 경로 — 아치별).
+        embed_resident: embed_resident(&model_path),
     };
     let p = llm170_core::plan::plan(&man, &hw, &wl);
     let s = p.sizes;
@@ -609,7 +614,7 @@ fn cmd_plan(args: &[String], ma: &ModelArgs) -> ExitCode {
     // [2026-10-16] serve 권고 — 플래너 KV 예산이 곧 kv-mem 권고값(운영자 명시).
     if p.fits() {
         println!(
-            "serve 권고: --kv-mem {} — 풀 ctx {}/{} ({}) · experts={}",
+            "serve 권고: --kv-mem {} — 풀 ctx {}/{} ({}) · experts={} · 호스트부 여유 최대 {}",
             fmt_mem(p.kv_budget),
             p.effective_ctx,
             p.goal_ctx,
@@ -618,7 +623,8 @@ fn cmd_plan(args: &[String], ma: &ModelArgs) -> ExitCode {
             } else {
                 "전량"
             },
-            p.experts_tier.name()
+            p.experts_tier.name(),
+            fmt_mem(p.kv_host_budget),
         );
     } else {
         println!("serve 권고: 없음(수용 거부) — 상한/호스트 재배분 필요");
@@ -812,6 +818,15 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
             .join(", ")
     );
     ExitCode::SUCCESS
+}
+
+/// [2026-10-16] embed 상주 정책(엔진 실측) — qwen 계열 로더는 F16/BF16 embed를
+/// VRAM에 올린다(prefill gather 가속 — upload_embed). gemma4는 호스트
+/// embed_row 유지(청크 체인). dtype만으로는 구분 불가(둘 다 BF16)이므로 실행
+/// 경로(아치 로더)가 플래너에 정책을 넘긴다 — 플래너 회계 실정합.
+fn embed_resident(dir: &std::path::Path) -> bool {
+    let arch = llm170_core::qwen35::bind::dir_arch(dir).unwrap_or_default();
+    !llm170_core::gemma4::bind::arch_ok(&arch)
 }
 
 /// [P3 gemma4 2026-10-14] 아치별 계획 파생 — ctx_info 레지스트리 디스패치.

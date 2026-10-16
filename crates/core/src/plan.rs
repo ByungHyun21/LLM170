@@ -158,6 +158,12 @@ pub struct Workload {
     pub kv_bytes_per_token: u64,
     pub state_bytes_per_ctx: u64,
     pub contexts: usize,
+    /// [2026-10-16] embed 상주 정책(엔진 실측) — true면 embed 바이트가 VRAM 몫
+    /// (dense와 함께 ①), false면 호스트 mmap(⑤). qwen 계열 = true(prefill gather
+    /// 가속 — 로더가 F16/BF16 embed를 VRAM 업로드), gemma4 = false(호스트
+    /// embed_row; head는 별도 int8 스트림). dtype만으로는 구분 불가(둘 다 BF16)
+    /// — 실행 경로가 정책을 넘긴다.
+    pub embed_resident: bool,
 }
 
 /// 배치 티어.
@@ -195,10 +201,13 @@ pub struct Plan {
     /// VRAM 핫셋(상주 시 = 전문가 총량).
     pub experts_hot: u64,
     pub row_sparse_tier: Tier,
-    /// 호스트 RAM 필요(스트리밍 전문가 + embed mmap).
+    /// 호스트 RAM 필요(스트리밍 전문가 + embed mmap[비상주 시]).
     pub host_ram_need: u64,
     /// SSD 필요(행-스파스 + SSD로 밀린 전문가).
     pub ssd_need: u64,
+    /// [2026-10-16] 호스트 KV 확장 여유(= host_ram − host_ram_need) — `--kv-mem`
+    /// 호스트부 권고 상한. 데스크톱 여유는 운영자 몫(서버 검증이 별도 예약).
+    pub kv_host_budget: u64,
     pub refuse: Option<&'static str>,
 }
 
@@ -219,13 +228,14 @@ impl Plan {
         }
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         format!(
-            "dense={:.1}G experts={:.1}G row_sparse={:.1}G embed={:.1}G · vram={:.1}G kv_budget={:.1}G ctx={}/{} ({}) · experts={}(hot {:.1}G) ple={} · host_ram_need={:.1}G ssd_need={:.1}G",
+            "dense={:.1}G experts={:.1}G row_sparse={:.1}G embed={:.1}G · vram={:.1}G kv_budget={:.1}G(+host {:.1}G) ctx={}/{} ({}) · experts={}(hot {:.1}G) ple={} · host_ram_need={:.1}G ssd_need={:.1}G",
             gib(self.sizes.dense),
             gib(self.sizes.experts),
             gib(self.sizes.row_sparse),
             gib(self.sizes.embed),
             gib(self.vram),
             gib(self.kv_budget),
+            gib(self.kv_host_budget),
             self.effective_ctx,
             self.goal_ctx,
             if self.ctx_capped { "capped" } else { "full" },
@@ -434,15 +444,19 @@ pub fn plan(m: &Manifest, hw: &Hardware, wl: &Workload) -> Plan {
     let v = hw.vram_free.unwrap_or(hw.vram_total);
     let x = hw.reserve;
     let mut refuse = None;
+    // [2026-10-16] embed 상주 정책 — 상주 시 VRAM 몫으로 이동(플래너 실회계).
+    let embed_vram = if wl.embed_resident { s.embed } else { 0 };
+    let embed_host = s.embed.saturating_sub(embed_vram);
 
-    // ① 매-토큰 dense(+head) — VRAM 필수. 불가 = 기동 거부 클래스.
-    if s.dense.saturating_add(x) > v {
-        refuse = Some("dense+예약 > 가용 VRAM");
+    // ① 매-토큰 dense(+head, +embed 상주분) — VRAM 필수. 불가 = 기동 거부 클래스.
+    if s.dense.saturating_add(embed_vram).saturating_add(x) > v {
+        refuse = Some("dense+embed 상주+예약 > 가용 VRAM");
     }
-    // ② KV 공유 풀 = 가용 − dense − 예약 − 문맥 추가분 상태.
+    // ② KV 공유 풀 = 가용 − (dense+embed 상주) − 예약 − 문맥 추가분 상태.
     let state = (wl.contexts.saturating_sub(1)) as u64 * wl.state_bytes_per_ctx;
     let kv_budget = v
         .saturating_sub(s.dense)
+        .saturating_sub(embed_vram)
         .saturating_sub(x)
         .saturating_sub(state);
     let cap = (kv_budget / wl.kv_bytes_per_token.max(1)) as usize;
@@ -457,11 +471,11 @@ pub fn plan(m: &Manifest, hw: &Hardware, wl: &Workload) -> Plan {
     let spare = kv_budget.saturating_sub(kv_used);
 
     // ③ 전문가 — 잔여 VRAM이 핫셋(전량 수용이면 상주). 스트리밍은 호스트 RAM이
-    //    전문가 뱅크 전체를 받을 때만, 아니면 SSD.
+    //    전문가 뱅크(+호스트 embed) 전체를 받을 때만, 아니면 SSD.
     let experts_hot = s.experts.min(spare);
     let experts_tier = if s.experts <= spare {
         Tier::Vram
-    } else if hw.host_ram >= s.experts.saturating_add(s.embed) {
+    } else if hw.host_ram >= s.experts.saturating_add(embed_host) {
         Tier::HostRam
     } else {
         Tier::Ssd
@@ -475,9 +489,9 @@ pub fn plan(m: &Manifest, hw: &Hardware, wl: &Workload) -> Plan {
         Tier::Ssd
     };
 
-    // ⑤ 회계 — 호스트 mmap(스트리밍 전문가 + embed), SSD(행-스파스/전문가).
+    // ⑤ 회계 — 호스트 mmap(스트리밍 전문가 + embed[비상주]), SSD(행-스파스/전문가).
     let streamed = s.experts.saturating_sub(experts_hot);
-    let host_ram_need = streamed.saturating_add(s.embed);
+    let host_ram_need = streamed.saturating_add(embed_host);
     let mut ssd_need = if row_sparse_tier == Tier::Ssd {
         s.row_sparse
     } else {
@@ -486,6 +500,8 @@ pub fn plan(m: &Manifest, hw: &Hardware, wl: &Workload) -> Plan {
     if experts_tier == Tier::Ssd {
         ssd_need = ssd_need.saturating_add(s.experts);
     }
+    // 호스트 KV 확장 여유(요청 우선 배치 — 호스트 RAM 총량 − 호스트 필요분).
+    let kv_host_budget = hw.host_ram.saturating_sub(host_ram_need);
 
     Plan {
         sizes: s,
@@ -500,6 +516,7 @@ pub fn plan(m: &Manifest, hw: &Hardware, wl: &Workload) -> Plan {
         row_sparse_tier,
         host_ram_need,
         ssd_need,
+        kv_host_budget,
         refuse,
     }
 }
@@ -649,7 +666,61 @@ mod tests {
             kv_bytes_per_token: 33 * 1024,
             state_bytes_per_ctx: 151 * (1 << 20),
             contexts: 4,
+            embed_resident: false,
         }
+    }
+
+    /// [2026-10-16] embed 상주 정책 — 상주 시 embed가 VRAM 몫(①·KV 예산 차감),
+    /// 비상주 시 호스트 mmap(⑤). kv_host_budget = 호스트 여유(요청 우선 상한).
+    #[test]
+    fn embed_resident_policy() {
+        let man = Manifest::from_items(vec![
+            ("blk.0.attn_q.weight".to_string(), 10 << 30),
+            (
+                "model.language_model.embed_tokens.weight".to_string(),
+                2 << 30,
+            ),
+        ]);
+        let hw = Hardware {
+            vram_total: 32 << 30,
+            vram_free: Some(32 << 30),
+            host_ram: 64 << 30,
+            ssd: None,
+            reserve: 2 << 30,
+            cards: 1,
+        };
+        let mut wl = wl(262_144);
+        wl.embed_resident = false;
+        let p_host = plan(&man, &hw, &wl);
+        wl.embed_resident = true;
+        let p_res = plan(&man, &hw, &wl);
+        assert_eq!(
+            p_host.kv_budget - p_res.kv_budget,
+            2 << 30,
+            "embed 상주 = KV 예산에서 2G 차감(VRAM 몫 이동)"
+        );
+        assert_eq!(
+            p_host.host_ram_need - p_res.host_ram_need,
+            2 << 30,
+            "호스트 필요분에서 제거"
+        );
+        assert_eq!(
+            p_res.kv_host_budget,
+            hw.host_ram - p_res.host_ram_need,
+            "호스트 KV 여유 = 호스트 − 필요분"
+        );
+        // 상주분이 VRAM 예산을 넘으면 ① 거부 / 비상주(호스트)면 통과.
+        let tight = Hardware {
+            vram_total: 13 << 30,
+            vram_free: Some(13 << 30),
+            ..hw
+        };
+        assert!(
+            plan(&man, &tight, &wl).refuse.is_some(),
+            "dense+embed+예약 > VRAM"
+        );
+        wl.embed_resident = false;
+        assert!(plan(&man, &tight, &wl).fits(), "비상주면 host로 통과");
     }
 
     /// 드라이런 예시(§2.M — 목표값이 아니라 함수 출력의 검증 픽스처):

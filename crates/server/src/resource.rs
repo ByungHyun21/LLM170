@@ -133,6 +133,12 @@ pub(crate) fn host_mem_available() -> Option<u64> {
     meminfo_kb("MemAvailable:")
 }
 
+/// [2026-10-16] VRAM 예약(워크스페이스·스크래치 + 스펙 VRAM) — 서버 예산과
+/// 자원 가드가 공유하는 단일 출처. (재산정: WY·링 ≈0.2GiB + MTP 아레나 등;
+/// 체크포인트 링은 핀드 호스트 RAM 이관으로 VRAM 몫 아님. dsave→dring0 순감
+/// 309MiB 환원 — 2026-10-14 실측.)
+pub const VRAM_RESERVE: u64 = 9 * (1 << 30) / 4 - 309 * (1 << 20); // 1995MiB — 실측 마진
+
 /// 가드 대상(A2/R1) — 판정 결과. 판정 계약은 guard_target_cases
 /// 표 테스트가 고정한다(`gpu`=VRAM 계정 여부, B17: 조회 실패=거부).
 pub struct GuardTarget {
@@ -161,6 +167,25 @@ pub fn guard_target(sub: &str, model: Option<&str>, rest: &[String]) -> Option<G
     path.map(|path| GuardTarget { path, gpu })
 }
 
+/// [2026-10-16] 범주 인지 dense 게이트(순수 — 테스트 표면) — ① 매-토큰
+/// dense(+head)는 VRAM 필수. 합산 가드는 dense가 호스트 용량에 묻혀 통과할 수
+/// 있다(소형 VRAM + 대형 호스트) → 로드 중 VRAM 실패/스래시. 예약 공유.
+pub fn check_dense_vram(dense: u64, vram_free: u64) -> Result<(), String> {
+    let gib = |b: u64| format!("{:.1} GiB", b as f64 / (1u64 << 30) as f64);
+    let need = dense.saturating_add(VRAM_RESERVE);
+    if need > vram_free {
+        return Err(format!(
+            "insufficient VRAM: dense(매-토큰 — VRAM 필수) ~{} + 예약 {} > 가용 {}. \
+             호스트가 넉넉해도 dense는 상주해야 한다(오프로드 허용 = 전문가·KV 한정) — \
+             다른 추론 프로세스의 VRAM을 확보한 뒤 재시도.",
+            gib(dense),
+            gib(VRAM_RESERVE),
+            gib(vram_free)
+        ));
+    }
+    Ok(())
+}
+
 pub fn preflight(model: &Path, gpu: bool) -> Result<(), String> {
     let bytes = model_bytes(model);
     if bytes == 0 {
@@ -183,6 +208,13 @@ pub fn preflight(model: &Path, gpu: bool) -> Result<(), String> {
     let host = host_mem_available();
     if host.is_none() {
         eprintln!("# rsrc-guard: MemAvailable 조회 불가 - 호스트 항목 없이 판정한다");
+    }
+    // [2026-10-16] 범주 인지 게이트 — 매니페스트 판독 시 ① dense는 VRAM 필수.
+    if gpu
+        && let Some(vf) = vram
+        && let Ok(man) = llm170_core::plan::Manifest::from_dir(model)
+    {
+        check_dense_vram(man.sums().dense, vf)?;
     }
     check(bytes, vram, host, gpu)
 }
@@ -330,6 +362,20 @@ mod tests {
         assert!(check(17 * GIB, None, None, true).is_err());
         // 측정되면 통과(용량 충분).
         assert!(check(17 * GIB, Some(20 * GIB), Some(30 * GIB), true).is_ok());
+    }
+
+    /// [2026-10-16] 범주 인지 dense 게이트 — 합산 가드의 사각(호스트가 dense를
+    /// 묻어 통과)을 차단. dense+예약 ≤ VRAM 통과 / 초과 거부.
+    #[test]
+    fn dense_vram_gate() {
+        // 27B급: dense 15.7G + 예약 ~2G ≤ 20G → 통과.
+        assert!(check_dense_vram(15_700 * (1 << 20), 20 * GIB).is_ok());
+        // dense 15.7G vs VRAM 10G(호스트가 커도) → 거부.
+        let e = check_dense_vram(15_700 * (1 << 20), 10 * GIB).unwrap_err();
+        assert!(e.contains("dense"), "{e}");
+        // 경계: dense + 예약 == 가용 → 통과(초과만 거부).
+        assert!(check_dense_vram(10 * GIB, 10 * GIB + VRAM_RESERVE).is_ok());
+        assert!(check_dense_vram(10 * GIB, 10 * GIB + VRAM_RESERVE - 1).is_err());
     }
 
     /// guard_target 판정 표 — 서브커맨드×인자 형태 계약(B19 확대 유지).
