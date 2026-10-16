@@ -302,9 +302,21 @@ impl W4a16Dec {
         }
         let tk = self.moe.top_k.max(1);
         let ns = t * tk;
-        let mut ib = vec![0u8; ns * 4];
-        self.cc
-            .d2h_async(ib.as_mut_ptr(), self.moe.moe_idx, ns * 4)?;
+        // [P4 2026-10-16] 핀드 상시 버퍼 — 페이지러블 Vec는 드라이버 내부
+        // 스테이징을 거쳐 d2h가 진짜 비동기가 아니다. 핀드 DMA 직행으로
+        // 동기 대기 구간을 줄인다(용량 성장 시 재할당).
+        let need = ns * 4;
+        if self.moe.pin_moe_idx_cap < need {
+            if !self.moe.pin_moe_idx.is_null() {
+                self.cc.pinned_free(self.moe.pin_moe_idx)?;
+            }
+            // 여유 있게 — 청크 tmax는 세션 고정이라 2배 성장으로 상각.
+            self.moe.pin_moe_idx = self.cc.pinned_alloc(need * 2)?;
+            self.moe.pin_moe_idx_cap = need * 2;
+        }
+        let ib: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(self.moe.pin_moe_idx as *mut u8, need) };
+        self.cc.d2h_async(ib.as_mut_ptr(), self.moe.moe_idx, need)?;
         self.cc.sync()?;
         let mut seen = vec![false; self.moe.n_experts];
         let mut distinct = 0usize;

@@ -378,6 +378,10 @@ impl W4a16Dec {
         let ns = t * tk;
         // [B4-1] 스트리밍: topk_t idx의 distinct 전문가를 캐시에 보장(장치
         // 테이블 갱신 완료) — 이후 GEMV가 테이블 간접 참조로 소비.
+        // [P4 2026-10-16 판정] cast_hilo 선포크(d2h 앞 배치)는 실측 기각 —
+        // 패킹(3-pass, t=512에서 ~50-100µs)이 d2h+호스트 루프보다 길어 버블을
+        // 채우지 못하고 sync 임계경로에 가산(pp1024 −4.1%). 동일 스트림 순서
+        // 보장이라 캐스팅을 뒤로 미뤄도 총량 불변 — 이득 경로 없음.
         if !self.moe.moe_resident {
             self.moe_stage_t(il, t)?;
         }

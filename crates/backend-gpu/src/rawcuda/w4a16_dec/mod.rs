@@ -340,6 +340,12 @@ pub(super) struct MoE {
     pub(super) moe_gcnt: CUdeviceptr,
     pub(super) moe_goff: CUdeviceptr,
     pub(super) moe_gmax: usize,
+    /// [P4 2026-10-16] topk idx d2h용 핀드 버퍼(스트리밍 프리필) — 층마다
+    /// 힙 할당+페이지러블 복사 대신 상시 핀드 1회 할당 재사용. DMA 직행으로
+    /// d2h 지연을 줄인다(용량 부족 시 재할당 — 스트리밍 경로에서는 ns 단조
+    /// 증가 아님, 청크 tmax 상한 고정).
+    pub(super) pin_moe_idx: *mut std::ffi::c_void,
+    pub(super) pin_moe_idx_cap: usize,
     /// 배치 전문가 출력([top_k][n_ff] · [top_k][hidden]) — act는 ew 전용
     /// 별도 버퍼(ew 커널 __restrict__ 계약 — 제자리 호출 금지).
     pub(super) exp: ExpBufs,
@@ -780,6 +786,8 @@ impl W4a16Dec {
                 moe_dev_tab: 0,
                 moe_idx: 0,
                 moe_wt: 0,
+                pin_moe_idx: std::ptr::null_mut(),
+                pin_moe_idx_cap: 0,
                 dsg: 0,
                 ev_fork: Vec::new(),
                 dsh: [0, 0],
