@@ -185,16 +185,11 @@ pub(crate) fn upload_moe(
     // 핫 몫(층당) = 예산 ÷ (층×전문가 1개 바이트). v0 정적 배분(층 균등) —
     // 런타임 통계 시드·교체는 W6 액추에이터 축.
     let n_cells = (hp.n_layer * hp.n_experts) as u64;
-    let per_expert = if n_cells > 0 {
-        expert_bytes / n_cells
-    } else {
-        0
-    };
-    let hot_fit = if per_expert > 0 {
-        (budget / per_expert / hp.n_layer as u64).min(hp.n_experts as u64) as usize
-    } else {
-        0
-    };
+    let per_expert = expert_bytes.checked_div(n_cells).unwrap_or(0);
+    let hot_fit = budget
+        .checked_div(per_expert)
+        .and_then(|v| v.checked_div(hp.n_layer as u64))
+        .map_or(0, |v| v.min(hp.n_experts as u64) as usize);
     enum MoePlace {
         Resident,
         Hybrid(usize),
