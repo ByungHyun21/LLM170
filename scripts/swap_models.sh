@@ -188,13 +188,13 @@ if want c; then
       echo "[w4a16] FAIL: 배너 runtime!=cuda — ${RUN}/c.log"; fail=1
     fi
     C=$(python3 -c "
-    import json
-    try:
-        d=json.load(open('"$RUN/c.json"'))
-        t=d.get('tokens') or (d['choices'][0].get('tokens') if 'choices' in d else None)
-        print(','.join(map(str,t)) if t else 'ERR')
-    except Exception:
-        print('ERR')
+import json
+try:
+    d=json.load(open('"$RUN/c.json"'))
+    t=d.get('tokens') or (d['choices'][0].get('tokens') if 'choices' in d else None)
+    print(','.join(map(str,t)) if t else 'ERR')
+except Exception:
+    print('ERR')
     ")
     case "$C" in
       "$GOLDEN"*) note "serve 토큰 OK: $(echo "$C" | head -c 60)";;
@@ -202,13 +202,13 @@ if want c; then
     esac
     for J in c2a c2b; do
       CJ=$(python3 -c "
-    import json
-    try:
-        d=json.load(open('"$RUN/$J.json"'))
-        t=d.get('tokens') or (d['choices'][0].get('tokens') if 'choices' in d else None)
-        print(','.join(map(str,t)) if t else 'ERR')
-    except Exception:
-        print('ERR')
+import json
+try:
+    d=json.load(open('"$RUN/$J.json"'))
+    t=d.get('tokens') or (d['choices'][0].get('tokens') if 'choices' in d else None)
+    print(','.join(map(str,t)) if t else 'ERR')
+except Exception:
+    print('ERR')
     ")
       case "$CJ" in
         "$GOLDEN"*) note "배치 불변성 OK($J)";;
@@ -304,13 +304,13 @@ if want d4; then
     wait "$SERVE_PID" 2>/dev/null
     trap - EXIT
     D4=$(python3 -c "
-    import json
-    try:
-        d=json.load(open('"$RUN/d4.json"'))
-        t=d.get('tokens') or (d['choices'][0].get('tokens') if 'choices' in d else None)
-        print(','.join(map(str,t)) if t else 'ERR')
-    except Exception:
-        print('ERR')
+import json
+try:
+    d=json.load(open('"$RUN/d4.json"'))
+    t=d.get('tokens') or (d['choices'][0].get('tokens') if 'choices' in d else None)
+    print(','.join(map(str,t)) if t else 'ERR')
+except Exception:
+    print('ERR')
     ")
     case "$D4" in
       "$GOLDEN35"*) note "35B 스트리밍 토큰 OK: $(echo "$D4" | head -c 60)";;
@@ -471,10 +471,10 @@ if want j; then
         echo "[w4a16] FAIL: $n 지문 기준 없음(${FP})"; fail=1; continue
       fi
       if python3 -c "
-    import sys
-    g=sys.argv[1].split(); r=sys.argv[2].split()
-    ok = abs(float(g[0])-float(r[0])) <= 1e-6 and abs(float(g[1])-float(r[1])) <= 1e-6
-    sys.exit(0 if ok else 1)
+import sys
+g=sys.argv[1].split(); r=sys.argv[2].split()
+ok = abs(float(g[0])-float(r[0])) <= 1e-6 and abs(float(g[1])-float(r[1])) <= 1e-6
+sys.exit(0 if ok else 1)
     " "$got" "$ref"; then
         note "$n 지문 OK: ppl=$(printf '%s' "$got" | cut -d' ' -f1) (기준 $(printf '%s' "$ref" | cut -d' ' -f1))"
       else
@@ -528,12 +528,12 @@ if want g4; then
       wait "$G4_PID" 2>/dev/null
       trap - EXIT
       D=$(python3 -c "
-    import json
-    try:
-        d=json.load(open('"$RUN/g4c.json"'))
-        print(','.join(map(str,d['tokens'])) if d.get('tokens') else 'ERR')
-    except Exception:
-        print('ERR')
+import json
+try:
+    d=json.load(open('"$RUN/g4c.json"'))
+    print(','.join(map(str,d['tokens'])) if d.get('tokens') else 'ERR')
+except Exception:
+    print('ERR')
     ")
       case "$D" in
         "$G4_GOLDEN"*) note "G4c HTTP 골든 OK: $(echo "$D" | head -c 60)";;
@@ -563,12 +563,12 @@ if want g4; then
       wait "$G4_PID" 2>/dev/null
       trap - EXIT
       D=$(python3 -c "
-    import json
-    try:
-        d=json.load(open('"$RUN/g4d.json"'))
-        print(','.join(map(str,d['tokens'])) if d.get('tokens') else 'ERR')
-    except Exception:
-        print('ERR')
+import json
+try:
+    d=json.load(open('"$RUN/g4d.json"'))
+    print(','.join(map(str,d['tokens'])) if d.get('tokens') else 'ERR')
+except Exception:
+    print('ERR')
     ")
       case "$D" in
         "$G4_GOLDEN"*) note "G4d 스트리밍 골든 OK: $(echo "$D" | head -c 60)";;
