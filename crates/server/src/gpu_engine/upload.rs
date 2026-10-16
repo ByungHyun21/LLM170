@@ -161,47 +161,135 @@ pub(crate) fn upload_moe(
     let free = llm170_backend_gpu::cuda_mem_free()
         .map(|(f, _)| f)
         .unwrap_or(0);
-    // [2.J] CLI 정책 우선 — 1=resident 강제 · 2=streaming 강제 · 0=auto(env/여유).
+    // [2.J] CLI 정책 우선 — 1=resident 강제 · 2=streaming 강제 · 3=hybrid 강제 ·
+    // 0=auto(env/여유). [2026-10-16 #11] hybrid = 핫 몫만 VRAM 직행(O_DIRECT),
+    // 비상주 몫만 RAM 스테이징 — 부분-fit에서 전량 RAM 복사/이중 패스 제거.
     // [2.M 사다리] auto는 **KV 우선**: KV 풀 몫(kv_reserve — 서버 산출)을 떼고
     // 남는 VRAM으로만 상주 판정. KV가 ctx를 보장한 뒤 남는 잔여가 전문가 핫셋.
     // (kv_reserve=0 = 종전 규칙 — 프로브 경로.)
-    let resident = match crate::engine::MOE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => true,
-        2 => false,
+    let margin = 1u64 << 30;
+    // [2026-10-16 #11] 캐시 우선 예약 — 하이브리드에서도 mcache가 순수 스트리밍과
+    // 같은 크기(k = min(96, (여유−KV)/2/층별슬롯))를 갖도록 예약하고, 핫 몫은
+    // 그 나머지로만 산정한다(프리필 distinct 가드 = k 계약 유지).
+    let qsz = hp.n_embd * hp.moe_ffn / 2;
+    let ssz = hp.n_embd * hp.moe_ffn / group.max(32) * 2;
+    let per_slot = 3 * (qsz + ssz);
+    let per_total = (hp.n_layer * per_slot).max(1) as u64;
+    let free_ps = free.saturating_sub(kv_reserve);
+    let k_cache = 96usize.min((free_ps / 2 / per_total) as usize);
+    let cache_bytes = k_cache as u64 * per_total;
+    let budget = free
+        .saturating_sub(kv_reserve)
+        .saturating_sub(margin)
+        .saturating_sub(cache_bytes);
+    // 핫 몫(층당) = 예산 ÷ (층×전문가 1개 바이트). v0 정적 배분(층 균등) —
+    // 런타임 통계 시드·교체는 W6 액추에이터 축.
+    let n_cells = (hp.n_layer * hp.n_experts) as u64;
+    let per_expert = if n_cells > 0 {
+        expert_bytes / n_cells
+    } else {
+        0
+    };
+    let hot_fit = if per_expert > 0 {
+        (budget / per_expert / hp.n_layer as u64).min(hp.n_experts as u64) as usize
+    } else {
+        0
+    };
+    enum MoePlace {
+        Resident,
+        Hybrid(usize),
+        Streaming,
+    }
+    let place = match crate::engine::MOE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => MoePlace::Resident,
+        2 => MoePlace::Streaming,
+        3 => {
+            if hot_fit >= hp.n_experts {
+                MoePlace::Resident
+            } else if hot_fit > 0 && k_cache > 0 {
+                MoePlace::Hybrid(hot_fit)
+            } else {
+                eprintln!("# moe: hybrid 강제 — VRAM 예산 없음(핫 0) → 스트리밍");
+                MoePlace::Streaming
+            }
+        }
         _ => match llm170_diag::flag::val("LLM170_MOE_RESIDENT") {
-            Some("0") => false,
-            Some("1") => true,
-            _ => free > expert_bytes + kv_reserve + (1 << 30),
+            Some("0") => MoePlace::Streaming,
+            Some("1") => MoePlace::Resident,
+            _ => {
+                if free > expert_bytes + kv_reserve + margin {
+                    MoePlace::Resident
+                } else if hot_fit > 0 && k_cache > 0 {
+                    MoePlace::Hybrid(hot_fit)
+                } else {
+                    MoePlace::Streaming
+                }
+            }
         },
     };
     let tab_ms = t1.elapsed().as_secs_f64() * 1e3;
     let t2 = std::time::Instant::now();
-    if resident {
-        // [2026-10-16] 전문가 상주 — O_DIRECT 직결 스트림(셀 단위).
-        // 셀 이름·길이는 expert_slice와 동일 규칙(bind::expert_base).
-        let mut lens: Vec<(usize, usize)> = Vec::with_capacity(tab.len());
-        let mut names: Vec<(String, String)> = Vec::with_capacity(tab.len());
-        for il in 0..hp.n_layer {
-            for e in 0..hp.n_experts {
-                for proj in ["gate_proj", "up_proj", "down_proj"] {
-                    let (qn, sn) = model.expert_names(il, e, proj);
-                    lens.push((ld.tensor_len(&qn)? as usize, ld.tensor_len(&sn)? as usize));
-                    names.push((qn, sn));
+    match place {
+        MoePlace::Resident => {
+            // [2026-10-16] 전문가 상주 — O_DIRECT 직결 스트림(셀 단위).
+            // 셀 이름·길이는 expert_slice와 동일 규칙(bind::expert_base).
+            let mut lens: Vec<(usize, usize)> = Vec::with_capacity(tab.len());
+            let mut names: Vec<(String, String)> = Vec::with_capacity(tab.len());
+            for il in 0..hp.n_layer {
+                for e in 0..hp.n_experts {
+                    for proj in ["gate_proj", "up_proj", "down_proj"] {
+                        let (qn, sn) = model.expert_names(il, e, proj);
+                        lens.push((ld.tensor_len(&qn)? as usize, ld.tensor_len(&sn)? as usize));
+                        names.push((qn, sn));
+                    }
                 }
             }
-        }
-        let mut f = |cell: usize, which: usize, off: u64, buf: &mut [u8]| {
-            let n = if which == 0 {
-                &names[cell].0
-            } else {
-                &names[cell].1
+            let mut f = |cell: usize, which: usize, off: u64, buf: &mut [u8]| {
+                let n = if which == 0 {
+                    &names[cell].0
+                } else {
+                    &names[cell].1
+                };
+                ld.read_into(n, off, buf)
             };
-            ld.read_into(n, off, buf)
-        };
-        dec.upload_experts_resident_streamed(&lens, &mut f)?;
-    } else {
-        // 비상주 = 호스트 mmap 스트리밍(설계: 스트리밍 소스는 캐시가 자산).
-        dec.set_expert_table(tab);
+            dec.upload_experts_resident_streamed(&lens, &mut f)?;
+        }
+        MoePlace::Hybrid(hot) => {
+            // [2026-10-16 #11] 핫 몫 = O_DIRECT 직행(디스크→VRAM), 비상주 몫만
+            // 호스트 RAM 스테이징(mcache 재업로드 소스).
+            let mut lens: Vec<(usize, usize)> = Vec::with_capacity(tab.len());
+            let mut names: Vec<(String, String)> = Vec::with_capacity(tab.len());
+            for il in 0..hp.n_layer {
+                for e in 0..hp.n_experts {
+                    for proj in ["gate_proj", "up_proj", "down_proj"] {
+                        let (qn, sn) = model.expert_names(il, e, proj);
+                        lens.push((ld.tensor_len(&qn)? as usize, ld.tensor_len(&sn)? as usize));
+                        names.push((qn, sn));
+                    }
+                }
+            }
+            let mut f = |cell: usize, which: usize, off: u64, buf: &mut [u8]| {
+                let n = if which == 0 {
+                    &names[cell].0
+                } else {
+                    &names[cell].1
+                };
+                ld.read_into(n, off, buf)
+            };
+            dec.upload_experts_hybrid_streamed(&lens, &mut f, hot, k_cache)?;
+            dec.set_expert_table_hybrid(tab, hot);
+            let hot_bytes = per_expert * hot as u64 * hp.n_layer as u64;
+            eprintln!(
+                "# moe: 하이브리드 — 핫 {hot}/{}전문가/층 VRAM 직행({:.2}GiB, O_DIRECT) · 비상주 {:.2}GiB만 RAM 스테이징 · 캐시 {k_cache}슬롯/층 예약",
+                hp.n_experts,
+                hot_bytes as f64 / (1u64 << 30) as f64,
+                (expert_bytes - hot_bytes) as f64 / (1u64 << 30) as f64,
+            );
+        }
+        MoePlace::Streaming => {
+            // 비상주 = 호스트 mmap 스트리밍(설계: 스트리밍 소스는 캐시가 자산).
+            dec.set_expert_table(tab);
+        }
     }
     ld.log_summary();
     eprintln!(
@@ -211,10 +299,10 @@ pub(crate) fn upload_moe(
         expert_bytes as f64 / (1u64 << 30) as f64,
         free as f64 / (1u64 << 30) as f64,
         kv_reserve as f64 / (1u64 << 30) as f64,
-        if resident {
-            "전량 상주"
-        } else {
-            "호스트 스트리밍"
+        match place {
+            MoePlace::Resident => "전량 상주".to_string(),
+            MoePlace::Hybrid(h) => format!("하이브리드 핫 {h}/{}층당", hp.n_experts),
+            MoePlace::Streaming => "호스트 스트리밍".to_string(),
         }
     );
     Ok(())

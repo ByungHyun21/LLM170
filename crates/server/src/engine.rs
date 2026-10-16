@@ -145,6 +145,7 @@ pub fn moe_name() -> &'static str {
     match MOE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
         1 => "resident",
         2 => "streaming",
+        3 => "hybrid",
         _ => "auto",
     }
 }
@@ -154,6 +155,7 @@ pub fn parse_moe_policy(v: &str) -> Option<u8> {
         "auto" => Some(0),
         "resident" => Some(1),
         "streaming" => Some(2),
+        "hybrid" => Some(3),
         _ => None,
     }
 }

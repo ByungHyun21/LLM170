@@ -32,7 +32,7 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
               [--reps N] [--ctx N]
       llama-bench 규격 PP/TG/NP 측정(엔진 직접 — HTTP 무경유, 합성 LCG 토큰).
   llm170 serve --model <w4a16_dir> --kv-mem <총량> [--port N] [--queue N]
-              [--ple ssd|ram|vram] [--spec auto|mtp|ngram|off] [--moe auto|resident|streaming]
+              [--ple ssd|ram|vram] [--spec auto|mtp|ngram|off] [--moe auto|resident|streaming|hybrid]
       OpenAI/Anthropic 호환 HTTP 서버. KV 총량 = --kv-mem(필수·무 auto — 권고는 `llm170 plan`).
       요청 상한 = min(모델 최대, 풀) — 모델 ctx 초과분은 출력 클램프(vLLM식·기동 로그에 기록),
       풀 초과는 거부, 잔여 부족은 대기(드롭 없음).
@@ -284,7 +284,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 Some(Some(p)) => {
                     crate::engine::MOE_POLICY.store(p as u64, std::sync::atomic::Ordering::Relaxed)
                 }
-                _ => return usage_err("--moe requires auto|resident|streaming"),
+                _ => return usage_err("--moe requires auto|resident|streaming|hybrid"),
             },
             other => return usage_err(&format!("unknown flag: {other}")),
         }

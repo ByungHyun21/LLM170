@@ -805,7 +805,13 @@ impl W4a16Dec {
 
     /// 전문가 슬라이스 테이블 등록 — (packed ptr/len, scale ptr/len) × (il,e,proj).
     /// 포인터는 서버 스토어 mmap 슬라이스 — 서버가 모델을 함께 보유하는 수명 계약.
-    pub fn set_expert_table(&mut self, mut tab: Vec<(u64, u64, u64, u64)>) {
+    pub fn set_expert_table(&mut self, tab: Vec<(u64, u64, u64, u64)>) {
+        self.set_expert_table_hybrid(tab, 0)
+    }
+
+    /// [2026-10-16 #11] 하이브리드 변형 — 앞 hot_per개/층(핫 몫)은 스테이징
+    /// 제외(VRAM 아레나 O_DIRECT 직행분), 비상주 몫만 호스트 RAM 1회 복사.
+    pub fn set_expert_table_hybrid(&mut self, mut tab: Vec<(u64, u64, u64, u64)>, hot_per: usize) {
         // [P7-fix] 기존 스테이징이 등록돼 있으면 해제(버퍼 해제 전 필수).
         if self.moe.host_stage_reg > 0 {
             // SAFETY: 등록 성공 상태(host_stage_reg>0)의 host_stage 선두 주소다.
@@ -819,11 +825,18 @@ impl W4a16Dec {
         // 로드 시 1회 호스트 RAM으로 복사한다(SSD mmap·페이지캐시 경로 의존
         // 제거). 탈출구 LLM170_MOE_HOST_STAGE=0, 할당 실패 시 mmap 유지.
         if llm170_diag::flag::ne0("LLM170_MOE_HOST_STAGE") {
-            let total: u64 = tab.iter().map(|e| e.1 + e.3).sum();
+            // [2026-10-16 #11] 핫 몫(앞 hot_per개/층)은 스테이징 제외 — VRAM
+            // 직행분이라 호스트 복사 불요(램 절감 = 핫 몫만큼).
+            let n_exp = self.moe.n_experts;
+            let rows: Vec<usize> = (0..tab.len())
+                .filter(|&i| n_exp == 0 || (i / 3) % n_exp >= hot_per)
+                .collect();
+            let total: u64 = rows.iter().map(|&i| tab[i].1 + tab[i].3).sum();
             let mut buf: Vec<u8> = Vec::new();
             if total > 0 && usize::try_from(total).is_ok_and(|n| buf.try_reserve_exact(n).is_ok()) {
-                let mut offs: Vec<(usize, usize)> = Vec::with_capacity(tab.len());
-                for &(qp, ql, sp, sl) in &tab {
+                let mut offs: Vec<(usize, usize, usize)> = Vec::with_capacity(rows.len());
+                for &i in &rows {
+                    let (qp, ql, sp, sl) = tab[i];
                     let qo = buf.len();
                     // SAFETY: tab 항목은 set_expert_table 수명 계약(mmap 슬라이스)
                     // — 호출 내 유효, len은 계약 검증 완료분.
@@ -835,12 +848,12 @@ impl W4a16Dec {
                     buf.extend_from_slice(unsafe {
                         std::slice::from_raw_parts(sp as *const u8, sl as usize)
                     });
-                    offs.push((qo, so));
+                    offs.push((i, qo, so));
                 }
                 let base = buf.as_ptr() as u64;
-                for (e, &(qo, so)) in tab.iter_mut().zip(offs.iter()) {
-                    e.0 = base + qo as u64;
-                    e.2 = base + so as u64;
+                for &(i, qo, so) in &offs {
+                    tab[i].0 = base + qo as u64;
+                    tab[i].2 = base + so as u64;
                 }
                 eprintln!(
                     "[moe] 호스트 RAM 스테이징 {:.2}GiB — 업로드 mmap 의존 제거(C2)",
@@ -865,7 +878,7 @@ impl W4a16Dec {
                     // 경계(선행 q·s 시작 오프셋)로 내린다.
                     if let Some(edge) = offs
                         .iter()
-                        .flat_map(|&(qo, so)| [qo, so])
+                        .flat_map(|&(_, qo, so)| [qo, so])
                         .filter(|&b| b <= bytes)
                         .max()
                     {
@@ -1084,6 +1097,111 @@ impl W4a16Dec {
         }
         let experts_bytes: u64 = lens.iter().map(|e| (e.0 + e.1) as u64).sum();
         self.register_moe_resident(dev_tab, experts_bytes)
+    }
+
+    /// [2026-10-16 #11] 하이브리드 상주 업로드 — 층당 앞 hot_per개 전문가는
+    /// O_DIRECT 직행으로 VRAM 아레나(테이블 엔트리 = 아레나 주소), 나머지
+    /// 엔트리는 0(스트리밍 계약: 읽기 전 mcache_insert가 기록). 디바이스
+    /// 테이블은 로드 시 1회 업로드하고 hot_tab(호스트 미러)을 보관한다.
+    pub fn upload_experts_hybrid_streamed(
+        &mut self,
+        lens: &[(usize, usize)],
+        fill: &mut dyn FnMut(usize, usize, u64, &mut [u8]) -> Result<(), String>,
+        hot_per: usize,
+        mcache_k_plan: usize,
+    ) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        let n_exp = self.moe.n_experts;
+        if n_exp == 0 || lens.len() != self.n_layers * n_exp * 3 || hot_per == 0 || hot_per >= n_exp
+        {
+            return Err("upload_experts_hybrid_streamed: 인자 위반".into());
+        }
+        let hot_cell = |i: usize| (i / 3) % n_exp < hot_per;
+        let (mut pk, mut sk) = ([0usize; 3], [0usize; 3]);
+        for (i, &(ql, sl)) in lens.iter().enumerate() {
+            if hot_cell(i) {
+                pk[i % 3] += ql;
+                sk[i % 3] += sl;
+            }
+        }
+        let (dpk, dsk, allocd) = self.alloc_expert_arenas(pk, sk)?;
+        let mut dev_tab = Vec::with_capacity(lens.len());
+        let (mut opk, mut osk) = ([0usize; 3], [0usize; 3]);
+        for (i, &(ql, sl)) in lens.iter().enumerate() {
+            let p = i % 3;
+            if hot_cell(i) {
+                dev_tab.push((
+                    dpk[p] + opk[p] as u64,
+                    ql as u64,
+                    dsk[p] + osk[p] as u64,
+                    sl as u64,
+                ));
+                opk[p] += ql;
+                osk[p] += sl;
+            } else {
+                // 비상주 엔트리 — 스테이징(읽기) 전 mcache_insert가 기록(0 = 미기록).
+                dev_tab.push((0, ql as u64, 0, sl as u64));
+            }
+        }
+        let r = (|| -> Result<(), String> {
+            let mut ring = super::mem::PinnedRing::new(&self.cc, STREAM_CHUNK)?;
+            let (mut cpk, mut csk) = ([0usize; 3], [0usize; 3]);
+            for (i, &(ql, sl)) in lens.iter().enumerate() {
+                let p = i % 3;
+                if !hot_cell(i) {
+                    continue;
+                }
+                if ql > 0 {
+                    ring.send(dpk[p] + cpk[p] as u64, ql, &mut |off, buf| {
+                        fill(i, 0, off, buf)
+                    })?;
+                }
+                if sl > 0 {
+                    ring.send(dsk[p] + csk[p] as u64, sl, &mut |off, buf| {
+                        fill(i, 1, off, buf)
+                    })?;
+                }
+                cpk[p] += ql;
+                csk[p] += sl;
+                llm170_diag::watchdog::bump();
+            }
+            ring.sync()
+        })();
+        if let Err(err) = r {
+            for p in allocd {
+                let _ = self.cc.free(p);
+            }
+            return Err(err);
+        }
+        // 디바이스 테이블 업로드(핫 엔트리 유효·비상주 0) + 호스트 미러 보관.
+        let mut flat: Vec<u64> = Vec::with_capacity(dev_tab.len() * 2);
+        for e in &dev_tab {
+            flat.push(e.0);
+            flat.push(e.2);
+        }
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×8).
+        let fb = unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 8) };
+        if self.moe.moe_dev_tab != 0 {
+            let _ = self.cc.free(self.moe.moe_dev_tab);
+            self.moe.moe_dev_tab = 0;
+        }
+        let dtab = self.cc.alloc(flat.len() * 8)?;
+        if let Err(e) = Self::h2d_chunked(&self.cc, dtab, fb) {
+            let _ = self.cc.free(dtab);
+            return Err(e);
+        }
+        self.moe.moe_dev_tab = dtab;
+        let hot_bytes: u64 = lens
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| hot_cell(i))
+            .map(|(_, &(ql, sl))| (ql + sl) as u64)
+            .sum();
+        self.weights_bytes += hot_bytes;
+        self.moe.hot_tab = dev_tab;
+        self.moe.hot_per_layer = hot_per;
+        self.moe.mcache_k_plan = mcache_k_plan;
+        Ok(())
     }
 
     /// head(output.weight) 상주 업로드 — [I8head 2026-10-11] bf16 → int8

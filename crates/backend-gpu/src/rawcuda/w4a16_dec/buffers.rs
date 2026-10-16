@@ -503,8 +503,19 @@ impl W4a16Dec {
             // 2패스 스테이징 재작성(80972389)에서 소멸 — t>8 능력은 가드와
             // 함께 유지하되 운용점은 t=8(무차). FN/CMP에서는 링크(Gen2 x4)가
             // 병목 — 이 비율은 개발기 기준값(CMP 재실측 필요).
-            let kmax = ((free / 2) / (self.n_layers * per_slot).max(1) as u64) as usize;
-            let k = 96usize.min(kmax);
+            let per_total = (self.n_layers * per_slot).max(1) as u64;
+            let kmax = if self.moe.mcache_k_plan > 0 {
+                // [2026-10-16 #11] 하이브리드 계획 k — 예산은 서버가 보장
+                // (핫+캐시+KV+마진 ≤ 로드 시 여유). 여기선 가용 한도만 재확인.
+                (free / per_total) as usize
+            } else {
+                ((free / 2) / per_total) as usize
+            };
+            let k = if self.moe.mcache_k_plan > 0 {
+                self.moe.mcache_k_plan.min(96).min(kmax)
+            } else {
+                96usize.min(kmax)
+            };
             if k > 0 {
                 let qb = self.n_layers * k * 3 * qsz;
                 let sb = self.n_layers * k * 3 * ssz;

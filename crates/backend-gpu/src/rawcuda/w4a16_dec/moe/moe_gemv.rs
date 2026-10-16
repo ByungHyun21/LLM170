@@ -148,40 +148,55 @@ impl W4a16Dec {
         // 수치 무변화), miss는 캐시 슬롯(빈/LRU 퇴거)으로 직접 h2d. 캐시 없음
         // (mcache_k=0)이면 종전 stg 경로 그대로.
         let use_cache = self.moe.mcache_k > 0;
-        let mut qd_list: Vec<(u64, u64)> = Vec::with_capacity(sel.len());
+        // [2026-10-16 #11] 핫 몫(e < hot_per_layer)은 로드 시 VRAM 아레나
+        // 직행분 — 캐시·스테이징 미경유. 아레나는 proj별 분리 레이아웃이라
+        // 3투영 포인터를 (q,s)쌍 배열로 직접 구성한다(테이블 미러 사용).
+        let hot = self.moe.hot_per_layer;
+        let mut qd_list: Vec<[(u64, u64); 3]> = Vec::with_capacity(sel.len());
         for (j, &(e, _)) in sel.iter().enumerate() {
-            let (qd, sd, need_h2d) = if use_cache {
-                match self.mcache_lookup(il, e) {
-                    Some(slot) => {
-                        self.moe.mcache_hits += 1;
-                        let qb = self.moe.mcache_q
-                            + ((il * self.moe.mcache_k + slot) * 3) as u64 * qsz as u64;
-                        let sb = self.moe.mcache_s
-                            + ((il * self.moe.mcache_k + slot) * 3) as u64 * ssz as u64;
-                        (qb, sb, false)
-                    }
-                    None => {
-                        self.moe.mcache_miss += 1;
-                        let slot = self.mcache_insert(il, e)?;
-                        let qb = self.moe.mcache_q
-                            + ((il * self.moe.mcache_k + slot) * 3) as u64 * qsz as u64;
-                        let sb = self.moe.mcache_s
-                            + ((il * self.moe.mcache_k + slot) * 3) as u64 * ssz as u64;
-                        (qb, sb, true)
-                    }
-                }
+            let trio = if hot > 0 && e < hot {
+                let b = (il * self.moe.n_experts + e) * 3;
+                let t = &self.moe.hot_tab[b..b + 3];
+                [(t[0].0, t[0].2), (t[1].0, t[1].2), (t[2].0, t[2].2)]
             } else {
-                let qb = self.moe.stg.q + ((j * 3) * qsz) as u64;
-                let sb = self.moe.stg.s + ((j * 3) * ssz) as u64;
-                (qb, sb, true)
+                let (qd, sd, need_h2d) = if use_cache {
+                    match self.mcache_lookup(il, e) {
+                        Some(slot) => {
+                            self.moe.mcache_hits += 1;
+                            let qb = self.moe.mcache_q
+                                + ((il * self.moe.mcache_k + slot) * 3) as u64 * qsz as u64;
+                            let sb = self.moe.mcache_s
+                                + ((il * self.moe.mcache_k + slot) * 3) as u64 * ssz as u64;
+                            (qb, sb, false)
+                        }
+                        None => {
+                            self.moe.mcache_miss += 1;
+                            let slot = self.mcache_insert(il, e)?;
+                            let qb = self.moe.mcache_q
+                                + ((il * self.moe.mcache_k + slot) * 3) as u64 * qsz as u64;
+                            let sb = self.moe.mcache_s
+                                + ((il * self.moe.mcache_k + slot) * 3) as u64 * ssz as u64;
+                            (qb, sb, true)
+                        }
+                    }
+                } else {
+                    let qb = self.moe.stg.q + ((j * 3) * qsz) as u64;
+                    let sb = self.moe.stg.s + ((j * 3) * ssz) as u64;
+                    (qb, sb, true)
+                };
+                if need_h2d {
+                    // [B4-1 결함수정 2026-10-13] 업로드는 공용 헬퍼 — 스테이징(moe_stage_t)
+                    // 삽입도 반드시 업로드를 동반한다(종전엔 t=1 경로만 업로드해 t≤8
+                    // GEMV가 미업로드 슬롯을 읽었다: 실측 오염 — 워밍업/프리필 유령 슬롯).
+                    self.mcache_upload_to(il, e, qd, sd)?;
+                }
+                [
+                    (qd, sd),
+                    (qd + qsz as u64, sd + ssz as u64),
+                    (qd + 2 * qsz as u64, sd + 2 * ssz as u64),
+                ]
             };
-            if need_h2d {
-                // [B4-1 결함수정 2026-10-13] 업로드는 공용 헬퍼 — 스테이징(moe_stage_t)
-                // 삽입도 반드시 업로드를 동반한다(종전엔 t=1 경로만 업로드해 t≤8
-                // GEMV가 미업로드 슬롯을 읽었다: 실측 오염 — 워밍업/프리필 유령 슬롯).
-                self.mcache_upload_to(il, e, qd, sd)?;
-            }
-            qd_list.push((qd, sd));
+            qd_list.push(trio);
         }
         self.cc.sync()?;
         if use_cache
@@ -198,11 +213,7 @@ impl W4a16Dec {
             );
         }
         for (j, &(_e, w)) in sel.iter().enumerate() {
-            let (q0, p0) = qd_list[j];
-            let q1 = q0 + qsz as u64;
-            let p1 = p0 + ssz as u64;
-            let q2 = q0 + (2 * qsz) as u64;
-            let p2 = p0 + (2 * ssz) as u64;
+            let [(q0, p0), (q1, p1), (q2, p2)] = qd_list[j];
             // proj 순서 = 테이블 조립 순서(gate, up, down) — 스테이징과 일치.
             self.gemv_launch_raw(q0, p0, n_ff, h, xn, s0)?;
             self.gemv_launch_raw(q1, p1, n_ff, h, xn, s1)?;
@@ -336,9 +347,12 @@ impl W4a16Dec {
         self.cc.sync()?;
         let mut seen = vec![false; self.moe.n_experts];
         let mut distinct = 0usize;
+        // [2026-10-16 #11] 핫 몫(e < hot_per_layer)은 VRAM 상주 — 스테이징·가드
+        // 대상 제외(캐시 슬롯 미소비; seen 미마킹이라 하단 스테이징 루프도 자동 제외).
+        let hot = self.moe.hot_per_layer;
         for j in 0..ns {
             let e = u32::from_le_bytes(ib[j * 4..j * 4 + 4].try_into().unwrap()) as usize;
-            if e >= self.moe.n_experts || seen[e] {
+            if e >= self.moe.n_experts || e < hot || seen[e] {
                 continue;
             }
             seen[e] = true;

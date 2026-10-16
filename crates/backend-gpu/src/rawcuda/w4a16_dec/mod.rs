@@ -334,6 +334,12 @@ pub(super) struct MoE {
     pub(super) moe_tab: Vec<(u64, u64, u64, u64)>,
     /// 전문가 상주 모드 — moe_tab이 VRAM 포인터(170HX 64GB 등).
     pub(super) moe_resident: bool,
+    /// [2026-10-16 #11] 하이브리드 핫 몫 — 층당 앞 hot_per_layer개 전문가가
+    /// VRAM 아레나 상주(O_DIRECT 직행). 0 = 없음(순수 스트리밍).
+    pub(super) hot_per_layer: usize,
+    /// 하이브리드 디바이스 테이블 호스트 미러 — t=1 스트리밍 경로가 핫 몫의
+    /// (q,s) 3투영을 직접 사용(핫 행 외 무효).
+    pub(super) hot_tab: Vec<(u64, u64, u64, u64)>,
     /// 전문가 디바이스 포인터 테이블(상주 — 배치 GEMV 간접 참조, (q,s) 쌍).
     /// **판독 계약(2026-10-16)**: t≤8 융합 GEMV·grp mma 경로는 그 청크의
     /// distinct 전문가가 **전수 스테이징**(mcache_insert가 이 표를 갱신)된 뒤에만
@@ -393,6 +399,9 @@ pub(super) struct MoE {
     pub(super) mcache_q: CUdeviceptr,
     pub(super) mcache_s: CUdeviceptr,
     pub(super) mcache_k: usize,
+    /// [2026-10-16 #11] 하이브리드 캐시 계획 k — 서버가 핫 몫과 함께 산출해
+    /// VRAM 예산을 예약한다(ensure_moe_bufs가 1회 소비). 0 = 종전 free/2 규칙.
+    pub(super) mcache_k_plan: usize,
     pub(super) mcache_ids: Vec<u16>,
     pub(super) mcache_age: Vec<u32>,
     pub(super) mcache_tick: u32,
@@ -823,6 +832,8 @@ impl W4a16Dec {
                 moe_scale_bf16: true,
                 moe_tab: Vec::new(),
                 moe_resident: false,
+                hot_per_layer: 0,
+                hot_tab: Vec::new(),
                 moe_dev_tab: 0,
                 moe_idx: 0,
                 moe_wt: 0,
@@ -835,6 +846,7 @@ impl W4a16Dec {
                 mcache_q: 0,
                 mcache_s: 0,
                 mcache_k: 0,
+                mcache_k_plan: 0,
                 mcache_ids: Vec::new(),
                 mcache_age: Vec::new(),
                 mcache_tick: 0,
