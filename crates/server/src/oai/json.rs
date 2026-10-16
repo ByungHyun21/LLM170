@@ -586,8 +586,19 @@ pub(super) fn jarr_pure_strings(s: &str) -> Option<Vec<String>> {
         if b[i] == b'"' {
             saw_any = true;
             let st = i + 1;
+            // [수정 2026-10-16] 표준 이스케이프 상태기계 — 종전 `b[j-1] != '\\'`
+            // 판정은 문자열 끝의 이스케이프 백슬래시(`\\` 뒤 `"`)를 오판해
+            // 폴백(무제약)으로 흘렸다(D4에서 고친 스캐너들과 동일 규약으로 통일).
             let mut j = st;
-            while j < b.len() && !(b[j] == b'"' && b[j - 1] != b'\\') {
+            let mut esc = false;
+            while j < b.len() {
+                if esc {
+                    esc = false;
+                } else if b[j] == b'\\' {
+                    esc = true;
+                } else if b[j] == b'"' {
+                    break;
+                }
                 j += 1;
             }
             if j >= b.len() {

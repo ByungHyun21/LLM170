@@ -309,6 +309,11 @@ impl W4a16Dec {
         if self.moe.pin_moe_idx_cap < need {
             if !self.moe.pin_moe_idx.is_null() {
                 self.cc.pinned_free(self.moe.pin_moe_idx)?;
+                // [수정 2026-10-16] free 성공 즉시 무효화 — 이어지는 alloc 실패가
+                // stale 포인터(옛 cap)를 남겨 다음 호출에서 이중 해제/유즈에프터
+                // 프리로 이어지던 에러 경로 결함. 실패 시 다음 호출이 재시도한다.
+                self.moe.pin_moe_idx = std::ptr::null_mut();
+                self.moe.pin_moe_idx_cap = 0;
             }
             // 여유 있게 — 청크 tmax는 세션 고정이라 2배 성장으로 상각.
             self.moe.pin_moe_idx = self.cc.pinned_alloc(need * 2)?;

@@ -429,6 +429,14 @@ mod tests {
     }
 
     #[test]
+    fn d6_escaped_backslash_enum_scans() {
+        // 문자열 끝 이스케이프 백슬래시(`\\` 뒤 `"`) — 종전 b[j-1] 판정은
+        // 폴백(None)으로 흘렸고, 표준 상태기계는 순수 문자열 배열로 인식한다.
+        let body = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"x":{"type":"string","enum":["a\\","b"]}}}}}}"#;
+        assert!(crate::oai::schema::schema_from_request(body).is_some());
+    }
+
+    #[test]
     fn d7_nested_array_tools_parse() {
         let body = r#"{"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}},{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"tz":{"type":"string","enum":["KST","UTC"]}}}}}]}"#;
         let names = crate::oai::parse_tool_names(body).unwrap();
