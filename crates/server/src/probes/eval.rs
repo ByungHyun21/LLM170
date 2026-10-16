@@ -162,6 +162,9 @@ fn ppl(args: &[String]) -> Result<String, String> {
     // [gemma4 2026-10-14] 아치 분기 — gemma4는 서빙 단일 경로(청크 t≤16·1..16
     // 동일 클래스)로 전 위치 로짓을 회수한다(경로 계측기 — 채택/기각 판정).
     let arch = llm170_core::qwen35::bind::dir_arch(Path::new(&dir)).unwrap_or_default();
+    if kld && !route {
+        return Err("--kld는 --route 동반 필수(덤프 열 순서 계약)".into());
+    }
     if llm170_core::gemma4::bind::arch_ok(&arch) {
         return ppl_g4(&dir, &toks, n, ctx, chunk, &out_path, json, route, kld);
     }

@@ -49,8 +49,8 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
 
 /// 응답 포맷 컨텍스트 — 엔드포인트별 조립에 필요한 최소값.
 struct EmitFmt {
-    /// [P8] 원본 요청 tools 원문(tool_calls 래핑 판정 — 있으면 Some).
-    tools_req: Option<String>,
+    /// [P0-D3 2026-10-16] 선언된 도구 이름집합 — 래핑은 name∈집합일 때만.
+    tool_names: Option<Vec<String>>,
     chat: bool,
     model: String,
     stop_strs: Vec<String>,
@@ -169,7 +169,7 @@ pub(crate) fn handle(
                     stream_mode,
                     // completions는 text_completion 포맷.
                     &EmitFmt {
-                        tools_req: None,
+                        tool_names: None,
                         chat: false,
                         model: jstr(&req.body, "model").unwrap_or_else(|| "local_llm".into()),
                         stop_strs: jstop(&req.body),
@@ -206,11 +206,7 @@ pub(crate) fn handle(
                     n_predict,
                     stream_mode,
                     &EmitFmt {
-                        tools_req: if req.body.contains("\"tools\"") {
-                            Some(req.body.clone())
-                        } else {
-                            None
-                        },
+                        tool_names: parse_tool_names(&req.body),
                         chat: true,
                         model: jstr(&req.body, "model").unwrap_or_else(|| "local_llm".into()),
                         stop_strs: jstop(&req.body),
@@ -341,9 +337,22 @@ fn peer_gone(stream: &mut TcpStream) -> bool {
     }
 }
 
+/// [P0-D3] 요청 tools[].function.name 집합 — 빈/파싱 실패 = None.
+fn parse_tool_names(body: &str) -> Option<Vec<String>> {
+    let tp = body.find("\"tools\"")?;
+    let arr = body[tp..].find('[')? + tp;
+    let seg = &body[arr..];
+    let close = seg.find(']')?;
+    let names: Vec<String> = crate::oai::json::jblocks(&seg[..=close])
+        .iter()
+        .filter_map(|blk| crate::oai::json::jstr(blk, "name"))
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
 /// [P8] 제약 출력 → tool_calls 배열 JSON(조각). {name,arguments} 단일 또는
 /// 배열(병렬). 파싱 불가 = None.
-fn wrap_tool_calls(_tools_req: &str, acc: &str) -> Option<String> {
+pub(crate) fn wrap_tool_calls(names: &[String], acc: &str) -> Option<String> {
     let t = acc.trim();
     let objs: Vec<&str> = if t.starts_with('[') {
         crate::oai::json::jblocks(t)
@@ -355,6 +364,10 @@ fn wrap_tool_calls(_tools_req: &str, acc: &str) -> Option<String> {
     let mut calls = Vec::new();
     for (i, o) in objs.iter().enumerate() {
         let name = crate::oai::json::jstr(o, "name")?;
+        // [P0-D3] 선언된 도구만 — 미선언 name은 래핑하지 않는다(오포장 방지).
+        if !names.iter().any(|n| n == &name) {
+            return None;
+        }
         // arguments 값 = 중첩 객체/배열 원문(jblock) 또는 문자열 JSON.
         let args = raw_value(o, "arguments").unwrap_or_else(|| "{}".into());
         calls.push(format!(
@@ -387,21 +400,22 @@ fn raw_value(o: &str, key: &str) -> Option<String> {
             let mut esc = false;
             let mut j = i;
             while j < b.len() {
-                match (b[j], in_s, esc) {
-                    (b'\\', true, false) => esc = true,
-                    (b'"', true, false) => in_s = false,
-                    (b'"', false, _) => in_s = true,
-                    (c, false, _) if c == open => depth += 1,
-                    (c, false, _) if c == close => {
+                // [P0-D4] 표준 상태기계(이중 백슬래시 수정 — json.rs 동일).
+                if esc {
+                    esc = false;
+                } else if b[j] == b'\\' && in_s {
+                    esc = true;
+                } else if b[j] == b'"' {
+                    in_s = !in_s;
+                } else if !in_s {
+                    if b[j] == open {
+                        depth += 1;
+                    } else if b[j] == close {
                         depth -= 1;
                         if depth == 0 {
                             return Some(o[i..=j].to_string());
                         }
                     }
-                    _ => {}
-                }
-                if b[j] != b'\\' {
-                    esc = false;
                 }
                 j += 1;
             }
@@ -478,6 +492,14 @@ fn run_and_emit(
         n_predict = lim;
     }
     let prompt_len = ids.len();
+    let constraint_was_active = constraint.is_some();
+    // [P0-D5b 2026-10-16] 제약 완결 토큰 = stops.first — completions처럼 stops가
+    // 비면 0토큰이 무한 방출된다(종료 판정 = eos ∨ stops 멤버십). 아치 종결자
+    // 보충으로 종결을 보장한다.
+    let mut stops = stops;
+    if constraint_was_active && stops.is_empty() {
+        stops = stops_for_arch();
+    }
     let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, stops, sampler, constraint)
     else {
         return;
@@ -552,9 +574,10 @@ fn run_and_emit(
         // 허용 = 병렬)이면 tool_calls 포맷으로 재구성(원문 content 보존 아님 —
         // 함수 호출 응답은 arguments가 본체). 파싱 실패 시 통과(일반 JSON).
         let tool_wrap = fmt
-            .tools_req
+            .tool_names
             .as_deref()
-            .and_then(|tr| wrap_tool_calls(tr, &acc));
+            .filter(|_| constraint_was_active)
+            .and_then(|names| wrap_tool_calls(names, &acc));
         let body = if let Some(tc) = tool_wrap {
             format!(
                 "{{\"id\":\"{id}\",\"created\":{created},\"model\":\"{}\",\"object\":\"chat.completion\",\"\

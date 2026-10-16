@@ -507,21 +507,23 @@ pub(super) fn jblock_at(s: &str, at: usize) -> Option<&str> {
     let mut in_s = false;
     let mut esc = false;
     for i in at..b.len() {
-        match (b[i], in_s, esc) {
-            (b'\\', true, false) => esc = true,
-            (b'"', true, false) => in_s = false,
-            (b'"', false, _) => in_s = true,
-            (b'{', false, _) => depth += 1,
-            (b'}', false, _) => {
+        // [P0-D4 2026-10-16] 표준 상태기계 — 이중 백슬래시(\\)에서 esc가
+        // 유지되며 다음 '"'를 놓쳐 in_s 패리티가 플립했다(블록 절단).
+        if esc {
+            esc = false;
+        } else if b[i] == b'\\' && in_s {
+            esc = true;
+        } else if b[i] == b'"' {
+            in_s = !in_s;
+        } else if !in_s {
+            if b[i] == b'{' {
+                depth += 1;
+            } else if b[i] == b'}' {
                 depth -= 1;
                 if depth == 0 {
                     return Some(&s[at..=i]);
                 }
             }
-            _ => {}
-        }
-        if b[i] != b'\\' {
-            esc = false;
         }
     }
     None

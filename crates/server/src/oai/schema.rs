@@ -223,7 +223,9 @@ fn parse_schema_node(b: &str) -> Option<Schema> {
                     && !e.is_empty()
                 {
                     out.push((k, Schema::Enum(e)));
-                } else if let Some(sub) = parse_schema_node(&v) {
+                } else {
+                    // [P0-D2] 미지원 프로퍼티 = 전체 폴백(None 전파).
+                    let sub = parse_schema_node(&v)?;
                     out.push((k, sub));
                 }
             }
@@ -378,6 +380,34 @@ mod tests {
         c.commit("\"v\"");
         c.commit("}");
         assert!(c.done());
+    }
+
+    #[test]
+    fn d2_unsupported_property_falls_back_whole() {
+        // array 프로퍼티 1개 = 전체 폴백(조용한 필드 탈락 금지).
+        let body = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"name":{"type":"string"},"tags":{"type":"array"}}}}}}"#;
+        assert!(crate::oai::schema::schema_from_request(body).is_none());
+        // 지원 범위 내 = 컴파일 성공.
+        let ok = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"name":{"type":"string"}}}}}}"#;
+        assert!(crate::oai::schema::schema_from_request(ok).is_some());
+    }
+
+    #[test]
+    fn d4_double_backslash_block_scan() {
+        // jblock_at: 값 내 이중 백슬래시 뒤 '"'가 문자열 종결로 인식되어야.
+        let s = r#"{"a":"x\\d","b":1}"#;
+        let blk = crate::oai::json::jblock_at(s, 0).unwrap();
+        assert_eq!(blk.len(), s.len(), "블록 전체 절단(구 결함은 조기 절단)");
+    }
+
+    #[test]
+    fn d3_tool_membership() {
+        // 선언되지 않은 name = 래핑 없음.
+        let acc = r#"{"name":"evil","arguments":{}}"#;
+        let names = vec!["good".to_string()];
+        assert!(crate::oai::wrap_tool_calls(&names, acc).is_none());
+        let names2 = vec!["good".to_string(), "evil".to_string()];
+        assert!(crate::oai::wrap_tool_calls(&names2, acc).is_some());
     }
 
     #[test]

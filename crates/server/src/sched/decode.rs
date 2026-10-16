@@ -106,7 +106,11 @@ fn q35_decode(e: &mut crate::gpu_engine::GpuEngine, slots: &mut [Slot], seqs: &[
                 econ_plain_sample(_pmm.elapsed().as_secs_f64() * 1e3, uslots.len());
                 let hn = flat.len() / uslots.len();
                 for (row, (chunk, &i)) in flat.chunks_mut(hn).zip(uslots.iter()).enumerate() {
-                    let smp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
+                    // [P0-D1 2026-10-16] 제약 슬롯도 pick 경유 — 혼합 배치에서
+                    // GPU argmax(toks[row])가 마스크를 우회해 스키마를 위반했다
+                    // (이슈 문서 D1·np2 혼합 재현 조건).
+                    let smp = slots[i].constraint.is_some()
+                        || slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
                     let t = if smp {
                         pick(&mut slots[i], chunk)
                     } else {
