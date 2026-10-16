@@ -121,11 +121,12 @@ mod graph;
 mod mem;
 mod prof;
 
-pub use self::caps::{DeviceCaps, VramSampler, cuda_mem_free};
+pub use self::caps::{DeviceCaps, VramSampler, cuda_mem_free, cuda_mem_free_dev};
 
 impl CudaCtx {
-    /// 드라이버 초기화 → 디바이스 0 확보 → 프라이머리 컨텍스트 유지·전환.
-    pub fn new() -> Result<Self, String> {
+    /// 드라이버 초기화 → 디바이스 확보(ordinal) → 프라이머리 컨텍스트 유지·전환.
+    /// [k2 코어-코디네이터 (a) 2026-10-16] 디바이스 명시 — new() = 0(종전 동작).
+    pub fn new_dev(ordinal: i32) -> Result<Self, String> {
         let drv = ffi::Driver::get()?;
         // SAFETY: 초기화 경로(단일 스레드) — 출력 포인터는 모두 스택 로컬.
         unsafe {
@@ -142,9 +143,12 @@ impl CudaCtx {
                 return Err("rawcuda: CUDA 디바이스 0개".into());
             }
             let mut dev: ffi::CUdevice = 0;
-            let r = (drv.device_get)(&mut dev, 0);
+            let r = (drv.device_get)(&mut dev, ordinal);
             if r != CUDA_SUCCESS {
-                return Err(format!("rawcuda: cuDeviceGet(0): {}", ffi::err_text(r)));
+                return Err(format!(
+                    "rawcuda: cuDeviceGet({ordinal}): {}",
+                    ffi::err_text(r)
+                ));
             }
             let mut namebuf = [0i8; 256];
             let r = (drv.device_get_name)(namebuf.as_mut_ptr(), namebuf.len() as _, dev);
@@ -198,6 +202,11 @@ impl CudaCtx {
                 allocs: std::cell::RefCell::new(Vec::new()),
             })
         }
+    }
+
+    /// [k2 (a)] 종전 동작 = 디바이스 0.
+    pub fn new() -> Result<Self, String> {
+        Self::new_dev(0)
     }
 
     /// 컨텍스트 가드 — 현재 스코프에서 이 ctx가 current임을 보장.

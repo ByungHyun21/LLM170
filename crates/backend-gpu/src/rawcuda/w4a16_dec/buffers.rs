@@ -495,7 +495,7 @@ impl W4a16Dec {
             let qsz = h * n_ff / 2;
             let ssz = h * n_ff / self.moe.moe_group.max(32) * 2;
             let per_slot = 3 * (qsz + ssz);
-            let free = crate::cuda_mem_free().map(|(f, _)| f).unwrap_or(0);
+            let free = self.free_vram().map(|(f, _)| f).unwrap_or(0);
             // [P6 2026-10-15 채택] free/4 → free/2 — 스트리밍 슬롯 예산이 상각의
             // 벽이었다(같은 세션 실측: k 70→96만으로 pp512 34.1→52.3 t/s
             // = +53%·t 8↔12은 무차 — 이득 전부 캐시 크기에서 온다). 비용 =
