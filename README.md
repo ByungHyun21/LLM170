@@ -30,7 +30,7 @@ Requires Rust 1.99+. No GPU toolchain needed to build.
 ```bash
 cargo build --release
 
-cargo run --release -- serve --model <w4a16_dir> --port 8080 --ctx auto
+cargo run --release -- serve --model <w4a16_dir> --kv-mem 24G --port 8080
 cargo run --release -- bench --model <w4a16_dir> --pp 512,1024,4096 --tg 128 --np 4
 cargo run --release -- w4a16-gpu <w4a16_dir> --prompt-tokens 148678,65233,202419 --n-predict 8
 cargo run --release -- w4a16-ref <w4a16_dir> --prompt-tokens 148678,65233,202419 --n-predict 8
