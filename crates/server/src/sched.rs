@@ -60,7 +60,7 @@ pub struct SlotJob {
     pub out: std::sync::mpsc::Sender<InferResult>,
     /// 108 P5: 큐 진입 시각 — 배정까지 대기(큐 적체·슬롯 부족 계측).
     pub queued: std::time::Instant,
-    /// [W2 2026-10-16] aging 동결로 백필이 차단됨(작업당 1회 계측 플래그).
+    /// [2026-10-16] aging 동결로 백필이 차단됨(작업당 1회 계측 플래그).
     pub aging_blocked: bool,
 }
 struct Slot {
@@ -219,7 +219,7 @@ pub static SCHED: Sched = Sched {
     econ_gen: AtomicU64::new(0),
     econ_probe_gen: AtomicU64::new(0),
     econ_rounds: AtomicU64::new(0),
-    // [W2 2026-10-16] aging 관측(게시 1Hz).
+    // [2026-10-16] aging 관측(게시 1Hz).
     aging_frozen: AtomicU64::new(0),
     aging_d_ms: AtomicU64::new(0),
     aging_freeze_ms: AtomicU64::new(0),
@@ -287,7 +287,7 @@ pub struct Sched {
     pub econ_probe_gen: AtomicU64,
     /// 스펙 라운드 시계(탐사 주기 — 32라운드마다 밴드 순환 1회).
     pub econ_rounds: AtomicU64,
-    // ── [W2 2026-10-16] aging(EASY 동결) 관측 — slot_loop 게시 ──
+    // ── [2026-10-16] aging(EASY 동결) 관측 — slot_loop 게시 ──
     /// 동결 게이지(0/1)·현 임계 D(ms).
     pub aging_frozen: AtomicU64,
     pub aging_d_ms: AtomicU64,
@@ -343,7 +343,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     let eos = eng.eos();
     // [K6-3 2026-10-13] 입장 보류열 — 예약이 풀 여유에 안 맞는 요청(FCFS 대기).
     let mut pending: Vec<SlotJob> = Vec::new();
-    // [W2 2026-10-16] aging — EASY 백필식 동결 + D 적응(부트스트랩 30s).
+    // [2026-10-16] aging — EASY 백필식 동결 + D 적응(부트스트랩 30s).
     // LLM170_AGING_D(초) = 고정 D·적응 OFF(운영 노브·A/B).
     let d_fix = llm170_diag::flag::val("LLM170_AGING_D")
         .and_then(|v| v.parse::<f64>().ok())
@@ -398,7 +398,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         // break했다 — 꺼낸 작업이 그대로 버려져(송신측 drop → 수신측 즉시 Err)
         // 동시 요청이 빈 응랍으로 소실됐다(4동시 중 여럿 drop 실측). 점유 검사를
         // try_recv **앞으로** 옮겨 작업을 큐에 남긴다 — 의도된 원래 계약.
-        // [W2 2026-10-16] aging 판정 — 선두(최장 대기)의 예상 입장 지연 > D면
+        // [2026-10-16] aging 판정 — 선두(최장 대기)의 예상 입장 지연 > D면
         // 신규 입장 동결(선두 1건만 허용 — slot_intake가 집행). 유휴 슬롯의
         // 접두 캐시 블록은 즉시 회수 가능분으로 계상(admission과 동일 가정).
         let now = std::time::Instant::now();
@@ -487,7 +487,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         }
 
         if decoded {
-            // [W2] 슬롯당 토큰/s EMA — aging 예측 입력(디코드 틱 실측: 배치에
+            // 슬롯당 토큰/s EMA — aging 예측 입력(디코드 틱 실측: 배치에
             // 참여한 슬롯은 이 틱에 1토큰씩 전진한다).
             if dec_ms > 0.0 {
                 let r = 1000.0 / dec_ms;
@@ -522,7 +522,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             publish_slot_views(&slots);
             publish_stats(&eng, copy_base);
             publish_aging(&aging);
-            // [W2 2026-10-16] 보류열이 남아 있으면 recv()로 영구 블록하지 않는다
+            // [2026-10-16] 보류열이 남아 있으면 recv()로 영구 블록하지 않는다
             // — 보류 작업의 재시도(회수→입장)는 다음 틱의 slot_intake가 수행한다.
             // (하네스 포착: 소형 풀에서 대형 2건 중 1건이 전 슬롯 유휴+보류 잔존
             // 상태에서 영구 대기 — 종전엔 신규 요청이 와야만 틱이 다시 돌았다.)
@@ -591,7 +591,7 @@ fn slot_intake(
 ) {
     // [K6-3 2026-10-13] 입장 보장 — 예약(프롬프트+생성한도+슬랙)이 풀 여유에
     // 맞아야 배정. **보류분 우선 재시도(도착 순서 = 기본 FCFS)** 후 신규 수신.
-    // [W2+검토 2026-10-16] 순서 규칙의 **단일 출처 = admit::binpack_order**(순수).
+    // [검토 반영 2026-10-16] 순서 규칙의 **단일 출처 = admit::binpack_order**(순수).
     // 런타임은 후보 선택만 위임하고(인라인 스캔 제거 — 이원 구현 drift 금지),
     // 부작용(회수·조기 거부·동결 계측)만 이 층이 집행한다. 매 반복 재계산(소비 반영).
     loop {
@@ -666,7 +666,7 @@ fn slot_intake(
             break;
         };
         SCHED.queue_depth.fetch_sub(1, Ordering::Relaxed);
-        // [W2] 동결 중엔 신규 입장도 차단(선두 보호 — 보류열 뒤로).
+        // 동결 중엔 신규 입장도 차단(선두 보호 — 보류열 뒤로).
         if freeze {
             // 계측 1회(이후 pending 스캔의 중복 계상 금지).
             j.aging_blocked = true;
@@ -700,7 +700,7 @@ fn slot_intake(
     }
 }
 
-/// [K6-3] 요청 예약 토큰 = 프롬프트 + 생성한도 + 슬랙. [W2 2026-10-16] 슬랙 = 8
+/// [K6-3] 요청 예약 토큰 = 프롬프트 + 생성한도 + 슬랙. [2026-10-16] 슬랙 = 8
 /// (스펙 검증 전방 tmax−1행 — 종전 2는 블록 경계+포화 시 생성 중 실패 창).
 fn j_need_tokens(j: &SlotJob) -> usize {
     admit::need_tokens(j.tokens.len(), j.n_predict)

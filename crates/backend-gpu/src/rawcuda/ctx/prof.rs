@@ -56,6 +56,19 @@ impl CudaCtx {
         }
     }
 
+    /// 이벤트 완료까지 CPU 대기 — 핀드 링의 버퍼별 재사용 담보(전체-스트림
+    /// sync와 달리 다른 버퍼의 DMA는 계속 진행 — 파이프라인 버블 제거).
+    /// clippy allow — launch와 동일 판정(불투명 핸들).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn event_sync(&self, ev: ffi::CUevent) -> Result<(), String> {
+        // SAFETY: ev는 본 모듈이 만든 핸들(호출자 수명 계약).
+        let r = unsafe { (self.drv.event_synchronize)(ev) };
+        if r != CUDA_SUCCESS {
+            return Err(format!("rawcuda: cuEventSynchronize: {}", ffi::err_text(r)));
+        }
+        Ok(())
+    }
+
     /// 커널 발사 직전 훅 — 함수 포인터를 심볼명(역상)으로 찾아 범주와 함께
     /// 이벤트를 남긴다. fns는 ~40항목이라 런치당 선형탐색이 저렴하다.
     pub fn prof_mark(&self, f: CUfunction) {

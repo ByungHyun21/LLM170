@@ -53,7 +53,7 @@ pub(crate) fn upload_model_g4(
     let h = hp.n_embd;
     let t0 = std::time::Instant::now();
     // ① 선형 — 밀집(양자화) + 라우터(플레인/양자화 무관 분기).
-    // [W4 2026-10-16] O_DIRECT 직결 스트림(핀드 링 — mmap 슬라이스 우회).
+    // [2026-10-16] O_DIRECT 직결 스트림(핀드 링 — mmap 슬라이스 우회).
     let mut ld = super::upload::DirectLoad::new(model.store());
     for il in 0..hp.n_layer {
         for suf in [
@@ -231,7 +231,7 @@ pub(crate) fn upload_model_g4(
             },
         };
         if resident {
-            // [W4 2026-10-16] 전문가 상주 — O_DIRECT 직결 스트림(셀 단위).
+            // [2026-10-16] 전문가 상주 — O_DIRECT 직결 스트림(셀 단위).
             let mut lens: Vec<(usize, usize)> = Vec::with_capacity(tab.len());
             let mut names: Vec<(String, String)> = Vec::with_capacity(tab.len());
             for il in 0..hp.n_layer {
@@ -269,7 +269,7 @@ pub(crate) fn upload_model_g4(
     }
     let moe_ms = t1.elapsed().as_secs_f64() * 1e3;
     // ⑤ head — 원본 embed(tied) 행별 int8 W8A16(단일 head 계약).
-    // [W4] O_DIRECT 직결 스트림(행-블록 양자화 — 호스트 RAM 상수).
+    // O_DIRECT 직결 스트림(행-블록 양자화 — 호스트 RAM 상수).
     let t2 = std::time::Instant::now();
     {
         let hw = model.wchk("output.weight").map_err(|e| e.to_string())?;

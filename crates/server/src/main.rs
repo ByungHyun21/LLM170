@@ -238,7 +238,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     // [K6-3 2026-10-13] --slots 폐지 — 동시성 = min(문맥 수, 풀 입장).
     // 문맥 수는 내부 상수(상태 메모리 = 문맥×gdn_state/슬롯 — 예산 회계 반영).
     const SERVE_CONTEXTS: usize = 4;
-    // [W1 2026-10-16] serve 입력 = --kv-mem(필수·무 auto) — --ctx(serve)는 폐지.
+    // [2026-10-16] serve 입력 = --kv-mem(필수·무 auto) — --ctx(serve)는 폐지.
     // 배분 절충(KV vs 전문가 vs PLE)은 운영자 명시 결정, 플래너는 검증·권고.
     let mut kv_mem: Option<u64> = None;
     let mut it = args.iter();
@@ -265,7 +265,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 Some(q) => queue = Some(q.max(1)),
                 None => return usage_err("--queue requires a number"),
             },
-            // [W1] PLE 티어 오버라이드(기본 ssd) — CLI > env 진단.
+            // PLE 티어 오버라이드(기본 ssd) — CLI > env 진단.
             "--ple" => match it.next().map(|v| crate::engine::parse_ple_policy(v)) {
                 Some(Some(p)) => {
                     crate::engine::PLE_POLICY.store(p as u64, std::sync::atomic::Ordering::Relaxed)
@@ -336,12 +336,12 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let _ = engine::TOKENIZER.set(tok);
-    // [W1 2026-10-16] kv-mem 검증·파생 — 요청 상한 = min(모델 최대, 풀 총량).
+    // [2026-10-16] kv-mem 검증·파생 — 요청 상한 = min(모델 최대, 풀 총량).
     let (model_max_ctx, cap, kv_budget, kv_reserve, plan_txt) = match model_ctx_info(&model_path) {
         Ok(ci) => {
             let model_max_ctx = ci.ctx;
             let mut plan_txt = String::new();
-            // [W1 2026-10-16] kv-mem 파생 — 풀 = kv-mem/KV-바이트-토큰(512 블록
+            // [2026-10-16] kv-mem 파생 — 풀 = kv-mem/KV-바이트-토큰(512 블록
             // 정렬), 요청 상한 = min(모델 최대, 풀). 클램프 없음(초과 = 거부).
             let pool_tokens = kv_layout(kv_mem, ci.kv_bytes_per_token, ci.ctx);
             if pool_tokens < 512 {
@@ -590,7 +590,7 @@ fn cmd_plan(args: &[String], ma: &ModelArgs) -> ExitCode {
         wl.state_bytes_per_ctx as f64 / (1u64 << 20) as f64
     );
     println!("plan: {}", p.summary());
-    // [W1 2026-10-16] serve 권고 — 플래너 KV 예산이 곧 kv-mem 권고값(운영자 명시).
+    // [2026-10-16] serve 권고 — 플래너 KV 예산이 곧 kv-mem 권고값(운영자 명시).
     if p.fits() {
         println!(
             "serve 권고: --kv-mem {} — 풀 ctx {}/{} ({}) · experts={}",
@@ -645,7 +645,7 @@ fn dir_bytes(p: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// [W1 2026-10-16] 크기 표기 — 로그용(바이너리 단위, 1자리).
+/// [2026-10-16] 크기 표기 — 로그용(바이너리 단위, 1자리).
 fn fmt_mem(b: u64) -> String {
     if b >= 1 << 30 {
         format!("{:.1}G", b as f64 / (1u64 << 30) as f64)
@@ -658,7 +658,7 @@ fn fmt_mem(b: u64) -> String {
     }
 }
 
-/// [W1 2026-10-16] `--kv-mem` 파싱 — 접미 K/M/G/T(2진) 또는 KB/MB/GB/TB·
+/// [2026-10-16] `--kv-mem` 파싱 — 접미 K/M/G/T(2진) 또는 KB/MB/GB/TB·
 /// KiB/MiB/GiB/TiB(대소문자 무시), 단위 없으면 바이트. 0·불명·소수점 = None
 /// (무 auto — 운영자 명시값만).
 fn parse_mem_bytes(s: &str) -> Option<u64> {
@@ -690,7 +690,7 @@ fn parse_mem_bytes(s: &str) -> Option<u64> {
     (v > 0).then_some(v)
 }
 
-/// [W1 2026-10-16] kv-mem → 실효 요청 상한(토큰) = min(모델 최대,
+/// [2026-10-16] kv-mem → 실효 요청 상한(토큰) = min(모델 최대,
 /// kv-mem/KV-토큰), 512 블록 정렬. 값 자체가 풀 총량(초과 요청은 거부).
 fn kv_layout(kv_mem: u64, kv_bytes_per_token: u64, model_max: usize) -> usize {
     let tokens = (kv_mem / kv_bytes_per_token.max(1)) as usize;
@@ -814,7 +814,7 @@ fn usage_err(msg: &str) -> ExitCode {
 mod tests {
     use super::*;
 
-    /// [W1] --kv-mem 파싱 — 단위 4계열·바이트·불명·0·소수점.
+    /// --kv-mem 파싱 — 단위 4계열·바이트·불명·0·소수점.
     #[test]
     fn parse_mem_bytes_units() {
         assert_eq!(parse_mem_bytes("24G"), Some(24 << 30));
@@ -836,7 +836,7 @@ mod tests {
         assert_eq!(parse_mem_bytes("12X"), None);
     }
 
-    /// [W1] kv_layout — 512 정렬·모델 클램프·최소(블록 미만).
+    /// kv_layout — 512 정렬·모델 클램프·최소(블록 미만).
     #[test]
     fn kv_layout_align_and_clamp() {
         // 27B 실측급: KV 33280B/토큰.
@@ -853,7 +853,7 @@ mod tests {
         assert_eq!(kv_layout(1 << 20, 0, 262_144) % 512, 0);
     }
 
-    /// [W1] fmt_mem — 로그 표기 경계.
+    /// fmt_mem — 로그 표기 경계.
     #[test]
     fn fmt_mem_units() {
         assert_eq!(fmt_mem(24 << 30), "24.0G");

@@ -2,19 +2,17 @@
 use llm170_backend_gpu::{AttnDims, GdnDims};
 use llm170_core::w4a16::{DirectReader, W4a16Model};
 
-/// [W4 2026-10-16] 상주 적재 바이트 소스 — O_DIRECT 직접 리더(샤드별 lazy).
+/// [2026-10-16] 상주 적재 바이트 소스 — O_DIRECT 직접 리더(샤드별 lazy).
 /// mmap 우회로 **페이지 캐시 잔류 0**(모델 > RAM도 성립) — 백엔드 핀드 링이
 /// `read_into`를 fill로 소비해 VRAM으로 스트리밍한다. CPU 참조·MoE 스트리밍
 /// (비상주) 소스는 호스트가 계층이라 mmap을 유지한다(캐시가 자산).
-///
-/// 진단 폴백: `LLM170_LOAD_MMAP=1` = mmap 슬라이스 경로(§7.3 폴백 — A/B·회귀
-/// 비교용. 적재 바이트·수치 불변).
+/// O_DIRECT 미지원 FS는 리더가 **자동으로 버퍼 읽기로 폴백**한다(DirectReader —
+/// 경로 선택 플래그 없음: env는 진단 전용 규율, 적재는 수치 불변).
 pub(crate) struct DirectLoad<'m> {
     store: &'m W4a16Model,
     paths: Vec<&'m std::path::Path>,
     readers: Vec<Option<DirectReader>>,
-    direct: bool,
-    /// 진단 누적 — reads/chunks 바이트.
+    /// 진단 누적 — fill 호출 수·바이트.
     pub chunks: u64,
     pub bytes: u64,
     logged: bool,
@@ -26,7 +24,6 @@ impl<'m> DirectLoad<'m> {
             store,
             paths: store.shard_paths(),
             readers: (0..store.shard_count()).map(|_| None).collect(),
-            direct: llm170_diag::flag::val("LLM170_LOAD_MMAP").is_none(),
             chunks: 0,
             bytes: 0,
             logged: false,
@@ -49,7 +46,7 @@ impl<'m> DirectLoad<'m> {
         self.store
             .tensor_range(name)
             .map(|(_, _, len)| len)
-            .ok_or_else(|| format!("W4 적재: 텐서 범위 부재 {name}"))
+            .ok_or_else(|| format!("적재: 텐서 범위 부재 {name}"))
     }
 
     /// 텐서 `[off, off+buf.len())` 채움 — 백엔드 fill 계약(전량 기록).
@@ -57,28 +54,20 @@ impl<'m> DirectLoad<'m> {
         let (shard, base, len) = self
             .store
             .tensor_range(name)
-            .ok_or_else(|| format!("W4 적재: 텐서 범위 부재 {name}"))?;
+            .ok_or_else(|| format!("적재: 텐서 범위 부재 {name}"))?;
         if off + buf.len() as u64 > len {
             return Err(format!(
-                "W4 적재: 범위 밖 {name} off={off} len={} 텐서={len}",
+                "적재: 범위 밖 {name} off={off} len={} 텐서={len}",
                 buf.len()
             ));
         }
         self.chunks += 1;
         self.bytes += buf.len() as u64;
-        if !self.direct {
-            let sl = self
-                .store
-                .tensor_slice(name)
-                .ok_or_else(|| format!("W4 적재(mmap 폴백): 슬라이스 부재 {name}"))?;
-            buf.copy_from_slice(&sl[off as usize..off as usize + buf.len()]);
-            return Ok(());
-        }
         let r = self.reader(shard)?;
         r.read_into(base + off, buf).map_err(|e| e.to_string())
     }
 
-    /// 로드 종료 1회 로그 — 직결/폴백·누적(운영 가시화).
+    /// 로드 종료 1회 로그 — 직결/폴백(리더 실측)·누적(운영 가시화).
     pub(crate) fn log_summary(&mut self) {
         if self.logged {
             return;
@@ -88,12 +77,14 @@ impl<'m> DirectLoad<'m> {
             return;
         }
         let align = self.readers.iter().flatten().map(|r| r.align()).max();
+        // 리더 실측 모드(FS 미지원이면 버퍼 폴백 — 숨기지 않는다).
+        let direct = self.readers.iter().flatten().all(|r| r.direct);
         eprintln!(
             "# load: {} 텐서청크 {}·{:.2}GiB{}",
-            if self.direct {
-                "O_DIRECT 직결(mmapped 슬라이스 우회)"
+            if direct {
+                "O_DIRECT 직결(mmap 우회)"
             } else {
-                "mmap 폴백(LLM170_LOAD_MMAP)"
+                "버퍼 읽기 폴백(O_DIRECT 미지원 FS)"
             },
             self.chunks,
             self.bytes as f64 / (1u64 << 30) as f64,
@@ -114,7 +105,7 @@ pub(crate) fn upload_moe(
 ) -> Result<(), String> {
     let hp = model.hp.clone();
     let t0 = std::time::Instant::now();
-    // [W4 2026-10-16] 플레인 가중 — O_DIRECT 직결 스트림(mmap 슬라이스 우회).
+    // [2026-10-16] 플레인 가중 — O_DIRECT 직결 스트림(mmap 슬라이스 우회).
     let mut ld = DirectLoad::new(model.store());
     for name in model.engine_names() {
         // token_embd(호스트 embed_row)·output(head 전용 업로드)는 체인이
@@ -186,7 +177,7 @@ pub(crate) fn upload_moe(
     let tab_ms = t1.elapsed().as_secs_f64() * 1e3;
     let t2 = std::time::Instant::now();
     if resident {
-        // [W4 2026-10-16] 전문가 상주 — O_DIRECT 직결 스트림(셀 단위).
+        // [2026-10-16] 전문가 상주 — O_DIRECT 직결 스트림(셀 단위).
         // 셀 이름·길이는 expert_slice와 동일 규칙(bind::expert_base).
         let mut lens: Vec<(usize, usize)> = Vec::with_capacity(tab.len());
         let mut names: Vec<(String, String)> = Vec::with_capacity(tab.len());
@@ -249,7 +240,7 @@ pub(crate) fn upload_model(
     if moe {
         upload_moe(dec, model, kv_reserve)?;
     } else {
-        // [W4 2026-10-16] 양자화 선형 — O_DIRECT 직결 스트림(핀드 링).
+        // [2026-10-16] 양자화 선형 — O_DIRECT 직결 스트림(핀드 링).
         let mut ld = DirectLoad::new(model.store());
         for name in model.engine_names() {
             if let Some(w) = model.w_raw(&name)

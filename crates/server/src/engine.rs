@@ -162,7 +162,7 @@ pub fn parse_moe_policy(v: &str) -> Option<u8> {
 pub struct InferRequest {
     pub model: PathBuf,
     /// 실효 요청 상한(토큰) = min(모델 전역 ctx, 풀 총량 — kv-mem 유래).
-    /// [W1 2026-10-16] `--ctx` 폐지 이후의 유일한 상한 소스. 엔진 cap·
+    /// [2026-10-16] `--ctx` 폐지 이후의 유일한 상한 소스. 엔진 cap·
     /// `SERVER_CTX`(OAI 입장 전 거부 판정)·`/stats`가 모두 이 값을 쓴다.
     pub ctx: usize,
     /// 모델 전역 상한(config 파생) — 적재 후 실블록 상한과 재비교(관측·로그).
@@ -204,7 +204,7 @@ impl Engine {
         self.0.mcache_stats()
     }
 
-    /// [W1 2026-10-16] 실블록 유래 단일 요청 상한(토큰) — kv-mem 풀의
+    /// [2026-10-16] 실블록 유래 단일 요청 상한(토큰) — kv-mem 풀의
     /// floor(블록/층) 몫 반영. 적재 후 실효 cap 확정(http::serve)에 쓴다.
     pub fn kv_cap_tokens(&self) -> usize {
         self.0.kv_cap_tokens()

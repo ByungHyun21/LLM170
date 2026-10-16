@@ -38,7 +38,7 @@ pub(crate) enum OutputVerdict {
     PoolExceeded,
 }
 
-/// [W1 2026-10-16·사용자 확정] 생성한도 상한 — **모델 초과분은 vLLM식 출력
+/// [2026-10-16·사용자 확정] 생성한도 상한 — **모델 초과분은 vLLM식 출력
 /// 클램프**, 풀(예약) 초과는 거부:
 /// ① 프롬프트+슬랙 ≥ 모델 최대 → 거부(모델 물리 한계),
 /// ② 프롬프트+출력+슬랙 > 모델 최대 → 출력 클램프(tg = 모델 최대−프롬프트−슬랙;
@@ -523,7 +523,7 @@ fn run_and_emit(
         return;
     }
     // [K6 입장 규약 2026-10-13] 프롬프트 초과 = 입장 전 거부(context_length_exceeded).
-    // [W1 2026-10-16·사용자 확정] 모델 ctx 초과분 = vLLM식 **출력 클램프**
+    // [2026-10-16·사용자 확정] 모델 ctx 초과분 = vLLM식 **출력 클램프**
     // (max_tokens = 모델 최대 − 프롬프트 − 슬랙) — 용량 오해 요청도 처리.
     // 풀(예약) 초과만 거부 — 풀은 입장 순서로 조정한다(요청 크기 제한 아님).
     let pool_cap = *SERVER_CTX.get().unwrap_or(&4096);
@@ -826,7 +826,7 @@ fn run_and_emit_anthropic(
         return;
     }
     // [K6 입장 규약 2026-10-13] 프롬프트 초과 = 거부(context_length_exceeded).
-    // [W1 2026-10-16·사용자 확정] 모델 초과 = vLLM식 출력 클램프 · 풀 초과 = 거부
+    // [2026-10-16·사용자 확정] 모델 초과 = vLLM식 출력 클램프 · 풀 초과 = 거부
     // (run_and_emit과 동일 — cap_output 단일 출처).
     let pool_cap = *SERVER_CTX.get().unwrap_or(&4096);
     let model_max = *SERVER_MODEL_MAX.get().unwrap_or(&usize::MAX);

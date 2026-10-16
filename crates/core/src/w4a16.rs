@@ -315,7 +315,7 @@ impl W4a16Model {
         m.get(s..t)
     }
 
-    /// [W4 2026-10-16] 텐서 파일 범위 — (샤드, 데이터 섹션 기준 오프셋, 길이).
+    /// [2026-10-16] 텐서 파일 범위 — (샤드, 데이터 섹션 기준 오프셋, 길이).
     /// O_DIRECT 직접 리더가 mmap 우회로 같은 바이트를 읽는 좌표.
     pub fn tensor_range(&self, name: &str) -> Option<(usize, u64, u64)> {
         let e = self.ar.entry(name)?;
@@ -323,12 +323,12 @@ impl W4a16Model {
         Some((e.shard, base + e.begin, e.end - e.begin))
     }
 
-    /// [W4] 샤드 수(리더 배열 크기).
+    /// 샤드 수(리더 배열 크기).
     pub fn shard_count(&self) -> usize {
         self.mmaps.len()
     }
 
-    /// [W4] 샤드 경로(리더 생성용 — mmap과 동일 순서).
+    /// 샤드 경로(리더 생성용 — mmap과 동일 순서).
     pub fn shard_paths(&self) -> Vec<&std::path::Path> {
         self.ar.shard_paths()
     }
@@ -603,7 +603,7 @@ fn extract_embedded_quant(cfg: &str) -> R<String> {
     Err(W4a16Error::Quant("quantization_config 객체 미종결".into()))
 }
 
-// ── [W4 2026-10-16] 상주 적재용 O_DIRECT 직접 리더 ──────────────────────────
+// ── [2026-10-16] 상주 적재용 O_DIRECT 직접 리더 ──────────────────────────
 
 /// 정렬 버퍼 — Vec + 주소 정렬 오프셋. Vec 할당은 주소 정렬을 보장하지 않는데
 /// (O_DIRECT는 버퍼 주소 정렬이 필수 계약) 앞 여유를 두고 잘라 쓴다.
@@ -630,7 +630,11 @@ impl AlignedBuf {
 /// 플랫폼에서도 open 실패 → 버퍼 폴백이라 안전하다.
 const O_DIRECT: i32 = 0o40000;
 
-/// [W4] 상주 적재용 O_DIRECT 직접 리더 — mmap 페이지 캐시 잔류 없이 VRAM 상주
+/// O_DIRECT 폴백 경고 1회 게이트 — 샤드별 리더 생성(25개 등)에서 경고가
+/// 샤드 수만큼 반복되던 것을 1회로 억제(검토 반영 2026-10-16).
+static FALLBACK_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 상주 적재용 O_DIRECT 직접 리더 — mmap 페이지 캐시 잔류 없이 VRAM 상주
 /// 적재 바이트를 스트리밍한다(모델 > RAM 성립). 정렬 계약(파일 오프셋·길이 =
 /// 블록 배수, 버퍼 주소 정렬)을 리더가 흡수한다: **정렬 창 + 선두/말미 부분
 /// 복원**(바운스 memcpy) — safetensors 텐서 오프셋은 512B/4KB 정렬이 아닌 것이
@@ -674,10 +678,13 @@ impl DirectReader {
         let (file, direct) = match oo(O_DIRECT) {
             Ok(f) => (f, true),
             Err(e) => {
-                eprintln!(
-                    "# load: O_DIRECT 불가({e}) — 버퍼 읽기 폴백(페이지 캐시 잔류): {}",
-                    path.display()
-                );
+                // [검토 반영] 샤드별 리더 생성 → 경고는 프로세스 1회만.
+                if !FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "# load: O_DIRECT 불가({e}) — 버퍼 읽기 폴백(페이지 캐시 잔류): {} (이후 생략)",
+                        path.display()
+                    );
+                }
                 (oo(0)?, false)
             }
         };
@@ -722,10 +729,22 @@ impl DirectReader {
             let from = (cur - wstart) as usize;
             let buf = self.win.slice_mut();
             let want = take as usize;
-            let got = self
-                .file
-                .read_at(&mut buf[..want], wstart)
-                .map_err(W4a16Error::Io)?;
+            // [검토 반영] 단축 반환(시그널 등) 재시도 — 부족분만큼 이어 읽는다.
+            // O_DIRECT 재개는 정렬 유지 필요(비정렬 진행이면 정직 중단).
+            let mut got = 0usize;
+            while got < from + need {
+                if got > 0 && self.direct && !got.is_multiple_of(self.align) {
+                    break;
+                }
+                let g = self
+                    .file
+                    .read_at(&mut buf[got..want], wstart + got as u64)
+                    .map_err(W4a16Error::Io)?;
+                if g == 0 {
+                    break; // EOF
+                }
+                got += g;
+            }
             if got < from + need {
                 return Err(W4a16Error::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -820,12 +839,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// [W4 2026-10-16] O_DIRECT 리더 — 정렬 창+선두/말미 복원의 경계 판정.
+    /// 실 블록디바이스 FS 경로(workspace target/tmp) 우선 — tmpfs(/tmp)면
+    /// O_DIRECT가 아예 검증되지 않는다(검토 반영 2026-10-16). 생성 실패 시
+    /// temp_dir 폴백.
+    fn direct_test_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return dir.join(format!("{tag}_{}", std::process::id()));
+        }
+        std::env::temp_dir().join(format!("{tag}_{}", std::process::id()))
+    }
+
+    /// [2026-10-16] O_DIRECT 리더 — 정렬 창+선두/말미 복원의 경계 판정.
     /// 합성 파일(결정론 패턴)로: 정렬·비정렬 오프셋/길이·다중 창·EOF 경계·
     /// EOF 초과 거부. O_DIRECT 폴백(FS 미지원)이어도 바이트 동일이 계약.
     #[test]
     fn direct_reader_boundaries() {
-        let path = std::env::temp_dir().join(format!("llm170_direct_{}", std::process::id()));
+        let path = direct_test_path("llm170_direct");
         let size = 300 * 1024 + 123; // 창(64KiB) 여러 개 + 비정렬 꼬리
         let data: Vec<u8> = (0..size).map(|i| (i as u64 % 251) as u8).collect();
         std::fs::write(&path, &data).unwrap();
@@ -833,8 +863,13 @@ mod tests {
         let mut r = DirectReader::open_with_window(&path, 64 << 10).unwrap();
         assert_eq!(r.align() % 4096, 0, "정렬 하한 4096");
         assert!(r.align().is_power_of_two());
-        // 참고 로그용: direct 여부는 FS 의존 — 양쪽 모두 바이트 동일 계약.
-        let _ = r.direct;
+        // 검토 반영: 폴백이면 명시 로그(폴백 경로만 검증되는 상황을 숨기지 않는다).
+        if !r.direct {
+            eprintln!(
+                " O_DIRECT 미지원 FS — 폴백(버퍼) 경로만 검증: {}",
+                path.display()
+            );
+        }
 
         let check = |r: &mut DirectReader, off: usize, len: usize| {
             let mut out = vec![0u8; len];
@@ -859,8 +894,7 @@ mod tests {
         assert_eq!(r.bytes_read, (64 << 10) + 5000 + 200_000 + 1000);
 
         // 빈/부재 파일 — 읽기 Err(정직).
-        let empty =
-            std::env::temp_dir().join(format!("llm170_direct_empty_{}", std::process::id()));
+        let empty = direct_test_path("llm170_direct_empty");
         std::fs::write(&empty, b"").unwrap();
         let mut r2 = DirectReader::open(&empty).unwrap();
         let mut o = [0u8; 16];

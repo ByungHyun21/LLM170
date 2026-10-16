@@ -49,7 +49,7 @@ impl QwenEngine {
     ) -> Result<(bool, bool), String> {
         upload_model(dec, model, ctx, kv_reserve)?;
         // 5) head — bf16 output.weight는 GPU 커널 경로(아니면 CPU 참조).
-        // [W4 2026-10-16] head/embed — O_DIRECT 직결 스트림(mmap 우회).
+        // [2026-10-16] head/embed — O_DIRECT 직결 스트림(mmap 우회).
         // head는 행-블록 양자화(호스트 RAM 상수 — 2.4GB 물질화 회피).
         let mut ld = super::upload::DirectLoad::new(model.store());
         let mut head_gpu = false;
@@ -419,12 +419,12 @@ impl QwenEngine {
         self.dec.kv_blocks_needed(n_tokens)
     }
 
-    /// [W1 2026-10-16] 실블록 유래 단일 요청 상한(토큰).
+    /// [2026-10-16] 실블록 유래 단일 요청 상한(토큰).
     pub fn kv_cap_tokens(&self) -> usize {
         self.dec.kv_cap_tokens()
     }
 
-    /// [W2 2026-10-16] 슬롯 점유 블록(aging 예측 입력).
+    /// [2026-10-16] 슬롯 점유 블록(aging 예측 입력).
     pub fn kv_used_blocks(&self, slot: usize) -> usize {
         self.dec.kv_used_blocks(slot)
     }

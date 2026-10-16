@@ -31,7 +31,7 @@ pub(super) fn run_generate(
     };
     // GPU head — bf16 output.weight를 상주 업로드(--no-head는 CPU 참조).
     // [검수 통합 2026-10-14] head_ready(다중 시나리오 2회차+)면 재업로드 생략.
-    // [W4 2026-10-16] O_DIRECT 직결 스트림(mmap 우회 — 프로브 로드도 캐시 잔류 0).
+    // [2026-10-16] O_DIRECT 직결 스트림(mmap 우회 — 프로브 로드도 캐시 잔류 0).
     let mut head_gpu = head_ready;
     if !no_head && !head_ready && head.ty == llm170_core::wtype::WType::Bf16 {
         let mut ld = crate::gpu_engine::DirectLoad::new(model.store());

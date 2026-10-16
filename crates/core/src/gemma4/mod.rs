@@ -188,12 +188,12 @@ impl Model {
             .ok_or_else(|| ModelError::MissingTensor(name.into()))
     }
 
-    /// [W4 2026-10-16] 스토어 접근(읽기 전용) — 상주 적재의 O_DIRECT 직결 좌표.
+    /// [2026-10-16] 스토어 접근(읽기 전용) — 상주 적재의 O_DIRECT 직결 좌표.
     pub fn store(&self) -> &crate::w4a16::W4a16Model {
         &self.w4
     }
 
-    /// [W4] 상주 적재 원시 텐서 이름 — `w()`와 동일 해석(이름만).
+    /// 상주 적재 원시 텐서 이름 — `w()`와 동일 해석(이름만).
     pub fn w_names(&self, name: &str) -> Option<(String, Option<String>)> {
         use bind::Eng;
         match bind::eng(name)? {
@@ -205,7 +205,7 @@ impl Model {
         }
     }
 
-    /// [W4] 전문가 트리플 원시 텐서 이름 — (packed, scale) — bind::expert_base
+    /// 전문가 트리플 원시 텐서 이름 — (packed, scale) — bind::expert_base
     /// 단일 출처(expert_slice와 동일 규칙).
     pub fn expert_names(&self, il: usize, e: usize, proj: &str) -> (String, String) {
         let base = bind::expert_base(il, e, proj);

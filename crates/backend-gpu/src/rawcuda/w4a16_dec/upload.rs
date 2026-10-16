@@ -540,7 +540,7 @@ impl W4a16Dec {
         }
     }
 
-    /// [W1 2026-10-16] 실블록 유래 단일 요청 상한(토큰) — `kv_blocks_needed(n)
+    /// [2026-10-16] 실블록 유래 단일 요청 상한(토큰) — `kv_blocks_needed(n)
     /// ≤ total`의 최대 n(= ⌊total/n_attn⌋×512 − 2; +2는 grow 정렬 여유).
     /// 풀 floor(블록 잔여)를 반영해 상한 표기·OAI 입장 전 거부를 실블록과 일치.
     pub fn kv_cap_tokens(&self) -> usize {
@@ -552,7 +552,7 @@ impl W4a16Dec {
         }
     }
 
-    /// [W2 2026-10-16] 슬롯 현재 점유 블록 — aging 예측 입력(완료 시 해제량).
+    /// [2026-10-16] 슬롯 현재 점유 블록 — aging 예측 입력(완료 시 해제량).
     pub fn kv_used_blocks(&self, slot: usize) -> usize {
         self.attn
             .kv_pool
@@ -776,7 +776,7 @@ impl W4a16Dec {
         self.register_moe_resident(dev_tab, experts_bytes)
     }
 
-    /// [W4 2026-10-16] 전문가 아레나 3종×2(q/s) 할당 — (아레나, 정리용 목록).
+    /// [2026-10-16] 전문가 아레나 3종×2(q/s) 할당 — (아레나, 정리용 목록).
     /// 업로드 본체(호스트 슬라이스)·스트림(_streamed) 공용.
     fn alloc_expert_arenas(
         &mut self,
@@ -804,7 +804,7 @@ impl W4a16Dec {
         Ok((dpk, dsk, allocd))
     }
 
-    /// [W4 2026-10-16] 전문가 상주 마감 — 디바이스 테이블 업로드 + 등록.
+    /// [2026-10-16] 전문가 상주 마감 — 디바이스 테이블 업로드 + 등록.
     /// 아레나 할당·전송은 호출부(본체/스트림) 몫.
     fn register_moe_resident(
         &mut self,
@@ -835,7 +835,7 @@ impl W4a16Dec {
         Ok(())
     }
 
-    /// [W4 2026-10-16] 전문가 상주 업로드(스트림) — `lens[i] = (q,s)` 셀 길이
+    /// [2026-10-16] 전문가 상주 업로드(스트림) — `lens[i] = (q,s)` 셀 길이
     /// (i%3 = proj: gate/up/down). `fill(cell, which, off, buf)`가 핀드 버퍼를
     /// 채운다(예: O_DIRECT 직결) — 호스트 물질화 없이 VRAM 아레나로.
     pub fn upload_experts_resident_streamed(
@@ -956,7 +956,9 @@ impl W4a16Dec {
                 }
             });
         }
-        for p in [self.head_w, self.head_sc, self.head_out] {
+        // [검토 반영 2026-10-16] 재적재 시 argmax_out(4B)도 해제 — 종전
+        // 누락은 재업로드마다 4B 누수였다(신규 스트림 경로와 동일 정정).
+        for p in [self.head_w, self.head_sc, self.head_out, self.argmax_out] {
             if p != 0 {
                 self.cc.free(p)?;
             }
@@ -964,6 +966,7 @@ impl W4a16Dec {
         self.head_w = 0; // G1: 부분 상태(head_n=0)로 소비되지 않게 마지막에 대입.
         self.head_sc = 0;
         self.head_out = 0;
+        self.argmax_out = 0;
         self.head_n = 0;
         self.head_k = 0;
         // int8 본체 + f32 행스케일 업로드.
@@ -982,13 +985,20 @@ impl W4a16Dec {
             let _ = self.cc.free(dsc);
             return Err(e);
         }
-        let dout = match self.cc.alloc(n * 4).and_then(|p| {
-            self.cc.alloc(4).map(|a| {
-                self.argmax_out = a;
-                p
-            })
-        }) {
-            Ok(p) => p,
+        // [검토 반영] alloc(4) 실패 시 alloc(n*4) 회수(and_then 체인은 p 유실).
+        let dout = match self.cc.alloc(n * 4) {
+            Ok(p) => match self.cc.alloc(4) {
+                Ok(a) => {
+                    self.argmax_out = a;
+                    p
+                }
+                Err(e) => {
+                    let _ = self.cc.free(p);
+                    let _ = self.cc.free(dw);
+                    let _ = self.cc.free(dsc);
+                    return Err(e);
+                }
+            },
             Err(e) => {
                 let _ = self.cc.free(dw);
                 let _ = self.cc.free(dsc);
@@ -1076,7 +1086,7 @@ impl W4a16Dec {
     }
 }
 
-// ── [W4 2026-10-16] 스트림 상주 업로드 — O_DIRECT 직결(핀드 링) ─────────────
+// ── [2026-10-16] 스트림 상주 업로드 — O_DIRECT 직결(핀드 링) ─────────────
 //
 // 서버/프로브 로더가 파일 스트림(예: core::w4a16::DirectReader)을 `fill` 콜백로
 // 공급하면 **핀드 링에 채워 곧바로 h2d_async**로 올린다 — 드라이버 스테이징
@@ -1230,7 +1240,8 @@ impl W4a16Dec {
                 "upload_head_stream: 형상 계약 위반 n={n} k={k} bytes={len} < {need}"
             ));
         }
-        for p in [self.head_w, self.head_sc, self.head_out] {
+        // [검토 반영 2026-10-16] 재적재 시 argmax_out(4B)도 해제(누수 정정).
+        for p in [self.head_w, self.head_sc, self.head_out, self.argmax_out] {
             if p != 0 {
                 self.cc.free(p)?;
             }
@@ -1238,6 +1249,7 @@ impl W4a16Dec {
         self.head_w = 0; // G1: 부분 상태(head_n=0)로 소비되지 않게 마지막에 대입.
         self.head_sc = 0;
         self.head_out = 0;
+        self.argmax_out = 0;
         self.head_n = 0;
         self.head_k = 0;
         let dw = self.cc.alloc(n * k)?;
@@ -1248,13 +1260,20 @@ impl W4a16Dec {
                 return Err(e);
             }
         };
-        let dout = match self.cc.alloc(n * 4).and_then(|p| {
-            self.cc.alloc(4).map(|a| {
-                self.argmax_out = a;
-                p
-            })
-        }) {
-            Ok(p) => p,
+        // [검토 반영] alloc(4) 실패 시 alloc(n*4) 회수(and_then 체인은 p 유실).
+        let dout = match self.cc.alloc(n * 4) {
+            Ok(p) => match self.cc.alloc(4) {
+                Ok(a) => {
+                    self.argmax_out = a;
+                    p
+                }
+                Err(e) => {
+                    let _ = self.cc.free(p);
+                    let _ = self.cc.free(dw);
+                    let _ = self.cc.free(dsc);
+                    return Err(e);
+                }
+            },
             Err(e) => {
                 let _ = self.cc.free(dw);
                 let _ = self.cc.free(dsc);

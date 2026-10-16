@@ -253,7 +253,7 @@ fn text_stream_multibyte_stop_no_panic() {
     assert!(ts.stopped && ts.trunc);
 }
 
-/// [W1 2026-10-16·사용자 확정] cap_output — 모델 초과 = vLLM식 출력 클램프,
+/// [2026-10-16·사용자 확정] cap_output — 모델 초과 = vLLM식 출력 클램프,
 /// 풀 초과 = 거부(풀은 순서 문제 — 클램프 대상 아님), 경계 판정.
 #[test]
 fn cap_output_policies() {

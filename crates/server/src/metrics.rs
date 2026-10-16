@@ -44,9 +44,9 @@ pub struct Info {
     pub n_slots: usize,
     /// 모델 파일 총합(디스크 — 분류의 기준점).
     pub model_bytes: u64,
-    /// [W1 2026-10-16] 운영자 `--kv-mem`(KV 총량 — 무 auto).
+    /// [2026-10-16] 운영자 `--kv-mem`(KV 총량 — 무 auto).
     pub kv_mem: u64,
-    /// [W1] 실효 요청 상한(토큰) = min(모델 최대, 풀) — kv-mem 유래.
+    /// 실효 요청 상한(토큰) = min(모델 최대, 풀) — kv-mem 유래.
     pub pool_cap_tokens: usize,
 }
 

@@ -20,7 +20,7 @@ pub(super) fn maybe_publish(
     }
 }
 
-/// [W2 2026-10-16] aging 관측 게시(최신값만) — 동결 상태·D·누적·차단.
+/// [2026-10-16] aging 관측 게시(최신값만) — 동결 상태·D·누적·차단.
 pub(super) fn publish_aging(a: &Aging) {
     let s = a.stats();
     SCHED.aging_frozen.store(s.frozen as u64, Ordering::Relaxed);

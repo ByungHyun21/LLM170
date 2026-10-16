@@ -142,16 +142,20 @@ impl W4a16Dec {
     }
 }
 
-/// [W4 2026-10-16] 핀드 2벌 링 — 파일 스트림을 VRAM으로 옮긴다.
+/// [2026-10-16] 핀드 2벌 링 — 파일 스트림을 VRAM으로 옮긴다.
 /// `send`의 fill이 핀드 버퍼를 채우면(예: O_DIRECT 리더) 곧바로 `h2d_async`로
 /// 복사해 **읽기와 PCIe 복사가 겹친다**(드라이버 스테이징 왕복 제거 — 핀드
 /// 소스는 cuMemcpyHtoDAsync가 직접 DMA한다). 호스트 RAM = 상수(2×chunk).
-/// 링 재사용 안전: 같은 버퍼를 다시 쓰기 전에 2청크마다 sync로 직전 DMA
-/// 완료를 담보한다(이벤트 불요 — 창 단위 파이프라인).
+/// 버퍼 재사용 담보 = **버퍼별 이벤트**(cuEventRecord→cuEventSynchronize):
+/// 그 버퍼의 직전 DMA만 기다려 다른 버퍼의 복사는 계속 진행된다(전체-스트림
+/// sync의 파이프라인 버블 제거 — 2026-10-16 검토 반영).
 pub(crate) struct PinnedRing<'a> {
     cc: &'a CudaCtx,
     a: *mut std::ffi::c_void,
     b: *mut std::ffi::c_void,
+    /// 버퍼별 복사 완료 이벤트(비타이밍 — 캡처 호환 클래스).
+    ev_a: ffi::CUevent,
+    ev_b: ffi::CUevent,
     chunk: usize,
     /// 링 전역 청크 카운터(호출 경계를 넘어 교대 유지).
     seq: u64,
@@ -173,10 +177,29 @@ impl<'a> PinnedRing<'a> {
             std::ptr::write_bytes(a, 0, chunk);
             std::ptr::write_bytes(b, 0, chunk);
         }
+        let ev_a = match cc.event_create_nt() {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = cc.pinned_free(a);
+                let _ = cc.pinned_free(b);
+                return Err(e);
+            }
+        };
+        let ev_b = match cc.event_create_nt() {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = cc.pinned_free(a);
+                let _ = cc.pinned_free(b);
+                cc.event_destroy(ev_a);
+                return Err(e);
+            }
+        };
         Ok(Self {
             cc,
             a,
             b,
+            ev_a,
+            ev_b,
             chunk,
             seq: 0,
         })
@@ -193,21 +216,23 @@ impl<'a> PinnedRing<'a> {
         let mut off = 0usize;
         while off < bytes {
             let n = self.chunk.min(bytes - off);
-            // 같은 버퍼(2청크 전) 재사용 전 대기 — DMA 완료 담보.
-            if self.seq.is_multiple_of(2) && self.seq > 0 {
-                self.cc.sync()?;
-            }
-            let p = if self.seq.is_multiple_of(2) {
-                self.a
+            let (p, ev) = if self.seq.is_multiple_of(2) {
+                (self.a, self.ev_a)
             } else {
-                self.b
+                (self.b, self.ev_b)
             };
+            // 이 버퍼의 직전 DMA 완료만 대기(2청크 전 — 다른 버퍼는 진행 중 허용).
+            if self.seq >= 2 {
+                self.cc.event_sync(ev)?;
+            }
             // SAFETY: pinned 할당 [0, n) — 0 초기화 완료 + fill 전량 기록 계약.
             let buf = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, n) };
             fill(off as u64, buf)?;
             // SAFETY: 같은 범위 — fill 완료 후 읽기 전용 뷰.
             let src = unsafe { std::slice::from_raw_parts(p as *const u8, n) };
             self.cc.h2d_async(dst + off as u64, src)?;
+            // 이 버퍼의 복사 완료 마킹(다음 재사용의 대기 지점).
+            self.cc.event_record(ev)?;
             self.seq += 1;
             off += n;
             // 업로드는 수 초 — 와치독 심박(로드 스텔 오판 방지).
@@ -224,6 +249,8 @@ impl<'a> PinnedRing<'a> {
 
 impl Drop for PinnedRing<'_> {
     fn drop(&mut self) {
+        self.cc.event_destroy(self.ev_a);
+        self.cc.event_destroy(self.ev_b);
         let _ = self.cc.pinned_free(self.a);
         let _ = self.cc.pinned_free(self.b);
     }

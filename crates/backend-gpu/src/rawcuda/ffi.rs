@@ -174,6 +174,9 @@ pub type CuEventElapsedTimeFn =
 /// cuEventDestroy.
 pub type CuEventDestroyFn = unsafe extern "system" fn(ev: CUevent) -> CUresult;
 
+/// cuEventSynchronize — CPU가 이벤트 완료까지 대기(핀드 링 버퍼 재사용 담보).
+pub type CuEventSynchronizeFn = unsafe extern "system" fn(ev: CUevent) -> CUresult;
+
 /// cuMemGetInfo_v2 — 가용/전체 디바이스 메모리(바이트). B6:
 /// 리소스 가드의 CUDA 런타임 VRAM 조회용(현재 컨텍스트 기준).
 pub type CuMemGetInfoFn =
@@ -371,6 +374,7 @@ pub(crate) struct Driver {
     pub event_record: CuEventRecordFn,
     pub event_elapsed: CuEventElapsedTimeFn,
     pub event_destroy: CuEventDestroyFn,
+    pub event_synchronize: CuEventSynchronizeFn,
 }
 
 impl Driver {
@@ -495,6 +499,9 @@ impl Driver {
                 )),
                 event_destroy: std::mem::transmute::<*mut c_void, CuEventDestroyFn>(sym!(
                     "cuEventDestroy"
+                )),
+                event_synchronize: std::mem::transmute::<*mut c_void, CuEventSynchronizeFn>(sym!(
+                    "cuEventSynchronize"
                 )),
 
                 mem_get_info: std::mem::transmute::<*mut c_void, CuMemGetInfoFn>(sym!(

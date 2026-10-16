@@ -31,7 +31,7 @@ pub static ENGINE_DEAD: AtomicBool = AtomicBool::new(false);
 /// 전달(107 W2: 종전 LLM170_CTX env 기본 4096이 --ctx 8192 엔진과 불일치해
 /// 조용히 거절).
 pub static SERVER_CTX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-/// [W1 2026-10-16] 모델 전역 ctx 상한(config) — OAI 판정에서 모델 몫(출력
+/// [2026-10-16] 모델 전역 ctx 상한(config) — OAI 판정에서 모델 몫(출력
 /// 클램프 대상)과 풀 몫(SERVER_CTX — 초과 = 거부)을 분리한다.
 pub static SERVER_MODEL_MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
@@ -54,7 +54,7 @@ pub fn serve(
     };
     let (tx, rx) = std::sync::mpsc::sync_channel::<SlotJob>(qcap);
     let eng = crate::engine::build_slots(req.clone(), slots);
-    // [W1 2026-10-16] 실효 요청 상한 확정 — 적재 후 실블록 기준(풀 floor 몫
+    // [2026-10-16] 실효 요청 상한 확정 — 적재 후 실블록 기준(풀 floor 몫
     // 반영). OAI 입장 전 거부(SERVER_CTX)가 이 값을 본다(무클램프·무 auto).
     let pool_cap = eng.kv_cap_tokens();
     let cap = if pool_cap >= 512 {
