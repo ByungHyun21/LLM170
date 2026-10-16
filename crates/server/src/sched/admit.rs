@@ -18,8 +18,10 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// 예약 슬랙(토큰) — 스펙 검증 전방 행(tmax−1 = 8)을 예약이 덮는다.
-pub const RESERVE_SLACK: usize = 8;
+/// 예약 슬랙(토큰) — 스펙 검증 전방 행(tmax−1)을 예약이 덮는다. tmax는 백엔드
+/// 단일 출처(`llm170_backend_gpu::SPEC_VERIFY_TMAX` = 1+kmax = 9) — 초안 깊이를
+/// 올리면 그 상수만 수정하면 된다.
+pub const RESERVE_SLACK: usize = llm170_backend_gpu::SPEC_VERIFY_TMAX - 1;
 
 /// 요청 예약 토큰 = 프롬프트 + 생성한도 + 슬랙.
 pub fn need_tokens(prompt: usize, n_predict: usize) -> usize {

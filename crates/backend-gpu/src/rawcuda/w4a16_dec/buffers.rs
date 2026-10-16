@@ -611,6 +611,9 @@ impl W4a16Dec {
                         self.cc.pinned_free(self.gdn.dchk)?;
                     }
                     self.gdn.dchk = std::ptr::null_mut(); // null 가드로 체크포인트 자동 비활성
+                    self.gdn.dchk_pos.clear();
+                    self.gdn.dchk_saved.clear();
+                    self.gdn.dchk_use.clear();
                 }
                 "spec:state" => {
                     for p in [

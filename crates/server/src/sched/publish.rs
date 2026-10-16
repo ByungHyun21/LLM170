@@ -45,6 +45,19 @@ pub(super) fn publish_stats(eng: &Engine, base: [(u64, u64, u64); 3]) {
     let (weights_gpu, kv_gpu, offload_cpu, ple_cpu) = eng.mem_stats();
     let (_, kv_host, host_blocks, total_blocks) = eng.kv_tier_bytes();
     let (free_vram, free_host) = eng.kv_tier_free();
+    // [2026-10-16] 메모리 배치 권고(관측 전용) — 최신 신호 1표본(1Hz).
+    let (hit, miss, _) = eng.mcache_stats();
+    let hit_rate = if hit + miss > 0 {
+        hit as f64 / (hit + miss) as f64
+    } else {
+        0.0
+    };
+    let offload = if kv_gpu + kv_host > 0 {
+        kv_host as f64 / (kv_gpu + kv_host) as f64
+    } else {
+        0.0
+    };
+    let advice = crate::memctl::sample(offload, hit_rate);
     crate::metrics::publish_memory(crate::metrics::MemView {
         weights_gpu,
         kv_gpu,
@@ -58,6 +71,11 @@ pub(super) fn publish_stats(eng: &Engine, base: [(u64, u64, u64); 3]) {
         active_per_token: eng.active_weight_bytes(),
         moe_mode: eng.moe_mode().to_string(),
         moe_cache: eng.mcache_stats(),
+        mem_advice: match advice {
+            crate::memctl::MemAdvice::Hold => 0,
+            crate::memctl::MemAdvice::PreferKv => 1,
+            crate::memctl::MemAdvice::PreferCache => 2,
+        },
     });
     let now = eng.copy_stats();
     let sub = |i: usize| -> (u64, u64, u64) {

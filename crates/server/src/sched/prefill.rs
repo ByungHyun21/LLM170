@@ -143,7 +143,13 @@ pub(super) fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
         // [K4 2026-10-12] 용량 초과(사전 검증 에러·프리필 미소비) — 엔진
         // 상태는 이전 cached와 정합이므로 캐시를 버리지 않는다(재요청
         // 접두 히트 유지). 그 외 런타임 에러는 현행 폐기(신뢰 불가).
-        if err.contains("context overflow") && s.prefilled == 0 && !s.cached.is_empty() {
+        // 마커 = 백엔드 단일 출처(CTX_OVERFLOW) — 메시지 변경에도 분기 유지.
+        // (청크 프리필 중간 실패(prefilled>0)는 통폐기 — 이미 소비된 청크도
+        // 유효 접두지만 상태 신뢰 우선. 부분 히트 개선 후보로 기록만.)
+        if err.contains(llm170_backend_gpu::CTX_OVERFLOW)
+            && s.prefilled == 0
+            && !s.cached.is_empty()
+        {
             let keep = std::mem::take(&mut s.cached);
             *s = Slot::free();
             s.cached = keep;

@@ -12,7 +12,7 @@ impl W4a16Dec {
         let cap = self.attn.attn.ok_or("attn: 형상 미등록")?.cap;
         if pos as usize >= cap {
             return Err(format!(
-                "context overflow: slot{slot} pos={pos} >= kvcap={cap}"
+                "{CTX_OVERFLOW}: slot{slot} pos={pos} >= kvcap={cap}"
             ));
         }
         // [K6-3] KV 온디맨드 확보(슬랙 2행) — t=1 진입 공통.
@@ -184,7 +184,7 @@ impl W4a16Dec {
         let cap = self.attn.attn.ok_or("attn: 형상 미등록")?.cap;
         if pos as usize >= cap {
             return Err(format!(
-                "context overflow: slot{slot} pos={pos} >= kvcap={cap}"
+                "{CTX_OVERFLOW}: slot{slot} pos={pos} >= kvcap={cap}"
             ));
         }
         // [K6-3] KV 온디맨드 확보(슬랙 2행) — t=1 진입 공통.

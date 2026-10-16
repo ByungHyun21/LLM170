@@ -1226,3 +1226,20 @@ fn norm_2816_guard_variant_matches_cpu_mirror() {
     eprintln!("[norm2816] max|diff| {maxd:.3e} · 최대상대 {maxr:.3e}");
     assert!(maxr < 1e-5 && maxd < 1e-4, "norm2816 오차 초과: {maxr:.3e}");
 }
+
+/// [2026-10-16] 체크포인트 퇴거(FLOP-aware 순수 선택) — 히트 0이면 최근성만
+/// 남아 종전 환형 순서와 동일(동작 보존), 절약 실적이 있으면 보호된다.
+#[test]
+fn ckpt_victim_flop_aware() {
+    let z = [0u32; 4];
+    // 최초(전부 0) = 슬롯 0.
+    assert_eq!(W4a16Dec::ckpt_victim(&z, &[0; 4]), 0);
+    // 사용 틱 오름차순 = 가장 오래된 슬롯 퇴거(환형 동일).
+    assert_eq!(W4a16Dec::ckpt_victim(&z, &[1, 2, 3, 4]), 0);
+    assert_eq!(W4a16Dec::ckpt_victim(&z, &[9, 6, 7, 8]), 1);
+    // 절약 토큰 > 0은 퇴거 후보에서 최후(보호).
+    assert_eq!(W4a16Dec::ckpt_victim(&[5, 0, 0, 0], &[1, 2, 3, 4]), 1);
+    assert_eq!(W4a16Dec::ckpt_victim(&[9, 9, 9, 0], &[9, 8, 7, 6]), 3);
+    // 같은 절약 = 오래된 사용 퇴거.
+    assert_eq!(W4a16Dec::ckpt_victim(&[7, 7, 7, 7], &[5, 2, 9, 3]), 1);
+}

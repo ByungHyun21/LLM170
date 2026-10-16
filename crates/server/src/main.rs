@@ -8,6 +8,7 @@ mod gpu_engine;
 mod http;
 mod infer;
 mod json;
+mod memctl;
 mod metrics;
 mod oai;
 mod probes;

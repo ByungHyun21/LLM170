@@ -19,6 +19,17 @@ use crate::rawcuda::ffi::{self, CUdeviceptr};
 use std::collections::HashMap;
 use unified_cache::{CacheCategory, Tier, UnifiedCacheRegistry, base_util};
 
+/// [2026-10-16] 검증 라운드 전방 행 상한 — t = 1+k(초안 k ≤ 8 밴드) = 최대 9.
+/// 서버 예약 슬랙(`sched::admit::RESERVE_SLACK = TMAX−1`)이 이 상수를 참조하는
+/// 단일 출처(초안 깊이 변경 시 여기만 수정).
+pub const SPEC_VERIFY_TMAX: usize = 9;
+
+/// [2026-10-16] 컨텍스트 초과 오류 마커 — 서버가 `err.contains(CTX_OVERFLOW)`로
+/// 캐시 유지 분기(K4 — 사전 검증 에러는 엔진 상태가 이전 cached와 정합)를
+/// 판정한다. 생산자(chains/prefill)·소비자(server/sched/prefill)가 이 상수를
+/// 공유 — 오류 메시지를 다듬어도 분기가 조용히 죽지 않는다.
+pub const CTX_OVERFLOW: &str = "context overflow";
+
 /// fwd3s T 상한(assets/attn.cu ATTN_TMAX와 동일 값).
 // 커널 ATTN_TMAX와 동기(2026-10-09: 8→32→128→512 — 프리필 청크 확대).
 pub const ATTN_F3S_TMAX: usize = 512;
@@ -537,6 +548,12 @@ pub(super) struct Gdn {
     /// [K3 2026-10-12] 체크포인트 위치 — 슬롯당 512 경계 스택 4개
     /// (512/1024/1536/2048 — 환형 저장). upto 이하 최대 경계.
     pub(super) dchk_pos: Vec<[u32; 4]>,
+    /// [2026-10-16] FLOP-aware 퇴거 값 — 슬롯×4: 누적 절약 토큰(복원 시
+    /// `upto − pos` 가산 = 재계산 면제량) · 최근 사용 틱. 퇴거 = (절약, 틱)
+    /// 최소 슬롯. 히트 0이면 최근성만 남아 종전 환형 순서와 동일(동작 보존).
+    pub(super) dchk_saved: Vec<[u32; 4]>,
+    pub(super) dchk_use: Vec<[u64; 4]>,
+    pub(super) dchk_tick: u64,
 }
 
 /// [K-STEP 2026-10-12 §3.4 ①] 디바이스 K-스텝 디코드 루프 상태 — W4a16Dec
@@ -929,6 +946,9 @@ impl W4a16Dec {
                 dsave: 0,
                 dchk: std::ptr::null_mut(),
                 dchk_pos: Vec::new(),
+                dchk_saved: Vec::new(),
+                dchk_use: Vec::new(),
+                dchk_tick: 0,
             },
             graph: Graph {
                 graph_cache: Vec::new(),

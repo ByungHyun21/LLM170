@@ -714,16 +714,12 @@ fn j_need_tokens(j: &SlotJob) -> usize {
     admit::need_tokens(j.tokens.len(), j.n_predict)
 }
 
-/// [K6-3] 유휴 슬롯(job 없음)의 KV 블록 1개 슬롯 회수 — LRU(가장 오래된
-/// touch) 우선. 접두 캐시는 압박 시 양보(사다리 1단계). 반환 = 회수 여부.
+/// [K6-3] 유휴 슬롯(job 없음)의 KV 블록 슬롯 회수 — [2026-10-16] FLOP-aware
+/// 퇴거: 캐시 접두가 **짧은** 슬롯 먼저(절약 적음 = 재계산 저렴), 동률 = LRU
+/// (오래된 touch). 빈 캐시는 블록이 없어 후보 제외(종전엔 빈 슬롯을 골라
+/// 헛시도 가능). 반환 = 회수 여부.
 fn reclaim_idle(eng: &mut Engine, slots: &mut [Slot]) -> bool {
-    let victim = slots
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.job.is_none())
-        .min_by_key(|(_, s)| s.touch)
-        .map(|(i, _)| i);
-    match victim {
+    match reclaim_victim(slots) {
         Some(i) => {
             let freed = eng.0.kv_release_slot(i);
             if freed > 0 {
@@ -738,6 +734,17 @@ fn reclaim_idle(eng: &mut Engine, slots: &mut [Slot]) -> bool {
     }
 }
 
+/// [2026-10-16] 회수 대상 선택(순수 — 테스트 표면): 접두 최소 → 동률 오래된
+/// touch. 빈 캐시 제외(회수 블록 0).
+fn reclaim_victim(slots: &[Slot]) -> Option<usize> {
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.job.is_none() && !s.cached.is_empty())
+        .min_by_key(|(_, s)| (s.cached.len(), s.touch))
+        .map(|(i, _)| i)
+}
+
 /// [K6-3 2026-10-13] 입장 판정 — 필요 블록(예약 토큰 = 프롬프트+생성한도+
 /// 슬랙 8 — `admit::need_tokens`)이 풀 여유 이하. 슬롯 보유 접두 블록은
 /// 보수적으로 미계상(과대 판정 = 대기 우선 — 활성 요청 안전). 큐 대기의 단일 기준.
@@ -748,7 +755,7 @@ fn admit_ok(eng: &Engine, j: &SlotJob) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::Slot;
+    use super::{Slot, reclaim_victim};
 
     /// [R14] 스펙 적응 게이트 경계 — 무수용 후 256토큰 재시도 조건.
     #[test]
@@ -763,6 +770,36 @@ mod tests {
         assert_eq!(s.generated & 255, 0, "256 배수에서 재시도 허용");
         s.generated = 257;
         assert_ne!(s.generated & 255, 0, "256 배수 외 재시도 차단");
+    }
+
+    /// [2026-10-16] 회수 대상 = FLOP-aware — **짧은 접두 먼저**(절약 적음 =
+    /// 재계산 저렴), 동률 = LRU(오래된 touch), 빈 캐시 제외(회수 블록 없음).
+    /// 구 정책(순수 LRU)은 긴 접두를 먼저 죽일 수 있었다.
+    #[test]
+    fn reclaim_victim_flop_aware() {
+        let mut long = Slot::free();
+        long.cached = vec![0; 700];
+        long.touch = 10;
+        let mut short = Slot::free();
+        short.cached = vec![0; 100];
+        short.touch = 1; // 오래됐지만 짧다 → 우선 퇴거
+        let mut empty = Slot::free();
+        empty.touch = 0; // 빈 캐시 = 제외(블록 0)
+        assert_eq!(
+            reclaim_victim(&[long, short, empty]),
+            Some(1),
+            "짧은 접두 우선"
+        );
+        // 같은 길이 = 오래된 touch.
+        let mut a = Slot::free();
+        a.cached = vec![0; 100];
+        a.touch = 5;
+        let mut b = Slot::free();
+        b.cached = vec![0; 100];
+        b.touch = 2;
+        assert_eq!(reclaim_victim(&[a, b]), Some(1));
+        // 전부 빈 캐시 = None.
+        assert_eq!(reclaim_victim(&[Slot::free()]), None);
     }
 
     /// [R14] 접두 트리 경계 — 512 미만 미스·512 이상 히트·제거 후 미스.

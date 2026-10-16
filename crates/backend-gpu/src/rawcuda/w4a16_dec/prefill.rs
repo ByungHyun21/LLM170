@@ -92,7 +92,7 @@ impl W4a16Dec {
         let pos = self.slot_pos[slot];
         let cap = self.attn.attn.ok_or("attn: 형상 미등록")?.cap;
         if pos as usize + t > cap {
-            return Err(format!("context overflow: pos{pos}+T{t} > kvcap{cap}"));
+            return Err(format!("{CTX_OVERFLOW}: pos{pos}+T{t} > kvcap{cap}"));
         }
         // [K6-3] KV 온디맨드 확보(슬랙 2행) — t≥2 진입 공통(프리필·검증).
         self.kv_ensure(slot, pos as usize + t + 2)?;

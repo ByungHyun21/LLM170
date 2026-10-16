@@ -51,6 +51,11 @@ FH=$(echo "$S" | jget 'd["memory"]["kv_cache"]["free_host_blocks"]')
 [ "${FV:-x}" != "x" ] && [ "${FH:-x}" != "x" ] \
   && note "티어 자유 블록 노출 OK — 자유 VRAM $FV/호스트 $FH" \
   || { echo "[tier] FAIL: free 블록 필드 부재"; fail=1; }
+ADV=$(echo "$S" | jget 'd["serving"]["mem_advice"]')
+case "$ADV" in
+  hold | prefer_kv | prefer_cache) note "배치 권고 필드 OK ($ADV)";;
+  *) echo "[tier] FAIL: mem_advice=$ADV"; fail=1;;
+esac
 [ "${HOST:-0}" -gt 0 ] \
   && note "호스트 아레나 $HOST B($HB 블록) · 전체 $TOT 블록 · 오프로드율 $RATIO" \
   || { echo "[tier] FAIL: host=$HOST"; fail=1; }

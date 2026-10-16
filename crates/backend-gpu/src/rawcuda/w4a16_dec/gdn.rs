@@ -453,6 +453,9 @@ impl W4a16Dec {
             Ok(p) => {
                 self.gdn.dchk = p;
                 self.gdn.dchk_pos = vec![[0u32; 4]; self.n_slots];
+                self.gdn.dchk_saved = vec![[0u32; 4]; self.n_slots];
+                self.gdn.dchk_use = vec![[0u64; 4]; self.n_slots];
+                self.gdn.dchk_tick = 0;
                 // [§3.4 ②] 체크포인트 회계 — 슬롯×4환형 전체. 실패(호스트)
                 // 경로는 미등록(기능 off와 정합).
                 if let Err(e) = self.ucache.allocate(

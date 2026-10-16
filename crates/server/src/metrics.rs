@@ -75,6 +75,8 @@ pub struct MemView {
     pub moe_mode: String,
     /// [§2.M ① 2026-10-15] 스트리밍 전문가 LRU 캐시 — (hits, miss, k슬롯/층).
     pub moe_cache: (u64, u64, usize),
+    /// [2026-10-16] 메모리 배치 권고(관측 전용) — 0=hold 1=prefer_kv 2=prefer_cache.
+    pub mem_advice: u8,
 }
 
 /// 복사(io) 뷰 — 런타임/적재 분리. 각 항목 = [h2d, d2h, d2d] × (바이트, ns, 호출).
@@ -223,6 +225,15 @@ fn pm_counter(o: &mut String, name: &str, help: &str, val: u64) {
 }
 
 /// JSON 문자열 이스케이프(최소 — 따옴표/역슬래시/제어문자).
+/// [2026-10-16] 메모리 배치 권고 이름(관측 전용 — /stats).
+fn advice_name(v: u8) -> &'static str {
+    match v {
+        1 => "prefer_kv",
+        2 => "prefer_cache",
+        _ => "hold",
+    }
+}
+
 fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
@@ -314,7 +325,7 @@ pub fn json() -> String {
         })
         .unwrap_or_default();
     format!(
-        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"model_max_ctx\":{},\"plan\":\"{}\",\"effective_ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"host\":{},\"cpu\":0,\"host_blocks\":{},\"total_blocks\":{},\"free_vram_blocks\":{},\"free_host_blocks\":{}}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\",\"moe_cache\":{{\"k\":{},\"hits\":{},\"miss\":{},\"hit_rate\":{:.4}}}}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"kv_mem_bytes\":{},\"pool_cap_tokens\":{},\"kv_offload_ratio\":{:.4},\"kv_pool_bytes\":{},\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"prefix_reuse_ratio\":{:.4},\"prefix_reuse_full\":{},\"prefix_reuse_ckpt\":{},\"ttft_ms_avg\":{:.1},\"trie_boundaries\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{},\"spec_rounds\":{},\"spec_accepted\":{},\"spec_round_ms_avg\":{:.2},\"aging\":{{\"frozen\":{},\"d_ms\":{},\"freeze_ms\":{},\"events\":{},\"blocked_jobs\":{},\"blocked_tokens\":{},\"head_wait_p95_ms\":{}}}}},\"slot_detail\":[{}]}}",
+        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"model_max_ctx\":{},\"plan\":\"{}\",\"effective_ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"host\":{},\"cpu\":0,\"host_blocks\":{},\"total_blocks\":{},\"free_vram_blocks\":{},\"free_host_blocks\":{}}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\",\"moe_cache\":{{\"k\":{},\"hits\":{},\"miss\":{},\"hit_rate\":{:.4}}}}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"kv_mem_bytes\":{},\"pool_cap_tokens\":{},\"kv_offload_ratio\":{:.4},\"mem_advice\":\"{}\",\"kv_pool_bytes\":{},\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"prefix_reuse_ratio\":{:.4},\"prefix_reuse_full\":{},\"prefix_reuse_ckpt\":{},\"ttft_ms_avg\":{:.1},\"trie_boundaries\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{},\"spec_rounds\":{},\"spec_accepted\":{},\"spec_round_ms_avg\":{:.2},\"aging\":{{\"frozen\":{},\"d_ms\":{},\"freeze_ms\":{},\"events\":{},\"blocked_jobs\":{},\"blocked_tokens\":{},\"head_wait_p95_ms\":{}}}}},\"slot_detail\":[{}]}}",
         esc(&s.info.instance),
         esc(&s.info.model),
         s.info.ctx,
@@ -365,6 +376,7 @@ pub fn json() -> String {
         } else {
             0.0
         },
+        advice_name(mem.mem_advice),
         mem.kv_gpu,
         jobs,
         if jobs > 0 {

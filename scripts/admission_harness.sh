@@ -48,6 +48,12 @@ CAP=$(stats | jget 'd["serving"]["pool_cap_tokens"]')
   && note "pool cap = $CAP tokens · kv_mem_bytes = $(stats | jget 'd["serving"]["kv_mem_bytes"]')" \
   || { echo "[admit] FAIL: pool cap=$CAP"; fail=1; }
 D=$(stats | jget 'd["serving"]["aging"]["d_ms"]')
+# 첫 게시(≈1s) 전 레이스 — 폴링(최대 10s).
+for _ in $(seq 1 20); do
+  [ "$D" = "500" ] && break
+  sleep 0.5
+  D=$(stats | jget 'd["serving"]["aging"]["d_ms"]')
+done
 [ "$D" = "500" ] \
   && note "aging D 고정 500ms OK(적응 OFF)" \
   || { echo "[admit] FAIL: d_ms=$D (LLM170_AGING_D=0.5 기대)"; fail=1; }

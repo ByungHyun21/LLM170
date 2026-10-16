@@ -304,6 +304,9 @@ impl GemmaEngine {
     }
     /// 검증 공용 — t행 청크 + KV 확보(pos 전진은 청크가 수행).
     fn spec_run(&mut self, slot: usize, rows: &[f32], t: usize) -> Result<Vec<Vec<f32>>, String> {
+        // g4 체인 상한 = 8. 전방 행 상한의 단일 출처는
+        // `llm170_backend_gpu::SPEC_VERIFY_TMAX`(=9, qwen 계약) — g4는 그보다
+        // 한 행 낮은 자체 제약(계약 2..=8). TMAX 변경 시 이 값도 동시 확인.
         if !(2..=8).contains(&t) {
             return Err(format!("g4 spec: t={t} (2..=8 계약)"));
         }

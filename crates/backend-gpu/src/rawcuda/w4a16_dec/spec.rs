@@ -285,7 +285,12 @@ impl W4a16Dec {
             return Ok(());
         }
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
-        let k = (pos / 512 - 1) as usize % 4;
+        // [2026-10-16] FLOP-aware 퇴거 — 가치 = (누적 절약 토큰, 최근 사용 틱)
+        // 최소 슬롯을 덮는다(체크포인트당 바이트 동일 → 메모리 항은 상수).
+        // 히트 0이면 최근성만 남아 종전 환형(최근 4경계) 순서와 동일 선택.
+        let k = Self::ckpt_victim(&self.gdn.dchk_saved[slot], &self.gdn.dchk_use[slot]);
+        self.gdn.dchk_tick += 1;
+        let tick = self.gdn.dchk_tick;
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
         let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;
@@ -315,9 +320,22 @@ impl W4a16Dec {
             )?;
         }
         self.gdn.dchk_pos[slot][k] = pos;
+        self.gdn.dchk_use[slot][k] = tick;
         // [§3.4 ② 2026-10-12] 사용 갱신 — 512경계 기록 시점 recency 리셋.
         self.ucache.touch("spec:ckpt")?;
         Ok(())
+    }
+
+    /// [2026-10-16] 체크포인트 퇴거 슬롯(순수) — 가치 (절약 토큰, 최근 사용
+    /// 틱) 최소. 전량 0(최초)이면 슬롯 0(환형 시작과 동일).
+    pub(super) fn ckpt_victim(saved: &[u32; 4], use_tick: &[u64; 4]) -> usize {
+        let mut best = 0usize;
+        for s in 1..4 {
+            if (saved[s], use_tick[s]) < (saved[best], use_tick[best]) {
+                best = s;
+            }
+        }
+        best
     }
 
     /// [K3] upto 이하 최대 체크포인트 경계 선택(0 = 없음).
@@ -341,7 +359,11 @@ impl W4a16Dec {
             return Ok(0);
         }
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
-        let k = (pos / 512 - 1) as usize % 4;
+        // [2026-10-16] 저장 슬롯 = 위치 조회(퇴거가 가치 기반이라 환형 인덱스
+        // 공식이 성립하지 않는다 — 저장 시 dchk_pos가 정본).
+        let Some(k) = self.gdn.dchk_pos[slot].iter().position(|&p| p == pos) else {
+            return Ok(0);
+        };
         let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
         let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;
@@ -368,6 +390,12 @@ impl W4a16Dec {
         )?;
         self.slot_pos[slot] = pos;
         self.attn_set_pos(slot, pos)?;
+        // [2026-10-16] FLOP 회계 — 이 복원이 면제한 재계산 토큰(upto−pos) 가산 +
+        // 최근성 갱신(퇴거 가치 입력 — 가치 높은 체크포인트 보호).
+        self.gdn.dchk_saved[slot][k] =
+            self.gdn.dchk_saved[slot][k].saturating_add(upto.saturating_sub(pos));
+        self.gdn.dchk_tick += 1;
+        self.gdn.dchk_use[slot][k] = self.gdn.dchk_tick;
         // [§3.4 ②] 사용 갱신 — 접두 히트(재사용 성립) 시점.
         self.ucache.touch("spec:ckpt")?;
         Ok(pos)
