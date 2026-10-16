@@ -252,3 +252,34 @@ fn text_stream_multibyte_stop_no_panic() {
     assert_eq!(ts.push_text("。").as_deref(), Some("는"));
     assert!(ts.stopped && ts.trunc);
 }
+
+/// [W1 2026-10-16·사용자 확정] cap_output — 모델 초과 = vLLM식 출력 클램프,
+/// 풀 초과 = 거부(풀은 순서 문제 — 클램프 대상 아님), 경계 판정.
+#[test]
+fn cap_output_policies() {
+    let s = crate::sched::admit::RESERVE_SLACK;
+    let max = 262_144usize;
+    // 사용자 예: 모델 256k·입력 200k·출력 100k → 클램프 = 모델 최대−프롬프트−슬랙.
+    let c = cap_output(200_000, 100_000, max, 1 << 40, s);
+    assert_eq!(c.tg, max - 200_000 - s, "모델 초과분은 출력 클램프(vLLM식)");
+    assert_eq!(c.verdict, OutputVerdict::Ok);
+    // 모델 내 = 원값 보존.
+    let c = cap_output(3, 8, max, 1 << 40, s);
+    assert_eq!((c.tg, c.verdict), (8, OutputVerdict::Ok));
+    // 풀 경계: 예약 == 풀 = 허용, 1 초과 = 거부.
+    let pool = 3 + 8 + s;
+    let c = cap_output(3, 8, max, pool, s);
+    assert_eq!((c.tg, c.verdict), (8, OutputVerdict::Ok));
+    let c = cap_output(3, 9, max, pool, s);
+    assert_eq!((c.tg, c.verdict), (9, OutputVerdict::PoolExceeded));
+    // 모델 클램프 후에도 풀 초과 = 거부(클램프 tg 보존 — 로그·메시지 일관).
+    let c = cap_output(200_000, 100_000, max, 150_000, s);
+    assert_eq!(c.tg, max - 200_000 - s);
+    assert_eq!(c.verdict, OutputVerdict::PoolExceeded);
+    // 프롬프트가 모델 한계(슬랙 포함) = 거부.
+    let c = cap_output(max - s, 1, max, 1 << 40, s);
+    assert_eq!(c.verdict, OutputVerdict::PromptTooLong);
+    // 풀 < 모델 한계: 클램프 불발(원값)이어도 풀이 원인이면 거부.
+    let c = cap_output(1_000, 5_000, max, 2_000, s);
+    assert_eq!((c.tg, c.verdict), (5_000, OutputVerdict::PoolExceeded));
+}

@@ -99,8 +99,28 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
 /// [2.J 2026-10-13] serve 런치 정책 — CLI가 env(진단)보다 우선한다.
 /// spec: 0=auto(경제성 게이트) · 1=mtp · 2=ngram · 3=off(평범).
 /// moe:  0=auto(여유 VRAM으로 상주/스트리밍) · 1=resident 강제 · 2=streaming 강제.
+/// ple:  0=ssd(기본 본진) · 1=ram 승격 · 2=vram 승격 — 계층 규칙은 PLE 보유
+///       모델(FN) 브링업 때 배선; 현행(27B/35B/gemma4)은 로그 전용.
 pub static SPEC_POLICY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_POLICY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PLE_POLICY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn ple_name() -> &'static str {
+    match PLE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => "ram",
+        2 => "vram",
+        _ => "ssd",
+    }
+}
+
+pub fn parse_ple_policy(v: &str) -> Option<u8> {
+    match v {
+        "ssd" => Some(0),
+        "ram" => Some(1),
+        "vram" => Some(2),
+        _ => None,
+    }
+}
 
 pub fn parse_spec_policy(v: &str) -> Option<u8> {
     match v {
@@ -141,8 +161,13 @@ pub fn parse_moe_policy(v: &str) -> Option<u8> {
 #[derive(Clone)]
 pub struct InferRequest {
     pub model: PathBuf,
+    /// 실효 요청 상한(토큰) = min(모델 전역 ctx, 풀 총량 — kv-mem 유래).
+    /// [W1 2026-10-16] `--ctx` 폐지 이후의 유일한 상한 소스. 엔진 cap·
+    /// `SERVER_CTX`(OAI 입장 전 거부 판정)·`/stats`가 모두 이 값을 쓴다.
     pub ctx: usize,
-    /// [K6-3 예산] KV 아레나 예산(바이트, 서버 파생 — None = 종전 총량).
+    /// 모델 전역 상한(config 파생) — 적재 후 실블록 상한과 재비교(관측·로그).
+    pub model_max_ctx: usize,
+    /// [K6-3 예산] KV 아레나 예산(바이트 — `--kv-mem` 그대로. None = 프로브/null).
     pub kv_budget: Option<u64>,
     /// [2.M 사다리] KV 풀 실할당 추정 = min(예산, ctx×문맥수×KV/토큰).
     /// 전문가 상주(auto) 판정에서 KV 몫을 먼저 떼는 데 쓴다(0/None = 종전 규칙).
@@ -177,6 +202,12 @@ impl Engine {
     /// [§2.M ①] 스트리밍 전문가 LRU 캐시 계측 — (hits, miss, k).
     pub fn mcache_stats(&self) -> (u64, u64, usize) {
         self.0.mcache_stats()
+    }
+
+    /// [W1 2026-10-16] 실블록 유래 단일 요청 상한(토큰) — kv-mem 풀의
+    /// floor(블록/층) 몫 반영. 적재 후 실효 cap 확정(http::serve)에 쓴다.
+    pub fn kv_cap_tokens(&self) -> usize {
+        self.0.kv_cap_tokens()
     }
 
     /// 복사 계측 — [h2d, d2h, d2d] × (바이트, ns, 호출).

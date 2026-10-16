@@ -3,7 +3,10 @@
 //! OAI/Anthropic 방출 러너가 산다. 전송(resp/sse/read_request/serve)은
 //! http.rs — 이 층은 바이트 해석과 프로토콜 스키만 담는다.
 use crate::engine::SlotJob;
-use crate::http::{ENGINE_DEAD, READY, SERVER_CTX, TokOut, read_request, resp, resp_sse_open, sse};
+use crate::http::{
+    ENGINE_DEAD, READY, SERVER_CTX, SERVER_MODEL_MAX, TokOut, read_request, resp, resp_sse_open,
+    sse,
+};
 use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 
@@ -16,6 +19,52 @@ mod tests;
 pub(crate) use self::json::chat_spec;
 use self::json::*;
 use self::stream::*;
+
+/// 요청 출력 상한 판정 결과 — `tg`는 항상 모델 클램프를 반영(거부 시에도
+/// 보존 — 로그·메시지 일관).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OutputCap {
+    pub tg: usize,
+    pub verdict: OutputVerdict,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OutputVerdict {
+    Ok,
+    /// 프롬프트+슬랙 ≥ 모델 최대 — 잘라도 생성 불가.
+    PromptTooLong,
+    /// 클램프 후에도 예약이 풀 총량 초과 — 거부(풀은 순서·대기 문제 —
+    /// 요청 크기 제한으로 풀 압박을 풀지 않는다).
+    PoolExceeded,
+}
+
+/// [W1 2026-10-16·사용자 확정] 생성한도 상한 — **모델 초과분은 vLLM식 출력
+/// 클램프**, 풀(예약) 초과는 거부:
+/// ① 프롬프트+슬랙 ≥ 모델 최대 → 거부(모델 물리 한계),
+/// ② 프롬프트+출력+슬랙 > 모델 최대 → 출력 클램프(tg = 모델 최대−프롬프트−슬랙;
+///    사용자가 모델 수용량을 오해한 요청도 서비스 지속),
+/// ③ 클램프 후 프롬프트+출력+슬랙 > 풀 총량 → 거부.
+pub(crate) fn cap_output(
+    prompt: usize,
+    n_predict: usize,
+    model_max: usize,
+    pool_cap: usize,
+    slack: usize,
+) -> OutputCap {
+    if prompt + slack >= model_max {
+        return OutputCap {
+            tg: n_predict,
+            verdict: OutputVerdict::PromptTooLong,
+        };
+    }
+    let tg = n_predict.min(model_max - prompt - slack).max(1);
+    let verdict = if prompt + tg + slack > pool_cap {
+        OutputVerdict::PoolExceeded
+    } else {
+        OutputVerdict::Ok
+    };
+    OutputCap { tg, verdict }
+}
 
 /// 유닉스 초.
 fn now_secs() -> u64 {
@@ -290,6 +339,7 @@ fn enqueue_job(
         progress: Some(ptx),
         out: otx,
         queued: std::time::Instant::now(),
+        aging_blocked: false,
     };
     // [D 2026-10-10] 어드미션 하드게이트 — 큐 포화는 429(재시도 가능)로 구분.
     // 종전엔 사망/포화가 같은 503 "queue full"이라 클라이언트가 재시도 여부를
@@ -472,32 +522,50 @@ fn run_and_emit(
         );
         return;
     }
-    // [K6 입장 규약 2026-10-13] 프롬프트 초과 = 입장 전 거부(context_length_exceeded);
-    // 프롬프트는 들어가나 생성한도가 넘으면 **클램프**(경고) — 사용 중 실패 금지.
-    let ctx = *SERVER_CTX.get().unwrap_or(&4096);
-    let mut n_predict = n_predict;
-    if ids.len() + 8 >= ctx {
-        resp(
-            stream,
-            400,
-            "application/json",
-            &format!(
-                "{{\"error\":\"context_length_exceeded: prompt {} + 8 >= ctx {}\"}}",
-                ids.len(),
-                ctx
-            ),
-        );
-        return;
-    }
-    if ids.len() + n_predict + 8 >= ctx {
-        let lim = ctx.saturating_sub(ids.len() + 8).max(1);
+    // [K6 입장 규약 2026-10-13] 프롬프트 초과 = 입장 전 거부(context_length_exceeded).
+    // [W1 2026-10-16·사용자 확정] 모델 ctx 초과분 = vLLM식 **출력 클램프**
+    // (max_tokens = 모델 최대 − 프롬프트 − 슬랙) — 용량 오해 요청도 처리.
+    // 풀(예약) 초과만 거부 — 풀은 입장 순서로 조정한다(요청 크기 제한 아님).
+    let pool_cap = *SERVER_CTX.get().unwrap_or(&4096);
+    let model_max = *SERVER_MODEL_MAX.get().unwrap_or(&usize::MAX);
+    let slack = crate::sched::admit::RESERVE_SLACK;
+    let cap = cap_output(ids.len(), n_predict, model_max, pool_cap, slack);
+    if cap.tg < n_predict {
         eprintln!(
-            "# max_tokens 클램프: {} → {lim} (prompt {} + 여유 8 vs ctx {ctx})",
+            "# max_tokens 클램프: {} → {} (prompt {} + slack {slack} vs 모델 최대 {model_max})",
             n_predict,
+            cap.tg,
             ids.len()
         );
-        n_predict = lim;
     }
+    let n_predict = match cap.verdict {
+        OutputVerdict::Ok => cap.tg,
+        OutputVerdict::PromptTooLong => {
+            resp(
+                stream,
+                400,
+                "application/json",
+                &format!(
+                    "{{\"error\":\"context_length_exceeded: prompt {} + slack {slack} >= model max {model_max}\"}}",
+                    ids.len()
+                ),
+            );
+            return;
+        }
+        OutputVerdict::PoolExceeded => {
+            resp(
+                stream,
+                400,
+                "application/json",
+                &format!(
+                    "{{\"error\":\"request exceeds the KV pool: prompt {} + max_tokens {} + slack {slack} > pool cap {pool_cap} (kv-mem)\"}}",
+                    ids.len(),
+                    cap.tg
+                ),
+            );
+            return;
+        }
+    };
     let prompt_len = ids.len();
     let constraint_was_active = constraint.is_some();
     // [P0-D5b 2026-10-16] 제약 완결 토큰 = stops.first — completions처럼 stops가
@@ -757,32 +825,49 @@ fn run_and_emit_anthropic(
         );
         return;
     }
-    // [K6 입장 규약 2026-10-13] 프롬프트 초과 = 거부(context_length_exceeded);
-    // 생성한도 초과(프롬프트는 들어감) = 클램프(경고) — run_and_emit과 동일.
-    let ctx = *SERVER_CTX.get().unwrap_or(&4096);
-    let mut n_predict = n_predict;
-    if ids.len() + 8 >= ctx {
-        resp(
-            stream,
-            400,
-            "application/json",
-            &format!(
-                "{{\"type\":\"error\",\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"context_length_exceeded: prompt {} + 8 >= ctx {}\"}}}}",
-                ids.len(),
-                ctx
-            ),
-        );
-        return;
-    }
-    if ids.len() + n_predict + 8 >= ctx {
-        let lim = ctx.saturating_sub(ids.len() + 8).max(1);
+    // [K6 입장 규약 2026-10-13] 프롬프트 초과 = 거부(context_length_exceeded).
+    // [W1 2026-10-16·사용자 확정] 모델 초과 = vLLM식 출력 클램프 · 풀 초과 = 거부
+    // (run_and_emit과 동일 — cap_output 단일 출처).
+    let pool_cap = *SERVER_CTX.get().unwrap_or(&4096);
+    let model_max = *SERVER_MODEL_MAX.get().unwrap_or(&usize::MAX);
+    let slack = crate::sched::admit::RESERVE_SLACK;
+    let cap = cap_output(ids.len(), n_predict, model_max, pool_cap, slack);
+    if cap.tg < n_predict {
         eprintln!(
-            "# max_tokens 클램프(anthropic): {} → {lim} (prompt {} + 여유 8 vs ctx {ctx})",
+            "# max_tokens 클램프(anthropic): {} → {} (prompt {} + slack {slack} vs 모델 최대 {model_max})",
             n_predict,
+            cap.tg,
             ids.len()
         );
-        n_predict = lim;
     }
+    let n_predict = match cap.verdict {
+        OutputVerdict::Ok => cap.tg,
+        OutputVerdict::PromptTooLong => {
+            resp(
+                stream,
+                400,
+                "application/json",
+                &format!(
+                    "{{\"type\":\"error\",\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"context_length_exceeded: prompt {} + slack {slack} >= model max {model_max}\"}}}}",
+                    ids.len()
+                ),
+            );
+            return;
+        }
+        OutputVerdict::PoolExceeded => {
+            resp(
+                stream,
+                400,
+                "application/json",
+                &format!(
+                    "{{\"type\":\"error\",\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"request exceeds the KV pool: prompt {} + max_tokens {} + slack {slack} > pool cap {pool_cap} (kv-mem)\"}}}}",
+                    ids.len(),
+                    cap.tg
+                ),
+            );
+            return;
+        }
+    };
     let prompt_len = ids.len();
     let Ok((orx, prx)) = enqueue_job(
         stream,

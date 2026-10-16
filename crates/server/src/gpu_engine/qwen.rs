@@ -404,6 +404,16 @@ impl QwenEngine {
         self.dec.kv_blocks_needed(n_tokens)
     }
 
+    /// [W1 2026-10-16] 실블록 유래 단일 요청 상한(토큰).
+    pub fn kv_cap_tokens(&self) -> usize {
+        self.dec.kv_cap_tokens()
+    }
+
+    /// [W2 2026-10-16] 슬롯 점유 블록(aging 예측 입력).
+    pub fn kv_used_blocks(&self, slot: usize) -> usize {
+        self.dec.kv_used_blocks(slot)
+    }
+
     /// 정지 토큰 — Q35 아키텍처 상수.
     pub fn eos(&self) -> u32 {
         llm170_core::qwen35::EOS_EOT

@@ -6,12 +6,14 @@
 use crate::engine::{Engine, InferResult};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub(crate) mod admit;
 mod assign;
 mod decode;
 mod econ;
 mod prefill;
 mod publish;
 mod spec;
+use self::admit::Aging;
 use self::assign::*;
 use self::decode::*;
 use self::prefill::*;
@@ -58,6 +60,8 @@ pub struct SlotJob {
     pub out: std::sync::mpsc::Sender<InferResult>,
     /// 108 P5: 큐 진입 시각 — 배정까지 대기(큐 적체·슬롯 부족 계측).
     pub queued: std::time::Instant,
+    /// [W2 2026-10-16] aging 동결로 백필이 차단됨(작업당 1회 계측 플래그).
+    pub aging_blocked: bool,
 }
 struct Slot {
     job: Option<SlotJob>,
@@ -215,6 +219,14 @@ pub static SCHED: Sched = Sched {
     econ_gen: AtomicU64::new(0),
     econ_probe_gen: AtomicU64::new(0),
     econ_rounds: AtomicU64::new(0),
+    // [W2 2026-10-16] aging 관측(게시 1Hz).
+    aging_frozen: AtomicU64::new(0),
+    aging_d_ms: AtomicU64::new(0),
+    aging_freeze_ms: AtomicU64::new(0),
+    aging_events: AtomicU64::new(0),
+    aging_blocked_jobs: AtomicU64::new(0),
+    aging_blocked_tokens: AtomicU64::new(0),
+    aging_head_wait_p95_ms: AtomicU64::new(0),
 };
 pub struct Sched {
     pub jobs: AtomicU64,
@@ -275,6 +287,18 @@ pub struct Sched {
     pub econ_probe_gen: AtomicU64,
     /// 스펙 라운드 시계(탐사 주기 — 32라운드마다 밴드 순환 1회).
     pub econ_rounds: AtomicU64,
+    // ── [W2 2026-10-16] aging(EASY 동결) 관측 — slot_loop 게시 ──
+    /// 동결 게이지(0/1)·현 임계 D(ms).
+    pub aging_frozen: AtomicU64,
+    pub aging_d_ms: AtomicU64,
+    /// 누적 동결 시간(ms)·동결 진입 횟수.
+    pub aging_freeze_ms: AtomicU64,
+    pub aging_events: AtomicU64,
+    /// 동결로 차단된 백필(작업수·토큰).
+    pub aging_blocked_jobs: AtomicU64,
+    pub aging_blocked_tokens: AtomicU64,
+    /// 선두 입장 대기 P95(ms).
+    pub aging_head_wait_p95_ms: AtomicU64,
 }
 impl Sched {
     pub fn summary(&self) -> String {
@@ -319,6 +343,14 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     let eos = eng.eos();
     // [K6-3 2026-10-13] 입장 보류열 — 예약이 풀 여유에 안 맞는 요청(FCFS 대기).
     let mut pending: Vec<SlotJob> = Vec::new();
+    // [W2 2026-10-16] aging — EASY 백필식 동결 + D 적응(부트스트랩 30s).
+    // LLM170_AGING_D(초) = 고정 D·적응 OFF(운영 노브·A/B).
+    let d_fix = llm170_diag::flag::val("LLM170_AGING_D")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|d| *d > 0.0);
+    let mut aging = Aging::new(30.0, d_fix);
+    let mut tps = 0f64; // 슬롯당 토큰/s EMA(디코드 틱 실측 — aging 예측 입력)
+    let mut last_tick = std::time::Instant::now();
     // 모니터링 — 복사 계측 기준(가중치 적재분을 load로 분리, 이후는 runtime).
     let copy_base = eng.copy_stats();
     // 기동 워밍업 — 첫 요청이 지연 초기화(raw_init, ctx 비례 수십 초)를
@@ -366,8 +398,50 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         // break했다 — 꺼낸 작업이 그대로 버려져(송신측 drop → 수신측 즉시 Err)
         // 동시 요청이 빈 응랍으로 소실됐다(4동시 중 여럿 drop 실측). 점유 검사를
         // try_recv **앞으로** 옮겨 작업을 큐에 남긴다 — 의도된 원래 계약.
+        // [W2 2026-10-16] aging 판정 — 선두(최장 대기)의 예상 입장 지연 > D면
+        // 신규 입장 동결(선두 1건만 허용 — slot_intake가 집행). 유휴 슬롯의
+        // 접두 캐시 블록은 즉시 회수 가능분으로 계상(admission과 동일 가정).
+        let now = std::time::Instant::now();
+        let dt_ms = now.duration_since(last_tick).as_millis().min(60_000) as u64;
+        last_tick = now;
+        let freeze = match pending.first() {
+            Some(j) => {
+                let mut free_eff = eng.0.kv_free_blocks();
+                let mut running: Vec<(usize, usize)> = Vec::new();
+                for (i, s) in slots.iter().enumerate() {
+                    let held = eng.0.kv_used_blocks(i);
+                    match &s.job {
+                        Some(j) => {
+                            let rem = j.tokens.len().saturating_sub(s.prefilled)
+                                + j.n_predict.max(1).saturating_sub(s.generated as usize);
+                            running.push((rem, held));
+                        }
+                        None => free_eff += held,
+                    }
+                }
+                let hb = eng.0.kv_blocks_needed(j_need_tokens(j));
+                aging.decide(dt_ms, hb, free_eff, &running, tps)
+            }
+            None => {
+                aging.idle();
+                false
+            }
+        };
+        if let Some(msg) = aging.maybe_adapt(now) {
+            eprintln!("# aging: {msg}");
+        }
         // [R7] ① 유입 — 큐 drain → 슬롯 배정(헬퍼 분리 · 동작 불변).
-        slot_intake(&mut slots, &mut eng, &rx, tick, &mut ptrie, &mut pending);
+        slot_intake(
+            &mut slots,
+            &mut eng,
+            &rx,
+            tick,
+            &mut ptrie,
+            &mut pending,
+            freeze,
+            &mut aging,
+            tps,
+        );
         // [§3.4 ③] 트리 동기화 — free 슬롯의 cached를 트리에 등록/해제.
         // 512 경계만 기록되므로 매 틱 재등록은 중복 없음(insert가 슬롯 중복 체크).
         for (i, s) in slots.iter().enumerate() {
@@ -380,7 +454,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             }
         }
         // [R7] 게시 스로틀(≤1Hz — 헬퍼 분리 · 동작 불변).
-        maybe_publish(&slots, &eng, copy_base, &mut last_pub);
+        maybe_publish(&slots, &eng, copy_base, &mut last_pub, &aging);
         tick += 1;
         let _it0 = std::time::Instant::now();
 
@@ -413,6 +487,12 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         }
 
         if decoded {
+            // [W2] 슬롯당 토큰/s EMA — aging 예측 입력(디코드 틱 실측: 배치에
+            // 참여한 슬롯은 이 틱에 1토큰씩 전진한다).
+            if dec_ms > 0.0 {
+                let r = 1000.0 / dec_ms;
+                tps = if tps <= 0.0 { r } else { 0.9 * tps + 0.1 * r };
+            }
             n_dec += 1;
             ms_dec += dec_ms;
             SCHED.ticks_decode.fetch_add(1, Ordering::Relaxed);
@@ -441,6 +521,15 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         if !busy {
             publish_slot_views(&slots);
             publish_stats(&eng, copy_base);
+            publish_aging(&aging);
+            // [W2 2026-10-16] 보류열이 남아 있으면 recv()로 영구 블록하지 않는다
+            // — 보류 작업의 재시도(회수→입장)는 다음 틱의 slot_intake가 수행한다.
+            // (하네스 포착: 소형 풀에서 대형 2건 중 1건이 전 슬롯 유휴+보류 잔존
+            // 상태에서 영구 대기 — 종전엔 신규 요청이 와야만 틱이 다시 돌았다.)
+            if !pending.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
         }
         if !busy {
             match rx.recv() {
@@ -488,6 +577,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
 /// break했다 — 꺼낸 작업이 그대로 버려져(송신측 drop → 수신측 즉시 Err)
 /// 동시 요청이 빈 응답으로 소실됐다(4동시 중 여럿 drop 실측). 점유 검사를
 /// try_recv **앞으로** 옮겨 작업을 큐에 남긴다 — 의도된 원래 계약.
+#[allow(clippy::too_many_arguments)]
 fn slot_intake(
     slots: &mut [Slot],
     eng: &mut Engine,
@@ -495,16 +585,37 @@ fn slot_intake(
     tick: u64,
     ptrie: &mut crate::tree::PrefixTrie,
     pending: &mut Vec<SlotJob>,
+    freeze: bool,
+    aging: &mut Aging,
+    tps: f64,
 ) {
     // [K6-3 2026-10-13] 입장 보장 — 예약(프롬프트+생성한도+슬랙)이 풀 여유에
     // 맞아야 배정. **보류분 우선 재시도(도착 순서 = 기본 FCFS)** 후 신규 수신.
+    // [W2 2026-10-16] bin-pack(스킵어헤드) = 설계 계약(§8-4): 뒤의 소형이
+    // '지금 들어갈 수 있으면' 입장. freeze = EASY 동결 — 선두(0)만 허용.
     let mut i = 0;
     while i < pending.len() {
         if !slots.iter().any(|s| s.job.is_none()) {
             break;
         }
+        if freeze && i > 0 {
+            // [W2] 백필 차단 — 작업당 1회 계측(동결이 스루풋에 준 비용).
+            if !pending[i].aging_blocked {
+                pending[i].aging_blocked = true;
+                aging.note_blocked(j_need_tokens(&pending[i]));
+            }
+            i += 1;
+            continue;
+        }
         if admit_ok(eng, &pending[i]) {
+            let head = i == 0;
             let j = pending.remove(i);
+            if head {
+                aging.note_head_wait(j.queued.elapsed().as_secs_f64());
+            }
+            if tps > 0.0 {
+                aging.observe_est(j_need_tokens(&j) as f64 / tps);
+            }
             assign_slot(slots, eng, j, tick, ptrie);
         } else {
             // [K6-3] 용량 자체 초과(무슨 수로도 불가) = 조기 거부(무한 대기 방지).
@@ -532,12 +643,21 @@ fn slot_intake(
         if !slots.iter().any(|s| s.job.is_none()) {
             break;
         }
-        let Ok(j) = rx.try_recv() else {
+        let Ok(mut j) = rx.try_recv() else {
             break;
         };
         SCHED.queue_depth.fetch_sub(1, Ordering::Relaxed);
-        if admit_ok(eng, &j) {
+        // [W2] 동결 중엔 신규 입장도 차단(선두 보호 — 보류열 뒤로).
+        if freeze {
+            // 계측 1회(이후 pending 스캔의 중복 계상 금지).
+            j.aging_blocked = true;
+            aging.note_blocked(j_need_tokens(&j));
+            pending.push(j);
+        } else if admit_ok(eng, &j) {
             // 107 W7: 배정 단일 구현으로 위임(접두 캐시 로직 동일).
+            if tps > 0.0 {
+                aging.observe_est(j_need_tokens(&j) as f64 / tps);
+            }
             assign_slot(slots, eng, j, tick, ptrie);
         } else if j_need_tokens(&j) > 0
             && eng.0.kv_blocks_needed(j_need_tokens(&j)) > eng.0.kv_total_blocks()
@@ -561,9 +681,10 @@ fn slot_intake(
     }
 }
 
-/// [K6-3] 요청 예약 토큰 = 프롬프트 + 생성한도 + 슬랙 2.
+/// [K6-3] 요청 예약 토큰 = 프롬프트 + 생성한도 + 슬랙. [W2 2026-10-16] 슬랙 = 8
+/// (스펙 검증 전방 tmax−1행 — 종전 2는 블록 경계+포화 시 생성 중 실패 창).
 fn j_need_tokens(j: &SlotJob) -> usize {
-    j.tokens.len() + j.n_predict.max(1) + 2
+    admit::need_tokens(j.tokens.len(), j.n_predict)
 }
 
 /// [K6-3] 유휴 슬롯(job 없음)의 KV 블록 1개 슬롯 회수 — LRU(가장 오래된

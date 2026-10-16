@@ -27,9 +27,13 @@ pub static READY: AtomicBool = AtomicBool::new(false);
 /// QA-11: slot_loop 스레드 사망(패닉) — 신규 요청을 "queue full" 오보 503 대신
 /// 명시적 사유로 거부하고 진행 중 요청의 채널 단절을 감지 가능하게.
 pub static ENGINE_DEAD: AtomicBool = AtomicBool::new(false);
-/// 서버 ctx 상한 — serve --ctx 값을 핸들러에 전달(107 W2: 종전
-/// LLM170_CTX env 기본 4096이 --ctx 8192 엔진과 불일치해 조용히 거절).
+/// 서버 ctx 상한 — serve 실효 상한(풀 유래, min(모델, kv-mem))을 핸들러에
+/// 전달(107 W2: 종전 LLM170_CTX env 기본 4096이 --ctx 8192 엔진과 불일치해
+/// 조용히 거절).
 pub static SERVER_CTX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// [W1 2026-10-16] 모델 전역 ctx 상한(config) — OAI 판정에서 모델 몫(출력
+/// 클램프 대상)과 풀 몫(SERVER_CTX — 초과 = 거부)을 분리한다.
+pub static SERVER_MODEL_MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 pub fn serve(
     addr: &str,
@@ -37,7 +41,6 @@ pub fn serve(
     slots: usize,
     queue_flag: Option<usize>,
 ) -> Result<(), String> {
-    let _ = SERVER_CTX.set(req.ctx);
     // [K6-3 --slots 폐지 2026-10-13] 문맥 수는 호출자(main)의 내부 상수 —
     // 구 "플래그 > env > 기본 1" 계통은 제거됐다(env 기본 1이 조용히 직렬
     // 서버를 만들던 함정도 함께 소멸). 동시성 = min(문맥, 풀 입장).
@@ -51,6 +54,20 @@ pub fn serve(
     };
     let (tx, rx) = std::sync::mpsc::sync_channel::<SlotJob>(qcap);
     let eng = crate::engine::build_slots(req.clone(), slots);
+    // [W1 2026-10-16] 실효 요청 상한 확정 — 적재 후 실블록 기준(풀 floor 몫
+    // 반영). OAI 입장 전 거부(SERVER_CTX)가 이 값을 본다(무클램프·무 auto).
+    let pool_cap = eng.kv_cap_tokens();
+    let cap = if pool_cap >= 512 {
+        req.ctx.min(pool_cap)
+    } else {
+        req.ctx
+    };
+    let _ = SERVER_CTX.set(cap);
+    let _ = SERVER_MODEL_MAX.set(req.model_max_ctx);
+    eprintln!(
+        "# effective cap: {cap} tokens = min(model max {}, kv-mem 풀 실블록 {pool_cap})",
+        req.model_max_ctx
+    );
     // B20: 적재 완료 — 전역 적재 락 해제(다음 기동의 재판정이 이 상주분을 본다).
     crate::resource::release_load_lock();
     // QA-11: 엔진 스레드 패닉 포착 — 종전엔 스레드가 죽어도 큐가 살아

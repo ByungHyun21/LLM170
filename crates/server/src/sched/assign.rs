@@ -89,11 +89,13 @@ pub(super) fn assign_slot(
     if reuse == 0 {
         eng.reset_seq(i);
     }
-    // [K6-3 2026-10-13] KV 확보 — 예약(프롬프트+생성한도+슬랙 2)까지 온디맨드
+    // [K6-3 2026-10-13] KV 확보 — 예약(프롬프트+생성한도+슬랙)까지 온디맨드
     // 배정. 입장 판정이 선행하나 재사용 슬롯의 기존 배정과 합산해 부족할 수
     // 있다(보수 판정) — 실패는 요청 오류로 정직하게(사용 중 실패 금지 정합:
     // 입장 후에는 배정 성공이 보장된다).
-    let need_tokens = j.tokens.len() + j.n_predict.max(1) + 2;
+    // [W2 2026-10-16] 슬랙 = admit::RESERVE_SLACK(8 = 스펙 전방 tmax−1행) —
+    // 입장 판정과 동일 함수(단일 출처, 종전 슬랙 2는 블록 경계에서 부족).
+    let need_tokens = super::admit::need_tokens(j.tokens.len(), j.n_predict);
     if let Err(e) = eng.0.kv_grow(i, need_tokens) {
         SCHED.requests_failed.fetch_add(1, Ordering::Relaxed);
         let _ = j.out.send(InferResult {

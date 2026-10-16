@@ -538,6 +538,27 @@ impl W4a16Dec {
         }
     }
 
+    /// [W1 2026-10-16] 실블록 유래 단일 요청 상한(토큰) — `kv_blocks_needed(n)
+    /// ≤ total`의 최대 n(= ⌊total/n_attn⌋×512 − 2; +2는 grow 정렬 여유).
+    /// 풀 floor(블록 잔여)를 반영해 상한 표기·OAI 입장 전 거부를 실블록과 일치.
+    pub fn kv_cap_tokens(&self) -> usize {
+        match self.attn.attn {
+            Some(dm) if dm.n_attn > 0 => {
+                ((self.kv_total_blocks() / dm.n_attn) * 512).saturating_sub(2)
+            }
+            _ => 0,
+        }
+    }
+
+    /// [W2 2026-10-16] 슬롯 현재 점유 블록 — aging 예측 입력(완료 시 해제량).
+    pub fn kv_used_blocks(&self, slot: usize) -> usize {
+        self.attn
+            .kv_pool
+            .as_ref()
+            .map(|p| p.used_blocks(slot))
+            .unwrap_or(0)
+    }
+
     /// 플레인 bf16 [n][k] 상주 업로드 — [n][k] 원본(w4a16_gemv_bf16 계약).
     pub fn upload_plain(
         &mut self,

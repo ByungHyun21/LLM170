@@ -44,6 +44,10 @@ pub struct Info {
     pub n_slots: usize,
     /// 모델 파일 총합(디스크 — 분류의 기준점).
     pub model_bytes: u64,
+    /// [W1 2026-10-16] 운영자 `--kv-mem`(KV 총량 — 무 auto).
+    pub kv_mem: u64,
+    /// [W1] 실효 요청 상한(토큰) = min(모델 최대, 풀) — kv-mem 유래.
+    pub pool_cap_tokens: usize,
 }
 
 /// 메모리 분류 뷰 — slot_loop가 저빈도 게시(모델이 시스템을 쓰는 방식).
@@ -302,7 +306,7 @@ pub fn json() -> String {
         })
         .unwrap_or_default();
     format!(
-        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"model_max_ctx\":{},\"plan\":\"{}\",\"effective_ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"cpu\":0}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\",\"moe_cache\":{{\"k\":{},\"hits\":{},\"miss\":{},\"hit_rate\":{:.4}}}}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"kv_pool_bytes\":{},\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"prefix_reuse_ratio\":{:.4},\"prefix_reuse_full\":{},\"prefix_reuse_ckpt\":{},\"ttft_ms_avg\":{:.1},\"trie_boundaries\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{},\"spec_rounds\":{},\"spec_accepted\":{},\"spec_round_ms_avg\":{:.2}}},\"slot_detail\":[{}]}}",
+        "{{\"instance\":\"{}\",\"model\":\"{}\",\"ctx\":{},\"model_max_ctx\":{},\"plan\":\"{}\",\"effective_ctx\":{},\"n_slots\":{},\"uptime_s\":{:.1},\"memory\":{{\"model_bytes\":{},\"gpu_total\":{gpu_total},\"gpu_used\":{gpu_used},\"weights\":{{\"gpu\":{},\"cpu\":{}}},\"kv_cache\":{{\"gpu\":{},\"cpu\":0}},\"workspace\":{{\"gpu\":{workspace},\"cpu\":0}},\"ple\":{{\"gpu\":0,\"cpu\":{}}},\"active_per_token\":{},\"host_rss\":{},\"moe_mode\":\"{}\",\"moe_cache\":{{\"k\":{},\"hits\":{},\"miss\":{},\"hit_rate\":{:.4}}}}},\"gpus\":[{}],\"io\":{{\"h2d_bytes\":{},\"h2d_ms\":{},\"h2d_calls\":{},\"d2h_bytes\":{},\"d2h_ms\":{},\"d2h_calls\":{},\"d2d_bytes\":{},\"d2d_ms\":{},\"d2d_calls\":{},\"load_h2d_bytes\":{},\"load_h2d_ms\":{},\"load_d2h_bytes\":{},\"load_d2d_bytes\":{}}},\"serving\":{{\"kv_mem_bytes\":{},\"pool_cap_tokens\":{},\"kv_pool_bytes\":{},\"jobs\":{},\"queue_wait_ms_avg\":{:.1},\"prefix_reuse_tokens\":{},\"prefix_reuse_ratio\":{:.4},\"prefix_reuse_full\":{},\"prefix_reuse_ckpt\":{},\"ttft_ms_avg\":{:.1},\"trie_boundaries\":{},\"decode_steps\":{},\"decode_ms_avg\":{:.2},\"prefill_chunks\":{},\"prefill_ms_avg\":{:.2},\"slots_active\":{},\"prompt_tokens\":{},\"generation_tokens\":{},\"requests\":{},\"requests_failed\":{},\"spec_rounds\":{},\"spec_accepted\":{},\"spec_round_ms_avg\":{:.2},\"aging\":{{\"frozen\":{},\"d_ms\":{},\"freeze_ms\":{},\"events\":{},\"blocked_jobs\":{},\"blocked_tokens\":{},\"head_wait_p95_ms\":{}}}}},\"slot_detail\":[{}]}}",
         esc(&s.info.instance),
         esc(&s.info.model),
         s.info.ctx,
@@ -341,6 +345,8 @@ pub fn json() -> String {
         io.load[0].1 / 1_000_000,
         io.load[1].0,
         io.load[2].0,
+        s.info.kv_mem,
+        s.info.pool_cap_tokens,
         mem.kv_gpu,
         jobs,
         if jobs > 0 {
@@ -388,6 +394,13 @@ pub fn json() -> String {
                 0.0
             }
         },
+        sc.aging_frozen.load(Ordering::Relaxed),
+        sc.aging_d_ms.load(Ordering::Relaxed),
+        sc.aging_freeze_ms.load(Ordering::Relaxed),
+        sc.aging_events.load(Ordering::Relaxed),
+        sc.aging_blocked_jobs.load(Ordering::Relaxed),
+        sc.aging_blocked_tokens.load(Ordering::Relaxed),
+        sc.aging_head_wait_p95_ms.load(Ordering::Relaxed),
         slot_detail.join(",")
     )
 }

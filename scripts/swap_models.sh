@@ -70,10 +70,37 @@ esac
 # 골든 접두를 판정한다(모델 로드 1회 절감) — 별도 8토큰 런 제거.
 note "[2/10] B(27B) GPU 체인 — [3b] 600토큰 런에 흡수(골든 접두 동일 계약)"
 
+# ── 3a. serve kv-mem 가드 (W1 — 필수·최소·상한·--ctx 폐지) ──
+note "[3a/10] serve --kv-mem 가드 — 무 auto·최소 블록·상한 거부·--ctx 폐지"
+if "$BIN" serve --model "$M_27B" --port 18098 > "$RUN/sv0.log" 2>&1; then
+  echo "[w4a16] FAIL: --kv-mem 누락이 통과됨"; fail=1
+elif grep -q -- "--kv-mem" "$RUN/sv0.log"; then note "kv-mem 필수 거부 OK: $(head -1 "$RUN/sv0.log")"
+else
+  echo "[w4a16] FAIL: kv-mem 누락 사유 불명 — ${RUN}/sv0.log"; fail=1
+fi
+if "$BIN" serve --model "$M_27B" --kv-mem 1M --port 18098 > "$RUN/sv1.log" 2>&1; then
+  echo "[w4a16] FAIL: --kv-mem 1M(블록 미만)이 통과됨"; fail=1
+elif grep -q "kv-mem 가드 거부" "$RUN/sv1.log"; then note "kv-mem 최소 거부 OK"
+else
+  echo "[w4a16] FAIL: kv-mem 최소 거부 사유 불명 — ${RUN}/sv1.log"; fail=1
+fi
+if "$BIN" serve --model "$M_27B" --kv-mem 23G --port 18098 > "$RUN/sv3.log" 2>&1; then
+  echo "[w4a16] FAIL: --kv-mem 23G(여유 초과)가 통과됨"; fail=1
+elif grep -q "kv-mem 가드 거부" "$RUN/sv3.log"; then note "kv-mem 상한 거부 OK"
+else
+  echo "[w4a16] FAIL: kv-mem 상한 거부 사유 불명 — ${RUN}/sv3.log"; fail=1
+fi
+if "$BIN" serve --model "$M_27B" --kv-mem 8G --ctx 4096 --port 18098 > "$RUN/sv2.log" 2>&1; then
+  echo "[w4a16] FAIL: serve --ctx가 통과됨(폐지 계약 위반)"; fail=1
+elif grep -q "ctx는 폐지" "$RUN/sv2.log"; then note "--ctx 폐지 거부 OK"
+else
+  echo "[w4a16] FAIL: --ctx 폐지 사유 불명 — ${RUN}/sv2.log"; fail=1
+fi
+
 # ── 3. C(27B) serve HTTP 종단 ──
 note "[3/10] C(27B) serve HTTP — runtime=cuda + 골든 접두"
 : > "$RUN/c.log"
-"$BIN" serve --model "$M_27B" --ctx 1024 --port "$PORT" > "$RUN/c.log" 2>&1 &
+"$BIN" serve --model "$M_27B" --kv-mem 128M --port "$PORT" > "$RUN/c.log" 2>&1 &
 SERVE_PID=$!
 # A2: 기기 전체 pkill 금지 — 이 실행의 서버 PID만 종료(개발 서버 보호).
 trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
@@ -194,7 +221,7 @@ esac
 # ── 6b. D4(35B) 스트리밍 serve — 전문가 LRU 캐시 경로 골든 ──
 note "[6b] D4(35B) 스트리밍 serve — --moe streaming 골든(캐시 경로)"
 : > "$RUN/d4.log"
-"$BIN" serve --model "$M_35B" --ctx 1024 --moe streaming --spec off --port "$PORT" > "$RUN/d4.log" 2>&1 &
+"$BIN" serve --model "$M_35B" --kv-mem 128M --moe streaming --spec off --port "$PORT" > "$RUN/d4.log" 2>&1 &
 SERVE_PID=$!
 trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
 for i in $(seq 1 100); do
@@ -292,7 +319,7 @@ note "[12/12] K(스펙 항등) — 128토큰 서브: 스펙 on/off 토큰 동일
 K_OK=0
 for pair in "on:" "off:LLM170_SPEC_OFF=1"; do
   mode="${pair%%:*}"; envs="${pair#*:}"
-  env $envs "$BIN" serve --model "$M_27B" --ctx 4096 --port "$PORT" \
+  env $envs "$BIN" serve --model "$M_27B" --kv-mem 512M --port "$PORT" \
     > "$RUN/k-$mode.log" 2>&1 &
   SERVE_PID=$!
   trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
@@ -400,9 +427,8 @@ if [ -d "$M_G4" ]; then
     *) echo "[w4a16] FAIL: G4f np16 — $(echo "$A" | grep -o 'np16-check.*' | head -1)"; fail=1;;
   esac
   echo "=== G4c. gemma4 HTTP 서브(채팅 · 아치 렌더·정지 토큰) ==="
-  # [ctx 하한 512] serve 가드(main.rs) — 256은 거부. 36ba1d4e(ctx_info 배선)
-  # 이후 가드가 활성화돼 이 엔트리 작성 시점(가드 생략)과 조건이 달라졌다.
-  "$BIN" serve --model "$M_G4" --ctx 512 --port 18099 > "$RUN/g4c.log" 2>&1 &
+  # [W1] --ctx(serve) 폐지 — kv-mem ≥ 블록 1개(512토큰)면 충분(요청은 소형).
+  "$BIN" serve --model "$M_G4" --kv-mem 128M --port 18099 > "$RUN/g4c.log" 2>&1 &
   G4_PID=$!
   # A2 규율: 이 실행의 PID만 종료(전역 pkill 금지).
   trap 'kill "$G4_PID" 2>/dev/null' EXIT
@@ -438,7 +464,7 @@ except Exception:
   # 단일 청크 전환이 t행 MoE(g4_moe_host_t — 스트리밍 미지원)로 폴백을
   # 오염시킨 회귀를 잡는 그물 — 비상주 구성은 v0 호스트 체인(g4_step)이 정본.
   echo "=== G4d. gemma4 HTTP 서브(--moe streaming — 저하 사다리) ==="
-  "$BIN" serve --model "$M_G4" --ctx 512 --moe streaming --port 18100 > "$RUN/g4d.log" 2>&1 &
+  "$BIN" serve --model "$M_G4" --kv-mem 128M --moe streaming --port 18100 > "$RUN/g4d.log" 2>&1 &
   G4_PID=$!
   trap 'kill "$G4_PID" 2>/dev/null' EXIT
   for i in $(seq 1 100); do
@@ -488,7 +514,7 @@ for name, mt in [("rB", 16), ("rA", 8)]:
 PYG4E
 for pair in "$M_G4:gemma4:18101" "$M_27B:qwen27:18102"; do
   d="${pair%%:*}"; rest="${pair#*:}"; n="${rest%%:*}"; port="${rest#*:}"
-  "$BIN" serve --model "$d" --ctx 4096 --port "$port" > "$RUN/g4e-$n.log" 2>&1 &
+  "$BIN" serve --model "$d" --kv-mem 512M --port "$port" > "$RUN/g4e-$n.log" 2>&1 &
   G4E_PID=$!
   trap 'kill "$G4E_PID" 2>/dev/null' EXIT
   for i in $(seq 1 100); do
@@ -518,7 +544,7 @@ done
 echo "[w4a16] ── 검수 요약(${#SUMMARY[@]}항목) ──"
 for s in "${SUMMARY[@]}"; do echo "[w4a16]   $s"; done
 if [ $fail -eq 0 ]; then
-  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU(600 흡수)·serve·장문(2시나리오 1런)·spec·경계 교차+np 자체 검증 / 35B MoE 참조+GPU(2시나리오)·장문(2시나리오)·spec·스트리밍(D4) / gemma4 v0 게이트+infer(G4)+np16 등가 / E 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
+  echo "[w4a16] smoke: ALL PASS (27B 참조·GPU(600 흡수)·serve·장문(2시나리오 1런)·spec·경계 교차+np 자체 검증 / 35B MoE 참조+GPU(2시나리오)·장문(2시나리오)·spec·스트리밍(D4) / gemma4 v0 게이트+infer(G4)+np16 등가 / E 가드·kv-mem 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로"
 else
   echo "[w4a16] smoke: FAILURES PRESENT"
 fi

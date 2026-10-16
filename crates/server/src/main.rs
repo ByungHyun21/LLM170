@@ -30,9 +30,10 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
   llm170 bench --model <w4a16_dir> [--pp N[,N..]] [--tg N[,N..]] [--np N[,N..]]
               [--reps N] [--ctx N]
       llama-bench 규격 PP/TG/NP 측정(엔진 직접 — HTTP 무경유, 합성 LCG 토큰).
-  llm170 serve --model <w4a16_dir> [--port N] [--ctx N|auto] [--queue N]
-              [--spec auto|mtp|ngram|off] [--moe auto|resident|streaming]
-      OpenAI/Anthropic 호환 HTTP 서버. 동시성 = min(내부 문맥, 풀 입장) — 슬롯 플래그 없음.
+  llm170 serve --model <w4a16_dir> --kv-mem <총량> [--port N] [--queue N]
+              [--ple ssd|ram|vram] [--spec auto|mtp|ngram|off] [--moe auto|resident|streaming]
+      OpenAI/Anthropic 호환 HTTP 서버. KV 총량 = --kv-mem(필수·무 auto — 권고는 `llm170 plan`),
+      요청 상한 = min(모델 최대, 풀) — 초과 요청은 거부(클램프·드롭 없음).
   llm170 w4a16-load <dir>
       W4A16(compressed-tensors int4 sym g128) 로더 완전성 검증 — 트리플·커버리지.
   llm170 w4a16-ref <dir> --prompt-tokens <ids> [--n-predict N] [--ctx N]
@@ -229,16 +230,16 @@ fn run_main() -> ExitCode {
     }
 }
 
-/// llm170 serve --model <dir> [--port N] [--ctx N|auto] [--queue N] [--spec ..] [--moe ..]
+/// llm170 serve --model <dir> --kv-mem <총량> [--port N] [--queue N] [--ple ..] [--spec ..] [--moe ..]
 fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
     let mut queue: Option<usize> = None;
     // [K6-3 2026-10-13] --slots 폐지 — 동시성 = min(문맥 수, 풀 입장).
     // 문맥 수는 내부 상수(상태 메모리 = 문맥×gdn_state/슬롯 — 예산 회계 반영).
     const SERVE_CONTEXTS: usize = 4;
-    let mut ctx = 4096usize;
-    // [2.J 2026-10-13] --ctx auto = 모델 전역 상한(config 파생).
-    let mut ctx_auto = false;
+    // [W1 2026-10-16] serve 입력 = --kv-mem(필수·무 auto) — --ctx(serve)는 폐지.
+    // 배분 절충(KV vs 전문가 vs PLE)은 운영자 명시 결정, 플래너는 검증·권고.
+    let mut kv_mem: Option<u64> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -246,17 +247,29 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 Some(p) => port = p,
                 None => return usage_err("--port requires a number"),
             },
-            "--ctx" => match it.next() {
-                Some(v) if v == "auto" => ctx_auto = true,
-                Some(v) => match v.parse().ok() {
-                    Some(c) => ctx = c,
-                    None => return usage_err("--ctx requires a number or auto"),
-                },
-                None => return usage_err("--ctx requires a number or auto"),
+            "--kv-mem" => match it.next().and_then(|v| parse_mem_bytes(v)) {
+                Some(b) => kv_mem = Some(b),
+                None => {
+                    return usage_err(
+                        "--kv-mem requires a size (e.g. 24G / 4096M / bytes — auto 없음)",
+                    );
+                }
             },
+            "--ctx" => {
+                return usage_err(
+                    "serve: --ctx는 폐지 — KV 총량은 --kv-mem <총량>으로 지정(bench --ctx는 유지)",
+                );
+            }
             "--queue" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(q) => queue = Some(q.max(1)),
                 None => return usage_err("--queue requires a number"),
+            },
+            // [W1] PLE 티어 오버라이드(기본 ssd) — CLI > env 진단.
+            "--ple" => match it.next().map(|v| crate::engine::parse_ple_policy(v)) {
+                Some(Some(p)) => {
+                    crate::engine::PLE_POLICY.store(p as u64, std::sync::atomic::Ordering::Relaxed)
+                }
+                _ => return usage_err("--ple requires ssd|ram|vram"),
             },
             // [2.J 2026-10-13] 런치 정책 2종 (CLI > env 진단).
             "--spec" => match it.next().map(|v| crate::engine::parse_spec_policy(v)) {
@@ -276,6 +289,11 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     }
     let Some(model_path) = ma.model.clone().map(PathBuf::from) else {
         return usage_err("--model required");
+    };
+    let Some(kv_mem) = kv_mem else {
+        return usage_err(
+            "--kv-mem <총량> required — 배분 절충은 운영자 명시 결정(무 auto; 권고 = `llm170 plan`)",
+        );
     };
     // 단일 트랙(2026-10-08): 수용 모델은 W4A16
     // 디렉터리 단일 — 그 외 포맷은 스니핑 단계에서 명시 에러.
@@ -317,20 +335,22 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let _ = engine::TOKENIZER.set(tok);
-    // [2.J 2026-10-13] 모델 파생 ctx 검증 — max_position_embeddings(기동 로그).
-    // 초과분은 클램프(가드: KV 정적 예산은 아직 엔진 ctx 파생).
-    let mut model_max_ctx = 0usize;
-    let mut kv_budget: Option<u64> = None;
-    let mut kv_reserve: Option<u64> = None;
-    let mut plan_txt = String::new();
-    match model_ctx_info(&model_path) {
+    // [W1 2026-10-16] kv-mem 검증·파생 — 요청 상한 = min(모델 최대, 풀 총량).
+    let (model_max_ctx, cap, kv_budget, kv_reserve, plan_txt) = match model_ctx_info(&model_path) {
         Ok(ci) => {
-            model_max_ctx = ci.ctx;
-            // [K6-3 예산 2026-10-13] 풀 예산 = 여유 VRAM − 가중치(dense) − 예약.
-            // 실효 ctx = min(모델 최대, 풀 파생) — 초과 요청은 클램프(로드 전).
-            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-            let mut pool_ctx = ci.ctx;
-            let mut budget = 0u64;
+            let model_max_ctx = ci.ctx;
+            let mut plan_txt = String::new();
+            // [W1 2026-10-16] kv-mem 파생 — 풀 = kv-mem/KV-바이트-토큰(512 블록
+            // 정렬), 요청 상한 = min(모델 최대, 풀). 클램프 없음(초과 = 거부).
+            let pool_tokens = kv_layout(kv_mem, ci.kv_bytes_per_token, ci.ctx);
+            if pool_tokens < 512 {
+                eprintln!(
+                    "# kv-mem 가드 거부: {} ≈ {pool_tokens} tokens < 512(블록 1개) — KV {:.1}KiB/토큰",
+                    fmt_mem(kv_mem),
+                    ci.kv_bytes_per_token.max(1) as f64 / 1024.0
+                );
+                return ExitCode::FAILURE;
+            }
             if let Some((free, total)) = llm170_backend_gpu::cuda_mem_free() {
                 // [예약 재산정 2026-10-14] 워크스페이스·스크래치 + 스펙 VRAM
                 // (WY·링 스냅샷 ≈0.2GiB + MTP 아레나 등 — 체크포인트 링은
@@ -338,23 +358,20 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 // 체크포인트(1.26GiB)를 이 예약의 여유로 먹던 시절 값.
                 // [dsave 대체 2026-10-14] 스펙 정밀 스냅샷(dsave — 27B/4슬롯
                 // 315.0MiB)이 프로브 전용 지연 할당으로 빠지고 dring0
-                // (5.6MiB)이 대신 들어와 순감 309.4MiB — 그 몫만 환원
-                // (런타임 실사용 동일 — 절대 여유 불변).
+                // (5.6MiB)이 대신 들어와 순감 309.4MiB — 그 몫만 환원.
                 const RESERVE: u64 = 9 * (1 << 30) / 4 - 309 * (1 << 20); // 1995MiB — 실측 마진
-                // 폴백 공식(매니페스트 판독 불가 시): 가중치 = dense 전량(디렉터리).
+                // 폴백 상한(매니페스트 판독 불가 시): 가중치 = dense 전량(디렉터리).
                 let wts = if ci.dense { dir_bytes(&model_path) } else { 0 };
-                // [K6-3] 문맥 추가분 = (문맥−1)×GDN 상태 — KV 예산에서 차감.
+                // [K6-3] 문맥 추가분 = (문맥−1)×GDN 상태 — KV 상한에서 차감.
                 let ctx_state = (SERVE_CONTEXTS as u64 - 1) * ci.gdn_state_bytes_per_slot;
-                budget = free
+                let mut max_kv = free
                     .saturating_sub(wts)
                     .saturating_sub(RESERVE)
                     .saturating_sub(ctx_state);
-                pool_ctx =
-                    (((budget / ci.kv_bytes_per_token.max(1)) as usize) / 512 * 512).min(ci.ctx);
-                // [2.M 2026-10-13] 배치 플래너 = 예산의 단일 산출원(매니페스트 판독 시).
-                // dense 범주(실상주 — embed는 호스트 mmap)로 가중치를 계상해 embed
-                // 바이트를 KV로 회수한다(구 공식은 dir 전량 — 27B에서 2.4GiB 과소).
-                // 판독 실패·거부 시엔 위 폴백 공식 유지(하위 ctx 가드가 거부 판정).
+                // [2.M 2026-10-13] 배치 플래너 = 상한·권고의 단일 산출원(매니페스트
+                // 판독 시). dense 범주(실상주 — embed는 호스트 mmap)로 가중치를
+                // 계상해 embed 바이트를 KV로 회수한다(구 공식은 dir 전량 — 27B에서
+                // 2.4GiB 과소). 판독 실패·거부 시엔 폴백 공식 유지.
                 match llm170_core::plan::Manifest::from_dir(&model_path) {
                     Ok(man) => {
                         let hw = llm170_core::plan::Hardware {
@@ -375,58 +392,65 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                         let p = llm170_core::plan::plan(&man, &hw, &wl);
                         plan_txt = p.summary();
                         if p.fits() {
-                            budget = p.kv_budget;
-                            pool_ctx = p.effective_ctx;
+                            max_kv = p.kv_budget;
                         }
                     }
                     Err(e) => eprintln!("# plan 건너뜀: {e}"),
                 }
-                kv_budget = Some(budget);
-            }
-            if ctx_auto {
-                ctx = pool_ctx;
-            }
-            if ctx > ci.ctx {
-                eprintln!("# ctx {ctx} > 모델 최대 {} — 클램프", ci.ctx);
-                ctx = ci.ctx;
-            }
-            if ctx > pool_ctx {
-                eprintln!(
-                    "# ctx {ctx} > 풀 파생 {pool_ctx}(예산 {:.1}GiB) — 클램프",
-                    gib(budget)
-                );
-                ctx = pool_ctx;
-            }
-            if ctx < 512 {
-                eprintln!(
-                    "# ctx 가드 거부: 풀 파생 ctx {ctx} < 512 — 가중치 {:.1}GiB + 예약 2.5GiB > 여유 VRAM",
-                    gib(dir_bytes(&model_path))
-                );
-                return ExitCode::FAILURE;
+                // 운영자 값 검증 — 상한 초과 = 거부(무 auto·무 클램프).
+                if kv_mem > max_kv {
+                    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                    eprintln!(
+                        "# kv-mem 가드 거부: 요청 {} > 최대 {} (여유 VRAM {:.1}G − 가중치 {:.1}G − 예약 {:.1}G − 상태 {:.1}G)",
+                        fmt_mem(kv_mem),
+                        fmt_mem(max_kv),
+                        gib(free),
+                        gib(wts),
+                        gib(RESERVE),
+                        gib(ctx_state)
+                    );
+                    eprintln!(
+                        "#   → 권고 {} (플래너) 이내로 지정. 호스트 확장(KV 오프로드)은 W3(§9.1) 미배선 — 현행 VRAM 한정.",
+                        fmt_mem(max_kv)
+                    );
+                    return ExitCode::FAILURE;
+                }
+                // 권고 = 플래너/폴백 상한(운영자 조정 참고 — 강제 아님).
+                eprintln!("# kv-mem 권고(플래너 상한): {}", fmt_mem(max_kv));
+            } else {
+                eprintln!("# kv-mem 검증 건너뜀: VRAM 조회 불가(가드가 거부할 것)");
             }
             eprintln!(
-                "# ctx: model max={} 풀 파생={pool_ctx} 사용={ctx} (kv 예산 {:.1}GiB)",
-                ci.ctx,
-                gib(budget)
+                "# kv-mem: {} = {pool_tokens} tokens(512 블록) · 요청 상한 = min(model {model_max_ctx}, pool {pool_tokens}) = {pool_tokens} · 계층 = VRAM(호스트 확장 W3)",
+                fmt_mem(kv_mem)
             );
             eprintln!(
-                "# policy: spec={}(CLI) moe={}(CLI) — env 진단(LLM170_SPEC_DRAFT_SOURCE/MOE_RESIDENT)보다 우선",
+                "# policy: spec={}(CLI) moe={}(CLI) ple={}(CLI/기본) — env 진단(LLM170_SPEC_DRAFT_SOURCE/MOE_RESIDENT)보다 우선",
                 crate::engine::spec_name(),
-                crate::engine::moe_name()
+                crate::engine::moe_name(),
+                crate::engine::ple_name()
             );
             if !plan_txt.is_empty() {
                 eprintln!("# plan: {plan_txt}");
             }
-            // [2.M 사다리] KV 예약(풀 실할당 추정) = min(예산, ctx×문맥수×KV/토큰)
-            // — 전문가 상주(auto) 판정이 이 몫을 떼고 남는 잔여로만 결정된다.
-            kv_reserve = kv_budget
-                .map(|b| b.min(SERVE_CONTEXTS as u64 * ctx as u64 * ci.kv_bytes_per_token.max(1)));
+            (
+                model_max_ctx,
+                pool_tokens,
+                // [2.M 사다리] KV 예산·예약(전문가 상주 판정) = 운영자 명시 몫.
+                Some(kv_mem),
+                Some(kv_mem),
+                plan_txt,
+            )
         }
-        Err(e) => eprintln!("# ctx 검증 건너뜀(config 판독 실패): {e}"),
-    }
+        Err(e) => {
+            eprintln!("error: kv-mem 검증 불가 — config 판독 실패: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let req = engine::InferRequest {
         model: model_path.clone(),
-        ctx,
+        ctx: cap,
+        model_max_ctx,
         kv_budget,
         kv_reserve,
     };
@@ -440,11 +464,13 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        ctx,
+        ctx: cap,
         model_max_ctx,
         plan: plan_txt,
         n_slots: SERVE_CONTEXTS,
         model_bytes: dir_bytes(&model_path),
+        kv_mem,
+        pool_cap_tokens: cap,
     });
     eprintln!(
         "# serve: 문맥 {SERVE_CONTEXTS}(내부 상수 — --slots 폐지) · 동시성 = min(문맥, 풀 입장)"
@@ -563,6 +589,23 @@ fn cmd_plan(args: &[String], ma: &ModelArgs) -> ExitCode {
         wl.state_bytes_per_ctx as f64 / (1u64 << 20) as f64
     );
     println!("plan: {}", p.summary());
+    // [W1 2026-10-16] serve 권고 — 플래너 KV 예산이 곧 kv-mem 권고값(운영자 명시).
+    if p.fits() {
+        println!(
+            "serve 권고: --kv-mem {} — 풀 ctx {}/{} ({}) · experts={}",
+            fmt_mem(p.kv_budget),
+            p.effective_ctx,
+            p.goal_ctx,
+            if p.ctx_capped {
+                "풀 클램프"
+            } else {
+                "전량"
+            },
+            p.experts_tier.name()
+        );
+    } else {
+        println!("serve 권고: 없음(수용 거부) — 상한/호스트 재배분 필요");
+    }
     // [2.M 샤드 플랜] 다중 카드 요청 시 — 레이어 파이프라인 배분·수용 판정.
     if cards > 1 {
         let split = man.layer_split();
@@ -599,6 +642,58 @@ fn dir_bytes(p: &std::path::Path) -> u64 {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+/// [W1 2026-10-16] 크기 표기 — 로그용(바이너리 단위, 1자리).
+fn fmt_mem(b: u64) -> String {
+    if b >= 1 << 30 {
+        format!("{:.1}G", b as f64 / (1u64 << 30) as f64)
+    } else if b >= 1 << 20 {
+        format!("{:.1}M", b as f64 / (1u64 << 20) as f64)
+    } else if b >= 1 << 10 {
+        format!("{:.1}K", b as f64 / 1024.0)
+    } else {
+        format!("{b}B")
+    }
+}
+
+/// [W1 2026-10-16] `--kv-mem` 파싱 — 접미 K/M/G/T(2진) 또는 KB/MB/GB/TB·
+/// KiB/MiB/GiB/TiB(대소문자 무시), 단위 없으면 바이트. 0·불명·소수점 = None
+/// (무 auto — 운영자 명시값만).
+fn parse_mem_bytes(s: &str) -> Option<u64> {
+    let low = s.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return None;
+    }
+    for (sfx, mult) in [
+        ("kib", 1u64 << 10),
+        ("kb", 1u64 << 10),
+        ("k", 1u64 << 10),
+        ("mib", 1u64 << 20),
+        ("mb", 1u64 << 20),
+        ("m", 1u64 << 20),
+        ("gib", 1u64 << 30),
+        ("gb", 1u64 << 30),
+        ("g", 1u64 << 30),
+        ("tib", 1u64 << 40),
+        ("tb", 1u64 << 40),
+        ("t", 1u64 << 40),
+        ("b", 1),
+    ] {
+        if let Some(n) = low.strip_suffix(sfx) {
+            let v: u64 = n.parse().ok()?;
+            return v.checked_mul(mult).filter(|b| *b > 0);
+        }
+    }
+    let v: u64 = low.parse().ok()?;
+    (v > 0).then_some(v)
+}
+
+/// [W1 2026-10-16] kv-mem → 실효 요청 상한(토큰) = min(모델 최대,
+/// kv-mem/KV-토큰), 512 블록 정렬. 값 자체가 풀 총량(초과 요청은 거부).
+fn kv_layout(kv_mem: u64, kv_bytes_per_token: u64, model_max: usize) -> usize {
+    let tokens = (kv_mem / kv_bytes_per_token.max(1)) as usize;
+    (tokens.min(model_max)) / 512 * 512
 }
 
 /// `llm170 tokenize --model <dir> [--no-special] (--text <s> | --file <f> | --stdin)`
@@ -712,4 +807,57 @@ fn model_ctx_info(p: &std::path::Path) -> Result<llm170_core::qwen35::CtxInfo, S
 fn usage_err(msg: &str) -> ExitCode {
     eprintln!("error: {msg}\n\n{USAGE}");
     ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [W1] --kv-mem 파싱 — 단위 4계열·바이트·불명·0·소수점.
+    #[test]
+    fn parse_mem_bytes_units() {
+        assert_eq!(parse_mem_bytes("24G"), Some(24 << 30));
+        assert_eq!(parse_mem_bytes("24g"), Some(24 << 30));
+        assert_eq!(parse_mem_bytes("24GiB"), Some(24 << 30));
+        assert_eq!(parse_mem_bytes("4096M"), Some(4096 << 20));
+        assert_eq!(parse_mem_bytes("4096MiB"), Some(4096 << 20));
+        assert_eq!(parse_mem_bytes("512K"), Some(512 << 10));
+        assert_eq!(parse_mem_bytes("1T"), Some(1 << 40));
+        assert_eq!(parse_mem_bytes("12345"), Some(12345));
+        assert_eq!(parse_mem_bytes("4096B"), Some(4096));
+        // 거부: auto·0·소수·불명·공백.
+        assert_eq!(parse_mem_bytes("auto"), None);
+        assert_eq!(parse_mem_bytes("0"), None);
+        assert_eq!(parse_mem_bytes("0G"), None);
+        assert_eq!(parse_mem_bytes("4.5G"), None);
+        assert_eq!(parse_mem_bytes("G"), None);
+        assert_eq!(parse_mem_bytes(""), None);
+        assert_eq!(parse_mem_bytes("12X"), None);
+    }
+
+    /// [W1] kv_layout — 512 정렬·모델 클램프·최소(블록 미만).
+    #[test]
+    fn kv_layout_align_and_clamp() {
+        // 27B 실측급: KV 33280B/토큰.
+        let bpt = 33_280u64;
+        // 1 GiB → 32263 tokens → 512 정렬 31744.
+        let t = kv_layout(1 << 30, bpt, 262_144);
+        assert_eq!(t, ((1u64 << 30) / bpt) as usize / 512 * 512);
+        assert_eq!(t % 512, 0);
+        // 모델 최대 클램프(풀 262144 초과분은 모델 상한).
+        assert_eq!(kv_layout(100 << 30, bpt, 16_384), 16_384);
+        // 최소 미만 = 0(호출부가 512 가드로 거부).
+        assert_eq!(kv_layout(1000, bpt, 262_144), 0);
+        // kv_bpt 0(비정상 config) — 1로 방어(패닉 금지).
+        assert_eq!(kv_layout(1 << 20, 0, 262_144) % 512, 0);
+    }
+
+    /// [W1] fmt_mem — 로그 표기 경계.
+    #[test]
+    fn fmt_mem_units() {
+        assert_eq!(fmt_mem(24 << 30), "24.0G");
+        assert_eq!(fmt_mem(128 << 20), "128.0M");
+        assert_eq!(fmt_mem(512 << 10), "512.0K");
+        assert_eq!(fmt_mem(999), "999B");
+    }
 }
