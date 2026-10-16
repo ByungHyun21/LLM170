@@ -71,9 +71,10 @@ pub fn serve(
     // [2026-10-16] KV 계층 회계 — VRAM/호스트 실할당·오프로드율(요청 우선 배치의
     // 관측 요건: 운영자가 보고 kv-mem·링크 부담을 조정).
     let (kv_vram, kv_host, host_blocks, total_blocks) = eng.kv_tier_bytes();
+    let (free_vram, free_host) = eng.kv_tier_free();
     if host_blocks > 0 {
         eprintln!(
-            "# kv-tier: VRAM {:.2}GiB({}블록) + 호스트 {:.2}GiB({host_blocks}블록) / 전체 {total_blocks}블록 · 오프로드율 {:.1}%",
+            "# kv-tier: VRAM {:.2}GiB({}블록) + 호스트 {:.2}GiB({host_blocks}블록) / 전체 {total_blocks}블록 · 오프로드율 {:.1}% · 자유 VRAM {free_vram}/호스트 {free_host}블록",
             kv_vram as f64 / (1u64 << 30) as f64,
             total_blocks - host_blocks,
             kv_host as f64 / (1u64 << 30) as f64,

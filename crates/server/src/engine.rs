@@ -217,6 +217,11 @@ impl Engine {
         self.0.kv_tier_bytes()
     }
 
+    /// [2026-10-16] KV 티어별 자유 블록 — (VRAM 자유, 호스트 자유).
+    pub fn kv_tier_free(&self) -> (usize, usize) {
+        self.0.kv_tier_free()
+    }
+
     /// 복사 계측 — [h2d, d2h, d2d] × (바이트, ns, 호출).
     pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
         self.0.copy_stats()

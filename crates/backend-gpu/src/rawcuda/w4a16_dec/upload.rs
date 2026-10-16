@@ -248,6 +248,17 @@ impl W4a16Dec {
         Ok(())
     }
 
+    /// [2026-10-16] 티어별 **자유** 블록 — 운영·컨트롤러 신호(배치 수가 아니라
+    /// 가용: VRAM이 비었는데 호스트가 점유 중인지 = 오프로드 점착·순서 편중 관측).
+    /// (VRAM 자유, 호스트 자유).
+    pub fn kv_tier_free(&self) -> (usize, usize) {
+        self.attn
+            .kv_pool
+            .as_ref()
+            .map(|p| (p.free_vram_blocks(), p.free_host_blocks()))
+            .unwrap_or((0, 0))
+    }
+
     /// [2026-10-16] KV 계층 회계 — (VRAM 바이트, 호스트 바이트, 호스트 블록,
     /// 전체 블록). 오프로드율 = 호스트/(VRAM+호스트) — /stats 노출.
     pub fn kv_tier_bytes(&self) -> (u64, u64, usize, usize) {
@@ -371,13 +382,13 @@ impl W4a16Dec {
             // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         let dq = self.cc.alloc(qnw.len() * 4)?;
+        // [2026-10-16 검토 반영] alloc 직후 즉시 필드 선점 — h2d 실패 창까지 폐쇄
+        // (이후 어느 오류경로든 필드 소유·free_all/재등록 정리가 회수).
+        self.attn.dqnw_a = dq;
         Self::h2d_chunked(&self.cc, dq, b(qnw))?;
         let dk = self.cc.alloc(knw.len() * 4)?;
-        Self::h2d_chunked(&self.cc, dk, b(knw))?;
-        // [2026-10-16 검토 반영] 필드 선점 — 이후 어느 오류경로든 이 두 버퍼는
-        // 필드 소유(재등록 정리·free_all이 회수)로 남는다.
-        self.attn.dqnw_a = dq;
         self.attn.dknw_a = dk;
+        Self::h2d_chunked(&self.cc, dk, b(knw))?;
         let pool = super::blocktable::KvPool::new(slots, n, mb, total_blocks, vram_blocks)?;
         let (dkc, dvc) = {
             // int8 KV(1B/원소) + 스케일 2벌. 기록 attn_prep_q,

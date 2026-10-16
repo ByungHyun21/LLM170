@@ -437,6 +437,11 @@ impl QwenEngine {
         self.dec.kv_tier_bytes()
     }
 
+    /// [2026-10-16] KV 티어별 자유 블록 — (VRAM 자유, 호스트 자유).
+    pub fn kv_tier_free(&self) -> (usize, usize) {
+        self.dec.kv_tier_free()
+    }
+
     /// 정지 토큰 — Q35 아키텍처 상수.
     pub fn eos(&self) -> u32 {
         llm170_core::qwen35::EOS_EOT

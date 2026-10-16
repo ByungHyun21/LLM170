@@ -46,6 +46,11 @@ done
 RATIO=$(echo "$S" | jget 'd["serving"]["kv_offload_ratio"]')
 TOT=$(echo "$S" | jget 'd["memory"]["kv_cache"]["total_blocks"]')
 HB=$(echo "$S" | jget 'd["memory"]["kv_cache"]["host_blocks"]')
+FV=$(echo "$S" | jget 'd["memory"]["kv_cache"]["free_vram_blocks"]')
+FH=$(echo "$S" | jget 'd["memory"]["kv_cache"]["free_host_blocks"]')
+[ "${FV:-x}" != "x" ] && [ "${FH:-x}" != "x" ] \
+  && note "티어 자유 블록 노출 OK — 자유 VRAM $FV/호스트 $FH" \
+  || { echo "[tier] FAIL: free 블록 필드 부재"; fail=1; }
 [ "${HOST:-0}" -gt 0 ] \
   && note "호스트 아레나 $HOST B($HB 블록) · 전체 $TOT 블록 · 오프로드율 $RATIO" \
   || { echo "[tier] FAIL: host=$HOST"; fail=1; }

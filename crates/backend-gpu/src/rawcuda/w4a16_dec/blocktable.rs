@@ -174,13 +174,11 @@ impl KvPool {
     }
 
     /// [2026-10-16] VRAM 자유 블록 수(진단 — 오프로드 점착 판정).
-    #[allow(dead_code)]
     pub fn free_vram_blocks(&self) -> usize {
         self.free_vram.len()
     }
 
     /// [2026-10-16] 호스트 자유 블록 수(진단).
-    #[allow(dead_code)]
     pub fn free_host_blocks(&self) -> usize {
         self.free_host.len()
     }

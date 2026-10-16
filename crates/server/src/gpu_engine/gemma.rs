@@ -391,6 +391,10 @@ impl GemmaEngine {
     pub fn kv_tier_bytes(&self) -> (u64, u64, usize, usize) {
         self.dec.kv_tier_bytes()
     }
+    /// [2026-10-16] KV 티어별 자유 블록 — (VRAM 자유, 호스트 자유).
+    pub fn kv_tier_free(&self) -> (usize, usize) {
+        self.dec.kv_tier_free()
+    }
     pub fn kv_release_slot(&mut self, slot: usize) -> usize {
         self.dec.kv_release(slot)
     }

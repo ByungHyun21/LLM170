@@ -178,6 +178,7 @@ engine_delegate_ref! {
     kv_cap_tokens() -> usize;
     kv_used_blocks(slot: usize) -> usize;
     kv_tier_bytes() -> (u64, u64, usize, usize);
+    kv_tier_free() -> (usize, usize);
     reuse_valid(slot: usize, l: usize, prompt_len: usize) -> bool;
     piece(tok: u32) -> String;
     mtp_drafts_on() -> bool;

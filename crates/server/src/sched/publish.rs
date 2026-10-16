@@ -44,12 +44,15 @@ pub(super) fn publish_aging(a: &Aging) {
 pub(super) fn publish_stats(eng: &Engine, base: [(u64, u64, u64); 3]) {
     let (weights_gpu, kv_gpu, offload_cpu, ple_cpu) = eng.mem_stats();
     let (_, kv_host, host_blocks, total_blocks) = eng.kv_tier_bytes();
+    let (free_vram, free_host) = eng.kv_tier_free();
     crate::metrics::publish_memory(crate::metrics::MemView {
         weights_gpu,
         kv_gpu,
         kv_host,
         kv_host_blocks: host_blocks as u64,
         kv_blocks_total: total_blocks as u64,
+        kv_free_vram: free_vram as u64,
+        kv_free_host: free_host as u64,
         offload_cpu,
         ple_cpu,
         active_per_token: eng.active_weight_bytes(),
