@@ -18,3 +18,4 @@ pmc*
 .omo/
 # 로컬 전용: ROCm rpath rustflags(기기별 절대경로 — 파일은 디스크에 유지)
 .cargo/
+reference/
