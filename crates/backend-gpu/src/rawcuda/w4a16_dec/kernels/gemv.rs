@@ -149,20 +149,24 @@ impl W4a16Dec {
                 ));
             }
         };
-        // [P8 2026-10-15] t>16(g32/bf16) = 타일 루프 단일 런치 — 가중 DRAM
+        // [P8→P9 2026-10-17] t>16(g32/bf16) = 타일 루프 단일 런치 — 가중 DRAM
         // 스트림 1회(종전 16행 호출 t/16회 재스트림 — 청크512 dense 61.7%의
         // 원인). 16 배수분을 tall로, 잔여 tail(<16)은 기존 스위치로(오프셋
         // 이동). 행별 산술 비트동일(레인·j-시퀀스·tree64가 행 독립).
+        // [P9] tall → tall2(워프당 2행 레지스터 블로킹): 종전 tall은 L1/LSU
+        // 처리율 상한(FFMA 13.1TF의 51.5%) — x float4 재판독을 2배 FFMA로
+        // 상각해 FFMA 포화 접근(상세 = gptq4.cu tall2 주석). 비트계약 불변.
+        // grid = 블록당 16행(8워프×2행).
         if t > 16 && g == 32 && sb {
             let t16 = t & !15;
-            let ft = self.cc.function("w4a16_gemv_g32_bf16_tall")?;
+            let ft = self.cc.function("w4a16_gemv_g32_bf16_tall2")?;
             let (mut aq, mut as_, mut ax, mut ay) = (dq, ds, x_dev, y_dev);
             let (mut an, mut ak, mut at) = (n as i32, k as i32, t16 as i32);
             self.cc.launch(
                 ft,
-                n.div_ceil(GEMV_TR) as u32,
-                1,
-                (32 * GEMV_TR) as u32,
+                n.div_ceil(16) as u32,
+                t16.div_ceil(128) as u32, // [P9] t-청크 2D 그리드(테일 희석)
+                256,
                 &mut crate::rawcuda::args::l7(
                     &mut aq, &mut as_, &mut ax, &mut ay, &mut an, &mut ak, &mut at,
                 ),
