@@ -674,6 +674,10 @@ pub struct W4a16Dec {
     pub kv_floor: Vec<u32>,
     /// 선형 상주 — 이름 → (packed, scale, n, k).
     lins: HashMap<String, (CUdeviceptr, CUdeviceptr, usize, usize)>,
+    /// [k타일 재팩 2026-10-17] g128·f16 전용 — q를 [k/32][n][4]로 전치한
+    /// mma(w4a16_gemm_g128_mma) 소요 사본. 디코드 GEMV는 비트계약 보존을
+    /// 위해 row-major 원본(lins)을 그대로 읽는다(이중 레이아웃).
+    lins_packed: HashMap<String, CUdeviceptr>,
     /// [gemma4 P3 2026-10-14] t행 청크 스크래치 — A 입력([t][k] f32)·Y 출력.
     g4_a: Buf,
     g4_y: Buf,
@@ -1020,6 +1024,7 @@ impl W4a16Dec {
             kv_assigned: vec![0; n_slots.max(1)],
             kv_floor: vec![0; n_slots.max(1)],
             lins: HashMap::new(),
+            lins_packed: HashMap::new(),
             g4_a: Buf { ptr: 0, cap: 0 },
             g4_y: Buf { ptr: 0, cap: 0 },
             g4_pes: Vec::new(),
@@ -1295,6 +1300,14 @@ impl W4a16Dec {
             .get(name)
             .copied()
             .ok_or_else(|| format!("상주 선형 없음: {name}"))
+    }
+
+    /// k타일 재팩 사본 포인터(g128·f16 업로드 시 항상 생성).
+    fn lin_packed(&self, name: &str) -> Result<CUdeviceptr, String> {
+        self.lins_packed
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("k타일 재팩 부재(g128·f16 아님?): {name}"))
     }
 
     /// MoE 배치 모드 문자열(모니터링) — "none" | "resident" | "streaming".

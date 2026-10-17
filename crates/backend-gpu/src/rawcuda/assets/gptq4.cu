@@ -1096,7 +1096,11 @@ __device__ __forceinline__ unsigned deq_pair_b(unsigned qw, int tt, float sc) {
 // 30.7KB로 L1 축소가 우세(marlin-C4 30.5KB 실측과 동형). 되돌림. 잔여
 // math_pipe_throttle(2.88) 해소는 smem 비증가 구조에서만 시도할 것.
 extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
-    const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
+    const unsigned* __restrict__ q,        // [k/32][n][4] u32 k타일(2026-10-17
+                                           // 재팩 — 원본 [n][k/8]을 업로드 시
+                                           // 호스트 전치. L2 국소성 — B 청크
+                                           // 스테이징이 순차판독. 디코드 GEMV는
+                                           // 비트계약 보존 위해 row-major 별품)
     const unsigned short* __restrict__ s,  // [n][k/128] f16 스케일
     const unsigned short* __restrict__ x,  // [t][k] f16 — split 경로 계약
                                            // (cast_x32/norm이 h2f(f2h)와 함께
@@ -1122,7 +1126,6 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
     // ALU 57.7%(디퀀트)·L2 86%(x f32 재판독) 이중 병목. N64로 x 재판독 절반.
     const int mt = (warp >> 2) * 32; // [marlin-A4] M64: 2 m워프 × 32 = M64
     const int ntw = (warp & 3) * 32; // [marlin-A2] N128: 워프당 32열
-    const int k8 = k >> 3;
     const int kg = k >> 7;
     float c[2][4][4]; // [marlin-A4] M64: 2 m프래그먼트 × 4 n프래그먼트
 #pragma unroll
@@ -1158,7 +1161,11 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
         const int gi = c8 * 8;
         const bool live = (n0 + r < n) && (gi + 7 < k);
         // 패딩 니블 = 8(값 0) — 0u면 (0-8)*sc ≠ 0이 된다.
-        wsp[0][r][c8] = live ? q[(size_t)(n0 + r) * k8 + (gi >> 3)] : 0x88888888u;
+        // [k타일 재팩 2026-10-17] q = [k/32][n][4] 타일 — 청크(gi>>5)·행의
+        // 4워드. 어드레싱만 변경(판독 u32·산술 비트동일).
+        wsp[0][r][c8] = live
+            ? q[((size_t)(gi >> 5) * n + (n0 + r)) * 4 + ((gi >> 3) & 3)]
+            : 0x88888888u;
     }
     for (int e = tid; e < MMA_N; e += 256) {
         unsigned short scb = 0;
@@ -1201,12 +1208,14 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
             // 트래픽). 둘 다 구조/계약 고정 — 잔여는 영속 타일 재편뿐.
             // [§1.3 2026-10-11] B 스테이징 16B .cg — 종전 4B .ca는 가중치
             // (1회 판독·재사용 없음)를 L1에 채워 프래그먼트/A의 L1을 압박
-            // (carveout 실측: 이 커널은 L1 민감). 16B 청크 = 행당 4 u32
             // (전 k청크 — k%128=0 계약으로 경계 정합) → .cg(L2 전용).
+            // [k타일 재팩 2026-10-17] q는 [k/32][n][4] 타일 — 아래 주소 산식만
+            // 변경(16B 연속성은 레이아웃 무관·값 비트동일).
             if (tid < MMA_N) {
                 const int r = tid;
                 if (n0 + r < n) {
-                    cp_async16(&wsp[cur ^ 1][r][0], &q[(size_t)(n0 + r) * k8 + (kn >> 3)]);
+                    cp_async16(&wsp[cur ^ 1][r][0],
+                               &q[((size_t)(kn >> 5) * n + (n0 + r)) * 4]);
                 } else {
 #pragma unroll
                     for (int c8 = 0; c8 < MMA_KC / 8; ++c8) {

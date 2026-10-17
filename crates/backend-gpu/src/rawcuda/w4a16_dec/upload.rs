@@ -3,6 +3,29 @@
 
 use super::*;
 
+/// [k타일 재팩 2026-10-17] q [n][k/8] u32 → [k/32][n][4] 호스트 전치 —
+/// w4a16_gemm_g128_mma의 B 청크 스테이징이 (k청크 × 전체 n행)을 순차
+/// 판독하도록 한다(행 스트라이드 k8의 L2 스래싱 제거). 값·k순서 불변
+/// (주소 산식만 변경). 디코드 GEMV는 row-major 원본을 계속 읽는다.
+/// k%32≠0이면 타일 경계가 어긋나 원본 길이를 초과 — 호출부가 가드.
+fn repack_ktile(q: &[u8], n: usize, k: usize) -> Vec<u8> {
+    let k8 = k / 8;
+    let src: Vec<u32> = q
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    let mut out = vec![0u8; q.len()];
+    let dst = out.as_chunks_mut::<4>().0;
+    for r in 0..n {
+        for w in 0..k8 {
+            dst[(w >> 2) * n * 4 + r * 4 + (w & 3)] = src[r * k8 + w].to_le_bytes();
+        }
+    }
+    out
+}
+
 impl W4a16Dec {
     /// 선형 상주 업로드 — packed u32 [n][k/8] · scale f16 [n][k/128].
     pub fn upload_lin(
@@ -61,6 +84,28 @@ impl W4a16Dec {
             return Err(e);
         }
         self.weights_bytes += (q.len() + s.len()) as u64;
+        // [k타일 재팩] g128·f16(mma 경로)은 재팩 사본을 추가 업로드 — 실패 시
+        // 성공분 회수 후 재시도(G2와 동일 규율).
+        if group == 128 && !scale_bf16 && k.is_multiple_of(32) {
+            let qp = repack_ktile(q, n, k);
+            match self
+                .cc
+                .alloc(qp.len())
+                .and_then(|dp| Self::h2d_chunked(&self.cc, dp, &qp).map(|_| dp))
+            {
+                Ok(dp) => {
+                    self.weights_bytes += q.len() as u64;
+                    if let Some(op) = self.lins_packed.insert(name.to_string(), dp) {
+                        let _ = self.cc.free(op);
+                    }
+                }
+                Err(e) => {
+                    let _ = self.cc.free(dq);
+                    let _ = self.cc.free(ds);
+                    return Err(e);
+                }
+            }
+        }
         if let Some((oq, os, _, _)) = self.lins.insert(name.to_string(), (dq, ds, n, k)) {
             let _ = self.cc.free(oq);
             let _ = self.cc.free(os);
@@ -1432,9 +1477,28 @@ impl W4a16Dec {
                 return Err(e);
             }
         };
+        // [k타일 재팩 2026-10-17] g128·f16은 q를 호스트에 전량 버퍼링해
+        // row-major 원본 + [k/32][n][4] 재팩 사본 2벌을 올린다(링 스트리밍은
+        // s만 — q 재팩이 전체 접근을 요구). 호스트 RAM = q 크기 상수배.
+        let tile = group == 128 && !scale_bf16 && k.is_multiple_of(32);
+        let (mut qh, mut qp): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+        if tile {
+            qh = vec![0u8; q_len];
+            let mut off = 0usize;
+            while off < q_len {
+                let end = (off + STREAM_CHUNK).min(q_len);
+                fill(0, off as u64, &mut qh[off..end])?;
+                off = end;
+            }
+            qp = repack_ktile(&qh, n, k);
+        }
         let r = (|| -> Result<(), String> {
             let mut ring = super::mem::PinnedRing::new(&self.cc, STREAM_CHUNK)?;
-            ring.send(dq, q_len, &mut |off, buf| fill(0, off, buf))?;
+            if tile {
+                Self::h2d_chunked(&self.cc, dq, &qh)?;
+            } else {
+                ring.send(dq, q_len, &mut |off, buf| fill(0, off, buf))?;
+            }
             ring.send(ds, s_len, &mut |off, buf| fill(1, off, buf))?;
             ring.sync()
         })();
@@ -1444,6 +1508,25 @@ impl W4a16Dec {
             return Err(e);
         }
         self.weights_bytes += (q_len + s_len) as u64;
+        if tile {
+            match self
+                .cc
+                .alloc(qp.len())
+                .and_then(|dp| Self::h2d_chunked(&self.cc, dp, &qp).map(|_| dp))
+            {
+                Ok(dp) => {
+                    self.weights_bytes += q_len as u64;
+                    if let Some(op) = self.lins_packed.insert(name.to_string(), dp) {
+                        let _ = self.cc.free(op);
+                    }
+                }
+                Err(e) => {
+                    let _ = self.cc.free(dq);
+                    let _ = self.cc.free(ds);
+                    return Err(e);
+                }
+            }
+        }
         if let Some((oq, os, _, _)) = self.lins.insert(name.to_string(), (dq, ds, n, k)) {
             let _ = self.cc.free(oq);
             let _ = self.cc.free(os);

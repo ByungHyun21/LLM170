@@ -24,7 +24,9 @@ impl W4a16Dec {
         // [T1] split mma 경로(단일 경로, t≥16). 검증: 27B 4k·35B 600
         // 토큰이 원본과 동일, 골든 유지, 허용오차 ~6e-4.
         // A=xh(f16 — split 경로가 이미 f2h 캐스트 제공), 계약 완화 승인 후.
-        if t >= 16 && grp == 128 && !sbf {
+        // [k타일 재팩 2026-10-17] mma는 [k/32][n][4] 재팩 사본에서 판독
+        // (k%32≠0 등 사본 부재 시 FFMA 폴백 — row-major 원본은 디코드 전용).
+        if t >= 16 && grp == 128 && !sbf && self.lins_packed.contains_key(name) {
             // [marlin-A 2026-10-10] A는 f16 미러(dx16) — 불변식: split 경로
             // GEMM A는 직전 cast_x32/norm_resid 산출(dx32)이고 dx16이 같은
             // [t][k] 값을 갖는다(두 경로가 항상 함께 기록). 종전 f32 A는
@@ -33,7 +35,8 @@ impl W4a16Dec {
                 return Err(format!("gemm: dx16 부족 {} < {}", self.dx16.cap, t * k));
             }
             let f = self.cc.function("w4a16_gemm_g128_mma")?;
-            let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx16.ptr, y_out);
+            let (mut p_q, mut p_s, mut p_x, mut p_y) =
+                (self.lin_packed(name)?, ds, self.dx16.ptr, y_out);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
             return self.cc.launch(
                 f,
