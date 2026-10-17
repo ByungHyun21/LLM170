@@ -299,6 +299,9 @@ pub(super) fn run_marlin_bench(
                 128u32,
                 true,
             ),
+            // [MarlinDecode 2026-10-17] m64v = M64/N128 마린 vs 행-GEMV(t=1) —
+            // m16(N256)은 소형 n에서 그리드 미포화(n/256블록)로 열세 실측.
+            "m64v" => ("w4a16_gemm_g128_marlin", 64usize, 128usize, 256u32, true),
             "m16" => (
                 "w4a16_gemm_g128_marlin_m16",
                 16usize,
