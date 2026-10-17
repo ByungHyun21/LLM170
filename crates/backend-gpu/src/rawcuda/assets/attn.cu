@@ -233,7 +233,7 @@ __device__ __forceinline__ AttnKvRowPtrs attn_blk_row(
 //     W=16384 모두 깊이 90%(거리 6.6K, 창 안) ✗·전량 KV ✓(반복 루프 퇴화·gen40).
 //   · 함의: 고정-메모리 절감은 검색(RULER/NIAH)에서 먼저 무너진다(정본 R10 #10
 //     예측을 자체 모델로 확증). 재실험 접점 = 위 3곳(빌드 상수) — 1M/CMP 장문
-//     정책 논의 시에만. 수치 전문은 원장(4090-detail) 동일 세션 기록.
+//     정책 논의 시에만. 수치 전문은 커밋 이력 참조.
 // [저비트 KV 계보 감시 2026-10-13] int4 이하 금지 승계: 회전·코드북 계열(k8v4·
 // TurboQuant·OSCAR·TriAxialKV·SAW-INT4·OffQ) + 2026 신생 lattice-VQ(KakeyaLattice
 // D4/E8·NexusQuant E8·HyperQuant·LLVQ Leech·VQKV) — "2-bit·needle 보존" 주장 포함
@@ -242,7 +242,7 @@ __device__ __forceinline__ AttnKvRowPtrs attn_blk_row(
 // 아니라 어텐션 메모리 대체 축 — 학습 의존·폐쇄 어휘·LM 사전학습 미검증(감시만).
 // [int8 장문 품질 실측 2026-10-13] needle(합성 패스코드 검색·깊이 10/50/90%) —
 // 27B 16K/24K **6/6 hit** · 35B 8K/16K/24K **8/9**(미스 1 = 24K·깊이 90%).
-// 단문 PPL(밴드 ±0.3%)과 별개의 AND 축 평가(eval.md). 하네스 규율: 판정은
+// 단문 PPL(밴드 ±0.3%)과 별개의 AND 축 평가. 하네스 규율: 판정은
 // 토큰 id 부분열이 아니라 **디토큰화 문자열 포함** — 생성 시점 토큰화는 문맥
 // 의존이라 id 검사는 정답을 놓친다(실측: 35B가 정답 패스코드를 다른 분할로
 // 생성해 0/6 오판 — `w4a16-eval needle`, --gen/--picks 진단 옵션).
