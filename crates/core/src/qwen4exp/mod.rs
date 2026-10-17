@@ -1,6 +1,6 @@
 //! [P7 2026-10-15] qwen4_exp(FN = Qwen3.8-Flash-Next) arch 골격 — §2.M 브링업
-//! 선행분. **config 판독 + ctx_info만** (serve ctx 파생·기동 가드 입력).
-//! 가중치 로드·엔진 경로·PLE/indexer 브링업은 본 트랙(플랜 §2.M).
+//! [FN 2단계 2026-10-17] CPU 오라클 엔진 골격(engine·stages) 추가 —
+//! w4a16-ref fn-probe 진입. 골든은 3차.
 //!
 //! 체크포인트 계약(2026-10-15 config 실측): `architectures =
 //! Qwen4ExpForConditionalGeneration` · `model_type = qwen4_exp` · hparams는
@@ -17,3 +17,9 @@ pub mod bind;
 // [FN 1단계 2026-10-17] w4a16-load 식별 연결 — bind::report(hparams 전항 +
 // ctx_info + PLE/ngram/MTP 스켈레톤 판별). packed 로드·엔진은 본 트랙.
 pub use bind::{Qwen4ExpCfg, arch_ok, ctx_info, dir_arch_ok, report};
+// [FN 2단계 2026-10-17] CPU 오라클 엔진 골격 — 스토어 직접 접근(gptq 팩).
+pub mod engine;
+pub mod stages;
+
+/// w4a16-ref fn-probe 진입 — engine::probe 재수출.
+pub use engine::probe;

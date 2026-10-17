@@ -63,6 +63,9 @@ pub enum StDtype {
     I32,
     I64,
     U8,
+    /// [FN 2단계 2026-10-17] PLE ngram 임베딩(float8_e4m3fn, 1B).
+    /// 디코드 자체는 3차 — 여기선 헤더 판독·형상 검증만.
+    F8E4M3,
 }
 
 impl StDtype {
@@ -75,6 +78,7 @@ impl StDtype {
             "I32" => StDtype::I32,
             "I64" => StDtype::I64,
             "U8" => StDtype::U8,
+            "F8_E4M3" => StDtype::F8E4M3,
             other => return Err(StError::BadHeader(format!("unknown dtype {other}"))),
         })
     }
@@ -84,7 +88,7 @@ impl StDtype {
             StDtype::F16 | StDtype::Bf16 | StDtype::I16 => 2,
             StDtype::F32 | StDtype::I32 => 4,
             StDtype::I64 => 8,
-            StDtype::U8 => 1,
+            StDtype::U8 | StDtype::F8E4M3 => 1,
         }
     }
 }

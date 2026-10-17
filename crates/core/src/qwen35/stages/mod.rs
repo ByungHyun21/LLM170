@@ -2,7 +2,8 @@
 
 mod attn;
 mod gdn;
-mod moe;
+// [FN 2단계 2026-10-17] MoE 라우팅(select_topk) 재사용 — qwen4exp 스테이지.
+pub(crate) mod moe;
 
 pub(crate) use attn::attn_layer;
 pub(crate) use gdn::gdn_layer;

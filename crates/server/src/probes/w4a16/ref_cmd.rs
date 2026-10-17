@@ -140,6 +140,14 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
                 .into(),
         );
     }
+    // [FN 2단계 2026-10-17] qwen4_exp(FN) — CPU 오라클 골격(fn-probe) 진입.
+    // 골든 greedy 경로는 3차(PLE·indexer·hyper-connection 미해부).
+    let path = std::path::Path::new(&dir);
+    if let Some(a) = llm170_core::qwen35::bind::dir_arch(path)
+        && llm170_core::qwen4exp::arch_ok(&a)
+    {
+        return llm170_core::qwen4exp::probe(path);
+    }
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     let mut n_predict = 32usize;
     let mut ctx = 4096usize;
@@ -356,6 +364,10 @@ impl RefEngine {
     pub(super) fn load(dir: &str, n_seqs: usize, ctx: usize) -> Result<Self, String> {
         let path = std::path::Path::new(dir);
         let arch = llm170_core::qwen35::bind::dir_arch(path).unwrap_or_default();
+        if llm170_core::qwen4exp::arch_ok(&arch) {
+            // [FN 2단계] FN은 gptq 팩 — qwen35/gemma4 W4A16 로더 계약 밖.
+            return Err("qwen4_exp(FN) 참조 greedy는 3차 — w4a16-ref fn-probe 경로 사용".into());
+        }
         if llm170_core::gemma4::bind::arch_ok(&arch) {
             let m = llm170_core::gemma4::Model::load(path).map_err(|e| e.to_string())?;
             Ok(RefEngine::Gemma(llm170_core::gemma4::Engine::new(
