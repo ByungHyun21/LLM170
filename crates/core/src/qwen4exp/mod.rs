@@ -8,9 +8,12 @@
 //! [linear×3, full×1] 반복(full_attention_interval=4 → full 12·linear 36) ·
 //! full층 KV = num_key_value_heads(2)×head_dim(256) · linear(GDN류) 상태 =
 //! linear_num_value_heads(48)×128×128 · **512 전문가 top-10**(+shared 640) ·
-//! PLE = ple_layer_ids([2])·embed 2560 · **MTP 헤드 보유**(mtp 1층 full-attn,
-//! hybrid — dense 마커 게이트와 정합) · ctx 262,144.
+//! PLE = ple_layer_ids([2])·embed 2560 · **MTP는 config에만 기술**(1층
+//! full-attn hybrid)되고 체크포인트 텐서는 미포함 → 엔진 n-gram 초안 폴백
+//! (2026-10-17 index.json 실측) · ctx 262,144.
 
 pub mod bind;
 
-pub use bind::{Qwen4ExpCfg, arch_ok, ctx_info, dir_arch_ok};
+// [FN 1단계 2026-10-17] w4a16-load 식별 연결 — bind::report(hparams 전항 +
+// ctx_info + PLE/ngram/MTP 스켈레톤 판별). packed 로드·엔진은 본 트랙.
+pub use bind::{Qwen4ExpCfg, arch_ok, ctx_info, dir_arch_ok, report};

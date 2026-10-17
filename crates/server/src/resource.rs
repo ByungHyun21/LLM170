@@ -159,6 +159,17 @@ pub fn guard_target(sub: &str, model: Option<&str>, rest: &[String]) -> Option<G
             .find(|a| !a.starts_with("--"))
             .map(std::path::PathBuf::from)
     });
+    // [FN 1단계 2026-10-17] qwen4_exp(FN) w4a16-load = 식별 전용 프로브
+    // (config.json + index.json 판독, 가중치 mmap 없음) — 121GiB 체크포인트
+    // 용량으로 호스트 예산 판정하면 식별 자체가 막힌다. 무가드 스킵.
+    if sub == "w4a16-load"
+        && path
+            .as_deref()
+            .and_then(llm170_core::qwen35::bind::dir_arch)
+            .is_some_and(|a| llm170_core::qwen4exp::arch_ok(&a))
+    {
+        return None;
+    }
     // 서빙 경로는 CUDA 고정 → VRAM 계정. CPU 전용 프로브는 제외.
     let gpu = !matches!(
         sub,

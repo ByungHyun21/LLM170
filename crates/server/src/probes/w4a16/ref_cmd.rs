@@ -10,11 +10,17 @@ pub(super) fn load(args: &[String]) -> Result<String, String> {
                 .into(),
         );
     }
+    // [FN 1단계 2026-10-17] qwen4_exp(FN)은 config/ctx_info 식별까지만 —
+    // auto_round:auto_gptq 팩이라 트리플 W4A16 검증 대상 아님(본 트랙).
+    // gemma4/qwen35 판별에 앞서 분기(w4a16-load 등록 패턴 준수).
+    let arch = llm170_core::qwen35::bind::dir_arch(std::path::Path::new(&dir));
+    if arch.as_deref().is_some_and(llm170_core::qwen4exp::arch_ok) {
+        return llm170_core::qwen4exp::report(std::path::Path::new(&dir));
+    }
     let store = llm170_core::w4a16::W4a16Model::open(std::path::Path::new(&dir))
         .map_err(|e| e.to_string())?;
     // 아치 바인딩이 등록된 모델만 커버리지(완전성)까지 검증한다 — 미등록
     // 아치는 포맷 계층(트리플 구조·형상 값·양자 파라미터)만.
-    let arch = llm170_core::qwen35::bind::dir_arch(std::path::Path::new(&dir));
     if arch
         .as_deref()
         .is_some_and(llm170_core::gemma4::bind::arch_ok)
