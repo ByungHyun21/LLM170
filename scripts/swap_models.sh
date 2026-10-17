@@ -23,7 +23,7 @@
 # 장문 골든(600/4000)은 GPU 동결(2회 재현) — CPU 대조는 35토큰 한계(D3).
 # 경로 회귀 검출용(값 변경 시 원인 판정 후 재동결).
 # [KVQ 채택 2026-10-10] int8 KV가 단일 경로 — 구 F(KVQ) 섹션은 기본 경로와
-# 동일해져 제거. 35B 600 골든은 int8 채택값으로 재동결(2회 재현, eval.md).
+# 동일해져 제거. 35B 600 골든은 int8 채택값으로 재동결(2회 재현).
 # 사용법: scripts/swap_models.sh [--section a,d2,d4,...]
 #   섹션 키(콤마 선택, 미지정 = 전체): a 3a c 3b d d2 d3 d4 e g g2 h k j g4 g4e
 #   게이트(#9): 섹션 실행 결과 = 전체 실행의 해당 섹션 결과와 동일(회귀 없음).
@@ -462,11 +462,11 @@ fi
 
 if want j; then
     note "[11/11] J(수치 지문) — 128토큰 창 PPL 동결 대조 (Q2 · 서브토큰 드리프트)"
-    FP="docs/eval/fingerprint.tsv"   # 로컬 원장(docs/ — 푸시 제외)
+    FP="scripts/eval-data/fingerprint.tsv"   # 로컬 원장(푸시 제외)
     # [gemma4 2026-10-14] 세 번째 = gemma4 — 비채팅 프로토콜(add_bos 강제 → --bos 2).
     for pair in "$M_27B:27B:" "$M_35B:35B:" "$M_G4:gemma4:--bos 2"; do
       d="${pair%%:*}"; rest="${pair#*:}"; n="${rest%%:*}"; extra="${rest#*:}"
-      jout=$(timeout 900 "$BIN" w4a16-eval ppl "$d" --corpus docs/eval/corpus-en.txt \
+      jout=$(timeout 900 "$BIN" w4a16-eval ppl "$d" --corpus scripts/eval-data/corpus-en.txt \
               --limit 128 $extra --json 2> "$RUN/j-$n.log" | tail -1)
       if [ -z "$jout" ]; then
         echo "[w4a16] FAIL: $n 수치 지문 실행 실패 — ${RUN}/j-$n.log"; fail=1; continue
@@ -601,7 +601,7 @@ PYCMP
     python3 - "$RUN" <<'PYG4E'
 import json, sys
 run = sys.argv[1]
-t = open('docs/eval/corpus-long.txt', encoding='utf-8').read()[:6000]
+t = open('scripts/eval-data/corpus-long.txt', encoding='utf-8').read()[:6000]
 for name, mt in [("rB", 16), ("rA", 8)]:
     body = {"model": "m", "messages": [{"role": "user", "content": t}],
             "max_tokens": mt, "temperature": 0}

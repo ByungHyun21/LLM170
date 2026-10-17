@@ -7,7 +7,7 @@
 //  - 대역: D2D·핀드 H2D/D2H (Gen2 x16 실효) · P2P(BAR1) 가시성 + 인접쌍 대역
 //  - PWRBRK# 간이 판별: FFMA 지속 런 중 reps 사이 클럭·전력 샘플(nvidia-smi) — 4×급락 서명 탐색
 // 빌드: nvcc -O3 -arch=sm_80 -o target/cmp_probe scripts/cmp_probe.cu
-// 기록: README 벤치 표(환경·요약) / docs/cmp170hx-detail.md(상세) — 2026-10-16 프로토콜.
+// 기록: README 벤치 표(환경·요약) — 2026-10-16 프로토콜.
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>

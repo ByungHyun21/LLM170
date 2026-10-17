@@ -88,7 +88,7 @@ pub const GEMM_FFMA_TMAX: usize = 32;
 
 // [KVQ 채택 2026-10-10] int8 KV 단일 경로 — KvMode 제거.
 // 근거(실측): int8 PPL 델타 ±0.3% 이내(장문 27B +0.0025%) · 장문 프리필
-// +54%@16K(42.7→27.7s) · 단문 동급 — f32/int4 경로는 삭제(docs/eval.md — 로컬 원장).
+// +54%@16K(42.7→27.7s) · 단문 동급 — f32/int4 경로는 삭제.
 
 /// [R5 2026-10-10] 단일 버퍼(ptr+cap) — ensure_*가 쌍을 함께 갱신한다.
 #[derive(Clone, Copy, Default)]
@@ -190,7 +190,7 @@ pub const ATTN_SPLITS: usize = 8; // 프리필(그리드 t×q_heads×8로 충분
 /// 장문에서 지연 바운드가 커져 분할 확대가 유효해졌다 — 실측(27B, bench):
 /// tg@64K 36.05→39.75(+10%)·tg@16K 47.8→49.3(+3%)·tg@512 53.5→53.0(−0.9%)
 /// / 35B 짧은 창 −0.5%. S=128은 장문 +0.4 t/s뿐이고 단문 −3%(빈 분할 블록
-/// 디스패치 비용)라 64가 균형점. 곡선·게이트 수치는 원장(4090-detail).
+/// 디스패치 비용)라 64가 균형점. 곡선·게이트 수치는 커밋 이력.
 pub const ATTN_SPLITS_D: usize = 64;
 /// attn.cu 병합 smem(ATTN_SPLITS_MAX)과 동일해야 함(테스트 대조).
 pub const ATTN_SPLITS_MAX: usize = 64;

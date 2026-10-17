@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 2차 재빌드 스윕 W5(+W6 연동) — .cu 상수 치환·빌드·원복 사이클 + ab-bench 2진 쌍 측정.
-# 플랜: plans/plan-tuning-sweep.md §5 · 우선순위 근거: docs/cmp170hx-detail.md §10
+# 근거: sm_80 nsys 지도(2026-10-16 — 커밋 이력) · 플랜 = plans/plan.md
 # (35B 전문가 grp2+d64 = 65.5% 지배 — GRP_KC 32는 A2b가 4090 점유용 희생분, CMP 복원 1순위).
 #
 # 계약:

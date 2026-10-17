@@ -1074,7 +1074,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64(
 // deq_pair_b와 f16 라운딩 동일 — (n−8)·s의 단일 RNE(exact 곱의 RNE).
 // 스케일 = 열별 f16 hmul2(청크 KC=64 ⊂ g128 그룹 1개 → 청크당 1회 로드).
 // x·k 순서가 기존 w4a16_gemm_g128_mma와 같으므로 출력 비트동일 전제
-// (A/B 게이트가 판정). 레퍼런스 대조: source/GPTQModel/gptqmodel_ext/marlin/
+// (A/B 게이트가 판정). 레퍼런스 대조: reference/GPTQModel/gptqmodel_ext/marlin/
 // {gptq_marlin_repack.cu, dequant.h, marlin_template.h} 실측(2026-10-12).
 
 #define MAR_M 64

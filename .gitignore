@@ -1,7 +1,8 @@
 plans/
-source/
-# docs/ — 원장·공개 문서 모두 푸시 제외(사용자 지시 2026-09-30). plans/·source/와 동일 취급.
+# docs/ — 원장·공개 문서 모두 푸시 제외(사용자 지시 2026-09-30). plans/·reference/와 동일 취급.
 docs/
+# 로컬 eval 픽스처(코퍼스·지문 — scripts/eval-data)
+scripts/eval-data/
 target*/
 docs-inner/
 __pycache__/

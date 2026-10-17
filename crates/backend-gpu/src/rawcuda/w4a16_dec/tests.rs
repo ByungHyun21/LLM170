@@ -1245,7 +1245,7 @@ fn ckpt_victim_flop_aware() {
 }
 
 // ═══ [k2 (c) 1단 2026-10-17] PP 2샤드 — 창 산식(호스트) + 등가(CUDA 필요) ═══
-// 게이트 ①(docs/k2-core-split.md): 직렬 PP 골든 = 단일 GPU 대비 비트동일.
+// 게이트 ①: 직렬 PP 골든 = 단일 GPU 대비 비트동일.
 // 창 산식: 27B n_layers=64·interval=4의 32/32 분할 경계 정합(어텐션 KV
 // 서브층·GDN gi 절대 인덱스·노름 행 2*il 절대 유지)을 테이블로 고정.
 #[test]

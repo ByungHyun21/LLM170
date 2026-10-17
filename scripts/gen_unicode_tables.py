@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Transpile llama.cpp unicode-data.cpp tables into Rust (crates/server/src/unicode_data.rs).
 
-Source: source/llama.cpp/src/unicode-data.cpp (llama-tokenizer port).
+Source: reference/llama.cpp/src/unicode-data.cpp (llama-tokenizer port).
 Regenerate: python3 scripts/gen_unicode_tables.py
 """
 
 import re
 from pathlib import Path
 
-SRC = Path("source/llama.cpp/src/unicode-data.cpp")
+SRC = Path("reference/llama.cpp/src/unicode-data.cpp")
 DST = Path("crates/server/src/unicode_data.rs")
 
 
@@ -38,7 +38,7 @@ lowercase = pairs(extract("unicode_map_lowercase"))
 
 lines = []
 lines.append("//! llama.cpp unicode 카테고리 테이블 전용 (scripts/gen_unicode_tables.py 생성).")
-lines.append("//! 원본: source/llama.cpp/src/unicode-data.cpp — 수동 수정 금지, 재생성만.")
+lines.append("//! 원본: reference/llama.cpp/src/unicode-data.cpp — 수동 수정 금지, 재생성만.")
 lines.append("")
 lines.append("/// (start, flags) — start 이상 ~ 다음 start 미만. 마지막 항목은 0x110000 상한.")
 lines.append("pub static RANGES_FLAGS: [(u32, u16); %d] = [" % len(ranges_flags))

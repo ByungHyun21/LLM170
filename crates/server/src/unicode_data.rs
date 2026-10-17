@@ -1,5 +1,5 @@
 //! llama.cpp unicode 카테고리 테이블 전용 (scripts/gen_unicode_tables.py 생성).
-//! 원본: source/llama.cpp/src/unicode-data.cpp — 수동 수정 금지, 재생성만.
+//! 원본: reference/llama.cpp/src/unicode-data.cpp — 수동 수정 금지, 재생성만.
 
 /// (start, flags) — start 이상 ~ 다음 start 미만. 마지막 항목은 0x110000 상한.
 pub static RANGES_FLAGS: [(u32, u16); 2273] = [

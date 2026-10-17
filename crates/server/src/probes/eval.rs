@@ -64,7 +64,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
     let dir = arg_str(args, 0, "");
     if dir.is_empty() {
         return Err(
-            "w4a16-eval ppl <dir> --corpus <txt> [--out dump] — 예: w4a16-eval ppl ../models/Qwen3.8-27B-W4A16-AutoRound --corpus docs/eval/corpus-en.txt --out /tmp/eval-a.tsv".into(),
+            "w4a16-eval ppl <dir> --corpus <txt> [--out dump] — 예: w4a16-eval ppl ../models/Qwen3.8-27B-W4A16-AutoRound --corpus scripts/eval-data/corpus-en.txt --out /tmp/eval-a.tsv".into(),
         );
     }
     let (mut corpus, mut from_tokens, mut out_path) =
@@ -204,7 +204,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
             ));
         }
         // [2026-10-10] 청크 경로 — t행 배치 프리필 + 전 위치 로짓 회수
-        // (GEMM t≥2 — t=1 GEMV와 수치 계급이 다름: 방법 B, eval.md 참조).
+        // (GEMM t≥2 — t=1 GEMV와 수치 계급이 다름: 방법 B).
         if !head_gpu {
             return Err("--chunk≥2는 GPU head 필요(CPU head 경로 미지원)".into());
         }
@@ -1245,7 +1245,7 @@ fn needle(args: &[String]) -> Result<String, String> {
 /// [Q4 2026-10-12] 샘플링 검증 하네스 — 고정 LCG 로짓에서 서빙 CPU
 /// 샘플러(splitmix64 시드 — rand 금지 계약)로 N표본 뽑고 이론
 /// softmax(temperature·top_k/top_p/min_p 비활성) 분포와 TV 거리·
-/// 카이제곱을 대조한다(판정 기준은 실행 출력 참조 — docs/eval.md).
+/// 카이제곱을 대조한다(판정 기준은 실행 출력 참조).
 fn sample(args: &[String]) -> Result<String, String> {
     let mut it = args.iter();
     let Some(dir) = it.next().cloned() else {

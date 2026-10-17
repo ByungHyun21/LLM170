@@ -3,9 +3,9 @@
 //! 계약: **원본·CPU 미러 불변, VRAM 배치만 교체**. 이 모듈은 GPTQ qweight
 //! ([n][k/8] u32 — lsb-first 니블, 우리 로더 레이아웃)를 marlin B 배치
 //! ([k/16][n/64][128] u32)로 변환하고, 스케일을 marlin 순서로 재배열한다.
-//! 레퍼런스: source/GPTQModel/gptqmodel_ext/marlin/gptq_marlin_repack.cu
+//! 레퍼런스: reference/GPTQModel/gptqmodel_ext/marlin/gptq_marlin_repack.cu
 //! (no-perm 경로 — 우리 W4A16은 고정 gs 그룹이라 g_idx/perm 불요) +
-//! source/vllm-venv/.../marlin_utils.py의 get_scale_perms/permute_scales.
+//! reference/vllm-venv/.../marlin_utils.py의 get_scale_perms/permute_scales.
 //!
 //! 니블 매핑(repack.cu num_bits==4, pack_idx={0,2,4,6,1,3,5,7}):
 //!   출력 u32 = vals[{0,2,4,6,1,3,5,7}]를 니블 0..7로.
