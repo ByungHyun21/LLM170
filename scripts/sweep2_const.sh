@@ -50,6 +50,7 @@ EOF
   python3 - "$f" "$macro" "$val" <<'EOF'
 import re, sys
 f, macro, val = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(f).read()
 pat = (re.compile(rf'^(#define {macro} )\d+', re.M) if f.endswith('.cu')
        else re.compile(rf'^(pub const {macro}: [^=]+? = )\d+_;?$'))
 n = len(pat.findall(src))
