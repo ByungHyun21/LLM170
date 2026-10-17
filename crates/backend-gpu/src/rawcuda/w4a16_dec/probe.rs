@@ -285,13 +285,24 @@ impl W4a16Dec {
             return self.mma_diff_plain(name, t);
         }
         let (dq, ds, n, k) = self.lin_spec(name)?;
+        // [split 계약 정합 2026-10-17] mma 커널의 x는 f16 — 종전 f32 버퍼를
+        // 그대로 넘겨 허위 NaN 보고(커널 f16 전환 시 프로브 미갱신 결함).
+        // 값을 f16 격자로 스냅해 양측 동일값: FFMA=f32(스냅) · mma=f16 비트.
         let xf: Vec<f32> = (0..t * k)
-            .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5)
+            .map(|i| {
+                let v =
+                    ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5;
+                crate::rawcuda::gptq4::h2f(crate::f32_to_f16(v))
+            })
             .collect();
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let xh: Vec<u16> = xf.iter().map(|&v| crate::f32_to_f16(v)).collect();
+        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4/×2).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
+        let hb = unsafe { std::slice::from_raw_parts(xh.as_ptr() as *const u8, xh.len() * 2) };
         let dx = self.cc.alloc(t * k * 4)?;
+        let dx16 = self.cc.alloc(t * k * 2)?;
         self.cc.h2d(dx, xb)?;
+        self.cc.h2d(dx16, hb)?;
         let da = self.cc.alloc(t * n * 4)?;
         let db = self.cc.alloc(t * n * 4)?;
         let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
@@ -310,7 +321,7 @@ impl W4a16Dec {
             )?;
             // mma(32×64, 256스레드).
             let fm = self.cc.function("w4a16_gemm_g128_mma")?;
-            let (mut m_q, mut m_s, mut m_x, mut m_y) = (self.lin_packed(name)?, ds, dx, db);
+            let (mut m_q, mut m_s, mut m_x, mut m_y) = (self.lin_packed(name)?, ds, dx16, db);
             let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
             self.cc.launch(
                 fm,
@@ -340,6 +351,7 @@ impl W4a16Dec {
                 .collect();
             Ok((fa, fb))
         })();
+        let _ = self.cc.free(dx16);
         let _ = self.cc.free(dx);
         let _ = self.cc.free(da);
         let _ = self.cc.free(db);
