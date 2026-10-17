@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# 4090 표준 배터리 — benchmark/4090.md 표 행을 **그대로 출력**한다(측정 1회 = 표 갱신).
+# 4090 표준 배터리 — 4090기 전용(sm_89 행 라벨 — CMP에서는 실행 대상 아님).
+# 구 원장 benchmark/4090.md는 폐지(2026-10-16; 역사 = git 이력·docs/4090-detail.md).
+# 표 행을 **그대로 출력**한다(측정 1회 = 표 갱신).
 # 규율(사용자 지시 2026-10-13): 스크립트와 표의 측정 세트를 일치시켜 이중 측정을 없앤다.
 #
 # 사용: scripts/bench_4090.sh [--long] [--reps N]
@@ -8,7 +10,7 @@
 #   --long(긴 창): pp 16384,32768,65536 + tg128 각 위치(ctx 69632) — 표:
 #     | backend | pp16384 | pp32768 | pp65536 | tg@16k | tg@32k | tg@64k |
 #   모델 = ../models 아래 27B·35B(환경변수 MODEL_27B/MODEL_35B로 교체 가능).
-# 출력 마지막 줄에 커밋 해시 제안을 인쇄한다(4090.md Environment 표의 commit 행).
+# 출력 마지막 줄에 커밋 해시 제안을 인쇄한다(구 4090.md Environment 표의 commit 행).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN=${BIN:-./target/release/llm170}
