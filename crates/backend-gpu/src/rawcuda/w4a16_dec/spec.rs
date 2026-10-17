@@ -21,6 +21,13 @@ impl W4a16Dec {
     /// [A-1] 스펙 검증 — t토큰(2..=8) 배치 체인 + 전 위치 그리디 토큰.
     /// 상태(GDN 스냅샷 포함)·pos는 전진한다(수용 판정 후 롤백은 호출부).
     pub fn spec_verify(&mut self, slot: usize, rows: &[f32], t: usize) -> Result<Vec<u32>, String> {
+        // [다중슬롯 700 수정 2026-10-17] 컨텍스트 가드 — 종전 부재. CtxGuard는
+        // 이탈 시 진입 전 컨텍스트(최초 NULL 포함)를 복원하므로, 가드 없는
+        // 진입부는 가드 해제 직후의 NULL 창에서 실행될 수 있다(실측: slot1
+        // 검증 t=4 캡처가 cur=0x0로 진입 → instantiate CUresult=201 → 문맥
+        // 독 → 700 폭포/교착. forward_device_argmax 등 나머지 진입부는 기존
+        // 가드 보유 — 이 함수만 누락).
+        let _g = self.cc.guard()?;
         if self.head_w == 0 {
             return Err("spec_verify: head 미등록".into());
         }
@@ -112,7 +119,10 @@ impl W4a16Dec {
             })();
             match cap {
                 Ok((e, g)) => self.graph.spec_graphs.push(((slot, t), e, g)),
-                Err(_) => {
+                Err(err) => {
+                    // [디버그 2026-10-17] 종전 무조건 삼킴 — 다중슬롯 크래시의
+                    // 첫 발화 지점(700 폭포의 원천) 노출.
+                    eprintln!("[spec-capture 실패] slot={slot} t={t}: {err}");
                     self.graph.spec_graph_ok = false;
                     self.cc.sync().ok();
                 }
@@ -131,6 +141,9 @@ impl W4a16Dec {
         rows: &[f32],
         t: usize,
     ) -> Result<Vec<f32>, String> {
+        // [다중슬롯 700 수정 2026-10-17] 컨텍스트 가드 — spec_verify 누락과 동일
+        // 계급(가드 해제 직후 NULL 창 진입 방지 — 일괄 보강).
+        let _g = self.cc.guard()?;
         if self.head_w == 0 {
             return Err("spec_verify_logits: head 미등록".into());
         }
@@ -156,6 +169,9 @@ impl W4a16Dec {
     /// [결함수정 2026-10-11 계약 승계] 상태·링 모두 GDN 서수(n_gdn)
     /// 스트라이드 — 모델 층(n_layers) 아님.
     pub fn spec_rollback(&mut self, slot: usize, keep: usize) -> Result<(), String> {
+        // [다중슬롯 700 수정 2026-10-17] 컨텍스트 가드 — spec_verify 누락과 동일
+        // 계급(가드 해제 직후 NULL 창 진입 방지 — 일괄 보강).
+        let _g = self.cc.guard()?;
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         if !self.spec_on || keep > 8 {
             return Err(format!("spec_rollback: 계약 위반 keep={keep}"));
