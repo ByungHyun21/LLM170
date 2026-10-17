@@ -111,7 +111,6 @@ impl QwenEngine {
         Ok((head_gpu && dec.owns_final_layer(), mtp))
     }
 
-
     /// [k2 (b) 2026-10-17] 디코더 층 창(기본 전체창) — GpuEngine 위임용.
     pub fn layer_window(&self) -> llm170_backend_gpu::LayerWindow {
         self.dec.layer_window()

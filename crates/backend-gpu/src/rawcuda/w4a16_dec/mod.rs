@@ -657,7 +657,10 @@ pub struct LayerWindow {
 impl LayerWindow {
     /// 전체 층 창(0..n_layers) — 기본값.
     pub fn full(n_layers: usize) -> Self {
-        Self { start: 0, end: n_layers }
+        Self {
+            start: 0,
+            end: n_layers,
+        }
     }
     /// 창 층 수.
     pub fn n(&self) -> usize {

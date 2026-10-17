@@ -146,7 +146,7 @@ impl W4a16Dec {
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, t, xh)
                 .map_err(|e| format!("T{il} input norm: {e}"))?;
-            let branch = if (il + 1) % interval == 0 {
+            let branch = if (il + 1).is_multiple_of(interval) {
                 // [R10] 4변형 → lin_forward 단일 디스패치(Gemm 경로).
                 let xin = if plain { xn } else { xh };
                 if fuse {
@@ -178,7 +178,7 @@ impl W4a16Dec {
                 gi += 1;
                 g
             };
-            let lo = if (il + 1) % interval == 0 {
+            let lo = if (il + 1).is_multiple_of(interval) {
                 format!("blk.{il}.attn_output.weight")
             } else {
                 format!("blk.{il}.ssm_out.weight")
@@ -234,10 +234,7 @@ impl W4a16Dec {
             // [k2 (b)] 전 위치 head/argmax는 마지막 층 소유 창만(비최종 샤드의
             // 검증 경로는 코디네이터 단계 소관). 전체창 = 항상 통과.
             if !owns_final {
-                return Err(
-                    "chain_t: 비최종 창 — 전 위치 head/argmax는 마지막 샤드 소관"
-                        .into(),
-                );
+                return Err("chain_t: 비최종 창 — 전 위치 head/argmax는 마지막 샤드 소관".into());
             }
             // [A-1] 전 위치 최종 노름 → 배치 head → 배치 argmax → 토큰 t개.
             let xn_all = self

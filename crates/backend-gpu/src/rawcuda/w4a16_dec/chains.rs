@@ -57,7 +57,7 @@ impl W4a16Dec {
             if il == 0 && self.debug_layers {
                 eprintln!("  G0 xn[0..4]={:?}", &xn[..4]);
             }
-            ab = if (il + 1) % interval == 0 {
+            ab = if (il + 1).is_multiple_of(interval) {
                 let ai = il / interval;
                 let q = self
                     .gemv_host(&format!("blk.{il}.attn_q.weight"), &xn)
@@ -127,7 +127,7 @@ impl W4a16Dec {
                 let a: f64 = ab.iter().map(|&v| v as f64).sum();
                 eprintln!(
                     "  G{il:>2} recr={} sum={:.6}",
-                    (il + 1) % interval != 0,
+                    !(il + 1).is_multiple_of(interval),
                     d + a
                 );
             }
@@ -246,7 +246,7 @@ impl W4a16Dec {
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, 1, x32)
                 .map_err(|e| format!("L{il} input norm: {e}"))?;
-            let branch = if (il + 1) % interval == 0 {
+            let branch = if (il + 1).is_multiple_of(interval) {
                 // [S2 2026-10-11] q/k/v 단독 3런치 → 다중세그먼트 1런치(테이블은
                 // ensure_chain_bufs 1회 작성 — 값 비트동일).
                 let xin = if plain { xn } else { x32 };
@@ -265,7 +265,7 @@ impl W4a16Dec {
                 gi += 1;
                 g
             };
-            let lo = if (il + 1) % interval == 0 {
+            let lo = if (il + 1).is_multiple_of(interval) {
                 format!("blk.{il}.attn_output.weight")
             } else {
                 format!("blk.{il}.ssm_out.weight")
@@ -327,7 +327,11 @@ impl W4a16Dec {
                     .iter()
                     .map(|c| f32::from_le_bytes(*c) as f64)
                     .sum();
-                eprintln!("  G{il:>2} recr={} sum={:.6}", (il + 1) % 4 != 0, d + a);
+                eprintln!(
+                    "  G{il:>2} recr={} sum={:.6}",
+                    !(il + 1).is_multiple_of(4),
+                    d + a
+                );
             }
         }
         // [k2 (b) 2026-10-17] 최종 노름은 마지막 층 소유 창만 — 비최종 창은
@@ -402,9 +406,7 @@ impl W4a16Dec {
         let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
         let win = self.window;
         if !win.owns_final(self.n_layers) {
-            return Err(
-                "batch_launch: 비최종 창 — head/argmax는 마지막 샤드 소관".into(),
-            );
+            return Err("batch_launch: 비최종 창 — head/argmax는 마지막 샤드 소관".into());
         }
         let mut gi = win.gdn_start(interval);
         let plain = self.plain_weights;
@@ -417,7 +419,7 @@ impl W4a16Dec {
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, t, xh)
                 .map_err(|e| format!("B{il} input norm: {e}"))?;
-            let branch = if (il + 1) % interval == 0 {
+            let branch = if (il + 1).is_multiple_of(interval) {
                 // [S2 2026-10-11] q/k/v 3런치 → 다중세그먼트 1런치(테이블 공용
                 // — t=1 판과 동일 메타, grid만 Σceil(n/TR)).
                 let xin = if plain { xn } else { xh };
@@ -436,7 +438,7 @@ impl W4a16Dec {
                 gi += 1;
                 g
             };
-            let lo = if (il + 1) % interval == 0 {
+            let lo = if (il + 1).is_multiple_of(interval) {
                 format!("blk.{il}.attn_output.weight")
             } else {
                 format!("blk.{il}.ssm_out.weight")
