@@ -1,17 +1,18 @@
-//! [A-1] 스페큘러티브 초안 — n-gram 단순형(llama.cpp ngram-simple 미러).
+//! [A-1] 스펙큘러티브 초안 — n-gram 단순형 + 다중 깊이 확장(C11 2026-10-17).
 //!
-//! 히스토리(프롬프트+생성)에서 마지막 n토큰 패턴의 **직전 출현**을 역방향
-//! 선형 스캔으로 찾아, 그 뒤 m토큰을 초안으로 복사한다. copy_max가 n 미만
-//! 이면 포기(무상태·추가 메모리 0 — common/ngram-map.cpp:49-112 동형).
+//! v1(llama.cpp ngram-simple 미러): 마지막 n토큰 패턴의 직전 출현을 역방향
+//! 선형 스캔으로 찾아 그 뒤 m토큰을 초안으로 복사.
+//! v2(C11): **다중 깊이 폴백**(긴 매치 우선) — n=8→6→4→3 순서로 시도해
+//! 가장 긴 매치의 continuation을 취한다. 빈도 기반 선택은 검증 무손실이므로
+//! 수용률만 개선(정확성 영향 0).
 //! 초안은 검증(배치 argmax 비교)으로만 수용되므로 정확성 위험은 없다.
 
-/// n-gram 초안 — 반환 길이 ≤ max_draft(호출부가 배치 상한으로 절단).
+/// n-gram 초안 v1 — 단일 깊이(호환성 유지·tuning-sweep 노브).
 pub fn ngram_draft(hist: &[u32], n: usize, m: usize, max_draft: usize) -> Vec<u32> {
     if n == 0 || hist.len() < n + 1 || max_draft == 0 {
         return Vec::new();
     }
     let pat = &hist[hist.len() - n..];
-    // 역방향 선형 스캔 — 첫 매치에서 중단(최근 출현 우선).
     let mut match_pos = None;
     let mut i = hist.len() - n - 1;
     loop {
@@ -33,6 +34,28 @@ pub fn ngram_draft(hist: &[u32], n: usize, m: usize, max_draft: usize) -> Vec<u3
         return Vec::new();
     }
     hist[after..after + copy_max.min(max_draft)].to_vec()
+}
+
+/// n-gram 초안 v2(C11) — 다중 깊이 폴백: 8→6→4→3 순서로 시도, 긴 매치 우선.
+/// 짧은 컨텍스트에서는 짧은 n도 시도(v1 폴백과 동일). 무손실(검증만 수용).
+pub fn ngram_draft_multi(hist: &[u32], m: usize, max_draft: usize) -> Vec<u32> {
+    // 컨텍스트 길이에 따라 시도할 깊이 목록 결정 — 긴 것부터.
+    let depths: &[usize] = if hist.len() >= 16 {
+        &[8, 6, 4, 3]
+    } else if hist.len() >= 8 {
+        &[6, 4, 3]
+    } else if hist.len() >= 4 {
+        &[3]
+    } else {
+        return Vec::new();
+    };
+    for &n in depths {
+        let d = ngram_draft(hist, n, m, max_draft);
+        if !d.is_empty() {
+            return d;
+        }
+    }
+    Vec::new()
 }
 
 #[cfg(test)]

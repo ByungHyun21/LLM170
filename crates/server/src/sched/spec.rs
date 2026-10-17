@@ -85,12 +85,17 @@ fn spec_round_impl(
     // [tuning-sweep W1 2026-10-16] n-gram n/m 인자화 — 기본 3/48(bench --sweep
     // 전용, serve는 Default). 초안 검증은 무손실이라 값이 토큰을 바꾸지 않는다
     // (수용률만 변화) — 해시 실드가 이를 상시 판정.
+    // [C11 2026-10-17] 다중 깊이 폴백(8→6→4→3) — ngram_knobs의 n이 0이면
+    // multi 경로(긴 매치 우선), 아니면 지정 깊이(v1 호환·튜닝 노브).
     let (nn, nm) = e.ngram_knobs();
     let draft: Vec<u32> = if mtp_on {
         match e.mtp_take_draft(i) {
             Some(d) => d,
+            None if nn == 0 => llm170_core::spec::ngram_draft_multi(&hist, nm, kk - 1),
             None => llm170_core::spec::ngram_draft(&hist, nn, nm, kk - 1),
         }
+    } else if nn == 0 {
+        llm170_core::spec::ngram_draft_multi(&hist, nm, kk - 1)
     } else {
         llm170_core::spec::ngram_draft(&hist, nn, nm, kk - 1)
     };

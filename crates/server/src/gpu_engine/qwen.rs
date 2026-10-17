@@ -53,7 +53,7 @@ impl QwenEngine {
     /// sched/spec.rs n-gram 초안 노브(기본 3/48).
     pub fn ngram_knobs(&self) -> (usize, usize) {
         (
-            self.tuning.ngram_n.unwrap_or(3),
+            self.tuning.ngram_n.unwrap_or(0),
             self.tuning.ngram_m.unwrap_or(48),
         )
     }
