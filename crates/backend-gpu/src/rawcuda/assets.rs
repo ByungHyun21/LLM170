@@ -43,11 +43,26 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_gemv_experts_g32_bf16",
             "w4a16_gemm_g32_mma_grp",
             "w4a16_gemm_g32_mma_grp2",
-            "w4a16_gemv_g32_bf16_tall2",
+            // [P9 2026-10-17] 레거시 tall — 디스패치 미사용(tall2가 단일 경로).
+            // gptq4.cu 바이트 동결(코드젠 고정, gemma4.cu 헤더 참조)로 커널이
+            // fatbin에 잔존 — 심볼 등록만 유지(부팅 바인딩·발사 없음).
+            "w4a16_gemv_g32_bf16_tall",
             "w4a16_moe_align",
             "w4a16_gemm_g128_mma",
             "w4a16_gemv_g32_bf16_t",
         ],
+        boot: true,
+    },
+    Asset {
+        // [P9 2026-10-17] gptq4.cu 분리 — gemma4 tall GEMV 계열(코드젠 고정,
+        // gemma4.cu 헤더 주석 참조). -fmad=false 계약은 gptq4와 동일.
+        name: "gemma4",
+        env: "LLM170_CUDA_GEMMA4_FATBIN_PATH",
+        paths: &[
+            "crates/backend-gpu/src/rawcuda/assets/gemma4.fatbin",
+            "src/rawcuda/assets/gemma4.fatbin",
+        ],
+        syms: &["w4a16_gemv_g32_bf16_tall2"],
         boot: true,
     },
     Asset {
@@ -214,6 +229,7 @@ pub fn asset_bytes(a: &Asset) -> Result<Vec<u8>, String> {
 pub fn cu_source(name: &str) -> &'static str {
     match name {
         "gptq4" => include_str!("assets/gptq4.cu"),
+        "gemma4" => include_str!("assets/gemma4.cu"),
         "moe" => include_str!("assets/moe.cu"),
         "norm" => include_str!("assets/norm.cu"),
         "gdn" => include_str!("assets/gdn.cu"),
