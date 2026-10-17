@@ -20,3 +20,8 @@ pub use rawcuda::w4a16_dec::{
 pub fn cuda_mem_free() -> Option<(u64, u64)> {
     rawcuda::ctx::cuda_mem_free()
 }
+
+/// [k2 (a) 2026-10-16] 디바이스 명시 VRAM 프로브 — 다중 카드 엔진 소유 디바이스.
+pub fn cuda_mem_free_dev(ordinal: i32) -> Option<(u64, u64)> {
+    rawcuda::ctx::cuda_mem_free_dev(ordinal)
+}

@@ -125,7 +125,12 @@ if want 3a; then
     else
       echo "[w4a16] FAIL: kv-mem 최소 거부 사유 불명 — ${RUN}/sv1.log"; fail=1
     fi
-    if timeout 120 "$BIN" serve --model "$M_27B" --kv-mem 100G --port 18098 > "$RUN/sv4.log" 2>&1; then
+    # [2026-10-16 CMP] 상한 거부 기대치를 기기 유도로 — 100G 하드코딩은 4090
+    # (24G VRAM+64G RAM) 기준이라 CMP(64G+107G)에서는 합법 수용(호스트부가
+    # 가용 RAM 안)이라 가드 아닌 타임아웃으로 죽었다. 거부 유발 = 양 여유의 2배.
+    SV4_G=$(( ( $(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0) / 1024
+              + $(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo) ) * 2 ))
+    if timeout 120 "$BIN" serve --model "$M_27B" --kv-mem "${SV4_G}G" --port 18098 > "$RUN/sv4.log" 2>&1; then
       echo "[w4a16] FAIL: --kv-mem 100G(호스트 여유 초과)가 통과됨"; fail=1
     elif grep -q "kv-mem 가드 거부" "$RUN/sv4.log"; then note "kv-mem 상한(호스트 여유) 거부 OK: $(grep -m1 'kv-mem 가드 거부' "$RUN/sv4.log" | cut -c1-80)"
     else
@@ -137,9 +142,11 @@ if want 3a; then
     else
       echo "[w4a16] FAIL: --ctx 폐지 사유 불명 — ${RUN}/sv2.log"; fail=1
     fi
-    # ② W3 분할 수용 — kv-mem 12G(VRAM부 상한 2.7G, 초과분 = 호스트 2계층).
+    # ② W3 분할 수용 — kv-mem 12G. [2026-10-16 CMP] 4090은 VRAM부 자연 상한
+    # (2.7G)로 분할됐으나 64G 카드는 12G 전부 VRAM에 들어 kv-tier 라인이 없다.
+    # 진단 노브로 VRAM부 상한 강제(W3 하네스 전용 배치 파라미터 — 수치 불변).
     : > "$RUN/sv3.log"
-    "$BIN" serve --model "$M_27B" --kv-mem 12G --port 18103 > "$RUN/sv3.log" 2>&1 &
+    LLM170_KV_VRAM_MB=2048 "$BIN" serve --model "$M_27B" --kv-mem 12G --port 18103 > "$RUN/sv3.log" 2>&1 &
     SERVE_PID=$!
     trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
     for i in $(seq 1 100); do

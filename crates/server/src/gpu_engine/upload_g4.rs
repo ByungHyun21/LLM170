@@ -215,9 +215,7 @@ pub(crate) fn upload_model_g4(
             }
         }
         let expert_bytes: u64 = tab.iter().map(|e| e.1 + e.3).sum();
-        let free = llm170_backend_gpu::cuda_mem_free()
-            .map(|(f, _)| f)
-            .unwrap_or(0);
+        let free = dec.free_vram().map(|(f, _)| f).unwrap_or(0);
         let resident = match crate::engine::MOE_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
             1 => true,
             2 => false,

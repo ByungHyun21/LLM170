@@ -645,6 +645,13 @@ pub(super) struct G4GraphEntry {
 
 pub struct W4a16Dec {
     pub(super) moe: MoE,
+    /// [tuning-sweep W2 2026-10-16] 스트리밍 전문가 LRU 재구성 노브(bench
+    /// --sweep 전용) — None = 상수 경로(cap 96·예산 free/2). serve/infer는
+    /// 항상 기본값(단일 경로 원칙 — ensure_moe_bufs가 소비).
+    pub(super) tuning_lru_cap: Option<usize>,
+    pub(super) tuning_lru_frac: Option<u64>,
+    /// [k2 (a)] 이 디코더의 디바이스 ordinal(여유 VRAM 판돡·PP 배선 소비).
+    pub device_ord: i32,
     pub(super) mtp: Mtp,
     pub(super) kstep: Kstep,
     pub(super) attn: Attn,
@@ -802,8 +809,14 @@ mod tests;
 
 impl W4a16Dec {
     /// 디코더 생성 — 5개 fatbin(체인 커널) 로드. 가중치는 upload_*로 공급.
-    pub fn new(n_slots: usize, hidden: usize, n_layers: usize) -> Result<Self, String> {
-        let mut cc = CudaCtx::new()?;
+    /// [k2 코어-코디네이터 (a) 2026-10-16] 디바이스 명시 — new() = 0(종전).
+    pub fn new_dev(
+        n_slots: usize,
+        hidden: usize,
+        n_layers: usize,
+        device: i32,
+    ) -> Result<Self, String> {
+        let mut cc = CudaCtx::new_dev(device)?;
         // [R9] 자산 매니페스트 단일 출처(rawcuda/assets.rs) — 부팅 로드분.
         for a in crate::rawcuda::assets::ASSETS.iter().filter(|a| a.boot) {
             cc.load_fatbin(a.name, &crate::rawcuda::assets::asset_bytes(a)?, a.syms)?;
@@ -817,7 +830,7 @@ impl W4a16Dec {
         // 안전하다. 참고: 가중치·스크래치는 이 네임스페이스 밖이라 예산은
         // 4 캐시에만 걸린다(전량 회계는 다음 트랜셰).
         let mut ucache = UnifiedCacheRegistry::new();
-        if let Some((free, _)) = crate::cuda_mem_free() {
+        if let Some((free, _)) = crate::cuda_mem_free_dev(device) {
             ucache.set_budget(Tier::Hbm, free);
         }
         ucache.set_enforce(true);
@@ -867,6 +880,9 @@ impl W4a16Dec {
                 dmo: Buf::default(),
                 moe_bufs_ok: false,
             },
+            tuning_lru_cap: None,
+            tuning_lru_frac: None,
+            device_ord: device,
             mtp: Mtp {
                 mtp_ok: false,
                 mtp_nw: 0,
@@ -1061,6 +1077,16 @@ impl W4a16Dec {
             route_capture: false,
             route_out: Vec::new(),
         })
+    }
+
+    /// [k2 (a)] 종전 생성 = 디바이스 0.
+    pub fn new(n_slots: usize, hidden: usize, n_layers: usize) -> Result<Self, String> {
+        Self::new_dev(n_slots, hidden, n_layers, 0)
+    }
+
+    /// [k2 (a)] 엔진 소유 디바이스의 여유 VRAM — 전역 프로브(디바이스 0) 대신.
+    pub fn free_vram(&self) -> Option<(u64, u64)> {
+        crate::cuda_mem_free_dev(self.device_ord)
     }
 
     pub fn device_name(&self) -> &str {

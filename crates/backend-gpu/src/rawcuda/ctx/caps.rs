@@ -136,10 +136,11 @@ impl VramSampler {
     }
 }
 
-/// cuInit → 디바이스 0 프라이머리 컨텍스트 유지 → cuMemGetInfo_v2.
+/// cuInit → 디바이스 프라이머리 컨텍스트 유지 → cuMemGetInfo_v2.
 /// 모듈 로드 없음(가드는 모델 적재 전 단계). 실패 시 None(호출부가 B17 정책
-/// 으로 거부 — Option 계약).
-pub fn cuda_mem_free() -> Option<(u64, u64)> {
+/// 으로 거부 — Option 계약). [k2 (a) 2026-10-16] 디바이스 명시 — 다중 카드에서
+/// 엔진 소유 디바이스의 여유를 읽는다(cuda_mem_free = 디바이스 0 종전 프록시).
+pub fn cuda_mem_free_dev(ordinal: i32) -> Option<(u64, u64)> {
     let drv = ffi::Driver::get().ok()?;
     // SAFETY: 출력은 스택 로컬 — 프로브 경로, 컨텍스트 유지는 프로세스 수명.
     unsafe {
@@ -147,7 +148,7 @@ pub fn cuda_mem_free() -> Option<(u64, u64)> {
             return None;
         }
         let mut dev: ffi::CUdevice = 0;
-        if (drv.device_get)(&mut dev, 0) != CUDA_SUCCESS {
+        if (drv.device_get)(&mut dev, ordinal) != CUDA_SUCCESS {
             return None;
         }
         let mut ctx: ffi::CUcontext = std::ptr::null_mut();
@@ -163,4 +164,9 @@ pub fn cuda_mem_free() -> Option<(u64, u64)> {
         }
         Some((free as u64, total as u64))
     }
+}
+
+/// 종전 동작 = 디바이스 0(엔진 밖 사전 프로브 — 플래너·배너·plan CLI).
+pub fn cuda_mem_free() -> Option<(u64, u64)> {
+    cuda_mem_free_dev(0)
 }

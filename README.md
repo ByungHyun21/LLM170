@@ -8,20 +8,43 @@ end-to-end on GPU with an int8 KV cache and CUDA-graph decode — 27B dense
 
 ## Benchmarks
 
-<!-- 표 외 텍스트 금지 (repo rule) — 값은 표 안에만. -->
-Dev-machine ledger (RTX 4090): [benchmark/4090.md](benchmark/4090.md)
+<!-- 표 외 텍스트 금지 (repo rule) — 값은 표 안에만. 우리 엔진 결과만 기재
+     (타 구현체 행 없음 — 사용자 방침 2026-10-16). 측정 상세 = docs/cmp170hx-detail.md. -->
 
-### Qwen3.8-27B-W4A16 (g128)
+### Environment (CMP 170HX)
 
-| backend | pp512 | pp4096 | pp16384 | tg128@4k |
-|---|---|---|---|---|
-| CUDA (170HX, sm_80) | — | — | — | — |
-
-| mode | CUDA (170HX) |
+| item | value |
 |---|---|
-| tg single | — |
-| np4 greedy | — |
-| serve | — |
+| GPU | 4x NVIDIA CMP 170HX (GA100, sm_80, 64 GB each) |
+| driver | 610.57.04 (unlock patch, pinned) |
+| PCIe | Gen2 x16 all 4 |
+| power limit | 180 W (fixed) |
+| SM / L2 | 70 SM; 32 MiB L2; persisting max 20 MiB |
+| host | AMD EPYC 7452 32C/64T, 107 GB RAM |
+
+### Qwen3.8-27B-W4A16 (g128, dense GDN)
+
+| row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
+|---|---|---|---|---|---|
+| CUDA (170HX, 180 W, 2026-10-16) | 704 | 695 | 648 | 26.6 | 57.7 |
+
+### Qwen3.6-35B-A3B-W4A16 (g32, MoE resident)
+
+| row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
+|---|---|---|---|---|---|
+| CUDA (170HX, 180 W, 2026-10-16) | 1365 | 1362 | 1298 | 108.8 | 182.6 |
+
+### Gemma-4-26B-A4B-it-QAT-W4A16 (g32, MoE resident)
+
+| row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
+|---|---|---|---|---|---|
+| CUDA (170HX, 180 W, 2026-10-16) | 483 | 451 | 379 | 44.7 | 118.7 |
+
+| mode (27B) | t/s | note |
+|---|---|---|
+| tg single (pp512) | 27.6 | reps3 median, stream hash stable |
+| np4 greedy | 57.7 | single-path equivalence OK (K=64) |
+| serve | — | not measured yet |
 
 ## Build & run
 
@@ -44,7 +67,6 @@ crates/core        W4A16 loader, CPU reference (quant lane), qwen35 CPU engine
 crates/diag        diagnostics (env flags, dumps)
 crates/backend-gpu rawcuda — CUDA driver bindings + kernel assets (.cu/fatbin)
 crates/server      CLI + HTTP server (continuous batching)
-benchmark/         measurement ledgers (dev machine: 4090.md)
 ```
 
 Kernel assets: `scripts/build_cuda_kernels.sh` (nvcc, sm_80+sm_89); kernel

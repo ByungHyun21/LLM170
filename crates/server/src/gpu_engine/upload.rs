@@ -158,9 +158,7 @@ pub(crate) fn upload_moe(
     // 상주 가능(170HX 64GB 등)이면 전문가 전량 VRAM — 토큰당 PCIe 스트리밍 제거.
     // 판정: 전문가 바이트 + 1GiB 여유. 불가면 스트리밍 테이블(호스트 mmap).
     let expert_bytes: u64 = tab.iter().map(|e| e.1 + e.3).sum();
-    let free = llm170_backend_gpu::cuda_mem_free()
-        .map(|(f, _)| f)
-        .unwrap_or(0);
+    let free = dec.free_vram().map(|(f, _)| f).unwrap_or(0);
     // [2.J] CLI 정책 우선 — 1=resident 강제 · 2=streaming 강제 · 3=hybrid 강제 ·
     // 0=auto(env/여유). [2026-10-16 #11] hybrid = 핫 몫만 VRAM 직행(O_DIRECT),
     // 비상주 몫만 RAM 스테이징 — 부분-fit에서 전량 RAM 복사/이중 패스 제거.

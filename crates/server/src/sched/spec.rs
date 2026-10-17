@@ -82,13 +82,17 @@ fn spec_round_impl(
     // [MTP-CHAIN §3.3] mtp_drafts_on=false(강제 ngram)면 생산(mtp_first/single/
     // post_round)·소비 모두 스킵(순수 n-gram 경로).
     let mtp_on = src == 0;
+    // [tuning-sweep W1 2026-10-16] n-gram n/m 인자화 — 기본 3/48(bench --sweep
+    // 전용, serve는 Default). 초안 검증은 무손실이라 값이 토큰을 바꾸지 않는다
+    // (수용률만 변화) — 해시 실드가 이를 상시 판정.
+    let (nn, nm) = e.ngram_knobs();
     let draft: Vec<u32> = if mtp_on {
         match e.mtp_take_draft(i) {
             Some(d) => d,
-            None => llm170_core::spec::ngram_draft(&hist, 3, 48, kk - 1),
+            None => llm170_core::spec::ngram_draft(&hist, nn, nm, kk - 1),
         }
     } else {
-        llm170_core::spec::ngram_draft(&hist, 3, 48, kk - 1)
+        llm170_core::spec::ngram_draft(&hist, nn, nm, kk - 1)
     };
     if draft.is_empty() {
         return Ok(false);

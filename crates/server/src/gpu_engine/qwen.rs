@@ -34,12 +34,28 @@ impl QwenEngine {
                 head_gpu,
                 softcap: llm170_core::qwen35::bind::final_logit_softcap(dir),
                 mtp,
+                tuning: super::Tuning::default(),
             }),
             Err(e) => {
                 dec.free_all_device();
                 Err(e)
             }
         }
+    }
+
+    /// [tuning-sweep W1/W2 2026-10-16] --sweep 노브 적용 — 원칙상 수치 불변
+    /// (스케줄·용량만)이나 이는 전제가 아니라 W0 해시 실드의 검증 대상.
+    pub fn apply_tuning(&mut self, t: super::Tuning) -> Result<(), String> {
+        self.tuning = t;
+        self.dec.set_lru_tuning(t.lru_cap, t.lru_frac)
+    }
+
+    /// sched/spec.rs n-gram 초안 노브(기본 3/48).
+    pub fn ngram_knobs(&self) -> (usize, usize) {
+        (
+            self.tuning.ngram_n.unwrap_or(3),
+            self.tuning.ngram_m.unwrap_or(48),
+        )
     }
 
     /// [D2 검수 2026-10-13] 컨텍스트 생성 **후** 적재 본체(head·embed·MTP).
@@ -207,11 +223,20 @@ impl QwenEngine {
         }
         let mut last = None;
         // 청크 크기 정책 — 순수 함수(테스트 표면, [R16]).
-        let tmax = prefill_tmax(
-            self.dec.is_moe(),
-            self.dec.moe_experts_resident(),
-            llm170_diag::flag::val("LLM170_PREFILL_T"),
-        );
+        let tmax = match self.tuning.chunk_t {
+            // [tuning-sweep W2] 청크 노브 — prefill_tmax 클램프를 경유(계약 보존:
+            // MoE 스트리밍 ≤12·전역 ≤512 등 정책이 그대로 적용된다).
+            Some(v) => prefill_tmax(
+                self.dec.is_moe(),
+                self.dec.moe_experts_resident(),
+                Some(&v.to_string()),
+            ),
+            None => prefill_tmax(
+                self.dec.is_moe(),
+                self.dec.moe_experts_resident(),
+                llm170_diag::flag::val("LLM170_PREFILL_T"),
+            ),
+        };
         let mut i = 0usize;
         while i < n {
             let t = (n - i).min(tmax);
