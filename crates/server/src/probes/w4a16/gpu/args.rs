@@ -27,6 +27,12 @@ pub(super) struct GpuArgs {
     pub(super) marlin_bench: Vec<(String, usize, usize, String)>, // [marlin S2] mma 대비 벤치
     /// [2.A-② 2026-10-13] marlin-bench 콜드 모드(L2 플러시 — HBM 조건 근사).
     pub(super) marlin_cold: bool,
+    /// [split-k marlin 디코드 2026-10-17] t=1 sk 커널 벤치(이름, reps).
+    pub(super) decode_bench: Vec<(String, usize)>,
+    /// [sk] 콜드 모드(L2 플러시 — marlin_cold와 동일 조건).
+    pub(super) decode_cold: bool,
+    /// [sk] 커널 격리 자체점검(합성 — 모델 무게 불요).
+    pub(super) decode_selfcheck: bool,
     pub(super) marlin_ref: Option<(String, usize)>, // [marlin S2] 실무게 64행 참조 대조
     pub(super) attn_fa2: Vec<(usize, usize, u32)>,  // [FA2] A/B (t, layer, pos0)
     pub(super) attn_fa2_bench: Vec<(usize, usize, usize, u32)>, // [FA2] (t, layer, reps, pos0)
@@ -70,6 +76,9 @@ pub(super) fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
         marlin_bench: Vec::new(),
         marlin_cold: false,
         marlin_ref: None,
+        decode_bench: Vec::new(),
+        decode_cold: false,
+        decode_selfcheck: false,
         attn_fa2: Vec::new(),
         attn_fa2_bench: Vec::new(),
         mode_ref: 0,
@@ -243,6 +252,16 @@ pub(super) fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
                 a.marlin_bench.push((name, t, reps, kern));
             }
             "--marlin-cold" => a.marlin_cold = true,
+            "--decode-bench" => {
+                let name = arg(&mut it, "--decode-bench requires a name")?.to_string();
+                let reps = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--decode-bench requires reps")?;
+                a.decode_bench.push((name, reps));
+            }
+            "--decode-cold" => a.decode_cold = true,
+            "--decode-selfcheck" => a.decode_selfcheck = true,
             "--bench-plain" => {
                 let name = arg(&mut it, "--bench-plain requires a name")?.to_string();
                 let t = it

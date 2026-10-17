@@ -33,7 +33,9 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
       llama-bench 규격 PP/TG/NP 측정(엔진 직접 — HTTP 무경유, 합성 LCG 토큰).
   llm170 serve --model <w4a16_dir> --kv-mem <총량> [--port N] [--queue N]
               [--ple ssd|ram|vram] [--spec auto|mtp|ngram|off] [--moe auto|resident|streaming|hybrid]
+              [--cards N]
       OpenAI/Anthropic 호환 HTTP 서버. KV 총량 = --kv-mem(필수·무 auto — 권고는 `llm170 plan`).
+      [PP 3차] --cards 2 = 2카드 직렬 파이프라인(스펙/MTP 강제 OFF — 토큰열 = 단일 카드와 동일).
       요청 상한 = min(모델 최대, 풀) — 모델 ctx 초과분은 출력 클램프(vLLM식·기동 로그에 기록),
       풀 초과는 거부, 잔여 부족은 대기(드롭 없음).
   llm170 w4a16-load <dir>
@@ -242,6 +244,8 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     // [2026-10-16] serve 입력 = --kv-mem(필수·무 auto) — --ctx(serve)는 폐지.
     // 배분 절충(KV vs 전문가 vs PLE)은 운영자 명시 결정, 플래너는 검증·권고.
     let mut kv_mem: Option<u64> = None;
+    // [PP 3차 2026-10-17] GPU 카드 수 — 1 = 현행 단일 경로 불변, 2 = PP 2샤드.
+    let mut cards = 1usize;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -285,6 +289,11 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                     crate::engine::MOE_POLICY.store(p as u64, std::sync::atomic::Ordering::Relaxed)
                 }
                 _ => return usage_err("--moe requires auto|resident|streaming|hybrid"),
+            },
+            // [PP 3차 2026-10-17] 2카드 파이프라인(오버랩·4카드는 비목표).
+            "--cards" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(c) if (1..=2).contains(&c) => cards = c,
+                _ => return usage_err("--cards requires 1 or 2 (4카드·TP는 비목표)"),
             },
             other => return usage_err(&format!("unknown flag: {other}")),
         }
@@ -366,18 +375,42 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 // 315.0MiB)이 프로브 전용 지연 할당으로 빠지고 dring0
                 // (5.6MiB)이 대신 들어와 순감 309.4MiB — 그 몫만 환원.
                 const RESERVE: u64 = resource::VRAM_RESERVE;
+                // [PP 3차 2026-10-17] 2카드 — 카드별 최악 여유로 동일 공식.
+                // 가중치는 카드당 절반(연속 층 분할), 플래너(단일 카드 전용)은
+                // 스킵. 카드1 프로브 실패 시 카드0 값으로 계속(엔진 적재가
+                // 정확히 실패시킨다 — 조용한 초과 승인 방지).
+                let (free, wts_div) = if cards == 2 {
+                    let f1 = llm170_backend_gpu::cuda_mem_free_dev(1).map(|(f, _)| f);
+                    match f1 {
+                        Some(f1) => (free.min(f1), 2u64),
+                        None => {
+                            eprintln!("# cards=2: 카드1 VRAM 조회 실패 — 카드0 기준으로 검증(엔진 적재가 최종 판정)");
+                            (free, 2u64)
+                        }
+                    }
+                } else {
+                    (free, 1u64)
+                };
                 // 폴백 상한(매니페스트 판독 불가 시): 가중치 = dense 전량(디렉터리).
-                let wts = if ci.dense { dir_bytes(&model_path) } else { 0 };
+                let wts = if ci.dense { dir_bytes(&model_path) / wts_div } else { 0 };
                 // [K6-3] 문맥 추가분 = (문맥−1)×GDN 상태 — KV 상한에서 차감.
                 let ctx_state = (SERVE_CONTEXTS as u64 - 1) * ci.gdn_state_bytes_per_slot;
                 let mut max_kv = free
                     .saturating_sub(wts)
                     .saturating_sub(RESERVE)
                     .saturating_sub(ctx_state);
+                // 2카드는 총 KV VRAM 상한 = 카드당 상한 × 2(각 카드가 절반 보유).
+                if cards == 2 {
+                    max_kv *= 2;
+                }
                 // [2.M 2026-10-13] 배치 플래너 = 상한·권고의 단일 산출원(매니페스트
                 // 판독 시). dense 범주(실상주 — embed는 호스트 mmap)로 가중치를
                 // 계상해 embed 바이트를 KV로 회수한다(구 공식은 dir 전량 — 27B에서
                 // 2.4GiB 과소). 판독 실패·거부 시엔 폴백 공식 유지.
+                // [PP 3차] 플래너는 단일 카드 전용 — 2카드는 카드당 폴백 공식(위).
+                if cards == 2 {
+                    eprintln!("# plan 건너뜀: PP 2카드(플래너 단일 카드 전용)");
+                } else {
                 match llm170_core::plan::Manifest::from_dir(&model_path) {
                     Ok(man) => {
                         let hw = llm170_core::plan::Hardware {
@@ -405,6 +438,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                         }
                     }
                     Err(e) => eprintln!("# plan 건너뜀: {e}"),
+                }
                 }
                 // [2026-10-16] 2계층 검증 — VRAM부 상한 초과분은 **호스트 확장**
                 // (요청 우선 — 거부하지 않는다). 호스트부는 가용 RAM 검증.
@@ -474,6 +508,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         kv_budget,
         kv_reserve,
         kv_vram_cap,
+        cards,
     };
     // 모니터링 — 정적 정보 등록 + 샘플러 스레드(1Hz; 무시 가능 비용,
     // 최신 스냅샷만 유지 — 시계열 누적은 외부 폴러 몫).

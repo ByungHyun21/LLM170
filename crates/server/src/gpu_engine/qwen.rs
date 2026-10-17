@@ -16,9 +16,28 @@ impl QwenEngine {
         kv_reserve: Option<u64>,
         kv_vram_cap: Option<u64>,
     ) -> Result<Self, String> {
+        Self::load_dev(dir, n_slots, ctx, kv_budget, kv_reserve, kv_vram_cap, 0, None)
+    }
+
+    /// [PP 3차 2026-10-17] 샤드 로드 — 디바이스 명시 + 층 창(PP 2샤드).
+    /// window=None이면 단일 경로와 완전 동일(기본 전체창·MTP 포함).
+    /// 샤드(window=Some)는 MTP 스킵 — 1차 PP는 스펙/MTP 강제 OFF(골든 우선).
+    pub fn load_dev(
+        dir: &Path,
+        n_slots: usize,
+        ctx: usize,
+        kv_budget: Option<u64>,
+        kv_reserve: Option<u64>,
+        kv_vram_cap: Option<u64>,
+        device: i32,
+        window: Option<(usize, usize)>,
+    ) -> Result<Self, String> {
         let model = llm170_core::qwen35::Model::load(dir).map_err(|e| e.to_string())?;
         let hp = model.hp.clone();
-        let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
+        let mut dec = W4a16Dec::new_dev(n_slots, hp.n_embd, hp.n_layer, device)?;
+        if let Some((ws, we)) = window {
+            dec.set_layer_window(ws, we)?;
+        }
         // [K6-3 예산] 풀 예산(여유 VRAM 파생) — upload_model(내부 set_attn) 전에 설정.
         dec.set_kv_budget(kv_budget);
         // [2026-10-16] 2계층 — VRAM 상한 초과분은 호스트 아레나(set_attn이 분할).
@@ -26,7 +45,7 @@ impl QwenEngine {
         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
         // [D2 검수 2026-10-13] 적재 실패 시 부분 할당 정리 — 재시도 루프가
         // VRAM을 되찾지 못하던 문제(첫 시도 실패 후 전부 OOM)의 해소.
-        match Self::fill(&mut dec, &model, ctx, kv_reserve.unwrap_or(0)) {
+        match Self::fill(&mut dec, &model, ctx, kv_reserve.unwrap_or(0), window) {
             Ok((head_gpu, mtp)) => Ok(QwenEngine {
                 model,
                 dec,
@@ -65,8 +84,9 @@ impl QwenEngine {
         model: &llm170_core::qwen35::Model,
         ctx: usize,
         kv_reserve: u64,
+        window: Option<(usize, usize)>,
     ) -> Result<(bool, bool), String> {
-        upload_model(dec, model, ctx, kv_reserve)?;
+        upload_model(dec, model, ctx, kv_reserve, window)?;
         // 5) head — bf16 output.weight는 GPU 커널 경로(아니면 CPU 참조).
         // [2026-10-16] head/embed — O_DIRECT 직결 스트림(mmap 우회).
         // head는 행-블록 양자화(호스트 RAM 상수 — 2.4GB 물질화 회피).
@@ -104,7 +124,8 @@ impl QwenEngine {
             )?;
         }
         ld.log_summary();
-        let mtp = upload_mtp(dec, model)?;
+        // [PP 3차] 샤드 로드는 MTP 스킵 — 1차 PP는 스펙/MTP 강제 OFF(골든 우선).
+        let mtp = if window.is_none() { upload_mtp(dec, model)? } else { false };
         // [k2 (b) 2026-10-17] 층 창 — head(output.weight)는 마지막 층 소유
         // 샤드만 담당. 기본 전체창 = 항상 참 → 동작 불변. 임베딩은 첫 샤드
         // 입력 조립용으로 전 창 공통 업로드 유지.
@@ -185,7 +206,7 @@ impl QwenEngine {
 
     /// head 로짓 — CPU 참조 경로(bf16 디퀀트 f32 내적, 골든과 동일 계급).
     /// A9: 로더가 보증하더라도 패닉 대신 Result — 서버 오류 응답으로 유도.
-    fn head_logits(&self, xn: &[f32]) -> Result<Vec<f32>, String> {
+    pub(super) fn head_logits(&self, xn: &[f32]) -> Result<Vec<f32>, String> {
         let head = self
             .model
             .w("output.weight")
@@ -197,7 +218,7 @@ impl QwenEngine {
 
     /// [R5] 토큰 열 → 임베딩 행 평탄 조립(t×h) — 배치 디코드 부트스트랩
     /// 공용(동작 불변: 토큰별 embed_row 동일 순서·동일 오류 전파).
-    fn embed_rows(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+    pub(super) fn embed_rows(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
         let h = self.model.hp.n_embd;
         let mut rows = Vec::with_capacity(tokens.len() * h);
         for tok in tokens {

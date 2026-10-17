@@ -68,6 +68,20 @@ pub(super) fn run_marlin_diff(
     dec.marlin_diff_check(name, t, &qm)
 }
 
+/// [split-k marlin 디코드 2026-10-17] --decode-bench — t=1 sk 커널 단독
+/// 형상별 벤치(현 GEMV 대비, ksp 전수). qm은 업로드 이중 버퍼 상주 사용.
+pub(super) fn run_decode_bench(
+    dec: &mut llm170_backend_gpu::W4a16Dec,
+    bench: &[(String, usize)],
+    cold: bool,
+) -> Result<String, String> {
+    let mut out = Vec::new();
+    for (name, reps) in bench {
+        out.push(dec.decode_bench(name, *reps, cold)?);
+    }
+    Ok(out.join("\n"))
+}
+
 /// [marlin S2 디버그] 커널 격리 자체점검 — 합성 n=128·k=128·s=1·x=1.
 /// 기대 = 정수 Σ(nib−8) (f32 누적 순서 무관 비트정확).
 pub(super) fn run_marlin_selfcheck(

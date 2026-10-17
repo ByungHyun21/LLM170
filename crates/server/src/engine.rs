@@ -176,6 +176,8 @@ pub struct InferRequest {
     /// [2.M 사다리] KV 풀 실할당 추정 = min(예산, ctx×문맥수×KV/토큰).
     /// 전문가 상주(auto) 판정에서 KV 몫을 먼저 떼는 데 쓴다(0/None = 종전 규칙).
     pub kv_reserve: Option<u64>,
+    /// [PP 3차 2026-10-17] GPU 카드 수(1 = 현행 단일 경로 불변, 2 = PP 2샤드).
+    pub cards: usize,
 }
 
 pub struct InferResult {
@@ -266,6 +268,7 @@ pub fn build_slots(req: InferRequest, n_slots: usize) -> Engine {
         req.kv_budget,
         req.kv_reserve,
         req.kv_vram_cap,
+        req.cards,
     );
     banner(
         &req.model,

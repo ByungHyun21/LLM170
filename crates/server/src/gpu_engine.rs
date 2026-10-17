@@ -11,11 +11,13 @@ use std::path::Path;
 mod g4;
 mod gemma;
 mod mtp;
+mod pp;
 mod qwen;
 mod spec;
 mod upload;
 mod upload_g4;
 pub(crate) use self::g4::{g4_chunk, g4_step};
+pub(crate) use self::pp::PpEngine;
 pub(crate) use self::gemma::GemmaEngine;
 pub(crate) use self::upload::{DirectLoad, upload_model};
 pub(crate) use self::upload_g4::{G4HostCfg, upload_model_g4};
@@ -123,6 +125,8 @@ mod tests {
 pub enum GpuEngine {
     Qwen(Box<QwenEngine>),
     Gemma(Box<GemmaEngine>),
+    /// [PP 3차 2026-10-17] 2카드 직렬 파이프라인(--cards 2 전용).
+    Pp(Box<PpEngine>),
 }
 
 /// 위임 매크로 — &mut self 메서드.
@@ -134,6 +138,7 @@ macro_rules! engine_delegate_mut {
                     match self {
                         GpuEngine::Qwen(e) => e.$name($($a),*),
                         GpuEngine::Gemma(e) => e.$name($($a),*),
+                        GpuEngine::Pp(e) => e.$name($($a),*),
                     }
                 }
             )*
@@ -151,6 +156,7 @@ macro_rules! engine_delegate_ref {
                     match self {
                         GpuEngine::Qwen(e) => e.$name($($a),*),
                         GpuEngine::Gemma(e) => e.$name($($a),*),
+                        GpuEngine::Pp(e) => e.$name($($a),*),
                     }
                 }
             )*
@@ -236,6 +242,31 @@ impl GpuEngine {
             )?)));
         }
         Ok(GpuEngine::Qwen(Box::new(QwenEngine::load(
+            dir,
+            n_slots,
+            ctx,
+            kv_budget,
+            kv_reserve,
+            kv_vram_cap,
+        )?)))
+    }
+}
+
+impl GpuEngine {
+    /// [PP 3차 2026-10-17] 2카드 로드 — qwen(dense 27B) 전용. cards=2 진입.
+    pub fn load_pp(
+        dir: &Path,
+        n_slots: usize,
+        ctx: usize,
+        kv_budget: Option<u64>,
+        kv_reserve: Option<u64>,
+        kv_vram_cap: Option<u64>,
+    ) -> Result<Self, String> {
+        let arch = llm170_core::qwen35::bind::dir_arch(dir).unwrap_or_default();
+        if llm170_core::gemma4::bind::arch_ok(&arch) {
+            return Err("PP 2샤드: gemma4 미지원(1차 = qwen dense 27B)".into());
+        }
+        Ok(GpuEngine::Pp(Box::new(PpEngine::load(
             dir,
             n_slots,
             ctx,

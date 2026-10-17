@@ -308,6 +308,7 @@ pub(crate) fn upload_model(
     model: &llm170_core::qwen35::Model,
     ctx: usize,
     kv_reserve: u64,
+    window: Option<(usize, usize)>,
 ) -> Result<(), String> {
     let hp = model.hp.clone();
     let interval = hp.full_attn_interval.max(1);
@@ -318,12 +319,24 @@ pub(crate) fn upload_model(
     }
     let moe = hp.n_experts > 0;
     // 1) 선형 상주 — GPU 체인은 원본(HF) 무게(순열은 커널 내부 처리).
+    // [PP 3차 2026-10-17] 샤드 창 — 선형(대용량)만 창 층 한정 업로드.
+    // 노름/GDN/어텐션 상수 테이블은 전층 올려도 소량(체인은 창 층만 참조).
     if moe {
+        if window.is_some() {
+            return Err("PP 샤딩: MoE 모델은 1차 미지원(dense 27B 전용)".into());
+        }
         upload_moe(dec, model, kv_reserve)?;
     } else {
         // [2026-10-16] 양자화 선형 — O_DIRECT 직결 스트림(핀드 링).
         let mut ld = DirectLoad::new(model.store());
         for name in model.engine_names() {
+            // [PP 3차] 창 외 층 선형 스킵 — blk.<il>. 접두 판정.
+            if let Some((ws, we)) = window
+                && let Some(il) = blk_layer_of(&name)
+                && !(ws..we).contains(&il)
+            {
+                continue;
+            }
             if let Some(w) = model.w_raw(&name)
                 && w.ty == llm170_core::wtype::WType::W4a16Split
             {
@@ -467,4 +480,27 @@ pub(crate) fn upload_model(
     }
     dec.set_attn(ad, Vec::new(), &qnw, &knw)?;
     Ok(())
+}
+
+/// [PP 3차 2026-10-17] "blk.<il>." 접두에서 층 번호 — 비층 이름(token_embd 등)은 None.
+fn blk_layer_of(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("blk.")?;
+    let digits = rest.split('.').next()?;
+    digits.parse().ok()
+}
+
+#[cfg(test)]
+mod pp_tests {
+    use super::blk_layer_of;
+
+    /// [PP 3차] 샤드 창 필터용 층 번호 판독 — 층 이름/비층 이름 경계.
+    #[test]
+    fn blk_layer_of_names() {
+        assert_eq!(blk_layer_of("blk.0.attn_q.weight"), Some(0));
+        assert_eq!(blk_layer_of("blk.31.ffn_down.weight"), Some(31));
+        assert_eq!(blk_layer_of("token_embd.weight"), None);
+        assert_eq!(blk_layer_of("output.weight"), None);
+        assert_eq!(blk_layer_of("mtp.layers.0.self_attn.q_proj.weight"), None);
+        assert_eq!(blk_layer_of("blk.12x.weight"), None);
+    }
 }

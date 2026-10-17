@@ -28,7 +28,7 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
         return gpu_run_g4(args);
     }
     let a = parse_args(args)?;
-    if a.bench.is_none() && a.prompts.is_empty() {
+    if a.bench.is_none() && !a.decode_selfcheck && a.prompts.is_empty() {
         return Err("w4a16-gpu: 프롬프트 필요(--prompt-tokens)".into());
     }
     let prompt: Vec<u32> = a.prompts.first().cloned().unwrap_or_default();
@@ -43,7 +43,7 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
     // 1~4) 모델 상주 업로드(GpuEngine 공용 — dense/MoE 분기 포함).
     // kv_reserve 0 = 종전 상주 규칙(프로브 — 서버 사다리 판정과 분리).
-    crate::gpu_engine::upload_model(&mut dec, &model, a.ctx, 0)?;
+    crate::gpu_engine::upload_model(&mut dec, &model, a.ctx, 0, None)?;
     // 보고용 split 선형 수(dense 한정 — MoE는 0).
     let n_lin = model
         .engine_names()
@@ -97,6 +97,12 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     }
     if let Some(x) = a.marlin_selfcheck32 {
         return run_marlin_selfcheck32(&mut dec, x);
+    }
+    if a.decode_selfcheck {
+        return dec.decode_selfcheck();
+    }
+    if !a.decode_bench.is_empty() {
+        return run_decode_bench(&mut dec, &a.decode_bench, a.decode_cold);
     }
     if !a.attn_fa2_bench.is_empty() {
         return run_attn_fa2_bench(&mut dec, &a.attn_fa2_bench);
@@ -201,6 +207,10 @@ pub(super) fn gpu_run_g4(args: &[String]) -> Result<String, String> {
     let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
     dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
     let cfg = crate::gpu_engine::upload_model_g4(&mut dec, &model, a.ctx)?;
+    // [P9-2] 형상별 t행 GEMV 벤치 게이트 — 업로드 직후·체인 전 단발 측정.
+    if let Some((name, t, reps)) = &a.bench_gemv_t {
+        return run_bench_gemv_t(&mut dec, name, *t, *reps);
+    }
     let upload_ms = t0.elapsed().as_secs_f64() * 1e3;
     // GPU 체인 — 프롬프트 전파 + 그리디 생성.
     let tg = std::time::Instant::now();
