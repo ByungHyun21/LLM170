@@ -1516,17 +1516,6 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
     for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
         const unsigned rbase = mtile * GRP_M;
-        // [2026-10-17 #2 판정] 'M 스태킹'(한 M타일에 타 전문가 슬롯 혼합)은
-        // 불가 — mma B 프래그먼트는 타일 전 M행 공유인데 전문가별 B가 상이
-        // (블록=전문가 1개 설계가 이미 그 계약). 실낭비는 **컴퓨트 낭비**:
-        // 35B pp512 덤프(LLM170_DUMP=moe_cnt, 40층 평균) M64 타일 156.5/층 →
-        // 연산 행 10,014 vs 유효 슬롯 4,096(M 활용 41%). 가중치 B 스트리밍
-        // ≈188MB/층(≈118µs@1.59TB/s) ≪ mma 63GMAC(≈853µs@147.8TF/s) — 7:1
-        // 컴퓨트 지배라 M 타일 재구성은 유효(스트리밍 불변 아님). 레버 =
-        // 16행 밴드(=m워프) 단위 스킵: M16 환산 타일 332/층 → 행 5,314(77%),
-        // mma 53%로 절감. k 순서·프래그먼트 불변, 죽은 행은 출력 가드가 본래
-        // 폐기하던 행 — 산술 불변(골든 토큰열 대조 판정).
-        const unsigned live = (cnt - rbase + 15) >> 4; // 이 타일 생 밴드(1..4)
         float c[4][4];
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
@@ -1535,12 +1524,6 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
         auto stage_ab = [&](int st, int kn) {
             for (int ee = tid; ee < GRP_M * GRP_KC / 4; ee += 256) {
                 const int r = ee / (GRP_KC / 4);
-                // [2026-10-17 #2] 완전 죽은 밴드(≥ live·16) 행은 mma가 읽지
-                // 않음 — 스테이징 스킵. 부분 밴드의 꼬리 행은 0 패딩 유지(mma가
-                // 16행 전체를 읽음).
-                if ((unsigned)r >= (live << 4)) {
-                    continue;
-                }
                 const int c4 = ee % (GRP_KC / 4);
                 const int gi = kn + c4 * 4;
                 if (rbase + r < cnt) {
@@ -1603,36 +1586,32 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2(
             asm volatile("cp.async.commit_group;");
             asm volatile("cp.async.wait_group 1;");
             __syncthreads();
-            // [2026-10-17 #2] 죽은 M16 밴드(=m워프) mma 스킵 — k루프 배리어는
-            // 그대로 순회(전 워프 도달 계약). 워프 균일 분기.
-            if ((unsigned)(warp >> 1) < live) {
 #pragma unroll
-                for (int ks = 0; ks < GRP_KC / 16; ++ks) {
-                    const int kb = ks * 16;
-                    const unsigned p00 = xs[cur][mt + g][kb + 2 * tt];
-                    const unsigned p01 = xs[cur][mt + g][kb + 2 * tt + 1];
-                    const unsigned p10 = xs[cur][mt + g + 8][kb + 2 * tt];
-                    const unsigned p11 = xs[cur][mt + g + 8][kb + 2 * tt + 1];
-                    const unsigned p20 = xs[cur][mt + g][kb + 2 * tt + 8];
-                    const unsigned p21 = xs[cur][mt + g][kb + 2 * tt + 9];
-                    const unsigned p30 = xs[cur][mt + g + 8][kb + 2 * tt + 8];
-                    const unsigned p31 = xs[cur][mt + g + 8][kb + 2 * tt + 9];
-                    const unsigned ah0 = hilo_hi(p00, p01);
-                    const unsigned al0 = hilo_lo(p00, p01);
-                    const unsigned ah1 = hilo_hi(p10, p11);
-                    const unsigned al1 = hilo_lo(p10, p11);
-                    const unsigned ah2 = hilo_hi(p20, p21);
-                    const unsigned al2 = hilo_lo(p20, p21);
-                    const unsigned ah3 = hilo_hi(p30, p31);
-                    const unsigned al3 = hilo_lo(p30, p31);
+            for (int ks = 0; ks < GRP_KC / 16; ++ks) {
+                const int kb = ks * 16;
+                const unsigned p00 = xs[cur][mt + g][kb + 2 * tt];
+                const unsigned p01 = xs[cur][mt + g][kb + 2 * tt + 1];
+                const unsigned p10 = xs[cur][mt + g + 8][kb + 2 * tt];
+                const unsigned p11 = xs[cur][mt + g + 8][kb + 2 * tt + 1];
+                const unsigned p20 = xs[cur][mt + g][kb + 2 * tt + 8];
+                const unsigned p21 = xs[cur][mt + g][kb + 2 * tt + 9];
+                const unsigned p30 = xs[cur][mt + g + 8][kb + 2 * tt + 8];
+                const unsigned p31 = xs[cur][mt + g + 8][kb + 2 * tt + 9];
+                const unsigned ah0 = hilo_hi(p00, p01);
+                const unsigned al0 = hilo_lo(p00, p01);
+                const unsigned ah1 = hilo_hi(p10, p11);
+                const unsigned al1 = hilo_lo(p10, p11);
+                const unsigned ah2 = hilo_hi(p20, p21);
+                const unsigned al2 = hilo_lo(p20, p21);
+                const unsigned ah3 = hilo_hi(p30, p31);
+                const unsigned al3 = hilo_lo(p30, p31);
 #pragma unroll
-                    for (int nt = 0; nt < 4; ++nt) {
-                        const int nb = ntw + nt * 8;
-                        const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
-                        const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
-                        mma_f16(c[nt], ah0, ah1, ah2, ah3, b0, b1);
-                        mma_f16(c[nt], al0, al1, al2, al3, b0, b1);
-                    }
+                for (int nt = 0; nt < 4; ++nt) {
+                    const int nb = ntw + nt * 8;
+                    const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
+                    const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
+                    mma_f16(c[nt], ah0, ah1, ah2, ah3, b0, b1);
+                    mma_f16(c[nt], al0, al1, al2, al3, b0, b1);
                 }
             }
             __syncthreads();
