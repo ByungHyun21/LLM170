@@ -40,11 +40,21 @@ end-to-end on GPU with an int8 KV cache and CUDA-graph decode — 27B dense
 |---|---|---|---|---|---|
 | CUDA (170HX, 180 W, 2026-10-16) | 483 | 451 | 379 | 44.7 | 118.7 |
 
-| mode (27B) | t/s | note |
+| mode (27B, 512tok prompt · 128 gen) | t/s | note |
 |---|---|---|
-| tg single (pp512) | 27.6 | reps3 median, stream hash stable |
-| np4 greedy | 57.7 | single-path equivalence OK (K=64) |
-| serve | — | not measured yet |
+| greedy (no spec) | 22.3 | baseline |
+| MTP | 23.7 | +6.3% |
+| n-gram | **27.1** | +21.5% |
+
+| mode (35B, 512tok prompt · 128 gen) | t/s | note |
+|---|---|---|
+| greedy (no spec) | 84.9 | baseline |
+| n-gram | 85.5 | +0.7% (MoE spec ≈ neutral) |
+
+| serve (27B) | value |
+|---|---|
+| TTFT cold / warm (prefix reuse) | 1165 ms / 325 ms (3.6x) |
+| prefix reuse ratio | 0.582 (2048 tok, 34% reused) |
 
 ## Build & run
 
