@@ -13,7 +13,8 @@
 #   6. D3(35B) 다중 청크(35토큰 = 32+3) — 배치 프리필 t≤32의 CPU/GPU 골든.
 #      (2026-10-09 교훈: 3토큰 케이스는 단일 청크만 탄다 — 다중 청크를 상시
 #       검증한다. 이 케이스가 gdn_exp 도메인 결함을 잡는 그물이다.)
-#   7. E(FN FP8PLE): 자원 가드 명시 거부(120GiB > 호스트).
+#   7. E(FN FP8PLE): stage-1 식별 통과(config 판독 — 브링업 보류 계약) +
+#      serve 자원 가드 명시 거부(148.7GiB > 가용 — 2026-10-17 실측).
 #   8. G(27B): 장문 600·4000토큰 — lim>256(attn 분할)·다중 청크 경로 골든.
 #   9. G2(35B): 장문 600·4000토큰 — 동일(35B MoE).
 #  10. H(스펙 옵트인): --spec 4 골든 접두(27B/35B) — 검증=t=1 등가·보정 경로 회귀.
@@ -325,17 +326,30 @@ except Exception:
     esac
 fi
 
-# ── 7. E(FN FP8PLE) 자원 가드 명시 거부 ──
+# ── 7. E(FN FP8PLE) stage-1 식별 + serve 자원 가드 명시 거부 ──
+# [2026-10-17 사용자 결정] FN 브링업 보류(stage-1)에 맞춰 갱신: 종전엔
+# w4a16-load가 자원 가드에 거부되길 기대했으나 이제 stage-1 식별(config
+# 판독)이 정상 통과다 — 로더 = stage-1 계약 판정, 자원 가드 거부 = serve
+# 경로(148.7GiB 필요 > 가용 — 적재 전 즉시 거부, 실측 메시지 유지).
 if want e; then
-    note "[7/10] E(FN FP8PLE) 자원 가드 명시 거부 판정"
+    note "[7/10] E(FN FP8PLE) stage-1 식별 + serve 자원 가드 거부"
     if timeout 60 "$BIN" w4a16-load "$M_FN" > "$RUN/e.log" 2>&1; then
-      echo "[w4a16] FAIL: 가드가 통과시킴(120GiB) — ${RUN}/e.log"; fail=1
-    elif grep -q "insufficient resources" "$RUN/e.log"; then
+      if grep -q "FN 1단계 식별 통과" "$RUN/e.log" && grep -q "arch=qwen4_exp(FN)" "$RUN/e.log"; then
+        note "stage-1 식별 통과 OK: $(grep -m1 '판정:' "$RUN/e.log")"
+      else
+        echo "[w4a16] FAIL: stage-1 판정 문구 불명 — ${RUN}/e.log"; fail=1
+      fi
+    else
+      echo "[w4a16] FAIL: w4a16-load 실패(stage-1 통과 기대) — ${RUN}/e.log"; fail=1
+    fi
+    if timeout 60 "$BIN" serve --model "$M_FN" --kv-mem 1G --port 18099 > "$RUN/e2.log" 2>&1; then
+      echo "[w4a16] FAIL: serve 가드가 통과시킴(148.7GiB) — ${RUN}/e2.log"; fail=1
+    elif grep -q "insufficient resources" "$RUN/e2.log"; then
       # [2026-10-16] 'rsrc-guard' 광역 매칭 제거 — 적재 락 대기("…대기(B20)")도
       # rsrc-guard 접두를 달고 있어 타 llm170 동시 실행 시 false-pass였다.
-      note "가드 거부 OK: $(head -1 "$RUN/e.log")"
+      note "serve 가드 거부 OK: $(head -1 "$RUN/e2.log")"
     else
-      echo "[w4a16] FAIL: 가드 외 사유(락 대기 포함) — ${RUN}/e.log"; fail=1
+      echo "[w4a16] FAIL: serve 가드 외 사유(락 대기 포함) — ${RUN}/e2.log"; fail=1
     fi
 fi
 
@@ -645,7 +659,7 @@ fi
 echo "[w4a16] ── 검수 요약(${#SUMMARY[@]}항목) ──"
 for s in "${SUMMARY[@]}"; do echo "[w4a16]   $s"; done
 if [ $fail -eq 0 ]; then
-    echo "[w4a16] smoke: ALL PASS (27B 참조·GPU(600 흡수)·serve·장문(2시나리오 1런)·spec·경계 교차+np 자체 검증 / 35B MoE 참조+GPU(2시나리오)·장문(2시나리오)·spec·스트리밍(D4) / gemma4 v0 게이트+infer(G4)+np16 등가 / E 가드·kv-mem 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로 [section=$SECTIONS]"
+    echo "[w4a16] smoke: ALL PASS (27B 참조·GPU(600 흡수)·serve·장문(2시나리오 1런)·spec·경계 교차+np 자체 검증 / 35B MoE 참조+GPU(2시나리오)·장문(2시나리오)·spec·스트리밍(D4) / gemma4 v0 게이트+infer(G4)+np16 등가 / E stage-1 식별+serve 가드 거부·kv-mem 가드 거부 / 스펙 항등 / 수치 지문) — int8 KV 단일 경로 [section=$SECTIONS]"
 else
     echo "[w4a16] smoke: FAILURES PRESENT [section=$SECTIONS]"
 fi
