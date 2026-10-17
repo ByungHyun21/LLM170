@@ -567,7 +567,13 @@ impl W4a16Dec {
         // 확보하지 않는다(해제 유지). 풀층·qwen(균일 layers 빈 벡터)은 무영향.
         let floor = self.kv_floor.get(slot).copied().unwrap_or(0) as usize;
         let mut new = 0usize;
+        // [k2 (b) 2026-10-17] 층 창 필터 훅 — 창 밖 KV 층은 이 샤드가 소유하지
+        // 않는다(확보 생략). 기본 전체창 = 항상 참 → 동작 불변.
+        let win = self.window;
         for l in 0..n_attn {
+            if !win.owns_attn(l, dm.interval) {
+                continue;
+            }
             let sliding = self.attn.layers.get(l).map(|x| x.sliding).unwrap_or(false);
             for bi in 0..nb {
                 if sliding && bi * 512 + 512 <= floor {

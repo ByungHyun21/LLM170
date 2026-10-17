@@ -503,6 +503,16 @@ impl GemmaEngine {
         self.model.hp.n_embd
     }
 
+    /// [k2 (b) 2026-10-17] 디코더 층 창(기본 전체창) — GpuEngine 위임용.
+    pub fn layer_window(&self) -> llm170_backend_gpu::LayerWindow {
+        self.dec.layer_window()
+    }
+
+    /// [k2 (b)] 내 창이 마지막 층 소유(head 담당 샤드 판정).
+    pub fn owns_final_layer(&self) -> bool {
+        self.dec.owns_final_layer()
+    }
+
     /// [2.N Stage 2] 접두 재사용 유효 판정 — 스케줄러가 restore_prefix 호출
     /// 전에 문의한다(전체·부분 공용). 조건(둘 다 필요):
     /// ① `floor ≤ l` — 접미사 프리필이 l부터 전부 재기록하므로 floor 미만

@@ -105,7 +105,21 @@ impl QwenEngine {
         }
         ld.log_summary();
         let mtp = upload_mtp(dec, model)?;
-        Ok((head_gpu, mtp))
+        // [k2 (b) 2026-10-17] 층 창 — head(output.weight)는 마지막 층 소유
+        // 샤드만 담당. 기본 전체창 = 항상 참 → 동작 불변. 임베딩은 첫 샤드
+        // 입력 조립용으로 전 창 공통 업로드 유지.
+        Ok((head_gpu && dec.owns_final_layer(), mtp))
+    }
+
+
+    /// [k2 (b) 2026-10-17] 디코더 층 창(기본 전체창) — GpuEngine 위임용.
+    pub fn layer_window(&self) -> llm170_backend_gpu::LayerWindow {
+        self.dec.layer_window()
+    }
+
+    /// [k2 (b)] 내 창이 마지막 층 소유(head 담당 샤드 판정).
+    pub fn owns_final_layer(&self) -> bool {
+        self.dec.owns_final_layer()
     }
 
     /// 메모리 분류(모니터링) — (상주 가중치, KV, CPU 오프로드, PLE 오프로드).

@@ -112,7 +112,12 @@ impl W4a16Dec {
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let h = self.hidden;
         let mut ab = self.dab_dev;
-        let mut gi = 0usize;
+        // [k2 (b) 2026-10-17] 층 창 — 기본 전체창이라 순회·값 불변. gi는 창
+        // 시작 직전 GDN 층 개수만큼 건너뛴 절대 인덱스(전체창 = 0).
+        let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
+        let win = self.window;
+        let owns_final = win.owns_final(self.n_layers);
+        let mut gi = win.gdn_start(interval);
         // 플레인(MoE) 모드 — bf16 GEMM(x 원시 f32), FFN은 MoE 배치.
         let plain = self.plain_weights;
         // [P10] GEMM 상한 — mma 경로(t≥16)는 t 무제한, FFMA 폴백
@@ -135,12 +140,12 @@ impl W4a16Dec {
         // [S2 2026-10-11] t≤8(GemvT)은 다중세그먼트 융합 경로(스펙 검증·
         // 소형 청크) — t≥9(Gemm)는 종전 단독 런치 유지.
         let fuse = matches!(lp, LinPath::GemvT);
-        for il in 0..self.n_layers {
+        for off in 0..win.n() {
+            let il = win.abs(off);
             let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, t, xh)
                 .map_err(|e| format!("T{il} input norm: {e}"))?;
-            let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
             let branch = if (il + 1) % interval == 0 {
                 // [R10] 4변형 → lin_forward 단일 디스패치(Gemm 경로).
                 let xin = if plain { xn } else { xh };
@@ -226,6 +231,14 @@ impl W4a16Dec {
             let _ = self.checkpoint_gdn(slot, endp);
         }
         if all {
+            // [k2 (b)] 전 위치 head/argmax는 마지막 층 소유 창만(비최종 샤드의
+            // 검증 경로는 코디네이터 단계 소관). 전체창 = 항상 통과.
+            if !owns_final {
+                return Err(
+                    "chain_t: 비최종 창 — 전 위치 head/argmax는 마지막 샤드 소관"
+                        .into(),
+                );
+            }
             // [A-1] 전 위치 최종 노름 → 배치 head → 배치 argmax → 토큰 t개.
             let xn_all = self
                 .norm_resid_dev(2 * self.n_layers, self.dres, ab, t, 0)
@@ -293,14 +306,19 @@ impl W4a16Dec {
                 .collect());
         }
         // 마지막 행만 최종 노름(+head) — 중간 행 로짓은 불필요(상각).
+        // [k2 (b)] 최종 노름은 마지막 층 소유 창만 — 비최종 창은 잔차 행을
+        // 핸드오프(다음 샤드 입력)로 회수. head는 최종 창 전용. 전체창 무변.
         let last = (t - 1) as u64 * (h as u64) * 4;
-        let xn_last = self
-            .norm_resid_dev(2 * self.n_layers, self.dres + last, ab + last, 1, 0)
-            .map_err(|e| format!("T final norm: {e}"))?;
+        let xn_last = if owns_final {
+            self.norm_resid_dev(2 * self.n_layers, self.dres + last, ab + last, 1, 0)
+                .map_err(|e| format!("T final norm: {e}"))?
+        } else {
+            ab + last
+        };
         let mut ob = vec![0u8; if head { self.head_n * 4 } else { h * 4 }];
         if head {
-            if self.head_w == 0 {
-                return Err("chain_device_t: head 미등록".into());
+            if self.head_w == 0 || !owns_final {
+                return Err("chain_device_t: head 미등록/비최종 창".into());
             }
             self.head_gemv_launch(xn_last, self.head_out)?;
             // 동기 d2h 금지 — 그래프 캡처가 만든 커스텀(비차단) 스트림과

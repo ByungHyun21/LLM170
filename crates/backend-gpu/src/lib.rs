@@ -13,7 +13,7 @@ pub use rawcuda::gptq4::Gptq4;
 pub use rawcuda::gptq4::h2f;
 pub use rawcuda::w4a16_dec::{
     AttnDims, AttnLayer, BATCH_DEC_MAX, CTX_OVERFLOW, G4_CHUNK_MAX, GEMM_FFMA_TMAX, GdnDims,
-    SPEC_VERIFY_TMAX, W4a16Dec, f32_to_f16,
+    LayerWindow, SPEC_VERIFY_TMAX, W4a16Dec, f32_to_f16,
 };
 
 /// VRAM 프로브 — 가드 preflight가 사용(미측정 시 B17 거부).

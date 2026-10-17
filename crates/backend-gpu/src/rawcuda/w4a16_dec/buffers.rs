@@ -250,8 +250,12 @@ impl W4a16Dec {
         let nl = self.n_layers;
         let span = if plain { 20usize } else { 25usize }; // u64/층
         let mut tab: Vec<u64> = vec![0; nl * span];
-        let mut meta: Vec<[u32; 8]> = Vec::with_capacity(nl);
-        for il in 0..nl {
+        // [k2 (b) 2026-10-17] 층 창 — 테이블은 창 층만 기입한다(메타는 절대
+        // 인덱스 정합을 위해 전체 폭 유지 — 창 밖 제로 엔트리, 실행 경로가
+        // 닿지 않는다). 기본 전체창 → 내용 불변.
+        let win = self.window;
+        let mut meta: Vec<[u32; 8]> = vec![[0u32; 8]; nl];
+        for il in win.start..win.end {
             let mut br: Vec<(String, u64, usize)> = Vec::new();
             if (il + 1) % interval == 0 {
                 br.push((format!("blk.{il}.attn_q.weight"), s0, w0));
@@ -304,9 +308,9 @@ impl W4a16Dec {
                 }
                 gm[gi] = [off, cnt, total as u32, tgrid as u32];
             }
-            meta.push([
+            meta[il] = [
                 gm[0][0], gm[0][1], gm[0][2], gm[1][0], gm[1][1], gm[1][2], gm[0][3], gm[1][3],
-            ]);
+            ];
         }
         let bytes = tab.len() * 8;
         // SAFETY: 로컬 Vec<u64>의 유효 수명 내 바이트 뷰(길이 = 원소수×8).

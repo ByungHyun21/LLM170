@@ -643,6 +643,50 @@ pub(super) struct G4GraphEntry {
     pub(super) handle: ffi::CUgraph,
 }
 
+/// [k2 코어-코디네이터 (b) 2026-10-17] 층 창 — 이 디코더 인스턴스가 담당하는
+/// 절대 층 반개구간 [start, end). 기본 = 전체 층(0..n_layers)이라 단일
+/// 인스턴스의 동작·골든 불변(PP 샤딩 1차 마일스톤 = 전체창 등가 플럼빙).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerWindow {
+    /// 창 첫 층(절대 인덱스).
+    pub start: usize,
+    /// 창 끝(절대 인덱스, 배타).
+    pub end: usize,
+}
+
+impl LayerWindow {
+    /// 전체 층 창(0..n_layers) — 기본값.
+    pub fn full(n_layers: usize) -> Self {
+        Self { start: 0, end: n_layers }
+    }
+    /// 창 층 수.
+    pub fn n(&self) -> usize {
+        self.end - self.start
+    }
+    /// 창 상대 오프셋 → 절대 층 인덱스(가중치명·노름 행 2*il은 절대 기준 유지).
+    pub fn abs(&self, off: usize) -> usize {
+        self.start + off
+    }
+    /// 절대 층이 창에 속하는가 — 업로드·kv_grow 창 필터 훅(전체창 = 항상 참).
+    pub fn contains(&self, layer: usize) -> bool {
+        layer >= self.start && layer < self.end
+    }
+    /// 창이 마지막 층(n_layers−1)을 소유하는가 — 최종 노름(2*n_layers 행)·
+    /// head/embed 분기 조건(전체창 = 항상 참 → 동작 불변).
+    pub fn owns_final(&self, n_layers: usize) -> bool {
+        self.end == n_layers
+    }
+    /// 창 시작 직전까지의 GDN 층 개수 — GDN 상태 인덱스(gi)는 절대
+    /// 순서 세기라 창 시작점에서 이만큼 건너뛴 채 시작(전체창 = 0).
+    pub fn gdn_start(&self, interval: usize) -> usize {
+        (0..self.start).filter(|&l| (l + 1) % interval != 0).count()
+    }
+    /// 어텐션 KV 서브층 l(전체 층 il의 l = il/interval 대응)이 창 소유인가
+    /// — kv_grow 층 필터 훅(전체창 = 항상 참 → 동작 불변).
+    pub fn owns_attn(&self, l: usize, interval: usize) -> bool {
+        self.contains((l + 1) * interval - 1)
+    }
+}
 pub struct W4a16Dec {
     pub(super) moe: MoE,
     /// [tuning-sweep W2 2026-10-16] 스트리밍 전문가 LRU 재구성 노브(bench
@@ -664,6 +708,8 @@ pub struct W4a16Dec {
     ucache: UnifiedCacheRegistry,
     pub hidden: usize,
     pub n_layers: usize,
+    /// [k2 (b)] 이 디코더의 층 창(기본 = 전체 층 — 샤딩 시 부분 창).
+    pub window: LayerWindow,
     pub n_slots: usize,
     pub slot_pos: Vec<u32>,
     /// [K6-3 2026-10-13] 슬롯별 KV 확보 고수위(토큰) — kv_ensure 무비용 no-op용.
@@ -1015,6 +1061,7 @@ impl W4a16Dec {
             ucache,
             hidden,
             n_layers,
+            window: LayerWindow::full(n_layers),
             n_slots: n_slots.max(1),
             slot_pos: vec![0; n_slots.max(1)],
             kv_assigned: vec![0; n_slots.max(1)],
@@ -1077,6 +1124,17 @@ impl W4a16Dec {
             route_capture: false,
             route_out: Vec::new(),
         })
+    }
+
+    /// [k2 (b) 2026-10-17] 이 디코더의 층 창(기본 = 전체 층).
+    pub fn layer_window(&self) -> LayerWindow {
+        self.window
+    }
+
+    /// [k2 (b)] 내 창이 마지막 층을 소유하는가 — 최종 노름·head/embed 분기
+    /// (전체창 = 항상 참). 코디네이터가 head 담당 샤드 판정에도 사용.
+    pub fn owns_final_layer(&self) -> bool {
+        self.window.owns_final(self.n_layers)
     }
 
     /// [k2 (a)] 종전 생성 = 디바이스 0.

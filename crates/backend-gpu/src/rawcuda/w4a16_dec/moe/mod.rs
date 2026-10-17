@@ -131,10 +131,18 @@ impl W4a16Dec {
         let (d0, d1) = (self.moe.dsh[0], self.moe.dsh[1]);
         let drt = self.moe.drt.ptr;
         let shared = self.moe.shared_ffn > 0;
+        // [k2 (b) 2026-10-17] 층 창 — 창 층만 테이블에 기입한다(엔트리는
+        // 층당 16u64 고정 폭이라 창 밖은 제로 행 유지 — 실행 경로가 닿지
+        // 않는다). 기본 전체창 → 내용 불변.
+        let win = self.window;
         let mut ent: Vec<u64> = Vec::with_capacity(nl * 4 * 4);
-        let mut rows: Vec<u32> = Vec::with_capacity(nl);
-        let mut rows_t3: Vec<u32> = Vec::with_capacity(nl);
+        let mut rows: Vec<u32> = vec![0; nl];
+        let mut rows_t3: Vec<u32> = vec![0; nl];
         for il in 0..nl {
+            if !win.contains(il) {
+                ent.extend([0u64; 16]);
+                continue;
+            }
             let (gw, gn, gk) = self.plain_spec(&format!("blk.{il}.moe_gate.weight"))?;
             ent.extend([gw, drt, gn as u64, gk as u64]);
             let mut r = gn as u32;
@@ -156,8 +164,8 @@ impl W4a16Dec {
             } else {
                 ent.extend([0u64; 12]);
             }
-            rows.push(r);
-            rows_t3.push(rt3);
+            rows[il] = r;
+            rows_t3[il] = rt3;
         }
         let bytes = ent.len() * 8;
         if self.moe.moe_multi_tab != 0 {

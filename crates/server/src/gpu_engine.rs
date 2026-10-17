@@ -189,6 +189,8 @@ engine_delegate_mut! {
 
 engine_delegate_ref! {
     spec_on() -> bool;
+    layer_window() -> llm170_backend_gpu::LayerWindow;
+    owns_final_layer() -> bool;
     seq_pos(slot: usize) -> u32;
     kv_total_blocks() -> usize;
     kv_free_blocks() -> usize;

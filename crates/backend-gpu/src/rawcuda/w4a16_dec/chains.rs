@@ -44,9 +44,13 @@ impl W4a16Dec {
         dres: CUdeviceptr,
     ) -> Result<Vec<f32>, String> {
         let mut ab = vec![0.0f32; self.hidden];
-        let mut gi = 0usize;
+        // [k2 (b) 2026-10-17] 층 창 — 기본 전체창(0..n_layers)이라 순회·값 불변.
+        // gi(GDN 상태 인덱스)는 절대 순서 세기라 창 시작만큼 건너뛴다.
         let interval = self.attn.attn.map(|a| a.interval).unwrap_or(4);
-        for il in 0..self.n_layers {
+        let win = self.window;
+        let mut gi = win.gdn_start(interval);
+        for off in 0..win.n() {
+            let il = win.abs(off);
             let xn = self
                 .norm_resid_staged(2 * il, dres, &ab)
                 .map_err(|e| format!("L{il} input norm: {e}"))?;
@@ -128,9 +132,14 @@ impl W4a16Dec {
                 );
             }
         }
-        let xn = self
-            .norm_resid_staged(2 * self.n_layers, dres, &ab)
-            .map_err(|e| format!("final norm: {e}"))?;
+        // [k2 (b)] 최종 노름(2*n_layers 행)은 마지막 층 소유 창만 — 비최종
+        // 창은 잔차 ab를 핸드오프(다음 샤드 입력)로 반환. 전체창 무변.
+        let xn = if win.owns_final(self.n_layers) {
+            self.norm_resid_staged(2 * self.n_layers, dres, &ab)
+                .map_err(|e| format!("final norm: {e}"))?
+        } else {
+            ab
+        };
         self.slot_pos[slot] = pos + 1;
         self.attn_set_pos(slot, pos + 1)?;
         Ok(xn)
@@ -218,11 +227,16 @@ impl W4a16Dec {
     pub(super) fn chain_device_body(&mut self, slot: usize) -> Result<CUdeviceptr, String> {
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let mut ab = self.dab_dev;
-        let mut gi = 0usize;
+        // [k2 (b) 2026-10-17] 층 창 — 기본 전체창이라 순회·값 불변. gi는 창
+        // 시작 직전 GDN 층 개수만큼 건너뛴 절대 인덱스(전체창 = 0).
+        let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
+        let win = self.window;
+        let mut gi = win.gdn_start(interval);
         // 플레인 모드(MoE 모델) — GEMV는 bf16(head_bf16), x는 원시 f32
         // (h2f 왕복 없음 — CPU 플레인 matmul 계약과 동일). FFN은 MoE.
         let plain = self.plain_weights;
-        for il in 0..self.n_layers {
+        for off in 0..win.n() {
+            let il = win.abs(off);
             // 노름이 x32를 융합 기록(cast_x32 노드 제거) — q/k/v(또는 qkv/z) 공유.
             let x32 = if plain {
                 0
@@ -232,7 +246,6 @@ impl W4a16Dec {
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, 1, x32)
                 .map_err(|e| format!("L{il} input norm: {e}"))?;
-            let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
             let branch = if (il + 1) % interval == 0 {
                 // [S2 2026-10-11] q/k/v 단독 3런치 → 다중세그먼트 1런치(테이블은
                 // ensure_chain_bufs 1회 작성 — 값 비트동일).
@@ -317,9 +330,14 @@ impl W4a16Dec {
                 eprintln!("  G{il:>2} recr={} sum={:.6}", (il + 1) % 4 != 0, d + a);
             }
         }
-        let xn_final = self
-            .norm_resid_dev(2 * self.n_layers, self.dres, ab, 1, 0)
-            .map_err(|e| format!("final norm: {e}"))?;
+        // [k2 (b) 2026-10-17] 최종 노름은 마지막 층 소유 창만 — 비최종 창은
+        // 잔차 ab를 핸드오프 포인터로 반환(다음 샤드 입력). 전체창 무변.
+        let xn_final = if win.owns_final(self.n_layers) {
+            self.norm_resid_dev(2 * self.n_layers, self.dres, ab, 1, 0)
+                .map_err(|e| format!("final norm: {e}"))?
+        } else {
+            ab
+        };
         Ok(xn_final)
     }
 
@@ -378,17 +396,27 @@ impl W4a16Dec {
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let h = self.hidden;
         let mut ab = self.dab_dev;
-        let mut gi = 0usize;
+        // [k2 (b) 2026-10-17] 층 창 — 기본 전체창이라 순회·값 불변. 배치 체인은
+        // head/argmax까지 묶여 있어 마지막 층 소유 창만 허용(비최종 샤드의
+        // 배치 경로는 코디네이터 단계 소관).
+        let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
+        let win = self.window;
+        if !win.owns_final(self.n_layers) {
+            return Err(
+                "batch_launch: 비최종 창 — head/argmax는 마지막 샤드 소관".into(),
+            );
+        }
+        let mut gi = win.gdn_start(interval);
         let plain = self.plain_weights;
         if t > 32 {
             return Err(format!("chain_device_batch: t={t} > 32 FFMA 상한"));
         }
-        for il in 0..self.n_layers {
+        for off in 0..win.n() {
+            let il = win.abs(off);
             let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };
             let xn = self
                 .norm_resid_dev(2 * il, self.dres, ab, t, xh)
                 .map_err(|e| format!("B{il} input norm: {e}"))?;
-            let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
             let branch = if (il + 1) % interval == 0 {
                 // [S2 2026-10-11] q/k/v 3런치 → 다중세그먼트 1런치(테이블 공용
                 // — t=1 판과 동일 메타, grid만 Σceil(n/TR)).
