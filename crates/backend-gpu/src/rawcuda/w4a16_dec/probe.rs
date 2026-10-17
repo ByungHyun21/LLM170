@@ -1206,6 +1206,333 @@ impl W4a16Dec {
         self.gemv_launch(name, x, y)
     }
 
+    /// [split-k marlin 디코드 2026-10-17] t=1 커널 단독 벤치 — 현행 생산 GEMV
+    /// (`w4a16_gemv_g128` — grid n·64스레드·f32 x) 대비 sk(sk1+reduce)를
+    /// ksp∈{1,2,4,8}∩(k/128)%ksp==0 전수 측정. qm/s/x/y는 상주·합성 버퍼,
+    /// 재패킹 사본은 업로드 이중 버퍼(lins_mk)를 그대로 사용(생산 포인터).
+    /// 값 대조(sk vs GEMV)도 1회 — maxabs/maxrel 허용오차 신호(게이트 전).
+    pub fn decode_bench(
+        &mut self,
+        name: &str,
+        reps: usize,
+        cold: bool,
+    ) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        let (dq, ds, n, k) = self.lin_spec(name)?;
+        let Some((dqm, _, _)) = self.lin_mk(name) else {
+            return Err(format!("decode-bench {name}: marlin 재패킹 상주 없음(업로드 확인)"));
+        };
+        if !k.is_multiple_of(128) {
+            return Err(format!("decode-bench {name}: k={k}%128 계약"));
+        }
+        let x16: Vec<u16> = (0..k)
+            .map(|i| {
+                let v =
+                    ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5;
+                crate::f32_to_f16(v)
+            })
+            .collect();
+        let x32: Vec<f32> = (0..k)
+            .map(|i| {
+                ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5
+            })
+            .collect();
+        // SAFETY: 로컬 Vec의 유효 수명 내 바이트 뷰(길이 = 원소수×2/×4).
+        let hb = unsafe { std::slice::from_raw_parts(x16.as_ptr() as *const u8, x16.len() * 2) };
+        let fb = unsafe { std::slice::from_raw_parts(x32.as_ptr() as *const u8, x32.len() * 4) };
+        let dxh = self.cc.alloc(k * 2)?;
+        let dxf = self.cc.alloc(k * 4)?;
+        self.cc.h2d(dxh, hb)?;
+        self.cc.h2d(dxf, fb)?;
+        let blocks = n.div_ceil(256);
+        let part = self.cc.alloc(blocks * 16 * 256 * 4)?;
+        let ya = self.cc.alloc(n * 4)?; // GEMV
+        let yb = self.cc.alloc(n * 4)?; // sk
+        let ksps: Vec<usize> = [1usize, 2, 4, 8, 16]
+            .into_iter()
+            .filter(|&p| (k / 128) % p == 0)
+            .collect();
+        let run_gemv = |me: &Self, y: CUdeviceptr| -> Result<(), String> {
+            let f = me.cc.function("w4a16_gemv_g128")?;
+            let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dxf, y);
+            let (mut p_n, mut p_k) = (n as i32, k as i32);
+            me.cc.launch(
+                f,
+                n as u32,
+                1,
+                64,
+                &mut crate::rawcuda::args::l6(
+                    &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k,
+                ),
+            )
+        };
+        let run_sk = |me: &Self, y: CUdeviceptr, ksp: usize| -> Result<(), String> {
+            let f = me.cc.function("w4a16_gemv_sk1_marlin")?;
+            let (mut p_q, mut p_s, mut p_x, mut p_o, mut p_p) = (dqm, ds, dxh, y, part);
+            let (mut p_n, mut p_k, mut p_sp) = (n as i32, k as i32, ksp as i32);
+            me.cc.launch(
+                f,
+                blocks as u32,
+                ksp as u32,
+                128,
+                &mut crate::rawcuda::args::l8(
+                    &mut p_q, &mut p_s, &mut p_x, &mut p_o, &mut p_p, &mut p_n, &mut p_k,
+                    &mut p_sp,
+                ),
+            )?;
+            if ksp > 1 {
+                let f = me.cc.function("w4a16_gemv_sk1_reduce")?;
+                me.cc.launch(
+                    f,
+                    blocks as u32,
+                    1,
+                    256,
+                    &mut crate::rawcuda::args::l4(&mut p_p, &mut p_o, &mut p_n, &mut p_sp),
+                )
+            } else {
+                Ok(())
+            }
+        };
+        // 콜드 모드 플러시 버퍼(256MB d2d — marlin_bench와 동일 조건).
+        let flush_bytes = 256usize << 20;
+        let (f0, f1) = if cold {
+            (self.cc.alloc(flush_bytes)?, self.cc.alloc(flush_bytes)?)
+        } else {
+            (0, 0)
+        };
+        let r = (|| -> Result<Vec<String>, String> {
+            // 워밍 + 값 대조(sk 첫 ksp vs GEMV).
+            run_gemv(self, ya)?;
+            run_sk(self, yb, ksps[0])?;
+            self.cc.sync()?;
+            let mut oa = vec![0u8; n * 4];
+            let mut ob = vec![0u8; n * 4];
+            self.cc.d2h(&mut oa, ya)?;
+            self.cc.d2h(&mut ob, yb)?;
+            self.cc.sync()?;
+            let (mut maxd, mut maxr) = (0f64, 0f64);
+            for i in 0..n {
+                let a = f32::from_le_bytes(oa[i * 4..i * 4 + 4].try_into().unwrap());
+                let b = f32::from_le_bytes(ob[i * 4..i * 4 + 4].try_into().unwrap());
+                maxd = maxd.max((a - b).abs() as f64);
+                maxr = maxr.max(((a - b).abs() / a.abs().max(1e-9)) as f64);
+            }
+            let mut acc = vec![0f64; ksps.len() + 1];
+            let rounds = 4usize;
+            let per = (reps / rounds).max(1);
+            for _ in 0..rounds {
+                // GEMV 기준 — [콜드 계측 수정] 플러시(256MB d2d)+sync는
+                // 시간에서 제외(커널만 적산 — 종전 포함 측정은 플러시 ~0.35ms가
+                // 전 형상을 동일값으로 눌러 왜곡).
+                let mut t0 = std::time::Instant::now();
+                for _ in 0..per {
+                    if cold {
+                        self.cc.d2d(f0, f1, flush_bytes)?;
+                        self.cc.sync()?;
+                        t0 = std::time::Instant::now();
+                    }
+                    run_gemv(self, ya)?;
+                    if cold {
+                        self.cc.sync()?;
+                        acc[0] += t0.elapsed().as_secs_f64();
+                    }
+                }
+                if !cold {
+                    self.cc.sync()?;
+                    acc[0] += t0.elapsed().as_secs_f64();
+                }
+                for (vi, &ksp) in ksps.iter().enumerate() {
+                    let mut t0 = std::time::Instant::now();
+                    for _ in 0..per {
+                        if cold {
+                            self.cc.d2d(f0, f1, flush_bytes)?;
+                            self.cc.sync()?;
+                            t0 = std::time::Instant::now();
+                        }
+                        run_sk(self, yb, ksp)?;
+                        if cold {
+                            self.cc.sync()?;
+                            acc[vi + 1] += t0.elapsed().as_secs_f64();
+                        }
+                    }
+                    if !cold {
+                        self.cc.sync()?;
+                        acc[vi + 1] += t0.elapsed().as_secs_f64();
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            out.push(format!(
+                "decode-bench {name} n={n} k={k} blocks={blocks} reps={reps} [{}]: \
+                 gemv {ms:.3}ms · 값대조 maxabs={maxd:.3e} maxrel={maxr:.3e}",
+                if cold { "cold" } else { "warm" },
+                ms = acc[0] * 1e3 / (per * rounds) as f64,
+            ));
+            let wb = (n * k) as f64 / 2.0 + (n * k / 128) as f64 * 2.0;
+            for (vi, &ksp) in ksps.iter().enumerate() {
+                let ms = acc[vi + 1] * 1e3 / (per * rounds) as f64;
+                out.push(format!(
+                    "  ksp={ksp}: {ms:.3}ms · {:.0}GB/s · gemv 대비 {:.3}×",
+                    wb * 1e-9 / (ms * 1e-3),
+                    acc[0] / acc[vi + 1],
+                ));
+            }
+            Ok(out)
+        })();
+        let _ = self.cc.free(dxh);
+        let _ = self.cc.free(dxf);
+        let _ = self.cc.free(part);
+        let _ = self.cc.free(ya);
+        let _ = self.cc.free(yb);
+        if cold {
+            let _ = self.cc.free(f0);
+            let _ = self.cc.free(f1);
+        }
+        Ok(r?.join("\n"))
+    }
+
+    /// [split-k marlin 디코드] 커널 격리 자체점검 — 합성 n=256·k=512·s=1·x=1
+    /// (기대 = Σ(nib−8) 정수 → f32 누적 비트정확)로 sk1(ksp 1..4)과
+    /// 2세그먼트 테이블판(w4a16_gemv_sk_marlin)을 정오 판정. 배선 전 결함
+    /// (repack·부분합·reduce·패딩)을 커널 단위에서 잡는다.
+    pub fn decode_selfcheck(&mut self) -> Result<String, String> {
+        let _g = self.cc.guard()?;
+        let (n, k) = (256usize, 512usize);
+        let q: Vec<u32> = (0..n * k / 8)
+            .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) ^ 0x1234_5678u32)
+            .collect();
+        let s: Vec<u16> = vec![0x3C00; n * k / 128]; // f16 1.0
+        let x16: Vec<u16> = vec![0x3C00; k];
+        let qm = llm170_core::marlin::marlin_repack_q(&q, n, k)?;
+        // 기대값 — 정수 Σ(nib−8) (f32 비트정확).
+        let mut want = vec![0f32; n];
+        for c in 0..n {
+            let mut acc = 0i64;
+            for j in 0..k {
+                let nib = ((q[c * k / 8 + j / 8] >> ((j % 8) * 4)) & 0xF) as i64 - 8;
+                acc += nib;
+            }
+            want[c] = acc as f32;
+        }
+        let dqm = self.cc.alloc(qm.len() * 4)?;
+        // SAFETY: 로컬 Vec<u32>/u16의 유효 수명 내 바이트 뷰.
+        let qb = unsafe { std::slice::from_raw_parts(qm.as_ptr() as *const u8, qm.len() * 4) };
+        let sb = unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+        let xb = unsafe { std::slice::from_raw_parts(x16.as_ptr() as *const u8, x16.len() * 2) };
+        self.cc.h2d(dqm, qb)?;
+        let ds = self.cc.alloc(sb.len())?;
+        self.cc.h2d(ds, sb)?;
+        let dx = self.cc.alloc(xb.len())?;
+        self.cc.h2d(dx, xb)?;
+        let blocks = n.div_ceil(256); // 1
+        let part = self.cc.alloc(blocks * 4 * 256 * 4)?;
+        let y = self.cc.alloc(n * 4)?;
+        let mut out = Vec::new();
+        let mut bad = 0usize;
+        let mut check = |got: &[u8], tag: &str| {
+            let (mut mism, mut first) = (0usize, None);
+            for c in 0..n {
+                let v = f32::from_le_bytes(got[c * 4..c * 4 + 4].try_into().unwrap());
+                if v.to_bits() != want[c].to_bits() {
+                    mism += 1;
+                    if first.is_none() {
+                        first = Some((c, want[c], v));
+                    }
+                }
+            }
+            if mism > 0 {
+                bad += 1;
+            }
+            out.push(format!(
+                "  {tag}: 불일치={mism}/{n}{}",
+                first
+                    .map(|(c, w, v)| format!(" 첫불량=(col{c}, 기대 {w}, 실제 {v})"))
+                    .unwrap_or_default(),
+            ));
+        };
+        for ksp in [1usize, 2, 4] {
+            let zero = vec![0u8; n * 4];
+            self.cc.h2d(y, &zero)?;
+            let f = self.cc.function("w4a16_gemv_sk1_marlin")?;
+            let (mut p_q, mut p_s, mut p_x, mut p_o, mut p_p) = (dqm, ds, dx, y, part);
+            let (mut p_n, mut p_k, mut p_sp) = (n as i32, k as i32, ksp as i32);
+            self.cc.launch(
+                f,
+                blocks as u32,
+                ksp as u32,
+                128,
+                &mut crate::rawcuda::args::l8(
+                    &mut p_q, &mut p_s, &mut p_x, &mut p_o, &mut p_p, &mut p_n, &mut p_k,
+                    &mut p_sp,
+                ),
+            )?;
+            if ksp > 1 {
+                let f = self.cc.function("w4a16_gemv_sk1_reduce")?;
+                self.cc.launch(
+                    f,
+                    blocks as u32,
+                    1,
+                    256,
+                    &mut crate::rawcuda::args::l4(&mut p_p, &mut p_o, &mut p_n, &mut p_sp),
+                )?;
+            }
+            let mut got = vec![0u8; n * 4];
+            self.cc.d2h(&mut got, y)?;
+            self.cc.sync()?;
+            check(&got, &format!("sk1 ksp={ksp}"));
+        }
+        // 테이블 2세그먼트(같은 가중 2본 — 같은 out 2개) — multi 판 경로.
+        {
+            let (y2, part2) = (self.cc.alloc(n * 4)?, self.cc.alloc(2 * 2 * 256 * 4)?);
+            let tab: Vec<u64> = vec![
+                dqm,
+                ds,
+                y,
+                n as u64,
+                k as u64,
+                dqm,
+                ds,
+                y2,
+                n as u64,
+                k as u64,
+            ];
+            let tb =
+                unsafe { std::slice::from_raw_parts(tab.as_ptr() as *const u8, tab.len() * 8) };
+            let dt = self.cc.alloc(tb.len())?;
+            self.cc.h2d(dt, tb)?;
+            let (mut p_t, mut p_x, mut p_p) = (dt, dx, part2);
+            let (mut p_c, mut p_s) = (2i32, 2i32);
+            let f = self.cc.function("w4a16_gemv_sk_marlin")?;
+            self.cc.launch(f, 2, 2, 128, &mut crate::rawcuda::args::l5(&mut p_t, &mut p_x, &mut p_p, &mut p_c, &mut p_s))?;
+            let f = self.cc.function("w4a16_gemv_sk_reduce")?;
+            self.cc.launch(f, 2, 1, 256, &mut crate::rawcuda::args::l4(&mut p_t, &mut p_p, &mut p_c, &mut p_s))?;
+            let mut got = vec![0u8; n * 4];
+            let mut got2 = vec![0u8; n * 4];
+            self.cc.d2h(&mut got, y)?;
+            self.cc.d2h(&mut got2, y2)?;
+            self.cc.sync()?;
+            check(&got, "multi seg0 ksp=2");
+            check(&got2, "multi seg1 ksp=2");
+            let _ = self.cc.free(y2);
+            let _ = self.cc.free(part2);
+            let _ = self.cc.free(dt);
+        }
+        let _ = self.cc.free(dqm);
+        let _ = self.cc.free(ds);
+        let _ = self.cc.free(dx);
+        let _ = self.cc.free(part);
+        let _ = self.cc.free(y);
+        let summary = if bad == 0 {
+            "전체 통과".to_string()
+        } else {
+            format!("불일치 케이스 {bad}")
+        };
+        Ok(format!(
+            "decode-selfcheck n={n} k={k} (기대=Σ(nib−8) 비트정확):\n{}\n{summary}",
+            out.join("\n")
+        ))
+    }
+
     pub fn gemm_bench_launch(
         &mut self,
         name: &str,

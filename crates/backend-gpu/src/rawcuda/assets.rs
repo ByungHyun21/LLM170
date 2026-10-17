@@ -62,7 +62,24 @@ pub const ASSETS: &[Asset] = &[
             "crates/backend-gpu/src/rawcuda/assets/gemma4.fatbin",
             "src/rawcuda/assets/gemma4.fatbin",
         ],
-        syms: &["w4a16_gemv_g32_bf16_tall2"],
+        syms: &["w4a16_gemv_g32_bf16_tall2", "w4a16_g32_xpad"],
+        boot: true,
+    },
+    Asset {
+        // [split-k marlin 디코드 2026-10-17] t=1 GEMV 대체 — moe.cu m16 마린
+        // 기반 k분할 커널(독립 .cu — 코드젠 고정, decode.cu 헤더 참조).
+        name: "decode",
+        env: "LLM170_CUDA_DECODE_FATBIN_PATH",
+        paths: &[
+            "crates/backend-gpu/src/rawcuda/assets/decode.fatbin",
+            "src/rawcuda/assets/decode.fatbin",
+        ],
+        syms: &[
+            "w4a16_gemv_sk_marlin",
+            "w4a16_gemv_sk_reduce",
+            "w4a16_gemv_sk1_marlin",
+            "w4a16_gemv_sk1_reduce",
+        ],
         boot: true,
     },
     Asset {
@@ -231,6 +248,7 @@ pub fn cu_source(name: &str) -> &'static str {
         "gptq4" => include_str!("assets/gptq4.cu"),
         "gemma4" => include_str!("assets/gemma4.cu"),
         "moe" => include_str!("assets/moe.cu"),
+        "decode" => include_str!("assets/decode.cu"),
         "norm" => include_str!("assets/norm.cu"),
         "gdn" => include_str!("assets/gdn.cu"),
         "attn" => include_str!("assets/attn.cu"),

@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 llm170-diag = { path = "../diag" }
+llm170-core = { path = "../core" }
 
 [lints]
 workspace = true

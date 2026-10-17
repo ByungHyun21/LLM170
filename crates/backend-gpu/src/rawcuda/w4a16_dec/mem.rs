@@ -94,12 +94,15 @@ impl W4a16Dec {
     /// 스트리밍 모드 = 상주 가중치(전문가는 별도 CPU 오프로드로 집계).
     pub fn active_weight_bytes(&self) -> u64 {
         let experts = self.experts_bytes;
+        // [split-k marlin] 이중 버퍼 재패킹 사본은 토큰당 판독 1본(원본은
+        // t=1 경로가 더 읽지 않는다) — 유효 대역폭 산출에서 제외.
+        let base = self.weights_bytes.saturating_sub(self.marlin_bytes);
         if self.moe.n_experts > 0 && self.moe.moe_resident {
             let unsel =
                 experts / self.moe.n_experts as u64 * (self.moe.n_experts - self.moe.top_k) as u64;
-            self.weights_bytes.saturating_sub(unsel)
+            base.saturating_sub(unsel)
         } else {
-            self.weights_bytes
+            base
         }
     }
 

@@ -70,7 +70,54 @@ impl W4a16Dec {
         } else {
             self.lin_grp.insert(name.to_string(), (group, scale_bf16));
         }
+        // [split-k marlin 디코드] 이중 버퍼 — g128·f16은 marlin 재패킹 사본을
+        // 함께 상주시킨다(t=1 sk 디스패치 소비). 실패는 내부 폴백(경고만).
+        if group == 128 && !scale_bf16 {
+            self.upload_lin_marlin(name, q, n, k);
+        }
         Ok(())
+    }
+
+    /// [split-k marlin 디코드 2026-10-17] g128·f16 선형의 marlin 재패킹 사본
+    /// 상주 등록(이중 버퍼 — 원본 row-major 유지, probe 재패킹의 정식 경로
+    /// 승격). q = packed u32 [n][k/8] 바이트. 실패(형상 계약 위반·VRAM 부족)는
+    /// 경고 후 스킵 — t=1 디스패치가 기존 GEMV로 폴백해 모델 로드는 불능이
+    /// 아니게 한다(27B: +n*k/2B ≈ +11.7GB — 64GB 여유 확인 완료).
+    fn upload_lin_marlin(&mut self, name: &str, q: &[u8], n: usize, k: usize) {
+        let repack = llm170_core::marlin::marlin_repack_q(
+            // SAFETY: q는 upload_lin_g 계약 길이(n*k/2, 4의 배수) 바이트 슬라이스.
+            unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u32, n * k / 8) },
+            n,
+            k,
+        );
+        let qm = match repack {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[marlin] {name}: 재패킹 스킵({e}) — GEMV 폴백");
+                return;
+            }
+        };
+        // SAFETY: 로컬 Vec<u32>의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let qb = unsafe { std::slice::from_raw_parts(qm.as_ptr() as *const u8, qm.len() * 4) };
+        let dqm = match self.cc.alloc(qb.len()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[marlin] {name}: 재패킹 VRAM 부족({e}) — GEMV 폴백");
+                return;
+            }
+        };
+        if let Err(e) = Self::h2d_chunked(&self.cc, dqm, qb) {
+            let _ = self.cc.free(dqm);
+            eprintln!("[marlin] {name}: 재패킹 업로드 실패({e}) — GEMV 폴백");
+            return;
+        }
+        self.weights_bytes += qb.len() as u64;
+        self.marlin_bytes += qb.len() as u64;
+        if let Some((old, _, _)) = self.lins_mk.insert(name.to_string(), (dqm, n, k)) {
+            let _ = self.cc.free(old);
+            self.weights_bytes = self.weights_bytes.saturating_sub((n * k / 2) as u64);
+            self.marlin_bytes = self.marlin_bytes.saturating_sub((n * k / 2) as u64);
+        }
     }
 
     // ── norm ──
@@ -1460,6 +1507,24 @@ impl W4a16Dec {
             self.lin_grp.remove(name);
         } else {
             self.lin_grp.insert(name.to_string(), (group, scale_bf16));
+        }
+        // [split-k marlin 디코드] 이중 버퍼 — 재패킹은 호스트 전체 q가 필요해
+        // fill(0,…)로 재료화한다(트랜지트 n*k/2B — 최대 ~151MB/가중).
+        if group == 128 && !scale_bf16 {
+            const RCHUNK: usize = 8 << 20;
+            let mut qbuf = vec![0u8; q_len];
+            let mut ok = true;
+            for off in (0..q_len).step_by(RCHUNK) {
+                let end = (off + RCHUNK).min(q_len);
+                if let Err(e) = fill(0, off as u64, &mut qbuf[off..end]) {
+                    eprintln!("[marlin] {name}: q 재료화 실패({e}) — GEMV 폴백");
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                self.upload_lin_marlin(name, &qbuf, n, k);
+            }
         }
         Ok(())
     }

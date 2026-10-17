@@ -250,15 +250,25 @@ impl W4a16Dec {
                 // [S2 2026-10-11] q/k/v 단독 3런치 → 다중세그먼트 1런치(테이블은
                 // ensure_chain_bufs 1회 작성 — 값 비트동일).
                 let xin = if plain { xn } else { x32 };
-                self.gemv_multi_dev(plain, il, 0, xin)
-                    .map_err(|e| format!("L{il} qkv: {e}"))?;
+                // [split-k marlin 2026-10-17] t=1 branch — 재패킹 상주 그룹은
+                // sk 런치(x f16 미러 — norm이 융합 기록). 미구성 = 기존 multi
+                // GEMV 폴백. 누산 재결합 허용 오차 클래스(±3% 이중게이트).
+                if !plain && self.sk_multi_dev(il, 0, self.dx16.ptr)? {
+                    // sk 발사 완료(ksp>1이면 2단 reduce 동반).
+                } else {
+                    self.gemv_multi_dev(plain, il, 0, xin)
+                        .map_err(|e| format!("L{il} qkv: {e}"))?;
+                }
                 self.attn_chain_dev_run(slot, il / interval, 1, s0, s1, s1b)
                     .map_err(|e| format!("L{il} attn: {e}"))?
             } else {
                 let xin = if plain { xn } else { x32 };
-                // [S2] qkv/z 2런치 → 1런치.
-                self.gemv_multi_dev(plain, il, 0, xin)
-                    .map_err(|e| format!("L{il} qkvz: {e}"))?;
+                // [S2] qkv/z 2런치 → 1런치. [split-k marlin] branch 동일 폴백.
+                if !plain && self.sk_multi_dev(il, 0, self.dx16.ptr)? {
+                } else {
+                    self.gemv_multi_dev(plain, il, 0, xin)
+                        .map_err(|e| format!("L{il} qkvz: {e}"))?;
+                }
                 let g = self
                     .gdn_chain_dev_run(slot, gi, 1, xn, s0, s1)
                     .map_err(|e| format!("L{il} gdn: {e}"))?;
@@ -274,14 +284,20 @@ impl W4a16Dec {
                 self.plain_gemv_dev(&lo, branch)
                     .map_err(|e| format!("L{il} {lo}: {e}"))?
             } else {
-                let (_, _, _, ko) = self.lin_spec(&lo)?;
+                let (_, _, n, ko) = self.lin_spec(&lo)?;
                 // [4.1 2026-10-11] branch 생산자(merge/gate)가 x32/미러 동시
                 // 기록 — cast_x32 노드 제거(값 비트동일).
                 if self.dx32.cap < ko || self.dx16.cap < ko {
                     return Err(format!("L{il} branch 융합: dx32/dx16 부족 {ko}"));
                 }
-                self.gemv_dev_x32(&lo, self.dx32.ptr)
-                    .map_err(|e| format!("L{il} {lo}: {e}"))?
+                // [split-k marlin] t=1 단일 세그먼트 — 재패킹 상주면 sk 런치.
+                let dy = self.ensure_dy(n)?;
+                if self.sk_single_dev(&lo, self.dx16.ptr, dy)? {
+                    dy
+                } else {
+                    self.gemv_dev_x32(&lo, self.dx32.ptr)
+                        .map_err(|e| format!("L{il} {lo}: {e}"))?
+                }
             };
             // [P10] cast_x32(ko) 재할당 대비 — 현재 dx32 재확인(위 주석 참조).
             let x32 = self.ensure_dx32(self.hidden)?;
@@ -297,16 +313,22 @@ impl W4a16Dec {
                 let x32n = x32; // 노름 융합 기록
                 let _ = xn2;
                 // [S2 2026-10-11] gate/up 2런치 → 다중세그먼트 1런치.
-                self.gemv_multi_dev(false, il, 1, x32n)
-                    .map_err(|e| format!("L{il} gateup: {e}"))?;
+                // [split-k marlin] t=1 gate/up — 재패킹 상주 그룹은 sk 런치.
+                if !self.sk_multi_dev(il, 1, self.dx16.ptr)? {
+                    self.gemv_multi_dev(false, il, 1, x32n)
+                        .map_err(|e| format!("L{il} gateup: {e}"))?;
+                }
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
                 // [4.1 2026-10-11] ew가 x32/미러 동시 기록 — cast 노드 제거.
                 self.ew_dev_fused(s0, s1, s2, kd)
                     .map_err(|e| format!("L{il} ew: {e}"))?;
-                // down은 s3 직접 쓰기 — dy 경유 d2d 제거.
-                self.gemv_launch(&dn, self.dx32.ptr, s3)
-                    .map_err(|e| format!("L{il} down: {e}"))?;
+                // down은 s3 직접 쓰기 — dy 경유 d2d 제거. [split-k marlin]
+                // 재패킹 상주면 sk(k=17408 등 긴 k에 k분할로 SM 포화).
+                if !self.sk_single_dev(&dn, self.dx16.ptr, s3)? {
+                    self.gemv_launch(&dn, self.dx32.ptr, s3)
+                        .map_err(|e| format!("L{il} down: {e}"))?;
+                }
                 ab = s3;
             }
             if self.debug_layers {

@@ -1,5 +1,6 @@
 use super::mem::realloc_fields;
 use super::*;
+use super::kernels::decode::sk_ksp;
 
 impl W4a16Dec {
     /// [R13 2026-10-12] 단일 Buf(ptr+cap) 재할당 공용 — [R12] capture_guard +
@@ -68,6 +69,15 @@ impl W4a16Dec {
             self.dxp = self.realloc_buf(self.dxp, n * 4, n, "dxp_cap")?;
         }
         Ok(self.dxp.ptr)
+    }
+
+    /// [P9-2 2026-10-17] tall2 x 패딩 스테이징 보장 — n = t16×(k+8) f32 원소.
+    /// k≥4096 g32/bf16 선형의 gemv_t 경로(캡처 포함 — warm_for_capture 선할당).
+    pub(super) fn ensure_dxtp(&mut self, n: usize) -> Result<CUdeviceptr, String> {
+        if n > self.dxtp.cap {
+            self.dxtp = self.realloc_buf(self.dxtp, n * 4, n, "dxtp_cap")?;
+        }
+        Ok(self.dxtp.ptr)
     }
 
     pub(super) fn ensure_ew_bufs(&mut self, n: usize) -> Result<(), String> {
@@ -237,6 +247,9 @@ impl W4a16Dec {
         // [S2 2026-10-11] 다중세그먼트 테이블(branch·gate/up) — dchain/스펙
         // 확정 후 1회. 캡처 전(warm_for_capture→본 함수) 작성이 계약.
         self.build_multi_tables()?;
+        // [split-k marlin 디코드 2026-10-17] t=1 sk 테이블·부분합 스크래치 —
+        // 같은 정적 계약(캡처 전 1회, 리플레이 간 불변).
+        self.build_sk_tables()?;
         self.chain_bufs_ok = true;
         Ok(())
     }
@@ -325,6 +338,77 @@ impl W4a16Dec {
         self.cc.h2d(self.dmulti, buf)?;
         self.cc.sync()?;
         self.dmulti_meta = meta;
+        Ok(())
+    }
+
+    /// [split-k marlin 디코드 2026-10-17] t=1 sk 테이블(qm판 [cnt][5])·층별
+    /// 그룹 메타·부분합 스크래치 — build_multi_tables 직후 1회. 그룹의 **전**
+    /// 세그먼트가 재패킹 상주 + k%128 + ksp 계약을 충족해야 배선(부분 혼용
+    /// 금지 — 한 런치 한 경로), 아니면 None(기존 GEMV 폴백). 스크래치는
+    /// 단일 세그먼트 런치(attn_output·ssm_out·ffn_down — sk1 직접 인자)까지
+    /// 포함해 최대 blocks×ksp×256 f32로 산출.
+    fn build_sk_tables(&mut self) -> Result<(), String> {
+        let nl = self.n_layers;
+        if self.plain_weights {
+            // 플레인(MoE) 모델은 bf16 GEMV 경로 — sk 미구성.
+            self.dsk_meta = vec![[None, None]; nl];
+            return Ok(());
+        }
+        let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
+        let win = self.window;
+        let [s0, s1, s1b, _s2, _s3] = self.dchain;
+        let (w0, w1) = (self.stg_w0, self.stg_w1);
+        let mut tab: Vec<u64> = Vec::new();
+        let mut meta: Vec<[Option<SkGroup>; 2]> = vec![[None, None]; nl];
+        let mut need = 0usize; // 최대 blocks×ksp(f32 256/블록)
+        for il in win.start..win.end {
+            let br: Vec<(String, u64, usize)> = if (il + 1) % interval == 0 {
+                vec![
+                    (format!("blk.{il}.attn_q.weight"), s0, w0),
+                    (format!("blk.{il}.attn_k.weight"), s1, w1),
+                    (format!("blk.{il}.attn_v.weight"), s1b, w1),
+                ]
+            } else {
+                vec![
+                    (format!("blk.{il}.attn_qkv.weight"), s0, w0),
+                    (format!("blk.{il}.attn_gate.weight"), s1, w1),
+                ]
+            };
+            let gu: Vec<(String, u64, usize)> = vec![
+                (format!("blk.{il}.ffn_gate.weight"), s0, w0),
+                (format!("blk.{il}.ffn_up.weight"), s1, w1),
+            ];
+            let mut groups = [None, None];
+            for (gi, segs) in [&br, &gu].into_iter().enumerate() {
+                if let Some(g) = sk_group_meta(self, &mut tab, segs) {
+                    need = need.max(g.blocks as usize * g.ksp as usize);
+                    groups[gi] = Some(g);
+                }
+            }
+            meta[il] = groups;
+        }
+        // 단일 세그먼트 런치 폭(sk1 — 이름은 층 유형별, lins_mk 전수 최대치).
+        for (_, n, k) in self.lins_mk.values() {
+            let blocks = n.div_ceil(256);
+            if let Some(ksp) = sk_ksp(blocks, *k) {
+                need = need.max(blocks * ksp as usize);
+            }
+        }
+        let bytes = tab.len() * 8;
+        if bytes > 0 {
+            // SAFETY: 로컬 Vec<u64>의 유효 수명 내 바이트 뷰(길이 = 원소수×8).
+            let buf = unsafe { std::slice::from_raw_parts(tab.as_ptr() as *const u8, bytes) };
+            if self.dsk == 0 {
+                self.dsk = self.cc.alloc(bytes)?;
+            }
+            self.cc.h2d(self.dsk, buf)?;
+        }
+        if need > self.dsk_part.cap {
+            self.dsk_part =
+                self.realloc_buf(self.dsk_part, need * 256 * 4, need, "dsk_part")?;
+        }
+        self.cc.sync()?;
+        self.dsk_meta = meta;
         Ok(())
     }
 
@@ -724,6 +808,15 @@ impl W4a16Dec {
         // [P10] t=1이 아니라 **최대 청크(CHAIN_TMAX)** 로 선할당 — 그래프는
         // 캡처 시점의 포인터를 기록하므로, 이후 프리필이 버퍼를 재할당하면
         // replay가 해제 주소를 쓴다(위 graph_invalidate 주석의 실측 결함).
+        // [P9-2] tall2 x 패딩 버퍼(dxtp) — k≥4096 g32/bf16 선형 전수 × 최대
+        // 청크(캡처 중 재할당 봉인 — 위 불변식 목록에 추가).
+        let mut mtp = 0usize;
+        for (name, &(_, _, _, k)) in self.lins.iter() {
+            if k >= 4096 && self.lin_grp.get(name).copied() == Some((32, true)) {
+                mtp = mtp.max(CHAIN_TMAX * (k + 8));
+            }
+        }
+        self.ensure_dxtp(mtp)?;
         self.ensure_norm_bufs(CHAIN_TMAX)?;
         self.ensure_gdn_bufs(CHAIN_TMAX)?;
         self.ensure_attn_bufs(CHAIN_TMAX)?;
@@ -794,4 +887,37 @@ impl W4a16Dec {
         }
         Ok(())
     }
+}
+
+/// [split-k marlin 디코드] 세그먼트 그룹의 sk 메타 산출 — 전 세그먼트가
+/// 재패킹 상주(lins_mk)·스테이징 폭·k%128·ksp 계약을 충족할 때만 테이블에
+/// (qm, s, out, n, k) u64×5를 append하고 그룹 메타를 반환(불충족 = None,
+/// 테이블 오염 없음). 세그먼트는 공통 k(같은 x 입력) — ksp는 그룹 단일값.
+fn sk_group_meta(
+    me: &W4a16Dec,
+    tab: &mut Vec<u64>,
+    segs: &[(String, u64, usize)],
+) -> Option<SkGroup> {
+    let mut resolved: Vec<(u64, u64, u64, usize, usize)> = Vec::new();
+    let mut blocks = 0usize;
+    for (name, out, wmax) in segs {
+        let (_, ds, n, k) = me.lin_spec(name).ok()?;
+        let (dqm, _, _) = me.lin_mk(name)?;
+        if !k.is_multiple_of(128) || n > *wmax {
+            return None;
+        }
+        resolved.push((dqm, ds, *out, n, k));
+        blocks += n.div_ceil(256);
+    }
+    let ksp = sk_ksp(blocks, resolved[0].4)?;
+    let off = tab.len() as u32;
+    for (qm, s, out, n, k) in &resolved {
+        tab.extend_from_slice(&[*qm, *s, *out, *n as u64, *k as u64]);
+    }
+    Some(SkGroup {
+        off,
+        cnt: resolved.len() as u32,
+        blocks: blocks as u32,
+        ksp,
+    })
 }

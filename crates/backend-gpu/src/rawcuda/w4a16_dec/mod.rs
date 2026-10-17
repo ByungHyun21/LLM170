@@ -133,6 +133,20 @@ pub struct StgBufs {
     pub cap: (usize, usize),
 }
 
+/// [split-k marlin 디코드 2026-10-17] 다중세그먼트 그룹 1개(층·branch|gateup)
+/// 의 sk 런치 메타 — build_multi_tables가 1회 산출.
+#[derive(Clone, Copy, Default)]
+pub(super) struct SkGroup {
+    /// dsk 테이블 u64 오프셋(세그먼트 시작).
+    pub off: u32,
+    /// 세그먼트 수.
+    pub cnt: u32,
+    /// grid.x = Σceil(n_s/256).
+    pub blocks: u32,
+    /// k분할 수((k/128)%ksp==0 보장 — sk_ksp 산출).
+    pub ksp: u8,
+}
+
 /// [R10 2026-10-10] 체인 선형 경로 — 3체인의 차이를 주입하는 열거.
 /// Gemv1: t=1 단독(1행 GEMV — 스테이징 폭 w 검사 동반),
 /// Gemm: t≥2 프리필(mma/FFMA GEMM), GemvT: t≤8 배치(TR GEMV).
@@ -749,6 +763,14 @@ pub struct W4a16Dec {
     /// `upload_lin`(g128/f16) 등록분은 미기재(디스패치 기본값) · `upload_lin_g`가
     /// 기재한다. GEMV 심볼 선택(g128 vs g32_bf16)만 가른다.
     lin_grp: HashMap<String, (usize, bool)>,
+    /// [split-k marlin 디코드 2026-10-17] marlin 재패킹 상주(이중 버퍼 — 원본
+    /// row-major 유지 + [k/16][n/64][128] u32 사본) — 이름 → (qm, n, k).
+    /// g128·f16 업로드에 한해 등록(형상 계약 위반·VRAM 부족 시 미등록 →
+    /// t=1 디스패치가 기존 GEMV로 폴백).
+    lins_mk: HashMap<String, (CUdeviceptr, usize, usize)>,
+    /// [sk] 재패킹 사본 바이트 합 — weights_bytes에는 포함(VRAM 실물),
+    /// active_weight_bytes에서는 제외(토큰당 판독은 단 1본).
+    marlin_bytes: u64,
     /// 플레인 bf16 상주 — 이름 → ([k][n] 전치 ptr, n, k). MoE 모델(35B)의
     /// 비양자화 선형(GDN·어텐션·라우터·shared) — head_bf16 GEMV 재사용.
     plains: HashMap<String, (CUdeviceptr, usize, usize)>,
@@ -783,6 +805,9 @@ pub struct W4a16Dec {
     /// [A2b 2026-10-15] 그룹 mma A의 (hi|lo) f16 packed 미러(u32/원소, 4B) —
     /// cast_hilo 산출. 3-pass 정밀도 회수(A 반올림 ~2^-11 제거).
     dxp: Buf,
+    /// [P9-2 2026-10-17] tall2 x 패딩 스테이징([t][k+8] f32) — k≥4096 g32/bf16
+    /// 선형의 L1 셋 충돌 해소(w4a16_g32_xpad 산출, tall2가 ks=k4+2로 판독).
+    dxtp: Buf,
     /// [FLA-10 2026-10-10] 플레인(bf16) 경로 A 미러([t][k] bf16) — bf16_mma가
     /// f32 대신 판독(재판독 대역 절반). cast_bf16과 커널 내 변환이 비트동일.
     dabf: Buf,
@@ -794,6 +819,16 @@ pub struct W4a16Dec {
     /// gateup_cnt, gateup_total, branch_tgrid, gateup_tgrid] — 오프셋은 u64
     /// 인덱스, total = 행 합(grid, t=1), *_tgrid = Σceil(n/GEMV_TR)(t행 판).
     dmulti_meta: Vec<[u32; 8]>,
+    /// [split-k marlin 디코드 2026-10-17] 다중세그먼트 t=1 테이블(qm판,
+    /// [cnt][5] = (qm, s, out, n, k)) — ensure_chain_bufs에서 1회 작성
+    /// (그래프 캡처 정적 계약 — 리플레이 간 내용 불변).
+    dsk: CUdeviceptr,
+    /// [sk] 층별 그룹 메타 [branch, gateup] — None이면 그 그룹은 기존 GEMV
+    /// 폴백(세그먼트 중 재패킹 부재·형상 계약 위안).
+    dsk_meta: Vec<[Option<SkGroup>; 2]>,
+    /// [sk] 부분합 스크래치([gblk][ksp][256] f32) — 전 런치 최대 블록수×
+    /// ksp 상한으로 1회 할당(캡처 중 alloc 금지 계약).
+    dsk_part: Buf,
     spec_on: bool,
     /// [A-1 진단] spec scan 커널 on/off(기본 = spec_on) — 교차 대조용.
     spec_scan_on: bool,
@@ -1090,6 +1125,8 @@ impl W4a16Dec {
             g4_pool: Vec::new(),
             g4_atab: (Vec::new(), Vec::new()),
             lin_grp: HashMap::new(),
+            lins_mk: HashMap::new(),
+            marlin_bytes: 0,
             plains: HashMap::new(),
             plain_weights: false,
             weights_bytes: 0,
@@ -1110,11 +1147,15 @@ impl W4a16Dec {
             dx32: Buf::default(),
             dx16: Buf::default(),
             dxp: Buf::default(),
+            dxtp: Buf::default(),
             dabf: Buf::default(),
             dmulti: 0,
             dmulti_meta: Vec::new(),
             spec_on: false,
             spec_scan_on: true,
+            dsk: 0,
+            dsk_meta: Vec::new(),
+            dsk_part: Buf::default(),
             dyt: Buf::default(),
             head_w: 0,
             head_sc: 0,
@@ -1383,6 +1424,12 @@ impl W4a16Dec {
             .get(name)
             .copied()
             .ok_or_else(|| format!("상주 선형 없음: {name}"))
+    }
+
+    /// [split-k marlin 디코드] 선형의 marlin 재패킹 사본 조회(미등록 = None →
+    /// t=1 디스패치가 기존 GEMV로 폴백).
+    fn lin_mk(&self, name: &str) -> Option<(CUdeviceptr, usize, usize)> {
+        self.lins_mk.get(name).copied()
     }
 
     /// MoE 배치 모드 문자열(모니터링) — "none" | "resident" | "streaming".
