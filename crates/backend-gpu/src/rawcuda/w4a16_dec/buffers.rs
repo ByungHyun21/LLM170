@@ -188,14 +188,18 @@ impl W4a16Dec {
         let h = self.hidden;
         let ad = self.attn.attn.ok_or("attn: 형상 미등록")?;
         let gd = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
+        // [k2 (c) 1단 2026-10-17] 폭 산출 탐침은 창 첫 층 — 비최종 샤드는
+        // blk.0 선형이 없다(창 밖 미업로드 계약). 모든 층이 FFN을 공유하므로
+        // 어떤 창 시작층이든 폭 계약은 동일하다.
+        let probe = self.window.start;
         let (ff_gate, ff_up) = if self.plain_weights {
             // 플레인(MoE) 모드 — dense FFN 없음. ew 스테이징 폭은 shared 폭.
-            let (_, g, _) = self.plain_spec("blk.0.moe_shared_gate.weight")?;
-            let (_, u, _) = self.plain_spec("blk.0.moe_shared_up.weight")?;
+            let (_, g, _) = self.plain_spec(&format!("blk.{probe}.moe_shared_gate.weight"))?;
+            let (_, u, _) = self.plain_spec(&format!("blk.{probe}.moe_shared_up.weight"))?;
             (g, u)
         } else {
-            let (_, _, g, _) = self.lin_spec("blk.0.ffn_gate.weight")?;
-            let (_, _, u, _) = self.lin_spec("blk.0.ffn_up.weight")?;
+            let (_, _, g, _) = self.lin_spec(&format!("blk.{probe}.ffn_gate.weight"))?;
+            let (_, _, u, _) = self.lin_spec(&format!("blk.{probe}.ffn_up.weight"))?;
             (g, u)
         };
         // 슬롯 0 = qg·qkv·gate/up, 슬롯 1 = kin/vin·z·up. ew가 gate·up을

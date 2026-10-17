@@ -306,13 +306,20 @@ impl W4a16Dec {
         // [k2 (b)] 최종 노름은 마지막 층 소유 창만 — 비최종 창은 잔차 행을
         // 핸드오프(다음 샤드 입력)로 회수. head는 최종 창 전용. 전체창 무변.
         let last = (t - 1) as u64 * (h as u64) * 4;
-        let xn_last = if owns_final {
-            self.norm_resid_dev(2 * self.n_layers, self.dres + last, ab + last, 1, 0)
-                .map_err(|e| format!("T final norm: {e}"))?
+        let (xn_last, out_rows) = if owns_final {
+            (
+                self.norm_resid_dev(2 * self.n_layers, self.dres + last, ab + last, 1, 0)
+                    .map_err(|e| format!("T final norm: {e}"))?,
+                h,
+            )
         } else {
-            ab + last
+            // [k2 (c) 1단 2026-10-17] 비최종 창 — 전 t행 경계 잔차(dres+ab)를
+            // 다음 샤드 입력으로 회수(t=1 체인과 같은 axpy w=1.0 가산 —
+            // 전체창 계층 연속과 비트동일). 반환 폭 = t×hidden.
+            self.axpy_dev(1.0, ab, self.dres, t * h)?;
+            (self.dres, t * h)
         };
-        let mut ob = vec![0u8; if head { self.head_n * 4 } else { h * 4 }];
+        let mut ob = vec![0u8; if head { self.head_n * 4 } else { out_rows * 4 }];
         if head {
             if self.head_w == 0 || !owns_final {
                 return Err("chain_device_t: head 미등록/비최종 창".into());
@@ -323,7 +330,7 @@ impl W4a16Dec {
             self.cc
                 .d2h_async(ob.as_mut_ptr(), self.head_out, self.head_n * 4)?;
         } else {
-            self.cc.d2h_async(ob.as_mut_ptr(), xn_last, h * 4)?;
+            self.cc.d2h_async(ob.as_mut_ptr(), xn_last, out_rows * 4)?;
         }
         self.cc.sync()?;
         let pos_after = pos + t as u32;
@@ -338,7 +345,8 @@ impl W4a16Dec {
         if head {
             llm170_diag::fp::fp_record("gpu.logits", &v);
         } else {
-            llm170_diag::fp::fp_record("gpu.xn", &v);
+            // [k2 (c)] 비최종 창 반환은 t행 잔차 — 지문은 마지막 행만(계약 폭).
+            llm170_diag::fp::fp_record("gpu.xn", &v[v.len() - h..]);
         }
         Ok(v)
     }

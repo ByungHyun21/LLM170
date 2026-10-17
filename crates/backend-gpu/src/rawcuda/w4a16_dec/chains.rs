@@ -340,7 +340,11 @@ impl W4a16Dec {
             self.norm_resid_dev(2 * self.n_layers, self.dres, ab, 1, 0)
                 .map_err(|e| format!("final norm: {e}"))?
         } else {
-            ab
+            // [k2 (c) 1단 2026-10-17] 경계 잔차 = dres + ab — 노름 커널의
+            // v = x + ab와 같은 f32 가산 1회(axpy w=1.0). 다음 샤드 첫 노름이
+            // x + 0(dab_dev 영)으로 합쳐져 전체창과 비트동일 경로가 된다.
+            self.axpy_dev(1.0, ab, self.dres, self.hidden)?;
+            self.dres
         };
         Ok(xn_final)
     }

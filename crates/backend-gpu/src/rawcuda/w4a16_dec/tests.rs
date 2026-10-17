@@ -1243,3 +1243,220 @@ fn ckpt_victim_flop_aware() {
     // 같은 절약 = 오래된 사용 퇴거.
     assert_eq!(W4a16Dec::ckpt_victim(&[7, 7, 7, 7], &[5, 2, 9, 3]), 1);
 }
+
+// ═══ [k2 (c) 1단 2026-10-17] PP 2샤드 — 창 산식(호스트) + 등가(CUDA 필요) ═══
+// 게이트 ①(docs/k2-core-split.md): 직렬 PP 골든 = 단일 GPU 대비 비트동일.
+// 창 산식: 27B n_layers=64·interval=4의 32/32 분할 경계 정합(어텐션 KV
+// 서브층·GDN gi 절대 인덱스·노름 행 2*il 절대 유지)을 테이블로 고정.
+#[test]
+fn layer_window_27b_split_math() {
+    let n = 64usize;
+    let (wa, wb) = (
+        LayerWindow { start: 0, end: 32 },
+        LayerWindow { start: 32, end: n },
+    );
+    // GDN 절대 순번 — 샤드B 시작 gi = 0..31 중 비어텐션 층 수(8개 제외).
+    assert_eq!(wa.gdn_start(4), 0);
+    assert_eq!(wb.gdn_start(4), 24);
+    assert_eq!(wb.abs(0), 32);
+    // 경계 직전 층 31은 어텐션((31+1)%4==0) — 서브층 l=7까지는 샤드A KV,
+    // l=8(절대 층 35)부터 샤드B.
+    assert!(wa.owns_attn(7, 4));
+    assert!(!wa.owns_attn(8, 4));
+    assert!(wb.owns_attn(8, 4));
+    assert!(!wb.owns_attn(7, 4));
+    assert!(wb.owns_final(n));
+    assert!(!wa.owns_final(n));
+    // 노름 행 2*il·최종 2*n_layers는 절대 인덱스 — 창 상대 오프셋과 무관.
+    for off in 0..wa.n() {
+        assert_eq!(wa.abs(off), off);
+    }
+    for off in 0..wb.n() {
+        assert_eq!(wb.abs(off), 32 + off);
+    }
+}
+
+// 2샤드 등가 — 합성 미니 4층(interval=4: 층 0·1·2 GDN, 층 3 어텐션)을
+// 전체창 단일 디코더(골든)와 [0,2)+[2,4) 2샤드로 각각 실실행, 토큰열
+// (프리필 t=3 + 디코드 t=1×4)이 완전 동일한지 판정. 가중 추출은 이름
+// 시드(순서 무관)라 골든·샤드가 같은 층의 같은 비트를 소비한다. 샤드는
+// 자기 창의 선형만 업로드한다(VRAM 절반 — 업로더 창 필터 계약).
+#[test]
+fn pp2shard_matches_full_window() {
+    let _cuda = CUDA_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = 1024usize;
+    let (qh, kvh, dch) = (4usize, 2usize, 256usize);
+    let (qdim, kvdim) = (qh * dch, kvh * dch); // 1024, 512
+    let ffn = 1024usize;
+    let vocab = 256usize;
+    let n_layers = 4usize;
+    let gd = GdnDims {
+        n_gdn: 3,
+        hidden: h,
+        h_k: 2,
+        h_v: 4,
+        d: 128,
+    };
+    let (conv_ch, gate_w) = (gd.conv_ch(), gd.h_v * 128); // 1024, 512
+    let (cap, interval) = (64usize, 4usize);
+
+    // 이름 시드 RNG — 업로드 순서·대상과 무관하게 같은 이름 = 같은 비트.
+    let seed_of = |name: &str| -> u64 {
+        let mut x = 0xcbf2_9ce4_8422_2325u64;
+        for b in name.bytes() {
+            x ^= b as u64;
+            x = x.wrapping_mul(0x1000_0000_01b3);
+        }
+        x ^ 0x0dd8_ba11_5eed_0f77
+    };
+    let lin = |dec: &mut super::W4a16Dec, name: &str, n: usize, k: usize| {
+        let mut s = seed_of(name);
+        let q: Vec<u8> = (0..n * k / 2)
+            .map(|_| (sm64(&mut s) & 0xff) as u8)
+            .collect();
+        let sc: Vec<u8> = (0..n * k / 128)
+            .flat_map(|_| f32_to_f16(sm_f32(&mut s, 0.004, 0.016)).to_le_bytes())
+            .collect();
+        dec.upload_lin(name, &q, &sc, n, k).expect("upload_lin");
+    };
+    // 층별 레지스트리 — GDN: qkv(=conv_ch)/gate(=h_v*128)/ssm_out,
+    // 어텐션: q/k/v/output. FFN 공통. 창 필터 업로드의 단일 출처.
+    let upload_layers = |dec: &mut super::W4a16Dec, layers: (usize, usize)| {
+        for il in layers.0..layers.1 {
+            if (il + 1) % interval == 0 {
+                lin(dec, &format!("blk.{il}.attn_q.weight"), qdim, h);
+                lin(dec, &format!("blk.{il}.attn_k.weight"), kvdim, h);
+                lin(dec, &format!("blk.{il}.attn_v.weight"), kvdim, h);
+                lin(dec, &format!("blk.{il}.attn_output.weight"), h, qdim);
+            } else {
+                lin(dec, &format!("blk.{il}.attn_qkv.weight"), conv_ch, h);
+                lin(dec, &format!("blk.{il}.attn_gate.weight"), gate_w, h);
+                lin(dec, &format!("blk.{il}.ssm_out.weight"), h, gate_w);
+            }
+            lin(dec, &format!("blk.{il}.ffn_gate.weight"), ffn, h);
+            lin(dec, &format!("blk.{il}.ffn_up.weight"), ffn, h);
+            lin(dec, &format!("blk.{il}.ffn_down.weight"), h, ffn);
+        }
+    };
+    // 전역 상수(전 모델 폭 — 절대 인덱스)·head — 모든 디코더 동일 비트.
+    let consts = |dec: &mut super::W4a16Dec| {
+        let mut s = 0x5eed_5eed_5eed_5eedu64;
+        let norms: Vec<f32> = (0..(2 * n_layers + 1) * h)
+            .map(|_| sm_f32(&mut s, 0.8, 1.2))
+            .collect();
+        dec.set_norm_weights(&norms, 2 * n_layers + 1)
+            .expect("set_norm_weights");
+        dec.set_gdn(
+            gd,
+            &(0..gd.n_gdn * gd.conv_ch() * 4)
+                .map(|_| sm_f32(&mut s, -0.05, 0.05))
+                .collect::<Vec<_>>(),
+            &(0..gd.n_gdn * 2 * gd.h_v * h)
+                .map(|_| sm_f32(&mut s, -0.05, 0.05))
+                .collect::<Vec<_>>(),
+            &(0..gd.n_gdn * gd.h_v)
+                .map(|_| sm_f32(&mut s, 0.0, 1.0))
+                .collect::<Vec<_>>(),
+            &(0..gd.n_gdn * gd.h_v)
+                .map(|_| sm_f32(&mut s, -0.05, 0.05))
+                .collect::<Vec<_>>(),
+            &(0..gd.n_gdn * 128)
+                .map(|_| sm_f32(&mut s, 0.5, 1.5))
+                .collect::<Vec<_>>(),
+        )
+        .expect("set_gdn");
+        let ad = AttnDims {
+            n_attn: n_layers / interval,
+            q_heads: qh,
+            kv_heads: kvh,
+            d: dch,
+            cap,
+            interval,
+            sliding_window: 0,
+        };
+        dec.set_attn(
+            ad,
+            Vec::new(),
+            &(0..ad.n_attn * dch)
+                .map(|_| sm_f32(&mut s, 0.5, 1.5))
+                .collect::<Vec<_>>(),
+            &(0..ad.n_attn * dch)
+                .map(|_| sm_f32(&mut s, 0.5, 1.5))
+                .collect::<Vec<_>>(),
+        )
+        .expect("set_attn");
+    };
+    let head_w: Vec<f32> = {
+        let mut s = seed_of("head");
+        (0..vocab * h)
+            .map(|_| sm_f32(&mut s, -0.05, 0.05))
+            .collect()
+    };
+    let embed_of = |t: u32| -> Vec<f32> {
+        let mut s = seed_of(&format!("emb.{t}"));
+        (0..h).map(|_| sm_f32(&mut s, -1.0, 1.0)).collect()
+    };
+    let argmax_min = |lg: &[f32]| -> u32 {
+        let mut bi = 0usize;
+        for (i, v) in lg.iter().enumerate() {
+            if *v > lg[bi] {
+                bi = i;
+            }
+        }
+        bi as u32
+    };
+
+    // 골든 = 전체창 단일 디코더(디바이스 0).
+    let mut gold = super::W4a16Dec::new_dev(1, h, n_layers, 0).expect("골든 CUDA");
+    upload_layers(&mut gold, (0, n_layers));
+    consts(&mut gold);
+    gold.upload_head(&bf16_bytes(&head_w), vocab, h)
+        .expect("upload_head");
+
+    // 2샤드 — A=[0,2) 디바이스 0(창 선형만), B=[2,4) 디바이스 1(+head).
+    let mut sa = super::W4a16Dec::new_dev(1, h, n_layers, 0).expect("샤드A CUDA");
+    sa.set_layer_window(0, 2).expect("set_layer_window A");
+    upload_layers(&mut sa, (0, 2));
+    consts(&mut sa);
+    let mut sb = super::W4a16Dec::new_dev(1, h, n_layers, 1).expect("샤드B CUDA(2번째 카드)");
+    sb.set_layer_window(2, 4).expect("set_layer_window B");
+    upload_layers(&mut sb, (2, 4));
+    consts(&mut sb);
+    sb.upload_head(&bf16_bytes(&head_w), vocab, h)
+        .expect("upload_head B");
+
+    let prompt = [7u32, 123, 42];
+    let mut rows: Vec<f32> = Vec::new();
+    for &t in &prompt {
+        rows.extend_from_slice(&embed_of(t));
+    }
+
+    // ── 골든: 프리필 t=3(head 로짓) → greedy 디코드 ×4 ──
+    gold.reset_state(0).expect("reset 골든");
+    let lg = gold
+        .forward_prefill(0, &rows, 3, true)
+        .expect("골든 프리필");
+    let mut gold_toks = vec![argmax_min(&lg)];
+    let mut cur = gold_toks[0];
+    for _ in 0..4 {
+        cur = gold
+            .forward_device_argmax(0, &embed_of(cur))
+            .expect("골든 디코드");
+        gold_toks.push(cur);
+    }
+
+    // ── 2샤드: 동일 절차를 직렬 오케스트레이터로 ──
+    sa.reset_state(0).expect("reset A");
+    sb.reset_state(0).expect("reset B");
+    let lg2 = forward_2shard(&mut sa, &mut sb, 0, &rows, 3, true).expect("2샤드 프리필");
+    assert_eq!(lg2.len(), lg.len(), "2샤드 로짓 폭 = 골든 head_n");
+    let mut pp_toks = vec![argmax_min(&lg2)];
+    let mut cur = pp_toks[0];
+    for _ in 0..4 {
+        cur = forward_2shard_argmax(&mut sa, &mut sb, 0, &embed_of(cur)).expect("2샤드 디코드");
+        pp_toks.push(cur);
+    }
+    assert_eq!(pp_toks, gold_toks, "2샤드 토큰열 ≠ 전체창 골든(비트 판정)");
+    assert_eq!(sa.slot_pos_of(0), gold.slot_pos_of(0), "slot_pos 정합");
+    assert_eq!(sb.slot_pos_of(0), gold.slot_pos_of(0), "slot_pos 정합 B");
+}

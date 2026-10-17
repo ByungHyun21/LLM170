@@ -850,6 +850,9 @@ mod prefill;
 mod probe;
 pub mod unified_cache;
 mod upload;
+// [k2 (c) 1단 2026-10-17] PP 2샤드 직렬 오케스트레이터 — shard.rs.
+mod shard;
+pub use shard::{forward_2shard, forward_2shard_argmax};
 
 mod spec;
 
@@ -1143,6 +1146,20 @@ impl W4a16Dec {
     /// [k2 (a)] 종전 생성 = 디바이스 0.
     pub fn new(n_slots: usize, hidden: usize, n_layers: usize) -> Result<Self, String> {
         Self::new_dev(n_slots, hidden, n_layers, 0)
+    }
+
+    /// [k2 (c) 1단 2026-10-17] 층 창 설정(PP 샤딩) — 생성 직후·업로드 전에
+    /// 코디네이터가 호출. 창 밖 선형 미업로드가 허용된다(체인·멀티 테이블은
+    /// 창 층만 참조). 비최종 창에서 head/전 위치 argmax 경로는 Err 가드.
+    pub fn set_layer_window(&mut self, start: usize, end: usize) -> Result<(), String> {
+        if start >= end || end > self.n_layers {
+            return Err(format!(
+                "set_layer_window: [{start},{end}) 위반 — n_layers={}",
+                self.n_layers
+            ));
+        }
+        self.window = LayerWindow { start, end };
+        Ok(())
     }
 
     /// [k2 (a)] 엔진 소유 디바이스의 여유 VRAM — 전역 프로브(디바이스 0) 대신.
