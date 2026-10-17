@@ -686,8 +686,18 @@ impl LayerWindow {
     }
     /// 어텐션 KV 서브층 l(전체 층 il의 l = il/interval 대응)이 창 소유인가
     /// — kv_grow 층 필터 훅(전체창 = 항상 참 → 동작 불변).
-    pub fn owns_attn(&self, l: usize, interval: usize) -> bool {
-        self.contains((l + 1) * interval - 1)
+    /// [회귀 수정 2026-10-17] MTP 가상 전체-어텐션 층(서버가 n_attn+1로 등록 —
+    /// il 매핑 (l+1)*interval−1이 n_layers를 넘는 마지막 서브층)은 모델 층
+    /// 창 밖이므로 **최종 층 소유 창(마지막 카드)**이 소유한다. 정규 서브층의
+    /// il은 항상 n_layers 미만이라 이 분기와 겹치지 않는다. 전체창은 둘 다
+    /// 참 — 원래 동작(전 서브층 KV 확보)과 동일하다.
+    pub fn owns_attn(&self, l: usize, interval: usize, n_layers: usize) -> bool {
+        let il = (l + 1) * interval - 1;
+        if il < n_layers {
+            self.contains(il)
+        } else {
+            self.owns_final(n_layers)
+        }
     }
 }
 pub struct W4a16Dec {

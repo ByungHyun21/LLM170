@@ -568,10 +568,12 @@ impl W4a16Dec {
         let floor = self.kv_floor.get(slot).copied().unwrap_or(0) as usize;
         let mut new = 0usize;
         // [k2 (b) 2026-10-17] 층 창 필터 훅 — 창 밖 KV 층은 이 샤드가 소유하지
-        // 않는다(확보 생략). 기본 전체창 = 항상 참 → 동작 불변.
+        // 않는다(확보 생략). MTP 가상 층(il 매핑이 n_layers를 넘는 마지막
+        // 서브층)은 최종 층 소유 창이 소유(owns_attn 내부) — 전체창 = 항상
+        // 참 → 동작 불변.
         let win = self.window;
         for l in 0..n_attn {
-            if !win.owns_attn(l, dm.interval) {
+            if !win.owns_attn(l, dm.interval, self.n_layers) {
                 continue;
             }
             let sliding = self.attn.layers.get(l).map(|x| x.sliding).unwrap_or(false);

@@ -1261,10 +1261,18 @@ fn layer_window_27b_split_math() {
     assert_eq!(wb.abs(0), 32);
     // 경계 직전 층 31은 어텐션((31+1)%4==0) — 서브층 l=7까지는 샤드A KV,
     // l=8(절대 층 35)부터 샤드B.
-    assert!(wa.owns_attn(7, 4));
-    assert!(!wa.owns_attn(8, 4));
-    assert!(wb.owns_attn(8, 4));
-    assert!(!wb.owns_attn(7, 4));
+    assert!(wa.owns_attn(7, 4, n));
+    assert!(!wa.owns_attn(8, 4, n));
+    assert!(wb.owns_attn(8, 4, n));
+    assert!(!wb.owns_attn(7, 4, n));
+    // MTP 가상 전체-어텐션 층(n_attn+1 등록 — il 매핑 67이 n_layers=64를
+    // 넘는 마지막 서브층 l=16)은 창 밖 모델 층이 아니라 최종 층 소유 창의
+    // 소유(전체창·샤드B 참, 샤드A 거짓). 누락 시 kv_grow가 이 층 KV를
+    // 확보하지 않아 CUresult=700(bench MTP 그래프 warmup 실측 회귀).
+    let full = LayerWindow::full(n);
+    assert!(full.owns_attn(16, 4, n));
+    assert!(wb.owns_attn(16, 4, n));
+    assert!(!wa.owns_attn(16, 4, n));
     assert!(wb.owns_final(n));
     assert!(!wa.owns_final(n));
     // 노름 행 2*il·최종 2*n_layers는 절대 인덱스 — 창 상대 오프셋과 무관.
