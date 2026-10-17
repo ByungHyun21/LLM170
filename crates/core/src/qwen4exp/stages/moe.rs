@@ -16,7 +16,10 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
     let n_exp = cfg.n_experts;
     let g = m.ent(&format!("{l}.gate.weight"))?;
     if g.shape != [n_exp as u64, cfg.hidden_size as u64] {
-        return Err(format!("mlp.gate {:?} ≠ [{n_exp},{}]", g.shape, cfg.hidden_size));
+        return Err(format!(
+            "mlp.gate {:?} ≠ [{n_exp},{}]",
+            g.shape, cfg.hidden_size
+        ));
     }
     let mut out = vec![vec![0.0f32; cfg.hidden_size]; xs.len()];
     for (t, x) in xs.iter().enumerate() {

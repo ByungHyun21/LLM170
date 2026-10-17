@@ -16,7 +16,16 @@ impl QwenEngine {
         kv_reserve: Option<u64>,
         kv_vram_cap: Option<u64>,
     ) -> Result<Self, String> {
-        Self::load_dev(dir, n_slots, ctx, kv_budget, kv_reserve, kv_vram_cap, 0, None)
+        Self::load_dev(
+            dir,
+            n_slots,
+            ctx,
+            kv_budget,
+            kv_reserve,
+            kv_vram_cap,
+            0,
+            None,
+        )
     }
 
     /// [PP 3차 2026-10-17] 샤드 로드 — 디바이스 명시 + 층 창(PP 2샤드).
@@ -125,7 +134,11 @@ impl QwenEngine {
         }
         ld.log_summary();
         // [PP 3차] 샤드 로드는 MTP 스킵 — 1차 PP는 스펙/MTP 강제 OFF(골든 우선).
-        let mtp = if window.is_none() { upload_mtp(dec, model)? } else { false };
+        let mtp = if window.is_none() {
+            upload_mtp(dec, model)?
+        } else {
+            false
+        };
         // [k2 (b) 2026-10-17] 층 창 — head(output.weight)는 마지막 층 소유
         // 샤드만 담당. 기본 전체창 = 항상 참 → 동작 불변. 임베딩은 첫 샤드
         // 입력 조립용으로 전 창 공통 업로드 유지.

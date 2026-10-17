@@ -384,7 +384,9 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                     match f1 {
                         Some(f1) => (free.min(f1), 2u64),
                         None => {
-                            eprintln!("# cards=2: 카드1 VRAM 조회 실패 — 카드0 기준으로 검증(엔진 적재가 최종 판정)");
+                            eprintln!(
+                                "# cards=2: 카드1 VRAM 조회 실패 — 카드0 기준으로 검증(엔진 적재가 최종 판정)"
+                            );
                             (free, 2u64)
                         }
                     }
@@ -392,7 +394,11 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                     (free, 1u64)
                 };
                 // 폴백 상한(매니페스트 판독 불가 시): 가중치 = dense 전량(디렉터리).
-                let wts = if ci.dense { dir_bytes(&model_path) / wts_div } else { 0 };
+                let wts = if ci.dense {
+                    dir_bytes(&model_path) / wts_div
+                } else {
+                    0
+                };
                 // [K6-3] 문맥 추가분 = (문맥−1)×GDN 상태 — KV 상한에서 차감.
                 let ctx_state = (SERVE_CONTEXTS as u64 - 1) * ci.gdn_state_bytes_per_slot;
                 let mut max_kv = free
@@ -411,34 +417,34 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 if cards == 2 {
                     eprintln!("# plan 건너뜀: PP 2카드(플래너 단일 카드 전용)");
                 } else {
-                match llm170_core::plan::Manifest::from_dir(&model_path) {
-                    Ok(man) => {
-                        let hw = llm170_core::plan::Hardware {
-                            vram_total: total,
-                            vram_free: Some(free),
-                            host_ram: resource::host_mem_available().unwrap_or(0),
-                            ssd: None,
-                            reserve: RESERVE,
-                            cards: 1,
-                        };
-                        let wl = llm170_core::plan::Workload {
-                            model_max_ctx: ci.ctx,
-                            want_ctx: ci.ctx,
-                            kv_bytes_per_token: ci.kv_bytes_per_token,
-                            state_bytes_per_ctx: ci.gdn_state_bytes_per_slot,
-                            contexts: SERVE_CONTEXTS,
-                            // [2026-10-16] embed 상주 정책(실행 경로) — qwen 계열
-                            // true(VRAM 업로드), gemma4 false(호스트 embed_row).
-                            embed_resident: embed_resident(&model_path),
-                        };
-                        let p = llm170_core::plan::plan(&man, &hw, &wl);
-                        plan_txt = p.summary();
-                        if p.fits() {
-                            max_kv = p.kv_budget;
+                    match llm170_core::plan::Manifest::from_dir(&model_path) {
+                        Ok(man) => {
+                            let hw = llm170_core::plan::Hardware {
+                                vram_total: total,
+                                vram_free: Some(free),
+                                host_ram: resource::host_mem_available().unwrap_or(0),
+                                ssd: None,
+                                reserve: RESERVE,
+                                cards: 1,
+                            };
+                            let wl = llm170_core::plan::Workload {
+                                model_max_ctx: ci.ctx,
+                                want_ctx: ci.ctx,
+                                kv_bytes_per_token: ci.kv_bytes_per_token,
+                                state_bytes_per_ctx: ci.gdn_state_bytes_per_slot,
+                                contexts: SERVE_CONTEXTS,
+                                // [2026-10-16] embed 상주 정책(실행 경로) — qwen 계열
+                                // true(VRAM 업로드), gemma4 false(호스트 embed_row).
+                                embed_resident: embed_resident(&model_path),
+                            };
+                            let p = llm170_core::plan::plan(&man, &hw, &wl);
+                            plan_txt = p.summary();
+                            if p.fits() {
+                                max_kv = p.kv_budget;
+                            }
                         }
+                        Err(e) => eprintln!("# plan 건너뜀: {e}"),
                     }
-                    Err(e) => eprintln!("# plan 건너뜀: {e}"),
-                }
                 }
                 // [2026-10-16] 2계층 검증 — VRAM부 상한 초과분은 **호스트 확장**
                 // (요청 우선 — 거부하지 않는다). 호스트부는 가용 RAM 검증.

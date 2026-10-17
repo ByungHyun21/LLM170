@@ -127,14 +127,7 @@ impl PpEngine {
                         true,
                     )?);
                 } else if is_last {
-                    let xn = forward_2shard(
-                        &mut self.a.dec,
-                        &mut self.b.dec,
-                        seq,
-                        &row,
-                        1,
-                        false,
-                    )?;
+                    let xn = forward_2shard(&mut self.a.dec, &mut self.b.dec, seq, &row, 1, false)?;
                     last = Some(self.b.head_logits(&xn)?);
                 } else {
                     forward_2shard(&mut self.a.dec, &mut self.b.dec, seq, &row, 1, false)?;
@@ -151,14 +144,8 @@ impl PpEngine {
                         true,
                     )?);
                 } else if is_last {
-                    let xn = forward_2shard(
-                        &mut self.a.dec,
-                        &mut self.b.dec,
-                        seq,
-                        &rows,
-                        t,
-                        false,
-                    )?;
+                    let xn =
+                        forward_2shard(&mut self.a.dec, &mut self.b.dec, seq, &rows, t, false)?;
                     last = Some(self.b.head_logits(&xn)?);
                 } else {
                     forward_2shard(&mut self.a.dec, &mut self.b.dec, seq, &rows, t, false)?;
@@ -248,7 +235,11 @@ impl PpEngine {
     }
 
     /// 배치 디코드 로짓(샘플링) — 슬롯별 직렬 + softcap(qwen 미러).
-    pub fn decode_np_logits(&mut self, seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<f32>, String> {
+    pub fn decode_np_logits(
+        &mut self,
+        seq_ids: &[usize],
+        tokens: &[u32],
+    ) -> Result<Vec<f32>, String> {
         let rows = self.a.embed_rows(tokens)?;
         let h = self.a.model.hp.n_embd;
         let mut out = Vec::new();
@@ -278,7 +269,10 @@ impl PpEngine {
     }
 
     pub fn kv_total_blocks(&self) -> usize {
-        self.a.dec.kv_total_blocks().min(self.b.dec.kv_total_blocks())
+        self.a
+            .dec
+            .kv_total_blocks()
+            .min(self.b.dec.kv_total_blocks())
     }
 
     pub fn kv_free_blocks(&self) -> usize {
@@ -351,7 +345,12 @@ impl PpEngine {
     pub fn spec_rewind_pos(&mut self, _slot: usize, _n: u32) -> Result<(), String> {
         Err("pp: 스펙 미지원".into())
     }
-    pub fn spec_verify(&mut self, _slot: usize, _rows: &[f32], _t: usize) -> Result<Vec<u32>, String> {
+    pub fn spec_verify(
+        &mut self,
+        _slot: usize,
+        _rows: &[f32],
+        _t: usize,
+    ) -> Result<Vec<u32>, String> {
         Err("pp: 스펙 미지원".into())
     }
     pub fn spec_verify_logits(

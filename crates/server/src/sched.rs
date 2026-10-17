@@ -135,12 +135,15 @@ pub(crate) fn load_gpu_retry(
         // [PP 3차] cards=2 → 2샤드 엔진(카드0·1), 그 외 단일 경로 불변.
         let loaded = if cards == 2 {
             crate::gpu_engine::GpuEngine::load_pp(
-                p, n_slots, ctx, kv_budget, kv_reserve, kv_vram_cap,
+                p,
+                n_slots,
+                ctx,
+                kv_budget,
+                kv_reserve,
+                kv_vram_cap,
             )
         } else {
-            crate::gpu_engine::GpuEngine::load(
-                p, n_slots, ctx, kv_budget, kv_reserve, kv_vram_cap,
-            )
+            crate::gpu_engine::GpuEngine::load(p, n_slots, ctx, kv_budget, kv_reserve, kv_vram_cap)
         };
         match loaded {
             Ok(mut e) => {

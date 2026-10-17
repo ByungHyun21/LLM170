@@ -31,7 +31,7 @@ def w(name, toks):
               open(f"{run}/{name}.json", "w"))
 P = lcg_list(0x1234_5678, 700)              # 공통 시스템 접두
 w("s1_cold",  lcg_list(0xDEAD_BEEF, 700))   # 고유(접두 공유 없음)
-w("s2_full",  P + [11, 22, 33])             # s3 사전 가열용(전체 접두 후보)
+w("s2_full",  P + [11, 22, 33])             # 전체 접두 재사용 후보
 w("s3_ckpt",  P + [44, 55, 66, 77])         # 700 공통 + 상이 접미(체크포인트)
 for c in (2, 4, 8):
     for i in range(c):
@@ -55,7 +55,7 @@ s=d.get("serving",{})
 print(s.get("requests_total",0), s.get("ttft_ms_avg",0), s.get("queue_wait_ms_avg",0))'; }
 
 # 시나리오별: 요청 1회 · (avg·n) 차분으로 구간 TTFT 합 산출
-scn() { # $1=파일명 $2=라벨
+scn() { # $1=파일 기본명 $2=라벨
   local A B
   A=$(snap); curl -s -X POST "http://127.0.0.1:$PORT/v1/completions" \
       -H 'Content-Type: application/json' -d @"$RUN/$1.json" > /dev/null
@@ -70,9 +70,9 @@ print(f'$2\t구간 TTFT={ttft:8.1f}ms\t큐대기={qw:6.1f}ms')"
 }
 
 echo "=== TTFT 3시나리오 (순차) ==="
-scn s1_cold.json "S1콜드     "
-scn s2_full.json "S2전체접두 "
-scn s3_ckpt.json "S3체크포인트"
+scn s1_cold "S1콜드     "
+scn s2_full "S2전체접두 "
+scn s3_ckpt "S3체크포인트"
 
 echo "=== 동시성 스윕 (혼합: 절반 공유 접두) ==="
 for C in 2 4 8; do

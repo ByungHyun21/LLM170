@@ -55,7 +55,9 @@ impl Model {
     }
 
     pub(crate) fn ent(&self, name: &str) -> Result<&StEntry, String> {
-        self.ar.entry(name).ok_or_else(|| format!("텐서 부재: {name}"))
+        self.ar
+            .entry(name)
+            .ok_or_else(|| format!("텐서 부재: {name}"))
     }
 
     /// 텐서 원시 슬라이스(mmap 무카피).
@@ -81,9 +83,10 @@ impl Model {
         match e.dtype {
             StDtype::Bf16 => {
                 for i in 0..n {
-                    v[i] = f32::from_bits(u32::from(u16::from_le_bytes(
-                        d[2 * i..2 * i + 2].try_into().unwrap(),
-                    )) << 16);
+                    v[i] = f32::from_bits(
+                        u32::from(u16::from_le_bytes(d[2 * i..2 * i + 2].try_into().unwrap()))
+                            << 16,
+                    );
                 }
             }
             StDtype::F16 => {
@@ -100,7 +103,10 @@ impl Model {
     pub(crate) fn matvec_bf16(&self, name: &str, x: &[f32]) -> Result<Vec<f32>, String> {
         let e = self.ent(name)?;
         if e.dtype != StDtype::Bf16 || e.shape.len() != 2 {
-            return Err(format!("{name}: [n,k] BF16 계약 위반 {:?} {:?}", e.dtype, e.shape));
+            return Err(format!(
+                "{name}: [n,k] BF16 계약 위반 {:?} {:?}",
+                e.dtype, e.shape
+            ));
         }
         let (n, k) = (e.shape[0] as usize, e.shape[1] as usize);
         if k != x.len() {
@@ -128,9 +134,7 @@ impl Model {
         let row = &d[2 * r * k..2 * (r + 1) * k];
         Ok((0..k)
             .map(|j| {
-                f32::from_bits(
-                    (u16::from_le_bytes([row[2 * j], row[2 * j + 1]]) as u32) << 16,
-                )
+                f32::from_bits((u16::from_le_bytes([row[2 * j], row[2 * j + 1]]) as u32) << 16)
             })
             .collect())
     }
@@ -191,10 +195,7 @@ impl Model {
     }
 
     /// 전문가 프로젝션 전체 행 디양자화([n,k] f32 — 프로브 소형 전용).
-    pub(crate) fn expert_mat(
-        &self,
-        base: &str,
-    ) -> Result<(Vec<Vec<f32>>, usize, usize), String> {
+    pub(crate) fn expert_mat(&self, base: &str) -> Result<(Vec<Vec<f32>>, usize, usize), String> {
         let (_, _, _, n, k) = self.expert_triple(base)?;
         let mut rows = Vec::with_capacity(n);
         for r in 0..n {
@@ -234,36 +235,9 @@ pub(crate) fn half_f32(b: u16) -> f32 {
     let e = ((b >> 10) & 0x1F) as i32;
     let m = (b & 0x3FF) as f32;
     match e {
-        0 => s as f32 * m * 2.0f32.powi(-24),
-        31 => f32::NAN * s as f32,
-        _ => s as f32 * (1.0 + m / 1024.0) * 2.0f32.powi(e - 15),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn half_decode() {
-        assert_eq!(half_f32(0x3C00), 1.0);
-        assert_eq!(half_f32(0xBC00), -1.0);
-        assert_eq!(half_f32(0x4000), 2.0);
-        assert_eq!(half_f32(0x0000), 0.0);
-        assert!((half_f32(0x3555) - 0.33325195).abs() < 1e-6);
-    }
-
-    /// 실모델 그래프 프로브 — LLM170_FN_MODEL 환경변수로 FN 디렉터리 지정
-    /// 시에만 실행(CI·회귀 무관). 서버 진입(리소스 가드)과 무관하게
-    /// 골격 판독 검증을 직접 수행한다.
-    #[test]
-    fn fn_probe_real_model() {
-        let Ok(d) = std::env::var("LLM170_FN_MODEL") else {
-            return;
-        };
-        let rep = probe(std::path::Path::new(&d)).expect("fn-probe 실패");
-        eprintln!("{rep}");
-        assert!(rep.contains("골격 통과"), "리포트: {rep}");
+        0 => s * m * 2.0f32.powi(-24),
+        31 => f32::NAN * s,
+        _ => s * (1.0 + m / 1024.0) * 2.0f32.powi(e - 15),
     }
 }
 
@@ -286,17 +260,25 @@ pub fn probe(dir: &Path) -> Result<String, String> {
     let mut ple_layers = Vec::new();
     for il in 0..cfg.num_hidden_layers {
         let has_lin = m
-            .ent(&format!("model.language_model.layers.{il}.linear_attn.A_log"))
+            .ent(&format!(
+                "model.language_model.layers.{il}.linear_attn.A_log"
+            ))
             .is_ok();
         let has_ful = m
-            .ent(&format!("model.language_model.layers.{il}.self_attn.q_proj.weight"))
+            .ent(&format!(
+                "model.language_model.layers.{il}.self_attn.q_proj.weight"
+            ))
             .is_ok();
         if has_lin == has_ful {
             return Err(format!("층 {il}: linear/full 어텐션 텐서 이중/부재"));
         }
         n_lin += has_lin as usize;
         n_ful += has_ful as usize;
-        if m.ent(&format!("model.language_model.layers.{il}.ple.conv1d.weight")).is_ok() {
+        if m.ent(&format!(
+            "model.language_model.layers.{il}.ple.conv1d.weight"
+        ))
+        .is_ok()
+        {
             ple_layers.push(il);
         }
     }
@@ -357,7 +339,11 @@ pub fn probe(dir: &Path) -> Result<String, String> {
         }
         lines.push(format!(
             "  층 {il} ({}) forward 통과 — |x|max={mx:.4} sum={sum:.4}",
-            if m.is_linear(il) { "linear/GDN" } else { "full-attn" }
+            if m.is_linear(il) {
+                "linear/GDN"
+            } else {
+                "full-attn"
+            }
         ));
     }
     // ③ head — 마지막 토큰 로짓 top-1.
@@ -372,7 +358,9 @@ pub fn probe(dir: &Path) -> Result<String, String> {
     if let Some(&pil) = ple_layers.first() {
         let v = super::stages::ple::verify(&m, pil)?;
         let e = super::stages::ple::forward(&m, pil, &xs).unwrap_err();
-        lines.push(format!("  PLE 층 {pil} 판독: {v}\n  PLE forward: Err — {e}"));
+        lines.push(format!(
+            "  PLE 층 {pil} 판독: {v}\n  PLE forward: Err — {e}"
+        ));
     }
     let ie = super::stages::full::indexer_forward(&m, 3, &xs).unwrap_err();
     let he = hyper_connection_forward(&m, 0).unwrap_err();
@@ -380,4 +368,31 @@ pub fn probe(dir: &Path) -> Result<String, String> {
         "  indexer: Err — {ie}\n  hyper-connection: Err — {he}\n  판정: FN 2단계 골격 통과 — 3차: PLE FP8 디코드·indexer top-k·hyper-connection·gptq 팩 골든·상태ful 디코드·MTP n-gram"
     ));
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn half_decode() {
+        assert_eq!(half_f32(0x3C00), 1.0);
+        assert_eq!(half_f32(0xBC00), -1.0);
+        assert_eq!(half_f32(0x4000), 2.0);
+        assert_eq!(half_f32(0x0000), 0.0);
+        assert!((half_f32(0x3555) - 0.33325195).abs() < 1e-6);
+    }
+
+    /// 실모델 그래프 프로브 — LLM170_FN_MODEL 환경변수로 FN 디렉터리 지정
+    /// 시에만 실행(CI·회귀 무관). 서버 진입(리소스 가드)과 무관하게
+    /// 골격 판독 검증을 직접 수행한다.
+    #[test]
+    fn fn_probe_real_model() {
+        let Ok(d) = std::env::var("LLM170_FN_MODEL") else {
+            return;
+        };
+        let rep = probe(std::path::Path::new(&d)).expect("fn-probe 실패");
+        eprintln!("{rep}");
+        assert!(rep.contains("골격 통과"), "리포트: {rep}");
+    }
 }

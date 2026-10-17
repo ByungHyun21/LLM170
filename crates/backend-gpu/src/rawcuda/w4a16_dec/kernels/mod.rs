@@ -1,9 +1,9 @@
 use super::*;
 
+pub(in crate::rawcuda::w4a16_dec) mod decode;
 mod gemm;
 mod gemv;
 mod plain;
-pub(in crate::rawcuda::w4a16_dec) mod decode;
 
 impl W4a16Dec {
     pub(in crate::rawcuda::w4a16_dec) fn norm_resid_at(

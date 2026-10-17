@@ -44,15 +44,20 @@ __device__ __forceinline__ float ld_scale(const unsigned short* __restrict__ p, 
 // k(2048×2816) 2.08→1.32(1.58×) · o(2816×4096) 11.49→4.21(2.73×) ·
 // gate 2.09→1.33(1.58×) · down 2.54→1.48(1.72×) · 글로벌 q(8192) 7.78→4.51
 // (1.72×) · 글로벌 o(2816×8192) 19.33→8.19(2.36×) — 슬라이딩 층 합산 2.02×.
-// (23%) — x 행 스트라이드 k·4B가 16/32KB(2^n)라 L1 셋 충돌. [P9-2
-// 2026-10-17 해소] k≥4096은 발사부가 x를 [t][k+8](float4 행 폭 k4+2)로
-// 재패킹(w4a16_g32_xpad)해 스트라이드 2^n 탈피 — 패드 8플로트 열은
-// tall2가 읽지 않는다(열 인덱스 < k4) → **행별 산술·값 불변(비트동일)**.
-// k<4096은 무패딩 직독(ks=k4) — t16·그래프 캡처 계약 무변경.
+// (23%) — x 행 스트라이드 k·4B가 16/32KB(2^n)라 L1 셋 충돌 의심 → **기각
+// 실측 2026-10-17(P9-2, GPU0/GPU1 t=512·reps20·A/B 동일 바이너리)**: 행
+// 스트라이드 패딩 x→[t][k+8]/[t][k+32] f32 재패킹 발사(값 불변 — 패드 열
+// 미판독)가 o(2816×4096) 5.53→5.49ms(±1%·무효) · 글로벌 o(2816×8192)
+// 9.90→10.71ms(**−8% 역행**) — +32B는 셋 인덱스(128B 그래뉼) 무변·+128B는
+// 셋 순차 분산에도 결과 동일 → 셋 충돌이 원인이 아니거나 L1 인덱싱이
+// 해시형(레이아웃 패딩으로 분산 불가). 잔여 후보 = 워프당 q/s 가중 판독
+// (레인 2B×64B 스트라이드 → 64B에 32섹터 = L1 파형 64/128의 절반)의
+// 섹터 낭비 — 해법은 q 레이아웃(인터리브 재패키징)이며 레이아웃 계약
+// 변경이라 별도 판정 필요(재개 조건). tall2 본체는 7-파라미터 원계약 유지.
 extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_g32_bf16_tall2(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x, float* __restrict__ out,
-    int n, int k, int t16, int ks)
+    int n, int k, int t16)
 {
     const int o0 = blockIdx.x * 16;   // 블록 = 16행(워프당 2행)
     const int tb0 = blockIdx.y * 128; // t-청크 시작(토큰 128 = T타일 8개)
@@ -77,6 +82,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_g32_bf16_tall2(
     }
     __syncthreads();
     const int jn = k >> 7;
+    const int k4 = k >> 2;
     // 죽은 행 포인터 = q 베이스(항상 유효 메모리) — 핫루프 무가드 계약.
     // 판독값은 쓰레기지만 그 행 출력은 la/lb 가드로 미기록(행 독립 — 무영향).
     const unsigned short* blank =
@@ -112,8 +118,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_g32_bf16_tall2(
             const float b3 = fmaf((float)(qwb >> 12), scb, -8.0f * scb);
 #pragma unroll
             for (int r = 0; r < T; ++r) {
-                // ks = x 행 스트라이드(float4 단위) — 무패딩 k4·패딩 k4+2 공용.
-                const float4 xv = xb[(size_t)(t0 + r) * ks + jj * 32];
+                const float4 xv = xb[(size_t)(t0 + r) * k4 + jj * 32];
                 acca[r] = fmaf(a0, xv.x, acca[r]);
                 acca[r] = fmaf(a1, xv.y, acca[r]);
                 acca[r] = fmaf(a2, xv.z, acca[r]);
@@ -152,20 +157,5 @@ extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_g32_bf16_tall2(
             }
             __syncthreads();
         }
-    }
-}
-
-// [P9-2] tall2 전용 x 패딩 재패킹 — [t16][k4] f32x4 → [t16][k4+2].
-// 패드 2개 float4(8 f32)는 미기록(커널이 절대 읽지 않음 — 값 불변).
-// k는 g32 계약상 32의 배수 → k4도 8의 배수라 행두 16B 정렬 유지.
-extern "C" __global__ void w4a16_g32_xpad(const float4* __restrict__ x,
-                                          float4* __restrict__ xp,
-                                          int k4, int t16)
-{
-    const size_t total = (size_t)t16 * (size_t)k4;
-    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < total;
-         i += (size_t)gridDim.x * blockDim.x) {
-        const size_t row = i / (size_t)k4;
-        xp[row * ((size_t)k4 + 2) + (i - row * (size_t)k4)] = x[i];
     }
 }

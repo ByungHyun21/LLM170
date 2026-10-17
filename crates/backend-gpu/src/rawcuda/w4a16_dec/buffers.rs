@@ -1,6 +1,6 @@
+use super::kernels::decode::sk_ksp;
 use super::mem::realloc_fields;
 use super::*;
-use super::kernels::decode::sk_ksp;
 
 impl W4a16Dec {
     /// [R13 2026-10-12] 단일 Buf(ptr+cap) 재할당 공용 — [R12] capture_guard +
@@ -69,15 +69,6 @@ impl W4a16Dec {
             self.dxp = self.realloc_buf(self.dxp, n * 4, n, "dxp_cap")?;
         }
         Ok(self.dxp.ptr)
-    }
-
-    /// [P9-2 2026-10-17] tall2 x 패딩 스테이징 보장 — n = t16×(k+8) f32 원소.
-    /// k≥4096 g32/bf16 선형의 gemv_t 경로(캡처 포함 — warm_for_capture 선할당).
-    pub(super) fn ensure_dxtp(&mut self, n: usize) -> Result<CUdeviceptr, String> {
-        if n > self.dxtp.cap {
-            self.dxtp = self.realloc_buf(self.dxtp, n * 4, n, "dxtp_cap")?;
-        }
-        Ok(self.dxtp.ptr)
     }
 
     pub(super) fn ensure_ew_bufs(&mut self, n: usize) -> Result<(), String> {
@@ -404,8 +395,7 @@ impl W4a16Dec {
             self.cc.h2d(self.dsk, buf)?;
         }
         if need > self.dsk_part.cap {
-            self.dsk_part =
-                self.realloc_buf(self.dsk_part, need * 256 * 4, need, "dsk_part")?;
+            self.dsk_part = self.realloc_buf(self.dsk_part, need * 256 * 4, need, "dsk_part")?;
         }
         self.cc.sync()?;
         self.dsk_meta = meta;
@@ -808,15 +798,6 @@ impl W4a16Dec {
         // [P10] t=1이 아니라 **최대 청크(CHAIN_TMAX)** 로 선할당 — 그래프는
         // 캡처 시점의 포인터를 기록하므로, 이후 프리필이 버퍼를 재할당하면
         // replay가 해제 주소를 쓴다(위 graph_invalidate 주석의 실측 결함).
-        // [P9-2] tall2 x 패딩 버퍼(dxtp) — k≥4096 g32/bf16 선형 전수 × 최대
-        // 청크(캡처 중 재할당 봉인 — 위 불변식 목록에 추가).
-        let mut mtp = 0usize;
-        for (name, &(_, _, _, k)) in self.lins.iter() {
-            if k >= 4096 && self.lin_grp.get(name).copied() == Some((32, true)) {
-                mtp = mtp.max(CHAIN_TMAX * (k + 8));
-            }
-        }
-        self.ensure_dxtp(mtp)?;
         self.ensure_norm_bufs(CHAIN_TMAX)?;
         self.ensure_gdn_bufs(CHAIN_TMAX)?;
         self.ensure_attn_bufs(CHAIN_TMAX)?;

@@ -160,38 +160,19 @@ impl W4a16Dec {
         if t > 16 && g == 32 && sb {
             let t16 = t & !15;
             let ft = self.cc.function("w4a16_gemv_g32_bf16_tall2")?;
-            // [P9-2 2026-10-17] k≥4096 x 패딩 — 행 스트라이드 k×4B가
-            // 16/32KB(2^n)라 L1 셋 충돌(o k=4096·글로벌 o k=8192 ~3.0TF/s).
-            // x를 [t16][k+8]로 재패킹(w4a16_g32_xpad)해 스트라이드 2^n 탈피.
-            // 패드 열은 tall2가 읽지 않는다(ks=k4+2, 열 < k4) — 값 비트동일.
-            // k<4096은 무패딩 직독(ks=k4) — 재패킹 비용 0, 동작 불변.
-            let (mut ax, aks) = if k >= 4096 {
-                let k4 = k >> 2;
-                let px = self.ensure_dxtp(t16 * (k + 8))?;
-                let fx = self.cc.function("w4a16_g32_xpad")?;
-                let (mut i0, mut i1, mut i2, mut i3) =
-                    (x_dev, px, k4 as i32, t16 as i32);
-                self.cc.launch(
-                    fx,
-                    (t16 * k4).div_ceil(1024) as u32,
-                    1,
-                    1024,
-                    &mut crate::rawcuda::args::l4(&mut i0, &mut i1, &mut i2, &mut i3),
-                )?;
-                (px, k4 + 2)
-            } else {
-                (x_dev, k >> 2)
-            };
-            let (mut aq, mut as_, mut ay) = (dq, ds, y_dev);
-            let (mut an, mut ak, mut at, mut aks) = (n as i32, k as i32, t16 as i32, aks as i32);
+            // [P9-2 2026-10-17 기각] k≥4096 x 패딩([t][k+8]/[t][k+32] 재패킹
+            // 발사) A/B — o 5.53→5.49ms(±1% 무효)·글로벌 o 9.90→10.71ms
+            // (−8% 역행): L1 셋 충돌 가설 기각(전수치 = gemma4.cu 헤더).
+            // 무패딩 직독 유지 — 잔여 후보 q 가중 섹터 낭비(재개 조건).
+            let (mut aq, mut as_, mut ax, mut ay) = (dq, ds, x_dev, y_dev);
+            let (mut an, mut ak, mut at) = (n as i32, k as i32, t16 as i32);
             self.cc.launch(
                 ft,
                 n.div_ceil(16) as u32,
                 t16.div_ceil(128) as u32, // [P9] t-청크 2D 그리드(테일 희석)
                 256,
-                &mut crate::rawcuda::args::l8(
+                &mut crate::rawcuda::args::l7(
                     &mut aq, &mut as_, &mut ax, &mut ay, &mut an, &mut ak, &mut at,
-                    &mut aks,
                 ),
             )?;
             if t == t16 {

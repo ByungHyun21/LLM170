@@ -1211,16 +1211,13 @@ impl W4a16Dec {
     /// ksp∈{1,2,4,8}∩(k/128)%ksp==0 전수 측정. qm/s/x/y는 상주·합성 버퍼,
     /// 재패킹 사본은 업로드 이중 버퍼(lins_mk)를 그대로 사용(생산 포인터).
     /// 값 대조(sk vs GEMV)도 1회 — maxabs/maxrel 허용오차 신호(게이트 전).
-    pub fn decode_bench(
-        &mut self,
-        name: &str,
-        reps: usize,
-        cold: bool,
-    ) -> Result<String, String> {
+    pub fn decode_bench(&mut self, name: &str, reps: usize, cold: bool) -> Result<String, String> {
         let _g = self.cc.guard()?;
         let (dq, ds, n, k) = self.lin_spec(name)?;
         let Some((dqm, _, _)) = self.lin_mk(name) else {
-            return Err(format!("decode-bench {name}: marlin 재패킹 상주 없음(업로드 확인)"));
+            return Err(format!(
+                "decode-bench {name}: marlin 재패킹 상주 없음(업로드 확인)"
+            ));
         };
         if !k.is_multiple_of(128) {
             return Err(format!("decode-bench {name}: k={k}%128 계약"));
@@ -1233,9 +1230,7 @@ impl W4a16Dec {
             })
             .collect();
         let x32: Vec<f32> = (0..k)
-            .map(|i| {
-                ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5
-            })
+            .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5)
             .collect();
         // SAFETY: 로컬 Vec의 유효 수명 내 바이트 뷰(길이 = 원소수×2/×4).
         let hb = unsafe { std::slice::from_raw_parts(x16.as_ptr() as *const u8, x16.len() * 2) };
@@ -1276,8 +1271,7 @@ impl W4a16Dec {
                 ksp as u32,
                 128,
                 &mut crate::rawcuda::args::l8(
-                    &mut p_q, &mut p_s, &mut p_x, &mut p_o, &mut p_p, &mut p_n, &mut p_k,
-                    &mut p_sp,
+                    &mut p_q, &mut p_s, &mut p_x, &mut p_o, &mut p_p, &mut p_n, &mut p_k, &mut p_sp,
                 ),
             )?;
             if ksp > 1 {
@@ -1462,8 +1456,7 @@ impl W4a16Dec {
                 ksp as u32,
                 128,
                 &mut crate::rawcuda::args::l8(
-                    &mut p_q, &mut p_s, &mut p_x, &mut p_o, &mut p_p, &mut p_n, &mut p_k,
-                    &mut p_sp,
+                    &mut p_q, &mut p_s, &mut p_x, &mut p_o, &mut p_p, &mut p_n, &mut p_k, &mut p_sp,
                 ),
             )?;
             if ksp > 1 {
@@ -1485,16 +1478,7 @@ impl W4a16Dec {
         {
             let (y2, part2) = (self.cc.alloc(n * 4)?, self.cc.alloc(2 * 2 * 256 * 4)?);
             let tab: Vec<u64> = vec![
-                dqm,
-                ds,
-                y,
-                n as u64,
-                k as u64,
-                dqm,
-                ds,
-                y2,
-                n as u64,
-                k as u64,
+                dqm, ds, y, n as u64, k as u64, dqm, ds, y2, n as u64, k as u64,
             ];
             let tb =
                 unsafe { std::slice::from_raw_parts(tab.as_ptr() as *const u8, tab.len() * 8) };
@@ -1503,9 +1487,21 @@ impl W4a16Dec {
             let (mut p_t, mut p_x, mut p_p) = (dt, dx, part2);
             let (mut p_c, mut p_s) = (2i32, 2i32);
             let f = self.cc.function("w4a16_gemv_sk_marlin")?;
-            self.cc.launch(f, 2, 2, 128, &mut crate::rawcuda::args::l5(&mut p_t, &mut p_x, &mut p_p, &mut p_c, &mut p_s))?;
+            self.cc.launch(
+                f,
+                2,
+                2,
+                128,
+                &mut crate::rawcuda::args::l5(&mut p_t, &mut p_x, &mut p_p, &mut p_c, &mut p_s),
+            )?;
             let f = self.cc.function("w4a16_gemv_sk_reduce")?;
-            self.cc.launch(f, 2, 1, 256, &mut crate::rawcuda::args::l4(&mut p_t, &mut p_p, &mut p_c, &mut p_s))?;
+            self.cc.launch(
+                f,
+                2,
+                1,
+                256,
+                &mut crate::rawcuda::args::l4(&mut p_t, &mut p_p, &mut p_c, &mut p_s),
+            )?;
             let mut got = vec![0u8; n * 4];
             let mut got2 = vec![0u8; n * 4];
             self.cc.d2h(&mut got, y)?;

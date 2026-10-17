@@ -805,9 +805,6 @@ pub struct W4a16Dec {
     /// [A2b 2026-10-15] 그룹 mma A의 (hi|lo) f16 packed 미러(u32/원소, 4B) —
     /// cast_hilo 산출. 3-pass 정밀도 회수(A 반올림 ~2^-11 제거).
     dxp: Buf,
-    /// [P9-2 2026-10-17] tall2 x 패딩 스테이징([t][k+8] f32) — k≥4096 g32/bf16
-    /// 선형의 L1 셋 충돌 해소(w4a16_g32_xpad 산출, tall2가 ks=k4+2로 판독).
-    dxtp: Buf,
     /// [FLA-10 2026-10-10] 플레인(bf16) 경로 A 미러([t][k] bf16) — bf16_mma가
     /// f32 대신 판독(재판독 대역 절반). cast_bf16과 커널 내 변환이 비트동일.
     dabf: Buf,
@@ -1147,7 +1144,6 @@ impl W4a16Dec {
             dx32: Buf::default(),
             dx16: Buf::default(),
             dxp: Buf::default(),
-            dxtp: Buf::default(),
             dabf: Buf::default(),
             dmulti: 0,
             dmulti_meta: Vec::new(),

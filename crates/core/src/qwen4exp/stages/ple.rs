@@ -23,14 +23,20 @@ pub fn verify(m: &Model, il: usize) -> Result<String, String> {
     let eb = format!("{l}.ple_embedding");
     let e0 = m.ent(&format!("{eb}.ngram_embedding.shard_0.weight"))?;
     let n_shards = (0..m.cfg.split_ngram_parts)
-        .filter(|&s| m.ent(&format!("{eb}.ngram_embedding.shard_{s}.weight")).is_ok())
+        .filter(|&s| {
+            m.ent(&format!("{eb}.ngram_embedding.shard_{s}.weight"))
+                .is_ok()
+        })
         .count();
     let offs = i64_vec(m, &format!("{eb}.ngram_heads_offsets"))?;
     let vocabs = i64_vec(m, &format!("{eb}.ngram_heads_vocab_sizes"))?;
     let mult = i64_vec(m, &format!("{eb}.layer_multipliers"))?;
     m.ent(&format!("{eb}.ngram_embedding.weight_scale"))?;
     if n_shards != m.cfg.split_ngram_parts {
-        return Err(format!("ngram shard {n_shards}/{}", m.cfg.split_ngram_parts));
+        return Err(format!(
+            "ngram shard {n_shards}/{}",
+            m.cfg.split_ngram_parts
+        ));
     }
     if offs.len() != m.cfg.heads_per_ngram * 2 || vocabs.len() != m.cfg.heads_per_ngram * 2 {
         return Err(format!(
@@ -41,12 +47,12 @@ pub fn verify(m: &Model, il: usize) -> Result<String, String> {
         ));
     }
     rep.push(format!(
-        "shards {n_shards}×{:?} {} · offsets {} · vocab합 {} · multipliers {:?}",
+        "shards {n_shards}×{:?} {dt:?} · offsets {} · vocab합 {} · multipliers {:?}",
         e0.shape,
-        format!("{:?}", e0.dtype),
         offs.len(),
         vocabs.iter().sum::<i64>(),
-        mult
+        mult,
+        dt = e0.dtype,
     ));
     Ok(rep.join(" · "))
 }
@@ -59,7 +65,9 @@ pub fn forward(_m: &Model, _il: usize, _xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>
 
 fn i64_vec(m: &Model, name: &str) -> Result<Vec<i64>, String> {
     let d = m.slice(name)?;
-    Ok(d.chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+    Ok(d.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect())
 }

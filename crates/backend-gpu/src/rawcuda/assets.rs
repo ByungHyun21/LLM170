@@ -62,7 +62,7 @@ pub const ASSETS: &[Asset] = &[
             "crates/backend-gpu/src/rawcuda/assets/gemma4.fatbin",
             "src/rawcuda/assets/gemma4.fatbin",
         ],
-        syms: &["w4a16_gemv_g32_bf16_tall2", "w4a16_g32_xpad"],
+        syms: &["w4a16_gemv_g32_bf16_tall2"],
         boot: true,
     },
     Asset {
