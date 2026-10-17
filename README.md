@@ -42,18 +42,18 @@ end-to-end on GPU with an int8 KV cache and CUDA-graph decode — 27B dense
 
 | mode (27B, 512tok prompt · 128 gen) | t/s | note |
 |---|---|---|
-| greedy (no spec) | 22.3 | baseline |
-| MTP | 23.7 | +6.3% |
-| n-gram | **27.1** | +21.5% |
+| greedy (no spec) | 37.4 | baseline |
+| MTP | 41.6 | +11.2% |
+| n-gram | **52.6** | +40.6% (3회 중 1회 ~42 — 드래프트 고갈) |
 
 | mode (35B, 512tok prompt · 128 gen) | t/s | note |
 |---|---|---|
-| greedy (no spec) | 84.9 | baseline |
-| n-gram | 85.5 | +0.7% (MoE spec ≈ neutral) |
+| greedy (no spec) | 114.2 | baseline |
+| n-gram | 114.1 | ±0% (MoE spec ≈ neutral) |
 
 | serve (27B) | value |
 |---|---|
-| TTFT cold / warm (prefix reuse) | 1165 ms / 325 ms (3.6x) |
+| TTFT cold / warm (prefix reuse) | 1054 ms / 305 ms (3.5x) |
 | prefix reuse ratio | 0.582 (2048 tok, 34% reused) |
 
 ## Build & run
