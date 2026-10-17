@@ -162,8 +162,9 @@ impl W4a16Dec {
             let st_bytes = dims.n_gdn * dims.h_v * 128 * 128 * 2; // f16 행-스케일
             let sc_n = dims.n_gdn * dims.h_v * 128;
             let ring_off = (slot * dims.n_gdn * 3 * dims.conv_ch()) as u64 * 4;
-            let st_off = (slot * dims.n_gdn * dims.h_v * 128 * 128) as u64 * 2;
-            let sc_off = (slot * sc_n) as u64 * 4;
+            let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dims, slot);
+            let st_off = st_slot as u64 * 2;
+            let sc_off = sc_slot as u64 * 4;
             Self::zero_dev(&self.cc, self.gdn.dring + ring_off, ring_bytes)?;
             Self::zero_dev(&self.cc, self.gdn.dgst + st_off, st_bytes)?;
             // [P1 2026-10-16] 스케일 초기화 = d2d(스트림 비동기) — 종전 동기

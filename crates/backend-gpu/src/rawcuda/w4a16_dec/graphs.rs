@@ -341,8 +341,6 @@ impl W4a16Dec {
         // 값 일정(그래프 캡처에 안전 — 주소만 베이크, 내용은 매 replay 복사).
         if let (Some(gd), Some(ad)) = (self.gdn.gdn, self.attn.attn) {
             let ring_stride = (gd.n_gdn * 3 * gd.conv_ch()) as u64;
-            let st_stride = (gd.n_gdn * gd.h_v * 128 * 128) as u64;
-            let sc_stride = (gd.n_gdn * gd.h_v * 128) as u64;
             let blk_stride = (ad.n_attn * ad.cap.div_ceil(512) * 4) as u64;
             // SAFETY: 핀드 5종은 ensure_batch_bufs가 tmax*8로 할당(t ≤ tmax 계약
             // — 위 도메인 검사) · 비중첩 기입.
@@ -351,8 +349,9 @@ impl W4a16Dec {
                     let blk = self.attn.dblk_tab + s as u64 * blk_stride * 8;
                     let pp = self.attn.dpp + s as u64 * 4;
                     let ring = self.gdn.dring + s as u64 * ring_stride * 4;
-                    let st = self.gdn.dgst + s as u64 * st_stride * 2;
-                    let sc = self.gdn.dsc + s as u64 * sc_stride * 4;
+                    let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&gd, s);
+                    let st = self.gdn.dgst + st_slot as u64 * 2;
+                    let sc = self.gdn.dsc + sc_slot as u64 * 4;
                     for (pin, v) in [
                         (self.graph.pin_row_blk, blk),
                         (self.graph.pin_row_pp, pp),

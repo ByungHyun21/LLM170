@@ -183,14 +183,12 @@ impl W4a16Dec {
             return Err("spec_rollback: 링 스냅샷 미확보(enable_spec)".into());
         }
         let _g = self.cc.guard()?;
-        let st_slot = slot * dm.n_gdn * dm.h_v * 128 * 128;
-        // [결함수정 2026-10-17] 스케일 슬롯 기저 — gdn.rs 10-13 정정과 동일
-        // 계급. 스케일 배열은 슬롯당 n_gdn×h_v×128(스칼라 1/행)인데 st_slot
-        // (×128 포함)을 곱해 슬롯≥1 재구성이 dsc +144MiB를 읽었다(실측:
-        // kv 8G C≥4 serve 700 — compute-sanitizer gdn_wy_reconstruct sc 로드
-        // 4B OOB·최초 발화점 확인, 1G에선 우연히 매핑 영역이라 무증상).
-        // 슬롯0만 정확 → 단일 슬롯 골든·스모크 통과(10-13 선례와 동형).
-        let sc_slot = slot * dm.n_gdn * dm.h_v * 128;
+        // [결함수정 2026-10-17] 스케일 슬롯 기저 — 종전 st_slot(상태 ×128²)을
+        // dsc에 그대로 곱해 슬롯≥1 재구성이 dsc +144MiB를 읽었다(실측: kv 8G
+        // C≥4 serve 700 — compute-sanitizer gdn_wy_reconstruct sc 로드 4B OOB·
+        // 최초 발화점, 1G는 우연 매핑으로 침묵 오염 — gdn.rs 10-13과 동형).
+        // 슬롯0만 정확 → 단일 슬롯 골든·스모크 통과. 파생 = 단일 출처.
+        let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dm, slot);
         let ring_slot = slot * dm.n_gdn * 3 * dm.conv_ch();
         let ring_elems = (3 * dm.conv_ch()) as u64;
         let f = self.cc.function("gdn_wy_reconstruct")?;
@@ -285,12 +283,12 @@ impl W4a16Dec {
     /// [A-1 진단] 슬롯 GDN 상태 덤프(d2h) — trio vs spec scan 대조용.
     pub fn spec_dump_state(&mut self, slot: usize) -> Result<Vec<f32>, String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
-        let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
+        let (st_slot, _) = super::gdn::gdn_state_offsets(&dm, slot);
         // [행-스케일] f16 원시값 디코드 — 스케일 미적용(경로 대조용: 양 경로가
         // 같은 스케일 계열을 쓰므로 비교 성립). 절대값 해석이 필요하면 ×sc.
         let bytes = dm.n_gdn * dm.h_v * dm.d * dm.d * 2;
         let mut b = vec![0u8; bytes];
-        self.cc.d2h(&mut b, self.gdn.dgst + st_slot * 2)?;
+        self.cc.d2h(&mut b, self.gdn.dgst + st_slot as u64 * 2)?;
         self.cc.sync()?;
         Ok(b.as_chunks::<2>()
             .0
@@ -314,9 +312,8 @@ impl W4a16Dec {
         let k = Self::ckpt_victim(&self.gdn.dchk_saved[slot], &self.gdn.dchk_use[slot]);
         self.gdn.dchk_tick += 1;
         let tick = self.gdn.dchk_tick;
-        let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
+        let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dm, slot);
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
-        let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;
         let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
@@ -328,12 +325,12 @@ impl W4a16Dec {
             let base = self.gdn.dchk as *mut u8;
             self.cc.d2h_async(
                 base.offset(off),
-                self.gdn.dgst + st_slot * 2,
+                self.gdn.dgst + st_slot as u64 * 2,
                 st_bytes as usize,
             )?;
             self.cc.d2h_async(
                 base.offset(off + st_bytes as isize),
-                self.gdn.dsc + sc_slot * 4,
+                self.gdn.dsc + sc_slot as u64 * 4,
                 sc_bytes as usize,
             )?;
             self.cc.d2h_async(
@@ -391,9 +388,8 @@ impl W4a16Dec {
         let Some(k) = self.gdn.dchk_pos[slot].iter().position(|&p| p == pos) else {
             return Ok(0);
         };
-        let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
+        let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dm, slot);
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
-        let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;
         let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
@@ -405,10 +401,12 @@ impl W4a16Dec {
         // 순서대로 소비(핀드라 비동기 성립).
         let host =
             unsafe { std::slice::from_raw_parts((self.gdn.dchk as *const u8).offset(off), total) };
-        self.cc
-            .h2d_async(self.gdn.dgst + st_slot * 2, &host[..st_bytes as usize])?;
         self.cc.h2d_async(
-            self.gdn.dsc + sc_slot * 4,
+            self.gdn.dgst + st_slot as u64 * 2,
+            &host[..st_bytes as usize],
+        )?;
+        self.cc.h2d_async(
+            self.gdn.dsc + sc_slot as u64 * 4,
             &host[st_bytes as usize..(st_bytes + sc_bytes) as usize],
         )?;
         self.cc.h2d_async(
@@ -447,16 +445,15 @@ impl W4a16Dec {
                 + dm.n_gdn * 3 * dm.conv_ch() * 4;
             self.gdn.dsave = self.cc.alloc(self.n_slots * per)?;
         }
-        let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
+        let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dm, slot);
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
-        let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;
         let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
-        self.copy_dev(self.gdn.dsave, self.gdn.dgst + st_slot * 2, st_bytes)?;
+        self.copy_dev(self.gdn.dsave, self.gdn.dgst + st_slot as u64 * 2, st_bytes)?;
         self.copy_dev(
             self.gdn.dsave + st_bytes,
-            self.gdn.dsc + sc_slot * 4,
+            self.gdn.dsc + sc_slot as u64 * 4,
             sc_bytes,
         )?;
         self.copy_dev(
@@ -476,15 +473,14 @@ impl W4a16Dec {
         if self.gdn.dsave == 0 {
             return Err("spec_load_state: 저장본 없음(spec_save_state 미호출)".into());
         }
-        let st_slot = (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64;
+        let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dm, slot);
         let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
-        let sc_slot = (slot * dm.n_gdn * dm.h_v * 128) as u64;
         let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
-        self.copy_dev(self.gdn.dgst + st_slot * 2, self.gdn.dsave, st_bytes)?;
+        self.copy_dev(self.gdn.dgst + st_slot as u64 * 2, self.gdn.dsave, st_bytes)?;
         self.copy_dev(
-            self.gdn.dsc + sc_slot * 4,
+            self.gdn.dsc + sc_slot as u64 * 4,
             self.gdn.dsave + st_bytes,
             sc_bytes,
         )?;

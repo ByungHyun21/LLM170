@@ -1,5 +1,19 @@
 use super::*;
 
+/// [결함 정정 단일 출처 2026-10-17] 슬롯별 GDN 상태(f16)·행 스케일(f32)
+/// **원소** 오프셋 = (상태, 스케일). 상태는 슬롯당 n_gdn×h_v×128×128,
+/// 스케일은 n_gdn×h_v×128(행 스칼라 1개) — 정확히 128배 차이. 두 배열에 같은
+/// 오프셋을 쓰면 슬롯≥1에서 128× OOB: ①10-13 gdn scan("np·다중 슬롯 serve
+/// illegal access") ②10-17 spec 롤백 재구성(kv 8G C≥4 700 — sanitizer
+/// gdn_wy_reconstruct sc 로드 4B OOB, 1G는 우연 매핑으로 침묵 오염).
+/// 슬롯 파생은 이 함수만 쓴다(파생식 중복 = 재발).
+pub(super) fn gdn_state_offsets(dm: &GdnDims, slot: usize) -> (usize, usize) {
+    (
+        slot * dm.n_gdn * dm.h_v * 128 * 128,
+        slot * dm.n_gdn * dm.h_v * 128,
+    )
+}
+
 impl W4a16Dec {
     /// GDN 체인 디바이스 — [A3 2026-10-09] 입력(xn·qkv·z)을 스테이징 버퍼로
     /// d2d 복사하지 않고 **커널 인자로 직접 소비**한다(호출자 버퍼가 곧 입력).
@@ -20,12 +34,11 @@ impl W4a16Dec {
         }
         self.ensure_gdn_bufs(t_len)?;
         let ring_slot = slot * dm.n_gdn * 3 * dm.conv_ch();
-        let st_slot = slot * dm.n_gdn * dm.h_v * 128 * 128;
-        // [결함수정 2026-10-13] 스케일 슬롯 기저 — 스케일 배열은 슬롯당
-        // n_gdn×h_v×128(스칼라 1/행)이므로 st_slot(×128 포함)을 쓰면
-        // 슬롯≥1에서 128× OOB(슬롯 0만 정확해 단일-슬롯 골든·스모크가
-        // 통과했고, np·다중 슬롯 serve가 illegal access로 죽었다).
-        let sc_slot = slot * dm.n_gdn * dm.h_v * 128;
+        // [결함수정 2026-10-13 → 단일 출처 2026-10-17] 스케일 슬롯 기저 —
+        // 스케일 배열은 슬롯당 n_gdn×h_v×128(스칼라 1/행)이므로 st_slot(×128
+        // 포함)을 쓰면 슬롯≥1에서 128× OOB(슬롯 0만 정확해 단일-슬롯 골든·
+        // 스모크가 통과했고, np·다중 슬롯 serve가 illegal access로 죽었다).
+        let (st_slot, sc_slot) = gdn_state_offsets(&dm, slot);
         let (mut tl, mut lay) = (t_len as i32, layer as i32);
         let (mut hk, mut hv, mut dd) = (dm.h_k as i32, dm.h_v as i32, dm.d as i32);
         let (mut hd, mut kl, mut vl, mut cch) = (
@@ -325,9 +338,10 @@ impl W4a16Dec {
     ) -> Result<(), String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let f = self.cc.function("gdn_rescale")?;
+        let (st_slot, sc_slot) = gdn_state_offsets(&dm, slot);
         let (mut p0, mut p1) = (
-            self.gdn.dgst + (slot * dm.n_gdn * dm.h_v * 128 * 128) as u64 * 2,
-            self.gdn.dsc + (slot * dm.n_gdn * dm.h_v * 128) as u64 * 4,
+            self.gdn.dgst + st_slot as u64 * 2,
+            self.gdn.dsc + sc_slot as u64 * 4,
         );
         let (mut hv, mut dd, mut lay) = (dm.h_v as i32, dm.d as i32, layer0 as i32);
         let mut head = 256.0f32;
