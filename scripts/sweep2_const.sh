@@ -5,27 +5,22 @@
 #
 # 계약:
 #  - 워킹트리 dirty 시 착수 거부(원복 보장 전제) — 종료 시 무조건 원복(fatbin blob·매니페스트 포함).
-#  - 치환 = "파일:MACRO:값" 콤마 목록. `#define MACRO <num>` 행 정확히 1회(미발견/중복 = 중단).
-#    Rust const 미러는 현재 부재(GRP_KC/DGRP_KC — 호스트 grid 무관, 2026-10-17 확인).
-#    미러가 있는 상수를 다룰 때는 듀얼 치환으로 확장할 것(미러 정적 테스트가 누락을 잡음).
-#  - ⚠ gptq4.cu는 비결정 코드젠(리빌드 = 드로우 리셋 ±4%) — 판정은 항상 ab-bench
-#    2진 쌍(=같은 세션 교차)으로. baseline 2진도 리빌드 후 재생성해 쌍을 맞춘다.
-#  - 원복 후 preflight 게이트(fmt·clippy·fatbin 매니페스트)를 돌리고 워킹트리 clean을 확인.
-#
-# 사용: scripts/sweep2_const.sh <tag> "<file:MACRO:val,..." [--ab <model_dir> <bench 인자...>]
-#   예: scripts/sweep2_const.sh kc64 "gptq4.cu:GRP_KC:64,moe.cu:DGRP_KC:64" \
-#         --ab ../models/Qwen3.6-35B-A3B-INT4-W4A16 --pp 512,1024 --tg 128 --ctx 16384
+#  - 치환 형식 3종(전부 "1회 정확 매칭" 보장):
+#      assets/<f>.cu:MACRO:val     — `#define MACRO <val>`(.cu 표준)
+#      <f>.rs:CONST:val            — `pub const CONST: <ty> = <val>;`(Rust 미러 듀얼 치환)
+#      <f>:RAW:<old>::<new>        — 리터럴 치환(구분자 `::` — launch_bounds 등)
+#    미러 정적 테스트가 치환 누락을 빌드 단계에서 잡는다(이중 치환이 가드의 핵심).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-TAG=${1:?tag} ; SUBS=${2:?"file:MACRO:val,..."} ; shift 2 || true
+TAG=${1:?tag} ; SUBS=${2:?"sub,..."} ; shift 2 || true
 AB_ARGS=()
 if [ "${1:-}" = "--ab" ]; then shift; AB_ARGS=("$@"); fi
-ASSETS=crates/backend-gpu/src/rawcuda/assets
+TRACKED="crates/backend-gpu/src"   # 원복 범위(assets + Rust 미러)
 git diff --quiet || { echo "sweep2: 워킹트리 dirty — 착수 거부"; exit 2; }
 git rev-parse --short HEAD >/dev/null
 
 restore() {  # fatbin·매니페스트 포함 전면 원복 + baseline 2진 재빌드
-  git checkout -q -- "$ASSETS"
+  git checkout -q -- "$TRACKED"
   cargo build --release -q 2>/dev/null || true
 }
 trap restore EXIT
@@ -34,19 +29,35 @@ trap restore EXIT
 mkdir -p /tmp/sweep2
 cp target/release/llm170 "/tmp/sweep2/${TAG}_base"
 
-# ② 치환 — 정확 매칭 1회 보장
+# ② 치환 — 형식별 정확 매칭 1회 보장
 IFS=',' read -ra PAIRS <<< "$SUBS"
 for p in "${PAIRS[@]}"; do
-  f="$ASSETS/${p%%:*}"; rest="${p#*:}"; macro="${rest%%:*}"; val="${rest#*:}"
+  f="${p%%:*}"; rest="${p#*:}"
+  if [ "${rest%%:*}" = RAW ]; then
+    spec="${rest#RAW:}"; old="${spec%%::*}"; new="${spec##*::}"
+    python3 - "$f" "$old" "$new" <<'EOF'
+import sys
+f, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(f).read()
+n = src.count(old)
+assert n == 1, f"{f}: RAW 패턴 {n}회(1회 기대): {old!r}"
+open(f, 'w').write(src.replace(old, new, 1))
+print(f"sweep2: sub RAW {f}: {old!r}->{new!r}")
+EOF
+    continue
+  fi
+  macro="${rest%%:*}"; val="${rest#*:}"
   python3 - "$f" "$macro" "$val" <<'EOF'
 import re, sys
 f, macro, val = sys.argv[1], sys.argv[2], sys.argv[3]
 src = open(f).read()
-pat = re.compile(rf'^(#define {macro} )\d+$', re.M)
+pat = (re.compile(rf'^(#define {macro} )\d+$', re.M) if f.endswith('.cu')
+       else re.compile(rf'^(pub const {macro}: [^=]+? = )\d+_;?$'))
 n = len(pat.findall(src))
-assert n == 1, f"{f}:{macro} #define {n}건(1건 기대)"
+assert n == 1, f"{f}:{macro} 정의 {n}건(1건 기대)"
 open(f, 'w').write(pat.sub(rf'\g<1>{val}', src, count=1))
-print(f"sweep2: sub {f.split('/')[-1]}:{macro}->{val}")
+kind = 'cu' if f.endswith('.cu') else 'rs'
+print(f"sweep2: sub {f.split('/')[-1]}:{macro}->{val} ({kind})")
 EOF
 done
 
