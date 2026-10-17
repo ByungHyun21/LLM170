@@ -321,7 +321,7 @@ impl W4a16Dec {
             )?;
             // mma(32×64, 256스레드).
             let fm = self.cc.function("w4a16_gemm_g128_mma")?;
-            let (mut m_q, mut m_s, mut m_x, mut m_y) = (self.lin_packed(name)?, ds, dx16, db);
+            let (mut m_q, mut m_s, mut m_x, mut m_y) = (dq, ds, dx16, db);
             let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
             self.cc.launch(
                 fm,
@@ -413,7 +413,7 @@ impl W4a16Dec {
         qm: &[u32],
     ) -> Result<String, String> {
         let _g = self.cc.guard()?;
-        let (_dq, ds, n, k) = self.lin_spec(name)?;
+        let (dq, ds, n, k) = self.lin_spec(name)?;
         if k % 128 != 0 || n % 64 != 0 {
             return Err(format!(
                 "marlin-diff {name}: k%128·n%64 계약 위반 k={k} n={n}"
@@ -446,7 +446,7 @@ impl W4a16Dec {
         let db = self.cc.alloc(t * n * 4)?;
         let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
             let f = self.cc.function("w4a16_gemm_g128_mma")?;
-            let (mut p_q, mut p_s, mut p_x, mut p_y) = (self.lin_packed(name)?, ds, dx, da);
+            let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx, da);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
             self.cc.launch(
                 f,
@@ -731,7 +731,7 @@ impl W4a16Dec {
                 run(
                     me,
                     "w4a16_gemm_g128_mma",
-                    me.lin_packed(name)?,
+                    dq,
                     py,
                     GEMM_MMA_M,
                     GEMM_MMA_N,
