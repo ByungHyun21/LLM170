@@ -184,6 +184,13 @@ impl W4a16Dec {
         }
         let _g = self.cc.guard()?;
         let st_slot = slot * dm.n_gdn * dm.h_v * 128 * 128;
+        // [결함수정 2026-10-17] 스케일 슬롯 기저 — gdn.rs 10-13 정정과 동일
+        // 계급. 스케일 배열은 슬롯당 n_gdn×h_v×128(스칼라 1/행)인데 st_slot
+        // (×128 포함)을 곱해 슬롯≥1 재구성이 dsc +144MiB를 읽었다(실측:
+        // kv 8G C≥4 serve 700 — compute-sanitizer gdn_wy_reconstruct sc 로드
+        // 4B OOB·최초 발화점 확인, 1G에선 우연히 매핑 영역이라 무증상).
+        // 슬롯0만 정확 → 단일 슬롯 골든·스모크 통과(10-13 선례와 동형).
+        let sc_slot = slot * dm.n_gdn * dm.h_v * 128;
         let ring_slot = slot * dm.n_gdn * 3 * dm.conv_ch();
         let ring_elems = (3 * dm.conv_ch()) as u64;
         let f = self.cc.function("gdn_wy_reconstruct")?;
@@ -198,7 +205,7 @@ impl W4a16Dec {
                 self.gdn.dwy_g,
             );
             let mut w4 = self.gdn.dgst + (st_slot as u64) * 2;
-            let mut w5 = self.gdn.dsc + (st_slot as u64) * 4;
+            let mut w5 = self.gdn.dsc + (sc_slot as u64) * 4;
             let (mut wm, mut hk, mut hv, mut dd, mut lay) = (
                 keep as i32,
                 dm.h_k as i32,
