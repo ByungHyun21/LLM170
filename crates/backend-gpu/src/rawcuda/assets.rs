@@ -112,6 +112,8 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_moe_topk256",
             // [2026-10-18] 전문가-우선 순열 v2(gptq4.cu 원본의 직렬 스캔 대체).
             "w4a16_moe_align2",
+            // [2026-10-18] 마린 f16 C → f32 스트림 변환.
+            "w4a16_h2f",
             "w4a16_shared_add",
             "w4a16_moe_accum_sg",
             "w4a16_gemm_g32_mma_grp_d64",
@@ -189,6 +191,33 @@ pub const ASSETS: &[Asset] = &[
             "attn_prep_g4",
             "attn_fwd3s_part_g4",
             "attn_fwd3s_merge_g4",
+        ],
+        boot: true,
+    },
+    Asset {
+        // [2026-10-18] vLLM 마린 벤더(Apache-2.0 — assets/marlin/ 사본, 업스트림
+        // 대조 정본·변경 금지). 27B dense t≥16 W4A16 후보. 심볼 = 템플릿 인스턴스
+        // 맹글명(툴체인·시그니처 계약 고정 — nvcc/템플릿 변경 시 재생성).
+        name: "marlin",
+        env: "LLM170_CUDA_MARLIN_FATBIN_PATH",
+        paths: &[
+            "crates/backend-gpu/src/rawcuda/assets/marlin.fatbin",
+            "src/rawcuda/assets/marlin.fatbin",
+        ],
+        syms: &[
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi1ELi8ELi4ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi2ELi4ELi8ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi2ELi8ELi4ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi3ELi4ELi8ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi3ELi8ELi4ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi4ELi4ELi8ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi4ELi8ELi4ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi1ELi16ELi4ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi2ELi16ELi4ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi3ELi16ELi4ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi4ELi16ELi4ELb0ELi4ELi8ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
         ],
         boot: true,
     },
@@ -281,6 +310,7 @@ pub fn cu_source(name: &str) -> &'static str {
         "ew" => include_str!("assets/ew.cu"),
         "embed" => include_str!("assets/embed.cu"),
         "smoke" => include_str!("assets/smoke.cu"),
+        "marlin" => include_str!("assets/marlin.cu"),
         _ => panic!("cu_source: 미지 자산 {name}"),
     }
 }
@@ -315,6 +345,18 @@ mod tests {
     #[test]
     fn asset_manifest_matches_cu_symbols() {
         for a in ASSETS {
+            // [2026-10-18] 마린 = C++ 템플릿 인스턴스(맹글명) — extern "C" 대조
+            // 대상 아님. 형태(맹글 접두·개수)만 확인한다.
+            if a.name == "marlin" {
+                assert_eq!(a.syms.len(), 13, "marlin 인스턴스 13종 계약");
+                for s in a.syms {
+                    assert!(
+                        s.starts_with("_ZN6marlin6MarlinILl"),
+                        "marlin 심볼 형태 위반: {s}"
+                    );
+                }
+                continue;
+            }
             let syms = cu_symbols(cu_source(a.name));
             for s in a.syms {
                 assert!(

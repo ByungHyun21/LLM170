@@ -73,7 +73,7 @@ impl W4a16Dec {
         // [split-k marlin 디코드] 이중 버퍼 — g128·f16은 marlin 재패킹 사본을
         // 함께 상주시킨다(t=1 sk 디스패치 소비). 실패는 내부 폴백(경고만).
         if group == 128 && !scale_bf16 {
-            self.upload_lin_marlin(name, q, n, k);
+            self.upload_lin_marlin(name, q, s, n, k);
         }
         Ok(())
     }
@@ -83,7 +83,7 @@ impl W4a16Dec {
     /// 승격). q = packed u32 [n][k/8] 바이트. 실패(형상 계약 위반·VRAM 부족)는
     /// 경고 후 스킵 — t=1 디스패치가 기존 GEMV로 폴백해 모델 로드는 불능이
     /// 아니게 한다(27B: +n*k/2B ≈ +11.7GB — 64GB 여유 확인 완료).
-    fn upload_lin_marlin(&mut self, name: &str, q: &[u8], n: usize, k: usize) {
+    fn upload_lin_marlin(&mut self, name: &str, q: &[u8], s: &[u8], n: usize, k: usize) {
         let repack = llm170_core::marlin::marlin_repack_q(
             // SAFETY: q는 upload_lin_g 계약 길이(n*k/2, 4의 배수) 바이트 슬라이스.
             unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u32, n * k / 8) },
@@ -117,6 +117,35 @@ impl W4a16Dec {
             let _ = self.cc.free(old);
             self.weights_bytes = self.weights_bytes.saturating_sub((n * k / 2) as u64);
             self.marlin_bytes = self.marlin_bytes.saturating_sub((n * k / 2) as u64);
+        }
+        // [2026-10-18] 마린 스케일 순열 사본([kg][n] f16) — gptq 64-청크 순열
+        // (core::marlin::marlin_permute_scales와 동일식·f16 비트 순열만).
+        if s.len() == n * (k / 128) * 2 {
+            let kg = k / 128;
+            let mut so = vec![0u8; s.len()];
+            for g in 0..kg {
+                for chunk in 0..(n / 64) {
+                    for p in 0..64 {
+                        let src = (chunk * 64 + (p / 8 + 8 * (p % 8))) * kg + g;
+                        let dst = g * n + chunk * 64 + p;
+                        so[dst * 2..dst * 2 + 2].copy_from_slice(&s[src * 2..src * 2 + 2]);
+                    }
+                }
+            }
+            if let Ok(dsc) = self.cc.alloc(so.len()) {
+                if Self::h2d_chunked(&self.cc, dsc, &so).is_ok() {
+                    self.weights_bytes += so.len() as u64;
+                    self.marlin_bytes += so.len() as u64;
+                    if let Some((old, _, _)) = self.lins_msc.insert(name.to_string(), (dsc, n, kg))
+                    {
+                        let _ = self.cc.free(old);
+                        self.weights_bytes = self.weights_bytes.saturating_sub(so.len() as u64);
+                        self.marlin_bytes = self.marlin_bytes.saturating_sub(so.len() as u64);
+                    }
+                } else {
+                    let _ = self.cc.free(dsc);
+                }
+            }
         }
     }
 
@@ -1522,8 +1551,19 @@ impl W4a16Dec {
                     break;
                 }
             }
-            if ok {
-                self.upload_lin_marlin(name, &qbuf, n, k);
+            // [2026-10-18] 마린 스케일 순열용 s 재료화(소형 — n*k/64B).
+            let mut sbuf = vec![0u8; s_len];
+            let mut ok_s = true;
+            for off in (0..s_len).step_by(RCHUNK) {
+                let end = (off + RCHUNK).min(s_len);
+                if let Err(e) = fill(1, off as u64, &mut sbuf[off..end]) {
+                    eprintln!("[marlin] {name}: s 재료화 실패({e}) — GEMV 폴백");
+                    ok_s = false;
+                    break;
+                }
+            }
+            if ok && ok_s {
+                self.upload_lin_marlin(name, &qbuf, &sbuf, n, k);
             }
         }
         Ok(())

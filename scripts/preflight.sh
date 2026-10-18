@@ -72,7 +72,12 @@ if [ ! -f "$A/FATBINS.manifest" ]; then
 else
     while read -r s f n; do
         [ -n "${n:-}" ] || continue
-        cs=$(cat "$A/$n.cu" "$A/cast_common.cuh" "$A/g4_common.cuh" | sha256sum | cut -d' ' -f1)
+        if [ "$n" = marlin ]; then # [2026-10-18] 벤더 헤더 전량 포함(빌드 스크립트와 동일식)
+            cs=$(cat "$A/marlin.cu" $A/marlin/*.h $A/marlin/*.cuh $A/marlin/core/*.hpp \
+                $A/marlin/torch/headeronly/util/Exception.h | sha256sum | cut -d' ' -f1)
+        else
+            cs=$(cat "$A/$n.cu" "$A/cast_common.cuh" "$A/g4_common.cuh" | sha256sum | cut -d' ' -f1)
+        fi
         cf=$(sha256sum "$A/$n.fatbin" | cut -d' ' -f1)
         if [ "$cs" != "$s" ]; then
             echo "FAIL — $n: 소스가 매니페스트 빌드와 다름(리빌드: scripts/build_cuda_kernels.sh)"; stale=1

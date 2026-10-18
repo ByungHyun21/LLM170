@@ -32,6 +32,11 @@ impl W4a16Dec {
             if self.dx16.cap < t * k {
                 return Err(format!("gemm: dx16 부족 {} < {}", self.dx16.cap, t * k));
             }
+            // [2026-10-18] vLLM 마린(벤더) 시도 — 사본 가용 시 단일 경로.
+            let a16 = self.dx16.ptr;
+            if self.marlin_gemm_try(name, t, n, k, a16, y_out)? {
+                return Ok(());
+            }
             let f = self.cc.function("w4a16_gemm_g128_mma")?;
             let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, self.dx16.ptr, y_out);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);

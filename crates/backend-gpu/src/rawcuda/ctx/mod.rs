@@ -282,6 +282,25 @@ impl CudaCtx {
         }
     }
 
+    /// [2026-10-18] 블록당 옵트인 최대 동적 smem(바이트) — 마린 GEMM 계약.
+    /// 실패 시 0(호출부가 폴백 판단).
+    pub fn smem_optin_max(&self) -> u32 {
+        // SAFETY: self.device는 본 컨텍스트의 유효 장치 핸들 — 스칼라 속성.
+        unsafe {
+            let mut v: std::os::raw::c_int = 0;
+            if (self.drv.device_get_attribute)(
+                &mut v,
+                ffi::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                self.device,
+            ) == CUDA_SUCCESS
+            {
+                v.max(0) as u32
+            } else {
+                0
+            }
+        }
+    }
+
     /// 로드된 커널 핸들 조회.
     pub fn function(&self, name: &str) -> Result<CUfunction, String> {
         self.fns

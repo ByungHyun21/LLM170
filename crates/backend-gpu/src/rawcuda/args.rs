@@ -37,6 +37,7 @@ args_fn!(l13, 13, A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M 
 args_fn!(l14, 14, A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n);
 args_fn!(l15, 15, A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o);
 args_fn!(l16, 16, A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o, P p);
+args_fn!(l18, 18, A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o, P p, Q q, R r);
 
 #[cfg(test)]
 mod tests {

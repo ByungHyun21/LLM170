@@ -70,6 +70,8 @@ pub const CU_DEVICE_ATTRIBUTE_CLOCK_RATE: c_int = 13; // SM 최대 클럭(kHz)
 pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
 pub const CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE: c_int = 36; // kHz
 pub const CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH: c_int = 37; // bits
+// [2026-10-18] 마린 GEMM 동적 smem 옵트인 상한(바이트) — vLLM marlin_mm과 동형.
+pub const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: c_int = 97;
 pub type CuDeviceGetNameFn =
     unsafe extern "system" fn(name: *mut c_char, len: c_int, dev: CUdevice) -> CUresult;
 pub type CuDeviceGetAttributeFn =

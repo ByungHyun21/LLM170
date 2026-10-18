@@ -774,6 +774,10 @@ pub struct W4a16Dec {
     /// g128·f16 업로드에 한해 등록(형상 계약 위반·VRAM 부족 시 미등록 →
     /// t=1 디스패치가 기존 GEMV로 폴백).
     lins_mk: HashMap<String, (CUdeviceptr, usize, usize)>,
+    /// [2026-10-18] 마린 스케일 순열 상주 — 이름 → (ptr, n, kg). [kg][n] f16
+    /// (gptq 마린 64-청크 순열 — 비트 순열만). t≥16 마린 GEMM 소비.
+    /// 등록 조건 = lins_mk와 동일(g128·f16).
+    lins_msc: HashMap<String, (CUdeviceptr, usize, usize)>,
     /// [sk] 재패킹 사본 바이트 합 — weights_bytes에는 포함(VRAM 실물),
     /// active_weight_bytes에서는 제외(토큰당 판독은 단 1본).
     marlin_bytes: u64,
@@ -814,6 +818,11 @@ pub struct W4a16Dec {
     /// [FLA-10 2026-10-10] 플레인(bf16) 경로 A 미러([t][k] bf16) — bf16_mma가
     /// f32 대신 판독(재판독 대역 절반). cast_bf16과 커널 내 변환이 비트동일.
     dabf: Buf,
+    /// [2026-10-18] 마린 GEMM f16 C 스크래치([t][n] f16) — h2f로 f32 출력 변환.
+    dmc: Buf,
+    /// [2026-10-18] 마린 블록 간 배리어 locks(sms×4 int32·0 초기화 — 커널이
+    /// 호출 종료 시 자체 리셋, 재사용 계약). 0 = 미할당.
+    dmlock: CUdeviceptr,
     /// [S2 2026-10-11] 다중세그먼트 테이블(디바이스 u64) — q/k/v·qkv/z·gate/up
     /// 을 1런치로(런치 꼬리 제거). 업로드·dchain 확정 후 ensure_chain_bufs에서
     /// 1회 작성 — 그래프 캡처 정적 계약(리플레이 간 내용 불변).
@@ -1129,6 +1138,7 @@ impl W4a16Dec {
             g4_atab: (Vec::new(), Vec::new()),
             lin_grp: HashMap::new(),
             lins_mk: HashMap::new(),
+            lins_msc: HashMap::new(),
             marlin_bytes: 0,
             plains: HashMap::new(),
             plain_weights: false,
@@ -1151,6 +1161,8 @@ impl W4a16Dec {
             dx16: Buf::default(),
             dxp: Buf::default(),
             dabf: Buf::default(),
+            dmc: Buf::default(),
+            dmlock: 0,
             dmulti: 0,
             dmulti_meta: Vec::new(),
             spec_on: false,

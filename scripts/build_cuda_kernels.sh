@@ -20,7 +20,14 @@ A=crates/backend-gpu/src/rawcuda/assets
 # 갱신" 사고를 못 잡는다(실측: 옛 fatbin + 새 mtime → 신선도 스킵이 리빌드
 # 누락). 자산별 (소스해시, fatbin해시) 쌍을 기록하고 preflight가 대조한다.
 MAN=$A/FATBINS.manifest
-man_src() { cat "$A/$1.cu" "$A/cast_common.cuh" "$A/g4_common.cuh" | sha256sum | cut -d' ' -f1; }
+man_src() { # [2026-10-18] marlin은 벤더 헤더 전량을 해시에 포함.
+    if [ "$1" = marlin ]; then
+        cat "$A/marlin.cu" $A/marlin/*.h $A/marlin/*.cuh $A/marlin/core/*.hpp \
+            $A/marlin/torch/headeronly/util/Exception.h | sha256sum | cut -d' ' -f1
+    else
+        cat "$A/$1.cu" "$A/cast_common.cuh" "$A/g4_common.cuh" | sha256sum | cut -d' ' -f1
+    fi
+}
 man_fb() { sha256sum "$A/$1.fatbin" | cut -d' ' -f1; }
 declare -A MAN_SRC=() MAN_FB=()
 if [ -f "$MAN" ]; then
@@ -42,14 +49,21 @@ build() { # name fmad_flag("" | "-fmad=false")
     # 재빌드 생략. gptq4는 재빌드마다 코드젠 추첨이 리셋되므로(실측 ±4%)
     # 불필요한 재컴파일이 고정 드로우를 덮어쓰는 사고를 막는다.
     # 강제 재빌드: touch <name>.cu 후 실행.
-    if [ -f "$out" ] && [ "$out" -nt "$src" ] \
+    local hdr_new=""
+    if [ "$name" = marlin ] && [ -f "$out" ]; then
+        hdr_new=$(find "$A/marlin" -type f -newer "$out" 2>/dev/null | head -1) || true
+    fi
+    if [ -f "$out" ] && [ "$out" -nt "$src" ] && [ -z "$hdr_new" ] \
         && [ "$out" -nt "$A/cast_common.cuh" ] && [ "$out" -nt "$A/g4_common.cuh" ]; then
         echo "CUDA $name 스킵(최신 — 강제: touch $src)"
         return
     fi
+    local extra=""
+    # [2026-10-18] 마린: constexpr 호출 허용 + torch headeronly 심 경로.
+    [ "$name" = marlin ] && extra="--expt-relaxed-constexpr -I$A/marlin"
     local tmp
     tmp=$(mktemp /tmp/opencode/${name}.XXXXXX.fatbin)
-    "$NVCC" -fatbin -O3 $fmad \
+    "$NVCC" -fatbin -O3 $fmad $extra \
         -gencode arch=compute_80,code=sm_80 \
         -o "$tmp" "$src"
     mv "$tmp" "$out"
@@ -69,16 +83,17 @@ build decode -fmad=false
 build moe   -fmad=false
 build moepp -fmad=false
 build head  -fmad=false
+build marlin            # [2026-10-18] vLLM 벤더(TU·헤더), 기본 fmad
 
 # 매니페스트 갱신 — 리빌드분은 새 쌍, 스킵분은 기존 엔트리 유지(부재 시 현재
 # 상태를 시드 — 최초 도입/매니페스트 삭제 시에만). preflight 5단계가 대조한다.
-for name in smoke norm gdn attn ew embed gptq4 gemma4 moe moepp decode head; do
+for name in smoke norm gdn attn ew embed gptq4 gemma4 moe moepp decode head marlin; do
     if [ -z "${MAN_SRC[$name]:-}" ]; then
         MAN_SRC[$name]=$(man_src "$name"); MAN_FB[$name]=$(man_fb "$name")
     fi
 done
 {
-    for name in smoke norm gdn attn ew embed gptq4 gemma4 moe moepp decode head; do
+    for name in smoke norm gdn attn ew embed gptq4 gemma4 moe moepp decode head marlin; do
         echo "${MAN_SRC[$name]} ${MAN_FB[$name]} $name"
     done
 } > "$MAN.tmp" && mv "$MAN.tmp" "$MAN"

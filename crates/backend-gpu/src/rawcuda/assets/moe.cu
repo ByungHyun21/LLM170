@@ -1657,3 +1657,15 @@ extern "C" __global__ void __launch_bounds__(128, 4) w4a16_gemm_g128_marlin_m16(
         }
     }
 }
+
+// [2026-10-18] f16→f32 변환 — 마린 GEMM의 f16 출력 → 엔진 f32 스트림.
+// 순수 값 변환(__half2float — 정확) · n2 = half2 원소 수(n/2) · 그리드-스트라이드.
+extern "C" __global__ void w4a16_h2f(const unsigned short* __restrict__ in,
+                                     float* __restrict__ out, int n2) {
+    const int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n2; i += stride) {
+        const __half2 h = *reinterpret_cast<const __half2*>(&in[2 * i]);
+        const float2 f = __half22float2(h);
+        *reinterpret_cast<float2*>(&out[2 * i]) = f;
+    }
+}
