@@ -159,6 +159,91 @@ impl W4a16Dec {
 
     /// [gemma4 P3 2026-10-14] 청크 디바이스 체인 — 스크래치 슬롯 확보.
     /// 재할당 시 캡처 그래프 전량 폐기(옛 포인터 replay 차단 — realloc_buf 동형).
+    /// [⑮② 2026-10-18] gemma4 다중세그먼트 테이블 — 층별 [q,k(,v)]·[gate,up]
+    /// 그룹을 dmulti/dmulti_meta에 (q,s,out,n,k) u64×5로 기입. out = G4_B1/
+    /// B2/B3 슬롯(호스트 체인과 동일 소비 위치). 슬롯은 G4_CHUNK_MAX×최대 n
+    /// 으로 선확보 — 이후 런타임 ensure가 재할당하지 않는다(그래프 정적 계약).
+    /// gemma4는 ensure_chain_bufs(qwen 테이블)를 부르지 않으므로 dmulti의
+    /// 단일 작성자다. 호출 = upload_g4 끝(층 등록 후 1회).
+    pub fn build_multi_tables_g4(&mut self) -> Result<(), String> {
+        let nl = self.n_layers;
+        let dm = self.attn.attn.ok_or("g4 multi: attn 미등록")?;
+        let tmax = G4_CHUNK_MAX;
+        let qd_max = self
+            .attn
+            .layers
+            .iter()
+            .map(|l| dm.q_heads * l.d)
+            .max()
+            .unwrap_or(0);
+        let mut nff_max = 0usize;
+        for il in 0..nl {
+            let (_, _, n, _) = self.lin_spec(&format!("blk.{il}.ffn_gate.weight"))?;
+            nff_max = nff_max.max(n);
+        }
+        let wmax = qd_max.max(nff_max);
+        let (b1, b2, b3) = (
+            self.g4_scratch_slot(Self::G4_B1, tmax * wmax * 4)?,
+            self.g4_scratch_slot(Self::G4_B2, tmax * wmax * 4)?,
+            self.g4_scratch_slot(Self::G4_B3, tmax * wmax * 4)?,
+        );
+        let mut tab: Vec<u64> = vec![0; nl * 25]; // 최대 5세그먼트(q,k,v,gu)×5 u64/층
+        let mut meta: Vec<[u32; 8]> = vec![[0u32; 8]; nl];
+        for il in 0..nl {
+            let keqv = self.attn.layers[il].k_eq_v;
+            let mut segs0: Vec<(String, u64)> = vec![
+                (format!("blk.{il}.attn_q.weight"), b1),
+                (format!("blk.{il}.attn_k.weight"), b2),
+            ];
+            if !keqv {
+                segs0.push((format!("blk.{il}.attn_v.weight"), b3));
+            }
+            let segs1: Vec<(String, u64)> = vec![
+                (format!("blk.{il}.ffn_gate.weight"), b1),
+                (format!("blk.{il}.ffn_up.weight"), b2),
+            ];
+            let mut wr = il * 25;
+            let mut gm = [[0u32; 4]; 2];
+            for (gi, segs) in [&segs0, &segs1].into_iter().enumerate() {
+                let off = wr as u32;
+                let (mut total, mut tgrid, mut cnt) = (0usize, 0usize, 0u32);
+                for (name, out) in segs {
+                    let (p0, p1, n, k) = self.lin_spec(name)?;
+                    if n > wmax {
+                        return Err(format!("g4 multi({name}): n={n} > 슬롯 {wmax}"));
+                    }
+                    tab[wr] = p0;
+                    wr += 1;
+                    tab[wr] = p1;
+                    wr += 1;
+                    tab[wr] = *out;
+                    wr += 1;
+                    tab[wr] = n as u64;
+                    wr += 1;
+                    tab[wr] = k as u64;
+                    wr += 1;
+                    total += n;
+                    tgrid += n.div_ceil(GEMV_TR);
+                    cnt += 1;
+                }
+                gm[gi] = [off, cnt, total as u32, tgrid as u32];
+            }
+            meta[il] = [
+                gm[0][0], gm[0][1], gm[0][2], gm[1][0], gm[1][1], gm[1][2], gm[0][3], gm[1][3],
+            ];
+        }
+        let bytes = tab.len() * 8;
+        // SAFETY: 로컬 Vec<u64>의 유효 수명 내 바이트 뷰.
+        let buf = unsafe { std::slice::from_raw_parts(tab.as_ptr() as *const u8, bytes) };
+        if self.dmulti == 0 {
+            self.dmulti = self.cc.alloc(bytes)?;
+        }
+        self.cc.h2d(self.dmulti, buf)?;
+        self.cc.sync()?;
+        self.dmulti_meta = meta;
+        Ok(())
+    }
+
     pub fn g4_scratch_slot(&mut self, idx: usize, bytes: usize) -> Result<CUdeviceptr, String> {
         if self.g4_pool.len() <= idx {
             self.g4_pool.resize(idx + 1, Buf { ptr: 0, cap: 0 });
@@ -583,12 +668,29 @@ impl W4a16Dec {
             // ① input_layernorm(디바이스) → q/k/(v) GEMV.
             let a = self.g4_scratch_slot(Self::G4_A, n * 4)?;
             self.rms_rows_dev(nb, x, a, t, eps)?;
-            let q = self.g4_dev_gemm(&format!("blk.{il}.attn_q.weight"), a, t, h, Self::G4_B1)?;
-            let k = self.g4_dev_gemm(&format!("blk.{il}.attn_k.weight"), a, t, h, Self::G4_B2)?;
-            let v = if l.k_eq_v {
-                k // v = k 원시(prep_g4 vn_on 계약 — 호스트 경로와 동일)
+            // [⑮② 2026-10-18] q/k(/v) 다중세그먼트 1런치(테이블 = build_
+            // multi_tables_g4). t>16은 tall 폴백(개별 호출 — 종전).
+            let (q, k, v) = if t <= 16 {
+                self.gemv_multi_g32_t_dev(il, 0, a, t)?;
+                let q = self.g4_scratch_slot(Self::G4_B1, t * qd * 4)?;
+                let k = self.g4_scratch_slot(Self::G4_B2, t * qd * 4)?;
+                let v = if l.k_eq_v {
+                    k
+                } else {
+                    self.g4_scratch_slot(Self::G4_B3, t * qd * 4)?
+                };
+                (q, k, v)
             } else {
-                self.g4_dev_gemm(&format!("blk.{il}.attn_v.weight"), a, t, h, Self::G4_B3)?
+                let q =
+                    self.g4_dev_gemm(&format!("blk.{il}.attn_q.weight"), a, t, h, Self::G4_B1)?;
+                let k =
+                    self.g4_dev_gemm(&format!("blk.{il}.attn_k.weight"), a, t, h, Self::G4_B2)?;
+                let v = if l.k_eq_v {
+                    k // v = k 원시(prep_g4 vn_on 계약 — 호스트 경로와 동일)
+                } else {
+                    self.g4_dev_gemm(&format!("blk.{il}.attn_v.weight"), a, t, h, Self::G4_B3)?
+                };
+                (q, k, v)
             };
             // ② 어텐션(디바이스 — 행별 pos/테이블) → o_proj → post_attn 잔차.
             let outv = self.attn_g4_dev(
@@ -600,9 +702,20 @@ impl W4a16Dec {
             self.axpy_dev(1.0, hh, x, n)?;
             // ③ dense MLP — pre_ff 노름 → gate/up → gelu → down → post_ff1.
             self.rms_rows_dev(nb + 2, x, a, t, eps)?;
-            let g = self.g4_dev_gemm(&format!("blk.{il}.ffn_gate.weight"), a, t, h, Self::G4_B1)?;
-            let u = self.g4_dev_gemm(&format!("blk.{il}.ffn_up.weight"), a, t, h, Self::G4_B2)?;
             let (_, _, _, n_ff) = self.lin_spec(&format!("blk.{il}.ffn_down.weight"))?;
+            // [⑮②] gate/up 다중세그먼트 1런치(t>16은 tall 폴백).
+            let (g, u) = if t <= 16 {
+                self.gemv_multi_g32_t_dev(il, 1, a, t)?;
+                (
+                    self.g4_scratch_slot(Self::G4_B1, t * n_ff * 4)?,
+                    self.g4_scratch_slot(Self::G4_B2, t * n_ff * 4)?,
+                )
+            } else {
+                (
+                    self.g4_dev_gemm(&format!("blk.{il}.ffn_gate.weight"), a, t, h, Self::G4_B1)?,
+                    self.g4_dev_gemm(&format!("blk.{il}.ffn_up.weight"), a, t, h, Self::G4_B2)?,
+                )
+            };
             let act = self.g4_dev_gelu(g, u, Self::G4_B3, t * n_ff)?;
             let m = self.g4_dev_gemm(&format!("blk.{il}.ffn_down.weight"), act, t, n_ff, 8)?;
             let h1 = self.g4_scratch_slot(9, n * 4)?; // hh 소비 후 재사용

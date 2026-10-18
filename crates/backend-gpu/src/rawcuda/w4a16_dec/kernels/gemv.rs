@@ -331,6 +331,40 @@ impl W4a16Dec {
         )
     }
 
+    /// [⑮② 2026-10-18] g32/bf16 다중세그먼트 t행 런치 — gemma4 청크 융합.
+    /// 메타 = build_multi_tables_g4가 1회 산출([off,cnt,total,…,tgrid]).
+    pub(in crate::rawcuda::w4a16_dec) fn gemv_multi_g32_t_dev(
+        &mut self,
+        il: usize,
+        group: usize,
+        x_dev: CUdeviceptr,
+        t: usize,
+    ) -> Result<(), String> {
+        let m = *self
+            .dmulti_meta
+            .get(il)
+            .ok_or_else(|| format!("gemv_multi_g32_t: 메타 부족 il={il}"))?;
+        let (off, cnt, tgrid) = if group == 0 {
+            (m[0], m[1], m[6])
+        } else {
+            (m[3], m[4], m[7])
+        };
+        if cnt == 0 {
+            return Err(format!("gemv_multi_g32_t: 세그먼트 없음 il={il} g={group}"));
+        }
+        let f = self.cc.function("w4a16_gemv_g32_bf16_multi_t")?;
+        let (mut p_t, mut p_x) = (self.dmulti + off as u64 * 8, x_dev);
+        let (mut p_c, mut p_tt) = (cnt as i32, t as i32);
+        let blk = 32 * GEMV_TR as u32;
+        self.cc.launch(
+            f,
+            tgrid,
+            1,
+            blk,
+            &mut crate::rawcuda::args::l4(&mut p_t, &mut p_x, &mut p_c, &mut p_tt),
+        )
+    }
+
     /// 분리 GEMV 발사(이름 무경유 — MoE 전문가 스테이징).
     pub(in crate::rawcuda::w4a16_dec) fn gemv_launch_raw(
         &self,

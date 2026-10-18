@@ -47,6 +47,8 @@ pub const ASSETS: &[Asset] = &[
             // gptq4.cu 바이트 동결(코드젠 고정, gemma4.cu 헤더 참조)로 커널이
             // fatbin에 잔존 — 심볼 등록만 유지(부팅 바인딩·발사 없음).
             "w4a16_gemv_g32_bf16_tall",
+            // [⑮② 2026-10-18] 다중세그먼트(q/k/v·gate/up) — gemma4 청크 융합.
+            "w4a16_gemv_g32_bf16_multi_t",
             "w4a16_moe_align",
             "w4a16_gemm_g128_mma",
             "w4a16_gemv_g32_bf16_t",

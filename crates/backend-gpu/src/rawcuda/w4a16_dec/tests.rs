@@ -238,10 +238,10 @@ fn trow_switch_coverage() {
     let gptq4 = include_str!("../assets/gptq4.cu");
     let moe = include_str!("../assets/moe.cu");
     let head = include_str!("../assets/head.cu");
-    // (소스, 매크로, 심볼 수): g128_t·g128_multi_t·g32_t, bf16_t·multi_t, i8_t.
+    // (소스, 매크로, 심볼 수): g128_t·g128_multi_t·g32_t·g32 multi_t, bf16_t·multi_t, i8_t.
     let groups: &[(&str, &str, usize)] = &[
         (gptq4, "GEMV_T_CASE(", 2),      // g128_t + multi_t
-        (gptq4, "GEMV_T_CASE_G32(", 1),  // g32_bf16_t
+        (gptq4, "GEMV_T_CASE_G32(", 2),  // [⑮②] g32_bf16_t + g32_bf16_multi_t
         (moe, "GEMV_T_CASE_BF(", 2),     // bf16_t + multi_t
         (head, "GEMV_I8_TROW_CASE(", 1), // i8_t head
     ];

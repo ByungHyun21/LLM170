@@ -876,6 +876,60 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g128_multi_t(
 }
 
 
+// [⑮② 2026-10-18] 다중 세그먼트 t행 GEMV(g32·bf16) — gemma4 청크의
+// q/k(/v)·gate/up 융합(골격 = g128_multi_t 공용: tab [count][5], 세그먼트
+// 블록수 ceil(n/GEMV_TR), 호스트 grid = Σ). 본체 = GEMV_T_CASE_G32 — 행별
+// 산술은 w4a16_gemv_g32_bf16_t와 **비트동일**(gemv_g32_t_body 그대로).
+// 이득 기전 = 웨이브 채움 상각: 개별 호출 실효 150~300GB/s(피크 10~20%)
+// = 램프/드레인 바운드(nsys 실측) — 3→1 런치로 램프 1회화. t≤16 계약.
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_g32_bf16_multi_t(
+    const unsigned long long* __restrict__ tab, // [count][5]: q, s, out, n, k
+    const float* __restrict__ x,                // [t][k] f32
+    int count, int t)
+{
+    const int blk = blockIdx.x;
+    int seg = count - 1;
+    int base = 0;
+    for (int ss = 0; ss < count; ++ss) {
+        const int ns = ((int)tab[ss * 5 + 3] + GEMV_TR - 1) / GEMV_TR;
+        if (blk < base + ns) {
+            seg = ss;
+            break;
+        }
+        base += ns;
+    }
+    const unsigned* q = (const unsigned*)(size_t)tab[seg * 5 + 0];
+    const unsigned short* s = (const unsigned short*)(size_t)tab[seg * 5 + 1];
+    float* out = (float*)(size_t)tab[seg * 5 + 2];
+    const int n = (int)tab[seg * 5 + 3];
+    const int k = (int)tab[seg * 5 + 4];
+    const int o0 = (blk - base) * GEMV_TR;
+    if (o0 >= n) {
+        return;
+    }
+    __shared__ double red[GEMV_TR][32];
+    __shared__ float sc[GEMV_TR][G4_SCMAX];
+    switch (t) {
+        GEMV_T_CASE_G32(1)
+        GEMV_T_CASE_G32(2)
+        GEMV_T_CASE_G32(3)
+        GEMV_T_CASE_G32(4)
+        GEMV_T_CASE_G32(5)
+        GEMV_T_CASE_G32(6)
+        GEMV_T_CASE_G32(7)
+        GEMV_T_CASE_G32(8)
+        GEMV_T_CASE_G32(9)
+        GEMV_T_CASE_G32(10)
+        GEMV_T_CASE_G32(11)
+        GEMV_T_CASE_G32(12)
+        GEMV_T_CASE_G32(13)
+        GEMV_T_CASE_G32(14)
+        GEMV_T_CASE_G32(15)
+        GEMV_T_CASE_G32(16)
+        default: break; // 호스트 계약 밖(t≤16)
+    }
+}
+
 // out[t][n] = x[t][k] · W4A16(g128, sym) — t≥2(프리필 배치) 전용.
 // [2026-10-08 P3-b 최종 — 채택 변형] 1라운드 진화(벤치 실측): 행=블록 43 →
 // smem(R=4) 51 → smem f16→f32 변환 63 → **R=8(512스레드) 72~77(채택)** →

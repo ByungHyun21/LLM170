@@ -313,6 +313,8 @@ pub(crate) fn upload_model_g4(
     // 층 스칼라·pes 등록은 여기서 단일화 — 디바이스 청크(엔진·eval·프로브
     // 공용)가 로드 시점 계약을 갖는다(set_g4_layer_scalar 누락 = 청크 실패).
     dec.set_g4_layer_scalar(&layer_scalar)?;
+    // [⑮② 2026-10-18] 다중세그먼트(q/k/v·gate/up) 테이블 — 청크 융합용.
+    dec.build_multi_tables_g4()?;
     eprintln!("[g4] 업로드 — 선형·노름 {attn_ms:.0}ms · MoE {moe_ms:.0}ms · head {head_ms:.0}ms");
     Ok(G4HostCfg {
         softcap: hp.softcap,
