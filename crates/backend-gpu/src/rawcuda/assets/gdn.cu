@@ -1166,10 +1166,14 @@ extern "C" __global__ void gdn_gate(
     float zv = z[t * (h_v * 128) + h * 128 + tid];
     float gv = ov * inv * nw[layer * 128 + tid] * (zv / (1.0f + gdn_expf(-zv)));
     gated[t * (h_v * 128) + h * 128 + tid] = gv;
+    // [⑯ 2026-10-18] 소프트 f2h/h2f → HW cvt(등가 근거는 norm.cu 주석).
     if (gated32 != (float*)0) {
-        gated32[t * (h_v * 128) + h * 128 + tid] = h2f(f2h(gv));
-    }
-    if (gated16 != (unsigned short*)0) {
-        gated16[t * (h_v * 128) + h * 128 + tid] = f2h(gv);
+        const __half hv = __float2half_rn(gv);
+        gated32[t * (h_v * 128) + h * 128 + tid] = __half2float(hv);
+        if (gated16 != (unsigned short*)0) {
+            gated16[t * (h_v * 128) + h * 128 + tid] = __half_as_ushort(hv);
+        }
+    } else if (gated16 != (unsigned short*)0) {
+        gated16[t * (h_v * 128) + h * 128 + tid] = __half_as_ushort(__float2half_rn(gv));
     }
 }

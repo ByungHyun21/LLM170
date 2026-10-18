@@ -2,6 +2,7 @@
 // 호스트 embed_row(행당 mmap 디코드+Vec 할당+h2d 20KB)를 토큰 id h2d(4B/행)
 // + 본 커널로 대체한다. 계약: h2f/b2f = Rust half_to_f32/bf16_to_f32와
 // 비트동일(decode_f32가 쓰는 동일 함수) — 값 불변(골든 재판정).
+#include <cuda_fp16.h>
 #include "cast_common.cuh"
 #include "g4_common.cuh" // b2f
 
@@ -23,7 +24,10 @@ extern "C" __global__ void w4a16_embed_gather(
         return;
     }
     const unsigned short v = emb[(size_t)tok * (size_t)k + (size_t)c];
-    out[i] = bf16 ? b2f(v) : h2f(v);
+    // [⑯ 2026-10-18] h2f 소프트(서브노멀 정규화 루프·분기) → HW cvt 1명령.
+    // f16→f32는 유한 도메인에서 무손실·비트동일(전 65536 패턴 스윕, 불일치=NaN만
+    // — 임베딩 가중치 실도메인 미발생). b2f는 시프트 그대로(무변경).
+    out[i] = bf16 ? b2f(v) : __half2float(__ushort_as_half(v));
 }
 
 // ── [MTP-CHAIN 2026-10-12 §3.3 레버 ②] MTP 장치 체인 부기 ──

@@ -1,3 +1,4 @@
+#include <cuda_fp16.h>
 #include "cast_common.cuh"
 
 // ── norm_resid CUDA 포팅 (G3, 2026-10-04) ──
@@ -67,11 +68,20 @@ extern "C" __global__ void norm_resid(
         int e = base + (j << 10) + tid;
         float y = v[j] * inv * nw[w_off + (j << 10) + tid];
         xn[e] = y;
+        // [⑯ 2026-10-18] 소프트 f2h/h2f(서브노멀 정규화 루프·inf/nan 분기 —
+        // SASS 원소당 ~35명령·BSSY/BSYNC 7쌍) → HW cvt 2명령. 등가 근거:
+        // cvt.rn.f16.f32는 유한·±inf 입력에서 소프트 f2h와 비트동일(서브노멀·
+        // 타이 포함 — 1.38억 비트패턴 스윕, 불일치=NaN만), f16→f32는 무손실
+        // (전 65536 패턴, 불일치=NaN만). NaN 페이로드만 상이 — 실도메인(유한
+        // 활성) 미발생, 골든/해시 게이트가 검증.
         if (xn32 != (float*)0) {
-            xn32[e] = h2f(f2h(y)); // cast_x32 커널과 동일 산식(비트 동일)
-        }
-        if (xn16 != (unsigned short*)0) {
-            xn16[e] = f2h(y); // xn32와 동일 비트(f16) — A 재판독 대역 절반.
+            const __half h = __float2half_rn(y);
+            xn32[e] = __half2float(h); // cast_x32 커널과 동일 산식(비트 동일)
+            if (xn16 != (unsigned short*)0) {
+                xn16[e] = __half_as_ushort(h); // xn32와 동일 비트(f16) — A 재판독 대역 절반.
+            }
+        } else if (xn16 != (unsigned short*)0) {
+            xn16[e] = __half_as_ushort(__float2half_rn(y));
         }
         x[e] = v[j];
     }
@@ -185,11 +195,15 @@ extern "C" __global__ void norm_resid_g(
         if (e >= lim) continue;
         float y = v[j] * inv * nw[w_off + (j << 10) + tid];
         xn[e] = y;
+        // [⑯ 2026-10-18] 소프트 f2h/h2f → HW cvt(근거는 norm_resid 상단 주석).
         if (xn32 != (float*)0) {
-            xn32[e] = h2f(f2h(y));
-        }
-        if (xn16 != (unsigned short*)0) {
-            xn16[e] = f2h(y);
+            const __half h = __float2half_rn(y);
+            xn32[e] = __half2float(h);
+            if (xn16 != (unsigned short*)0) {
+                xn16[e] = __half_as_ushort(h);
+            }
+        } else if (xn16 != (unsigned short*)0) {
+            xn16[e] = __half_as_ushort(__float2half_rn(y));
         }
         x[e] = v[j];
     }

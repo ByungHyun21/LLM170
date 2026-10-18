@@ -10,6 +10,7 @@
 // 발사와 동일. 27B FFN n=17408 → 136블록, g/u/y 완전 coalesce 스트리밍
 // (블록당 512B×3) — 순수 메모리 본드 원소별 연산.
 
+#include <cuda_fp16.h>
 #include "cast_common.cuh"
 __device__ __forceinline__ float ew_expf(float x)
 {
@@ -40,11 +41,16 @@ extern "C" __global__ void ew(
     float e = ew_expf(-v);
     float act = (v / (1.0f + e)) * u[j];
     y[j] = act;
+    // [⑯ 2026-10-18] 소프트 f2h/h2f(원소당 ~35명령·분기) → HW cvt 2명령.
+    // 등가 근거는 norm.cu norm_resid 상단 주석(전수 스윕 — 유한 도메인 비트동일).
     if (y32 != (float*)0) {
-        y32[j] = h2f(f2h(act));
-    }
-    if (y16 != (unsigned short*)0) {
-        y16[j] = f2h(act);
+        const __half h = __float2half_rn(act);
+        y32[j] = __half2float(h);
+        if (y16 != (unsigned short*)0) {
+            y16[j] = __half_as_ushort(h);
+        }
+    } else if (y16 != (unsigned short*)0) {
+        y16[j] = __half_as_ushort(__float2half_rn(act));
     }
 }
 
@@ -69,11 +75,16 @@ extern "C" __global__ void ew_gelu(
     float x3 = v * v * v;
     float act = 0.5f * v * (1.0f + tanhf(0.7978846f * (v + 0.044715f * x3))) * u[j];
     y[j] = act;
+    // [⑯ 2026-10-18] 소프트 f2h/h2f(원소당 ~35명령·분기) → HW cvt 2명령.
+    // 등가 근거는 norm.cu norm_resid 상단 주석(전수 스윕 — 유한 도메인 비트동일).
     if (y32 != (float*)0) {
-        y32[j] = h2f(f2h(act));
-    }
-    if (y16 != (unsigned short*)0) {
-        y16[j] = f2h(act);
+        const __half h = __float2half_rn(act);
+        y32[j] = __half2float(h);
+        if (y16 != (unsigned short*)0) {
+            y16[j] = __half_as_ushort(h);
+        }
+    } else if (y16 != (unsigned short*)0) {
+        y16[j] = __half_as_ushort(__float2half_rn(act));
     }
 }
 
