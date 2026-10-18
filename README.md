@@ -38,7 +38,7 @@ end-to-end on GPU with an int8 KV cache and CUDA-graph decode — 27B dense
 
 | row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
 |---|---|---|---|---|---|
-| CUDA (170HX, 180 W, 2026-10-18) | 1010.86 | 879.11 | 648.97 | 49.62 | — |
+| CUDA (170HX, 180 W, 2026-10-18) | 1008.41 | 876.81 | 645.61 | 50.09 | — |
 
 | mode (27B, 512tok prompt · 128 gen) | t/s | note |
 |---|---|---|
