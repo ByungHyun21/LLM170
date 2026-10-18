@@ -748,9 +748,20 @@ extern "C" __global__ void gdn_rescale(
     __half* row = &st[st_h + (long)i * d];
     const float s = sc[sc_h + i];
     float mx = 0.0f;
-    for (int j = 0; j < d; ++j) {
-        const float a = fabsf(__half2float(row[j]) * s);
-        if (a > mx) mx = a;
+    // [2026-10-18 벡터 판독] 종전 스칼라 2B×128회 — 스레드 간 256B 산개로
+    // 워프 로드가 섹터를 16× 과다 소비(실측 455µs ≈ 330GB/s = 대역의 1/4).
+    // 16B 로드 = 스레드가 자기 행 섹터를 온전히 소비. 값·비교 순서·샘플
+    // 불변(j 오름차순·동일 수식) — **비트동일**.
+    const ulonglong2* rv = reinterpret_cast<const ulonglong2*>(row);
+    #pragma unroll
+    for (int jv = 0; jv < d / 8; ++jv) {
+        const ulonglong2 w = rv[jv];
+        const __half* hh = reinterpret_cast<const __half*>(&w);
+        #pragma unroll
+        for (int k2 = 0; k2 < 8; ++k2) {
+            const float a = fabsf(__half2float(hh[k2]) * s);
+            if (a > mx) mx = a;
+        }
     }
     if (mx > 0.0f) {
         // [히스테리시스 2026-10-13] 재기록은 저장 최대가 [head/8, head*8] 밖일
