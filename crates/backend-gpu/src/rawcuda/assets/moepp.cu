@@ -30,6 +30,11 @@
 #define DGRP_M 64
 #define DGRP_N 64
 #define DGRP_KC 32
+// [⑥-c2 2026-10-18] m-타일 z분할 수 — 슬롯 분포 편중(97+ 슬롯 전문가 존재,
+// 실측 moe-cnt)으로 단일 블록이 mtiles를 직렬 처리하면 테일이 지배:
+// grid.x = 전문가×PP_MZ, 블록 = (e = x/PP_MZ, mz = x%PP_MZ), m타일 = mz부터
+// PP_MZ 스트라이드. 산술 불변 = 비트동일. 호스트 MOE_PP_MZ와 동일 계약.
+#define PP_MZ 4
 
 // [⑥] f32 → f16(RNE) 미러 — 단일패스 A 소스(hilo_pack의 hi 성분과 비트동일).
 extern "C" __global__ void w4a16_cast_f16(const float* __restrict__ in,
@@ -55,7 +60,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2_f16(
     const unsigned short* __restrict__ x, int xstride, int sp,
     float* __restrict__ out, float* __restrict__ out2, int n, int k)
 {
-    const int e = blockIdx.x;
+    const int e = blockIdx.x / PP_MZ;
+    const int mz = blockIdx.x % PP_MZ;
     const unsigned cnt = gcnt[e];
     if (cnt == 0) {
         return;
@@ -81,7 +87,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2_f16(
     __shared__ __align__(16) unsigned short xs[2][GRP_M][GRP_KC * 2 + 16];
     __shared__ unsigned short ws[2][2 * GRP_N][GRP_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
-    for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
+    for (unsigned mtile = (unsigned)mz; mtile < mtiles; mtile += PP_MZ) {
         const unsigned rbase = mtile * GRP_M;
         float c[4][4];
 #pragma unroll
@@ -209,7 +215,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64_f16(
     const unsigned short* __restrict__ x, int xstride, int sp,
     float* __restrict__ out, int n, int k)
 {
-    const int e = blockIdx.x;
+    const int e = blockIdx.x / PP_MZ;
+    const int mz = blockIdx.x % PP_MZ;
     const unsigned cnt = gcnt[e];
     if (cnt == 0) {
         return;
@@ -232,7 +239,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64_f16(
     __shared__ __align__(16) unsigned short xs[2][DGRP_M][DGRP_KC * 2 + 16];
     __shared__ unsigned short ws[2][DGRP_N][DGRP_KC + 8];
     const unsigned mtiles = (cnt + DGRP_M - 1) / DGRP_M;
-    for (unsigned mtile = 0; mtile < mtiles; ++mtile) {
+    for (unsigned mtile = (unsigned)mz; mtile < mtiles; mtile += PP_MZ) {
         const unsigned rbase = mtile * DGRP_M;
         float c[4][4];
 #pragma unroll

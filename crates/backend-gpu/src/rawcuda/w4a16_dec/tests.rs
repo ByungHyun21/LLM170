@@ -152,6 +152,11 @@ fn gemm_mma_mirror() {
         GEMM_GRP_N,
         "gptq4.cu GRP_N ↔ GEMM_GRP_N"
     );
+    assert_eq!(
+        define(include_str!("../assets/moepp.cu"), "PP_MZ") as usize,
+        MOE_PP_MZ,
+        "moepp.cu PP_MZ ↔ MOE_PP_MZ(MoE 프리필 m타일 z분할)"
+    );
 }
 
 #[test]

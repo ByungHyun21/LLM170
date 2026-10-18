@@ -29,7 +29,7 @@ impl W4a16Dec {
         );
         self.cc.launch(
             f,
-            self.moe.n_experts as u32,
+            (self.moe.n_experts * MOE_PP_MZ) as u32,
             n.div_ceil(64) as u32,
             256,
             &mut crate::rawcuda::args::l11(
@@ -63,7 +63,7 @@ impl W4a16Dec {
         let (mut p_o, mut p_o2, mut p_n, mut p_k) = (out_gate, out_up, n as i32, k as i32);
         self.cc.launch(
             f,
-            self.moe.n_experts as u32,
+            (self.moe.n_experts * MOE_PP_MZ) as u32,
             n.div_ceil(GEMM_GRP_N) as u32,
             256,
             &mut crate::rawcuda::args::l12(

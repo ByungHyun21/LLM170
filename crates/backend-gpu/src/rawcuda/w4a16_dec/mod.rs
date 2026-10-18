@@ -47,6 +47,10 @@ pub const GEMM_BMMA_M: usize = 32;
 pub const GEMM_BMMA_N: usize = 64;
 pub const GEMM_GRP_M: usize = 64;
 pub const GEMM_GRP_N: usize = 32;
+/// [⑥-c2 2026-10-18] MoE 프리필 grp 커널의 m-타일 z분할 수(커널 moepp.cu
+/// PP_MZ 미러 — 정적검사 gemm_mma_mirror). grid.x = 전문가×이 값,
+/// 블록 = (e = x/PP_MZ, mz = x%PP_MZ)가 m타일을 스트라이드 분담.
+pub const MOE_PP_MZ: usize = 4;
 /// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
 /// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — A5-4: qs 스테이징 +
 /// V-타일(GDN_NSPLIT) + Stile 더블 버퍼 기준).
