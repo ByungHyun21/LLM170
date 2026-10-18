@@ -842,11 +842,15 @@ extern "C" __global__ void attn_fwd3s_merge(
     float ov = (acc / l) * (1.0f / (1.0f + attn_expf(-g)));
     const long oi = (long)t * (q_heads * 256) + (long)h * 256 + tid;
     outv[oi] = ov;
+    // [⑯ 2026-10-18] 소프트 f2h/h2f → HW cvt(등가 근거는 norm.cu 주석).
     if (out32 != (float*)0) {
-        out32[oi] = h2f(f2h(ov));
-    }
-    if (out16 != (unsigned short*)0) {
-        out16[oi] = f2h(ov);
+        const __half h = __float2half_rn(ov);
+        out32[oi] = __half2float(h);
+        if (out16 != (unsigned short*)0) {
+            out16[oi] = __half_as_ushort(h);
+        }
+    } else if (out16 != (unsigned short*)0) {
+        out16[oi] = __half_as_ushort(__float2half_rn(ov));
     }
 }
 
@@ -1013,11 +1017,15 @@ extern "C" __global__ void attn_fwd3s_merge_g4(
     float ov = acc / l;
     const long oi = (long)t * (q_heads * d) + (long)h * d + tid;
     outv[oi] = ov;
+    // [⑯ 2026-10-18] 소프트 f2h/h2f → HW cvt(등가 근거는 norm.cu 주석).
     if (out32 != (float*)0) {
-        out32[oi] = h2f(f2h(ov));
-    }
-    if (out16 != (unsigned short*)0) {
-        out16[oi] = f2h(ov);
+        const __half h = __float2half_rn(ov);
+        out32[oi] = __half2float(h);
+        if (out16 != (unsigned short*)0) {
+            out16[oi] = __half_as_ushort(h);
+        }
+    } else if (out16 != (unsigned short*)0) {
+        out16[oi] = __half_as_ushort(__float2half_rn(ov));
     }
 }
 
@@ -1309,10 +1317,7 @@ extern "C" __global__ void attn_fwd3s_part_qg(
 #define FA2_BR 32
 #define FA2_BC 32
 
-__device__ __forceinline__ unsigned fa2_pk(unsigned short a, unsigned short b)
-{
-    return (unsigned)a | ((unsigned)b << 16);
-}
+// (fa2_pk은 ⑯ 2026-10-18 Ps packed cvt 전환으로 제거 — __floats2half2_rn이 대체.)
 
 __device__ __forceinline__ void fa2_mma(float* c, unsigned a0, unsigned a1,
                                         unsigned a2, unsigned a3, unsigned b0,
@@ -1403,7 +1408,7 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
         if (row < t_len) {
             qv = qh[(size_t)row * (q_heads * 256) + (size_t)h * 256 + d_];
         }
-        Qs[r][d_] = f2h(qv * qsc);
+        Qs[r][d_] = __half_as_ushort(__float2half_rn(qv * qsc)); // [⑯] 소프트→HW cvt
     }
     if (tid < FA2_BR) {
         m_s[tid] = -1e30f;
@@ -1462,7 +1467,9 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
             }
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                VsT[qq * 16 + i][j] = f2h((float)vb[i]);
+                // [⑯ 2026-10-18] |vb|≤127 = f16 정확 표현 — HW cvt가 trivially
+                // 동일(소프트 f2h는 원소당 ~12명령·분기). Ps도 HW packed cvt로.
+                VsT[qq * 16 + i][j] = __half_as_ushort(__float2half_rn((float)vb[i]));
             }
         }
         if (tid < FA2_BC) {
@@ -1578,10 +1585,14 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
                 const float p3 = attn_expf(sa[f][3] - mnewB);
                 sumA += p0 + p1;
                 sumB += p2 + p3;
+                // [⑯ 2026-10-18] f2h×2 소프트(+분기) → F2FP.PACK_AB 1명령
+                // (__floats2half2_rn = 레인별 RNE — 전수 스윕으로 동일 확인).
+                const __half2 h01 = __floats2half2_rn(p0 * vs0, p1 * vs1);
+                const __half2 h23 = __floats2half2_rn(p2 * vs0, p3 * vs1);
                 *reinterpret_cast<unsigned*>(&Ps[rA][cc]) =
-                    fa2_pk(f2h(p0 * vs0), f2h(p1 * vs1));
+                    *reinterpret_cast<const unsigned*>(&h01);
                 *reinterpret_cast<unsigned*>(&Ps[rB][cc]) =
-                    fa2_pk(f2h(p2 * vs0), f2h(p3 * vs1));
+                    *reinterpret_cast<const unsigned*>(&h23);
             }
             sumA += __shfl_xor_sync(0xffffffffu, sumA, 1);
             sumA += __shfl_xor_sync(0xffffffffu, sumA, 2);
@@ -1666,11 +1677,15 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
                     }
                     const long oi = (size_t)r0 * (q_heads * 256) + (size_t)h * 256 + d2;
                     outv[oi] = ov;
+                    // [⑯ 2026-10-18] 소프트 f2h/h2f → HW cvt(근거는 norm.cu 주석).
                     if (out32 != (float*)0) {
-                        out32[oi] = h2f(f2h(ov));
-                    }
-                    if (out16 != (unsigned short*)0) {
-                        out16[oi] = f2h(ov);
+                        const __half h = __float2half_rn(ov);
+                        out32[oi] = __half2float(h);
+                        if (out16 != (unsigned short*)0) {
+                            out16[oi] = __half_as_ushort(h);
+                        }
+                    } else if (out16 != (unsigned short*)0) {
+                        out16[oi] = __half_as_ushort(__float2half_rn(ov));
                     }
                 }
             }
