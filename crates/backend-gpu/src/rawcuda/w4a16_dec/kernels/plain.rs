@@ -69,9 +69,9 @@ impl W4a16Dec {
             let tiles32 = t.div_ceil(GEMM_BMMA_M) as u64 * n.div_ceil(GEMM_BMMA_N) as u64;
             let m16 = tiles32 < 2 * self.cc.sm_count().max(1) as u64;
             let f = self.cc.function(if m16 {
-                "w4a16_gemm_bf16_mma16"
+                "w4a16_gemm_bf16_mma2_16"
             } else {
-                "w4a16_gemm_bf16_mma"
+                "w4a16_gemm_bf16_mma2"
             })?;
             let (mut p_w, mut p_x, mut p_o) = (w, self.dabf.ptr, y_out);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);

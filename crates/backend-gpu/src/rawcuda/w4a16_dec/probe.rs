@@ -1130,7 +1130,7 @@ impl W4a16Dec {
                     &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
                 ),
             )?;
-            let fm = self.cc.function("w4a16_gemm_bf16_mma")?;
+            let fm = self.cc.function("w4a16_gemm_bf16_mma2")?;
             let (mut m_w, mut m_x, mut m_o) = (w, dx, db);
             let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
             let mut m_b = 0i32; // [FLA-10] 게이트는 f32 경로(xbf=0).

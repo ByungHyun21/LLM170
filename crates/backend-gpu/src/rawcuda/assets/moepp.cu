@@ -30,6 +30,7 @@
 #define DGRP_M 64
 #define DGRP_N 64
 #define DGRP_KC 32
+#define BMMA_N 64 // [⑥-g] moe.cu 로컬 define 미러(플레인 bf16 mma N타일)
 // [⑥-c2 2026-10-18] m-타일 z분할 수 — 슬롯 분포 편중(97+ 슬롯 전문가 존재,
 // 실측 moe-cnt)으로 단일 블록이 mtiles를 직렬 처리하면 테일이 지배:
 // grid.x = 전문가×PP_MZ, 블록 = (e = x/PP_MZ, mz = x%PP_MZ), m타일 = mz부터
@@ -78,6 +79,167 @@ extern "C" __global__ void w4a16_cast_f16(const float* __restrict__ in,
             out[j] = f2h(in[j]);
         }
     }
+}
+
+// [⑥-g 2026-10-18] 플레인 bf16 mma — cp.async 이중버퍼 변형(moe.cu bmma_body 대체).
+// ncu(원판): 1웨이브·Mem 78.8%·long_sb 29%·barrier 26.6%·MIO 11% — 청크당 동기
+// 스테이징(LDG→STS)이 LSU/지연을 노출. cp.async는 레지스터 경유 없이 global→smem
+// 직행 + wait_group 파이프라인으로 배리어를 결과 대기로 대체. KC=32라 2단 버퍼
+// smem 15.4KB — 점유(8블록) 불변. 값·k 순서·mma 불변 = 비트동일(해시 검증).
+// xbf=1(프로덕션): bf16 미러 순수 복사 / xbf=0(프로브 게이트): f32→bf16 변환.
+__device__ __forceinline__ unsigned short f2bf16_v(float v) {
+    const unsigned u = __float_as_uint(v);
+    return (unsigned short)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
+
+__device__ __forceinline__ void mma_bf16(float* c, unsigned a0, unsigned a1,
+                                         unsigned a2, unsigned a3,
+                                         unsigned b0, unsigned b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+template <int MM>
+__device__ __forceinline__ void bmma_body2(
+    const unsigned short* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ out, int n, int k, int t, int xbf)
+{
+    __shared__ __align__(16) unsigned short xs[2][MM][MMA_KC + 8];
+    __shared__ __align__(16) unsigned short ws[2][BMMA_N][MMA_KC + 8];
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.x * MM;
+    const int n0 = blockIdx.y * BMMA_N;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int g = lane >> 2;
+    const int tt = lane & 3;
+    const int mt = (MM == 32) ? (warp >> 2) * 16 : 0;
+    const int ntw = (MM == 32) ? (warp & 3) * 16 : warp * 8;
+    constexpr int NF = (MM == 32) ? 2 : 1;
+    float c[NF][4];
+#pragma unroll
+    for (int i = 0; i < 4 * NF; ++i) {
+        ((float*)c)[i] = 0.0f;
+    }
+    auto stage = [&](int st, int k0) {
+        if (xbf) {
+            const unsigned short* x16 = reinterpret_cast<const unsigned short*>(x);
+            for (int e = tid; e < MM * MMA_KC / 8; e += 256) {
+                const int r = e / (MMA_KC / 8);
+                const int c8 = e % (MMA_KC / 8);
+                const int gi = k0 + c8 * 8;
+                if (m0 + r < t && gi + 7 < k) {
+                    cp_async16(&xs[st][r][c8 * 8], &x16[(size_t)(m0 + r) * k + gi]);
+                } else {
+                    for (int j = 0; j < 8; ++j) {
+                        xs[st][r][c8 * 8 + j] = (m0 + r < t && gi + j < k)
+                            ? x16[(size_t)(m0 + r) * k + gi + j]
+                            : (unsigned short)0;
+                    }
+                }
+            }
+        } else {
+            for (int e = tid; e < MM * MMA_KC / 4; e += 256) {
+                const int r = e / (MMA_KC / 4);
+                const int c4 = e % (MMA_KC / 4);
+                const int gi = k0 + c4 * 4;
+                const float4 v = (m0 + r < t)
+                    ? *reinterpret_cast<const float4*>(&x[(size_t)(m0 + r) * k + gi])
+                    : make_float4(0.f, 0.f, 0.f, 0.f);
+                if (gi + 3 < k) {
+                    xs[st][r][c4 * 4] = f2bf16_v(v.x);
+                    xs[st][r][c4 * 4 + 1] = f2bf16_v(v.y);
+                    xs[st][r][c4 * 4 + 2] = f2bf16_v(v.z);
+                    xs[st][r][c4 * 4 + 3] = f2bf16_v(v.w);
+                } else {
+                    xs[st][r][c4 * 4] = (gi < k) ? f2bf16_v(v.x) : (unsigned short)0;
+                    xs[st][r][c4 * 4 + 1] = (gi + 1 < k) ? f2bf16_v(v.y) : (unsigned short)0;
+                    xs[st][r][c4 * 4 + 2] = (gi + 2 < k) ? f2bf16_v(v.z) : (unsigned short)0;
+                    xs[st][r][c4 * 4 + 3] = (gi + 3 < k) ? f2bf16_v(v.w) : (unsigned short)0;
+                }
+            }
+        }
+        for (int e = tid; e < BMMA_N * MMA_KC / 8; e += 256) {
+            const int r = e / (MMA_KC / 8);
+            const int c8 = e % (MMA_KC / 8);
+            const int gi = k0 + c8 * 8;
+            if (n0 + r < n && gi + 7 < k) {
+                cp_async16(&ws[st][r][c8 * 8], &w[(size_t)(n0 + r) * k + gi]);
+            } else {
+                for (int j = 0; j < 8; ++j) {
+                    ws[st][r][c8 * 8 + j] = (n0 + r < n && gi + j < k)
+                        ? w[(size_t)(n0 + r) * k + gi + j]
+                        : (unsigned short)0;
+                }
+            }
+        }
+    };
+    stage(0, 0);
+    asm volatile("cp.async.commit_group;");
+    int cur = 0;
+    for (int k0 = 0; k0 < k; k0 += MMA_KC, cur ^= 1) {
+        const int kn = k0 + MMA_KC;
+        if (kn < k) {
+            stage(cur ^ 1, kn);
+        }
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 1;");
+        __syncthreads();
+#pragma unroll
+        for (int ks = 0; ks < MMA_KC / 16; ++ks) {
+            const int kb = ks * 16;
+            const int row = (lane & 15);
+            const int colblk = (lane & 16) ? 8 : 0;
+            unsigned a0, a1, a2, a3;
+            ldm_x4(a0, a1, a2, a3, &xs[cur][mt + row][kb + colblk]);
+#pragma unroll
+            for (int nt = 0; nt < NF; ++nt) {
+                const int nb = ntw + nt * 8;
+                unsigned b0, b1;
+                ldm_x2(b0, b1, &ws[cur][nb + (lane & 7)][kb + ((lane & 8) ? 8 : 0)]);
+                mma_bf16(c[nt], a0, a1, a2, a3, b0, b1);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int nt = 0; nt < NF; ++nt) {
+        const int col = n0 + ntw + nt * 8 + 2 * tt;
+        const int r0 = m0 + mt + g;
+        if (r0 < t) {
+            if (col < n) {
+                out[(size_t)r0 * n + col] = c[nt][0];
+            }
+            if (col + 1 < n) {
+                out[(size_t)r0 * n + col + 1] = c[nt][1];
+            }
+        }
+        if (r0 + 8 < t) {
+            if (col < n) {
+                out[(size_t)(r0 + 8) * n + col] = c[nt][2];
+            }
+            if (col + 1 < n) {
+                out[(size_t)(r0 + 8) * n + col + 1] = c[nt][3];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 6) w4a16_gemm_bf16_mma2(
+    const unsigned short* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ out, int n, int k, int t, int xbf)
+{
+    bmma_body2<32>(w, x, out, n, k, t, xbf);
+}
+
+extern "C" __global__ void w4a16_gemm_bf16_mma2_16(
+    const unsigned short* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ out, int n, int k, int t, int xbf)
+{
+    bmma_body2<16>(w, x, out, n, k, t, xbf);
 }
 
 // grp2 f16-A — 게이트·업 2N 융합(N64 = 게이트 32 + 업 32), M=전문가 슬롯 수.

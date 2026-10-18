@@ -127,6 +127,8 @@ pub const ASSETS: &[Asset] = &[
         ],
         syms: &[
             "w4a16_cast_f16",
+            "w4a16_gemm_bf16_mma2",
+            "w4a16_gemm_bf16_mma2_16",
             "w4a16_gemm_g32_mma_grp2_f16",
             "w4a16_gemm_g32_mma_grp_d64_f16",
         ],
