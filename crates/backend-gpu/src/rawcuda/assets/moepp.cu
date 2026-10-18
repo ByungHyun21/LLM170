@@ -53,7 +53,9 @@ extern "C" __global__ void w4a16_cast_f16(const float* __restrict__ in,
 }
 
 // grp2 f16-A — 게이트·업 2N 융합(N64 = 게이트 32 + 업 32), M=전문가 슬롯 수.
-extern "C" __global__ void w4a16_gemm_g32_mma_grp2_f16(
+// [⑥-d 2026-10-18] __launch_bounds__(256,4) — 점유 3→4블록(reg 70→≤64, 이슈율
+// 2.4/4·wait 32% 스톨을 워프 수로 메움; xs 스트라이드 반감으로 smem 20.5KB).
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g32_mma_grp2_f16(
     const unsigned long long* __restrict__ tab, int base,
     const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
     const unsigned* __restrict__ goff,
@@ -83,8 +85,10 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp2_f16(
     const int ntw = (warp & 1) * 32; // 2 n워프 × 32 = N64(게이트 32+업 32)
     const int k8 = k >> 3;
     const int kg = k >> 5; // g32
-    // A f16 — 행 스트라이드 160B(원 u32판 [KC+8]u32와 동일 — 뱅크 거동 승계).
-    __shared__ __align__(16) unsigned short xs[2][GRP_M][GRP_KC * 2 + 16];
+    // A f16 — 행 스트라이드 40half(80B): 원소 32 + 뱅크패딩 8. 워드 인덱스
+    // (r*20 + j/2) → 레인 뱅크 20g+tt = 전역 무충돌(160B 스트라이드의 2-way
+    // 충돌 제거) + smem 반감([⑥-d 2026-10-18]).
+    __shared__ __align__(16) unsigned short xs[2][GRP_M][GRP_KC + 8];
     __shared__ unsigned short ws[2][2 * GRP_N][GRP_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
     for (unsigned mtile = (unsigned)mz; mtile < mtiles; mtile += PP_MZ) {
@@ -235,8 +239,8 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64_f16(
     const int ntw = (warp & 1) * 32; // 2 n워프 × 32 = N64
     const int k8 = k >> 3;
     const int kg = k >> 5; // g32
-    // A f16 — 행 스트라이드 160B(원 u32판 [KC+8]u32와 동일 — 뱅크 거동 승계).
-    __shared__ __align__(16) unsigned short xs[2][DGRP_M][DGRP_KC * 2 + 16];
+    // A f16 — 행 스트라이드 40half(80B): 원소 32 + 뱅크패딩 8(무충돌 — ⑥-d).
+    __shared__ __align__(16) unsigned short xs[2][DGRP_M][DGRP_KC + 8];
     __shared__ unsigned short ws[2][DGRP_N][DGRP_KC + 8];
     const unsigned mtiles = (cnt + DGRP_M - 1) / DGRP_M;
     for (unsigned mtile = (unsigned)mz; mtile < mtiles; mtile += PP_MZ) {
