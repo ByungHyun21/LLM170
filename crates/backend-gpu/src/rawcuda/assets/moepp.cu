@@ -66,17 +66,22 @@ __device__ __forceinline__ unsigned short deq_hi_v(unsigned qw, int j, float sc)
 }
 
 // [⑥] f32 → f16(RNE) 미러 — 단일패스 A 소스(hilo_pack의 hi 성분과 비트동일).
+// [⑥-i 2026-10-18] f2h(소프트) → __float2half_rn(HW cvt 1명령) — 캐스트도
+// ⑥-f와 동일 클래스(원소당 ~20명령→1). 유한 입력에서 RNE 동일(비트동일 —
+// 벤치 해시 검증; NaN 페이로드만 상이 — 활성값 비해당).
 extern "C" __global__ void w4a16_cast_f16(const float* __restrict__ in,
                                           unsigned short* __restrict__ out, int n) {
     const int i4 = blockIdx.x * blockDim.x + threadIdx.x;
     if ((i4 + 1) * 4 <= n) {
         const float4 v = *reinterpret_cast<const float4*>(in + i4 * 4);
         unsigned* o = reinterpret_cast<unsigned*>(out + i4 * 4);
-        o[0] = (unsigned)f2h(v.x) | ((unsigned)f2h(v.y) << 16);
-        o[1] = (unsigned)f2h(v.z) | ((unsigned)f2h(v.w) << 16);
+        o[0] = (unsigned)__half_as_ushort(__float2half_rn(v.x))
+             | ((unsigned)__half_as_ushort(__float2half_rn(v.y)) << 16);
+        o[1] = (unsigned)__half_as_ushort(__float2half_rn(v.z))
+             | ((unsigned)__half_as_ushort(__float2half_rn(v.w)) << 16);
     } else {
         for (int j = i4 * 4; j < n; ++j) {
-            out[j] = f2h(in[j]);
+            out[j] = __half_as_ushort(__float2half_rn(in[j]));
         }
     }
 }
