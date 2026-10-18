@@ -373,8 +373,12 @@ extern "C" __global__ void gdn_l2perm(
 #define GDN_TILE 16
 // [A5-4] state 열 V-타일: 블록 = (h, vs타일). 구 VSLICE와 달리 A/KQ는
 // prepass가 비중복 계산한다(절단 시 A/KQ 중복이 기각 원인이었다).
-#define GDN_NSPLIT 4 // [2026-10-10 실험] 8은 smem 36.2KB — 3블록 문턱
+#define GDN_NSPLIT 4 // [2026-10-10 실험] 8은 당시 smem 36.2KB — 3블록 문턱
                      // 33.3KB 미달로 점유 무변(원복).
+                     // [2026-10-18 CMP 재검] 아래 bp 버그 수정 후 8을
+                     // 비트동일·골든 불변으로 재판정 — pp512 720→688(−4.5%)·
+                     // pp1024 713→680(−4.6%) = 고정비(sk/A/KQ 블록당 재판독)
+                     // 이중화로 기각. V-분할 축 소진.
 #define GDN_VS (128 / GDN_NSPLIT)   // 블록당 열 수
 #define GDN_NGRP 16                 // 워크그룹 = 512스레드 / GDN_VS
 
@@ -523,7 +527,11 @@ extern "C" __global__ void gdn_scan(
                 gcs[t] = acc;
             }
             gcs[GDN_CS] = acc;
-            bp[tid] = (tid < n) ? bg[(t0 + tid) * (2 * h_v) + h] : 0.0f;
+            // [2026-10-18] bp는 [CS]인데 tid(=tx%GDN_VS)로 기록 — VS==CS(32)
+        // 가정이 숨어 VS<32면 bp[VS..CS-1]이 미기록 smem(전진대입 rhs 오염
+        // — NSPLIT≠4에서 n=32 발산·비결정의 원인). threadIdx.x로 전 구간
+        // 기록 — VS=32에선 tx≡tid라 기존과 비트동일.
+        bp[threadIdx.x] = (threadIdx.x < n) ? bg[(t0 + threadIdx.x) * (2 * h_v) + h] : 0.0f;
         }
         // [A5-4] A/KQ는 prepass 산출 복사(prepass와 셀 값 비트동일).
         {

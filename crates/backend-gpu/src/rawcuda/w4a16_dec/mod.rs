@@ -57,6 +57,8 @@ pub const MOE_PP_MZ: usize = 4;
 pub const GDN_SCAN_SMEM: u32 = 27_140; // [FLA-1] +e[CS] 128B (qs 제거 -16KB 유지)
 /// [A5-4 2026-10-10 FLA 2단] gdn_scan V-타일 분할 수(커널 GDN_NSPLIT와
 /// 동일 계약) — grid = h_v×NSPLIT, 블록 = GDN_NGRP×GDN_VS스레드.
+/// [2026-10-18 CMP 재검] 8은 bp 버그 수정 후 비트동일·골든 불변 —
+/// 성능 pp −4.5% 기각(커널 GDN_NSPLIT 주석). 4 확정.
 pub const GDN_NSPLIT: usize = 4;
 /// [A5-4] gdn_scan 워크그룹 수(커널 GDN_NGRP와 동일 계약).
 pub const GDN_NGRP: usize = 16;
