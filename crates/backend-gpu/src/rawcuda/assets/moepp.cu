@@ -54,6 +54,16 @@ __device__ __forceinline__ void ldm_x2(unsigned& r0, unsigned& r1, const void* p
                  : "r"(a));
 }
 
+// [⑥-f 2026-10-18] 디큐트 전용 초경량 f32→f16 — `cvt.rn.f16.f32` 단일 명령.
+// (g4_common의 f2h는 호스트 전수 대조용 서브노멀 정규화 루프 + 분기 —
+// SASS 실측 원소당 ~20명령·BSSY/BSYNC 2쌍. 본 입력 = (nib−8)·sc — 정확한
+// ≤15비트 곱(sc는 f16 값의 f32 정확 표현)이라 HW cvt RNE = 소프트 f2h RNE와
+// 동일 결과(서브노멀 출력 포함) — 비트동일은 벤치 해시로 검증.)
+__device__ __forceinline__ unsigned short deq_hi_v(unsigned qw, int j, float sc) {
+    const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
+    return __half_as_ushort(__float2half_rn((float)nib * sc));
+}
+
 // [⑥] f32 → f16(RNE) 미러 — 단일패스 A 소스(hilo_pack의 hi 성분과 비트동일).
 extern "C" __global__ void w4a16_cast_f16(const float* __restrict__ in,
                                           unsigned short* __restrict__ out, int n) {
@@ -163,7 +173,7 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g32_mma_grp2_f16
                 if (live) {
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
-                        ws[st][r][c8 * 8 + j] = deq_hi_e(qw, j, scf);
+                        ws[st][r][c8 * 8 + j] = deq_hi_v(qw, j, scf);
                     }
                 } else {
 #pragma unroll
@@ -313,7 +323,7 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64_f16(
                 if (live) {
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
-                        ws[st][r][c8 * 8 + j] = deq_hi_e(qw, j, scf);
+                        ws[st][r][c8 * 8 + j] = deq_hi_v(qw, j, scf);
                     }
                 } else {
 #pragma unroll
