@@ -26,7 +26,7 @@ end-to-end on GPU with an int8 KV cache and CUDA-graph decode — 27B dense
 
 | row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
 |---|---|---|---|---|---|
-| CUDA (170HX, 180 W, 2026-10-18) | 755.54 | 745.01 | 715.00 | 42.20 | 59.50 |
+| CUDA (170HX, 180 W, 2026-10-18) | 1258.83 | 1248.77 | 1178.92 | 42.66 | 59.50 |
 
 ### Qwen3.6-35B-A3B-W4A16 (g32, MoE resident)
 
