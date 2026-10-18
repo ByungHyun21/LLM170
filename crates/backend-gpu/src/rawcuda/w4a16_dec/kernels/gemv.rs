@@ -159,7 +159,9 @@ impl W4a16Dec {
         // grid = 블록당 16행(8워프×2행).
         if t > 16 && g == 32 && sb {
             let t16 = t & !15;
-            let ft = self.cc.function("w4a16_gemv_g32_bf16_tall2")?;
+            // [⑮ 2026-10-18] tall4(R=4·T=8) — ncu: tall2는 L1 81.3%·lg_throttle
+            // 55%로 x 재판독 포화(행당 x 파형/FFMA 절반화). 비트계약 불변.
+            let ft = self.cc.function("w4a16_gemv_g32_bf16_tall4")?;
             // [P9-2 2026-10-17 기각] k≥4096 x 패딩([t][k+8]/[t][k+32] 재패킹
             // 발사) A/B — o 5.53→5.49ms(±1% 무효)·글로벌 o 9.90→10.71ms
             // (−8% 역행): L1 셋 충돌 가설 기각(전수치 = gemma4.cu 헤더).
@@ -168,7 +170,7 @@ impl W4a16Dec {
             let (mut an, mut ak, mut at) = (n as i32, k as i32, t16 as i32);
             self.cc.launch(
                 ft,
-                n.div_ceil(16) as u32,
+                n.div_ceil(32) as u32,
                 t16.div_ceil(128) as u32, // [P9] t-청크 2D 그리드(테일 희석)
                 256,
                 &mut crate::rawcuda::args::l7(
