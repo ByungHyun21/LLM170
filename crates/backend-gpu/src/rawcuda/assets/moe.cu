@@ -863,6 +863,69 @@ extern "C" __global__ void w4a16_moe_accum_sg(const float* __restrict__ w,
     }
 }
 
+// [2026-10-18] 전문가-우선 슬롯 순열 v2 — gptq4.cu w4a16_moe_align의 단일
+// 스레드 O(nslots) 직렬 스캐터를 대체. 출력은 완전 동일(전문가별 슬롯 j
+// 오름차순 — C4 계약·입력만의 함수, 원자 획득 순 무관). 카운트(원자합)·
+// 접두(스레드 0)는 종전과 동일. gptq4.cu 원본은 코드젠 드로우 동결
+// (2026-10-11 경고)로 잔존 — 심볼 등록만. n_exp ≤ 1024(호스트 가드)·
+// 블록 256. [실측 2026-10-18] 발사당 103.8µs(원본) → 34.7µs(본 커널) —
+// 중간 시안 "전문가별 전슬롯 스캔"(65.6µs)은 명령량 열세로 폐기.
+// 35B A/B pp512 +1.7%·pp1024 +1.4%·비트동일(해시 불변).
+extern "C" __global__ void w4a16_moe_align2(
+    const int* __restrict__ idx, int nslots,
+    unsigned* __restrict__ gslot, unsigned* __restrict__ gcnt,
+    unsigned* __restrict__ goff, int n_exp)
+{
+    __shared__ unsigned cnt[1024];
+    __shared__ unsigned off[1024];
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    for (int i = tid; i < n_exp; i += nt) {
+        cnt[i] = 0;
+    }
+    __syncthreads();
+    for (int j = tid; j < nslots; j += nt) {
+        atomicAdd(&cnt[idx[j]], 1u);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        unsigned acc = 0;
+        for (int i = 0; i < n_exp; ++i) {
+            off[i] = acc;
+            acc += cnt[i];
+            gcnt[i] = cnt[i];
+            goff[i] = off[i];
+        }
+    }
+    __syncthreads();
+    // 스캐터 = 단일 워프 32-슬롯 청크 순차 스캔. 청크 내 랭크는
+    // __match_any_sync(같은 전문가 레인 마스크)·popc로 일괄 — 스레드별
+    // 전슬롯 스캔(v2 = 66µs 실측, 중복 명령 처리량 바운드)을 청크당
+    // ~20명령으로 대체. 진행 카운트는 값별 리더 1인이 비원자 가산
+    // (청크 내 값당 그룹 유일 — 결정론). 순서는 j 오름차순 계약 그대로.
+    if (tid < 32) {
+        const int l = tid;
+        const unsigned lt = (1u << l) - 1u;
+        for (int i = l; i < n_exp; i += 32) {
+            cnt[i] = 0; // 진행 카운터 재사용(접두는 goff/gcnt에 기기록)
+        }
+        __syncwarp();
+        for (int base = 0; base < nslots; base += 32) {
+            const int j = base + l;
+            const int e = (j < nslots) ? idx[j] : -1;
+            const unsigned m = __match_any_sync(0xFFFFFFFFu, e);
+            if (e >= 0 && j < nslots) {
+                gslot[off[e] + cnt[e] + __popc(m & lt)] = (unsigned)j;
+            }
+            __syncwarp(); // 전원 랭크 확정 후 카운트 갱신
+            if (e >= 0 && j < nslots && (1u << l) == (m & (0u - m))) {
+                cnt[e] += __popc(m);
+            }
+            __syncwarp(); // 갱신 가시화 후 차기 청크
+        }
+    }
+}
+
 extern "C" __global__ void w4a16_shared_add(const float* __restrict__ sg,
                                             const float* __restrict__ x,
                                             float* __restrict__ y, int n) {

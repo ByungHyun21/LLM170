@@ -49,6 +49,8 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_gemv_g32_bf16_tall",
             // [⑮② 2026-10-18] 다중세그먼트(q/k/v·gate/up) — gemma4 청크 융합.
             "w4a16_gemv_g32_bf16_multi_t",
+            // [2026-10-18] 레거시 — 디스패치 미사용(moe.cu align2가 단일 경로).
+            // gptq4.cu 드로우 동결로 커널만 잔존(심볼 등록·발사 없음).
             "w4a16_moe_align",
             "w4a16_gemm_g128_mma",
             "w4a16_gemv_g32_bf16_t",
@@ -108,6 +110,8 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_moe_pes_scale",
             "w4a16_moe_topk_t",
             "w4a16_moe_topk256",
+            // [2026-10-18] 전문가-우선 순열 v2(gptq4.cu 원본의 직렬 스캔 대체).
+            "w4a16_moe_align2",
             "w4a16_shared_add",
             "w4a16_moe_accum_sg",
             "w4a16_gemm_g32_mma_grp_d64",
