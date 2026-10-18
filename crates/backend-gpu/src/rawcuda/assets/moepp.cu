@@ -26,10 +26,10 @@
 
 #define GRP_M 64
 #define GRP_N 32
-#define GRP_KC 32
+#define GRP_KC 64 // [⑥-h 2026-10-18] 32→64 — 배리어 절반·스테이징 2iter/스레드(LDG 상각)
 #define DGRP_M 64
 #define DGRP_N 64
-#define DGRP_KC 32
+#define DGRP_KC 64 // [⑥-h] 32→64 (동일 근거)
 #define BMMA_N 64 // [⑥-g] moe.cu 로컬 define 미러(플레인 bf16 mma N타일)
 // [⑥-c2 2026-10-18] m-타일 z분할 수 — 슬롯 분포 편중(97+ 슬롯 전문가 존재,
 // 실측 moe-cnt)으로 단일 블록이 mtiles를 직렬 처리하면 테일이 지배:
