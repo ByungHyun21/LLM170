@@ -117,6 +117,22 @@ pub const ASSETS: &[Asset] = &[
         boot: true,
     },
     Asset {
+        // [⑥ 2026-10-18] MoE 프리필 grp 커널의 A=f16 단일패스 변형 —
+        // gptq4.cu/moe.cu 드로우 동결 유지용 독립 파일(.cu 헤더 참조).
+        name: "moepp",
+        env: "LLM170_CUDA_MOEPP_FATBIN_PATH",
+        paths: &[
+            "crates/backend-gpu/src/rawcuda/assets/moepp.fatbin",
+            "src/rawcuda/assets/moepp.fatbin",
+        ],
+        syms: &[
+            "w4a16_cast_f16",
+            "w4a16_gemm_g32_mma_grp2_f16",
+            "w4a16_gemm_g32_mma_grp_d64_f16",
+        ],
+        boot: true,
+    },
+    Asset {
         name: "norm",
         env: "LLM170_CUDA_NORM_FATBIN_PATH",
         paths: &[
@@ -248,6 +264,7 @@ pub fn cu_source(name: &str) -> &'static str {
         "gptq4" => include_str!("assets/gptq4.cu"),
         "gemma4" => include_str!("assets/gemma4.cu"),
         "moe" => include_str!("assets/moe.cu"),
+        "moepp" => include_str!("assets/moepp.cu"),
         "decode" => include_str!("assets/decode.cu"),
         "norm" => include_str!("assets/norm.cu"),
         "gdn" => include_str!("assets/gdn.cu"),

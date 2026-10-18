@@ -753,16 +753,18 @@ impl W4a16Dec {
             )?;
         }
         // ④ 전문가 — 상주 경로 2종:
-        //  [A2b 2026-10-15] t>G4_TROW_MAX(프리필 청크) = **그룹드 mma 3-pass**
-        //  (CMP 방향 — GA100-class는 FP32 약·TC 강·HBM 넓음): 전문가-우선
-        //  정렬 후 가중을 전문가당 1회만 판독하고, A·B의 f16 반올림을 hi/lo
-        //  2분해로 회수한다(잔여 = f32 누산 순서 — eval 밴드 판정).
+        //  [⑥ 2026-10-18] t>G4_TROW_MAX(프리필 청크) = **그룹드 mma A 단일
+        //  f16 패스** (CMP 방향 — GA100-class는 FP32 약·TC 강·HBM 넓음):
+        //  전문가-우선 정렬 후 가중을 전문가당 1회만 판독하고, A는 단일
+        //  f16(RNE) — [A2b] hi/lo 2분해는 ncu wait 스톨(고정지연 의존) 지배로
+        //  제거(moepp.cu). 잔여 오차 = A f16 반올림 + f32 누산 순서 — eval
+        //  게이트 판정(과거 실측 en PPL +0.17%·agree 98.6% 밴드).
         //  t≤16(디코드 배치·단문 청크) = 융합 GEMV(f32 비트동일 기준선).
         let ns = t * tk;
         let base = il * n_exp * 3;
         if t > G4_TROW_MAX && n_exp <= 1024 {
             self.moe_align_launch(ns)?;
-            let xp = self.cast_hilo_dev(dxn, t * h)?;
+            let xp = self.cast_f16_dev(dxn, t * h)?;
             self.gemm_g32_mma_grp2_launch(
                 base,
                 xp,
@@ -779,7 +781,7 @@ impl W4a16Dec {
                 self.moe.exp.act,
                 ns * n_ff,
             )?;
-            let ap = self.cast_hilo_dev(self.moe.exp.act, ns * n_ff)?;
+            let ap = self.cast_f16_dev(self.moe.exp.act, ns * n_ff)?;
             self.gemm_g32_mma_grp_d64_launch(base + 2, ap, n_ff, 1, self.moe.exp.dn, h, n_ff)?;
         } else {
             self.gemv_experts_glu_launch(base, ns, dxn, h, tk, self.moe.exp.act, n_ff, h)?;

@@ -68,17 +68,18 @@ build gptq4 -fmad=false
 build gemma4 -fmad=false
 build decode -fmad=false
 build moe   -fmad=false
+build moepp -fmad=false
 build head  -fmad=false
 
 # 매니페스트 갱신 — 리빌드분은 새 쌍, 스킵분은 기존 엔트리 유지(부재 시 현재
 # 상태를 시드 — 최초 도입/매니페스트 삭제 시에만). preflight 5단계가 대조한다.
-for name in smoke norm gdn attn ew embed gptq4 gemma4 moe decode head; do
+for name in smoke norm gdn attn ew embed gptq4 gemma4 moe moepp decode head; do
     if [ -z "${MAN_SRC[$name]:-}" ]; then
         MAN_SRC[$name]=$(man_src "$name"); MAN_FB[$name]=$(man_fb "$name")
     fi
 done
 {
-    for name in smoke norm gdn attn ew embed gptq4 gemma4 moe decode head; do
+    for name in smoke norm gdn attn ew embed gptq4 gemma4 moe moepp decode head; do
         echo "${MAN_SRC[$name]} ${MAN_FB[$name]} $name"
     done
 } > "$MAN.tmp" && mv "$MAN.tmp" "$MAN"

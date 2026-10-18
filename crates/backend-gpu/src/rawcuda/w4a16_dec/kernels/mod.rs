@@ -80,7 +80,7 @@ impl W4a16Dec {
 
     /// [A2b 2026-10-15] ew_gelu를 명시 f32 버퍼에 기록(슬롯 비경유) — 그룹 mma
     /// 경로의 act(전문가 활성) 산출. `ew_dev`(silu)의 gelu판, 미러 없음
-    /// (A 미러는 `cast_hilo_dev`가 packed로 만든다).
+    /// (A 미러는 `cast_f16_dev`가 만든다).
     pub(in crate::rawcuda::w4a16_dec) fn ew_gelu_dev(
         &mut self,
         g_dev: CUdeviceptr,
@@ -103,18 +103,20 @@ impl W4a16Dec {
         )
     }
 
-    /// [A2b 2026-10-15] f32 → (hi|lo) f16 packed(A 미러 4B/원소) — 그룹 mma
-    /// 3-pass의 A 소스. 캡처 중 재할당은 capture_guard로 즉시 실패(사전 warm 계약).
-    pub(in crate::rawcuda::w4a16_dec) fn cast_hilo_dev(
+    /// [⑥ 2026-10-18] f32 → f16(RNE) 미러(2B/원소) — 그룹 mma **단일패스**
+    /// A 소스. 종전 [A2b] cast_hilo(hi|lo 2-pass)의 hi 성분과 비트동일.
+    /// 캡처 중 재할당은 capture_guard로 즉시 실패(사전 warm 계약).
+    /// dxp 버퍼는 4B/원소 용량 기준 — 앞 2B만 사용(재할당 없음).
+    pub(in crate::rawcuda::w4a16_dec) fn cast_f16_dev(
         &mut self,
         x_dev: CUdeviceptr,
         n: usize,
     ) -> Result<CUdeviceptr, String> {
         if n == 0 {
-            return Err("cast_hilo: n=0".into());
+            return Err("cast_f16: n=0".into());
         }
         let p = self.ensure_dxp(n)?;
-        let f = self.cc.function("w4a16_cast_hilo")?;
+        let f = self.cc.function("w4a16_cast_f16")?;
         let (mut a0, mut a1, mut nn) = (x_dev, p, n as i32);
         self.cc.launch(
             f,
@@ -337,6 +339,6 @@ impl W4a16Dec {
         )
     }
 
-    // [A2b 2026-10-15] (구 ew_dev_mirror 삭제 — A 미러는 cast_hilo_dev의
-    // packed(hi|lo)로 대체. 3-pass가 f16 미러를 소비하지 않는다.)
+    // [A2b 2026-10-15] (구 ew_dev_mirror 삭제 — A 미러는 캐스트 커널이
+    // 만든다. [⑥ 2026-10-18] cast_hilo packed → cast_f16 단일 f16.)
 }
