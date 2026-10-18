@@ -17,12 +17,16 @@ pub(crate) fn g4_chunk(
     rows: &[f32],
     t: usize,
     head_last: bool,
+    softcap: bool,
 ) -> Result<Vec<Vec<f32>>, String> {
     let hp = &model.hp;
     // 노름 행 계약 = 8행/층 + 최종 1행(upload_model_g4 조립 순서).
     let rows_per_layer = 8usize;
     let mut out = dec.g4_chunk_dev(slots, pos, rows, t, head_last, rows_per_layer, hp.eps)?;
-    if cfg.softcap > 0.0 {
+    // [⑮③ 2026-10-18] greedy 소비는 소프트캡 생략 가능(c·tanh(x/c) = 단조
+    // 증가 — argmax 불변·동률 보존). 호스트 tanh 262144개/토큰 ≈ 2.2ms 절감
+    // (nsys 실측: 토큰 경계 CPU 공백). 로짓(샘플) 소비는 유지.
+    if softcap && cfg.softcap > 0.0 {
         for r in out.iter_mut() {
             for l in r.iter_mut() {
                 *l = cfg.softcap * (*l / cfg.softcap).tanh();
@@ -43,6 +47,7 @@ pub(crate) fn g4_step(
     slot: usize,
     tok: u32,
     pos: u32,
+    softcap: bool,
 ) -> Result<Vec<f32>, String> {
     let hp = &model.hp;
     let h = hp.n_embd;
@@ -163,7 +168,7 @@ pub(crate) fn g4_step(
         eprintln!("gemma4[gpu] final max|x|={mx:.4} nan={nan}");
     }
     let mut lg = dec.head_logits_host(&xf)?;
-    if cfg.softcap > 0.0 {
+    if softcap && cfg.softcap > 0.0 {
         for l in lg.iter_mut() {
             *l = cfg.softcap * (*l / cfg.softcap).tanh();
         }

@@ -395,7 +395,8 @@ fn ppl_g4(
         }
         let csv: Vec<usize> = vec![0; t];
         let cpos: Vec<u32> = (0..t).map(|r| (i + r) as u32).collect();
-        let lgs = crate::gpu_engine::g4_chunk(&mut dec, &model, &cfg, &csv, &cpos, &rb, t, false)?;
+        let lgs =
+            crate::gpu_engine::g4_chunk(&mut dec, &model, &cfg, &csv, &cpos, &rb, t, false, true)?;
         if route {
             // 청크분 = 층 실행 순서대로 [t][k] 세그먼트 nl개(캡처 계약).
             // 행 정렬 = rows 루프와 동일 가드(마지막 위치는 스코어링 없음).
@@ -998,8 +999,9 @@ fn needle(args: &[String]) -> Result<String, String> {
                 }
                 let csv: Vec<usize> = vec![0; t];
                 let cpos: Vec<u32> = (0..t).map(|r| (i + r) as u32).collect();
-                let out =
-                    crate::gpu_engine::g4_chunk(&mut dec, &model, &cfg, &csv, &cpos, &rb, t, last)?;
+                let out = crate::gpu_engine::g4_chunk(
+                    &mut dec, &model, &cfg, &csv, &cpos, &rb, t, last, true,
+                )?;
                 if last {
                     lg = out.into_iter().next().unwrap_or_default();
                 }
@@ -1028,6 +1030,7 @@ fn needle(args: &[String]) -> Result<String, String> {
                     &er,
                     1,
                     false,
+                    true,
                 )?;
                 row = out.into_iter().next().unwrap_or_default();
             }

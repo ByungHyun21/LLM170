@@ -444,7 +444,7 @@ pub(super) fn g4_gpu_chain(
     let mut lg = Vec::new();
     for &tok in prompt {
         dec.kv_grow(0, pos as usize + 1)?;
-        lg = g4_step(dec, model, cfg, 0, tok, pos)?;
+        lg = g4_step(dec, model, cfg, 0, tok, pos, true)?;
         pos += 1;
     }
     let mut step_logits: Vec<Vec<f32>> = vec![lg.clone()];
@@ -453,7 +453,7 @@ pub(super) fn g4_gpu_chain(
         let next = llm170_core::gemma4::greedy(&lg);
         out.push(next);
         dec.kv_grow(0, pos as usize + 1)?;
-        lg = g4_step(dec, model, cfg, 0, next, pos)?;
+        lg = g4_step(dec, model, cfg, 0, next, pos, true)?;
         pos += 1;
         step_logits.push(lg.clone());
     }

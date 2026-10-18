@@ -93,11 +93,19 @@ impl GemmaEngine {
     /// **전문가 비상주(스트리밍)에선 v0 호스트 체인(g4_step)으로 폴백** — t행
     /// MoE(g4_moe_dev_t)가 스트리밍 미지원이라, 배치·프리필의 비상주 분기가
     /// 모두 수렴하는 이 스텝이 저하 사다리의 단일 통로다.
-    fn step(&mut self, seq: usize, tok: u32) -> Result<Vec<f32>, String> {
+    fn step(&mut self, seq: usize, tok: u32, softcap: bool) -> Result<Vec<f32>, String> {
         let pos = self.dec.slot_pos[seq];
         self.dec.kv_grow(seq, pos as usize + 1)?;
         if !self.dec.moe_experts_resident() {
-            let lg = g4_step(&mut self.dec, &self.model, &self.cfg, seq, tok, pos)?;
+            let lg = g4_step(
+                &mut self.dec,
+                &self.model,
+                &self.cfg,
+                seq,
+                tok,
+                pos,
+                softcap,
+            )?;
             self.dec.slot_pos[seq] = pos + 1;
             // [2.N Stage 2] 스트리밍 경로도 확정 위치 — KV 트림은 MoE 상주와 무관.
             self.maybe_trim(seq)?;
@@ -113,6 +121,7 @@ impl GemmaEngine {
             &rows,
             1,
             false,
+            softcap,
         )?;
         self.dec.slot_pos[seq] = pos + 1;
         // [2.N Stage 2] 확정 1토큰 — 플로어 전진 가능.
@@ -172,7 +181,7 @@ impl GemmaEngine {
             let pos = self.dec.slot_pos[seq];
             self.dec.kv_grow(seq, pos as usize + chunk.len())?;
             if chunk.len() == 1 {
-                last = self.step(seq, chunk[0])?;
+                last = self.step(seq, chunk[0], true)?;
             } else {
                 let mut rows: Vec<f32> = Vec::with_capacity(chunk.len() * self.model.hp.n_embd);
                 for &tk in chunk {
@@ -189,6 +198,7 @@ impl GemmaEngine {
                     &rows,
                     chunk.len(),
                     want, // [⑰-1] 중간 청크 = 헤드 스킵
+                    true,
                 )?;
                 self.dec.slot_pos[seq] = pos + chunk.len() as u32;
                 if want {
@@ -204,6 +214,18 @@ impl GemmaEngine {
     /// 슬롯 배치 1토큰 — **이종 슬롯·위치 t행 청크**(가중 상각) + 행별 로짓.
     /// 스트리밍 전문가·t>16은 슬롯별 t=1 폴백.
     pub fn decode(&mut self, seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
+        self.decode_sc(seq_ids, tokens, true)
+    }
+
+    /// [⑮③ 2026-10-18] softcap 플래그판 — greedy 전용 소비(전부-그리디 배치:
+    /// decode_np_greedy·스텝)는 소프트캡 생략(argmax 단조 불변 = 토큰 동일,
+    /// 호스트 tanh 262144개/토큰 ≈ 2.2ms 절감). 로짓(샘플·혼합) 소비는 true.
+    fn decode_sc(
+        &mut self,
+        seq_ids: &[usize],
+        tokens: &[u32],
+        softcap: bool,
+    ) -> Result<Vec<Vec<f32>>, String> {
         if seq_ids.len() != tokens.len() {
             return Err(format!(
                 "decode: seqs={} toks={} 불일치",
@@ -216,12 +238,12 @@ impl GemmaEngine {
         }
         let t = seq_ids.len();
         if t == 1 {
-            return Ok(vec![self.step(seq_ids[0], tokens[0])?]);
+            return Ok(vec![self.step(seq_ids[0], tokens[0], softcap)?]);
         }
         if t > 16 || !self.dec.moe_experts_resident() {
             let mut out = Vec::with_capacity(t);
             for (&s, &tok) in seq_ids.iter().zip(tokens.iter()) {
-                out.push(self.step(s, tok)?);
+                out.push(self.step(s, tok, softcap)?);
             }
             return Ok(out);
         }
@@ -243,6 +265,7 @@ impl GemmaEngine {
             &rows,
             t,
             false,
+            true,
         )?;
         for (i, &s) in seq_ids.iter().enumerate() {
             self.dec.slot_pos[s] = pos[i] + 1;
@@ -261,14 +284,15 @@ impl GemmaEngine {
         tokens: &[u32],
     ) -> Result<Vec<u32>, String> {
         Ok(self
-            .decode(seq_ids, tokens)?
+            .decode_sc(seq_ids, tokens, false)?
             .iter()
             .map(|l| llm170_core::matmul::greedy_from(l))
             .collect())
     }
 
     pub fn decode_greedy(&mut self, seq: usize, token: u32) -> Result<u32, String> {
-        let lg = self.step(seq, token)?;
+        // greedy 소비 — 소프트캡 생략(argmax 단조 불변, 토큰 동일).
+        let lg = self.step(seq, token, false)?;
         Ok(llm170_core::matmul::greedy_from(&lg))
     }
 
@@ -362,6 +386,7 @@ impl GemmaEngine {
             rows,
             t,
             false,
+            true,
         )?;
         self.dec.slot_pos[slot] = pos0 + t as u32;
         Ok(lgs)
