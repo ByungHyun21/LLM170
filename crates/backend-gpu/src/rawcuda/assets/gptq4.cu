@@ -1105,6 +1105,10 @@ extern "C" __global__ void w4a16_copy(const float4* __restrict__ src,
 // 누산 64개(c[2][8][4])의 레지스터 압박으로 점유 3→2블록, A 절반 이득을
 // 압도(bf16_mma N128 기각과 동형: 이 계열은 L2보다 점유 민감). 되돌림.
 #define MMA_N 128
+// [KC64 실험 2026-10-18] 마린 thread_k=64 대응 — K청크 32→64(공용 MMA_KC와
+// 분리한 g128 전용). 배리어·cp.async 그룹·스테이징 왕복 빈도 ÷2. 값 비트동일
+// (k 누산 순서 불변). 판정은 실측 기록.
+#define MMA_KC_G 64
 
 #define GRP_M 64
 #define GRP_N 32
@@ -1149,6 +1153,13 @@ __device__ __forceinline__ unsigned deq_pair_b(unsigned qw, int tt, float sc) {
 // (P4096 2765→2838ms·pp16384 14494→15241ms·커널 7712→7958ms) — smem
 // 30.7KB로 L1 축소가 우세(marlin-C4 30.5KB 실측과 동형). 되돌림. 잔여
 // math_pipe_throttle(2.88) 해소는 smem 비증가 구조에서만 시도할 것.
+// [실측 원장 — 2026-10-18 캠페인2(g128_mma 현대화, CMP)] (a) N192@384·lb(384,2):
+// 비트동일·pp512 −4.3%·pp1024 −4.1% 기각. (b) N256@256 재검(FLA-11 4090 기각 형상):
+// lb(256,2) −3.7/−3.8% · lb(256,1)(마린 뚱뚱 CTA 지점) −3.7% — 점유 무관 동일
+// 손실 = N256 타일 자체가 이 파이프라인과 열세(기각). (c) KC=64(MMA_KC_G — 마린
+// thread_k=64 대응): 비트동일·pp512 **+5.1%** 채택(배리어·wait_group 빈도 ÷2).
+// (d) +3버퍼 파이프라인(ST3·프리페치 2·smem 124KB/3CTA): KC64 대비 −1.9% 기각
+// (L1 40KB 잔존 — marlin-C4와 동형).
 // [실측 기각 원장 — 2026-10-18 ⑭/⑰②] (1) launch_bounds(256,3→4)(REG 79→64·
 // 스필 8B·4블록): 비트동일·**pp512 −4.4%** — reg 79 할당의 스케줄/ILP가
 // load-bearing(sk_marlin lb5 −2.1%와 동형). (2) t=2 행-분할 매핑(워프=1행×2열·
@@ -1173,9 +1184,9 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
 {
     // [지연 은닉] 더블 버퍼 — ncu: Compute 27%·점유 35%·No Eligible 77%(지연
     // 바운드). 스테이징(k+1)과 mma(k)를 겹친다(버퍼 2×27.6KB = 55KB < 100KB).
-    __shared__ __align__(16) unsigned short xs[2][MMA_M][MMA_KC + 8];
+    __shared__ __align__(16) unsigned short xs[2][MMA_M][MMA_KC_G + 8];
     // [marlin-B] B는 패킹 int4 그대로(디큐트는 레지스터, mma 전) + 청크 스케일.
-    __shared__ unsigned wsp[2][MMA_N][MMA_KC / 8];
+    __shared__ unsigned wsp[2][MMA_N][MMA_KC_G / 8];
     __shared__ float ssm[2][MMA_N];
     const int tid = threadIdx.x;
     const int m0 = blockIdx.x * MMA_M;
@@ -1198,9 +1209,9 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
     int cur = 0;
     int k0 = 0;
     // 초기 스테이징(청크 0) — f16 16B 로드 → 그대로 복사(변환 없음).
-    for (int e = tid; e < MMA_M * MMA_KC / 8; e += 256) {
-        const int r = e / (MMA_KC / 8);
-        const int c8 = e % (MMA_KC / 8);
+    for (int e = tid; e < MMA_M * MMA_KC_G / 8; e += 256) {
+        const int r = e / (MMA_KC_G / 8);
+        const int c8 = e % (MMA_KC_G / 8);
         const int gi = c8 * 8;
         if (m0 + r < t && gi + 7 < k) {
             cp_async16(&xs[0][r][c8 * 8], &x[(size_t)(m0 + r) * k + gi]);
@@ -1218,9 +1229,9 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
         }
     }
     asm volatile("cp.async.commit_group;");
-    for (int e = tid; e < MMA_N * (MMA_KC / 8); e += 256) {
-        const int r = e / (MMA_KC / 8);
-        const int c8 = e % (MMA_KC / 8);
+    for (int e = tid; e < MMA_N * (MMA_KC_G / 8); e += 256) {
+        const int r = e / (MMA_KC_G / 8);
+        const int c8 = e % (MMA_KC_G / 8);
         const int gi = c8 * 8;
         const bool live = (n0 + r < n) && (gi + 7 < k);
         // 패딩 니블 = 8(값 0) — 0u면 (0-8)*sc ≠ 0이 된다.
@@ -1238,13 +1249,13 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
     // smem 30.5KB/블록으로 L1 캐시 축소(프래그먼트·스테이징 L1 의존).
     asm volatile("cp.async.wait_group 0;");
     __syncthreads();
-    for (; k0 < k; k0 += MMA_KC, cur ^= 1) {
+    for (; k0 < k; k0 += MMA_KC_G, cur ^= 1) {
         // 다음 청크 스테이징을 cp.async로 발사 — 아래 mma와 겹친다.
-        const int kn = k0 + MMA_KC;
+        const int kn = k0 + MMA_KC_G;
         if (kn < k) {
-            for (int e = tid; e < MMA_M * MMA_KC / 8; e += 256) {
-                const int r = e / (MMA_KC / 8);
-                const int c8 = e % (MMA_KC / 8);
+            for (int e = tid; e < MMA_M * MMA_KC_G / 8; e += 256) {
+                const int r = e / (MMA_KC_G / 8);
+                const int c8 = e % (MMA_KC_G / 8);
                 const int gi = kn + c8 * 8;
                 if (m0 + r < t && gi + 7 < k) {
                     cp_async16(&xs[cur ^ 1][r][c8 * 8], &x[(size_t)(m0 + r) * k + gi]);
@@ -1273,9 +1284,14 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
                 const int r = tid;
                 if (n0 + r < n) {
                     cp_async16(&wsp[cur ^ 1][r][0], &q[(size_t)(n0 + r) * k8 + (kn >> 3)]);
+#pragma unroll
+                    for (int c2 = 4; c2 < MMA_KC_G / 8; c2 += 4) {
+                        cp_async16(&wsp[cur ^ 1][r][c2],
+                                   &q[(size_t)(n0 + r) * k8 + (kn >> 3) + c2]);
+                    }
                 } else {
 #pragma unroll
-                    for (int c8 = 0; c8 < MMA_KC / 8; ++c8) {
+                    for (int c8 = 0; c8 < MMA_KC_G / 8; ++c8) {
                         wsp[cur ^ 1][r][c8] = 0x88888888u;
                     }
                 }
@@ -1290,7 +1306,7 @@ extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
             asm volatile("cp.async.commit_group;");
         }
 #pragma unroll
-        for (int ks = 0; ks < MMA_KC / 16; ++ks) {
+        for (int ks = 0; ks < MMA_KC_G / 16; ++ks) {
             const int kb = ks * 16;
             // 프래그먼트 = 스모크 검증 방식(명시 판독). ldmatrix는 전치/분배
             // 불일치로 계통 오차(실측 maxabs 3e10) — 정확성 우선으로 되돌림.

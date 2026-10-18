@@ -67,6 +67,8 @@ impl W4a16Dec {
             // [M16 2026-10-11] 그리드 기아 형상이면 M16 변형(블록 2배) —
             // 값은 MM32와 비트동일(같은 k 순서·mma). 판정: M32 타일 수 < SM 수.
             let tiles32 = t.div_ceil(GEMM_BMMA_M) as u64 * n.div_ceil(GEMM_BMMA_N) as u64;
+            // [실측 2026-10-18] 임계 2×SM→4×SM(M16 확대): 비트동일·35B pp512
+            // −0.3%·pp1024 −0.6% — 평탄/열세, 2× 유지(M16 축 소진).
             let m16 = tiles32 < 2 * self.cc.sm_count().max(1) as u64;
             let f = self.cc.function(if m16 {
                 "w4a16_gemm_bf16_mma2_16"
