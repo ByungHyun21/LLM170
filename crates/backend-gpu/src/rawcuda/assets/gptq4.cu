@@ -1095,6 +1095,15 @@ __device__ __forceinline__ unsigned deq_pair_b(unsigned qw, int tt, float sc) {
 // (P4096 2765→2838ms·pp16384 14494→15241ms·커널 7712→7958ms) — smem
 // 30.7KB로 L1 축소가 우세(marlin-C4 30.5KB 실측과 동형). 되돌림. 잔여
 // math_pipe_throttle(2.88) 해소는 smem 비증가 구조에서만 시도할 것.
+// [실측 기각 원장 — 2026-10-18 ⑭/⑰②] (1) launch_bounds(256,3→4)(REG 79→64·
+// 스필 8B·4블록): 비트동일·**pp512 −4.4%** — reg 79 할당의 스케줄/ILP가
+// load-bearing(sk_marlin lb5 −2.1%와 동형). (2) t=2 행-분할 매핑(워프=1행×2열·
+// 셔플 트리 — x 재판독 8→2워프): 비트동일·**np2 −13%**(np4 −0.5%) — 행공유 v2
+// (−26~53%)·TR16·x 제거 상한 +24%와 합쳐 **x 축 3차 종결**. 잔여 = M-타일 확대
+// (M128 — 가중 재판독 t/M ÷2)급 재설계뿐.
+// [⑰② 실측 2026-10-18] 배치 np2 합산 = +2%뿐(per-slot 43.6ms=2.0×) — t=2의
+// per-row 비용이 t=1 sk와 동급(가중 공유 이득 없음 — issue/지연 바운드).
+// ncu(multi_t t=2): L1/TEX 77%·DRAM 6%·SM 38%. np4는 +36%(디큐트 상각 — t≥4 수익).
 extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemm_g128_mma(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
     const unsigned short* __restrict__ s,  // [n][k/128] f16 스케일

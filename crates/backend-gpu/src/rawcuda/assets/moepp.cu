@@ -250,6 +250,11 @@ extern "C" __global__ void w4a16_gemm_bf16_mma2_16(
 // grp2 f16-A — 게이트·업 2N 융합(N64 = 게이트 32 + 업 32), M=전문가 슬롯 수.
 // [⑥-d 2026-10-18] __launch_bounds__(256,4) — 점유 3→4블록(reg 70→≤64, 이슈율
 // 2.4/4·wait 32% 스톨을 워프 수로 메움; xs 스트라이드 반감으로 smem 20.5KB).
+// [⑥-a 실측 기각 — 2026-10-18: 쌍 디큐트] `deq_hi_v`(원소당 ~7명령)를 쌍
+// 처리(BFE·2×I2F·2×FMUL·cvt.rn.f16x2.f32·u32 store)로: 비트동일·35B pp −0.3%
+// = 중립. **SASS 대조: grp2_f16 768→1112(+45%)** — ptxas가 원판을 이미 쌍
+// packing(수작업 = 코드젠 역전 — ⑥-d '수작업 half2 +명령'의 SASS 재확인).
+// +45% 명령에도 시간 중립 = 스테이징 ALU 비지배. 잔여 = 레이아웃급 재설계뿐.
 extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g32_mma_grp2_f16(
     const unsigned long long* __restrict__ tab, int base,
     const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
