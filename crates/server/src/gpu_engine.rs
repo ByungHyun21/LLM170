@@ -192,6 +192,7 @@ engine_delegate_mut! {
     enable_spec() -> Result<(), String>;
     apply_tuning(t: Tuning) -> Result<(), String>;
     spec_verify_logits(slot: usize, rows: &[f32], t: usize) -> Result<Vec<f32>, String>;
+    warm_spec_graphs(n_slots: usize, eos: u32) -> Result<(), String>;
 }
 
 engine_delegate_ref! {

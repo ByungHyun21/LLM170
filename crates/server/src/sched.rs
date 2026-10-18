@@ -372,21 +372,35 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     // 뒤집어쓰지 않도록 여기서 소진하고 상태를 되돌린다. 준비 전에는 /health가
     // 503이라 클라이언트가 계측을 시작하지 않는다.
     {
-        let warm: Vec<u32> = vec![1u32; 16];
-        // [K6-3 2026-10-13] 온디맨드 풀 — 워밍업 전 슬롯 0 KV 확보(실패는 치명 아님).
-        if let Err(e) = eng.0.kv_grow(0, warm.len() + 8) {
-            eprintln!("# warmup KV 확보 실패(치명 아님): {e}");
+        // [⑰-spec 2026-10-18] 더미 프리필 = 528토큰(프리필 청크 상한 512+16) —
+        // 첫 실요청의 프리필 경로 버퍼(dabf_cap 등 t의존)를 부팅에서 선확보해
+        // 선캡처 그래프의 invalidate(재할당)를 봉인한다(실측: 16토큰 워밍은
+        // 첫 pair에서 dabf 재할당 → 7건 재캡처).
+        // 전 슬롯 더미 워밍 — 첫 동시 요청이 슬롯 1+의 그래프 캡처(kstep·체인)를
+        // 물지 않도록 부팅에서 소진한다.
+        let warm: Vec<u32> = vec![1u32; 528];
+        for slot in 0..n_slots {
+            // [K6-3 2026-10-13] 온디맨드 풀 — 워밍업 전 슬롯 KV 확보(실패는 치명 아님).
+            if let Err(e) = eng.0.kv_grow(slot, warm.len() + 8) {
+                eprintln!("# warmup KV 확보 실패(치명 아님) slot{slot}: {e}");
+            }
+            let w: Result<(), String> = eng.0.prefill(slot, &warm).and_then(|l| {
+                let t = llm170_core::qwen35::greedy(&l);
+                eng.0.decode_greedy(slot, t).map(|_| ())
+            });
+            if let Err(err) = w {
+                eprintln!("# warmup 실패(치명 아님) slot{slot}: {err}");
+            }
+            // [K6-3] 워밍업 점유 반납 — reset_seq가 상태 리셋 + KV 블록 해제
+            // (방치 시 소형 풀에서 대형 예약 요청이 영원히 대기하는 결함).
+            let _ = eng.0.reset_seq(slot);
         }
-        let w: Result<(), String> = eng.0.prefill(0, &warm).and_then(|l| {
-            let t = llm170_core::qwen35::greedy(&l);
-            eng.0.decode_greedy(0, t).map(|_| ())
-        });
-        if let Err(err) = w {
-            eprintln!("# warmup 실패(치명 아님): {err}");
+        // [⑰-spec] spec 경로 지연 캡처 3종 소진 — kstep(전 슬롯)·mtp-chain
+        // (전 슬롯)·mtp-graph(t별). 첫 동시 pair가 캡처 직렬화로 물던
+        // +724/1527ms(실측 2026-10-18) 제거. 실패는 지연 캡처 폴백(치명 아님).
+        if let Err(e) = eng.0.warm_spec_graphs(n_slots, eos) {
+            eprintln!("# warmup spec 캡처 실패(치명 아님): {e}");
         }
-        // [K6-3] 워밍업 점유 반납 — reset_seq가 상태 리셋 + KV 블록 해제
-        // (방치 시 소형 풀에서 대형 예약 요청이 영원히 대기하는 결함).
-        let _ = eng.0.reset_seq(0);
     }
     crate::http::READY.store(true, std::sync::atomic::Ordering::Release);
     let mut slots: Vec<Slot> = (0..n_slots).map(|_| Slot::free()).collect();

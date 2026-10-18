@@ -135,7 +135,11 @@ impl W4a16Dec {
     /// 모델당 상수라 재캡처 없음 — 테스트가 서로 다른 eos로 검증). 버퍼
     /// ensure는 전부 캡처 밖(캡처 중 cuMemAlloc 금지 계약 — ensure_graph·
     /// ensure_mtp_chain_graph 미러).
-    fn ensure_kstep_graph(&mut self, slot: usize, eos: u32) -> Result<ffi::CUgraphExec, String> {
+    pub(super) fn ensure_kstep_graph(
+        &mut self,
+        slot: usize,
+        eos: u32,
+    ) -> Result<ffi::CUgraphExec, String> {
         if slot >= self.kstep.graphs.len() {
             self.kstep.graphs.resize(slot + 1, None);
         }

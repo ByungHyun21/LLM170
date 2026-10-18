@@ -379,6 +379,12 @@ impl GemmaEngine {
         false
     }
 
+    /// [⑰-spec 2026-10-18] 위임 no-op — gemma4는 MTP/kstep 선캡처 대상이
+    /// 아니다(전 슬롯 더미 워밍이 실경로 캡처를 담당).
+    pub fn warm_spec_graphs(&mut self, _n_slots: usize, _eos: u32) -> Result<(), String> {
+        Ok(())
+    }
+
     /// [접두 재사용 2026-10-14] 엔진 소비 위치 — 순수 어텐션은 상태가 pos뿐.
     pub fn seq_pos(&self, slot: usize) -> u32 {
         self.dec.slot_pos.get(slot).copied().unwrap_or(0)

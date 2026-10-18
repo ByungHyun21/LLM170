@@ -17,6 +17,13 @@ impl QwenEngine {
         }
     }
 
+    /// [⑰-spec 2026-10-18] 부팅 선캡처 위임 — kstep(전 슬롯)·MTP계(등록 시
+    /// 슬롯별 체인 + t별 본체). sched 부팅 워밍(전 슬롯 더미 잡) 직후 호출.
+    /// 실패는 지연 캡처 폴백(치명 아님) — 호출부가 로그만 남긴다.
+    pub fn warm_spec_graphs(&mut self, n_slots: usize, eos: u32) -> Result<(), String> {
+        self.dec.warm_spec_graphs(n_slots, eos)
+    }
+
     /// [MTP] 라운드 전 — 검증 체인 dres의 수용 접두 acc행을 hidden 어셈블리로
     /// (롤백·보정 디코드 전에 호출해야 dres가 살아있다).
     pub fn mtp_pre_round(&mut self, acc: usize) -> Result<(), String> {

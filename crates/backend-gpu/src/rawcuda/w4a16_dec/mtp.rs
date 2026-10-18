@@ -933,6 +933,55 @@ impl super::W4a16Dec {
         Ok(e)
     }
 
+    /// [⑰-spec 2026-10-18] 부팅 선캡처 — spec 경로 지연 캡처 3종을 여기서
+    /// 소진한다: kstep(슬롯별) + MTP계(등록 모델: mtp-chain 슬롯별 ·
+    /// mtp-graph t별 — 배치 폭). 호출부(서버 부팅 워밍)가 더미 잡으로 슬롯
+    /// 상태를 재료화한 **직후** 호출할 것 — 캡처는 포인터만 기록하므로
+    /// 슬롯 상태가 없으면 무효 주소가 베이킹된다. 첫 오류만 반환(진단용)
+    /// — 호출부는 지연 캡처 폴백으로 계속한다.
+    pub fn warm_spec_graphs(&mut self, n_slots: usize, eos: u32) -> Result<(), String> {
+        // 부팅 워밍 스레드는 컨텍스트가 비현행일 수 있다 — ensure 내부의
+        // alloc/캡처가 CUresult 201로 죽는다(실측 2026-10-18: kstep.buf 40B).
+        let _g = self.cc.guard()?;
+        let mut first: Option<String> = None;
+        for slot in 0..n_slots {
+            if let Err(e) = self.ensure_kstep_graph(slot, eos) {
+                first.get_or_insert(e);
+            }
+        }
+        // 배치 그래프 — 프리픽스 슬롯집합(t=2..min(n_slots, BATCH_DEC_MAX)).
+        // 첫 동시 pair({0,1})가 [batch-graph] 캡처를 물지 않도록. 전제 =
+        // ensure_batch_bufs(핀드) + 전 슬롯 상태(부팅 더미 워밍 선행).
+        if n_slots >= 2 {
+            if let Err(e) = self.ensure_batch_bufs() {
+                first.get_or_insert(e);
+            } else {
+                for t in 2..=n_slots.min(super::BATCH_DEC_MAX) {
+                    let slots: Vec<usize> = (0..t).collect();
+                    if let Err(e) = self.batch_capture(&(t, slots), t) {
+                        first.get_or_insert(e);
+                    }
+                }
+            }
+        }
+        if self.mtp.mtp_ok {
+            for slot in 0..n_slots.min(self.mtp.mtp_chain_graphs.len()) {
+                if let Err(e) = self.ensure_mtp_chain_graph(slot) {
+                    first.get_or_insert(e);
+                }
+            }
+            for t in 1..=n_slots.min(MTP_TMAX) {
+                if let Err(e) = self.ensure_mtp_graph(0, t) {
+                    first.get_or_insert(e);
+                }
+            }
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// [MTP-CHAIN] 체인 스텝 그래프 본문 — 캡처 전용(직접 발사 없음).
     /// 리플레이 1회 = 재귀 1스텝: 부기 → 임베딩 gather → fin→hidden → 본체.
     fn mtp_chain_step_launch(&mut self, slot: usize) -> Result<(), String> {

@@ -410,6 +410,12 @@ impl PpEngine {
         false
     }
 
+    /// [⑰-spec 2026-10-18] 위임 no-op — PP 1차는 스펙/MTP 강제 OFF(골든
+    /// 우선)라 선캡처 대상이 아니다.
+    pub fn warm_spec_graphs(&mut self, _n_slots: usize, _eos: u32) -> Result<(), String> {
+        Ok(())
+    }
+
     // ── 관측·메타 — A 대표(합산 가능분은 합산) ──
 
     pub fn apply_tuning(&mut self, t: super::Tuning) -> Result<(), String> {
