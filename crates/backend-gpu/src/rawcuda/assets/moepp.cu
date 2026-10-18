@@ -36,6 +36,24 @@
 // PP_MZ 스트라이드. 산술 불변 = 비트동일. 호스트 MOE_PP_MZ와 동일 계약.
 #define PP_MZ 4
 
+// [⑥-e 2026-10-18] ldmatrix — fragment smem 재판독(8× 중복)을 1명령으로.
+// A는 x4(비전치), B는 x2(비전치 — mma.col B 프래그먼트와 분배 일치. .trans는
+// 전치돼 계통 오류 — moe.cu 실측 이력).
+__device__ __forceinline__ void ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2,
+                                       unsigned& r3, const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(a));
+}
+
+__device__ __forceinline__ void ldm_x2(unsigned& r0, unsigned& r1, const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r0), "=r"(r1)
+                 : "r"(a));
+}
+
 // [⑥] f32 → f16(RNE) 미러 — 단일패스 A 소스(hilo_pack의 hi 성분과 비트동일).
 extern "C" __global__ void w4a16_cast_f16(const float* __restrict__ in,
                                           unsigned short* __restrict__ out, int n) {
@@ -169,15 +187,17 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g32_mma_grp2_f16
 #pragma unroll
             for (int ks = 0; ks < GRP_KC / 16; ++ks) {
                 const int kb = ks * 16;
-                const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
-                const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
-                const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
-                const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
+                // [⑥-e] ldmatrix: A x4(레인 0-15 = 행 mt+0..15·열 kb, 16-31 = +8열),
+                // B x2(레인 0-7 = n행·열 kb, 8-15 = +8열) — 프래그먼트 값 동일(비트동일).
+                const int lrow = (lane & 15);
+                const int lcol = (lane & 16) ? 8 : 0;
+                unsigned a0, a1, a2, a3;
+                ldm_x4(a0, a1, a2, a3, &xs[cur][mt + lrow][kb + lcol]);
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt) {
                     const int nb = ntw + nt * 8;
-                    const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
-                    const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
+                    unsigned b0, b1;
+                    ldm_x2(b0, b1, &ws[cur][nb + (lane & 7)][kb + ((lane & 8) ? 8 : 0)]);
                     mma_f16(c[nt], a0, a1, a2, a3, b0, b1);
                 }
             }
@@ -317,15 +337,16 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64_f16(
 #pragma unroll
             for (int ks = 0; ks < DGRP_KC / 16; ++ks) {
                 const int kb = ks * 16;
-                const unsigned a0 = pk2bf(&xs[cur][mt + g][kb + 2 * tt]);
-                const unsigned a1 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt]);
-                const unsigned a2 = pk2bf(&xs[cur][mt + g][kb + 2 * tt + 8]);
-                const unsigned a3 = pk2bf(&xs[cur][mt + g + 8][kb + 2 * tt + 8]);
+                // [⑥-e] ldmatrix (grp2_f16와 동일 계약 — 비트동일).
+                const int lrow = (lane & 15);
+                const int lcol = (lane & 16) ? 8 : 0;
+                unsigned a0, a1, a2, a3;
+                ldm_x4(a0, a1, a2, a3, &xs[cur][mt + lrow][kb + lcol]);
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt) {
                     const int nb = ntw + nt * 8;
-                    const unsigned b0 = pk2bf(&ws[cur][nb + g][kb + 2 * tt]);
-                    const unsigned b1 = pk2bf(&ws[cur][nb + g][kb + 2 * tt + 8]);
+                    unsigned b0, b1;
+                    ldm_x2(b0, b1, &ws[cur][nb + (lane & 7)][kb + ((lane & 8) ? 8 : 0)]);
                     mma_f16(c[nt], a0, a1, a2, a3, b0, b1);
                 }
             }
