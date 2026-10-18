@@ -384,6 +384,12 @@ extern "C" __global__ void attn_prep_q(
 // [2026-10-09] 8→32: 블록=토큰 구조라 smem이 T와 무관(가드일 뿐) —
 // 프리필 청크 확대(가중치 재사용 ↑)용.
 #define ATTN_TMAX 512
+// [2026-10-18 E1] 분할 입도 분리(커밋 6318c052 승계) — 분할 경계를
+// ATTN_CHUNK(256)로 반올림하면 단·중문맥 활성 분할이 붕괴한다(lim 513 → 3분할
+// = 24블록; ncu: SM 3.4%·점유 24%·L1TEX 스톨 31%). 입도 32 = 같은 lim에서
+// 17분할·136블록. 행 루프·트리 리덕션 폭(256)은 그대로 — 수학 동일, 분할
+// 경계(부분합 파티션)만 변화 = eval 클래스. part_qg(디코드)·part_g4(gemma4).
+#define ATTN_SPLIT_GRAIN 32
 // ── [S12 2026-10-07] 위치축 청크.online 소프트맥스 — 공유메모리 6KB→2KB ──
 // 이전 구현은 sarr[1024]에 lim행 스코어를 전부 담아 두었다. 공유메모리 고정
 // 크기라 lim(=pp[0]+t+1)이 1024를 넘으면 sarr[row]가 블록 밖을 넘어가고
@@ -901,7 +907,8 @@ extern "C" __global__ void attn_fwd3s_part_g4(
         return;
     }
     int chunk_rows = (span + eff - 1) / eff;
-    chunk_rows = ((chunk_rows + ATTN_CHUNK - 1) / ATTN_CHUNK) * ATTN_CHUNK;
+    // [2026-10-18 E1] 분할 입도(공용 정의) — 256 반올림은 활성 분할 붕괴.
+    chunk_rows = ((chunk_rows + ATTN_SPLIT_GRAIN - 1) / ATTN_SPLIT_GRAIN) * ATTN_SPLIT_GRAIN;
     int lo = start + s * chunk_rows;
     int hi = min(lim, lo + chunk_rows);
     float m_run = -1e30f;
@@ -1038,11 +1045,6 @@ extern "C" __global__ void attn_fwd3s_merge_g4(
 // needle: 27B 16K/24K 6/6·32K 3/3·64K 3/3 (기준선 불변). 빈 분할 블록은 조기
 // 반환 + m/l만 기록(merge가 l≤0 스킵 — 256-float 기록 불요).
 #define ATTN_GQ_MAX 8
-// [2026-10-18 E1] 분할 입도 분리 — 종전 분할 경계는 ATTN_CHUNK(256) 반올림이라
-// 단·중문맥에서 활성 분할이 3개(24블록)로 붕괴했다(ncu: SM 3.4%·점유 24%·
-// L1TEX 스톨 31%). 입도 32 = 같은 lim(513)에서 17분할·136블록 활성 — 행 루프·
-// 트리 리덕션 폭(256)은 그대로: 수학 동일, 분할 경계(부분합 파티션)만 변화 = eval 클래스.
-#define ATTN_SPLIT_GRAIN 32
 extern "C" __global__ void attn_fwd3s_part_qg(
     const float* __restrict__ qh,
     const unsigned long long* __restrict__ dblk_tab, // [K6-2] [layer][mb][4]
