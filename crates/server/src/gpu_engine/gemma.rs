@@ -136,6 +136,22 @@ impl GemmaEngine {
     /// SM 38~41% 지연(청크 예산 33%)·head는 청크당 고정 738MB. 차기 = t=64
     /// (dense는 mma 재개 조건 — M64 타일 포화).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        self.prefill_impl(seq, tokens, true)
+            .map(|o| o.unwrap_or_default())
+    }
+
+    /// [⑰-1 2026-10-18] 상태 전진 전용 — 중간 청크 헤드·로짓 d2h 스킵
+    /// (서브 청크당 608KB pageable D2H 낭비 제거 — qwen과 동일 계약).
+    pub fn prefill_state(&mut self, seq: usize, tokens: &[u32]) -> Result<(), String> {
+        self.prefill_impl(seq, tokens, false).map(|_| ())
+    }
+
+    fn prefill_impl(
+        &mut self,
+        seq: usize,
+        tokens: &[u32],
+        want: bool,
+    ) -> Result<Option<Vec<f32>>, String> {
         if tokens.is_empty() {
             return Err("prefill: 빈 프롬프트 — 토큰 1개 이상 필요".into());
         }
@@ -172,15 +188,17 @@ impl GemmaEngine {
                     &cpos,
                     &rows,
                     chunk.len(),
-                    true, // 프리필 — 마지막 행 로짓만
+                    want, // [⑰-1] 중간 청크 = 헤드 스킵
                 )?;
                 self.dec.slot_pos[seq] = pos + chunk.len() as u32;
-                last = lgs.into_iter().last().unwrap_or_default();
+                if want {
+                    last = lgs.into_iter().last().unwrap_or_default();
+                }
             }
         }
         // [2.N Stage 2] 프리필 확정 — 플로어 전진 가능.
         self.maybe_trim(seq)?;
-        Ok(last)
+        Ok(if want { Some(last) } else { None })
     }
 
     /// 슬롯 배치 1토큰 — **이종 슬롯·위치 t행 청크**(가중 상각) + 행별 로짓.

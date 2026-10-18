@@ -93,6 +93,22 @@ impl PpEngine {
     /// forward_2shard 청크; GPU gather 경로와 값 동일 — 골든 계약).
     /// softcap 미적용 = 단일 경로 prefill과 동일 표면.
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        // [⑰-1] impl 경유(중간 청크 헤드 스킵 공유) — want=true = 종전 계약.
+        self.prefill_impl(seq, tokens, true)
+            .map(|o| o.unwrap_or_default())
+    }
+
+    /// [⑰-1] 상태 전진 전용 — 중간 청크 헤드·d2h 스킵(qwen prefill_state와 동일 계약).
+    pub fn prefill_state(&mut self, seq: usize, tokens: &[u32]) -> Result<(), String> {
+        self.prefill_impl(seq, tokens, false).map(|_| ())
+    }
+
+    fn prefill_impl(
+        &mut self,
+        seq: usize,
+        tokens: &[u32],
+        want: bool,
+    ) -> Result<Option<Vec<f32>>, String> {
         let n = tokens.len();
         if n == 0 {
             return Err("prefill: 빈 프롬프트 — 토큰 1개 이상 필요".into());
@@ -117,7 +133,7 @@ impl PpEngine {
             let part = &tokens[i..i + t];
             if t == 1 {
                 let row = self.a.model.embed_row(part[0]).map_err(|e| e.to_string())?;
-                if is_last && self.b.head_gpu {
+                if is_last && want && self.b.head_gpu {
                     last = Some(forward_2shard(
                         &mut self.a.dec,
                         &mut self.b.dec,
@@ -126,7 +142,7 @@ impl PpEngine {
                         1,
                         true,
                     )?);
-                } else if is_last {
+                } else if is_last && want {
                     let xn = forward_2shard(&mut self.a.dec, &mut self.b.dec, seq, &row, 1, false)?;
                     last = Some(self.b.head_logits(&xn)?);
                 } else {
@@ -134,7 +150,7 @@ impl PpEngine {
                 }
             } else {
                 let rows = self.a.embed_rows(part)?;
-                if is_last && self.b.head_gpu {
+                if is_last && want && self.b.head_gpu {
                     last = Some(forward_2shard(
                         &mut self.a.dec,
                         &mut self.b.dec,
@@ -143,7 +159,7 @@ impl PpEngine {
                         t,
                         true,
                     )?);
-                } else if is_last {
+                } else if is_last && want {
                     let xn =
                         forward_2shard(&mut self.a.dec, &mut self.b.dec, seq, &rows, t, false)?;
                     last = Some(self.b.head_logits(&xn)?);
@@ -153,7 +169,11 @@ impl PpEngine {
             }
             i += t;
         }
-        last.ok_or_else(|| "prefill: 빈 프롬프트 — 토큰 1개 이상 필요".to_string())
+        Ok(if want {
+            Some(last.ok_or_else(|| "prefill: 빈 프롬프트 — 토큰 1개 이상 필요".to_string())?)
+        } else {
+            None
+        })
     }
 
     /// 배치 디코드 로짓 — 슬롯별 직렬(1차 제약: 배치 체인 팬아웃 비목표).

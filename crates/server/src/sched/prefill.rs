@@ -63,13 +63,19 @@ pub(super) fn slot_prefill(
         // [P8] 제약 슬롯은 prefill 마지막 로짓도 pick(마스킹) 경유 — 첫
         // 토큰부터 스키마 강제(실측: 우회 시 1토큰 프리앰블 새는 결함).
         let cons = slots[i].constraint.is_some();
-        let r: Result<u32, String> = eng.0.prefill(i, &part).map(|mut l| {
-            if samp || cons {
-                pick(&mut slots[i], &mut l)
-            } else {
-                llm170_core::qwen35::greedy(&l)
-            }
-        });
+        let r: Result<u32, String> = if end < slots[i].job.as_ref().unwrap().tokens.len() {
+            // [⑰-1 2026-10-18] 중간 청크 = 헤드·로짓 d2h 스킵(낭비 제거).
+            // 최종 청크만 로짓 판정(emit 토큰). KV·MTP 전진 동일 → 토큰열 불변.
+            eng.0.prefill_state(i, &part).map(|_| 0)
+        } else {
+            eng.0.prefill(i, &part).map(|mut l| {
+                if samp || cons {
+                    pick(&mut slots[i], &mut l)
+                } else {
+                    llm170_core::qwen35::greedy(&l)
+                }
+            })
+        };
         (end, r)
     };
     // [B5] 라운드로빈 — 방금 전진한 슬롯을 최신으로 갱신, 다음

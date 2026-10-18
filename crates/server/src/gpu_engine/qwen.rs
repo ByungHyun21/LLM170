@@ -263,6 +263,24 @@ impl QwenEngine {
     /// 시퀀스 prefill → 마지막 로짓. t≤8 배치 청크(GEMM t≥2 경로)로 처리하고
     /// head는 마지막 토큰만 계산한다(중간 토큰 상각).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        self.prefill_impl(seq, tokens, true)
+            .map(|o| o.unwrap_or_default())
+    }
+
+    /// [⑰-1 2026-10-18] 상태 전진 전용 프리필 — 중간 청크의 **헤드·로짓 d2h
+    /// 스킵**(서브 프리필 청크당 어휘 로짓 608KB pageable D2H ≈ 370ms/chunk
+    /// 낭비였음 — 실측 TTFT: 512tk 1116ms·2700tk 4886ms = 벤치 pp의 2.5×).
+    /// KV·MTP 상태 전진은 prefill과 동일(헤드는 읽기 전용) → 토큰열 불변.
+    pub fn prefill_state(&mut self, seq: usize, tokens: &[u32]) -> Result<(), String> {
+        self.prefill_impl(seq, tokens, false).map(|_| ())
+    }
+
+    fn prefill_impl(
+        &mut self,
+        seq: usize,
+        tokens: &[u32],
+        want: bool,
+    ) -> Result<Option<Vec<f32>>, String> {
         let n = tokens.len();
         if n == 0 {
             // A10: 빈 프롬프트는 조용한 제로 로짓 대신 명시 오류.
@@ -299,9 +317,9 @@ impl QwenEngine {
             };
             if t == 1 {
                 let row = self.model.embed_row(part[0]).map_err(|e| e.to_string())?;
-                if is_last && self.head_gpu {
+                if is_last && want && self.head_gpu {
                     last = Some(self.dec.forward_prefill(seq, &row, 1, true)?);
-                } else if is_last {
+                } else if is_last && want {
                     let xn = self.dec.forward_prefill(seq, &row, 1, false)?;
                     last = Some(self.head_logits(&xn)?);
                 } else {
@@ -311,9 +329,9 @@ impl QwenEngine {
                 // [S3-1 2026-10-11] 임베딩 GPU gather — 행 조립(mmap 디코드+
                 // 할당+h2d t×h×4B)을 id h2d(4B/행)+gather로 대체. 값 동일
                 // (h2f/b2f = decode_f32 동일 함수 — 골든 계약).
-                if is_last && self.head_gpu {
+                if is_last && want && self.head_gpu {
                     last = Some(self.dec.forward_prefill_toks(seq, part, t, true)?);
-                } else if is_last {
+                } else if is_last && want {
                     let xn = self.dec.forward_prefill_toks(seq, part, t, false)?;
                     last = Some(self.head_logits(&xn)?);
                 } else {
@@ -322,9 +340,9 @@ impl QwenEngine {
             } else {
                 // [R5] 행 조립 — embed_rows 공용(동작 불변).
                 let rows = self.embed_rows(part)?;
-                if is_last && self.head_gpu {
+                if is_last && want && self.head_gpu {
                     last = Some(self.dec.forward_prefill(seq, &rows, t, true)?);
-                } else if is_last {
+                } else if is_last && want {
                     let xn = self.dec.forward_prefill(seq, &rows, t, false)?;
                     last = Some(self.head_logits(&xn)?);
                 } else {
@@ -348,7 +366,11 @@ impl QwenEngine {
             }
             i += t;
         }
-        last.ok_or_else(|| "prefill: 빈 프롬프트 — 토큰 1개 이상 필요".to_string())
+        Ok(if want {
+            Some(last.ok_or_else(|| "prefill: 빈 프롬프트 — 토큰 1개 이상 필요".to_string())?)
+        } else {
+            None
+        })
     }
 
     /// 배치 디코드 — seq별 1토큰 forward → 로짓.
