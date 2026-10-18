@@ -1,8 +1,8 @@
 # LLM170
 
 Pure-Rust LLM inference engine — single track **CUDA + W4A16** (int4 sym g128,
-f16 activations) for the NVIDIA CMP 170HX 64GB (sm_80); also runs on RTX 4090
-(sm_89). `serve`/`infer` run W4A16 directories (compressed-tensors / AutoRound)
+f16 activations) for the NVIDIA CMP 170HX 64GB (sm_80).
+`serve`/`infer` run W4A16 directories (compressed-tensors / AutoRound)
 end-to-end on GPU with an int8 KV cache and CUDA-graph decode — 27B dense
 (g128) and 35B-A3B MoE (g32).
 
@@ -26,19 +26,19 @@ end-to-end on GPU with an int8 KV cache and CUDA-graph decode — 27B dense
 
 | row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
 |---|---|---|---|---|---|
-| CUDA (170HX, 180 W, 2026-10-17) | 690 | 677 | 634 | 38.6 | 56.8 |
+| CUDA (170HX, 180 W, 2026-10-18) | 723.52 | 711.28 | 682.89 | 42.34 | 59.50 |
 
 ### Qwen3.6-35B-A3B-W4A16 (g32, MoE resident)
 
 | row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
 |---|---|---|---|---|---|
-| CUDA (170HX, 180 W, 2026-10-17) | 1317 | 1317 | 1255 | 105.5 | 173.6 |
+| CUDA (170HX, 180 W, 2026-10-18) | 2490.27 | 2484.70 | 2399.69 | 117.99 | 181.59 |
 
 ### Gemma-4-26B-A4B-it-QAT-W4A16 (g32, MoE resident)
 
 | row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
 |---|---|---|---|---|---|
-| CUDA (170HX, 180 W, 2026-10-17) | 659 | 600 | 478 | 44.4 | — |
+| CUDA (170HX, 180 W, 2026-10-18) | 987.65 | 859.74 | 632.40 | 45.18 | — |
 
 | mode (27B, 512tok prompt · 128 gen) | t/s | note |
 |---|---|---|
@@ -79,7 +79,7 @@ crates/backend-gpu rawcuda — CUDA driver bindings + kernel assets (.cu/fatbin)
 crates/server      CLI + HTTP server (continuous batching)
 ```
 
-Kernel assets: `scripts/build_cuda_kernels.sh` (nvcc, sm_80+sm_89); kernel
+Kernel assets: `scripts/build_cuda_kernels.sh` (nvcc, sm_80); kernel
 outputs must match the CPU reference (`crates/core/src/quant/lane.rs`).
 Pre-commit gate: `scripts/preflight.sh` · numeric gate: `w4a16-eval`
 (goldens · ΔPPL band · needle).
