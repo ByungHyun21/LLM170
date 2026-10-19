@@ -1180,7 +1180,164 @@ impl W4a16Dec {
             return Err(err);
         }
         let experts_bytes: u64 = lens.iter().map(|e| (e.0 + e.1) as u64).sum();
+        // [2026-10-19] 마린 MoE 재패킹 아레나(상주 전용 — 실패는 경고·폴백).
+        if let Err(e) = self.build_marlin_moe_arenas(lens, fill) {
+            eprintln!("[marlin_moe] 재패킹 스킵({e}) — 레거시 커널 폴백");
+        }
         self.register_moe_resident(dev_tab, experts_bytes)
+    }
+
+    /// f32 → f16 비트(RNE) — 마린 스케일 변환용(bf16→f32→f16 — bf16 값은 정확).
+    fn f32_to_f16_bits(v: f32) -> u16 {
+        let x = v.to_bits();
+        let sign = ((x >> 16) & 0x8000) as u16;
+        let exp = ((x >> 23) & 0xFF) as i32 - 127 + 15;
+        let man = x & 0x7F_FFFF;
+        if exp >= 0x1F {
+            return sign | 0x7C00;
+        }
+        if exp <= 0 {
+            if exp < -10 {
+                return sign;
+            }
+            let m = (man | 0x80_0000) >> (14 - exp);
+            return sign | (m as u16);
+        }
+        let m = man >> 13;
+        let mut r = sign | ((exp as u16) << 10) | (m as u16);
+        let rem = man & 0x1FFF;
+        if rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1) {
+            r = r.wrapping_add(1);
+        }
+        r
+    }
+
+    /// [2026-10-19] 마린 MoE 재패킹 아레나 구축 — **상주 경로 전용**(설계:
+    /// 완전 상주 시에만 마린 디스패치 — 하이브리드/스트리밍은 레거시 커널 =
+    /// 골든 무접촉). w13 = gate|up 호스트 융합 → `marlin_repack_q` · w2 = down ·
+    /// 스케일 [g][n] 순열+bf16→f16. 실패는 경고만(아레나 0 = 폴백).
+    fn build_marlin_moe_arenas(
+        &mut self,
+        lens: &[(usize, usize)],
+        fill: &mut dyn FnMut(usize, usize, u64, &mut [u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let (nl, ne, nff, h) = (
+            self.n_layers,
+            self.moe.n_experts,
+            self.moe.moe_ffn,
+            self.hidden,
+        );
+        let (k13, n13) = (h, 2 * nff);
+        let (k2, n2) = (nff, h);
+        if !k13.is_multiple_of(128)
+            || !n13.is_multiple_of(64)
+            || !k2.is_multiple_of(16)
+            || !n2.is_multiple_of(64)
+        {
+            return Err(format!(
+                "marlin_moe 계약: k13={k13} n13={n13} k2={k2} n2={n2}"
+            ));
+        }
+        let g13 = k13 / 32;
+        let g2 = k2 / 32;
+        let st13 = n13 * k13 / 2; // 전문가당 B 바이트(int4 = k*n/2)
+        let st2 = n2 * k2 / 2;
+        let ss13 = g13 * n13 * 2; // 스케일 f16 바이트
+        let ss2 = g2 * n2 * 2;
+        let (a13, a2, s13, s2) = (
+            self.cc.alloc(nl * ne * st13)?,
+            self.cc.alloc(nl * ne * st2)?,
+            self.cc.alloc(nl * ne * ss13)?,
+            self.cc.alloc(nl * ne * ss2)?,
+        );
+        let r = (|| -> Result<(), String> {
+            const RCHUNK: usize = 8 << 20;
+            let mat = |fill: &mut dyn FnMut(usize, usize, u64, &mut [u8]) -> Result<(), String>,
+                       i: usize,
+                       which: usize,
+                       len: usize|
+             -> Result<Vec<u8>, String> {
+                let mut b = vec![0u8; len];
+                for off in (0..len).step_by(RCHUNK) {
+                    let end = (off + RCHUNK).min(len);
+                    fill(i, which, off as u64, &mut b[off..end])?;
+                }
+                Ok(b)
+            };
+            let perm16 = |sb: &[u8], n: usize, k: usize, gs: usize| -> Result<Vec<u8>, String> {
+                // bf16 [n][k/gs] → f32 → marlin 순열 [k/gs][n] → f16.
+                let g = k / gs;
+                let sf: Vec<f32> = sb
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                    .collect();
+                let pf = llm170_core::marlin::marlin_permute_scales(&sf, n, k, gs)?;
+                let mut out = vec![0u8; g * n * 2];
+                for (i, v) in pf.iter().enumerate() {
+                    out[i * 2..i * 2 + 2].copy_from_slice(&Self::f32_to_f16_bits(*v).to_le_bytes());
+                }
+                Ok(out)
+            };
+            for layer in 0..nl {
+                for e in 0..ne {
+                    let i0 = (layer * ne + e) * 3;
+                    // ── w13: gate|up 융합 재패킹 + 스케일 융합 순열 ──
+                    let (ql0, sl0) = lens[i0];
+                    let (ql1, sl1) = lens[i0 + 1];
+                    let (qb0, sb0) = (mat(fill, i0, 0, ql0)?, mat(fill, i0, 1, sl0)?);
+                    let (qb1, sb1) = (mat(fill, i0 + 1, 0, ql1)?, mat(fill, i0 + 1, 1, sl1)?);
+                    let mut qcat = qb0;
+                    qcat.extend_from_slice(&qb1);
+                    let q32: Vec<u32> = qcat
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let rp = llm170_core::marlin::marlin_repack_q(&q32, n13, k13)?;
+                    let rb: Vec<u8> = rp.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let off = (layer * ne + e) as u64 * st13 as u64;
+                    Self::h2d_chunked(&self.cc, a13 + off, &rb)?;
+                    let mut scat = sb0;
+                    scat.extend_from_slice(&sb1);
+                    let sp = perm16(&scat, n13, k13, 32)?;
+                    Self::h2d_chunked(&self.cc, s13 + (layer * ne + e) as u64 * ss13 as u64, &sp)?;
+                    // ── w2: down 재패킹 + 스케일 순열 ──
+                    let (ql2, sl2) = lens[i0 + 2];
+                    let qb2 = mat(fill, i0 + 2, 0, ql2)?;
+                    let sb2 = mat(fill, i0 + 2, 1, sl2)?;
+                    let q32b: Vec<u32> = qb2
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let rp2 = llm170_core::marlin::marlin_repack_q(&q32b, n2, k2)?;
+                    let rb2: Vec<u8> = rp2.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    Self::h2d_chunked(&self.cc, a2 + (layer * ne + e) as u64 * st2 as u64, &rb2)?;
+                    let sp2 = perm16(&sb2, n2, k2, 32)?;
+                    Self::h2d_chunked(&self.cc, s2 + (layer * ne + e) as u64 * ss2 as u64, &sp2)?;
+                    llm170_diag::watchdog::bump();
+                }
+            }
+            self.cc.sync()
+        })();
+        if let Err(e) = r {
+            for p in [a13, a2, s13, s2] {
+                let _ = self.cc.free(p);
+            }
+            return Err(e);
+        }
+        self.moe_m13 = a13;
+        self.moe_m2 = a2;
+        self.moe_s13 = s13;
+        self.moe_s2 = s2;
+        let bytes = (nl * ne * (st13 + st2 + ss13 + ss2)) as u64;
+        self.weights_bytes += bytes;
+        self.marlin_bytes += bytes;
+        Ok(())
     }
 
     /// [2026-10-16 #11] 하이브리드 상주 업로드 — 층당 앞 hot_per개 전문가는

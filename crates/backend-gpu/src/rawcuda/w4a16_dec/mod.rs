@@ -823,6 +823,13 @@ pub struct W4a16Dec {
     /// [2026-10-18] 마린 블록 간 배리어 locks(sms×4 int32·0 초기화 — 커널이
     /// 호출 종료 시 자체 리셋, 재사용 계약). 0 = 미할당.
     dmlock: CUdeviceptr,
+    /// [2026-10-19] 마린 MoE 재패킹 아레나(상주 경로 전용) — [층][전문가] 연속.
+    /// m13 = gate|up 융합 B(2·n_ff×hidden), m2 = down B(hidden×n_ff),
+    /// s13/s2 = 스케일 [g][n] 순열 f16. 전부 0 = 미구축(레거시 디스패치).
+    moe_m13: CUdeviceptr,
+    moe_m2: CUdeviceptr,
+    moe_s13: CUdeviceptr,
+    moe_s2: CUdeviceptr,
     /// [S2 2026-10-11] 다중세그먼트 테이블(디바이스 u64) — q/k/v·qkv/z·gate/up
     /// 을 1런치로(런치 꼬리 제거). 업로드·dchain 확정 후 ensure_chain_bufs에서
     /// 1회 작성 — 그래프 캡처 정적 계약(리플레이 간 내용 불변).
@@ -1163,6 +1170,10 @@ impl W4a16Dec {
             dabf: Buf::default(),
             dmc: Buf::default(),
             dmlock: 0,
+            moe_m13: 0,
+            moe_m2: 0,
+            moe_s13: 0,
+            moe_s2: 0,
             dmulti: 0,
             dmulti_meta: Vec::new(),
             spec_on: false,
