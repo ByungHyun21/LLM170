@@ -54,7 +54,7 @@ pub const MOE_PP_MZ: usize = 4;
 /// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
 /// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — A5-4: qs 스테이징 +
 /// V-타일(GDN_NSPLIT) + Stile 더블 버퍼 기준).
-pub const GDN_SCAN_SMEM: u32 = 27_140; // [FLA-1] +e[CS] 128B (qs 제거 -16KB 유지)
+pub const GDN_SCAN_SMEM: u32 = 31_236; // [설계(1) 10-19] Stile 128×VS (8패스 폐지)
 /// [A5-4 2026-10-10 FLA 2단] gdn_scan V-타일 분할 수(커널 GDN_NSPLIT와
 /// 동일 계약) — grid = h_v×NSPLIT, 블록 = GDN_NGRP×GDN_VS스레드.
 /// [2026-10-18 CMP 재검] 8은 bp 버그 수정 후 비트동일·골든 불변 —

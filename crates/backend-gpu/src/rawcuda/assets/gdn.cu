@@ -478,8 +478,10 @@ extern "C" __global__ void gdn_scan(
     __half* KS = KQ + GDN_CS * GDN_CS;                 // [CS*GDN_VS]
     __half* QS = KS + GDN_CS * GDN_VS;                 // [CS*GDN_VS]
     float* dc = (float*)(QS + GDN_CS * GDN_VS);        // [CS*GDN_VS]
-    __half* Stile = (__half*)(dc + GDN_CS * GDN_VS);   // [2*TILE*GDN_VS] f16 상태 타일
-    float* bp = (float*)(Stile + 2 * GDN_TILE * GDN_VS); // [CS]
+    // [설계(1) 2026-10-19] Stile = 상태 슬라이스 전량(128행×VS) — 8패스
+    // 더블버퍼 폐지(1회 스테이징). 소비 인덱스 (s2b+r)*VS+tid는 종전 동일.
+    __half* Stile = (__half*)(dc + GDN_CS * GDN_VS);   // [128*GDN_VS] f16 상태 슬라이스
+    float* bp = (float*)(Stile + 128 * GDN_VS);        // [CS]
     float* gcs = bp + GDN_CS;                          // [CS+1]
     float* wsm = gcs + (GDN_CS + 1);                   // [CS]
     float* e = wsm + GDN_CS;                           // [CS] exp(gcs) 사전값
@@ -564,31 +566,24 @@ extern "C" __global__ void gdn_scan(
             rqs[k] = 0.0f;
         }
         {
-            // pass 0 타일 선적재(buf 0) — cp.async(레지스터 경유 제거).
-            for (int e = threadIdx.x; e < GDN_TILE * GDN_VS; e += blockDim.x) {
-                int r = e / GDN_VS, cl = e % GDN_VS;
-                // [행-스케일] cp.async(4B)는 2B 원소 불가 — 직접 f16 적재.
-                Stile[e] = st[st_h + (long)r * d + cl];
+            // [설계(1) 2026-10-19] 상태 슬라이스 1회 스테이징 — 16B uint4(8 half).
+            // 종전 8패스×2B 스칼라 적재+패스별 배리어를 제거(순수 복사 — 값·
+            // 순서 불변·비트동일). 스테이징 후 Stile 불변 → 그룹 간 배리어 불요.
+            for (int e = threadIdx.x; e < 128 * (GDN_VS / 8); e += blockDim.x) {
+                const int r = e / (GDN_VS / 8);
+                const int u = e % (GDN_VS / 8);
+                *reinterpret_cast<uint4*>(&Stile[r * GDN_VS + u * 8]) =
+                    *reinterpret_cast<const uint4*>(&st[st_h + (long)r * d + u * 8]);
             }
         }
         __syncthreads();
         for (int pass_ = 0; pass_ < 8; pass_++) {
-            int s2b = pass_ * GDN_TILE;
-            // 다음 타일을 반대 버퍼에 cp.async 프리페치(소비와 완전 중첩).
-            if (pass_ + 1 < 8) {
-                __half* nxt = Stile + ((pass_ & 1) ^ 1) * (GDN_TILE * GDN_VS);
-                const int nb = s2b + GDN_TILE;
-                for (int e = threadIdx.x; e < GDN_TILE * GDN_VS; e += blockDim.x) {
-                    int r = e / GDN_VS, cl = e % GDN_VS;
-                    nxt[e] = st[st_h + (long)(nb + r) * d + cl];
-                }
-            }
-            const __half* cur = Stile + (pass_ & 1) * (GDN_TILE * GDN_VS);
+            const int s2b = pass_ * GDN_TILE;
             // [A5-3] 타일 16값을 레지스터로 1회 로드(그룹 내 i들이 재사용).
             float sv0[GDN_TILE];
 #pragma unroll
             for (int r = 0; r < GDN_TILE; ++r) {
-                sv0[r] = __half2float(cur[r * GDN_VS + tid]) * sc[sc_h + s2b + r];
+                sv0[r] = __half2float(Stile[(s2b + r) * GDN_VS + tid]) * sc[sc_h + s2b + r];
             }
             // [A5] i축 워크그룹 분배 — i별 누적 순서(pass·s2p)는 원序 그대로.
             for (int k = 0; k < IK; ++k) {
@@ -616,7 +611,7 @@ extern "C" __global__ void gdn_scan(
                 rks[k] = __half2float(__float2half_rn(rks[k] + ak));
                 rqs[k] = __half2float(__float2half_rn(rqs[k] + aq * qscale));
             }
-            __syncthreads(); // f16 직접 적재 — 비동기 프리페치 없음
+            // [설계(1)] 패스 간 배리어 없음 — Stile은 스테이징 후 불변.
         }
         for (int k = 0; k < IK; ++k) {
             const int i = grp + k * GDN_NGRP;

@@ -182,7 +182,7 @@ fn gdn_scan_layout_mirror() {
         + cs * vs * 2
         + cs * vs * 2
         + cs * vs * 4
-        + 2 * tile * vs * 4
+        + 128 * vs * 2 // [설계(1)] Stile = 상태 슬라이스 전량(더블버퍼 폐지)
         + cs * 4
         + (cs + 1) * 4
         + cs * 4
