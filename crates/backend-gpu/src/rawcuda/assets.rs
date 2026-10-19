@@ -195,6 +195,35 @@ pub const ASSETS: &[Asset] = &[
         boot: true,
     },
     Asset {
+        // [2026-10-19] vLLM marlin_moe_wna16 벤더(Apache-2.0 — assets/marlin_moe/
+        // 사본, 업스트림 대조 정본). 35B/gemma4 프리필 전문가 GEMM 후보.
+        // 채리픽 = g32·f16 세트 15 인스턴스 — 맹글명(툴체인 계약).
+        name: "marlin_moe",
+        env: "LLM170_CUDA_MARLIN_MOE_FATBIN_PATH",
+        paths: &[
+            "crates/backend-gpu/src/rawcuda/assets/marlin_moe.fatbin",
+            "src/rawcuda/assets/marlin_moe.fatbin",
+        ],
+        syms: &[
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb1ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi1ELi8ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi1ELi8ELi4ELb1ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi2ELi4ELi8ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi2ELi8ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi3ELi4ELi8ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi3ELi8ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi4ELi4ELi8ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi4ELi8ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb1ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi2ELi16ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi3ELi16ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+            "_ZN16marlin_moe_wna166MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi4ELi16ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiS8_S8_S6_ibiiiPibbb",
+        ],
+        boot: true,
+    },
+    Asset {
         // [2026-10-18] vLLM 마린 벤더(Apache-2.0 — assets/marlin/ 사본, 업스트림
         // 대조 정본·변경 금지). 27B dense t≥16 W4A16 후보. 심볼 = 템플릿 인스턴스
         // 맹글명(툴체인·시그니처 계약 고정 — nvcc/템플릿 변경 시 재생성).
@@ -311,6 +340,7 @@ pub fn cu_source(name: &str) -> &'static str {
         "embed" => include_str!("assets/embed.cu"),
         "smoke" => include_str!("assets/smoke.cu"),
         "marlin" => include_str!("assets/marlin.cu"),
+        "marlin_moe" => include_str!("assets/marlin_moe.cu"),
         _ => panic!("cu_source: 미지 자산 {name}"),
     }
 }
@@ -353,6 +383,16 @@ mod tests {
                     assert!(
                         s.starts_with("_ZN6marlin6MarlinILl"),
                         "marlin 심볼 형태 위반: {s}"
+                    );
+                }
+                continue;
+            }
+            if a.name == "marlin_moe" {
+                assert_eq!(a.syms.len(), 15, "marlin_moe 인스턴스 15종 계약");
+                for s in a.syms {
+                    assert!(
+                        s.starts_with("_ZN16marlin_moe_wna166MarlinILl"),
+                        "marlin_moe 심볼 형태 위반: {s}"
                     );
                 }
                 continue;

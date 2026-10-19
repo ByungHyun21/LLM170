@@ -24,6 +24,10 @@ man_src() { # [2026-10-18] marlin은 벤더 헤더 전량을 해시에 포함.
     if [ "$1" = marlin ]; then
         cat "$A/marlin.cu" $A/marlin/*.h $A/marlin/*.cuh $A/marlin/core/*.hpp \
             $A/marlin/torch/headeronly/util/Exception.h | sha256sum | cut -d' ' -f1
+    elif [ "$1" = marlin_moe ]; then
+        cat "$A/marlin_moe.cu" $A/marlin_moe/*.h \
+            $A/marlin_moe/quantization/marlin/*.h* $A/marlin_moe/core/*.hpp \
+            $A/marlin_moe/torch/headeronly/util/Exception.h | sha256sum | cut -d' ' -f1
     else
         cat "$A/$1.cu" "$A/cast_common.cuh" "$A/g4_common.cuh" | sha256sum | cut -d' ' -f1
     fi
@@ -52,6 +56,8 @@ build() { # name fmad_flag("" | "-fmad=false")
     local hdr_new=""
     if [ "$name" = marlin ] && [ -f "$out" ]; then
         hdr_new=$(find "$A/marlin" -type f -newer "$out" 2>/dev/null | head -1) || true
+    elif [ "$name" = marlin_moe ] && [ -f "$out" ]; then
+        hdr_new=$(find "$A/marlin_moe" -type f -newer "$out" 2>/dev/null | head -1) || true
     fi
     if [ -f "$out" ] && [ "$out" -nt "$src" ] && [ -z "$hdr_new" ] \
         && [ "$out" -nt "$A/cast_common.cuh" ] && [ "$out" -nt "$A/g4_common.cuh" ]; then
@@ -61,6 +67,7 @@ build() { # name fmad_flag("" | "-fmad=false")
     local extra=""
     # [2026-10-18] 마린: constexpr 호출 허용 + torch headeronly 심 경로.
     [ "$name" = marlin ] && extra="--expt-relaxed-constexpr -I$A/marlin"
+    [ "$name" = marlin_moe ] && extra="--expt-relaxed-constexpr -I$A/marlin_moe"
     local tmp
     tmp=$(mktemp /tmp/opencode/${name}.XXXXXX.fatbin)
     "$NVCC" -fatbin -O3 $fmad $extra \
@@ -84,16 +91,17 @@ build moe   -fmad=false
 build moepp -fmad=false
 build head  -fmad=false
 build marlin            # [2026-10-18] vLLM 벤더(TU·헤더), 기본 fmad
+build marlin_moe        # [2026-10-19] vLLM MoE 벤더(TU·헤더), 기본 fmad
 
 # 매니페스트 갱신 — 리빌드분은 새 쌍, 스킵분은 기존 엔트리 유지(부재 시 현재
 # 상태를 시드 — 최초 도입/매니페스트 삭제 시에만). preflight 5단계가 대조한다.
-for name in smoke norm gdn attn ew embed gptq4 gemma4 moe moepp decode head marlin; do
+for name in smoke norm gdn attn ew embed gptq4 gemma4 moe moepp decode head marlin marlin_moe; do
     if [ -z "${MAN_SRC[$name]:-}" ]; then
         MAN_SRC[$name]=$(man_src "$name"); MAN_FB[$name]=$(man_fb "$name")
     fi
 done
 {
-    for name in smoke norm gdn attn ew embed gptq4 gemma4 moe moepp decode head marlin; do
+    for name in smoke norm gdn attn ew embed gptq4 gemma4 moe moepp decode head marlin marlin_moe; do
         echo "${MAN_SRC[$name]} ${MAN_FB[$name]} $name"
     done
 } > "$MAN.tmp" && mv "$MAN.tmp" "$MAN"

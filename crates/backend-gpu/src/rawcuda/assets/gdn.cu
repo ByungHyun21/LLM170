@@ -565,18 +565,19 @@ extern "C" __global__ void gdn_scan(
             rks[k] = 0.0f;
             rqs[k] = 0.0f;
         }
-        {
+        if (c == 0) {
             // [설계(1) 2026-10-19] 상태 슬라이스 1회 스테이징 — 16B uint4(8 half).
-            // 종전 8패스×2B 스칼라 적재+패스별 배리어를 제거(순수 복사 — 값·
-            // 순서 불변·비트동일). 스테이징 후 Stile 불변 → 그룹 간 배리어 불요.
+            // [설계(2b) 2026-10-19] 청크 0 한정 — 이후 청크는 Stile이 상태
+            // (갱신 RMW가 smem에서) — 중간 전역 접근 소멸. 최종 전역 상태는
+            // 청크 루프 뒤 1회 환류로 종전과 동일(비트동일).
             for (int e = threadIdx.x; e < 128 * (GDN_VS / 8); e += blockDim.x) {
                 const int r = e / (GDN_VS / 8);
                 const int u = e % (GDN_VS / 8);
                 *reinterpret_cast<uint4*>(&Stile[r * GDN_VS + u * 8]) =
                     *reinterpret_cast<const uint4*>(&st[st_h + (long)r * d + u * 8]);
             }
+            __syncthreads(); // 균일 분기 — c==0에서만(이후 청크는 700 배리어로 충분)
         }
-        __syncthreads();
         for (int pass_ = 0; pass_ < 8; pass_++) {
             const int s2b = pass_ * GDN_TILE;
             // [A5-3] 타일 16값을 레지스터로 1회 로드(그룹 내 i들이 재사용).
@@ -627,6 +628,10 @@ extern "C" __global__ void gdn_scan(
         // 직렬 exp 2n회 제거. 값은 종전 인라인 계산과 비트동일(같은 함수·입력).
         if (threadIdx.x < GDN_CS) {
             e[threadIdx.x] = (threadIdx.x < n) ? gdn_expf(gcs[threadIdx.x]) : 0.0f;
+            // [설계(2a) 2026-10-19] wsm 사전 이동 — gcs만 의존(같은 함수·입력
+            // = 비트동일). 해(solve) 뒤 별도 블록+배리어 1회 제거.
+            const float gtot0 = gcs[GDN_CS];
+            wsm[threadIdx.x] = (threadIdx.x < n) ? gdn_expf(gtot0 - gcs[threadIdx.x]) : 0.0f;
         }
         __syncthreads();
 
@@ -659,8 +664,7 @@ extern "C" __global__ void gdn_scan(
         {
             float gtot = gcs[GDN_CS];
             float gt_exp = gdn_expf(gtot);
-            if (threadIdx.x < GDN_CS) wsm[threadIdx.x] = (threadIdx.x < n) ? gdn_expf(gtot - gcs[threadIdx.x]) : 0.0f;
-            __syncthreads();
+            // [설계(2a)] wsm은 e[] 블록에서 선기록 — 배리어 1회 절감(비트동일).
             // [FLA-1 2026-10-10] 출력 병렬화 — 16그룹 × 2행(행별 순서 그대로:
             // e[i]·QS + KQ[i][p≤i]·dc[p]). 상태 갱신과 독립(배리어 불증).
             for (int r = 0; r < 2; ++r) {
@@ -690,15 +694,23 @@ extern "C" __global__ void gdn_scan(
             // [A5] 상태 갱신 행(s2) 워크그룹 분배 — 행별 j 순서는 원序 그대로.
             for (int s2 = grp; s2 < 128; s2 += GDN_NGRP) {
                 const float s_i = sc[sc_h + s2];
-                float acc = __half2float(st[st_h + (long)s2 * d + tid]) * s_i * gt_exp;
+                // [설계(2b)] RMW를 smem Stile에서 — 같은 셀·같은 순서(비트동일).
+                float acc = __half2float(Stile[s2 * GDN_VS + tid]) * s_i * gt_exp;
                 for (int j = 0; j < n; j++)
                     acc += __half2float(sk[j * 128 + s2]) * wsm[j] * dcr[j];
                 float y = acc / s_i;
                 y = fminf(fmaxf(y, -65504.0f), 65504.0f);
-                st[st_h + (long)s2 * d + tid] = __float2half_rn(y);
+                Stile[s2 * GDN_VS + tid] = __float2half_rn(y);
             }
             __syncthreads();
         }
+    }
+    // [설계(2b) 2026-10-19] 상태 환류 — 전 청크 후 1회(전역 st 최종값 동일).
+    for (int e = threadIdx.x; e < 128 * (GDN_VS / 8); e += blockDim.x) {
+        const int r = e / (GDN_VS / 8);
+        const int u = e % (GDN_VS / 8);
+        *reinterpret_cast<uint4*>(&st[st_h + (long)r * d + u * 8]) =
+            *reinterpret_cast<const uint4*>(&Stile[r * GDN_VS + u * 8]);
     }
 }
 
