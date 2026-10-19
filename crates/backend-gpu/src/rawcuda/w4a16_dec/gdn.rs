@@ -262,28 +262,71 @@ impl W4a16Dec {
                 ),
             )?;
 
-            let f = self.cc.function("gdn_scan")?;
-            self.cc.set_dynamic_smem(f, GDN_SCAN_SMEM)?;
-            let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6, mut s7) = (
-                self.gdn.dq2,
+            // [GDN-FLA K1/K2 2026-10-19] wu(청크 병렬 해·W'/U_local) → h(순수
+            // 재귀) → o(청크 병렬 출력). FlashKDA 정본: 토큰 병렬 작업 전부 K1.
+            let fw = self.cc.function("gdn_wu")?;
+            self.cc.set_dynamic_smem(fw, GDN_WU_SMEM)?;
+            let nch_w = t_len.div_ceil(GDN_CS) as u32;
+            let (mut w0, mut w1, mut w2, mut w3, mut w4) = (
                 self.gdn.dk2,
                 self.gdn.dv2,
                 self.gdn.dbg,
                 self.gdn.dakq,
+                self.gdn.dwu,
+            );
+            self.cc.launch_shared(
+                fw,
+                nch_w,
+                dm.h_v as u32,
+                (2 * dm.d) as u32,
+                GDN_WU_SMEM,
+                &mut crate::rawcuda::args::l9(
+                    &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut tl, &mut hk, &mut hv, &mut dd,
+                ),
+            )?;
+            let fh = self.cc.function("gdn_h")?;
+            self.cc.set_dynamic_smem(fh, GDN_H_SMEM)?;
+            let (mut h0, mut h1, mut h2, mut h3, mut h4, mut h5, mut h6) = (
+                self.gdn.dk2,
+                self.gdn.dbg,
+                self.gdn.dwu,
                 self.gdn.dgst + (st_slot as u64) * 2,
-                self.gdn.dgo,
                 self.gdn.dsc + (sc_slot as u64) * 4,
+                self.gdn.dhbuf,
+                self.gdn.ddcbuf,
             );
             // grid = h_v×NSPLIT(블록 = GDN_NGRP×GDN_VS = 512스레드).
             self.cc.launch_shared(
-                f,
+                fh,
                 (dm.h_v * GDN_NSPLIT) as u32,
                 1,
                 (GDN_NGRP * (128 / GDN_NSPLIT)) as u32,
-                GDN_SCAN_SMEM,
-                &mut crate::rawcuda::args::l13(
-                    &mut s0, &mut s1, &mut s2, &mut s3, &mut s4, &mut s5, &mut s7, &mut s6,
-                    &mut tl, &mut hk, &mut hv, &mut dd, &mut lay,
+                GDN_H_SMEM,
+                &mut crate::rawcuda::args::l12(
+                    &mut h0, &mut h1, &mut h2, &mut h3, &mut h4, &mut h5, &mut h6, &mut tl,
+                    &mut hk, &mut hv, &mut dd, &mut lay,
+                ),
+            )?;
+            let fo = self.cc.function("gdn_o")?;
+            self.cc.set_dynamic_smem(fo, GDN_O_SMEM)?;
+            let (mut o0, mut o1, mut o2, mut o3, mut o4, mut o5, mut o6) = (
+                self.gdn.dq2,
+                self.gdn.dbg,
+                self.gdn.dakq,
+                self.gdn.ddcbuf,
+                self.gdn.dhbuf,
+                self.gdn.dsc + (sc_slot as u64) * 4,
+                self.gdn.dgo,
+            );
+            self.cc.launch_shared(
+                fo,
+                nch_w * dm.h_v as u32,
+                1,
+                1024,
+                GDN_O_SMEM,
+                &mut crate::rawcuda::args::l12(
+                    &mut o0, &mut o1, &mut o2, &mut o3, &mut o4, &mut o5, &mut o6, &mut tl,
+                    &mut hk, &mut hv, &mut dd, &mut lay,
                 ),
             )?;
         }

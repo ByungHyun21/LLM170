@@ -117,6 +117,9 @@ impl W4a16Dec {
                 &mut self.gdn.dgpart,
                 &mut self.gdn.dgdc,
                 &mut self.gdn.dakq,
+                &mut self.gdn.dhbuf,
+                &mut self.gdn.dwu,
+                &mut self.gdn.ddcbuf,
             ],
             [
                 t_len * cch * 4,
@@ -136,6 +139,10 @@ impl W4a16Dec {
                 self.n_slots * dm.h_v * 128 * 4,
                 // [A5-4] A/KQ prepass 스크래치(최대 청크 수 기준, t_len 무관).
                 dm.h_v * (CHAIN_TMAX / GDN_CS) * 2 * GDN_CS * GDN_CS * 2,
+                // [GDN-FLA 2026-10-19] 청크 시작 상태·dc 물질화(최대 청크 수).
+                dm.h_v * (CHAIN_TMAX / GDN_CS) * dm.d * dm.d * 2,
+                dm.h_v * (CHAIN_TMAX / GDN_CS) * GDN_CS * 2 * dm.d * 4,
+                dm.h_v * (CHAIN_TMAX / GDN_CS) * GDN_CS * dm.d * 4,
             ],
         )?;
         self.gdn.gdn_t_cap = t_len;

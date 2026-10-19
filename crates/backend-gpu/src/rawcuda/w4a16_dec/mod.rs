@@ -55,13 +55,23 @@ pub const MOE_PP_MZ: usize = 4;
 /// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — A5-4: qs 스테이징 +
 /// V-타일(GDN_NSPLIT) + Stile 더블 버퍼 기준).
 pub const GDN_SCAN_SMEM: u32 = 31_236; // [설계(1) 10-19] Stile 128×VS (8패스 폐지)
+/// [GDN-FLA 2026-10-19] gdn_h(상태 전용) 동적 공유메모리 — sk/sv/A/KS/dc/
+/// Stile/bp/gcs/wsm/e (KQ·QS 제거분). 커널 레이아웃 계약.
+pub const GDN_H_SMEM: u32 = 41_220;
+/// [GDN-FLA 2026-10-19] gdn_o(청크 병렬 출력) 동적 공유메모리 — KQ/dc/
+/// Stile/gcs/e. 커널 레이아웃 계약.
+pub const GDN_O_SMEM: u32 = 59_652;
+/// [GDN-FLA] gdn_o 워크그룹 수(커널 GDN_NGRP_O 미러 — 블록 256스레드).
+pub const GDN_NGRP_O: usize = 8;
+/// [GDN-FLA K1] gdn_wu(청크 병렬 해) 동적 공유메모리 — A/R/pe/pb.
+pub const GDN_WU_SMEM: u32 = 35_072;
 /// [A5-4 2026-10-10 FLA 2단] gdn_scan V-타일 분할 수(커널 GDN_NSPLIT와
 /// 동일 계약) — grid = h_v×NSPLIT, 블록 = GDN_NGRP×GDN_VS스레드.
 /// [2026-10-18 CMP 재검] 8은 bp 버그 수정 후 비트동일·골든 불변 —
 /// 성능 pp −4.5% 기각(커널 GDN_NSPLIT 주석). 4 확정.
 pub const GDN_NSPLIT: usize = 4;
 /// [A5-4] gdn_scan 워크그룹 수(커널 GDN_NGRP와 동일 계약).
-pub const GDN_NGRP: usize = 16;
+pub const GDN_NGRP: usize = 8;
 /// gdn_scan 청크 크기(커널 GDN_CS와 동일 계약) — prepass 그리드·스크래치 산정.
 pub const GDN_CS: usize = 32;
 /// [A9 2026-10-10] 배치 디코드 최대 토큰(커널 head.cu HEAD_TMAX 미러).
@@ -552,6 +562,12 @@ pub(super) struct Gdn {
     pub(super) dgdc: CUdeviceptr,
     /// [A5-4] gdn_scan A/KQ prepass 스크래치 — [2][h_v][maxchunks][CS][CS] half.
     pub(super) dakq: CUdeviceptr,
+    /// [GDN-FLA 2026-10-19] 청크 시작 상태 물질화 — [h_v][maxchunks][d*d] half.
+    pub(super) dhbuf: CUdeviceptr,
+    /// [GDN-FLA K1 2026-10-19] W'/U_local — [h_v][maxchunks][CS][2d] f32.
+    pub(super) dwu: CUdeviceptr,
+    /// [GDN-FLA 2026-10-19] dc 물질화 — [h_v][maxchunks][CS][d] f32 (h 기록·o 판독).
+    pub(super) ddcbuf: CUdeviceptr,
     pub(super) dgate: CUdeviceptr,
     pub(super) gdn_t_cap: usize,
     /// [TreeWY 2.B 2026-10-12] 스펙 검증 WY 표현 — S_0([n_gdn][h_v][d*d])·
@@ -1094,6 +1110,9 @@ impl W4a16Dec {
                 dgpart: 0,
                 dgdc: 0,
                 dakq: 0,
+                dhbuf: 0,
+                dwu: 0,
+                ddcbuf: 0,
                 dgate: 0,
                 gdn_t_cap: 0,
                 dwy_s0: 0,
