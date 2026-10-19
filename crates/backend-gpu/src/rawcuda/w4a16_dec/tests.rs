@@ -163,7 +163,6 @@ fn gemm_mma_mirror() {
 fn gdn_scan_layout_mirror() {
     let cu = include_str!("../assets/gdn.cu");
     let cs = define(cu, "GDN_CS") as usize;
-    let tile = define(cu, "GDN_TILE") as usize;
     let nsplit = define(cu, "GDN_NSPLIT") as usize;
     assert_eq!(cs, GDN_CS, "gdn.cu GDN_CS ↔ GDN_CS");
     assert_eq!(nsplit, GDN_NSPLIT, "gdn.cu GDN_NSPLIT ↔ GDN_NSPLIT");
