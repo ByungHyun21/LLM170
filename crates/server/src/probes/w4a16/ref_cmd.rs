@@ -242,6 +242,8 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
             return Err(format!("토큰 {n}개 — NLL에는 2개 이상 필요"));
         }
         let mut eng = RefEngine::load(&dir, 1, ctx)?;
+        // [B20 보완 2026-10-19] 적재 완료 = 락 해제(CPU 오라클 장기 실행 보호).
+        crate::resource::release_load_lock();
         let t0 = std::time::Instant::now();
         let mut l = eng.prefill(0, &toks[..1])?;
         let mut nll_sum = 0f64;
@@ -275,6 +277,8 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
     }
     let n = prompts.len();
     let mut eng = RefEngine::load(&dir, n, ctx)?;
+    // [B20 보완 2026-10-19] 적재 완료 = 락 해제.
+    crate::resource::release_load_lock();
     // 재개 — 체크포인트 검증(프롬프트 일치) + 상태 복원 + 그간 출력 복원.
     // `--n-predict`는 재개 지점부터 추가 토큰 수다.
     let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];

@@ -196,6 +196,8 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         // 워밍업 1회(짧은 프리필+디코드 — 스크래치·그래프 warm).
         {
             eng.reset_seq(0).map_err(|e| e.to_string())?;
+            // [B20 보완 2026-10-19] 적재 완료 = 락 해제(프로브 경로 누락 보수).
+            crate::resource::release_load_lock();
             let _ = eng
                 .prefill(0, &prompt[..64.min(max_pp)])
                 .map_err(|e| e.to_string())?;

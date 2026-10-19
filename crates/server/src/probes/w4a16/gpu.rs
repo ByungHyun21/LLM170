@@ -37,6 +37,8 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     }
     let model =
         llm170_core::qwen35::Model::load(std::path::Path::new(&dir)).map_err(|e| e.to_string())?;
+    // [B20 보완 2026-10-19] 적재 완료 = 락 해제.
+    crate::resource::release_load_lock();
     let hp = model.hp.clone();
     let t0 = std::time::Instant::now();
     let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
@@ -202,6 +204,8 @@ pub(super) fn gpu_run_g4(args: &[String]) -> Result<String, String> {
     }
     let model =
         llm170_core::gemma4::Model::load(std::path::Path::new(&dir)).map_err(|e| e.to_string())?;
+    // [B20 보완 2026-10-19] 적재 완료 = 락 해제.
+    crate::resource::release_load_lock();
     let hp = model.hp.clone();
     let t0 = std::time::Instant::now();
     let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;

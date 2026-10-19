@@ -175,6 +175,8 @@ fn ppl(args: &[String]) -> Result<String, String> {
         return Err("--kld는 gemma4 전용(현 계측 축)".into());
     }
     let model = llm170_core::qwen35::Model::load(Path::new(&dir)).map_err(|e| e.to_string())?;
+    // [B20 보완 2026-10-19] 적재 완료 = 락 해제.
+    crate::resource::release_load_lock();
     let hp = model.hp.clone();
     let t0 = std::time::Instant::now();
     let mut dec = W4a16Dec::new(1, hp.n_embd, hp.n_layer)?;
@@ -359,6 +361,8 @@ fn ppl_g4(
 ) -> Result<String, String> {
     let t0 = std::time::Instant::now();
     let model = llm170_core::gemma4::Model::load(Path::new(dir)).map_err(|e| e.to_string())?;
+    // [B20 보완 2026-10-19] 적재 완료 = 락 해제.
+    crate::resource::release_load_lock();
     let hp = model.hp.clone();
     let h = hp.n_embd;
     let mut dec = W4a16Dec::new(1, h, hp.n_layer)?;
