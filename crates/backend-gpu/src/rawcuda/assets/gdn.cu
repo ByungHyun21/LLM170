@@ -409,6 +409,7 @@ extern "C" __global__ void gdn_scan_akq(
     const int n = min(t_len - t0, GDN_CS);
     const int kh = h % h_k;
     __shared__ __half sk[GDN_CS * 128];
+    __shared__ __half qh[GDN_CS * 128];   // [akq-mma] f16 q 타일(A operand)
     __shared__ float qs[GDN_CS * 128];
     __shared__ float gcs[GDN_CS + 1];
     __shared__ float bp[GDN_CS];
@@ -417,6 +418,7 @@ extern "C" __global__ void gdn_scan_akq(
         bool live = t < n;
         sk[e] = __float2half_rn(live ? k[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f);
         qs[e] = live ? q[(t0 + t) * (h_k * d) + kh * 128 + dv] : 0.0f;
+        qh[e] = __float2half_rn(qs[e]);
     }
     if (threadIdx.x < GDN_CS) {
         float acc = 0.0f;
@@ -432,25 +434,68 @@ extern "C" __global__ void gdn_scan_akq(
     const size_t plane = (size_t)h_v * gridDim.y * GDN_CS * GDN_CS;
     __half* Aout = akq + (size_t)h * gridDim.y * GDN_CS * GDN_CS + (size_t)c * GDN_CS * GDN_CS;
     __half* KQout = Aout + plane;
-    for (int e = threadIdx.x; e < GDN_CS * GDN_CS; e += blockDim.x) {
-        int i = e / GDN_CS, j = e % GDN_CS;
-        if (i < n) {
-            float dk = 0.0f, dq = 0.0f;
-            for (int s2 = 0; s2 < 128; s2++) {
-                float kj = __half2float(sk[j * 128 + s2]);
-                dk += __half2float(sk[i * 128 + s2]) * kj;
-                dq += qs[i * 128 + s2] * kj;
+    // [akq-mma 2026-10-19] A/KQ 그람을 mma.m16n8k16으로 — A = sk/qh(f16,
+    // [i][k]), B = sk의 [j][k] 레이아웃(비전치 ldmatrix — k가 연속). 8워프 =
+    // M2×N4. 게이팅(bp·exp(gcs_i−gcs_j))은 C 프래그먼트 좌표에서 후처리.
+    {
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        if (warp < 8) {
+            const int mt = warp >> 2, nt = warp & 3;
+            float ca0 = 0.f, ca1 = 0.f, ca2 = 0.f, ca3 = 0.f;
+            float cq0 = 0.f, cq1 = 0.f, cq2 = 0.f, cq3 = 0.f;
+            const int a_row = (lane & 7) + 8 * ((lane >> 3) & 1);
+            const int a_col = 8 * (lane >> 4);
+            const int b_row = lane & 7;
+            const int b_tile = (lane >> 3) & 1;
+            for (int ks = 0; ks < 8; ks++) {
+                unsigned a0, a1, a2, a3, q0, q1, q2, q3, b0, b1;
+                const __half* kp = &sk[(mt * 16 + a_row) * 128 + (ks * 16 + a_col)];
+                const __half* qp = &qh[(mt * 16 + a_row) * 128 + (ks * 16 + a_col)];
+                const __half* bp2 = &sk[(nt * 8 + b_row) * 128 + (ks * 16 + 8 * b_tile)];
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                             "{%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                             : "l"(__cvta_generic_to_shared(kp)));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                             "{%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(q0), "=r"(q1), "=r"(q2), "=r"(q3)
+                             : "l"(__cvta_generic_to_shared(qp)));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+                             "{%0,%1}, [%2];\n"
+                             : "=r"(b0), "=r"(b1)
+                             : "l"(__cvta_generic_to_shared(bp2)));
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                             : "+f"(ca0), "+f"(ca1), "+f"(ca2), "+f"(ca3)
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                             : "+f"(cq0), "+f"(cq1), "+f"(cq2), "+f"(cq3)
+                             : "r"(q0), "r"(q1), "r"(q2), "r"(q3), "r"(b0), "r"(b1));
             }
-            float bi = bp[i];
-            Aout[i * GDN_CS + j] = __float2half_rn((j < i) ? dk * bi * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
-            KQout[i * GDN_CS + j] = __float2half_rn((j <= i) ? dq * qscale * gdn_expf(gcs[i] - gcs[j]) : 0.0f);
-        } else {
-            Aout[i * GDN_CS + j] = __float2half_rn(0.0f);
-            KQout[i * GDN_CS + j] = __float2half_rn(0.0f);
+            const int r0 = mt * 16 + (lane >> 2);
+            const int cbase = nt * 8 + 2 * (lane & 3);
+            const float cvA[4] = {ca0, ca1, ca2, ca3};
+            const float cvQ[4] = {cq0, cq1, cq2, cq3};
+            const int rrow[4] = {r0, r0, r0 + 8, r0 + 8};
+            const int ccol[4] = {cbase, cbase + 1, cbase, cbase + 1};
+#pragma unroll
+            for (int q4 = 0; q4 < 4; q4++) {
+                const int i = rrow[q4];
+                const int j = ccol[q4];
+                if (i >= n) continue;
+                const float gi = gcs[i], gj = gcs[j];
+                const float w = gdn_expf(gi - gj);
+                Aout[i * GDN_CS + j] = __float2half_rn(
+                    (j < i) ? cvA[q4] * bp[i] * w : 0.0f);
+                KQout[i * GDN_CS + j] = __float2half_rn(
+                    (j <= i) ? cvQ[q4] * qscale * w : 0.0f);
+            }
         }
     }
-}
-extern "C" __global__ void gdn_scan(
+
+}extern "C" __global__ void gdn_scan(
     const float* __restrict__ q,     // [T][k_len]
     const float* __restrict__ k,     // [T][k_len] L2
     const float* __restrict__ v,     // [T][h_v*128] lc
