@@ -151,7 +151,10 @@ pub struct GuardTarget {
 /// (메타 서브커맨드 또는 경로 부재 — 로더 에러가 더 정확).
 pub fn guard_target(sub: &str, model: Option<&str>, rest: &[String]) -> Option<GuardTarget> {
     // 토크나이저 파일만 판독 — 무게 미적재. plan은 매니페스트 헤더만(무적재).
-    if matches!(sub, "tokenize" | "plan") {
+    // [2026-10-19] diag(envcheck·diff 등)도 무적재 — preflight가 envcheck를
+    // 부르는데 다른 llm170(예: CPU 오라클)이 락을 쥐면 600s 대기 후 preflight
+    // 자체가 실패했다(실측). 진단 계열은 가드 제외.
+    if matches!(sub, "tokenize" | "plan" | "diag") {
         return None;
     }
     let path = model.map(std::path::PathBuf::from).or_else(|| {
