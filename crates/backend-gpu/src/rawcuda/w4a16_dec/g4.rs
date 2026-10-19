@@ -875,27 +875,34 @@ impl W4a16Dec {
         //  t≤16(디코드 배치·단문 청크) = 융합 GEMV(f32 비트동일 기준선).
         let ns = t * tk;
         let base = il * n_exp * 3;
+        let out = self.g4_scratch_slot(out_slot, t * h * 4)?;
+        // [2026-10-19] 마린 MoE 시도(상주 전용) — gemma4 = gelu_tanh 활성.
+        // 정렬(align2)이 공통 전제 — 마린·레거시 모두 먼저 수행.
+        let mut marlin_done = false;
         if t > G4_TROW_MAX && n_exp <= 1024 {
             self.moe_align_launch(ns)?;
-            let xp = self.cast_f16_dev(dxn, t * h)?;
-            self.gemm_g32_mma_grp2_launch(
-                base,
-                xp,
-                h,
-                tk,
-                self.moe.exp.gate,
-                self.moe.exp.up,
-                n_ff,
-                h,
-            )?;
-            self.ew_gelu_dev(
-                self.moe.exp.gate,
-                self.moe.exp.up,
-                self.moe.exp.act,
-                ns * n_ff,
-            )?;
-            let ap = self.cast_f16_dev(self.moe.exp.act, ns * n_ff)?;
-            self.gemm_g32_mma_grp_d64_launch(base + 2, ap, n_ff, 1, self.moe.exp.dn, h, n_ff)?;
+            marlin_done = self.marlin_moe_ffn_dev(il, dxn, t, h, n_ff, tk, true, out)?;
+            if !marlin_done {
+                let xp = self.cast_f16_dev(dxn, t * h)?;
+                self.gemm_g32_mma_grp2_launch(
+                    base,
+                    xp,
+                    h,
+                    tk,
+                    self.moe.exp.gate,
+                    self.moe.exp.up,
+                    n_ff,
+                    h,
+                )?;
+                self.ew_gelu_dev(
+                    self.moe.exp.gate,
+                    self.moe.exp.up,
+                    self.moe.exp.act,
+                    ns * n_ff,
+                )?;
+                let ap = self.cast_f16_dev(self.moe.exp.act, ns * n_ff)?;
+                self.gemm_g32_mma_grp_d64_launch(base + 2, ap, n_ff, 1, self.moe.exp.dn, h, n_ff)?;
+            }
         } else {
             self.gemv_experts_glu_launch(base, ns, dxn, h, tk, self.moe.exp.act, n_ff, h)?;
             self.gemv_experts_launch(
@@ -909,8 +916,9 @@ impl W4a16Dec {
                 n_ff,
             )?;
         }
-        let out = self.g4_scratch_slot(out_slot, t * h * 4)?;
-        self.moe_accum_dev(self.moe.moe_wt, self.moe.exp.dn, out, tk, ns, h)?;
+        if !marlin_done {
+            self.moe_accum_dev(self.moe.moe_wt, self.moe.exp.dn, out, tk, ns, h)?;
+        }
         Ok(out)
     }
 

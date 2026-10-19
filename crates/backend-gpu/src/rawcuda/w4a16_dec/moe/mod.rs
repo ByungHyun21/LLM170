@@ -466,7 +466,8 @@ impl W4a16Dec {
                 );
             }
             // [2026-10-19] 마린 MoE(상주 전용) — 성공 시 act/down/accum 생략.
-            marlin_done = self.marlin_moe_ffn_dev(il, xn, t, h, n_ff, tk, false)?;
+            marlin_done =
+                self.marlin_moe_ffn_dev(il, xn, t, h, n_ff, tk, false, self.moe.dmo.ptr)?;
             if !marlin_done {
                 // [⑥ 2026-10-18] A = f16(RNE) 단일 미러 — [A2b] (hi|lo) 2-pass
                 // 제거. ncu: grp2 스톨 지배 = wait(고정지연 의존) 33.6%·

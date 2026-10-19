@@ -296,8 +296,10 @@ impl W4a16Dec {
     }
 
     /// [2026-10-19] 마린 MoE FFN 시도(상주 전용) — w13→활성→w2→topk 합산을
-    /// dmo(f32)에 직접 기록. Ok(false) = 미가용/설정 불가 — 호출부가 레거시
-    /// 커널(grp2/d64/accum)로 폴백. 스트라이드 식은 스테이지③ 업로드와 동일 계약.
+    /// out(f32 [t][h])에 직접 기록(qwen35 = dmo · gemma4 = g4 스크래치 슬롯).
+    /// gelu=false = silu(엔진 ew(silu·mul)) · true = gelu_tanh(gemma4).
+    /// Ok(false) = 미가용/설정 불가 — 호출부가 레거시(grp2/d64/accum)로 폴백.
+    /// 스트라이드 식은 스테이지③ 업로드와 동일 계약.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::rawcuda::w4a16_dec) fn marlin_moe_ffn_dev(
         &mut self,
@@ -308,6 +310,7 @@ impl W4a16Dec {
         n_ff: usize,
         top_k: usize,
         gelu: bool,
+        out: CUdeviceptr,
     ) -> Result<bool, String> {
         if self.moe_m13 == 0 || self.moe_m2 == 0 || self.moe_s13 == 0 || self.moe_s2 == 0 {
             return Ok(false);
@@ -429,7 +432,7 @@ impl W4a16Dec {
         // topk 합산 → dmo f32.
         {
             let f = self.cc.function("w4a16_moe_topk_sum_f16")?;
-            let (mut p_c, mut p_o) = (self.moe_mc2.ptr, self.moe.dmo.ptr);
+            let (mut p_c, mut p_o) = (self.moe_mc2.ptr, out);
             let (mut p_t, mut p_h, mut p_k) = (t as i32, h as i32, top_k as i32);
             self.cc.launch(
                 f,
