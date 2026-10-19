@@ -156,6 +156,7 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
     let mut ckpt_every: usize = 512;
     // [Q1 2026-10-12] 오라클 NLL 모드 — 코퍼스 순회 CPU teacher-forced NLL.
     let (mut corpus, mut limit) = (None::<String>, usize::MAX);
+    let mut nll_out: Option<String> = None;
     // [gemma4 2026-10-14] --bos <id>: 코퍼스 선두에 BOS 부착. gemma4처럼
     // 채팅 템플릿·BOS 의존이 큰 모델은 raw 텍스트 NLL이 프로토콜 아티팩트로
     // 폭발한다(HF 대조로 확인) — 품질 게이트는 BOS 부착 프로토콜을 쓴다.
@@ -203,6 +204,13 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--limit requires a number")?;
             }
+            // [2026-10-19 진리층] f64 정확항 + 보상 누산 — "정확"의 기준값.
+            "--hi-prec" => {
+                llm170_core::quant::exact::set_hi_prec(true);
+            }
+            "--nll-out" => {
+                nll_out = Some(arg(&mut it, "--nll-out requires a path")?.to_string());
+            }
             "--ckpt" => {
                 ckpt_path = Some(arg(&mut it, "--ckpt requires a path")?.to_string());
             }
@@ -237,13 +245,23 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
         let t0 = std::time::Instant::now();
         let mut l = eng.prefill(0, &toks[..1])?;
         let mut nll_sum = 0f64;
+        let mut per_pos: Vec<f64> = Vec::with_capacity(n - 1);
         for i in 1..n {
-            nll_sum += crate::probes::eval::nll_of(&l, toks[i]);
+            let v = crate::probes::eval::nll_of(&l, toks[i]);
+            nll_sum += v;
+            per_pos.push(v);
             let mut ls = eng.decode(0, &[toks[i]])?;
             l = ls.pop().ok_or("decode logits 부재")?;
             if i % 128 == 0 {
                 progress(&format!("# ref: nll {i}/{n}"));
             }
+        }
+        if let Some(p) = &nll_out {
+            let mut buf = String::from("# w4a16-ref nll dump v1\n");
+            for (i, v) in per_pos.iter().enumerate() {
+                buf.push_str(&format!("{}\t{v:.9}\n", i + 1));
+            }
+            std::fs::write(p, buf).map_err(|e| format!("nll-out: {e}"))?;
         }
         let mean = nll_sum / (n - 1) as f64;
         let ppl = mean.exp();

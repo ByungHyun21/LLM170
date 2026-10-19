@@ -34,6 +34,23 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
         let scale = w
             .aux
             .expect("w4a16 split: aux(scale) 필수 계약 — Model::w 보장");
+        // [2026-10-19 진리층] hi-prec — f64 정확항 + 보상 누산(quant::exact).
+        if crate::quant::exact::hi_prec() {
+            let (group, sbf) = (w.group, w.scale_bf16);
+            let qb = n_in / 2;
+            let sb = n_in * 2 / group;
+            for r in 0..out.len() {
+                out[r] = crate::quant::exact::dot_row_w4a16_exact_bytes(
+                    &w.data[r * qb..],
+                    &scale[r * sb..],
+                    x,
+                    n_in,
+                    group,
+                    sbf,
+                ) as f32;
+            }
+            return;
+        }
         let (dp, dl, sp, sl) = (
             w.data.as_ptr() as usize,
             w.data.len(),
