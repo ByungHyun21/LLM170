@@ -994,15 +994,17 @@ extern "C" __global__ void gdn_o(
 {
     extern __shared__ char smem_raw[];
     __half* KQ = (__half*)smem_raw;                   // [CS*CS]
-    float* dc = (float*)(KQ + GDN_CS * GDN_CS);       // [CS*GDN_VS]
-    __half* Stile = (__half*)(dc + GDN_CS * GDN_VS);  // [128*GDN_VS]
-    float* gcs = (float*)(Stile + 128 * GDN_VS);      // [CS+1]
+    float* dc = (float*)(KQ + GDN_CS * GDN_CS);       // [CS*d]
+    __half* Stile = (__half*)(dc + GDN_CS * d);       // [128*d]
+    __half* qt = Stile + 128 * d;                     // [CS*d] f16 q타일
+    float* gcs = (float*)(qt + GDN_CS * d);           // [CS+1]
     float* e = gcs + (GDN_CS + 1);                    // [CS]
     const int n_chunks = (t_len + GDN_CS - 1) / GDN_CS;
-    const int c = blockIdx.x / (h_v * GDN_NSPLIT);
-    const int rem = blockIdx.x % (h_v * GDN_NSPLIT);
-    const int h = rem / GDN_NSPLIT;
-    const int vs = (rem % GDN_NSPLIT) * GDN_VS;
+    // [NSPLIT=1 2026-10-19] o 커널 = vs 128열 전체(1024스레드·32워프=M2×N16)
+    // — q타일 스테이징이 헤드·청크당 1회(중복 4× 제거).
+    const int c = blockIdx.x / h_v;
+    const int h = blockIdx.x % h_v;
+    const int vs = 0;
     const int kh = h % h_k;
     const int tid = threadIdx.x % GDN_VS;
     const int grp = threadIdx.x / GDN_VS;
@@ -1021,14 +1023,14 @@ extern "C" __global__ void gdn_o(
             reinterpret_cast<uint2*>(KQ)[e4] = reinterpret_cast<const uint2*>(KQg)[e4];
         }
     }
-    for (int q2 = threadIdx.x; q2 < GDN_CS * GDN_VS; q2 += blockDim.x) {
-        const int j = q2 / GDN_VS, t2 = q2 % GDN_VS;
+    for (int q2 = threadIdx.x; q2 < GDN_CS * d; q2 += blockDim.x) {
+        const int j = q2 / d, t2 = q2 % d;
         dc[q2] = dcbuf[dcb + (long)c * GDN_CS * d + (long)j * d + t2];
     }
-    for (int q2 = threadIdx.x; q2 < 128 * (GDN_VS / 8); q2 += blockDim.x) {
-        const int r = q2 / (GDN_VS / 8);
-        const int u = q2 % (GDN_VS / 8);
-        *reinterpret_cast<uint4*>(&Stile[r * GDN_VS + u * 8]) =
+    for (int q2 = threadIdx.x; q2 < 128 * (d / 8); q2 += blockDim.x) {
+        const int r = q2 / (d / 8);
+        const int u = q2 % (d / 8);
+        *reinterpret_cast<uint4*>(&Stile[r * d + u * 8]) =
             *reinterpret_cast<const uint4*>(&hbuf[hb + (long)c * d * d + (long)r * d + u * 8]);
     }
     if (threadIdx.x < GDN_CS) {
@@ -1043,52 +1045,66 @@ extern "C" __global__ void gdn_o(
     if (threadIdx.x < GDN_CS) {
         e[threadIdx.x] = (threadIdx.x < n) ? gdn_expf(gcs[threadIdx.x]) : 0.0f;
     }
-    __syncthreads();
+        // [mma 2026-10-19] A operand 스테이징 — f16(q·qscale·sc[r]) (행스케일 폴딩).
+    for (int q2 = threadIdx.x; q2 < GDN_CS * d; q2 += blockDim.x) {
+        const int iq = q2 / d, rq = q2 % d;
+        float qv = (iq < n) ? q[(t0 + iq) * (h_k * d) + kh * 128 + rq] : 0.0f;
+        qt[iq * d + rq] = __float2half_rn(qv * qscale * sc[sc_h + rq]);
+    }
+__syncthreads();
     // QS(원序·패스별 f16 반올림 유지) + 출력
     constexpr int IK_O = (GDN_CS + GDN_NGRP_O - 1) / GDN_NGRP_O;
-    float rqs[IK_O];
-#pragma unroll
-    for (int kk = 0; kk < IK_O; ++kk) rqs[kk] = 0.0f;
-    for (int pass_ = 0; pass_ < 8; pass_++) {
-        const int s2b = pass_ * GDN_TILE;
-        float sv0[GDN_TILE];
-#pragma unroll
-        for (int r = 0; r < GDN_TILE; ++r) {
-            sv0[r] = __half2float(Stile[(s2b + r) * GDN_VS + tid]) * sc[sc_h + s2b + r];
+    // [mma 2026-10-19] QS = q·S_c 를 mma.m16n8k16으로 — FlashKDA 정본의 SM80 MMA
+    // 경로. A = qt(CS×K f16) · B = Stile(상태 f16, ldmatrix.trans) · C = QS f32.
+    // M = CS(2×16) · N = VS(4×8) · K = d(8×16) — 8워프 = 2×4 타일.
+    {
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int mt = warp >> 4;          // M 타일 0..1
+        const int nt = warp & 15;          // N 타일 0..15
+        float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+        const int a_row = (lane & 7) + 8 * ((lane >> 3) & 1);
+        const int a_col = 8 * (lane >> 4);
+        const int b_row = (lane & 7) + 8 * (lane >> 3);
+        for (int ks = 0; ks < 8; ks++) {
+            unsigned a0, a1, a2, a3, b0, b1;
+            const __half* ap = &qt[(mt * 16 + a_row) * d + (ks * 16 + a_col)];
+            const __half* bp = &Stile[(ks * 16 + b_row) * d + nt * 8];
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                         "{%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                         : "l"(__cvta_generic_to_shared(ap)));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
+                         "{%0,%1}, [%2];\n"
+                         : "=r"(b0), "=r"(b1)
+                         : "l"(__cvta_generic_to_shared(bp)));
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                         : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
         }
-        for (int kk = 0; kk < IK_O; ++kk) {
-            const int i = grp + kk * GDN_NGRP_O;
+        const int r0 = mt * 16 + (lane >> 2);
+        const int cbase = nt * 8 + 2 * (lane & 3);
+        const float cv[4] = {c0, c1, c2, c3};
+        const int rrow[4] = {r0, r0, r0 + 8, r0 + 8};
+        const int ccol[4] = {cbase, cbase + 1, cbase, cbase + 1};
+#pragma unroll
+        for (int q4 = 0; q4 < 4; q4++) {
+            const int i = rrow[q4];
+            const int cc = ccol[q4];
             if (i >= n) continue;
-            float aq = 0.0f;
-            for (int s2p = 0; s2p < GDN_TILE; s2p += 4) {
-                const float s0 = sv0[s2p];
-                const float s1 = sv0[s2p + 1];
-                const float s2v = sv0[s2p + 2];
-                const float s3 = sv0[s2p + 3];
-                const float4 q4 = *reinterpret_cast<const float4*>(
-                    &q[(t0 + i) * (h_k * d) + kh * 128 + s2b + s2p]);
-                aq += q4.x * s0;
-                aq += q4.y * s1;
-                aq += q4.z * s2v;
-                aq += q4.w * s3;
-            }
-            rqs[kk] = __half2float(__float2half_rn(rqs[kk] + aq * qscale));
-        }
-    }
-    for (int kk = 0; kk < IK_O; ++kk) {
-        const int i = grp + kk * GDN_NGRP_O;
-        if (i >= n) continue;
-        float qs = __half2float(__float2half_rn(rqs[kk]));
-        float oi = e[i] * qs;
+            float oi = e[i] * cv[q4];
 #pragma unroll
-        for (int p = 0; p < GDN_CS; p++) {
-            if (p <= i) {
-                float w = __half2float(KQ[i * GDN_CS + p]);
-                oi += w * dc[p * GDN_VS + tid];
+            for (int p = 0; p < GDN_CS; p++) {
+                if (p <= i) {
+                    float w = __half2float(KQ[i * GDN_CS + p]);
+                    oi += w * dc[p * d + cc];
+                }
             }
+            outv[(t0 + i) * (h_v * d) + h * 128 + vs + cc] = oi;
         }
-        outv[(t0 + i) * (h_v * d) + h * 128 + vs + tid] = oi;
     }
+
 }
 
 // ── [P9] t=1 전용 GDN — i축(상태 행) 분할 3커널 ──
