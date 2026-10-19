@@ -114,6 +114,8 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_moe_align2",
             // [2026-10-18] 마린 f16 C → f32 스트림 변환.
             "w4a16_h2f",
+            // [2026-10-19] 마린 MoE 정렬 변환(gslot→sorted_ids·expert_ids·num_post).
+            "w4a16_moe_align_marlin",
             "w4a16_shared_add",
             "w4a16_moe_accum_sg",
             "w4a16_gemm_g32_mma_grp_d64",

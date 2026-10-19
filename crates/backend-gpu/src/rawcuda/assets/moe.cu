@@ -1669,3 +1669,43 @@ extern "C" __global__ void w4a16_h2f(const unsigned short* __restrict__ in,
         *reinterpret_cast<float2*>(&out[2 * i]) = f;
     }
 }
+
+// [2026-10-19] 마린 MoE 정렬 변환 — gslot/gcnt/goff(전문가별 슬롯 j 오름차순)을
+// 마린 형식(sorted_token_ids·expert_ids·num_tokens_post_padded)으로 변환.
+// 블록 = block(마지막 블록 패딩 = sentinel ≥ n_slots). 1단계(스레드 0) 블록
+// 접두, 2단계(전문가별 병렬 복사) — align2와 동형의 결정론.
+extern "C" __global__ void w4a16_moe_align_marlin(
+    const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
+    const unsigned* __restrict__ goff, int* __restrict__ sorted_ids,
+    int* __restrict__ expert_ids, int* __restrict__ num_post, int n_exp,
+    int block, int sentinel) {
+    __shared__ int boff[1024];
+    if (blockIdx.x != 0) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+        int pos = 0;
+        for (int e = 0; e < n_exp; ++e) {
+            boff[e] = pos;
+            const int c = (int)gcnt[e];
+            pos += ((c + block - 1) / block) * block;
+        }
+        num_post[0] = pos;
+    }
+    __syncthreads();
+    for (int e = tid; e < n_exp; e += blockDim.x) {
+        const int c = (int)gcnt[e];
+        const int base = boff[e];
+        const unsigned* sl = gslot + goff[e];
+        int blk_i = base / block;
+        for (int s = 0; s < c; s += block) {
+            expert_ids[blk_i] = e;
+            const int m = min(block, c - s);
+            for (int k2 = 0; k2 < block; ++k2) {
+                sorted_ids[base + s + k2] = (k2 < m) ? (int)sl[s + k2] : sentinel;
+            }
+            blk_i += 1;
+        }
+    }
+}

@@ -4,6 +4,7 @@ pub(in crate::rawcuda::w4a16_dec) mod decode;
 mod gemm;
 mod gemv;
 mod marlin;
+mod marlin_moe;
 mod plain;
 
 impl W4a16Dec {
