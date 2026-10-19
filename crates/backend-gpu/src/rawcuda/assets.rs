@@ -168,7 +168,6 @@ pub const ASSETS: &[Asset] = &[
         syms: &[
             "gdn_conv",
             "gdn_l2perm",
-            "gdn_scan",
             "gdn_wu",
             "gdn_h",
             "gdn_o",

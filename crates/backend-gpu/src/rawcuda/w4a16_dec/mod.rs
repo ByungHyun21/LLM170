@@ -51,10 +51,7 @@ pub const GEMM_GRP_N: usize = 32;
 /// PP_MZ 미러 — 정적검사 gemm_mma_mirror). grid.x = 전문가×이 값,
 /// 블록 = (e = x/PP_MZ, mz = x%PP_MZ)가 m타일을 스트라이드 분담.
 pub const MOE_PP_MZ: usize = 4;
-/// GDN scan 동적 공유메모리(assets/gdn.cu 계약 — 정적 48KB 초과).
-/// gdn_scan 동적 공유메모리(커널 레이아웃 계약 — A5-4: qs 스테이징 +
-/// V-타일(GDN_NSPLIT) + Stile 더블 버퍼 기준).
-pub const GDN_SCAN_SMEM: u32 = 31_236; // [설계(1) 10-19] Stile 128×VS (8패스 폐지)
+// [설계(1) 10-19] Stile 128×VS (8패스 폐지)
 /// [GDN-FLA 2026-10-19] gdn_h(상태 전용) 동적 공유메모리 — sk/sv/A/KS/dc/
 /// Stile/bp/gcs/wsm/e (KQ·QS 제거분). 커널 레이아웃 계약.
 pub const GDN_H_SMEM: u32 = 41_220;
@@ -65,14 +62,14 @@ pub const GDN_O_SMEM: u32 = 59_652;
 pub const GDN_NGRP_O: usize = 8;
 /// [GDN-FLA K1] gdn_wu(청크 병렬 해) 동적 공유메모리 — A/R/pe/pb.
 pub const GDN_WU_SMEM: u32 = 35_072;
-/// [A5-4 2026-10-10 FLA 2단] gdn_scan V-타일 분할 수(커널 GDN_NSPLIT와
+/// [A5-4] GDN V-타일 분할 수(커널 GDN_NSPLIT와
 /// 동일 계약) — grid = h_v×NSPLIT, 블록 = GDN_NGRP×GDN_VS스레드.
 /// [2026-10-18 CMP 재검] 8은 bp 버그 수정 후 비트동일·골든 불변 —
 /// 성능 pp −4.5% 기각(커널 GDN_NSPLIT 주석). 4 확정.
 pub const GDN_NSPLIT: usize = 4;
-/// [A5-4] gdn_scan 워크그룹 수(커널 GDN_NGRP와 동일 계약).
+/// [A5-4] GDN 워크그룹 수(커널 GDN_NGRP와 동일 계약).
 pub const GDN_NGRP: usize = 8;
-/// gdn_scan 청크 크기(커널 GDN_CS와 동일 계약) — prepass 그리드·스크래치 산정.
+/// GDN 청크 크기(커널 GDN_CS와 동일 계약) — prepass 그리드·스크래치 산정.
 pub const GDN_CS: usize = 32;
 /// [A9 2026-10-10] 배치 디코드 최대 토큰(커널 head.cu HEAD_TMAX 미러).
 pub const BATCH_DEC_MAX: usize = 8;

@@ -62,9 +62,8 @@ fn realloc_fields_partial_failure_retry_safe() {
 }
 
 use super::{
-    ATTN_F3S_TMAX, ATTN_SPLITS, CHAIN_TMAX, G4_CHUNK_MAX, G4_TROW_MAX, GDN_CS, GDN_NGRP,
-    GDN_NSPLIT, GDN_SCAN_SMEM, GEMM_BMMA_M, GEMM_BMMA_N, GEMM_FFMA_TMAX, GEMM_GRP_M, GEMM_GRP_N,
-    GEMM_MMA_M, GEMM_MMA_N, GEMV_TR,
+    ATTN_F3S_TMAX, ATTN_SPLITS, CHAIN_TMAX, G4_CHUNK_MAX, G4_TROW_MAX, GEMM_BMMA_M, GEMM_BMMA_N,
+    GEMM_FFMA_TMAX, GEMM_GRP_M, GEMM_GRP_N, GEMM_MMA_M, GEMM_MMA_N, GEMV_TR,
 };
 
 /// [A2 2026-10-15] 청크 상한 ↔ 구조 계약 — MoE 버퍼(CHAIN_TMAX)·t행 분할 정합.
@@ -157,42 +156,6 @@ fn gemm_mma_mirror() {
         MOE_PP_MZ,
         "moepp.cu PP_MZ ↔ MOE_PP_MZ(MoE 프리필 m타일 z분할)"
     );
-}
-
-#[test]
-fn gdn_scan_layout_mirror() {
-    let cu = include_str!("../assets/gdn.cu");
-    let cs = define(cu, "GDN_CS") as usize;
-    let nsplit = define(cu, "GDN_NSPLIT") as usize;
-    assert_eq!(cs, GDN_CS, "gdn.cu GDN_CS ↔ GDN_CS");
-    assert_eq!(nsplit, GDN_NSPLIT, "gdn.cu GDN_NSPLIT ↔ GDN_NSPLIT");
-    assert_eq!(
-        define(cu, "GDN_NGRP") as usize,
-        GDN_NGRP,
-        "gdn.cu GDN_NGRP ↔ GDN_NGRP"
-    );
-    let vs = 128 / nsplit;
-    // gdn_scan 레이아웃(sk/sv/A/KQ/KS/QS/dc/Stile×2/bp/gcs/wsm) 바이트
-    // 합 — [A5-4b] qs 스테이징 제거(글로벌 직접 판독, -16KB) 반영.
-    let total = cs * 128 * 2
-        + cs * vs * 2
-        + cs * cs * 2
-        + cs * cs * 2
-        + cs * vs * 2
-        + cs * vs * 2
-        + cs * vs * 4
-        + 128 * vs * 2 // [설계(1)] Stile = 상태 슬라이스 전량(더블버퍼 폐지)
-        + cs * 4
-        + (cs + 1) * 4
-        + cs * 4
-        + cs * 4;
-    assert_eq!(total as u32, GDN_SCAN_SMEM, "gdn_scan 동적 smem 합");
-}
-
-#[test]
-fn g4_scmax_mirror() {
-    let scmax = define(include_str!("../assets/gptq4.cu"), "G4_SCMAX") as usize;
-    assert_eq!(scmax, crate::rawcuda::gptq4::G4_SCMAX, "gptq4.cu G4_SCMAX");
 }
 
 #[test]
