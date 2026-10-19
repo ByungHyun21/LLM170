@@ -628,20 +628,31 @@ extern "C" __global__ void gdn_scan(
                     continue;
                 }
                 float ak = 0.0f, aq = 0.0f;
-                for (int s2p = 0; s2p < GDN_TILE; s2p += 2) {
+                // [벡터화 2026-10-19] half2→uint2(4 half)·float2→float4 — 누산
+                // 순서(s0,s1,s2,s3 오름차순)는 2-wide 2회와 완전 동일(비트동일).
+                for (int s2p = 0; s2p < GDN_TILE; s2p += 4) {
                     const float s0 = sv0[s2p];
                     const float s1 = sv0[s2p + 1];
-                    const __half2 sk2 =
-                        *reinterpret_cast<const __half2*>(&sk[i * 128 + s2b + s2p]);
-                    const float2 skf = __half22float2(sk2);
-                    const float2 qf = (i < n)
-                        ? *reinterpret_cast<const float2*>(
+                    const float s2v = sv0[s2p + 2];
+                    const float s3 = sv0[s2p + 3];
+                    const uint2 sk4 =
+                        *reinterpret_cast<const uint2*>(&sk[i * 128 + s2b + s2p]);
+                    const float2 k01 = __half22float2(
+                        *reinterpret_cast<const __half2*>(&sk4.x));
+                    const float2 k23 = __half22float2(
+                        *reinterpret_cast<const __half2*>(&sk4.y));
+                    const float4 q4 = (i < n)
+                        ? *reinterpret_cast<const float4*>(
                               &q[(t0 + i) * (h_k * d) + kh * 128 + s2b + s2p])
-                        : make_float2(0.0f, 0.0f);
-                    ak += skf.x * s0;
-                    ak += skf.y * s1;
-                    aq += qf.x * s0;
-                    aq += qf.y * s1;
+                        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    ak += k01.x * s0;
+                    ak += k01.y * s1;
+                    ak += k23.x * s2v;
+                    ak += k23.y * s3;
+                    aq += q4.x * s0;
+                    aq += q4.y * s1;
+                    aq += q4.z * s2v;
+                    aq += q4.w * s3;
                 }
                 rks[k] = __half2float(__float2half_rn(rks[k] + ak));
                 rqs[k] = __half2float(__float2half_rn(rqs[k] + aq * qscale));
@@ -745,6 +756,338 @@ extern "C" __global__ void gdn_scan(
         const int u = e % (GDN_VS / 8);
         *reinterpret_cast<uint4*>(&st[st_h + (long)r * d + u * 8]) =
             *reinterpret_cast<const uint4*>(&Stile[r * GDN_VS + u * 8]);
+    }
+}
+
+// ── [GDN-FLA 2026-10-19] K1/K2 분할 — wu(청크 병렬 해) + h(순수 재귀) + o(출력) ──
+// 설계 = plans/gdn-fla-redesign.md §2·§8. FlashKDA 정본 대조(2026-04): 토큰 병렬
+// 작업(해 포함)은 전부 K1로 — K2(재귀)는 토큰 병렬 작업을 품지 않는다(그 병목이
+// 단일 융합 커널의 SM 유휴 원인, 분할로 ≥15%). 수식 재배열:
+//   dc = A⁻¹(bp∘v) − A⁻¹(diag(bp∘e)·k)·S = U_local − W'·S
+//   W'=A⁻¹(diag(bp∘e)k)[CS,K] · U_local=A⁻¹(bp∘v)[CS,VS전체] — 상태 무관(청크 병렬)
+//   S' = S·gt_exp + kᵀ·(wsm∘(U_local − W'·S)) · o = e∘(q·S·qscale) + KQ·(U_local−W'·S)
+// 클래스 변경(해 경로 재배열 — eval 게이트). wubuf = [h_v][nch][CS][2d] f32
+// (열 [0,d)=W' · [d,2d)=U_local).
+
+// gdn_wu — K1(청크 병렬): 해(A⁻¹)를 RHS [CS,2d]에 적용해 W'/U_local 물질화.
+// 그리드 (nch, h_v) · 블록 2d스레드(열 소유) · 전진대입 = i 직렬(CS)·열 병렬.
+extern "C" __global__ void gdn_wu(
+    const float* __restrict__ k,     // [T][h_k*d]
+    const float* __restrict__ v,     // [T][h_v*d]
+    const float* __restrict__ bg,    // [T][2*h_v]
+    const __half* __restrict__ akq,  // A만
+    float* __restrict__ wubuf,       // [h_v][nch][CS][2d]
+    int t_len, int h_k, int h_v, int d)
+{
+    extern __shared__ char smem_raw[];
+    __half* A = (__half*)smem_raw;                 // [CS*CS]
+    float* R = (float*)(A + GDN_CS * GDN_CS);      // [CS][2d]
+    float* pe = R + GDN_CS * 2 * d;                // [CS] e
+    float* pb = pe + GDN_CS;                       // [CS] bp
+    const int n_chunks = (t_len + GDN_CS - 1) / GDN_CS;
+    const int c = blockIdx.x, h = blockIdx.y;
+    const int kh = h % h_k;
+    const int col = threadIdx.x;
+    const int t0 = c * GDN_CS;
+    const int n = min(t_len - t0, GDN_CS);
+    {
+        const __half* Ag = akq + (size_t)h * n_chunks * GDN_CS * GDN_CS +
+                           (size_t)c * GDN_CS * GDN_CS;
+        for (int e4 = threadIdx.x; e4 < GDN_CS * GDN_CS / 4; e4 += blockDim.x) {
+            reinterpret_cast<uint2*>(A)[e4] = reinterpret_cast<const uint2*>(Ag)[e4];
+        }
+    }
+    if (threadIdx.x < GDN_CS) {
+        float acc = 0.0f;
+        for (int t = 0; t < GDN_CS; t++) {
+            acc += (t < n) ? bg[(t0 + t) * (2 * h_v) + h_v + h] : 0.0f;
+            pe[t] = acc;
+        }
+        for (int t = 0; t < GDN_CS; t++) pe[t] = (t < n) ? gdn_expf(pe[t]) : 0.0f;
+        pb[threadIdx.x] = (threadIdx.x < n) ? bg[(t0 + threadIdx.x) * (2 * h_v) + h] : 0.0f;
+    }
+    __syncthreads();
+    for (int j = 0; j < GDN_CS; j++) {
+        float r = 0.0f;
+        if (j < n) {
+            if (col < d)
+                r = pb[j] * pe[j] * k[(t0 + j) * (h_k * d) + kh * 128 + col];
+            else
+                r = pb[j] * v[(t0 + j) * (h_v * d) + h * 128 + (col - d)];
+        }
+        R[j * 2 * d + col] = r;
+    }
+    __syncthreads();
+    for (int i = 0; i < n; i++) {
+        float r = R[i * 2 * d + col];
+#pragma unroll
+        for (int j = 0; j < GDN_CS; j++) {
+            if (j < i) r -= __half2float(A[i * GDN_CS + j]) * R[j * 2 * d + col];
+        }
+        R[i * 2 * d + col] = r;
+    }
+    for (int i = 0; i < n; i++) {
+        wubuf[(((long)h * n_chunks + c) * GDN_CS + i) * (2 * d) + col] =
+            R[i * 2 * d + col];
+    }
+}
+
+// gdn_h — K2(순수 재귀): t = W'·S → dc = U_local − t → S' = S·gt_exp + kᵀ(wsm∘dc).
+// 해·KS·출력 없음. 그리드 (h_v×NSPLIT)·512스레드. S_c 물질화(o 판독원).
+// [FlashKDA 대조 2026-10-19] launch_bounds로 2블록/SM 강제(88→64캡) —
+// 점유 = 배리어/wait 은닉의 핵심(정본 K1 = 256,8). 스필 여부는 실측.
+extern "C" __global__ void __launch_bounds__(512, 2) gdn_h(
+    const float* __restrict__ k,     // [T][h_k*d]
+    const float* __restrict__ bg,    // [T][2*h_v]
+    const float* __restrict__ wubuf, // [h_v][nch][CS][2d]
+    __half* __restrict__ st,         // [L][h_v][d²] r/w
+    const float* __restrict__ sc,    // [L][h_v][d]
+    __half* __restrict__ hbuf,       // [h_v][nch][d*d]
+    float* __restrict__ dcbuf,       // [h_v][nch][CS][d] — dc 물질화(o 판독원)
+    int t_len, int h_k, int h_v, int d, int layer)
+{
+    extern __shared__ char smem_raw[];
+    __half* sk = (__half*)smem_raw;                  // [CS*128]
+    float* Wp = (float*)(sk + GDN_CS * 128);         // [CS*128] W'
+    float* Ul = Wp + GDN_CS * 128;                   // [CS*GDN_VS] U_local 슬라이스
+    __half* Stile = (__half*)(Ul + GDN_CS * GDN_VS); // [128*GDN_VS]
+    float* dc = (float*)(Stile + 128 * GDN_VS);      // [CS*GDN_VS]
+    float* gcs = dc + GDN_CS * GDN_VS;               // [CS+1]
+    float* wsm = gcs + (GDN_CS + 1);                 // [CS]
+    int h = blockIdx.x / GDN_NSPLIT;
+    int vs = (blockIdx.x % GDN_NSPLIT) * GDN_VS;
+    int kh = h % h_k;
+    int tid = threadIdx.x % GDN_VS;
+    int grp = threadIdx.x / GDN_VS;
+    int n_chunks = (t_len + GDN_CS - 1) / GDN_CS;
+    long st_h = (long)layer * h_v * d * d + (long)h * d * d + vs;
+    const long sc_h = ((long)layer * h_v + h) * d;
+    const long hb = ((long)h * n_chunks) * d * d + vs;
+    const long wb = (long)h * n_chunks * GDN_CS * 2 * d;
+    const long dcb = ((long)h * n_chunks) * GDN_CS * d + vs;
+
+    for (int c = 0; c < n_chunks; c++) {
+        int t0 = c * GDN_CS;
+        int n = min(t_len - t0, GDN_CS);
+        for (int e4 = threadIdx.x; e4 < GDN_CS * 32; e4 += blockDim.x) {
+            int t = e4 / 32, dv4 = (e4 % 32) * 4;
+            bool live = t < n;
+            float4 kv = live ? *reinterpret_cast<const float4*>(
+                                  &k[(t0 + t) * (h_k * d) + kh * 128 + dv4])
+                             : make_float4(0.f, 0.f, 0.f, 0.f);
+            *reinterpret_cast<__half2*>(&sk[t * 128 + dv4]) =
+                __floats2half2_rn(kv.x, kv.y);
+            *reinterpret_cast<__half2*>(&sk[t * 128 + dv4 + 2]) =
+                __floats2half2_rn(kv.z, kv.w);
+        }
+        for (int q = threadIdx.x; q < GDN_CS * 128; q += blockDim.x) {
+            const int j = q / 128, r = q % 128;
+            Wp[q] = wubuf[wb + (long)c * GDN_CS * 2 * d + (long)j * 2 * d + r];
+        }
+        for (int q = threadIdx.x; q < GDN_CS * GDN_VS; q += blockDim.x) {
+            const int j = q / GDN_VS, t2 = q % GDN_VS;
+            Ul[q] = wubuf[wb + (long)c * GDN_CS * 2 * d + (long)j * 2 * d + d + vs + t2];
+        }
+        if (threadIdx.x < GDN_CS) {
+            float acc = 0.0f;
+            for (int t = 0; t < GDN_CS; t++) {
+                acc += (t < n) ? bg[(t0 + t) * (2 * h_v) + h_v + h] : 0.0f;
+                gcs[t] = acc;
+            }
+            gcs[GDN_CS] = acc;
+        }
+        __syncthreads();
+        if (c == 0) {
+            for (int e = threadIdx.x; e < 128 * (GDN_VS / 8); e += blockDim.x) {
+                const int r = e / (GDN_VS / 8);
+                const int u = e % (GDN_VS / 8);
+                *reinterpret_cast<uint4*>(&Stile[r * GDN_VS + u * 8]) =
+                    *reinterpret_cast<const uint4*>(&st[st_h + (long)r * d + u * 8]);
+            }
+            __syncthreads();
+        }
+        for (int e = threadIdx.x; e < 128 * (GDN_VS / 8); e += blockDim.x) {
+            const int r = e / (GDN_VS / 8);
+            const int u = e % (GDN_VS / 8);
+            *reinterpret_cast<uint4*>(&hbuf[hb + (long)c * d * d + (long)r * d + u * 8]) =
+                *reinterpret_cast<const uint4*>(&Stile[r * GDN_VS + u * 8]);
+        }
+        // t = W'·S → dc = U_local − t (f32 단일 누산 — r 오름차순)
+        {
+            constexpr int IK = (GDN_CS + GDN_NGRP - 1) / GDN_NGRP;
+            float rks[IK];
+#pragma unroll
+            for (int kk = 0; kk < IK; ++kk) rks[kk] = 0.0f;
+            for (int pass_ = 0; pass_ < 8; pass_++) {
+                const int s2b = pass_ * GDN_TILE;
+                float sv0[GDN_TILE];
+#pragma unroll
+                for (int r = 0; r < GDN_TILE; ++r) {
+                    sv0[r] = __half2float(Stile[(s2b + r) * GDN_VS + tid]) *
+                             sc[sc_h + s2b + r];
+                }
+                for (int kk = 0; kk < IK; ++kk) {
+                    const int i = grp + kk * GDN_NGRP;
+                    if (i >= n) continue;
+                    float ak = 0.0f;
+#pragma unroll
+                    for (int s2p = 0; s2p < GDN_TILE; ++s2p) {
+                        ak += Wp[i * 128 + s2b + s2p] * sv0[s2p];
+                    }
+                    rks[kk] += ak;
+                }
+            }
+            for (int kk = 0; kk < IK; ++kk) {
+                const int i = grp + kk * GDN_NGRP;
+                dc[i * GDN_VS + tid] = (i < n) ? (Ul[i * GDN_VS + tid] - rks[kk]) : 0.0f;
+            }
+            // dc 물질화(o 커널이 W'·S 재계산 없이 사용 — 트래픽·FLOP 절감).
+            for (int kk = 0; kk < IK; ++kk) {
+                const int i = grp + kk * GDN_NGRP;
+                if (i < n)
+                    dcbuf[dcb + (long)c * GDN_CS * d + (long)i * d + tid] = dc[i * GDN_VS + tid];
+            }
+        }
+        if (threadIdx.x < GDN_CS) {
+            const float gtot0 = gcs[GDN_CS];
+            wsm[threadIdx.x] = (threadIdx.x < n) ? gdn_expf(gtot0 - gcs[threadIdx.x]) : 0.0f;
+        }
+        __syncthreads();
+        {
+            float gtot = gcs[GDN_CS];
+            float gt_exp = gdn_expf(gtot);
+            float dcr[GDN_CS];
+#pragma unroll
+            for (int j = 0; j < GDN_CS; ++j) dcr[j] = dc[j * GDN_VS + tid];
+            for (int s2 = grp; s2 < 128; s2 += GDN_NGRP) {
+                const float s_i = sc[sc_h + s2];
+                float acc = __half2float(Stile[s2 * GDN_VS + tid]) * s_i * gt_exp;
+                for (int j = 0; j < n; j++)
+                    acc += __half2float(sk[j * 128 + s2]) * wsm[j] * dcr[j];
+                float y = acc / s_i;
+                y = fminf(fmaxf(y, -65504.0f), 65504.0f);
+                Stile[s2 * GDN_VS + tid] = __float2half_rn(y);
+            }
+            __syncthreads();
+        }
+    }
+    for (int e = threadIdx.x; e < 128 * (GDN_VS / 8); e += blockDim.x) {
+        const int r = e / (GDN_VS / 8);
+        const int u = e % (GDN_VS / 8);
+        *reinterpret_cast<uint4*>(&st[st_h + (long)r * d + u * 8]) =
+            *reinterpret_cast<const uint4*>(&Stile[r * GDN_VS + u * 8]);
+    }
+}
+
+// gdn_o — 청크 병렬 출력: dc = U_local − W'·S_c (자체 계산) →
+// o = e∘(q·S_c·qscale) + KQ·dc. 그리드 (nch×h_v×NSPLIT)·256스레드.
+#define GDN_NGRP_O 8
+extern "C" __global__ void gdn_o(
+    const float* __restrict__ q,      // [T][h_k*d]
+    const float* __restrict__ bg,     // [T][2*h_v]
+    const __half* __restrict__ akq,   // KQ만
+    const float* __restrict__ dcbuf,  // [h_v][nch][CS][d] — h 커널 산출
+    const __half* __restrict__ hbuf,  // [h_v][nch][d*d]
+    const float* __restrict__ sc,     // [L][h_v][d]
+    float* __restrict__ outv,         // [T][h_v*d]
+    int t_len, int h_k, int h_v, int d, int layer)
+{
+    extern __shared__ char smem_raw[];
+    __half* KQ = (__half*)smem_raw;                   // [CS*CS]
+    float* dc = (float*)(KQ + GDN_CS * GDN_CS);       // [CS*GDN_VS]
+    __half* Stile = (__half*)(dc + GDN_CS * GDN_VS);  // [128*GDN_VS]
+    float* gcs = (float*)(Stile + 128 * GDN_VS);      // [CS+1]
+    float* e = gcs + (GDN_CS + 1);                    // [CS]
+    const int n_chunks = (t_len + GDN_CS - 1) / GDN_CS;
+    const int c = blockIdx.x / (h_v * GDN_NSPLIT);
+    const int rem = blockIdx.x % (h_v * GDN_NSPLIT);
+    const int h = rem / GDN_NSPLIT;
+    const int vs = (rem % GDN_NSPLIT) * GDN_VS;
+    const int kh = h % h_k;
+    const int tid = threadIdx.x % GDN_VS;
+    const int grp = threadIdx.x / GDN_VS;
+    const int t0 = c * GDN_CS;
+    const int n = min(t_len - t0, GDN_CS);
+    const float qscale = 1.0f / sqrtf((float)d);
+    const long hb = ((long)h * n_chunks) * d * d + vs;
+    const long dcb = ((long)h * n_chunks) * GDN_CS * d + vs;
+    const long sc_h = ((long)layer * h_v + h) * d;
+
+    {
+        const size_t plane = (size_t)h_v * n_chunks * GDN_CS * GDN_CS;
+        const __half* KQg = akq + plane +
+            (size_t)h * n_chunks * GDN_CS * GDN_CS + (size_t)c * GDN_CS * GDN_CS;
+        for (int e4 = threadIdx.x; e4 < GDN_CS * GDN_CS / 4; e4 += blockDim.x) {
+            reinterpret_cast<uint2*>(KQ)[e4] = reinterpret_cast<const uint2*>(KQg)[e4];
+        }
+    }
+    for (int q2 = threadIdx.x; q2 < GDN_CS * GDN_VS; q2 += blockDim.x) {
+        const int j = q2 / GDN_VS, t2 = q2 % GDN_VS;
+        dc[q2] = dcbuf[dcb + (long)c * GDN_CS * d + (long)j * d + t2];
+    }
+    for (int q2 = threadIdx.x; q2 < 128 * (GDN_VS / 8); q2 += blockDim.x) {
+        const int r = q2 / (GDN_VS / 8);
+        const int u = q2 % (GDN_VS / 8);
+        *reinterpret_cast<uint4*>(&Stile[r * GDN_VS + u * 8]) =
+            *reinterpret_cast<const uint4*>(&hbuf[hb + (long)c * d * d + (long)r * d + u * 8]);
+    }
+    if (threadIdx.x < GDN_CS) {
+        float acc = 0.0f;
+        for (int t = 0; t < GDN_CS; t++) {
+            acc += (t < n) ? bg[(t0 + t) * (2 * h_v) + h_v + h] : 0.0f;
+            gcs[t] = acc;
+        }
+        gcs[GDN_CS] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.x < GDN_CS) {
+        e[threadIdx.x] = (threadIdx.x < n) ? gdn_expf(gcs[threadIdx.x]) : 0.0f;
+    }
+    __syncthreads();
+    // QS(원序·패스별 f16 반올림 유지) + 출력
+    constexpr int IK_O = (GDN_CS + GDN_NGRP_O - 1) / GDN_NGRP_O;
+    float rqs[IK_O];
+#pragma unroll
+    for (int kk = 0; kk < IK_O; ++kk) rqs[kk] = 0.0f;
+    for (int pass_ = 0; pass_ < 8; pass_++) {
+        const int s2b = pass_ * GDN_TILE;
+        float sv0[GDN_TILE];
+#pragma unroll
+        for (int r = 0; r < GDN_TILE; ++r) {
+            sv0[r] = __half2float(Stile[(s2b + r) * GDN_VS + tid]) * sc[sc_h + s2b + r];
+        }
+        for (int kk = 0; kk < IK_O; ++kk) {
+            const int i = grp + kk * GDN_NGRP_O;
+            if (i >= n) continue;
+            float aq = 0.0f;
+            for (int s2p = 0; s2p < GDN_TILE; s2p += 4) {
+                const float s0 = sv0[s2p];
+                const float s1 = sv0[s2p + 1];
+                const float s2v = sv0[s2p + 2];
+                const float s3 = sv0[s2p + 3];
+                const float4 q4 = *reinterpret_cast<const float4*>(
+                    &q[(t0 + i) * (h_k * d) + kh * 128 + s2b + s2p]);
+                aq += q4.x * s0;
+                aq += q4.y * s1;
+                aq += q4.z * s2v;
+                aq += q4.w * s3;
+            }
+            rqs[kk] = __half2float(__float2half_rn(rqs[kk] + aq * qscale));
+        }
+    }
+    for (int kk = 0; kk < IK_O; ++kk) {
+        const int i = grp + kk * GDN_NGRP_O;
+        if (i >= n) continue;
+        float qs = __half2float(__float2half_rn(rqs[kk]));
+        float oi = e[i] * qs;
+#pragma unroll
+        for (int p = 0; p < GDN_CS; p++) {
+            if (p <= i) {
+                float w = __half2float(KQ[i * GDN_CS + p]);
+                oi += w * dc[p * GDN_VS + tid];
+            }
+        }
+        outv[(t0 + i) * (h_v * d) + h * 128 + vs + tid] = oi;
     }
 }
 
