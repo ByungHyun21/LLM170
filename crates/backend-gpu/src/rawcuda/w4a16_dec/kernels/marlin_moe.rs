@@ -295,6 +295,153 @@ impl W4a16Dec {
         Ok(true)
     }
 
+    /// [2026-10-19] 마린 MoE FFN 시도(상주 전용) — w13→활성→w2→topk 합산을
+    /// dmo(f32)에 직접 기록. Ok(false) = 미가용/설정 불가 — 호출부가 레거시
+    /// 커널(grp2/d64/accum)로 폴백. 스트라이드 식은 스테이지③ 업로드와 동일 계약.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::rawcuda::w4a16_dec) fn marlin_moe_ffn_dev(
+        &mut self,
+        il: usize,
+        xn: CUdeviceptr,
+        t: usize,
+        h: usize,
+        n_ff: usize,
+        top_k: usize,
+        gelu: bool,
+    ) -> Result<bool, String> {
+        if self.moe_m13 == 0 || self.moe_m2 == 0 || self.moe_s13 == 0 || self.moe_s2 == 0 {
+            return Ok(false);
+        }
+        let ne = self.moe.n_experts;
+        let ns = t * top_k;
+        if ne == 0 || ns == 0 {
+            return Ok(false);
+        }
+        // 블록 크기 휴리스틱(vLLM marlin_moe.py): M*topk/E/b < 0.9인 첫 b.
+        let mut block = 64usize;
+        for b in [8usize, 16, 32, 48, 64] {
+            if (ns as f64) / (ne as f64) / (b as f64) < 0.9 {
+                block = b;
+                break;
+            }
+        }
+        // 아레나 스트라이드(스테이지③과 동일식).
+        let (st13, st2) = (n_ff * h, h * n_ff / 2);
+        let (ss13, ss2) = ((h / 32) * 2 * n_ff * 2, (n_ff / 32) * h * 2);
+        // 스크래치(지연 확보).
+        let sms = self.cc.sm_count().max(1) as usize;
+        let sorted_n = ns + ne * block;
+        let exp_n = ns.div_ceil(block) + ne + 8;
+        let c13_n = ns * 2 * n_ff * 2;
+        let act_n = ns * n_ff * 2;
+        let c2_n = ns * h * 2;
+        // C_tmp — vLLM ops.cu: min(size_n·sorted, sms·4·block·max_thread_n),
+        // m8(block=8)은 ×2(실측 계약 — 커널의 m8 리듀스가 2배 사용).
+        let ctmp_n = ((2 * n_ff).max(h) * sorted_n).min(sms * 4 * block * 256)
+            * if block == 8 { 2 } else { 1 }
+            * 4;
+        macro_rules! ensure_buf {
+            ($f:ident, $n:expr, $w:expr) => {
+                if $n > self.$f.cap {
+                    self.$f = self.realloc_buf(self.$f, $n, $n, $w)?;
+                }
+            };
+        }
+        ensure_buf!(moe_msorted, sorted_n * 4, "moe_msorted");
+        ensure_buf!(moe_mexp, exp_n * 4, "moe_mexp");
+        ensure_buf!(moe_mnpost, 4, "moe_mnpost");
+        ensure_buf!(moe_mc13, c13_n, "moe_mc13");
+        ensure_buf!(moe_mact, act_n, "moe_mact");
+        ensure_buf!(moe_mc2, c2_n, "moe_mc2");
+        ensure_buf!(moe_mctmp, ctmp_n, "moe_mctmp");
+        let x16 = self.cast_f16_dev(xn, t * h)?;
+        // 정렬 변환(gslot → 마린 형식).
+        self.moe_align_marlin_dev(
+            self.moe_msorted.ptr,
+            self.moe_mexp.ptr,
+            self.moe_mnpost.ptr,
+            block,
+            ns as i32,
+        )?;
+        let topw = self.moe.moe_wt;
+        // w13: gate|up 융합(prob_m=t·top_k=topk·가중 미적용).
+        let b13 = self.moe_m13 + (il * ne) as u64 * st13 as u64;
+        let s13 = self.moe_s13 + (il * ne) as u64 * ss13 as u64;
+        if !self.marlin_moe_gemm_dev(
+            x16,
+            self.moe_mc13.ptr,
+            self.moe_mctmp.ptr,
+            b13,
+            s13,
+            self.moe_msorted.ptr,
+            self.moe_mexp.ptr,
+            self.moe_mnpost.ptr,
+            topw,
+            t,
+            2 * n_ff,
+            h,
+            top_k,
+            false,
+            block,
+        )? {
+            return Ok(false);
+        }
+        // 활성 → act f16 — qwen35 MoE = silu·mul · gemma4 = gelu_tanh.
+        {
+            let f = self.cc.function(if gelu {
+                "w4a16_moe_act_gelu_f16"
+            } else {
+                "w4a16_moe_act_silu_f16"
+            })?;
+            let (mut p_c, mut p_a) = (self.moe_mc13.ptr, self.moe_mact.ptr);
+            let (mut p_ns, mut p_nf) = (ns as i32, n_ff as i32);
+            let n = ns * n_ff;
+            self.cc.launch(
+                f,
+                n.div_ceil(4096) as u32,
+                1,
+                256,
+                &mut crate::rawcuda::args::l4(&mut p_c, &mut p_a, &mut p_ns, &mut p_nf),
+            )?;
+        }
+        // w2: down(prob_m=ns·top_k=1·가중 적용).
+        let b2 = self.moe_m2 + (il * ne) as u64 * st2 as u64;
+        let s2 = self.moe_s2 + (il * ne) as u64 * ss2 as u64;
+        if !self.marlin_moe_gemm_dev(
+            self.moe_mact.ptr,
+            self.moe_mc2.ptr,
+            self.moe_mctmp.ptr,
+            b2,
+            s2,
+            self.moe_msorted.ptr,
+            self.moe_mexp.ptr,
+            self.moe_mnpost.ptr,
+            topw,
+            ns,
+            h,
+            n_ff,
+            1,
+            true,
+            block,
+        )? {
+            return Ok(false);
+        }
+        // topk 합산 → dmo f32.
+        {
+            let f = self.cc.function("w4a16_moe_topk_sum_f16")?;
+            let (mut p_c, mut p_o) = (self.moe_mc2.ptr, self.moe.dmo.ptr);
+            let (mut p_t, mut p_h, mut p_k) = (t as i32, h as i32, top_k as i32);
+            self.cc.launch(
+                f,
+                (t * h).div_ceil(4096) as u32,
+                1,
+                256,
+                &mut crate::rawcuda::args::l5(&mut p_c, &mut p_o, &mut p_t, &mut p_h, &mut p_k),
+            )?;
+        }
+        Ok(true)
+    }
+
     /// [2026-10-19] 마린 MoE 정렬 변환(gslot→sorted_ids·expert_ids·num_post).
     pub(in crate::rawcuda::w4a16_dec) fn moe_align_marlin_dev(
         &mut self,

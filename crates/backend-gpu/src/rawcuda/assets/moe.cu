@@ -1709,3 +1709,52 @@ extern "C" __global__ void w4a16_moe_align_marlin(
         }
     }
 }
+
+// [2026-10-19] 마린 MoE 활성 — f16 C13([ns][2*n_ff] = gate|up) → f16 act([ns][n_ff])
+// = gelu_pytorch_tanh(gate)*up (ew_gelu·glu_gelu와 동일 수식·f16 반올림).
+extern "C" __global__ void w4a16_moe_act_gelu_f16(
+    const unsigned short* __restrict__ c13, unsigned short* __restrict__ act,
+    int ns, int n_ff) {
+    const int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < ns * n_ff; i += stride) {
+        const int r = i / n_ff, c = i % n_ff;
+        const float g = __half2float(*reinterpret_cast<const __half*>(&c13[r * 2 * n_ff + c]));
+        const float u = __half2float(*reinterpret_cast<const __half*>(&c13[r * 2 * n_ff + n_ff + c]));
+        const float x3 = g * g * g;
+        const float a = (0.5f * g * (1.0f + tanhf(0.7978846f * (g + 0.044715f * x3)))) * u;
+        // 주의: __half를 unsigned short에 직접 대입하면 __half→float→정수
+        // 절단 변환이 일어난다(0.0005→0) — 반드시 비트 보존으로 쓴다.
+        act[i] = __half_as_ushort(__float2half_rn(a));
+    }
+}
+
+// [2026-10-19] 마린 MoE 활성(silu) — f16 C13([ns][2*n_ff]) → f16 act([ns][n_ff]).
+// qwen35 MoE = silu·mul(엔진 ew(silu·mul)와 동일식: g/(1+__expf(-g))*u).
+extern "C" __global__ void w4a16_moe_act_silu_f16(
+    const unsigned short* __restrict__ c13, unsigned short* __restrict__ act,
+    int ns, int n_ff) {
+    const int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < ns * n_ff; i += stride) {
+        const int r = i / n_ff, c = i % n_ff;
+        const float g = __half2float(*reinterpret_cast<const __half*>(&c13[r * 2 * n_ff + c]));
+        const float u = __half2float(*reinterpret_cast<const __half*>(&c13[r * 2 * n_ff + n_ff + c]));
+        const float e = __expf(-g);
+        act[i] = __half_as_ushort(__float2half_rn((g / (1.0f + e)) * u));
+    }
+}
+
+// [2026-10-19] 마린 MoE topk 합산 — f16 C2([ns][h]) → f32 out([t][h]).
+// 행 순서 = 슬롯(token*topk+k) — 합산 순서 k 오름차순(마린 mul_topk 가중 적용 후).
+extern "C" __global__ void w4a16_moe_topk_sum_f16(
+    const unsigned short* __restrict__ c2, float* __restrict__ out, int t, int h,
+    int top_k) {
+    const int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < t * h; i += stride) {
+        const int r = i / h, c = i % h;
+        float acc = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            acc += __half2float(*reinterpret_cast<const __half*>(&c2[(r * top_k + k) * h + c]));
+        }
+        out[i] = acc;
+    }
+}

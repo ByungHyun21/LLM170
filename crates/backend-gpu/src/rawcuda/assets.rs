@@ -116,6 +116,10 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_h2f",
             // [2026-10-19] 마린 MoE 정렬 변환(gslot→sorted_ids·expert_ids·num_post).
             "w4a16_moe_align_marlin",
+            // [2026-10-19] 마린 MoE 활성(gelu_tanh·silu f16)·topk 합산.
+            "w4a16_moe_act_gelu_f16",
+            "w4a16_moe_act_silu_f16",
+            "w4a16_moe_topk_sum_f16",
             "w4a16_shared_add",
             "w4a16_moe_accum_sg",
             "w4a16_gemm_g32_mma_grp_d64",

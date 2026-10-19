@@ -830,6 +830,15 @@ pub struct W4a16Dec {
     moe_m2: CUdeviceptr,
     moe_s13: CUdeviceptr,
     moe_s2: CUdeviceptr,
+    /// [2026-10-19] 마린 MoE 스크래치 — 정렬(sorted/expids/npost)·C13/act/C2(f16)·
+    /// C_tmp(f32 리듀스). 지연 확보(realloc_buf 패턴).
+    moe_msorted: Buf,
+    moe_mexp: Buf,
+    moe_mnpost: Buf,
+    moe_mc13: Buf,
+    moe_mact: Buf,
+    moe_mc2: Buf,
+    moe_mctmp: Buf,
     /// [S2 2026-10-11] 다중세그먼트 테이블(디바이스 u64) — q/k/v·qkv/z·gate/up
     /// 을 1런치로(런치 꼬리 제거). 업로드·dchain 확정 후 ensure_chain_bufs에서
     /// 1회 작성 — 그래프 캡처 정적 계약(리플레이 간 내용 불변).
@@ -1174,6 +1183,13 @@ impl W4a16Dec {
             moe_m2: 0,
             moe_s13: 0,
             moe_s2: 0,
+            moe_msorted: Buf::default(),
+            moe_mexp: Buf::default(),
+            moe_mnpost: Buf::default(),
+            moe_mc13: Buf::default(),
+            moe_mact: Buf::default(),
+            moe_mc2: Buf::default(),
+            moe_mctmp: Buf::default(),
             dmulti: 0,
             dmulti_meta: Vec::new(),
             spec_on: false,

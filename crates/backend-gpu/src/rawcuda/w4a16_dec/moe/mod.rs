@@ -421,6 +421,9 @@ impl W4a16Dec {
         // agree 98.566% / ko +0.0091%·97.337%(밴드: int8 KV 채택 이력보다 작음).
         // t≥9(프리필)는 종전 grp2 유지.
         let group = t > 8 && n_exp <= 1024;
+        // [2026-10-19] 마린 MoE 시도(상주 전용) — **정렬(align2)이 공통 전제**라
+        // 먼저 수행하고 마린을 시도한다(미가용 시 레거시 grp2/d64 폴백).
+        let mut marlin_done = false;
         if group {
             // [P11] 그룹 mma GEMM — 전문가별 슬롯 묶음(M=슬롯 수), T1 계약 미러.
             self.moe_align_launch(ns)?;
@@ -462,25 +465,38 @@ impl W4a16Dec {
                     "[moe-cnt] il={il} slots={ns} sum={sum} tiles M64={t64} M32={t32} M16={t16} hist[0|1-8|9-16|17-32|33-48|49-64|65-96|97+]={hist:?}"
                 );
             }
-            // [⑥ 2026-10-18] A = f16(RNE) 단일 미러 — [A2b] (hi|lo) 2-pass
-            // 제거. ncu: grp2 스톨 지배 = wait(고정지연 의존) 33.6%·
-            // math_pipe 9.6% — mma 2패스·A 분해 ALU를 절반화(moepp.cu).
-            // 수치 클래스 = f16-A(과거 en PPL +0.17% 밴드) — eval 게이트 판정.
-            let x16 = self.cast_f16_dev(xn, t * h)?;
-            // [§1.2 2026-10-11] 게이트·업 2N 융합 — 발사 1회(A 스테이징·배리어 상각).
-            self.gemm_g32_mma_grp2_launch(
-                base,
-                x16,
-                h,
-                tk,
-                self.moe.exp.gate,
-                self.moe.exp.up,
-                n_ff,
-                h,
-            )?;
+            // [2026-10-19] 마린 MoE(상주 전용) — 성공 시 act/down/accum 생략.
+            marlin_done = self.marlin_moe_ffn_dev(il, xn, t, h, n_ff, tk, false)?;
+            if !marlin_done {
+                // [⑥ 2026-10-18] A = f16(RNE) 단일 미러 — [A2b] (hi|lo) 2-pass
+                // 제거. ncu: grp2 스톨 지배 = wait(고정지연 의존) 33.6%·
+                // math_pipe 9.6% — mma 2패스·A 분해 ALU를 절반화(moepp.cu).
+                // 수치 클래스 = f16-A(과거 en PPL +0.17% 밴드) — eval 게이트 판정.
+                let x16 = self.cast_f16_dev(xn, t * h)?;
+                // [§1.2 2026-10-11] 게이트·업 2N 융합 — 발사 1회(A 스테이징·배리어 상각).
+                self.gemm_g32_mma_grp2_launch(
+                    base,
+                    x16,
+                    h,
+                    tk,
+                    self.moe.exp.gate,
+                    self.moe.exp.up,
+                    n_ff,
+                    h,
+                )?;
+            }
         } else {
             self.gemv_experts_launch(base, ns, xn, h, tk, self.moe.exp.gate, n_ff, h)?;
             self.gemv_experts_launch(base + 1, ns, xn, h, tk, self.moe.exp.up, n_ff, h)?;
+        }
+        if marlin_done {
+            // 마린 경로 = w13/활성/w2/합산 완료 — shared 꼬리만 남음.
+            if fused {
+                self.moe_shared_tail_t(il, xn, t, forked)?;
+            } else {
+                self.moe_shared_t(il, xn, t)?;
+            }
+            return Ok(self.moe.dmo.ptr);
         }
         // act는 f32 기록(미러 없음) — down A f16 미러는 cast_f16이 만든다.
         // ([⑥ 2026-10-18] 종전 [A2b] hi|lo packed·ew_dev_mirror는 삭제 경로.)
