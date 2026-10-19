@@ -310,7 +310,10 @@ impl Tokenizer {
             let merges_txt = std::fs::read_to_string(dir.join("merges.txt"))
                 .map_err(|e| format!("merges.txt: {e}"))?;
             for line in merges_txt.lines() {
-                if line.is_empty() || line.starts_with('#') {
+                // [2026-10-19] 헤더 스킵은 정확히 "#version"만 — 종전
+                // `starts_with('#')`는 실제 병합 줄 "# #"(rank 294)·"## ##"(538)을
+                // 스킵해 '#' 계열 병합 전부가 실패했다(HF 대조로 적발: "##" → [2,2]).
+                if line.is_empty() || line.starts_with("#version") {
                     continue;
                 }
                 let b = line.as_bytes();
@@ -412,11 +415,18 @@ impl Tokenizer {
             && let Some((_, mt)) = cobj.iter().find(|(k, _)| k == "model_type")
             && let Some(mt) = mt.as_str()
         {
-            pre = match mt {
-                "qwen3_5" => Pre::Qwen35,
-                "qwen2" | "qwen3" => Pre::Qwen2,
-                "gemma4" | "gemma4_text" => Pre::Gemma,
-                _ => Pre::Other,
+            // [2026-10-19] 접두 매치 — qwen3_5_moe(35B-A3B)가 정확 일치 "qwen3_5"에
+            // 걸리지 않아 탐욕 폴백(Pre::Other)으로 떨어지던 버그: BPE가 아닌
+            // 최장일치 인코딩 → HF 대비 93% 토큰 경계 불일치·OOD 토큰열 →
+            // 35B PPL 15.5(vs vLLM/HF 9.5) 실측. 정규식 실측 = 27B/35B/FN 동일.
+            pre = if mt.starts_with("qwen3_5") || mt.starts_with("qwen4") {
+                Pre::Qwen35
+            } else if mt.starts_with("qwen2") || mt.starts_with("qwen3") {
+                Pre::Qwen2
+            } else if mt.starts_with("gemma4") {
+                Pre::Gemma
+            } else {
+                Pre::Other
             };
         }
 
