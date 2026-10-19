@@ -366,6 +366,13 @@ extern "C" __global__ void gdn_l2perm(
                     q_out, k_out, v_out, bg, t_len, layer, h_k, h_v, hidden);
 }
 
+// [설계(1) 2026-10-19 채택] 상태 슬라이스 1회 스테이징(16B uint4·8패스 폐지,
+// 배리어 7→1/청크 — 비트동일): A/B pp512 +1.0%·pp1024 +2.0%(ca0279ca).
+// [설계(2) 2026-10-19 실측 기각] wsm 사전 이동 + 상태 smem 상주(중간 청크
+// 전역 접근 소멸 — 비트동일): A/B pp512 −0.0%·pp1024 +0.1% = 중립 — 잔여
+// 스톨(barrier 2.9·wait 1.6·long 1.5·short 1.0/발행)은 sk/sv/A/KQ 적재·출력
+// 쓰기 등 분산 — 단일 비트동일 레버 없음. 되돌림. 잔여 축 = 클래스 변경
+// (블록해·mma·청크 병렬)뿐.
 // gdn_scan — FLA 청크 알고리즘. [A5-4 2026-10-10 FLA 2단] A/KQ·gcs 전제는
 // 청크 병렬 prepass(gdn_scan_akq)로 분리 — 상태 의존부(KS/QS·전진대입·
 // 출력·상태 갱신)만 이 커널에 남기고 state 열을 V-타일(GDN_NSPLIT)로 나눠
