@@ -1431,7 +1431,19 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
         }
     }
 
-    for (int c0 = 0; c0 < nchunks; ++c0) {
+    // [gemma4 2026-10-19] SW 창 밖 청크 스킵 — 블록 첫 행(최소 lo)의 창 하한
+    // 이전 청크는 전 열이 마스크(기여 exp(-1e30−m)=0 · m/l/O 불변)이므로
+    // 정확히 생략한다. sw=0(qwen)은 c_start=0 — 루프 범위 불변(비트 불변).
+    // (2026-10-13 기각안과 다름: 그것은 KV 보유 절단(품질 손상)이고 이것은
+    // 수학적으로 마스크된 판독 제거다.)
+    int c_start = 0;
+    if (sw > 0) {
+        const int lo_first = pos0 + rb + 1 - sw;
+        if (lo_first > 0) {
+            c_start = lo_first / FA2_BC;
+        }
+    }
+    for (int c0 = c_start; c0 < nchunks; ++c0) {
         const int base = c0 * FA2_BC;
         // ── 스테이징: K int8 복사(또는 0) + V f16 전치 + 스케일 ──
         // [K6-2] 행 기저 = 블록 테이블(종전 kc/vc+… 전개와 동일 주소).
