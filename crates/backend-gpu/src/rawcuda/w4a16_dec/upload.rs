@@ -72,18 +72,31 @@ impl W4a16Dec {
         }
         // [split-k marlin 디코드] 이중 버퍼 — g128·f16은 marlin 재패킹 사본을
         // 함께 상주시킨다(t=1 sk 디스패치 소비). 실패는 내부 폴백(경고만).
-        if group == 128 && !scale_bf16 {
-            self.upload_lin_marlin(name, q, s, n, k);
+        // [2026-10-19] g32·bf16(gemma4 dense)도 이중 버퍼 등록 — t>16 마린
+        // GEMM 소비(kernels/gemv.rs). 실패 폴백 계약은 g128과 동일.
+        if (group == 128 && !scale_bf16) || (group == 32 && scale_bf16) {
+            self.upload_lin_marlin(name, q, s, n, k, group, scale_bf16);
         }
         Ok(())
     }
 
-    /// [split-k marlin 디코드 2026-10-17] g128·f16 선형의 marlin 재패킹 사본
-    /// 상주 등록(이중 버퍼 — 원본 row-major 유지, probe 재패킹의 정식 경로
-    /// 승격). q = packed u32 [n][k/8] 바이트. 실패(형상 계약 위반·VRAM 부족)는
-    /// 경고 후 스킵 — t=1 디스패치가 기존 GEMV로 폴백해 모델 로드는 불능이
-    /// 아니게 한다(27B: +n*k/2B ≈ +11.7GB — 64GB 여유 확인 완료).
-    fn upload_lin_marlin(&mut self, name: &str, q: &[u8], s: &[u8], n: usize, k: usize) {
+    /// [split-k marlin 디코드 2026-10-17] 재패킹 사본 상주 등록(이중 버퍼 —
+    /// 원본 row-major 유지). q = packed u32 [n][k/8] 바이트. 실패(형상 계약
+    /// 위반·VRAM 부족)는 경고 후 스킵 — 디스패치가 기존 GEMV/tall로 폴백해
+    /// 모델 로드는 불능이 아니게 한다(27B g128: +n*k/2B ≈ +11.7GB).
+    /// [2026-10-19] g32·bf16(gemma4 dense) 일반화 — 스케일은 디코드→f32→
+    /// 순열→f16 단일 경로(g128·f16은 값 동일 왕복 = 비트 순열 보존).
+    #[allow(clippy::too_many_arguments)]
+    fn upload_lin_marlin(
+        &mut self,
+        name: &str,
+        q: &[u8],
+        s: &[u8],
+        n: usize,
+        k: usize,
+        group: usize,
+        scale_bf16: bool,
+    ) {
         let repack = llm170_core::marlin::marlin_repack_q(
             // SAFETY: q는 upload_lin_g 계약 길이(n*k/2, 4의 배수) 바이트 슬라이스.
             unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u32, n * k / 8) },
@@ -118,21 +131,40 @@ impl W4a16Dec {
             self.weights_bytes = self.weights_bytes.saturating_sub((n * k / 2) as u64);
             self.marlin_bytes = self.marlin_bytes.saturating_sub((n * k / 2) as u64);
         }
-        // [2026-10-18] 마린 스케일 순열 사본([kg][n] f16) — gptq 64-청크 순열
-        // (core::marlin::marlin_permute_scales와 동일식·f16 비트 순열만).
-        if s.len() == n * (k / 128) * 2 {
-            let kg = k / 128;
-            let mut so = vec![0u8; s.len()];
-            for g in 0..kg {
-                for chunk in 0..(n / 64) {
-                    for p in 0..64 {
-                        let src = (chunk * 64 + (p / 8 + 8 * (p % 8))) * kg + g;
-                        let dst = g * n + chunk * 64 + p;
-                        so[dst * 2..dst * 2 + 2].copy_from_slice(&s[src * 2..src * 2 + 2]);
+        // [2026-10-19] 마린 스케일 순열 사본([kg][n] f16) — gptq 64-청크 순열.
+        // 단일 경로: 디코드(f16/bf16→f32 정확) → marlin_permute_scales(gs=group)
+        // → f16 인코딩. g128·f16은 값 왕복이 비트 보존(종전 인라인 비트 순열과
+        // 동일 결과), g32·bf16은 marlin_moe s13/s2(perm16)과 동일 계약 —
+        // 스케일 f16 정밀도 클래스(eval 게이트 판정 대상).
+        let kg = k / group;
+        if s.len() == n * kg * 2 {
+            let sf: Vec<f32> = s
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| {
+                    let b = u16::from_le_bytes(*c);
+                    if scale_bf16 {
+                        llm170_core::quant::deq::bf16_to_f32(b)
+                    } else {
+                        llm170_core::quant::deq::half_to_f32(b)
                     }
+                })
+                .collect();
+            let so: Vec<u8> = match llm170_core::marlin::marlin_permute_scales(&sf, n, k, group) {
+                Ok(pf) => {
+                    let mut out = vec![0u8; pf.len() * 2];
+                    for (i, v) in pf.iter().enumerate() {
+                        out[i * 2..i * 2 + 2]
+                            .copy_from_slice(&Self::f32_to_f16_bits(*v).to_le_bytes());
+                    }
+                    out
                 }
-            }
-            if let Ok(dsc) = self.cc.alloc(so.len()) {
+                Err(_) => Vec::new(),
+            };
+            if !so.is_empty()
+                && let Ok(dsc) = self.cc.alloc(so.len())
+            {
                 if Self::h2d_chunked(&self.cc, dsc, &so).is_ok() {
                     self.weights_bytes += so.len() as u64;
                     self.marlin_bytes += so.len() as u64;
@@ -1696,7 +1728,7 @@ impl W4a16Dec {
         }
         // [split-k marlin 디코드] 이중 버퍼 — 재패킹은 호스트 전체 q가 필요해
         // fill(0,…)로 재료화한다(트랜지트 n*k/2B — 최대 ~151MB/가중).
-        if group == 128 && !scale_bf16 {
+        if (group == 128 && !scale_bf16) || (group == 32 && scale_bf16) {
             const RCHUNK: usize = 8 << 20;
             let mut qbuf = vec![0u8; q_len];
             let mut ok = true;
@@ -1720,7 +1752,7 @@ impl W4a16Dec {
                 }
             }
             if ok && ok_s {
-                self.upload_lin_marlin(name, &qbuf, &sbuf, n, k);
+                self.upload_lin_marlin(name, &qbuf, &sbuf, n, k, group, scale_bf16);
             }
         }
         Ok(())

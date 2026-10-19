@@ -34,7 +34,7 @@ impl W4a16Dec {
             }
             // [2026-10-18] vLLM 마린(벤더) 시도 — 사본 가용 시 단일 경로.
             let a16 = self.dx16.ptr;
-            if self.marlin_gemm_try(name, t, n, k, a16, y_out)? {
+            if self.marlin_gemm_try(name, t, n, k, a16, y_out, 128)? {
                 return Ok(());
             }
             let f = self.cc.function("w4a16_gemm_g128_mma")?;

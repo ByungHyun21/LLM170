@@ -158,6 +158,16 @@ impl W4a16Dec {
         // 상각해 FFMA 포화 접근(상세 = gptq4.cu tall2 주석). 비트계약 불변.
         // grid = 블록당 16행(8워프×2행).
         if t > 16 && g == 32 && sb {
+            // [2026-10-19] 마린 g32 우선 — 재패킹 사본(lins_mk/lins_msc)이 있으면
+            // t>16 dense를 마린 GEMM으로(27B g128과 동일 운영 계약 — 사본 부재·
+            // 형상 미충족 시 tall4 폴백). A=f16 미러는 cast_f16이 만든다(값 = 종전
+            // tall4의 f32 x를 RNE 반올림 — 산술 클래스 변경, eval 게이트 판정).
+            let x16 = self.cast_f16_dev(x_dev, t * k)?;
+            if self.marlin_gemm_try(name, t, n, k, x16, y_dev, g)? {
+                return Ok(());
+            }
+        }
+        if t > 16 && g == 32 && sb {
             let t16 = t & !15;
             // [⑮ 2026-10-18] tall4(R=4·T=8) — ncu: tall2는 L1 81.3%·lg_throttle
             // 55%로 x 재판독 포화(행당 x 파형/FFMA 절반화). 비트계약 불변.

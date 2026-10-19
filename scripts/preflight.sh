@@ -75,6 +75,9 @@ else
         if [ "$n" = marlin ]; then # [2026-10-18] 벤더 헤더 전량 포함(빌드 스크립트와 동일식)
             cs=$(cat "$A/marlin.cu" $A/marlin/*.h $A/marlin/*.cuh $A/marlin/core/*.hpp \
                 $A/marlin/torch/headeronly/util/Exception.h | sha256sum | cut -d' ' -f1)
+        elif [ "$n" = marlin_g32 ]; then # [2026-10-19] 동일식(벤더 헤더 marlin/)
+            cs=$(cat "$A/marlin_g32.cu" $A/marlin/*.h $A/marlin/*.cuh $A/marlin/core/*.hpp \
+                $A/marlin/torch/headeronly/util/Exception.h | sha256sum | cut -d' ' -f1)
         elif [ "$n" = marlin_moe ]; then # [2026-10-19] 동일식
             cs=$(cat "$A/marlin_moe.cu" $A/marlin_moe/*.h \
                 $A/marlin_moe/quantization/marlin/*.h* $A/marlin_moe/core/*.hpp \

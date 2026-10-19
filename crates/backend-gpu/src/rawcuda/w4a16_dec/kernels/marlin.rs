@@ -48,13 +48,62 @@ fn marlin_sym(threads: u32, m: usize, tn: usize, tk: usize) -> Option<&'static s
     })
 }
 
+/// [2026-10-19] g32(group_blocks=2) 판 — assets/marlin_g32.cu 채리픽 13종과 1:1.
+/// gemma4 dense(g32·bf16) t>16 경로 소비(맹글명은 툴체인 계약 — 재추출 절차
+/// = marlin_g32.cu 빌드 후 cuobjdump -symbols).
+fn marlin_g32_sym(threads: u32, m: usize, tn: usize, tk: usize) -> Option<&'static str> {
+    Some(match (threads, m, tn, tk) {
+        (128, 1, 4, 8) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (128, 1, 8, 4) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi1ELi8ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (128, 2, 4, 8) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi2ELi4ELi8ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (128, 2, 8, 4) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi2ELi8ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (128, 3, 4, 8) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi3ELi4ELi8ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (128, 3, 8, 4) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi3ELi8ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (128, 4, 4, 8) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi4ELi4ELi8ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (128, 4, 8, 4) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi128ELi4ELi8ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (256, 1, 16, 4) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi1ELi16ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (256, 1, 8, 8) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (256, 2, 16, 4) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi2ELi16ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (256, 3, 16, 4) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi3ELi16ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        (256, 4, 16, 4) => {
+            "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi4ELi16ELi4ELb0ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi"
+        }
+        _ => return None,
+    })
+}
+
 impl W4a16Dec {
-    /// [2026-10-18] vLLM 마린 GEMM 시도(27B dense t≥16 g128) — 벤더
-    /// assets/marlin/(Apache-2.0, 업스트림 대조 정본). 재패킹(lins_mk)·
-    /// 스케일 순열(lins_msc) 사본이 있을 때만 동작 — 부재 시 Ok(false)로
-    /// 기존 g128_mma 폴백(운영 계약: 사본 부재 = 용량/형상 계약 미충족일 때만).
-    /// C = f16 스크래치 → `w4a16_h2f`로 f32(y_out) — 엔진 스트림 dtype 계약.
+    /// [2026-10-18] vLLM 마린 GEMM 시도(27B dense t≥16 g128 · [2026-10-19]
+    /// gemma4 dense t>16 g32) — 벤더 assets/marlin/(Apache-2.0). 재패킹
+    /// (lins_mk)·스케일 순열(lins_msc) 사본이 있을 때만 동작 — 부재 시
+    /// Ok(false)로 기존 경로 폴백(운영 계약: 사본 부재 = 용량/형상 계약
+    /// 미충족일 때만). C = f16 스크래치 → `w4a16_h2f`로 f32(y_out).
     /// M 분할·타일 픽 = vLLM marlin_mm 휴리스틱 이식(max_par 16/128, m블록 4캡).
+    /// group = 128(f16·27B, marlin.fatbin) | 32(bf16·gemma4, marlin_g32.fatbin).
     pub(in crate::rawcuda::w4a16_dec) fn marlin_gemm_try(
         &mut self,
         name: &str,
@@ -63,6 +112,7 @@ impl W4a16Dec {
         k: usize,
         x16: CUdeviceptr,
         y_out: CUdeviceptr,
+        group: usize,
     ) -> Result<bool, String> {
         let Some(&(bq, _, _)) = self.lins_mk.get(name) else {
             return Ok(false);
@@ -108,7 +158,11 @@ impl W4a16Dec {
             for &(th, tn, tk) in cands {
                 if n.is_multiple_of(tn * 16)
                     && k.is_multiple_of(tk * 16)
-                    && let Some(sym) = marlin_sym(th, thread_m, tn, tk)
+                    && let Some(sym) = if group == 32 {
+                        marlin_g32_sym(th, thread_m, tn, tk)
+                    } else {
+                        marlin_sym(th, thread_m, tn, tk)
+                    }
                 {
                     pick = Some((th, sym));
                     break;

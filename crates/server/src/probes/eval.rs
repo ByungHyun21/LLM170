@@ -991,11 +991,12 @@ fn needle(args: &[String]) -> Result<String, String> {
             dec.reset_state(0)?;
             // [K6-3 결함수정] 문맥+답변 KV 블록 확보 — 프로브는 스케줄러 부재.
             dec.kv_grow(0, toks.len() + 16)?;
-            // 청크 프리필(≤8) — 마지막 청크만 마지막 행 로짓(서빙 프리필 동일).
+            // 청크 프리필 — [2026-10-19] --pf 존중(기본 512 = 서빙 프리필 동일
+            // 경로·t>16 마린 dense). 8 고정 시대의 판정과의 비교는 --pf 8으로.
             let mut i = 0usize;
             let mut lg: Vec<f32> = Vec::new();
             while i < toks.len() {
-                let t = (toks.len() - i).min(8);
+                let t = (toks.len() - i).min(pf.max(2));
                 let last = i + t == toks.len();
                 let mut rb: Vec<f32> = Vec::with_capacity(t * hp.n_embd);
                 for &tok in &toks[i..i + t] {
