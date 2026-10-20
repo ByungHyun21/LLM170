@@ -384,7 +384,10 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
     while let Some(x) = it.next() {
         if x == "--device" {
             let v = it.next().ok_or("--device requires a list")?;
-            devices = v.split(',').map(|d| d.parse().map_err(|_| format!("--device {d}"))).collect::<Result<Vec<i32>, String>>()?;
+            devices = v
+                .split(',')
+                .map(|d| d.parse().map_err(|_| format!("--device {d}")))
+                .collect::<Result<Vec<i32>, String>>()?;
         } else {
             rest.push(x);
         }
@@ -419,9 +422,21 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
         let nl = cfg.num_hidden_layers;
         let mid = nl / 2;
         let mut da = W4a16Dec::new_dev(1, h, nl, devices[0])?;
-        crate::gpu_engine::upload_fn_win(&mut da, &cfg, std::path::Path::new(&ct_dir), a.ctx, Some((0, mid)))?;
+        crate::gpu_engine::upload_fn_win(
+            &mut da,
+            &cfg,
+            std::path::Path::new(&ct_dir),
+            a.ctx,
+            Some((0, mid)),
+        )?;
         let mut db = W4a16Dec::new_dev(1, h, nl, devices[1])?;
-        crate::gpu_engine::upload_fn_win(&mut db, &cfg, std::path::Path::new(&ct_dir), a.ctx, Some((mid, nl)))?;
+        crate::gpu_engine::upload_fn_win(
+            &mut db,
+            &cfg,
+            std::path::Path::new(&ct_dir),
+            a.ctx,
+            Some((mid, nl)),
+        )?;
         (da, Some(db))
     } else {
         let mut d = W4a16Dec::new(1, h, cfg.num_hidden_layers)?;

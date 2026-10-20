@@ -282,7 +282,6 @@ impl W4a16Dec {
             )?;
         }
         let interval = self.attn.attn.ok_or("fn_chain: attn 미등록")?.interval;
-        let n_layers = self.n_layers;
         let mut gi = win.gdn_start(interval);
         for off in 0..win.n() {
             let il = win.abs(off);
@@ -453,7 +452,9 @@ impl W4a16Dec {
             let mut rb = vec![0u8; t * hh * 4];
             self.cc.d2h(&mut rb, self.fn_.r.ptr)?;
             // SAFETY: rb는 t*hh*4 바이트(정렬 4) — f32 뷰 재해석.
-            return Ok(unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, t * hh).to_vec() });
+            return Ok(unsafe {
+                std::slice::from_raw_parts(rb.as_ptr() as *const f32, t * hh).to_vec()
+            });
         }
         // ── 최종 mixer — norm(행 2L) + mix(head 입력 sample).
         self.fn_hc_cycle(

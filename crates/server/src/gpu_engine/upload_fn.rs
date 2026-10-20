@@ -224,10 +224,11 @@ pub(crate) fn upload_fn_win(
         )?;
     }
     // PLE kv 팩(key_proj[hh]‖value_proj[h] n축 연접) — PLE 층 소유 창만.
-    if !window.is_none_or(|(ws, we)| cfg.ple_layer_ids.first().is_none_or(|&p| p >= ws && p < we)) && cfg.ple_layer_ids.first().is_some() {
-        // 비소유 — 스킵(ple kv 미등록 — 체인도 창 밖이라 참조 없음).
-    } else
+    if let Some(&p) = cfg.ple_layer_ids.first()
+        && !window.is_none_or(|(ws, we)| p >= ws && p < we)
     {
+        // 비소유 — 스킵(ple kv 미등록 — 체인도 창 밖이라 참조 없음).
+    } else {
         let kb = store
             .tensor_slice("model.language_model.layers.1.ple.key_proj.weight")
             .ok_or("ple.key_proj 부재")?;
@@ -241,7 +242,14 @@ pub(crate) fn upload_fn_win(
     }
     // head(BF16) — 최종 창만.
     if owns_final {
-        up(dec, &store, "blk.head.weight", "lm_head.weight", cfg.vocab, h)?;
+        up(
+            dec,
+            &store,
+            "blk.head.weight",
+            "lm_head.weight",
+            cfg.vocab,
+            h,
+        )?;
     }
     dec.set_plain_mode(true);
     dec.set_moe(
