@@ -44,6 +44,12 @@ pub struct Qwen4ExpCfg {
     pub output_gate_sigmoid: bool,
     /// shared_expert_intermediate_size.
     pub shared_ffn: usize,
+    /// moe_intermediate_size(전문가 FFN 폭 — FN 실측 640).
+    pub moe_ffn: usize,
+    /// hyper-connection 저랭크(hc_lowrank — FN 실측 320).
+    pub hc_lowrank: usize,
+    /// rms_norm_eps(FN 실측 1e-6) — HC·PLE 노름.
+    pub rms_norm_eps: f32,
     /// PLE 배치 층(config ple_layer_ids — 체크포인트 0-based 인덱스와 1 차이).
     pub ple_layer_ids: Vec<usize>,
     pub ple_embed_dim: usize,
@@ -130,6 +136,9 @@ impl Qwen4ExpCfg {
             n_experts: num("num_experts")?,
             top_k: num("num_experts_per_tok")?,
             shared_ffn: num_opt("shared_expert_intermediate_size", 0),
+            moe_ffn: num_opt("moe_intermediate_size", 0),
+            hc_lowrank: num_opt("hc_lowrank", 0),
+            rms_norm_eps: t.get("rms_norm_eps").and_then(Json::as_f64).unwrap_or(1e-6) as f32,
             ple_layer_ids,
             ple_embed_dim: num_opt("ple_embed_dim", 0),
             ngram_vocab_base: t

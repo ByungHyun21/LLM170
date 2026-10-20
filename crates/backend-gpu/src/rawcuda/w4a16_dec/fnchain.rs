@@ -78,7 +78,7 @@ impl W4a16Dec {
             self.fn_.hc,
             self.fn_.lowrank,
         );
-        let mut alloc = |b: &mut Buf, bytes: usize| -> Result<(), String> {
+        let alloc = |b: &mut Buf, bytes: usize| -> Result<(), String> {
             if b.cap < bytes {
                 if b.ptr != 0 {
                     self.cc.free(b.ptr)?;

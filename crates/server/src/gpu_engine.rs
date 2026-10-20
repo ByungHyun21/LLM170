@@ -15,6 +15,7 @@ mod pp;
 mod qwen;
 mod spec;
 mod upload;
+mod upload_fn;
 mod upload_g4;
 pub(crate) use self::g4::{g4_chunk, g4_step};
 pub(crate) use self::gemma::GemmaEngine;
