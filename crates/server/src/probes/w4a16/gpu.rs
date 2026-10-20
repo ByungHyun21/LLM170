@@ -505,9 +505,7 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
                     cfg.indexer_n_heads,
                     cfg.indexer_head_dim / 2,
                 );
-                let mut caches: Vec<QsaCache> = Vec::new();
-                let mut qlns: Vec<Vec<f32>> = Vec::new();
-                let mut klns: Vec<Vec<f32>> = Vec::new();
+                let (caches, qlns, klns) = (&mut qsa_caches, &mut qsa_qlns, &mut qsa_klns);
                 let mut cb = |il: usize, tt: usize, rows: &[f32]| -> (Vec<i32>, Vec<i32>) {
                     let li = il / cfg.full_interval.max(1);
                     while caches.len() <= li {
