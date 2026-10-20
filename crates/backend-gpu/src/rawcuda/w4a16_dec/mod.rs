@@ -602,11 +602,15 @@ pub(super) struct Gdn {
     pub(super) dchk_tick: u64,
     /// [FN M1 2026-10-20] GDN 출력게이트 = sigmoid(config output_gate_type).
     /// qwen35(27B/35B) = silu(기본 false). gdn_gate/gdn_gate_sig 심볼 선택.
+    /// [WIP] fnchain.rs 미구현 — 소비부 상륙까지 dead-code 허용.
+    #[allow(dead_code)]
     pub(super) sig_gate: bool,
 }
 
 /// [FN M1 2026-10-20] Qwen3.8-Flash-Next 하이퍼커넥션·PLE 상태/스크래치 —
 /// W4a16Dec 필드 도메인 그룹. fn_chain_dev_t(fnchain.rs) 전용.
+/// [WIP] fnchain.rs 미구현 — 소비부 상륙까지 dead-code 허용.
+#[allow(dead_code)]
 pub(super) struct Fn {
     /// FN 체인 등록 완료(set_fn 성공).
     pub(super) on: bool,
