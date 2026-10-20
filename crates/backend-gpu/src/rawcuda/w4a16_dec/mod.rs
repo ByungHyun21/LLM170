@@ -52,9 +52,13 @@ pub const GEMM_GRP_N: usize = 32;
 /// 블록 = (e = x/PP_MZ, mz = x%PP_MZ)가 m타일을 스트라이드 분담.
 pub const MOE_PP_MZ: usize = 4;
 // [설계(1) 10-19] Stile 128×VS (8패스 폐지)
-/// [GDN-FLA 2026-10-19] gdn_h(상태 전용) 동적 공유메모리 — sk/sv/A/KS/dc/
-/// Stile/bp/gcs/wsm/e (KQ·QS 제거분). 커널 레이아웃 계약.
-pub const GDN_H_SMEM: u32 = 41_220;
+/// [GDN-FLA 2026-10-19] gdn_h(상태 전용) 동적 공유메모리 — 커널 레이아웃 계약.
+/// [mma2 2026-10-20] Ul→dc 제자리 병합·wsm 폐지·보폭 패딩(sk/Wp 136·
+/// Stile 40·Wdc 오버레이) — 41,220 → 40,068B(4블록/SM 문턱 40,960 이하).
+pub const GDN_H_SMEM: u32 = 40_068;
+/// [TB 인터리브 2026-10-20] gdn_l2perm 블록당 토큰 수(커널 GDN_L2_TB 미러) —
+/// a/b 도트에서 abuf 슬라이스를 토큰이 공유(그리드 y = ceil(t_len/이 값)).
+pub const GDN_L2_TB: usize = 4;
 /// [GDN-FLA 2026-10-19] gdn_o(청크 병렬 출력) 동적 공유메모리 — KQ/dc/
 /// Stile/gcs/e. 커널 레이아웃 계약.
 pub const GDN_O_SMEM: u32 = 59_652;
