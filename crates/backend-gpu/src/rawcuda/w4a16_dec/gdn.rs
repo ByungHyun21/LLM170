@@ -335,7 +335,11 @@ impl W4a16Dec {
         // 노드 제거(값 비트동일). dx32/dx16 = t_len×v_len 보장.
         let ng = t_len * dm.v_len();
         let (g32, g16) = (self.ensure_dx32(ng)?, self.ensure_dx16(ng)?);
-        let f = self.cc.function("gdn_gate")?;
+        // [FN 2026-10-20] 출력게이트 = config output_gate_type(qwen35 silu /
+        // FN sigmoid) — gdn_gate_sig 심볼(fn.cu) 선택.
+        let f = self
+            .cc
+            .function(if self.gdn.sig_gate { "gdn_gate_sig" } else { "gdn_gate" })?;
         let (mut g0, mut g1, mut g2, mut g3) = (self.gdn.dgo, z_dev, self.gdn.dnwg, self.gdn.dgate);
         let (mut g4, mut g5) = (g32, g16);
         self.cc.launch(
@@ -720,7 +724,9 @@ impl W4a16Dec {
         {
             let ng = t_len * dm.v_len();
             let (g32, g16) = (self.ensure_dx32(ng)?, self.ensure_dx16(ng)?);
-            let f = self.cc.function("gdn_gate")?;
+            let f = self
+                .cc
+                .function(if self.gdn.sig_gate { "gdn_gate_sig" } else { "gdn_gate" })?;
             let (mut g0, mut g1, mut g2, mut g3) =
                 (self.gdn.dgo, z_dev, self.gdn.dnwg, self.gdn.dgate);
             let (mut g4, mut g5) = (g32, g16);
