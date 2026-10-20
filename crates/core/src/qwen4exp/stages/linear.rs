@@ -13,15 +13,36 @@
 //! norm[128] = **평범 RMSNorm 가중치(+1 금지)** — vLLM RMSNormGated는
 //! plain `x_normed*weight`(layernorm.py forward_static)이고 체크포인트
 //! 실측 평균 ≈0.97(zero-centered 원시 w가 아님) → `f32_vec` 그대로
-//! (q/k_norm·hc_norm 등 Gemma 노름만 `Model::norm_vec` +1). 상태ful
-//! 디코드는 3차.
+//! (q/k_norm·hc_norm 등 Gemma 노름만 `Model::norm_vec` +1).
+//! [D2 2026-10-20] `forward_state` — conv 히스토리(k−1토큰 in_proj_qkv
+//! 출력)·GDN 상태를 전달하는 상태ful 경로(오라클 디코드).
 
 use super::super::engine::Model;
 use crate::gdn::gdn_chunk_seq;
 use crate::gdn_norm::{GdnGate, gdn_norm_gated};
 use crate::ops::{l2_norm, sigmoid, silu, softplus};
 
+/// 상태 0 프로브 — 상태ful `forward_state`의 1청크 래퍼.
 pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
+    let qkv_n = m.ent(&format!(
+        "model.language_model.layers.{il}.linear_attn.in_proj_qkv.weight"
+    ))?
+    .shape[0] as usize;
+    let mut st = vec![0.0f32; m.cfg.linear_value_heads * m.cfg.linear_head_dim * m.cfg.linear_head_dim];
+    let mut hist: Vec<Vec<f32>> = Vec::new();
+    forward_state(m, il, xs, &mut hist, &mut st, qkv_n)
+}
+
+/// [D2] 상태ful GDN forward — `conv_hist` = 직전 토큰 in_proj_qkv 출력
+/// (최대 k−1개·vLLM conv 상태 계약), `st` = GDN 상태[h_v·d·d](입출).
+pub fn forward_state(
+    m: &Model,
+    il: usize,
+    xs: &[Vec<f32>],
+    conv_hist: &mut Vec<Vec<f32>>,
+    st: &mut [f32],
+    qkv_n: usize,
+) -> Result<Vec<Vec<f32>>, String> {
     let l = format!("model.language_model.layers.{il}.linear_attn");
     let cfg = &m.cfg;
     let n_tok = xs.len();
@@ -29,9 +50,11 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
     let d = cfg.linear_head_dim;
     let v_len = h_v * d;
 
-    // 형상·dtype 체크 — qkv 폭에서 q/k 헤드 수 유도.
+    // 형상·dtype 체크 — qkv 폭은 호출부 전달값과 대조.
     let eq = m.ent(&format!("{l}.in_proj_qkv.weight"))?;
-    let qkv_n = *eq.shape.first().ok_or("in_proj_qkv shape 부재")? as usize;
+    if *eq.shape.first().ok_or("in_proj_qkv shape 부재")? as usize != qkv_n {
+        return Err("in_proj_qkv 폭 불일치".into());
+    }
     if qkv_n <= v_len || !(qkv_n - v_len).is_multiple_of(2 * d) {
         return Err(format!(
             "in_proj_qkv n={qkv_n} — v({v_len}) 외 q/k 균분 위반"
@@ -87,7 +110,7 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
         }
     }
 
-    // causal conv1d(좌측 0패딩) + silu → q|k|v 분할.
+    // causal conv1d(청크 앞은 conv_hist — 부족분/미초기화 0) + silu → q|k|v.
     let mut q_all = vec![0.0f32; n_tok * k_len];
     let mut k_all = vec![0.0f32; n_tok * k_len];
     let mut v_all = vec![0.0f32; n_tok * v_len];
@@ -95,11 +118,18 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
         for c in 0..qkv_n {
             let mut acc = 0.0f32;
             for j in 0..conv_k {
-                let hist = t + j >= conv_k - 1; // x[t + j - (conv_k-1)]
-                if hist {
-                    let src = qkv[t + j - (conv_k - 1)][c];
-                    acc += conv_w[c * conv_k + j] * src;
-                }
+                let q = t as isize + j as isize - (conv_k as isize - 1);
+                let src = if q >= 0 {
+                    qkv[q as usize][c]
+                } else {
+                    let hq = conv_hist.len() as isize + q;
+                    if hq >= 0 {
+                        conv_hist[hq as usize][c]
+                    } else {
+                        0.0
+                    }
+                };
+                acc += conv_w[c * conv_k + j] * src;
             }
             let o = silu(acc);
             if c < k_len {
@@ -109,6 +139,13 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
             } else {
                 v_all[t * v_len + c - 2 * k_len] = o;
             }
+        }
+    }
+    // conv 히스토리 갱신 — 최근 k−1개의 원시 qkv.
+    for row in qkv {
+        conv_hist.push(row);
+        if conv_hist.len() > conv_k - 1 {
+            conv_hist.remove(0);
         }
     }
     // q/k per-head l2_norm.
@@ -122,11 +159,10 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
         }
     }
 
-    // GDN 코어 — 상태 0 프로브(1청크).
-    let mut st = vec![0.0f32; h_v * d * d];
+    // GDN 코어 — 상태 입출(청크 경계 연속).
     let mut o_all = vec![0.0f32; n_tok * v_len];
     gdn_chunk_seq(
-        &q_all, &k_all, &v_all, &beta_all, &g_all, &mut st, &mut o_all, n_tok, h_k, h_v,
+        &q_all, &k_all, &v_all, &beta_all, &g_all, st, &mut o_all, n_tok, h_k, h_v,
     );
 
     // norm_gated: rms_norm(o, norm[128])·게이트(config — FN=sigmoid) → out_proj.

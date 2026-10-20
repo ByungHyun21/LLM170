@@ -3,9 +3,9 @@
 //! 텐서 계약(FN 실측): q_proj [12288,2560] = 24헤드×(q 256‖gate 256)
 //! · k/v_proj [512,2560](KV 2헤드×256) · o_proj [2560,6144] ·
 //! q/k_norm [256]. RoPE: n_rot 64(partial_rotary_factor 0.25)·theta 1e7
-//! — qwen35 rope_head 재사용. **indexer(경량 top-k 경로)는 미구현** —
-//! `indexer_forward`가 명시적 Err. 아래 forward는 dense 전체 attention
-//! 프로브(indexer 근사 아님 — 골든 불가, 형상·dtype 검증 목적).
+//! — qwen35 rope_head 재사용. indexer top-k 실제 경로는 [D2]
+//! `stages/qsa.rs`(full_forward — 상태ful 선택 집합 어텐션). 아래
+//! forward는 dense 전체 attention 프로브(구조 검증 목적).
 //!
 //! [D0 2026-10-20 판별] q_proj Q‖gate 레이아웃 = **헤드별 인터리브 확정**:
 //! vLLM qwen3_next.py `_project_qkv_gate` 이저 경로가
@@ -102,9 +102,3 @@ fn cfg_rope_base() -> f32 {
     1e7
 }
 
-/// indexer(경량 top-k 어텐션 경로) — **미구현(3차)**.
-/// 텐서: index_qk_proj [640,2560] · q/k_layernorm [128] ·
-/// indexer_n_heads 4·head_dim 128·budget 2048(config).
-pub fn indexer_forward(_m: &Model, _il: usize, _xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
-    Err("indexer top-k 경로 미구현 — FN 3차 (index_qk_proj 4헤드×128 · budget 2048 · 점수→top-k 선택→가중합 그래프 해부 필요)".into())
-}

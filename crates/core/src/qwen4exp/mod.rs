@@ -19,7 +19,12 @@ pub mod bind;
 pub use bind::{Qwen4ExpCfg, arch_ok, ctx_info, dir_arch_ok, report};
 // [FN 2단계 2026-10-17] CPU 오라클 엔진 골격 — 스토어 직접 접근(gptq 팩).
 pub mod engine;
+// [FN D1→재팩 2026-10-20] GPTQ→CT 무손실 재패커(니블 전치) — fn-repack 진입.
+// (wt/fnoracle: repack.rs 미탑재 — FnRepack 병합 시 재활성. — FnOracle)
+// pub mod repack;
 pub mod stages;
+// [FN D2 2026-10-20] 상태ful CPU 오라클 — 전 48층 forward 체인·greedy 골든.
+pub mod oracle;
 
 /// w4a16-ref fn-probe 진입 — engine::probe 재수출.
 pub use engine::probe;
