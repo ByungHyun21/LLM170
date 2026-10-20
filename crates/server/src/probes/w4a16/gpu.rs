@@ -467,6 +467,10 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
         Ok((emb_flat, ple_flat, t))
     };
     let mut sample: Vec<f32> = Vec::new();
+    // [QSA] 선택 캐시·노름 가중 — **청크 루프 밖**(청크 경계 지속 계약).
+    let mut qsa_caches: Vec<llm170_core::qwen4exp::stages::qsa::QsaCache> = Vec::new();
+    let mut qsa_qlns: Vec<Vec<f32>> = Vec::new();
+    let mut qsa_klns: Vec<Vec<f32>> = Vec::new();
     std::thread::scope(|sc| -> Result<(), String> {
         let mut prefetch: Option<
             std::thread::ScopedJoinHandle<Result<(Vec<f32>, Vec<f32>, usize), String>>,
