@@ -251,6 +251,12 @@ pub(crate) fn upload_fn(
         }
     }
     dec.set_expert_table(tab);
+    // [M3 2026-10-20] 스트리밍 LRU 확대 — 기본 96슬롯(frac 2)은 t≤8 강제.
+    // FN 512전문가 top-10의 청크 distinct는 핫 집중으로 512톤≈263 — 캐시
+    // 320슬롯(≈42GB·frac 1 전체 여유)이 t=512 청크를 수용해 mma GEMM +
+    // t>8 전문가 그룹 경로를 활성화한다. KV 예약은 서빙 경로 계약(프로브
+    // ctx 기준) — 서빙 편성 시 kv_reserve와 합산 재판정.
+    dec.set_lru_tuning(Some(320), Some(1))?;
     // ── 3) GDN 상수 — a 먼저 b 다음(커널 ab 색인)·norm은 +1 금지(D0). ──
     let n_gdn = cfg.num_hidden_layers - cfg.num_hidden_layers / cfg.full_interval.max(1);
     let dims = GdnDims {

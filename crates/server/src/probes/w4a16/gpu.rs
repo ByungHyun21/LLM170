@@ -403,7 +403,7 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
 
     // 청크 프리필 + 그리디.
     let tg = std::time::Instant::now();
-    let chunk_max = 8usize; // [M1] 스트리밍 전문가 distinct 가드(t≤8 계약 — 상주/PP는 M3)
+    let chunk_max = 512usize; // [M3] LRU 320슬롯 확대로 t=512 청크(distinct 263 ≤ 320)
     let hist = prompt.clone();
     let mut pos = 0usize;
     let mut sample: Vec<f32>;
