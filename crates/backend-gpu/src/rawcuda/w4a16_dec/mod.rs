@@ -600,6 +600,61 @@ pub(super) struct Gdn {
     pub(super) dchk_saved: Vec<[u32; 4]>,
     pub(super) dchk_use: Vec<[u64; 4]>,
     pub(super) dchk_tick: u64,
+    /// [FN M1 2026-10-20] GDN 출력게이트 = sigmoid(config output_gate_type).
+    /// qwen35(27B/35B) = silu(기본 false). gdn_gate/gdn_gate_sig 심볼 선택.
+    pub(super) sig_gate: bool,
+}
+
+/// [FN M1 2026-10-20] Qwen3.8-Flash-Next 하이퍼커넥션·PLE 상태/스크래치 —
+/// W4a16Dec 필드 도메인 그룹. fn_chain_dev_t(fnchain.rs) 전용.
+pub(super) struct Fn {
+    /// FN 체인 등록 완료(set_fn 성공).
+    pub(super) on: bool,
+    /// hc_count(4)·lowrank(320) — 커널·선형 형상 계약.
+    pub(super) hc: usize,
+    pub(super) lowrank: usize,
+    /// rms_norm_eps(1e-6) — hc_norm·PLE 노름.
+    pub(super) eps: f32,
+    /// hc_norm 가중 [2L+1][hc*hidden] f32(행 = attn(il)·mlp(il)·…·mixer).
+    pub(super) d_hcn: CUdeviceptr,
+    /// PLE 활성(il=ple_layer_ids−1 — 0-based 단일 층 계약). None = 미배치.
+    pub(super) ple_il: Option<usize>,
+    /// PLE conv1d 가중 [10240][4] f32(원본 [10240,1,4] 평탄화).
+    pub(super) d_ple_w: CUdeviceptr,
+    /// PLE 노름 가중 norm_key/norm_query/norm_conv [10240] f32 각(원본 bf16).
+    pub(super) d_ple_nk: CUdeviceptr,
+    pub(super) d_ple_nq: CUdeviceptr,
+    pub(super) d_ple_nc: CUdeviceptr,
+    /// PLE conv 상태 [슬롯][9][10240] f32 — 청크 경계 지속(제3 상태축).
+    pub(super) d_ple_st: CUdeviceptr,
+    /// 슬롯별 상태 유효(첫 청크 이후 true — wb 이후 세팅).
+    pub(super) ple_init: Vec<bool>,
+    // ── 청크 스크래치(지연 확보 — realloc_buf 패턴) ──
+    /// 다중스트림 상태 R [t][hc*hidden] f32.
+    pub(super) r: Buf,
+    /// hc_norm 출력 xn [t][hc*hidden].
+    pub(super) xn: Buf,
+    /// W_up 게이트 출력 g [t][hc*hidden].
+    pub(super) g: Buf,
+    /// 블록 입력 x [t][hidden].
+    pub(super) x: Buf,
+    /// 저랭크 lora(silu 입력) [t][lowrank].
+    pub(super) lora: Buf,
+    /// 블록 출력 y(hc_write 소비) [t][hidden].
+    pub(super) y: Buf,
+    /// W_inject 원시 출력 [t][hc].
+    pub(super) inj: Buf,
+    /// PLE 임베딩 스테이징 [t][hidden] f32(호스트 게더→h2d).
+    pub(super) ple_e: Buf,
+    /// PLE key [t][hc*hidden] / value [t][hidden] / gated·normed [t][hc*hidden].
+    pub(super) ple_k: Buf,
+    pub(super) ple_v: Buf,
+    pub(super) ple_gd: Buf,
+    pub(super) ple_nm: Buf,
+    /// MoE 웨이브 상한(스트리밍 distinct 가드 — 기본 8).
+    pub(super) wave: usize,
+    /// 스크래치 확보 폭(t).
+    pub(super) warm_t: usize,
 }
 
 /// [K-STEP 2026-10-12 §3.4 ①] 디바이스 K-스텝 디코드 루프 상태 — W4a16Dec
@@ -1084,6 +1139,7 @@ impl W4a16Dec {
             },
             gdn: Gdn {
                 gdn: None,
+                sig_gate: false,
                 dcw: 0,
                 dab_c: 0,
                 dalog: 0,

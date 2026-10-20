@@ -149,6 +149,30 @@ pub const ASSETS: &[Asset] = &[
         boot: true,
     },
     Asset {
+        // [FN M1 2026-10-20] Qwen3.8-Flash-Next 전용 — hyper-connection
+        // (Gated Residual)·PLE(게이트/숏컨브)·GDN sigmoid 게이트판·전문가
+        // g128/f16 GEMV(gptq4.cu 바이트동결으로 자체 포함).
+        name: "fn",
+        env: "LLM170_CUDA_FN_FATBIN_PATH",
+        paths: &[
+            "crates/backend-gpu/src/rawcuda/assets/fn.fatbin",
+            "src/rawcuda/assets/fn.fatbin",
+        ],
+        syms: &[
+            "fn_hc_init",
+            "fn_hc_norm",
+            "fn_hc_silu",
+            "fn_hc_mix",
+            "fn_hc_write",
+            "fn_ple_gate",
+            "fn_ple_conv",
+            "fn_ple_conv_wb",
+            "gdn_gate_sig",
+            "w4a16_gemv_experts_g128_f16",
+        ],
+        boot: true,
+    },
+    Asset {
         name: "norm",
         env: "LLM170_CUDA_NORM_FATBIN_PATH",
         paths: &[
