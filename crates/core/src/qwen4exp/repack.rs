@@ -206,7 +206,7 @@ fn repack_triple<W: Write>(
     // qzeros 전수 상수 검증 — 무손실(sym zp=8) 계약의 관문. 하나라도 어긋나면
     // 이 재패커의 전제가 무너진다(명시 거부 — GPTQ-asym 경로 필요).
     for (i, c) in qz.as_chunks::<4>().0.iter().enumerate() {
-        let w = u32::from_le_bytes((*c).try_into().expect("4B"));
+        let w = u32::from_le_bytes(*c);
         if w != QZ_WORD {
             return Err(format!(
                 "{base}.qzeros[{i}] = {w:#010x} — 비상수 zero-point(D1 계약 위반)"
@@ -987,14 +987,14 @@ mod tests {
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|c| u32::from_le_bytes((*c).try_into().unwrap()))
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
             want_words.push((base.to_string(), wv, n, kw));
             let sv: Vec<u16> = sc
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|c| u16::from_le_bytes((*c).try_into().unwrap()))
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             want_scales.push((base.to_string(), sv, n, kg));
         }
