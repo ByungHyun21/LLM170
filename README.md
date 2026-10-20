@@ -32,7 +32,7 @@ end-to-end on GPU with an int8 KV cache and CUDA-graph decode — 27B dense
 
 | row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
 |---|---|---|---|---|---|
-| CUDA (170HX, 180 W, 2026-10-19) | 3753.84 | 3742.17 | 3563.23 | 120.65 | 189.08 |
+| CUDA (170HX, 180 W, 2026-10-20 mma3) | 4653.47 | 4607.67 | 4356.50 | 120.41 | 189.08 |
 
 ### Gemma-4-26B-A4B-it-QAT-W4A16 (g32, MoE resident)
 
