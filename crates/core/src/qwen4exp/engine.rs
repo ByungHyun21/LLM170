@@ -112,7 +112,7 @@ impl Model {
     /// vLLM은 RMSNormGated(plain `x_normed*weight`, layernorm.py
     /// forward_static)이고 체크포인트 실측 평균 ≈0.97(원시 w≈0인
     /// zero-centered 분포가 아님) — qwen3_next 계약 그대로 평범 가중치.
-    pub(crate) fn norm_vec(&self, name: &str) -> Result<Vec<f32>, String> {
+    pub fn norm_vec(&self, name: &str) -> Result<Vec<f32>, String> {
         let mut v = self.f32_vec(name)?;
         plus1(&mut v);
         Ok(v)

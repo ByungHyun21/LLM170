@@ -487,7 +487,84 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
                 prefetch = Some(sc.spawn(move || prep(p0)));
             }
             let (d_emb, d_ple) = dec.fn_stage(&emb_flat, Some(&ple_flat), t)?;
-            if let Some(db) = dec_b.as_mut() {
+            if qsa {
+                // [QSA] 호스트 선택 콜백 — 체인이 idx_qk GEMM·d2h를 마친 행을
+                // 받아 오라클 코드(norm+rope·압축키 유지·select)로 집합 산출.
+                use llm170_core::ops::{rms_norm, rope_head};
+                use llm170_core::qwen4exp::stages::qsa::{QsaCache, select};
+                let (ratio, btop) = (
+                    cfg.indexer_compress_ratio.max(1),
+                    cfg.indexer_budget / cfg.indexer_compress_ratio.max(1),
+                );
+                let (ihd, nih, i_rot) = (
+                    cfg.indexer_head_dim,
+                    cfg.indexer_n_heads,
+                    cfg.indexer_head_dim / 2,
+                );
+                let mut caches: Vec<QsaCache> = Vec::new();
+                let mut qlns: Vec<Vec<f32>> = Vec::new();
+                let mut klns: Vec<Vec<f32>> = Vec::new();
+                let mut cb = |il: usize, tt: usize, rows: &[f32]| -> (Vec<i32>, Vec<i32>) {
+                    let li = il / cfg.full_interval.max(1);
+                    while caches.len() <= li {
+                        caches.push(QsaCache::new());
+                        let l = format!("model.language_model.layers.{il}.self_attn.indexer");
+                        qlns.push(
+                            m.norm_vec(&format!("{l}.q_layernorm.weight"))
+                                .unwrap_or_default(),
+                        );
+                        klns.push(
+                            m.norm_vec(&format!("{l}.k_layernorm.weight"))
+                                .unwrap_or_default(),
+                        );
+                    }
+                    let eps = cfg.rms_norm_eps;
+                    let w640 = (nih + 1) * ihd;
+                    let mut sels: Vec<Vec<i32>> = Vec::with_capacity(tt);
+                    let mut max_n = 0usize;
+                    for r in 0..tt {
+                        let p = pos + r;
+                        let row = &rows[r * w640..(r + 1) * w640];
+                        let mut qs: Vec<Vec<f32>> = Vec::with_capacity(nih);
+                        for hh in 0..nih {
+                            let b = hh * ihd;
+                            let mut head = rms_norm(&row[b..b + ihd], &qlns[li], eps);
+                            rope_head(&mut head, p as u32, i_rot, 1e7);
+                            qs.push(head);
+                        }
+                        let k = row[nih * ihd..nih * ihd + ihd].to_vec();
+                        let c = &mut caches[li];
+                        c.raw_k.push(k);
+                        if (p + 1).is_multiple_of(ratio) {
+                            let mut pooled = vec![0.0f32; ihd];
+                            for off in 0..ratio {
+                                let src = &c.raw_k[c.raw_k.len() - ratio + off];
+                                for (dd, v) in pooled.iter_mut().enumerate() {
+                                    *v += src[dd];
+                                }
+                            }
+                            for v in pooled.iter_mut() {
+                                *v /= ratio as f32;
+                            }
+                            let mut nk = rms_norm(&pooled, &klns[li], eps);
+                            rope_head(&mut nk, (p + 1 - ratio) as u32, i_rot, 1e7);
+                            c.comp_k.push(nk);
+                        }
+                        let sel = select(&caches[li], &qs, p, ratio, btop);
+                        max_n = max_n.max(sel.len());
+                        sels.push(sel.into_iter().map(|x| x as i32).collect());
+                    }
+                    let mut flat = Vec::with_capacity(tt * max_n);
+                    let mut cnt = Vec::with_capacity(tt);
+                    for sv in sels {
+                        cnt.push(sv.len() as i32);
+                        flat.extend_from_slice(&sv);
+                        flat.extend(std::iter::repeat_n(-1i32, max_n - sv.len()));
+                    }
+                    (flat, cnt)
+                };
+                sample = dec.fn_chain_run_qsa(0, pos as u32, t, d_emb, d_ple, None, &mut cb)?;
+            } else if let Some(db) = dec_b.as_mut() {
                 let r_out = dec.fn_chain_run(0, pos as u32, t, d_emb, d_ple, None)?;
                 let r_in = db.fn_stage_r(&r_out, t)?;
                 sample = db.fn_chain_run(0, pos as u32, t, d_emb, None, Some(r_in))?;

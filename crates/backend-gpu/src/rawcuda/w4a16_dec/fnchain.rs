@@ -403,7 +403,7 @@ impl W4a16Dec {
             )?;
             let is_full = (il + 1).is_multiple_of(interval);
             #[allow(clippy::too_many_arguments)]
-            let branch = if is_full && qsa_sel.is_some() {
+            let branch = if let Some(cb) = qsa_sel.as_mut().filter(|_| is_full) {
                 // [QSA 2026-10-20] 풀층 선택 집합 경로 — idx_qk GEMM(체인) →
                 // d2h → 호스트 순수 선택(오라클 코드·집합 정합) → h2d →
                 // q/k/v GEMM + sel 어텐션(attn_qsa_part).
@@ -422,7 +422,7 @@ impl W4a16Dec {
                 let rows: Vec<f32> = unsafe {
                     std::slice::from_raw_parts(ib.as_ptr() as *const f32, t * ihd640).to_vec()
                 };
-                let (sel, nsel) = qsa_sel.as_mut().unwrap()(il, t, &rows);
+                let (sel, nsel) = cb(il, t, &rows);
                 let stride = sel.len() / t.max(1);
                 let selb: Vec<u8> = sel.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let nselb: Vec<u8> = nsel.iter().flat_map(|v| v.to_le_bytes()).collect();
