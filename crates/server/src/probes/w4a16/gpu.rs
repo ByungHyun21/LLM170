@@ -396,6 +396,9 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
         return Err(format!("--device {} — 최대 2장(FN 계약)", devices.len()));
     }
     let pp2 = devices.len() == 2;
+    // [QSA] --qsa — 인덱서 선택 집합 경로(오라클 대조 골든화).
+    let qsa = args.iter().any(|x| x == "--qsa");
+    let rest: Vec<String> = rest.into_iter().filter(|x| x != "--qsa").collect();
     let a = parse_args(&rest)?;
     if a.prompts.is_empty() {
         return Err("w4a16-gpu(FN): --prompt-tokens 필요".into());

@@ -390,3 +390,166 @@ extern "C" __global__ void w4a16_gemv_experts_g128_f16(
     fn_gemv_row_g128((const unsigned*)e[0], (const unsigned short*)e[1],
                      x + xoff, out + (size_t)sl * n, o, k);
 }
+
+
+// [QSA] attn.cu 헬퍼 사본(독립 컴파일 — decode.cu 선례). attn_part_step의
+// 청크 온라인 소프트맥스와 동일 산식(값 계약 동일).
+#define ATTN_CHUNK_QSA 256
+struct QsaKvRowPtrs {
+    signed char* k;
+    signed char* v;
+    float* ks;
+    float* vs;
+};
+__device__ __forceinline__ QsaKvRowPtrs qsa_blk_row(
+    const unsigned long long* __restrict__ tab, int layer, int cap, int row,
+    long kv_dim, int kv_heads, int kh)
+{
+    const unsigned long long* bt =
+        tab + ((long)layer * ((cap + 511) >> 9) + (row >> 9)) * 4;
+    const unsigned long long ro = (unsigned long long)(row & 511);
+    const long hstride = (kv_heads > 0) ? (kv_dim / kv_heads) : 256;
+    QsaKvRowPtrs p;
+    p.k = reinterpret_cast<signed char*>(bt[0]) +
+          ro * (unsigned long long)kv_dim + (long)kh * hstride;
+    p.v = reinterpret_cast<signed char*>(bt[1]) +
+          ro * (unsigned long long)kv_dim + (long)kh * hstride;
+    p.ks = reinterpret_cast<float*>(
+        bt[2] + (ro * (unsigned long long)kv_heads + (unsigned long long)kh) * 4ULL);
+    p.vs = reinterpret_cast<float*>(
+        bt[3] + (ro * (unsigned long long)kv_heads + (unsigned long long)kh) * 4ULL);
+    return p;
+}
+template <typename KDot, typename VAcc>
+__device__ __forceinline__ void attn_part_step_qsa(KDot kdot, VAcc vacc,
+                                               float* __restrict__ sarr,
+                                               float* __restrict__ reds, int nch,
+                                               int tid, float& m_run, float& l_run,
+                                               float& acc)
+{
+    float p = -1e30f;
+    if (tid < nch) {
+        p = kdot(tid);
+    }
+    sarr[tid] = p;
+    __syncthreads();
+    reds[tid] = (tid < nch) ? sarr[tid] : -1e30f;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (tid < st) reds[tid] = fmaxf(reds[tid], reds[tid + st]);
+        __syncthreads();
+    }
+    float m_new = fmaxf(m_run, reds[0]);
+    float corr = (m_run <= -1e29f) ? 0.0f : expf(m_run - m_new);
+    __syncthreads();
+    float e = 0.0f;
+    if (tid < nch) {
+        e = expf(sarr[tid] - m_new);
+        sarr[tid] = e;
+    }
+    reds[tid] = e;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (tid < st) reds[tid] += reds[tid + st];
+        __syncthreads();
+    }
+    acc *= corr;
+#pragma unroll 8
+    for (int i = 0; i < nch; ++i) {
+        acc += sarr[i] * vacc(i);
+    }
+    l_run = l_run * corr + reds[0];
+    m_run = m_new;
+    __syncthreads();
+}
+
+// ── [QSA 2026-10-20] 선택 집합 어텐션 — attn_fwd3s_part_q의 행 순회만
+// sel 리스트(절대 행 번호)로 교체한 FN 인덱서 판(part 레이아웃 258 동일 —
+// attn_fwd3s_merge를 splits=1로 그대로 재소비). 수치 클래스 = part_q 계열
+// (q f32·K int8·온라인 소프트맥스 f32) — FN 골든은 오라클(QSA CPU) 대조.
+// sel = [t][sel_stride] 패딩 -1, nsel = [t] 행별 개수. kdot의 masked 행은
+// -1e30(기여 0 — attn_part_step 계약).
+extern "C" __global__ void attn_qsa_part(
+    const float* __restrict__ qh,
+    const unsigned long long* __restrict__ dblk_tab,
+    float* __restrict__ part,
+    const unsigned* __restrict__ pp,
+    const int* __restrict__ sel,
+    const int* __restrict__ nsel,
+    int sel_stride,
+    int t_len, int layer, int q_heads, int kv_heads, int cap, float kq_scale)
+{
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int gq = q_heads / kv_heads;
+    const int kh = h / gq;
+    const long kv_dim = (long)kv_heads * 256;
+    const long qrow = (long)t * (q_heads * 256) + (long)h * 256;
+    __shared__ float qs[256];
+    __shared__ float sarr[ATTN_CHUNK_QSA];
+    __shared__ float reds[256];
+    qs[tid] = qh[qrow + tid];
+    __syncthreads();
+    const int lim = nsel[t];
+    float* out = part + ((long)t * q_heads + h) * 258;
+    float m_run = -1e30f;
+    float l_run = 0.0f;
+    float acc = 0.0f;
+    const int* rows = sel + (long)t * sel_stride;
+    for (int base = 0; base < lim; base += ATTN_CHUNK_QSA) {
+        const int nch = min(ATTN_CHUNK_QSA, lim - base);
+        attn_part_step_qsa(
+            [&](int i) -> float {
+                const int row = rows[base + i];
+                if (row < 0) {
+                    return -1e30f;
+                }
+                const QsaKvRowPtrs rp =
+                    qsa_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                const uint4* k16 = reinterpret_cast<const uint4*>(rp.k);
+                const float4* q4 = reinterpret_cast<const float4*>(qs);
+                float p0 = 0.0f;
+#pragma unroll 4
+                for (int d16 = 0; d16 < 16; d16++) {
+                    const uint4 w = k16[d16];
+                    const float4 qa = q4[d16 * 4 + 0];
+                    const float4 qb = q4[d16 * 4 + 1];
+                    const float4 qc = q4[d16 * 4 + 2];
+                    const float4 qd = q4[d16 * 4 + 3];
+                    p0 += qa.x * (float)(signed char)(w.x & 0xffu);
+                    p0 += qa.y * (float)(signed char)((w.x >> 8) & 0xffu);
+                    p0 += qa.z * (float)(signed char)((w.x >> 16) & 0xffu);
+                    p0 += qa.w * (float)(signed char)(w.x >> 24);
+                    p0 += qb.x * (float)(signed char)(w.y & 0xffu);
+                    p0 += qb.y * (float)(signed char)((w.y >> 8) & 0xffu);
+                    p0 += qb.z * (float)(signed char)((w.y >> 16) & 0xffu);
+                    p0 += qb.w * (float)(signed char)(w.y >> 24);
+                    p0 += qc.x * (float)(signed char)(w.z & 0xffu);
+                    p0 += qc.y * (float)(signed char)((w.z >> 8) & 0xffu);
+                    p0 += qc.z * (float)(signed char)((w.z >> 16) & 0xffu);
+                    p0 += qc.w * (float)(signed char)(w.z >> 24);
+                    p0 += qd.x * (float)(signed char)(w.w & 0xffu);
+                    p0 += qd.y * (float)(signed char)((w.w >> 8) & 0xffu);
+                    p0 += qd.z * (float)(signed char)((w.w >> 16) & 0xffu);
+                    p0 += qd.w * (float)(signed char)(w.w >> 24);
+                }
+                return p0 * (kq_scale * rp.ks[0]);
+            },
+            [&](int i) -> float {
+                const int row = rows[base + i];
+                if (row < 0) {
+                    return 0.0f;
+                }
+                const QsaKvRowPtrs rp =
+                    qsa_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+                return (float)rp.v[tid] * rp.vs[0];
+            },
+            sarr, reds, nch, tid, m_run, l_run, acc);
+    }
+    if (tid == 0) {
+        out[0] = m_run;
+        out[1] = l_run;
+    }
+    out[2 + tid] = acc;
+}

@@ -655,6 +655,10 @@ pub(super) struct Fn {
     pub(super) ple_v: Buf,
     pub(super) ple_gd: Buf,
     pub(super) ple_nm: Buf,
+    /// [QSA] 선택 리스트 [t][stride]·개수 [t] 스테이징·인덱서 헤드 수.
+    pub(super) sel: Buf,
+    pub(super) nsel: Buf,
+    pub(super) idx_heads: usize,
     /// MoE 웨이브 상한(스트리밍 distinct 가드 — 기본 8).
     pub(super) wave: usize,
     /// 스크래치 확보 폭(t).
@@ -688,6 +692,9 @@ impl Default for Fn {
             ple_v: Buf::default(),
             ple_gd: Buf::default(),
             ple_nm: Buf::default(),
+            sel: Buf::default(),
+            nsel: Buf::default(),
+            idx_heads: 4,
             wave: 8,
             warm_t: 0,
         }

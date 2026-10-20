@@ -21,6 +21,7 @@ impl W4a16Dec {
         hcn: &[f32],
         ple: Option<(usize, &[f32], &[f32], &[f32], &[f32])>,
         sig_gate: bool,
+        idx_heads: usize,
     ) -> Result<(), String> {
         let _g = self.cc.guard()?;
         let hh = hc * self.hidden;
@@ -63,6 +64,7 @@ impl W4a16Dec {
             self.fn_.ple_init = vec![false; self.n_slots];
         }
         self.gdn.sig_gate = sig_gate;
+        self.fn_.idx_heads = idx_heads;
         self.fn_.on = true;
         Ok(())
     }
@@ -101,6 +103,10 @@ impl W4a16Dec {
         alloc(&mut self.fn_.ple_v, t * h * 4)?;
         alloc(&mut self.fn_.ple_gd, f32n * 4)?;
         alloc(&mut self.fn_.ple_nm, f32n * 4)?;
+        // [QSA] 선택 리스트 상한 = 청크 t × (예산 블록×ratio + ratio) 최악.
+        let sel_max = t * (self.fn_.idx_heads * 512 + 8);
+        alloc(&mut self.fn_.sel, sel_max * 4)?;
+        alloc(&mut self.fn_.nsel, t * 4)?;
         self.fn_.warm_t = t;
         Ok(())
     }
@@ -233,12 +239,13 @@ impl W4a16Dec {
         ple_e_dev: Option<CUdeviceptr>,
     ) -> Result<Vec<f32>, String> {
         // 전체창 진입(emb 엔트리·final 출구) — 단일 GPU 경로 불변.
-        self.fn_chain_run(slot, pos, t, d_emb, ple_e_dev, None)
+        self.fn_chain_run_inner(slot, pos, t, d_emb, ple_e_dev, None, None)
     }
 
     /// [PP2-FN 2026-10-20] 창 일반 체인 — self.window 순회. 비최종 창은
     /// R[t][hc·hidden] 전체를 반환(경계 잔차 — PP 샤드B가 h2d해 이어받는다),
     /// 최종 창은 mixer+sample. r_in_dev(Some) = 이전 샤드의 R(emb 무시).
+    #[allow(clippy::type_complexity)]
     pub fn fn_chain_run(
         &mut self,
         slot: usize,
@@ -247,6 +254,36 @@ impl W4a16Dec {
         d_emb: CUdeviceptr,
         ple_e_dev: Option<CUdeviceptr>,
         r_in_dev: Option<CUdeviceptr>,
+    ) -> Result<Vec<f32>, String> {
+        self.fn_chain_run_inner(slot, pos, t, d_emb, ple_e_dev, r_in_dev, None)
+    }
+
+    /// [QSA] 콜백판 — 풀층에서 호스트 선택(오라클 코드)을 끼워 넣는 진입.
+    /// [QSA] 콜밭판 — 체인이 idx_qk GEMM·d2h·h2d를 수행하고 호스트 콜백은
+    /// 순수 선택(오라클 코드)만: (il, t, idx_rows[t][640]) → (sel, nsel).
+    #[allow(clippy::type_complexity)]
+    pub fn fn_chain_run_qsa(
+        &mut self,
+        slot: usize,
+        pos: u32,
+        t: usize,
+        d_emb: CUdeviceptr,
+        ple_e_dev: Option<CUdeviceptr>,
+        r_in_dev: Option<CUdeviceptr>,
+        qsa_sel: &mut dyn FnMut(usize, usize, &[f32]) -> (Vec<i32>, Vec<i32>),
+    ) -> Result<Vec<f32>, String> {
+        self.fn_chain_run_inner(slot, pos, t, d_emb, ple_e_dev, r_in_dev, Some(qsa_sel))
+    }
+
+    fn fn_chain_run_inner(
+        &mut self,
+        slot: usize,
+        pos: u32,
+        t: usize,
+        d_emb: CUdeviceptr,
+        ple_e_dev: Option<CUdeviceptr>,
+        r_in_dev: Option<CUdeviceptr>,
+        mut qsa_sel: Option<&mut dyn FnMut(usize, usize, &[f32]) -> (Vec<i32>, Vec<i32>)>,
     ) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
         if !self.fn_.on {
@@ -365,7 +402,69 @@ impl W4a16Dec {
                 &format!("blk.{il}.hc_inj_a.weight"),
             )?;
             let is_full = (il + 1).is_multiple_of(interval);
-            let branch = if is_full {
+            #[allow(clippy::too_many_arguments)]
+            let branch = if is_full && qsa_sel.is_some() {
+                // [QSA 2026-10-20] 풀층 선택 집합 경로 — idx_qk GEMM(체인) →
+                // d2h → 호스트 순수 선택(오라클 코드·집합 정합) → h2d →
+                // q/k/v GEMM + sel 어텐션(attn_qsa_part).
+                self.lin_forward(
+                    true,
+                    LinPath::Gemm,
+                    &format!("blk.{il}.idx_qk.weight"),
+                    self.fn_.x.ptr,
+                    self.fn_.g.ptr,
+                    t,
+                )?;
+                let ihd640 = (self.fn_.idx_heads + 1) * 128;
+                let mut ib = vec![0u8; t * ihd640 * 4];
+                self.cc.d2h(&mut ib, self.fn_.g.ptr)?;
+                // SAFETY: ib는 t*640*4 바이트(정렬 4) — f32 뷰 재해석.
+                let rows: Vec<f32> = unsafe {
+                    std::slice::from_raw_parts(ib.as_ptr() as *const f32, t * ihd640).to_vec()
+                };
+                let (sel, nsel) = qsa_sel.as_mut().unwrap()(il, t, &rows);
+                let stride = sel.len() / t.max(1);
+                let selb: Vec<u8> = sel.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let nselb: Vec<u8> = nsel.iter().flat_map(|v| v.to_le_bytes()).collect();
+                self.cc.h2d(self.fn_.sel.ptr, &selb)?;
+                self.cc.h2d(self.fn_.nsel.ptr, &nselb)?;
+                self.lin_forward(
+                    true,
+                    LinPath::Gemm,
+                    &format!("blk.{il}.attn_q.weight"),
+                    self.fn_.x.ptr,
+                    self.dchain[0],
+                    t,
+                )?;
+                self.lin_forward(
+                    true,
+                    LinPath::Gemm,
+                    &format!("blk.{il}.attn_k.weight"),
+                    self.fn_.x.ptr,
+                    self.dchain[1],
+                    t,
+                )?;
+                self.lin_forward(
+                    true,
+                    LinPath::Gemm,
+                    &format!("blk.{il}.attn_v.weight"),
+                    self.fn_.x.ptr,
+                    self.dchain[2],
+                    t,
+                )?;
+                self.attn_qsa_launch(
+                    slot,
+                    il / interval,
+                    t,
+                    self.dchain[0],
+                    self.dchain[1],
+                    self.dchain[2],
+                    self.fn_.sel.ptr,
+                    self.fn_.nsel.ptr,
+                    stride,
+                )?;
+                self.attn.doutv_a
+            } else if is_full {
                 self.lin_forward(
                     true,
                     LinPath::Gemm,

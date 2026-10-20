@@ -498,6 +498,7 @@ pub(crate) fn upload_fn_win(
         &hcn,
         Some((1, &ple_w, &n1, &n2, &n3)),
         true,
+        cfg.indexer_n_heads,
     )?;
     Ok(())
 }

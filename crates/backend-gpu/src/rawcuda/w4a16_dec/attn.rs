@@ -285,6 +285,64 @@ impl W4a16Dec {
         )
     }
 
+    /// [QSA 2026-10-20] 선택 집합 어텐션 — prep(KV/qh 기록) 후 attn_qsa_part
+    /// + merge(splits=1). sel = [t][stride] 절대 행(-1 패딩)·nsel = [t].
+    pub(super) fn attn_qsa_launch(
+        &mut self,
+        slot: usize,
+        layer: usize,
+        t_len: usize,
+        qg_dev: CUdeviceptr,
+        kin_dev: CUdeviceptr,
+        vin_dev: CUdeviceptr,
+        sel_dev: CUdeviceptr,
+        nsel_dev: CUdeviceptr,
+        sel_stride: usize,
+    ) -> Result<(), String> {
+        let dm = self.attn.attn.ok_or("attn: 형상 미등록")?;
+        if t_len == 0 || t_len > ATTN_F3S_TMAX {
+            return Err(format!("attn qsa: T={t_len} — 도메인 위반"));
+        }
+        self.attn_prep_launch(slot, layer, t_len, qg_dev, kin_dev, vin_dev)?;
+        let (mut tl, mut lay) = (t_len as i32, layer as i32);
+        let (mut qh, mut kvh, mut cp) = (dm.q_heads as i32, dm.kv_heads as i32, dm.cap as i32);
+        let mut scl = dm.layer(layer).scale();
+        let mut st = sel_stride as i32;
+        let f = self.cc.function("attn_qsa_part")?;
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            self.attn.dqh_a,
+            self.attn_blk_ptr(slot),
+            self.attn.dattn_part,
+            self.attn_pp_ptr(slot),
+        );
+        let (mut a4, mut a5) = (sel_dev, nsel_dev);
+        self.cc.launch(
+            f,
+            t_len as u32,
+            dm.q_heads as u32,
+            256,
+            &mut crate::rawcuda::args::l13(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut st, &mut tl, &mut lay,
+                &mut qh, &mut kvh, &mut cp, &mut scl,
+            ),
+        )?;
+        let nm = t_len * dm.q_heads * 256;
+        let (m32, m16) = (self.ensure_dx32(nm)?, self.ensure_dx16(nm)?);
+        let fm = self.cc.function("attn_fwd3s_merge")?;
+        let (mut mp, mut mg, mut mo) = (self.attn.dattn_part, qg_dev, self.attn.doutv_a);
+        let (mut mo32, mut mo16) = (m32, m16);
+        let (mut tl2, mut qh2, mut sp) = (t_len as i32, dm.q_heads as i32, 1i32);
+        self.cc.launch(
+            fm,
+            t_len as u32,
+            dm.q_heads as u32,
+            256,
+            &mut crate::rawcuda::args::l8(
+                &mut mp, &mut mg, &mut mo, &mut mo32, &mut mo16, &mut tl2, &mut qh2, &mut sp,
+            ),
+        )
+    }
+
     /// [gemma4 P2 2026-10-14] attn_prep_g4 Q 경로 직접 런처 — 검증 전용
     /// (`--prep-g4-check`). K/V 경로는 블록 테이블이 필요해 호출하지 않는다
     /// (grid.y = q_heads만). CPU 미러와 허용오차 대조용.
