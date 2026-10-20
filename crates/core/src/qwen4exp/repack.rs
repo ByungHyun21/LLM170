@@ -90,9 +90,9 @@ enum Out {
 impl Out {
     fn nbytes(&self) -> u64 {
         match self {
-            // packed + scale + shape
+            // packed + scale(g32 복제 ×4) + shape
             Out::Repack { n, kw, kg, .. } => {
-                (*n as u64) * (*kw as u64) * 4 + (*n as u64) * (*kg as u64) * 2 + 16
+                (*n as u64) * (*kw as u64) * 4 + (*n as u64) * (*kg as u64) * 4 * 2 + 16
             }
             Out::Copy { nbytes, .. } => *nbytes,
         }
@@ -101,7 +101,7 @@ impl Out {
         match self {
             Out::Repack { n, kw, kg, .. } => [
                 ("I32", vec![*n as u64, *kw as u64], 4),
-                ("F16", vec![*n as u64, *kg as u64], 2),
+                ("F16", vec![*n as u64, (*kg as u64) * 4], 2),
                 ("I64", vec![2], 8),
             ],
             Out::Copy { .. } => unreachable!("Copy는 names() 경로만 사용"),
@@ -224,13 +224,19 @@ fn repack_triple<W: Write>(
     }
     out.write_all(&pk)
         .map_err(|e| format!("{base}.packed: {e}"))?;
-    // weight_scale[n, kg] F16 — scales[kg, n] 비트 그대로 전치.
-    let mut s = vec![0u8; n * kg * 2];
+    // weight_scale[n, kg32] F16 — scales[kg, n] 전치 + **g128→g32 스케일 복제**.
+    // [FN M1 2026-10-20] FN 전문가(g128)를 기존 g32 마린 MoE 경로에 태우기
+    // 위해 각 g128 스케일을 4개 g32 그룹에 복제 — 니블 불변·스케일 동값으로
+    // 디큐트 값 비트동일(상위 그룹 스케일의 자식 그룹 재사용). kg32 = k/32.
+    let kg32 = kg * (G / 32);
+    let mut s = vec![0u8; n * kg32 * 2];
     for gi in 0..kg {
         let row = &sc[gi * n * 2..(gi + 1) * n * 2];
         for (r, s2) in row.as_chunks::<2>().0.iter().enumerate() {
-            let d = (r * kg + gi) * 2;
-            s[d..d + 2].copy_from_slice(s2);
+            for rep in 0..(G / 32) {
+                let d = (r * kg32 + gi * (G / 32) + rep) * 2;
+                s[d..d + 2].copy_from_slice(s2);
+            }
         }
     }
     out.write_all(&s)
@@ -526,7 +532,7 @@ fn repack_inner(
         ));
     }
     let store = W4a16Model::open(dst_dir).map_err(|e| format!("자체검증(W4a16 open): {e}"))?;
-    if store.n_lins() != expect_experts || store.group() != G {
+    if store.n_lins() != expect_experts || store.group() != 32 {
         return Err(format!(
             "자체검증: lins {} (기대 {expect_experts}) · g{}",
             store.n_lins(),
@@ -704,7 +710,7 @@ const CT_QUANT_CONFIG: &str = r#"{
           "actorder": null,
           "block_structure": null,
           "dynamic": false,
-          "group_size": 128,
+          "group_size": 32,
           "num_bits": 4,
           "observer": "mse",
           "observer_kwargs": {},
@@ -798,8 +804,8 @@ pub fn verify_sample(
     let gq = engine::Model::load(src_dir).map_err(|e| format!("GPTQ 원본: {e}"))?;
     let ct = W4a16Model::open(dst_dir).map_err(|e| format!("CT 출력: {e}"))?;
     let g = ct.group();
-    if g != G {
-        return Err(format!("CT 그룹 {g} ≠ {G}"));
+    if g != 32 {
+        return Err(format!("CT 그룹 {g} ≠ 32(g32 복제 계약)"));
     }
     let mut rows = 0u64;
     let mut cells = 0u64;
@@ -854,11 +860,20 @@ pub fn verify_sample(
                         }
                         words += 1;
                     }
-                    for gi in 0..kg {
-                        let a = [sc[2 * (r * kg + gi)], sc[2 * (r * kg + gi) + 1]];
-                        let bq = [gs[2 * (gi * n + r)], gs[2 * (gi * n + r) + 1]];
-                        if a != bq {
-                            return Err(format!("{base} scale[{r},{gi}] 비트 불일치"));
+                    // g32 복제 검증 — 원본 g128 스케일이 4자식 그룹에 동값.
+                    // (여기 kg = CT 스토어 그룹 개수 = k/32 — 원본은 kg/4개.)
+                    let rep_n = G / 32;
+                    for gi128 in 0..(kg / rep_n) {
+                        let bq = [gs[2 * (gi128 * n + r)], gs[2 * (gi128 * n + r) + 1]];
+                        for rep in 0..rep_n {
+                            let o32 = 2 * (r * kg + gi128 * rep_n + rep);
+                            let a = [sc[o32], sc[o32 + 1]];
+                            if a != bq {
+                                return Err(format!(
+                                    "{base} scale[{r},{}](g32 복제) 비트 불일치",
+                                    gi128 * rep_n + rep
+                                ));
+                            }
                         }
                     }
                 }
@@ -1067,11 +1082,17 @@ mod tests {
             }
             let (_, sv, _, kg) = want_scales.iter().find(|(b, ..)| b == base).unwrap();
             let sraw = out.read(&format!("{base}.weight_scale")).unwrap();
+            let kg32 = kg * 4;
             for r in 0..*n {
                 for gi in 0..*kg {
-                    let got =
-                        u16::from_le_bytes(sraw[2 * (r * kg + gi)..][..2].try_into().unwrap());
-                    assert_eq!(got, sv[gi * n + r], "{base} scale [{r},{gi}]");
+                    for rep in 0..4 {
+                        let got = u16::from_le_bytes(
+                            sraw[2 * (r * kg32 + gi * 4 + rep)..][..2]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        assert_eq!(got, sv[gi * n + r], "{base} scale [{r},{}]", gi * 4 + rep);
+                    }
                 }
             }
             let shp = out.read(&format!("{base}.weight_shape")).unwrap();
@@ -1097,7 +1118,7 @@ mod tests {
         // W4a16Model 완전 개방(quant splice · 트리플 계약).
         let store = W4a16Model::open(&dst).expect("W4a16 open 실패");
         assert_eq!(store.n_lins(), 2);
-        assert_eq!(store.group(), 128);
+        assert_eq!(store.group(), 32);
         let cfg = std::fs::read_to_string(dst.join("config.json")).unwrap();
         assert!(cfg.contains("compressed-tensors"));
         assert!(cfg.contains("Qwen4ExpForConditionalGeneration"));
