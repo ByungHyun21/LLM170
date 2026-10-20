@@ -131,7 +131,7 @@ impl Qwen4ExpCfg {
             output_gate_sigmoid: t
                 .get("output_gate_type")
                 .and_then(Json::as_str)
-                .map_or(false, |s| s == "sigmoid"),
+                .is_some_and(|s| s == "sigmoid"),
             mtp_cfg_layers: num_opt("mtp_num_hidden_layers", 0),
         })
     }
