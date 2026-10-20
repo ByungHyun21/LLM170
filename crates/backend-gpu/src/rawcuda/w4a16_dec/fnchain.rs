@@ -318,6 +318,18 @@ impl W4a16Dec {
                 &mut crate::rawcuda::args::l3(&mut a0, &mut a1, &mut nn),
             )?;
         }
+        if self.debug_layers {
+            let mut rb = vec![0u8; hh * 4];
+            self.cc.d2h(&mut rb, self.fn_.r.ptr)?;
+            let row: Vec<f32> = rb
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            let mx = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            eprintln!("fn[gpu] init R0max={mx:.4}");
+        }
         let interval = self.attn.attn.ok_or("fn_chain: attn 미등록")?.interval;
         let mut gi = win.gdn_start(interval);
         for off in 0..win.n() {
@@ -531,7 +543,31 @@ impl W4a16Dec {
                 format!("blk.{il}.ssm_out.weight")
             };
             self.lin_forward(true, LinPath::Gemm, &lo, branch, self.fn_.y.ptr, t)?;
+            if self.debug_layers {
+                let mut yb = vec![0u8; h * 4];
+                self.cc.d2h(&mut yb, self.fn_.y.ptr)?;
+                let yr: Vec<f32> = yb
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                let ym = yr.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                eprintln!("fn[gpu] layer {il:>2} y0max={ym:.4}");
+            }
             self.fn_hc_write(t)?;
+            if self.debug_layers {
+                let mut rb = vec![0u8; hh * 4];
+                self.cc.d2h(&mut rb, self.fn_.r.ptr)?;
+                let row: Vec<f32> = rb
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                let mx = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                eprintln!("fn[gpu] layer {il:>2} attn R0max={mx:.4}");
+            }
             // ── MoE 블록: HC mix → MoE → HC write.
             self.fn_hc_cycle(
                 2 * il + 1,
@@ -544,6 +580,21 @@ impl W4a16Dec {
             // moe 출력 → y 버퍼 d2d(프로브급 — 이후 커널 직접 소비로 최적화).
             self.cc.d2d(self.fn_.y.ptr, y2, t * h * 4)?;
             self.fn_hc_write(t)?;
+            // [디버그 배선 2026-10-20] 층별 지문 — R 행 0(오라클 r[0] 대응).
+            // debug_layers가 켜지면 그래프 무효화(기존 g4_graph_ok 계약).
+            if self.debug_layers {
+                let mut rb = vec![0u8; hh * 4];
+                self.cc.d2h(&mut rb, self.fn_.r.ptr)?;
+                let row: Vec<f32> = rb
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                let mx = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let nan = row.iter().any(|v| v.is_nan());
+                eprintln!("fn[gpu] layer {il:>2} R0max={mx:.4} nan={nan}");
+            }
         }
         // [PP2] 비최종 창 — R 전체를 경계 잔차로 반환.
         let (win, n_layers) = (self.window, self.n_layers);

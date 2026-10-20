@@ -396,6 +396,8 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
         return Err(format!("--device {} — 최대 2장(FN 계약)", devices.len()));
     }
     let pp2 = devices.len() == 2;
+    // [디버그] FN dec에도 debug_layers 반영(지문 — 첫 발산 층 추적).
+    let dbg_layers = llm170_diag::dump::opts().key("debug_layers");
     // [QSA] --qsa — 인덱서 선택 집합 경로(오라클 대조 골든화).
     let qsa = args.iter().any(|x| x == "--qsa");
     let rest: Vec<String> = rest.into_iter().filter(|x| x != "--qsa").collect();
@@ -443,6 +445,7 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
         (da, Some(db))
     } else {
         let mut d = W4a16Dec::new(1, h, cfg.num_hidden_layers)?;
+        d.debug_layers = dbg_layers;
         crate::gpu_engine::upload_fn(&mut d, &cfg, std::path::Path::new(&ct_dir), a.ctx)?;
         (d, None)
     };

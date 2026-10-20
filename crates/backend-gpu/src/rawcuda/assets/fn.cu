@@ -23,7 +23,10 @@ extern "C" __global__ void fn_hc_init(const float* __restrict__ emb,
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int hh = 10240; // hc_count(4) * hidden(2560) — FN 고정(커널 전용)
-    r[i] = emb[(i / hh) * 2560 + (i % hh)];
+    // [fix 2026-10-20] 스트림 복제 — (i%hh)는 10240 전역이라 2560으로 접어
+    // 읽는다(종전 식은 스트림≥1에서 다음 토큰 임베딩을 읽었다 — init 지문
+    // 0.0938≠0.0432 발산의 원인).
+    r[i] = emb[(i / hh) * 2560 + (i % hh) % 2560];
 }
 
 // 그룹 GemmaRMSNorm — R [t][10240] → xn [t][10240]. w = 해당 HC 모듈의

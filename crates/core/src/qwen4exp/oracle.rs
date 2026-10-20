@@ -110,6 +110,10 @@ impl Oracle {
         let xs = self.m.embed(chunk)?;
         let mut r: Vec<Vec<f32>> = xs.iter().map(|e| e.repeat(hc_n)).collect();
         self.hist.extend_from_slice(chunk);
+        if llm170_diag::dump::opts().key("debug_layers") {
+            let mx = r[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            eprintln!("fn[cpu] init R0max={mx:.4}");
+        }
         for il in 0..n_layers {
             // PLE — 어텐션 HC mix 앞에서 멀티스트림 상태에 직접 가산.
             if Some(il) == self.ple_il {
@@ -137,6 +141,11 @@ impl Oracle {
                     hidden,
                 );
             }
+            if llm170_diag::dump::opts().key("debug_layers") {
+                let ym = attn_out[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let mx = r[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                eprintln!("fn[cpu] layer {il:>2} y0max={ym:.4} attn R0max={mx:.4}");
+            }
             // MoE 블록.
             let (block2, inj2) = hc::mix(&self.m, &format!("{lp}.mlp_hyper_connection"), &r)?;
             let ffn = moe::forward(&self.m, il, &block2)?;
@@ -148,6 +157,13 @@ impl Oracle {
                     hc_n,
                     hidden,
                 );
+            }
+            // [디버그 배선 2026-10-20] 층별 지문 — R 행 0 max|x|(GPU fn[gpu]와
+            // 동일 계약). LLM170_DUMP=debug_layers.
+            if llm170_diag::dump::opts().key("debug_layers") {
+                let mx = r[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let nan = r[0].iter().any(|v| v.is_nan());
+                eprintln!("fn[cpu] layer {il:>2} R0max={mx:.4} nan={nan}");
             }
         }
         self.pos += chunk.len();
