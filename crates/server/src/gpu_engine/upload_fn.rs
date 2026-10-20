@@ -42,7 +42,7 @@ pub(crate) fn upload_fn(
         .tensor_slice("model.language_model.layers.0.linear_attn.in_proj_qkv.weight")
         .ok_or("qkv 폭 판독")?
         .len()
-        / 2;
+        / (2 * h); // BF16 [rows, h] — rows = 바이트/(2h).
     let h_k = (qkv_n - v_len) / (2 * cfg.linear_head_dim);
     // ── 1) plain BF16 선형(엔진 이름 = fnchain 계약) ──
     for il in 0..cfg.num_hidden_layers {
@@ -51,7 +51,7 @@ pub(crate) fn upload_fn(
             up(
                 dec,
                 &store,
-                &format!("blk.{il}.attn_q"),
+                &format!("blk.{il}.attn_q.weight"),
                 &format!("{}.self_attn.q_proj.weight", lp(il)),
                 cfg.heads * cfg.head_dim * 2,
                 h,
@@ -59,7 +59,7 @@ pub(crate) fn upload_fn(
             up(
                 dec,
                 &store,
-                &format!("blk.{il}.attn_k"),
+                &format!("blk.{il}.attn_k.weight"),
                 &format!("{}.self_attn.k_proj.weight", lp(il)),
                 cfg.kv_heads * cfg.head_dim,
                 h,
@@ -67,7 +67,7 @@ pub(crate) fn upload_fn(
             up(
                 dec,
                 &store,
-                &format!("blk.{il}.attn_v"),
+                &format!("blk.{il}.attn_v.weight"),
                 &format!("{}.self_attn.v_proj.weight", lp(il)),
                 cfg.kv_heads * cfg.head_dim,
                 h,
@@ -75,16 +75,16 @@ pub(crate) fn upload_fn(
             up(
                 dec,
                 &store,
-                &format!("blk.{il}.attn_o"),
+                &format!("blk.{il}.attn_o.weight"),
                 &format!("{}.self_attn.o_proj.weight", lp(il)),
                 h,
-                cfg.heads * cfg.head_dim * 2,
+                cfg.heads * cfg.head_dim,
             )?;
         } else {
             up(
                 dec,
                 &store,
-                &format!("blk.{il}.in_qkv"),
+                &format!("blk.{il}.attn_qkv.weight"),
                 &format!("{}.linear_attn.in_proj_qkv.weight", lp(il)),
                 qkv_n,
                 h,
@@ -92,7 +92,7 @@ pub(crate) fn upload_fn(
             up(
                 dec,
                 &store,
-                &format!("blk.{il}.in_z"),
+                &format!("blk.{il}.attn_gate.weight"),
                 &format!("{}.linear_attn.in_proj_z.weight", lp(il)),
                 v_len,
                 h,
@@ -100,7 +100,7 @@ pub(crate) fn upload_fn(
             up(
                 dec,
                 &store,
-                &format!("blk.{il}.ssm_out"),
+                &format!("blk.{il}.ssm_out.weight"),
                 &format!("{}.linear_attn.out_proj.weight", lp(il)),
                 h,
                 v_len,
@@ -114,7 +114,7 @@ pub(crate) fn upload_fn(
             up(
                 dec,
                 &store,
-                &format!("blk.{il}.hc_dn_{tag}"),
+                &format!("blk.{il}.hc_dn_{tag}.weight"),
                 &format!("{}.{hc}.input_mix_weight_down.weight", lp(il)),
                 lr,
                 hh,
@@ -122,7 +122,7 @@ pub(crate) fn upload_fn(
             up(
                 dec,
                 &store,
-                &format!("blk.{il}.hc_up_{tag}"),
+                &format!("blk.{il}.hc_up_{tag}.weight"),
                 &format!("{}.{hc}.input_mix_weight_up.weight", lp(il)),
                 hh,
                 lr,
@@ -130,7 +130,7 @@ pub(crate) fn upload_fn(
             up(
                 dec,
                 &store,
-                &format!("blk.{il}.hc_inj_{tag}"),
+                &format!("blk.{il}.hc_inj_{tag}.weight"),
                 &format!("{}.{hc}.block_inject_weight.weight", lp(il)),
                 cfg.hc_count,
                 hh,
@@ -182,7 +182,7 @@ pub(crate) fn upload_fn(
     up(
         dec,
         &store,
-        "blk.final_hc_dn",
+        "blk.final_hc_dn.weight",
         "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
         lr,
         hh,
@@ -190,13 +190,13 @@ pub(crate) fn upload_fn(
     up(
         dec,
         &store,
-        "blk.final_hc_up",
+        "blk.final_hc_up.weight",
         "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
         hh,
         lr,
     )?;
     dec.upload_plain(
-        "blk.final_hc_inj",
+        "blk.final_hc_inj.weight",
         &vec![0u8; cfg.hc_count * hh * 2],
         cfg.hc_count,
         hh,
@@ -212,14 +212,14 @@ pub(crate) fn upload_fn(
         let mut pk = Vec::with_capacity(kb.len() + vb.len());
         pk.extend_from_slice(kb);
         pk.extend_from_slice(vb);
-        dec.upload_plain("blk.1.ple_kv", &pk, hh + h, h)?;
+        dec.upload_plain("blk.1.ple_kv.weight", &pk, hh + h, h)?;
     }
     // head(BF16).
     up(
         dec,
         &store,
-        "blk.head",
-        "model.lm_head.weight",
+        "blk.head.weight",
+        "lm_head.weight",
         cfg.vocab,
         h,
     )?;
@@ -266,11 +266,12 @@ pub(crate) fn upload_fn(
     let mut alog: Vec<f32> = Vec::with_capacity(n_gdn * hv);
     let mut dtb: Vec<f32> = Vec::with_capacity(n_gdn * hv);
     let mut nw: Vec<f32> = Vec::with_capacity(n_gdn * 128);
+    // GDN·노름 상수 텐서는 BF16 — 상위 16비트 f32 확장(무손실).
     let f32_of = |b: &[u8]| -> Vec<f32> {
-        b.as_chunks::<4>()
+        b.as_chunks::<2>()
             .0
             .iter()
-            .map(|c| f32::from_le_bytes(*c))
+            .map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16))
             .collect()
     };
     let ts = |nm: String| -> Result<Vec<u8>, String> {
@@ -295,13 +296,23 @@ pub(crate) fn upload_fn(
             "{}.linear_attn.in_proj_b.weight",
             lp(il)
         ))?));
-        alog.extend(f32_of(&ts(format!("{}.linear_attn.A_log.weight", lp(il)))?));
-        dtb.extend(f32_of(&ts(format!(
-            "{}.linear_attn.dt_bias.weight",
-            lp(il)
-        ))?));
+        alog.extend(f32_of(&ts(format!("{}.linear_attn.A_log", lp(il)))?));
+        dtb.extend(f32_of(&ts(format!("{}.linear_attn.dt_bias", lp(il)))?));
         nw.extend(f32_of(&ts(format!("{}.linear_attn.norm.weight", lp(il)))?));
     }
+    eprintln!(
+        "[fn-up] GDN 상수: cw={} ab={} alog={} dtb={} nw={} (기대 cw={} ab={} alog={} dtb={} nw={})",
+        cw.len(),
+        ab.len(),
+        alog.len(),
+        dtb.len(),
+        nw.len(),
+        n_gdn * cch * 4,
+        n_gdn * 2 * hv * h,
+        n_gdn * hv,
+        n_gdn * hv,
+        n_gdn * 128
+    );
     dec.set_gdn(dims, &cw, &ab, &alog, &dtb, &nw)?;
     // ── 4) full층 어텐션 표 — q/k_norm은 +1(D0 norm_vec 계약). ──
     let n_attn = cfg.num_hidden_layers / cfg.full_interval.max(1);

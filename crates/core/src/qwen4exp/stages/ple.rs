@@ -55,6 +55,52 @@ pub fn conv_state_len() -> usize {
 /// PLE forward — R(멀티스트림 [T, hc·H])에 PLE 출력 직접 가산(원위치).
 /// `base_pos` = 청크 첫 토큰의 절대 위치, `hist` = 전체 시퀀스 토큰열
 /// (hist[base_pos..]가 이번 청크). 상태(conv) 갱신 포함.
+///
+/// [GPU M1 2026-10-20] 청크 PLE 임베딩 게더(forward ① 단계만) — GPU 프로브가
+/// 호스트에서 조달해 h2d(ple_e)한다. kv_proj 이전의 [t][emb_dim] f32 반환.
+#[allow(clippy::doc_lazy_continuation)]
+pub fn gather_emb(m: &Model, hist: &[u32], base_pos: usize) -> Result<Vec<Vec<f32>>, String> {
+    let cfg = &m.cfg;
+    let n_tok = hist.len() - base_pos;
+    let emb_dim = cfg.ple_embed_dim;
+    let ngram_heads = (cfg.ngram_size - 1) * cfg.heads_per_ngram;
+    let head_dim = emb_dim / ngram_heads;
+    let eb = "model.language_model.layers.1.ple.ple_embedding".to_string();
+    let mult = i64_vec(m, &format!("{eb}.layer_multipliers"))?;
+    let sizes = i64_vec(m, &format!("{eb}.ngram_heads_vocab_sizes"))?;
+    let offsets = i64_vec(m, &format!("{eb}.ngram_heads_offsets"))?;
+    let scale = m.f32_vec(&format!("{eb}.ngram_embedding.weight_scale"))?[0];
+    let shard_rows = m
+        .ent(&format!("{eb}.ngram_embedding.shard_0.weight"))?
+        .shape[0] as usize;
+    let eos = cfg.eos_token_id;
+    let mut out = Vec::with_capacity(n_tok);
+    for t in 0..n_tok {
+        let ids = ngram_ids(
+            hist,
+            base_pos + t,
+            &mult,
+            &sizes,
+            &offsets,
+            eos,
+            cfg.heads_per_ngram,
+        );
+        let mut emb = vec![0.0f32; emb_dim];
+        for (h, &id) in ids.iter().enumerate() {
+            ple_row(
+                m,
+                &eb,
+                shard_rows,
+                id,
+                scale,
+                &mut emb[h * head_dim..(h + 1) * head_dim],
+            )?;
+        }
+        out.push(emb);
+    }
+    Ok(out)
+}
+
 pub fn forward(
     m: &Model,
     il: usize,

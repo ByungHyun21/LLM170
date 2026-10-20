@@ -1052,7 +1052,7 @@ extern "C" __global__ void attn_fwd3s_merge_g4(
 // 골든+지문 2종 확인) · >8K는 분할 경계 반올림류(merge는 수학 동일) — 게이트
 // needle: 27B 16K/24K 6/6·32K 3/3·64K 3/3 (기준선 불변). 빈 분할 블록은 조기
 // 반환 + m/l만 기록(merge가 l≤0 스킵 — 256-float 기록 불요).
-#define ATTN_GQ_MAX 8
+#define ATTN_GQ_MAX 12 // [FN 2026-10-20] gq=24/2=12 — 8 상향(기존 gq≤8 무영향·16은 정적 smem 49KB 초과)
 extern "C" __global__ void attn_fwd3s_part_qg(
     const float* __restrict__ qh,
     const unsigned long long* __restrict__ dblk_tab, // [K6-2] [layer][mb][4]

@@ -19,6 +19,7 @@ pub fn dir_arch_ok(arch: &str) -> bool {
 /// text_config 산출물 — ctx_info + w4a16-load 브링업 리포트 전항.
 /// [FN 1단계 2026-10-17] hidden·heads·하이브리드 층 분포·PLE/ngram hparams
 /// 추가 판독(2026-10-17 config 실측 계약 반영).
+#[derive(Clone)]
 pub struct Qwen4ExpCfg {
     pub num_hidden_layers: usize,
     /// full_attention_interval — layer_types [linear×(n-1), full×1] 반복.

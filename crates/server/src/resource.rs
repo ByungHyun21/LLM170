@@ -167,8 +167,10 @@ pub fn guard_target(sub: &str, model: Option<&str>, rest: &[String]) -> Option<G
     // 용량으로 호스트 예산 판정하면 식별 자체가 막힌다. 무가드 스킵.
     // [FN D2 2026-10-20] w4a16-ref 동일 스킵 — 오라클은 스토어 직접
     // mmap 스트리밍(RSS = 페이지 캐시 분량)이라 dense 적재 예산 추정
-    // (148GiB)이 실측과 무관하다.
-    if matches!(sub, "w4a16-load" | "w4a16-ref")
+    // (148GiB)이 실측과 무관하다. [M1 2026-10-20] w4a16-gpu도 동일 —
+    // 체인은 전문가 호스트 mmap 스트리밍(CT 테이블)+dense plain 등록이라
+    // dense-전량 적재 추정과 무관(§2.M 오프로딩 인지 재산정 잔여).
+    if matches!(sub, "w4a16-load" | "w4a16-ref" | "w4a16-gpu")
         && path
             .as_deref()
             .and_then(llm170_core::qwen35::bind::dir_arch)

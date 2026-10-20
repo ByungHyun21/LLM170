@@ -27,6 +27,13 @@ pub(super) fn gpu_run(args: &[String]) -> Result<String, String> {
     {
         return gpu_run_g4(args);
     }
+    // [FN M1 2026-10-20] qwen4_exp 아치 — 전용 체인(fnchain) 경로.
+    if llm170_core::qwen35::bind::dir_arch(std::path::Path::new(&dir))
+        .as_deref()
+        .is_some_and(llm170_core::qwen4exp::bind::arch_ok)
+    {
+        return gpu_run_fn(args);
+    }
     let a = parse_args(args)?;
     if a.bench.is_none() && !a.decode_selfcheck && a.prompts.is_empty() {
         return Err("w4a16-gpu: 프롬프트 필요(--prompt-tokens)".into());
@@ -360,6 +367,72 @@ pub(super) fn gpu_run_g4(args: &[String]) -> Result<String, String> {
         gpu_ms / n_tok as f64,
         csv(&got),
         csv(&want),
+    ))
+}
+
+// ── [FN M1 2026-10-20] qwen4_exp(FN) GPU 체인 프로브 — 속도 지도용 ──
+// 풀층 dense 어텐션(인덱서 미구현)으로 골든 불가 — M1 판정 = 청크 t/s·nsys.
+///   llm170 w4a16-gpu <FN 원본 dir> --prompt-tokens <ids> [--n-predict N] [--ctx N]
+fn gpu_run_fn(args: &[String]) -> Result<String, String> {
+    use llm170_backend_gpu::W4a16Dec;
+    let dir = arg_str(args, 0, "");
+    let a = parse_args(args)?;
+    if a.prompts.is_empty() {
+        return Err("w4a16-gpu(FN): --prompt-tokens 필요".into());
+    }
+    let prompt: Vec<u32> = a.prompts.first().cloned().unwrap_or_default();
+    if prompt.len() + a.n_predict + 1 > a.ctx {
+        return Err(format!(
+            "ctx({}) < prompt({})+n_predict({})",
+            a.ctx,
+            prompt.len(),
+            a.n_predict
+        ));
+    }
+    // 오라클(원본 GPTQ dir) — 임베딩·PLE 게더·골든 참조.
+    let m = llm170_core::qwen4exp::engine::Model::load(std::path::Path::new(&dir))
+        .map_err(|e| e.to_string())?;
+    crate::resource::release_load_lock();
+    let cfg = m.cfg.clone();
+    let h = cfg.hidden_size;
+    let t0 = std::time::Instant::now();
+    let mut dec = W4a16Dec::new(1, h, cfg.num_hidden_layers)?;
+    let ct_dir = format!("{dir}-CT");
+    crate::gpu_engine::upload_fn(&mut dec, &cfg, std::path::Path::new(&ct_dir), a.ctx)?;
+    let upload_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+    // 청크 프리필 + 그리디.
+    let tg = std::time::Instant::now();
+    let chunk_max = 512usize;
+    let hist = prompt.clone();
+    let mut pos = 0usize;
+    let mut sample: Vec<f32>;
+    let mut n_chunk = 0usize;
+    loop {
+        let t = chunk_max.min(hist.len() - pos);
+        let chunk = &hist[pos..pos + t];
+        let emb = m.embed(chunk)?;
+        let ple = llm170_core::qwen4exp::stages::ple::gather_emb(&m, &hist, pos)?;
+        let emb_flat: Vec<f32> = emb.into_iter().flatten().collect();
+        let ple_flat: Vec<f32> = ple.into_iter().flatten().collect();
+        let (d_emb, d_ple) = dec.fn_stage(&emb_flat, Some(&ple_flat), t)?;
+        sample = dec.fn_chain_dev_t(0, pos as u32, t, d_emb, d_ple)?;
+        pos += t;
+        n_chunk += 1;
+        if pos >= hist.len() {
+            break;
+        }
+    }
+    // head(plain GEMV t=1) → argmax.
+    let logits = dec.fn_head(&sample)?;
+    let last_tok = llm170_core::qwen35::greedy(&logits);
+    let gpu_ms = tg.elapsed().as_secs_f64() * 1e3;
+    Ok(format!(
+        "[FN M1] 업로드 {upload_ms:.0}ms · 프리필 {}톤 {gpu_ms:.0}ms ({:.0} t/s · 청크 {n_chunk}) · argmax {} · sample |x|max {:.3}",
+        hist.len(),
+        hist.len() as f64 / (gpu_ms / 1e3),
+        last_tok,
+        sample.iter().fold(0f32, |a, v| a.max(v.abs()))
     ))
 }
 

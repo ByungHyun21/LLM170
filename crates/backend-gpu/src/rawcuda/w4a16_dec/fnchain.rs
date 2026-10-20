@@ -181,6 +181,31 @@ impl W4a16Dec {
         )
     }
 
+    /// 청크 입력 스테이징 — emb[t][hidden]·ple[t][hidden] f32 h2d.
+    /// 반환 = (d_emb, Some(d_ple)) — fn_chain_dev_t 인자.
+    pub fn fn_stage(
+        &mut self,
+        emb: &[f32],
+        ple: Option<&[f32]>,
+        t: usize,
+    ) -> Result<(CUdeviceptr, Option<CUdeviceptr>), String> {
+        let _g = self.cc.guard()?;
+        self.fn_ensure_bufs(t)?;
+        let h = self.hidden;
+        // SAFETY: emb/ple 로컬 슬라이스 유효 수명 내 바이트 뷰(길이 = 원소×4).
+        let eb = unsafe { std::slice::from_raw_parts(emb.as_ptr() as *const u8, t * h * 4) };
+        self.cc.h2d(self.fn_.x.ptr, eb)?;
+        let p = match ple {
+            Some(p) => {
+                let pb = unsafe { std::slice::from_raw_parts(p.as_ptr() as *const u8, t * h * 4) };
+                self.cc.h2d(self.fn_.ple_e.ptr, pb)?;
+                Some(self.fn_.ple_e.ptr)
+            }
+            None => None,
+        };
+        Ok((self.fn_.x.ptr, p))
+    }
+
     /// HC 쓰기 — R += y·2σ(inj/4). fn_.y·fn_.inj 소비.
     fn fn_hc_write(&mut self, t: usize) -> Result<(), String> {
         let f = self.cc.function("fn_hc_write")?;
@@ -211,7 +236,16 @@ impl W4a16Dec {
         if !self.fn_.on {
             return Err("fn_chain: set_fn 미등록".into());
         }
+        // [fix 2026-10-20] KV 온디맨드 확보 — chain_t와 동일(누락 시 K6 블록
+        // 테이블 기저 0 → attn_prep_q 불법 기록).
+        self.kv_ensure(slot, pos as usize + t + 2)?;
         self.fn_ensure_bufs(t)?;
+        // [fix 2026-10-20] classic 체인 스크래치(dchain·GDN·attn·MoE) 보장 —
+        // chain_t와 동일 전제(커널 내부 ensure가 없는 버퍼들).
+        self.ensure_chain_bufs()?;
+        self.ensure_gdn_bufs(t)?;
+        self.ensure_attn_bufs(t)?;
+        self.ensure_dyt(t)?;
         let (h, hh, hc) = (self.hidden, self.fn_.hc * self.hidden, self.fn_.hc);
         if pos == 0 {
             // R 초기화 — 임베딩 행을 hc 스트림으로 복제.
@@ -237,7 +271,7 @@ impl W4a16Dec {
                 self.lin_forward(
                     true,
                     LinPath::Gemm,
-                    &format!("blk.{il}.ple_kv"),
+                    &format!("blk.{il}.ple_kv.weight"),
                     pe,
                     self.fn_.ple_k.ptr,
                     t,
@@ -305,16 +339,16 @@ impl W4a16Dec {
             self.fn_hc_cycle(
                 2 * il,
                 t,
-                &format!("blk.{il}.hc_dn_a"),
-                &format!("blk.{il}.hc_up_a"),
-                &format!("blk.{il}.hc_inj_a"),
+                &format!("blk.{il}.hc_dn_a.weight"),
+                &format!("blk.{il}.hc_up_a.weight"),
+                &format!("blk.{il}.hc_inj_a.weight"),
             )?;
             let is_full = (il + 1).is_multiple_of(interval);
             let branch = if is_full {
                 self.lin_forward(
                     true,
                     LinPath::Gemm,
-                    &format!("blk.{il}.attn_q"),
+                    &format!("blk.{il}.attn_q.weight"),
                     self.fn_.x.ptr,
                     self.dchain[0],
                     t,
@@ -322,7 +356,7 @@ impl W4a16Dec {
                 self.lin_forward(
                     true,
                     LinPath::Gemm,
-                    &format!("blk.{il}.attn_k"),
+                    &format!("blk.{il}.attn_k.weight"),
                     self.fn_.x.ptr,
                     self.dchain[1],
                     t,
@@ -330,7 +364,7 @@ impl W4a16Dec {
                 self.lin_forward(
                     true,
                     LinPath::Gemm,
-                    &format!("blk.{il}.attn_v"),
+                    &format!("blk.{il}.attn_v.weight"),
                     self.fn_.x.ptr,
                     self.dchain[2],
                     t,
@@ -347,7 +381,7 @@ impl W4a16Dec {
                 self.lin_forward(
                     true,
                     LinPath::Gemm,
-                    &format!("blk.{il}.in_qkv"),
+                    &format!("blk.{il}.attn_qkv.weight"),
                     self.fn_.x.ptr,
                     self.dchain[0],
                     t,
@@ -355,7 +389,7 @@ impl W4a16Dec {
                 self.lin_forward(
                     true,
                     LinPath::Gemm,
-                    &format!("blk.{il}.in_z"),
+                    &format!("blk.{il}.attn_gate.weight"),
                     self.fn_.x.ptr,
                     self.dchain[1],
                     t,
@@ -372,9 +406,9 @@ impl W4a16Dec {
                 g
             };
             let lo = if is_full {
-                format!("blk.{il}.attn_o")
+                format!("blk.{il}.attn_o.weight")
             } else {
-                format!("blk.{il}.ssm_out")
+                format!("blk.{il}.ssm_out.weight")
             };
             self.lin_forward(true, LinPath::Gemm, &lo, branch, self.fn_.y.ptr, t)?;
             self.fn_hc_write(t)?;
@@ -382,9 +416,9 @@ impl W4a16Dec {
             self.fn_hc_cycle(
                 2 * il + 1,
                 t,
-                &format!("blk.{il}.hc_dn_m"),
-                &format!("blk.{il}.hc_up_m"),
-                &format!("blk.{il}.hc_inj_m"),
+                &format!("blk.{il}.hc_dn_m.weight"),
+                &format!("blk.{il}.hc_up_m.weight"),
+                &format!("blk.{il}.hc_inj_m.weight"),
             )?;
             let y2 = self.moe_ffn_dev_t(il, self.fn_.x.ptr, t)?;
             // moe 출력 → y 버퍼 d2d(프로브급 — 이후 커널 직접 소비로 최적화).
@@ -395,9 +429,9 @@ impl W4a16Dec {
         self.fn_hc_cycle(
             2 * n_layers,
             t,
-            "blk.final_hc_dn",
-            "blk.final_hc_up",
-            "blk.final_hc_inj",
+            "blk.final_hc_dn.weight",
+            "blk.final_hc_up.weight",
+            "blk.final_hc_inj.weight",
         )?;
         // 마지막 행 sample 회수.
         let mut ob = vec![0u8; h * 4];
@@ -407,5 +441,25 @@ impl W4a16Dec {
         let out: Vec<f32> =
             unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, h).to_vec() };
         Ok(out)
+    }
+
+    /// head(plain BF16 "blk.head.weight") — sample[hidden] 1행 → 로짓 [vocab].
+    /// M1 프로브용(호출당 할당 — 디코드 상수화는 최적화 단계).
+    pub fn fn_head(&mut self, sample: &[f32]) -> Result<Vec<f32>, String> {
+        let _g = self.cc.guard()?;
+        let h = self.hidden;
+        let (_, vocab, _) = self.plain_spec("blk.head.weight")?;
+        let dx = self.cc.alloc(h * 4)?;
+        let dy = self.cc.alloc(vocab * 4)?;
+        // SAFETY: sample 로컬 슬라이스 유효 수명 내 바이트 뷰.
+        let sb = unsafe { std::slice::from_raw_parts(sample.as_ptr() as *const u8, h * 4) };
+        self.cc.h2d(dx, sb)?;
+        self.lin_forward(true, LinPath::GemvT, "blk.head.weight", dx, dy, 1)?;
+        let mut ob = vec![0u8; vocab * 4];
+        self.cc.d2h(&mut ob, dy)?;
+        self.cc.free(dx)?;
+        self.cc.free(dy)?;
+        // SAFETY: ob는 vocab*4 바이트(정렬 4) — f32 뷰 재해석.
+        Ok(unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, vocab).to_vec() })
     }
 }
