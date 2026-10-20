@@ -247,6 +247,141 @@ extern "C" __global__ void w4a16_gemm_bf16_mma2_16(
     bmma_body2<16>(w, x, out, n, k, t, xbf);
 }
 
+// ── [B5 2026-10-20] 플레인 bf16 mma3 — M64×N128 타일·KC64 ──
+// 35B 프리필 잔여 최대 축: 현행 mma2(M32×N64·KC32)는 ncu 실측 Mem 62%·
+// Compute 50%·점유 40% — ldmatrix/스테이징 대비 mma 비율(6:4)이 낮아
+// LSU 파이프가 지배. g128 채택 원장(102dd618 계열 — KC64 채택·N256/M128
+// 기각·M64+N128 국소최적)의 타일 구성을 bf16으로 이식:
+//   - 워프 2m×4n(각 m32×n32) — ldm:mma = 6:8(0.75, mma2의 1.5 절반)
+//   - KC 32→64 — 배리어·commit/wait_group 왕복 ÷2(k=2048에서 64→32회)
+//   - FLOP/스테이징바이트 21→43 — B(가중치) smem 트래픽 절감
+// 스케줄: A 64×(KC+8)·B 128×(KC+8) half ×2버퍼 = 55.3KB(2블록/SM).
+// 산술·k 순서·mma 명령은 mma2와 동일(같은 k 승순 f32 누산) = **비트동일**
+// (패딩 행/열은 0 기여 — 쓰기 가드로 미기록). 도메인: t≥64·n≥2048·k%64=0
+// (in_proj_qkv/q 8192·in_proj_z 4096·out/o 2048 — 호스트 게이트 미만은
+// 기존 mma2/16 경로 불변).
+#define BMMA3_KC 64
+// 55.3KB — 정적 한계(48KB) 초과로 동적 smem(호스트 set_dynamic_smem 사전
+// opt-in — marlin/G5 scan 계약. xs [2][64][72] → ws [2][128][72] half 순).
+extern __shared__ __align__(16) unsigned short b3sm[];
+#define B3_XS(st, r, c) (b3sm + ((st) * 64 + (r)) * (BMMA3_KC + 8) + (c))
+#define B3_WS(st, r, c) \
+    (b3sm + 2 * 64 * (BMMA3_KC + 8) + ((st) * 128 + (r)) * (BMMA3_KC + 8) + (c))
+ extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemm_bf16_mma3(
+     const unsigned short* __restrict__ w, const unsigned short* __restrict__ x16,
+     float* __restrict__ out, int n, int k, int t)
+ {
+     const int tid = threadIdx.x;
+    const int m0 = blockIdx.x * 64;
+    const int n0 = blockIdx.y * 128;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int g = lane >> 2;
+    const int tt = lane & 3;
+    const int mt = (warp >> 2) * 32; // 2 m워프 × 32 = M64
+    const int ntw = (warp & 3) * 32; // 4 n워프 × 32 = N128
+    float c[2][4][4];                // 2 m프래그먼트 × 4 n프래그먼트
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        ((float*)c)[i] = 0.0f;
+    }
+    // A는 bf16 미러(호스트 cast_bf16 선행 — mma2 xbf=1 프로덕션 계약 동일).
+    auto stage = [&](int st, int k0) {
+        for (int e = tid; e < 64 * BMMA3_KC / 8; e += 256) {
+            const int r = e / (BMMA3_KC / 8);
+            const int c8 = e % (BMMA3_KC / 8);
+            const int gi = k0 + c8 * 8;
+            if (m0 + r < t && gi + 7 < k) {
+                cp_async16(B3_XS(st, r, c8 * 8), &x16[(size_t)(m0 + r) * k + gi]);
+            } else {
+                for (int j = 0; j < 8; ++j) {
+                    B3_XS(st, r, c8 * 8)[j] =
+                        (m0 + r < t && gi + j < k)
+                            ? x16[(size_t)(m0 + r) * k + gi + j]
+                            : (unsigned short)0;
+                }
+            }
+        }
+        for (int e = tid; e < 128 * BMMA3_KC / 8; e += 256) {
+            const int r = e / (BMMA3_KC / 8);
+            const int c8 = e % (BMMA3_KC / 8);
+            const int gi = k0 + c8 * 8;
+            if (n0 + r < n && gi + 7 < k) {
+                cp_async16(B3_WS(st, r, c8 * 8), &w[(size_t)(n0 + r) * k + gi]);
+            } else {
+                for (int j = 0; j < 8; ++j) {
+                    B3_WS(st, r, c8 * 8)[j] =
+                        (n0 + r < n && gi + j < k)
+                            ? w[(size_t)(n0 + r) * k + gi + j]
+                            : (unsigned short)0;
+                }
+            }
+        }
+    };
+    stage(0, 0);
+    asm volatile("cp.async.commit_group;");
+    int cur = 0;
+    for (int k0 = 0; k0 < k; k0 += BMMA3_KC, cur ^= 1) {
+        const int kn = k0 + BMMA3_KC;
+        if (kn < k) {
+            stage(cur ^ 1, kn);
+        }
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 1;");
+        __syncthreads();
+#pragma unroll
+        for (int ks = 0; ks < BMMA3_KC / 16; ++ks) {
+            const int kb = ks * 16;
+            const int row = (lane & 15);
+            const int colblk = (lane & 16) ? 8 : 0;
+            unsigned a[2][4];
+#pragma unroll
+            for (int mf = 0; mf < 2; ++mf) {
+                ldm_x4(a[mf][0], a[mf][1], a[mf][2], a[mf][3],
+                       B3_XS(cur, mt + mf * 16 + row, kb + colblk));
+            }
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const int nb = ntw + nt * 8;
+                unsigned b0, b1;
+                ldm_x2(b0, b1, B3_WS(cur, nb + (lane & 7), kb + ((lane & 8) ? 8 : 0)));
+#pragma unroll
+                for (int mf = 0; mf < 2; ++mf) {
+                    mma_bf16(c[mf][nt], a[mf][0], a[mf][1], a[mf][2], a[mf][3], b0, b1);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int mf = 0; mf < 2; ++mf) {
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const int col = n0 + ntw + nt * 8 + 2 * tt;
+            const int r0 = m0 + mt + mf * 16 + g;
+            if (r0 < t) {
+                if (col < n) {
+                    out[(size_t)r0 * n + col] = c[mf][nt][0];
+                }
+                if (col + 1 < n) {
+                    out[(size_t)r0 * n + col + 1] = c[mf][nt][1];
+                }
+            }
+            if (r0 + 8 < t) {
+                if (col < n) {
+                    out[(size_t)(r0 + 8) * n + col] = c[mf][nt][2];
+                }
+                if (col + 1 < n) {
+                    out[(size_t)(r0 + 8) * n + col + 1] = c[mf][nt][3];
+                }
+            }
+        }
+    }
+#undef BMMA3_KC
+#undef B3_XS
+#undef B3_WS
+}
+
 // grp2 f16-A — 게이트·업 2N 융합(N64 = 게이트 32 + 업 32), M=전문가 슬롯 수.
 // [⑥-d 2026-10-18] __launch_bounds__(256,4) — 점유 3→4블록(reg 70→≤64, 이슈율
 // 2.4/4·wait 32% 스톨을 워프 수로 메움; xs 스트라이드 반감으로 smem 20.5KB).

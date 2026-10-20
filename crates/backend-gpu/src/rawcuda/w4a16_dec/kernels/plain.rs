@@ -64,6 +64,29 @@ impl W4a16Dec {
                     &mut crate::rawcuda::args::l3(&mut c_in, &mut c_out, &mut c_n),
                 )?;
             }
+            // [B5 2026-10-20] 대형 형상 mma3(M64×N128·KC64 — moepp.cu 헤더).
+            // 35B 프리필 지배 3형상(qkv/q 8192·z 4096·out/o 2048) 전용.
+            // 값은 mma2와 비트동일(같은 k 승순 f32 누산 — 도메인 게이트
+            // 미만은 기존 mma2/16 경로 불변).
+            if t >= 64 && n >= 2048 && n.is_multiple_of(128) && k.is_multiple_of(64) {
+                let f = self.cc.function("w4a16_gemm_bf16_mma3")?;
+                // 동적 smem 55296B(xs 2×64×72·ws 2×128×72 half) — opt-in 후
+                // launch_shared(launch의 shared=0 고정 해제 — ctx 계약).
+                const B3_SMEM: u32 = 2 * (64 + 128) * (64 + 8) * 2;
+                self.cc.set_dynamic_smem(f, B3_SMEM)?;
+                let (mut p_w, mut p_x, mut p_o) = (w, self.dabf.ptr, y_out);
+                let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
+                return self.cc.launch_shared(
+                    f,
+                    t.div_ceil(64) as u32,
+                    n.div_ceil(128) as u32,
+                    256,
+                    B3_SMEM,
+                    &mut crate::rawcuda::args::l6(
+                        &mut p_w, &mut p_x, &mut p_o, &mut p_n, &mut p_k, &mut p_t,
+                    ),
+                );
+            }
             // [M16 2026-10-11] 그리드 기아 형상이면 M16 변형(블록 2배) —
             // 값은 MM32와 비트동일(같은 k 순서·mma). 판정: M32 타일 수 < SM 수.
             let tiles32 = t.div_ceil(GEMM_BMMA_M) as u64 * n.div_ceil(GEMM_BMMA_N) as u64;
