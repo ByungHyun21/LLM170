@@ -232,6 +232,22 @@ impl W4a16Dec {
         d_emb: CUdeviceptr,
         ple_e_dev: Option<CUdeviceptr>,
     ) -> Result<Vec<f32>, String> {
+        // 전체창 진입(emb 엔트리·final 출구) — 단일 GPU 경로 불변.
+        self.fn_chain_run(slot, pos, t, d_emb, ple_e_dev, None)
+    }
+
+    /// [PP2-FN 2026-10-20] 창 일반 체인 — self.window 순회. 비최종 창은
+    /// R[t][hc·hidden] 전체를 반환(경계 잔차 — PP 샤드B가 h2d해 이어받는다),
+    /// 최종 창은 mixer+sample. r_in_dev(Some) = 이전 샤드의 R(emb 무시).
+    pub fn fn_chain_run(
+        &mut self,
+        slot: usize,
+        pos: u32,
+        t: usize,
+        d_emb: CUdeviceptr,
+        ple_e_dev: Option<CUdeviceptr>,
+        r_in_dev: Option<CUdeviceptr>,
+    ) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
         if !self.fn_.on {
             return Err("fn_chain: set_fn 미등록".into());
@@ -247,8 +263,13 @@ impl W4a16Dec {
         self.ensure_attn_bufs(t)?;
         self.ensure_dyt(t)?;
         let (h, hh, hc) = (self.hidden, self.fn_.hc * self.hidden, self.fn_.hc);
-        if pos == 0 {
-            // R 초기화 — 임베딩 행을 hc 스트림으로 복제.
+        let win = self.window;
+        if let Some(ri) = r_in_dev {
+            // [PP2] 샤드B 진입 — 이전 샤드 R을 적재(d2d — 동일 버퍼면 무해).
+            self.cc.d2d(self.fn_.r.ptr, ri, t * hh * 4)?;
+        } else {
+            // R 초기화 — **매 청크**(멀티스트림 잔차는 토큰별 — 청크가 토큰을
+            // 완결 처리. oracle forward 계약. PP2 비최종 샤드A도 emb 진입).
             let f = self.cc.function("fn_hc_init")?;
             let n = t * hh;
             let (mut a0, mut a1, mut nn) = (d_emb, self.fn_.r.ptr, n as i32);
@@ -262,8 +283,9 @@ impl W4a16Dec {
         }
         let interval = self.attn.attn.ok_or("fn_chain: attn 미등록")?.interval;
         let n_layers = self.n_layers;
-        let mut gi = 0usize;
-        for il in 0..n_layers {
+        let mut gi = win.gdn_start(interval);
+        for off in 0..win.n() {
+            let il = win.abs(off);
             // PLE — HC mix 앞에서 멀티스트림 상태에 직접 가산.
             if self.fn_.ple_il == Some(il) {
                 let pe = ple_e_dev.ok_or("fn_chain: PLE 스테이징 부재")?;
@@ -425,6 +447,14 @@ impl W4a16Dec {
             self.cc.d2d(self.fn_.y.ptr, y2, t * h * 4)?;
             self.fn_hc_write(t)?;
         }
+        // [PP2] 비최종 창 — R 전체를 경계 잔차로 반환.
+        let (win, n_layers) = (self.window, self.n_layers);
+        if !win.owns_final(n_layers) {
+            let mut rb = vec![0u8; t * hh * 4];
+            self.cc.d2h(&mut rb, self.fn_.r.ptr)?;
+            // SAFETY: rb는 t*hh*4 바이트(정렬 4) — f32 뷰 재해석.
+            return Ok(unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, t * hh).to_vec() });
+        }
         // ── 최종 mixer — norm(행 2L) + mix(head 입력 sample).
         self.fn_hc_cycle(
             2 * n_layers,
@@ -441,6 +471,17 @@ impl W4a16Dec {
         let out: Vec<f32> =
             unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, h).to_vec() };
         Ok(out)
+    }
+
+    /// [PP2] 샤드B 진입 R 스테이징 — r[t][hc·hidden] h2d → fn_.r.
+    pub fn fn_stage_r(&mut self, r: &[f32], t: usize) -> Result<CUdeviceptr, String> {
+        let _g = self.cc.guard()?;
+        self.fn_ensure_bufs(t)?;
+        let hh = self.fn_.hc * self.hidden;
+        // SAFETY: r 로컬 슬라이스 유효 수명 내 바이트 뷰(길이 = 원소×4).
+        let rb = unsafe { std::slice::from_raw_parts(r.as_ptr() as *const u8, t * hh * 4) };
+        self.cc.h2d(self.fn_.r.ptr, rb)?;
+        Ok(self.fn_.r.ptr)
     }
 
     /// head(plain BF16 "blk.head.weight") — sample[hidden] 1행 → 로짓 [vocab].

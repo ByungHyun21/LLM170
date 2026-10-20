@@ -376,7 +376,24 @@ pub(super) fn gpu_run_g4(args: &[String]) -> Result<String, String> {
 fn gpu_run_fn(args: &[String]) -> Result<String, String> {
     use llm170_backend_gpu::W4a16Dec;
     let dir = arg_str(args, 0, "");
-    let a = parse_args(args)?;
+    // [PP 2026-10-20] --device <ids> — 카드 목록(콤마). 2장 = 직렬 파이프라인
+    // (FN 허용 2-GPU). 단일 = 해당 카드 고정(기본 카드 0).
+    let mut devices: Vec<i32> = vec![0];
+    let mut rest: Vec<String> = Vec::new();
+    let mut it = args.iter().cloned().peekable();
+    while let Some(x) = it.next() {
+        if x == "--device" {
+            let v = it.next().ok_or("--device requires a list")?;
+            devices = v.split(',').map(|d| d.parse().map_err(|_| format!("--device {d}"))).collect::<Result<Vec<i32>, String>>()?;
+        } else {
+            rest.push(x);
+        }
+    }
+    if devices.len() > 2 {
+        return Err(format!("--device {} — 최대 2장(FN 계약)", devices.len()));
+    }
+    let pp2 = devices.len() == 2;
+    let a = parse_args(&rest)?;
     if a.prompts.is_empty() {
         return Err("w4a16-gpu(FN): --prompt-tokens 필요".into());
     }
@@ -396,9 +413,21 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
     let cfg = m.cfg.clone();
     let h = cfg.hidden_size;
     let t0 = std::time::Instant::now();
-    let mut dec = W4a16Dec::new(1, h, cfg.num_hidden_layers)?;
     let ct_dir = format!("{dir}-CT");
-    crate::gpu_engine::upload_fn(&mut dec, &cfg, std::path::Path::new(&ct_dir), a.ctx)?;
+    // PP2 — 샤드A[0,24)·B[24,48) 직렬(오버랩은 후속). 경계 잔차 = R[t][hc·h].
+    let (mut dec, mut dec_b) = if pp2 {
+        let nl = cfg.num_hidden_layers;
+        let mid = nl / 2;
+        let mut da = W4a16Dec::new_dev(1, h, nl, devices[0])?;
+        crate::gpu_engine::upload_fn_win(&mut da, &cfg, std::path::Path::new(&ct_dir), a.ctx, Some((0, mid)))?;
+        let mut db = W4a16Dec::new_dev(1, h, nl, devices[1])?;
+        crate::gpu_engine::upload_fn_win(&mut db, &cfg, std::path::Path::new(&ct_dir), a.ctx, Some((mid, nl)))?;
+        (da, Some(db))
+    } else {
+        let mut d = W4a16Dec::new(1, h, cfg.num_hidden_layers)?;
+        crate::gpu_engine::upload_fn(&mut d, &cfg, std::path::Path::new(&ct_dir), a.ctx)?;
+        (d, None)
+    };
     let upload_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     // 청크 프리필 + 그리디.
@@ -416,7 +445,13 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
         let emb_flat: Vec<f32> = emb.into_iter().flatten().collect();
         let ple_flat: Vec<f32> = ple.into_iter().flatten().collect();
         let (d_emb, d_ple) = dec.fn_stage(&emb_flat, Some(&ple_flat), t)?;
-        sample = dec.fn_chain_dev_t(0, pos as u32, t, d_emb, d_ple)?;
+        if let Some(db) = dec_b.as_mut() {
+            let r_out = dec.fn_chain_run(0, pos as u32, t, d_emb, d_ple, None)?;
+            let r_in = db.fn_stage_r(&r_out, t)?;
+            sample = db.fn_chain_run(0, pos as u32, t, d_emb, None, Some(r_in))?;
+        } else {
+            sample = dec.fn_chain_dev_t(0, pos as u32, t, d_emb, d_ple)?;
+        }
         pos += t;
         n_chunk += 1;
         if pos >= hist.len() {
@@ -424,7 +459,10 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
         }
     }
     // head(plain GEMV t=1) → argmax.
-    let logits = dec.fn_head(&sample)?;
+    let logits = match dec_b.as_mut() {
+        Some(db) => db.fn_head(&sample)?,
+        None => dec.fn_head(&sample)?,
+    };
     let last_tok = llm170_core::qwen35::greedy(&logits);
     let gpu_ms = tg.elapsed().as_secs_f64() * 1e3;
     Ok(format!(

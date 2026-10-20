@@ -21,7 +21,7 @@ pub(crate) use self::g4::{g4_chunk, g4_step};
 pub(crate) use self::gemma::GemmaEngine;
 pub(crate) use self::pp::PpEngine;
 pub(crate) use self::upload::{DirectLoad, upload_model};
-pub(crate) use self::upload_fn::upload_fn;
+pub(crate) use self::upload_fn::{upload_fn, upload_fn_win};
 pub(crate) use self::upload_g4::{G4HostCfg, upload_model_g4};
 
 pub struct QwenEngine {

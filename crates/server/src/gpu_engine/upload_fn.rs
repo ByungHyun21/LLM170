@@ -29,6 +29,23 @@ pub(crate) fn upload_fn(
     dir: &Path,
     ctx: usize,
 ) -> Result<(), String> {
+    upload_fn_win(dec, cfg, dir, ctx, None)
+}
+
+/// [PP2-FN 2026-10-20] 창 분할판 — window=None 전체창(단일 GPU 불변).
+/// 선형·전문가·head·최종 mixer는 창 소유분만; 상수(GDN·attn 노름·HC 노름·
+/// PLE)는 전층(소량 — qwen35 PP 관례).
+pub(crate) fn upload_fn_win(
+    dec: &mut W4a16Dec,
+    cfg: &llm170_core::qwen4exp::Qwen4ExpCfg,
+    dir: &Path,
+    ctx: usize,
+    window: Option<(usize, usize)>,
+) -> Result<(), String> {
+    if let Some((ws, we)) = window {
+        dec.set_layer_window(ws, we)?;
+    }
+    let owns_final = window.is_none_or(|(_, we)| we == cfg.num_hidden_layers);
     let store = W4a16Model::open(dir).map_err(|e| format!("FN CT 스토어: {e}"))?;
     let lp = |il: usize| format!("model.language_model.layers.{il}");
     let (h, hh, lr) = (
@@ -46,6 +63,9 @@ pub(crate) fn upload_fn(
     let h_k = (qkv_n - v_len) / (2 * cfg.linear_head_dim);
     // ── 1) plain BF16 선형(엔진 이름 = fnchain 계약) ──
     for il in 0..cfg.num_hidden_layers {
+        if !window.is_none_or(|(ws, we)| il >= ws && il < we) {
+            continue;
+        }
         let is_full = (il + 1) % cfg.full_interval.max(1) == 0;
         if is_full {
             up(
@@ -178,30 +198,35 @@ pub(crate) fn upload_fn(
             h,
         )?;
     }
-    // 최종 mixer — inj는 use_combine=false로 미사용(0 패딩 등록).
-    up(
-        dec,
-        &store,
-        "blk.final_hc_dn.weight",
-        "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
-        lr,
-        hh,
-    )?;
-    up(
-        dec,
-        &store,
-        "blk.final_hc_up.weight",
-        "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
-        hh,
-        lr,
-    )?;
-    dec.upload_plain(
-        "blk.final_hc_inj.weight",
-        &vec![0u8; cfg.hc_count * hh * 2],
-        cfg.hc_count,
-        hh,
-    )?;
-    // PLE kv 팩 — key_proj[hh]‖value_proj[h] (n축 연접).
+    // 최종 mixer(inj는 use_combine=false 미사용 — 0 패딩) — 최종 창만.
+    if owns_final {
+        up(
+            dec,
+            &store,
+            "blk.final_hc_dn.weight",
+            "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
+            lr,
+            hh,
+        )?;
+        up(
+            dec,
+            &store,
+            "blk.final_hc_up.weight",
+            "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
+            hh,
+            lr,
+        )?;
+        dec.upload_plain(
+            "blk.final_hc_inj.weight",
+            &vec![0u8; cfg.hc_count * hh * 2],
+            cfg.hc_count,
+            hh,
+        )?;
+    }
+    // PLE kv 팩(key_proj[hh]‖value_proj[h] n축 연접) — PLE 층 소유 창만.
+    if !window.is_none_or(|(ws, we)| cfg.ple_layer_ids.first().is_none_or(|&p| p >= ws && p < we)) && cfg.ple_layer_ids.first().is_some() {
+        // 비소유 — 스킵(ple kv 미등록 — 체인도 창 밖이라 참조 없음).
+    } else
     {
         let kb = store
             .tensor_slice("model.language_model.layers.1.ple.key_proj.weight")
@@ -214,15 +239,10 @@ pub(crate) fn upload_fn(
         pk.extend_from_slice(vb);
         dec.upload_plain("blk.1.ple_kv.weight", &pk, hh + h, h)?;
     }
-    // head(BF16).
-    up(
-        dec,
-        &store,
-        "blk.head.weight",
-        "lm_head.weight",
-        cfg.vocab,
-        h,
-    )?;
+    // head(BF16) — 최종 창만.
+    if owns_final {
+        up(dec, &store, "blk.head.weight", "lm_head.weight", cfg.vocab, h)?;
+    }
     dec.set_plain_mode(true);
     dec.set_moe(
         cfg.n_experts,
@@ -237,6 +257,9 @@ pub(crate) fn upload_fn(
     let mut tab: Vec<(u64, u64, u64, u64)> =
         Vec::with_capacity(cfg.num_hidden_layers * cfg.n_experts * 3);
     for il in 0..cfg.num_hidden_layers {
+        if !window.is_none_or(|(ws, we)| il >= ws && il < we) {
+            continue;
+        }
         for e in 0..cfg.n_experts {
             for proj in ["gate_proj", "up_proj", "down_proj"] {
                 let base = format!("{}.mlp.experts.{e}.{proj}", lp(il));
@@ -250,7 +273,15 @@ pub(crate) fn upload_fn(
             }
         }
     }
-    dec.set_expert_table(tab);
+    // [PP2] 테이블 인덱스 = 절대 il — 창 밖 층은 (0,0,0,0) 패딩(체인 미참조).
+    if let Some((ws, we)) = window {
+        let mut full = vec![(0u64, 0u64, 0u64, 0u64); cfg.num_hidden_layers * cfg.n_experts * 3];
+        let stride = cfg.n_experts * 3;
+        full[ws * stride..we * stride].copy_from_slice(&tab);
+        dec.set_expert_table(full);
+    } else {
+        dec.set_expert_table(tab);
+    }
     // [M3 2026-10-20] 스트리밍 LRU 확대 — 기본 96슬롯(frac 2)은 t≤8 강제.
     // FN 512전문가 top-10의 청크 distinct는 핫 집중으로 512톤≈263 — 캐시
     // 320슬롯(≈42GB·frac 1 전체 여유)이 t=512 청크를 수용해 mma GEMM +
@@ -360,6 +391,7 @@ pub(crate) fn upload_fn(
     let rows = 2 * cfg.num_hidden_layers + 1;
     let mut hcn: Vec<f32> = Vec::with_capacity(rows * hh);
     for il in 0..cfg.num_hidden_layers {
+        // [PP2] 노름 테이블은 전층 관례(행 인덱스 = 절대 2il·2il+1 유지).
         for hc in ["attn_hyper_connection", "mlp_hyper_connection"] {
             let mut v = f32_of(&ts(format!("{}.{hc}.hc_norm.weight", lp(il)))?);
             for x in v.iter_mut() {
