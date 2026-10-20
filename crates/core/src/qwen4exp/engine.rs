@@ -492,8 +492,8 @@ mod tests {
             assert_eq!(ent.dtype, StDtype::I32, "{name}: dtype");
             let d = m.slice(name).expect("슬라이스");
             let mut th = [0u64; 16];
-            for c in d.chunks_exact(4) {
-                let w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            for c in d.as_chunks::<4>().0 {
+                let w = u32::from_le_bytes(*c);
                 for i in 0..8 {
                     th[((w >> (4 * i)) & 0xF) as usize] += 1;
                 }
@@ -557,8 +557,8 @@ mod tests {
         ] {
             let d = m.slice(&format!("{base}.qweight")).expect("qweight");
             let mut qh = [0u64; 16];
-            for c in d.chunks_exact(4) {
-                let w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            for c in d.as_chunks::<4>().0 {
+                let w = u32::from_le_bytes(*c);
                 for i in 0..8 {
                     qh[((w >> (4 * i)) & 0xF) as usize] += 1;
                 }
