@@ -21,6 +21,7 @@ pub use bind::{Qwen4ExpCfg, arch_ok, ctx_info, dir_arch_ok, report};
 pub mod engine;
 // [FN D1→재팩 2026-10-20] GPTQ→CT 무손실 재패커(니블 전치) — fn_repack 바이너리 진입.
 pub mod repack;
+pub mod stages;
 // [FN D2 2026-10-20] 상태ful CPU 오라클 — 전 48층 forward 체인·greedy 골든.
 pub mod oracle;
 
