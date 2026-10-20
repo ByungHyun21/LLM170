@@ -281,14 +281,59 @@ pub(crate) fn upload_fn_win(
             }
         }
     }
-    // [PP2] 테이블 인덱스 = 절대 il — 창 밖 층은 (0,0,0,0) 패딩(체인 미참조).
+    // [PP2 2026-10-20] 창 샤드는 **마린-단독 상주** 시도(프리필 전용 — 이중
+    // 아레나 한계 회피). 실패(형상·메모리)는 스트리밍 폴백(창 0패딩 테이블).
+    let mut marlin_only = false;
     if let Some((ws, we)) = window {
-        let mut full = vec![(0u64, 0u64, 0u64, 0u64); cfg.num_hidden_layers * cfg.n_experts * 3];
-        let stride = cfg.n_experts * 3;
-        full[ws * stride..we * stride].copy_from_slice(&tab);
-        dec.set_expert_table(full);
-    } else {
-        dec.set_expert_table(tab);
+        let n_win = we - ws;
+        let ne = cfg.n_experts;
+        let mut lens_win: Vec<(usize, usize)> = Vec::with_capacity(n_win * ne * 3);
+        let mut fills: Vec<(u64, u64)> = Vec::with_capacity(n_win * ne * 3); // (q,s) 호스트 ptr
+        for il in ws..we {
+            for e in 0..ne {
+                for proj in ["gate_proj", "up_proj", "down_proj"] {
+                    let base = format!("{}.mlp.experts.{e}.{proj}", lp(il));
+                    let (q, s, _, _) = store.expert_at(&base).ok_or("전문가 트리플 부재")?;
+                    lens_win.push((q.len(), s.len()));
+                    fills.push((q.as_ptr() as u64, s.as_ptr() as u64));
+                }
+            }
+        }
+        let mut fill = |i: usize, which: usize, off: u64, buf: &mut [u8]| -> Result<(), String> {
+            let (qp, sp) = fills[i];
+            let src = if which == 0 { qp } else { sp };
+            // SAFETY: CT mmap 슬라이스(전문가 트리플 — StArchive 수명 내).
+            let sl = unsafe { std::slice::from_raw_parts(src as *const u8, buf.len()) };
+            let off = off as usize;
+            if off + buf.len() > sl.len() {
+                return Err(format!(
+                    "marlin_only fill: i={i} off {off}+{} > {}",
+                    buf.len(),
+                    sl.len()
+                ));
+            }
+            buf.copy_from_slice(&sl[off..off + buf.len()]);
+            Ok(())
+        };
+        match dec.upload_experts_marlin_only_streamed(&lens_win, &mut fill, ws) {
+            Ok(()) => {
+                marlin_only = true;
+                eprintln!("[fn-up] 마린-단독 상주: {n_win}층 × {ne}전문가(프리필 전용 계약)");
+            }
+            Err(e) => eprintln!("[fn-up] 마린-단독 실패({e}) — 스트리밍 폴백"),
+        }
+    }
+    if !marlin_only {
+        // [PP2] 테이블 인덱스 = 절대 il — 창 밖 층은 (0,0,0,0) 패딩(체인 미참조).
+        if let Some((ws, we)) = window {
+            let mut full =
+                vec![(0u64, 0u64, 0u64, 0u64); cfg.num_hidden_layers * cfg.n_experts * 3];
+            let stride = cfg.n_experts * 3;
+            full[ws * stride..we * stride].copy_from_slice(&tab);
+            dec.set_expert_table(full);
+        } else {
+            dec.set_expert_table(tab);
+        }
     }
     // [M3 2026-10-20] 스트리밍 LRU 확대 — 기본 96슬롯(frac 2)은 t≤8 강제.
     // FN 512전문가 top-10의 청크 distinct는 핫 집중으로 512톤≈263 — 캐시

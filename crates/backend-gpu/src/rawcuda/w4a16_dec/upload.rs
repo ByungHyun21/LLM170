@@ -1477,6 +1477,152 @@ impl W4a16Dec {
         Ok(())
     }
 
+    /// [FN PP2 2026-10-20] 마린-단독 상주(프리필 전용) — raw 아레나 없이 마린
+    /// 아레나만 할당(이중 아레나 60GB/카드 한계 회피). 창 컴팩트 배치 + 절대
+    /// il 인덱싱은 아레나 베이스를 -lo·ne·stride 사전 오프셋해 맞춘다(커널
+    /// 불변). **계약: t≤8 GEMV 전문가 경로(raw 테이블) 불가** — 디코드는
+    /// 스트리밍/상주 raw 배치와 별도 경로 필요(프리필 속도 지표 전용).
+    /// 실패는 Err(호출부가 스트리밍 폴백).
+    pub fn upload_experts_marlin_only_streamed(
+        &mut self,
+        lens_win: &[(usize, usize)],
+        fill: &mut dyn FnMut(usize, usize, u64, &mut [u8]) -> Result<(), String>,
+        layer_lo: usize,
+    ) -> Result<(), String> {
+        let _g = self.cc.guard()?;
+        let (nl_all, ne, nff, h) = (
+            self.n_layers,
+            self.moe.n_experts,
+            self.moe.moe_ffn,
+            self.hidden,
+        );
+        let n_win = if ne > 0 { lens_win.len() / 3 / ne } else { 0 };
+        if ne == 0 || n_win == 0 || layer_lo + n_win > nl_all {
+            return Err(format!(
+                "marlin_only: lens {} → n_win {n_win} lo {layer_lo} nl {nl_all} 위반",
+                lens_win.len()
+            ));
+        }
+        let (k13, n13) = (h, 2 * nff);
+        let (k2, n2) = (nff, h);
+        if !k13.is_multiple_of(128)
+            || !n13.is_multiple_of(64)
+            || !k2.is_multiple_of(16)
+            || !n2.is_multiple_of(64)
+        {
+            return Err(format!(
+                "marlin_only 계약: k13={k13} n13={n13} k2={k2} n2={n2}"
+            ));
+        }
+        let (g13, g2) = (k13 / 32, k2 / 32);
+        let (st13, st2) = (n13 * k13 / 2, n2 * k2 / 2);
+        let (ss13, ss2) = (g13 * n13 * 2, g2 * n2 * 2);
+        let (a13, a2, s13, s2) = (
+            self.cc.alloc(n_win * ne * st13)?,
+            self.cc.alloc(n_win * ne * st2)?,
+            self.cc.alloc(n_win * ne * ss13)?,
+            self.cc.alloc(n_win * ne * ss2)?,
+        );
+        const RCHUNK: usize = 8 << 20;
+        let mat = |fill: &mut dyn FnMut(usize, usize, u64, &mut [u8]) -> Result<(), String>,
+                   i: usize,
+                   which: usize,
+                   len: usize|
+         -> Result<Vec<u8>, String> {
+            let mut b = vec![0u8; len];
+            for off in (0..len).step_by(RCHUNK) {
+                let end = (off + RCHUNK).min(len);
+                fill(i, which, off as u64, &mut b[off..end])?;
+            }
+            Ok(b)
+        };
+        let perm16 = |sb: &[u8], n: usize, k: usize, gs: usize| -> Result<Vec<u8>, String> {
+            let g = k / gs;
+            let sf: Vec<f32> = sb
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            let pf = llm170_core::marlin::marlin_permute_scales(&sf, n, k, gs)?;
+            let mut out = vec![0u8; g * n * 2];
+            for (i, v) in pf.iter().enumerate() {
+                out[i * 2..i * 2 + 2].copy_from_slice(&Self::f32_to_f16_bits(*v).to_le_bytes());
+            }
+            Ok(out)
+        };
+        let r = (|| -> Result<(), String> {
+            for layer in 0..n_win {
+                for e in 0..ne {
+                    let i0 = (layer * ne + e) * 3;
+                    let (ql0, sl0) = lens_win[i0];
+                    let (ql1, sl1) = lens_win[i0 + 1];
+                    let (qb0, sb0) = (mat(fill, i0, 0, ql0)?, mat(fill, i0, 1, sl0)?);
+                    let (qb1, sb1) = (mat(fill, i0 + 1, 0, ql1)?, mat(fill, i0 + 1, 1, sl1)?);
+                    let mut qcat = qb0;
+                    qcat.extend_from_slice(&qb1);
+                    let q32: Vec<u32> = qcat
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let rp = llm170_core::marlin::marlin_repack_q(&q32, n13, k13)?;
+                    let rb: Vec<u8> = rp.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    Self::h2d_chunked(&self.cc, a13 + (layer * ne + e) as u64 * st13 as u64, &rb)?;
+                    let mut scat = sb0;
+                    scat.extend_from_slice(&sb1);
+                    let sp = perm16(&scat, n13, k13, 32)?;
+                    Self::h2d_chunked(&self.cc, s13 + (layer * ne + e) as u64 * ss13 as u64, &sp)?;
+                    let (ql2, sl2) = lens_win[i0 + 2];
+                    let qb2 = mat(fill, i0 + 2, 0, ql2)?;
+                    let sb2 = mat(fill, i0 + 2, 1, sl2)?;
+                    let q32b: Vec<u32> = qb2
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let rp2 = llm170_core::marlin::marlin_repack_q(&q32b, n2, k2)?;
+                    let rb2: Vec<u8> = rp2.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    Self::h2d_chunked(&self.cc, a2 + (layer * ne + e) as u64 * st2 as u64, &rb2)?;
+                    let sp2 = perm16(&sb2, n2, k2, 32)?;
+                    Self::h2d_chunked(&self.cc, s2 + (layer * ne + e) as u64 * ss2 as u64, &sp2)?;
+                    llm170_diag::watchdog::bump();
+                }
+            }
+            self.cc.sync()
+        })();
+        if let Err(e) = r {
+            for p in [a13, a2, s13, s2] {
+                let _ = self.cc.free(p);
+            }
+            return Err(e);
+        }
+        // 절대 il 인덱싱 사전 오프셋(커널: base + il·ne·stride → 창 컴팩트 착지).
+        let (off13, off2) = (
+            (layer_lo as u64 * ne as u64) * st13 as u64,
+            (layer_lo as u64 * ne as u64) * st2 as u64,
+        );
+        let (os13, os2) = (
+            (layer_lo as u64 * ne as u64) * ss13 as u64,
+            (layer_lo as u64 * ne as u64) * ss2 as u64,
+        );
+        self.moe_m13 = a13.wrapping_sub(off13);
+        self.moe_m2 = a2.wrapping_sub(off2);
+        self.moe_s13 = s13.wrapping_sub(os13);
+        self.moe_s2 = s2.wrapping_sub(os2);
+        let bytes = (n_win * ne * (st13 + st2 + ss13 + ss2)) as u64;
+        self.weights_bytes += bytes;
+        // raw 테이블 = 전체 크기 0패딩(길이 계약 — t>8 마린 경로만 소비).
+        self.set_expert_table(vec![(0u64, 0u64, 0u64, 0u64); nl_all * ne * 3]);
+        // [fix] 상주 플래그 — 미설정 시 스트리밍 스테이징(moe_stage_t)이
+        // distinct 가드를 발사한다(마린이 참조할 raw 0 테이블 대상).
+        self.moe.moe_resident = true;
+        self.experts_bytes = bytes;
+        Ok(())
+    }
+
     /// head(output.weight) 상주 업로드 — [I8head 2026-10-11] bf16 → int8
     /// (행별 amax/127 스케일) 양자화 후 업로드.
     /// 품질 판정(eval chunk4): en PPL +0.061%·argmax 99.139% / ko +0.0002%·
