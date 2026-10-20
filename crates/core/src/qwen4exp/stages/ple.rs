@@ -99,10 +99,25 @@ pub fn forward(
     let mut normed_all = vec![vec![0.0f32; hc * hidden]; n_tok];
     for t in 0..n_tok {
         // ① n-gram id → FP8 임베딩 디코드.
-        let ids = ngram_ids(hist, base_pos + t, &mult, &sizes, &offsets, eos, cfg.heads_per_ngram);
+        let ids = ngram_ids(
+            hist,
+            base_pos + t,
+            &mult,
+            &sizes,
+            &offsets,
+            eos,
+            cfg.heads_per_ngram,
+        );
         let mut emb = vec![0.0f32; emb_dim];
         for (h, &id) in ids.iter().enumerate() {
-            ple_row(m, &eb, shard_rows, id, scale, &mut emb[h * head_dim..(h + 1) * head_dim])?;
+            ple_row(
+                m,
+                &eb,
+                shard_rows,
+                id,
+                scale,
+                &mut emb[h * head_dim..(h + 1) * head_dim],
+            )?;
         }
         // ② kv_proj.
         let key = m.matvec_bf16(&format!("{l}.key_proj.weight"), &emb)?;
@@ -374,11 +389,7 @@ mod tests {
         let tri2 = 3i64.wrapping_mul(7) ^ 11i64.wrapping_mul(11);
         for h in 0..16 {
             let expect = if h < 8 { tri2 } else { base2 };
-            assert_eq!(
-                ids[h],
-                expect.rem_euclid(sizes[h]) + offsets[h],
-                "헤드 {h}"
-            );
+            assert_eq!(ids[h], expect.rem_euclid(sizes[h]) + offsets[h], "헤드 {h}");
         }
         // pos=4: 선행 [3, 999] — shift1=999(자연 EOS) → crossed, shift2=EOS 치환.
         let ids4 = ngram_ids(&hist, 4, &mult, &sizes, &offsets, eos, 8);

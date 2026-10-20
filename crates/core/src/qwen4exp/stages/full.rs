@@ -101,4 +101,3 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
 fn cfg_rope_base() -> f32 {
     1e7
 }
-

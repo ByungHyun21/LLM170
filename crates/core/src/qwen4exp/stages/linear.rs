@@ -24,11 +24,13 @@ use crate::ops::{l2_norm, sigmoid, silu, softplus};
 
 /// 상태 0 프로브 — 상태ful `forward_state`의 1청크 래퍼.
 pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
-    let qkv_n = m.ent(&format!(
-        "model.language_model.layers.{il}.linear_attn.in_proj_qkv.weight"
-    ))?
-    .shape[0] as usize;
-    let mut st = vec![0.0f32; m.cfg.linear_value_heads * m.cfg.linear_head_dim * m.cfg.linear_head_dim];
+    let qkv_n = m
+        .ent(&format!(
+            "model.language_model.layers.{il}.linear_attn.in_proj_qkv.weight"
+        ))?
+        .shape[0] as usize;
+    let mut st =
+        vec![0.0f32; m.cfg.linear_value_heads * m.cfg.linear_head_dim * m.cfg.linear_head_dim];
     let mut hist: Vec<Vec<f32>> = Vec::new();
     forward_state(m, il, xs, &mut hist, &mut st, qkv_n)
 }

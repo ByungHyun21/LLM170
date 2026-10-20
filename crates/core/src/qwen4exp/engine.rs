@@ -405,7 +405,9 @@ pub fn probe(dir: &Path) -> Result<String, String> {
             );
         }
         let hm = rc.iter().flatten().fold(0.0f32, |a, &b| a.max(b.abs()));
-        lines.push(format!("  hyper-connection 층 3 mix+combine 통과(|R|max={hm:.4})"));
+        lines.push(format!(
+            "  hyper-connection 층 3 mix+combine 통과(|R|max={hm:.4})"
+        ));
     }
     {
         let mut kv = super::stages::qsa::KvCache::new();
@@ -421,7 +423,9 @@ pub fn probe(dir: &Path) -> Result<String, String> {
             ix.comp_k.len()
         ));
     }
-    lines.push("  판정: FN D2 통과 — 상태ful 오라클(oracle)·w4a16-ref greedy·골든 사용 가능".to_string());
+    lines.push(
+        "  판정: FN D2 통과 — 상태ful 오라클(oracle)·w4a16-ref greedy·골든 사용 가능".to_string(),
+    );
     Ok(lines.join("\n"))
 }
 

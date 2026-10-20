@@ -73,7 +73,11 @@ fn indexer_project(
     pos: u32,
     q_ln: &[f32],
 ) -> Result<(Vec<Vec<f32>>, Vec<f32>), String> {
-    let (n_ih, ihd, n_rot) = (m.cfg.indexer_n_heads, m.cfg.indexer_head_dim, m.cfg.indexer_head_dim / 2);
+    let (n_ih, ihd, n_rot) = (
+        m.cfg.indexer_n_heads,
+        m.cfg.indexer_head_dim,
+        m.cfg.indexer_head_dim / 2,
+    );
     let qk = m.matvec_bf16(&format!("{l}.indexer.index_qk_proj.weight"), x)?;
     let mut q = Vec::with_capacity(n_ih);
     for h in 0..n_ih {
@@ -90,7 +94,13 @@ fn indexer_project(
 /// 선택 토큰 집합 — 쿼리 절대 위치 p. top-512 블록 전개 + 불완전 블록
 /// 꼬리(expand_qsa_block_indices 전수). 동점은 블록 인덱스 오름차순
 /// (결정적 오라클 규약 — GPU topk 동점 순서와 다를 수 있음[INFERENCE]).
-pub fn select(idx: &QsaCache, q: &[Vec<f32>], p: usize, ratio: usize, block_topk: usize) -> Vec<usize> {
+pub fn select(
+    idx: &QsaCache,
+    q: &[Vec<f32>],
+    p: usize,
+    ratio: usize,
+    block_topk: usize,
+) -> Vec<usize> {
     let visible = (p + 1) / ratio;
     if visible == 0 {
         return (0..=p).collect();

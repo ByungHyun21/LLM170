@@ -76,8 +76,10 @@ impl Oracle {
         // PLE 층 — 체크포인트 실물 스캔(config ple_layer_ids는 1-based라
         // 1 차이 — 프로브와 동일한 판별).
         let ple_il = (0..cfg.num_hidden_layers).find(|&il| {
-            m.ent(&format!("model.language_model.layers.{il}.ple.conv1d.weight"))
-                .is_ok()
+            m.ent(&format!(
+                "model.language_model.layers.{il}.ple.conv1d.weight"
+            ))
+            .is_ok()
         });
         let ple_state = ple_il.map(|_| ple::PleState::new(cfg.hc_count * cfg.hidden_size));
         Ok(Oracle {
@@ -127,13 +129,25 @@ impl Oracle {
                 LayerSt::Full { kv, idx } => qsa::full_forward(&self.m, il, &block, base, kv, idx)?,
             };
             for t in 0..r.len() {
-                hc::combine_tok(&mut r[t], &attn_out[t], &inj[t * hc_n..(t + 1) * hc_n], hc_n, hidden);
+                hc::combine_tok(
+                    &mut r[t],
+                    &attn_out[t],
+                    &inj[t * hc_n..(t + 1) * hc_n],
+                    hc_n,
+                    hidden,
+                );
             }
             // MoE 블록.
             let (block2, inj2) = hc::mix(&self.m, &format!("{lp}.mlp_hyper_connection"), &r)?;
             let ffn = moe::forward(&self.m, il, &block2)?;
             for t in 0..r.len() {
-                hc::combine_tok(&mut r[t], &ffn[t], &inj2[t * hc_n..(t + 1) * hc_n], hc_n, hidden);
+                hc::combine_tok(
+                    &mut r[t],
+                    &ffn[t],
+                    &inj2[t * hc_n..(t + 1) * hc_n],
+                    hc_n,
+                    hidden,
+                );
             }
         }
         self.pos += chunk.len();
@@ -182,7 +196,10 @@ mod tests {
         for (x, y) in la.iter().zip(lb.iter()) {
             worst = worst.max((x - y).abs());
         }
-        eprintln!("prefill↔재계산: max|Δlogit| = {worst:.3e} ({} 로짓)", la.len());
+        eprintln!(
+            "prefill↔재계산: max|Δlogit| = {worst:.3e} ({} 로짓)",
+            la.len()
+        );
         assert_eq!(greedy_from(&la), greedy_from(&lb), "argmax 불일치");
         assert!(worst < 1e-3, "로짓 편차 {worst} ≥ 1e-3");
     }

@@ -139,7 +139,10 @@ impl Qwen4ExpCfg {
             ngram_size: num_opt("ngram_size", 0),
             heads_per_ngram: num_opt("heads_per_ngram", 0),
             split_ngram_parts: num_opt("split_ngram_parts", 0),
-            eos_token_id: t.get("eos_token_id").and_then(Json::as_f64).map_or(0, |x| x as u32),
+            eos_token_id: t
+                .get("eos_token_id")
+                .and_then(Json::as_f64)
+                .map_or(0, |x| x as u32),
             hc_count: num_opt("hc_count", 4),
             indexer_n_heads: num_opt("indexer_n_heads", 0),
             indexer_head_dim: num_opt("indexer_head_dim", 0),

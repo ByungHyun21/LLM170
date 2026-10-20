@@ -106,7 +106,10 @@ mod tests {
         let gate = vec![0.0f32; 8];
         let m0 = gate_mean_tok(&xn, &gate, hc, hidden);
         for j in 0..4 {
-            assert!((m0[j] - (xn[j] + xn[4 + j]) / 4.0).abs() < 1e-7, "게이트 평균");
+            assert!(
+                (m0[j] - (xn[j] + xn[4 + j]) / 4.0).abs() < 1e-7,
+                "게이트 평균"
+            );
         }
         // combine: inj 로짓 0 → g = 2σ(0) = 1 → R += y 그대로.
         let y = vec![1.0f32, -1.0, 2.0, 0.5];
