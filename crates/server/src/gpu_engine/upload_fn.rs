@@ -76,6 +76,15 @@ pub(crate) fn upload_fn_win(
                 cfg.heads * cfg.head_dim * 2,
                 h,
             )?;
+            // [QSA] 인덱서 투영 [640,2560](q 4×128 ‖ k 128).
+            up(
+                dec,
+                &store,
+                &format!("blk.{il}.idx_qk.weight"),
+                &format!("{}.self_attn.indexer.index_qk_proj.weight", lp(il)),
+                (cfg.indexer_n_heads + 1) * cfg.indexer_head_dim,
+                h,
+            )?;
             up(
                 dec,
                 &store,
