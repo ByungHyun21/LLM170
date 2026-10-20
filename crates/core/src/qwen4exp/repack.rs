@@ -205,8 +205,8 @@ fn repack_triple<W: Write>(
     let sc = tbytes(ar, mmaps, &format!("{base}.scales"))?;
     // qzeros 전수 상수 검증 — 무손실(sym zp=8) 계약의 관문. 하나라도 어긋나면
     // 이 재패커의 전제가 무너진다(명시 거부 — GPTQ-asym 경로 필요).
-    for (i, c) in qz.chunks_exact(4).enumerate() {
-        let w = u32::from_le_bytes(c.try_into().expect("4B"));
+    for (i, c) in qz.as_chunks::<4>().0.iter().enumerate() {
+        let w = u32::from_le_bytes((*c).try_into().expect("4B"));
         if w != QZ_WORD {
             return Err(format!(
                 "{base}.qzeros[{i}] = {w:#010x} — 비상수 zero-point(D1 계약 위반)"
@@ -217,7 +217,7 @@ fn repack_triple<W: Write>(
     let mut pk = vec![0u8; n * kw * 4];
     for jw in 0..kw {
         let row = &qw[jw * n * 4..(jw + 1) * n * 4];
-        for (r, w4) in row.chunks_exact(4).enumerate() {
+        for (r, w4) in row.as_chunks::<4>().0.iter().enumerate() {
             let d = (r * kw + jw) * 4;
             pk[d..d + 4].copy_from_slice(w4);
         }
@@ -228,7 +228,7 @@ fn repack_triple<W: Write>(
     let mut s = vec![0u8; n * kg * 2];
     for gi in 0..kg {
         let row = &sc[gi * n * 2..(gi + 1) * n * 2];
-        for (r, s2) in row.chunks_exact(2).enumerate() {
+        for (r, s2) in row.as_chunks::<2>().0.iter().enumerate() {
             let d = (r * kg + gi) * 2;
             s[d..d + 2].copy_from_slice(s2);
         }
@@ -462,7 +462,7 @@ fn repack_inner(
                 if let Ok(n) = r {
                     bytes_done.fetch_add(n, Ordering::Relaxed);
                 }
-                let _ = tx.send((fname.clone(), r.map(|n| n as u64)));
+                let _ = tx.send((fname.clone(), r));
             });
         }
         drop(tx);
@@ -470,7 +470,7 @@ fn repack_inner(
         let t_start = Instant::now();
         loop {
             match rx.recv_timeout(Duration::from_secs(3)) {
-                Ok((name, Ok(nb))) => {
+                Ok((name, Ok(_nb))) => {
                     done += 1;
                     let el = t_start.elapsed().as_secs_f64();
                     let cur = bytes_done.load(Ordering::Relaxed);
@@ -984,13 +984,17 @@ mod tests {
                 sc.clone(),
             ));
             let wv: Vec<u32> = qw
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes((*c).try_into().unwrap()))
                 .collect();
             want_words.push((base.to_string(), wv, n, kw));
             let sv: Vec<u16> = sc
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes((*c).try_into().unwrap()))
                 .collect();
             want_scales.push((base.to_string(), sv, n, kg));
         }
