@@ -731,8 +731,15 @@ impl W4a16Dec {
                 (q, k, v)
             };
             // ② 어텐션(디바이스 — 행별 pos/테이블) → o_proj → post_attn 잔차.
+            // [E1-mirror 2026-10-20] t≤8(디코드·스펙 검증)은 분할 = ATTN_SPLITS_D(64)
+            // — qwen 디코드 선례(+10% tg) 미러. ncu 실측: splits=2에서 점유 12.5%·
+            // SM/메모리 SOL 5~7%(순수 레이턴시 바운드 — 32블록×8워프만 활성).
+            // 활성 분할은 커널이 grain(32)로 상한 자판(초과분 = 빈 partial 기록).
+            // 분할 경계 변화 = ulp급 eval 클래스(E1 노트 참조) — span≤256은
+            // eff=1로 불변(단문 골든·지문 비트동일 유지).
+            let sp_dec = if t <= 8 { ATTN_SPLITS_D } else { 2 };
             let outv = self.attn_g4_dev(
-                slots, pos, il, q, k, v, dm.q_heads, l.kv_heads, d, sw, l.kq_scale, 2, 5, 6, 7,
+                slots, pos, il, q, k, v, dm.q_heads, l.kv_heads, d, sw, l.kq_scale, sp_dec, 5, 6, 7,
             )?;
             let o = self.g4_dev_gemm(&format!("blk.{il}.attn_output.weight"), outv, t, qd, 8)?;
             let hh = self.g4_scratch_slot(9, n * 4)?;
