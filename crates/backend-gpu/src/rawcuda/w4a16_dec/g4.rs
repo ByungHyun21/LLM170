@@ -984,14 +984,25 @@ impl W4a16Dec {
         // [A2 2026-10-15] t>G4_TROW_MAX = 행 분할(head i8_t 스위치 ≤16 계약) —
         // 프리필은 t=1(마지막 행)·디코드는 t≤8이라 실사용은 단일 호출뿐이지만,
         // 청크 상한 상향(64)에 대비해 계약을 지킨다.
+        // [head t=1 2026-10-20] rows=1은 전용 행=블록 커널(w4a16_gemv_i8)로 —
+        // 산술 비트동일(64레인 f32 FMA → f64 tree64 동일 순서)하나 _t 템플릿판은
+        // REG 92(점유 29%·255GB/s·2.9ms 실측) vs 전용판 REG 32. 27B 경로
+        // (graphs/prefill head_gemv_launch)와 동일 라우팅 — t=1 우위는 채택 이력.
         let mut r0 = 0usize;
         while r0 < t {
             let rows = G4_TROW_MAX.min(t - r0);
-            self.head_gemv_t_launch(
-                x_dev + (r0 * self.hidden * 4) as u64,
-                y + (r0 * self.head_n * 4) as u64,
-                rows,
-            )?;
+            if rows == 1 {
+                self.head_gemv_i8_launch(
+                    x_dev + (r0 * self.hidden * 4) as u64,
+                    y + (r0 * self.head_n * 4) as u64,
+                )?;
+            } else {
+                self.head_gemv_t_launch(
+                    x_dev + (r0 * self.hidden * 4) as u64,
+                    y + (r0 * self.head_n * 4) as u64,
+                    rows,
+                )?;
+            }
             r0 += rows;
         }
         Ok(y)
