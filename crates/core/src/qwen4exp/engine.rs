@@ -14,11 +14,10 @@
 //!   select_topk 재사용) + gptq int4 전문가 + shared(sigmoid 게이트).
 //! - head·embed: embed_tokens/lm_head BF16 직접.
 //!
-//! **미구현 지점(3차 — todo가 아니라 명시적 Err + 문서)**:
-//! ① hyper-connection(4스트림 믹서·hc_norm[10240]·block_inject) — 프로브는
-//!   단순 잔차(x += out) 근사. ② PLE FP8 ngram 임베딩 디코드 + indexer
-//!   top-k 경로. ③ gptq 팩 nibble 순서·zero(+1) 바이어스의 골든 검증.
-//! ④ 상태ful 디코드(KV/GDN 상태 재사용)·골든 토큰열. ⑤ MTP n-gram 폴백.
+//! [D2 2026-10-20 완료] hyper-connection(stages/hc)·PLE FP8 forward
+//! (stages/ple)·indexer top-k(stages/qsa)·상태ful 오라클(oracle.rs —
+//! w4a16-ref greedy 진입) 전부 구현. 잔여: MTP n-gram 폴백·vLLM 골든
+//! 대조(다음 단계).
 
 use super::bind::Qwen4ExpCfg;
 use crate::st::{StArchive, StDtype, StEntry};
@@ -270,13 +269,8 @@ pub(crate) fn half_f32(b: u16) -> f32 {
     }
 }
 
-/// hyper-connection(4스트림 잔차 믹서) — **미구현(3차)**.
-/// 텐서: 층별 attn/mlp_hyper_connection(input_mix up/down [10240,320]·
-/// hc_norm [10240]·block_inject [4,10240]) + 최상위 hyper_connection_mixer.
-/// 프로브는 단순 잔차(x += out) 근사로 대체한다.
-pub fn hyper_connection_forward(_m: &Model, _il: usize) -> Result<(), String> {
-    Err("hyper-connection 4스트림 믹서 미구현 — FN 3차 (프로브는 단순 잔차 근사)".into())
-}
+// hyper-connection(GatedResidual) — [D2] stages/hc 전수 구현.
+// 프로브/오라클은 `stages::hc::{mix, mix_final, combine_tok}` 사용.
 
 /// 그래프 프로브 — 구조 검증 + linear/full 1층분 forward(형상·dtype 체크)
 /// + PLE·indexer·hyper-connection 미구현 지점 명시. w4a16-ref 진입점.
@@ -383,19 +377,55 @@ pub fn probe(dir: &Path) -> Result<String, String> {
         "  head 통과 — vocab {} 로짓 max={lmax:.4} top1={argmax}",
         logits.len()
     ));
-    // ④ 미구현 지점(3차) — 판독 검증 + 명시적 Err.
+    // ④ [D2] PLE·hyper-connection·indexer 실물 forward 스모크(1층분).
     if let Some(&pil) = ple_layers.first() {
         let v = super::stages::ple::verify(&m, pil)?;
-        let e = super::stages::ple::forward(&m, pil, &xs).unwrap_err();
+        let mut rp: Vec<Vec<f32>> = xs.iter().map(|e| e.repeat(m.cfg.hc_count)).collect();
+        let mut pst = super::stages::ple::PleState::new(m.cfg.hc_count * cfg.hidden_size);
+        super::stages::ple::forward(&m, pil, &tokens, 0, &mut rp, &mut pst)
+            .map_err(|e| format!("PLE forward 실패: {e}"))?;
+        let pm = rp.iter().flatten().fold(0.0f32, |a, &b| a.max(b.abs()));
+        if !rp.iter().all(|t| t.iter().all(|v| v.is_finite())) {
+            return Err("PLE forward 비유한값".into());
+        }
+        lines.push(format!("  PLE 층 {pil} forward 통과(|R|max={pm:.4}) — {v}"));
+    }
+    {
+        let lp = "model.language_model.layers.3.attn_hyper_connection";
+        let rh: Vec<Vec<f32>> = xs.iter().map(|e| e.repeat(m.cfg.hc_count)).collect();
+        let (blk, inj) = super::stages::hc::mix(&m, lp, &rh)?;
+        let mut rc = rh;
+        for t in 0..rc.len() {
+            super::stages::hc::combine_tok(
+                &mut rc[t],
+                &blk[t],
+                &inj[t * m.cfg.hc_count..(t + 1) * m.cfg.hc_count],
+                m.cfg.hc_count,
+                cfg.hidden_size,
+            );
+        }
+        let hm = rc.iter().flatten().fold(0.0f32, |a, &b| a.max(b.abs()));
         lines.push(format!(
-            "  PLE 층 {pil} 판독: {v}\n  PLE forward: Err — {e}"
+            "  hyper-connection 층 3 mix+combine 통과(|R|max={hm:.4})"
         ));
     }
-    let ie = super::stages::full::indexer_forward(&m, 3, &xs).unwrap_err();
-    let he = hyper_connection_forward(&m, 0).unwrap_err();
-    lines.push(format!(
-        "  indexer: Err — {ie}\n  hyper-connection: Err — {he}\n  판정: FN 2단계 골격 통과 — 3차: PLE FP8 디코드·indexer top-k·hyper-connection·gptq 팩 골든·상태ful 디코드·MTP n-gram"
-    ));
+    {
+        let mut kv = super::stages::qsa::KvCache::new();
+        let mut ix = super::stages::qsa::QsaCache::new();
+        let oa = super::stages::qsa::full_forward(&m, 3, &xs, 0, &mut kv, &mut ix)?;
+        let qm = oa.iter().flatten().fold(0.0f32, |a, &b| a.max(b.abs()));
+        if !oa.iter().all(|t| t.iter().all(|v| v.is_finite())) {
+            return Err("QSA forward 비유한값".into());
+        }
+        lines.push(format!(
+            "  indexer+QSA 층 3 forward 통과(|out|max={qm:.4}) — raw {}토큰·압축 {}블록",
+            ix.raw_k.len(),
+            ix.comp_k.len()
+        ));
+    }
+    lines.push(
+        "  판정: FN D2 통과 — 상태ful 오라클(oracle)·w4a16-ref greedy·골든 사용 가능".to_string(),
+    );
     Ok(lines.join("\n"))
 }
 
@@ -422,7 +452,7 @@ mod tests {
         };
         let rep = probe(std::path::Path::new(&d)).expect("fn-probe 실패");
         eprintln!("{rep}");
-        assert!(rep.contains("골격 통과"), "리포트: {rep}");
+        assert!(rep.contains("D2 통과"), "리포트: {rep}");
     }
 
     /// [D0] zero-centered 노름 합성 — plus1 원소 단위 증명.

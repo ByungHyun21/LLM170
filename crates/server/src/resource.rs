@@ -165,7 +165,10 @@ pub fn guard_target(sub: &str, model: Option<&str>, rest: &[String]) -> Option<G
     // [FN 1단계 2026-10-17] qwen4_exp(FN) w4a16-load = 식별 전용 프로브
     // (config.json + index.json 판독, 가중치 mmap 없음) — 121GiB 체크포인트
     // 용량으로 호스트 예산 판정하면 식별 자체가 막힌다. 무가드 스킵.
-    if sub == "w4a16-load"
+    // [FN D2 2026-10-20] w4a16-ref 동일 스킵 — 오라클은 스토어 직접
+    // mmap 스트리밍(RSS = 페이지 캐시 분량)이라 dense 적재 예산 추정
+    // (148GiB)이 실측과 무관하다.
+    if matches!(sub, "w4a16-load" | "w4a16-ref")
         && path
             .as_deref()
             .and_then(llm170_core::qwen35::bind::dir_arch)

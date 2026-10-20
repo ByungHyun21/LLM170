@@ -54,6 +54,17 @@ pub struct Qwen4ExpCfg {
     pub split_ngram_parts: usize,
     /// config MTP 층 수(기록만 — 체크포인트 미포함, 엔진 n-gram 초안 폴백).
     pub mtp_cfg_layers: usize,
+    /// eos_token_id — PLE n-gram 어휘 경계 치환(vLLM model_state 신규 시퀀스
+    /// 컨텍스트를 eos로 채우는 계약. FN 실측 248044).
+    pub eos_token_id: u32,
+    /// hyper-connection 스트림 수(config hc_count — FN 실측 4).
+    pub hc_count: usize,
+    /// QSA 인덱서 hparams(indexer_n_heads 4·kv 1·head_dim 128·budget
+    /// 2048·compress 4 — FN 실측).
+    pub indexer_n_heads: usize,
+    pub indexer_head_dim: usize,
+    pub indexer_budget: usize,
+    pub indexer_compress_ratio: usize,
 }
 
 impl Qwen4ExpCfg {
@@ -128,6 +139,15 @@ impl Qwen4ExpCfg {
             ngram_size: num_opt("ngram_size", 0),
             heads_per_ngram: num_opt("heads_per_ngram", 0),
             split_ngram_parts: num_opt("split_ngram_parts", 0),
+            eos_token_id: t
+                .get("eos_token_id")
+                .and_then(Json::as_f64)
+                .map_or(0, |x| x as u32),
+            hc_count: num_opt("hc_count", 4),
+            indexer_n_heads: num_opt("indexer_n_heads", 0),
+            indexer_head_dim: num_opt("indexer_head_dim", 0),
+            indexer_budget: num_opt("indexer_budget", 0),
+            indexer_compress_ratio: num_opt("indexer_compress_ratio", 0),
             output_gate_sigmoid: t
                 .get("output_gate_type")
                 .and_then(Json::as_str)

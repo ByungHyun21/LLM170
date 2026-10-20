@@ -140,14 +140,6 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
                 .into(),
         );
     }
-    // [FN 2단계 2026-10-17] qwen4_exp(FN) — CPU 오라클 골격(fn-probe) 진입.
-    // 골든 greedy 경로는 3차(PLE·indexer·hyper-connection 미해부).
-    let path = std::path::Path::new(&dir);
-    if let Some(a) = llm170_core::qwen35::bind::dir_arch(path)
-        && llm170_core::qwen4exp::arch_ok(&a)
-    {
-        return llm170_core::qwen4exp::probe(path);
-    }
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     let mut n_predict = 32usize;
     let mut ctx = 4096usize;
@@ -225,6 +217,19 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
             }
             other => return Err(format!("unknown flag: {other}")),
         }
+    }
+    // [FN D2 2026-10-20] greedy 경로 개통 — 프롬프트 지정 시 참조 엔진
+    // (RefEngine::Fn·상태ful 오라클)로 진행. 무지정이면 기존 fn-probe.
+    let path = std::path::Path::new(&dir);
+    let is_fn = llm170_core::qwen35::bind::dir_arch(path)
+        .map(|a| llm170_core::qwen4exp::arch_ok(&a))
+        .unwrap_or(false);
+    if is_fn && (prompts.is_empty() || corpus.is_some()) {
+        return if corpus.is_some() {
+            Err("FN --eval-corpus 미지원 — --prompt-tokens greedy 사용".into())
+        } else {
+            llm170_core::qwen4exp::probe(path)
+        };
     }
     if prompts.is_empty() && corpus.is_none() {
         return Err("at least one --prompt-tokens 또는 --eval-corpus required".into());
@@ -380,6 +385,8 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
 pub(super) enum RefEngine {
     Qwen(llm170_core::qwen35::Engine),
     Gemma(llm170_core::gemma4::Engine),
+    /// [FN D2] 상태ful CPU 오라클(단일 시퀀스 — prefill/디코드 동일 경로).
+    Fn(Box<llm170_core::qwen4exp::oracle::Oracle>),
 }
 
 impl RefEngine {
@@ -387,8 +394,12 @@ impl RefEngine {
         let path = std::path::Path::new(dir);
         let arch = llm170_core::qwen35::bind::dir_arch(path).unwrap_or_default();
         if llm170_core::qwen4exp::arch_ok(&arch) {
-            // [FN 2단계] FN은 gptq 팩 — qwen35/gemma4 W4A16 로더 계약 밖.
-            return Err("qwen4_exp(FN) 참조 greedy는 3차 — w4a16-ref fn-probe 경로 사용".into());
+            // [FN D2] gptq 팩 — 스토어 직접 접근 오라클. 단일 시퀀스만.
+            if n_seqs > 1 {
+                return Err("FN 참조 오라클은 단일 시퀀스만 지원".into());
+            }
+            let o = llm170_core::qwen4exp::oracle::Oracle::new(path).map_err(|e| e.to_string())?;
+            return Ok(RefEngine::Fn(Box::new(o)));
         }
         if llm170_core::gemma4::bind::arch_ok(&arch) {
             let m = llm170_core::gemma4::Model::load(path).map_err(|e| e.to_string())?;
@@ -407,6 +418,12 @@ impl RefEngine {
         match self {
             RefEngine::Qwen(e) => e.prefill(seq, tokens).map_err(|x| x.to_string()),
             RefEngine::Gemma(e) => e.prefill(seq, tokens).map_err(|x| x.to_string()),
+            RefEngine::Fn(e) => {
+                if seq != 0 {
+                    return Err("FN 오라클 단일 시퀀스 위반".into());
+                }
+                e.forward(tokens).map_err(|x| x.to_string())
+            }
         }
     }
 
@@ -414,6 +431,8 @@ impl RefEngine {
         match self {
             RefEngine::Qwen(e) => e.decode(&[seq], tokens).map_err(|x| x.to_string()),
             RefEngine::Gemma(e) => e.decode(&[seq], tokens).map_err(|x| x.to_string()),
+            // 마지막 토큰 로짓만 반환(참조 greedy 경로 전용 계약).
+            RefEngine::Fn(e) => Ok(vec![e.forward(tokens).map_err(|x| x.to_string())?]),
         }
     }
 
@@ -421,6 +440,9 @@ impl RefEngine {
         match self {
             RefEngine::Qwen(e) => e.decode_greedy(seq, token).map_err(|x| x.to_string()),
             RefEngine::Gemma(e) => e.decode_greedy(seq, token).map_err(|x| x.to_string()),
+            RefEngine::Fn(e) => Ok(llm170_core::matmul::greedy_from(
+                &e.forward(&[token]).map_err(|x| x.to_string())?,
+            )),
         }
     }
 
@@ -429,6 +451,7 @@ impl RefEngine {
         match self {
             RefEngine::Qwen(e) => e.seqs.get(seq).map(|s| s.pos).unwrap_or(0),
             RefEngine::Gemma(e) => e.seqs.get(seq).map(|s| s.pos).unwrap_or(0),
+            RefEngine::Fn(e) => e.pos() as u32,
         }
     }
 
@@ -437,6 +460,7 @@ impl RefEngine {
         match self {
             RefEngine::Qwen(e) => e.ckpt_save().map_err(|x| x.to_string()),
             RefEngine::Gemma(e) => e.ckpt_save().map_err(|x| x.to_string()),
+            RefEngine::Fn(_) => Err("FN 참조 체크포인트 미지원(D3 접두 체크포인트 트랙)".into()),
         }
     }
 
@@ -445,6 +469,7 @@ impl RefEngine {
         match self {
             RefEngine::Qwen(e) => e.ckpt_load(blob).map_err(|x| x.to_string()),
             RefEngine::Gemma(e) => e.ckpt_load(blob).map_err(|x| x.to_string()),
+            RefEngine::Fn(_) => Err("FN 참조 체크포인트 미지원(D3 접두 체크포인트 트랙)".into()),
         }
     }
 }
