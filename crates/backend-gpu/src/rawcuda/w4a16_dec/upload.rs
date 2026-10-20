@@ -1496,7 +1496,7 @@ impl W4a16Dec {
             self.moe.moe_ffn,
             self.hidden,
         );
-        let n_win = if ne > 0 { lens_win.len() / 3 / ne } else { 0 };
+        let n_win = lens_win.len().checked_div(3 * ne.max(1)).unwrap_or(0);
         if ne == 0 || n_win == 0 || layer_lo + n_win > nl_all {
             return Err(format!(
                 "marlin_only: lens {} → n_win {n_win} lo {layer_lo} nl {nl_all} 위반",
