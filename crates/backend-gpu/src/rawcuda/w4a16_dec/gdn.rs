@@ -110,12 +110,10 @@ impl W4a16Dec {
             self.gdn.dv2,
             self.gdn.dbg,
         );
-        // [TB 인터리브 2026-10-20] 그리드 y = ceil(t/TB) — 커널이 블록당
-        // TB 토큰을 도트에서 인터리브(abuf 재판독 절감).
         self.cc.launch(
             f,
             dm.h_v as u32,
-            t_len.div_ceil(GDN_L2_TB) as u32,
+            t_len as u32,
             128,
             &mut crate::rawcuda::args::l16(
                 &mut l0, &mut l1, &mut l2, &mut l3, &mut l4, &mut l5, &mut l6, &mut l7, &mut l8,
@@ -633,7 +631,7 @@ impl W4a16Dec {
             self.cc.launch(
                 f,
                 dm.h_v as u32,
-                t_len.div_ceil(GDN_L2_TB) as u32,
+                t_len as u32,
                 128,
                 &mut crate::rawcuda::args::l16(
                     &mut l0, &mut l1, &mut l2, &mut l3, &mut l4, &mut l5, &mut l6, &mut l7,
