@@ -463,15 +463,21 @@ impl W4a16Dec {
                 ),
             )?;
         }
-        // ② [FA2 2026-10-19] t>8 연속 단일 슬롯 d=256(슬라이딩)층 프리필 —
-        // part_g4+merge 대신 FA2 타일 경로(qwen attn_fa2_launch 미러 —
-        // kq_scale=1.0·no_gate=1·sw 창 인자는 2026-10-14부터 커널 준비됨).
-        // 풀층(d=512 — 커널 d=256 하드코딩)·혼합 슬롯·t≤8(디코드·스펙 검증)은
-        // 기존 part_g4+merge 단일 경로.
+        // ② [FA2 2026-10-19] t>8 연속 단일 슬롯 프리필 — part_g4+merge 대신
+        // FA2 타일 경로(qwen attn_fa2_launch 미러 — kq_scale=1.0·no_gate=1·
+        // sw 창 인자는 2026-10-14부터 커널 준비됨). d=256(슬라이딩 25층) =
+        // attn_fa2_qg(BR=BC=32) · d=512(풀층 5개) = attn_fa2_g4_512(BR=BC=16 —
+        // KD 512 정적 smem 44.8KB 한도 내 타일 축소, PV 4워프 d-쿼터).
+        // 혼합 슬롯·t≤8(디코드·스펙 검증)은 기존 part_g4+merge 단일 경로.
         let contig =
             slots.windows(2).all(|w| w[0] == w[1]) && pos.windows(2).all(|w| w[1] == w[0] + 1);
-        if t > 8 && d == 256 && contig {
-            let f = self.cc.function("attn_fa2_qg")?;
+        if t > 8 && (d == 256 || d == 512) && contig {
+            let f = self.cc.function(if d == 512 {
+                "attn_fa2_g4_512"
+            } else {
+                "attn_fa2_qg"
+            })?;
+            let rows = if d == 512 { 16 } else { 32 };
             let (mut a0, mut a1, mut a2, mut a3) = (qh, self.attn_blk_ptr(slots[0]), 0u64, outv);
             let (mut a4, mut a5, mut a6) = (0u64, 0u64, pos_dev); // qg·out32·out16 미사용
             let (mut tl, mut lay, mut qh_, mut kvh, mut cp) = (
@@ -485,7 +491,7 @@ impl W4a16Dec {
             let mut scl = kq_scale;
             self.cc.launch(
                 f,
-                t.div_ceil(32) as u32,
+                t.div_ceil(rows) as u32,
                 q_heads as u32,
                 128,
                 &mut crate::rawcuda::args::l15(

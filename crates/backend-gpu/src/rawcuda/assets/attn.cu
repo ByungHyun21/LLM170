@@ -1704,3 +1704,379 @@ extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_qg(
         }
     }
 }
+
+// ── [FA2 g4 풀층 2026-10-19] d=512 전역 어텐션층(gemma4 5개) 전용 변형 ──
+// attn_fa2_qg의 구조 재사용(수치 클래스 동일 — q f16·P f16·mma)이나 타일 축소:
+// BR=BC=16(KD 512에서 정적 smem 한도 내 — Qs 16.6K+K8 8.3K+VsT 18.4K+Ps 0.6K
+// +상태 ≈ 44.8KB, 점유 2블록/SM). 워프 역할 재분배: 스코어 = warp0 단독
+// (16행×16열 — wi 행반 구조는 BR=32 전용), PV = 전 4워프가 d 4쿼터 분담
+// (d_ = warp*128 + f*8 — o[16][4] 레지스터는 원판과 동일 크기). 스코어시
+// warp1-3 유휴는 스테이징(KV int8→f16)이 지배 경로라 허용 — 밀도는 ncu로
+// 재확인 계약. 인과/SW 마스크·온라인 소프트맥스·에필로그 융합은 원판과
+// 동일 산식(qwen 경로 코드와의 중복은 의도적 — 원판 SASS 불변 보존).
+extern "C" __global__ void __launch_bounds__(128, 2) attn_fa2_g4_512(
+    const float* __restrict__ qh,
+    const unsigned long long* __restrict__ dblk_tab,
+    const float* __restrict__ qg,
+    float* __restrict__ outv,
+    float* __restrict__ out32,
+    unsigned short* __restrict__ out16,
+    const unsigned* __restrict__ pp,
+    int t_len, int layer, int q_heads, int kv_heads, int cap, float kq_scale,
+    int sw, int no_gate)
+{
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int g = lane >> 2;
+    const int tt = lane & 3;
+    const int h = blockIdx.y;
+    const int gq_ = q_heads / kv_heads;
+    const int kh = h / gq_;
+    const int rb = blockIdx.x * 16; // BR=16
+    const int pos0 = (int)pp[0];
+    const long kv_dim = (long)kv_heads * 512;
+
+    __shared__ __align__(16) unsigned short Qs[16][520];
+    __shared__ __align__(16) signed char K8[16][528]; // 512+16 — uint4 스테이징 16B 정렬(원판 272 계약과 동일)
+    __shared__ __align__(16) unsigned short VsT[512][18];
+    __shared__ __align__(16) unsigned short Ps[16][20];
+    __shared__ float ksc_s[16];
+    __shared__ float vsc_s[16];
+    __shared__ float m_s[16];
+    __shared__ float l_s[16];
+    __shared__ float corr_s[16];
+
+    // Q f16 오버플로 가드 — **행별 스케일**(원판 attn_fa2_qg의 타일 전역과 달리).
+    // 행별이어야 청크 경계(콜드 512분할 vs 웜 발화 경계 재개)와 무관하게
+    // f16 라운딩이 행 단위로 확정 — 재사용 정합(G4e) 계약. 소프트맥스는
+    // 행별 양수 스케일에도 불변(점수·m·l·P 동일 인자). 패스1 = 행별 최대
+    // (스레드별 국소 최대 → 워프 축소 → [4][16] → 최종), 패스2 = 재판독 적용.
+    float qmxr[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        qmxr[r] = 0.0f;
+    }
+    for (int e = tid; e < 16 * 512; e += 128) {
+        const int r = e >> 9;
+        const int d_ = e & 511;
+        const int row = rb + r;
+        if (row < t_len) {
+            qmxr[r] = fmaxf(
+                qmxr[r],
+                fabsf(qh[(size_t)row * (q_heads * 512) + (size_t)h * 512 + d_]));
+        }
+    }
+    __shared__ float qrm[4][16];
+    __shared__ float qrow[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        float m = qmxr[r];
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 16));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 8));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+        if ((lane & 31) == 0) {
+            qrm[warp][r] = m;
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        if (lane < 16) {
+            qrow[lane] = fmaxf(fmaxf(qrm[0][lane], qrm[1][lane]),
+                               fmaxf(qrm[2][lane], qrm[3][lane]));
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < 16 * 512; e += 128) {
+        const int r = e >> 9;
+        const int d_ = e & 511;
+        const int row = rb + r;
+        float qv = 0.0f;
+        if (row < t_len) {
+            qv = qh[(size_t)row * (q_heads * 512) + (size_t)h * 512 + d_];
+        }
+        const float qs_r = (qrow[r] > 30000.0f) ? (30000.0f / qrow[r]) : 1.0f;
+        Qs[r][d_] = __half_as_ushort(__float2half_rn(qv * qs_r));
+    }
+    if (tid < 16) {
+        m_s[tid] = -1e30f;
+        l_s[tid] = 0.0f;
+        corr_s[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const int row_end = min(rb + 15, t_len - 1);
+    const int lim_max = pos0 + row_end + 1;
+    const int nchunks = (lim_max + 15) / 16;
+    const int pos_end = pos0 + t_len;
+
+    float o[16][4];
+#pragma unroll
+    for (int f = 0; f < 16; ++f) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            o[f][i] = 0.0f;
+        }
+    }
+
+    // SW 스킵 — 원판과 동일 산식(풀층 sw=0 → c_start=0).
+    int c_start = 0;
+    if (sw > 0) {
+        const int lo_first = pos0 + rb + 1 - sw;
+        if (lo_first > 0) {
+            c_start = lo_first / 16;
+        }
+    }
+    for (int c0 = c_start; c0 < nchunks; ++c0) {
+        const int base = c0 * 16;
+        // ── 스테이징: K int8(16B씩 32회/행... KD 512 = e<16*32) + V f16 전치 ──
+        for (int e = tid; e < 16 * 32; e += 128) {
+            const int j = e >> 5;
+            const int qq = e & 31;
+            const int row = base + j;
+            const signed char* kp =
+                attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh).k +
+                qq * 16;
+            if (row < pos_end) {
+                *reinterpret_cast<uint4*>(&K8[j][qq * 16]) =
+                    *reinterpret_cast<const uint4*>(kp);
+            } else {
+                *reinterpret_cast<uint4*>(&K8[j][qq * 16]) =
+                    make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        for (int e = tid; e < 16 * 32; e += 128) {
+            const int j = e >> 5;
+            const int qq = e & 31;
+            const int row = base + j;
+            signed char vb[16];
+            if (row < pos_end) {
+                const signed char* vp =
+                    attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh).v +
+                    qq * 16;
+                *reinterpret_cast<uint4*>(vb) = *reinterpret_cast<const uint4*>(vp);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    vb[i] = 0;
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                VsT[qq * 16 + i][j] =
+                    __half_as_ushort(__float2half_rn((float)vb[i]));
+            }
+        }
+        if (tid < 16) {
+            const int row = base + tid;
+            const bool ok = row < pos_end;
+            const AttnKvRowPtrs rp =
+                attn_blk_row(dblk_tab, layer, cap, row, kv_dim, kv_heads, kh);
+            ksc_s[tid] = ok ? rp.ks[0] : 0.0f;
+            vsc_s[tid] = ok ? rp.vs[0] : 0.0f;
+        }
+        __syncthreads();
+
+        // ── S = Q·K^T — warp0 단독(16행×16열) + 온라인 소프트맥스 + P ──
+        if (warp == 0) {
+            float sa[2][4];
+#pragma unroll
+            for (int f = 0; f < 2; ++f) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    sa[f][i] = 0.0f;
+                }
+            }
+#pragma unroll
+            for (int kb = 0; kb < 512; kb += 16) {
+                const unsigned a0 =
+                    *reinterpret_cast<const unsigned*>(&Qs[g][kb + 2 * tt]);
+                const unsigned a1 =
+                    *reinterpret_cast<const unsigned*>(&Qs[g + 8][kb + 2 * tt]);
+                const unsigned a2 =
+                    *reinterpret_cast<const unsigned*>(&Qs[g][kb + 2 * tt + 8]);
+                const unsigned a3 =
+                    *reinterpret_cast<const unsigned*>(&Qs[g + 8][kb + 2 * tt + 8]);
+#pragma unroll
+                for (int f = 0; f < 2; ++f) {
+                    const int j = f * 8 + g;
+                    const unsigned b0 =
+                        fa2_k8(*reinterpret_cast<const unsigned short*>(&K8[j][kb + 2 * tt]));
+                    const unsigned b1 = fa2_k8(
+                        *reinterpret_cast<const unsigned short*>(&K8[j][kb + 2 * tt + 8]));
+                    fa2_mma(sa[f], a0, a1, a2, a3, b0, b1);
+                }
+            }
+            const int rA = g;
+            const int rB = g + 8;
+            const int nA = pos0 + rb + rA + 1 - base;
+            const int nB = pos0 + rb + rB + 1 - base;
+            const int loA = (sw > 0) ? (pos0 + rb + rA + 1 - sw - base) : 0;
+            const int loB = (sw > 0) ? (pos0 + rb + rB + 1 - sw - base) : 0;
+            // 행별 가드 복원 인자(qsc와 곱셈 역원 — 오버플로 행만 ≠1).
+            const float iqA =
+                (qrow[rA] > 30000.0f) ? (qrow[rA] * (1.0f / 30000.0f)) : 1.0f;
+            const float iqB =
+                (qrow[rB] > 30000.0f) ? (qrow[rB] * (1.0f / 30000.0f)) : 1.0f;
+#pragma unroll
+            for (int f = 0; f < 2; ++f) {
+                const int cc = f * 8 + 2 * tt;
+                const float s0 = kq_scale * ksc_s[cc];
+                const float s1 = kq_scale * ksc_s[cc + 1];
+                sa[f][0] *= s0 * iqA;
+                sa[f][1] *= s1 * iqA;
+                sa[f][2] *= s0 * iqB;
+                sa[f][3] *= s1 * iqB;
+                if (cc >= nA) {
+                    sa[f][0] = -1e30f;
+                }
+                if (cc + 1 >= nA) {
+                    sa[f][1] = -1e30f;
+                }
+                if (cc >= nB) {
+                    sa[f][2] = -1e30f;
+                }
+                if (cc + 1 >= nB) {
+                    sa[f][3] = -1e30f;
+                }
+                if (cc < loA) {
+                    sa[f][0] = -1e30f;
+                }
+                if (cc + 1 < loA) {
+                    sa[f][1] = -1e30f;
+                }
+                if (cc < loB) {
+                    sa[f][2] = -1e30f;
+                }
+                if (cc + 1 < loB) {
+                    sa[f][3] = -1e30f;
+                }
+            }
+            float mg = -1e30f;
+            float mh = -1e30f;
+#pragma unroll
+            for (int f = 0; f < 2; ++f) {
+                mg = fmaxf(mg, fmaxf(sa[f][0], sa[f][1]));
+                mh = fmaxf(mh, fmaxf(sa[f][2], sa[f][3]));
+            }
+            mg = fmaxf(mg, __shfl_xor_sync(0xffffffffu, mg, 1));
+            mg = fmaxf(mg, __shfl_xor_sync(0xffffffffu, mg, 2));
+            mh = fmaxf(mh, __shfl_xor_sync(0xffffffffu, mh, 1));
+            mh = fmaxf(mh, __shfl_xor_sync(0xffffffffu, mh, 2));
+            const float moldA = m_s[rA];
+            const float moldB = m_s[rB];
+            const float mnewA = fmaxf(moldA, mg);
+            const float mnewB = fmaxf(moldB, mh);
+            const float corrA = (moldA <= -1e29f) ? 0.0f : attn_expf(moldA - mnewA);
+            const float corrB = (moldB <= -1e29f) ? 0.0f : attn_expf(moldB - mnewB);
+            float sumA = 0.0f;
+            float sumB = 0.0f;
+#pragma unroll
+            for (int f = 0; f < 2; ++f) {
+                const int cc = f * 8 + 2 * tt;
+                const float vs0 = vsc_s[cc];
+                const float vs1 = vsc_s[cc + 1];
+                const float p0 = attn_expf(sa[f][0] - mnewA);
+                const float p1 = attn_expf(sa[f][1] - mnewA);
+                const float p2 = attn_expf(sa[f][2] - mnewB);
+                const float p3 = attn_expf(sa[f][3] - mnewB);
+                sumA += p0 + p1;
+                sumB += p2 + p3;
+                const __half2 h01 = __floats2half2_rn(p0 * vs0, p1 * vs1);
+                const __half2 h23 = __floats2half2_rn(p2 * vs0, p3 * vs1);
+                *reinterpret_cast<unsigned*>(&Ps[rA][cc]) =
+                    *reinterpret_cast<const unsigned*>(&h01);
+                *reinterpret_cast<unsigned*>(&Ps[rB][cc]) =
+                    *reinterpret_cast<const unsigned*>(&h23);
+            }
+            sumA += __shfl_xor_sync(0xffffffffu, sumA, 1);
+            sumA += __shfl_xor_sync(0xffffffffu, sumA, 2);
+            sumB += __shfl_xor_sync(0xffffffffu, sumB, 1);
+            sumB += __shfl_xor_sync(0xffffffffu, sumB, 2);
+            __syncwarp();
+            if (tt == 0) {
+                m_s[rA] = mnewA;
+                m_s[rB] = mnewB;
+                l_s[rA] = l_s[rA] * corrA + sumA;
+                l_s[rB] = l_s[rB] * corrB + sumB;
+                corr_s[rA] = corrA;
+                corr_s[rB] = corrB;
+            }
+        }
+        __syncthreads();
+
+        // ── PV: O = O·corr + P·V — 전 4워프가 d 4쿼터(각 128) 분담 ──
+        {
+            const int rA = g;
+            const int rB = g + 8;
+            const float corrA = corr_s[rA];
+            const float corrB = corr_s[rB];
+#pragma unroll
+            for (int f = 0; f < 16; ++f) {
+                o[f][0] *= corrA;
+                o[f][1] *= corrA;
+                o[f][2] *= corrB;
+                o[f][3] *= corrB;
+            }
+            const int kb = 0; // BC=16 — k16 한 스텝
+            const unsigned a0 =
+                *reinterpret_cast<const unsigned*>(&Ps[rA][kb + 2 * tt]);
+            const unsigned a1 =
+                *reinterpret_cast<const unsigned*>(&Ps[rB][kb + 2 * tt]);
+            const unsigned a2 =
+                *reinterpret_cast<const unsigned*>(&Ps[rA][kb + 2 * tt + 8]);
+            const unsigned a3 =
+                *reinterpret_cast<const unsigned*>(&Ps[rB][kb + 2 * tt + 8]);
+#pragma unroll
+            for (int f = 0; f < 16; ++f) {
+                const int d_ = warp * 128 + f * 8 + g;
+                const unsigned b0 = *reinterpret_cast<const unsigned*>(
+                    &VsT[d_][kb + 2 * tt]);
+                const unsigned b1 = *reinterpret_cast<const unsigned*>(
+                    &VsT[d_][kb + 2 * tt + 8]);
+                fa2_mma(o[f], a0, a1, a2, a3, b0, b1);
+            }
+        }
+        __syncthreads();
+    }
+
+    // ── 에필로그: O/l (게이트 없음 계약 — no_gate≠0이면 qg 미판독) ──
+    {
+        const int rA = g;
+        const int rB = g + 8;
+        const float invlA = 1.0f / l_s[rA];
+        const float invlB = 1.0f / l_s[rB];
+        const int rowA = rb + rA;
+        const int rowB = rb + rB;
+#pragma unroll
+        for (int f = 0; f < 16; ++f) {
+            const int d_ = warp * 128 + f * 8 + 2 * tt;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int r0 = (e < 2) ? rowA : rowB;
+                const int d2 = d_ + (e & 1);
+                if (r0 < t_len) {
+                    float ov = o[f][e] * ((e < 2) ? invlA : invlB);
+                    if (!no_gate) {
+                        const float gv = qg[(size_t)r0 * (q_heads * 1024) +
+                                            (size_t)h * 1024 + 512 + d2];
+                        ov *= 1.0f / (1.0f + attn_expf(-gv));
+                    }
+                    const long oi = (size_t)r0 * (q_heads * 512) + (size_t)h * 512 + d2;
+                    outv[oi] = ov;
+                    if (out32 != (float*)0) {
+                        const __half hf = __float2half_rn(ov);
+                        out32[oi] = __half2float(hf);
+                        if (out16 != (unsigned short*)0) {
+                            out16[oi] = __half_as_ushort(hf);
+                        }
+                    } else if (out16 != (unsigned short*)0) {
+                        out16[oi] = __half_as_ushort(__float2half_rn(ov));
+                    }
+                }
+            }
+        }
+    }
+}

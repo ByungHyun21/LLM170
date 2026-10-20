@@ -431,14 +431,37 @@ impl GemmaEngine {
         if upto == 0 || upto > p {
             return Err(format!("gemma4: restore_prefix {upto} > pos {p}"));
         }
-        if self.dec.kv_floor_of(slot) > upto {
+        // [재사용 클래스 정합 2026-10-20] 복원 위치를 **콜드 청크 그리드로
+        // 양자화(내림)**한다. 프리필 경로가 t>8 FA2 어텐션·t>16 마린 GEMM
+        // 클래스(t≤8/16 = part_g4·GEMV f32 클래스)로 분기한 뒤로, 임의 위치
+        // 되감기는 같은 행을 콜드와 다른 산술 클래스로 재계산해 재사용 정합
+        // (콜드==웜 토큰)을 깬다(실측: 2241 되감기 → t=1 재계산 행이 토큰 10
+        // 플립). 그리드 = prefill()과 동일 t_chunk(단일 출처) — 경계가 같으면
+        // 행별 클래스·타일 구성까지 비트동일. 재계산 ≤511행 추가(≈0.1s).
+        let t_grid = if self.dec.moe_experts_resident() {
+            self.tuning
+                .chunk_t
+                .unwrap_or(llm170_backend_gpu::G4_CHUNK_MAX)
+                .min(llm170_backend_gpu::G4_CHUNK_MAX)
+        } else {
+            1
+        };
+        let q = if t_grid > 1 {
+            (upto / t_grid as u32) * t_grid as u32
+        } else {
+            upto
+        };
+        if q == 0 {
+            return Err("gemma4: restore_prefix 그리드 양자화 = 0 — 콜드".into());
+        }
+        if self.dec.kv_floor_of(slot) > q {
             return Err(format!(
-                "gemma4: restore_prefix {upto} < floor {}",
+                "gemma4: restore_prefix {q} < floor {}",
                 self.dec.kv_floor_of(slot)
             ));
         }
-        self.dec.slot_pos[slot] = upto;
-        Ok(upto)
+        self.dec.slot_pos[slot] = q;
+        Ok(q)
     }
     pub fn kv_grow(&mut self, slot: usize, n_tokens: usize) -> Result<usize, String> {
         self.dec.kv_grow(slot, n_tokens)

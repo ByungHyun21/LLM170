@@ -6,7 +6,7 @@
 pub struct Hparams {
     pub n_layer: usize,
     pub n_embd: usize,
-    /// dense MLP 폭(2112) — MoE와 병렬(둘 다 존재).
+    /// dense MLP 폭(2176 — 2026-10-14 실측판; 구판 2112는 config 파생이라 무영향) — MoE와 병렬.
     pub n_ff: usize,
     /// Q 헤드 수(16 — 전 층 공통).
     pub n_head: usize,
