@@ -161,8 +161,10 @@ impl Model {
 
     /// gptq int4 전문가 행 디양자화 — base는 `.qweight` 접미사 전 이름.
     /// 레이아웃(FN 실측): qweight I32 [k/8, n] · qzeros I32 [k/g, n/8]
-    /// · scales F16 [k/g, n] · g=128. auto_gptq 계약: 니블은 입력축 8개
-    /// 팩(LE), zero는 언팩값 −1. **팩 순서·바이어스는 3차 골든에서 검증**.
+    /// · scales F16 [k/g, n] · g=128. auto_gptq 팩 계약: 니블은 입력축
+    /// 8개 팩(LE), zero = 언팩값 **+ 1**(vLLM q_gemm.cu `zero_offset=1`
+    /// — classic auto_gptq 팩. [D1] 전수 스캔: FN qzeros 전 니블=7
+    /// 상수 → zero=8, sym. CT weight_packed zp=8과 동일 계약).
     pub(crate) fn expert_row(&self, base: &str, r: usize) -> Result<Vec<f32>, String> {
         let (qw, qz, sc, n, k) = self.expert_triple(base)?;
         let g = GPTQ_GROUP;
@@ -180,7 +182,7 @@ impl Model {
                     .try_into()
                     .unwrap(),
             );
-            let zero = (((zw >> (4 * (r % 8))) & 0xF) as i32) - 1;
+            let zero = (((zw >> (4 * (r % 8))) & 0xF) as i32) + 1;
             let sb = 2 * (gi * n + r);
             let s = half_f32(u16::from_le_bytes([sc[sb], sc[sb + 1]]));
             *v = (nib - zero) as f32 * s;
@@ -456,5 +458,132 @@ mod tests {
             (0.8..1.2).contains(&mean),
             "linear_attn.norm 평균 {mean} — 평범 가중치 계약 위반"
         );
+    }
+
+    /// [D1] gptq qzeros sym 판정 — 전문가 qzeros **전수 스캔**(mmap CPU).
+    /// LLM170_FN_MODEL 지정 시에만 실행. 대상 48층×512전문가×3투영의
+    /// qzeros I32 니블 전부(약 9.4억)를 히스토그램화해 단일 상수(=sym
+    /// zero-point)인지 판정한다. 언팩 계약은 expert_row와 동일(LE 워드,
+    /// 니블 시프트 4·i) — 원시 니블 v의 zero-point는 v−1.
+    /// 함께: ① 표본 qweight 니블 분포(팩 무결성) ② expert_row 수동
+    /// 디큐트 교차검증(스캔 모달 니블로 재계산해 비트일치 확인).
+    #[test]
+    fn fn_qzeros_sym_scan_real_model() {
+        let Ok(d) = std::env::var("LLM170_FN_MODEL") else {
+            return;
+        };
+        let m = Model::load(std::path::Path::new(&d)).expect("로드 실패");
+        let mut hist = [0u64; 16];
+        let mut tensors = 0u64;
+        let mut const_tensors = 0u64;
+        let mut const_value_hist = [0u64; 16];
+        let mut layer_hist: std::collections::BTreeMap<u64, [u64; 16]> =
+            std::collections::BTreeMap::new();
+        let mut worst: Vec<(u64, u64, u64)> = Vec::new(); // (il, e, 상이 니블 수)
+        let mut names: Vec<&String> =
+            m.ar.entries()
+                .keys()
+                .filter(|n| n.contains(".mlp.experts.") && n.ends_with(".qzeros"))
+                .collect();
+        names.sort_unstable();
+        assert_eq!(names.len(), 48 * 512 * 3, "전문가 qzeros 텐서 수 위반");
+        for name in &names {
+            let ent = m.ent(name).expect("엔트리");
+            assert_eq!(ent.dtype, StDtype::I32, "{name}: dtype");
+            let d = m.slice(name).expect("슬라이스");
+            let mut th = [0u64; 16];
+            for c in d.chunks_exact(4) {
+                let w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                for i in 0..8 {
+                    th[((w >> (4 * i)) & 0xF) as usize] += 1;
+                }
+            }
+            let used: u64 = th.iter().filter(|&&c| c > 0).count() as u64;
+            let (mode_i, &mode_c) = th.iter().enumerate().max_by_key(|(_, c)| *c).unwrap();
+            let il: u64 = name
+                .split('.')
+                .nth(3)
+                .and_then(|s| s.parse().ok())
+                .expect("층 파싱");
+            tensors += 1;
+            if used == 1 {
+                const_tensors += 1;
+                const_value_hist[mode_i] += 1;
+            } else {
+                let ex: u64 = name
+                    .split('.')
+                    .nth(5)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                worst.push((il, ex, th.iter().sum::<u64>() - mode_c));
+                worst.sort_by_key(|&(_, _, dv)| std::cmp::Reverse(dv));
+                worst.truncate(8);
+            }
+            for i in 0..16 {
+                hist[i] += th[i];
+                layer_hist.entry(il).or_insert([0; 16])[i] += th[i];
+            }
+        }
+        let total: u64 = hist.iter().sum();
+        let mode = hist.iter().enumerate().max_by_key(|(_, c)| *c).unwrap().0;
+        let off_mode: u64 = total - hist[mode];
+        eprintln!(
+            "qzeros 스캔: 텐서 {tensors} · 니블 {total} · 최빠값 {mode}({}) · 상이 {off_mode} ({:.6}%)",
+            hist[mode],
+            100.0 * off_mode as f64 / total as f64
+        );
+        eprintln!("전역 히스토그램: {hist:?}");
+        eprintln!("상수 텐서 {const_tensors}/{tensors} — 상숫값 분포 {const_value_hist:?}");
+        eprintln!("비상수 최악 8(il,e,상이수): {worst:?}");
+        for &il in &[0u64, 1, 2, 23, 47] {
+            if let Some(h) = layer_hist.get(&il) {
+                let t: u64 = h.iter().sum();
+                let md = h.iter().enumerate().max_by_key(|(_, c)| *c).unwrap().0;
+                eprintln!("층 {il}: 니블 {t} · 최빠 {md} · 상이 {}", t - h[md]);
+            }
+        }
+        assert!(
+            off_mode == 0,
+            "비상수 qzeros 발견 — GPTQ-asym 스토어 경로 필요"
+        );
+
+        // 표본 qweight 니블 분포(팩 무결성 — 전체 60GB는 읽지 않고 스프레드).
+        for base in [
+            "model.language_model.layers.0.mlp.experts.0.gate_proj",
+            "model.language_model.layers.1.mlp.experts.7.down_proj",
+            "model.language_model.layers.2.mlp.experts.13.up_proj",
+            "model.language_model.layers.23.mlp.experts.5.gate_proj",
+            "model.language_model.layers.47.mlp.experts.511.down_proj",
+        ] {
+            let d = m.slice(&format!("{base}.qweight")).expect("qweight");
+            let mut qh = [0u64; 16];
+            for c in d.chunks_exact(4) {
+                let w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                for i in 0..8 {
+                    qh[((w >> (4 * i)) & 0xF) as usize] += 1;
+                }
+            }
+            eprintln!("qweight {base}: {qh:?}");
+            assert!(qh.iter().all(|&c| c > 0), "니블 전 범위 미사용 — 팩 의심");
+        }
+
+        // 교차검증: expert_row(base, r) 원소를 상수 zero=8(스캔 니블 7
+        // + vLLM zero_offset 1 — engine과 별개 경로)로 수동 재계산.
+        let base = "model.language_model.layers.23.mlp.experts.5.gate_proj";
+        let r = 7usize;
+        let row = m.expert_row(base, r).expect("expert_row");
+        let (qw, qz, sc, n, k) = m.expert_triple(base).expect("트리플");
+        const ZERO: i32 = 8; // 스캔 상수(니블 7) + 1 — CT sym zp=8 동일
+        for j in [0usize, 1, 63, 127, 128, k / 2, k - 1] {
+            let word = u32::from_le_bytes(qw[4 * ((j / 8) * n + r)..][..4].try_into().unwrap());
+            let nib = ((word >> (4 * (j % 8))) & 0xF) as i32;
+            let sb = 2 * ((j / GPTQ_GROUP) * n + r);
+            let s = half_f32(u16::from_le_bytes([sc[sb], sc[sb + 1]]));
+            assert_eq!(row[j], (nib - ZERO) as f32 * s, "j={j} 디큐트 불일치");
+        }
+        // qzeros 실측 워드도 expert_row 인덱싱과 동일 위치에서 상수 확인.
+        let zw = u32::from_le_bytes(qz[4 * (r / 8)..][..4].try_into().unwrap());
+        assert_eq!(((zw >> (4 * (r % 8))) & 0xF) as usize, mode);
+        eprintln!("교차검증 통과: zero=8(스캔 니블 7 + vLLM zero_offset 1) · expert_row 비트일치");
     }
 }
