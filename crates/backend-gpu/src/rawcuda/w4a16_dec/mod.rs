@@ -919,6 +919,13 @@ pub struct W4a16Dec {
     /// gateup_cnt, gateup_total, branch_tgrid, gateup_tgrid] — 오프셋은 u64
     /// 인덱스, total = 행 합(grid, t=1), *_tgrid = Σceil(n/GEMV_TR)(t행 판).
     dmulti_meta: Vec<[u32; 8]>,
+
+    /// [g4 디코드 ② 2026-10-20] gemma4 전용 다중세그먼트 메타(행 블로킹 R판) —
+    /// 층별 [off0,cnt0,tot0, off1,cnt1,tot1, g0grid(r4,r2,r1), g1grid(r4,r2,r1),
+    /// off2, g2grid(r4,r2,r1), off3, g3grid(r4,r2,r1)]. 그룹 0·1 = q/k(/v)·
+    /// gate/up(노름 융합 판), 2·3 = o_proj·ffn_down(플레인 판, 단일 세그먼트).
+    /// grid = Σ⌈n/(8R)⌉, R은 t에서 파생(≤4→4, ≤8→2, ≤16→1) — 커널 계약.
+    dmulti_meta_g4: Vec<[u32; 20]>,
     /// [split-k marlin 디코드 2026-10-17] 다중세그먼트 t=1 테이블(qm판,
     /// [cnt][5] = (qm, s, out, n, k)) — ensure_chain_bufs에서 1회 작성
     /// (그래프 캡처 정적 계약 — 리플레이 간 내용 불변).
@@ -1268,6 +1275,7 @@ impl W4a16Dec {
             moe_mctmp: Buf::default(),
             dmulti: 0,
             dmulti_meta: Vec::new(),
+            dmulti_meta_g4: Vec::new(),
             spec_on: false,
             spec_scan_on: true,
             dsk: 0,

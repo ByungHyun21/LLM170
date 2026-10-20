@@ -47,8 +47,10 @@ pub const ASSETS: &[Asset] = &[
             // gptq4.cu 바이트 동결(코드젠 고정, gemma4.cu 헤더 참조)로 커널이
             // fatbin에 잔존 — 심볼 등록만 유지(부팅 바인딩·발사 없음).
             "w4a16_gemv_g32_bf16_tall",
-            // [⑮② 2026-10-18] 다중세그먼트(q/k/v·gate/up) — gemma4 청크 융합.
-            "w4a16_gemv_g32_bf16_multi_t",
+            // [g4 디코드 ①② 2026-10-20] 다중세그먼트 행 블로킹 판 — 구
+            // multi_t(⑮②)는 이 판으로 교체(완전 컷오버 — 심볼 삭제).
+            "w4a16_gemv_g32_bf16_multi_norm_t",
+            "w4a16_gemv_g32_bf16_multi_plain_t",
             // [2026-10-18] 레거시 — 디스패치 미사용(moe.cu align2가 단일 경로).
             // gptq4.cu 드로우 동결로 커널만 잔존(심볼 등록·발사 없음).
             "w4a16_moe_align",
@@ -180,7 +182,15 @@ pub const ASSETS: &[Asset] = &[
             "crates/backend-gpu/src/rawcuda/assets/norm.fatbin",
             "src/rawcuda/assets/norm.fatbin",
         ],
-        syms: &["norm_resid", "norm_resid_g", "rms_rows"],
+        syms: &[
+            "norm_resid",
+            "norm_resid_g",
+            "rms_rows",
+            // [g4 디코드 융합 2026-10-20] 소비자 융합 3종(비트동일 — norm.cu 주석)
+            "rms_rows2",
+            "rms_add",
+            "rms_add_scale",
+        ],
         boot: true,
     },
     Asset {

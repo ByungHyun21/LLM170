@@ -181,14 +181,17 @@ impl W4a16Dec {
             let (_, _, n, _) = self.lin_spec(&format!("blk.{il}.ffn_gate.weight"))?;
             nff_max = nff_max.max(n);
         }
-        let wmax = qd_max.max(nff_max);
+        // [g4 디코드 ② 2026-10-20] o_proj·ffn_down(n=hidden) 추가 — 4그룹
+        // (0=q/k/v, 1=gate/up, 2=o_proj, 3=ffn_down) × R별 grid 메타.
+        let wmax = qd_max.max(nff_max).max(self.hidden);
         let (b1, b2, b3) = (
             self.g4_scratch_slot(Self::G4_B1, tmax * wmax * 4)?,
             self.g4_scratch_slot(Self::G4_B2, tmax * wmax * 4)?,
             self.g4_scratch_slot(Self::G4_B3, tmax * wmax * 4)?,
         );
-        let mut tab: Vec<u64> = vec![0; nl * 25]; // 최대 5세그먼트(q,k,v,gu)×5 u64/층
-        let mut meta: Vec<[u32; 8]> = vec![[0u32; 8]; nl];
+        let slot8 = self.g4_scratch_slot(8, tmax * self.hidden * 4)?;
+        let mut tab: Vec<u64> = vec![0; nl * 35]; // 최대 7세그먼트(q,k,v,gu,o,dn)×5 u64/층
+        let mut meta: Vec<[u32; 20]> = vec![[0u32; 20]; nl];
         for il in 0..nl {
             let keqv = self.attn.layers[il].k_eq_v;
             let mut segs0: Vec<(String, u64)> = vec![
@@ -202,15 +205,22 @@ impl W4a16Dec {
                 (format!("blk.{il}.ffn_gate.weight"), b1),
                 (format!("blk.{il}.ffn_up.weight"), b2),
             ];
-            let mut wr = il * 25;
-            let mut gm = [[0u32; 4]; 2];
-            for (gi, segs) in [&segs0, &segs1].into_iter().enumerate() {
+            let segs2: Vec<(String, u64)> =
+                vec![(format!("blk.{il}.attn_output.weight"), slot8)];
+            let segs3: Vec<(String, u64)> = vec![(format!("blk.{il}.ffn_down.weight"), slot8)];
+            let mut wr = il * 35;
+            // 그룹별 (off, cnt) + R별 grid(Σ⌈n/(8R)⌉ — 커널 rpb 계약 미러).
+            for (gi, segs) in [&segs0, &segs1, &segs2, &segs3].into_iter().enumerate() {
                 let off = wr as u32;
-                let (mut total, mut tgrid, mut cnt) = (0usize, 0usize, 0u32);
+                let mut cnt = 0u32;
+                let (mut g4r, mut g2r, mut g1r) = (0u32, 0u32, 0u32);
                 for (name, out) in segs {
                     let (p0, p1, n, k) = self.lin_spec(name)?;
                     if n > wmax {
                         return Err(format!("g4 multi({name}): n={n} > 슬롯 {wmax}"));
+                    }
+                    if k % 128 != 0 {
+                        return Err(format!("g4 multi({name}): k={k} — 128배수 계약 위반"));
                     }
                     tab[wr] = p0;
                     wr += 1;
@@ -222,15 +232,29 @@ impl W4a16Dec {
                     wr += 1;
                     tab[wr] = k as u64;
                     wr += 1;
-                    total += n;
-                    tgrid += n.div_ceil(GEMV_TR);
+                    g4r += n.div_ceil(32) as u32;
+                    g2r += n.div_ceil(16) as u32;
+                    g1r += n.div_ceil(8) as u32;
                     cnt += 1;
                 }
-                gm[gi] = [off, cnt, total as u32, tgrid as u32];
+                // 메타 레이아웃: 그룹 0·1 = [3g]=off, [3g+1]=cnt, [6+3g..8+3g]=
+                // grid(r4,r2,r1) · 그룹 2·3 = [12+4g']=off, [+1..+3]=grid
+                // (g'=g−2, 단일 세그먼트 — cnt 고정 1).
+                if gi < 2 {
+                    let b = gi * 3;
+                    meta[il][b] = off;
+                    meta[il][b + 1] = cnt;
+                    meta[il][6 + gi * 3] = g4r;
+                    meta[il][7 + gi * 3] = g2r;
+                    meta[il][8 + gi * 3] = g1r;
+                } else {
+                    let moff = 12 + (gi - 2) * 4;
+                    meta[il][moff] = off;
+                    meta[il][moff + 1] = g4r;
+                    meta[il][moff + 2] = g2r;
+                    meta[il][moff + 3] = g1r;
+                }
             }
-            meta[il] = [
-                gm[0][0], gm[0][1], gm[0][2], gm[1][0], gm[1][1], gm[1][2], gm[0][3], gm[1][3],
-            ];
         }
         let bytes = tab.len() * 8;
         // SAFETY: 로컬 Vec<u64>의 유효 수명 내 바이트 뷰.
@@ -240,7 +264,7 @@ impl W4a16Dec {
         }
         self.cc.h2d(self.dmulti, buf)?;
         self.cc.sync()?;
-        self.dmulti_meta = meta;
+        self.dmulti_meta_g4 = meta;
         Ok(())
     }
 
@@ -703,13 +727,12 @@ impl W4a16Dec {
             let qd = dm.q_heads * d;
             let nb = il * nw_per_layer;
             let sw = if l.sliding { dm.sliding_window } else { 0 };
-            // ① input_layernorm(디바이스) → q/k/(v) GEMV.
+            // ① input_layernorm → q/k/(v) GEMV. [g4 디코드 ①② 2026-10-20]
+            // t≤16 = 노름 프로로그 융합 GEMV 1런치(원시 x 입력 — rms_rows
+            // 산출값과 비트동일), t>16 = 노름 + tall GEMM(종전).
             let a = self.g4_scratch_slot(Self::G4_A, n * 4)?;
-            self.rms_rows_dev(nb, x, a, t, eps)?;
-            // [⑮② 2026-10-18] q/k(/v) 다중세그먼트 1런치(테이블 = build_
-            // multi_tables_g4). t>16은 tall 폴백(개별 호출 — 종전).
             let (q, k, v) = if t <= 16 {
-                self.gemv_multi_g32_t_dev(il, 0, a, t)?;
+                self.gemv_multi_g32_rb_dev(il, 0, x, nb, t, eps)?;
                 let q = self.g4_scratch_slot(Self::G4_B1, t * qd * 4)?;
                 let k = self.g4_scratch_slot(Self::G4_B2, t * qd * 4)?;
                 let v = if l.k_eq_v {
@@ -719,6 +742,7 @@ impl W4a16Dec {
                 };
                 (q, k, v)
             } else {
+                self.rms_rows_dev(nb, x, a, t, eps)?;
                 let q =
                     self.g4_dev_gemm(&format!("blk.{il}.attn_q.weight"), a, t, h, Self::G4_B1)?;
                 let k =
@@ -741,52 +765,59 @@ impl W4a16Dec {
             let outv = self.attn_g4_dev(
                 slots, pos, il, q, k, v, dm.q_heads, l.kv_heads, d, sw, l.kq_scale, sp_dec, 5, 6, 7,
             )?;
-            let o = self.g4_dev_gemm(&format!("blk.{il}.attn_output.weight"), outv, t, qd, 8)?;
-            let hh = self.g4_scratch_slot(9, n * 4)?;
-            self.rms_rows_dev(nb + 1, o, hh, t, eps)?;
-            self.axpy_dev(1.0, hh, x, n)?;
+            // o_proj — t≤16 = 행 블로킹 판(그룹 2 테이블), t>16 = tall.
+            let o = if t <= 16 {
+                self.gemv_multi_g32_rb_dev(il, 2, outv, 0, t, 0.0)?;
+                self.g4_scratch_slot(8, t * h * 4)?
+            } else {
+                self.g4_dev_gemm(&format!("blk.{il}.attn_output.weight"), outv, t, qd, 8)?
+            };
+            // post_attn 노름+잔차 1런치(rms_add — 기존 rms_rows+axpy(1.0) 비트동일).
+            self.rms_add_dev(nb + 1, o, x, t, eps)?;
             // ③ dense MLP — pre_ff 노름 → gate/up → gelu → down → post_ff1.
-            self.rms_rows_dev(nb + 2, x, a, t, eps)?;
             let (_, _, _, n_ff) = self.lin_spec(&format!("blk.{il}.ffn_down.weight"))?;
-            // [⑮②] gate/up 다중세그먼트 1런치(t>16은 tall 폴백).
+            // [⑮②+①②] gate/up — t≤16 노름 융합 GEMV, t>16 노름+tall(종전).
             let (g, u) = if t <= 16 {
-                self.gemv_multi_g32_t_dev(il, 1, a, t)?;
+                self.gemv_multi_g32_rb_dev(il, 1, x, nb + 2, t, eps)?;
                 (
                     self.g4_scratch_slot(Self::G4_B1, t * n_ff * 4)?,
                     self.g4_scratch_slot(Self::G4_B2, t * n_ff * 4)?,
                 )
             } else {
+                self.rms_rows_dev(nb + 2, x, a, t, eps)?;
                 (
                     self.g4_dev_gemm(&format!("blk.{il}.ffn_gate.weight"), a, t, h, Self::G4_B1)?,
                     self.g4_dev_gemm(&format!("blk.{il}.ffn_up.weight"), a, t, h, Self::G4_B2)?,
                 )
             };
             let act = self.g4_dev_gelu(g, u, Self::G4_B3, t * n_ff)?;
-            let m = self.g4_dev_gemm(&format!("blk.{il}.ffn_down.weight"), act, t, n_ff, 8)?;
-            let h1 = self.g4_scratch_slot(9, n * 4)?; // hh 소비 후 재사용
+            // ffn_down — t≤16 = 행 블로킹 판(그룹 3 테이블), t>16 = tall.
+            let m = if t <= 16 {
+                self.gemv_multi_g32_rb_dev(il, 3, act, 0, t, 0.0)?;
+                self.g4_scratch_slot(8, t * h * 4)?
+            } else {
+                self.g4_dev_gemm(&format!("blk.{il}.ffn_down.weight"), act, t, n_ff, 8)?
+            };
+            let h1 = self.g4_scratch_slot(9, n * 4)?;
             self.rms_rows_dev(nb + 3, m, h1, t, eps)?;
-            // ④ MoE — 라우터(hn)·전문가(nm) 입력 분리 노름 → 디바이스 MoE.
+            // ④ MoE — 라우터(hn)·전문가(nm) 입력 노름 1런치(rms_rows2 — 같은
+            // x·같은 누산, 가중 2행 — rms_rows 2런치와 비트동일).
             let hn = self.g4_scratch_slot(Self::G4_HN, n * 4)?;
             let nm = self.g4_scratch_slot(Self::G4_NM, n * 4)?;
-            self.rms_rows_dev(nb + 7, x, hn, t, eps)?;
-            self.rms_rows_dev(nb + 4, x, nm, t, eps)?;
+            self.rms_rows2_dev(nb + 7, nb + 4, x, hn, nm, t, eps)?;
             let pes = self.g4_pes_dev(il);
             if pes == 0 {
                 return Err(format!("g4_chunk_dev: L{il} pes 미등록(set_g4_pes 선행)"));
             }
             let moe = self.g4_moe_dev_t(il, hn, nm, pes, t, Self::G4_MOE)?;
-            let h2 = self.g4_scratch_slot(Self::G4_H2, n * 4)?;
-            self.rms_rows_dev(nb + 5, moe, h2, t, eps)?;
-            // ⑤ 병합(h1+h2) → post_ff 노름 → 잔차 → layer_scalar.
-            self.axpy_dev(1.0, h2, h1, n)?;
-            let hf = self.g4_scratch_slot(Self::G4_HF, n * 4)?;
-            self.rms_rows_dev(nb + 6, h1, hf, t, eps)?;
-            self.axpy_dev(1.0, hf, x, n)?;
+            // ⑤ MoE 출력 노름+잔차 1런치(h1 += rms(moe) — 비트동일) →
+            // post_ff 노름+잔차+layer_scalar 1런치(기존 3런치와 비트동일).
+            self.rms_add_dev(nb + 5, moe, h1, t, eps)?;
             let ls = *self
                 .g4_ls
                 .get(il)
                 .ok_or("g4_chunk_dev: layer_scalar 미등록(set_g4_layer_scalar)")?;
-            self.scale_dev(x, ls, n)?;
+            self.rms_add_scale_dev(nb + 6, h1, x, ls, t, eps)?;
             // [디버그 배선 2026-10-15] 층별 지문 — CPU 오라클(`gemma4 layer`)·
             // 호스트 체인(`gemma4[gpu]`)과 같은 형식으로 최초 발산 층을 추적한다.
             // 행 0 = 청크 첫 토큰(CPU xs[0] 기준과 동일 계보). debug_layers가

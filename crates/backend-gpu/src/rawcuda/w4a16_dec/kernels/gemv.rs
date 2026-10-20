@@ -341,37 +341,64 @@ impl W4a16Dec {
         )
     }
 
-    /// [⑮② 2026-10-18] g32/bf16 다중세그먼트 t행 런치 — gemma4 청크 융합.
-    /// 메타 = build_multi_tables_g4가 1회 산출([off,cnt,total,…,tgrid]).
-    pub(in crate::rawcuda::w4a16_dec) fn gemv_multi_g32_t_dev(
+    /// [g4 디코드 ①② 2026-10-20] 다중세그먼트 t행 GEMV(행 블로킹 R판) —
+    /// 메타 = build_multi_tables_g4([off,cnt,·,R별 grid…] — dmulti_meta_g4).
+    /// 그룹 0·1(q/k(/v)·gate/up) = 노름 프로로그 융합판(원시 x + 노름 가중
+    /// 행 w_row), 그룹 2·3(o_proj·ffn_down) = 플레인 판. ncu 근거 = long-
+    /// scoreboard 46.8% 레이턴시 바운드 → 워프당 R행 블로킹(x 판독 공유 +
+    /// 독립 acc 사슬). t≤16 계약, R = t≤4→4, ≤8→2, ≤16→1.
+    pub(in crate::rawcuda::w4a16_dec) fn gemv_multi_g32_rb_dev(
         &mut self,
         il: usize,
         group: usize,
         x_dev: CUdeviceptr,
+        w_row: usize,
         t: usize,
+        eps: f32,
     ) -> Result<(), String> {
         let m = *self
-            .dmulti_meta
+            .dmulti_meta_g4
             .get(il)
-            .ok_or_else(|| format!("gemv_multi_g32_t: 메타 부족 il={il}"))?;
-        let (off, cnt, tgrid) = if group == 0 {
-            (m[0], m[1], m[6])
+            .ok_or_else(|| format!("gemv_multi_g32_rb: 메타 부족 il={il}"))?;
+        let ri = if t <= 4 {
+            0
+        } else if t <= 8 {
+            1
         } else {
-            (m[3], m[4], m[7])
+            2
         };
-        if cnt == 0 {
-            return Err(format!("gemv_multi_g32_t: 세그먼트 없음 il={il} g={group}"));
+        let (off, cnt, grid, norm) = match group {
+            0 => (m[0], m[1], m[6 + ri], true),
+            1 => (m[3], m[4], m[9 + ri], true),
+            2 => (m[12], 1, m[13 + ri], false),
+            3 => (m[16], 1, m[17 + ri], false),
+            _ => return Err(format!("gemv_multi_g32_rb: 그룹 {group} 없음")),
+        };
+        if cnt == 0 || t == 0 || t > 16 || x_dev == 0 {
+            return Err(format!(
+                "gemv_multi_g32_rb: 계약 위반 il={il} g={group} t={t} cnt={cnt}"
+            ));
         }
-        let f = self.cc.function("w4a16_gemv_g32_bf16_multi_t")?;
-        let (mut p_t, mut p_x) = (self.dmulti + off as u64 * 8, x_dev);
-        let (mut p_c, mut p_tt) = (cnt as i32, t as i32);
-        let blk = 32 * GEMV_TR as u32;
+        let f = self.cc.function(if norm {
+            "w4a16_gemv_g32_bf16_multi_norm_t"
+        } else {
+            "w4a16_gemv_g32_bf16_multi_plain_t"
+        })?;
+        let nw = if norm {
+            self.dnw + ((w_row * self.hidden) * 4) as u64
+        } else {
+            0
+        };
+        let (mut p_t, mut p_x, mut p_nw) = (self.dmulti + off as u64 * 8, x_dev, nw);
+        let (mut p_c, mut p_tt, mut p_e) = (cnt as i32, t as i32, eps);
         self.cc.launch(
             f,
-            tgrid,
+            grid,
             1,
-            blk,
-            &mut crate::rawcuda::args::l4(&mut p_t, &mut p_x, &mut p_c, &mut p_tt),
+            32 * GEMV_TR as u32,
+            &mut crate::rawcuda::args::l6(
+                &mut p_t, &mut p_x, &mut p_nw, &mut p_c, &mut p_tt, &mut p_e,
+            ),
         )
     }
 
