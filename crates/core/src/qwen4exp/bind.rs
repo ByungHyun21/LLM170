@@ -39,6 +39,9 @@ pub struct Qwen4ExpCfg {
     pub max_pos: usize,
     pub n_experts: usize,
     pub top_k: usize,
+    /// GDN 출력게이트 활성화(config output_gate_type — "sigmoid"면 참,
+    /// vLLM getattr 기본값 "silu"). qwen4exp(FN) 실측 = sigmoid(논문 Eq.11).
+    pub output_gate_sigmoid: bool,
     /// shared_expert_intermediate_size.
     pub shared_ffn: usize,
     /// PLE 배치 층(config ple_layer_ids — 체크포인트 0-based 인덱스와 1 차이).
@@ -125,6 +128,10 @@ impl Qwen4ExpCfg {
             ngram_size: num_opt("ngram_size", 0),
             heads_per_ngram: num_opt("heads_per_ngram", 0),
             split_ngram_parts: num_opt("split_ngram_parts", 0),
+            output_gate_sigmoid: t
+                .get("output_gate_type")
+                .and_then(Json::as_str)
+                .map_or(false, |s| s == "sigmoid"),
             mtp_cfg_layers: num_opt("mtp_num_hidden_layers", 0),
         })
     }
@@ -273,6 +280,7 @@ mod tests {
             r#"{"architectures":["Qwen4ExpForConditionalGeneration"],
                "text_config":{"num_hidden_layers":48,"full_attention_interval":4,
                "num_key_value_heads":2,"head_dim":256,"num_attention_heads":24,
+               "output_gate_type":"sigmoid",
                "hidden_size":2560,"vocab_size":248320,
                "linear_num_value_heads":48,"linear_value_head_dim":128,
                "max_position_embeddings":262144,"num_experts":512,
@@ -300,6 +308,8 @@ mod tests {
         assert_eq!(c.ple_layer_ids, vec![2]);
         assert_eq!(c.split_ngram_parts, 128);
         assert_eq!(c.mtp_cfg_layers, 1);
+        // [D0] GDN 출력게이트 판독 — FN 실측 sigmoid(기본 silu 폴백 별도).
+        assert!(c.output_gate_sigmoid);
         let _ = std::fs::remove_dir_all(&d);
     }
 

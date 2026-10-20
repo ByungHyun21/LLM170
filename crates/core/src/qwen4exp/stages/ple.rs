@@ -5,6 +5,9 @@
 //! [10240] · ple_embedding: ngram_embedding.shard_{0..127} F8_E4M3
 //! [2500012,160] + weight_scale + ngram_heads_offsets/vocab_sizes I64[16]
 //! + layer_multipliers I64[3]. FP8 디코드·ngram 조회 그래프는 3차.
+//! [D0] norm_{conv,key,query} = Gemma식 zero-centered(1+w) — vLLM
+//! Qwen4ExpPLEGroupedNorm `normalized*(1+w)`(ple_layer.py:62). 3차 forward
+//! 구현 시 가중치는 반드시 `Model::norm_vec`(+1 합성 단일 지점)으로.
 
 use super::super::engine::Model;
 

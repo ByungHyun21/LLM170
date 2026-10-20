@@ -7,8 +7,14 @@
 //! ·d=128 — qwen35와 동일 형상 계약).
 //!
 //! 프로브 계약: 상태 0에서 1청크 forward(conv 히스토리 좌측 0패딩).
-//! q/k 정규화 = l2_norm(가중치 없음 — Qwen3-Next 계약), 출력 게이팅 =
-//! rms_norm(norm[128])·silu(z). 상태ful 디코드는 3차.
+//! q/k 정규화 = l2_norm(가중치 없음 — Qwen3-Next 계약). [D0 2026-10-20]
+//! 출력게이트 = sigmoid(config output_gate_type — FN 실측; 논문 Eq.11
+//! o=W_o[σ(W_zx)⊙RMSNorm(y)], vLLM RMSNormGated activation 인자).
+//! norm[128] = **평범 RMSNorm 가중치(+1 금지)** — vLLM RMSNormGated는
+//! plain `x_normed*weight`(layernorm.py forward_static)이고 체크포인트
+//! 실측 평균 ≈0.97(zero-centered 원시 w가 아님) → `f32_vec` 그대로
+//! (q/k_norm·hc_norm 등 Gemma 노름만 `Model::norm_vec` +1). 상태ful
+//! 디코드는 3차.
 
 use super::super::engine::Model;
 use crate::gdn::gdn_chunk_seq;
@@ -123,19 +129,15 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
         &q_all, &k_all, &v_all, &beta_all, &g_all, &mut st, &mut o_all, n_tok, h_k, h_v,
     );
 
-    // norm_gated: rms_norm(o, norm[128])·silu(z) → out_proj.
+    // norm_gated: rms_norm(o, norm[128])·게이트(config — FN=sigmoid) → out_proj.
+    let gate = if cfg.output_gate_sigmoid {
+        GdnGate::Sigmoid
+    } else {
+        GdnGate::Silu
+    };
     let mut gated = vec![vec![0.0f32; v_len]; n_tok];
     gdn_norm_gated(
-        GdnGate::Silu,
-        &o_all,
-        &z,
-        &norm_w,
-        m.eps,
-        n_tok,
-        h_v,
-        d,
-        v_len,
-        &mut gated,
+        gate, &o_all, &z, &norm_w, m.eps, n_tok, h_v, d, v_len, &mut gated,
     );
     let mut out = Vec::with_capacity(n_tok);
     for t in 0..n_tok {

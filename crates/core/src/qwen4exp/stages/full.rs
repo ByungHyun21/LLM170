@@ -1,12 +1,22 @@
 //! full어텐션층 스테이지 — Q‖gate 퓨전 q_proj + GQA + RoPE(qwen35 미러).
 //!
 //! 텐서 계약(FN 실측): q_proj [12288,2560] = 24헤드×(q 256‖gate 256)
-//! (헤드별 인터리브 — qwen35 계약 상속, **3차 골든에서 재확인**) · k/v_proj
-//! [512,2560](KV 2헤드×256) · o_proj [2560,6144] · q/k_norm [256].
-//! RoPE: n_rot 64(partial_rotary_factor 0.25)·theta 1e7 — qwen35 rope_head
-//! 재사용. **indexer(경량 top-k 경로)는 미구현** — `indexer_forward`가
-//! 명시적 Err. 아래 forward는 dense 전체 attention 프로브(indexer 근사
-//! 아님 — 골든 불가, 형상·dtype 검증 목적).
+//! · k/v_proj [512,2560](KV 2헤드×256) · o_proj [2560,6144] ·
+//! q/k_norm [256]. RoPE: n_rot 64(partial_rotary_factor 0.25)·theta 1e7
+//! — qwen35 rope_head 재사용. **indexer(경량 top-k 경로)는 미구현** —
+//! `indexer_forward`가 명시적 Err. 아래 forward는 dense 전체 attention
+//! 프로브(indexer 근사 아님 — 골든 불가, 형상·dtype 검증 목적).
+//!
+//! [D0 2026-10-20 판별] q_proj Q‖gate 레이아웃 = **헤드별 인터리브 확정**:
+//! vLLM qwen3_next.py `_project_qkv_gate` 이저 경로가
+//! `q_gate.view(num_heads, -1)` 후 `torch.chunk(2, dim=-1)`로 각 헤드
+//! (q‖gate)를 분할 — q_proj 행 h*512..h*512+256=Q·+256..+512=gate.
+//! FN QSAAttention(nvidia/qsa.py:337)이 이 클래스를 상속하고
+//! "checkpoints always pack a sigmoid output gate next to Q" 주석과 함께
+//! 동일 qkv_proj 계약 사용. 샤드 노름 통계 교차검증은 q/gate 분포가
+//! 유사해 판별 불능[INFERENCE] — 코드 증거가 준거.
+//!
+//! q/k_norm = Gemma식 zero-centered(1+w) — `Model::norm_vec` 합성(D0).
 
 use super::super::engine::Model;
 use crate::ops::{rms_norm, rope_head, sigmoid};
@@ -21,8 +31,8 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
     if q_n != n_head * 2 * hd {
         return Err(format!("q_proj n={q_n} ≠ Q‖gate {n_head}×2×{hd}"));
     }
-    let q_norm_w = m.f32_vec(&format!("{l}.q_norm.weight"))?;
-    let k_norm_w = m.f32_vec(&format!("{l}.k_norm.weight"))?;
+    let q_norm_w = m.norm_vec(&format!("{l}.q_norm.weight"))?;
+    let k_norm_w = m.norm_vec(&format!("{l}.k_norm.weight"))?;
     let n_rot = hd / 4; // partial_rotary_factor 0.25
     let kq_scale = 1.0f32 / (hd as f32).sqrt();
 

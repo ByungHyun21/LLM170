@@ -99,6 +99,26 @@ impl Model {
         Ok(v)
     }
 
+    /// zero-centered(Gemma식) 노름 가중치 판독 — f32_vec + 1 합성.
+    /// **FN norm+1 계약의 단일 지점**(qwen35 로더 `Eng::Synth{plus1}`의
+    /// StArchive 등가 — FN은 W4a16Model 스토어가 아니라 지연 mmap 판독
+    ///이라 가중치 합성은 읽기 시점 이 한 곳에서만 일어난다).
+    /// 근거: 논문 §2.1.1 "consistently applied to all other RMSNorm layers"
+    /// ·vLLM GemmaRMSNorm/GroupedGemmaRMSNorm(`normalized*(1+w)` —
+    /// qsa.py q/k_norm·indexer_qsa.py q/k_layernorm·ple_layer.py
+    /// Qwen4ExpPLEGroupedNorm·hyperconnection.py hc_norm 전부).
+    /// 대상: self_attn.{q,k}_norm·mlp_hyper_connection.hc_norm·ple.
+    /// norm_{conv,key,query}·indexer.{q,k}_layernorm·
+    /// hyper_connection_mixer.hc_norm. **예외 — linear_attn.norm은 +1 금지**:
+    /// vLLM은 RMSNormGated(plain `x_normed*weight`, layernorm.py
+    /// forward_static)이고 체크포인트 실측 평균 ≈0.97(원시 w≈0인
+    /// zero-centered 분포가 아님) — qwen3_next 계약 그대로 평범 가중치.
+    pub(crate) fn norm_vec(&self, name: &str) -> Result<Vec<f32>, String> {
+        let mut v = self.f32_vec(name)?;
+        plus1(&mut v);
+        Ok(v)
+    }
+
     /// [n_out, n_in] BF16 행렬 × x → y(스트리밍 디양자화 — 사본 없음).
     pub(crate) fn matvec_bf16(&self, name: &str, x: &[f32]) -> Result<Vec<f32>, String> {
         let e = self.ent(name)?;
@@ -226,6 +246,13 @@ impl Model {
     /// 마지막 hidden → 로짓(lm_head [vocab, hidden] 스트리밍 matvec).
     pub fn head(&self, h: &[f32]) -> Result<Vec<f32>, String> {
         self.matvec_bf16("lm_head.weight", h)
+    }
+}
+
+/// 노름 가중치 zero-centered 합성(w → 1+w) — `norm_vec` 전용(단일 지점).
+pub(crate) fn plus1(v: &mut [f32]) {
+    for x in v.iter_mut() {
+        *x += 1.0;
     }
 }
 
@@ -394,5 +421,40 @@ mod tests {
         let rep = probe(std::path::Path::new(&d)).expect("fn-probe 실패");
         eprintln!("{rep}");
         assert!(rep.contains("골격 통과"), "리포트: {rep}");
+    }
+
+    /// [D0] zero-centered 노름 합성 — plus1 원소 단위 증명.
+    #[test]
+    fn norm_plus1() {
+        let mut v = vec![0.0f32, -0.25, 0.5, -1.0];
+        plus1(&mut v);
+        assert_eq!(v, vec![1.0, 0.75, 1.5, 0.0]);
+    }
+
+    /// [D0] 실모델 norm 계약 — Gemma 노름은 norm_vec = f32_vec+1,
+    /// linear_attn.norm은 평범 가중치(원시 w가 이미 ~1 분포 — +1 금지).
+    #[test]
+    fn fn_norm_contract_real_model() {
+        let Ok(d) = std::env::var("LLM170_FN_MODEL") else {
+            return;
+        };
+        let m = Model::load(std::path::Path::new(&d)).expect("로드 실패");
+        let gemma = "model.language_model.layers.3.self_attn.q_norm.weight";
+        let raw = m.f32_vec(gemma).expect("q_norm 부재");
+        let syn = m.norm_vec(gemma).expect("norm_vec 실패");
+        assert_eq!(raw.len(), syn.len());
+        for (r, s) in raw.iter().zip(syn.iter()) {
+            assert_eq!(*s, r + 1.0, "Gemma 노름은 정확히 +1");
+        }
+        // linear_attn.norm = 평범 가중치 — 원시 평균이 1 근처(zero-centered
+        // 라면 0 근처). +1 합성 실수 방지 가드.
+        let gdn = m
+            .f32_vec("model.language_model.layers.0.linear_attn.norm.weight")
+            .expect("linear_attn.norm 부재");
+        let mean = gdn.iter().sum::<f32>() / gdn.len() as f32;
+        assert!(
+            (0.8..1.2).contains(&mean),
+            "linear_attn.norm 평균 {mean} — 평범 가중치 계약 위반"
+        );
     }
 }
