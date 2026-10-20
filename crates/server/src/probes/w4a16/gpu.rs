@@ -450,29 +450,55 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
     let chunk_max = 512usize; // [M3] LRU 320슬롯 확대로 t=512 청크(distinct 263 ≤ 320)
     let hist = prompt.clone();
     let mut pos = 0usize;
-    let mut sample: Vec<f32>;
     let mut n_chunk = 0usize;
-    loop {
-        let t = chunk_max.min(hist.len() - pos);
-        let chunk = &hist[pos..pos + t];
-        let emb = m.embed(chunk)?;
-        let ple = llm170_core::qwen4exp::stages::ple::gather_emb(&m, &hist, pos)?;
+    // [프리페치 2026-10-20] 호스트 PLE 게더(48GB FP8 난판독 ~150ms/청크)를
+    // GPU 청크 연산과 오버랩 — 다음 청크 준비를 백그라운드 스레드로 선작업.
+    // 게더는 hist(토큰열)만 의존 — GPU 무의존·결정적.
+    // [프리페치] 스코프드 스레드 — m·hist 대여 허용(읽기 전용·결정적 게더).
+    let prep = |p0: usize| -> Result<(Vec<f32>, Vec<f32>, usize), String> {
+        let t = chunk_max.min(hist.len() - p0);
+        let emb = m.embed(&hist[p0..p0 + t])?;
+        let ple = llm170_core::qwen4exp::stages::ple::gather_emb(&m, &hist, p0)?;
         let emb_flat: Vec<f32> = emb.into_iter().flatten().collect();
         let ple_flat: Vec<f32> = ple.into_iter().flatten().collect();
-        let (d_emb, d_ple) = dec.fn_stage(&emb_flat, Some(&ple_flat), t)?;
-        if let Some(db) = dec_b.as_mut() {
-            let r_out = dec.fn_chain_run(0, pos as u32, t, d_emb, d_ple, None)?;
-            let r_in = db.fn_stage_r(&r_out, t)?;
-            sample = db.fn_chain_run(0, pos as u32, t, d_emb, None, Some(r_in))?;
-        } else {
-            sample = dec.fn_chain_dev_t(0, pos as u32, t, d_emb, d_ple)?;
+        Ok((emb_flat, ple_flat, t))
+    };
+    let mut sample: Vec<f32> = Vec::new();
+    std::thread::scope(|sc| -> Result<(), String> {
+        let mut prefetch: Option<
+            std::thread::ScopedJoinHandle<Result<(Vec<f32>, Vec<f32>, usize), String>>,
+        > = None;
+        loop {
+            let (emb_flat, ple_flat, t) = if pos == 0 {
+                prep(pos)?
+            } else {
+                prefetch
+                    .take()
+                    .unwrap()
+                    .join()
+                    .map_err(|_| "프리페치 스레드 패닉")??
+            };
+            // 다음 청크 백그라운드 준비(GPU가 현재 청크 연산 중).
+            if pos + t < hist.len() {
+                let p0 = pos + t;
+                prefetch = Some(sc.spawn(move || prep(p0)));
+            }
+            let (d_emb, d_ple) = dec.fn_stage(&emb_flat, Some(&ple_flat), t)?;
+            if let Some(db) = dec_b.as_mut() {
+                let r_out = dec.fn_chain_run(0, pos as u32, t, d_emb, d_ple, None)?;
+                let r_in = db.fn_stage_r(&r_out, t)?;
+                sample = db.fn_chain_run(0, pos as u32, t, d_emb, None, Some(r_in))?;
+            } else {
+                sample = dec.fn_chain_dev_t(0, pos as u32, t, d_emb, d_ple)?;
+            }
+            pos += t;
+            n_chunk += 1;
+            if pos >= hist.len() {
+                break;
+            }
         }
-        pos += t;
-        n_chunk += 1;
-        if pos >= hist.len() {
-            break;
-        }
-    }
+        Ok(())
+    })?;
     // head(plain GEMV t=1) → argmax.
     let logits = match dec_b.as_mut() {
         Some(db) => db.fn_head(&sample)?,
