@@ -856,7 +856,7 @@ pub fn verify_sample(
                     }
                     for gi in 0..kg {
                         let a = [sc[2 * (r * kg + gi)], sc[2 * (r * kg + gi) + 1]];
-                        let bq = [gs[2 * (gi * n + r)], gs[2 * (gi * n + r)] + 1];
+                        let bq = [gs[2 * (gi * n + r)], gs[2 * (gi * n + r) + 1]];
                         if a != bq {
                             return Err(format!("{base} scale[{r},{gi}] 비트 불일치"));
                         }
