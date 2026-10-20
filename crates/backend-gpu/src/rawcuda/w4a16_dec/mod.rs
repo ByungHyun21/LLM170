@@ -661,6 +661,39 @@ pub(super) struct Fn {
     pub(super) warm_t: usize,
 }
 
+impl Default for Fn {
+    fn default() -> Self {
+        Self {
+            on: false,
+            hc: 0,
+            lowrank: 0,
+            eps: 1e-6,
+            d_hcn: 0,
+            ple_il: None,
+            d_ple_w: 0,
+            d_ple_nk: 0,
+            d_ple_nq: 0,
+            d_ple_nc: 0,
+            d_ple_st: 0,
+            ple_init: Vec::new(),
+            r: Buf::default(),
+            xn: Buf::default(),
+            g: Buf::default(),
+            x: Buf::default(),
+            lora: Buf::default(),
+            y: Buf::default(),
+            inj: Buf::default(),
+            ple_e: Buf::default(),
+            ple_k: Buf::default(),
+            ple_v: Buf::default(),
+            ple_gd: Buf::default(),
+            ple_nm: Buf::default(),
+            wave: 8,
+            warm_t: 0,
+        }
+    }
+}
+
 /// [K-STEP 2026-10-12 §3.4 ①] 디바이스 K-스텝 디코드 루프 상태 — W4a16Dec
 /// 필드 도메인 그룹. buf 레이아웃: [ctr 4B][stop 4B][out KSTEP_KMAX×4B]
 /// (w4a16_kstep_ctrl 기록부 — 리플레이 간 유지, 배치마다 호스트 8B 0 리셋).
@@ -805,6 +838,8 @@ pub struct W4a16Dec {
     pub(super) kstep: Kstep,
     pub(super) attn: Attn,
     pub(super) gdn: Gdn,
+    /// [FN M1 2026-10-20] 하이퍼커넥션·PLE 상태(fnchain.rs).
+    pub(super) fn_: Fn,
     pub(super) graph: Graph,
     pub cc: CudaCtx,
     /// [§3.4 ② 2026-10-12] 통합 캐시 회계(KV·체크포인트·스펙 상태·
@@ -983,6 +1018,7 @@ mod attn;
 mod blocktable;
 mod buffers;
 mod chains;
+mod fnchain;
 mod g4;
 mod gdn;
 mod graphs;
@@ -1141,6 +1177,7 @@ impl W4a16Dec {
                 dattn_part: 0,
                 attn_t_cap: 0,
             },
+            fn_: Fn::default(),
             gdn: Gdn {
                 gdn: None,
                 sig_gate: false,
