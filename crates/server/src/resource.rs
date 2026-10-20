@@ -186,6 +186,29 @@ pub fn guard_target(sub: &str, model: Option<&str>, rest: &[String]) -> Option<G
     path.map(|path| GuardTarget { path, gpu })
 }
 
+/// [잠복① 수선 2026-10-20] FN(qwen4_exp) 아치 인지 용량 산정 — CT 디렉터리
+/// 전량(122GB)이 아니라 **실제 상주 레이아웃**을 센다: 전문가 트리플(호스트
+/// 스테이징/마린 원료)·dense 비전문가(카드 상주)·PLE(호스트 페이지캐시 —
+/// 상주 아님·슬랙만). 반환 = (dense_bytes, host_bytes) — 합산 가드는
+/// host_bytes를 모델 중량으로, dense 게이트는 dense_bytes로 각각 판정.
+/// 정밀 플래너 통합(§2.M) 전의 정직한 중간 계약.
+pub fn fn_layout_bytes(dir: &std::path::Path) -> Result<(u64, u64), String> {
+    let ar = llm170_core::st::StArchive::open(dir).map_err(|e| format!("FN 레이아웃: {e}"))?;
+    let (mut dense, mut experts, mut ple) = (0u64, 0u64, 0u64);
+    for (name, e) in ar.entries() {
+        let b = e.nbytes();
+        if name.contains(".mlp.experts.") {
+            experts += b;
+        } else if name.contains(".ple_embedding.") {
+            ple += b;
+        } else {
+            dense += b;
+        }
+    }
+    // 호스트 = 전문가 스트리밍(마린 원료 포함) + PLE 페이지캐시 여유(¼).
+    Ok((dense, experts + ple / 4))
+}
+
 /// [2026-10-16] 범주 인지 dense 게이트(순수 — 테스트 표면) — ① 매-토큰
 /// dense(+head)는 VRAM 필수. 합산 가드는 dense가 호스트 용량에 묻혀 통과할 수
 /// 있다(소형 VRAM + 대형 호스트) → 로드 중 VRAM 실패/스래시. 예약 공유.
@@ -210,6 +233,14 @@ pub fn preflight(model: &Path, gpu: bool) -> Result<(), String> {
     if bytes == 0 {
         return Ok(()); // 경로 오류는 로더의 에러가 더 정확하다 - 여기서는 통과
     }
+    // [잠복① 2026-10-20] FN(qwen4_exp) = 아치 인지 레이아웃 산정 — CT 전량
+    // (122GB)이 아닌 실제 상주(전문가 스트리밍/마린 원료 = 호스트·dense =
+    // 카드)로 합산 가드를 판정. dense VRAM 게이트는 아래 범주 게이트가
+    // 매니페스트 기준으로 담당(FN 매니페스트 dense 항은 비전문가 합).
+    let bytes = match fn_layout_bytes(model) {
+        Ok((_dense, host)) if host > 0 => host,
+        _ => bytes,
+    };
     let vram = if gpu {
         // B6: CUDA 단일(2026-10-08 백엔드 탈락 반영) — cuMemGetInfo(rawcuda ffi).
         // 실패는 None → check의 B17 게이트가 거부한다.
