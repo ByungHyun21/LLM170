@@ -168,6 +168,16 @@ fn ppl(args: &[String]) -> Result<String, String> {
     if llm170_core::gemma4::bind::arch_ok(&arch) {
         return ppl_g4(&dir, &toks, n, ctx, chunk, &out_path, json, route, kld);
     }
+    // [2026-10-21] FN(qwen4_exp) — 골든 정합 후 eval 인가 개통. 청크 128
+    // 고정(전문가 LRU 320슬롯 distinct 가드 — 랜덤 코퍼스 512/256청크 초과
+    // 실측), 전 위치 로짓 = 체인 + 헤드 GEMM(fn_chain_logits). route/kld는
+    // FN 미지원(가드 유지).
+    if llm170_core::qwen4exp::arch_ok(&arch) {
+        if route || kld {
+            return Err("FN은 --route/--kld 미지원(FN eval = ppl/agree 우선)".into());
+        }
+        return ppl_fn(&dir, &toks, n, ctx, chunk, &out_path, json);
+    }
     if route {
         return Err("--route는 gemma4(MoE 라우팅) 전용".into());
     }
@@ -343,6 +353,61 @@ fn eval_report(
             .map(|p| format!("\n  덤프 {p}"))
             .unwrap_or_default()
     ))
+}
+
+/// ppl — FN(qwen4_exp) 아치 분기 — 2026-10-21 골든 정합 후 개통.
+/// 청크 = min(chunk.max(2),128) — 전문가 LRU 320슬롯 distinct 가드(랜덤
+/// 코퍼스 512/256 초과 실측). 전 위치 로짓 = 체인 + 헤드 GEMM
+/// (fn_chain_logits). 행 규약 = qwen35/ppl_g4와 동일(agree/ci 소비 동일).
+fn ppl_fn(
+    dir: &str,
+    toks: &[u32],
+    n: usize,
+    ctx: usize,
+    chunk: usize,
+    out_path: &Option<String>,
+    json: bool,
+) -> Result<String, String> {
+    use llm170_core::qwen4exp::stages::ple;
+    let m = llm170_core::qwen4exp::engine::Model::load(Path::new(dir))?;
+    crate::resource::release_load_lock();
+    let cfg = m.cfg.clone();
+    let ct_dir = format!("{dir}-CT");
+    let t0 = std::time::Instant::now();
+    let mut dec = W4a16Dec::new(1, cfg.hidden_size, cfg.num_hidden_layers)?;
+    crate::gpu_engine::upload_fn(&mut dec, &cfg, Path::new(&ct_dir), ctx)?;
+    // 기본 --chunk=1이면 FN은 128로 승격(전문가·KV 캐시 가드 상한). 명시
+    // chunk≥2는 128로 클램프.
+    let chunk_max = if chunk >= 2 { chunk.min(128) } else { 128 };
+    let vocab = cfg.vocab;
+    let mut rows: Vec<Row> = Vec::with_capacity(n - 1);
+    let mut nll_sum = 0f64;
+    let mut i = 0usize;
+    while i + 1 < n {
+        let t = (n - i).min(chunk_max);
+        let emb = m.embed(&toks[i..i + t])?;
+        let pl = ple::gather_emb(&m, toks, i)?;
+        let emb_flat: Vec<f32> = emb.iter().flatten().copied().collect();
+        let ple_flat: Vec<f32> = pl.iter().flatten().copied().collect();
+        let lg = dec.fn_chain_logits(0, i as u32, t, &emb_flat, Some(&ple_flat))?;
+        for r in 0..t {
+            let g = i + r;
+            if g + 1 >= n {
+                break;
+            }
+            let lr = &lg[r * vocab..(r + 1) * vocab];
+            let (am, margin) = argmax_margin(lr);
+            let tgt = toks[g + 1];
+            let nll = nll_of(lr, tgt);
+            nll_sum += nll;
+            rows.push((g as u32 + 1, tgt, am, nll, margin));
+        }
+        i += t;
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    eval_report(
+        dir, n, chunk_max, true, &rows, nll_sum, ms, out_path, json, None, None,
+    )
 }
 
 /// ppl — gemma4 아치 분기(서빙 청크 경로 = 단일 클래스). 헤드·softcap은 청크

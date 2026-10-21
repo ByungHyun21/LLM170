@@ -32,6 +32,9 @@ set -u
 cd "$(dirname "$0")/.."
 BIN=./target/release/llm170
 GOLDEN="156037,16072,154029,209495,30"
+GOLDENFN5="271" # [2026-10-21 재동결] FN 5톤(148678,65233,202419,771,99012) GPU=오라클
+               # argmax·48층 지문 전층 정합(버그 7종 수정 직후 — 구 2977은 오라클
+               # v↔k 페어링 버그 산물로 무효, 상세 plans/profiling-eval.md 말단).
 # W4-1 MoE(35B-A3B g32) — 참조 골든 접두(2026-10-09 확정).
 GOLDEN35="156037,16072,154029,156504,30"
 # 장문 골든(2026-10-10 GPU 동결): lim>256·다중 청크.
@@ -348,8 +351,24 @@ if want e; then
       # [2026-10-16] 'rsrc-guard' 광역 매칭 제거 — 적재 락 대기("…대기(B20)")도
       # rsrc-guard 접두를 달고 있어 타 llm170 동시 실행 시 false-pass였다.
       note "serve 가드 거부 OK: $(head -1 "$RUN/e2.log")"
+    elif grep -q "미지원 아키텍처" "$RUN/e2.log"; then
+      # [2026-10-21] FN serve 배선 전 — 아치 단계 즉시 거부도 동일 의도
+      # (조용한 오서빙 방지). 배선 후엔 이 분기 삭제(가드 검사로 복귀).
+      note "serve 아치 거부 OK(FN serve 미배선): $(head -1 "$RUN/e2.log")"
     else
       echo "[w4a16] FAIL: serve 가드 외 사유(락 대기 포함) — ${RUN}/e2.log"; fail=1
+    fi
+    # [2026-10-21] GPU 5톤 골든 — 브링업 체인 정합(이후 단계적 확대).
+    if timeout 420 "$BIN" w4a16-gpu "$M_FN" --prompt-tokens 148678,65233,202419,771,99012 \
+      > "$RUN/e3.out" 2> "$RUN/e3.log"; then
+      E3=$(grep -m1 'argmax ' "$RUN/e3.out" | grep -o 'argmax [0-9]*' | awk '{print $2}')
+      case "$E3" in
+        "$GOLDENFN5") note "FN 5톤 GPU 골든 OK: argmax $E3";;
+        "") echo "[w4a16] FAIL: FN 5톤 argmax 판독 불가 — ${RUN}/e3.log"; fail=1;;
+        *) echo "[w4a16] FAIL: FN 5톤 골든 불일치: $E3 ≠ $GOLDENFN5 — ${RUN}/e3.log"; fail=1;;
+      esac
+    else
+      echo "[w4a16] FAIL: FN 5톤 GPU 실행 실패 — ${RUN}/e3.log"; fail=1
     fi
 fi
 

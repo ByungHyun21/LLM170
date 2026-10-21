@@ -224,12 +224,11 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
     let is_fn = llm170_core::qwen35::bind::dir_arch(path)
         .map(|a| llm170_core::qwen4exp::arch_ok(&a))
         .unwrap_or(false);
-    if is_fn && (prompts.is_empty() || corpus.is_some()) {
-        return if corpus.is_some() {
-            Err("FN --eval-corpus 미지원 — --prompt-tokens greedy 사용".into())
-        } else {
-            llm170_core::qwen4exp::probe(path)
-        };
+    // [2026-10-21] FN --eval-corpus 개통 — NLL 경로(① 토큰 prefill → 토큰
+    // 디코드)는 RefEngine::Fn의 prefill/decode로 그대로 성립한다. 속도
+    // 주의: FN 오라클 디코드는 PLE 히스토리 게더가 주 병목(위치당 수 초~).
+    if is_fn && prompts.is_empty() {
+        return llm170_core::qwen4exp::probe(path);
     }
     if prompts.is_empty() && corpus.is_none() {
         return Err("at least one --prompt-tokens 또는 --eval-corpus required".into());

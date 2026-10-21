@@ -859,6 +859,45 @@ impl W4a16Dec {
         Ok(self.fn_.r.ptr)
     }
 
+    /// [eval 2026-10-21] 청크 forward + **전 위치** 헤드 logits d2h
+    /// ([t][vocab] f32) — w4a16-eval ppl/agree의 FN 경로. 체인(최종 믹서)이
+    /// 전 행을 이미 계산해 fn_.x에 남기므로 헤드만 전 행 GEMM으로 태운다.
+    /// 마지막 행 sample d2h(체인 계약)는 소형 — 무시.
+    pub fn fn_chain_logits(
+        &mut self,
+        slot: usize,
+        pos: u32,
+        t: usize,
+        emb: &[f32],
+        ple: Option<&[f32]>,
+    ) -> Result<Vec<f32>, String> {
+        if t == 0 || t > 1024 {
+            return Err(format!("fn_chain_logits: t={t} 범위 밖"));
+        }
+        let (d_emb, d_ple) = self.fn_stage(emb, ple, t)?;
+        let _ = self.fn_chain_dev_t(slot, pos, t, d_emb, d_ple)?;
+        let _g = self.cc.guard()?;
+        let (_, vocab, _) = self.plain_spec("blk.head.weight")?;
+        let dy = self.cc.alloc(t * vocab * 4)?;
+        self.lin_forward(
+            true,
+            LinPath::Gemm,
+            "blk.head.weight",
+            self.fn_.x.ptr,
+            dy,
+            t,
+        )?;
+        let mut ob = vec![0u8; t * vocab * 4];
+        self.cc.d2h(&mut ob, dy)?;
+        self.cc.free(dy)?;
+        Ok(ob
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    }
+
     /// head(plain BF16 "blk.head.weight") — sample[hidden] 1행 → 로짓 [vocab].
     /// M1 프로브용(호출당 할당 — 디코드 상수화는 최적화 단계).
     pub fn fn_head(&mut self, sample: &[f32]) -> Result<Vec<f32>, String> {

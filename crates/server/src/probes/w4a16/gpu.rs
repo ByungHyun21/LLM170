@@ -805,7 +805,9 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
     if gdn_check {
         use llm170_core::qwen4exp::stages::hc::{gate_mean_tok, hc_norm_tok};
         use llm170_core::qwen4exp::stages::linear;
-        let t = 5usize;
+        // [2026-10-21] t=128 — 300톤 사다리에서 층5(0.07%→1.5% 점프) 발산이
+        // 멀티 GDN 서브청크(체인 CS=32) 경로를 지목. t=5는 단일 부분청크만.
+        let t = prompt.len().min(128);
         let prompt5: Vec<u32> = prompt.iter().take(t).copied().collect();
         let emb = m.embed(&prompt5)?;
         // R = embed×4 → 오라클 HC mix(attn 모듈) → x.
@@ -859,9 +861,10 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
 
     // 청크 프리필 + 그리디.
     let tg = std::time::Instant::now();
-    // [M3→600톤 2026-10-21] 256 — 랜덤 600톤 프롬프트의 distinct 전문가
-    // 368 > 캐시 320(512청크 가드 발동)이라 청크 축소(분할 불변 계약).
-    let chunk_max = 256usize;
+    // [M3→600톤 2026-10-21] 128 — 랜덤 프롬프트 distinct가 청크 크기에 따라
+    // 320 초과(512→368·256→333)라 오라클 PCH=128과 경계 일치시킨다(분할
+    // 불변 계약).
+    let chunk_max = 128usize;
     let hist = prompt.clone();
     let mut pos = 0usize;
     let mut n_chunk = 0usize;
