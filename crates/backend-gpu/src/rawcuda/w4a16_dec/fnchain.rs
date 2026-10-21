@@ -289,9 +289,17 @@ impl W4a16Dec {
         mut qsa_sel: Option<&mut dyn FnMut(usize, usize, &[f32]) -> (Vec<i32>, Vec<i32>)>,
     ) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
+        if slot >= self.slot_pos.len() {
+            return Err(format!("fn_chain: slot {slot} 범위 밖"));
+        }
         if !self.fn_.on {
             return Err("fn_chain: set_fn 미등록".into());
         }
+        // [bugfix 2026-10-21] 청크 절대 위치를 slot_pos에 반영 — attn_chain_dev_run은
+        // slot_pos를 읽는다. 종전엔 pos 인자만 넘기고 slot_pos를 갱신하지 않아 모든
+        // 청크가 pos=0에서 KV를 덮어썼다(5톤 단일 청크 골든만 통과, 300톤 청크 경계
+        // 이후 layer 3 풀어텐션 발산).
+        self.slot_pos[slot] = pos;
         // [fix 2026-10-20] KV 온디맨드 확보 — chain_t와 동일(누락 시 K6 블록
         // 테이블 기저 0 → attn_prep_q 불법 기록).
         self.kv_ensure(slot, pos as usize + t + 2)?;
@@ -652,6 +660,7 @@ impl W4a16Dec {
         if !win.owns_final(n_layers) {
             let mut rb = vec![0u8; t * hh * 4];
             self.cc.d2h(&mut rb, self.fn_.r.ptr)?;
+            self.slot_pos[slot] = pos + t as u32;
             // SAFETY: rb는 t*hh*4 바이트(정렬 4) — f32 뷰 재해석.
             return Ok(unsafe {
                 std::slice::from_raw_parts(rb.as_ptr() as *const f32, t * hh).to_vec()
@@ -672,6 +681,7 @@ impl W4a16Dec {
         // SAFETY: ob는 h*4 바이트(정렬 4) — f32 뷰 재해석.
         let out: Vec<f32> =
             unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, h).to_vec() };
+        self.slot_pos[slot] = pos + t as u32;
         Ok(out)
     }
 
