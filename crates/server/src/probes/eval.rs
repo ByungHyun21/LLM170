@@ -375,6 +375,8 @@ fn ppl_fn(
     let ct_dir = format!("{dir}-CT");
     let t0 = std::time::Instant::now();
     let mut dec = W4a16Dec::new(1, cfg.hidden_size, cfg.num_hidden_layers)?;
+    // [진단] FN eval도 debug_layers 지문을 낸다 — 청크 경계 상태 발산 추적.
+    dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
     let _fn_store = crate::gpu_engine::upload_fn(&mut dec, &cfg, Path::new(&ct_dir), ctx, false)?;
     // 기본 --chunk=1이면 FN은 128로 승격(전문가·KV 캐시 가드 상한). 명시
     // chunk≥2는 128로 클램프.
