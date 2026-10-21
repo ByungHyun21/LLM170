@@ -525,7 +525,7 @@ mod tests {
     /// 골격 판독 검증을 직접 수행한다.
     #[test]
     fn fn_probe_real_model() {
-        let Ok(d) = std::env::var("LLM170_FN_MODEL") else {
+        let Some(d) = llm170_diag::flag::val("LLM170_FN_MODEL") else {
             return;
         };
         let rep = probe(std::path::Path::new(&d)).expect("fn-probe 실패");
@@ -545,7 +545,7 @@ mod tests {
     /// linear_attn.norm은 평범 가중치(원시 w가 이미 ~1 분포 — +1 금지).
     #[test]
     fn fn_norm_contract_real_model() {
-        let Ok(d) = std::env::var("LLM170_FN_MODEL") else {
+        let Some(d) = llm170_diag::flag::val("LLM170_FN_MODEL") else {
             return;
         };
         let m = Model::load(std::path::Path::new(&d)).expect("로드 실패");
@@ -577,7 +577,7 @@ mod tests {
     /// 디큐트 교차검증(스캔 모달 니블로 재계산해 비트일치 확인).
     #[test]
     fn fn_qzeros_sym_scan_real_model() {
-        let Ok(d) = std::env::var("LLM170_FN_MODEL") else {
+        let Some(d) = llm170_diag::flag::val("LLM170_FN_MODEL") else {
             return;
         };
         let m = Model::load(std::path::Path::new(&d)).expect("로드 실패");

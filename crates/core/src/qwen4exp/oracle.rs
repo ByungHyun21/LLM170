@@ -221,7 +221,7 @@ mod tests {
     /// 허용오차 1e-3 + argmax 일치. LLM170_FN_MODEL 지정 시에만 실행.
     #[test]
     fn fn_oracle_equiv_real_model() {
-        let Ok(d) = std::env::var("LLM170_FN_MODEL") else {
+        let Some(d) = llm170_diag::flag::val("LLM170_FN_MODEL") else {
             return;
         };
         let p = GOLDEN_PROMPT;
@@ -250,7 +250,7 @@ mod tests {
     /// vLLM 대조는 다음 단계(과제 범위 밖) — 우선 자체 일관성 기준.
     #[test]
     fn fn_golden_real_model() {
-        let Ok(d) = std::env::var("LLM170_FN_MODEL") else {
+        let Some(d) = llm170_diag::flag::val("LLM170_FN_MODEL") else {
             return;
         };
         let mut o = Oracle::new(std::path::Path::new(&d)).expect("오라클 로드");

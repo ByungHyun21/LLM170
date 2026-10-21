@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     // OOM 킬러 지정 희생자 — llm170 본체와 동일 규약(초대형 mmap 보호).
-    if std::env::var_os("LLM170_NO_OOM_ADJ").is_none() {
+    if llm170_diag::flag::val("LLM170_NO_OOM_ADJ").is_none() {
         let _ = std::fs::write("/proc/self/oom_score_adj", b"1000");
     }
     let args: Vec<String> = std::env::args().skip(1).collect();

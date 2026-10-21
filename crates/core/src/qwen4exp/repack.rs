@@ -1204,9 +1204,9 @@ mod tests {
     /// 표본: 층 {0,23,47} × 전문가 {0,7,511} × 3투영 — **전 행** 비트일치.
     #[test]
     fn fn_repack_equiv_real_model() {
-        let (Ok(src), Ok(dst)) = (
-            std::env::var("LLM170_FN_MODEL"),
-            std::env::var("LLM170_FN_MODEL_CT"),
+        let (Some(src), Some(dst)) = (
+            llm170_diag::flag::val("LLM170_FN_MODEL"),
+            llm170_diag::flag::val("LLM170_FN_MODEL_CT"),
         ) else {
             return;
         };

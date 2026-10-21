@@ -7,6 +7,9 @@
 use super::finish;
 use std::process::ExitCode;
 
+#[cfg(test)]
+mod tiny_equiv_tests;
+
 mod gates;
 mod gpu;
 mod ref_cmd;
