@@ -400,7 +400,12 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
     let dbg_layers = llm170_diag::dump::opts().key("debug_layers");
     // [QSA] --qsa — 인덱서 선택 집합 경로(오라클 대조 골든화).
     let qsa = args.iter().any(|x| x == "--qsa");
-    let rest: Vec<String> = rest.into_iter().filter(|x| x != "--qsa").collect();
+    // [gdn-check] GDN 0층 고립 대조 — 동일 x(호스트 HC mix)로 오라클·GPU 출력 비교.
+    let gdn_check = args.iter().any(|x| x == "--gdn-check");
+    let rest: Vec<String> = rest
+        .into_iter()
+        .filter(|x| x != "--qsa" && x != "--gdn-check")
+        .collect();
     let a = parse_args(&rest)?;
     if a.prompts.is_empty() {
         return Err("w4a16-gpu(FN): --prompt-tokens 필요".into());
@@ -450,6 +455,62 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
         (d, None)
     };
     let upload_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+    // [gdn-check] 0층 GDN 고립 대조 — x = 호스트 HC mix(오라클 코드) 동일 입력.
+    if gdn_check {
+        use llm170_core::qwen4exp::stages::hc::{gate_mean_tok, hc_norm_tok};
+        use llm170_core::qwen4exp::stages::linear;
+        let t = 5usize;
+        let prompt5: Vec<u32> = prompt.iter().take(t).copied().collect();
+        let emb = m.embed(&prompt5)?;
+        // R = embed×4 → 오라클 HC mix(attn 모듈) → x.
+        let w = m.norm_vec("model.language_model.layers.0.attn_hyper_connection.hc_norm.weight")?;
+        let lp0 = "model.language_model.layers.0.attn_hyper_connection";
+        let mut xs: Vec<Vec<f32>> = Vec::with_capacity(t);
+        for rt in &emb {
+            let r = rt.repeat(cfg.hc_count);
+            let xn = hc_norm_tok(&r, cfg.hc_count, h, &w, cfg.rms_norm_eps);
+            let down = m.matvec_bf16(&format!("{lp0}.input_mix_weight_down.weight"), &xn)?;
+            let lora: Vec<f32> = down
+                .iter()
+                .map(|v| llm170_core::ops::silu(v / cfg.hc_count as f32))
+                .collect();
+            let gate = m.matvec_bf16(&format!("{lp0}.input_mix_weight_up.weight"), &lora)?;
+            xs.push(gate_mean_tok(&xn, &gate, cfg.hc_count, h));
+        }
+        // CPU 참조 — forward_state(신선 상태).
+        let mut conv0 = Vec::new();
+        let mut st0 =
+            vec![0.0f32; cfg.linear_value_heads * cfg.linear_head_dim * cfg.linear_head_dim];
+        let qkv_n0 = m
+            .ent("model.language_model.layers.0.linear_attn.in_proj_qkv.weight")?
+            .shape[0] as usize;
+        // gated까지 — 오라클 forward_state의 out_proj 전 단계 재현 대신
+        // forward_state 결과(o_proj 후)와 코어 gated를 모두 계산.
+        let cpu = linear::forward_state(&m, 0, &xs, &mut conv0, &mut st0, qkv_n0)?;
+        let _ = qkv_n0;
+        // GPU — 동일 x로 백엔드 고립 헬퍼.
+        let x_flat: Vec<f32> = xs.iter().flatten().copied().collect();
+        let y = dec.fn_gdn_probe(&x_flat, t)?;
+        // 대조 — gated(헤드 재배치 후 o_proj 전).
+        let mut mx_diff = 0f32;
+        let mut cx = 0f32;
+        let mut gx = 0f32;
+        for tt in 0..t {
+            for i in 0..h {
+                let c = cpu[tt][i];
+                let gv = y[tt * h + i];
+                mx_diff = mx_diff.max((c - gv).abs());
+                cx = cx.max(c.abs());
+                gx = gx.max(gv.abs());
+            }
+        }
+        let g0 = y[..h].iter().fold(0f32, |a, v| a.max(v.abs()));
+        return Ok(format!(
+            "[gdn-check] t={t} max|cpu-gpu|={mx_diff:.6} cpu_max={cx:.4} gpu_max={gx:.4} ratio={:.3} gated0={g0:.4}",
+            gx / cx.max(1e-9)
+        ));
+    }
 
     // 청크 프리필 + 그리디.
     let tg = std::time::Instant::now();

@@ -161,6 +161,20 @@ pub fn forward_state(
         }
     }
 
+    // [gdn-check] 코어 입력 지문(행0) — beta/g 전원소 + 스캔 후 o.
+    if llm170_diag::dump::opts().key("debug_layers") {
+        let f2 = |v: &[f32]| -> String {
+            v.iter()
+                .map(|x| format!("{x:.3}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        eprintln!(
+            "fn[cpu] core-in L{il} betaN={} gN={}",
+            f2(&beta_all[..h_v]),
+            f2(&g_all[..h_v]),
+        );
+    }
     // GDN 코어 — 상태 입출(청크 경계 연속).
     let mut o_all = vec![0.0f32; n_tok * v_len];
     gdn_chunk_seq(
@@ -179,6 +193,11 @@ pub fn forward_state(
     );
     let mut out = Vec::with_capacity(n_tok);
     for t in 0..n_tok {
+        if t == 0 && llm170_diag::dump::opts().key("debug_layers") {
+            let mx = gated[0].iter().fold(0f32, |a, v| a.max(v.abs()));
+            let om = o_all[..v_len].iter().fold(0f32, |a, v| a.max(v.abs()));
+            eprintln!("fn[cpu] gated L{il} R0max={mx:.4} oN={om:.4}");
+        }
         out.push(m.matvec_bf16(&format!("{l}.out_proj.weight"), &gated[t])?);
     }
     Ok(out)

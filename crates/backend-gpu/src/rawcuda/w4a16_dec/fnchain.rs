@@ -624,6 +624,76 @@ impl W4a16Dec {
         Ok(out)
     }
 
+    /// [gdn-check] GDN 0층 고립 실행 — x[t][hidden] 스테이징 → qkv/z GEMM →
+    /// gdn 체인 → gated 출력 d2h 반환(헤드 재배치·o_proj 전).
+    pub fn fn_gdn_probe(&mut self, x: &[f32], t: usize) -> Result<Vec<f32>, String> {
+        let _g = self.cc.guard()?;
+        let h = self.hidden;
+        if x.len() != t * h {
+            return Err(format!("fn_gdn_probe: x={} != t{t}×h{h}", x.len()));
+        }
+        self.fn_ensure_bufs(t)?;
+        self.ensure_chain_bufs()?;
+        self.ensure_gdn_bufs(t)?;
+        // SAFETY: x 로컬 슬라이스 유효 수명 내 바이트 뷰.
+        let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, t * h * 4) };
+        self.cc.h2d(self.fn_.x.ptr, xb)?;
+        self.lin_forward(
+            true,
+            LinPath::Gemm,
+            "blk.0.attn_qkv.weight",
+            self.fn_.x.ptr,
+            self.dchain[0],
+            t,
+        )?;
+        self.lin_forward(
+            true,
+            LinPath::Gemm,
+            "blk.0.attn_gate.weight",
+            self.fn_.x.ptr,
+            self.dchain[1],
+            t,
+        )?;
+        let g = self.gdn_chain_dev_run(0, 0, t, self.fn_.x.ptr, self.dchain[0], self.dchain[1])?;
+        // [gated] 코어 출력(o_proj 전) — dgate = gdn 체인 gated 버퍼.
+        let mut ob = vec![0u8; t * h * 4];
+        // SAFETY: ob 로컬 버퍼 — d2h 대상 길이 계약.
+        self.cc.d2h(&mut ob, g)?;
+        // [gdn-check 미러] 코어 입력 버퍼 행0 지문 — 오라클 core-in 대조.
+        if llm170_diag::dump::opts().key("debug_layers") {
+            let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
+            let nb = |n: usize| vec![0u8; n * 4];
+            let rd = |buf: CUdeviceptr, n: usize| -> Result<Vec<f32>, String> {
+                let mut b = nb(n);
+                self.cc.d2h(&mut b, buf)?;
+                Ok(b.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect())
+            };
+            let mx = |v: &[f32]| v.iter().fold(0f32, |a, x| a.max(x.abs()));
+            // bg = [beta 48][g 48] 엔진 순서(커널 내부 vperm)·o = 스캔 출력.
+            // 실측 2026-10-21: bg·conv v는 오라클과 원소 정합 — 발산은
+            // 스캔(oN CPU 0.0966 vs GPU 0.0592) 내부에 국소화.
+            let bgr = rd(self.gdn.dbg, 2 * dm.h_v)?;
+            let f2 = |v: &[f32]| -> String {
+                v.iter()
+                    .map(|x| format!("{x:.3}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let o0 = rd(self.gdn.dgo, dm.v_len())?;
+            eprintln!("fn[gpu] core-in L0 bgN={} oN={:.4}", f2(&bgr), mx(&o0),);
+        }
+        Ok(ob
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    }
+
     /// [PP2] 샤드B 진입 R 스테이징 — r[t][hc·hidden] h2d → fn_.r.
     pub fn fn_stage_r(&mut self, r: &[f32], t: usize) -> Result<CUdeviceptr, String> {
         let _g = self.cc.guard()?;

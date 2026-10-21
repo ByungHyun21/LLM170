@@ -53,7 +53,7 @@ impl Model {
         })
     }
 
-    pub(crate) fn ent(&self, name: &str) -> Result<&StEntry, String> {
+    pub fn ent(&self, name: &str) -> Result<&StEntry, String> {
         self.ar
             .entry(name)
             .ok_or_else(|| format!("텐서 부재: {name}"))
@@ -119,7 +119,7 @@ impl Model {
     }
 
     /// [n_out, n_in] BF16 행렬 × x → y(스트리밍 디양자화 — 사본 없음).
-    pub(crate) fn matvec_bf16(&self, name: &str, x: &[f32]) -> Result<Vec<f32>, String> {
+    pub fn matvec_bf16(&self, name: &str, x: &[f32]) -> Result<Vec<f32>, String> {
         let e = self.ent(name)?;
         if e.dtype != StDtype::Bf16 || e.shape.len() != 2 {
             return Err(format!(
