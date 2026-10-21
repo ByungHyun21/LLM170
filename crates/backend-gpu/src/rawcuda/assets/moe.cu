@@ -249,6 +249,127 @@ extern "C" __global__ void w4a16_gemv_bf16_multi_t(
     }
 }
 
+// [35B GEMV 2026-10-21] 플레인 bf16 t행 GEMV 벡터화 — 32레인/행·8행/블록·
+// uint4(bf16 8개) 로드. 종전 2B 스칼라(64레인)의 지연 바운드(ncu SM 24%·
+// 점유 39%)를 벡터 로드로 줄인다. 플레인 경로는 토큰 수준(골든)·eval 판정 —
+// W4A16 lane 비트계약 대상 아님. t=1(디코드)과 t=4(np4)가 같은 행별 산술을
+// 타도록 t행 커널 하나로 통일한다(배치 불변성 np-check PASS).
+// 실측: np4 +15.6% (252→291 t/s), tg128 −2.8% (127→123) — 트레이드 기록.
+template <int T>
+__device__ __forceinline__ void gemv_bf16_t_v4_body(
+    const unsigned short* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ out, int n, int k, int o0)
+{
+    const int l = threadIdx.x & 31;
+    const int g = threadIdx.x >> 5;
+    const int o = o0 + g;
+    const bool live = o < n;
+    float acc[T];
+#pragma unroll
+    for (int r = 0; r < T; ++r) acc[r] = 0.0f;
+    if (live) {
+        const unsigned short* wrow = w + (size_t)o * k;
+        const bool vec = ((k & 7) == 0) && (((size_t)wrow & 15) == 0);
+        if (vec) {
+            int base = l * 8;
+            for (; base + 7 < k; base += 256) {
+                const uint4 wv = *reinterpret_cast<const uint4*>(wrow + base);
+                const float w0 = b2f((unsigned short)(wv.x & 0xffffu));
+                const float w1 = b2f((unsigned short)(wv.x >> 16));
+                const float w2 = b2f((unsigned short)(wv.y & 0xffffu));
+                const float w3 = b2f((unsigned short)(wv.y >> 16));
+                const float w4 = b2f((unsigned short)(wv.z & 0xffffu));
+                const float w5 = b2f((unsigned short)(wv.z >> 16));
+                const float w6 = b2f((unsigned short)(wv.w & 0xffffu));
+                const float w7 = b2f((unsigned short)(wv.w >> 16));
+#pragma unroll
+                for (int r = 0; r < T; ++r) {
+                    const float* xr = x + (size_t)r * k + base;
+                    const float4 xa = *reinterpret_cast<const float4*>(xr);
+                    const float4 xb = *reinterpret_cast<const float4*>(xr + 4);
+                    acc[r] += w0 * xa.x;
+                    acc[r] += w1 * xa.y;
+                    acc[r] += w2 * xa.z;
+                    acc[r] += w3 * xa.w;
+                    acc[r] += w4 * xb.x;
+                    acc[r] += w5 * xb.y;
+                    acc[r] += w6 * xb.z;
+                    acc[r] += w7 * xb.w;
+                }
+            }
+            for (int i = base; i < k; ++i) {
+                const float wv = b2f(wrow[i]);
+#pragma unroll
+                for (int r = 0; r < T; ++r) acc[r] += wv * x[(size_t)r * k + i];
+            }
+        } else {
+            for (int i = l; i < k; i += 32) {
+                const float wv = b2f(wrow[i]);
+#pragma unroll
+                for (int r = 0; r < T; ++r) acc[r] += wv * x[(size_t)r * k + i];
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < T; ++r) {
+        double v = (double)acc[r];
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(v, off);
+            if (l < off) v += oth;
+        }
+        if (live && l == 0) out[(size_t)r * n + o] = (float)v;
+    }
+}
+
+#define GEMV_T_CASE_BF_V4(N) \
+    case N: gemv_bf16_t_v4_body<N>(w, x, out, n, k, o0); break;
+
+extern "C" __global__ void w4a16_gemv_bf16_multi_t_v4(
+    const unsigned long long* __restrict__ tab, // [count][4]: w, out, n, k
+    const float* __restrict__ x,                // [t][k] f32
+    int count, int t)
+{
+    const int blk = blockIdx.x;
+    int seg = count - 1;
+    int base = 0;
+    for (int ss = 0; ss < count; ++ss) {
+        const int ns = ((int)tab[ss * 4 + 2] + GEMV_TR - 1) / GEMV_TR;
+        if (blk < base + ns) {
+            seg = ss;
+            break;
+        }
+        base += ns;
+    }
+    const unsigned short* w = (const unsigned short*)(size_t)tab[seg * 4 + 0];
+    float* out = (float*)(size_t)tab[seg * 4 + 1];
+    const int n = (int)tab[seg * 4 + 2];
+    const int k = (int)tab[seg * 4 + 3];
+    const int o0 = (blk - base) * GEMV_TR;
+    if (o0 >= n || t <= 0 || t > G4_TMAX) {
+        return;
+    }
+    switch (t) {
+        GEMV_T_CASE_BF_V4(1)
+        GEMV_T_CASE_BF_V4(2)
+        GEMV_T_CASE_BF_V4(3)
+        GEMV_T_CASE_BF_V4(4)
+        GEMV_T_CASE_BF_V4(5)
+        GEMV_T_CASE_BF_V4(6)
+        GEMV_T_CASE_BF_V4(7)
+        GEMV_T_CASE_BF_V4(8)
+        GEMV_T_CASE_BF_V4(9)
+        GEMV_T_CASE_BF_V4(10)
+        GEMV_T_CASE_BF_V4(11)
+        GEMV_T_CASE_BF_V4(12)
+        GEMV_T_CASE_BF_V4(13)
+        GEMV_T_CASE_BF_V4(14)
+        GEMV_T_CASE_BF_V4(15)
+        GEMV_T_CASE_BF_V4(16)
+        default: break;
+    }
+}
+
 // ── T2(2026-10-09): 플레인 bf16 mma GEMM — 계약 완화 승인 후 첫 본체 ──
 // A=x(bf16 반올림, 스테이징에서 f32→bf16 RNE), B=w bf16(스토어 원본 [n][k]),
 // f32 누적. 프래그먼트 규약은 --mma-smoke에서 검증(비트동일 0.00e0):

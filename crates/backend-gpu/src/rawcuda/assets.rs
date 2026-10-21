@@ -99,6 +99,8 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_gemv_multi",
             "w4a16_gemv_bf16_t",
             "w4a16_gemv_bf16_multi_t",
+            // [35B GEMV 2026-10-21] 플레인 bf16 다중세그먼트 t행 벡터화(moe.cu).
+            "w4a16_gemv_bf16_multi_t_v4",
             "w4a16_cast_bf16",
             "w4a16_cast_hilo",
             "w4a16_gemm_bf16_mma",

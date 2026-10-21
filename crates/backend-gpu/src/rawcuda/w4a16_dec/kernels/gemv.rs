@@ -259,6 +259,11 @@ impl W4a16Dec {
         group: usize,
         x_dev: CUdeviceptr,
     ) -> Result<(), String> {
+        // [35B GEMV 2026-10-21] 플레인 t=1 다중세그먼트는 t행 v4 경로로 —
+        // np4(t=4)와 같은 행별 산술(배치 불변성 유지). W4A16(g128)은 종전 경로.
+        if plain {
+            return self.gemv_multi_t_dev(true, il, group, x_dev, 1);
+        }
         let m = *self
             .dmulti_meta
             .get(il)
@@ -292,15 +297,16 @@ impl W4a16Dec {
         t: usize,
     ) -> Result<(), String> {
         let name = if plain {
-            "w4a16_gemv_bf16_multi_t"
+            // [35B GEMV 2026-10-21] 32레인/행·uint4 벡터화(토큰 수준 판정).
+            "w4a16_gemv_bf16_multi_t_v4"
         } else {
             "w4a16_gemv_g128_multi_t"
         };
         let f = self.cc.function(name)?;
         let (mut p_t, mut p_x) = (table, x_dev);
         let (mut p_c, mut p_tt) = (count as i32, t as i32);
-        // [A-float4] split은 32레인/행 — 플레인(bf16)은 종전 64레인.
-        let blk = if plain { 64 * GEMV_TR } else { 32 * GEMV_TR } as u32;
+        // [A-float4] split은 32레인/행 — 플레인 v4도 32레인/8행/블록.
+        let blk = 32 * GEMV_TR as u32;
         self.cc.launch(
             f,
             total as u32,
@@ -323,7 +329,8 @@ impl W4a16Dec {
             .dmulti_meta
             .get(il)
             .ok_or_else(|| format!("gemv_multi_t: 메타 부족 il={il}"))?;
-        let (off, cnt, tgrid) = if group == 0 {
+        // 플레인 v4 = 32레인/8행/블록 → t행과 같은 tgrid(m[6]/m[7]).
+        let (off, cnt, grid) = if group == 0 {
             (m[0], m[1], m[6])
         } else {
             (m[3], m[4], m[7])
@@ -335,7 +342,7 @@ impl W4a16Dec {
             plain,
             self.dmulti + off as u64 * 8,
             x_dev,
-            tgrid as usize,
+            grid as usize,
             cnt as usize,
             t,
         )
