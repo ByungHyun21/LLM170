@@ -54,13 +54,18 @@ PORT=$((18210 + ($$ % 400)))
 
 # [2026-10-16 #9] 섹션 필터 — 기본 전체. 예: --section d2,d4 (35B GPU·스트리밍만).
 SECTIONS=all
-if [ $# -ge 1 ]; then
-    if [ "$1" = "--section" ] && [ $# -eq 2 ]; then
-        SECTIONS="${2// /}"
-    else
-        echo "사용: $0 [--section <키,키,...>] — 키: a,3a,c,3b,d,d2,d3,d4,e,g,g2,h,k,j,g4,g4e" >&2
-        exit 2
-    fi
+if [ $# -ge 1 ] && [ "$1" = "--fast" ]; then
+    # [검증 티어 2026-10-22] 패스트 레인 = 3a,c (가드 + serve 골든·배치 불변성,
+    # 실로드 2회 ≈ 2분). 스케줄·파이프라인·서빙 축 변경의 착수 게이트.
+    # 수치 경로(커널·산술·샘플링) 변경은 전체 실행 필수 — 골든 재동결만이
+    # 참조 재유도(a,d,d3)를 대체한다.
+    set -- "--section" "3a,c"
+fi
+if [ "$1" = "--section" ] && [ $# -eq 2 ]; then
+    SECTIONS="${2// /}"
+else
+    echo "사용: $0 [--fast | --section <키,키,...>] — 키: a,3a,c,3b,d,d2,d3,d4,e,g,g2,h,k,j,g4,g4e" >&2
+    exit 2
 fi
 if [ "$SECTIONS" != all ]; then
     if [ -z "${SECTIONS//,/}" ]; then
