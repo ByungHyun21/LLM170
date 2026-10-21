@@ -22,39 +22,27 @@ end-to-end on GPU with an int8 KV cache and CUDA-graph decode — 27B dense
 | SM / L2 | 70 SM; 32 MiB L2; persisting max 20 MiB |
 | host | AMD EPYC 7452 32C/64T, 107 GB RAM |
 
-### Qwen3.8-27B-W4A16 (g128, dense GDN)
+### Throughput (CMP 170HX, 180 W)
 
-| row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
-|---|---|---|---|---|---|
-| CUDA (170HX, 180 W, 2026-10-18) | 1258.83 | 1248.77 | 1178.92 | 42.66 | 59.50 |
+| model | cards | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
+|---|---|---|---|---|---|---|
+| Qwen3.8-27B-W4A16 | 1 | 1258.83 | 1248.77 | 1178.92 | 42.66 | 59.50 |
+| Qwen3.6-35B-A3B-W4A16 | 1 | 4653.47 | 4607.67 | 4356.50 | 120.41 | 189.08 |
+| Gemma-4-26B-A4B-it-QAT-W4A16 | 1 | 4565.01 | 4308.14 | 3652.48 | 66.76 | — |
+| Qwen3.8-Flash-Next-W4A16 | 2 | 1269 | — | 1588 | — | — |
 
-### Qwen3.6-35B-A3B-W4A16 (g32, MoE resident)
+### Decode mode (512 tok prompt · 128 gen)
 
-| row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
-|---|---|---|---|---|---|
-| CUDA (170HX, 180 W, 2026-10-20 mma3) | 4653.47 | 4607.67 | 4356.50 | 120.41 | 189.08 |
+| model | greedy t/s | MTP t/s | n-gram t/s |
+|---|---|---|---|
+| Qwen3.8-27B-W4A16 | 37.4 | 41.6 | 52.6 |
+| Qwen3.6-35B-A3B-W4A16 | 114.2 | — | 114.1 |
 
-### Gemma-4-26B-A4B-it-QAT-W4A16 (g32, MoE resident)
+### Serve (27B)
 
-| row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |
-|---|---|---|---|---|---|
-| CUDA (170HX, 180 W, 2026-10-20 attn splits64) | 4565.01 | 4308.14 | 3652.48 | 66.76 | — |
-
-| mode (27B, 512tok prompt · 128 gen) | t/s | note |
-|---|---|---|
-| greedy (no spec) | 37.4 | baseline |
-| MTP | 41.6 | +11.2% |
-| n-gram | **52.6** | +40.6% (3회 중 1회 ~42 — 드래프트 고갈) |
-
-| mode (35B, 512tok prompt · 128 gen) | t/s | note |
-|---|---|---|
-| greedy (no spec) | 114.2 | baseline |
-| n-gram | 114.1 | ±0% (MoE spec ≈ neutral) |
-
-| serve (27B) | value |
-|---|---|
-| TTFT cold / warm (prefix reuse) | 1054 ms / 305 ms (3.5x) |
-| prefix reuse ratio | 0.582 (2048 tok, 34% reused) |
+| model | TTFT cold ms | TTFT warm ms | prefix reuse ratio |
+|---|---|---|---|
+| Qwen3.8-27B-W4A16 | 1054 | 305 | 0.582 |
 
 ## Build & run
 
