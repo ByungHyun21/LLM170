@@ -173,9 +173,7 @@ impl Oracle {
                     .map(|v| format!("{v:.4}"))
                     .collect::<Vec<_>>()
                     .join(",");
-                eprintln!(
-                    "fn[cpu] layer {il:>2} x2max={xm:.4} ymmax={ym:.4} x2[..12]={f12}"
-                );
+                eprintln!("fn[cpu] layer {il:>2} x2max={xm:.4} ymmax={ym:.4} x2[..12]={f12}");
             }
             for t in 0..r.len() {
                 hc::combine_tok(

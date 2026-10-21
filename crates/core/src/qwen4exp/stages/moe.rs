@@ -13,9 +13,9 @@
 //! B) shared 사전계산(토큰 병렬) — sgate·s_out(BF16 matvec — 임계 미만
 //!    순차, 중첩 없음).
 //! C) (t,행밴드) 유닛 병렬 — out[t][r] = Σ_e(선택 순서) w·dot(dw_e[r], h_e)
-//!    + sgate·s_out[t][r]. 행별 전문가 가산 순서·shared 마지막 가산
-//!    순서는 순차판과 동일(비트동일). hs·out은 평탄 버퍼(유닛별 상호배타
-//!    원소 기록 — 중첩 Vec raw 인덱싱 회피).
+//!    에 sgate·s_out[t][r]를 마지막 가산. 행별 전문가 가산 순서·shared
+//!    마지막 가산 순서는 순차판과 동일(비트동일). hs·out은 평탄 버퍼
+//!    (유닛별 상호배타 원소 기록 — 중첩 Vec raw 인덱싱 회피).
 
 use super::super::engine::{Model, SendPtr, par_ranges};
 use crate::ops::{sigmoid, silu};
@@ -96,7 +96,8 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
             for t in b0..b1 {
                 let x = &xs[t];
                 let sg = sigmoid(
-                    m.matvec_bf16(&format!("{l}.shared_expert_gate.weight"), x).unwrap()[0],
+                    m.matvec_bf16(&format!("{l}.shared_expert_gate.weight"), x)
+                        .unwrap()[0],
                 );
                 let s_up = m
                     .matvec_bf16(&format!("{l}.shared_expert.gate_proj.weight"), x)

@@ -24,9 +24,7 @@ impl W4a16Dec {
             (32, false) => "w4a16_gemv_experts_g32_f16",
             (32, true) => "w4a16_gemv_experts_g32_bf16",
             (128, false) => "w4a16_gemv_experts_g128_f16",
-            (g, b) => {
-                return Err(format!("gemv_experts: 미지원 포맷 group={g} bf16={b}"))
-            }
+            (g, b) => return Err(format!("gemv_experts: 미지원 포맷 group={g} bf16={b}")),
         };
         let f = self.cc.function(sym)?;
         let (mut p_t, mut p_b, mut p_i, mut p_ns) = (

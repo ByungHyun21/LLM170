@@ -576,6 +576,7 @@ impl W4a16Dec {
                     .map(|x| format!("{x:.4}"))
                     .collect::<Vec<_>>()
                     .join(",");
+                eprintln!("fn[gpu] layer {il:>2} attn R0max={mx:.4} r0[..12]={f16s}");
                 if il == 0 && llm170_diag::dump::opts().key("r_full") {
                     let mut fb = vec![0u8; t * hh * 4];
                     // SAFETY: fb 로컬 버퍼 — d2h 대상 길이 계약.
@@ -901,9 +902,8 @@ impl W4a16Dec {
         // SAFETY: 로컬 슬라이스 유효 수명 내 바이트 뷰.
         let rb = unsafe { std::slice::from_raw_parts(r.as_ptr() as *const u8, t * hh * 4) };
         self.cc.h2d(self.fn_.r.ptr, rb)?;
-        let eb = unsafe {
- std::slice::from_raw_parts(ple_e.as_ptr() as *const u8, t * emb_dim * 4)
-        };
+        let eb =
+            unsafe { std::slice::from_raw_parts(ple_e.as_ptr() as *const u8, t * emb_dim * 4) };
         self.cc.h2d(self.fn_.ple_e.ptr, eb)?;
         let hc = self.fn_.hc;
         self.lin_forward(
@@ -931,8 +931,8 @@ impl W4a16Dec {
             hc as u32,
             256,
             &mut crate::rawcuda::args::l10(
-                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
-                &mut tl, &mut ep,
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7, &mut tl,
+                &mut ep,
             ),
         )?;
         let f = self.cc.function("fn_ple_conv")?;
@@ -978,5 +978,4 @@ impl W4a16Dec {
         }
         Ok((r2, gd, nm, key, val))
     }
-
 }

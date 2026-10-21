@@ -550,7 +550,8 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
                 .ent("model.language_model.layers.0.linear_attn.in_proj_qkv.weight")?
                 .shape[0] as usize;
             let mut conv0 = Vec::new();
-            let mut st0 = vec![0.0f32; cfg.linear_value_heads * cfg.linear_head_dim * cfg.linear_head_dim];
+            let mut st0 =
+                vec![0.0f32; cfg.linear_value_heads * cfg.linear_head_dim * cfg.linear_head_dim];
             let attn = linear::forward_state(&m, 0, &block, &mut conv0, &mut st0, qkv_n)?;
             let y0m = attn[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
             let bx = block[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
@@ -575,12 +576,12 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
             let rp_flat: Vec<f32> = rp.iter().flatten().copied().collect();
             let (gx2, _xn, _lo, _g, _ij) = dec.fn_hc_probe(&rp_flat, t, true)?;
             let c2f: Vec<f32> = cx2.iter().flatten().copied().collect();
-            lines.push(format!(
-                "[r'] x {}",
-                cmp("x2", &c2f, &gx2)
-            ));
+            lines.push(format!("[r'] x {}", cmp("x2", &c2f, &gx2)));
         }
-        return Ok(format!("[hc-check] t={t}\n{}\n{}\n{}", lines[0], lines[1], lines[2]));
+        return Ok(format!(
+            "[hc-check] t={t}\n{}\n{}\n{}",
+            lines[0], lines[1], lines[2]
+        ));
     }
 
     // [ple-check] 1층 PLE 고립 대조 — r' = 오라클 0층 어텐션 후 상태,
@@ -665,8 +666,7 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
                 for i in 0..hdim {
                     cgd[ob + i] = g * cval[tt * hdim + i];
                 }
-                let nn =
-                    llm170_core::ops::rms_norm(&cgd[ob..ob + hdim], &nc[b..b + hdim], m.eps);
+                let nn = llm170_core::ops::rms_norm(&cgd[ob..ob + hdim], &nc[b..b + hdim], m.eps);
                 cnm[ob..ob + hdim].copy_from_slice(&nn);
             }
         }
@@ -717,11 +717,10 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
         }
         // 라우터·선택 대조(오라클 select_topk — 같은 로짓이면 같은 집합).
         let crt: Vec<f32> = (0..t)
-            .map(|tt| {
+            .flat_map(|tt| {
                 m.matvec_bf16("model.language_model.layers.0.mlp.gate.weight", &xs[tt])
                     .unwrap()
             })
-            .flatten()
             .collect();
         let (mut rtd, mut rtm) = (0f32, 0f32);
         for (&a, &b) in crt.iter().zip(grt.iter()) {
@@ -730,9 +729,7 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
         }
         use llm170_core::qwen35::stages::select_topk;
         let sel0 = select_topk(&crt[..cfg.n_experts], cfg.top_k);
-        let gpu_sel0: Vec<(i32, f32)> = (0..cfg.top_k)
-            .map(|k| (gix[k], gwt[k]))
-            .collect();
+        let gpu_sel0: Vec<(i32, f32)> = (0..cfg.top_k).map(|k| (gix[k], gwt[k])).collect();
         let f8 = |v: &[f32]| -> String {
             v.iter()
                 .take(8)
