@@ -438,31 +438,41 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
     let t0 = std::time::Instant::now();
     let ct_dir = format!("{dir}-CT");
     // PP2 — 샤드A[0,24)·B[24,48) 직렬(오버랩은 후속). 경계 잔차 = R[t][hc·h].
-    let (mut dec, mut dec_b) = if pp2 {
+    // [잠복② 2026-10-21] CT 스토어를 디코더와 같은 스코프에 보유 — no-stage
+    // 전문가 테이블이 mmap 포인터를 쓰므로 드롭 시 언매핑(SIGSEGV).
+    let (mut dec, mut dec_b, _fn_st_a, _fn_st_b) = if pp2 {
         let nl = cfg.num_hidden_layers;
         let mid = nl / 2;
         let mut da = W4a16Dec::new_dev(1, h, nl, devices[0])?;
-        crate::gpu_engine::upload_fn_win(
+        let st_a = crate::gpu_engine::upload_fn_win(
             &mut da,
             &cfg,
             std::path::Path::new(&ct_dir),
             a.ctx,
             Some((0, mid)),
+            false,
         )?;
         let mut db = W4a16Dec::new_dev(1, h, nl, devices[1])?;
-        crate::gpu_engine::upload_fn_win(
+        let st_b = crate::gpu_engine::upload_fn_win(
             &mut db,
             &cfg,
             std::path::Path::new(&ct_dir),
             a.ctx,
             Some((mid, nl)),
+            false,
         )?;
-        (da, Some(db))
+        (da, Some(db), Some(st_a), Some(st_b))
     } else {
         let mut d = W4a16Dec::new(1, h, cfg.num_hidden_layers)?;
         d.debug_layers = dbg_layers;
-        crate::gpu_engine::upload_fn(&mut d, &cfg, std::path::Path::new(&ct_dir), a.ctx)?;
-        (d, None)
+        let st = crate::gpu_engine::upload_fn(
+            &mut d,
+            &cfg,
+            std::path::Path::new(&ct_dir),
+            a.ctx,
+            false,
+        )?;
+        (d, None, Some(st), None)
     };
     let upload_ms = t0.elapsed().as_secs_f64() * 1e3;
 

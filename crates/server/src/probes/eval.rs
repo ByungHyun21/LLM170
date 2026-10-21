@@ -375,7 +375,7 @@ fn ppl_fn(
     let ct_dir = format!("{dir}-CT");
     let t0 = std::time::Instant::now();
     let mut dec = W4a16Dec::new(1, cfg.hidden_size, cfg.num_hidden_layers)?;
-    crate::gpu_engine::upload_fn(&mut dec, &cfg, Path::new(&ct_dir), ctx)?;
+    let _fn_store = crate::gpu_engine::upload_fn(&mut dec, &cfg, Path::new(&ct_dir), ctx, false)?;
     // 기본 --chunk=1이면 FN은 128로 승격(전문가·KV 캐시 가드 상한). 명시
     // chunk≥2는 128로 클램프.
     let chunk_max = if chunk >= 2 { chunk.min(128) } else { 128 };

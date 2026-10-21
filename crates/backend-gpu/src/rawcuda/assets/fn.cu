@@ -265,14 +265,22 @@ extern "C" __global__ void fn_ple_conv_wb(const float* __restrict__ normed,
 {
     const int c = blockIdx.y * blockDim.x + threadIdx.x;
     if (c >= 10240) return;
+    // [fix 2026-10-21] t<9 청크의 **시프트 누락** — 오라클(ple.rs ⑥)은
+    // new[i] = x[t_end−9+i] = (청크 내) normed[t−9+i] 또는 구 state[t+i].
+    // 종전 커널은 src<0에서 구 state[i]를 그대로 남겨(시프트 없이) t<9
+    // 다중청크에서 conv 윈도우가 어긋났다 — chunk=2 eval PPL 140.4 vs
+    // chunk=64 20.9(청크 불변성 붕괴)로 발견. i 오름차순 쓰기·i+t 읽기는
+    // 쓰기 전 판독이라 in-place 안전(스레드=채널 열, 상호 겹침 없음).
     #pragma unroll
     for (int i = 0; i < 9; ++i) {
         const int src = t - 9 + i;
         if (src >= 0) {
             state[(size_t)i * 10240 + c] = normed[(size_t)src * 10240 + c];
-        } else if (!has_init) {
+        } else if (has_init) {
+            state[(size_t)i * 10240 + c] = state[(size_t)(i + t) * 10240 + c];
+        } else {
             state[(size_t)i * 10240 + c] = 0.0f;
-        } // has_init && src<0 → 구값 유지(= 구 state[i+t])
+        }
     }
 }
 

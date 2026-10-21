@@ -227,7 +227,7 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
     // [2026-10-21] FN --eval-corpus 개통 — NLL 경로(① 토큰 prefill → 토큰
     // 디코드)는 RefEngine::Fn의 prefill/decode로 그대로 성립한다. 속도
     // 주의: FN 오라클 디코드는 PLE 히스토리 게더가 주 병목(위치당 수 초~).
-    if is_fn && prompts.is_empty() {
+    if is_fn && prompts.is_empty() && corpus.is_none() {
         return llm170_core::qwen4exp::probe(path);
     }
     if prompts.is_empty() && corpus.is_none() {

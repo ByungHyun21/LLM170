@@ -28,8 +28,9 @@ pub(crate) fn upload_fn(
     cfg: &llm170_core::qwen4exp::Qwen4ExpCfg,
     dir: &Path,
     ctx: usize,
-) -> Result<(), String> {
-    upload_fn_win(dec, cfg, dir, ctx, None)
+    stage_host: bool,
+) -> Result<W4a16Model, String> {
+    upload_fn_win(dec, cfg, dir, ctx, None, stage_host)
 }
 
 /// [PP2-FN 2026-10-20] 창 분할판 — window=None 전체창(단일 GPU 불변).
@@ -41,7 +42,11 @@ pub(crate) fn upload_fn_win(
     dir: &Path,
     ctx: usize,
     window: Option<(usize, usize)>,
-) -> Result<(), String> {
+    stage_host: bool,
+) -> Result<W4a16Model, String> {
+    // [잠복② 2026-10-21] 반환 = CT 스토어 — no-stage 테이블의 mmap 포인터
+    // 수명 계약("서버가 모델을 함께 보유") 이행. 호출자가 디코더 수명 동안
+    // 보유해야 한다(드롭 시 언매핑 → 첫 전문가 접근 SIGSEGV 실측).
     if let Some((ws, we)) = window {
         dec.set_layer_window(ws, we)?;
     }
@@ -339,9 +344,15 @@ pub(crate) fn upload_fn_win(
                 vec![(0u64, 0u64, 0u64, 0u64); cfg.num_hidden_layers * cfg.n_experts * 3];
             let stride = cfg.n_experts * 3;
             full[ws * stride..we * stride].copy_from_slice(&tab);
-            dec.set_expert_table(full);
-        } else {
+            if stage_host {
+                dec.set_expert_table(full);
+            } else {
+                dec.set_expert_table_nostage(full);
+            }
+        } else if stage_host {
             dec.set_expert_table(tab);
+        } else {
+            dec.set_expert_table_nostage(tab);
         }
     }
     // [M3 2026-10-20] 스트리밍 LRU 확대 — 기본 96슬롯(frac 2)은 t≤8 강제.
@@ -509,5 +520,5 @@ pub(crate) fn upload_fn_win(
         true,
         cfg.indexer_n_heads,
     )?;
-    Ok(())
+    Ok(store)
 }

@@ -922,12 +922,30 @@ impl W4a16Dec {
     /// 전문가 슬라이스 테이블 등록 — (packed ptr/len, scale ptr/len) × (il,e,proj).
     /// 포인터는 서버 스토어 mmap 슬라이스 — 서버가 모델을 함께 보유하는 수명 계약.
     pub fn set_expert_table(&mut self, tab: Vec<(u64, u64, u64, u64)>) {
-        self.set_expert_table_hybrid(tab, 0)
+        self.set_expert_table_hybrid_opts(tab, 0, None)
+    }
+
+    /// [2026-10-21 잠복②] 단발 진단·eval 런용 — 호스트 스테이징 **명시 해제**.
+    /// 스테이징 63GiB(C2)는 장기 serve의 페이지캐시 의존 제거용이라 단발 런엔
+    /// 무의미하고, 자원 가드 밖(프로브 경로)이라 OOM 실사례(오라클 동시 실행).
+    /// 미스는 mmap/페이지캐시 경유(수치 불변 — 바이트 출처만 다름).
+    pub fn set_expert_table_nostage(&mut self, tab: Vec<(u64, u64, u64, u64)>) {
+        self.set_expert_table_hybrid_opts(tab, 0, Some(false))
     }
 
     /// [2026-10-16 #11] 하이브리드 변형 — 앞 hot_per개/층(핫 몫)은 스테이징
     /// 제외(VRAM 아레나 O_DIRECT 직행분), 비상주 몫만 호스트 RAM 1회 복사.
-    pub fn set_expert_table_hybrid(&mut self, mut tab: Vec<(u64, u64, u64, u64)>, hot_per: usize) {
+    pub fn set_expert_table_hybrid(&mut self, tab: Vec<(u64, u64, u64, u64)>, hot_per: usize) {
+        self.set_expert_table_hybrid_opts(tab, hot_per, None)
+    }
+
+    /// stage = None(env `LLM170_MOE_HOST_STAGE` 기본) · Some(false) 명시 해제.
+    pub fn set_expert_table_hybrid_opts(
+        &mut self,
+        mut tab: Vec<(u64, u64, u64, u64)>,
+        hot_per: usize,
+        stage: Option<bool>,
+    ) {
         // [P7-fix] 기존 스테이징이 등록돼 있으면 해제(버퍼 해제 전 필수).
         if self.moe.host_stage_reg > 0 {
             // SAFETY: 등록 성공 상태(host_stage_reg>0)의 host_stage 선두 주소다.
@@ -940,7 +958,10 @@ impl W4a16Dec {
         // [C2 2026-10-09] 호스트 RAM 스테이징(사용자 결정) — 스트리밍 셋을
         // 로드 시 1회 호스트 RAM으로 복사한다(SSD mmap·페이지캐시 경로 의존
         // 제거). 탈출구 LLM170_MOE_HOST_STAGE=0, 할당 실패 시 mmap 유지.
-        if llm170_diag::flag::ne0("LLM170_MOE_HOST_STAGE") {
+        // [잠복② 2026-10-21] stage=Some(false) = 명시 해제(단발 진단·eval —
+        // 프로브 경로는 자원 가드 밖이라 63GiB 스테이징이 OOM을 만들었다).
+        let do_stage = stage.unwrap_or_else(|| llm170_diag::flag::ne0("LLM170_MOE_HOST_STAGE"));
+        if do_stage {
             // [2026-10-16 #11] 핫 몫(앞 hot_per개/층)은 스테이징 제외 — VRAM
             // 직행분이라 호스트 복사 불요(램 절감 = 핫 몫만큼).
             let n_exp = self.moe.n_experts;
