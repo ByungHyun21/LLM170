@@ -15,7 +15,13 @@ impl W4a16Dec {
         n: usize,
         k: usize,
     ) -> Result<(), String> {
-        let f = self.cc.function("w4a16_gemm_g32_mma_grp_d64_f16")?;
+        // [FN 2026-10-21] 스케일 f16판 — grp2와 동일 계열(FN CT F16 스케일).
+        let sym = if self.moe.moe_group == 32 && !self.moe.moe_scale_bf16 {
+            "w4a16_gemm_g32_mma_grp_d64_sf16"
+        } else {
+            "w4a16_gemm_g32_mma_grp_d64_f16"
+        };
+        let f = self.cc.function(sym)?;
         let (mut p_t, mut p_b) = (self.moe.moe_dev_tab, base as i32);
         let (mut p_g, mut p_c, mut p_of) =
             (self.moe.moe_gslot, self.moe.moe_gcnt, self.moe.moe_goff);
@@ -55,7 +61,14 @@ impl W4a16Dec {
         n: usize,
         k: usize,
     ) -> Result<(), String> {
-        let f = self.cc.function("w4a16_gemm_g32_mma_grp2_f16")?;
+        // [FN 2026-10-21] 스케일 f16(FN CT weight_scale F16 g32)판 심볼 —
+        // bf16판은 f16 비트를 재해석해 전문가 출력 왜곡(GEMV와 동일 계열).
+        let sym = if self.moe.moe_group == 32 && !self.moe.moe_scale_bf16 {
+            "w4a16_gemm_g32_mma_grp2_sf16"
+        } else {
+            "w4a16_gemm_g32_mma_grp2_f16"
+        };
+        let f = self.cc.function(sym)?;
         let (mut p_t, mut p_b) = (self.moe.moe_dev_tab, base as i32);
         let (mut p_g, mut p_c, mut p_of) =
             (self.moe.moe_gslot, self.moe.moe_gcnt, self.moe.moe_goff);

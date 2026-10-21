@@ -390,7 +390,8 @@ extern __shared__ __align__(16) unsigned short b3sm[];
 // = 중립. **SASS 대조: grp2_f16 768→1112(+45%)** — ptxas가 원판을 이미 쌍
 // packing(수작업 = 코드젠 역전 — ⑥-d '수작업 half2 +명령'의 SASS 재확인).
 // +45% 명령에도 시간 중립 = 스테이징 ALU 비지배. 잔여 = 레이아웃급 재설계뿐.
-extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g32_mma_grp2_f16(
+template <bool SC_F16>
+__device__ void grp2_f16_impl(
     const unsigned long long* __restrict__ tab, int base,
     const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
     const unsigned* __restrict__ goff,
@@ -473,7 +474,9 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g32_mma_grp2_f16
                 if (rr < n) {
                     scb = s[(size_t)rr * kg + (gi >> 5)];
                 }
-                const float scf = __uint_as_float((unsigned)scb << 16);
+                const float scf = SC_F16
+                    ? __half2float(__ushort_as_half(scb))
+                    : __uint_as_float((unsigned)scb << 16);
                 // 스트리밍 힌트 — B는 블록별 1회 판독(재사용 없음),
                 // L2를 A 재사용에 남긴다.
                 const unsigned qw = live ? __ldcs(&q[(size_t)rr * k8 + (gi >> 3)]) : 0u;
@@ -549,7 +552,8 @@ extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g32_mma_grp2_f16
 }
 
 // grp_d64 f16-A — down 단일 투영 N64.
-extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64_f16(
+template <bool SC_F16>
+__device__ void grp_d64_f16_impl(
     const unsigned long long* __restrict__ tab, int base,
     const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
     const unsigned* __restrict__ goff,
@@ -625,7 +629,9 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64_f16(
                 if (rr < n) {
                     scb = s[(size_t)rr * kg + (gi >> 5)];
                 }
-                const float scf = __uint_as_float((unsigned)scb << 16);
+                const float scf = SC_F16
+                    ? __half2float(__ushort_as_half(scb))
+                    : __uint_as_float((unsigned)scb << 16);
                 const unsigned qw = live ? __ldcs(&q[(size_t)rr * k8 + (gi >> 3)]) : 0u;
                 if (live) {
 #pragma unroll
@@ -694,3 +700,33 @@ extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64_f16(
         }
     }
 }
+
+// [FN 2026-10-21] 스케일 f16판 심볼 — CT weight_scale F16(g32) 대응.
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g32_mma_grp2_f16(
+    const unsigned long long* __restrict__ tab, int base,
+    const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
+    const unsigned* __restrict__ goff,
+    const unsigned short* __restrict__ x, int xstride, int sp,
+    float* __restrict__ out, float* __restrict__ out2, int n, int k)
+{ grp2_f16_impl<false>(tab, base, gslot, gcnt, goff, x, xstride, sp, out, out2, n, k); }
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g32_mma_grp2_sf16(
+    const unsigned long long* __restrict__ tab, int base,
+    const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
+    const unsigned* __restrict__ goff,
+    const unsigned short* __restrict__ x, int xstride, int sp,
+    float* __restrict__ out, float* __restrict__ out2, int n, int k)
+{ grp2_f16_impl<true>(tab, base, gslot, gcnt, goff, x, xstride, sp, out, out2, n, k); }
+extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64_f16(
+    const unsigned long long* __restrict__ tab, int base,
+    const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
+    const unsigned* __restrict__ goff,
+    const unsigned short* __restrict__ x, int xstride, int sp,
+    float* __restrict__ out, int n, int k)
+{ grp_d64_f16_impl<false>(tab, base, gslot, gcnt, goff, x, xstride, sp, out, n, k); }
+extern "C" __global__ void w4a16_gemm_g32_mma_grp_d64_sf16(
+    const unsigned long long* __restrict__ tab, int base,
+    const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,
+    const unsigned* __restrict__ goff,
+    const unsigned short* __restrict__ x, int xstride, int sp,
+    float* __restrict__ out, int n, int k)
+{ grp_d64_f16_impl<true>(tab, base, gslot, gcnt, goff, x, xstride, sp, out, n, k); }

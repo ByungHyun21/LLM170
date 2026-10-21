@@ -862,7 +862,9 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
 
     // 청크 프리필 + 그리디.
     let tg = std::time::Instant::now();
-    let chunk_max = 512usize; // [M3] LRU 320슬롯 확대로 t=512 청크(distinct 263 ≤ 320)
+    // [M3→600톤 2026-10-21] 256 — 랜덤 600톤 프롬프트의 distinct 전문가
+    // 368 > 캐시 320(512청크 가드 발동)이라 청크 축소(분할 불변 계약).
+    let chunk_max = 256usize;
     let hist = prompt.clone();
     let mut pos = 0usize;
     let mut n_chunk = 0usize;

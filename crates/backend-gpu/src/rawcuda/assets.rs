@@ -146,6 +146,8 @@ pub const ASSETS: &[Asset] = &[
             "w4a16_gemm_bf16_mma3",
             "w4a16_gemm_g32_mma_grp2_f16",
             "w4a16_gemm_g32_mma_grp_d64_f16",
+            "w4a16_gemm_g32_mma_grp2_sf16",
+            "w4a16_gemm_g32_mma_grp_d64_sf16",
         ],
         boot: true,
     },
