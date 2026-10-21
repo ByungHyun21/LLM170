@@ -1430,7 +1430,7 @@ fn sample(args: &[String]) -> Result<String, String> {
     ))
 }
 
-fn argmax_margin(lg: &[f32]) -> (u32, f32) {
+pub(crate) fn argmax_margin(lg: &[f32]) -> (u32, f32) {
     let mut best = f32::NEG_INFINITY;
     let mut bi = 0u32;
     for (i, &v) in lg.iter().enumerate() {

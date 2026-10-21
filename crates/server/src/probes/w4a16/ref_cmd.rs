@@ -252,10 +252,12 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
         let mut l = eng.prefill(0, &toks[..1])?;
         let mut nll_sum = 0f64;
         let mut per_pos: Vec<f64> = Vec::with_capacity(n - 1);
+        let mut argm: Vec<Vec<f32>> = Vec::with_capacity(n - 1);
         for i in 1..n {
             let v = crate::probes::eval::nll_of(&l, toks[i]);
             nll_sum += v;
             per_pos.push(v);
+            argm.push(l.clone());
             let mut ls = eng.decode(0, &[toks[i]])?;
             l = ls.pop().ok_or("decode logits 부재")?;
             if i % 128 == 0 {
@@ -263,9 +265,15 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
             }
         }
         if let Some(p) = &nll_out {
-            let mut buf = String::from("# w4a16-ref nll dump v1\n");
+            // [2026-10-21] eval 덤프 형식(pos tgt argmax nll margin)으로 —
+            // agree가 오라클 덤프를 직접 소비(이전 v1 = pos nll 2열은 agree 불가).
+            // 주석 헤더 = w4a16-eval dump v1 동형.
+            let mut buf =
+                String::from("# w4a16-ref nll dump v2\n# cols: pos target argmax nll margin\n");
             for (i, v) in per_pos.iter().enumerate() {
-                buf.push_str(&format!("{}\t{v:.9}\n", i + 1));
+                let tgt = toks[i + 1];
+                let (am, mg) = crate::probes::eval::argmax_margin(&argm[i]);
+                buf.push_str(&format!("{}\t{tgt}\t{am}\t{v:.9}\t{mg:.9}\n", i + 1));
             }
             std::fs::write(p, buf).map_err(|e| format!("nll-out: {e}"))?;
         }
