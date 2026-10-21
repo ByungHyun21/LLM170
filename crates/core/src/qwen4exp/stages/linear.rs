@@ -175,11 +175,43 @@ pub fn forward_state(
             f2(&g_all[..h_v]),
         );
     }
+    // [v헤드 페어링 2026-10-21] FN 체크포인트 v축은 group-major(엔진 순서와
+    // 역방향) — HF v헤드 h의 k헤드 = h/G(G=h_v/h_k). 근거: FLA GVA 커널
+    // (`chunk_fwd.py` `i_h // (HV // H)`·`fused_recurrent.py` `i_h = i_hv //
+    // (HV // H)`)·qwen35 로더 계약("HF 원본 group-major — subhead-major
+    // 순열 사본 필수"). gdn_chunk_seq/gdn_ar_batch 코어는 subhead-major
+    // 페어링(h%h_k)이므로 v·beta·g를 엔진 순서로 순열해 호출하고 출력 o를
+    // 역순열한다(상태 st[h_v][d·d]는 엔진 순서로 영구 유지 — 청크·디코드
+    // 전 경로 동일 순열이라 연속성 보존). h_v==h_k이면 항등순열.
+    let g_gva = h_v / h_k;
+    let hf_of = |e: usize| g_gva * (e % h_k) + e / h_k;
+    let (mut v_sub, mut beta_sub, mut g_sub, mut o_sub) = (
+        vec![0.0f32; n_tok * v_len],
+        vec![0.0f32; n_tok * h_v],
+        vec![0.0f32; n_tok * h_v],
+        vec![0.0f32; n_tok * v_len],
+    );
+    for t in 0..n_tok {
+        for e in 0..h_v {
+            let h = hf_of(e);
+            beta_sub[t * h_v + e] = beta_all[t * h_v + h];
+            g_sub[t * h_v + e] = g_all[t * h_v + h];
+            v_sub[t * v_len + e * d..t * v_len + (e + 1) * d]
+                .copy_from_slice(&v_all[t * v_len + h * d..t * v_len + (h + 1) * d]);
+        }
+    }
     // GDN 코어 — 상태 입출(청크 경계 연속).
     let mut o_all = vec![0.0f32; n_tok * v_len];
     gdn_chunk_seq(
-        &q_all, &k_all, &v_all, &beta_all, &g_all, st, &mut o_all, n_tok, h_k, h_v,
+        &q_all, &k_all, &v_sub, &beta_sub, &g_sub, st, &mut o_sub, n_tok, h_k, h_v,
     );
+    for t in 0..n_tok {
+        for e in 0..h_v {
+            let h = hf_of(e);
+            o_all[t * v_len + h * d..t * v_len + (h + 1) * d]
+                .copy_from_slice(&o_sub[t * v_len + e * d..t * v_len + (e + 1) * d]);
+        }
+    }
 
     // norm_gated: rms_norm(o, norm[128])·게이트(config — FN=sigmoid) → out_proj.
     let gate = if cfg.output_gate_sigmoid {

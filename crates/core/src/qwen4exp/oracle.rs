@@ -144,11 +144,39 @@ impl Oracle {
             if llm170_diag::dump::opts().key("debug_layers") {
                 let ym = attn_out[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let mx = r[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                eprintln!("fn[cpu] layer {il:>2} y0max={ym:.4} attn R0max={mx:.4}");
+                let f16s = r[0]
+                    .iter()
+                    .take(12)
+                    .map(|x| format!("{x:.4}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!("fn[cpu] layer {il:>2} y0max={ym:.4} attn R0max={mx:.4} r0[..12]={f16s}");
+            }
+            if il == 0 && base == 0 && llm170_diag::dump::opts().key("r_full") {
+                let mut buf = Vec::with_capacity(r.len() * hc_n * hidden * 4);
+                for row in &r {
+                    for v in row {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                let _ = std::fs::write("/tmp/cpu_r0.bin", &buf);
             }
             // MoE 블록.
             let (block2, inj2) = hc::mix(&self.m, &format!("{lp}.mlp_hyper_connection"), &r)?;
             let ffn = moe::forward(&self.m, il, &block2)?;
+            if llm170_diag::dump::opts().key("debug_layers") {
+                let xm = block2[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let ym = ffn[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let f12: String = block2[0]
+                    .iter()
+                    .take(12)
+                    .map(|v| format!("{v:.4}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!(
+                    "fn[cpu] layer {il:>2} x2max={xm:.4} ymmax={ym:.4} x2[..12]={f12}"
+                );
+            }
             for t in 0..r.len() {
                 hc::combine_tok(
                     &mut r[t],

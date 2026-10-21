@@ -170,6 +170,7 @@ pub const ASSETS: &[Asset] = &[
             "fn_ple_conv_wb",
             "gdn_gate_sig",
             "w4a16_gemv_experts_g128_f16",
+            "w4a16_gemv_experts_g32_f16",
             "attn_qsa_part",
         ],
         boot: true,

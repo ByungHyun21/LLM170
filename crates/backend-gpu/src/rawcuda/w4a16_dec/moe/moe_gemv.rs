@@ -16,7 +16,19 @@ impl W4a16Dec {
         n: usize,
         k: usize,
     ) -> Result<(), String> {
-        let f = self.cc.function("w4a16_gemv_experts_g32_bf16")?;
+        // [FN 2026-10-21] 전문가 포맷별 커널 — FN CT는 [n][k/8] 팩 + f16
+        // 스케일(g32 — CT weight_scale [n][k/32] 실측). 35B g32·bf16은
+        // 종전 심볼. f16 비트를 bf16으로 읽으면 전문가 출력 전체 왜곡
+        // (fn-moe-check 실측: 라우터·선택 정합인데 출력 발산).
+        let sym = match (self.moe.moe_group, self.moe.moe_scale_bf16) {
+            (32, false) => "w4a16_gemv_experts_g32_f16",
+            (32, true) => "w4a16_gemv_experts_g32_bf16",
+            (128, false) => "w4a16_gemv_experts_g128_f16",
+            (g, b) => {
+                return Err(format!("gemv_experts: 미지원 포맷 group={g} bf16={b}"))
+            }
+        };
+        let f = self.cc.function(sym)?;
         let (mut p_t, mut p_b, mut p_i, mut p_ns) = (
             self.moe.moe_dev_tab,
             base as i32,

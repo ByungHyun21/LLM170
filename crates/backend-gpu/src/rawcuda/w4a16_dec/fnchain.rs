@@ -99,7 +99,10 @@ impl W4a16Dec {
         alloc(&mut self.fn_.y, t * h * 4)?;
         alloc(&mut self.fn_.inj, t * hc * 4)?;
         alloc(&mut self.fn_.ple_e, t * h * 4)?;
-        alloc(&mut self.fn_.ple_k, f32n * 4)?;
+        // [fix 2026-10-21] ple_kv 팩 GEMM 출력 = [t][hh+h](key‖value) —
+        // 종전 t·hh 할당은 value분이 인접 버퍼(ple_gd/ple_nm)를 침범해
+        // PLE 출력 폭발(ple-check gpu_max 12.7 vs cpu 0.29).
+        alloc(&mut self.fn_.ple_k, t * (hh + h) * 4)?;
         alloc(&mut self.fn_.ple_v, t * h * 4)?;
         alloc(&mut self.fn_.ple_gd, f32n * 4)?;
         alloc(&mut self.fn_.ple_nm, f32n * 4)?;
@@ -347,8 +350,9 @@ impl W4a16Dec {
                     t,
                 )?;
                 let f = self.cc.function("fn_ple_gate")?;
-                let (mut a0, mut a1) =
-                    (self.fn_.ple_k.ptr, self.fn_.ple_k.ptr + (t * hh * 4) as u64);
+                // [fix 2026-10-21] key·value 인자 모두 ple_k 베이스 — kv 팩
+                // 인터리브(행폭 12800) 인덱싱은 커널 내부(kbase·+10240).
+                let (mut a0, mut a1) = (self.fn_.ple_k.ptr, self.fn_.ple_k.ptr);
                 let (mut a2, mut a3, mut a4, mut a5, mut a6, mut a7) = (
                     self.fn_.r.ptr,
                     self.fn_.d_ple_nk,
@@ -566,7 +570,18 @@ impl W4a16Dec {
                     .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 let mx = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                eprintln!("fn[gpu] layer {il:>2} attn R0max={mx:.4}");
+                let f16s = row
+                    .iter()
+                    .take(12)
+                    .map(|x| format!("{x:.4}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if il == 0 && llm170_diag::dump::opts().key("r_full") {
+                    let mut fb = vec![0u8; t * hh * 4];
+                    // SAFETY: fb 로컬 버퍼 — d2h 대상 길이 계약.
+                    self.cc.d2h(&mut fb, self.fn_.r.ptr)?;
+                    let _ = std::fs::write("/tmp/gpu_r0.bin", &fb);
+                }
             }
             // ── MoE 블록: HC mix → MoE → HC write.
             self.fn_hc_cycle(
@@ -576,7 +591,42 @@ impl W4a16Dec {
                 &format!("blk.{il}.hc_up_m.weight"),
                 &format!("blk.{il}.hc_inj_m.weight"),
             )?;
+            let xpre = if self.debug_layers {
+                let mut b = vec![0u8; h * 4];
+                self.cc.d2h(&mut b, self.fn_.x.ptr)?;
+                Some(
+                    b.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
+                        .fold(f32::NEG_INFINITY, |a, v| a.max(v)),
+                )
+            } else {
+                None
+            };
             let y2 = self.moe_ffn_dev_t(il, self.fn_.x.ptr, t)?;
+            if self.debug_layers {
+                let mut xb = vec![0u8; h * 4];
+                self.cc.d2h(&mut xb, self.fn_.x.ptr)?;
+                let xm = xb
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+                let mut yb = vec![0u8; h * 4];
+                self.cc.d2h(&mut yb, y2)?;
+                let ym = yb
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+                eprintln!(
+                    "fn[gpu] layer {il:>2} x2pre={:.4} x2post={xm:.4} ymmax={ym:.4}",
+                    xpre.unwrap_or(0.0)
+                );
+            }
             // moe 출력 → y 버퍼 d2d(프로브급 — 이후 커널 직접 소비로 최적화).
             self.cc.d2d(self.fn_.y.ptr, y2, t * h * 4)?;
             self.fn_hc_write(t)?;
@@ -624,8 +674,100 @@ impl W4a16Dec {
         Ok(out)
     }
 
+    /// [hc-check] HC mix 0층 고립 실행 — r[t][hc·hidden] 스테이징 →
+    /// fn_hc_cycle(노름·lora·게이트·믹스) → (x[t][hidden], xn·lora·g 플랫)
+    /// d2h 반환(오라클 hc::mix 중간단계와 원소 대조용).
+    pub fn fn_hc_probe(
+        &mut self,
+        r: &[f32],
+        t: usize,
+        mlp: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let _g = self.cc.guard()?;
+        let hh = self.fn_.hc * self.hidden;
+        if r.len() != t * hh {
+            return Err(format!("fn_hc_probe: r={} != t{t}×hh{hh}", r.len()));
+        }
+        self.fn_ensure_bufs(t)?;
+        // SAFETY: r 로컬 슬라이스 유효 수명 내 바이트 뷰.
+        let rb = unsafe { std::slice::from_raw_parts(r.as_ptr() as *const u8, t * hh * 4) };
+        self.cc.h2d(self.fn_.r.ptr, rb)?;
+        let (dn, up, inj) = if mlp {
+            (
+                "blk.0.hc_dn_m.weight",
+                "blk.0.hc_up_m.weight",
+                "blk.0.hc_inj_m.weight",
+            )
+        } else {
+            (
+                "blk.0.hc_dn_a.weight",
+                "blk.0.hc_up_a.weight",
+                "blk.0.hc_inj_a.weight",
+            )
+        };
+        self.fn_hc_cycle(if mlp { 1 } else { 0 }, t, dn, up, inj)?;
+        let rd = |buf: CUdeviceptr, n: usize| -> Result<Vec<f32>, String> {
+            let mut b = vec![0u8; n * 4];
+            self.cc.d2h(&mut b, buf)?;
+            Ok(b.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect())
+        };
+        let x = rd(self.fn_.x.ptr, t * self.hidden)?;
+        let xn = rd(self.fn_.xn.ptr, t * hh)?;
+        let lora = rd(self.fn_.lora.ptr, t * self.fn_.lowrank)?;
+        let g = rd(self.fn_.g.ptr, t * hh)?;
+        let inj = rd(self.fn_.inj.ptr, t * self.fn_.hc)?;
+        Ok((x, xn, lora, g, inj))
+    }
+
+    /// [fn-moe-check] MoE 0층 고립 실행 — x[t][hidden] 스테이징 →
+    /// moe_ffn_dev_t(라우터·topk·전문가·shared) → (출력 [t][hidden],
+    /// 라우터 로짓 [t][n_exp], topk idx/wt [t][top_k]) d2h.
+    pub fn fn_moe_probe(
+        &mut self,
+        x: &[f32],
+        t: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<i32>, Vec<f32>), String> {
+        let _g = self.cc.guard()?;
+        let h = self.hidden;
+        if x.len() != t * h {
+            return Err(format!("fn_moe_probe: x={} != t{t}×h{h}", x.len()));
+        }
+        self.fn_ensure_bufs(t)?;
+        // SAFETY: x 로컬 슬라이스 유효 수명 내 바이트 뷰.
+        let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, t * h * 4) };
+        self.cc.h2d(self.fn_.x.ptr, xb)?;
+        let out = self.moe_ffn_dev_t(0, self.fn_.x.ptr, t)?;
+        let rdf = |p: CUdeviceptr, n: usize| -> Result<Vec<f32>, String> {
+            let mut b = vec![0u8; n * 4];
+            self.cc.d2h(&mut b, p)?;
+            Ok(b.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect())
+        };
+        let o = rdf(out, t * h)?;
+        let n_exp = self.moe.n_experts;
+        let tk = self.moe.top_k;
+        let rt = rdf(self.moe.drt.ptr, t * n_exp)?;
+        let mut ib = vec![0u8; t * tk * 4];
+        self.cc.d2h(&mut ib, self.moe.moe_idx)?;
+        let ix: Vec<i32> = ib
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
+            .collect();
+        let wt = rdf(self.moe.moe_wt, t * tk)?;
+        Ok((o, rt, ix, wt))
+    }
+
     /// [gdn-check] GDN 0층 고립 실행 — x[t][hidden] 스테이징 → qkv/z GEMM →
-    /// gdn 체인 → gated 출력 d2h 반환(헤드 재배치·o_proj 전).
+    /// gdn 체인 → ssm_out(o_proj) 후 [t][hidden] d2h 반환(오라클과 동일 단계).
     pub fn fn_gdn_probe(&mut self, x: &[f32], t: usize) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
         let h = self.hidden;
@@ -655,10 +797,21 @@ impl W4a16Dec {
             t,
         )?;
         let g = self.gdn_chain_dev_run(0, 0, t, self.fn_.x.ptr, self.dchain[0], self.dchain[1])?;
-        // [gated] 코어 출력(o_proj 전) — dgate = gdn 체인 gated 버퍼.
+        // [gdn-check 2026-10-21] 비교 대상 = ssm_out(o_proj)까지 — 오라클
+        // forward_state가 out_proj 후를 반환하므로 동일 단계에서 대조
+        // (이전 gated(전) vs post-o_proj(후) 비교는 0.997 max-ratio로
+        // 미묘해 보이는 무의미 대조였다 — 86760144 커밋 참조).
+        self.lin_forward(
+            true,
+            LinPath::Gemm,
+            "blk.0.ssm_out.weight",
+            g,
+            self.fn_.y.ptr,
+            t,
+        )?;
         let mut ob = vec![0u8; t * h * 4];
         // SAFETY: ob 로컬 버퍼 — d2h 대상 길이 계약.
-        self.cc.d2h(&mut ob, g)?;
+        self.cc.d2h(&mut ob, self.fn_.y.ptr)?;
         // [gdn-check 미러] 코어 입력 버퍼 행0 지문 — 오라클 core-in 대조.
         if llm170_diag::dump::opts().key("debug_layers") {
             let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
@@ -724,4 +877,106 @@ impl W4a16Dec {
         // SAFETY: ob는 vocab*4 바이트(정렬 4) — f32 뷰 재해석.
         Ok(unsafe { std::slice::from_raw_parts(ob.as_ptr() as *const f32, vocab).to_vec() })
     }
+
+    /// [ple-check] PLE 1층 고립 실행 — ple_e[t][emb]·r[t][hh] 스테이징 →
+    /// kv GEMM → gate → conv(+잔차) → r'' d2h 반환(오라클 ple::forward와
+    /// 동일 단계). gated/normed도 회수(단계 대조용).
+    pub fn fn_ple_probe(
+        &mut self,
+        ple_e: &[f32],
+        r: &[f32],
+        t: usize,
+        emb_dim: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let _g = self.cc.guard()?;
+        let hh = self.fn_.hc * self.hidden;
+        if r.len() != t * hh || ple_e.len() != t * emb_dim {
+            return Err(format!(
+                "fn_ple_probe: r={} ple_e={} (t{t}·hh{hh}·emb{emb_dim})",
+                r.len(),
+                ple_e.len()
+            ));
+        }
+        self.fn_ensure_bufs(t)?;
+        // SAFETY: 로컬 슬라이스 유효 수명 내 바이트 뷰.
+        let rb = unsafe { std::slice::from_raw_parts(r.as_ptr() as *const u8, t * hh * 4) };
+        self.cc.h2d(self.fn_.r.ptr, rb)?;
+        let eb = unsafe {
+ std::slice::from_raw_parts(ple_e.as_ptr() as *const u8, t * emb_dim * 4)
+        };
+        self.cc.h2d(self.fn_.ple_e.ptr, eb)?;
+        let hc = self.fn_.hc;
+        self.lin_forward(
+            true,
+            LinPath::Gemm,
+            "blk.1.ple_kv.weight",
+            self.fn_.ple_e.ptr,
+            self.fn_.ple_k.ptr,
+            t,
+        )?;
+        let f = self.cc.function("fn_ple_gate")?;
+        let (mut a0, mut a1) = (self.fn_.ple_k.ptr, self.fn_.ple_k.ptr);
+        let (mut a2, mut a3, mut a4, mut a5, mut a6, mut a7) = (
+            self.fn_.r.ptr,
+            self.fn_.d_ple_nk,
+            self.fn_.d_ple_nq,
+            self.fn_.d_ple_nc,
+            self.fn_.ple_gd.ptr,
+            self.fn_.ple_nm.ptr,
+        );
+        let (mut tl, mut ep) = (t as i32, self.fn_.eps);
+        self.cc.launch(
+            f,
+            t as u32,
+            hc as u32,
+            256,
+            &mut crate::rawcuda::args::l10(
+                &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
+                &mut tl, &mut ep,
+            ),
+        )?;
+        let f = self.cc.function("fn_ple_conv")?;
+        let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6) = (
+            self.fn_.ple_nm.ptr,
+            self.fn_.ple_gd.ptr,
+            self.fn_.r.ptr,
+            self.fn_.d_ple_w,
+            self.fn_.d_ple_st,
+            t as i32,
+            0i32,
+        );
+        self.cc.launch(
+            f,
+            t as u32,
+            hh.div_ceil(256) as u32,
+            256,
+            &mut crate::rawcuda::args::l7(
+                &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6,
+            ),
+        )?;
+        let rdf = |buf: CUdeviceptr, n: usize| -> Result<Vec<f32>, String> {
+            let mut b = vec![0u8; n * 4];
+            self.cc.d2h(&mut b, buf)?;
+            Ok(b.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect())
+        };
+        let h = self.hidden;
+        let r2 = rdf(self.fn_.r.ptr, t * hh)?;
+        let gd = rdf(self.fn_.ple_gd.ptr, t * hh)?;
+        let nm = rdf(self.fn_.ple_nm.ptr, t * hh)?;
+        // kv 팩 인터리브 — 토큰별 슬라이스로 모은다(행폭 hh+h).
+        let pk = rdf(self.fn_.ple_k.ptr, t * (hh + h))?;
+        let mut key = Vec::with_capacity(t * hh);
+        let mut val = Vec::with_capacity(t * h);
+        for tt in 0..t {
+            let b = tt * (hh + h);
+            key.extend_from_slice(&pk[b..b + hh]);
+            val.extend_from_slice(&pk[b + hh..b + hh + h]);
+        }
+        Ok((r2, gd, nm, key, val))
+    }
+
 }

@@ -23,6 +23,64 @@ use super::bind::Qwen4ExpCfg;
 use crate::st::{StArchive, StDtype, StEntry};
 use std::path::Path;
 
+/// 원시 포인터의 usize 보관 래퍼(병렬 클로저 캡처용) — usize 필드는
+/// Send+Sync. gdn.rs ar_pool SendPtr와 동일 패턴.
+#[derive(Clone, Copy)]
+pub(crate) struct SendPtr(usize);
+
+impl SendPtr {
+    pub(crate) fn new<T>(p: *mut T) -> Self {
+        Self(p as usize)
+    }
+    /// SAFETY: 호출자는 원 포인터의 대상 버퍼가 유효하고(스코프 조인 전
+    /// 파기 없음), 기록 영역이 유닛별 상호배타임을 보증해야 한다.
+    pub(crate) unsafe fn as_ptr<T>(&self) -> *mut T {
+        self.0 as *mut T
+    }
+}
+/// [오라클 병렬화 2026-10-21] 인덱스 범위 [0,n)을 T연속 구간으로 나눠
+/// 병렬 실행(호출 스레드가 마지막 구간 담당). **비트동일 계약**: 각 구간
+/// 내 산술은 순차 버전과 동일한 순서(행/원소 오름차순) — 분할 축이 서로
+/// 독립인 행/토큰뿐이므로 결과 비트 불변. T = min(가용 코어, n/64).
+/// 중첩 방지: 병렬 구간 안에서의 재호출은 순차 실행(TLS 플래그).
+/// 오라클(참조) 실행 시간 단축용 — 프로덕션 경로 무관.
+pub(crate) fn par_ranges<F: Fn(usize, usize) + Send + Sync>(n: usize, f: F) {
+    use std::cell::Cell;
+    std::thread_local! {
+        static IN_PAR: Cell<bool> = const { Cell::new(false) };
+    }
+    if IN_PAR.with(|x| x.get()) {
+        f(0, n);
+        return;
+    }
+    let t = std::thread::available_parallelism()
+        .map_or(1, |x| x.get())
+        .min(n.div_ceil(64))
+        .max(1);
+    if t <= 1 {
+        f(0, n);
+        return;
+    }
+    let step = n.div_ceil(t);
+    let f_ref = &f;
+    IN_PAR.with(|x| x.set(true));
+    std::thread::scope(|s| {
+        for c in 0..t {
+            let (b0, b1) = (c * step, ((c + 1) * step).min(n));
+            if b0 >= b1 {
+                continue;
+            }
+            if c == t - 1 {
+                f(b0, b1); // 마지막 구간 = 호출 스레드(스폰 1절약).
+            } else {
+                // f_ref(&F, Copy)만 이동 — f는 대여 공유(Send+Sync).
+                s.spawn(move || f_ref(b0, b1));
+            }
+        }
+    });
+    IN_PAR.with(|x| x.set(false));
+}
+
 /// gptq 그룹 크기(FN 실측 — qzeros [k/128, n/8]·scales [k/128, n]).
 const GPTQ_GROUP: usize = 128;
 
@@ -133,14 +191,34 @@ impl Model {
         }
         let d = self.slice(name)?;
         let mut y = vec![0.0f32; n];
-        for (r, yr) in y.iter_mut().enumerate() {
-            let row = &d[2 * r * k..2 * (r + 1) * k];
-            let mut acc = 0.0f64;
-            for (j, &xv) in x.iter().enumerate() {
-                let b = u16::from_le_bytes([row[2 * j], row[2 * j + 1]]);
-                acc += (f32::from_bits((b as u32) << 16)) as f64 * xv as f64;
+        // [병렬화 2026-10-21] 행분할 — 행별 f64 순차 누산 그대로(비트동일).
+        // 임계값: n*k ≥ 4M MAC(스폰 오버헤드 상쇄) 미만은 순차.
+        if n as u64 * k as u64 >= 4_000_000 {
+            let y_ptr = SendPtr::new(y.as_mut_ptr());
+            par_ranges(n, |b0, b1| {
+                // SAFETY: 행 범위 [b0,b1)은 유닛별 상호배타 — par_ranges
+                // 조인 전 y는 유효.
+                let yp = unsafe { y_ptr.as_ptr::<f32>() };
+                for r in b0..b1 {
+                    let row = &d[2 * r * k..2 * (r + 1) * k];
+                    let mut acc = 0.0f64;
+                    for (j, &xv) in x.iter().enumerate() {
+                        let b = u16::from_le_bytes([row[2 * j], row[2 * j + 1]]);
+                        acc += (f32::from_bits((b as u32) << 16)) as f64 * xv as f64;
+                    }
+                    unsafe { *yp.add(r) = acc as f32 };
+                }
+            });
+        } else {
+            for (r, yr) in y.iter_mut().enumerate() {
+                let row = &d[2 * r * k..2 * (r + 1) * k];
+                let mut acc = 0.0f64;
+                for (j, &xv) in x.iter().enumerate() {
+                    let b = u16::from_le_bytes([row[2 * j], row[2 * j + 1]]);
+                    acc += (f32::from_bits((b as u32) << 16)) as f64 * xv as f64;
+                }
+                *yr = acc as f32;
             }
-            *yr = acc as f32;
         }
         Ok(y)
     }
@@ -216,7 +294,7 @@ impl Model {
     }
 
     /// 전문가 프로젝션 전체 행 디양자화([n,k] f32 — 프로브 소형 전용).
-    pub(crate) fn expert_mat(&self, base: &str) -> Result<(Vec<Vec<f32>>, usize, usize), String> {
+    pub fn expert_mat(&self, base: &str) -> Result<(Vec<Vec<f32>>, usize, usize), String> {
         let (_, _, _, n, k) = self.expert_triple(base)?;
         let mut rows = Vec::with_capacity(n);
         for r in 0..n {

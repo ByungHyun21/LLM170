@@ -62,7 +62,10 @@ extern "C" __global__ void fn_hc_norm(const float* __restrict__ r,
         for (int j = 0; j < 10; ++j) {
             const int i = tid + j * 256;
             const float y = x[i] * rrms;
-            o[i] = y + y * wr[i];
+            // [fix 2026-10-21] w는 업로드에서 이미 +1 합성(Gemma 관례 —
+            // 업로드 +1·커널 평범 곱). 종전 y+y·w는 이중 +1(raw+2)이었다
+            // — hc-check 실측: xn 원소비가 (raw+2)/(raw+1)과 정확 일치.
+            o[i] = y * wr[i];
         }
         __syncthreads();
     }
@@ -108,11 +111,14 @@ extern "C" __global__ void fn_hc_write(float* __restrict__ r,
     const int tt = blockIdx.x;
     if (tt >= t) return;
     const int s = blockIdx.y;
-    const int i = threadIdx.x;
-    if (i >= 2560) return;
+    // [fix 2026-10-21] 스트라이드 루프 — 블록 256스레드가 2560원소 전부를
+    // 덮는다(종전 i=threadIdx.x 단발은 선두 256원소만 기록: r' 덤프 실측
+    // 원소 256번부터 전량 불일치 — 어텐션/MLP 양쪽 쓰기가 모두 부분 기록).
     const float u = inj[tt * 4 + s] * 0.25f;
     const float sc = 2.0f / (1.0f + __expf(-u));
-    r[(size_t)tt * 10240 + s * 2560 + i] += y[(size_t)tt * 2560 + i] * sc;
+    for (int i = threadIdx.x; i < 2560; i += blockDim.x) {
+        r[(size_t)tt * 10240 + s * 2560 + i] += y[(size_t)tt * 2560 + i] * sc;
+    }
 }
 
 // ── PLE(position-learning enhancement) ───────────────────────────────────
@@ -140,12 +146,16 @@ extern "C" __global__ void fn_ple_gate(const float* __restrict__ key,
     const int s = blockIdx.y;
     const int tid = threadIdx.x;
     if (tt >= t) return;
-    const size_t base = (size_t)tt * 10240 + s * 2560;
+    // [fix 2026-10-21] ple_kv 팩 GEMM 출력 = 토큰당 [key 10240|value 2560]
+    // 인터리브(행폭 12800) — key/value 모두 이 스트라이드로 읽는다(종전
+    // key=10240 스트라이드·value=키 블록 후 별도 배열 오프셋은 이중 관례
+    // 충돌로 엉뚱한 행 판독 — ple-check value 4.4배 왜곡의 원인).
+    const size_t kbase = (size_t)tt * 12800 + s * 2560; // kv 팩 판독(행폭 12800)
+    const size_t base = (size_t)tt * 10240 + s * 2560;  // r 판독·gated/normed 기록
     const size_t wb = s * 2560; // 노름 가중 스트림 오프셋
-    const float* k = key + base;
+    const float* k = key + kbase;
     const float* q = r + base;
     float kk = 0.0f, qq = 0.0f;
-    #pragma unroll
     for (int j = 0; j < 10; ++j) {
         const int i = tid + j * 256;
         const float kv = k[i], qv = q[i];
@@ -173,8 +183,9 @@ extern "C" __global__ void fn_ple_gate(const float* __restrict__ key,
     #pragma unroll
     for (int j = 0; j < 10; ++j) {
         const int i = tid + j * 256;
-        const float kn = k[i] * rk * (1.0f + nk[wb + i]);
-        const float qn = q[i] * rq * (1.0f + nq[wb + i]);
+        // [fix 2026-10-21] nk/nq는 업로드에서 +1 합성 — 평범 곱(이중 +1 제거).
+        const float kn = k[i] * rk * nk[wb + i];
+        const float qn = q[i] * rq * nq[wb + i];
         dot += kn * qn;
     }
     red[tid] = dot;
@@ -187,7 +198,7 @@ extern "C" __global__ void fn_ple_gate(const float* __restrict__ key,
     const float sign = d < 0.0f ? -1.0f : (d > 0.0f ? 1.0f : 0.0f);
     const float g = 1.0f / (1.0f + __expf(-sign * sqrtf(fmaxf(fabsf(d), 1e-6f))));
     float gg = 0.0f;
-    const float* wv = val + (size_t)tt * 2560;
+    const float* wv = val + (size_t)tt * 12800 + 10240;
     #pragma unroll
     for (int j = 0; j < 10; ++j) {
         const int i = tid + j * 256;
@@ -206,7 +217,8 @@ extern "C" __global__ void fn_ple_gate(const float* __restrict__ key,
     for (int j = 0; j < 10; ++j) {
         const int i = tid + j * 256;
         const float gv = gated[base + i];
-        normed[base + i] = gv * rg * (1.0f + nc[wb + i]);
+        // [fix 2026-10-21] nc도 업로드 +1 — 평범 곱(이중 +1 제거).
+        normed[base + i] = gv * rg * nc[wb + i];
     }
 }
 
@@ -224,10 +236,13 @@ extern "C" __global__ void fn_ple_conv(const float* __restrict__ normed,
     if (tt >= t) return;
     const int c = blockIdx.y * blockDim.x + threadIdx.x;
     if (c >= 10240) return;
+    // [fix 2026-10-21] 탭 오프셋 = t+3k−9(오라클 ple.rs conv_y 전수 —
+    // k=0이 가장 오래된 t−9, k=3이 현재). 종전 jj=t−3k는 가중-탭 짝이
+    // 반전(층1 y0 발산의 원인).
     float acc = 0.0f;
     #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        const int jj = tt - 3 * k;
+        const int jj = tt - 9 + 3 * k;
         float tap;
         if (jj >= 0) {
             tap = normed[(size_t)jj * 10240 + c];
@@ -303,11 +318,15 @@ extern "C" __global__ void gdn_gate_sig(
     }
 }
 
-// ── 전문가 g128·f16 배치 GEMV(스트리밍 mcache 간접) ──────────────────────
-// gptq4.cu w4a16_gemv_experts_g32_bf16의 g128/f16 판 — 바이트동결된
-// gptq4.cu 대신 fn.cu에 자체 포함. 행본체 산술 = gemv_row_body<7,false>
-// 미러(64레인·f64 tree64·fmaf 3-op — k 128배수 계약).
-#define FN_SCMAX 64 // k ≤ 128*64 = 8192(FN 전문가 k = 2560/640)
+// ── 전문가 배치 GEMV(스트리밍 mcache 간접) ──────────────────────────────
+// gptq4.cu w4a16_gemv_experts_g32_bf16의 FN 판들 — 바이트동결된 gptq4.cu
+// 대신 fn.cu에 자체 포함. 행본체 산술 = gemv_row_body 미러(64레인·f64
+// tree64·fmaf 3-op — k 128배수 계약).
+// [2026-10-21] g32·f16 추가 — FN CT 전문가(weight_packed [n][k/8] ·
+// weight_scale F16 [n][k/32]). 종전 g32_bf16은 f16 비트를 bf16으로 해석해
+// 전문가 출력 전체 왜곡(fn-moe-check: 라우터·선택 정합인데 출력 발산).
+#define FN_SCMAX 128 // k ≤ 32*128 = 4096(FN 전문가 k = 2560/640 → kg 80/20)
+
 
 __device__ __forceinline__ void fn_gemv_row_g128(
     const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
@@ -392,6 +411,93 @@ extern "C" __global__ void w4a16_gemv_experts_g128_f16(
     const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
     fn_gemv_row_g128((const unsigned*)e[0], (const unsigned short*)e[1],
                      x + xoff, out + (size_t)sl * n, o, k);
+}
+
+// g32·f16 행본체 — 128폭 청크는 4스케일 그룹(레인 16개씩: 그룹 4jj+(l>>4)).
+__device__ __forceinline__ void fn_gemv_row_g32_f16(
+    const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
+    const unsigned short* __restrict__ s,  // [n][k/32] f16 스케일
+    const float* __restrict__ x,           // [k] f32(원시 — 플레인 경로)
+    float* __restrict__ out, int o, int k)
+{
+    if (o < 0) return;
+    const int l = threadIdx.x;
+    __shared__ double red[64];
+    __shared__ float sc[FN_SCMAX];
+    const int k8 = k >> 3;
+    const int kg = k >> 5;
+    for (int g = l; g < kg; g += 64) {
+        sc[g] = h2f(s[(size_t)o * kg + g]);
+    }
+    __syncthreads();
+    const unsigned* qrow = q + (size_t)o * k8;
+    const int jn = k >> 7;
+    const int sh = 8 * (l & 3);
+    const int sgrp = l >> 4; // 청크 내 그룹 오프셋(16레인 = 32원소 = 1그룹)
+    float acc = 0.0f;
+    int j = 0;
+    const unsigned* qp = qrow + (l >> 2);
+    const float2* xp = reinterpret_cast<const float2*>(x) + l;
+    for (; j + 8 <= jn; j += 8) {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int jj = j + u;
+            const unsigned qw = __ldcs(qp);
+            const float2 xv = *xp;
+            const unsigned byte = (qw >> sh) & 0xFFu;
+            const float scv = sc[4 * jj + sgrp]; // g32: 청크당 4그룹
+            const float w0 = fmaf((float)(byte & 0xFu), scv, -8.0f * scv);
+            const float w1 = fmaf((float)(byte >> 4), scv, -8.0f * scv);
+            acc = fmaf(w0, xv.x, acc);
+            acc = fmaf(w1, xv.y, acc);
+            qp += 16;
+            xp += 64;
+        }
+    }
+    for (; j < jn; ++j) {
+        const unsigned qw = __ldcs(qp);
+        const float2 xv = *xp;
+        const unsigned byte = (qw >> sh) & 0xFFu;
+        const float scv = sc[4 * j + sgrp];
+        const float w0 = fmaf((float)(byte & 0xFu), scv, -8.0f * scv);
+        const float w1 = fmaf((float)(byte >> 4), scv, -8.0f * scv);
+        acc = fmaf(w0, xv.x, acc);
+        acc = fmaf(w1, xv.y, acc);
+        qp += 16;
+        xp += 64;
+    }
+    red[l] = (double)acc;
+    __syncthreads();
+    if (l < 32) {
+        double r = red[l] + red[l + 32];
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(r, off);
+            if (l < off) {
+                r += oth;
+            }
+        }
+        if (l == 0) {
+            out[o] = (float)r;
+        }
+    }
+}
+
+extern "C" __global__ void w4a16_gemv_experts_g32_f16(
+    const unsigned long long* __restrict__ tab, int base,
+    const int* __restrict__ idx, int nslots,
+    const float* __restrict__ x, int xstride, int sp,
+    float* __restrict__ out, int n, int k)
+{
+    const int sl = blockIdx.x / n;
+    if (sl >= nslots) {
+        return;
+    }
+    const int o = blockIdx.x - sl * n;
+    const unsigned long long* e = tab + (size_t)(base + idx[sl] * 3) * 2;
+    const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
+    fn_gemv_row_g32_f16((const unsigned*)e[0], (const unsigned short*)e[1],
+                        x + xoff, out + (size_t)sl * n, o, k);
 }
 
 

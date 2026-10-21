@@ -420,7 +420,12 @@ impl W4a16Dec {
         // 스테이징)와는 수치 클래스 상이 — eval chunk4 A/B: en PPL +0.1697%·
         // agree 98.566% / ko +0.0091%·97.337%(밴드: int8 KV 채택 이력보다 작음).
         // t≥9(프리필)는 종전 grp2 유지.
-        let group = t > 8 && n_exp <= 1024;
+        // [잠복③ 해소 2026-10-21] marlin-only 상주(moe_resident)는 raw GEMV
+        // 간접 테이블이 0패딩(스테이징 없음)이므로 t≤8도 그룹(마린) 경로로
+        // 강제 — FN 골든 브링업 t=5 프리필에서 전문가 출력 0(층0 MoE 후
+        // R0 0.16 vs 오라클 0.35)이 이 갈래였다. 수치 클래스 = 마린 f16
+        // (청크 t>8과 동일 — 클래스 일관성 향상), 게이트 = 골든·eval.
+        let group = (t > 8 || self.moe.moe_resident) && n_exp <= 1024;
         // [2026-10-19] 마린 MoE 시도(상주 전용) — **정렬(align2)이 공통 전제**라
         // 먼저 수행하고 마린을 시도한다(미가용 시 레거시 grp2/d64 폴백).
         let mut marlin_done = false;

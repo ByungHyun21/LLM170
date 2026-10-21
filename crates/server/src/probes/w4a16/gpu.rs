@@ -401,10 +401,20 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
     // [QSA] --qsa — 인덱서 선택 집합 경로(오라클 대조 골든화).
     let qsa = args.iter().any(|x| x == "--qsa");
     // [gdn-check] GDN 0층 고립 대조 — 동일 x(호스트 HC mix)로 오라클·GPU 출력 비교.
+    // [hc-check] HC mix 0층 고립 대조 — 동일 r(임베딩×hc)로 오라클·GPU x 비교.
     let gdn_check = args.iter().any(|x| x == "--gdn-check");
+    let hc_check = args.iter().any(|x| x == "--hc-check");
+    let fn_moe_check = args.iter().any(|x| x == "--fn-moe-check");
+    let ple_check = args.iter().any(|x| x == "--ple-check");
     let rest: Vec<String> = rest
         .into_iter()
-        .filter(|x| x != "--qsa" && x != "--gdn-check")
+        .filter(|x| {
+            x != "--qsa"
+                && x != "--gdn-check"
+                && x != "--hc-check"
+                && x != "--fn-moe-check"
+                && x != "--ple-check"
+        })
         .collect();
     let a = parse_args(&rest)?;
     if a.prompts.is_empty() {
@@ -457,6 +467,344 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
     let upload_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     // [gdn-check] 0층 GDN 고립 대조 — x = 호스트 HC mix(오라클 코드) 동일 입력.
+    // [hc-check] 0층 HC mix 고립 대조 — r = embed×hc(오라클과 동일) →
+    // 오라클 hc::mix block_in vs GPU fn_hc_cycle x.
+    if hc_check {
+        use llm170_core::qwen4exp::stages::hc::{self, gate_mean_tok, hc_norm_tok};
+        let t = 5usize;
+        let prompt5: Vec<u32> = prompt.iter().take(t).copied().collect();
+        let emb = m.embed(&prompt5)?;
+        let rs: Vec<Vec<f32>> = emb.iter().map(|e| e.repeat(cfg.hc_count)).collect();
+        let r_flat: Vec<f32> = rs.iter().flatten().copied().collect();
+        let (h, hc_n) = (cfg.hidden_size, cfg.hc_count);
+        let cmp = |name: &str, cpu: &[f32], gpu: &[f32]| -> String {
+            let (mut d, mut c, mut g) = (0f32, 0f32, 0f32);
+            for (&a, &b) in cpu.iter().zip(gpu.iter()) {
+                d = d.max((a - b).abs());
+                c = c.max(a.abs());
+                g = g.max(b.abs());
+            }
+            format!("{name} max|Δ|={d:.6} cpu_max={c:.4} gpu_max={g:.4}")
+        };
+        let mut lines = Vec::new();
+        for mlp in [false, true] {
+            let lp0 = if mlp {
+                "model.language_model.layers.0.mlp_hyper_connection"
+            } else {
+                "model.language_model.layers.0.attn_hyper_connection"
+            };
+            // 오라클 중간단계(노름→down→silu(/hc)→up→믹스).
+            let w = m.norm_vec(&format!("{lp0}.hc_norm.weight"))?;
+            let mut xns = Vec::with_capacity(t);
+            for rt in &rs {
+                xns.push(hc_norm_tok(rt, hc_n, h, &w, m.eps));
+            }
+            let mut loras = Vec::with_capacity(t);
+            for xn in &xns {
+                let down = m.matvec_bf16(&format!("{lp0}.input_mix_weight_down.weight"), xn)?;
+                loras.push(
+                    down.iter()
+                        .map(|v| llm170_core::ops::silu(v / hc_n as f32))
+                        .collect::<Vec<f32>>(),
+                );
+            }
+            let mut gs = Vec::with_capacity(t);
+            for lora in &loras {
+                gs.push(m.matvec_bf16(&format!("{lp0}.input_mix_weight_up.weight"), lora)?);
+            }
+            let cpu_x: Vec<Vec<f32>> = xns
+                .iter()
+                .zip(gs.iter())
+                .map(|(xn, g)| gate_mean_tok(xn, g, hc_n, h))
+                .collect();
+            let (gx, gxn, glora, gg, ginj) = dec.fn_hc_probe(&r_flat, t, mlp)?;
+            let cpu_xn: Vec<f32> = xns.iter().flatten().copied().collect();
+            let cpu_lora: Vec<f32> = loras.iter().flatten().copied().collect();
+            let cpu_g: Vec<f32> = gs.iter().flatten().copied().collect();
+            let cpu_xf: Vec<f32> = cpu_x.iter().flatten().copied().collect();
+            let mut cpu_inj = Vec::with_capacity(t * hc_n);
+            for xn in &xns {
+                let ij = m.matvec_bf16(&format!("{lp0}.block_inject_weight.weight"), xn)?;
+                cpu_inj.extend(ij);
+            }
+            let tag = if mlp { "mlp" } else { "attn" };
+            lines.push(format!(
+                "[{tag}] {}\n  {}\n  {}\n  {}\n  {}",
+                cmp("xn  ", &cpu_xn, &gxn),
+                cmp("lora", &cpu_lora, &glora),
+                cmp("g   ", &cpu_g, &gg),
+                cmp("x   ", &cpu_xf, &gx),
+                cmp("inj ", &cpu_inj, &ginj),
+            ));
+        }
+        // [r' 고립 2026-10-21] 체인 재현입력 — 오라클 어텐션 블록(GDN 0층)을
+        // 적용한 r'로 mlp mix를 양측 비산(체인 x2 발산 재현 시도).
+        {
+            use llm170_core::qwen4exp::stages::linear;
+            let (block, inj) = hc::mix(
+                &m,
+                "model.language_model.layers.0.attn_hyper_connection",
+                &rs,
+            )?;
+            let qkv_n = m
+                .ent("model.language_model.layers.0.linear_attn.in_proj_qkv.weight")?
+                .shape[0] as usize;
+            let mut conv0 = Vec::new();
+            let mut st0 = vec![0.0f32; cfg.linear_value_heads * cfg.linear_head_dim * cfg.linear_head_dim];
+            let attn = linear::forward_state(&m, 0, &block, &mut conv0, &mut st0, qkv_n)?;
+            let y0m = attn[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let bx = block[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            eprintln!("[r'-mid] attn x0max={bx:.4} y0max={y0m:.4}");
+            let mut rp: Vec<Vec<f32>> = rs.clone();
+            for tt in 0..t {
+                hc::combine_tok(
+                    &mut rp[tt],
+                    &attn[tt],
+                    &inj[tt * cfg.hc_count..(tt + 1) * cfg.hc_count],
+                    cfg.hc_count,
+                    cfg.hidden_size,
+                );
+            }
+            let rpm = rp[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            eprintln!("[r'-mid] rp0max={rpm:.4}");
+            let (cx2, _ci2) = hc::mix(
+                &m,
+                "model.language_model.layers.0.mlp_hyper_connection",
+                &rp,
+            )?;
+            let rp_flat: Vec<f32> = rp.iter().flatten().copied().collect();
+            let (gx2, _xn, _lo, _g, _ij) = dec.fn_hc_probe(&rp_flat, t, true)?;
+            let c2f: Vec<f32> = cx2.iter().flatten().copied().collect();
+            lines.push(format!(
+                "[r'] x {}",
+                cmp("x2", &c2f, &gx2)
+            ));
+        }
+        return Ok(format!("[hc-check] t={t}\n{}\n{}\n{}", lines[0], lines[1], lines[2]));
+    }
+
+    // [ple-check] 1층 PLE 고립 대조 — r' = 오라클 0층 어텐션 후 상태,
+    // ple_e = 호스트 게더(gather_emb — 양측 동일 코드).
+    if ple_check {
+        use llm170_core::qwen4exp::stages::hc;
+        use llm170_core::qwen4exp::stages::linear;
+        use llm170_core::qwen4exp::stages::ple;
+        let t = 5usize;
+        let prompt5: Vec<u32> = prompt.iter().take(t).copied().collect();
+        let emb = m.embed(&prompt5)?;
+        let rs: Vec<Vec<f32>> = emb.iter().map(|e| e.repeat(cfg.hc_count)).collect();
+        let (block, inj) = hc::mix(
+            &m,
+            "model.language_model.layers.0.attn_hyper_connection",
+            &rs,
+        )?;
+        let qkv_n = m
+            .ent("model.language_model.layers.0.linear_attn.in_proj_qkv.weight")?
+            .shape[0] as usize;
+        let mut conv0 = Vec::new();
+        let mut st0 =
+            vec![0.0f32; cfg.linear_value_heads * cfg.linear_head_dim * cfg.linear_head_dim];
+        let attn = linear::forward_state(&m, 0, &block, &mut conv0, &mut st0, qkv_n)?;
+        let mut rp: Vec<Vec<f32>> = rs.clone();
+        for tt in 0..t {
+            hc::combine_tok(
+                &mut rp[tt],
+                &attn[tt],
+                &inj[tt * cfg.hc_count..(tt + 1) * cfg.hc_count],
+                cfg.hc_count,
+                cfg.hidden_size,
+            );
+        }
+        // 오라클 PLE — rp 사본에 적용.
+        let mut rpo = rp.clone();
+        let mut pst = ple::PleState::new(cfg.hc_count * cfg.hidden_size);
+        ple::forward(&m, 1, &prompt5, 0, &mut rpo, &mut pst)?;
+        // GPU PLE — 동일 rp + 호스트 게더(동일 gather_emb).
+        let pe = ple::gather_emb(&m, &prompt5, 0)?;
+        let pe_flat: Vec<f32> = pe.iter().flatten().copied().collect();
+        let rp_flat: Vec<f32> = rp.iter().flatten().copied().collect();
+        let (gr2, ggd, gnm, gkey, gval) =
+            dec.fn_ple_probe(&pe_flat, &rp_flat, t, cfg.ple_embed_dim)?;
+        // 오라클 중간단계 — key/value(kv matvec)·gated·normed(ple ③ 전수).
+        let lp1 = "model.language_model.layers.1.ple";
+        let mut ckey = Vec::with_capacity(t * cfg.hc_count * cfg.hidden_size);
+        let mut cval = Vec::with_capacity(t * cfg.hidden_size);
+        for row in &pe {
+            ckey.extend(m.matvec_bf16(&format!("{lp1}.key_proj.weight"), row)?);
+            cval.extend(m.matvec_bf16(&format!("{lp1}.value_proj.weight"), row)?);
+        }
+        let nk = m.norm_vec(&format!("{lp1}.norm_key.weight"))?;
+        let nq = m.norm_vec(&format!("{lp1}.norm_query.weight"))?;
+        let nc = m.norm_vec(&format!("{lp1}.norm_conv.weight"))?;
+        let (hdim, hc_n) = (cfg.hidden_size, cfg.hc_count);
+        let mut cgd = vec![0.0f32; t * hc_n * hdim];
+        let mut cnm = vec![0.0f32; t * hc_n * hdim];
+        for tt in 0..t {
+            for s in 0..hc_n {
+                let b = s * hdim;
+                let k_n = llm170_core::ops::rms_norm(
+                    &ckey[tt * hc_n * hdim + b..tt * hc_n * hdim + b + hdim],
+                    &nk[b..b + hdim],
+                    m.eps,
+                );
+                let q_n = llm170_core::ops::rms_norm(&rp[tt][b..b + hdim], &nq[b..b + hdim], m.eps);
+                let mut dot = 0.0f64;
+                for i in 0..hdim {
+                    dot += k_n[i] as f64 * q_n[i] as f64;
+                }
+                let d = (dot as f32) / (hdim as f32).sqrt();
+                let sign = if d > 0.0 {
+                    1.0
+                } else if d < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+                let g = llm170_core::ops::sigmoid(sign * d.abs().max(1e-6).sqrt());
+                let ob = tt * hc_n * hdim + b;
+                for i in 0..hdim {
+                    cgd[ob + i] = g * cval[tt * hdim + i];
+                }
+                let nn =
+                    llm170_core::ops::rms_norm(&cgd[ob..ob + hdim], &nc[b..b + hdim], m.eps);
+                cnm[ob..ob + hdim].copy_from_slice(&nn);
+            }
+        }
+        let cmp = |name: &str, cpu: &[f32], gpu: &[f32]| -> String {
+            let (mut d, mut c, mut g) = (0f32, 0f32, 0f32);
+            for (&a, &b) in cpu.iter().zip(gpu.iter()) {
+                d = d.max((a - b).abs());
+                c = c.max(a.abs());
+                g = g.max(b.abs());
+            }
+            format!("{name} max|Δ|={d:.6} cpu_max={c:.4} gpu_max={g:.4}")
+        };
+        let cpu_r2: Vec<f32> = rpo.iter().flatten().copied().collect();
+        return Ok(format!(
+            "[ple-check] t={t}\n  key {}\n  val {}\n  gd {}\n  nm {}\n  r'' {}",
+            cmp("key", &ckey, &gkey),
+            cmp("val", &cval, &gval),
+            cmp("gd", &cgd, &ggd),
+            cmp("nm", &cnm, &gnm),
+            cmp("r2", &cpu_r2, &gr2),
+        ));
+    }
+
+    // [fn-moe-check] 0층 MoE 고립 대조 — x = 오라클 mlp HC mix block_in.
+    if fn_moe_check {
+        use llm170_core::qwen4exp::stages::{hc, moe};
+        let t = 5usize;
+        let prompt5: Vec<u32> = prompt.iter().take(t).copied().collect();
+        let emb = m.embed(&prompt5)?;
+        let rs: Vec<Vec<f32>> = emb.iter().map(|e| e.repeat(cfg.hc_count)).collect();
+        let (xs, _inj) = hc::mix(
+            &m,
+            "model.language_model.layers.0.mlp_hyper_connection",
+            &rs,
+        )?;
+        let cpu = moe::forward(&m, 0, &xs)?;
+        let x_flat: Vec<f32> = xs.iter().flatten().copied().collect();
+        let (g, grt, gix, gwt) = dec.fn_moe_probe(&x_flat, t)?;
+        let mut d = 0f32;
+        let mut cm = 0f32;
+        let mut gm = 0f32;
+        for tt in 0..t {
+            for i in 0..cfg.hidden_size {
+                d = d.max((cpu[tt][i] - g[tt * cfg.hidden_size + i]).abs());
+                cm = cm.max(cpu[tt][i].abs());
+                gm = gm.max(g[tt * cfg.hidden_size + i].abs());
+            }
+        }
+        // 라우터·선택 대조(오라클 select_topk — 같은 로짓이면 같은 집합).
+        let crt: Vec<f32> = (0..t)
+            .map(|tt| {
+                m.matvec_bf16("model.language_model.layers.0.mlp.gate.weight", &xs[tt])
+                    .unwrap()
+            })
+            .flatten()
+            .collect();
+        let (mut rtd, mut rtm) = (0f32, 0f32);
+        for (&a, &b) in crt.iter().zip(grt.iter()) {
+            rtd = rtd.max((a - b).abs());
+            rtm = rtm.max(a.abs().max(b.abs()));
+        }
+        use llm170_core::qwen35::stages::select_topk;
+        let sel0 = select_topk(&crt[..cfg.n_experts], cfg.top_k);
+        let gpu_sel0: Vec<(i32, f32)> = (0..cfg.top_k)
+            .map(|k| (gix[k], gwt[k]))
+            .collect();
+        let f8 = |v: &[f32]| -> String {
+            v.iter()
+                .take(8)
+                .map(|x| format!("{x:.4}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let sel_s = |s: &[(usize, f32)]| -> String {
+            s.iter()
+                .map(|(e, w)| format!("{e}:{w:.3}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let sel_s2 = |s: &[(i32, f32)]| -> String {
+            s.iter()
+                .map(|(e, w)| format!("{e}:{w:.3}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // 전문가합(shared 제외) 고립 — GPU 출력에서 shared 기여를 분리한다:
+        let ddot = |a: &[f32], b: &[f32]| -> f32 {
+            let mut acc = 0.0f64;
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                acc += x as f64 * y as f64;
+            }
+            acc as f32
+        };
+        let mut exp_only = vec![vec![0.0f32; cfg.hidden_size]; t];
+        for tt in 0..t {
+            let logits = m.matvec_bf16("model.language_model.layers.0.mlp.gate.weight", &xs[tt])?;
+            let sel = select_topk(&logits, cfg.top_k);
+            for &(e, w) in &sel {
+                let gw = m
+                    .expert_mat(&format!(
+                        "model.language_model.layers.0.mlp.experts.{e}.gate_proj"
+                    ))
+                    .unwrap();
+                let uw = m
+                    .expert_mat(&format!(
+                        "model.language_model.layers.0.mlp.experts.{e}.up_proj"
+                    ))
+                    .unwrap();
+                let mut hh = vec![0.0f32; gw.1];
+                for (r, row) in gw.0.iter().enumerate() {
+                    hh[r] = llm170_core::ops::silu(ddot(row, &xs[tt])) * ddot(&uw.0[r], &xs[tt]);
+                }
+                let dw = m
+                    .expert_mat(&format!(
+                        "model.language_model.layers.0.mlp.experts.{e}.down_proj"
+                    ))
+                    .unwrap();
+                for (r, row) in dw.0.iter().enumerate() {
+                    exp_only[tt][r] += w * ddot(row, &hh);
+                }
+            }
+        }
+        let (mut ed, mut ecm) = (0f32, 0f32);
+        for tt in 0..t {
+            for i in 0..cfg.hidden_size {
+                ed = ed.max((exp_only[tt][i] - g[tt * cfg.hidden_size + i]).abs());
+                ecm = ecm.max(exp_only[tt][i].abs());
+            }
+        }
+        return Ok(format!(
+            "[fn-moe-check] t={t} max|cpu-gpu|={d:.6} cpu_max={cm:.4} gpu_max={gm:.4}\n  router max|Δ|={rtd:.6} max={rtm:.4}\n  expert-only max|Δ|={ed:.6} expert_max={ecm:.4}\n  cpu sel0: {}\n  gpu sel0: {}\n  cpu0[0..8]={}\n  gpu0[0..8]={}",
+            sel_s(&sel0),
+            sel_s2(&gpu_sel0),
+            f8(&cpu[0]),
+            f8(&g),
+        ));
+    }
+
     if gdn_check {
         use llm170_core::qwen4exp::stages::hc::{gate_mean_tok, hc_norm_tok};
         use llm170_core::qwen4exp::stages::linear;
@@ -492,7 +840,7 @@ fn gpu_run_fn(args: &[String]) -> Result<String, String> {
         // GPU — 동일 x로 백엔드 고립 헬퍼.
         let x_flat: Vec<f32> = xs.iter().flatten().copied().collect();
         let y = dec.fn_gdn_probe(&x_flat, t)?;
-        // 대조 — gated(헤드 재배치 후 o_proj 전).
+        // 대조 — ssm_out(o_proj) 후 [t][hidden] 양측 동일 단계(오라클 반환값).
         let mut mx_diff = 0f32;
         let mut cx = 0f32;
         let mut gx = 0f32;

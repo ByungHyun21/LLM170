@@ -16,7 +16,7 @@ use crate::qwen35::{mm_batch, mm_group};
 /// 라우터 로짓 → softmax(전문가 전체) → top-k → 재정규화 — (전문가, 가중)
 /// 내림차순. 결정적(동률 = 낮은 인덱스). backend-gpu `moe_topk`(배치 경로)가
 /// 같은 시맨틱을 미러한다(크레이트 의존 방향 제약 — 변경 시 동시 갱신).
-pub(crate) fn select_topk(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+pub fn select_topk(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     let n = logits.len();
     let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut p = vec![0.0f32; n];

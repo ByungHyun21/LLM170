@@ -8,6 +8,9 @@ pub(crate) mod moe;
 pub(crate) use attn::attn_layer;
 pub(crate) use gdn::gdn_layer;
 pub(crate) use moe::moe_ffn;
+// [fn-moe-check 2026-10-21] 라우팅 미러 공개 — GPU topk 대조 프로브가
+// 오라클과 동일한 선택 산출에 쓴다(softmax→k라운드→재정규화).
+pub use moe::select_topk;
 
 /// 스테이지 실행 컨텍스트 — 모델 뷰(불변).
 pub struct Ctx<'a> {
