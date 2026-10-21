@@ -142,14 +142,7 @@ impl W4a16Dec {
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|c| {
-                    let b = u16::from_le_bytes(*c);
-                    if scale_bf16 {
-                        llm170_core::quant::deq::bf16_to_f32(b)
-                    } else {
-                        llm170_core::quant::deq::half_to_f32(b)
-                    }
-                })
+                .map(|c| Self::scale_bits_to_f32(u16::from_le_bytes(*c), scale_bf16))
                 .collect();
             let so: Vec<u8> = match llm170_core::marlin::marlin_permute_scales(&sf, n, k, group) {
                 Ok(pf) => {
@@ -1240,6 +1233,17 @@ impl W4a16Dec {
         self.register_moe_resident(dev_tab, experts_bytes)
     }
 
+    /// [FN PP2 2026-10-21] 2바이트 스케일 디코드 — `set_moe`가 선언한 dtype 계약.
+    /// FN CT 전문가 = F16 g32(repack 비트 전치), 35B/gemma4 = BF16. 마린 경로가
+    /// bf16 고정 해석으로 F16 비트를 지수 재해석하던 버그의 단일 분기점.
+    fn scale_bits_to_f32(b: u16, scale_bf16: bool) -> f32 {
+        if scale_bf16 {
+            llm170_core::quant::deq::bf16_to_f32(b)
+        } else {
+            llm170_core::quant::deq::half_to_f32(b)
+        }
+    }
+
     /// f32 → f16 비트(RNE) — 마린 스케일 변환용(bf16→f32→f16 — bf16 값은 정확).
     fn f32_to_f16_bits(v: f32) -> u16 {
         let x = v.to_bits();
@@ -1557,13 +1561,17 @@ impl W4a16Dec {
             }
             Ok(b)
         };
+        // [FN PP2 2026-10-21] 스케일 dtype = set_moe 계약(FN CT = F16 g32,
+        // 35B/gemma4 = BF16). 종전 bf16 고정 해석은 F16 비트를 재해석해
+        // PP2 마린-단독 상주 값이 틀렸다 — dense 마린 경로와 동일 분기.
+        let scale_bf16 = self.moe.moe_scale_bf16;
         let perm16 = |sb: &[u8], n: usize, k: usize, gs: usize| -> Result<Vec<u8>, String> {
             let g = k / gs;
             let sf: Vec<f32> = sb
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .map(|c| Self::scale_bits_to_f32(u16::from_le_bytes(*c), scale_bf16))
                 .collect();
             let pf = llm170_core::marlin::marlin_permute_scales(&sf, n, k, gs)?;
             let mut out = vec![0u8; g * n * 2];
@@ -2159,5 +2167,15 @@ mod tests {
             W4a16Dec::kv_block_addr(bv, bh, 3, stride, 4),
             0x1_0000 + 3 * 0x100
         );
+    }
+
+    /// [FN PP2 2026-10-21] 마린 스케일 dtype 분기 — F16/BF16 비트를 각각
+    /// 올바르게 f32로 디코드한다(교차 해석 가드). 0.5 = F16 0x3800 / BF16 0x3F00.
+    #[test]
+    fn marlin_scale_dtype_branch() {
+        assert_eq!(W4a16Dec::scale_bits_to_f32(0x3800, false), 0.5);
+        assert_eq!(W4a16Dec::scale_bits_to_f32(0x3F00, true), 0.5);
+        assert!((W4a16Dec::scale_bits_to_f32(0x3800, true) - 0.5).abs() > 1e-3);
+        assert!((W4a16Dec::scale_bits_to_f32(0x3F00, false) - 0.5).abs() > 1e-3);
     }
 }
