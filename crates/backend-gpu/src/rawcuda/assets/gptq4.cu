@@ -172,6 +172,125 @@ __device__ __forceinline__ void gemv_row_body(
     }
 }
 
+// [35B experts 2026-10-21] gate+up 2행 동시 GEMV — 한 루프에서 두 행을
+// 누산해 x 판독 1회·전역 왕복(act 슬롯) 제거. 행별 fmaf 순서는
+// gemv_row_body와 동일(게이트/업 각 누산 사슬 불변 → act 골든 동일).
+// 스케일은 행별 두 배열(scg/scu), 환원은 red 재사용(게이트→업).
+// GELU=false silu(35B), true gelu_tanh(gemma4) — 활성식도 종전과 동일.
+template <int SHIFT, bool BF16, bool GELU>
+__device__ __forceinline__ void gemv_row_pair_body(
+    const unsigned* __restrict__ qg, const unsigned short* __restrict__ sg,
+    const unsigned* __restrict__ qu, const unsigned short* __restrict__ su,
+    const float* __restrict__ x, float* __restrict__ out, int o, int k)
+{
+    if (o < 0) {
+        return;
+    }
+    const int l = threadIdx.x;
+    __shared__ double red[G4_LANES];
+    __shared__ float scg[G4_SCMAX];
+    __shared__ float scu[G4_SCMAX];
+    const int k8 = k >> 3;
+    const int kg = k >> SHIFT;
+    for (int g = l; g < kg; g += G4_LANES) {
+        scg[g] = ld_scale<BF16>(sg + (size_t)o * kg, g);
+        scu[g] = ld_scale<BF16>(su + (size_t)o * kg, g);
+    }
+    __syncthreads();
+    const unsigned* qgp = qg + (size_t)o * k8 + (l >> 2);
+    const unsigned* qup = qu + (size_t)o * k8 + (l >> 2);
+    const int jn = k >> 7;
+    const int sh = 8 * (l & 3);
+    float accg = 0.0f;
+    float accu = 0.0f;
+    int j = 0;
+    const float2* xp = reinterpret_cast<const float2*>(x) + l;
+    for (; j + 8 <= jn; j += 8) {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int jj = j + u;
+            const unsigned qwg = __ldcs(qgp);
+            const unsigned qwu = __ldcs(qup);
+            const float2 xv = *xp;
+            const unsigned bg = (qwg >> sh) & 0xFFu;
+            const unsigned bu = (qwu >> sh) & 0xFFu;
+            const float scgv = scg[sidx2<SHIFT>(l, jj)];
+            const float scuv = scu[sidx2<SHIFT>(l, jj)];
+            const float wg0 = fmaf((float)(bg & 0xFu), scgv, -8.0f * scgv);
+            const float wg1 = fmaf((float)(bg >> 4), scgv, -8.0f * scgv);
+            const float wu0 = fmaf((float)(bu & 0xFu), scuv, -8.0f * scuv);
+            const float wu1 = fmaf((float)(bu >> 4), scuv, -8.0f * scuv);
+            accg = fmaf(wg0, xv.x, accg);
+            accg = fmaf(wg1, xv.y, accg);
+            accu = fmaf(wu0, xv.x, accu);
+            accu = fmaf(wu1, xv.y, accu);
+            qgp += 16;
+            qup += 16;
+            xp += 64;
+        }
+    }
+    for (; j < jn; ++j) {
+        const unsigned qwg = __ldcs(qgp);
+        const unsigned qwu = __ldcs(qup);
+        const float2 xv = *xp;
+        const unsigned bg = (qwg >> sh) & 0xFFu;
+        const unsigned bu = (qwu >> sh) & 0xFFu;
+        const float scgv = scg[sidx2<SHIFT>(l, j)];
+        const float scuv = scu[sidx2<SHIFT>(l, j)];
+        const float wg0 = fmaf((float)(bg & 0xFu), scgv, -8.0f * scgv);
+        const float wg1 = fmaf((float)(bg >> 4), scgv, -8.0f * scgv);
+        const float wu0 = fmaf((float)(bu & 0xFu), scuv, -8.0f * scuv);
+        const float wu1 = fmaf((float)(bu >> 4), scuv, -8.0f * scuv);
+        accg = fmaf(wg0, xv.x, accg);
+        accg = fmaf(wg1, xv.y, accg);
+        accu = fmaf(wu0, xv.x, accu);
+        accu = fmaf(wu1, xv.y, accu);
+        qgp += 16;
+        qup += 16;
+        xp += 64;
+    }
+    red[l] = (double)accg;
+    __syncthreads();
+    float g = 0.0f;
+    if (l < 32) {
+        double r = red[l] + red[l + 32];
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(r, off);
+            if (l < off) {
+                r += oth;
+            }
+        }
+        if (l == 0) {
+            g = (float)r;
+        }
+    }
+    __syncthreads();
+    red[l] = (double)accu;
+    __syncthreads();
+    if (l < 32) {
+        double r = red[l] + red[l + 32];
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+            const double oth = shfl_down_f64(r, off);
+            if (l < off) {
+                r += oth;
+            }
+        }
+        if (l == 0) {
+            const float u = (float)r;
+            float a;
+            if constexpr (GELU) {
+                const float x3 = g * g * g;
+                a = (0.5f * g * (1.0f + tanhf(0.7978846f * (g + 0.044715f * x3)))) * u;
+            } else {
+                a = (g / (1.0f + __expf(-g))) * u;
+            }
+            out[o] = a;
+        }
+    }
+}
+
 template <int SHIFT, bool BF16>
 __device__ __forceinline__ void gemv_body(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
@@ -315,18 +434,13 @@ extern "C" __global__ void w4a16_gemv_experts_glu(
     const unsigned long long* eu = tab + (size_t)(base + 1 + idx[sl] * 3) * 2;
     const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
     float* slot = act + (size_t)sl * n;
-    gemv_row_body<5, true>((const unsigned*)eg[0], (const unsigned short*)eg[1],
-                           x + xoff, slot, o, k);
-    __syncthreads();
-    const float g = slot[o];
-    gemv_row_body<5, true>((const unsigned*)eu[0], (const unsigned short*)eu[1],
-                           x + xoff, slot, o, k);
-    __syncthreads();
-    const float u = slot[o];
-    if (threadIdx.x == 0) {
-        const float e = __expf(-g);
-        slot[o] = (g / (1.0f + e)) * u;
-    }
+    // [35B experts 2026-10-21] gate/up 한 루프 동시 누산 — x 1회 판독,
+    // 게이트 결과는 전역 슬롯 왕복 없이 lane0 레지스터로 전달(행별 fmaf
+    // 순서 불변). act 골든 동일.
+    gemv_row_pair_body<5, true, false>(
+        (const unsigned*)eg[0], (const unsigned short*)eg[1],
+        (const unsigned*)eu[0], (const unsigned short*)eu[1], x + xoff, slot, o,
+        k);
 }
 
 // [gemma4 P2 2026-10-14] 전문가 gate+up+활성 융합 — gelu_tanh판.
@@ -348,18 +462,12 @@ extern "C" __global__ void w4a16_gemv_experts_glu_gelu(
     const unsigned long long* eu = tab + (size_t)(base + 1 + idx[sl] * 3) * 2;
     const size_t xoff = (size_t)(sl / (sp > 0 ? sp : 1)) * (size_t)xstride;
     float* slot = act + (size_t)sl * n;
-    gemv_row_body<5, true>((const unsigned*)eg[0], (const unsigned short*)eg[1],
-                           x + xoff, slot, o, k);
-    __syncthreads();
-    const float g = slot[o];
-    gemv_row_body<5, true>((const unsigned*)eu[0], (const unsigned short*)eu[1],
-                           x + xoff, slot, o, k);
-    __syncthreads();
-    const float u = slot[o];
-    if (threadIdx.x == 0) {
-        const float x3 = g * g * g;
-        slot[o] = (0.5f * g * (1.0f + tanhf(0.7978846f * (g + 0.044715f * x3)))) * u;
-    }
+    // [35B experts 2026-10-21] gate/up 한 루프 동시 누산 — silu판과 동일
+    // 구조, 활성식만 gelu_tanh(종전과 동일식).
+    gemv_row_pair_body<5, true, true>(
+        (const unsigned*)eg[0], (const unsigned short*)eg[1],
+        (const unsigned*)eu[0], (const unsigned short*)eu[1], x + xoff, slot, o,
+        k);
 }
 
 // t=1 GEMV 래퍼 — g128·f16(27B) / g32·bf16(35B 전문가).
