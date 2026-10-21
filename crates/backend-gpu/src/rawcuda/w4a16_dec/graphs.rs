@@ -511,7 +511,7 @@ impl W4a16Dec {
         if self.head_w == 0 {
             return Err("prefill_logits: head 미등록 — upload_head 선행".into());
         }
-        self.chain_t(slot, rows, t, true, true, true)
+        self.chain_t(slot, rows, t, true, true, true, false)
     }
 
     /// 1토큰 forward + GPU head — xn 판독 없이 로짓만 회수(왕복 1회).

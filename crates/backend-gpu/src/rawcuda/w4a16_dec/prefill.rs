@@ -34,7 +34,41 @@ impl W4a16Dec {
         let tb = unsafe { std::slice::from_raw_parts(toks.as_ptr() as *const u8, t * 4) };
         self.cc.h2d_async(self.dtg, tb)?;
         self.embed_gather_launch(self.dtg, self.dres, t)?;
-        self.chain_t_sel(slot, None, t, head, false, false)
+        self.chain_t_sel(slot, None, t, head, false, false, false)
+    }
+
+    /// [파이프라인 2026-10-22] greedy 프리필(t≥2, 임베딩 상주) — 마지막 행만
+    /// head+argmax(디바이스) 후 토큰 1개(4B) 회수. 종전 greedy 최종 청크는
+    /// 로짓 전사 D2H(어휘×4B ≈ 600KB pageable — 슬로패스 수 ms)를 매 요청
+    /// 치렀다. argmax = `w4a16_argmax_min`(min-index-on-tie = 호스트
+    /// greedy_from 미러 — 디코드 forward_device_argmax 동일 커널) → 토큰 불변.
+    /// softcap 등 호스트 로짓 후처리가 있는 모델은 호출부가 로짓 경로 유지.
+    pub fn forward_prefill_toks_greedy(
+        &mut self,
+        slot: usize,
+        toks: &[u32],
+        t: usize,
+    ) -> Result<u32, String> {
+        let _g = self.cc.guard()?;
+        if !self.embed_ready() {
+            return Err("forward_prefill_toks_greedy: 임베딩 미등록".into());
+        }
+        if !(2..=CHAIN_TMAX).contains(&t) || toks.len() != t || slot >= self.n_slots {
+            return Err(format!(
+                "forward_prefill_toks_greedy: t={t} toks={} 계약 위반",
+                toks.len()
+            ));
+        }
+        if let Some(&bad) = toks.iter().find(|&&x| x as usize >= self.emb_n) {
+            return Err(format!("forward_prefill_toks_greedy: 토큰 범위 위반 {bad}"));
+        }
+        self.ensure_chain_bufs()?;
+        // SAFETY: toks 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
+        let tb = unsafe { std::slice::from_raw_parts(toks.as_ptr() as *const u8, t * 4) };
+        self.cc.h2d_async(self.dtg, tb)?;
+        self.embed_gather_launch(self.dtg, self.dres, t)?;
+        let v = self.chain_t_sel(slot, None, t, true, false, false, true)?;
+        Ok(v[0] as u32)
     }
     // ── CUDA Graph(체인 캡처 — P1) ──
 
@@ -48,7 +82,7 @@ impl W4a16Dec {
         t: usize,
         head: bool,
     ) -> Result<Vec<f32>, String> {
-        self.chain_t(slot, rows, t, head, false, false)
+        self.chain_t(slot, rows, t, head, false, false, false)
     }
 
     /// [A-1] 스펙 검증 체인 — `all`=true면 **전 위치** 최종 노름+배치 head+
@@ -56,6 +90,10 @@ impl W4a16Dec {
     /// 롤백은 호출부(상태 복원 + pos 되감기) 소관.
     /// [eval 2026-10-10] `logits`=true(all과 함께)면 argmax 대신 [t][head_n]
     /// 로짓을 회수한다(청크 프리필 PPL 가속 — eval 프로브 전용).
+    /// [파이프라인 2026-10-22] `last_argmax`=true(head와 함께)면 **마지막 행만**
+    /// head GEMV + argmax(`w4a16_argmax_min` — min-index tie = 호스트
+    /// greedy_from 미러) 후 토큰 1개(id를 f32로) 회수 — all=true의 전-행
+    /// 배치 head와 달리 비용이 t에 비례하지 않는다(greedy 프리필 최종 청크용).
     pub(super) fn chain_t(
         &mut self,
         slot: usize,
@@ -64,8 +102,9 @@ impl W4a16Dec {
         head: bool,
         all: bool,
         logits: bool,
+        last_argmax: bool,
     ) -> Result<Vec<f32>, String> {
-        self.chain_t_sel(slot, Some(rows), t, head, all, logits)
+        self.chain_t_sel(slot, Some(rows), t, head, all, logits, last_argmax)
     }
 
     /// [S3-1 2026-10-11] 입력 선택판 — Some = 호스트 행 h2d, None = dres 기채움
@@ -78,6 +117,7 @@ impl W4a16Dec {
         head: bool,
         all: bool,
         logits: bool,
+        last_argmax: bool,
     ) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
         if !(2..=CHAIN_TMAX).contains(&t)
@@ -319,16 +359,44 @@ impl W4a16Dec {
             self.axpy_dev(1.0, ab, self.dres, t * h)?;
             (self.dres, t * h)
         };
-        let mut ob = vec![0u8; if head { self.head_n * 4 } else { out_rows * 4 }];
+        let mut ob = vec![
+            0u8;
+            if head && !last_argmax {
+                self.head_n * 4
+            } else {
+                out_rows * 4
+            }
+        ];
+        // [파이프라인 2026-10-22] greedy 최종 청크 — 로짓 전사 D2H 대신
+        // 디바이스 argmax 4B. 커널/규칙 = 디코드 forward_device_argmax와
+        // 동일(w4a16_argmax_min, min-index-on-tie) → 토큰 불변.
+        let mut tok4 = [0u8; 4];
         if head {
             if self.head_w == 0 || !owns_final {
                 return Err("chain_device_t: head 미등록/비최종 창".into());
             }
+            if last_argmax && self.argmax_out == 0 {
+                return Err("chain_device_t: argmax 미등록 — upload_head 선행".into());
+            }
             self.head_gemv_launch(xn_last, self.head_out)?;
-            // 동기 d2h 금지 — 그래프 캡처가 만든 커스텀(비차단) 스트림과
-            // 경합한다(실측: serve 배치 프리필 쓰레기 토큰). 스트림 순서 복사.
-            self.cc
-                .d2h_async(ob.as_mut_ptr(), self.head_out, self.head_n * 4)?;
+            if last_argmax {
+                let fa = self.cc.function("w4a16_argmax_min")?;
+                let (mut p_l, mut p_nn, mut p_a) =
+                    (self.head_out, self.head_n as i32, self.argmax_out);
+                self.cc.launch(
+                    fa,
+                    1,
+                    1,
+                    1024,
+                    &mut crate::rawcuda::args::l3(&mut p_l, &mut p_nn, &mut p_a),
+                )?;
+                self.cc.d2h_async(tok4.as_mut_ptr(), self.argmax_out, 4)?;
+            } else {
+                // 동기 d2h 금지 — 그래프 캡처가 만든 커스텀(비차단) 스트림과
+                // 경합한다(실측: serve 배치 프리필 쓰레기 토큰). 스트림 순서 복사.
+                self.cc
+                    .d2h_async(ob.as_mut_ptr(), self.head_out, self.head_n * 4)?;
+            }
         } else {
             self.cc.d2h_async(ob.as_mut_ptr(), xn_last, out_rows * 4)?;
         }
@@ -336,6 +404,9 @@ impl W4a16Dec {
         let pos_after = pos + t as u32;
         self.slot_pos[slot] = pos_after;
         self.attn_set_pos(slot, pos_after)?;
+        if head && last_argmax {
+            return Ok(vec![u32::from_le_bytes(tok4) as f32]);
+        }
         let v: Vec<f32> = ob
             .as_chunks::<4>()
             .0

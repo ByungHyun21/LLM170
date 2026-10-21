@@ -238,9 +238,14 @@ fn run_main() -> ExitCode {
 fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
     let mut queue: Option<usize> = None;
-    // [K6-3 2026-10-13] --slots 폐지 — 동시성 = min(문맥 수, 풀 입장).
+    // [K6-3 2026-10-13 --slots 폐지] — 동시성 = min(문맥, 풀 입장).
     // 문맥 수는 내부 상수(상태 메모리 = 문맥×gdn_state/슬롯 — 예산 회계 반영).
-    const SERVE_CONTEXTS: usize = 4;
+    // [파이프라인 2026-10-22] 4→8: ttft_harness C=8에서 슬롯 상한이 절반
+    // 요청을 통째로 큐대기로 돌렸다(35B 633ms·27B 2032ms — 순수 입장 병목,
+    // 계산 아님). 슬롯당 한계 비용 = GDN 스크래치 수 MB + 그래프 캡처·워밍업
+    // 시간뿐(KV는 공유 풀 — 입장 판정이 지킨다). 배치 디코드 상한
+    // BATCH_DEC_MAX=8과 정렬.
+    const SERVE_CONTEXTS: usize = 8;
     // [2026-10-16] serve 입력 = --kv-mem(필수·무 auto) — --ctx(serve)는 폐지.
     // 배분 절충(KV vs 전문가 vs PLE)은 운영자 명시 결정, 플래너는 검증·권고.
     let mut kv_mem: Option<u64> = None;

@@ -3,8 +3,8 @@ use super::decode::pick;
 use super::econ::econ_mtp_maintain;
 use super::spec::slot_emit;
 use super::{
-    Engine, InferResult, PF_BUDGET_TOKENS, PF_CHUNK_MAX, PF_CHUNK_MIN, PF_CHUNK_MIXED,
-    PF_LONG_PROMPT, ProgressFrame, SCHED, Slot, slot_fail,
+    Engine, InferResult, PF_BUDGET_TOKENS, PF_CHUNK_MAX, PF_CHUNK_MIN, PF_LONG_PROMPT,
+    ProgressFrame, SCHED, Slot, slot_fail,
 };
 use std::sync::atomic::Ordering;
 
@@ -20,12 +20,36 @@ pub(super) fn slot_prefill(
     npw: bool,
     t0w: &std::time::Instant,
 ) -> Option<f64> {
+    // [§2] 혼합 — 타 슬롯이 이미 디코드 중(프리필 완료+잔존)이면 청크 캡으로
+    // 디코드 정지 시간을 유계화(프리필 총량은 동일). 캡 = 엔진별 시간 등급
+    // [파이프라인 2026-10-22]: dense 27B 128토큰(≈102ms) 기준, MoE 상주 35B는
+    // 512토큰(≈110ms) 전폭 — 슬롯 8 상향 후 혼합 구간 증가로 128 캡의
+    // 청크 수 4배·디코드 틱 직렬화가 서비스 시간을 부풀렸다(C=8 실측).
+    // 디코드 중 슬롯(prefilled==len)과 프리필 후보(prefilled<len)는 서로
+    // 배타라 후보 공통 상수로 호이스팅해도 동일하다.
+    let others_decoding = slots
+        .iter()
+        .any(|s| s.job.is_some() && s.prefilled == s.job.as_ref().unwrap().tokens.len());
+    let cap_now = if others_decoding {
+        eng.0.prefill_mixed_cap()
+    } else {
+        PF_CHUNK_MAX
+    };
+    // [파이프라인 2026-10-22] 완료-우선 선택 — 이번 틱에 끝낼 수 있는 슬롯
+    // (잔여 ≤ 현재 청크 상한)을 라운드로빈보다 먼저 뽑는다. 종전 순수 touch
+    // 라운드로빈에서 접두 히트 슬롯의 2토큰 접미 청크가 콜드 512청크들 뒤로
+    // 밀려 TTFT 150ms→900ms가 되는 사례(27B ttft_harness C=2 — 첫 토큰 emit은
+    // 최종 청크에서만 일어남). 잔여>상한 슬롯은 종전대로 touch 순서(기아 없음 —
+    // 긴 프롬프트도 잔여가 상한 이하로 줄면 완료-우선 대상이 된다).
     let pf = (0..slots.len())
         .filter(|&i| {
             slots[i].job.is_some()
                 && slots[i].prefilled < slots[i].job.as_ref().unwrap().tokens.len()
         })
-        .min_by_key(|&i| slots[i].touch);
+        .min_by_key(|&i| {
+            let left = slots[i].job.as_ref().unwrap().tokens.len() - slots[i].prefilled;
+            (if left <= cap_now { 0 } else { 1 }, slots[i].touch)
+        });
     let i = pf?;
     let _pft = std::time::Instant::now();
     llm170_diag::watchdog::bump();
@@ -41,24 +65,21 @@ pub(super) fn slot_prefill(
     if backlog > 1 && left > PF_LONG_PROMPT {
         chunk = chunk.min(PF_CHUNK_MAX / 2);
     }
-    // [§2] 혼합 — 타 슬롯이 이미 디코드 중(프리필 완료+잔존)이면
-    // 청크 캡으로 디코드 정지 시간을 유계화(프리필 총량은 동일).
-    let others_decoding = slots.iter().enumerate().any(|(j, s)| {
-        j != i && s.job.is_some() && s.prefilled == s.job.as_ref().unwrap().tokens.len()
-    });
     if others_decoding {
-        chunk = chunk.min(PF_CHUNK_MIXED);
+        chunk = chunk.min(cap_now);
     }
     let chunk = chunk.min(left);
-    // Q4(FN)는 prefill_greedy — 청크마다 어휘 152k
-    // 로짓 pageable D2H(슬로패스 수십 ms) 대신 GPU argmax 8B 회수.
-    // Q35(27B)는 종전 전사 경로(원시 프리필 내부 d2h).
+    // [파이프라인 2026-10-22] greedy 슬롯 = 디바이스 argmax 프리필 — 최종 청크
+    // 토큰 1개(4B)만 D2H. 종전 greedy는 로짓 전사 D2H(어휘×4B ≈ 600KB
+    // pageable — 슬로패스 수 ms) + 호스트 argmax를 요청마다 치렀다(35B 서빙
+    // nsys: 로짓 D2H API 163ms/6회). 토큰 불변 = w4a16_argmax_min(min-index
+    // tie)은 greedy_from 미러 — 디코드 greedy와 동일 계약(엔진별 softcap
+    // 가드는 gpu_engine/qwen.rs prefill_greedy 주석).
+    // 샘플링/제약 슬롯은 로짓 판이 필요(마지막 청크만 판정) — 기존 prefill.
     let (start, logits) = {
         let end = (slots[i].prefilled + chunk).min(slots[i].job.as_ref().unwrap().tokens.len());
         let part: Vec<u32> =
             slots[i].job.as_ref().unwrap().tokens[slots[i].prefilled..end].to_vec();
-        // 샘플링 슬롯은 로짓 판(마지막 청크만 판정에 사용) — Q4도
-        // prefill_greedy 대신 prefill. greedy는 종전 최적 경로.
         let samp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
         // [P8] 제약 슬롯은 prefill 마지막 로짓도 pick(마스킹) 경유 — 첫
         // 토큰부터 스키마 강제(실측: 우회 시 1토큰 프리앰블 새는 결함).
@@ -67,14 +88,12 @@ pub(super) fn slot_prefill(
             // [⑰-1 2026-10-18] 중간 청크 = 헤드·로짓 d2h 스킵(낭비 제거).
             // 최종 청크만 로짓 판정(emit 토큰). KV·MTP 전진 동일 → 토큰열 불변.
             eng.0.prefill_state(i, &part).map(|_| 0)
+        } else if samp || cons {
+            eng.0
+                .prefill(i, &part)
+                .map(|mut l| pick(&mut slots[i], &mut l))
         } else {
-            eng.0.prefill(i, &part).map(|mut l| {
-                if samp || cons {
-                    pick(&mut slots[i], &mut l)
-                } else {
-                    llm170_core::qwen35::greedy(&l)
-                }
-            })
+            eng.0.prefill_greedy(i, &part)
         };
         (end, r)
     };

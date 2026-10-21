@@ -95,7 +95,7 @@ impl W4a16Dec {
             // SAFETY: 위 복사와 동일 범위(t*h f32) — 핀드 유효.
             let pin =
                 unsafe { std::slice::from_raw_parts(self.graph.pin_batch_in as *const f32, t * h) };
-            let v = self.chain_t(slot, pin, t, false, true, false)?;
+            let v = self.chain_t(slot, pin, t, false, true, false, false)?;
             let toks: Vec<u32> = v.into_iter().map(|x| x as u32).collect();
             if self.graph.spec_graphs.len() >= 8 {
                 let (_, e, g) = self.graph.spec_graphs.remove(0);
@@ -105,7 +105,7 @@ impl W4a16Dec {
                 self.cc.capture_begin()?;
                 self.graph.capture_pinned_src = true;
                 self.graph.capture_no_host = true;
-                let r = self.chain_t(slot, pin, t, false, true, false);
+                let r = self.chain_t(slot, pin, t, false, true, false, false);
                 self.graph.capture_no_host = false;
                 self.graph.capture_pinned_src = false;
                 if let Err(e) = r {
@@ -129,7 +129,7 @@ impl W4a16Dec {
             }
             return Ok(toks);
         }
-        let v = self.chain_t(slot, rows, t, false, true, false)?;
+        let v = self.chain_t(slot, rows, t, false, true, false, false)?;
         Ok(v.into_iter().map(|x| x as u32).collect())
     }
 
@@ -153,7 +153,7 @@ impl W4a16Dec {
         if !(2..=8).contains(&t) {
             return Err(format!("spec_verify_logits: t={t} 계약(2..=8)"));
         }
-        self.chain_t(slot, rows, t, false, true, true)
+        self.chain_t(slot, rows, t, false, true, true, false)
     }
 
     /// [A-1→TreeWY 2.B 2026-10-12] 롤백 — 배치 `keep`개 토큰 처리 시점 상태로

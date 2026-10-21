@@ -6,6 +6,13 @@ use super::upload::upload_model;
 use llm170_backend_gpu::W4a16Dec;
 use std::path::Path;
 
+/// [파이프라인 2026-10-22] 프리필 반환 — 로짓(샘플링·제약·softcap 모델) 또는
+/// 토큰(greedy 디바이스 argmax 경로).
+enum PrefillOut {
+    Logits(Vec<f32>),
+    Token(u32),
+}
+
 impl QwenEngine {
     /// 모델 로드 + 가중치 상주 업로드(간헐 ENOENT 재시도는 호출부 소관).
     pub fn load(
@@ -263,8 +270,39 @@ impl QwenEngine {
     /// 시퀀스 prefill → 마지막 로짓. t≤8 배치 청크(GEMM t≥2 경로)로 처리하고
     /// head는 마지막 토큰만 계산한다(중간 토큰 상각).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
-        self.prefill_impl(seq, tokens, true)
-            .map(|o| o.unwrap_or_default())
+        match self.prefill_impl(seq, tokens, true, false)? {
+            Some(PrefillOut::Logits(v)) => Ok(v),
+            _ => Err("prefill: 로짓 없음".into()),
+        }
+    }
+
+    /// [파이프라인 2026-10-22] greedy 프리필 — 최종 청크만 디바이스 argmax
+    /// (4B D2H). 종전 greedy는 로짓 전사 D2H(어휘×4B ≈ 600KB pageable —
+    /// 슬로패스 수 ms) + 호스트 argmax를 매 요청 치렀다(35B 서빙 nsys:
+    /// 로짓 D2H API 163ms/6회). 토큰 불변 근거 = `w4a16_argmax_min`
+    /// (min-index-on-tie)은 호스트 greedy_from 미러이며 디코드 greedy가
+    /// 이미 이 계약으로 돌아간다. **softcap>0 모델은 로짓 경로 유지** —
+    /// 디바이스 argmax는 호스트 softcap 후처리 전 로짓을 본다. head 미상주·
+    /// 임베딩 미상주(행 경로) 폴백도 호스트 로짓+greedy로 동작 불변.
+    pub fn prefill_greedy(&mut self, seq: usize, tokens: &[u32]) -> Result<u32, String> {
+        match self.prefill_impl(seq, tokens, true, true)? {
+            Some(PrefillOut::Token(t)) => Ok(t),
+            _ => Err("prefill_greedy: 토큰 없음".into()),
+        }
+    }
+
+    /// [파이프라인 2026-10-22] 혼합(타 슬롯 디코드 중) 프리필 청크 상한 —
+    /// 시간 등급 원칙: 청크 1개의 GPU 시간을 dense 27B 128토큰(≈102ms)과
+    /// 같은 등급으로 유지. MoE 상주(35B)는 512토큰이 ≈110ms라 전폭(512) —
+    /// 슬롯 8 상향 후 혼합 구간이 늘며 128 캡이 프리필을 4배 청크 수로
+    /// 쪼개 디코드 틱 직렬화를 키웠다(ttft_harness C=8 서비스 624→1348ms
+    /// 실측). 토큰열 불변 — 청크 분할은 상태 전진 경계일 뿐(⑰-1 계약).
+    pub fn prefill_mixed_cap(&self) -> usize {
+        if self.dec.is_moe() && self.dec.moe_experts_resident() {
+            512
+        } else {
+            128
+        }
     }
 
     /// [⑰-1 2026-10-18] 상태 전진 전용 프리필 — 중간 청크의 **헤드·로짓 d2h
@@ -272,7 +310,7 @@ impl QwenEngine {
     /// 낭비였음 — 실측 TTFT: 512tk 1116ms·2700tk 4886ms = 벤치 pp의 2.5×).
     /// KV·MTP 상태 전진은 prefill과 동일(헤드는 읽기 전용) → 토큰열 불변.
     pub fn prefill_state(&mut self, seq: usize, tokens: &[u32]) -> Result<(), String> {
-        self.prefill_impl(seq, tokens, false).map(|_| ())
+        self.prefill_impl(seq, tokens, false, false).map(|_| ())
     }
 
     fn prefill_impl(
@@ -280,7 +318,8 @@ impl QwenEngine {
         seq: usize,
         tokens: &[u32],
         want: bool,
-    ) -> Result<Option<Vec<f32>>, String> {
+        greedy: bool,
+    ) -> Result<Option<PrefillOut>, String> {
         let n = tokens.len();
         if n == 0 {
             // A10: 빈 프롬프트는 조용한 제로 로짓 대신 명시 오류.
@@ -318,10 +357,16 @@ impl QwenEngine {
             if t == 1 {
                 let row = self.model.embed_row(part[0]).map_err(|e| e.to_string())?;
                 if is_last && want && self.head_gpu {
-                    last = Some(self.dec.forward_prefill(seq, &row, 1, true)?);
+                    // greedy = 디코드와 동일한 1토큰 argmax 경로(softcap
+                    // 없을 때만 — 토큰 불변 조건은 prefill_greedy 주석).
+                    last = Some(if greedy && self.softcap <= 0.0 {
+                        PrefillOut::Token(self.dec.forward_device_argmax(seq, &row)?)
+                    } else {
+                        PrefillOut::Logits(self.dec.forward_prefill(seq, &row, 1, true)?)
+                    });
                 } else if is_last && want {
                     let xn = self.dec.forward_prefill(seq, &row, 1, false)?;
-                    last = Some(self.head_logits(&xn)?);
+                    last = Some(PrefillOut::Logits(self.head_logits(&xn)?));
                 } else {
                     self.dec.forward_prefill(seq, &row, 1, false)?;
                 }
@@ -330,21 +375,31 @@ impl QwenEngine {
                 // 할당+h2d t×h×4B)을 id h2d(4B/행)+gather로 대체. 값 동일
                 // (h2f/b2f = decode_f32 동일 함수 — 골든 계약).
                 if is_last && want && self.head_gpu {
-                    last = Some(self.dec.forward_prefill_toks(seq, part, t, true)?);
+                    last = Some(if greedy && self.softcap <= 0.0 {
+                        PrefillOut::Token(self.dec.forward_prefill_toks_greedy(seq, part, t)?)
+                    } else {
+                        PrefillOut::Logits(self.dec.forward_prefill_toks(seq, part, t, true)?)
+                    });
                 } else if is_last && want {
                     let xn = self.dec.forward_prefill_toks(seq, part, t, false)?;
-                    last = Some(self.head_logits(&xn)?);
+                    last = Some(PrefillOut::Logits(self.head_logits(&xn)?));
                 } else {
                     self.dec.forward_prefill_toks(seq, part, t, false)?;
                 }
             } else {
-                // [R5] 행 조립 — embed_rows 공용(동작 불변).
+                // [R5] 행 조립 — embed_rows 공용(동작 불변). greedy도 호스트
+                // 로짓+greedy(임베딩 미상주 = 드문 폴백 — 단일 경로 유지).
                 let rows = self.embed_rows(part)?;
                 if is_last && want && self.head_gpu {
-                    last = Some(self.dec.forward_prefill(seq, &rows, t, true)?);
+                    let l = self.dec.forward_prefill(seq, &rows, t, true)?;
+                    last = Some(if greedy {
+                        PrefillOut::Token(llm170_core::qwen35::greedy(&l))
+                    } else {
+                        PrefillOut::Logits(l)
+                    });
                 } else if is_last && want {
                     let xn = self.dec.forward_prefill(seq, &rows, t, false)?;
-                    last = Some(self.head_logits(&xn)?);
+                    last = Some(PrefillOut::Logits(self.head_logits(&xn)?));
                 } else {
                     self.dec.forward_prefill(seq, &rows, t, false)?;
                 }
@@ -367,7 +422,15 @@ impl QwenEngine {
             i += t;
         }
         Ok(if want {
-            Some(last.ok_or_else(|| "prefill: 빈 프롬프트 — 토큰 1개 이상 필요".to_string())?)
+            let o = last.ok_or_else(|| "prefill: 빈 프롼프트 — 토큰 1개 이상 필요".to_string())?;
+            // 폴백(softcap>0·head/임베딩 미상주)은 로짓으로 흘러온다 — greedy
+            // 호출부를 위해 여기서 토큰 확정(호스트 greedy, 종전 경로와 동일).
+            Some(match o {
+                PrefillOut::Logits(l) if greedy => {
+                    PrefillOut::Token(llm170_core::qwen35::greedy(&l))
+                }
+                o => o,
+            })
         } else {
             None
         })

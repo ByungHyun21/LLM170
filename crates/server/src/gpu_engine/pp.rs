@@ -98,6 +98,19 @@ impl PpEngine {
             .map(|o| o.unwrap_or_default())
     }
 
+    /// [파이프라인 2026-10-22] greedy 프리필 — 2샤드 경로는 로짓 회수 후
+    /// 호스트 greedy(동작 불변; 단일 경로 qwen의 디바이스 argmax와 토큰
+    /// 계약 동일 — greedy_from 미러).
+    pub fn prefill_greedy(&mut self, seq: usize, tokens: &[u32]) -> Result<u32, String> {
+        let l = self.prefill(seq, tokens)?;
+        Ok(llm170_core::qwen35::greedy(&l))
+    }
+
+    /// [파이프라인 2026-10-22] 혼합 청크 상한 — 2샤드 27B는 종전 정책(128).
+    pub fn prefill_mixed_cap(&self) -> usize {
+        128
+    }
+
     /// [⑰-1] 상태 전진 전용 — 중간 청크 헤드·d2h 스킵(qwen prefill_state와 동일 계약).
     pub fn prefill_state(&mut self, seq: usize, tokens: &[u32]) -> Result<(), String> {
         self.prefill_impl(seq, tokens, false).map(|_| ())

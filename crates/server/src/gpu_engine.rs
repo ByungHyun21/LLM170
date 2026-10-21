@@ -168,6 +168,7 @@ macro_rules! engine_delegate_ref {
 
 engine_delegate_mut! {
     prefill(seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String>;
+    prefill_greedy(seq: usize, tokens: &[u32]) -> Result<u32, String>;
     prefill_state(seq: usize, tokens: &[u32]) -> Result<(), String>;
     kv_grow(slot: usize, n_tokens: usize) -> Result<usize, String>;
     kv_release_slot(slot: usize) -> usize;
@@ -222,6 +223,7 @@ engine_delegate_ref! {
     embed_row(tok: u32) -> Result<Vec<f32>, String>;
     vocab() -> usize;
     n_embd() -> usize;
+    prefill_mixed_cap() -> usize;
 }
 
 impl GpuEngine {

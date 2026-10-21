@@ -95,9 +95,22 @@ pub fn serve(
             READY.store(false, Ordering::Release);
         }
     });
-    // QA-10: 바인딩은 적재 후 — 종전 역순(bind→적재)은 커널 백로그가 TCP만
-    // 받아주는 무응답 창을 만들었다(llama-server은 적재 완료 후 바인딩).
-    // READY 503("loading") 계약이 실제로 관측 가능해진다(워밍업 창).
+    // QA-10 + [파이프라인 2026-10-22]: 바인딩은 적재 **및 기동 워밍업 이후**.
+    // 종전 역순(bind→적재)은 커널 백로그가 TCP만 받아주는 무응답 창(QA-10),
+    // 적재 후에도 slot_loop 내 워밍업(전 슬롯 더미 프리필+그래프 캡처, 수 초)이
+    // 배너 뒤에 진행돼 첫 요청이 채널에서 워밍업 잔여를 통째로 큐대기로 뒤집어썼다
+    // (27B 실측: 청 콜드 TTFT 1976ms 중 큐대기 1300ms — ttft_harness S1).
+    // READY(워밍업 완료 시점에 slot_loop가 설정) 또는 엔진 사망 플래그를 기다린
+    // 뒤 바인딩·배너한다. 300s 안전 밸브는 워밍업 교착 시에도 전송 계층이
+    // 살아서 503/진단을 내보내게 하는 최후 수단(watchdog이 원인을 보고).
+    let t_warm = std::time::Instant::now();
+    while !READY.load(Ordering::Acquire) && !ENGINE_DEAD.load(Ordering::Acquire) {
+        if t_warm.elapsed() > std::time::Duration::from_secs(300) {
+            eprintln!("# 경고: 워밍업 300s 미종료 — 바인딩 강행(READY=false 유지)");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     let listener = match TcpListener::bind(addr) {
         Ok(l) => l,
         Err(e) => return Err(e.to_string()),

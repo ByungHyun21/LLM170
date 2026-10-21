@@ -28,10 +28,6 @@ const PF_BUDGET_TOKENS: usize = 1024;
 const PF_CHUNK_MAX: usize = 512;
 /// 청크 최소.
 const PF_CHUNK_MIN: usize = 64;
-/// [§2 2026-10-11] 혼합 정책 — 타 슬롯이 디코드 중이면 프리필 청크를 이 값으로
-/// 캡. 512청크는 27B에서 ~443ms 동안 타 슬롯 디코드를 정지(실측). 단독
-/// 프리필(벤치마크·첫 요청)은 종전 최대 청크 유지 — 토큰 산술 불변.
-const PF_CHUNK_MIXED: usize = 128;
 /// 이 길이 초과 프롬프트는 경합 시 절반 청크(라운드로빈 최대 대기 ↓).
 const PF_LONG_PROMPT: usize = 2048;
 
@@ -459,23 +455,16 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         if let Some(msg) = aging.maybe_adapt(now) {
             eprintln!("# aging: {msg}");
         }
-        // [R7] ① 유입 — 큐 drain → 슬롯 배정(헬퍼 분리 · 동작 불변).
-        slot_intake(
-            &mut slots,
-            &mut eng,
-            &rx,
-            tick,
-            &mut ptrie,
-            &mut pending,
-            freeze,
-            &mut aging,
-            tps,
-        );
         // [§3.4 ③] 트리 동기화 — free 슬롯의 cached를 트리에 등록(정리 = 재구축).
         // 512 경계만 기록되므로 매 틱 재등록은 중복 없음(insert가 슬롯 중복 체크).
         // [2026-10-16] 생산 경로는 슬롯 제거를 호출하지 않아 스테일 노드가
         // 누적 — 노드가 살아있는 cached 총량의 2배(+슬랙)를 넘으면 재구축한다.
         // 상각: 트리거 시점의 스테일 ≈ live → 재구축 비용이 삽입당 O(1).
+        // [파이프라인 2026-10-22] 등록을 intake **앞으로** 이동 — 종전엔 직전
+        // 틱에서 해제된 슬롯의 캐시가 같은 틱에 도착한 요청의 배정에 보이지
+        // 않았다(재등록이 intake 뒤 = 틱 경계 레이스. 실측: 27B ttft_harness
+        // C=2에서 S3 직후 도착한 접두 히트 요청이 재사용 없이 콜드 521ms —
+        // 1s 간격 재현에선 157ms 히트 정상).
         let live_tokens: usize = slots
             .iter()
             .filter(|s| s.job.is_none() && s.cached.len() >= 512)
@@ -504,6 +493,18 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     .store(ptrie.n_boundaries as u64, Ordering::Relaxed);
             }
         }
+        // [R7] ① 유입 — 큐 drain → 슬롯 배정(헬퍼 분리 · 동작 불변).
+        slot_intake(
+            &mut slots,
+            &mut eng,
+            &rx,
+            tick,
+            &mut ptrie,
+            &mut pending,
+            freeze,
+            &mut aging,
+            tps,
+        );
         // [R7] 게시 스로틀(≤1Hz — 헬퍼 분리 · 동작 불변).
         maybe_publish(&slots, &eng, copy_base, &mut last_pub, &aging);
         tick += 1;
