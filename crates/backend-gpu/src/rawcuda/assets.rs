@@ -403,6 +403,8 @@ pub fn cu_source(name: &str) -> &'static str {
         "head" => include_str!("assets/head.cu"),
         "ew" => include_str!("assets/ew.cu"),
         "embed" => include_str!("assets/embed.cu"),
+        // [FN 2026-10-21] FN 전용 체인 자산 — ASSETS 등록분과 대조 누락 보수.
+        "fn" => include_str!("assets/fn.cu"),
         "smoke" => include_str!("assets/smoke.cu"),
         "marlin" => include_str!("assets/marlin.cu"),
         "marlin_moe" => include_str!("assets/marlin_moe.cu"),
