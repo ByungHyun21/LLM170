@@ -18,6 +18,8 @@ const PF_BUDGET_TOKENS: usize = 1024;
 const PF_CHUNK_MAX: usize = 512;
 const PF_CHUNK_MIN: usize = 64;
 const PF_LONG_PROMPT: usize = 2048;
+const PF_BURST_TOKENS: usize = 1024;
+const PF_BURST_PROMPT: usize = 256;
 
 pub enum ProgressFrame {
     Tok(u32),
@@ -394,11 +396,20 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         let pending_prefill = slots
             .iter()
             .any(|s| s.job.is_some() && s.prefilled < s.job.as_ref().unwrap().tokens.len());
+        let burst = pending_prefill && prefill_burst(&slots);
         if !decoded || pending_prefill {
-            if let Some(pf_ms) = slot_prefill(&mut eng, &mut slots, &active, tick, eos, npw, &t0w) {
+            let mut did_pf = false;
+            while let Some(pf_ms) =
+                slot_prefill(&mut eng, &mut slots, &active, tick, eos, npw, &t0w)
+            {
                 n_pf += 1;
                 ms_pf += pf_ms;
-            } else {
+                did_pf = true;
+                if !burst {
+                    break;
+                }
+            }
+            if !did_pf && !decoded {
                 continue;
             }
         }

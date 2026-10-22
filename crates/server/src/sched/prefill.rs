@@ -2,10 +2,25 @@ use super::decode::pick;
 use super::econ::econ_mtp_maintain;
 use super::spec::slot_emit;
 use super::{
-    Engine, InferResult, PF_BUDGET_TOKENS, PF_CHUNK_MAX, PF_CHUNK_MIN, PF_LONG_PROMPT,
-    ProgressFrame, SCHED, Slot, slot_fail,
+    Engine, InferResult, PF_BUDGET_TOKENS, PF_BURST_PROMPT, PF_BURST_TOKENS, PF_CHUNK_MAX,
+    PF_CHUNK_MIN, PF_LONG_PROMPT, ProgressFrame, SCHED, Slot, slot_fail,
 };
 use std::sync::atomic::Ordering;
+
+pub(super) fn prefill_burst(slots: &[Slot]) -> bool {
+    let (mut n, mut total, mut max) = (0usize, 0usize, 0usize);
+    for s in slots {
+        let Some(j) = &s.job else { continue };
+        let left = j.tokens.len().saturating_sub(s.prefilled);
+        if left == 0 {
+            continue;
+        }
+        n += 1;
+        total += left;
+        max = max.max(left);
+    }
+    n >= 2 && total <= PF_BURST_TOKENS && max <= PF_BURST_PROMPT
+}
 
 pub(super) fn slot_prefill(
     eng: &mut Engine,
