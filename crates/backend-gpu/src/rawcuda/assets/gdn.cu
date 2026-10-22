@@ -366,6 +366,11 @@ extern "C" __global__ void gdn_l2perm(
                     q_out, k_out, v_out, bg, t_len, layer, h_k, h_v, hidden);
 }
 
+__device__ __forceinline__ void gdn_cp16(void* dst, const void* src) {
+    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
+}
+
 extern "C" __global__ void gdn_l2perm8(
     const float* __restrict__ q_in,
     const float* __restrict__ k_in,
@@ -392,9 +397,12 @@ extern "C" __global__ void gdn_l2perm8(
     const float eps = 1e-6f;
     const float* abA = abuf + (layer * 2) * h_v * hidden + h * hidden;
     const float* abB = abA + h_v * hidden;
-    for (int i = threadIdx.x; i < 2 * hidden; i += blockDim.x) {
-        abs_[i] = (i < hidden) ? abA[i] : abB[i - hidden];
+    for (int i = threadIdx.x * 4; i < hidden; i += blockDim.x * 4) {
+        gdn_cp16(&abs_[i], &abA[i]);
+        gdn_cp16(&abs_[hidden + i], &abB[i]);
     }
+    asm volatile("cp.async.commit_group;\n");
+    asm volatile("cp.async.wait_group 0;\n");
     __syncthreads();
     float pa = 0.0f;
     float pb = 0.0f;
