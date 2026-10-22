@@ -389,6 +389,10 @@ pub(crate) fn upload_model(
     let mtp_attn = model
         .w_raw("mtp.layers.0.self_attn.q_proj.weight")
         .is_some();
+    let owns_final = window.is_none_or(|(_, we)| we == hp.n_layer);
+    dec.set_mtp_attn_planned(
+        owns_final && mtp_attn && crate::engine::mtp_upload_on(window.is_some()),
+    );
     let n_attn = hp.n_layer / interval + usize::from(mtp_attn);
     let ad = AttnDims {
         n_attn,

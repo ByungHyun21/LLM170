@@ -1,4 +1,3 @@
-
 use crate::json::Json;
 use std::path::Path;
 
@@ -172,15 +171,14 @@ fn skeleton(dir: &Path) -> Result<Skeleton, String> {
     let mut mtp_tensors = 0;
     if let Json::Obj(items) = wm {
         for (name, _) in items {
-            if name.contains(".ple.") {
-                if let Some(idx) = name
+            if name.contains(".ple.")
+                && let Some(idx) = name
                     .strip_prefix("model.language_model.layers.")
                     .and_then(|r| r.split('.').next())
                     .and_then(|s| s.parse::<usize>().ok())
-                    && !ple_layers.contains(&idx)
-                {
-                    ple_layers.push(idx);
-                }
+                && !ple_layers.contains(&idx)
+            {
+                ple_layers.push(idx);
             }
             if name.contains("ngram_embedding.shard_") {
                 ngram_shards += 1;

@@ -117,6 +117,14 @@ pub fn parse_spec_policy(v: &str) -> Option<u8> {
     }
 }
 
+pub fn mtp_upload_on(pp: bool) -> bool {
+    match SPEC_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+        2 | 3 => false,
+        1 => true,
+        _ => !pp || llm170_diag::flag::val("LLM170_PP_MTP") == Some("1"),
+    }
+}
+
 pub fn spec_name() -> &'static str {
     match SPEC_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
         1 => "mtp",

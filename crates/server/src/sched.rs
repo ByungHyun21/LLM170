@@ -573,9 +573,8 @@ fn slot_intake(
                     j_need_tokens(&j)
                 )),
             });
-        } else if reclaim_idle(eng, slots) {
-            pending.push(j);
         } else {
+            let _ = reclaim_idle(eng, slots);
             pending.push(j);
         }
     }

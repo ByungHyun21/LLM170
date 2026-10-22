@@ -1,8 +1,6 @@
-
 use super::*;
 
 impl W4a16Dec {
-
     pub fn forward_prefill_toks(
         &mut self,
         slot: usize,
@@ -137,7 +135,7 @@ impl W4a16Dec {
         } else {
             LinPath::Gemm
         };
-        let fuse = matches!(lp, LinPath::GemvT);
+        let fuse = matches!(lp, LinPath::GemvT) && !self.dense_marlin_only();
         for off in 0..win.n() {
             let il = win.abs(off);
             let xh = if plain { 0 } else { self.ensure_dx32(t * h)? };

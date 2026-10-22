@@ -394,6 +394,7 @@ impl W4a16Dec {
     }
 
     pub fn enable_spec(&mut self) -> Result<(), String> {
+        let _g = self.cc.guard()?;
         if self.moe.n_experts > 0 && !self.moe.moe_resident {
             return Err("스트리밍(비상주 MoE) — 검증 체인 미지원(t>1 상주 전용)".into());
         }

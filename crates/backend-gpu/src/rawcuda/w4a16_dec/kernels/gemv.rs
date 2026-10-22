@@ -9,6 +9,13 @@ impl W4a16Dec {
     ) -> Result<(), String> {
         let (dq, ds, n, k) = self.lin_spec(name)?;
         let (g, sb) = self.lin_grp.get(name).copied().unwrap_or((128, false));
+        if dq == 0 {
+            let x16 = self.cast_f16_dev(x32_dev, k)?;
+            if self.marlin_gemv1_launch(name, x16, y_out)? {
+                return Ok(());
+            }
+            return Err(format!("gemv {name}: 마린 경로 실패 — 원본 q 폐기됨"));
+        }
         if k > g * 256 {
             return Err(format!(
                 "gemv {name}: k={k} > {} (t=1 smem sc 계약, g{g})",
@@ -110,6 +117,9 @@ impl W4a16Dec {
         t: usize,
     ) -> Result<(), String> {
         let (dq, ds, n, k) = self.lin_spec(name)?;
+        if dq == 0 {
+            return self.gemm_launch(name, x_dev, y_dev, t);
+        }
         let (g, sb) = self.lin_grp.get(name).copied().unwrap_or((128, false));
         let sym = match (g, sb) {
             (128, false) => "w4a16_gemv_g128_t",

@@ -1,4 +1,3 @@
-
 use super::*;
 
 pub(super) fn realloc_fields<const N: usize>(
@@ -65,7 +64,12 @@ impl W4a16Dec {
 
     pub fn active_weight_bytes(&self) -> u64 {
         let experts = self.experts_bytes;
-        let base = self.weights_bytes.saturating_sub(self.marlin_bytes);
+        let dup = if self.marlin_dense {
+            0
+        } else {
+            self.marlin_bytes
+        };
+        let base = self.weights_bytes.saturating_sub(dup);
         if self.moe.n_experts > 0 && self.moe.moe_resident {
             let unsel =
                 experts / self.moe.n_experts as u64 * (self.moe.n_experts - self.moe.top_k) as u64;

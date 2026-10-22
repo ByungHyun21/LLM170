@@ -56,6 +56,32 @@ pub fn forward_2shard(
     }
 }
 
+pub fn forward_2shard_toks(
+    a: &mut W4a16Dec,
+    b: &mut W4a16Dec,
+    slot: usize,
+    toks: &[u32],
+    t: usize,
+    head: bool,
+) -> Result<Vec<f32>, String> {
+    check_pair(a, b)?;
+    if !(2..=super::CHAIN_TMAX).contains(&t) || toks.len() != t {
+        return Err(format!(
+            "forward_2shard_toks: t={t} toks={} 계약 위반",
+            toks.len()
+        ));
+    }
+    let mid = a.forward_prefill_toks(slot, toks, t, false)?;
+    if mid.len() != t * a.hidden {
+        return Err(format!(
+            "forward_2shard_toks: 경계 잔차 {} != t{t}×h{} — 샤드A 비최종 창 계약 위반",
+            mid.len(),
+            a.hidden
+        ));
+    }
+    b.forward_prefill(slot, &mid, t, head)
+}
+
 pub fn forward_2shard_argmax(
     a: &mut W4a16Dec,
     b: &mut W4a16Dec,

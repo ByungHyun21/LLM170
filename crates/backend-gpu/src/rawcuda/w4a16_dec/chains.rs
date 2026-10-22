@@ -160,7 +160,6 @@ impl W4a16Dec {
         Ok(())
     }
 
-
     pub(super) fn chain_device(
         &mut self,
         slot: usize,
@@ -360,6 +359,7 @@ impl W4a16Dec {
         }
         let mut gi = win.gdn_start(interval);
         let plain = self.plain_weights;
+        let marlin_dense = !plain && self.dense_marlin_only();
         if t > 32 {
             return Err(format!("chain_device_batch: t={t} > 32 FFMA 상한"));
         }
@@ -371,14 +371,60 @@ impl W4a16Dec {
                 .map_err(|e| format!("B{il} input norm: {e}"))?;
             let branch = if (il + 1).is_multiple_of(interval) {
                 let xin = if plain { xn } else { xh };
-                self.gemv_multi_t_dev(plain, il, 0, xin, t)
-                    .map_err(|e| format!("B{il} qkv: {e}"))?;
+                if marlin_dense {
+                    self.lin_forward(
+                        false,
+                        LinPath::Gemm,
+                        &format!("blk.{il}.attn_q.weight"),
+                        xin,
+                        s0,
+                        t,
+                    )?;
+                    self.lin_forward(
+                        false,
+                        LinPath::Gemm,
+                        &format!("blk.{il}.attn_k.weight"),
+                        xin,
+                        s1,
+                        t,
+                    )?;
+                    self.lin_forward(
+                        false,
+                        LinPath::Gemm,
+                        &format!("blk.{il}.attn_v.weight"),
+                        xin,
+                        s1b,
+                        t,
+                    )?;
+                } else {
+                    self.gemv_multi_t_dev(plain, il, 0, xin, t)
+                        .map_err(|e| format!("B{il} qkv: {e}"))?;
+                }
                 self.attn_chain_dev_batch(slots, il / interval, t, s0, s1, s1b)
                     .map_err(|e| format!("B{il} attn: {e}"))?
             } else {
                 let xin = if plain { xn } else { xh };
-                self.gemv_multi_t_dev(plain, il, 0, xin, t)
-                    .map_err(|e| format!("B{il} qkvz: {e}"))?;
+                if marlin_dense {
+                    self.lin_forward(
+                        false,
+                        LinPath::Gemm,
+                        &format!("blk.{il}.attn_qkv.weight"),
+                        xin,
+                        s0,
+                        t,
+                    )?;
+                    self.lin_forward(
+                        false,
+                        LinPath::Gemm,
+                        &format!("blk.{il}.attn_gate.weight"),
+                        xin,
+                        s1,
+                        t,
+                    )?;
+                } else {
+                    self.gemv_multi_t_dev(plain, il, 0, xin, t)
+                        .map_err(|e| format!("B{il} qkvz: {e}"))?;
+                }
                 let g = self
                     .gdn_chain_dev_batch(slots, gi, t, xn, s0, s1)
                     .map_err(|e| format!("B{il} gdn: {e}"))?;
@@ -410,8 +456,27 @@ impl W4a16Dec {
             } else {
                 let xh3 = xh;
                 let _ = xn2;
-                self.gemv_multi_t_dev(false, il, 1, xh3, t)
-                    .map_err(|e| format!("B{il} gateup: {e}"))?;
+                if marlin_dense {
+                    self.lin_forward(
+                        false,
+                        LinPath::Gemm,
+                        &format!("blk.{il}.ffn_gate.weight"),
+                        xh3,
+                        s0,
+                        t,
+                    )?;
+                    self.lin_forward(
+                        false,
+                        LinPath::Gemm,
+                        &format!("blk.{il}.ffn_up.weight"),
+                        xh3,
+                        s1,
+                        t,
+                    )?;
+                } else {
+                    self.gemv_multi_t_dev(false, il, 1, xh3, t)
+                        .map_err(|e| format!("B{il} gateup: {e}"))?;
+                }
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
                 self.ew_dev_fused(s0, s1, s2, t * kd)?;

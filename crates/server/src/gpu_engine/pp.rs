@@ -1,6 +1,6 @@
 
 use super::QwenEngine;
-use llm170_backend_gpu::{forward_2shard, forward_2shard_argmax};
+use llm170_backend_gpu::{forward_2shard, forward_2shard_argmax, forward_2shard_toks};
 use std::path::Path;
 
 pub struct PpEngine {
@@ -17,22 +17,33 @@ impl PpEngine {
         kv_reserve: Option<u64>,
         kv_vram_cap: Option<u64>,
     ) -> Result<Self, String> {
-        let n_layer = llm170_core::qwen35::Model::load(dir)
-            .map_err(|e| e.to_string())?
-            .hp
-            .n_layer;
+        let model = llm170_core::qwen35::Model::load(dir).map_err(|e| e.to_string())?;
+        let hp = model.hp.clone();
+        let mtp_attn = model
+            .w_raw("mtp.layers.0.self_attn.q_proj.weight")
+            .is_some()
+            && crate::engine::mtp_upload_on(true);
+        let n_layer = hp.n_layer;
         if n_layer % 2 != 0 {
             return Err(format!("PP 2샤드: 홀수 층({n_layer}) — 균등 분할 불가"));
         }
         let k = n_layer / 2;
-        let half = |v: Option<u64>| v.map(|b| b / 2);
+        let interval = hp.full_attn_interval.max(1);
+        let owned = |range: std::ops::Range<usize>| {
+            range.filter(|&il| (il + 1).is_multiple_of(interval)).count()
+        };
+        let a_owned = owned(0..k);
+        let b_owned = owned(k..n_layer) + usize::from(mtp_attn);
+        let total = (a_owned + b_owned).max(1);
+        let split =
+            |v: Option<u64>, n: usize| v.map(|b| (b as u128 * n as u128 / total as u128) as u64);
         let mut a = Box::new(QwenEngine::load_dev(
             dir,
             n_slots,
             ctx,
-            half(kv_budget),
-            half(kv_reserve),
-            half(kv_vram_cap),
+            split(kv_budget, a_owned),
+            split(kv_reserve, a_owned),
+            split(kv_vram_cap, a_owned),
             0,
             Some((0, k)),
         )?);
@@ -40,9 +51,9 @@ impl PpEngine {
             dir,
             n_slots,
             ctx,
-            half(kv_budget),
-            half(kv_reserve),
-            half(kv_vram_cap),
+            split(kv_budget, b_owned),
+            split(kv_reserve, b_owned),
+            split(kv_vram_cap, b_owned),
             1,
             Some((k, n_layer)),
         ) {
@@ -117,10 +128,16 @@ impl PpEngine {
         };
         let mut last = None;
         let mut i = 0usize;
+        let mtp_on = self.b.mtp_drafts_on();
         while i < n {
             let t = (n - i).min(tmax);
             let is_last = i + t == n;
             let part = &tokens[i..i + t];
+            let mtp_pos = if mtp_on {
+                Some(self.b.dec.slot_pos_of(seq))
+            } else {
+                None
+            };
             if t == 1 {
                 let row = self.a.model.embed_row(part[0]).map_err(|e| e.to_string())?;
                 if is_last && want && self.b.head_gpu {
@@ -137,6 +154,36 @@ impl PpEngine {
                     last = Some(self.b.head_logits(&xn)?);
                 } else {
                     forward_2shard(&mut self.a.dec, &mut self.b.dec, seq, &row, 1, false)?;
+                }
+            } else if self.a.dec.embed_ready() {
+                if is_last && want && self.b.head_gpu {
+                    last = Some(forward_2shard_toks(
+                        &mut self.a.dec,
+                        &mut self.b.dec,
+                        seq,
+                        part,
+                        t,
+                        true,
+                    )?);
+                } else if is_last && want {
+                    let xn = forward_2shard_toks(
+                        &mut self.a.dec,
+                        &mut self.b.dec,
+                        seq,
+                        part,
+                        t,
+                        false,
+                    )?;
+                    last = Some(self.b.head_logits(&xn)?);
+                } else {
+                    forward_2shard_toks(
+                        &mut self.a.dec,
+                        &mut self.b.dec,
+                        seq,
+                        part,
+                        t,
+                        false,
+                    )?;
                 }
             } else {
                 let rows = self.a.embed_rows(part)?;
@@ -155,6 +202,21 @@ impl PpEngine {
                     last = Some(self.b.head_logits(&xn)?);
                 } else {
                     forward_2shard(&mut self.a.dec, &mut self.b.dec, seq, &rows, t, false)?;
+                }
+            }
+            if let Some(ps) = mtp_pos {
+                let (calls, save_row): (&[u32], Option<usize>) = if is_last {
+                    (&tokens[i + 1..i + t], Some(t - 1))
+                } else {
+                    (&tokens[i + 1..=i + t], None)
+                };
+                let emb = self.b.embed_rows(calls)?;
+                if let Err(err) = self
+                    .b
+                    .dec
+                    .mtp_prefill_chunk(seq, calls, &emb, ps, save_row)
+                {
+                    eprintln!("# mtp(무시): {err}");
                 }
             }
             i += t;
@@ -283,7 +345,7 @@ impl PpEngine {
         self.a
             .dec
             .kv_blocks_needed(n_tokens)
-            .max(self.b.dec.kv_blocks_needed(n_tokens))
+            .min(self.b.dec.kv_blocks_needed(n_tokens))
     }
 
     pub fn kv_cap_tokens(&self) -> usize {
@@ -333,60 +395,98 @@ impl PpEngine {
 
 
     pub fn enable_spec(&mut self) -> Result<(), String> {
-        Err("pp 1차: 스펙 미지원(강제 OFF)".into())
+        if llm170_diag::flag::val("LLM170_PP_SPEC") == Some("0") {
+            return Err("pp spec disabled(env)".into());
+        }
+        self.a.dec.enable_spec()?;
+        self.b.dec.enable_spec()
     }
     pub fn spec_on(&self) -> bool {
-        false
+        self.a.dec.spec_on() && self.b.dec.spec_on()
     }
-    pub fn spec_rollback(&mut self, _slot: usize, _keep: usize) -> Result<(), String> {
-        Err("pp: 스펙 미지원".into())
+    pub fn spec_rollback(&mut self, slot: usize, keep: usize) -> Result<(), String> {
+        self.a.dec.spec_rollback(slot, keep)?;
+        self.b.dec.spec_rollback(slot, keep)
     }
-    pub fn spec_rewind_pos(&mut self, _slot: usize, _n: u32) -> Result<(), String> {
-        Err("pp: 스펙 미지원".into())
+    pub fn spec_rewind_pos(&mut self, slot: usize, n: u32) -> Result<(), String> {
+        self.a.dec.spec_rewind_pos(slot, n)?;
+        self.b.dec.spec_rewind_pos(slot, n)
     }
     pub fn spec_verify(
         &mut self,
-        _slot: usize,
-        _rows: &[f32],
-        _t: usize,
+        slot: usize,
+        rows: &[f32],
+        t: usize,
     ) -> Result<Vec<u32>, String> {
-        Err("pp: 스펙 미지원".into())
+        let h = self.a.n_embd();
+        if rows.len() != t * h {
+            return Err(format!(
+                "pp spec_verify: rows={} != t{t}×h{h}",
+                rows.len()
+            ));
+        }
+        let mid = self.a.dec.forward_prefill(slot, rows, t, false)?;
+        if mid.len() != t * h {
+            return Err(format!(
+                "pp spec_verify: 경계 잔차 {} != t{t}×h{h}",
+                mid.len()
+            ));
+        }
+        self.b.dec.spec_verify(slot, &mid, t)
     }
     pub fn spec_verify_logits(
         &mut self,
-        _slot: usize,
-        _rows: &[f32],
-        _t: usize,
+        slot: usize,
+        rows: &[f32],
+        t: usize,
     ) -> Result<Vec<f32>, String> {
-        Err("pp: 스펙 미지원".into())
+        let h = self.a.n_embd();
+        if rows.len() != t * h {
+            return Err(format!(
+                "pp spec_verify_logits: rows={} != t{t}×h{h}",
+                rows.len()
+            ));
+        }
+        let mid = self.a.dec.forward_prefill(slot, rows, t, false)?;
+        if mid.len() != t * h {
+            return Err(format!(
+                "pp spec_verify_logits: 경계 잔차 {} != t{t}×h{h}",
+                mid.len()
+            ));
+        }
+        self.b.spec_verify_logits(slot, &mid, t)
     }
-    pub fn mtp_first(&mut self, _slot: usize, _tok: u32) -> Result<(), String> {
-        Ok(())
+    pub fn mtp_first(&mut self, slot: usize, tok: u32) -> Result<(), String> {
+        self.b.mtp_first(slot, tok)
     }
-    pub fn mtp_single(&mut self, _slot: usize, _tok: u32) -> Result<(), String> {
-        Ok(())
+    pub fn mtp_single(&mut self, slot: usize, tok: u32) -> Result<(), String> {
+        self.b.mtp_single(slot, tok)
     }
-    pub fn mtp_pre_round(&mut self, _acc: usize) -> Result<(), String> {
-        Ok(())
+    pub fn mtp_pre_round(&mut self, acc: usize) -> Result<(), String> {
+        self.b.mtp_pre_round(acc)
     }
     pub fn mtp_post_round(
         &mut self,
-        _slot: usize,
-        _accepted: &[u32],
-        _corrected: u32,
+        slot: usize,
+        accepted: &[u32],
+        corrected: u32,
     ) -> Result<(), String> {
-        Ok(())
+        self.b.mtp_post_round(slot, accepted, corrected)
     }
     pub fn mtp_slot_kv_reset(&mut self) -> Result<(), String> {
-        Ok(())
+        self.b.mtp_slot_kv_reset()
     }
-    pub fn mtp_slot_fresh(&mut self, _slot: usize) {}
-    pub fn mtp_slot_reused(&mut self, _slot: usize) {}
-    pub fn mtp_take_draft(&mut self, _slot: usize) -> Option<Vec<u32>> {
-        None
+    pub fn mtp_slot_fresh(&mut self, slot: usize) {
+        self.b.mtp_slot_fresh(slot)
+    }
+    pub fn mtp_slot_reused(&mut self, slot: usize) {
+        self.b.mtp_slot_reused(slot)
+    }
+    pub fn mtp_take_draft(&mut self, slot: usize) -> Option<Vec<u32>> {
+        self.b.mtp_take_draft(slot)
     }
     pub fn mtp_drafts_on(&self) -> bool {
-        false
+        self.b.spec_on() && self.b.mtp_drafts_on()
     }
 
     pub fn warm_spec_graphs(&mut self, _n_slots: usize, _eos: u32) -> Result<(), String> {

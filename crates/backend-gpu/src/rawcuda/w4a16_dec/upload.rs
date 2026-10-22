@@ -1,4 +1,3 @@
-
 use super::*;
 
 impl W4a16Dec {
@@ -60,9 +59,40 @@ impl W4a16Dec {
             self.lin_grp.insert(name.to_string(), (group, scale_bf16));
         }
         if (group == 128 && !scale_bf16) || (group == 32 && scale_bf16) {
-            self.upload_lin_marlin(name, q, s, n, k, group, scale_bf16);
+            let _ = self.upload_lin_marlin(name, q, s, n, k, group, scale_bf16);
         }
         Ok(())
+    }
+
+    pub fn consolidate_marlin_dense(&mut self) {
+        if self.moe.n_experts != 0 || self.lins.is_empty() || self.marlin_dense {
+            return;
+        }
+        for (name, &(dq, _, _, k)) in self.lins.iter() {
+            if dq == 0 {
+                continue;
+            }
+            if !self.lins_mk.contains_key(name)
+                || !self.lins_msc.contains_key(name)
+                || !k.is_multiple_of(128)
+                || self.lin_grp.get(name).copied().unwrap_or((128, false)) != (128, false)
+            {
+                return;
+            }
+        }
+        let names: Vec<String> = self.lins.keys().cloned().collect();
+        for name in names {
+            let (dq, ds, n, k) = self.lins[&name];
+            if dq == 0 {
+                continue;
+            }
+            if self.cc.free(dq).is_ok() {
+                self.lins.insert(name, (0, ds, n, k));
+                let qb = (n * k / 2) as u64;
+                self.weights_bytes = self.weights_bytes.saturating_sub(qb);
+            }
+        }
+        self.marlin_dense = true;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -75,7 +105,7 @@ impl W4a16Dec {
         k: usize,
         group: usize,
         scale_bf16: bool,
-    ) {
+    ) -> bool {
         let repack = llm170_core::marlin::marlin_repack_q(
             unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u32, n * k / 8) },
             n,
@@ -85,7 +115,7 @@ impl W4a16Dec {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[marlin] {name}: 재패킹 스킵({e}) — GEMV 폴백");
-                return;
+                return false;
             }
         };
         let qb = unsafe { std::slice::from_raw_parts(qm.as_ptr() as *const u8, qm.len() * 4) };
@@ -93,13 +123,13 @@ impl W4a16Dec {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[marlin] {name}: 재패킹 VRAM 부족({e}) — GEMV 폴백");
-                return;
+                return false;
             }
         };
         if let Err(e) = Self::h2d_chunked(&self.cc, dqm, qb) {
             let _ = self.cc.free(dqm);
             eprintln!("[marlin] {name}: 재패킹 업로드 실패({e}) — GEMV 폴백");
-            return;
+            return false;
         }
         self.weights_bytes += qb.len() as u64;
         self.marlin_bytes += qb.len() as u64;
@@ -109,43 +139,44 @@ impl W4a16Dec {
             self.marlin_bytes = self.marlin_bytes.saturating_sub((n * k / 2) as u64);
         }
         let kg = k / group;
-        if s.len() == n * kg * 2 {
-            let sf: Vec<f32> = s
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| Self::scale_bits_to_f32(u16::from_le_bytes(*c), scale_bf16))
-                .collect();
-            let so: Vec<u8> = match llm170_core::marlin::marlin_permute_scales(&sf, n, k, group) {
-                Ok(pf) => {
-                    let mut out = vec![0u8; pf.len() * 2];
-                    for (i, v) in pf.iter().enumerate() {
-                        out[i * 2..i * 2 + 2]
-                            .copy_from_slice(&Self::f32_to_f16_bits(*v).to_le_bytes());
-                    }
-                    out
-                }
-                Err(_) => Vec::new(),
-            };
-            if !so.is_empty()
-                && let Ok(dsc) = self.cc.alloc(so.len())
-            {
-                if Self::h2d_chunked(&self.cc, dsc, &so).is_ok() {
-                    self.weights_bytes += so.len() as u64;
-                    self.marlin_bytes += so.len() as u64;
-                    if let Some((old, _, _)) = self.lins_msc.insert(name.to_string(), (dsc, n, kg))
-                    {
-                        let _ = self.cc.free(old);
-                        self.weights_bytes = self.weights_bytes.saturating_sub(so.len() as u64);
-                        self.marlin_bytes = self.marlin_bytes.saturating_sub(so.len() as u64);
-                    }
-                } else {
-                    let _ = self.cc.free(dsc);
-                }
-            }
+        if s.len() != n * kg * 2 {
+            return false;
         }
+        let sf: Vec<f32> = s
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| Self::scale_bits_to_f32(u16::from_le_bytes(*c), scale_bf16))
+            .collect();
+        let so: Vec<u8> = match llm170_core::marlin::marlin_permute_scales(&sf, n, k, group) {
+            Ok(pf) => {
+                let mut out = vec![0u8; pf.len() * 2];
+                for (i, v) in pf.iter().enumerate() {
+                    out[i * 2..i * 2 + 2].copy_from_slice(&Self::f32_to_f16_bits(*v).to_le_bytes());
+                }
+                out
+            }
+            Err(_) => return false,
+        };
+        if so.is_empty() {
+            return false;
+        }
+        let Ok(dsc) = self.cc.alloc(so.len()) else {
+            return false;
+        };
+        if Self::h2d_chunked(&self.cc, dsc, &so).is_err() {
+            let _ = self.cc.free(dsc);
+            return false;
+        }
+        self.weights_bytes += so.len() as u64;
+        self.marlin_bytes += so.len() as u64;
+        if let Some((old, _, _)) = self.lins_msc.insert(name.to_string(), (dsc, n, kg)) {
+            let _ = self.cc.free(old);
+            self.weights_bytes = self.weights_bytes.saturating_sub(so.len() as u64);
+            self.marlin_bytes = self.marlin_bytes.saturating_sub(so.len() as u64);
+        }
+        true
     }
-
 
     pub fn set_norm_weights(&mut self, nw: &[f32], rows: usize) -> Result<(), String> {
         if self.hidden == 0 || self.hidden > 8192 {
@@ -176,7 +207,6 @@ impl W4a16Dec {
         self.norm_w_rows = rows;
         Ok(())
     }
-
 
     pub fn set_gdn(
         &mut self,
@@ -353,11 +383,13 @@ impl W4a16Dec {
             )
         };
         let mb = dims.cap.div_ceil(512);
-        let need_blocks = slots * n * mb;
+        let owned_attn = self.n_attn_owned(&dims);
+        let need_blocks = slots * owned_attn * mb;
         let block_k = 512 * kvd;
         let block_s = 512 * kvh * 4;
         let per_block = 2 * (block_k + block_s) as u64;
         let total_blocks = match self.attn.kv_budget {
+            Some(_) if need_blocks == 0 => 0,
             Some(b) => ((b / per_block.max(1)) as usize).clamp(1, need_blocks),
             None => need_blocks,
         };
@@ -366,6 +398,7 @@ impl W4a16Dec {
             .map(|mb| mb << 20);
         let vram_cap = diag_vram.or(self.attn.kv_vram_cap);
         let vram_blocks = match vram_cap {
+            Some(_) if total_blocks == 0 => 0,
             Some(b) => ((b / per_block.max(1)) as usize).clamp(1, total_blocks),
             None => total_blocks,
         };
@@ -418,7 +451,9 @@ impl W4a16Dec {
         self.attn.dknw_a = dk;
         Self::h2d_chunked(&self.cc, dk, b(knw))?;
         let pool = super::blocktable::KvPool::new(slots, n, mb, total_blocks, vram_blocks)?;
-        let (dkc, dvc) = {
+        let (dkc, dvc) = if vram_blocks == 0 {
+            (0, 0)
+        } else {
             let kbytes = vram_blocks * block_k;
             let kc = self.cc.alloc(kbytes)?;
             Self::zero_dev(&self.cc, kc, kbytes)?;
@@ -560,9 +595,8 @@ impl W4a16Dec {
         let n_attn = dm.n_attn;
         let floor = self.kv_floor.get(slot).copied().unwrap_or(0) as usize;
         let mut new = 0usize;
-        let win = self.window;
         for l in 0..n_attn {
-            if !win.owns_attn(l, dm.interval, self.n_layers) {
+            if !self.owns_attn_layer(l, &dm) {
                 continue;
             }
             let sliding = self.attn.layers.get(l).map(|x| x.sliding).unwrap_or(false);
@@ -694,18 +728,26 @@ impl W4a16Dec {
 
     pub fn kv_blocks_needed(&self, n_tokens: usize) -> usize {
         match self.attn.attn {
-            Some(dm) => {
+            Some(dm) if dm.n_attn > 0 => {
+                let owned = self.n_attn_owned(&dm);
+                if owned == 0 {
+                    return 0;
+                }
                 let mb = dm.cap.div_ceil(512);
-                (n_tokens + 2).div_ceil(512).min(mb) * dm.n_attn
+                (n_tokens + 2).div_ceil(512).min(mb) * owned
             }
-            None => 0,
+            _ => 0,
         }
     }
 
     pub fn kv_cap_tokens(&self) -> usize {
         match self.attn.attn {
             Some(dm) if dm.n_attn > 0 => {
-                ((self.kv_total_blocks() / dm.n_attn) * 512).saturating_sub(2)
+                let owned = self.n_attn_owned(&dm);
+                if owned == 0 {
+                    return 0;
+                }
+                ((self.kv_total_blocks() / owned) * 512).saturating_sub(2)
             }
             _ => 0,
         }
@@ -1595,7 +1637,6 @@ impl W4a16Dec {
     }
 }
 
-
 const STREAM_CHUNK: usize = 8 << 20;
 
 impl W4a16Dec {
@@ -1669,7 +1710,7 @@ impl W4a16Dec {
                 }
             }
             if ok && ok_s {
-                self.upload_lin_marlin(name, &qbuf, &sbuf, n, k, group, scale_bf16);
+                let _ = self.upload_lin_marlin(name, &qbuf, &sbuf, n, k, group, scale_bf16);
             }
         }
         Ok(())

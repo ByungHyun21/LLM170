@@ -8,11 +8,11 @@ pub(in crate::rawcuda::w4a16_dec) fn sk_ksp(blocks: usize, k: usize) -> Option<u
     let cap = (groups / 5).clamp(1, SK_KSP_CAP);
     let mut best = 1usize;
     for ksp in [1usize, 2, 4, 8] {
-        if ksp <= cap && groups.is_multiple_of(ksp) {
+        if ksp <= cap && groups.is_multiple_of(ksp) && blocks * ksp >= SK_SM_TARGET {
             best = ksp;
         }
     }
-    (blocks * best >= SK_SM_TARGET).then_some(best as u8)
+    Some(best as u8)
 }
 
 pub(in crate::rawcuda::w4a16_dec) const SK_SM_TARGET: usize = 70;
@@ -53,6 +53,36 @@ impl W4a16Dec {
                 &mut crate::rawcuda::args::l4(&mut p_t, &mut p_p, &mut p_c, &mut p_s),
             )?;
         }
+        Ok(true)
+    }
+
+    pub(in crate::rawcuda::w4a16_dec) fn marlin_gemv1_launch(
+        &mut self,
+        name: &str,
+        x16: CUdeviceptr,
+        out: CUdeviceptr,
+    ) -> Result<bool, String> {
+        let (_, ds, n, k) = self.lin_spec(name)?;
+        let Some((dqm, _, _)) = self.lin_mk(name) else {
+            return Ok(false);
+        };
+        if !k.is_multiple_of(128) {
+            return Ok(false);
+        }
+        let blocks = n.div_ceil(256);
+        let f = self.cc.function("w4a16_gemv_sk1_marlin")?;
+        let (mut p_q, mut p_s, mut p_x) = (dqm, ds, x16);
+        let (mut p_o, mut p_p) = (out, 0u64);
+        let (mut p_n, mut p_k, mut p_sp) = (n as i32, k as i32, 1i32);
+        self.cc.launch(
+            f,
+            blocks as u32,
+            1,
+            128,
+            &mut crate::rawcuda::args::l8(
+                &mut p_q, &mut p_s, &mut p_x, &mut p_o, &mut p_p, &mut p_n, &mut p_k, &mut p_sp,
+            ),
+        )?;
         Ok(true)
     }
 

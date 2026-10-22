@@ -1,4 +1,3 @@
-
 use crate::rawcuda::ctx::CudaCtx;
 use crate::rawcuda::ffi::{self, CUdeviceptr};
 use std::collections::HashMap;
@@ -30,7 +29,6 @@ pub const G4_TROW_MAX: usize = 16;
 pub const KSTEP_KMAX: usize = 8;
 pub const GEMV_TR: usize = 8;
 pub const GEMM_FFMA_TMAX: usize = 32;
-
 
 #[derive(Clone, Copy, Default)]
 pub struct Buf {
@@ -557,6 +555,8 @@ pub struct W4a16Dec {
     lins_mk: HashMap<String, (CUdeviceptr, usize, usize)>,
     lins_msc: HashMap<String, (CUdeviceptr, usize, usize)>,
     marlin_bytes: u64,
+    marlin_dense: bool,
+    mtp_attn_planned: bool,
     plains: HashMap<String, (CUdeviceptr, usize, usize)>,
     plain_weights: bool,
     weights_bytes: u64,
@@ -640,10 +640,10 @@ mod moe;
 mod mtp;
 mod prefill;
 mod probe;
+mod shard;
 pub mod unified_cache;
 mod upload;
-mod shard;
-pub use shard::{forward_2shard, forward_2shard_argmax};
+pub use shard::{forward_2shard, forward_2shard_argmax, forward_2shard_toks};
 
 mod spec;
 
@@ -868,6 +868,8 @@ impl W4a16Dec {
             lins_mk: HashMap::new(),
             lins_msc: HashMap::new(),
             marlin_bytes: 0,
+            marlin_dense: false,
+            mtp_attn_planned: false,
             plains: HashMap::new(),
             plain_weights: false,
             weights_bytes: 0,
@@ -944,8 +946,27 @@ impl W4a16Dec {
         self.window.owns_final(self.n_layers)
     }
 
+    pub(super) fn owns_attn_layer(&self, l: usize, dm: &AttnDims) -> bool {
+        let real = self.n_layers / dm.interval.max(1);
+        if l < real {
+            self.window.owns_attn(l, dm.interval, self.n_layers)
+        } else {
+            self.mtp_attn_planned && l < dm.n_attn
+        }
+    }
+
+    pub(super) fn n_attn_owned(&self, dm: &AttnDims) -> usize {
+        (0..dm.n_attn)
+            .filter(|&l| self.owns_attn_layer(l, dm))
+            .count()
+    }
+
     pub fn new(n_slots: usize, hidden: usize, n_layers: usize) -> Result<Self, String> {
         Self::new_dev(n_slots, hidden, n_layers, 0)
+    }
+
+    pub fn set_mtp_attn_planned(&mut self, on: bool) {
+        self.mtp_attn_planned = on;
     }
 
     pub fn set_layer_window(&mut self, start: usize, end: usize) -> Result<(), String> {
@@ -1019,6 +1040,21 @@ impl W4a16Dec {
             .collect();
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         self.cc.h2d(self.dx32.ptr, xb)?;
+        if dq == 0 {
+            let x16 = self.cast_f16_dev(self.dx32.ptr, k)?;
+            if !self.marlin_gemv1_launch(name, x16, self.dy.ptr)? {
+                return Err(format!("gemv {name}: 마린 경로 실패 — 원본 q 폐기됨"));
+            }
+            let mut ob = vec![0u8; n * 4];
+            self.cc.d2h_async(ob.as_mut_ptr(), self.dy.ptr, n * 4)?;
+            self.cc.sync()?;
+            return Ok(ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect());
+        }
         let (grp, sbf) = self.lin_grp.get(name).copied().unwrap_or((128, false));
         let sym = crate::rawcuda::gptq4::kernel_sym(true, grp, sbf)?;
         let f = self.cc.function(sym)?;
@@ -1072,6 +1108,21 @@ impl W4a16Dec {
         }
         let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
         self.cc.h2d(self.dx32.ptr, xb)?;
+        if dq == 0 {
+            let x16 = self.cast_f16_dev(self.dx32.ptr, k)?;
+            if !self.marlin_gemv1_launch(name, x16, self.dy.ptr)? {
+                return Err(format!("gemv_f32 {name}: 마린 경로 실패 — 원본 q 폐기됨"));
+            }
+            let mut ob = vec![0u8; n * 4];
+            self.cc.d2h_async(ob.as_mut_ptr(), self.dy.ptr, n * 4)?;
+            self.cc.sync()?;
+            return Ok(ob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect());
+        }
         let (grp, sbf) = self.lin_grp.get(name).copied().unwrap_or((128, false));
         if k > grp * 256 {
             return Err(format!(
@@ -1148,6 +1199,14 @@ impl W4a16Dec {
 
     fn lin_mk(&self, name: &str) -> Option<(CUdeviceptr, usize, usize)> {
         self.lins_mk.get(name).copied()
+    }
+
+    pub(super) fn has_orig_q(&self, name: &str) -> bool {
+        self.lins.get(name).is_some_and(|v| v.0 != 0)
+    }
+
+    pub fn dense_marlin_only(&self) -> bool {
+        self.marlin_dense
     }
 
     pub fn moe_mode(&self) -> &'static str {

@@ -1,4 +1,3 @@
-
 mod bench;
 mod engine;
 mod gpu_engine;
@@ -129,21 +128,19 @@ fn run_main() -> ExitCode {
     if !matches!(
         args.first().map(String::as_str),
         Some("tokenize") | Some("plan")
+    ) && let Some(gt) = resource::guard_target(
+        args.first().map(String::as_str).unwrap_or(""),
+        ma.model.as_deref(),
+        &ma.rest,
     ) {
-        if let Some(gt) = resource::guard_target(
-            args.first().map(String::as_str).unwrap_or(""),
-            ma.model.as_deref(),
-            &ma.rest,
-        ) {
-            if let Err(e) = resource::acquire_load_lock() {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-            if let Err(e) = resource::preflight(&gt.path, gt.gpu) {
-                resource::release_load_lock();
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
+        if let Err(e) = resource::acquire_load_lock() {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(e) = resource::preflight(&gt.path, gt.gpu) {
+            resource::release_load_lock();
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
         }
     }
     struct EL;

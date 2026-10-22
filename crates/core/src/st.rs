@@ -1,4 +1,3 @@
-
 use crate::json::Json;
 use std::collections::HashMap;
 use std::io::Read;
@@ -299,6 +298,8 @@ impl StArchive {
         self.entries.get(name)
     }
 
+    /// # Safety
+    /// `out` must point to at least `cap` writable bytes for the duration of the call.
     pub unsafe fn read_into(&self, name: &str, out: *mut u8, cap: usize) -> StResult<()> {
         let e = self
             .entries

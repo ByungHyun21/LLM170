@@ -87,9 +87,20 @@ impl QwenEngine {
         window: Option<(usize, usize)>,
     ) -> Result<(bool, bool), String> {
         upload_model(dec, model, ctx, kv_reserve, window)?;
+        dec.consolidate_marlin_dense();
         let mut ld = super::upload::DirectLoad::new(model.store());
         let mut head_gpu = false;
-        if let Some(w) = model.w("output.weight")
+        let owns_final = window.is_none_or(|(_, we)| we == model.hp.n_layer);
+        let owns_first = window.is_none_or(|(ws, _)| ws == 0);
+        let mtp_b_embed = owns_final
+            && window.is_some()
+            && model.w_raw("mtp.layers.0.self_attn.q_proj.weight").is_some()
+            && crate::engine::mtp_upload_on(true);
+        let gpu_embed = window.is_none()
+            || (owns_first && llm170_diag::flag::val("LLM170_PP_GPU_EMBED") != Some("0"))
+            || mtp_b_embed;
+        if owns_final
+            && let Some(w) = model.w("output.weight")
             && w.ty == llm170_core::wtype::WType::Bf16
         {
             let (tn, _) = model
@@ -100,7 +111,8 @@ impl QwenEngine {
             dec.upload_head_stream(w.n_out as usize, w.n_in as usize, len, &mut f)?;
             head_gpu = true;
         }
-        if let Some(w) = model.w("token_embd.weight")
+        if gpu_embed
+            && let Some(w) = model.w("token_embd.weight")
             && matches!(
                 w.ty,
                 llm170_core::wtype::WType::F16 | llm170_core::wtype::WType::Bf16
@@ -120,7 +132,7 @@ impl QwenEngine {
             )?;
         }
         ld.log_summary();
-        let mtp = if window.is_none() {
+        let mtp = if owns_final && crate::engine::mtp_upload_on(window.is_some()) {
             upload_mtp(dec, model)?
         } else {
             false

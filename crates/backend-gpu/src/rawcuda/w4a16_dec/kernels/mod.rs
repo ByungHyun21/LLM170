@@ -130,7 +130,13 @@ impl W4a16Dec {
         match (plain, path) {
             (false, LinPath::Gemv1 { w }) => self.gemv_stage_x32(name, x, dst, w),
             (false, LinPath::Gemm) => self.gemm_launch(name, x, dst, t),
-            (false, LinPath::GemvT) => self.gemv_t_launch(name, x, dst, t),
+            (false, LinPath::GemvT) => {
+                if self.has_orig_q(name) {
+                    self.gemv_t_launch(name, x, dst, t)
+                } else {
+                    self.gemm_launch(name, x, dst, t)
+                }
+            }
             (true, LinPath::Gemv1 { w }) => self.plain_stage_x32(name, x, dst, w),
             (true, LinPath::Gemm) => self.plain_gemm_launch(name, x, dst, t),
             (true, LinPath::GemvT) => self.plain_gemv_t_launch(name, x, dst, t),
@@ -249,7 +255,6 @@ impl W4a16Dec {
         self.norm_resid_at(w, x_dev, ab_dev, t_len, xn32)
     }
 
-
     pub(in crate::rawcuda::w4a16_dec) fn ew_dev(
         &mut self,
         g_dev: CUdeviceptr,
@@ -308,5 +313,4 @@ impl W4a16Dec {
             &mut crate::rawcuda::args::l6(&mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut nn),
         )
     }
-
 }
