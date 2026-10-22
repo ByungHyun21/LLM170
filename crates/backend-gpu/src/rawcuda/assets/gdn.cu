@@ -708,16 +708,24 @@ extern "C" __global__ void __launch_bounds__(512, 2) gdn_h(
             *reinterpret_cast<__half2*>(&sk[t * 128 + dv4 + 2]) =
                 __floats2half2_rn(kv.z, kv.w);
         }
-        for (int q = threadIdx.x; q < GDN_CS * 128; q += blockDim.x) {
-            const int j = q / 128, r = q % 128;
-
-
-
-            Wp[q] = __float2half_rn(wubuf[wb + (long)c * GDN_CS * 2 * d + (long)j * 2 * d + r]);
+        for (int q4 = threadIdx.x; q4 < GDN_CS * 128 / 4; q4 += blockDim.x) {
+            const int q = q4 * 4;
+            const int j = q / 128;
+            const int r = q % 128;
+            const long off = wb + (long)c * GDN_CS * 2 * d + (long)j * 2 * d + r;
+            const float4 wv = *reinterpret_cast<const float4*>(&wubuf[off]);
+            *reinterpret_cast<__half2*>(&Wp[j * 128 + r]) =
+                __floats2half2_rn(wv.x, wv.y);
+            *reinterpret_cast<__half2*>(&Wp[j * 128 + r + 2]) =
+                __floats2half2_rn(wv.z, wv.w);
         }
-        for (int q = threadIdx.x; q < GDN_CS * GDN_VS; q += blockDim.x) {
-            const int j = q / GDN_VS, t2 = q % GDN_VS;
-            Ul[q] = wubuf[wb + (long)c * GDN_CS * 2 * d + (long)j * 2 * d + d + vs + t2];
+        for (int q4 = threadIdx.x; q4 < GDN_CS * GDN_VS / 4; q4 += blockDim.x) {
+            const int q = q4 * 4;
+            const int j = q / GDN_VS;
+            const int t2 = q % GDN_VS;
+            const long off = wb + (long)c * GDN_CS * 2 * d + (long)j * 2 * d + d + vs + t2;
+            *reinterpret_cast<float4*>(&Ul[j * GDN_VS + t2]) =
+                *reinterpret_cast<const float4*>(&wubuf[off]);
         }
         if (threadIdx.x < GDN_CS) {
             float acc = 0.0f;
@@ -876,9 +884,11 @@ extern "C" __global__ void gdn_o(
             reinterpret_cast<uint2*>(KQ)[e4] = reinterpret_cast<const uint2*>(KQg)[e4];
         }
     }
-    for (int q2 = threadIdx.x; q2 < GDN_CS * d; q2 += blockDim.x) {
+    for (int q4 = threadIdx.x; q4 < GDN_CS * d / 4; q4 += blockDim.x) {
+        const int q2 = q4 * 4;
         const int j = q2 / d, t2 = q2 % d;
-        dc[q2] = dcbuf[dcb + (long)c * GDN_CS * d + (long)j * d + t2];
+        *reinterpret_cast<float4*>(&dc[q2]) = *reinterpret_cast<const float4*>(
+            &dcbuf[dcb + (long)c * GDN_CS * d + (long)j * d + t2]);
     }
     for (int q2 = threadIdx.x; q2 < 128 * (d / 8); q2 += blockDim.x) {
         const int r = q2 / (d / 8);
@@ -899,10 +909,22 @@ extern "C" __global__ void gdn_o(
         e[threadIdx.x] = (threadIdx.x < n) ? gdn_expf(gcs[threadIdx.x]) : 0.0f;
     }
 
-    for (int q2 = threadIdx.x; q2 < GDN_CS * d; q2 += blockDim.x) {
+    for (int q4 = threadIdx.x; q4 < GDN_CS * d / 4; q4 += blockDim.x) {
+        const int q2 = q4 * 4;
         const int iq = q2 / d, rq = q2 % d;
-        float qv = (iq < n) ? q[(t0 + iq) * (h_k * d) + kh * 128 + rq] : 0.0f;
-        qt[iq * d + rq] = __float2half_rn(qv * qscale * sc[sc_h + rq]);
+        float4 qv = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (iq < n) {
+            qv = *reinterpret_cast<const float4*>(
+                &q[(t0 + iq) * (h_k * d) + kh * 128 + rq]);
+        }
+        const float s0 = qscale * sc[sc_h + rq];
+        const float s1 = qscale * sc[sc_h + rq + 1];
+        const float s2 = qscale * sc[sc_h + rq + 2];
+        const float s3 = qscale * sc[sc_h + rq + 3];
+        *reinterpret_cast<__half2*>(&qt[iq * d + rq]) =
+            __floats2half2_rn(qv.x * s0, qv.y * s1);
+        *reinterpret_cast<__half2*>(&qt[iq * d + rq + 2]) =
+            __floats2half2_rn(qv.z * s2, qv.w * s3);
     }
 __syncthreads();
 
