@@ -66,20 +66,7 @@ impl W4a16Dec {
             ),
         )?;
 
-        let f = self.cc.function("gdn_l2perm")?;
-        let (
-            mut l0,
-            mut l1,
-            mut l2,
-            mut l3,
-            mut l4,
-            mut l5,
-            mut l6,
-            mut l7,
-            mut l8,
-            mut l9,
-            mut l10,
-        ) = (
+        let (mut l0, mut l1, mut l2, mut l3, mut l4, mut l5, mut l6, mut l7, mut l8, mut l9, mut l10) = (
             self.gdn.dgq,
             self.gdn.dgk,
             self.gdn.dgv,
@@ -92,16 +79,34 @@ impl W4a16Dec {
             self.gdn.dv2,
             self.gdn.dbg,
         );
-        self.cc.launch(
-            f,
-            dm.h_v as u32,
-            t_len as u32,
-            128,
-            &mut crate::rawcuda::args::l16(
-                &mut l0, &mut l1, &mut l2, &mut l3, &mut l4, &mut l5, &mut l6, &mut l7, &mut l8,
-                &mut l9, &mut l10, &mut tl, &mut lay, &mut hk, &mut hv, &mut hd,
-            ),
-        )?;
+        if t_len >= 4 {
+            let f = self.cc.function("gdn_l2perm8")?;
+            let smem = 2 * dm.hidden * 4 + 8 * 128 * 4;
+            self.cc.set_dynamic_smem(f, smem as u32)?;
+            self.cc.launch_shared(
+                f,
+                dm.h_v as u32,
+                t_len.div_ceil(8) as u32,
+                1024,
+                smem as u32,
+                &mut crate::rawcuda::args::l16(
+                    &mut l0, &mut l1, &mut l2, &mut l3, &mut l4, &mut l5, &mut l6, &mut l7,
+                    &mut l8, &mut l9, &mut l10, &mut tl, &mut lay, &mut hk, &mut hv, &mut hd,
+                ),
+            )?;
+        } else {
+            let f = self.cc.function("gdn_l2perm")?;
+            self.cc.launch(
+                f,
+                dm.h_v as u32,
+                t_len as u32,
+                128,
+                &mut crate::rawcuda::args::l16(
+                    &mut l0, &mut l1, &mut l2, &mut l3, &mut l4, &mut l5, &mut l6, &mut l7,
+                    &mut l8, &mut l9, &mut l10, &mut tl, &mut lay, &mut hk, &mut hv, &mut hd,
+                ),
+            )?;
+        }
 
         let mut skip_scan = false;
         if t_len == 1 {

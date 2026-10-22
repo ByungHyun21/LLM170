@@ -366,6 +366,110 @@ extern "C" __global__ void gdn_l2perm(
                     q_out, k_out, v_out, bg, t_len, layer, h_k, h_v, hidden);
 }
 
+extern "C" __global__ void gdn_l2perm8(
+    const float* __restrict__ q_in,
+    const float* __restrict__ k_in,
+    const float* __restrict__ v_in,
+    const float* __restrict__ xn,
+    const float* __restrict__ abuf,
+    const float* __restrict__ alog,
+    const float* __restrict__ dtb,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    float* __restrict__ bg,
+    int t_len, int layer, int h_k, int h_v, int hidden)
+{
+    extern __shared__ float smem[];
+    float* abs_ = smem;
+    float* red = smem + 2 * hidden;
+    const int h = blockIdx.x;
+    const int lane = threadIdx.x & 127;
+    const int grp = threadIdx.x >> 7;
+    const int t = blockIdx.y * 8 + grp;
+    const bool live = t < t_len;
+    const int kh = h % h_k;
+    const float eps = 1e-6f;
+    const float* abA = abuf + (layer * 2) * h_v * hidden + h * hidden;
+    const float* abB = abA + h_v * hidden;
+    for (int i = threadIdx.x; i < 2 * hidden; i += blockDim.x) {
+        abs_[i] = (i < hidden) ? abA[i] : abB[i - hidden];
+    }
+    __syncthreads();
+    float pa = 0.0f;
+    float pb = 0.0f;
+    for (int i = lane; i < hidden; i += 128) {
+        const float xv = live ? xn[(size_t)t * hidden + i] : 0.0f;
+        pa += xv * abs_[i];
+        pb += xv * abs_[hidden + i];
+    }
+    red[grp * 128 + lane] = pa;
+    __syncthreads();
+    for (int st = 64; st > 0; st >>= 1) {
+        if (lane < st) {
+            red[grp * 128 + lane] += red[grp * 128 + lane + st];
+        }
+        __syncthreads();
+    }
+    const float a_val = red[grp * 128];
+    __syncthreads();
+    red[grp * 128 + lane] = pb;
+    __syncthreads();
+    for (int st = 64; st > 0; st >>= 1) {
+        if (lane < st) {
+            red[grp * 128 + lane] += red[grp * 128 + lane + st];
+        }
+        __syncthreads();
+    }
+    const float b_val = red[grp * 128];
+    if (lane == 0 && live) {
+        const int G = h_v / h_k;
+        const int p_inv = (h % G) * h_k + h / G;
+        const float al = alog[layer * h_v + h];
+        const float dt = dtb[layer * h_v + h];
+        const float ssm_a = -gdn_expf(al);
+        const float sp = (a_val + dt > 20.0f) ? (a_val + dt) : gdn_logf(1.0f + gdn_expf(a_val + dt));
+        bg[(size_t)t * (2 * h_v) + p_inv] = 1.0f / (1.0f + gdn_expf(-b_val));
+        bg[(size_t)t * (2 * h_v) + h_v + p_inv] = sp * ssm_a;
+    }
+    if (live) {
+        const int G = h_v / h_k;
+        const int p_inv = (h % G) * h_k + h / G;
+        v_out[(size_t)t * (h_v * 128) + p_inv * 128 + lane] =
+            v_in[(size_t)t * (h_v * 128) + h * 128 + lane];
+    }
+    if (h < h_k) {
+        const int qi_off = (size_t)t * (h_k * 128) + kh * 128 + lane;
+        const float qv = live ? q_in[qi_off] : 0.0f;
+        red[grp * 128 + lane] = qv * qv;
+        __syncthreads();
+        for (int st = 64; st > 0; st >>= 1) {
+            if (lane < st) {
+                red[grp * 128 + lane] += red[grp * 128 + lane + st];
+            }
+            __syncthreads();
+        }
+        const float qi = 1.0f / sqrtf(red[grp * 128] + eps);
+        if (live) {
+            q_out[qi_off] = qv * qi;
+        }
+        __syncthreads();
+        const float kv = live ? k_in[qi_off] : 0.0f;
+        red[grp * 128 + lane] = kv * kv;
+        __syncthreads();
+        for (int st = 64; st > 0; st >>= 1) {
+            if (lane < st) {
+                red[grp * 128 + lane] += red[grp * 128 + lane + st];
+            }
+            __syncthreads();
+        }
+        const float ki = 1.0f / sqrtf(red[grp * 128] + eps);
+        if (live) {
+            k_out[qi_off] = kv * ki;
+        }
+    }
+}
+
 
 #define GDN_CS 32
 #define GDN_TILE 16
