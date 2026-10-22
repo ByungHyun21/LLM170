@@ -7,8 +7,8 @@ pub const SPEC_VERIFY_TMAX: usize = 9;
 
 pub const CTX_OVERFLOW: &str = "context overflow";
 
-pub const ATTN_F3S_TMAX: usize = 1024;
-pub const CHAIN_TMAX: usize = 1024;
+pub const ATTN_F3S_TMAX: usize = 2048;
+pub const CHAIN_TMAX: usize = 2048;
 pub const GEMM_MMA_M: usize = 64;
 pub const GEMM_MMA_N: usize = 128;
 pub const GEMM_BMMA_M: usize = 32;
