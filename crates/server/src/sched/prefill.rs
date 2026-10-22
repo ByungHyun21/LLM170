@@ -19,7 +19,13 @@ pub(super) fn slot_prefill(
     let others_decoding = slots
         .iter()
         .any(|s| s.job.is_some() && s.prefilled == s.job.as_ref().unwrap().tokens.len());
-    let cap_now = if others_decoding {
+    let backlog = slots
+        .iter()
+        .filter(|s| s.job.is_some() && s.prefilled < s.job.as_ref().unwrap().tokens.len())
+        .count();
+    let cap_now = if others_decoding && backlog > 1 {
+        PF_CHUNK_MAX
+    } else if others_decoding {
         eng.0.prefill_mixed_cap()
     } else {
         PF_CHUNK_MAX
@@ -37,10 +43,6 @@ pub(super) fn slot_prefill(
     let _pft = std::time::Instant::now();
     llm170_diag::watchdog::bump();
     let left = slots[i].job.as_ref().unwrap().tokens.len() - slots[i].prefilled;
-    let backlog = slots
-        .iter()
-        .filter(|s| s.job.is_some() && s.prefilled < s.job.as_ref().unwrap().tokens.len())
-        .count();
     let mut chunk = PF_BUDGET_TOKENS
         .saturating_sub(active.len())
         .clamp(PF_CHUNK_MIN, PF_CHUNK_MAX);
