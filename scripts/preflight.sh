@@ -3,25 +3,32 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 fail=0
 
-echo "== 1/5 rustfmt =="
+echo "== 1/6 주석 0 =="
+if out=$(python3 scripts/comment_check.py 2>&1); then
+    echo "OK"
+else
+    echo "FAIL"; printf '%s\n' "$out" | head -20; fail=1
+fi
+
+echo "== 2/6 rustfmt =="
 if cargo fmt --all -- --check >/dev/null 2>&1; then
     echo "OK"
 else
     echo "FAIL — cargo fmt --all 적용 후 재시도"; cargo fmt --all -- --check | head -10; fail=1
 fi
 
-echo "== 2/5 clippy =="
+echo "== 3/6 clippy =="
 if cargo clippy --workspace --all-targets -- -D warnings >/dev/null 2>&1; then
     echo "OK"
 else
     echo "FAIL:"; cargo clippy --workspace --all-targets -- -D warnings 2>&1 | grep -E "^(error|warning)" | sort | uniq -c | head -10; fail=1
 fi
 
-echo "== 3/5 cargo 경고 0 (dev check — 릴리스는 빌드 게이트가 담당) =="
+echo "== 4/6 cargo 경고 0 (dev check — 릴리스는 빌드 게이트가 담당) =="
 w=$(cargo check --workspace --all-targets 2>&1 | grep -c "^warning" || true)
 if [[ "$w" -eq 0 ]]; then echo "OK"; else echo "FAIL — warning ${w}건"; fail=1; fi
 
-echo "== 4/5 env 동치 (108 P1) =="
+echo "== 5/6 env 동치 (108 P1) =="
 if cargo build --release -q -p llm170-server >/dev/null 2>&1; then
     if ! ./target/release/llm170 diag envcheck >/dev/null; then
         ./target/release/llm170 diag envcheck; fail=1
@@ -32,7 +39,7 @@ else
     echo "FAIL — 빌드 오류"; fail=1
 fi
 
-echo "== 5/5 스테일 fatbin 가드 =="
+echo "== 6/6 스테일 fatbin 가드 =="
 A=crates/backend-gpu/src/rawcuda/assets
 stale=0
 for cu in "$A"/*.cu; do

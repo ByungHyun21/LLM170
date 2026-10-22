@@ -1,95 +1,95 @@
-// ── GDN 체인 CUDA 포팅 (G5, 2026-10-04) ──
-// 산술은 구 rawhip 커널의 gdn_conv(L330-365)·
-// gdn_gate(L368-393)·gdn_l2perm(L397-472)·gdn_scan
-// (L484-608)을 1:1 직이식한다(원본 그대로 베낌).
-// 원본과의 차이는 4점(1-3 아래, 4번은 #include 직후 트랜센던트 블록):
-// 1) hip 판이 27B 폭(10240/2048/6144/5120/96/48헤드)으로 경직된 상수를
-//    런치 인자(k_len/v_len/conv_ch/hidden/h_k/h_v)로 일반화 — 27B 값
-//    (hidden=5120, h_k=16, h_v=48)을 넣으면 원소 순서까지 원본과 동일.
-//    목적은 35B-A3B GDN 형상 지원(hidden=2048, h_k=16, h_v=32,
-//    conv_ch=8192 — 실측 형상 config.json
-//    text_config 실측 2026-10-04).
-// 2) scan 공유메모리 합계 57,732B(A5-4: sk 8KB · qs 16KB · sv/KS/QS 4KB×3 ·
-//    A/KQ 2KB×2 · dc 8KB · Stile 8KB×2(더블 버퍼) · bp/gcs/wsm 388B — V-타일
-//    64열 기준)는 CUDA 정적 __shared__ 한계 48KB를 초과한다(ROCm LDS 64KB에서는
-//    상주 가능했던 배치) → 동적
-//    공유메모리(extern __shared__ + cuFuncSetAttribute opt-in)로 동일
-//    배치·동일 산술로 이식. 배치 순서·f16 저장 지점은 불변.
-// 3) conv 원본의 자리표시 행(o = silu(xt)·0+0 — 무효 산출, 원본 주석
-//    "자리표시 — 아래 정정")은 제거. 살아있는 산술만 이식.
-// 4) 트랜센던트/수축(위 블록 참조): 빌드 -fmad=false(FMA 수축 제거 —
-//    호스트 미러와 연산 DAG 비트동일), 초월함수는 자작 f64 미러,
-//    qscale은 IEEE sqrt+div. 전부 (hip은 참조 구현일 뿐
-//    진실 아님 — CUDA가 코어/미러에 더 가까운 쪽이 옳음)에 근거한
-//    정밀화. 수학 동등·정밀도 상향, 값 변화는 ulp 수준.
-//
-// lc 순열 계약(§3.3 — 방향 혼동으로 사고 1회): HF v헤드 h는 [h_k][G]
-// k-주요 배치, lc(FLA)는 [G][h_k] 그룹-주요 — 전치 p_inv=(h%G)·h_k+h/G,
-// G=h_v/h_k(27B: G=3 → (h%3)·16+h/3 — 원본식과 동일). l2perm·gate 모두
-// scatter(쓰기측 인덱스에 p_inv) — CPU 미러가 gather라 방향 혼동 주의.
-// (음성대조 gather 쌍둥이는 H 정리에서 제거 — 2026-10-09.)
-//
-// 그리드 계약(결함 5호): T>1 커널(l2perm/gate)은 t=blockIdx.y —
-// grid (h_v, T). gy=1로 두면 행 1+가 미실행된다(과거 사고).
-//
-// [CMP 170HX(sm_80, GA100 70SM, HBM2e ~1.5TB/s) 설계 근거]
-// - conv: 순수 스트리밍(채널축 완전 병렬, 그리드 conv_ch/128 = 27B 80·
-//   35B 64블록, 128스레드가 128연속 채널 → 완전 coalesce). T행은 링
-//   의존이라 순차(런치 1회로 T행 전체 순회 — §3.3 계약). w0-w3·h0-h2는
-//   레지스터 상주(스레드당 f32 7개) — 소형 레지스터로 다중 블록/SM
-//   상주, GA100에서 80블록 즉시 분배·스트리밍 병렬성 확보. 행 의존
-//   루프라 ILP는 탭 간 덧셈 트리(w3·x+w0·h0+w1·h1+w2·h2 결합 순서는
-//   산술 계약이라 불변).
-// - l2perm: 그리드 (h_v, T) — 27B T=32면 1536블록으로 70SM 포화.
-//   지배 비용은 abuf [L][2][h_v][hidden] 판독(27B 층당 1.97MB) — 같은
-//   h의 T개 블록이 동일 abuf 슬라이스를 재판독하므로 L2(T축 재사용)
-//   로 흡수된다. WG=128·red[128] 트리 환원은 산술 계약(환원 순서
-//   미러 대상)이라 유지.
-//   [2026-10-19 실측 기각] 환원 동기 절약(7스텝 smem 트리 → 앞2스텝 단일
-//   패스+뒤5스텝 워프 셔플 — 같은 DAG·비트동일·해시 불변) A/B: 27B
-//   pp512 −0.2%·pp1024 −0.1% = 중립 — l2perm의 지배 비용은 abuf L2
-//   판독이며 동기/환원 아님(⑬② 진단의 '4트리×7sync'는 비지배 항). 되돌림.
-// - scan: [A5-4 2026-10-10] A/KQ·gcs 전제는 청크 병렬 prepass
-//   (gdn_scan_akq, 그리드 h_v×n_chunks)로 분리 — 상태 의존부(KS/QS·전진
-//   대입·출력·상태 갱신)만 남기고 state 열을 V-타일(NSPLIT=4)로 나눠
-//   grid=h_v×4. 구 "D열 2분할 손익 미확정"(A/KQ 전체 128내적 중복이
-//   원인)은 prepass가 중복을 제거해 성립 — 비트동일 유지. 동적 공유
-//   43,396B. KS/QS는 2-wide LDS(니블 쌍·float2) 적용. SASS 미세 최적화는
-//   170HX 도착 후 재판단(현 잔여 스톨: 배리어·스케줄러 지연).
-// - gate: 그리드 (h_v, T), 블록 128 — 메모리 본드 소형, 특기 사항 없음.
-#include <cuda_fp16.h>
-#include "cast_common.cuh" // [4.1] gdn_gate 융합 기록(f2h/h2f — cast 커널과 동일)
 
-// ── 미러 트랜센던트(G5 정밀화) ──
-// 계약: 장치 초월함수(libdevice expf 2ulp·__expf/__logf fast)는 호스트
-// 오라클과 비트재현 불가 — f16 저장 경계 교차(실측 2026-10-04: 27B
-// 실가중 픽스처에서 스캔 단계 7.6e-6 → 게이트 rms 증폭 ×289로 종단
-// 3.3e-4, 임계 2e-4 초과)를 유발한다. 본 파일의 트랜센던트는 순수 f64
-// 연산 DAG(IEEE mul/add/div/floor·비트 재구성만, FMA 수축 없음 — 빌드
-// -fmad=false)로 자작해 양측(본 .cu ↔ 구 프로브 오라클 트윈)의
-// 비트동일을 계약으로 삼는다. 정확도는 f64 다항 근사(~1e-12 상대 —
-// f32 캐스트 기준 참값과 수 ulp)로 수학 동등·정밀도 상향. 도메인:
-// exp |x| ≤ 128(k 비트 재구성 상한), log y ≥ 2^-1022 정규수(softplus
-// 인자 ≥ 1 — 실사용 영역). 연산 순서·상수는 절대 변경 금지(비트동일
-// 계약 — Rust 트윈과 리터럴까지 동일해야 한다).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include <cuda_fp16.h>
+#include "cast_common.cuh"
+
+
+
+
+
+
+
+
+
+
+
+
+
 __device__ __forceinline__ double gdn_exp_d(double x)
 {
-    // [2026-10-09 결함 수정] 도메인 가드 — 2^k 비트 재구성 `(1023+k)<<52`는
-    // **k ≥ -1022**에서만 유효하다(그 아래는 비정규 — 지수 필드가 음수로
-    // 시프트돼 쓰레기/NaN). 즉 유효역은 x ≥ -708.5.
-    // 실측 결함: 35B GDN 헤드 11 게이트 g ≈ -91.6/토큰 → 청크 누적 gcs가
-    // t=7에서 -641(통과)·t=8에서 -733(파괴 → 상태·출력 NaN, argmax 0 반복).
-    // CPU 미러(f32 exp)는 이 구간에서 0으로 언더플로하므로 그 의미론으로
-    // 클램프한다(f32 결과 동일). 상한 x > ln(2^1024) ≈ 709.78 → +inf.
-    // 유효역 산술은 불변 — 기존 골든 무영향.
+
+
+
+
+
+
+
+
     if (x < -708.5) {
         return 0.0;
     }
     if (x > 709.78) {
-        return __longlong_as_double(0x7ff0000000000000LL); // +inf
+        return __longlong_as_double(0x7ff0000000000000LL);
     }
-    // k = floor(x·invln2 + ½)(양수 음수 공용 반올림) → r = x − k·ln2(hi/lo)
-    // → 테일러 차수 7 → 2^k 비트 재구성.
+
+
     const double invln2 = 1.4426950408889634;
     const double ln2_hi = 6.9314718036912382e-01;
     const double ln2_lo = 1.9082149292705877e-10;
@@ -103,15 +103,15 @@ __device__ __forceinline__ double gdn_exp_d(double x)
     return p * scale;
 }
 
-// [FLA-8 채택 2026-10-10] f64 폴리 → __expf/__logf(2ulp) — eval 판정 후 채택.
-// 근거: f64 트랜센던털이 GDN 소형 커널들의 지배 비용(conv 201µs/런치 = f64
-// 파이프 2/cyc 포화, gate·akq 동형). 실측: 35B 프리필 145→132ms(-9%) ·
-// 27B 377→357ms(-5%) · scan 11.5→9.5ms · conv·gate 대폭 감소.
-// 판정(방법 B): 골든 6종(단문·35토큰·600·4K ×2모델) 전부 통과 —
-// 편차가 f16 저장 경계에 흡수. 장문 PPL 델타 +0.024%(35B)/−0.002%(27B),
-// 일치율 97.7%/99.9% — 방법 자체 노이즈 대역. 종전 기각(conv-only fast exp
-// → 600 플립)은 eval 이전 판정 — 전면 적용은 통과(구 기록: 속도 플랜).
-// 도메인 가드(±708/709)는 __expf가 자연 처리(언더플로 0·오버플로 inf).
+
+
+
+
+
+
+
+
+
 __device__ __forceinline__ float gdn_expf(float x)
 {
     return __expf(x);
@@ -119,8 +119,8 @@ __device__ __forceinline__ float gdn_expf(float x)
 
 __device__ __forceinline__ double gdn_log_d(double y)
 {
-    // m·2^e 규약(m ∈ [1,2), √2 초과 시 반감 → [√½,√2)) → atanh 급수
-    // z¹¹차 → + e·ln2.
+
+
     const double ln2 = 6.9314718036912382e-01;
     unsigned long long bits = __double_as_longlong(y);
     int e = (int)((bits >> 52) & 0x7ff) - 1023;
@@ -136,33 +136,33 @@ __device__ __forceinline__ double gdn_log_d(double y)
     return 2.0 * s * q + (double)e * ln2;
 }
 
-// [FLA-8 채택] __logf(2ulp) — softplus 게이트 경로(값 계약은 exp와 동일 계급).
+
 __device__ __forceinline__ float gdn_logf(float y)
 {
     return __logf(y);
 }
 
-// gdn_conv — 채널별 4탭(링 3 + 현재) conv + silu. [2026-10-10 토큰축 병렬화]
-// 종전: 그리드 (conv_ch/128, 1) 단일 런치가 T행을 **순차 순회** — ncu 실측
-// No Eligible 96.8%·IPC 0.13(512토큰 0.53ms/층, 프리필 conv 13.4ms의 원인).
-// 4탭은 **입력 이력**만 필요(출력 의존 아님) → 토큰을 CONV_TC 블록으로
-// 나눠 병렬화. 산술식·순서는 종전과 동일(비트동일 — 골든 판정).
-// 링 [L][3][conv_ch]: t0==0 블록이 이전 청크의 x[-3..-1]을 읽고, 마지막
-// 블록(t1==t_len)이 이번 청크의 x[t_len-3..t_len-1]을 기록(§3.3 계약 유지).
+
+
+
+
+
+
+
 #define CONV_TC 16
 extern "C" __global__ void gdn_conv(
-    const float* __restrict__ qkv,   // [T][conv_ch]
-    const float* __restrict__ convw, // [L][conv_ch][4]
-    float* __restrict__ ring,        // [L][3][conv_ch]
-    float* __restrict__ q_out,       // [T][k_len]
-    float* __restrict__ k_out,       // [T][k_len]
-    float* __restrict__ v_out,       // [T][v_len]
-    float* __restrict__ ring_snap,   // [T][L][3][conv_ch] — 토큰 i 처리 후 링
-                                     // (스펙 롤백용, 0이면 생략)
-    float* __restrict__ ring_pre,    // [L][3][conv_ch] 층 슬라이스 — 배치 시작
-                                     // (라운드 전) 링(acc==0 복원용, 0=생략)
-    const unsigned long long* __restrict__ row_ring, // [행 퓨전 2026-10-14] nullable
-                                     // (행별 슬롯 링 베이스 — 배치 전용)
+    const float* __restrict__ qkv,
+    const float* __restrict__ convw,
+    float* __restrict__ ring,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    float* __restrict__ ring_snap,
+
+    float* __restrict__ ring_pre,
+
+    const unsigned long long* __restrict__ row_ring,
+
     int t_len, int layer, int k_len, int v_len, int conv_ch)
 {
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
@@ -171,8 +171,8 @@ extern "C" __global__ void gdn_conv(
     float w1 = convw[layer * conv_ch * 4 + ch * 4 + 1];
     float w2 = convw[layer * conv_ch * 4 + ch * 4 + 2];
     float w3 = convw[layer * conv_ch * 4 + ch * 4 + 3];
-    // [배치 행 퓨전 2026-10-14] 행 = z(행당 1토큰) · 링 = 행별 슬롯 베이스.
-    // 배치 디코드 전용 — 원자 1토큰 산술은 종전(t_len=1 발사)과 동일(주소·순서).
+
+
     if (row_ring != (const unsigned long long*)0) {
         const int row = blockIdx.y;
         float* rr = (float*)row_ring[row] + (long)layer * 3 * conv_ch;
@@ -202,14 +202,14 @@ extern "C" __global__ void gdn_conv(
         h1 = ring[layer * 3 * conv_ch + 1 * conv_ch + ch];
         h2 = ring[layer * 3 * conv_ch + 2 * conv_ch + ch];
         if (ring_pre != (float*)0) {
-            // [dsave 대체 2026-10-14] 갱신 전 링 보존 — acc==0(전량 거절)
-            // 복원의 S_0 동반 상태(링은 WY 대상이 아니라 스냅샷 1벌).
+
+
             ring_pre[0 * conv_ch + ch] = h0;
             ring_pre[conv_ch + ch] = h1;
             ring_pre[2 * conv_ch + ch] = h2;
         }
     } else {
-        // 내부 청크 헤일로 = 같은 qkv의 앞 3행(CONV_TC ≥ 4 전제).
+
         h0 = qkv[(t0 - 3) * conv_ch + ch];
         h1 = qkv[(t0 - 2) * conv_ch + ch];
         h2 = qkv[(t0 - 1) * conv_ch + ch];
@@ -227,8 +227,8 @@ extern "C" __global__ void gdn_conv(
         }
         h0 = h1; h1 = h2; h2 = xt;
         if (ring_snap != (float*)0) {
-            // 토큰 t 처리 후 링 = (x[t-2], x[t-1], x[t]). 호스트가 층 슬라이스
-            // (layer * TMAX * 3 * conv_ch)를 더해 전달 — 레이아웃 [t][3][ch].
+
+
             float* rs = ring_snap + ((long)t * 3) * conv_ch + ch;
             rs[0] = h0;
             rs[(long)conv_ch] = h1;
@@ -242,31 +242,31 @@ extern "C" __global__ void gdn_conv(
     }
 }
 
-// l2perm 본체 — a/b 도트(xn·abuf) + q/k L2 + v·beta|g lc 순열
-// (구 rawhip 커널 L397-472 직이식, 폭 인자화). 그리드 (h_v, T), WG=128.
-// v는 scatter, beta|g는 lc 순열 scatter(bg[.. + p_inv]).
-// [FLA-15 기각 2026-10-10] T-배칭(블록당 4토큰 — abuf 슬라이스 공유로 L2
-// 트래픽 ÷4 목표): 구현·전 크기 기준선 일치 검증까지 완료했으나 **이득
-// 무의미** — 27B 13.42→12.89ms(-4%)·35B 2.40→2.35ms, 벽시계 불변(27B
-// 351~354 vs 350~352ms). 원인: 환원을 토큰별 순차로 유지해야 했고(아래)
-// 그 배리어 직렬화가 L2 절감을 상쇄. 되돌림.
-// **[주의 — 재사용 금지 클래스]** 환원까지 배칭한 변형(2D smem
-// `red[2*TB][128]` 또는 동일 주소의 행-오프셋 형태)은 t∈[65..96]
-// (n_chunks=3)에서만 NaN(출력 0) — 1D red[128]+순차 환원은 전 크기 정상.
-// 주소·산술이 동일한데 차원만 바꾼 형태가 실패 = nvcc 코드젠 의심(원인
-// 미규명). smem red 형태 변경 시 전 크기 스윕(t=64/88/96/128) 필수.
+
+
+
+
+
+
+
+
+
+
+
+
+
 __device__ __forceinline__ void gdn_l2perm_body(
-    const float* __restrict__ q_in,   // [T][k_len]
-    const float* __restrict__ k_in,   // [T][k_len]
-    const float* __restrict__ v_in,   // [T][h_v*128] HF
-    const float* __restrict__ xn,     // [T][hidden] (xtb)
-    const float* __restrict__ abuf,   // [L][2][h_v][hidden]
-    const float* __restrict__ alog,   // [L][h_v]
-    const float* __restrict__ dtb,    // [L][h_v]
-    float* __restrict__ q_out,        // [T][k_len]
-    float* __restrict__ k_out,        // [T][k_len]
-    float* __restrict__ v_out,        // [T][h_v*128] lc
-    float* __restrict__ bg,           // [T][2*h_v] beta|g lc
+    const float* __restrict__ q_in,
+    const float* __restrict__ k_in,
+    const float* __restrict__ v_in,
+    const float* __restrict__ xn,
+    const float* __restrict__ abuf,
+    const float* __restrict__ alog,
+    const float* __restrict__ dtb,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    float* __restrict__ bg,
     int t_len, int layer, int h_k, int h_v, int hidden)
 {
     __shared__ float red[128];
@@ -276,8 +276,8 @@ __device__ __forceinline__ void gdn_l2perm_body(
     if (t >= t_len) return;
     const float eps = 1e-6f;
 
-    // [FLA-9 2026-10-10] a/b 도트 루프 병합 — xn 판독 1회(종전 2회, L2 96%
-    // 포화 실측). 각 누산의 i-오름차순 순서는 원序 그대로(비트동일).
+
+
     float pa = 0.0f;
     float pb = 0.0f;
     const float* abA = abuf + (layer * 2) * h_v * hidden + h * hidden;
@@ -305,8 +305,8 @@ __device__ __forceinline__ void gdn_l2perm_body(
     float b_val = red[0];
     __syncthreads();
 
-    // lc 순열: HF [h_k][G] → lc [G][h_k] 전치. 27B(G=3, h_k=16)이면
-    // 원본식 (h%3)*16+h/3와 동일.
+
+
     int G = h_v / h_k;
     int p_inv = (h % G) * h_k + h / G;
     if (tid == 0) {
@@ -342,12 +342,12 @@ __device__ __forceinline__ void gdn_l2perm_body(
         __syncthreads();
         k_out[t * (h_k * 128) + kh * 128 + tid] = kv * ki;
     }
-    // scatter 방향(계약): 쓰기측 인덱스에 p_inv.
+
     v_out[t * (h_v * 128) + p_inv * 128 + tid] =
         v_in[t * (h_v * 128) + h * 128 + tid];
 }
 
-// l2perm — scatter(계약 방향).
+
 extern "C" __global__ void gdn_l2perm(
     const float* __restrict__ q_in,
     const float* __restrict__ k_in,
@@ -366,7 +366,7 @@ extern "C" __global__ void gdn_l2perm(
                     q_out, k_out, v_out, bg, t_len, layer, h_k, h_v, hidden);
 }
 
-// GDN 청크 상수 — K1(wu)/K2(h)/출력(o) 공용 계약(Rust mod.rs 동일 값).
+
 #define GDN_CS 32
 #define GDN_TILE 16
 #define GDN_NSPLIT 4
@@ -374,9 +374,9 @@ extern "C" __global__ void gdn_l2perm(
 #define GDN_NGRP 8
 
 extern "C" __global__ void gdn_scan_akq(
-    const float* __restrict__ q,   // [T][k_len]
-    const float* __restrict__ k,   // [T][k_len] L2
-    const float* __restrict__ bg,  // [T][2*h_v]
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ bg,
     __half* __restrict__ akq,
     int t_len, int h_k, int h_v, int d)
 {
@@ -386,7 +386,7 @@ extern "C" __global__ void gdn_scan_akq(
     const int n = min(t_len - t0, GDN_CS);
     const int kh = h % h_k;
     __shared__ __half sk[GDN_CS * 128];
-    __shared__ __half qh[GDN_CS * 128];   // [akq-mma] f16 q 타일(A operand)
+    __shared__ __half qh[GDN_CS * 128];
     __shared__ float qs[GDN_CS * 128];
     __shared__ float gcs[GDN_CS + 1];
     __shared__ float bp[GDN_CS];
@@ -411,9 +411,9 @@ extern "C" __global__ void gdn_scan_akq(
     const size_t plane = (size_t)h_v * gridDim.y * GDN_CS * GDN_CS;
     __half* Aout = akq + (size_t)h * gridDim.y * GDN_CS * GDN_CS + (size_t)c * GDN_CS * GDN_CS;
     __half* KQout = Aout + plane;
-    // [akq-mma 2026-10-19] A/KQ 그람을 mma.m16n8k16으로 — A = sk/qh(f16,
-    // [i][k]), B = sk의 [j][k] 레이아웃(비전치 ldmatrix — k가 연속). 8워프 =
-    // M2×N4. 게이팅(bp·exp(gcs_i−gcs_j))은 C 프래그먼트 좌표에서 후처리.
+
+
+
     {
         const int lane = threadIdx.x & 31;
         const int warp = threadIdx.x >> 5;
@@ -474,31 +474,31 @@ extern "C" __global__ void gdn_scan_akq(
 
 }
 
-// ── [GDN-FLA 2026-10-19] K1/K2 분할 — wu(청크 병렬 해) + h(순수 재귀) + o(출력) ──
-// 설계 = plans/gdn-fla-redesign.md §2·§8. FlashKDA 정본 대조(2026-04): 토큰 병렬
-// 작업(해 포함)은 전부 K1로 — K2(재귀)는 토큰 병렬 작업을 품지 않는다(그 병목이
-// 단일 융합 커널의 SM 유휴 원인, 분할로 ≥15%). 수식 재배열:
-//   dc = A⁻¹(bp∘v) − A⁻¹(diag(bp∘e)·k)·S = U_local − W'·S
-//   W'=A⁻¹(diag(bp∘e)k)[CS,K] · U_local=A⁻¹(bp∘v)[CS,VS전체] — 상태 무관(청크 병렬)
-//   S' = S·gt_exp + kᵀ·(wsm∘(U_local − W'·S)) · o = e∘(q·S·qscale) + KQ·(U_local−W'·S)
-// 클래스 변경(해 경로 재배열 — eval 게이트). wubuf = [h_v][nch][CS][2d] f32
-// (열 [0,d)=W' · [d,2d)=U_local).
 
-// gdn_wu — K1(청크 병렬): 해(A⁻¹)를 RHS [CS,2d]에 적용해 W'/U_local 물질화.
-// 그리드 (nch, h_v) · 블록 2d스레드(열 소유) · 전진대입 = i 직렬(CS)·열 병렬.
+
+
+
+
+
+
+
+
+
+
+
 extern "C" __global__ void gdn_wu(
-    const float* __restrict__ k,     // [T][h_k*d]
-    const float* __restrict__ v,     // [T][h_v*d]
-    const float* __restrict__ bg,    // [T][2*h_v]
-    const __half* __restrict__ akq,  // A만
-    float* __restrict__ wubuf,       // [h_v][nch][CS][2d]
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ bg,
+    const __half* __restrict__ akq,
+    float* __restrict__ wubuf,
     int t_len, int h_k, int h_v, int d)
 {
     extern __shared__ char smem_raw[];
-    __half* A = (__half*)smem_raw;                 // [CS*CS]
-    float* R = (float*)(A + GDN_CS * GDN_CS);      // [CS][2d]
-    float* pe = R + GDN_CS * 2 * d;                // [CS] e
-    float* pb = pe + GDN_CS;                       // [CS] bp
+    __half* A = (__half*)smem_raw;
+    float* R = (float*)(A + GDN_CS * GDN_CS);
+    float* pe = R + GDN_CS * 2 * d;
+    float* pb = pe + GDN_CS;
     const int n_chunks = (t_len + GDN_CS - 1) / GDN_CS;
     const int c = blockIdx.x, h = blockIdx.y;
     const int kh = h % h_k;
@@ -547,29 +547,29 @@ extern "C" __global__ void gdn_wu(
     }
 }
 
-// gdn_h — K2(순수 재귀): t = W'·S → dc = U_local − t → S' = S·gt_exp + kᵀ(wsm∘dc).
-// 해·KS·출력 없음. 그리드 (h_v×NSPLIT)·512스레드. S_c 물질화(o 판독원).
-// [FlashKDA 대조 2026-10-19] launch_bounds로 2블록/SM 강제(88→64캡) —
-// 점유 = 배리어/wait 은닉의 핵심(정본 K1 = 256,8). 스필 여부는 실측.
+
+
+
+
 extern "C" __global__ void __launch_bounds__(512, 2) gdn_h(
-    const float* __restrict__ k,     // [T][h_k*d]
-    const float* __restrict__ bg,    // [T][2*h_v]
-    const float* __restrict__ wubuf, // [h_v][nch][CS][2d]
-    __half* __restrict__ st,         // [L][h_v][d²] r/w
-    const float* __restrict__ sc,    // [L][h_v][d]
-    __half* __restrict__ hbuf,       // [h_v][nch][d*d]
-    float* __restrict__ dcbuf,       // [h_v][nch][CS][d] — dc 물질화(o 판독원)
+    const float* __restrict__ k,
+    const float* __restrict__ bg,
+    const float* __restrict__ wubuf,
+    __half* __restrict__ st,
+    const float* __restrict__ sc,
+    __half* __restrict__ hbuf,
+    float* __restrict__ dcbuf,
     int t_len, int h_k, int h_v, int d, int layer)
 {
     extern __shared__ char smem_raw[];
-    __half* sk = (__half*)smem_raw;                  // [CS*128]
-    __half* Wp = sk + GDN_CS * 128;                  // [CS*128] W'(f16)
-    float* Ul = (float*)(Wp + GDN_CS * 128);         // [CS*GDN_VS] U_local 슬라이스
-    __half* Stile = (__half*)(Ul + GDN_CS * GDN_VS); // [128*GDN_VS] Ŝ(무스케일)
-    __half* Ssc = Stile + 128 * GDN_VS;              // [128*GDN_VS] 스케일 적용 상태(B)
-    float* dc = (float*)(Ssc + 128 * GDN_VS);        // [CS*GDN_VS]
-    float* gcs = dc + GDN_CS * GDN_VS;               // [CS+1]
-    float* wsm = gcs + (GDN_CS + 1);                 // [CS]
+    __half* sk = (__half*)smem_raw;
+    __half* Wp = sk + GDN_CS * 128;
+    float* Ul = (float*)(Wp + GDN_CS * 128);
+    __half* Stile = (__half*)(Ul + GDN_CS * GDN_VS);
+    __half* Ssc = Stile + 128 * GDN_VS;
+    float* dc = (float*)(Ssc + 128 * GDN_VS);
+    float* gcs = dc + GDN_CS * GDN_VS;
+    float* wsm = gcs + (GDN_CS + 1);
     int h = blockIdx.x / GDN_NSPLIT;
     int vs = (blockIdx.x % GDN_NSPLIT) * GDN_VS;
     int kh = h % h_k;
@@ -598,9 +598,9 @@ extern "C" __global__ void __launch_bounds__(512, 2) gdn_h(
         }
         for (int q = threadIdx.x; q < GDN_CS * 128; q += blockDim.x) {
             const int j = q / 128, r = q % 128;
-            // A operand = f16(W') — 행스케일은 B(스케일 적용 상태) 쪽.
-            // [주의 2026-10-19] A에 sc 폴딩 금지 — sc는 행 최댓값 정규화로
-            // 10³~10⁵ 급 → f16 오버플로(65504) → t 폭발(G0 238 vs 기준 10.8).
+
+
+
             Wp[q] = __float2half_rn(wubuf[wb + (long)c * GDN_CS * 2 * d + (long)j * 2 * d + r]);
         }
         for (int q = threadIdx.x; q < GDN_CS * GDN_VS; q += blockDim.x) {
@@ -631,22 +631,22 @@ extern "C" __global__ void __launch_bounds__(512, 2) gdn_h(
             *reinterpret_cast<uint4*>(&hbuf[hb + (long)c * d * d + (long)r * d + u * 8]) =
                 *reinterpret_cast<const uint4*>(&Stile[r * GDN_VS + u * 8]);
         }
-        // B operand용 스케일 적용 상태 — Ssc[r][v] = f16(Ŝ[r][v]·sc[r])
-        // (실제 상태값 = O(35) → f16 안전. sc는 Ŝ과 곱해 상쇄되므로 A에 넣지 않음).
+
+
         for (int q = threadIdx.x; q < 128 * GDN_VS; q += blockDim.x) {
             const int r = q / GDN_VS;
             Ssc[q] = __float2half_rn(__half2float(Stile[q]) * sc[sc_h + r]);
         }
         __syncthreads();
-        // t = W'·S → dc = U_local − t — [mma 2026-10-19] mma.m16n8k16
-        // (A = f16(W') · B = f16(Ŝ·sc) · C = t f32). M=CS(2×16)·N=VS(4×8)·
-        // K=d(8×16) — 8워프. O 커널과 동일 패턴.
+
+
+
         {
             constexpr int IK = (GDN_CS + GDN_NGRP - 1) / GDN_NGRP;
             const int lane = threadIdx.x & 31;
             const int warp = threadIdx.x >> 5;
-            const int mt = warp >> 2;          // M 타일 0..1
-            const int nt = warp & 3;           // N 타일 0..3
+            const int mt = warp >> 2;
+            const int nt = warp & 3;
             float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
             const int a_row = (lane & 7) + 8 * ((lane >> 3) & 1);
             const int a_col = 8 * (lane >> 4);
@@ -679,9 +679,9 @@ extern "C" __global__ void __launch_bounds__(512, 2) gdn_h(
                 const int cc = ccol[q4];
                 dc[i * GDN_VS + cc] = (i < n) ? (Ul[i * GDN_VS + cc] - cv[q4]) : 0.0f;
             }
-            // dc 물질화(o 커널이 W'·S 재계산 없이 사용 — 트래픽·FLOP 절감).
-            // [레이스 수정 2026-10-19] mma가 쓴 dc 열을 다른 스레드가 읽으므로
-            // 배리어 필수(mma 후 즉시 읽으면 미기록 값 → 출력 0).
+
+
+
             __syncthreads();
             for (int kk = 0; kk < IK; ++kk) {
                 const int i = grp + kk * GDN_NGRP;
@@ -720,29 +720,29 @@ extern "C" __global__ void __launch_bounds__(512, 2) gdn_h(
     }
 }
 
-// gdn_o — 청크 병렬 출력: dc = U_local − W'·S_c (자체 계산) →
-// o = e∘(q·S_c·qscale) + KQ·dc. 그리드 (nch×h_v×NSPLIT)·256스레드.
+
+
 #define GDN_NGRP_O 8
 extern "C" __global__ void gdn_o(
-    const float* __restrict__ q,      // [T][h_k*d]
-    const float* __restrict__ bg,     // [T][2*h_v]
-    const __half* __restrict__ akq,   // KQ만
-    const float* __restrict__ dcbuf,  // [h_v][nch][CS][d] — h 커널 산출
-    const __half* __restrict__ hbuf,  // [h_v][nch][d*d]
-    const float* __restrict__ sc,     // [L][h_v][d]
-    float* __restrict__ outv,         // [T][h_v*d]
+    const float* __restrict__ q,
+    const float* __restrict__ bg,
+    const __half* __restrict__ akq,
+    const float* __restrict__ dcbuf,
+    const __half* __restrict__ hbuf,
+    const float* __restrict__ sc,
+    float* __restrict__ outv,
     int t_len, int h_k, int h_v, int d, int layer)
 {
     extern __shared__ char smem_raw[];
-    __half* KQ = (__half*)smem_raw;                   // [CS*CS]
-    float* dc = (float*)(KQ + GDN_CS * GDN_CS);       // [CS*d]
-    __half* Stile = (__half*)(dc + GDN_CS * d);       // [128*d]
-    __half* qt = Stile + 128 * d;                     // [CS*d] f16 q타일
-    float* gcs = (float*)(qt + GDN_CS * d);           // [CS+1]
-    float* e = gcs + (GDN_CS + 1);                    // [CS]
+    __half* KQ = (__half*)smem_raw;
+    float* dc = (float*)(KQ + GDN_CS * GDN_CS);
+    __half* Stile = (__half*)(dc + GDN_CS * d);
+    __half* qt = Stile + 128 * d;
+    float* gcs = (float*)(qt + GDN_CS * d);
+    float* e = gcs + (GDN_CS + 1);
     const int n_chunks = (t_len + GDN_CS - 1) / GDN_CS;
-    // [NSPLIT=1 2026-10-19] o 커널 = vs 128열 전체(1024스레드·32워프=M2×N16)
-    // — q타일 스테이징이 헤드·청크당 1회(중복 4× 제거).
+
+
     const int c = blockIdx.x / h_v;
     const int h = blockIdx.x % h_v;
     const int vs = 0;
@@ -786,23 +786,23 @@ extern "C" __global__ void gdn_o(
     if (threadIdx.x < GDN_CS) {
         e[threadIdx.x] = (threadIdx.x < n) ? gdn_expf(gcs[threadIdx.x]) : 0.0f;
     }
-        // [mma 2026-10-19] A operand 스테이징 — f16(q·qscale·sc[r]) (행스케일 폴딩).
+
     for (int q2 = threadIdx.x; q2 < GDN_CS * d; q2 += blockDim.x) {
         const int iq = q2 / d, rq = q2 % d;
         float qv = (iq < n) ? q[(t0 + iq) * (h_k * d) + kh * 128 + rq] : 0.0f;
         qt[iq * d + rq] = __float2half_rn(qv * qscale * sc[sc_h + rq]);
     }
 __syncthreads();
-    // QS(원序·패스별 f16 반올림 유지) + 출력
+
     constexpr int IK_O = (GDN_CS + GDN_NGRP_O - 1) / GDN_NGRP_O;
-    // [mma 2026-10-19] QS = q·S_c 를 mma.m16n8k16으로 — FlashKDA 정본의 SM80 MMA
-    // 경로. A = qt(CS×K f16) · B = Stile(상태 f16, ldmatrix.trans) · C = QS f32.
-    // M = CS(2×16) · N = VS(4×8) · K = d(8×16) — 8워프 = 2×4 타일.
+
+
+
     {
         const int lane = threadIdx.x & 31;
         const int warp = threadIdx.x >> 5;
-        const int mt = warp >> 4;          // M 타일 0..1
-        const int nt = warp & 15;          // N 타일 0..15
+        const int mt = warp >> 4;
+        const int nt = warp & 15;
         float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
         const int a_row = (lane & 7) + 8 * ((lane >> 3) & 1);
         const int a_col = 8 * (lane >> 4);
@@ -848,63 +848,63 @@ __syncthreads();
 
 }
 
-// ── [P9] t=1 전용 GDN — i축(상태 행) 분할 3커널 ──
-// ncu 실측: gdn_scan은 점유 8.3%·compute 8.3% = 지연 바운드(48블록×4워프,
-// 상태 64KB/블록). t=1이면 A(하삼각)·cumsum·청크 기구가 전부 자명하므로
-// i축(128)을 split(4)으로 나눠 grid를 h_v×4(192블록)로 늘린다.
-// 수식(t=1, g=bg[h_v+h], β=bg[h], e=exp(g), wsm[0]=1, gt_exp=e):
-//   KS[d]=Σ_i half(k[i])·st[i][d]   QS[d]=Σ_i q[i]·st[i][d]
-//   dc[d]=β·(half(v[d]) − e·KS[d])
-//   out[d]=e·QS[d]·qscale + KQ00·dc[d]   (KQ00 = Σ q·half(k) · qscale)
-//   st[i][d] = st[i][d]·e + half(k[i])·dc[d]
-// 산술 순서는 i 오름차순 유지(부분합은 분할 순서로 결합) — half 라운딩
-// 지점(KS/QS 8패스 half 누적)은 계약 완화로 f32 단일 누적으로 단순화.
+
+
+
+
+
+
+
+
+
+
+
 #define GDN1_SPLIT 8
 
-// [S4 실측 기각 2026-10-11] t=1 trio(본 3커널)를 gdn_spec_scan 1런치
-// (t_len=1·snap=null)로 융합 시도 — 실측 역행: 27B tg 50.46→49.03 tok/s
-// (−2.8%)·np4 109.0→102.9(−5.6%). 원인: 융합 커널은 블록 h_v개·i축 128직렬
-// (spec_scan 구조 — t≤8 배치 전용 설계)이라 trio의 8분할 병렬도
-// (part/upd grid h_v×8)를 잃는다. 런치 −2/층 이득을 병렬도 손실이 초과.
-// trio 유지(spec_scan은 t≥2 배치·스펙 전용 — 역할 불변).
-// [상태 저장 정밀도 실측 2026-10-13 — 현재 = f32 유지(원복)]
-// 라이브 GDN 상태([n_gdn][h_v][128²]/슬롯)를 2바이트 float으로 저장하는 후보 2형식을
-// 전 배선·평가했다(골든 8토큰 불변·WY 재구성 테스트 f16 통과):
-//  · 27B: 단문 밴드 내(f16 −0.09%·bf16 −0.11%)이고 **장문도 평탄**(8K/16K/32K ±0.03%).
-//  · 35B: 단문 초과(f16 +1.55%·bf16 +0.72% @en128) + **장문에서 폭증** — bf16
-//    +2.2%(8K)·+6.8%(16K)·**+10.8%(32K)**, CI [+9.1,+12.5]. needle은 이 손상을 못 잡음
-//    (35B 9/9) — **PPL 장문 창이 결정적**(단문 단독 판정 금지의 실증).
-//  · 원인 = 채널 스케일 부재의 서브노멀 손실(정밀도 8× 열세인 bf16이 35B에서 f16보다
-//    2.2× 우세한 역전이 증거 · 진단 `LLM170_DUMP=gdst`: |S|max≤35·서브노멀 질량 12~28%).
-//  · 차기 후보 = **행(kdim)별 스케일 저장**(f16/int8+scale): ① 스케일 표(캘리브레이션
-//    데이터 의존 해소 방식 확정) ② 읽기 q·s / 갱신 k÷s 폴딩(A행렬·kq 무접촉)
-//    ③ WY는 스케일 곱으로 복원(무접촉 의미) ④ eval = 규약 ①②③ 전부.
-// [상태 행-스케일 2026-10-13] 라이브 상태 = f16 + 행(kdim)별 f32 스케일.
-//   S[i][j] = sc[h·d+i] × Ŝ[i][j], Ŝ = __half. 기록 커널은 ÷s로 저장,
-//   판독 커널은 ×s — 본 커널이 기록 직후 행 max로 스케일을 재정규화한다.
-//   head(기본 256) = 저장 최대 → 서브노멀 문턱 6e-5·max/head(≈2.3e-7·max),
-//   오버플로 여유 65504/head(≈256× 한-토큰 성장; 기록측은 ±65504 클램프).
-// 행당 1스레드(스레드 간 리덕션 없음 — 결정적·단순).
-// [rescale 통합 2026-10-13] 층 범위 판 — grid (h_v, n_layers), layer0 = 기저.
-// 체인 끝(마지막 GDN 층)에서 전 층을 1회 런치로 정규화(디코드 48런치/토큰 → 1).
-// 층별 수학·히스테리시스는 종전과 동일(비트동일) — 층 L 상태는 같은 체인 안에서
-// 재판독이 없고(다음 토큰이 첫 판독), 체크포인트(청크 끝)는 이 지점 뒤다.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 extern "C" __global__ void gdn_rescale(
     __half* __restrict__ st, float* __restrict__ sc,
     int h_v, int d, int layer0, float head)
 {
     const int h = blockIdx.x;
     const int layer = layer0 + (int)blockIdx.y;
-    const int i = threadIdx.x; // 행(kdim)
+    const int i = threadIdx.x;
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
     const long sc_h = ((long)layer * h_v + h) * d;
     __half* row = &st[st_h + (long)i * d];
     const float s = sc[sc_h + i];
     float mx = 0.0f;
-    // [2026-10-18 벡터 판독] 종전 스칼라 2B×128회 — 스레드 간 256B 산개로
-    // 워프 로드가 섹터를 16× 과다 소비(실측 455µs ≈ 330GB/s = 대역의 1/4).
-    // 16B 로드 = 스레드가 자기 행 섹터를 온전히 소비. 값·비교 순서·샘플
-    // 불변(j 오름차순·동일 수식) — **비트동일**.
+
+
+
+
     const ulonglong2* rv = reinterpret_cast<const ulonglong2*>(row);
     #pragma unroll
     for (int jv = 0; jv < d / 8; ++jv) {
@@ -917,10 +917,10 @@ extern "C" __global__ void gdn_rescale(
         }
     }
     if (mx > 0.0f) {
-        // [히스테리시스 2026-10-13] 재기록은 저장 최대가 [head/8, head*8] 밖일
-        // 때만 — 매-토큰 재정규화는 이중 반올림(기록+재기록)으로 손상 가중
-        // (실측: 35B 128창 +2.41% vs raw f16 +1.55%). 대역 유지로 서브노멀·
-        // 오버플로 마진은 그대로.
+
+
+
+
         const float sm = mx / s;
         if (sm > head * 8.0f || sm < head / 8.0f) {
             float ns = mx / head;
@@ -938,16 +938,16 @@ extern "C" __global__ void gdn1_part(
     const float* __restrict__ q, const float* __restrict__ k,
     const __half* __restrict__ st, const float* __restrict__ sc,
     float* __restrict__ part,
-    const unsigned long long* __restrict__ row_st, // [행 퓨전] nullable
+    const unsigned long long* __restrict__ row_st,
     const unsigned long long* __restrict__ row_sc,
     int h_k, int h_v, int d, int layer)
 {
     const int h = blockIdx.x;
     int s = blockIdx.y;
-    const int tid = threadIdx.x; // = d 인덱스
+    const int tid = threadIdx.x;
     const int kh = h % h_k;
-    // [배치 행 퓨전 2026-10-14] 퓨전이면 y = 행×SPLIT + 분할 — 상태·입력 행별
-    // 베이스(주소는 종전 토큰별 발사와 동일: 행 k → k번째 토큰).
+
+
     if (row_st != (const unsigned long long*)0) {
         const int row = blockIdx.y / GDN1_SPLIT;
         s = blockIdx.y - row * GDN1_SPLIT;
@@ -982,8 +982,8 @@ extern "C" __global__ void gdn1_comb(
     const int h = blockIdx.x;
     const int tid = threadIdx.x;
     const int kh = h % h_k;
-    // [배치 행 퓨전 2026-10-14] 행 = blockIdx.y(단일 경로는 y=1 → 행 0 = 종전
-    // 발사와 동일 주소). 호스트는 베이스를 전달한다.
+
+
     const int row = blockIdx.y;
     q = q + (long)row * h_k * 128;
     k = k + (long)row * h_k * 128;
@@ -1022,7 +1022,7 @@ extern "C" __global__ void gdn1_upd(
     const float* __restrict__ k, const float* __restrict__ bg,
     const float* __restrict__ dc, __half* __restrict__ st,
     const float* __restrict__ sc,
-    const unsigned long long* __restrict__ row_st, // [행 퓨전] nullable
+    const unsigned long long* __restrict__ row_st,
     const unsigned long long* __restrict__ row_sc,
     int h_k, int h_v, int d, int layer)
 {
@@ -1030,7 +1030,7 @@ extern "C" __global__ void gdn1_upd(
     int s = blockIdx.y;
     const int tid = threadIdx.x;
     const int kh = h % h_k;
-    // [배치 행 퓨전 2026-10-14] 퓨전이면 y = 행×SPLIT + 분할(주소는 종전 동일).
+
     if (row_st != (const unsigned long long*)0) {
         const int row = blockIdx.y / GDN1_SPLIT;
         s = blockIdx.y - row * GDN1_SPLIT;
@@ -1057,28 +1057,28 @@ extern "C" __global__ void gdn1_upd(
     }
 }
 
-// [A-1 2026-10-10] 스펙 검증용 GDN — t≤8 토큰 루프 순차 스캔.
-// [TreeWY 2.B 2026-10-12] 토큰별 상태 스냅샷(snap — dsnap 27B 1.50GiB)은
-// 폐지. 롤백 복원 지점은 gdn_wy_solve가 기록하는 WY 표현(S_0·dc·G·k,
-// 27B 약 164MB)에서 gdn_wy_reconstruct가 재구성한다(출력·최종 상태 산술
-// 은 불변 — 스냅샷 기록만 제거).
-// t=1 trio(part/comb/upd)를 블록=(h) 하나로 융합하되 산술은 trio와 **비트
-// 동일**: KS/QS는 8분할(16행) 부분합을 분할 순서로 결합, half(k)/half(v)/
-// exp 라운딩 지점 동일, kq00은 동일 트리.
-// (열 소유 스레드 구조라 토큰 간 상태 의존이 스레드-로컬 — 동기화는 kq00
-// 트리뿐.)
+
+
+
+
+
+
+
+
+
+
 extern "C" __global__ void gdn_spec_scan(
-    const float* __restrict__ q,     // [T][k_len]
-    const float* __restrict__ k,     // [T][k_len]
-    const float* __restrict__ v,     // [T][h_v*128]
-    const float* __restrict__ bg,    // [T][2*h_v]
-    __half* __restrict__ st,         // [L][h_v][d²] r/w — 최종 상태(f16 행-스케일)
-    const float* __restrict__ sc,    // [L][h_v][d]
-    float* __restrict__ outv,        // [T][h_v*128]
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ bg,
+    __half* __restrict__ st,
+    const float* __restrict__ sc,
+    float* __restrict__ outv,
     int t_len, int h_k, int h_v, int d, int layer)
 {
     const int h = blockIdx.x;
-    const int tid = threadIdx.x; // = d 인덱스
+    const int tid = threadIdx.x;
     const int kh = h % h_k;
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
     const long sc_h = ((long)layer * h_v + h) * d;
@@ -1087,7 +1087,7 @@ extern "C" __global__ void gdn_spec_scan(
     for (int t = 0; t < t_len; ++t) {
         const float* qt = q + (long)t * (h_k * 128);
         const float* kt = k + (long)t * (h_k * 128);
-        // part(8분할 부분합 → 분할 순서 결합) — trio gdn1_part/comb 미러.
+
         float ks = 0.0f, qs = 0.0f;
         for (int s = 0; s < GDN1_SPLIT; ++s) {
             const int i0 = s * (128 / GDN1_SPLIT);
@@ -1101,7 +1101,7 @@ extern "C" __global__ void gdn_spec_scan(
             ks += pks;
             qs += pqs;
         }
-        // kq00 — trio comb의 블록 트리와 동일 순서.
+
         red[tid] = qt[kh * 128 + tid] * __half2float(__float2half_rn(kt[kh * 128 + tid]));
         __syncthreads();
         for (int stp = 64; stp > 0; stp >>= 1) {
@@ -1117,7 +1117,7 @@ extern "C" __global__ void gdn_spec_scan(
         const float sv = __half2float(__float2half_rn(v[t * (h_v * 128) + h * 128 + tid]));
         const float rhs = beta * (sv - e * ks);
         outv[t * (h_v * 128) + h * 128 + tid] = e * qs * qscale + kq00 * rhs;
-        // 상태 갱신(trio gdn1_upd 미러) — 스냅샷 기록은 TreeWY 폐지.
+
         __half* sst = st + st_h;
         for (int i = 0; i < 128; ++i) {
             const float kv = __half2float(__float2half_rn(kt[kh * 128 + i]));
@@ -1127,42 +1127,42 @@ extern "C" __global__ void gdn_spec_scan(
             y = fminf(fmaxf(y, -65504.0f), 65504.0f);
             *p = __float2half_rn(y);
         }
-        __syncthreads(); // 다음 토큰 kq00 트리 전 정리
+        __syncthreads();
     }
 }
 
-// ── [TreeWY 2.B 2026-10-12] WY 표현 — 유사값 solve + 접두 상태 재구성 ──
-// 스펙 롤백의 토큰별 상태 스냅샷(dsnap, 27B 1.50GiB·35B 640MiB)을
-// S_0 1개 + 유사값 dc + 누적감쇠 G + k행(27B 약 164MB)으로 대체한다.
-// 수치 검증 = scripts/poc_treewy.py(fp32 |ΔS_m| ≤1.2e-7 — eval
-// 클래스 판정, 2026-10-12). 규약은 PoC 그대로 — (I+A)dc=rhs0 순전대입
-// (논문 TreeWY 2608.20961의 W=(I−tril(βxxᵀ))⁻¹와는 부호 규약 차이만:
-// L=−A. 항 이동 시 +). 수식:
-//   G_i = Σ_{r≤i} g_r(포함 누적)
-//   A[i][j] = β_i·(k_i·k_j)·exp(G_i−G_j)        (j<i 강하삼각)
-//   rhs0_i  = β_i·(v_i − exp(G_i)·(k_i^T S_0))
-//   dc_i = rhs0_i − Σ_{j<i} A[i][j]·dc_j        (j 오름차순 소거)
-//   S_m = exp(G_{m-1})·S_0 + Σ_{j≤m-1} exp(G_{m-1}−G_j)·k_j·dc_j^T
-// k/v는 순차 스캔(gdn_spec_scan)과 동일한 f16 저장 반올림 경유, 초월함수는
-// gdn_expf(FLA-8 채택 클래스). 검증 출력·최종 상태는 순차 스캔이 그대로
-// 생산(비트 불변) — 본 커널은 롤백 데이터만 담당한다.
-// 버퍼 레이아웃(호스트 enable_spec — n_gdn 스트라이드):
-//   wy_s0[n_gdn][h_v][d²] · wy_dc[n_gdn][8][h_v][128]
-//   wy_g[n_gdn][8][h_v]   · wy_k[n_gdn][8][k_len](f16 반올림 후 값)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 extern "C" __global__ void gdn_wy_solve(
-    const float* __restrict__ k,   // [T][k_len] L2 완료
-    const float* __restrict__ v,   // [T][h_v*128]
-    const float* __restrict__ bg,  // [T][2*h_v]
-    const __half* __restrict__ st, // 슬롯 상태 f16 [n_gdn][h_v][d²] — S_0(읽기 전용)
-    const float* __restrict__ sc,  // [n_gdn][h_v][d] — 행별 스케일
-    float* __restrict__ wy_s0,     // [n_gdn][h_v][d*d] — S_0 저장
-    float* __restrict__ wy_dc,     // [n_gdn][8][h_v][128]
-    float* __restrict__ wy_g,      // [n_gdn][8][h_v]
-    float* __restrict__ wy_k,      // [n_gdn][8][k_len]
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ bg,
+    const __half* __restrict__ st,
+    const float* __restrict__ sc,
+    float* __restrict__ wy_s0,
+    float* __restrict__ wy_dc,
+    float* __restrict__ wy_g,
+    float* __restrict__ wy_k,
     int t_len, int h_k, int h_v, int d, int layer)
 {
     const int h = blockIdx.x;
-    const int tid = threadIdx.x; // = value 열 인덱스
+    const int tid = threadIdx.x;
     const int kh = h % h_k;
     const int k_len = h_k * 128;
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
@@ -1170,9 +1170,9 @@ extern "C" __global__ void gdn_wy_solve(
     __shared__ float G[8];
     __shared__ float A[8][8];
 
-    // k행(f16 반올림 후) 저장 — h<h_k 블록이 자기 kh 슬라이스 1회
-    // (l2perm의 q/k 노름 분담 관례와 동일). 재구성 커널은 여기서 읽는다
-    // — dk2는 층마다 덮어써져 라운드 종료 시 마지막 층분만 남는다.
+
+
+
     if (h < h_k) {
         for (int t = 0; t < t_len; ++t) {
             const long ix = kh * 128 + tid;
@@ -1180,7 +1180,7 @@ extern "C" __global__ void gdn_wy_solve(
                 __half2float(__float2half_rn(k[(long)t * k_len + ix]));
         }
     }
-    // G 누적(포함) — thread 0이 계산·기록.
+
     if (tid == 0) {
         float acc = 0.0f;
         for (int t = 0; t < t_len; ++t) {
@@ -1190,7 +1190,7 @@ extern "C" __global__ void gdn_wy_solve(
         }
     }
     __syncthreads();
-    // Gram A[i][j](j<i) — 셀당 1스레드 길이 128 내적(블록 간 중복은 소량).
+
     for (int e = tid; e < t_len * t_len; e += 128) {
         const int i = e / t_len, j = e % t_len;
         if (j < i) {
@@ -1205,13 +1205,13 @@ extern "C" __global__ void gdn_wy_solve(
         }
     }
     __syncthreads();
-    // S_0 저장(열 tid) — 호스트가 본 커널을 gdn_spec_scan 앞에 발사하므로
-    // st는 아직 라운드 시작 상태다.
+
+
     for (int i2 = 0; i2 < 128; ++i2) {
         wy_s0[st_h + (long)i2 * d + tid] =
             __half2float(st[st_h + (long)i2 * d + tid]) * sc[sc_h + i2];
     }
-    // KS0·rhs0 → 순전대입 → dc(i·j 고정 8 전개 — dcr 레지스터 상주).
+
     float dcr[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -1237,28 +1237,28 @@ extern "C" __global__ void gdn_wy_solve(
     }
 }
 
-// [TreeWY 2.B] 접두 m 상태 재구성 — spec_rollback(keep=m)이 dsnap D2D 대신
-// 발사(그리드 h_v, 블록 128 — solve와 동일 열 소유 구조).
-// S_m = exp(G_{m-1})·S_0 + Σ_{j<m} exp(G_{m-1}−G_j)·k_j·dc_j^T
-// (j 오름차순 — PoC wy_state와 동일 순서).
-// [dsave 대체 2026-10-14] m=0 = 라운드 전 상태 복원(S_m = S_0 — 감쇠 없음):
-// wy_g[-1] 판독 없이 S_0만 스케일 나눗셈으로 되쓴다(acc==0 경로).
+
+
+
+
+
+
 extern "C" __global__ void gdn_wy_reconstruct(
-    const float* __restrict__ wy_k,  // [n_gdn][8][k_len]
-    const float* __restrict__ wy_s0, // [n_gdn][h_v][d*d]
-    const float* __restrict__ wy_dc, // [n_gdn][8][h_v][128]
-    const float* __restrict__ wy_g,  // [n_gdn][8][h_v]
-    __half* __restrict__ st,         // 슬롯 상태 f16 [n_gdn][h_v][d²] — 기록 대상
-    const float* __restrict__ sc,    // [n_gdn][h_v][d] — 행별 스케일
+    const float* __restrict__ wy_k,
+    const float* __restrict__ wy_s0,
+    const float* __restrict__ wy_dc,
+    const float* __restrict__ wy_g,
+    __half* __restrict__ st,
+    const float* __restrict__ sc,
     int m, int h_k, int h_v, int d, int layer)
 {
     const int h = blockIdx.x;
-    const int tid = threadIdx.x; // = value 열 인덱스
+    const int tid = threadIdx.x;
     const int kh = h % h_k;
     const int k_len = h_k * 128;
     const long st_h = (long)layer * h_v * d * d + (long)h * d * d;
     const long sc_h = ((long)layer * h_v + h) * d;
-    __shared__ float w[9]; // w[0]=exp(G_{m-1}), w[1+j]=exp(G_{m-1}−G_j)
+    __shared__ float w[9];
     if (tid == 0) {
         if (m == 0) {
             w[0] = 1.0f;
@@ -1287,18 +1287,18 @@ extern "C" __global__ void gdn_wy_reconstruct(
     }
 }
 
-// gdn_gate — rms(o_lc)·nw·silu(z) → gated(HF), 역순열 포함
-// (구 rawhip 커널 L368-393 직이식, 폭 인자화). 그리드 (h_v, T), WG=128.
-// [4.1 2026-10-11] 생산자 융합 — 선택 출력 gated32/gated16(nullable) 동시
-// 기록. gated32 = h2f(f2h(gv))·gated16 = f2h(gv) — cast_x32/cast_x16 커널과
-// 동일 산식(norm xn32/xn16 P6 패턴, cast_common 동일 함수 → 비트 동일).
+
+
+
+
+
 extern "C" __global__ void gdn_gate(
-    const float* __restrict__ o_lc,  // [T][h_v*128] lc
-    const float* __restrict__ z,     // [T][h_v*128] HF
-    const float* __restrict__ nw,    // [L][128]
-    float* __restrict__ gated,       // [T][h_v*128] HF
-    float* __restrict__ gated32,     // [4.1] x32(roundtrip) — nullable
-    unsigned short* __restrict__ gated16, // [4.1] f16 미러 — nullable
+    const float* __restrict__ o_lc,
+    const float* __restrict__ z,
+    const float* __restrict__ nw,
+    float* __restrict__ gated,
+    float* __restrict__ gated32,
+    unsigned short* __restrict__ gated16,
     int t_len, int layer, int h_k, int h_v)
 {
     __shared__ float red[128];
@@ -1319,7 +1319,7 @@ extern "C" __global__ void gdn_gate(
     float zv = z[t * (h_v * 128) + h * 128 + tid];
     float gv = ov * inv * nw[layer * 128 + tid] * (zv / (1.0f + gdn_expf(-zv)));
     gated[t * (h_v * 128) + h * 128 + tid] = gv;
-    // [⑯ 2026-10-18] 소프트 f2h/h2f → HW cvt(등가 근거는 norm.cu 주석).
+
     if (gated32 != (float*)0) {
         const __half hv = __float2half_rn(gv);
         gated32[t * (h_v * 128) + h * 128 + tid] = __half2float(hv);

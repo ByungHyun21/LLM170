@@ -194,8 +194,9 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// # Safety
-    /// `p` must point to `bytes` valid host bytes that remain mapped until unregistered.
+
+
+    #[allow(clippy::missing_safety_doc)]
     pub unsafe fn host_register(
         &self,
         p: *mut std::ffi::c_void,
@@ -208,8 +209,9 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// # Safety
-    /// `p` must be a host pointer previously registered with `host_register`.
+
+
+    #[allow(clippy::missing_safety_doc)]
     pub unsafe fn host_unregister(&self, p: *mut std::ffi::c_void) -> Result<(), String> {
         let r = unsafe { (self.drv.host_unregister)(p) };
         if r != CUDA_SUCCESS {
