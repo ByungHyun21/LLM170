@@ -1,37 +1,6 @@
-//! 통계 eval 프로브 — `w4a16-eval ppl|agree` (2026-10-10 신설).
-//!
-//! 목적: 연산 경로 후보의 **품질 편차 계측기**. 방침(루트 AGENTS.md —
-//! "연산 경로는 모듈당 하나, fast를 기본으로")상 수치를 바꾸는 후보는
-//! 런타임 플래그로 병존시키지 않는다. 후보는 머지 시점에 이 계측으로
-//! PPL·teacher-forced argmax 일치율(편차)을 확인해 단일 경로로 채택
-//! (골든 재동결)하거나 삭제한다. 기본 경로 골든과 독립인 별도 계측기.
-//!
-//! `ppl`: 코퍼스(텍스트 또는 토큰 파일)를 t=1 디코드로 훑어 전 위치
-//! NLL·PPL을 계산하고 per-position 덤프(토큰/argmax/NLL/top1-2 마진)를
-//! 기록한다. NLL은 tokens[1..] 기준(첫 토큰은 문맥만), logsumexp f64.
-//! `agree`: 두 덤프 비교 — argmax 일치율·최초 발산·NLL/PPL 델타.
-//!
-//! 사용법:
-//!   llm170 w4a16-eval ppl <w4a16_dir> --corpus <txt> [--ctx N] [--limit N]
-//!                           [--chunk N] [--bos <id>] [--route] [--out dump.tsv] [--json]
-//!   llm170 w4a16-eval ppl <w4a16_dir> --from-tokens <file> [...]
-//!   llm170 w4a16-eval agree <a.tsv> <b.tsv>
-//!   llm170 w4a16-eval needle <w4a16_dir> [--ctx N] [--lens N,N] [--sets N] [--json]
 
 use super::{arg, arg_str, finish};
 use llm170_backend_gpu::W4a16Dec;
-// [품질 게이트 규약 2026-10-12/13 — 코드가 정본] 숫자 후보(KV·상태 dtype 등)의
-// 채택/기각 판정(단일 경로 교체제 — 채택 시 골든 재동결+사유·델타 기록):
-// ① 단문 PPL 쌍(창별 en/ko) + `ci` 블록 부트스트랩 CI — 밴드 |ΔPPL| ≤ 0.3%(초과 = 기각).
-// ② 장문 PPL 쌍(mix 8K/16K/32K · chunk16) + `ci` — **단문 창은 장문 손상을 과소평가**
-//    (실측: GDN 상태 bf16·35B — 128창 +0.72% vs 32K창 **+10.8%**, 15×; guide와 무관한
-//    순환 누적형 손상은 장문에서만 드러남).
-// ③ 장문 AND: `needle`(MRCR-lite 다중 바늘·--hard·confused 검출) — PPL이 못 보는 회수
-//    실패 검출(역도 성립: needle이 못 잡는 누적 손상을 PPL 장문이 잡음 — 둘 다 필수).
-// ④ 불변식: 골든(단문·장문)·`agree`(argmax 일치율).
-// 업계 대비(2026-10-13 실코드 조사): vLLM = 태스크 정확도 0.88~0.95±0~8%p · KV는
-// 옵트인 PPL 델타 공개(+1.17~2.71%) · SGLang = "reported GSM8K −5%p" 사전 등록 —
-// 우리 밴드가 10~20× 타이트(폴백 없는 영구 교체의 대가 — 완화 논의는 장문 창+CI 증거로만).
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -56,10 +25,8 @@ fn run(args: &[String]) -> Result<String, String> {
     }
 }
 
-/// 덤프 한 행 — (pos, target, argmax, nll, margin).
 type Row = (u32, u32, u32, f64, f32);
 
-/// ppl — 코퍼스 순회 + NLL/PPL + 덤프.
 fn ppl(args: &[String]) -> Result<String, String> {
     let dir = arg_str(args, 0, "");
     if dir.is_empty() {
@@ -100,8 +67,6 @@ fn ppl(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--ctx requires a number")?;
             }
-            // [gemma4 2026-10-14] --bos <id>: 코퍼스 선두 BOS 부착 — ref 명령
-            // (`--bos`)과 동일 프로토콜(gemma4는 add_bos 강제 — HF 914/870 대조).
             "--bos" => {
                 bos = Some(
                     it.next()
@@ -109,10 +74,7 @@ fn ppl(args: &[String]) -> Result<String, String> {
                         .ok_or("--bos requires an id")?,
                 );
             }
-            // [P4 2026-10-15] 라우팅 top-k 캡처(gemma4 전용 — MoE 진단·agree
-            // Jaccard 소스). 그래프 캡처 비활성 직접 발사 경로(수치 불변).
             "--route" => route = true,
-            // [§2.I 2026-10-16] top-k 로짓 덤프 — agree KLD 근사 소스.
             "--kld" => kld = true,
             "--limit" => {
                 limit = it
@@ -130,7 +92,6 @@ fn ppl(args: &[String]) -> Result<String, String> {
     let mut toks: Vec<u32> = if let Some(c) = &corpus {
         let text = std::fs::read_to_string(c).map_err(|e| format!("corpus {c}: {e}"))?;
         let tk = crate::tokenize::Tokenizer::load(Path::new(&dir))?;
-        // 특수 토큰 미해석 — 코퍼스 원문 그대로(결정적).
         tk.encode_opts(&text, false)
     } else {
         let f = from_tokens.as_deref().unwrap_or("");
@@ -147,8 +108,6 @@ fn ppl(args: &[String]) -> Result<String, String> {
         }
         v
     };
-    // [gemma4 2026-10-14] BOS 선두 부착(--bos) — ref 명령(`--bos`)과 동일 순서
-    // (삽입 후 limit). gemma4는 add_bos 강제(프로토콜 정합 — 상대 편차가 게이트).
     if let Some(b) = bos {
         toks.insert(0, b);
     }
@@ -159,8 +118,6 @@ fn ppl(args: &[String]) -> Result<String, String> {
     if n - 1 > ctx {
         return Err(format!("토큰 {n} > ctx {ctx} — --ctx 확대 필요"));
     }
-    // [gemma4 2026-10-14] 아치 분기 — gemma4는 서빙 단일 경로(청크 t≤16·1..16
-    // 동일 클래스)로 전 위치 로짓을 회수한다(경로 계측기 — 채택/기각 판정).
     let arch = llm170_core::qwen35::bind::dir_arch(Path::new(&dir)).unwrap_or_default();
     if kld && !route {
         return Err("--kld는 --route 동반 필수(덤프 열 순서 계약)".into());
@@ -168,10 +125,6 @@ fn ppl(args: &[String]) -> Result<String, String> {
     if llm170_core::gemma4::bind::arch_ok(&arch) {
         return ppl_g4(&dir, &toks, n, ctx, chunk, &out_path, json, route, kld);
     }
-    // [2026-10-21] FN(qwen4_exp) — 골든 정합 후 eval 인가 개통. 청크 128
-    // 고정(전문가 LRU 320슬롯 distinct 가드 — 랜덤 코퍼스 512/256청크 초과
-    // 실측), 전 위치 로짓 = 체인 + 헤드 GEMM(fn_chain_logits). route/kld는
-    // FN 미지원(가드 유지).
     if llm170_core::qwen4exp::arch_ok(&arch) {
         if route || kld {
             return Err("FN은 --route/--kld 미지원(FN eval = ppl/agree 우선)".into());
@@ -185,7 +138,6 @@ fn ppl(args: &[String]) -> Result<String, String> {
         return Err("--kld는 gemma4 전용(현 계측 축)".into());
     }
     let model = llm170_core::qwen35::Model::load(Path::new(&dir)).map_err(|e| e.to_string())?;
-    // [B20 보완 2026-10-19] 적재 완료 = 락 해제.
     crate::resource::release_load_lock();
     let hp = model.hp.clone();
     let t0 = std::time::Instant::now();
@@ -199,24 +151,17 @@ fn ppl(args: &[String]) -> Result<String, String> {
         dec.upload_head(head.data, head.n_out as usize, head.n_in as usize)?;
     }
     dec.reset_state(0)?;
-    // [K6-3 결함수정 2026-10-13] 프로브 직접 경로는 스케줄러가 없어 KV 풀
-    // 블록을 스스로 확보해야 한다 — 미확보 시 512토큰(블록 경계) 초과에서
-    // 테이블 범위 밖 접근(illegal access, 실측). 창 전체(+슬랙)를 1회 보장.
     dec.kv_grow(0, n + 8)?;
     let vocab = head.n_out as usize;
     let mut rows: Vec<Row> = Vec::with_capacity(n - 1);
     let mut nll_sum = 0f64;
     if chunk >= 2 {
-        // [A2 2026-10-15] qwen 배치 청크 = FFMA GEMM 경로(≤GEMM_FFMA_TMAX) —
-        // gemma4(ppl_g4)만 G4_CHUNK_MAX(64)까지 허용한다.
         if chunk > llm170_backend_gpu::GEMM_FFMA_TMAX {
             return Err(format!(
                 "--chunk {chunk}: qwen 배치 ≤ GEMM_FFMA_TMAX({})",
                 llm170_backend_gpu::GEMM_FFMA_TMAX
             ));
         }
-        // [2026-10-10] 청크 경로 — t행 배치 프리필 + 전 위치 로짓 회수
-        // (GEMM t≥2 — t=1 GEMV와 수치 계급이 다름: 방법 B).
         if !head_gpu {
             return Err("--chunk≥2는 GPU head 필요(CPU head 경로 미지원)".into());
         }
@@ -270,7 +215,6 @@ fn ppl(args: &[String]) -> Result<String, String> {
     )
 }
 
-/// 덤프·요약 공용 — qwen·gemma4 경로가 같은 형식을 낸다(동결 — agree/ci 소비).
 #[allow(clippy::too_many_arguments)]
 fn eval_report(
     dir: &str,
@@ -289,8 +233,6 @@ fn eval_report(
     let ppl = mean.exp();
     if let Some(p) = out_path {
         let mut s = String::with_capacity(rows.len() * 40 + 256);
-        // [P4 2026-10-15] route 덤프 = 헤더 route=L{층}k{k} + 6열째(층순
-        // top-k id 16진 — agree 자카드 소스). 형식 v1 호환(무route는 5열).
         if let Some((rs, nl, tk)) = route {
             s.push_str(&format!(
                 "# w4a16-eval dump v1 model={dir} tokens={n} head={} chunk={chunk} nll_sum={nll_sum:.9} ppl={ppl:.9} route=L{nl}k{tk}{}\n",
@@ -355,10 +297,6 @@ fn eval_report(
     ))
 }
 
-/// ppl — FN(qwen4_exp) 아치 분기 — 2026-10-21 골든 정합 후 개통.
-/// 청크 = min(chunk.max(2),128) — 전문가 LRU 320슬롯 distinct 가드(랜덤
-/// 코퍼스 512/256 초과 실측). 전 위치 로짓 = 체인 + 헤드 GEMM
-/// (fn_chain_logits). 행 규약 = qwen35/ppl_g4와 동일(agree/ci 소비 동일).
 fn ppl_fn(
     dir: &str,
     toks: &[u32],
@@ -375,11 +313,8 @@ fn ppl_fn(
     let ct_dir = format!("{dir}-CT");
     let t0 = std::time::Instant::now();
     let mut dec = W4a16Dec::new(1, cfg.hidden_size, cfg.num_hidden_layers)?;
-    // [진단] FN eval도 debug_layers 지문을 낸다 — 청크 경계 상태 발산 추적.
     dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
     let _fn_store = crate::gpu_engine::upload_fn(&mut dec, &cfg, Path::new(&ct_dir), ctx, false)?;
-    // 기본 --chunk=1이면 FN은 128로 승격(전문가·KV 캐시 가드 상한). 명시
-    // chunk≥2는 128로 클램프.
     let chunk_max = if chunk >= 2 { chunk.min(128) } else { 128 };
     let vocab = cfg.vocab;
     let mut rows: Vec<Row> = Vec::with_capacity(n - 1);
@@ -412,9 +347,6 @@ fn ppl_fn(
     )
 }
 
-/// ppl — gemma4 아치 분기(서빙 청크 경로 = 단일 클래스). 헤드·softcap은 청크
-/// 내부(원문 embed 행별 int8 W8A16) — 청크 t는 1..=G4_CHUNK_MAX로 클램프
-/// ([2.N t≤16 2026-10-15] 승격 상한과 동기 — 청크 8/16 동등성 계측용).
 fn ppl_g4(
     dir: &str,
     toks: &[u32],
@@ -428,7 +360,6 @@ fn ppl_g4(
 ) -> Result<String, String> {
     let t0 = std::time::Instant::now();
     let model = llm170_core::gemma4::Model::load(Path::new(dir)).map_err(|e| e.to_string())?;
-    // [B20 보완 2026-10-19] 적재 완료 = 락 해제.
     crate::resource::release_load_lock();
     let hp = model.hp.clone();
     let h = hp.n_embd;
@@ -438,12 +369,8 @@ fn ppl_g4(
         dec.set_g4_pes(il, cfg.pes_row(il, hp.n_experts))?;
     }
     dec.kv_grow(0, n + 8)?;
-    // [P4 2026-10-15] 라우팅 캡처 — 그래프 캡처와 양립 불가(g4_graph_ok가
-    // 차단 → 직접 발사). 수치 불변(디바이스 moe_idx 판독만).
     let (nl, tk) = (hp.n_layer, hp.top_k.max(1));
     let mut routes: Vec<String> = Vec::new();
-    // [§2.I 2026-10-16] KLD 근사 — top-16 로짓(id:f32비트) 열. 전어휘 저장
-    // 과다(248k×4B/토큰), 합집합 top-k KL로 agree가 근사 판정.
     let mut klds: Vec<String> = Vec::new();
     if route {
         if hp.n_experts > 256 {
@@ -469,8 +396,6 @@ fn ppl_g4(
         let lgs =
             crate::gpu_engine::g4_chunk(&mut dec, &model, &cfg, &csv, &cpos, &rb, t, false, true)?;
         if route {
-            // 청크분 = 층 실행 순서대로 [t][k] 세그먼트 nl개(캡처 계약).
-            // 행 정렬 = rows 루프와 동일 가드(마지막 위치는 스코어링 없음).
             let seg = std::mem::take(&mut dec.route_out);
             if seg.len() != nl * t * tk {
                 return Err(format!(
@@ -532,12 +457,6 @@ fn ppl_g4(
     )
 }
 
-/// ci — 두 덤프의 **쌍대 ΔNLL 블록 부트스트랩 CI**(채택 게이트 계측기, §2.I).
-/// 같은 코퍼스·같은 창의 teacher-forced NLL 두 벌을 토큰별로 짝지어 Δ(후보−기준)
-/// 평균과 95% CI를 낸다. 인접 토큰 자기상관을 반영해 **이동블록 부트스트랩**
-/// (기본 블록 16토큰) — i.i.d. 재표집은 CI를 과소평가한다. 난수는 splitmix64
-/// (rand 크레이트 금지 계약 — seed 고정 시 결정적).
-/// 밴드 판정은 ΔPPL%(= exp(ΔNLL평균)−1)의 CI로: 상한 < 밴드면 통과 등.
 fn ci(args: &[String]) -> Result<String, String> {
     let a = arg_str(args, 0, "");
     let b = arg_str(args, 1, "");
@@ -596,7 +515,7 @@ fn ci(args: &[String]) -> Result<String, String> {
                 x.0, y.0
             ));
         }
-        let delta = y.3 - x.3; // 후보 − 기준(음수 = 후보 우세)
+        let delta = y.3 - x.3;
         if delta < 0.0 {
             win += 1;
         } else if delta > 0.0 {
@@ -612,7 +531,6 @@ fn ci(args: &[String]) -> Result<String, String> {
     let mean = d.iter().sum::<f64>() / n as f64;
     let mean_a = da.rows.iter().map(|r| r.3).sum::<f64>() / n as f64;
     let mean_b = db.rows.iter().map(|r| r.3).sum::<f64>() / n as f64;
-    // 이동블록 부트스트랩 — 시작 위치 균일 추출, 블록 내 순서 보존(순환).
     let blk = block.min(n);
     let nblk = n.div_ceil(blk);
     let mut rng = seed;
@@ -638,7 +556,6 @@ fn ci(args: &[String]) -> Result<String, String> {
     let qp = |p: f64| means[((means.len() - 1) as f64 * p).round() as usize];
     let (lo, hi) = (qp(0.025), qp(0.975));
     let pos_frac = means.iter().filter(|&&m| m > 0.0).count() as f64 / means.len() as f64;
-    // ΔNLL → ΔPPL% (PPL = exp(nll_mean)).
     let (ppl_a, ppl_b) = (mean_a.exp(), mean_b.exp());
     let pct = |x: f64| (x.exp() - 1.0) * 100.0;
     if json {
@@ -660,14 +577,11 @@ fn ci(args: &[String]) -> Result<String, String> {
     ))
 }
 
-/// 덤프 파싱 결과.
 struct Dump {
     rows: Vec<Row>,
     nll_sum: Option<f64>,
-    /// [P4 2026-10-15] 라우팅 캡처 덤프 — (n_layer, top_k)와 행별 hex 열.
     route: Option<(usize, usize)>,
     routes: Vec<String>,
-    /// [§2.I 2026-10-16] top-16 로짓 덤프(헤더 kld=16) — agree KLD 소스.
     kld: bool,
     klds: Vec<String>,
 }
@@ -687,11 +601,9 @@ fn read_dump(path: &str) -> Result<Dump, String> {
             {
                 nll_sum = tok.parse::<f64>().ok();
             }
-            // [§2.I] kld=16 플래그(라우트 행과 동일 헤더 라인 끝).
             if line.contains("kld=16") {
                 kld = true;
             }
-            // [P4] route=L{층}k{k} — 마지막 헤더 토큰(층·k 메타).
             if let Some(v) = line.split("route=").nth(1)
                 && let Some(tok) = v.split_whitespace().next()
             {
@@ -764,14 +676,12 @@ fn read_dump(path: &str) -> Result<Dump, String> {
     })
 }
 
-/// agree — 두 덤프의 argmax 일치율·최초 발산·NLL/PPL 델타.
 fn agree(args: &[String]) -> Result<String, String> {
     let a = arg_str(args, 0, "");
     let b = arg_str(args, 1, "");
     if a.is_empty() || b.is_empty() {
         return Err("w4a16-eval agree <a.tsv> <b.tsv>".into());
     }
-    // [Q5 2026-10-12] 마진 컷 — 근접동률(margin<ε) 플립과 실질 발산을 구분.
     let mut margin_cut = 1.0f32;
     let mut it = args.iter().skip(2);
     while let Some(x) = it.next() {
@@ -811,7 +721,6 @@ fn agree(args: &[String]) -> Result<String, String> {
             matches += 1;
         } else {
             div += 1;
-            // 플립의 대표 마진 = 두 덤프 중 **작은** 쪽(양쪽 모두 확신해야 실질).
             let m = x.4.min(y.4);
             m_min = m_min.min(m);
             m_max = m_max.max(m);
@@ -844,8 +753,6 @@ fn agree(args: &[String]) -> Result<String, String> {
     } else {
         "플립 없음".into()
     };
-    // [P4 2026-10-15] 라우팅 Jaccard — 두 덤프의 MoE top-k 선택 일치율(§2.I
-    // baseline: 라우팅 민감도의 직접 계측 — dense mma 기각 기록과 연결).
     let mut route_desc = String::new();
     if da.route.is_some() || db.route.is_some() {
         let (nl, k) = match (da.route, db.route) {
@@ -892,7 +799,6 @@ fn agree(args: &[String]) -> Result<String, String> {
             jflip as f64 / jn as f64 * 100.0,
             wj
         );
-        // [§2.I 2026-10-16] top-16 근사 KL — 로짓 분포 편차의 직접 계측.
         if da.kld && db.kld {
             let mut ksum = 0f64;
             let mut kn = 0usize;
@@ -933,7 +839,6 @@ fn route_ids(hex: &str) -> Result<Vec<u32>, String> {
         .collect()
 }
 
-/// [§2.I] kld 열 디코드 — (id, f32비트) 16쌍.
 fn dec_topk(h: &str) -> Option<Vec<(u32, f32)>> {
     let b = h.as_bytes();
     if b.len() != 16 * 14 {
@@ -949,24 +854,12 @@ fn dec_topk(h: &str) -> Option<Vec<(u32, f32)>> {
     Some(out)
 }
 
-/// top-k 집합 자카드 = |∩| / |A∪B| (동일 k 전제). 플립 정의 = J < 1.
 fn route_jaccard(a: &[u32], b: &[u32]) -> f64 {
     let c = a.iter().filter(|x| b.contains(x)).count();
     let u = a.len() + b.len() - c;
     if u == 0 { 1.0 } else { c as f64 / u as f64 }
 }
 
-/// argmax + top1-2 마진 — CPU `greedy_from` 규약(엄격 비교, 동률=최저 인덱스).
-/// [Q3 2026-10-12] needle 하네스 — 장문 검색 정확도(플랜 §5 Q3).
-/// 장문 검색 게이트 — 합성 haystack(중성 문장 반복)에 고유 패스코드를 심고
-/// greedy 답변이 **그 패스코드를 정확히** 꺼내는지 채점한다(결정적 LCG·greedy).
-/// ① 단일 바늘(기본): --depths(기본 10/50/90%)별 삽입·질의.
-/// ② 다중 바늘 MRCR-lite(--needles N): N개를 균등 분산 삽입, 슬롯별 질의 —
-///    다른 바늘 오답 검출 = confused. --hard면 접두 4자 공유(근접 디스턴트랙터,
-///    접두 매칭으론 못 맞히게).
-/// 판정은 토큰 id 부분열 **또는 디토큰화 문자열 포함** — 생성 토큰화는 문맥
-/// 의존이라 id만 보면 정답을 놓친다(실측: 35B 오판). 문맥 프리필은 ppl 청크
-/// 경로와 동일(KV 누적 — 수치 계급 동일). 판정 결과·프로토콜은 코드 옆이 정본.
 fn needle(args: &[String]) -> Result<String, String> {
     let mut it = args.iter();
     let Some(dir) = it.next().cloned() else {
@@ -974,10 +867,10 @@ fn needle(args: &[String]) -> Result<String, String> {
     };
     let (mut ctx, mut lens, mut sets, mut json) =
         (16384usize, vec![4096usize, 16384], 1usize, false);
-    let mut ngen = 8usize; // greedy 생성 토큰(패스코드 탐색 창)
-    let (mut pf, mut picks_dbg) = (512usize, false); // 프리필 청크 캡·답변 덤프
-    let (mut needles, mut hard) = (1usize, false); // 다중 바늘·근접 디스턴트랙터
-    let mut bos: Option<u32> = None; // [gemma4] 선두 BOS(ref·ppl --bos와 동일 프로토콜)
+    let mut ngen = 8usize;
+    let (mut pf, mut picks_dbg) = (512usize, false);
+    let (mut needles, mut hard) = (1usize, false);
+    let mut bos: Option<u32> = None;
     let mut depths = vec![10usize, 50, 90];
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -1040,8 +933,6 @@ fn needle(args: &[String]) -> Result<String, String> {
             other => return Err(format!("w4a16-eval needle: unknown flag {other}")),
         }
     }
-    // [gemma4 2026-10-14] 아치 분기 — 케이스 생성(프로토콜)은 공용, 실행만
-    // 분리(클로저). gemma4 = 서빙 청크 경로(프리필 ≤8·그리디 t=1).
     let arch = llm170_core::qwen35::bind::dir_arch(Path::new(&dir)).unwrap_or_default();
     let is_g4 = llm170_core::gemma4::bind::arch_ok(&arch);
     let tk = crate::tokenize::Tokenizer::load(Path::new(&dir))?;
@@ -1056,10 +947,7 @@ fn needle(args: &[String]) -> Result<String, String> {
         }
         Box::new(move |toks: &[u32]| -> Result<Vec<u32>, String> {
             dec.reset_state(0)?;
-            // [K6-3 결함수정] 문맥+답변 KV 블록 확보 — 프로브는 스케줄러 부재.
             dec.kv_grow(0, toks.len() + 16)?;
-            // 청크 프리필 — [2026-10-19] --pf 존중(기본 512 = 서빙 프리필 동일
-            // 경로·t>16 마린 dense). 8 고정 시대의 판정과의 비교는 --pf 8으로.
             let mut i = 0usize;
             let mut lg: Vec<f32> = Vec::new();
             while i < toks.len() {
@@ -1079,7 +967,6 @@ fn needle(args: &[String]) -> Result<String, String> {
                 }
                 i += t;
             }
-            // 그리디 ngen — 마지막 문맥 위치에서 이어감.
             let mut picks: Vec<u32> = Vec::with_capacity(ngen);
             let mut row = lg;
             let base = toks.len() as u32;
@@ -1124,8 +1011,6 @@ fn needle(args: &[String]) -> Result<String, String> {
             dec.reset_state(0)?;
             let n_ctx = toks.len() - 1;
             dec.kv_grow(0, toks.len() + 16)?;
-            // 문맥 n-1토큰까지 배치 체인 프리필(무로짓·t≥2) — 마지막 토큰은
-            // t=1 head로 예측(프리필/디코드 경계 동일).
             let mut i = 0usize;
             while i < n_ctx {
                 let t = (n_ctx - i).clamp(2, pf.max(2));
@@ -1156,11 +1041,7 @@ fn needle(args: &[String]) -> Result<String, String> {
         })
     };
 
-    // 합성 haystack — 중성 산책 문장 반복(코퍼스 의존 없음·결정적).
     const HAY: &str = "The narrow alpine trail bends past the old stone bridge and continues through the quiet valley below the snow line. ";
-    // [장거리 렌즈 2026-10-13] 1400→4000(≈88K토큰) — 32K/64K 렌즈 지원.
-    // [200K 렌즈 2026-10-17] 고정 4000 → lens 최대값 적응형(문장≈22토큰·마진 4K) —
-    // 204K 렌즈(GDN 200K 재검증) 상향. 코퍼스 무의존·결정성 유지.
     let hay_reps = (lens.iter().max().unwrap_or(&16384) + 4096) / 22 + 1;
     let hay: Vec<u32> = tk.encode_opts(&HAY.repeat(hay_reps.max(4000)), false);
     let mut seed = 0x5EED_C0DE_1234_5678u64;
@@ -1171,13 +1052,12 @@ fn needle(args: &[String]) -> Result<String, String> {
         (seed >> 33) as u32
     };
     let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut rows: Vec<(usize, usize, usize, bool, bool)> = Vec::new(); // len·깊이%·슬롯·hit·confused
+    let mut rows: Vec<(usize, usize, usize, bool, bool)> = Vec::new();
     for &l in &lens {
         if l + 64 * needles + usize::from(bos.is_some()) > ctx {
             return Err(format!("len {l} + 질문 > ctx {ctx} — --ctx 확대 필요"));
         }
         for _set in 0..sets {
-            // [MRCR-lite 2026-10-13] 패스코드 needles개 — --hard면 접두 4자 공유.
             let shared: String = if hard && needles > 1 {
                 (0..4)
                     .map(|_| alphabet[(lcg() as usize) % alphabet.len()] as char)
@@ -1214,7 +1094,6 @@ fn needle(args: &[String]) -> Result<String, String> {
                 })
                 .collect();
             let word_id: Vec<Vec<u32>> = pcs.iter().map(|w| tk.encode_opts(w, false)).collect();
-            // 삽입 위치 % — needles=1이면 --depths(호환), N>1이면 균등 분산.
             let positions: Vec<usize> = if needles == 1 {
                 depths.clone()
             } else {
@@ -1226,8 +1105,6 @@ fn needle(args: &[String]) -> Result<String, String> {
             if hay.len() < hay_need {
                 return Err(format!("haystack 부족: {} < {hay_need}", hay.len()));
             }
-            // 케이스 = (마커 배치 인덱스, 질의 슬롯) — 단일 바늘은 깊이별 슬롯0,
-            // 다중 바늘은 문맥(마커 전부)을 조립한 뒤 슬롯별 질의.
             let cases: Vec<(usize, usize)> = if needles == 1 {
                 (0..positions.len()).map(|i| (i, 0)).collect()
             } else {
@@ -1251,15 +1128,10 @@ fn needle(args: &[String]) -> Result<String, String> {
                     toks.extend_from_slice(&hay[prev..hay_need]);
                 }
                 toks.extend_from_slice(&q_id[ask]);
-                // [gemma4 2026-10-14] --bos: 선두 BOS(ref·ppl과 동일 순서).
                 if let Some(b) = bos {
                     toks.insert(0, b);
                 }
                 let picks = run_case(&toks)?;
-                // [하네스 결함수정 2026-10-13] 토큰 id 부분열만으로는 생성-시점
-                // 토큰화가 단독 인코딩과 다를 때 정답을 놓친다(실측: 35B가
-                // "FAR39C"를 정확히 출력했는데도 0/6 — 병합 차이). 조각 문자열
-                // 연결로 패스코드 원문(ASCII)도 함께 찾는다.
                 let mut gen_text = String::new();
                 for &id in &picks {
                     gen_text.push_str(tk.piece(id).unwrap_or(""));
@@ -1317,10 +1189,6 @@ fn needle(args: &[String]) -> Result<String, String> {
     Ok(s)
 }
 
-/// [Q4 2026-10-12] 샘플링 검증 하네스 — 고정 LCG 로짓에서 서빙 CPU
-/// 샘플러(splitmix64 시드 — rand 금지 계약)로 N표본 뽑고 이론
-/// softmax(temperature·top_k/top_p/min_p 비활성) 분포와 TV 거리·
-/// 카이제곱을 대조한다(판정 기준은 실행 출력 참조).
 fn sample(args: &[String]) -> Result<String, String> {
     let mut it = args.iter();
     let Some(dir) = it.next().cloned() else {
@@ -1365,7 +1233,6 @@ fn sample(args: &[String]) -> Result<String, String> {
         seed: 0x5EED_C0DE,
     };
     let mut smp = llm170_core::sampler::Sampler::new(params.clone());
-    // 고정 로짓 — LCG 결정적([-8, 8] 범위).
     let mut seed = 0xABCD_1234_5678_9DEFu64;
     let base_logits: Vec<f32> = (0..nv)
         .map(|i| {
@@ -1381,7 +1248,6 @@ fn sample(args: &[String]) -> Result<String, String> {
         let t = smp.sample(&mut lg);
         counts[t as usize] += 1;
     }
-    // 이론 분포 — 비활성 필터(top_k만) 적용 softmax·코드 표본은 f64.
     let mx = base_logits.iter().cloned().fold(f32::MIN, f32::max);
     let mut idx: Vec<usize> = (0..nv).collect();
     if topk > 0 && topk < nv {
@@ -1407,7 +1273,6 @@ fn sample(args: &[String]) -> Result<String, String> {
         }
     }
     tv *= 0.5;
-    // [Q4-fx] 상위 편차 프로파일 — 편향 방향 진단(토큰·기대·관측·비).
     let mut top: Vec<(usize, f64, u64)> = idx
         .iter()
         .map(|&i| {
@@ -1455,9 +1320,6 @@ pub(crate) fn argmax_margin(lg: &[f32]) -> (u32, f32) {
     (bi, margin)
 }
 
-/// [§2.I 2026-10-16] top-k 로짓 쌍(id, 값) — KLD 근사 덤프용(전어휘 저장
-/// 과다: 248k×4B/토큰). k=16: 질량 대부분 커버, agree에서 두 덤프의
-/// 합집합 기준 근사 KL 계산.
 fn topk_logits(lg: &[f32], k: usize) -> Vec<(u32, f32)> {
     let mut idx: Vec<u32> = (0..lg.len() as u32).collect();
     idx.sort_by(|&a, &b| lg[b as usize].total_cmp(&lg[a as usize]));
@@ -1465,8 +1327,6 @@ fn topk_logits(lg: &[f32], k: usize) -> Vec<(u32, f32)> {
     idx.into_iter().map(|i| (i, lg[i as usize])).collect()
 }
 
-/// 합집합 top-k 근사 KL(P‖Q) — 로그확도 정규화(전합 대신 top-k 합) 후
-/// 누락 토큰은 하한(최소 로짓)으로 채움. 근사 계측(판정 보조).
 fn kld_topk(a: &[(u32, f32)], b: &[(u32, f32)]) -> f64 {
     const FLOOR: f64 = -30.0;
     let la = |id: u32| {
@@ -1481,7 +1341,6 @@ fn kld_topk(a: &[(u32, f32)], b: &[(u32, f32)]) -> f64 {
             .map(|x| x.1 as f64)
             .unwrap_or(FLOOR)
     };
-    // 정규화 상수(합집합).
     let ids: Vec<u32> = a.iter().map(|x| x.0).chain(b.iter().map(|x| x.0)).collect();
     let za = ids.iter().map(|&i| la(i).exp()).sum::<f64>().ln();
     let zb = ids.iter().map(|&i| lb(i).exp()).sum::<f64>().ln();
@@ -1494,7 +1353,6 @@ fn kld_topk(a: &[(u32, f32)], b: &[(u32, f32)]) -> f64 {
         .sum()
 }
 
-/// -ln p(target) — logsumexp(전 어휘) f64 누적, max 차감.
 pub(crate) fn nll_of(lg: &[f32], tgt: u32) -> f64 {
     let m = lg.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
     if !m.is_finite() {
@@ -1528,21 +1386,18 @@ mod tests {
 
     #[test]
     fn nll_uniform_two() {
-        // 로짓 [0,0] → p=1/2 → NLL=ln2.
         let v = nll_of(&[0.0, 0.0], 0);
         assert!((v - std::f64::consts::LN_2).abs() < 1e-12);
     }
 
     #[test]
     fn nll_dominant() {
-        // 로짓 [10,0] → p(tgt=0)≈1 → NLL≈0.
         let v = nll_of(&[10.0, 0.0], 0);
         assert!(v < 1e-4, "nll={v}");
     }
 
     #[test]
     fn agree_margin_cut_splits_real_vs_near() {
-        // pos1: argmax 동일 · pos2: 근접 플립(마진 0.01) · pos3: 실질 플립(마진 3.0).
         let pa = std::env::temp_dir().join(format!("eval-ag-a-{}.tsv", std::process::id()));
         let pb = std::env::temp_dir().join(format!("eval-ag-b-{}.tsv", std::process::id()));
         let hdr = "# w4a16-eval dump v1 model=x tokens=4 head=gpu nll_sum=4.0 ppl=2.7\n# cols: pos target argmax nll margin\n";
@@ -1623,7 +1478,6 @@ mod ci_tests {
 
     #[test]
     fn ci_uniform_delta_ppl() {
-        // 균일 Δ=+0.1 NLL → ΔPPL = e^0.1−1 = +10.5171%.
         let base: Vec<f64> = (0..64).map(|i| 1.0 + 0.001 * i as f64).collect();
         let cand: Vec<f64> = base.iter().map(|x| x + 0.1).collect();
         let p1 = write_tmp_dump(&base, "ci-u1");
@@ -1637,7 +1491,6 @@ mod ci_tests {
 
     #[test]
     fn ci_block_bootstrap_orders() {
-        // 혼합 부호 — CI가 평균을 감싼다.
         let base: Vec<f64> = (0..128).map(|_| 2.0).collect();
         let mut cand = base.clone();
         for i in (0..128).step_by(2) {

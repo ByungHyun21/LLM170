@@ -1,22 +1,4 @@
 #!/usr/bin/env bash
-# 같은 세션 A/B 성능 하네스 — "수정 전/후를 같은 세션에서" 규율의 도구화.
-# (루트 AGENTS.md: 절대치의 세션 간 비교 금지 — 워밍업 후 교차 측정·중앙값만.)
-#
-# 사용: scripts/ab-bench.sh <model_dir> <binA> <binB> [bench 인자...]
-#   예: scripts/ab-bench.sh ../models/Qwen3.8-27B-W4A16-AutoRound \
-#         /tmp/baseline/llm170 ./target/release/llm170 --pp 512 --tg 32 --ctx 2048
-# 기본 bench 인자 = --pp 512 --tg 32 --ctx 2048.
-# [주기 단축 2026-10-15] 로드 절반화 — 프로세스 교차 1라운드 × bench 인프로세스
-# 반복(기본 3회, 벤치 자체 워밍업 포함). 로드가 긴 모델(gemma4 MoE 6s+head 2.4s)일수록
-# 이득. 의심 구간은 AB_ROUNDS=2로 교차 라운드 추가.
-#   AB_REPS(기본 3) = 라운드 내 프로세스-내 반복 · AB_ROUNDS(기본 1) = 프로세스 교차 라운드
-#
-# 가드: (1) 두 바이너리 실행 가능 검사.
-#       (2) profile feature 계측 빌드 **거부** — [실측 2026-10-15] 계측 포함
-#           베이스라인 바이너리로 디코드 −19% 아티팩트를 "청크 효과"로 오독할
-#           뻔했다. 성능 판정용 바이너리는 기본 feature 릴리스 빌드만.
-# 출력: 항목별 t/s 중앙값(A/B)과 델타% — 판정(채택/기각)은 사람이 한다.
-# 종료코드: 0 = 측정 성립 · 1 = 일부 런 실패 · 2 = 사용법/가드 거부.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 if [ $# -lt 3 ]; then
@@ -34,8 +16,6 @@ RUN=$(mktemp -d /tmp/opencode/ab-bench.XXXXXX)
 
 for b in "$BIN_A" "$BIN_B"; do
     [ -x "$b" ] || { echo "ab-bench: 실행 불가 $b" >&2; exit 2; }
-    # pipefail 환경에서 `strings | grep -q`는 프로듀서 SIGPIPE(141)를 파이프 실패로
-    # 만들어 가드를 무력화한다(실측) — 출력 캡처 비교로 판정.
     if [ -n "$(strings -a "$b" 2>/dev/null | grep -m1 "llm170 profile")" ]; then
         echo "ab-bench: 거부 — $b 는 profile feature(계측) 포함 빌드(성능 A/B 부적합)" >&2
         exit 2

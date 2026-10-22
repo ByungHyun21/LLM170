@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Gemma-4-26B-A4B-it QAT W4A16(g32·BF16 스케일·per-expert) 다운로드 — CMP 셋업 2026-10-16.
-# 소스: reinforce20001/gemma4-26b-a4b-it-qat-w4a16-ct — "구글 공식 QAT W4A16 CT 미러
-#   rg20001"(플랜 §2.N)의 실체. 지문: dense FFN 2176·전문가 768·16.5GiB(=16.47G 기록)
-#   정합. sachin6624/xbill9판은 2112/704 구판으로 판별(다운로드 금지).
-# 대상: ../models/Gemma-4-26B-A4B-it-QAT-W4A16 (swap_models.sh M_G4 경로 동일)
-# 규칙: 모델은 한 번에 1개씩(사용자 지시 2026-10-16). 재실행 = 완료 파일 스킵 + 이어받기.
 set -euo pipefail
 REPO="reinforce20001/gemma4-26b-a4b-it-qat-w4a16-ct"
 NAME="Gemma-4-26B-A4B-it-QAT-W4A16"

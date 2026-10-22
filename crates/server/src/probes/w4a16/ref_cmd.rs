@@ -1,4 +1,3 @@
-//! [R2] 참조 러너·로더 프로브 — w4a16-load · w4a16-ref.
 
 use super::super::{arg, arg_str};
 
@@ -10,17 +9,12 @@ pub(super) fn load(args: &[String]) -> Result<String, String> {
                 .into(),
         );
     }
-    // [FN 1단계 2026-10-17] qwen4_exp(FN)은 config/ctx_info 식별까지만 —
-    // auto_round:auto_gptq 팩이라 트리플 W4A16 검증 대상 아님(본 트랙).
-    // gemma4/qwen35 판별에 앞서 분기(w4a16-load 등록 패턴 준수).
     let arch = llm170_core::qwen35::bind::dir_arch(std::path::Path::new(&dir));
     if arch.as_deref().is_some_and(llm170_core::qwen4exp::arch_ok) {
         return llm170_core::qwen4exp::report(std::path::Path::new(&dir));
     }
     let store = llm170_core::w4a16::W4a16Model::open(std::path::Path::new(&dir))
         .map_err(|e| e.to_string())?;
-    // 아치 바인딩이 등록된 모델만 커버리지(완전성)까지 검증한다 — 미등록
-    // 아치는 포맷 계층(트리플 구조·형상 값·양자 파라미터)만.
     if arch
         .as_deref()
         .is_some_and(llm170_core::gemma4::bind::arch_ok)
@@ -58,7 +52,6 @@ pub(super) fn load(args: &[String]) -> Result<String, String> {
     }
 }
 
-/// gemma4 로더 완전성 — 바인딩 validate(형상 계약·커버리지·전문가 구조).
 fn load_gemma4(dir: &str, store: &llm170_core::w4a16::W4a16Model) -> Result<String, String> {
     let cfg = llm170_core::gemma4::bind::GemmaCfg::load(std::path::Path::new(dir))
         .map_err(|e| e.to_string())?;
@@ -95,8 +88,6 @@ fn load_gemma4(dir: &str, store: &llm170_core::w4a16::W4a16Model) -> Result<Stri
     }
 }
 
-/// 포맷 계층 리포트 — 아치 바인딩 미등록 모델(신규 도입 트랙).
-/// 검증 = 트리플 구조(open) + weight_shape 값 대조 + 양자 파라미터 표기.
 fn format_store_level(
     dir: &str,
     store: &llm170_core::w4a16::W4a16Model,
@@ -126,12 +117,6 @@ fn format_store_level(
     }
 }
 
-/// 참조 러너 — CPU qwen35/gemma4 greedy. 프롬프트 prefill → 시드 1토큰 +
-/// `--n-predict` 디코드(총 n_predict+1 토큰). 출력: `tokens: a,b,c`(단일 프롬프트).
-/// `--ckpt <경로>`: NLL·토큰열 진행을 주기 저장(원자 기록). `--resume <경로>`:
-/// 체크포인트부터 계속(`--n-predict`는 추가 토큰 수). 프롬프트가 바이트
-/// 단위로 같아야 한다(다르면 거부). 진행률은 stderr `# ref:` 줄로 나온다
-/// (stdout `tokens:` 계약 불변).
 pub(super) fn reference(args: &[String]) -> Result<String, String> {
     let dir = arg_str(args, 0, "");
     if dir.is_empty() {
@@ -146,12 +131,8 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
     let mut ckpt_path: Option<String> = None;
     let mut resume_path: Option<String> = None;
     let mut ckpt_every: usize = 512;
-    // [Q1 2026-10-12] 오라클 NLL 모드 — 코퍼스 순회 CPU teacher-forced NLL.
     let (mut corpus, mut limit) = (None::<String>, usize::MAX);
     let mut nll_out: Option<String> = None;
-    // [gemma4 2026-10-14] --bos <id>: 코퍼스 선두에 BOS 부착. gemma4처럼
-    // 채팅 템플릿·BOS 의존이 큰 모델은 raw 텍스트 NLL이 프로토콜 아티팩트로
-    // 폭발한다(HF 대조로 확인) — 품질 게이트는 BOS 부착 프로토콜을 쓴다.
     let mut bos: Option<u32> = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -196,7 +177,6 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--limit requires a number")?;
             }
-            // [2026-10-19 진리층] f64 정확항 + 보상 누산 — "정확"의 기준값.
             "--hi-prec" => {
                 llm170_core::quant::exact::set_hi_prec(true);
             }
@@ -218,15 +198,10 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
             other => return Err(format!("unknown flag: {other}")),
         }
     }
-    // [FN D2 2026-10-20] greedy 경로 개통 — 프롬프트 지정 시 참조 엔진
-    // (RefEngine::Fn·상태ful 오라클)로 진행. 무지정이면 기존 fn-probe.
     let path = std::path::Path::new(&dir);
     let is_fn = llm170_core::qwen35::bind::dir_arch(path)
         .map(|a| llm170_core::qwen4exp::arch_ok(&a))
         .unwrap_or(false);
-    // [2026-10-21] FN --eval-corpus 개통 — NLL 경로(① 토큰 prefill → 토큰
-    // 디코드)는 RefEngine::Fn의 prefill/decode로 그대로 성립한다. 속도
-    // 주의: FN 오라클 디코드는 PLE 히스토리 게더가 주 병목(위치당 수 초~).
     if is_fn && prompts.is_empty() && corpus.is_none() {
         return llm170_core::qwen4exp::probe(path);
     }
@@ -234,7 +209,6 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
         return Err("at least one --prompt-tokens 또는 --eval-corpus required".into());
     }
     if let Some(c) = &corpus {
-        // [Q1] CPU 오라클 NLL — 전 위치 teacher-forced, 전 어휘 logsumexp(f64).
         let text = std::fs::read_to_string(c).map_err(|e| format!("corpus {c}: {e}"))?;
         let tk = crate::tokenize::Tokenizer::load(std::path::Path::new(&dir))?;
         let mut toks = tk.encode_opts(&text, false);
@@ -246,7 +220,6 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
             return Err(format!("토큰 {n}개 — NLL에는 2개 이상 필요"));
         }
         let mut eng = RefEngine::load(&dir, 1, ctx)?;
-        // [B20 보완 2026-10-19] 적재 완료 = 락 해제(CPU 오라클 장기 실행 보호).
         crate::resource::release_load_lock();
         let t0 = std::time::Instant::now();
         let mut l = eng.prefill(0, &toks[..1])?;
@@ -265,9 +238,6 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
             }
         }
         if let Some(p) = &nll_out {
-            // [2026-10-21] eval 덤프 형식(pos tgt argmax nll margin)으로 —
-            // agree가 오라클 덤프를 직접 소비(이전 v1 = pos nll 2열은 agree 불가).
-            // 주석 헤더 = w4a16-eval dump v1 동형.
             let mut buf =
                 String::from("# w4a16-ref nll dump v2\n# cols: pos target argmax nll margin\n");
             for (i, v) in per_pos.iter().enumerate() {
@@ -289,10 +259,7 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
     }
     let n = prompts.len();
     let mut eng = RefEngine::load(&dir, n, ctx)?;
-    // [B20 보완 2026-10-19] 적재 완료 = 락 해제.
     crate::resource::release_load_lock();
-    // 재개 — 체크포인트 검증(프롬프트 일치) + 상태 복원 + 그간 출력 복원.
-    // `--n-predict`는 재개 지점부터 추가 토큰 수다.
     let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
     if let Some(rp) = &resume_path {
         let (saved_prompts, saved_out) = ckpt_read(rp, &mut eng)?;
@@ -311,9 +278,6 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
             ));
         }
     }
-    // 시퀀스별: 잔여 프리필(128 청크·진행률) → 시드 → 디코드(진행률·주기 저장).
-    // 재개면 out에 이미 나온 토큰이 있고 pos가 그만큼 전진해 있다. n_predict는
-    // 추가 토큰 수다. 청크 분할 프리필은 수치 불변(양쪽 아치 append 규율).
     for (s, p) in prompts.iter().enumerate() {
         let mut pos = eng.seq_pos(s) as usize;
         if pos > p.len() && out[s].is_empty() {
@@ -387,12 +351,9 @@ pub(super) fn reference(args: &[String]) -> Result<String, String> {
     Ok(r)
 }
 
-/// 참조 엔진 — 아치별 CPU 엔진(qwen35·gemma4) 디스패치(병렬 미러·trait 없음).
-/// [gemma4 P2-3 2026-10-14] GPU 프로브의 오라클 대조가 쓰도록 공개(super).
 pub(super) enum RefEngine {
     Qwen(llm170_core::qwen35::Engine),
     Gemma(llm170_core::gemma4::Engine),
-    /// [FN D2] 상태ful CPU 오라클(단일 시퀀스 — prefill/디코드 동일 경로).
     Fn(Box<llm170_core::qwen4exp::oracle::Oracle>),
 }
 
@@ -401,7 +362,6 @@ impl RefEngine {
         let path = std::path::Path::new(dir);
         let arch = llm170_core::qwen35::bind::dir_arch(path).unwrap_or_default();
         if llm170_core::qwen4exp::arch_ok(&arch) {
-            // [FN D2] gptq 팩 — 스토어 직접 접근 오라클. 단일 시퀀스만.
             if n_seqs > 1 {
                 return Err("FN 참조 오라클은 단일 시퀀스만 지원".into());
             }
@@ -438,7 +398,6 @@ impl RefEngine {
         match self {
             RefEngine::Qwen(e) => e.decode(&[seq], tokens).map_err(|x| x.to_string()),
             RefEngine::Gemma(e) => e.decode(&[seq], tokens).map_err(|x| x.to_string()),
-            // 마지막 토큰 로짓만 반환(참조 greedy 경로 전용 계약).
             RefEngine::Fn(e) => Ok(vec![e.forward(tokens).map_err(|x| x.to_string())?]),
         }
     }
@@ -453,7 +412,6 @@ impl RefEngine {
         }
     }
 
-    /// 시퀀스 소비 위치(프리필+디코드 누적) — 재개 잔여 계산용.
     pub(super) fn seq_pos(&self, seq: usize) -> u32 {
         match self {
             RefEngine::Qwen(e) => e.seqs.get(seq).map(|s| s.pos).unwrap_or(0),
@@ -462,7 +420,6 @@ impl RefEngine {
         }
     }
 
-    /// 엔진 상태 직렬화(전 시퀀스) — 서버 래퍼가 프롬프트·출력과 함께 저장.
     pub(super) fn ckpt_save(&self) -> Result<Vec<u8>, String> {
         match self {
             RefEngine::Qwen(e) => e.ckpt_save().map_err(|x| x.to_string()),
@@ -471,7 +428,6 @@ impl RefEngine {
         }
     }
 
-    /// 엔진 상태 복원(형상 대조 — 불일치 거부).
     pub(super) fn ckpt_load(&mut self, blob: &[u8]) -> Result<(), String> {
         match self {
             RefEngine::Qwen(e) => e.ckpt_load(blob).map_err(|x| x.to_string()),
@@ -481,19 +437,11 @@ impl RefEngine {
     }
 }
 
-/// 진행률 1줄(stderr — 줄 단위 플러시라 리다이렉트해도 실시간으로 보인다).
 fn progress(msg: &str) {
     eprintln!("{msg}");
     let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
-/// 체크포인트 파일 형식(전부 LE):
-/// ```text
-/// magic 8B "REFCKP01" · n_seqs u32
-/// per seq: prompt_len u32 + prompt · out_len u32 + out · core_len u32 + core blob
-/// ```
-/// 프롬프트를 통째로 저장해 재개 시 바이트 단위로 대조한다(다른 입력에
-/// 옛 상태를 얹는 조용한 오염 방지).
 const CK_MAGIC: &[u8; 8] = b"REFCKP01";
 
 fn put_u32(v: &mut Vec<u8>, x: u32) {
@@ -509,7 +457,6 @@ fn get_u32(b: &[u8], p: &mut usize) -> Result<u32, String> {
     Ok(x)
 }
 
-/// 원자 기록 — tmp 후 rename(중단 시 반쪽 파일이 본 파일을 덮지 않는다).
 fn ckpt_write(
     path: &str,
     prompts: &[Vec<u32>],
@@ -539,7 +486,6 @@ fn ckpt_write(
     Ok(())
 }
 
-/// 읽기 — (프롬프트열, 출력열) 반환 + 엔진 상태 복원.
 fn ckpt_read(path: &str, eng: &mut RefEngine) -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>), String> {
     let b = std::fs::read(path).map_err(|e| format!("resume 읽기 실패 {path}: {e}"))?;
     if b.len() < 8 || &b[..8] != CK_MAGIC {

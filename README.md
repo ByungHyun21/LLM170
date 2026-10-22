@@ -8,8 +8,7 @@ end-to-end on GPU with an int8 KV cache and CUDA-graph decode — 27B dense
 
 ## Benchmarks
 
-<!-- 표 외 텍스트 금지 (repo rule) — 값은 표 안에만. 우리 엔진 결과만 기재
-     (타 구현체 행 없음 — 사용자 방침 2026-10-16). -->
+
 
 ### Environment (CMP 170HX)
 

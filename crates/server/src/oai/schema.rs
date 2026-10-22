@@ -1,12 +1,3 @@
-//! [P8 2026-10-16] XGrammar-2 서브셋 — json_schema 제약 디코딩.
-//! 스키마 하위집합: `type: object`(properties: string|integer|number|boolean|
-//! enum)·선언 프로퍼티 전부 필수·키 고정 순서(서브셋 계약 — 승람 시 순서
-//! 자유화). 컴파일 = 문자 NFA(상태-집합 스레딩으로 교대 표현) → 디코드
-//! 스텝마다 허용 토큰 = NFA 경로 접두사. 토큰 허용집합은 상태집합별 캐시.
-//! 계측: 마스크 스텝 수.
-//!
-//! 전제(운영 제약): 제약 슬롯은 스펙 라운드 비활성(초안이 마스크를 모른다)
-//! ·greedy 전용.
 
 use std::collections::HashMap;
 
@@ -52,7 +43,6 @@ impl Nfa {
     }
 }
 
-/// json 값 스키마 노드(서브셋).
 #[derive(Clone, Debug)]
 pub enum Schema {
     Str,
@@ -66,7 +56,6 @@ pub enum Schema {
 fn compile(nfa: &mut Nfa, froms: &[usize], sch: &Schema) -> Vec<usize> {
     match sch {
         Schema::Str => {
-            // "…" — 몸통: printable(단 ", \ 제외) + \escape 2글자.
             let body = nfa.chr(froms, '"')[0];
             let esc = nfa.add_state();
             for c in (32u8..=126u8).map(char::from) {
@@ -84,7 +73,6 @@ fn compile(nfa: &mut Nfa, froms: &[usize], sch: &Schema) -> Vec<usize> {
                 hi: '\\',
                 to: esc,
             });
-            // escape 다음 printable 1글자 → body로 복귀.
             let back = nfa.cls(&[esc], char::from(32), char::from(126));
             nfa.edges[back].push(Edge {
                 lo: char::from(32),
@@ -94,7 +82,6 @@ fn compile(nfa: &mut Nfa, froms: &[usize], sch: &Schema) -> Vec<usize> {
             close
         }
         Schema::Int | Schema::Num => {
-            // -? (0|[1-9][0-9]*)(.frac)?(e[+-]?d+)? — Num만 frac/exp.
             let neg = nfa.add_state();
             for &f in froms {
                 nfa.edges[f].push(Edge {
@@ -118,9 +105,6 @@ fn compile(nfa: &mut Nfa, froms: &[usize], sch: &Schema) -> Vec<usize> {
                 to: n19,
             });
             let mut ends = vec![d0, d19, n0, n19];
-            // '-'만 있고 숫자 없음은 불허여야 하나 서브셋: 다음 스텝 마스크가
-            // 숫자 외 차단(ends에 neg 포함이면 '-' 직후 허용집합이 숫자만).
-            // → neg 제거(빈 값 방지는 호출부).
             if matches!(sch, Schema::Num) {
                 let mut fends = Vec::new();
                 for &e in &ends {
@@ -170,7 +154,6 @@ fn compile(nfa: &mut Nfa, froms: &[usize], sch: &Schema) -> Vec<usize> {
             [t, f].concat()
         }
         Schema::Enum(vs) => {
-            // JSON 출력은 문자열 리터럴 — 값 인용 포함 컴파일.
             let mut ends = Vec::new();
             for v in vs {
                 ends.extend(nfa.lit(froms, &format!("\"{v}\"")));
@@ -192,14 +175,11 @@ fn compile(nfa: &mut Nfa, froms: &[usize], sch: &Schema) -> Vec<usize> {
     }
 }
 
-/// [P8] 요청 파싱 — `response_format:{"type":"json_schema","json_schema":
-/// {"schema":{...}}}` → Schema 서브셋. 미지원 타입은 None(무제약 폴백 +
-/// 경고 로그). 서브셋: object(string|integer|number|boolean|enum).
 pub fn schema_from_request(body: &str) -> Option<Schema> {
     let rf = body.find("\"response_format\"")?;
     let seg = &body[rf..];
     if !seg.contains("\"json_schema\"") {
-        return None; // json_object/미지정 — 무제약
+        return None;
     }
     let ks = seg.find("\"schema\"")?;
     let ob = seg[ks..].find('{')? + ks;
@@ -207,9 +187,6 @@ pub fn schema_from_request(body: &str) -> Option<Schema> {
     parse_schema_node(block, 0)
 }
 
-/// [2026-10-16] 중첩 상한 — 외부 입력(요청 본문)의 object 스키마 중첩에 상한이
-/// 없으면 핸들러 스레드 스택이 터진다(스택 오버플로는 catch 불가 — 거절 응답도
-/// 못 남). 초과 노드는 미지원과 동일하게 None(전체 무제약 폴백) — 기존 정책 경로.
 const MAX_SCHEMA_DEPTH: usize = 64;
 
 fn parse_schema_node(b: &str, depth: usize) -> Option<Schema> {
@@ -223,12 +200,9 @@ fn parse_schema_node(b: &str, depth: usize) -> Option<Schema> {
         "number" => Some(Schema::Num),
         "boolean" => Some(Schema::Bool),
         "object" => {
-            // properties — jblocks로 (키, 노드) 재귀. enum은 string 내부.
             let props = crate::oai::json::jobject_props(b)?;
             let mut out = Vec::new();
             for (k, v) in props {
-                // [P0-D6 2026-10-16] "enum" 키가 있으면 순수 문자열 배열만 Enum —
-                // 비문자열(integer enum)·혼재는 전체 폴백(조용한 약화 금지).
                 if v.contains("\"enum\"") {
                     let arr = crate::oai::json::jstrs_span(&v, "enum");
                     let e = match arr.as_deref().and_then(crate::oai::json::jarr_pure_strings) {
@@ -237,7 +211,6 @@ fn parse_schema_node(b: &str, depth: usize) -> Option<Schema> {
                     };
                     out.push((k, Schema::Enum(e)));
                 } else {
-                    // [P0-D2] 미지원 프로퍼티 = 전체 폴백(None 전파).
                     let sub = parse_schema_node(&v, depth + 1)?;
                     out.push((k, sub));
                 }
@@ -251,12 +224,10 @@ fn parse_schema_node(b: &str, depth: usize) -> Option<Schema> {
     }
 }
 
-/// 디코드 스텝 제약기 — 상태 집합 시뮬레이션 + 토큰 허용 캐시.
 pub struct Constraint {
     nfa: Nfa,
     states: Vec<usize>,
     cache: HashMap<Vec<usize>, Vec<u32>>,
-    /// 계측: 마스크 스텝 수.
     pub steps: u64,
 }
 
@@ -306,7 +277,6 @@ impl Constraint {
         true
     }
 
-    /// 토큰 허용 집합(상태집합 캐시) — decode 클로저로 토큰 텍스트 주입.
     pub fn allowed<F: Fn(u32) -> String>(&mut self, decode: F, vocab: u32) -> &[u32] {
         let key = self.states.clone();
         if !self.cache.contains_key(&key) {
@@ -321,7 +291,6 @@ impl Constraint {
         self.cache.get(&key).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
-    /// 토큰 확정 — 상태 전이.
     pub fn commit(&mut self, text: &str) {
         for ch in text.chars() {
             self.states = self.step_char(ch);
@@ -329,7 +298,6 @@ impl Constraint {
         self.steps += 1;
     }
 
-    /// 수용 상태 도달(테스트·계측 전용 — 운용은 allowed 빈집합→종결 토큰).
     #[cfg(test)]
     pub fn done(&self) -> bool {
         self.states.iter().any(|&s| self.nfa.accept[s])
@@ -397,17 +365,14 @@ mod tests {
 
     #[test]
     fn d2_unsupported_property_falls_back_whole() {
-        // array 프로퍼티 1개 = 전체 폴백(조용한 필드 탈락 금지).
         let body = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"name":{"type":"string"},"tags":{"type":"array"}}}}}}"#;
         assert!(crate::oai::schema::schema_from_request(body).is_none());
-        // 지원 범위 내 = 컴파일 성공.
         let ok = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"name":{"type":"string"}}}}}}"#;
         assert!(crate::oai::schema::schema_from_request(ok).is_some());
     }
 
     #[test]
     fn d4_double_backslash_block_scan() {
-        // jblock_at: 값 내 이중 백슬래시 뒤 '"'가 문자열 종결로 인식되어야.
         let s = r#"{"a":"x\\d","b":1}"#;
         let blk = crate::oai::json::jblock_at(s, 0).unwrap();
         assert_eq!(blk.len(), s.len(), "블록 전체 절단(구 결함은 조기 절단)");
@@ -415,7 +380,6 @@ mod tests {
 
     #[test]
     fn d3_tool_membership() {
-        // 선언되지 않은 name = 래핑 없음.
         let acc = r#"{"name":"evil","arguments":{}}"#;
         let names = vec!["good".to_string()];
         assert!(crate::oai::wrap_tool_calls(&names, acc).is_none());
@@ -425,21 +389,16 @@ mod tests {
 
     #[test]
     fn d6_integer_and_mixed_enum_fallback() {
-        // integer enum = 전체 폴백(모든 정수 허용하는 약화 금지).
         let body = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"lv":{"type":"integer","enum":[1,2]}}}}}}"#;
         assert!(crate::oai::schema::schema_from_request(body).is_none());
-        // 혼재 enum도 폴백.
         let mixed = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"x":{"type":"string","enum":["a",1]}}}}}}"#;
         assert!(crate::oai::schema::schema_from_request(mixed).is_none());
-        // 순수 문자열 enum은 통과.
         let pure = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"x":{"type":"string","enum":["a","b"]}}}}}}"#;
         assert!(crate::oai::schema::schema_from_request(pure).is_some());
     }
 
     #[test]
     fn d6_escaped_backslash_enum_scans() {
-        // 문자열 끝 이스케이프 백슬래시(`\\` 뒤 `"`) — 종전 b[j-1] 판정은
-        // 폴백(None)으로 흘렸고, 표준 상태기계는 순수 문자열 배열로 인식한다.
         let body = r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"x":{"type":"string","enum":["a\\","b"]}}}}}}"#;
         assert!(crate::oai::schema::schema_from_request(body).is_some());
     }
@@ -466,8 +425,6 @@ mod tests {
         assert!(c.done());
     }
 
-    /// [2026-10-16] 중첩 상한 — 깊이 8은 파싱, 상한(64) 초과는 None(무제약
-    /// 폴백)으로 흘려 핸들러 스택을 지킨다(미지원 정책 경로 그대로).
     #[test]
     fn depth_cap_nested_schema() {
         let nest = |n: usize| {

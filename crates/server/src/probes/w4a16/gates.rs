@@ -1,11 +1,6 @@
-//! [R2] 모듈 게이트 — w4a16-gemv/gemm(커널 vs core lane 비트 판정).
 
 use super::super::{arg, arg_str};
 
-/// 모듈 게이트 — 커널 vs core `dot_row_w4a16_lane` 비트 판정.
-/// 형상은 스토어에서 자동 열거(distinct (n,k) → 첫 base), x는 결정적 생성.
-///   w4a16-gemv <dir> [--rows N] [--seed X]          (t=1)
-///   w4a16-gemm <dir> [--rows N] [--t N≤16] [--seed X]
 pub(super) fn gemm_gate(args: &[String], default_t: usize) -> Result<String, String> {
     let dir = arg_str(args, 0, "");
     if dir.is_empty() {
@@ -48,7 +43,6 @@ pub(super) fn gemm_gate(args: &[String], default_t: usize) -> Result<String, Str
         return Err(format!("--t {t}: 1..=16"));
     }
     let g4 = llm170_backend_gpu::Gptq4::new()?;
-    // 형상 열거 — --lin이면 model.w()(순열 사본 포함) 단일, 아니면 store 전수.
     let mut shapes: std::collections::BTreeMap<(usize, usize), String> =
         std::collections::BTreeMap::new();
     let mut lin_data: Option<(Vec<u8>, Vec<u8>, usize, bool)> = None;
@@ -84,7 +78,6 @@ pub(super) fn gemm_gate(args: &[String], default_t: usize) -> Result<String, Str
                     .ok_or_else(|| format!("{base}: weight_scale 슬라이스 부재"))?,
             )
         };
-        // 그룹·스케일 dtype — --lin이면 Weight 실측, 아니면 스토어 실측.
         let (group, bf16) = match &lin_data {
             Some((_, _, g, b)) => (*g, *b),
             None => (store.group(), store.scale_is_bf16(base)),
@@ -102,7 +95,6 @@ pub(super) fn gemm_gate(args: &[String], default_t: usize) -> Result<String, Str
             .iter()
             .map(|c| u16::from_le_bytes(*c))
             .collect();
-        // 참조용 f32 스케일 — f16/bf16 디코드(둘 다 정확).
         let sf32: Vec<f32> = s
             .iter()
             .map(|&h| {
@@ -113,7 +105,6 @@ pub(super) fn gemm_gate(args: &[String], default_t: usize) -> Result<String, Str
                 }
             })
             .collect();
-        // x — 결정적(splitmix64) f16 비트. 스케일이 작은 모델이라 ±1 균일.
         let mut rnd = SplitMix64::new(seed ^ ((*n as u64) << 32) ^ *k as u64);
         let x: Vec<u16> = (0..t * k)
             .map(|_| llm170_backend_gpu::f32_to_f16(rnd.next_pm1()))
@@ -140,10 +131,6 @@ pub(super) fn gemm_gate(args: &[String], default_t: usize) -> Result<String, Str
                 }
             }
         }
-        // [gemma4 2026-10-14] 판정 클래스 — t=1 GEMV는 FMA 기반 float4/스칼라
-        // 본체(파일 계약: "비트동일 아님 — 비트 게이트 진단용")라 **허용오차
-        // 클래스**(1e-5)로 판정, t≥2 GEMM은 비트 계약. 실결함(꼬리 누락 0.158
-        // 실측)은 허용오차로도 잡힌다.
         let ok = if default_t == 1 {
             maxd <= 1e-5
         } else {
@@ -192,7 +179,6 @@ pub(super) fn gemm_gate(args: &[String], default_t: usize) -> Result<String, Str
     }
 }
 
-/// splitmix64 — 결정적 테스트 입력(rand 크레이트 금지 계약).
 struct SplitMix64(u64);
 impl SplitMix64 {
     fn new(s: u64) -> Self {

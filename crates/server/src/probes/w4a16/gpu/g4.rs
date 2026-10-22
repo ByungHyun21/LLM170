@@ -1,13 +1,7 @@
-//! probes/w4a16/gpu.rs에서 분해(순수 이동 — 코드 무변).
 use crate::gpu_engine::g4_step;
 
-/// h2d 대역폭 실측 — (a) 핀드 소스, (b) 페이지러블 소스(드라이버 스테이징).
-/// [gemma4 P2 2026-10-14] g4 어텐션 통합 대조 — prep_g4 → part_g4 → merge_g4
-/// 전 경로를 CPU 미러(int8 KV 양자화 + rope + SW 창 + 소프트맥스 + AV)와
-/// 허용오차 판정. 슬라이딩(d=256, 창)·풀(d=512, 전역) 2구성.
 pub(super) fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, String> {
     use llm170_backend_gpu::AttnDims;
-    // (이름, d, q_heads, kv_heads, pairs, span, denom, base, vn, sw)
     let configs: [(
         &str,
         usize,
@@ -34,7 +28,7 @@ pub(super) fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Resul
         ),
         ("풀(d=512 전역)", 512, 4, 1, 64, 256, 512, 1e6, true, 0),
     ];
-    let (t_len, pos0, splits) = (16usize, 0u32, 2usize); // pos0=0 — KV 캐시가 t_len행분만 기록(미러 정합)
+    let (t_len, pos0, splits) = (16usize, 0u32, 2usize);
     let mut out = String::from("attn_g4 통합(prep→part→merge) — CPU 미러 대조\n");
     let mut ok_all = true;
     for (name, d, q_heads, kv_heads, pairs, span, denom, base, vn, sw) in configs {
@@ -88,8 +82,6 @@ pub(super) fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Resul
                 splits, pos0,
             )
             .map_err(|e| format!("attn_g4({name}): {e}"))?;
-        // ── CPU 미러 ──
-        // (a) prep 미러: 가중 RMS + rope → qh, k_raw(원시), v_raw
         let rope = |h: &mut [f32], pos: u32| {
             for p in 0..pairs {
                 let theta = base.powf(-(2.0 * p as f32) / denom as f32);
@@ -118,7 +110,6 @@ pub(super) fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Resul
                 qh[(t * q_heads + h) * d..(t * q_heads + h) * d + d].copy_from_slice(&hd);
             }
         }
-        // K/V int8 양자화(커널과 동일: absmax/127 · ks=0→1 · round-half-even · clamp)
         let quant = |hd: &[f32]| -> (Vec<i8>, f32) {
             let amax = hd.iter().fold(0f32, |m, v| m.max(v.abs()));
             let mut ks = amax * (1.0f32 / 127.0);
@@ -149,13 +140,12 @@ pub(super) fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Resul
                 k8[t * kv_heads + kh] = qq;
                 ks8[t * kv_heads + kh] = ss;
                 let vsrc = &vin[(t * kv_heads + kh) * d..(t * kv_heads + kh) * d + d];
-                let hd2 = rms(vsrc, None); // v_norm(무가중) — gemma4
+                let hd2 = rms(vsrc, None);
                 let (qq2, ss2) = quant(&hd2);
                 v8[t * kv_heads + kh] = qq2;
                 vs8[t * kv_heads + kh] = ss2;
             }
         }
-        // 어텐션(dim별 softmax — 창 적용)
         let mut maxd = 0f32;
         for t in 0..t_len {
             let lim = pos0 as usize + t + 1;
@@ -197,9 +187,7 @@ pub(super) fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Resul
                 }
             }
         }
-        ok_all &= maxd < 2e-2; // int8 KV + exp 경로 — 절대 밴드
-        // (2) 호출 분할 일치 — t_len=2 1회 vs t_len=1 ×2(체인 패턴). 배치 모드는
-        // 위 미러로 검증됐으므로, 두 모드 일치 = 체인 호출 패턴의 KV 누적 정합.
+        ok_all &= maxd < 2e-2;
         let q2 = &q[..2 * q_heads * d];
         let k2 = &kin[..2 * kv_heads * d];
         let v2 = &vin[..2 * kv_heads * d];
@@ -274,10 +262,6 @@ pub(super) fn run_attn_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Resul
     Ok(out)
 }
 
-/// [gemma4 P2 2026-10-14] attn_prep_g4 Q 경로 대조 — 가중 RMS + rope 파라미터
-/// (pairs·span·denom·base) 3구성: qwen 등가(32/32/64/1e7)·gemma4 슬라이딩
-/// (128/128/256/1e4)·gemma4 풀(64/256/512/1e6). CPU 미러와 허용오차 대조
-/// (누적 순서 상이 — 비트 아님).
 pub(super) fn run_prep_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, String> {
     let (t_len, q_heads) = (2usize, 2usize);
     let pos0 = 3u32;
@@ -336,8 +320,6 @@ pub(super) fn run_prep_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Resul
                 }
             }
         }
-        // 판정 = 절대오차(값 ~O(1)에서 커널/CPU 누적 순서 차 ~1e-7). 상대는
-        // |h|≈0 원소에서 부풀려지는 지표 아티팩트 — 정보 기록만.
         ok_all &= maxd < 1e-5;
         maxr_all = maxr_all.max(maxd);
         out.push_str(&format!(
@@ -356,9 +338,6 @@ pub(super) fn run_prep_g4_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Resul
     Ok(out)
 }
 
-/// [gemma4 P2 2026-10-14] per-expert 사전 스케일 커널 검증 — 합성 idx/pes로
-/// wt' = wt·pes[idx] (f32 곱 — 비트 판정). HF 라우터 순서(재정규화 후 곱)의
-/// 커널 구현 대조.
 pub(super) fn run_moe_pes_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, String> {
     let n = 8usize;
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -392,8 +371,6 @@ pub(super) fn run_moe_pes_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Resul
     ))
 }
 
-/// [gemma4 P2 2026-10-14] ew_gelu 커널 vs CPU 계약(core::ops::gelu_tanh) —
-/// 커널 대조 검증(트랜센던털 등급 — tanhf, 비트 아님). 결정적 입력(splitmix64).
 pub(super) fn run_ew_gelu_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Result<String, String> {
     let n = 4096usize;
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -431,8 +408,6 @@ pub(super) fn run_ew_gelu_check(dec: &mut llm170_backend_gpu::W4a16Dec) -> Resul
     ))
 }
 
-/// GPU 체인 — 프롬프트를 1토큰씩(pos 0..) 통과한 뒤 n_predict 토큰 생성.
-/// 반환 = 생성 토큰열 + 스텝별 로짓(진단 — 로짓[i] = i번째 생성 직전).
 pub(super) fn g4_gpu_chain(
     dec: &mut llm170_backend_gpu::W4a16Dec,
     model: &llm170_core::gemma4::Model,
@@ -460,7 +435,6 @@ pub(super) fn g4_gpu_chain(
     Ok((out, step_logits))
 }
 
-/// 로짓 top-5 (토큰:값) — 진단 표시용.
 pub(super) fn g4_top5(l: &[f32]) -> Vec<(u32, f32)> {
     let mut v: Vec<(u32, f32)> = l
         .iter()

@@ -1,9 +1,3 @@
-//! safetensors 헤더·index.json·tokenizer/config용 최소 JSON 파서.
-//! (2026-10-08 단일 트랙 재편에서 core로 이관.)
-//!
-//! 표준 일반 JSON은 아님 — 헤더 스키마에 필요한 부분집합:
-//! 객체·배열·문자열·정수/실수·bool·null. 깊이/길이 상한으로
-//! 손상 헤더 방어.
 
 use std::collections::HashMap;
 
@@ -58,7 +52,6 @@ impl Json {
         }
     }
 
-    /// 정수 배열(u64) — shape/data_offsets용.
     pub fn as_num_array(&self) -> Option<Vec<u64>> {
         match self {
             Json::Arr(a) => a
@@ -79,7 +72,6 @@ impl Json {
             .map(|(_, v)| v)
     }
 
-    /// 객체를 HashMap 뷰로(중복 키는 마지막 우선 — JSON 관례).
     pub fn map(&self) -> HashMap<&str, &Json> {
         self.as_object()
             .map(|o| o.iter().map(|(k, v)| (k.as_str(), v)).collect())
@@ -206,7 +198,6 @@ impl<'a> P<'a> {
             .ok_or_else(|| format!("bad number at {s}"))
     }
 
-    /// `at`부터 4자리 16진수(\\u 이스케이프 뒤) — 범위 밖이면 오류.
     fn hex4(&self, at: usize) -> Result<u32, String> {
         if at + 4 > self.b.len() {
             return Err("bad \\u escape".into());
@@ -242,9 +233,6 @@ impl<'a> P<'a> {
                         Some(b'b') => out.push('\u{8}'),
                         Some(b'f') => out.push('\u{c}'),
                         Some(b'u') => {
-                            // H(2026-10-09): 유효 서로게이트 쌍(\uD800-\uDBFF
-                            // + \uDC00-\uDFFF)을 수용 — 종전엔 전부 거부. 단독
-                            // 서로게이트는 종전처럼 거부(유효성 규칙 동일).
                             let h = self.hex4(self.i + 1)?;
                             let (cp, span) = if (0xD800..=0xDBFF).contains(&h) {
                                 if self.b.get(self.i + 5) != Some(&b'\\')
@@ -256,7 +244,6 @@ impl<'a> P<'a> {
                                 if !(0xDC00..=0xDFFF).contains(&l) {
                                     return Err("unpaired high surrogate".into());
                                 }
-                                // 소비 폭 = 첫 escape(4hex) + 두 번째(2+4) — 공통 +1 별도.
                                 (0x10000 + ((h - 0xD800) << 10) + (l - 0xDC00), 10)
                             } else if (0xDC00..=0xDFFF).contains(&h) {
                                 return Err("unpaired low surrogate".into());
@@ -275,7 +262,6 @@ impl<'a> P<'a> {
                     self.i += 1;
                 }
                 Some(_) => {
-                    // 멀티바이트 UTF-8 — 그대로 통과.
                     let s = self.i;
                     while self.b.get(self.i).is_some_and(|c| *c >= 0x80) {
                         self.i += 1;
@@ -330,7 +316,6 @@ mod tests {
 
     #[test]
     fn surrogate_pairs_accepted_unpaired_rejected() {
-        // 😀 U+1F600 = \uD83D\uDE00 — 유효 쌍 수용(H 하드닝).
         assert_eq!(
             Json::parse(r#""\uD83D\uDE00""#).unwrap(),
             Json::Str("😀".into())

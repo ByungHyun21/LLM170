@@ -1,69 +1,23 @@
-// gemma4 전용 tall GEMV 계열 — [P9 2026-10-17] gptq4.cu에서 분리.
-// 분리 사유(코드젠 고정): gptq4.cu는 27B/35B 주경로(g128 mma·GEMV·그룹)
-// 커널을 함께 담는데, 신규 커널 추가시 fatbin 재컴파일이 **타 커널
-// 코드젠을 재추첨**한다 — 실측 2026-10-17: tall2 추가 한 건으로 27B
-// pp/tg 전 축 −2~3% 회귀(동일 소스 복원 시 회귀 소멸 확인). 따라서
-// gemma4 tall 계열은 본 파일에서 독립 컴파일하고 gptq4.cu는 바이트
-// 동결(0fc62786 기준). 잔여 tall 레거시 심볰(w4a16_gemv_g32_bf16_tall)은
-// 디스패치에서 미사용이나 코드젠 보존을 위해 gptq4.cu에 잔존 — 제거는
-// gptq4 전체 재추첨·A/B 재측정과 동반할 때만.
-// 빌드 계약: -fmad=false(gptq4 계열 — FMA 수축 제거, core 미러 비트동일).
 #include <cuda_fp16.h>
 #include "g4_common.cuh"
 
-// gptq4.cu와 동일 정의(분리 시각 기준) — 값 계약: k ≤ 128*G4_SCMAX.
 #define G4_SCMAX 256
 
-// 스케일 로드 — BF16이면 b2f, 아니면 h2f(gptq4.cu 원본과 동일 값).
 template <bool BF16>
 __device__ __forceinline__ float ld_scale(const unsigned short* __restrict__ p, int i) {
     return BF16 ? b2f(p[i]) : h2f(p[i]);
 }
 
-// ── [P9 2026-10-17] tall 2행 레지스터 블로킹(R=2) — x L1 재판독 절반 ──
-// 판정 배경(CMP 170HX = GA100·70SM·FP32 64/SM·L1 128B/clk): 종전 tall은
-// 워프=1출력행이라 레인당 x float4 16회/jj → L1 파형 66/워프-jj vs FFMA
-// 34사이클(2 warp-inst/clk) = **L1 1.94× 병목**(FFMA 상한 13.1TF의 51.5%).
-// 실측 정합: pp1024 1087t/s·tall 60.4% → 5.8TF/s = FFMA 44% = L1 상한의
-// 87% — FFMA 비포화·DRAM도 1%대(가중 1회 스트림) = **L1/LSU 처리율 지배**.
-// 따라서 cp.async 가중 더블버퍼(가중 = L1 트래픽 2%·지연은 16워프로 이미
-// 은닉)·smem x 스테이징(LDS가 LDG와 같은 128B/clk 자원 — 재사용 감소 없음)
-// 모두 무의미하고, 유일 레버 = **행/워프 배가로 x 1판독을 2배 FFMA로 상각**.
-// R=2면 L1:FFMA = 33:34로 평형 — 상한 ≈ FFMA 포화(이론 12.8TF).
-// 비트계약: 행별 산술(레인 l·j-시퀀스·f32 acc·tree64)은 tall과 **완전 동일**
-// — 워프가 행 2개를 지님(행 독립). acc 시퀀스는 각 행 자신의 fmaf 열
-// (w0·x, w1·y, w2·z, w3·w 순) 그대로, 타행 연산과의 교차는 값에 무관.
-// 구조: 블록 256스레드(8워프) = 16행(종전 8행) · grid = (ceil(n/16),
-// ceil(t16/128)) — **t-축 청크 분할**(y블록이 토큰 128개 구간 담당: k-루프는
-// 행별 전체라 (행,토큰) 산술·tree64가 그대로 — 토큰 청크는 행 독립 = 비트
-// 불변. 그리드 확대로 웨이브 테일 희석, 대가 = 가중 L2 재판독 ×청크수(≤4,
-// 가중 ≤5.8MB ≪ L2 30MB — DRAM 불변).
-// t16 = 16의 배수(호스트 계약 — tail은 ≤16 스위치 발사, 종전과 동일).
-// 실측 채택(2026-10-17, CMP 170HX GPU0, t=512·reps20, 기준 = t≤16 스위치
-// 슬라이스와 **비트 0 불일치** 전 형상): q(4096×2816) 4.14→2.26ms(1.83×) ·
-// k(2048×2816) 2.08→1.32(1.58×) · o(2816×4096) 11.49→4.21(2.73×) ·
-// gate 2.09→1.33(1.58×) · down 2.54→1.48(1.72×) · 글로벌 q(8192) 7.78→4.51
-// (1.72×) · 글로벌 o(2816×8192) 19.33→8.19(2.36×) — 슬라이딩 층 합산 2.02×.
-// (23%) — x 행 스트라이드 k·4B가 16/32KB(2^n)라 L1 셋 충돌 의심 → **기각
-// 실측 2026-10-17(P9-2, GPU0/GPU1 t=512·reps20·A/B 동일 바이너리)**: 행
-// 스트라이드 패딩 x→[t][k+8]/[t][k+32] f32 재패킹 발사(값 불변 — 패드 열
-// 미판독)가 o(2816×4096) 5.53→5.49ms(±1%·무효) · 글로벌 o(2816×8192)
-// 9.90→10.71ms(**−8% 역행**) — +32B는 셋 인덱스(128B 그래뉼) 무변·+128B는
-// 셋 순차 분산에도 결과 동일 → 셋 충돌이 원인이 아니거나 L1 인덱싱이
-// 해시형(레이아웃 패딩으로 분산 불가). 잔여 후보 = 워프당 q/s 가중 판독
-// (레인 2B×64B 스트라이드 → 64B에 32섹터 = L1 파형 64/128의 절반)의
-// 섹터 낭비 — 해법은 q 레이아웃(인터리브 재패키징)이며 레이아웃 계약
-// 변경이라 별도 판정 필요(재개 조건). tall2 본체는 7-파라미터 원계약 유지.
 extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_g32_bf16_tall2(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x, float* __restrict__ out,
     int n, int k, int t16)
 {
-    const int o0 = blockIdx.x * 16;   // 블록 = 16행(워프당 2행)
-    const int tb0 = blockIdx.y * 128; // t-청크 시작(토큰 128 = T타일 8개)
+    const int o0 = blockIdx.x * 16;
+    const int tb0 = blockIdx.y * 128;
     const int tb1 = min(tb0 + 128, t16);
     const int l = threadIdx.x & 31;
-    const int w = threadIdx.x >> 5;   // 워프 0..7
+    const int w = threadIdx.x >> 5;
     const int oa = o0 + 2 * w;
     const int ob = oa + 1;
     const bool la = oa < n;
@@ -72,7 +26,6 @@ extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_g32_bf16_tall2(
     const int kg = k >> 5;
     __shared__ double red[16][32];
     __shared__ float sc[16][G4_SCMAX];
-    // 스케일 스테이징 — 16행 × kg(플랫 분할, 죽은 행은 미기록 = 값 무의미).
     for (int idx = threadIdx.x; idx < 16 * kg; idx += 256) {
         const int row = idx / kg;
         const int gg = idx - row * kg;
@@ -83,8 +36,6 @@ extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_g32_bf16_tall2(
     __syncthreads();
     const int jn = k >> 7;
     const int k4 = k >> 2;
-    // 죽은 행 포인터 = q 베이스(항상 유효 메모리) — 핫루프 무가드 계약.
-    // 판독값은 쓰레기지만 그 행 출력은 la/lb 가드로 미기록(행 독립 — 무영향).
     const unsigned short* blank =
         reinterpret_cast<const unsigned short*>(q) + l;
     const unsigned short* qa = la
@@ -129,8 +80,6 @@ extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_g32_bf16_tall2(
                 accb[r] = fmaf(b3, xv.w, accb[r]);
             }
         }
-        // tree64 — 행별 계약 순서(첫 결합 l<16, 셔플 8..1) 그대로. red 버퍼만
-        // 2행분이고 va/vb 셔플 교차는 행 독립이라 값에 무관.
         for (int rr = 0; rr < T; ++rr) {
             red[2 * w][l] = (double)acca[rr];
             red[2 * w + 1][l] = (double)accb[rr];
@@ -160,14 +109,6 @@ extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_g32_bf16_tall2(
     }
 }
 
-// ── [⑮ 2026-10-18] tall4 — R=4 행 레지스터 블로킹(T=8) ──
-// 근거(ncu, tall2): L1 81.3% 포화·FMA 21.5%·lg_throttle 55.1% — x(f32) 재판독의
-// L1 파형이 지배. tall2(R=2/T=16)에서 행 2→4·T 16→8(동일 32 acc — 레지스터 유지):
-// x float4 1판독을 4행 FFMA(16)로 상각 — 행당 x 파형/FFMA 절반.
-// 비트계약: 행별 산술(레인 l·j-시퀀스·f32 acc·tree64)은 tall과 완전 동일
-// (행 독립 — 값 불변, 해시 검증).
-// 구조: 블록 256스레드(8워프) = 32행(워프당 4행) · grid = (ceil(n/32),
-// ceil(t16/128)) — t-축 청크 분할·잔여 tail(<16)은 종전 스위치 발사.
 extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_g32_bf16_tall4(
     const unsigned* __restrict__ q, const unsigned short* __restrict__ s,
     const float* __restrict__ x, float* __restrict__ out,

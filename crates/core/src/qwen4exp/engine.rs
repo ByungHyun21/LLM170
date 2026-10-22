@@ -1,30 +1,8 @@
-//! [FN 2단계 2026-10-17] qwen4_exp(FN) CPU 오라클 엔진 골격 — 실행 레이어
-//! 그래프. **스토어 직접 접근**(StArchive + 샤드 mmap) — FN 체크포인트는
-//! auto_round:auto_gptq 팩(qweight/qzeros/scales)이라 W4a16Model
-//! (compressed-tensors weight_packed 계약)로 열 수 없다.
-//!
-//! 2차 마일스톤 계약(골격+판독 검증):
-//! - 하이브리드 층 분기: linear_attn 36 / self_attn(full) 12(interval 4).
-//! - linear층 = GDN 계열(Qwen3-Next GatedDeltaNet 미러): in_proj_qkv/a/b/z
-//!   · conv1d(k=4) · A_log/dt_bias · norm[128] · out_proj — 코어는
-//!   `crate::gdn`(qwen35와 동일 형상 계약: h_k=16·h_v=48·d=128) 재사용.
-//! - full층 = Q‖gate 퓨전 q_proj[12288] + q/k_norm[256] + GQA 24Q/2KV
-//!   + RoPE(n_rot 64·base 1e7 — qwen35와 동일 계약).
-//! - MoE: 라우터 BF16[512] top-10(전체 softmax·재정규화 — qwen35
-//!   select_topk 재사용) + gptq int4 전문가 + shared(sigmoid 게이트).
-//! - head·embed: embed_tokens/lm_head BF16 직접.
-//!
-//! [D2 2026-10-20 완료] hyper-connection(stages/hc)·PLE FP8 forward
-//! (stages/ple)·indexer top-k(stages/qsa)·상태ful 오라클(oracle.rs —
-//! w4a16-ref greedy 진입) 전부 구현. 잔여: MTP n-gram 폴백·vLLM 골든
-//! 대조(다음 단계).
 
 use super::bind::Qwen4ExpCfg;
 use crate::st::{StArchive, StDtype, StEntry};
 use std::path::Path;
 
-/// 원시 포인터의 usize 보관 래퍼(병렬 클로저 캡처용) — usize 필드는
-/// Send+Sync. gdn.rs ar_pool SendPtr와 동일 패턴.
 #[derive(Clone, Copy)]
 pub(crate) struct SendPtr(usize);
 
@@ -32,18 +10,10 @@ impl SendPtr {
     pub(crate) fn new<T>(p: *mut T) -> Self {
         Self(p as usize)
     }
-    /// SAFETY: 호출자는 원 포인터의 대상 버퍼가 유효하고(스코프 조인 전
-    /// 파기 없음), 기록 영역이 유닛별 상호배타임을 보증해야 한다.
     pub(crate) unsafe fn as_ptr<T>(&self) -> *mut T {
         self.0 as *mut T
     }
 }
-/// [오라클 병렬화 2026-10-21] 인덱스 범위 [0,n)을 T연속 구간으로 나눠
-/// 병렬 실행(호출 스레드가 마지막 구간 담당). **비트동일 계약**: 각 구간
-/// 내 산술은 순차 버전과 동일한 순서(행/원소 오름차순) — 분할 축이 서로
-/// 독립인 행/토큰뿐이므로 결과 비트 불변. T = min(가용 코어, n/64).
-/// 중첩 방지: 병렬 구간 안에서의 재호출은 순차 실행(TLS 플래그).
-/// 오라클(참조) 실행 시간 단축용 — 프로덕션 경로 무관.
 pub(crate) fn par_ranges<F: Fn(usize, usize) + Send + Sync>(n: usize, f: F) {
     use std::cell::Cell;
     std::thread_local! {
@@ -71,9 +41,8 @@ pub(crate) fn par_ranges<F: Fn(usize, usize) + Send + Sync>(n: usize, f: F) {
                 continue;
             }
             if c == t - 1 {
-                f(b0, b1); // 마지막 구간 = 호출 스레드(스폰 1절약).
+                f(b0, b1);
             } else {
-                // f_ref(&F, Copy)만 이동 — f는 대여 공유(Send+Sync).
                 s.spawn(move || f_ref(b0, b1));
             }
         }
@@ -81,26 +50,22 @@ pub(crate) fn par_ranges<F: Fn(usize, usize) + Send + Sync>(n: usize, f: F) {
     IN_PAR.with(|x| x.set(false));
 }
 
-/// gptq 그룹 크기(FN 실측 — qzeros [k/128, n/8]·scales [k/128, n]).
 const GPTQ_GROUP: usize = 128;
 
 pub struct Model {
     pub cfg: Qwen4ExpCfg,
     ar: StArchive,
     mmaps: Vec<memmap2::Mmap>,
-    /// rms_norm_eps.
     pub eps: f32,
 }
 
 impl Model {
-    /// 디렉터리 열기 — config + 아카이브 헤더 + 샤드 mmap.
     pub fn load(dir: &Path) -> Result<Self, String> {
         let cfg = Qwen4ExpCfg::load(dir)?;
         let ar = StArchive::open(dir).map_err(|e| format!("safetensors: {e}"))?;
         let mut mmaps = Vec::new();
         for p in ar.shard_paths() {
             let f = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
-            // SAFETY: 읽기 전용 매핑 — 수정하지 않는다(w4a16 mmap 동일 계약).
             mmaps.push(unsafe { memmap2::Mmap::map(&f).map_err(|e| e.to_string())? });
         }
         Ok(Model {
@@ -117,7 +82,6 @@ impl Model {
             .ok_or_else(|| format!("텐서 부재: {name}"))
     }
 
-    /// 텐서 원시 슬라이스(mmap 무카피).
     pub(crate) fn slice(&self, name: &str) -> Result<&[u8], String> {
         let e = self.ent(name)?;
         let base = self
@@ -131,7 +95,6 @@ impl Model {
         Ok(&m[(base + e.begin) as usize..(base + e.end) as usize])
     }
 
-    /// 1-D BF16/F16 텐서 → f32 벡터.
     pub(crate) fn f32_vec(&self, name: &str) -> Result<Vec<f32>, String> {
         let e = self.ent(name)?;
         let d = self.slice(name)?;
@@ -156,27 +119,12 @@ impl Model {
         Ok(v)
     }
 
-    /// zero-centered(Gemma식) 노름 가중치 판독 — f32_vec + 1 합성.
-    /// **FN norm+1 계약의 단일 지점**(qwen35 로더 `Eng::Synth{plus1}`의
-    /// StArchive 등가 — FN은 W4a16Model 스토어가 아니라 지연 mmap 판독
-    ///이라 가중치 합성은 읽기 시점 이 한 곳에서만 일어난다).
-    /// 근거: 논문 §2.1.1 "consistently applied to all other RMSNorm layers"
-    /// ·vLLM GemmaRMSNorm/GroupedGemmaRMSNorm(`normalized*(1+w)` —
-    /// qsa.py q/k_norm·indexer_qsa.py q/k_layernorm·ple_layer.py
-    /// Qwen4ExpPLEGroupedNorm·hyperconnection.py hc_norm 전부).
-    /// 대상: self_attn.{q,k}_norm·mlp_hyper_connection.hc_norm·ple.
-    /// norm_{conv,key,query}·indexer.{q,k}_layernorm·
-    /// hyper_connection_mixer.hc_norm. **예외 — linear_attn.norm은 +1 금지**:
-    /// vLLM은 RMSNormGated(plain `x_normed*weight`, layernorm.py
-    /// forward_static)이고 체크포인트 실측 평균 ≈0.97(원시 w≈0인
-    /// zero-centered 분포가 아님) — qwen3_next 계약 그대로 평범 가중치.
     pub fn norm_vec(&self, name: &str) -> Result<Vec<f32>, String> {
         let mut v = self.f32_vec(name)?;
         plus1(&mut v);
         Ok(v)
     }
 
-    /// [n_out, n_in] BF16 행렬 × x → y(스트리밍 디양자화 — 사본 없음).
     pub fn matvec_bf16(&self, name: &str, x: &[f32]) -> Result<Vec<f32>, String> {
         let e = self.ent(name)?;
         if e.dtype != StDtype::Bf16 || e.shape.len() != 2 {
@@ -191,13 +139,9 @@ impl Model {
         }
         let d = self.slice(name)?;
         let mut y = vec![0.0f32; n];
-        // [병렬화 2026-10-21] 행분할 — 행별 f64 순차 누산 그대로(비트동일).
-        // 임계값: n*k ≥ 4M MAC(스폰 오버헤드 상쇄) 미만은 순차.
         if n as u64 * k as u64 >= 4_000_000 {
             let y_ptr = SendPtr::new(y.as_mut_ptr());
             par_ranges(n, |b0, b1| {
-                // SAFETY: 행 범위 [b0,b1)은 유닛별 상호배타 — par_ranges
-                // 조인 전 y는 유효.
                 let yp = unsafe { y_ptr.as_ptr::<f32>() };
                 for r in b0..b1 {
                     let row = &d[2 * r * k..2 * (r + 1) * k];
@@ -223,7 +167,6 @@ impl Model {
         Ok(y)
     }
 
-    /// BF16 임베딩 행 1개 → f32.
     pub(crate) fn embed_row(&self, name: &str, r: usize) -> Result<Vec<f32>, String> {
         let e = self.ent(name)?;
         let k = *e.shape.last().ok_or("임베딩 shape 부재")? as usize;
@@ -236,12 +179,6 @@ impl Model {
             .collect())
     }
 
-    /// gptq int4 전문가 행 디양자화 — base는 `.qweight` 접미사 전 이름.
-    /// 레이아웃(FN 실측): qweight I32 [k/8, n] · qzeros I32 [k/g, n/8]
-    /// · scales F16 [k/g, n] · g=128. auto_gptq 팩 계약: 니블은 입력축
-    /// 8개 팩(LE), zero = 언팩값 **+ 1**(vLLM q_gemm.cu `zero_offset=1`
-    /// — classic auto_gptq 팩. [D1] 전수 스캔: FN qzeros 전 니블=7
-    /// 상수 → zero=8, sym. CT weight_packed zp=8과 동일 계약).
     pub(crate) fn expert_row(&self, base: &str, r: usize) -> Result<Vec<f32>, String> {
         let (qw, qz, sc, n, k) = self.expert_triple(base)?;
         let g = GPTQ_GROUP;
@@ -267,7 +204,6 @@ impl Model {
         Ok(row)
     }
 
-    /// gptq 트리플 슬라이스 + 형상 검증 → (qweight, qzeros, scales, n, k).
     fn expert_triple(&self, base: &str) -> Result<(&[u8], &[u8], &[u8], usize, usize), String> {
         let eq = self.ent(&format!("{base}.qweight"))?;
         let ez = self.ent(&format!("{base}.qzeros"))?;
@@ -293,7 +229,6 @@ impl Model {
         ))
     }
 
-    /// 전문가 프로젝션 전체 행 디양자화([n,k] f32 — 프로브 소형 전용).
     pub fn expert_mat(&self, base: &str) -> Result<(Vec<Vec<f32>>, usize, usize), String> {
         let (_, _, _, n, k) = self.expert_triple(base)?;
         let mut rows = Vec::with_capacity(n);
@@ -303,12 +238,10 @@ impl Model {
         Ok((rows, n, k))
     }
 
-    /// 층 타입 판정 — layer_types 실측 우선(config load에서 이미 반영).
     pub fn is_linear(&self, il: usize) -> bool {
         (il % self.cfg.full_interval.max(1)) != self.cfg.full_interval.max(1) - 1
     }
 
-    /// 임베딩 → hidden.
     pub fn embed(&self, tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
         tokens
             .iter()
@@ -322,20 +255,17 @@ impl Model {
             .collect()
     }
 
-    /// 마지막 hidden → 로짓(lm_head [vocab, hidden] 스트리밍 matvec).
     pub fn head(&self, h: &[f32]) -> Result<Vec<f32>, String> {
         self.matvec_bf16("lm_head.weight", h)
     }
 }
 
-/// 노름 가중치 zero-centered 합성(w → 1+w) — `norm_vec` 전용(단일 지점).
 pub(crate) fn plus1(v: &mut [f32]) {
     for x in v.iter_mut() {
         *x += 1.0;
     }
 }
 
-/// F16 → f32(참조 경로 — 정확도 우선).
 pub(crate) fn half_f32(b: u16) -> f32 {
     let s: f32 = if b >> 15 == 1 { -1.0 } else { 1.0 };
     let e = ((b >> 10) & 0x1F) as i32;
@@ -347,15 +277,10 @@ pub(crate) fn half_f32(b: u16) -> f32 {
     }
 }
 
-// hyper-connection(GatedResidual) — [D2] stages/hc 전수 구현.
-// 프로브/오라클은 `stages::hc::{mix, mix_final, combine_tok}` 사용.
 
-/// 그래프 프로브 — 구조 검증 + linear/full 1층분 forward(형상·dtype 체크)
-/// + PLE·indexer·hyper-connection 미구현 지점 명시. w4a16-ref 진입점.
 pub fn probe(dir: &Path) -> Result<String, String> {
     let m = Model::load(dir)?;
     let cfg = &m.cfg;
-    // ① 구조 검증 — 텐서 실측 층 분포 vs config.
     let mut n_lin = 0;
     let mut n_ful = 0;
     let mut ple_layers = Vec::new();
@@ -389,7 +314,6 @@ pub fn probe(dir: &Path) -> Result<String, String> {
             cfg.n_linear, cfg.n_full
         ));
     }
-    // 전문가 수 실측(층 0 기준).
     let n_exp_real = (0..cfg.n_experts)
         .filter(|&e| {
             m.ent(&format!(
@@ -402,7 +326,6 @@ pub fn probe(dir: &Path) -> Result<String, String> {
         return Err(format!("전문가 실측 {n_exp_real}/{}", cfg.n_experts));
     }
 
-    // ② 실행 — 임베딩 → (linear층 0 · full층 3) 1층분 forward.
     let tokens: Vec<u32> = [9707, 11, 728, 264].to_vec();
     let mut xs = m.embed(&tokens)?;
     let mut lines = vec![format!(
@@ -421,7 +344,6 @@ pub fn probe(dir: &Path) -> Result<String, String> {
         } else {
             super::stages::full::forward(&m, il, &xs)?
         };
-        // 잔차(hyper-connection 근사) + MoE.
         for t in 0..xs.len() {
             for i in 0..cfg.hidden_size {
                 xs[t][i] += attn_out[t][i];
@@ -447,7 +369,6 @@ pub fn probe(dir: &Path) -> Result<String, String> {
             }
         ));
     }
-    // ③ head — 마지막 토큰 로짓 top-1.
     let logits = m.head(&xs[xs.len() - 1])?;
     let argmax = crate::matmul::greedy_from(&logits);
     let lmax = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
@@ -455,7 +376,6 @@ pub fn probe(dir: &Path) -> Result<String, String> {
         "  head 통과 — vocab {} 로짓 max={lmax:.4} top1={argmax}",
         logits.len()
     ));
-    // ④ [D2] PLE·hyper-connection·indexer 실물 forward 스모크(1층분).
     if let Some(&pil) = ple_layers.first() {
         let v = super::stages::ple::verify(&m, pil)?;
         let mut rp: Vec<Vec<f32>> = xs.iter().map(|e| e.repeat(m.cfg.hc_count)).collect();
@@ -520,9 +440,6 @@ mod tests {
         assert!((half_f32(0x3555) - 0.33325195).abs() < 1e-6);
     }
 
-    /// 실모델 그래프 프로브 — LLM170_FN_MODEL 환경변수로 FN 디렉터리 지정
-    /// 시에만 실행(CI·회귀 무관). 서버 진입(리소스 가드)과 무관하게
-    /// 골격 판독 검증을 직접 수행한다.
     #[test]
     fn fn_probe_real_model() {
         let Some(d) = llm170_diag::flag::val("LLM170_FN_MODEL") else {
@@ -533,7 +450,6 @@ mod tests {
         assert!(rep.contains("D2 통과"), "리포트: {rep}");
     }
 
-    /// [D0] zero-centered 노름 합성 — plus1 원소 단위 증명.
     #[test]
     fn norm_plus1() {
         let mut v = vec![0.0f32, -0.25, 0.5, -1.0];
@@ -541,8 +457,6 @@ mod tests {
         assert_eq!(v, vec![1.0, 0.75, 1.5, 0.0]);
     }
 
-    /// [D0] 실모델 norm 계약 — Gemma 노름은 norm_vec = f32_vec+1,
-    /// linear_attn.norm은 평범 가중치(원시 w가 이미 ~1 분포 — +1 금지).
     #[test]
     fn fn_norm_contract_real_model() {
         let Some(d) = llm170_diag::flag::val("LLM170_FN_MODEL") else {
@@ -556,8 +470,6 @@ mod tests {
         for (r, s) in raw.iter().zip(syn.iter()) {
             assert_eq!(*s, r + 1.0, "Gemma 노름은 정확히 +1");
         }
-        // linear_attn.norm = 평범 가중치 — 원시 평균이 1 근처(zero-centered
-        // 라면 0 근처). +1 합성 실수 방지 가드.
         let gdn = m
             .f32_vec("model.language_model.layers.0.linear_attn.norm.weight")
             .expect("linear_attn.norm 부재");
@@ -568,13 +480,6 @@ mod tests {
         );
     }
 
-    /// [D1] gptq qzeros sym 판정 — 전문가 qzeros **전수 스캔**(mmap CPU).
-    /// LLM170_FN_MODEL 지정 시에만 실행. 대상 48층×512전문가×3투영의
-    /// qzeros I32 니블 전부(약 9.4억)를 히스토그램화해 단일 상수(=sym
-    /// zero-point)인지 판정한다. 언팩 계약은 expert_row와 동일(LE 워드,
-    /// 니블 시프트 4·i) — 원시 니블 v의 zero-point는 v−1.
-    /// 함께: ① 표본 qweight 니블 분포(팩 무결성) ② expert_row 수동
-    /// 디큐트 교차검증(스캔 모달 니블로 재계산해 비트일치 확인).
     #[test]
     fn fn_qzeros_sym_scan_real_model() {
         let Some(d) = llm170_diag::flag::val("LLM170_FN_MODEL") else {
@@ -587,7 +492,7 @@ mod tests {
         let mut const_value_hist = [0u64; 16];
         let mut layer_hist: std::collections::BTreeMap<u64, [u64; 16]> =
             std::collections::BTreeMap::new();
-        let mut worst: Vec<(u64, u64, u64)> = Vec::new(); // (il, e, 상이 니블 수)
+        let mut worst: Vec<(u64, u64, u64)> = Vec::new();
         let mut names: Vec<&String> =
             m.ar.entries()
                 .keys()
@@ -655,7 +560,6 @@ mod tests {
             "비상수 qzeros 발견 — GPTQ-asym 스토어 경로 필요"
         );
 
-        // 표본 qweight 니블 분포(팩 무결성 — 전체 60GB는 읽지 않고 스프레드).
         for base in [
             "model.language_model.layers.0.mlp.experts.0.gate_proj",
             "model.language_model.layers.1.mlp.experts.7.down_proj",
@@ -675,13 +579,11 @@ mod tests {
             assert!(qh.iter().all(|&c| c > 0), "니블 전 범위 미사용 — 팩 의심");
         }
 
-        // 교차검증: expert_row(base, r) 원소를 상수 zero=8(스캔 니블 7
-        // + vLLM zero_offset 1 — engine과 별개 경로)로 수동 재계산.
         let base = "model.language_model.layers.23.mlp.experts.5.gate_proj";
         let r = 7usize;
         let row = m.expert_row(base, r).expect("expert_row");
         let (qw, qz, sc, n, k) = m.expert_triple(base).expect("트리플");
-        const ZERO: i32 = 8; // 스캔 상수(니블 7) + 1 — CT sym zp=8 동일
+        const ZERO: i32 = 8;
         for j in [0usize, 1, 63, 127, 128, k / 2, k - 1] {
             let word = u32::from_le_bytes(qw[4 * ((j / 8) * n + r)..][..4].try_into().unwrap());
             let nib = ((word >> (4 * (j % 8))) & 0xF) as i32;
@@ -689,7 +591,6 @@ mod tests {
             let s = half_f32(u16::from_le_bytes([sc[sb], sc[sb + 1]]));
             assert_eq!(row[j], (nib - ZERO) as f32 * s, "j={j} 디큐트 불일치");
         }
-        // qzeros 실측 워드도 expert_row 인덱싱과 동일 위치에서 상수 확인.
         let zw = u32::from_le_bytes(qz[4 * (r / 8)..][..4].try_into().unwrap());
         assert_eq!(((zw >> (4 * (r % 8))) & 0xF) as usize, mode);
         eprintln!("교차검증 통과: zero=8(스캔 니블 7 + vLLM zero_offset 1) · expert_row 비트일치");

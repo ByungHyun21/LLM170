@@ -1,11 +1,3 @@
-//! MoE FFN 스테이지(W4-1, 35B-A3B) — 라우터 top-k 소프트맥스 + 전문가 가중합
-//! + shared_expert(sigmoid 게이트).
-//!
-//! 시맨틱 기준(vllm qwen3_next — Qwen3NextSparseMoeBlock): 라우터 로짓에
-//! **전문가 전체 softmax** → top-k → 재정규화(norm_topk_prob 기본 True),
-//! shared = sigmoid(shared_expert_gate·x)·MLP(gate/up/down, silu).
-//! 전문가는 스토어 트리플 슬라이스에서 직접 구성(Model::expert_w — 30k
-//! 이름맵 무경유). 선택 전문가별 토큰 묶음으로 행 디양자화 1회 상각.
 
 use super::Ctx;
 use crate::ops::silu;
@@ -13,9 +5,6 @@ use crate::qwen35::ModelError;
 use crate::qwen35::dispatch::mm_group_ref;
 use crate::qwen35::{mm_batch, mm_group};
 
-/// 라우터 로짓 → softmax(전문가 전체) → top-k → 재정규화 — (전문가, 가중)
-/// 내림차순. 결정적(동률 = 낮은 인덱스). backend-gpu `moe_topk`(배치 경로)가
-/// 같은 시맨틱을 미러한다(크레이트 의존 방향 제약 — 변경 시 동시 갱신).
 pub fn select_topk(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     let n = logits.len();
     let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -33,9 +22,6 @@ pub fn select_topk(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
         return Vec::new();
     }
     let mut idx: Vec<usize> = (0..n).collect();
-    // P12 E4(2026-10-09): 전량 정렬 O(n log n) → nth 선택 O(n) + 상위 k만 정렬.
-    // 비교자가 (p 내림차순, 인덱스 오름차순) 전순서라 nth 분할의 앞 k집합은
-    // 전량 정렬 상위 k와 동일(동률 규칙 보존) — 이후 합·나눗셈 순서 불변(비트동일).
     let mut ord = |&a: &usize, &b: &usize| p[b].total_cmp(&p[a]).then(a.cmp(&b));
     idx.select_nth_unstable_by(kk - 1, &mut ord);
     idx.truncate(kk);
@@ -44,8 +30,6 @@ pub fn select_topk(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     idx.iter().map(|&e| (e, p[e] / wsum)).collect()
 }
 
-/// MoE FFN — out[t] = Σ_i w_i·E_i(x_t) + sigmoid(sgate·x_t)·S(x_t).
-/// out은 덮어쓴다(잔차 가산은 호출부 — dense FFN과 동일 계약).
 pub(crate) fn moe_ffn(
     ctx: &Ctx,
     il: usize,
@@ -61,7 +45,6 @@ pub(crate) fn moe_ffn(
     let n_ff = hp.moe_ffn;
     assert_eq!(out.len(), n_tok);
 
-    // 라우터 로짓 [n_tok][n_exp] — 플레인 가중(35B = BF16).
     let gate_w = m.wchk(&format!("blk.{il}.moe_gate.weight"))?;
     assert_eq!(gate_w.n_out as usize, n_exp, "라우터 출력 = 전문가 수");
     let mut logits = vec![vec![0.0f32; n_exp]; n_tok];
@@ -72,7 +55,6 @@ pub(crate) fn moe_ffn(
         sel.push(select_topk(l, top_k));
     }
 
-    // 전문가 디스패치 — 선택된 전문가별 토큰 묶음.
     let mut by_exp: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_exp];
     for (t, s) in sel.iter().enumerate() {
         for &(e, w) in s {
@@ -84,7 +66,6 @@ pub(crate) fn moe_ffn(
         if toks.is_empty() {
             continue;
         }
-        // [P12 E3] 참조 수집 — 종전 행 clone(프리필 1024토큰에서 층당 수십 MB).
         let xs: Vec<&[f32]> = toks.iter().map(|&(t, _)| x[t].as_slice()).collect();
         let gw = m
             .expert_w(il, e, "gate_proj")
@@ -107,7 +88,7 @@ pub(crate) fn moe_ffn(
             .expert_w(il, e, "down_proj")
             .ok_or_else(|| ModelError::MissingTensor(format!("blk.{il}.expert{e}.down_proj")))?;
         let mut d = vec![vec![0.0f32; n_embd]; toks.len()];
-        mm_batch(&g, &dw, &mut d); // g는 소유 행(게이트 활성) — 래퍼가 참조 수집.
+        mm_batch(&g, &dw, &mut d);
         for (ti, &(t, w)) in toks.iter().enumerate() {
             for i in 0..n_embd {
                 moe_out[t][i] += w * d[ti][i];
@@ -115,7 +96,6 @@ pub(crate) fn moe_ffn(
         }
     }
 
-    // shared_expert — sigmoid(sgate·x)·down(silu(gate·x)·up·x).
     if hp.shared_ffn > 0 {
         let sf = hp.shared_ffn;
         let sgw = m.wchk(&format!("blk.{il}.moe_shared_gate.weight"))?;
@@ -152,7 +132,6 @@ pub(crate) fn moe_ffn(
 mod tests {
     use super::select_topk;
 
-    /// 시맨틱 고정 — softmax 전체 → top-k → 재정규화(합 1), 내림차순.
     #[test]
     fn select_topk_renormalizes_and_orders() {
         let sel = select_topk(&[2.0, 1.0, 0.5, -1.0], 2);
@@ -162,12 +141,10 @@ mod tests {
         assert!(sel[0].1 > sel[1].1, "내림차순");
         let sum: f32 = sel.iter().map(|&(_, w)| w).sum();
         assert!((sum - 1.0).abs() < 1e-6, "재정규화 합={sum}");
-        // 원 softmax 값 비례: p0/p1 = exp(1) 비율 유지.
         let ratio = sel[0].1 / sel[1].1;
         assert!((ratio - std::f32::consts::E).abs() < 1e-4, "비율={ratio}");
     }
 
-    /// 동률은 낮은 인덱스 우선(결정적) — backend-gpu moe_topk 미러 계약.
     #[test]
     fn select_topk_tie_breaks_low_index() {
         let sel = select_topk(&[1.0, 1.0, 1.0], 2);

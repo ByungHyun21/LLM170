@@ -22,7 +22,6 @@ impl W4a16Dec {
         if w >= self.norm_w_rows {
             return Err(format!("norm: w={w} >= rows={}", self.norm_w_rows));
         }
-        // [marlin-A] xn16 미러 — xn32와 같은 조건으로 함께 기록.
         let xn16 = if xn32 != 0 {
             let need = t_len * self.hidden;
             if need > self.dx16.cap {
@@ -35,7 +34,6 @@ impl W4a16Dec {
         let f = self.cc.function(if self.hidden.is_multiple_of(1024) {
             "norm_resid"
         } else {
-            // [gemma4 2026-10-14] hidden 2816(1024 배수 아님) — 행 경계 가드 변형.
             "norm_resid_g"
         })?;
         let mut tl = t_len as i32;
@@ -55,7 +53,6 @@ impl W4a16Dec {
         Ok(self.norm.dxn)
     }
 
-    /// 잔차 x_dev에 ab(호스트) 가산 + 노름 xn 판독(스테이징 1행).
     pub(in crate::rawcuda::w4a16_dec) fn norm_resid_staged(
         &mut self,
         w: usize,
@@ -66,7 +63,6 @@ impl W4a16Dec {
             return Err("norm: 순차 잔차/분기 폭 계약 위반".into());
         }
         self.ensure_norm_bufs(1)?;
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let abb = unsafe { std::slice::from_raw_parts(ab.as_ptr() as *const u8, ab.len() * 4) };
         self.cc.h2d(self.norm.dab, abb)?;
         let xn = self.norm_resid_at(w, x_dev, self.norm.dab, 1, 0)?;
@@ -74,15 +70,11 @@ impl W4a16Dec {
         self.cc.d2h(&mut bytes, xn)?;
         self.cc.sync()?;
         Ok(
-            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, self.hidden) }
                 .to_vec(),
         )
     }
 
-    /// [A2b 2026-10-15] ew_gelu를 명시 f32 버퍼에 기록(슬롯 비경유) — 그룹 mma
-    /// 경로의 act(전문가 활성) 산출. `ew_dev`(silu)의 gelu판, 미러 없음
-    /// (A 미러는 `cast_f16_dev`가 만든다).
     pub(in crate::rawcuda::w4a16_dec) fn ew_gelu_dev(
         &mut self,
         g_dev: CUdeviceptr,
@@ -105,10 +97,6 @@ impl W4a16Dec {
         )
     }
 
-    /// [⑥ 2026-10-18] f32 → f16(RNE) 미러(2B/원소) — 그룹 mma **단일패스**
-    /// A 소스. 종전 [A2b] cast_hilo(hi|lo 2-pass)의 hi 성분과 비트동일.
-    /// 캡처 중 재할당은 capture_guard로 즉시 실패(사전 warm 계약).
-    /// dxp 버퍼는 4B/원소 용량 기준 — 앞 2B만 사용(재할당 없음).
     pub(in crate::rawcuda::w4a16_dec) fn cast_f16_dev(
         &mut self,
         x_dev: CUdeviceptr,
@@ -130,9 +118,6 @@ impl W4a16Dec {
         Ok(p)
     }
 
-    /// [R10 2026-10-10] 체인 선형 경로 — 3체인(단독 t=1 / 프리필 t≥2 /
-    /// 배치 t≤8)의 차이는 이 열거 하나다. 방출 커널·인자 순서는 종전과 동일
-    /// (그래프 캡처 불변식 — 골든·스모크로 검증).
     pub(in crate::rawcuda::w4a16_dec) fn lin_forward(
         &mut self,
         plain: bool,
@@ -152,7 +137,6 @@ impl W4a16Dec {
         }
     }
 
-    /// 가중 누적 — y += w·x.
     pub(in crate::rawcuda::w4a16_dec) fn axpy_dev(
         &mut self,
         w: f32,
@@ -173,9 +157,6 @@ impl W4a16Dec {
         )
     }
 
-    /// shared 게이트 가산 — y[t][i] += sigmoid(sg[t])·x[t][i] (grid = t).
-    /// [§4.5] 전문가 누적 + shared 가산 융합 런치 — accum_dev와 동일 그리드
-    /// ((n/256, 행), 256스레드) + sg/sx 인자.
     pub(in crate::rawcuda::w4a16_dec) fn moe_accum_sg_dev(
         &mut self,
         w: CUdeviceptr,
@@ -220,11 +201,6 @@ impl W4a16Dec {
         )
     }
 
-    /// [gemma4 P3 2026-10-14] 잔차 없는 순수 행별 RMS — `rms_rows` 커널
-    /// (호스트 `ops::rms_norm` **비트 미러**: 32세그먼트 f32 순차 누산 →
-    /// f64 결합 → 정밀 sqrt). gemma4 디바이스 상주 청크의 노름 대체 —
-    /// `norm_resid*`(잔차 융합·1024트리)와는 다른 산술이라 호스트 경로
-    /// 교체에 쓸 수 없다. x·y 비중첩(제자리 불가 — 부모 행을 읽는다).
     pub(in crate::rawcuda::w4a16_dec) fn rms_rows_dev(
         &mut self,
         w: usize,
@@ -243,7 +219,6 @@ impl W4a16Dec {
             return Err("rms_rows: t=0/포인터 0 계약 위반".into());
         }
         let f = self.cc.function("rms_rows")?;
-        // 동적 smem = [hidden]x + [32]세그먼트 + [1]스케일 (2816 = 11.4KB).
         let smem = ((self.hidden + 33) * 4) as u32;
         let mut tl = t_len as i32;
         let mut wo = (w * self.hidden) as i32;
@@ -262,7 +237,6 @@ impl W4a16Dec {
         )
     }
 
-    /// 노름 1회(디바이스 x·ab) — xn은 self.norm.dxn(다음 노름이 덮는다).
     pub(in crate::rawcuda::w4a16_dec) fn norm_resid_dev(
         &mut self,
         w: usize,
@@ -275,9 +249,7 @@ impl W4a16Dec {
         self.norm_resid_at(w, x_dev, ab_dev, t_len, xn32)
     }
 
-    // ── ew(silu·mul) ──
 
-    /// ew(silu·mul) 디바이스 발사 — g·u → y(원시 f32 — MoE 소비 경로).
     pub(in crate::rawcuda::w4a16_dec) fn ew_dev(
         &mut self,
         g_dev: CUdeviceptr,
@@ -288,7 +260,6 @@ impl W4a16Dec {
         self.ew_dev_on(self.cc.stream, g_dev, u_dev, y_dev, n)
     }
 
-    /// [B3] ew — 보조 스트림 발사 변형(shared 꼬리 포크).
     pub(in crate::rawcuda::w4a16_dec) fn ew_dev_on(
         &mut self,
         s: ffi::CUstream,
@@ -313,9 +284,6 @@ impl W4a16Dec {
         )
     }
 
-    /// [4.1 2026-10-11] ew + x32/미러 동시 기록 — split 체인의 cast_x32 노드
-    /// 제거(값 비트동일: h2f(f2h(act))·f2h(act) — cast 커널과 동일 산식).
-    /// dx32/dx16을 n까지 보장하고 커널에 넘긴다.
     pub(in crate::rawcuda::w4a16_dec) fn ew_dev_fused(
         &mut self,
         g_dev: CUdeviceptr,
@@ -341,6 +309,4 @@ impl W4a16Dec {
         )
     }
 
-    // [A2b 2026-10-15] (구 ew_dev_mirror 삭제 — A 미러는 캐스트 커널이
-    // 만든다. [⑥ 2026-10-18] cast_hilo packed → cast_f16 단일 f16.)
 }

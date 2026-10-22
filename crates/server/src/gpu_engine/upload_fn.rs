@@ -1,13 +1,8 @@
-//! [FN M1 2026-10-20] FN(Qwen3.8-Flash-Next) 업로드 — CT 디렉터리(재팩본)에서
-//! plain BF16 dense·HC 저랭크·PLE kv·라우터·shared·head 등록 + CT g32 전문가
-//! 스트리밍 테이블 + GDN 상수(sigmoid 게이트) + full층 어텐션 표 + HC 노름.
-//! 체인 소비부 = w4a16_dec::fnchain(fn_chain_dev_t 이름 계약).
 
 use llm170_backend_gpu::{AttnDims, AttnLayer, GdnDims, W4a16Dec};
 use llm170_core::w4a16::W4a16Model;
 use std::path::Path;
 
-/// 가중 등록 헬퍼(대여 분리).
 fn up(
     dec: &mut W4a16Dec,
     store: &W4a16Model,
@@ -20,9 +15,7 @@ fn up(
     dec.upload_plain(name, b, n, k)
 }
 
-/// CT 디렉터리에서 FN 전체 업로드. 프로브가 임베딩·PLE ngram 게더를 호스트에서
-/// 조달한다(오라클 코드 재사용).
-#[allow(dead_code)] // [WIP] CLI 프로브 상륙 전까지
+#[allow(dead_code)]
 pub(crate) fn upload_fn(
     dec: &mut W4a16Dec,
     cfg: &llm170_core::qwen4exp::Qwen4ExpCfg,
@@ -33,9 +26,6 @@ pub(crate) fn upload_fn(
     upload_fn_win(dec, cfg, dir, ctx, None, stage_host)
 }
 
-/// [PP2-FN 2026-10-20] 창 분할판 — window=None 전체창(단일 GPU 불변).
-/// 선형·전문가·head·최종 mixer는 창 소유분만; 상수(GDN·attn 노름·HC 노름·
-/// PLE)는 전층(소량 — qwen35 PP 관례).
 pub(crate) fn upload_fn_win(
     dec: &mut W4a16Dec,
     cfg: &llm170_core::qwen4exp::Qwen4ExpCfg,
@@ -44,9 +34,6 @@ pub(crate) fn upload_fn_win(
     window: Option<(usize, usize)>,
     stage_host: bool,
 ) -> Result<W4a16Model, String> {
-    // [잠복② 2026-10-21] 반환 = CT 스토어 — no-stage 테이블의 mmap 포인터
-    // 수명 계약("서버가 모델을 함께 보유") 이행. 호출자가 디코더 수명 동안
-    // 보유해야 한다(드롭 시 언매핑 → 첫 전문가 접근 SIGSEGV 실측).
     if let Some((ws, we)) = window {
         dec.set_layer_window(ws, we)?;
     }
@@ -58,15 +45,13 @@ pub(crate) fn upload_fn_win(
         cfg.hc_count * cfg.hidden_size,
         cfg.hc_lowrank,
     );
-    // GDN 키 헤드 = qkv 폭에서 유도(oracle stages/linear.rs 동일 산식).
     let v_len = cfg.linear_value_heads * cfg.linear_head_dim;
     let qkv_n = store
         .tensor_slice("model.language_model.layers.0.linear_attn.in_proj_qkv.weight")
         .ok_or("qkv 폭 판독")?
         .len()
-        / (2 * h); // BF16 [rows, h] — rows = 바이트/(2h).
+        / (2 * h);
     let h_k = (qkv_n - v_len) / (2 * cfg.linear_head_dim);
-    // ── 1) plain BF16 선형(엔진 이름 = fnchain 계약) ──
     for il in 0..cfg.num_hidden_layers {
         if !window.is_none_or(|(ws, we)| il >= ws && il < we) {
             continue;
@@ -81,7 +66,6 @@ pub(crate) fn upload_fn_win(
                 cfg.heads * cfg.head_dim * 2,
                 h,
             )?;
-            // [QSA] 인덱서 투영 [640,2560](q 4×128 ‖ k 128).
             up(
                 dec,
                 &store,
@@ -140,7 +124,6 @@ pub(crate) fn upload_fn_win(
                 v_len,
             )?;
         }
-        // HC 저랭크(attn·mlp 양블록) — in_proj_a/b는 set_gdn 상수로.
         for (tag, hc) in [
             ("a", "attn_hyper_connection"),
             ("m", "mlp_hyper_connection"),
@@ -170,7 +153,6 @@ pub(crate) fn upload_fn_win(
                 hh,
             )?;
         }
-        // MoE 라우터·shared.
         up(
             dec,
             &store,
@@ -212,7 +194,6 @@ pub(crate) fn upload_fn_win(
             h,
         )?;
     }
-    // 최종 mixer(inj는 use_combine=false 미사용 — 0 패딩) — 최종 창만.
     if owns_final {
         up(
             dec,
@@ -237,11 +218,9 @@ pub(crate) fn upload_fn_win(
             hh,
         )?;
     }
-    // PLE kv 팩(key_proj[hh]‖value_proj[h] n축 연접) — PLE 층 소유 창만.
     if let Some(&p) = cfg.ple_layer_ids.first()
         && !window.is_none_or(|(ws, we)| p >= ws && p < we)
     {
-        // 비소유 — 스킵(ple kv 미등록 — 체인도 창 밖이라 참조 없음).
     } else {
         let kb = store
             .tensor_slice("model.language_model.layers.1.ple.key_proj.weight")
@@ -254,7 +233,6 @@ pub(crate) fn upload_fn_win(
         pk.extend_from_slice(vb);
         dec.upload_plain("blk.1.ple_kv.weight", &pk, hh + h, h)?;
     }
-    // head(BF16) — 최종 창만.
     if owns_final {
         up(
             dec,
@@ -275,7 +253,6 @@ pub(crate) fn upload_fn_win(
         false,
         false,
     );
-    // ── 2) CT g32 전문가 — 스트리밍 테이블(호스트 mmap 포인터) ──
     let mut tab: Vec<(u64, u64, u64, u64)> =
         Vec::with_capacity(cfg.num_hidden_layers * cfg.n_experts * 3);
     for il in 0..cfg.num_hidden_layers {
@@ -295,14 +272,12 @@ pub(crate) fn upload_fn_win(
             }
         }
     }
-    // [PP2 2026-10-20] 창 샤드는 **마린-단독 상주** 시도(프리필 전용 — 이중
-    // 아레나 한계 회피). 실패(형상·메모리)는 스트리밍 폴백(창 0패딩 테이블).
     let mut marlin_only = false;
     if let Some((ws, we)) = window {
         let n_win = we - ws;
         let ne = cfg.n_experts;
         let mut lens_win: Vec<(usize, usize)> = Vec::with_capacity(n_win * ne * 3);
-        let mut fills: Vec<(u64, u64)> = Vec::with_capacity(n_win * ne * 3); // (q,s) 호스트 ptr
+        let mut fills: Vec<(u64, u64)> = Vec::with_capacity(n_win * ne * 3);
         for il in ws..we {
             for e in 0..ne {
                 for proj in ["gate_proj", "up_proj", "down_proj"] {
@@ -316,7 +291,6 @@ pub(crate) fn upload_fn_win(
         let mut fill = |i: usize, which: usize, off: u64, buf: &mut [u8]| -> Result<(), String> {
             let (qp, sp) = fills[i];
             let src = if which == 0 { qp } else { sp };
-            // SAFETY: CT mmap 슬라이스(전문가 트리플 — StArchive 수명 내).
             let sl = unsafe { std::slice::from_raw_parts(src as *const u8, buf.len()) };
             let off = off as usize;
             if off + buf.len() > sl.len() {
@@ -338,7 +312,6 @@ pub(crate) fn upload_fn_win(
         }
     }
     if !marlin_only {
-        // [PP2] 테이블 인덱스 = 절대 il — 창 밖 층은 (0,0,0,0) 패딩(체인 미참조).
         if let Some((ws, we)) = window {
             let mut full =
                 vec![(0u64, 0u64, 0u64, 0u64); cfg.num_hidden_layers * cfg.n_experts * 3];
@@ -355,13 +328,7 @@ pub(crate) fn upload_fn_win(
             dec.set_expert_table_nostage(tab);
         }
     }
-    // [M3 2026-10-20] 스트리밍 LRU 확대 — 기본 96슬롯(frac 2)은 t≤8 강제.
-    // FN 512전문가 top-10의 청크 distinct는 핫 집중으로 512톤≈263 — 캐시
-    // 320슬롯(≈42GB·frac 1 전체 여유)이 t=512 청크를 수용해 mma GEMM +
-    // t>8 전문가 그룹 경로를 활성화한다. KV 예약은 서빙 경로 계약(프로브
-    // ctx 기준) — 서빙 편성 시 kv_reserve와 합산 재판정.
     dec.set_lru_tuning(Some(320), Some(1))?;
-    // ── 3) GDN 상수 — a 먼저 b 다음(커널 ab 색인)·norm은 +1 금지(D0). ──
     let n_gdn = cfg.num_hidden_layers - cfg.num_hidden_layers / cfg.full_interval.max(1);
     let dims = GdnDims {
         n_gdn,
@@ -376,7 +343,6 @@ pub(crate) fn upload_fn_win(
     let mut alog: Vec<f32> = Vec::with_capacity(n_gdn * hv);
     let mut dtb: Vec<f32> = Vec::with_capacity(n_gdn * hv);
     let mut nw: Vec<f32> = Vec::with_capacity(n_gdn * 128);
-    // GDN·노름 상수 텐서는 BF16 — 상위 16비트 f32 확장(무손실).
     let f32_of = |b: &[u8]| -> Vec<f32> {
         b.as_chunks::<2>()
             .0
@@ -424,7 +390,6 @@ pub(crate) fn upload_fn_win(
         n_gdn * 128
     );
     dec.set_gdn(dims, &cw, &ab, &alog, &dtb, &nw)?;
-    // ── 4) full층 어텐션 표 — q/k_norm은 +1(D0 norm_vec 계약). ──
     let n_attn = cfg.num_hidden_layers / cfg.full_interval.max(1);
     let adims = AttnDims {
         q_heads: cfg.heads,
@@ -460,11 +425,9 @@ pub(crate) fn upload_fn_win(
         }
     }
     dec.set_attn(adims, layers, &qnw, &knw)?;
-    // ── 5) HC 노름(97행 × [hh], +1)·PLE 가중·sigmoid 게이트 ──
     let rows = 2 * cfg.num_hidden_layers + 1;
     let mut hcn: Vec<f32> = Vec::with_capacity(rows * hh);
     for il in 0..cfg.num_hidden_layers {
-        // [PP2] 노름 테이블은 전층 관례(행 인덱스 = 절대 2il·2il+1 유지).
         for hc in ["attn_hyper_connection", "mlp_hyper_connection"] {
             let mut v = f32_of(&ts(format!("{}.{hc}.hc_norm.weight", lp(il)))?);
             for x in v.iter_mut() {

@@ -1,10 +1,7 @@
-//! sched.rs에서 분해(순수 이동 — 코드 무변).
 use super::{Aging, SCHED, Slot};
 use crate::engine::Engine;
 use std::sync::atomic::Ordering;
 
-/// [R7] 모니터링 게시 스로틀(≤1Hz — 최신값만, 핫패스 할당 최소화) —
-/// 슬롯 루프에서 순수 이동.
 pub(super) fn maybe_publish(
     slots: &[Slot],
     eng: &Engine,
@@ -20,7 +17,6 @@ pub(super) fn maybe_publish(
     }
 }
 
-/// [2026-10-16] aging 관측 게시(최신값만) — 동결 상태·D·누적·차단.
 pub(super) fn publish_aging(a: &Aging) {
     let s = a.stats();
     SCHED.aging_frozen.store(s.frozen as u64, Ordering::Relaxed);
@@ -40,12 +36,10 @@ pub(super) fn publish_aging(a: &Aging) {
         .store((s.head_wait_p95_s * 1000.0) as u64, Ordering::Relaxed);
 }
 
-/// 모니터링 — 메모리 분류 + 복사 계측 게시(최신값만).
 pub(super) fn publish_stats(eng: &Engine, base: [(u64, u64, u64); 3]) {
     let (weights_gpu, kv_gpu, offload_cpu, ple_cpu) = eng.mem_stats();
     let (_, kv_host, host_blocks, total_blocks) = eng.kv_tier_bytes();
     let (free_vram, free_host) = eng.kv_tier_free();
-    // [2026-10-16] 메모리 배치 권고(관측 전용) — 최신 신호 1표본(1Hz).
     let (hit, miss, _) = eng.mcache_stats();
     let hit_rate = if hit + miss > 0 {
         hit as f64 / (hit + miss) as f64
@@ -91,7 +85,6 @@ pub(super) fn publish_stats(eng: &Engine, base: [(u64, u64, u64); 3]) {
     });
 }
 
-/// 모니터링 게시 — 슬롯 뷰 + 활성 수(최신값 덮어쓰기, 히스토리 없음).
 pub(super) fn publish_slot_views(slots: &[Slot]) {
     let views: Vec<crate::metrics::SlotView> = slots
         .iter()

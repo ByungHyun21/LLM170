@@ -1,24 +1,8 @@
-//! Gated DeltaNet — llama.cpp 대응 구현.
-//!
-//! - `gdn_chunk_seq`: 청크(CS=64) prefill — **AR과 구조 동일** 수학(d = (I+A)⁻¹(βv − M)).
-//!   llama CPU fused 커널(ops.cpp one_chunk, 순차 AR)과 동일 의미론임을
-//!   소형 랜덤 모델 + `-ub 1` 교차검증으로 확인 (2026-08-30).
-//!   참고: llama의 그래프 청크 경도(build_delta_net_chunking)는 S-항 적용 순서가
-//!   달라 순차 AR과 미세하게 다른 수치를 냄 — 평탄한 랜덤 로짓에서 argmax가 갈렸음.
-//!   본 엔진은 의미론 기준(순차 AR)을 따르고 실모델 토큰 스트림으로 검증.
-//! - `gdn_ar_batch`: 자기회귀 디코드, 배치 = (시퀀스 × 토큰 1개).
-//!
-//! 헤드 매핑: V-헤드는 tiled 재배열 → **V 헤드 h ↔ K 헤드 h % H_k**
-//! (fused 커널 `ik1 = iv1 % nek1`, delta-net-base repeat 모두 동일).
-//!
-//! 상태 S[kdim, vdim] — 두 경로 동일 레이아웃.
 
 use llm170_diag::profile_span;
 
-pub const CS: usize = 64; // chunk size (비-KDA: 64)
+pub const CS: usize = 64;
 
-/// 한 시퀀스 prefill. 레이아웃: q/k `[T][H_k][d]`, v `[T][H_v][d]`, beta/g `[T][H_v]`,
-/// state `[H_v][d*d]` (입출), out `[T][H_v][d]`. V 헤드별 스레드 병렬.
 pub fn gdn_chunk_seq(
     q: &[f32],
     k: &[f32],
@@ -32,7 +16,7 @@ pub fn gdn_chunk_seq(
     h_v: usize,
 ) {
     profile_span!("cpu::gdn_chunk");
-    let d = q.len() / (h_k * t_len); // d_state (kdim == vdim)
+    let d = q.len() / (h_k * t_len);
     debug_assert!(q.len().is_multiple_of(h_k * t_len));
     let v_stride = h_v * d;
     let mut local_outs: Vec<Vec<f32>> = vec![vec![0.0f32; t_len * d]; h_v];
@@ -83,7 +67,7 @@ fn gdn_chunk_head(
     let v_stride = h_v * d;
     let n_chunks = t_len.div_ceil(CS);
 
-    let st = &mut state[..d * d]; // [kdim, vdim]
+    let st = &mut state[..d * d];
     let mut qp = vec![0.0f32; CS * d];
     let mut kp = vec![0.0f32; CS * d];
     let mut vp = vec![0.0f32; CS * d];
@@ -97,7 +81,6 @@ fn gdn_chunk_head(
         let t0 = c * CS;
         let n = (t0 + CS).min(t_len) - t0;
 
-        // 제로 패딩 복사 (delta-net-base.cpp:63-70)
         for t in 0..n {
             let src = t0 + t;
             qp[t * d..t * d + d]
@@ -133,14 +116,8 @@ fn gdn_chunk_head(
         }
         let g_last = gcs[CS - 1];
 
-        // ==== 청크 수학 — AR과 구조 동일 (d = (I+A)⁻¹(βv − M)) ====
-        // A[i,j] = β_i·(k_i·k_j)·e^{gcs_i−gcs_j} (i>j, 엄격 하삼각)
-        // M_i    = β_i·e^{gcs_i}·(k_i·S_prev)
-        // o_i    = e^{gcs_i}·(S_prevᵀ q_i) + Σ_{j≤i} (q_i·k_j)·e^{gcs_i−gcs_j}·d_j
-        // S_new  = S_prev·e^{g_last} + Σ_j k_j·e^{g_last−gcs_j} ⊗ d_j
         for i in 0..n {
             let beta_i = bp[i];
-            // rhs_i = β_i·v_i − β_i·e^{gcs_i}·(k_i·S_prev)
             for dv in 0..d {
                 oi[dv] = beta_i * vp[i * d + dv];
             }
@@ -159,7 +136,6 @@ fn gdn_chunk_head(
             }
             let dbase = i * d;
             d_out[dbase..(d + dbase)].copy_from_slice(&oi[..d]);
-            // 전진 대입: d_i = rhs_i − Σ_{j<i} A[i,j]·d_j
             for j in 0..i {
                 let dot: f32 = (0..d).map(|s2| kp[i * d + s2] * kp[j * d + s2]).sum();
                 let aij = dot * beta_i * (gcs[i] - gcs[j]).exp();
@@ -170,7 +146,6 @@ fn gdn_chunk_head(
                     d_out[dbase + dv] -= aij * d_out[j * d + dv];
                 }
             }
-            // o_i = e^{gcs_i}·(S_prev·q_i) + Σ_{j≤i} kq[i,j]·d_j
             for dv in 0..d {
                 oi[dv] = 0.0;
             }
@@ -197,7 +172,6 @@ fn gdn_chunk_head(
             }
             out[(t0 + i) * d..(t0 + i) * d + d].copy_from_slice(&oi);
         }
-        // 상태 갱신: S ← S·e^{g_last} + Σ_j k_j·e^{g_last−gcs_j}⊗d_j
         let gl_exp = g_last.exp();
         for xv in st.iter_mut() {
             *xv *= gl_exp;
@@ -214,11 +188,6 @@ fn gdn_chunk_head(
     }
 }
 
-// ── GDN AR 헤드 병렬 풀 ──
-// 구 직접 디코드 계측(2026-09): gdn:delta 79.6ms/토큰, 그중 상당분이 토큰당
-// 48층 × 48헤드 = 2304회 thread::scope OS 스폰이었다. 상수 풀로 스폰 비용
-// 제거. 잡이 'static이어야 하므로 호출자 소유 버퍼는 원시 포인터로 캡처하고
-// run_par가 완료 카운터 도달 시에만 반환함으로써 수명을 증명한다(아래 SAFETY).
 pub mod ar_pool {
     use std::collections::VecDeque;
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -233,9 +202,6 @@ pub mod ar_pool {
     static SPAWNED: std::sync::Once = std::sync::Once::new();
     static SPAWNED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    /// 큐 확보 + 워커 스폰(1회). **set-then-spawn 계약**: 워커는 큐 값이
-    /// OnceLock에 저장된 뒤에만 스폰한다 — 초기화 진행 중 스폰하면 워커의
-    /// 큐 조회가 None을 보고 조용히 종료한다(C1, 2026-10-08 분석).
     fn queue() -> &'static Queue {
         let q = QUEUE.get_or_init(|| Queue {
             jobs: Mutex::new(VecDeque::new()),
@@ -252,14 +218,13 @@ pub mod ar_pool {
                     Ok(_) => {
                         SPAWNED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    Err(_) => break, // 잔여 워커로 진행(run_par가 전멸을 폴백 처리)
+                    Err(_) => break,
                 }
             }
         });
         q
     }
 
-    /// 스폰된 워커 수(회귀 테스트·진단용 — set-then-spawn 계약 확인).
     pub fn spawned_workers() -> usize {
         SPAWNED_N.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -280,12 +245,9 @@ pub mod ar_pool {
         }
     }
 
-    /// n_jobs개 잡 분배 후 전부 완료까지 대기. 잡 패닉은 페이로드를 보관해
-    /// 호출자 스레드에서 재개한다(thread::scope + join().unwrap() 의미 보존).
     pub fn run_par(n_jobs: usize, make: impl Fn(usize) -> Job) {
         let q = queue();
         if spawned_workers() == 0 {
-            // 워커 전멸(스폰 실패) — 호출 스레드 순차 실행(완료 카운터 교착 방지).
             for i in 0..n_jobs {
                 (make(i))();
             }
@@ -329,19 +291,9 @@ pub mod ar_pool {
     }
 }
 
-/// 원시 포인터의 usize 보관 래퍼 — ar_pool 잡 캡처용.
-/// (usize 필드는 Send — 에디션 2021 정밀 캡처가 구조체가 아닌 필드를
-/// 캡처하므로 *mut 을 직접 넣으면 Send가 깨진다.)
-/// SAFETY: 주소가 가리키는 버퍼는 run_par 반환 전까지 유효하고(완료
-/// 카운터 증명) pair별 접근 영역은 서로 격리된다 — gdn_ar_batch의 SAFETY 참조.
 #[derive(Clone, Copy)]
 struct SendPtr(usize);
 
-/// 단일 (seq, v-head) AR 스텝. 비트동일 보존 전제:
-/// · sk/o 순회를 행(kdim) 우량으로 전환하되 kdim 누적 순서와 항 표현식
-///   `(s·q)·scale`·`(s·k)` 을 원문과 동일하게 유지한다(열 우량 그대로면
-///   스트라이드 d 접근으로 캐시·벡터화 모두 실패).
-/// · delta 갱신은 각 원소에 +1회 — 열→행 전환은 값 불변(비트동일).
 #[allow(clippy::too_many_arguments)]
 fn gdn_ar_head(
     st: &mut [f32],
@@ -385,13 +337,7 @@ fn gdn_ar_head(
     lo.copy_from_slice(&o);
 }
 
-// (행별 도트 풀 병렬 헬퍼 2종은 제거 — 잡당 고정비 ~3µs가 3584-길이 도트를
-// 못 이겨 스칼라 대비 무차. 2026-10-02 실험 기록.)
 
-/// 배치 디코드: 토큰 1개 × n_seqs. (build_delta_net_autoregressive / fused one_chunk)
-/// 레이아웃: q/k `[B][H_k][d]`, v `[B][H_v][d]`, beta/g `[B][H_v]`,
-/// states `[B][H_v][d*d]`, out `[B][H_v][d]`. (seq, v-head) 쌍별 병렬
-/// (ar_pool 상수 풀 — 스폰 2304회/토큰 제거).
 pub fn gdn_ar_batch(
     q: &[f32],
     k: &[f32],
@@ -413,11 +359,6 @@ pub fn gdn_ar_batch(
     let n_pairs = n_seqs * h_v;
     let mut local_outs = vec![0.0f32; n_pairs * d];
     {
-        // SAFETY: 잡은 원시 포인터(SendPtr)만 캡처한다.
-        // (1) states·local_outs·q·k·v·beta·g는 run_par 반환 전까지 유효 —
-        //     run_par는 완료 카운터가 n_pairs에 도달해야만 반환한다.
-        // (2) pair별 영역은 서로 겹치지 않는다: 상태는 d*d 청크, 로컬 출력은
-        //     d 청크(기존 chunks_mut 분할과 동일), 입력은 읽기 전용 공유.
         let st_base = SendPtr(states.as_mut_ptr() as usize);
         let lo_base = SendPtr(local_outs.as_mut_ptr() as usize);
         let (qb, kb, vb, bb, gb) = (
@@ -459,7 +400,6 @@ pub fn gdn_ar_batch(
 mod tests {
     use super::*;
 
-    /// 강한 내부 정합성: AR(토큰별)과 chunked 결과가 일치해야 한다.
     #[test]
     fn chunked_matches_ar() {
         let h_k = 2;
@@ -488,7 +428,6 @@ mod tests {
         for x in v.iter_mut() {
             *x = rnd();
         }
-        // 실제 모델 전제: q,k는 L2 정규화, β∈(0,1) sigmoid, g≤0
         for ti in 0..t {
             for h in 0..h_k {
                 let b = ti * h_k * d + h * d;
@@ -555,8 +494,6 @@ mod tests {
         assert!(max_state_diff < 5e-2, "상태 불일치: {max_state_diff}");
     }
 
-    /// C1 회귀 — set-then-spawn: 워커가 초기화 경쟁으로 조용히 죽으면
-    /// run_par가 완료 카운터에서 교착한다. 워치독으로 hang 대신 실패시킨다.
     #[test]
     fn ar_pool_spawns_workers_and_completes() {
         use std::sync::Arc;
@@ -587,7 +524,6 @@ mod tests {
         );
     }
 
-    /// 동시 run_par 스트레스 — 큐 초기화·분배가 다중 호출에서도 완결.
     #[test]
     fn ar_pool_concurrent_run_par() {
         use std::sync::Arc;

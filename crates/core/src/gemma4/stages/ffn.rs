@@ -1,19 +1,8 @@
-//! gemma4 FFN 스테이지 — dense MLP(2112·gelu_tanh) + MoE(라우터 top-8) 병렬.
-//!
-//! 계약(2026-10-14 HF 대조):
-//! - 라우터 = **가중 없는 RMS** → `·scale·h^-0.5` → BF16 proj → softmax(전문가
-//!   전체, f32) → top-8 → **재정규화(합 1)** → `·per_expert_scale[e]`.
-//!   입력 = **MLP 이전 h**(어텐션 잔차) — MLP 입력과 별개.
-//! - 전문가 = gelu_tanh(gate)·up → down, 선택 가중치 합산.
-//! - dense(pre_ff)와 MoE(pre_ff_2)는 **별개 노름**으로 병렬 계산 후
-//!   `post_ff_norm1(dense) + post_ff_norm2(moe)` 병합(호출부).
 
 use super::super::{Model, ModelError};
 use crate::matmul::cpu::{matmul, matmul_batch};
 use crate::ops::{gelu_tanh, rms_norm_plain};
 
-/// 라우터 — (전문가, 가중) 내림차순. 동률 = 낮은 인덱스(결정적).
-/// `h` = 라우터 입력(MLP 이전 잔차 h) 행들.
 pub(crate) fn route(
     model: &Model,
     il: usize,
@@ -37,7 +26,6 @@ pub(crate) fn route(
             .map(|(v, s)| v * s * inv)
             .collect();
         matmul(&r, &w, &mut logits);
-        // softmax(f32·전체) → top-k → 재정규화 → per_expert_scale.
         let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut p = vec![0.0f32; n_exp];
         let mut sum = 0.0f32;
@@ -64,7 +52,6 @@ pub(crate) fn route(
     Ok(out)
 }
 
-/// dense MLP — out[t] = down(gelu_tanh(gate(n_t))·up(n_t)). `x` = pre_ff 노름 행.
 pub(crate) fn dense_mlp(
     model: &Model,
     il: usize,
@@ -91,8 +78,6 @@ pub(crate) fn dense_mlp(
     Ok(())
 }
 
-/// MoE — `sel`(route 결과) 기준 전문가별 토큰 묶음 계산 → 가중 합산.
-/// `x` = pre_ff_2 노름 행(라우터 입력과 별개 계약).
 pub(crate) fn moe_block(
     model: &Model,
     il: usize,
@@ -108,7 +93,6 @@ pub(crate) fn moe_block(
     for row in out.iter_mut() {
         row.fill(0.0);
     }
-    // 선택 전문가별 토큰 묶음 — 행 디양자화 1회 상각.
     let mut by_exp: Vec<Vec<(usize, f32)>> = vec![Vec::new(); hp.n_experts];
     for (t, s) in sel.iter().enumerate() {
         for &(e, w) in s {
@@ -153,7 +137,6 @@ pub(crate) fn moe_block(
 mod tests {
     use crate::ops::gelu_tanh;
 
-    /// gelu_tanh = HF `gelu_pytorch_tanh` 근사 — torch 참조값 고정(2026-10-14 실측).
     #[test]
     fn gelu_tanh_reference_values() {
         let cases = [

@@ -1,16 +1,11 @@
-//! qwen35 아키텍처 바인딩 — HF 이름맵·synth·V헤드 순열·기대 커버리지.
-//! (2026-10-08 R4: `w4a16` 스토어에서 분리. 새 모델군은 이 모듈에 준하는
-//! 바인딩을 추가한다 — 스토어는 형식만, 바인딩이 아키텍처를 안다.)
 
 use crate::json::Json;
 use crate::w4a16::{R, Report, W4a16Error, W4a16Model, decode_f32};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// 지원 아키텍처 식별자(config.json `architectures`/`model_type`).
 pub const ARCHES: &[&str] = &[
     "Qwen3_5ForConditionalGeneration",
-    // W4-1: 35B-A3B MoE(g32) — dense와 같은 qwen3_5 계열, FFN만 MoE.
     "Qwen3_5MoeForConditionalGeneration",
 ];
 
@@ -18,7 +13,6 @@ pub fn arch_supported(arch: &str) -> bool {
     ARCHES.contains(&arch)
 }
 
-/// 디렉터리 config.json에서 아키텍처 식별자 추출(architectures[0] → model_type).
 pub fn dir_arch(dir: &Path) -> Option<String> {
     let txt = std::fs::read_to_string(dir.join("config.json")).ok()?;
     let v = Json::parse(&txt).ok()?;
@@ -30,9 +24,6 @@ pub fn dir_arch(dir: &Path) -> Option<String> {
     v.get("model_type").and_then(Json::as_str).map(String::from)
 }
 
-/// 모델 전역 로짓 softcap(config.json — arch 중립 메타데이터).
-/// `text_config.final_logit_softcapping` 우선, 평면 키 fallback, 부재 = 0(미적용).
-/// gemma4 = 30.0 · qwen3.5 = 부재.
 pub fn final_logit_softcap(dir: &Path) -> f32 {
     let Ok(txt) = std::fs::read_to_string(dir.join("config.json")) else {
         return 0.0;
@@ -46,13 +37,10 @@ pub fn final_logit_softcap(dir: &Path) -> f32 {
         .unwrap_or(0.0) as f32
 }
 
-/// 전문가 텐서 베이스 이름 — qwen3_5 계열(`...layers.{l}.mlp.experts.{e}.{proj}`).
-/// 스토어는 경로를 모른다(무경유 접근자 `W4a16Model::expert_at(base)`에 전달).
 pub fn expert_base(layer: usize, e: usize, proj: &str) -> String {
     format!("model.language_model.layers.{layer}.mlp.experts.{e}.{proj}")
 }
 
-/// qwen3_5 계열 하이퍼파라미터(config.json 발췌).
 #[derive(Debug, Clone)]
 pub struct QwenCfg {
     pub hidden: usize,
@@ -62,9 +50,7 @@ pub struct QwenCfg {
     pub head_dim: usize,
     pub ffn: usize,
     pub vocab: usize,
-    /// full-attention 간격(4 → full il = {3,7,…,63}).
     pub full_interval: usize,
-    /// GDN — state_size·key_heads·value_heads·conv 커널.
     pub linear_key_head_dim: usize,
     pub linear_num_key_heads: usize,
     pub linear_num_value_heads: usize,
@@ -72,10 +58,7 @@ pub struct QwenCfg {
     pub partial_rotary_factor: f64,
     pub rope_theta: f64,
     pub rms_norm_eps: f64,
-    /// [2.J 2026-10-13] 모델 전역 ctx 상한(config.json max_position_embeddings
-    /// — text_config 중첩이 표준, 평면 키도 허용). 서버 --ctx 검증·실효 ctx 파생.
     pub max_pos: usize,
-    // ── MoE(0이면 dense FFN) ──
     pub n_experts: usize,
     pub top_k: usize,
     pub moe_ffn: usize,
@@ -83,7 +66,6 @@ pub struct QwenCfg {
 }
 
 impl QwenCfg {
-    /// config.json 로드 + 아키텍처 게이트.
     pub fn load(dir: &Path) -> R<Self> {
         if let Some(arch) = dir_arch(dir)
             && !arch_supported(&arch)
@@ -101,7 +83,6 @@ impl QwenCfg {
         let tc = v.get("text_config").unwrap_or(&v);
         let u = |k: &str| -> Option<usize> { tc.get(k).and_then(Json::as_f64).map(|x| x as usize) };
         let bad = |k: &str| W4a16Error::BadTensor(format!("config.json: {k} 부재"));
-        // rope 파라미터는 text_config.rope_parameters에 중첩(실측) — 평면 키도 허용.
         let rp = tc.get("rope_parameters").unwrap_or(tc);
         let f = |k: &str| -> Option<f64> { rp.get(k).and_then(Json::as_f64) };
         let cfg = QwenCfg {
@@ -110,8 +91,6 @@ impl QwenCfg {
             heads: u("num_attention_heads").ok_or_else(|| bad("num_attention_heads"))?,
             kv_heads: u("num_key_value_heads").ok_or_else(|| bad("num_key_value_heads"))?,
             head_dim: u("head_dim").ok_or_else(|| bad("head_dim"))?,
-            // MoE는 dense intermediate_size가 없다 — moe_intermediate_size로
-            // 대체(엔진 ffn 필드는 dense 전용, MoE 경로는 moe_ffn을 쓴다).
             ffn: u("intermediate_size")
                 .or_else(|| u("moe_intermediate_size"))
                 .ok_or_else(|| bad("intermediate_size"))?,
@@ -134,7 +113,6 @@ impl QwenCfg {
                 .get("rms_norm_eps")
                 .and_then(Json::as_f64)
                 .unwrap_or(1e-6),
-            // [2.J] 전역 ctx 상한 — text_config 우선, 평면 fallback.
             max_pos: u("max_position_embeddings")
                 .or_else(|| {
                     v.get("max_position_embeddings")
@@ -147,8 +125,6 @@ impl QwenCfg {
             moe_ffn: u("moe_intermediate_size").unwrap_or(0),
             shared_ffn: u("shared_expert_intermediate_size").unwrap_or(0),
         };
-        // 교차필드 계약(C4) — 위반은 로드 중 0나누기(attn)·언더플로(conv)·조용한
-        // GQA 오매핑이 된다. 파싱 시점에 명시 거부(게이트 B/C 계약 보호).
         let pos = |v: usize, k: &str| -> R<()> {
             if v == 0 {
                 Err(W4a16Error::Config(format!("config.json: {k}=0")))
@@ -183,7 +159,6 @@ impl QwenCfg {
                 cfg.linear_num_value_heads, cfg.linear_num_key_heads
             )));
         }
-        // MoE 교차필드 — n_experts>0이면 top_k/FFN 폭 전부 양수·상한 내.
         if cfg.n_experts > 0
             && (cfg.top_k == 0
                 || cfg.top_k > cfg.n_experts
@@ -199,10 +174,6 @@ impl QwenCfg {
     }
 }
 
-/// 순열 사본 정렬 계약(C2) — build_perm/conv_rows_f32_permuted는 128행 블록
-/// 단위로만 순열하고 꼬리(n%128)를 0으로 방치한다(오류·패닉 없이 잘못된
-/// 가중치 = 조용한 오염). validate가 구축 전에 전수 검사한다.
-/// name 규약: `in_proj_z`는 전 행(base 0), 그 외(qkv·conv1d)는 vbase 이후.
 pub fn perm_align_check(cfg: &QwenCfg, items: &[(String, usize)]) -> R<()> {
     let vbase = 2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim;
     for (name, v) in items {
@@ -221,17 +192,9 @@ pub fn perm_align_check(cfg: &QwenCfg, items: &[(String, usize)]) -> R<()> {
     Ok(())
 }
 
-/// 엔진(블록) 텐서명 해석 — qwen35 스테이지가 요구하는 이름을 소스로 매핑.
-/// V헤드 순열은 **필수**다 — 엔진은 subhead-major 계약
-/// (V헤드 h ↔ K헤드 h % nk, gdn.rs `ik1 = iv1 % nek1` 미러)이라, HF 원본
-/// (group-major)을 그대로 주면 k/v 짝이 어긋난다(직접 로드 실측: 출력 붕괴).
-/// 따라서 v-축 텐서는 순열 사본(perm store)으로 subhead-major를 공급한다.
 pub enum Eng {
-    /// 양자화 선형 — 분리 버퍼 Weight(packed+scale). vperm 적용 축 명시.
     Quant { base: String, vperm: PV },
-    /// BF16 플레인 — rows_perm=true면 행(V헤드) 순열(alpha/beta).
     Plain { name: String, rows_perm: bool },
-    /// f32 합성 — perm: 0 없음(norm)·1 헤드 인덱스(dt_bias/A_log)·2 conv 채널.
     Synth {
         name: String,
         plus1: bool,
@@ -240,20 +203,14 @@ pub enum Eng {
     },
 }
 
-/// V축 순열 스펙 — 엔진(subhead-major) 계약.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PV {
-    /// 순열 없음.
     None,
-    /// n축·vbase(=2·nk·hd) 이후 128행 블록(attn_qkv v부).
     VPart,
-    /// n축 전 행 128블록(in_proj_z).
     AllN,
-    /// k축 전 열 128블록(out_proj).
     AllK,
 }
 
-/// `blk.{il}.*`·전역 이름 → 소스 해석. (스테이지 접점 전수가 지나는 단일 계약)
 pub fn eng(name: &str) -> Option<Eng> {
     if name == "token_embd.weight" {
         return Some(Eng::Plain {
@@ -275,14 +232,7 @@ pub fn eng(name: &str) -> Option<Eng> {
             perm: 0,
         });
     }
-    // [MTP 2026-10-12] MTP 블록 — 스토어 키가 HF 이름 그대로. 노름 = Synth
-    // (plus1 — 본체 norm 계약), 2D .weight = Plain(BF16). 3D 전문가 스택
-    // (35B MoE MTP)은 미지원(None — 차기).
     if name.starts_with("mtp.") {
-        // [정정 2026-10-12] 노름 매칭 = "norm" 포함(.weight) — 종전
-        // ends_with("norm.weight")는 pre_fc_norm_hidden/embedding을 놓쳐
-        // +1 없이 Plain으로 떨어졌다(그 두 텐서만 zero-centered인데 raw
-        // 사용 → MTP 첫 단계부터 왜곡, 초안 상수화의 뿌리).
         if name.ends_with(".weight") && name.contains("norm") {
             return Some(Eng::Synth {
                 name: name.into(),
@@ -343,8 +293,6 @@ pub fn eng(name: &str) -> Option<Eng> {
         "ffn_gate.weight" => q("mlp.gate_proj", PV::None),
         "ffn_up.weight" => q("mlp.up_proj", PV::None),
         "ffn_down.weight" => q("mlp.down_proj", PV::None),
-        // MoE(35B) — 라우터·shared_expert는 플레인. 전문가는 스토어 접근자
-        // (Model::expert_slice)로 인덱스 접근 — 이름맵에 30,720개를 넣지 않는다.
         "moe_gate.weight" => Some(Eng::Plain {
             name: format!("{l}.mlp.gate.weight"),
             rows_perm: false,
@@ -369,8 +317,6 @@ pub fn eng(name: &str) -> Option<Eng> {
     }
 }
 
-/// 엔진 접점 이름 전수(스테이지가 요구하는 이름) — 상주 로더/W3 배선용.
-/// 층 유형과 무관하게 전 접미사를 열거한다(비실재는 w()가 None으로 걸러냄).
 pub fn engine_names(cfg: &QwenCfg) -> Vec<String> {
     let mut v = vec![
         "token_embd.weight".to_string(),
@@ -402,7 +348,6 @@ pub fn engine_names(cfg: &QwenCfg) -> Vec<String> {
         ] {
             v.push(format!("blk.{il}.{suf}"));
         }
-        // MoE(35B-A3B) — 라우터·shared. 전문가는 이름맵 무경유(스토어 접근자).
         if cfg.n_experts > 0 {
             for suf in [
                 "moe_gate.weight",
@@ -418,38 +363,28 @@ pub fn engine_names(cfg: &QwenCfg) -> Vec<String> {
     v
 }
 
-/// 순열 사본 저장소 — 엔진 접점의 V축 텐서(HF→subhead-major).
 pub struct PermStore {
-    /// quant base → (packed, scale) 순열 사본.
     q: HashMap<String, (Vec<u8>, Vec<u8>)>,
-    /// 플레인(HF 이름) → BF16 행 순열 사본(alpha/beta).
     p: HashMap<String, Vec<u8>>,
 }
 
 impl PermStore {
-    /// 양자화 순열 사본 슬라이스 — PV::None이면 호출하지 않는다(원본 사용).
     pub fn quant(&self, base: &str) -> Option<(&[u8], &[u8])> {
         let s = self.q.get(base)?;
         Some((&s.0, &s.1))
     }
 
-    /// 플레인 행 순열 사본 슬라이스(alpha/beta).
     pub fn plain(&self, name: &str) -> Option<&[u8]> {
         self.p.get(name).map(|v| v.as_slice())
     }
 }
 
-/// GDN V헤드 순열 — llama.cpp(subhead-major) ↔ HF(group-major):
-/// 블록 i ← 원본 블록 ratio·(i%nk) + i/nk (실측 확정 — beta 지문
-/// corr 1.000·ssm_out 블록 corr 0.999, 동일 규약 미러).
 fn vperm(cfg: &QwenCfg, i: usize) -> usize {
     let nk = cfg.linear_num_key_heads;
     let ratio = cfg.linear_num_value_heads / nk;
     ratio * (i % nk) + i / nk
 }
 
-/// 플레인 가중 행/열 128블록 순열(그룹 무관) — 원시 바이트 사본.
-/// 35B처럼 GDN 투영이 비양자화(BF16)인 모델용 — 양자화 경로와 동일 규약.
 fn plain_perm(store: &W4a16Model, cfg: &QwenCfg, name: &str, pv: PV) -> Option<Vec<u8>> {
     let e = store.entry(name)?;
     let es = match e.dtype {
@@ -494,9 +429,6 @@ fn plain_perm(store: &W4a16Model, cfg: &QwenCfg, name: &str, pv: PV) -> Option<V
     Some(d)
 }
 
-/// V헤드 순열 사본 구축 — 엔진(subhead-major) 계약 공급용.
-/// 128블록 = 헤드차원(linear_key_head_dim) 단위라 그룹 무관 — 스케일 행/블록
-/// 바이트만 group으로 환산한다(g128 27B · g32 35B).
 pub fn build_perm(store: &W4a16Model, cfg: &QwenCfg) -> PermStore {
     let group = store.group();
     let nk = cfg.linear_num_key_heads;
@@ -506,7 +438,7 @@ pub fn build_perm(store: &W4a16Model, cfg: &QwenCfg) -> PermStore {
     let lp = "model.language_model.layers.";
     for il in 0..cfg.layers {
         if (il + 1).is_multiple_of(cfg.full_interval) {
-            continue; // full-attn 층은 V축 순열 없음(직접 대응 확인됨).
+            continue;
         }
         let l = format!("{lp}{il}.");
         for (suf, pv) in [
@@ -516,7 +448,6 @@ pub fn build_perm(store: &W4a16Model, cfg: &QwenCfg) -> PermStore {
         ] {
             let base = format!("{l}{suf}");
             let Some((n, k)) = store.lin_shape(&base) else {
-                // 비양자화(35B — 전문가 외 전부 BF16) — 플레인 순열 사본.
                 let name = format!("{base}.weight");
                 if let Some(out) = plain_perm(store, cfg, &name, pv) {
                     p.insert(name, out);
@@ -548,17 +479,15 @@ pub fn build_perm(store: &W4a16Model, cfg: &QwenCfg) -> PermStore {
                     }
                 }
                 PV::AllK => {
-                    // 행 내 k-블록(128열) 순열 — 원본 행 사본 후 셔플.
                     let nblk = k / 128;
                     let mut scratch = vec![0u8; rb];
                     for r in 0..n {
                         scratch.copy_from_slice(&pk[r * rb..(r + 1) * rb]);
                         for g in 0..nblk {
-                            let s = g * 64; // 128원소 = u32×16 = 64B
+                            let s = g * 64;
                             let sg = vperm(cfg, g) * 64;
                             d[r * rb + s..r * rb + s + 64].copy_from_slice(&scratch[sg..sg + 64]);
                         }
-                        // 스케일 블록 = 128열 = 128/group개 스케일(×2B).
                         let sblk = 128 * 2 / group;
                         let srow = &mut ds[r * sb..(r + 1) * sb];
                         let temp: Vec<u8> = sc[r * sb..(r + 1) * sb].to_vec();
@@ -572,7 +501,6 @@ pub fn build_perm(store: &W4a16Model, cfg: &QwenCfg) -> PermStore {
             }
             q.insert(base, (d, ds));
         }
-        // alpha/beta — 행(V헤드) 순열(BF16 바이트).
         for suf in [
             "linear_attn.in_proj_a.weight",
             "linear_attn.in_proj_b.weight",
@@ -594,13 +522,10 @@ pub fn build_perm(store: &W4a16Model, cfg: &QwenCfg) -> PermStore {
     PermStore { q, p }
 }
 
-/// 헤드 인덱스 순열(1D — dt_bias·A_log).
 pub fn permute_heads_f32(cfg: &QwenCfg, v: &[f32]) -> Vec<f32> {
     (0..v.len()).map(|i| v[vperm(cfg, i)]).collect()
 }
 
-/// conv 채널 행 순열 f32 — [ch][kk] 평탄, vbase 이후 128채널(헤드차원) 블록
-/// 순열 — 그룹 무관(스케일 무접촉).
 pub fn conv_rows_f32_permuted(store: &W4a16Model, cfg: &QwenCfg, name: &str) -> R<Vec<f32>> {
     let e = store
         .entry(name)
@@ -622,15 +547,12 @@ pub fn conv_rows_f32_permuted(store: &W4a16Model, cfg: &QwenCfg, name: &str) -> 
     Ok(out)
 }
 
-/// 전수 검증 — weight_shape 값 대조(스토어) + 커버리지(기대 집합 전수).
 pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
     let mut rep = Report {
         triples: store.n_lins(),
         ..Default::default()
     };
     rep.bad_shape_value = store.check_shape_values()?;
-    // MoE 전문가 트리플 구조(W4-1) — 층당 n_experts×3, 형상 계약 포함.
-    // 이름맵·커버리지에 30,720개를 싣지 않고 여기서 구조로 검증한다.
     if cfg.n_experts > 0 {
         for il in 0..cfg.layers {
             for e in 0..cfg.n_experts {
@@ -655,13 +577,12 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
             }
         }
     }
-    // 순열 정렬 계약(C2) — 순열 사본 구축(build_perm) 전에 전수 거부.
     {
         let lp = "model.language_model.layers.";
         let mut items: Vec<(String, usize)> = Vec::new();
         for il in 0..cfg.layers {
             if (il + 1).is_multiple_of(cfg.full_interval) {
-                continue; // full-attn 층은 V축 순열 없음.
+                continue;
             }
             let l = format!("{lp}{il}.");
             for (suf, nm) in [
@@ -678,7 +599,6 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
         }
         perm_align_check(cfg, &items)?;
     }
-    // 커버리지: 기대 양자화/플레인 집합 vs 실제.
     let (exp_q, exp_p) = expected_names(cfg);
     for base in &exp_q {
         if store.lin_shape(base).is_none() {
@@ -690,7 +610,6 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
             rep.missing_plain.push(name.clone());
         }
     }
-    // 분류: visual/mtp/텍스트 플레인/트리플 파트.
     let triple_part = |n: &str| {
         n.ends_with(".weight_packed")
             || n.ends_with(".weight_scale")
@@ -698,7 +617,6 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
     };
     for name in store.entries().keys() {
         if name.starts_with("model.visual.") {
-            // visual은 무양자화 BF16/F32 — 텍스트 경로 무사용.
             rep.visual += 1;
             continue;
         }
@@ -712,19 +630,15 @@ pub fn validate(store: &W4a16Model, cfg: &QwenCfg) -> R<Report> {
         if exp_p.contains(name) {
             rep.plain_text += 1;
         } else {
-            // 기대 밖 텍스트 텐서 — 정체불명(텍스트 경로에 bias 부재 실측).
             rep.unknown_text.push(name.clone());
         }
     }
     Ok(rep)
 }
 
-/// 기대 텐서 집합 — (양자화 base, 플레인 이름). qwen3_5 실측 스키마의 전수.
 fn expected_names(cfg: &QwenCfg) -> (Vec<String>, Vec<String>) {
     let (mut q, mut p) = (Vec::new(), Vec::new());
     let lp = "model.language_model.layers.";
-    // MoE(35B): dense mlp.{gate,up,down}_proj 부재 — 라우터·shared_expert가
-    // 플레인으로, 전문가 트리플은 validate의 구조 검사(층당 experts×3)가 맡는다.
     let ffn_q: &[&str] = if cfg.n_experts > 0 {
         &[]
     } else {
@@ -741,7 +655,6 @@ fn expected_names(cfg: &QwenCfg) -> (Vec<String>, Vec<String>) {
     } else {
         &[]
     };
-    // MoE는 어텐션 투영도 BF16 플레인(실측 — 전문가만 양자화).
     let attn_q: &[&str] = if cfg.n_experts > 0 {
         &[]
     } else {
@@ -844,7 +757,6 @@ mod tests {
     #[test]
     fn cfg_accept_and_reject_cross_fields() {
         assert!(QwenCfg::parse(&cfg_text(40, 8, 16, 64, 4)).is_ok());
-        // C4: 0 필드·GQA 불일치·vperm ratio 위반은 명시 거부.
         let e = QwenCfg::parse(&cfg_text(40, 0, 16, 64, 4))
             .unwrap_err()
             .to_string();
@@ -863,7 +775,6 @@ mod tests {
         assert!(e.contains("linear_conv_kernel_dim=0"), "{e}");
     }
 
-    /// [gemma4] 최종 로짓 softcap 파생 — text_config 중첩·평면·부재(0).
     #[test]
     fn final_logit_softcap_from_config() {
         let dir = std::env::temp_dir().join(format!("llm170_softcap_{}", std::process::id()));
@@ -885,7 +796,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// [2.J] max_position_embeddings 파생 — 평면/중첩(text_config) 두 경로.
     #[test]
     fn cfg_max_pos_parse() {
         assert_eq!(
@@ -899,7 +809,6 @@ mod tests {
             "linear_num_key_heads":16,"linear_num_value_heads":64,
             "linear_conv_kernel_dim":4}}"#;
         assert_eq!(QwenCfg::parse(nested).unwrap().max_pos, 131072);
-        // 부재는 명시 거부.
         let miss = cfg_text(40, 8, 16, 64, 4).replace(r#","max_position_embeddings":262144"#, "");
         assert!(
             QwenCfg::parse(&miss)
@@ -937,8 +846,7 @@ mod tests {
     #[test]
     fn perm_align_rules() {
         let cfg = cfg_fixture();
-        let vbase = 2 * 16 * 128; // 4096
-        // 정렬 OK — qkv v부(6144)·z(5120)·conv(vbase+2560).
+        let vbase = 2 * 16 * 128;
         let ok = vec![
             (
                 "model.language_model.layers.0.linear_attn.in_proj_qkv".to_string(),
@@ -954,14 +862,12 @@ mod tests {
             ),
         ];
         assert!(perm_align_check(&cfg, &ok).is_ok());
-        // C2: 128 꼬리행은 거부(순열 사본이 0으로 방치되는 오염).
         let bad = vec![(
             "model.language_model.layers.0.linear_attn.in_proj_qkv".to_string(),
             vbase + 6144 + 64,
         )];
         let e = perm_align_check(&cfg, &bad).unwrap_err().to_string();
         assert!(e.contains("순열 정렬 위반"), "{e}");
-        // vbase 미만도 거부.
         let bad2 = vec![(
             "model.language_model.layers.0.conv1d".to_string(),
             vbase - 128,
@@ -969,8 +875,6 @@ mod tests {
         assert!(perm_align_check(&cfg, &bad2).is_err());
     }
 
-    /// V헤드 순열 계약(2026-10-09): 전단사 + 그룹→서브헤드 인터리브.
-    /// 27B(16→48)·35B(16→32)·기타 ratio 실형상과 ratio=1 항등을 고정한다.
     #[test]
     fn vperm_bijection_and_interleave() {
         let mk = |nk: usize, nv: usize| {
@@ -985,16 +889,13 @@ mod tests {
             img.sort_unstable();
             assert_eq!(img, (0..nv).collect::<Vec<_>>(), "nk={nk} nv={nv}");
         }
-        // ratio=1(헤드 수 동일)이면 항등 — 순열 무의미.
         let c1 = mk(16, 16);
         assert!((0..16).all(|i| vperm(&c1, i) == i));
-        // 27B: 그룹 메이저 0·16·32(모두 k%nk=0) → 서브헤드 메이저 0·1·2.
         let c27 = mk(16, 48);
         assert_eq!(
             (vperm(&c27, 0), vperm(&c27, 16), vperm(&c27, 32)),
             (0, 1, 2)
         );
-        // permute_heads_f32 = vperm 라벨 순열(로더가 쓰는 실제 경로).
         let v: Vec<f32> = (0..48).map(|i| i as f32).collect();
         let out = permute_heads_f32(&c27, &v);
         assert_eq!(out.len(), 48);

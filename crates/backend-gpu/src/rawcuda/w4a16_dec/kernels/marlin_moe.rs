@@ -1,11 +1,7 @@
-// [2026-10-19] 스테이지② = 런처·정렬 변환 준비 — 소비(디스패치 배선)는 스테이지④.
-// 그때까지 dead_code 허용(args.rs 미사용 아리티 전례).
 #![allow(dead_code)]
 
 use super::super::*;
 
-/// [2026-10-19] marlin MoE 호스트 — reference/vllm csrc/moe/marlin_moe_wna16/
-/// ops.cu 이식(타일 표·캐시 크기·유효성·allow_count). 벤더 커널과 툴체인 계약.
 #[derive(Clone, Copy)]
 struct MoeTh {
     k: usize,
@@ -48,9 +44,8 @@ const MOE_LARGE: [MoeTh; 3] = [
     },
 ];
 const MOE_STAGES: usize = 4;
-const MOE_GROUP: usize = 32; // g32(group_blocks=2)
+const MOE_GROUP: usize = 32;
 
-/// 인스턴스별 REG(cuobjdump -res-usage — 고정 툴체인 계약) — allow_count 산정.
 fn moe_regs(th: u32, m: usize, tn: usize, tk: usize, m8: bool) -> usize {
     match (th, m, tn, tk, m8) {
         (128, 4, 4, 8, false) => 255,
@@ -72,7 +67,6 @@ fn moe_regs(th: u32, m: usize, tn: usize, tk: usize, m8: bool) -> usize {
     }
 }
 
-/// 인스턴스 맹글명 표 — assets/marlin_moe.cu 채리픽 15종과 1:1.
 fn moe_sym(th: u32, m: usize, tn: usize, tk: usize, m8: bool) -> Option<&'static str> {
     Some(match (th, m, tn, tk, m8) {
         (128, 1, 4, 8, false) => {
@@ -197,9 +191,6 @@ fn moe_determine(
 }
 
 impl W4a16Dec {
-    /// [2026-10-19] 마린 MoE GEMM 런치(vLLM marlin_mm 이식). Ok(false) =
-    /// 설정 불가 — 호출부가 기존 grp2/d64 경로로 폴백(운영 계약).
-    /// C는 f16([prob_m*top_k][prob_n]) — 소비자가 h2f/합산으로 f32 전환.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::rawcuda::w4a16_dec) fn marlin_moe_gemm_dev(
         &mut self,
@@ -295,11 +286,6 @@ impl W4a16Dec {
         Ok(true)
     }
 
-    /// [2026-10-19] 마린 MoE FFN 시도(상주 전용) — w13→활성→w2→topk 합산을
-    /// out(f32 [t][h])에 직접 기록(qwen35 = dmo · gemma4 = g4 스크래치 슬롯).
-    /// gelu=false = silu(엔진 ew(silu·mul)) · true = gelu_tanh(gemma4).
-    /// Ok(false) = 미가용/설정 불가 — 호출부가 레거시(grp2/d64/accum)로 폴백.
-    /// 스트라이드 식은 스테이지③ 업로드와 동일 계약.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::rawcuda::w4a16_dec) fn marlin_moe_ffn_dev(
         &mut self,
@@ -320,7 +306,6 @@ impl W4a16Dec {
         if ne == 0 || ns == 0 {
             return Ok(false);
         }
-        // 블록 크기 휴리스틱(vLLM marlin_moe.py): M*topk/E/b < 0.9인 첫 b.
         let mut block = 64usize;
         for b in [8usize, 16, 32, 48, 64] {
             if (ns as f64) / (ne as f64) / (b as f64) < 0.9 {
@@ -328,18 +313,14 @@ impl W4a16Dec {
                 break;
             }
         }
-        // 아레나 스트라이드(스테이지③과 동일식).
         let (st13, st2) = (n_ff * h, h * n_ff / 2);
         let (ss13, ss2) = ((h / 32) * 2 * n_ff * 2, (n_ff / 32) * h * 2);
-        // 스크래치(지연 확보).
         let sms = self.cc.sm_count().max(1) as usize;
         let sorted_n = ns + ne * block;
         let exp_n = ns.div_ceil(block) + ne + 8;
         let c13_n = ns * 2 * n_ff * 2;
         let act_n = ns * n_ff * 2;
         let c2_n = ns * h * 2;
-        // C_tmp — vLLM ops.cu: min(size_n·sorted, sms·4·block·max_thread_n),
-        // m8(block=8)은 ×2(실측 계약 — 커널의 m8 리듀스가 2배 사용).
         let ctmp_n = ((2 * n_ff).max(h) * sorted_n).min(sms * 4 * block * 256)
             * if block == 8 { 2 } else { 1 }
             * 4;
@@ -358,7 +339,6 @@ impl W4a16Dec {
         ensure_buf!(moe_mc2, c2_n, "moe_mc2");
         ensure_buf!(moe_mctmp, ctmp_n, "moe_mctmp");
         let x16 = self.cast_f16_dev(xn, t * h)?;
-        // 정렬 변환(gslot → 마린 형식).
         self.moe_align_marlin_dev(
             self.moe_msorted.ptr,
             self.moe_mexp.ptr,
@@ -367,7 +347,6 @@ impl W4a16Dec {
             ns as i32,
         )?;
         let topw = self.moe.moe_wt;
-        // w13: gate|up 융합(prob_m=t·top_k=topk·가중 미적용).
         let b13 = self.moe_m13 + (il * ne) as u64 * st13 as u64;
         let s13 = self.moe_s13 + (il * ne) as u64 * ss13 as u64;
         if !self.marlin_moe_gemm_dev(
@@ -389,7 +368,6 @@ impl W4a16Dec {
         )? {
             return Ok(false);
         }
-        // 활성 → act f16 — qwen35 MoE = silu·mul · gemma4 = gelu_tanh.
         {
             let f = self.cc.function(if gelu {
                 "w4a16_moe_act_gelu_f16"
@@ -407,7 +385,6 @@ impl W4a16Dec {
                 &mut crate::rawcuda::args::l4(&mut p_c, &mut p_a, &mut p_ns, &mut p_nf),
             )?;
         }
-        // w2: down(prob_m=ns·top_k=1·가중 적용).
         let b2 = self.moe_m2 + (il * ne) as u64 * st2 as u64;
         let s2 = self.moe_s2 + (il * ne) as u64 * ss2 as u64;
         if !self.marlin_moe_gemm_dev(
@@ -429,7 +406,6 @@ impl W4a16Dec {
         )? {
             return Ok(false);
         }
-        // topk 합산 → dmo f32.
         {
             let f = self.cc.function("w4a16_moe_topk_sum_f16")?;
             let (mut p_c, mut p_o) = (self.moe_mc2.ptr, out);
@@ -445,7 +421,6 @@ impl W4a16Dec {
         Ok(true)
     }
 
-    /// [2026-10-19] 마린 MoE 정렬 변환(gslot→sorted_ids·expert_ids·num_post).
     pub(in crate::rawcuda::w4a16_dec) fn moe_align_marlin_dev(
         &mut self,
         sorted: CUdeviceptr,

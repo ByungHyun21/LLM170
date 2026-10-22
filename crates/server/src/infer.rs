@@ -1,5 +1,3 @@
-//! infer — W4A16 CUDA 체인 greedy 추론 CLI (JSONL {"seq","pos","token","text"}).
-//! 참조(CPU)는 `w4a16-ref` 프로브 — 여기는 GPU 단일 경로.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -120,7 +118,6 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// 이 시점 emit — JSONL 1행 출력.
 fn emit(seq: usize, pos: u32, token: u32, eng: &crate::gpu_engine::GpuEngine) {
     println!(
         "{{\"seq\":{},\"pos\":{},\"token\":{},\"text\":{}}}",

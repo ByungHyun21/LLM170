@@ -1,11 +1,3 @@
-//! bench — llama-bench 규격 PP/TG/NP 측정 (2026-10-11 복원 — W4A16/CUDA 단일
-//! 트랙용 재작성).
-//!
-//! 원형(구 트랙 bench CLI — 이미 삭제된 커밋)의 의미론 승계: 합성 LCG 토큰(seed 0x1234_5678 —
-//! 크레이트 관례, rand 금지), 워밍업 1회 + reps회 측정, llama-bench 스타일
-//! 출력. **엔진 직접**(GpuEngine — HTTP 무경유). PP = prefill 벽(로그짓 전),
-//! TG = 프리필 후 greedy 디코드, NP = N슬롯 배치 디코드 합산(슬롯별 짧은
-//! 프리필 후 배치 체인). eos 무시(ignore-eos 관례 — 조기 종료 방지).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -28,7 +20,6 @@ fn parse_list(v: &str) -> Option<Vec<usize>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// [검수 통합 2026-10-14] 토큰 스트림 지문(FNV-1a) — 빌드 간 np 스트림 대조용.
 fn fnv1a_u32(v: &[u32]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &x in v {
@@ -38,7 +29,6 @@ fn fnv1a_u32(v: &[u32]) -> u64 {
     h
 }
 
-/// [tuning-sweep W3 2026-10-16] 노브 1개만 채운 Tuning(값 None = 기본 경로).
 fn tune_one(knob: &str, v: Option<u64>) -> crate::gpu_engine::Tuning {
     let mut t = crate::gpu_engine::Tuning::default();
     match knob {
@@ -52,7 +42,6 @@ fn tune_one(knob: &str, v: Option<u64>) -> crate::gpu_engine::Tuning {
     t
 }
 
-/// [tuning-sweep W3] 스윕 시작/종료 클럭·전력 기록(ab-bench 규율 이식).
 fn sm_clock() -> String {
     std::process::Command::new("nvidia-smi")
         .args([
@@ -86,10 +75,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let mut nps: Vec<usize> = Vec::new();
     let mut reps = 1usize;
     let mut ctx = 4096usize;
-    // [검수 통합 2026-10-14] np 단일 경로 등가 검사 폭(K토큰) — 0=끔.
-    // 기본 64: np 측정 런이 곧 배치 불변성 판정(해시는 상시 출력).
     let mut np_check = 64usize;
-    // [tuning-sweep W3 2026-10-16] 노브 스윕 — 모델 1로드, 값 교차 라운드·중앙값.
     let mut sweep: Option<(String, Vec<u64>)> = None;
     let mut sweep_rounds = 3usize;
     let mut min_gain = 0.05f64;
@@ -149,8 +135,6 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 Some(v) => min_gain = v.clamp(0.0, 10.0),
                 None => return usage_err_bench("--min-gain requires a float"),
             },
-            // [P6 2026-10-15] --moe 강제(serve와 동일 파서) — C20: auto 상주
-            // 판정이 환경으로 뒤집히지 않게 스트리밍 레짐 실험을 고정한다.
             "--moe" => match it.next().and_then(|v| crate::engine::parse_moe_policy(v)) {
                 Some(p) => {
                     crate::engine::MOE_POLICY.store(p as u64, std::sync::atomic::Ordering::Relaxed)
@@ -164,8 +148,6 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         return usage_err_bench("--model required");
     };
 
-    // [tuning-sweep W3] 계측(profile) 빌드 거부 — ab-bench와 동일 계약(실측
-    // 2026-10-15: 계측 포함 빌드로 청크 효과를 오독할 뻔).
     if sweep.is_some() && llm170_diag::PROFILE_BUILD {
         eprintln!("error: --sweep은 profile(계측) 빌드에서 거부 — 순수 release로 재빌드");
         return ExitCode::from(2);
@@ -179,7 +161,6 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         ));
     }
 
-    // 수제 LCG 합성 토큰(관례 seed — rand 금지).
     let mut seed = 0x1234_5678u64;
     let mut lcg = || {
         seed = seed
@@ -193,45 +174,37 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         let mut lines = Vec::new();
         let mut eng = GpuEngine::load(&model_path, max_np, ctx, None, None, None)
             .map_err(|e| e.to_string())?;
-        // 워밍업 1회(짧은 프리필+디코드 — 스크래치·그래프 warm).
         {
             eng.reset_seq(0).map_err(|e| e.to_string())?;
-            // [B20 보완 2026-10-19] 적재 완료 = 락 해제(프로브 경로 누락 보수).
             crate::resource::release_load_lock();
             let _ = eng
                 .prefill(0, &prompt[..64.min(max_pp)])
                 .map_err(|e| e.to_string())?;
             let _ = eng.decode_greedy(0, prompt[0]).map_err(|e| e.to_string())?;
         }
-        // pp별 워밍업 — 청크 스크래치(ensure) 재할당·그래프 캡처를 계측 밖으로.
         for &pp in &pps {
             eng.reset_seq(0).map_err(|e| e.to_string())?;
             let _ = eng.prefill(0, &prompt[..pp]).map_err(|e| e.to_string())?;
         }
         if let Some((knob, vals)) = sweep.clone() {
-            // ── [tuning-sweep W3] 스윕: 기본값 포함 교차 라운드 → 중앙값 표.
-            // 해시 실드: 값 간 측정 스트림 해시 불일치 = 그 노브가 수치 경로를
-            // 건드림 = 즉시 제외 + 기록(플랜 검증 1).
             let tg = *tgs.first().unwrap_or(&128);
             lines.push(format!(
                 "sweep | {knob} | rounds={sweep_rounds} min_gain={min_gain} | start [{}]",
                 sm_clock()
             ));
-            let mut order: Vec<u64> = vec![0]; // 0 = 기본(상수 경로)
+            let mut order: Vec<u64> = vec![0];
             order.extend(vals.iter().copied());
-            // (값, pp) → 측정치 모음 + 해시
             let mut pp_ts: std::collections::HashMap<(u64, usize), Vec<f64>> = Default::default();
             let mut tg_ts: std::collections::HashMap<(u64, usize), Vec<f64>> = Default::default();
             let mut hashes: std::collections::HashMap<(u64, usize), u64> = Default::default();
             for r in 0..sweep_rounds {
                 let mut round = order.clone();
                 if r % 2 == 1 {
-                    round.reverse(); // 짝수(1-색인) 라운드 역순 — 드리프트 균등화
+                    round.reverse();
                 }
                 for v in round {
                     eng.apply_tuning(tune_one(&knob, if v == 0 { None } else { Some(v) }))
                         .map_err(|e| e.to_string())?;
-                    // 워밍업 — 값 전환 재구성(스크래치 ensure·그래프)을 계측 밖으로.
                     for &pp in &pps {
                         eng.reset_seq(0).map_err(|e| e.to_string())?;
                         let _ = eng.prefill(0, &prompt[..pp]).map_err(|e| e.to_string())?;
@@ -263,14 +236,12 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     }
                 }
             }
-            // 원복 — 이후 np 섹션은 상수 경로(단일 값 규율).
             eng.apply_tuning(crate::gpu_engine::Tuning::default())
                 .map_err(|e| e.to_string())?;
             for &pp in &pps {
                 eng.reset_seq(0).map_err(|e| e.to_string())?;
                 let _ = eng.prefill(0, &prompt[..pp]).map_err(|e| e.to_string())?;
             }
-            // 중앙값 표(README 표 형식 라인)
             for &v in &order {
                 let name = if v == 0 {
                     "base".to_string()
@@ -290,7 +261,6 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 ));
                 lines.push(row);
             }
-            // 해시 실드 판정
             let mut shield_ok = true;
             for &pp in &pps {
                 let base = hashes.get(&(0, pp)).copied().unwrap_or(0);
@@ -307,7 +277,6 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             if shield_ok {
                 lines
                     .push("sweep-hash | OK — 값 간 스트림 해시 전부 일치(무결성 실드)".to_string());
-                // 최선값 판정(첫 pp 축) — 채택은 사람 판정(플랜 채택 절차).
                 let base = median_f(pp_ts.get(&(0, pps[0])).cloned().unwrap_or_default());
                 let mut best: Option<(u64, f64)> = None;
                 for &v in &vals {
@@ -338,8 +307,6 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     let l = eng.prefill(0, &prompt[..pp]).map_err(|e| e.to_string())?;
                     let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
                     let mut next = llm170_core::qwen35::greedy(&l);
-                    // [tuning-sweep W0] pp/tg 스트림 해시 상시 방출(종전 np 전용
-                    // — 스윕 무결성 실드의 재료로 일반화).
                     let mut stream = vec![next];
                     for &tg in &tgs {
                         let t1 = Instant::now();
@@ -366,10 +333,6 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 }
             }
         }
-        // NP — 슬롯별 짧은 프리필(비계측) 후 배치 디코드 합산.
-        // [검수 통합 2026-10-14] 슬롯별 스트림 해시 상시 + 단일 경로 등가
-        // 검사(--np-check K, 기본 64) — 측정 런이 곧 배치 불변성 판정. 해시는
-        // 빌드 간 A/B 대조용(경로 변경이 토큰을 바꾸면 해시 불일치).
         for &np in &nps {
             let mut toks: Vec<u32> = Vec::with_capacity(np);
             for s in 0..np {
@@ -411,8 +374,6 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     let l = eng
                         .prefill(s, &prompt[..64.min(max_pp)])
                         .map_err(|e| e.to_string())?;
-                    // 배치 스트림의 선행 토큰 = 프리필 그리디(루프 밖 소비) —
-                    // 단일 경로도 같은 토큰을 먹인 뒤의 출력과 비교(오프바이원 주의).
                     let mut next = llm170_core::qwen35::greedy(&l);
                     for (i, &bt) in stream.iter().take(k).enumerate() {
                         let single = eng.decode_greedy(s, next).map_err(|e| e.to_string())?;

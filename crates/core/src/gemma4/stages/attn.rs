@@ -1,18 +1,8 @@
-//! gemma4 어텐션 스테이지 — CPU 참조 (HF `Gemma4TextAttention` 미러).
-//!
-//! 계약(2026-10-14 HF 대조):
-//! - q = rope(q_norm(q_proj(h))) — QK 노름 = **학습가중** per-head RMS(+1 아님).
-//! - k = rope(k_norm(k_proj(h))) · v = **가중 없는** RMS(v_proj(h));
-//!   풀층(k_eq_v) = v_proj 없음 → v = v_norm(k_proj(h) **원시**).
-//! - 스케일 **1.0**(1/√d 없음)·출력 게이트 없음·q/k/v 캐시는 노름·rope 후 값.
-//! - 슬라이딩 층 마스크 = 자기 포함 창(`kv > q − sw`), 풀층 전역 causal.
 
 use super::super::{Model, ModelError, SeqState};
 use crate::matmul::cpu::matmul_batch;
 use crate::ops::{rms_norm, rms_norm_plain, rope_head_dim};
 
-/// 단일 헤드 어텐션 — q·k 내적(스케일 1.0) → exp_cr 소프트맥스 → Σp·v.
-/// `start` = 창 시작(포함) — 슬라이딩 마스크.
 #[allow(clippy::too_many_arguments)]
 fn attn_head(
     qh: &[f32],
@@ -85,7 +75,6 @@ pub(crate) fn attn_layer(
     let q_norm_w = model.f32_vec(&format!("blk.{il}.attn_q_norm.weight"))?;
     let k_norm_w = model.f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?;
 
-    // q·k·(v) 투영 — 전 토큰 배치.
     let mut q_all = vec![vec![0.0f32; n_head * hd]; n_tok];
     let mut k_all = vec![vec![0.0f32; n_kv * hd]; n_tok];
     matmul_batch(xs, &wq, &mut q_all);
@@ -108,7 +97,6 @@ pub(crate) fn attn_layer(
         for t in 0..t_len {
             let row = s * t_len + t;
             let pos = pos0 + t as u32;
-            // k·v 캐시 적립 — k는 노름+rope, v는 가중 없는 노름만.
             for h in 0..n_kv {
                 let src = &k_all[row][h * hd..h * hd + hd];
                 let mut kh = rms_norm(src, &k_norm_w, hp.eps);
@@ -123,7 +111,6 @@ pub(crate) fn attn_layer(
                 let vh = rms_norm_plain(vraw, hp.eps);
                 cache_v[b..b + hd].copy_from_slice(&vh);
             }
-            // q — 헤드별 노름+rope.
             let mut qh = vec![0.0f32; hd];
             let mut attn_out = std::mem::take(&mut attn_all[row]);
             let start = if sw == 0 {
@@ -151,7 +138,6 @@ pub(crate) fn attn_layer(
             attn_all[row] = attn_out;
         }
     }
-    // wo 프로젝션 — 전 토큰 배치 1회.
     matmul_batch(&attn_all, &wo, &mut out);
     Ok(out)
 }

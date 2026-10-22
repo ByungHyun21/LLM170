@@ -1,4 +1,3 @@
-//! gemma4 스테이지 — 어텐션·FFN(dense MLP + MoE 병렬).
 
 mod attn;
 mod ffn;

@@ -1,32 +1,8 @@
-//! [A-1] 스페큘러티브 디코딩 — 검증/롤백 호스트.
-//!
-//! 설계(llama.cpp §4.1 이식):
-//! - 초안: n-gram(core::spec) — 검증으로만 수용되므로 정확성 위험 없음.
-//! - 검증: t토큰 배치 체인 + 전 위치 argmax(chain_t all=true) — 가중 커널이
-//!   t행으로 상각되어 1토큰 비용에 가까움.
-//! - GDN 상태: [TreeWY 2.B 2026-10-12] gdn_wy_solve가 WY 표현(S_0·dc·G·k)
-//!   기록 — 부분 수용 시 gdn_wy_reconstruct가 상태를 재구성하고 conv 링은
-//!   dsnap_ring D2D로 복원(종전 토큰별 상태 스냅샷 dsnap 폐지 — 27B
-//!   1.50GiB→약 164MB, PoC fp32 |ΔS_m|≤1.2e-7 eval 클래스).
-//!   [dsave 대체 2026-10-14] 전량 거절(keep=0) 복원도 같은 재구성 클래스
-//!   (m=0 = S_0) + 라운드 전 conv 링 1벌(dring0 — 라운드 conv가 갱신 전
-//!   링 기록). 종전 dsave(slot×[f16 상태+스케일+링] — 27B/4슬롯 약
-//!   315MiB)는 프로브 전용 지연 할당으로 강등 — serve VRAM 회수분은 예약
-//!   재산정으로 컨텍스트에 환원.
-//! - KV/pos는 위치 카운터만 되감으면 됨(스테일 엔트리는 다음 쓰기가 덮음).
 
 use super::*;
 
 impl W4a16Dec {
-    /// [A-1] 스펙 검증 — t토큰(2..=8) 배치 체인 + 전 위치 그리디 토큰.
-    /// 상태(GDN 스냅샷 포함)·pos는 전진한다(수용 판정 후 롤백은 호출부).
     pub fn spec_verify(&mut self, slot: usize, rows: &[f32], t: usize) -> Result<Vec<u32>, String> {
-        // [다중슬롯 700 수정 2026-10-17] 컨텍스트 가드 — 종전 부재. CtxGuard는
-        // 이탈 시 진입 전 컨텍스트(최초 NULL 포함)를 복원하므로, 가드 없는
-        // 진입부는 가드 해제 직후의 NULL 창에서 실행될 수 있다(실측: slot1
-        // 검증 t=4 캡처가 cur=0x0로 진입 → instantiate CUresult=201 → 문맥
-        // 독 → 700 폭포/교착. forward_device_argmax 등 나머지 진입부는 기존
-        // 가드 보유 — 이 함수만 누락).
         let _g = self.cc.guard()?;
         if self.head_w == 0 {
             return Err("spec_verify: head 미등록".into());
@@ -37,15 +13,10 @@ impl W4a16Dec {
         if !(2..=8).contains(&t) {
             return Err(format!("spec_verify: t={t} 계약(2..=8)"));
         }
-        // [K6-3] KV 온디맨드 확보 — 검증 행 t(+슬랙 2행) 포함(그래프 경로 공통).
         {
             let pos0 = self.slot_pos[slot] as usize;
             self.kv_ensure(slot, pos0 + t + 2)?;
         }
-        // [A6-1 2026-10-11] 검증 체인 (slot,t) 그래프 캐시 — 런치 오버헤드 제거.
-        // 행은 핀드 고정 버퍼(캡처 h2d 소스 고정), pos는 replay 직전 그래프
-        // 밖 h2d(같은 스트림 순서). 미스 = 직접 발사(정답·호스트 갱신 포함)
-        // 후 캡처(미실행) — batch_capture 동형. 캡처 실패 시 영구 비활성.
         if self.graph.spec_graph_ok
             && !self.graph.pin_batch_in.is_null()
             && !self.graph.pin_pos.is_null()
@@ -55,7 +26,6 @@ impl W4a16Dec {
             if rows.len() != t * h {
                 return Err(format!("spec_verify: rows 계약 {}", rows.len()));
             }
-            // SAFETY: 핀드 스크래치는 self 소유(수명=self)·복사 크기 t*h*4.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     rows.as_ptr() as *const u8,
@@ -64,7 +34,6 @@ impl W4a16Dec {
                 );
             }
             let pos = self.slot_pos[slot];
-            // SAFETY: pin_pos = n_slots*4 핀드(그래프 경로 선행 할당).
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     pos.to_le_bytes().as_ptr(),
@@ -73,7 +42,6 @@ impl W4a16Dec {
                 );
             }
             let posb =
-                // SAFETY: self.pin_*는 pinned_alloc 소유(수명=self).
                 unsafe { std::slice::from_raw_parts(self.graph.pin_pos as *const u8, self.n_slots * 4) };
             self.cc.h2d_async(
                 self.attn.dpp + (slot as u64) * 4,
@@ -92,7 +60,6 @@ impl W4a16Dec {
                 self.slot_pos[slot] = pos + t as u32;
                 return Ok(toks);
             }
-            // SAFETY: 위 복사와 동일 범위(t*h f32) — 핀드 유효.
             let pin =
                 unsafe { std::slice::from_raw_parts(self.graph.pin_batch_in as *const f32, t * h) };
             let v = self.chain_t(slot, pin, t, false, true, false, false)?;
@@ -120,8 +87,6 @@ impl W4a16Dec {
             match cap {
                 Ok((e, g)) => self.graph.spec_graphs.push(((slot, t), e, g)),
                 Err(err) => {
-                    // [디버그 2026-10-17] 종전 무조건 삼킴 — 다중슬롯 크래시의
-                    // 첫 발화 지점(700 폭포의 원천) 노출.
                     eprintln!("[spec-capture 실패] slot={slot} t={t}: {err}");
                     self.graph.spec_graph_ok = false;
                     self.cc.sync().ok();
@@ -133,16 +98,12 @@ impl W4a16Dec {
         Ok(v.into_iter().map(|x| x as u32).collect())
     }
 
-    /// [§7 2단계 2026-10-11] 검증 체인 + [t][vocab] 로짓 회수 — 비greedy
-    /// 거절샘플링용(eval logits 경로 재사용). 상태·pos는 전진(호출부 롤백).
     pub fn spec_verify_logits(
         &mut self,
         slot: usize,
         rows: &[f32],
         t: usize,
     ) -> Result<Vec<f32>, String> {
-        // [다중슬롯 700 수정 2026-10-17] 컨텍스트 가드 — spec_verify 누락과 동일
-        // 계급(가드 해제 직후 NULL 창 진입 방지 — 일괄 보강).
         let _g = self.cc.guard()?;
         if self.head_w == 0 {
             return Err("spec_verify_logits: head 미등록".into());
@@ -156,21 +117,7 @@ impl W4a16Dec {
         self.chain_t(slot, rows, t, false, true, true, false)
     }
 
-    /// [A-1→TreeWY 2.B 2026-10-12] 롤백 — 배치 `keep`개 토큰 처리 시점 상태로
-    /// 슬롯 GDN 상태·conv 링 복원. 상태는 WY 재구성
-    /// (S_keep = exp(G_{keep-1})·S_0 + Σ_{j≤keep-1} exp(G_{keep-1}−G_j)·
-    /// k_j·dc_j^T — gdn_wy_reconstruct 런치, 종전 dsnap[keep-1] D2D 대체),
-    /// conv 링은 dsnap_ring D2D(keep≥1)·dring0(keep=0 — 라운드 전 1벌).
-    /// pos 되감기는 spec_rewind_pos 소관.
-    /// [dsave 대체 2026-10-14] keep=0 = **라운드 전 상태 복원**(m=0 재구성 =
-    /// S_0, 감쇠 없음) + dring0(라운드 conv가 갱신 전 링을 기록). 종전
-    /// spec_load_state(dsave 516MiB급 스크래치) 경로 대체 — 수치 클래스는
-    /// keep≥1 재구성과 동일(eval — f16 반올림 경유, PoC ΔS≤1.2e-7급).
-    /// [결함수정 2026-10-11 계약 승계] 상태·링 모두 GDN 서수(n_gdn)
-    /// 스트라이드 — 모델 층(n_layers) 아님.
     pub fn spec_rollback(&mut self, slot: usize, keep: usize) -> Result<(), String> {
-        // [다중슬롯 700 수정 2026-10-17] 컨텍스트 가드 — spec_verify 누락과 동일
-        // 계급(가드 해제 직후 NULL 창 진입 방지 — 일괄 보강).
         let _g = self.cc.guard()?;
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         if !self.spec_on || keep > 8 {
@@ -183,19 +130,11 @@ impl W4a16Dec {
             return Err("spec_rollback: 링 스냅샷 미확보(enable_spec)".into());
         }
         let _g = self.cc.guard()?;
-        // [결함수정 2026-10-17] 스케일 슬롯 기저 — 종전 st_slot(상태 ×128²)을
-        // dsc에 그대로 곱해 슬롯≥1 재구성이 dsc +144MiB를 읽었다(실측: kv 8G
-        // C≥4 serve 700 — compute-sanitizer gdn_wy_reconstruct sc 로드 4B OOB·
-        // 최초 발화점, 1G는 우연 매핑으로 침묵 오염 — gdn.rs 10-13과 동형).
-        // 슬롯0만 정확 → 단일 슬롯 골든·스모크 통과. 파생 = 단일 출처.
         let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dm, slot);
         let ring_slot = slot * dm.n_gdn * 3 * dm.conv_ch();
         let ring_elems = (3 * dm.conv_ch()) as u64;
         let f = self.cc.function("gdn_wy_reconstruct")?;
         for gi in 0..dm.n_gdn {
-            // [TreeWY] 상태 재구성 — 스냅샷 복사 대신 S_0+dc+G+k에서 조립
-            // (keep=0은 m=0 — S_0만). st는 슬롯 베이스(커널이 layer 오프셋을
-            // 더한다 — spec_scan 계약).
             let (mut w0, mut w1, mut w2, mut w3) = (
                 self.gdn.dwy_k,
                 self.gdn.dwy_s0,
@@ -221,7 +160,6 @@ impl W4a16Dec {
                     &mut hv, &mut dd, &mut lay,
                 ),
             )?;
-            // [행-스케일] 재구성 직후 스케일 정규화.
             self.gdn_rescale_slot(slot, gi)?;
             let rsrc = if keep == 0 {
                 self.gdn.dring0 + gi as u64 * ring_elems * 4
@@ -234,17 +172,12 @@ impl W4a16Dec {
         Ok(())
     }
 
-    /// [A-1] D2D 복사(커널) — 롤백 전용. cuMemcpyDtoDAsync가 드라이버
-    /// 세그폴트(초유일 사용 경로 — 실측 백트레이스)라 커널 복사로 대체.
     pub(super) fn copy_dev(
         &self,
         dst: CUdeviceptr,
         src: CUdeviceptr,
         bytes: u64,
     ) -> Result<(), String> {
-        // [2026-10-12] 컨텍스트 가드 — 스케줄 스레드 등 비-로드 스레드에서
-        // 무가드 런치는 invalid device context(201)로 죽는다(실측: 스트리밍
-        // 서브 스펙 라운드).
         let _g = self.cc.guard()?;
         let f = self.cc.function("w4a16_copy")?;
         let n4 = (bytes / 16) as i64;
@@ -258,17 +191,14 @@ impl W4a16Dec {
         )
     }
 
-    /// [A-1 진단] spec scan 커널 토글(교차 대조용).
     pub fn spec_set_scan(&mut self, on: bool) {
         self.spec_scan_on = on;
     }
 
-    /// [TreeWY 2.B 진단] GDN h_v — 프로브의 상태 덤프 인덱스 해석용.
     pub fn spec_hv(&self) -> usize {
         self.gdn.gdn.map(|d| d.h_v).unwrap_or(0)
     }
 
-    /// [A-1 진단] GDN 출력(o_lc) 덤프 — 마지막 GDN 층 값.
     pub fn spec_dump_outv(&mut self, n: usize) -> Result<Vec<f32>, String> {
         let mut b = vec![0u8; n * 4];
         self.cc.d2h(&mut b, self.gdn.dgo)?;
@@ -280,12 +210,9 @@ impl W4a16Dec {
             .collect())
     }
 
-    /// [A-1 진단] 슬롯 GDN 상태 덤프(d2h) — trio vs spec scan 대조용.
     pub fn spec_dump_state(&mut self, slot: usize) -> Result<Vec<f32>, String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         let (st_slot, _) = super::gdn::gdn_state_offsets(&dm, slot);
-        // [행-스케일] f16 원시값 디코드 — 스케일 미적용(경로 대조용: 양 경로가
-        // 같은 스케일 계열을 쓰므로 비교 성립). 절대값 해석이 필요하면 ×sc.
         let bytes = dm.n_gdn * dm.h_v * dm.d * dm.d * 2;
         let mut b = vec![0u8; bytes];
         self.cc.d2h(&mut b, self.gdn.dgst + st_slot as u64 * 2)?;
@@ -297,30 +224,21 @@ impl W4a16Dec {
             .collect())
     }
 
-    /// [A2→K3 2026-10-12] 접두 재사용 체크포인트 — 슬롯 GDN 상태+conv 링
-    /// 저장 + 위치 기억. **512 경계마다** 호출 — 환형 스택 4개
-    /// (512/1024/1536/2048 — k=(pos/512-1)%4)에 최근 4경계 유지.
-    /// 값은 순수 복사(산술 불변).
     pub fn checkpoint_gdn(&mut self, slot: usize, pos: u32) -> Result<(), String> {
         if self.gdn.dchk.is_null() || slot >= self.gdn.dchk_pos.len() || !pos.is_multiple_of(512) {
             return Ok(());
         }
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
-        // [2026-10-16] FLOP-aware 퇴거 — 가치 = (누적 절약 토큰, 최근 사용 틱)
-        // 최소 슬롯을 덮는다(체크포인트당 바이트 동일 → 메모리 항은 상수).
-        // 히트 0이면 최근성만 남아 종전 환형(최근 4경계) 순서와 동일 선택.
         let k = Self::ckpt_victim(&self.gdn.dchk_saved[slot], &self.gdn.dchk_use[slot]);
         self.gdn.dchk_tick += 1;
         let tick = self.gdn.dchk_tick;
         let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dm, slot);
-        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
-        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
+        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64;
+        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64;
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
         let per = st_bytes + sc_bytes + ring_bytes;
         let off = ((slot as u64 * 4 + k as u64) * per) as isize;
-        // SAFETY: dchk = pinned_alloc(4·slots·per) — (slot,k)는 위 가드가 보장,
-        // 오프셋 합계 ≤ 할당. 호스트는 이 영역을 직접 읽지 않는다(복원=h2d).
         unsafe {
             let base = self.gdn.dchk as *mut u8;
             self.cc.d2h_async(
@@ -341,17 +259,11 @@ impl W4a16Dec {
         }
         self.gdn.dchk_pos[slot][k] = pos;
         self.gdn.dchk_use[slot][k] = tick;
-        // [2026-10-16] 새 체크포인트는 절약 0에서 시작 — 퇴거된 것의 누적 절약
-        // (dchk_saved)을 승계하면 세대 간 가치가 누적돼 FLOP-aware 퇴거가 최근성
-        // 순으로 퇴화한다(정확성 정본은 dchk_pos — 무영향).
         self.gdn.dchk_saved[slot][k] = 0;
-        // [§3.4 ② 2026-10-12] 사용 갱신 — 512경계 기록 시점 recency 리셋.
         self.ucache.touch("spec:ckpt")?;
         Ok(())
     }
 
-    /// [2026-10-16] 체크포인트 퇴거 슬롯(순수) — 가치 (절약 토큰, 최근 사용
-    /// 틱) 최소. 전량 0(최초)이면 슬롯 0(환형 시작과 동일).
     pub(super) fn ckpt_victim(saved: &[u32; 4], use_tick: &[u64; 4]) -> usize {
         let mut best = 0usize;
         for s in 1..4 {
@@ -362,7 +274,6 @@ impl W4a16Dec {
         best
     }
 
-    /// [K3] upto 이하 최대 체크포인트 경계 선택(0 = 없음).
     fn ck_pick(&self, slot: usize, upto: u32) -> u32 {
         let mut best = 0u32;
         if let Some(ks) = self.gdn.dchk_pos.get(slot) {
@@ -375,30 +286,23 @@ impl W4a16Dec {
         best
     }
 
-    /// [A2→K3] 체크포인트 복원 — upto 이하 최대 경계의 상태+링을 슬롯으로
-    /// 되돌리고 pos를 해당 위치로(절대 설정). 반환 = 복원 위치(0 = 없음).
     pub fn restore_gdn(&mut self, slot: usize, upto: u32) -> Result<u32, String> {
         let pos = self.ck_pick(slot, upto);
         if self.gdn.dchk.is_null() || pos == 0 {
             return Ok(0);
         }
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
-        // [2026-10-16] 저장 슬롯 = 위치 조회(퇴거가 가치 기반이라 환형 인덱스
-        // 공식이 성립하지 않는다 — 저장 시 dchk_pos가 정본).
         let Some(k) = self.gdn.dchk_pos[slot].iter().position(|&p| p == pos) else {
             return Ok(0);
         };
         let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dm, slot);
-        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
-        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
+        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64;
+        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64;
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
         let per = st_bytes + sc_bytes + ring_bytes;
         let off = ((slot as u64 * 4 + k as u64) * per) as isize;
         let total = (st_bytes + sc_bytes + ring_bytes) as usize;
-        // SAFETY: dchk = pinned_alloc(4·slots·per) 소유 — 위 가드(pos>0)가
-        // 기록 완료를 보장. h2d_async는 이 슬라이스를 즉시 읽지 않고 스트림이
-        // 순서대로 소비(핀드라 비동기 성립).
         let host =
             unsafe { std::slice::from_raw_parts((self.gdn.dchk as *const u8).offset(off), total) };
         self.cc.h2d_async(
@@ -415,28 +319,18 @@ impl W4a16Dec {
         )?;
         self.slot_pos[slot] = pos;
         self.attn_set_pos(slot, pos)?;
-        // [2026-10-16] FLOP 회계 — 이 복원이 면제한 재계산 토큰(upto−pos) 가산 +
-        // 최근성 갱신(퇴거 가치 입력 — 가치 높은 체크포인트 보호).
         self.gdn.dchk_saved[slot][k] =
             self.gdn.dchk_saved[slot][k].saturating_add(upto.saturating_sub(pos));
         self.gdn.dchk_tick += 1;
         self.gdn.dchk_use[slot][k] = self.gdn.dchk_tick;
-        // [§3.4 ②] 사용 갱신 — 접두 히트(재사용 성립) 시점.
         self.ucache.touch("spec:ckpt")?;
         Ok(pos)
     }
 
-    /// [A2→K3] 체크포인트 위치 — upto 이하 최대(0 = 없음).
     pub fn checkpoint_pos(&self, slot: usize, upto: u32) -> u32 {
         self.ck_pick(slot, upto)
     }
 
-    /// [A-1 진단 → 프로브 전용 2026-10-14] 슬롯 상태 저장/복원(전 층·헤드).
-    /// 프로덕션 롤백은 WY 재구성(spec_rollback) 단일 경로 — 이 dsave 정밀
-    /// 스냅샷은 **프로브(--spec-check)의 대조 실험**(라운드 전 상태로 정확
-    /// 복원)에서만 필요하므로 **지연 할당**한다(serve 경로 VRAM 무증가.
-    /// 회계 미등록 — 프로브 수명 한정, ucache 퇴거 시 sweep이 해제).
-    /// [행-스케일] 상태 f16(×2) + 스케일 f32(×4) + conv 링 f32(×4).
     pub fn spec_save_state(&mut self, slot: usize) -> Result<(), String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         if self.gdn.dsave == 0 {
@@ -446,8 +340,8 @@ impl W4a16Dec {
             self.gdn.dsave = self.cc.alloc(self.n_slots * per)?;
         }
         let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dm, slot);
-        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
-        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
+        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64;
+        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64;
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
         self.copy_dev(self.gdn.dsave, self.gdn.dgst + st_slot as u64 * 2, st_bytes)?;
@@ -461,21 +355,17 @@ impl W4a16Dec {
             self.gdn.dring + ring_slot * 4,
             ring_bytes,
         )?;
-        // [§3.4 ②] 사용 갱신 — 스펙 라운드 저장 시점.
         self.ucache.touch("spec:state")
     }
 
-    /// [A-1 진단 → 프로브 전용 2026-10-14] 저장 상태 복원(프로브 대조 실험용
-    /// — 프로덕션 롤백은 spec_rollback). spec_save_state가 지연 할당한
-    /// dsave 필요.
     pub fn spec_load_state(&mut self, slot: usize) -> Result<(), String> {
         let dm = self.gdn.gdn.ok_or("GDN: 형상 미등록")?;
         if self.gdn.dsave == 0 {
             return Err("spec_load_state: 저장본 없음(spec_save_state 미호출)".into());
         }
         let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dm, slot);
-        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64; // f16 상태
-        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64; // 행별 스케일
+        let st_bytes = (dm.n_gdn * dm.h_v * dm.d * dm.d * 2) as u64;
+        let sc_bytes = (dm.n_gdn * dm.h_v * dm.d * 4) as u64;
         let ring_slot = (slot * dm.n_gdn * 3 * dm.conv_ch()) as u64;
         let ring_bytes = (dm.n_gdn * 3 * dm.conv_ch() * 4) as u64;
         self.copy_dev(self.gdn.dgst + st_slot as u64 * 2, self.gdn.dsave, st_bytes)?;
@@ -489,12 +379,9 @@ impl W4a16Dec {
             self.gdn.dsave + st_bytes + sc_bytes,
             ring_bytes,
         )?;
-        // [§3.4 ②] 사용 갱신 — 복원(수용/롤백) 시점.
         self.ucache.touch("spec:state")
     }
 
-    /// [A-1] pos 되감기 — slot_pos/attn pos를 n만큼 되돌린다(스테일 KV는
-    /// 다음 쓰기가 덮는다).
     pub fn spec_rewind_pos(&mut self, slot: usize, n: u32) -> Result<(), String> {
         let p = self.slot_pos[slot].saturating_sub(n);
         self.slot_pos[slot] = p;

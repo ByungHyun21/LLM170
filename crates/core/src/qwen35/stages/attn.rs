@@ -1,4 +1,3 @@
-//! Full-attention층 스테이지 — CPU 참조 경로.
 
 use super::super::{ModelError, SeqState, span_block};
 use super::Ctx;
@@ -6,8 +5,6 @@ use crate::ops::{rms_norm, rope_head, sigmoid};
 use crate::qwen35::{mm_batch, mm_group};
 use llm170_diag::profile_span;
 
-/// qwen35 단일 헤드 어텐션 — 점수→exp_cr 소프트맥스→가중합→게이트(D2).
-/// 연산 순서·exp 선택(exp_cr) 불변.
 #[allow(clippy::too_many_arguments)]
 fn attn_head(
     qh: &[f32],
@@ -79,7 +76,6 @@ pub(crate) fn attn_layer(
     if il == 3 && llm170_diag::dump::opts().key("debug_layers") {
         crate::qwen35::diag::a3_normed(&xs[0]);
     }
-    // q·k·v 동일 입력 xs — 1그룹 배치
     let mut group: [Vec<Vec<f32>>; 3] = [
         vec![vec![0.0f32; wq.n_out as usize]; n_tok],
         vec![vec![0.0f32; wk.n_out as usize]; n_tok],
@@ -152,7 +148,6 @@ pub(crate) fn attn_layer(
             attn_all[row] = attn_out;
         }
     }
-    // wo 프로젝션 — 전 토큰 배치 1회
     {
         span_block!("cpu::attn_wo", {
             mm_batch(&attn_all, &wo, &mut out);

@@ -1,25 +1,11 @@
 #!/usr/bin/env python3
-# [테스트 재설계 2026-10-22] 합성 tiny W4A16 모델 생성기 — CPU↔GPU 같은 실행 등가
-# 테스트의 고정 재료. 시드 고정 랜덤 가중치(splitmix64 계열 LCG) — 재현 보장.
-#
-# 사용: scripts/gen_tiny_w4a16.py [출력루트=target/tiny-fixtures]
-# 생성: <root>/tiny-dense (qwen35 dense g128, 4층: GDN 3 + attn 1)
-#       <root>/tiny-moe   (qwen35 MoE g32 전문가 8·top2, 어텐션/GDN 플레인 bf16)
-#
-# 형상 계약(실모델 헤더 실측 + hparams.rs 공식):
-#   d_state=linear_key_head_dim, dt_rank=linear_num_value_heads,
-#   d_inner=nv·lkhd, conv_ch=d_inner+2·nk·lkhd, n_group=nk
-#   in_proj_qkv n=conv_ch, in_proj_z n=d_inner, out_proj (hidden, d_inner)
-#   linear_attn.norm.weight=[d_state], A_log/dt_bias/in_proj_a/b=[dt_rank]
-#   GDN 순열 정렬: (conv_ch−2·nk·lkhd)%128==0, z n%128==0, out k%128==0
-#   니블 lsb-first, zp=8, 그룹 g128(dense)/g32(MoE 전문가), 스케일 bf16
 import json, struct, sys, os
 
 def lcg(seed):
     x = seed & ((1 << 64) - 1)
     while True:
         x = (x * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
-        yield ((x >> 11) / float(1 << 53)) - 0.5  # [-0.5, 0.5)
+        yield ((x >> 11) / float(1 << 53)) - 0.5
 
 def f16(v):
     import struct as s
@@ -27,7 +13,7 @@ def f16(v):
 
 def bf16(v):
     b = struct.pack('<f', v)
-    return b[2:] + b[3:] if False else bytes([b[2], b[3]])  # 상위 16비트 절단
+    return b[2:] + b[3:] if False else bytes([b[2], b[3]])
 
 class St:
     def __init__(self):
@@ -40,10 +26,8 @@ class St:
         vals = [next(gen) * scale for _ in range(n)]
         self.add(name, 'BF16', shape, b''.join(bf16(v) for v in vals))
     def triple(self, name, n, k, gen, group, sigma=0.05):
-        # [GPU 커널 계약] g128=F16 스케일(27B형) · g32=BF16(35B형) — 실측 헤더.
         spack = (lambda v: f16(v)) if group == 128 else bf16
         sdt = 'F16' if group == 128 else 'BF16'
-        # W ~ N(0, sigma) 근사(LCG uniform 합) → 대칭 int4 그룹 양자화.
         import math
         ng = k // group
         packed = bytearray()
@@ -107,7 +91,6 @@ def base_cfg(arch):
                 "quantization_config": qc}}
 
 def gdn_layer(st, p, g, quant, group):
-    # 트리플(양자화) 또는 플레인 bf16 — MoE 모델은 어텐션/GDN 투영 플레인.
     def lin(name, n, k, sigma=0.05):
         if quant: st.triple(p + name, n, k, g, group, sigma)
         else: st.bf16(p + name + '.weight', [n, k], g, sigma)
@@ -115,19 +98,19 @@ def gdn_layer(st, p, g, quant, group):
     lin('linear_attn.in_proj_z', D_INNER, H)
     lin('linear_attn.out_proj', H, D_INNER)
     st.bf16(p + 'linear_attn.norm.weight', [LKHD], g, 0.1)
-    st.bf16(p + 'linear_attn.A_log', [NV], g, -1.0)   # ssm_a=−exp(A_log) 안정(음수)
+    st.bf16(p + 'linear_attn.A_log', [NV], g, -1.0)
     st.bf16(p + 'linear_attn.dt_bias', [NV], g, 0.1)
     st.bf16(p + 'linear_attn.in_proj_a.weight', [NV, H], g, 0.05)
     st.bf16(p + 'linear_attn.in_proj_b.weight', [NV, H], g, 0.05)
     st.bf16(p + 'linear_attn.conv1d.weight', [CONV_CH, 1, 4], g, 0.05)
-    st.bf16(p + 'input_layernorm.weight', [H], g, 0.1)      # HF 규약 w−1 → 엔진 +1
+    st.bf16(p + 'input_layernorm.weight', [H], g, 0.1)
     st.bf16(p + 'post_attention_layernorm.weight', [H], g, 0.1)
 
 def attn_layer(st, p, g, quant, group):
     def lin(name, n, k, sigma=0.05):
         if quant: st.triple(p + name, n, k, g, group, sigma)
         else: st.bf16(p + name + '.weight', [n, k], g, sigma)
-    lin('self_attn.q_proj', HEADS * 2 * HD, H)  # 헤드별 q+gate 교차(attn.rs:130)
+    lin('self_attn.q_proj', HEADS * 2 * HD, H)
     lin('self_attn.k_proj', KV * HD, H)
     lin('self_attn.v_proj', KV * HD, H)
     lin('self_attn.o_proj', H, HEADS * HD)
@@ -140,7 +123,7 @@ def build(root, name, moe):
     st, g = St(), lcg(0x7149_4901)
     arch = 'Qwen3_5MoeForConditionalGeneration' if moe else 'Qwen3_5ForConditionalGeneration'
     cfg = base_cfg(arch)
-    quant_dense = not moe  # MoE 모델의 dense 투영은 플레인(실측 35B 계약)
+    quant_dense = not moe
     if moe:
         tc = cfg['text_config']
         tc.pop('intermediate_size')
@@ -150,7 +133,7 @@ def build(root, name, moe):
         tc['quantization_config']['config_groups']['group_0']['weights']['group_size'] = 32
     for il in range(L):
         p = 'model.language_model.layers.%d.' % il
-        if (il + 1) % 4 == 0:  # full attention
+        if (il + 1) % 4 == 0:
             attn_layer(st, p, g, quant_dense, 128)
         else:
             gdn_layer(st, p, g, quant_dense, 128)

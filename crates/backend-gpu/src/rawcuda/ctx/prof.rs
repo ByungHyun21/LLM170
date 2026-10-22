@@ -1,10 +1,8 @@
 use super::*;
 
 impl CudaCtx {
-    /// 이벤트 생성(진단 타이머).
     pub fn event_create(&self) -> Result<ffi::CUevent, String> {
         let mut ev: ffi::CUevent = std::ptr::null_mut();
-        // SAFETY: 초기화 경로(단일 스레드) — 출력 포인터는 스택 로컬.
         let r = unsafe { (self.drv.event_create)(&mut ev, 0) };
         if r != CUDA_SUCCESS {
             return Err(format!("rawcuda: cuEventCreate: {}", ffi::err_text(r)));
@@ -12,11 +10,8 @@ impl CudaCtx {
         Ok(ev)
     }
 
-    /// [B3] 비타이밍 이벤트 생성 — 그래프 캡처에 허용되는 플래그
-    /// (CU_EVENT_DISABLE_TIMING=2; 타이밍 이벤트는 캡처 금지).
     pub fn event_create_nt(&self) -> Result<ffi::CUevent, String> {
         let mut ev: ffi::CUevent = std::ptr::null_mut();
-        // SAFETY: 초기화 경로(단일 스레드) — 출력 포인터는 스택 로컬.
         let r = unsafe { (self.drv.event_create)(&mut ev, 2) };
         if r != CUDA_SUCCESS {
             return Err(format!("rawcuda: cuEventCreate(nt): {}", ffi::err_text(r)));
@@ -24,11 +19,8 @@ impl CudaCtx {
         Ok(ev)
     }
 
-    /// [B3] 임의 스트림에 이벤트 기록(포크/조인).
-    /// clippy allow — launch와 동일 판정(불투명 핸들).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn event_record_on(&self, ev: ffi::CUevent, s: ffi::CUstream) -> Result<(), String> {
-        // SAFETY: ev/s는 본 모듈 산출 핸들(호출자 수명 계약).
         let r = unsafe { (self.drv.event_record)(ev, s) };
         if r != CUDA_SUCCESS {
             return Err(format!("rawcuda: cuEventRecord: {}", ffi::err_text(r)));
@@ -36,10 +28,8 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// clippy allow — launch와 동일 판정(불투명 핸들).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn event_record(&self, ev: ffi::CUevent) -> Result<(), String> {
-        // SAFETY: ev는 event_create 산출 핸들(호출자 수명 계약).
         let r = unsafe { (self.drv.event_record)(ev, self.stream) };
         if r != CUDA_SUCCESS {
             return Err(format!("rawcuda: cuEventRecord: {}", ffi::err_text(r)));
@@ -47,21 +37,15 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// clippy allow — launch와 동일 판정(불투명 핸들).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn event_destroy(&self, ev: ffi::CUevent) {
-        // SAFETY: ev는 본 모듈이 만든 핸들 — 파괴 후 재사용 금지(호출자 계약).
         unsafe {
             let _ = (self.drv.event_destroy)(ev);
         }
     }
 
-    /// 이벤트 완료까지 CPU 대기 — 핀드 링의 버퍼별 재사용 담보(전체-스트림
-    /// sync와 달리 다른 버퍼의 DMA는 계속 진행 — 파이프라인 버블 제거).
-    /// clippy allow — launch와 동일 판정(불투명 핸들).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn event_sync(&self, ev: ffi::CUevent) -> Result<(), String> {
-        // SAFETY: ev는 본 모듈이 만든 핸들(호출자 수명 계약).
         let r = unsafe { (self.drv.event_synchronize)(ev) };
         if r != CUDA_SUCCESS {
             return Err(format!("rawcuda: cuEventSynchronize: {}", ffi::err_text(r)));
@@ -69,8 +53,6 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// 커널 발사 직전 훅 — 함수 포인터를 심볼명(역상)으로 찾아 범주와 함께
-    /// 이벤트를 남긴다. fns는 ~40항목이라 런치당 선형탐색이 저렴하다.
     pub fn prof_mark(&self, f: CUfunction) {
         if !self.prof.on || self.prof.capturing.get() {
             return;
@@ -90,15 +72,12 @@ impl CudaCtx {
         self.prof.cats.borrow_mut().push(prof_cat(name));
     }
 
-    /// 범주별 합산 리포트(ms/토큰, %). 호출 전 sync 권장 — 여기서 마지막
-    /// 센티넬 이벤트를 기록하고 sync한다. 이벤트는 파괴 후 비운다.
     pub fn prof_report(&self, label: &str) -> Result<String, String> {
         if !self.prof.on {
             return Ok(String::new());
         }
         let sentinel = self.event_create()?;
         self.event_record(sentinel)?;
-        // SAFETY: 스트림 완료 대기(동기 호출 — 계약: 단일 스레드 사용).
         let r = unsafe { (self.drv.stream_synchronize)(self.stream) };
         if r != CUDA_SUCCESS {
             return Err(format!("rawcuda: prof sync: {}", ffi::err_text(r)));
@@ -115,7 +94,6 @@ impl CudaCtx {
                 sentinel
             };
             let mut ms = 0f32;
-            // SAFETY: 두 이벤트 모두 기록 완료(sync 후) — elapsed 유효.
             let r = unsafe { (self.drv.event_elapsed)(&mut ms, a, b) };
             if r == CUDA_SUCCESS {
                 acc[cats[i]] += ms as f64;

@@ -1,38 +1,16 @@
-// FN(Qwen3.8-Flash-Next) 전용 커널 — M1 프리필 체인(w4a16_dec/fnchain.rs).
-// [빌드 계약] -fmad=false(sm_80) — gdn/attn/ew와 동일 노선. 신규 산술
-// (HC·PLE)은 vLLM 0.31 참조구현(qwen4_exp common/nvidia ops)과 수식 1:1,
-// 정밀도 클래스는 체인 f32(모듈 계약 — 골든 판정은 M2 토큰 대조).
-// gptq4.cu는 바이트동결이라 전문가 g128 GEMV 행본체를 여기에 자체 포함
-// (산술 순서 = gptq4.cu gemv_row_body<7,false> 미러).
-#include <cuda_fp16.h> // gdn_gate_sig의 f16 미러 기록(gdn.cu와 동일 계약)
-#include "g4_common.cuh" // h2f/f2h/b2f/shfl_down_f64 — 공용 헬퍼(단일 정의)
+#include <cuda_fp16.h>
+#include "g4_common.cuh"
 
-// ── hyper-connection(Gated Residual) ─────────────────────────────────────
-// 수식 출처: vllm/models/qwen4_exp/common/hyperconnection.py + nvidia/ops/hc.py
-//  · mix:    xn = GroupedGemmaRMSNorm(R)[스트림별 RMS·(1+w)] (hc_norm)
-//  · gate   = σ(W_up · silu(W_down·xn / hc) / 1) — silu 인자가 /hc(4)
-//  · block  = mean_s( σ(gate)_s ⊙ xn_s )
-//  · inject = 2σ(W_inj·xn / hc) — 쓰기 R'_s = R_s + y·inj_s
-// 최종 mixer = 노름+mix만(use_combine=False).
 
-// R 초기화 — 임베딩 행 [t][2560]을 4스트림으로 복제 → R [t][10240].
-// grid = ceil(n/256), n = t*10240.
 extern "C" __global__ void fn_hc_init(const float* __restrict__ emb,
                                       float* __restrict__ r, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const int hh = 10240; // hc_count(4) * hidden(2560) — FN 고정(커널 전용)
-    // [fix 2026-10-20] 스트림 복제 — (i%hh)는 10240 전역이라 2560으로 접어
-    // 읽는다(종전 식은 스트림≥1에서 다음 토큰 임베딩을 읽었다 — init 지문
-    // 0.0938≠0.0432 발산의 원인).
+    const int hh = 10240;
     r[i] = emb[(i / hh) * 2560 + (i % hh) % 2560];
 }
 
-// 그룹 GemmaRMSNorm — R [t][10240] → xn [t][10240]. w = 해당 HC 모듈의
-// hc_norm 행 포인터(호스트가 행 오프셋을 인자로 조립). 스트림별(2560)
-// RMS 환원 — y = x·rrms; y += y·w(참조 커널의 FMA 형태 — fmad=false로
-// 2반올림). grid = t, 블록 256(스트림 순차 4회).
 extern "C" __global__ void fn_hc_norm(const float* __restrict__ r,
                                       const float* __restrict__ w,
                                       float* __restrict__ xn, int t, float eps)
@@ -45,7 +23,7 @@ extern "C" __global__ void fn_hc_norm(const float* __restrict__ r,
         const float* x = r + (size_t)tt * 10240 + s * 2560;
         float v = 0.0f;
         #pragma unroll
-        for (int j = 0; j < 10; ++j) { // 256레인 × 10 = 2560
+        for (int j = 0; j < 10; ++j) {
             const float e = x[tid + j * 256];
             v += e * e;
         }
@@ -62,28 +40,21 @@ extern "C" __global__ void fn_hc_norm(const float* __restrict__ r,
         for (int j = 0; j < 10; ++j) {
             const int i = tid + j * 256;
             const float y = x[i] * rrms;
-            // [fix 2026-10-21] w는 업로드에서 이미 +1 합성(Gemma 관례 —
-            // 업로드 +1·커널 평범 곱). 종전 y+y·w는 이중 +1(raw+2)이었다
-            // — hc-check 실측: xn 원소비가 (raw+2)/(raw+1)과 정확 일치.
             o[i] = y * wr[i];
         }
         __syncthreads();
     }
 }
 
-// silu(x/hc) — 저랭크 게이트 전활성. lora [t][320] 원소별.
-// grid = ceil(n/256).
 extern "C" __global__ void fn_hc_silu(const float* __restrict__ x,
                                       float* __restrict__ y, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float u = x[i] * 0.25f; // /hc_count(4) — 참조 _hc_silu_kernel
+    const float u = x[i] * 0.25f;
     y[i] = u / (1.0f + __expf(-u));
 }
 
-// 게이트 믹스 — x[t][2560] = Σ_s σ(g_s)·xn_s / 4 (g = W_up 출력 [t][10240]).
-// grid = (t, 2560/256).
 extern "C" __global__ void fn_hc_mix(const float* __restrict__ xn,
                                      const float* __restrict__ g,
                                      float* __restrict__ x, int t)
@@ -102,8 +73,6 @@ extern "C" __global__ void fn_hc_mix(const float* __restrict__ xn,
     x[(size_t)tt * 2560 + i] = acc * 0.25f;
 }
 
-// HC 쓰기 — R[t][s·2560+i] += y[t][i]·2σ(inj[t·4+s]/4). inj = W_inject·xn
-// 원시 출력 [t][4]. grid = (t, 4).
 extern "C" __global__ void fn_hc_write(float* __restrict__ r,
                                        const float* __restrict__ y,
                                        const float* __restrict__ inj, int t)
@@ -111,9 +80,6 @@ extern "C" __global__ void fn_hc_write(float* __restrict__ r,
     const int tt = blockIdx.x;
     if (tt >= t) return;
     const int s = blockIdx.y;
-    // [fix 2026-10-21] 스트라이드 루프 — 블록 256스레드가 2560원소 전부를
-    // 덮는다(종전 i=threadIdx.x 단발은 선두 256원소만 기록: r' 덤프 실측
-    // 원소 256번부터 전량 불일치 — 어텐션/MLP 양쪽 쓰기가 모두 부분 기록).
     const float u = inj[tt * 4 + s] * 0.25f;
     const float sc = 2.0f / (1.0f + __expf(-u));
     for (int i = threadIdx.x; i < 2560; i += blockDim.x) {
@@ -121,16 +87,7 @@ extern "C" __global__ void fn_hc_write(float* __restrict__ r,
     }
 }
 
-// ── PLE(position-learning enhancement) ───────────────────────────────────
-// 수식 출처: vllm qwen4_exp common/ops/ple.py(_ple_gate_kernel·_ple_conv_kernel)
-// · key/value = kv_proj(emb) — key [t][10240](스트림별), value [t][2560](공유)
-// · per (t, s): k_n = RMS(key_s)·(1+nk_s) · q_n = RMS(R_s)·(1+nq_s)
-//   d = ⟨k_n, q_n⟩/√2560 · g = σ(sign(d)·√max(|d|, 1e-6)) · gated_s = g·v
-//   normed_s = RMS(gated_s)·(1+nc_s)
-// · conv: depthwise k4 dil3 — out tap t−{0,3,6,9}, silu, R += gated + silu(conv)
 
-// 게이트 — grid = (t, 4), 블록 256. 노름 가중 nk/nq/nc = [10240] 원본
-// 레이아웃 그대로(스트림 오프셋 s*2560로 인덱싱).
 extern "C" __global__ void fn_ple_gate(const float* __restrict__ key,
                                        const float* __restrict__ val,
                                        const float* __restrict__ r,
@@ -146,13 +103,9 @@ extern "C" __global__ void fn_ple_gate(const float* __restrict__ key,
     const int s = blockIdx.y;
     const int tid = threadIdx.x;
     if (tt >= t) return;
-    // [fix 2026-10-21] ple_kv 팩 GEMM 출력 = 토큰당 [key 10240|value 2560]
-    // 인터리브(행폭 12800) — key/value 모두 이 스트라이드로 읽는다(종전
-    // key=10240 스트라이드·value=키 블록 후 별도 배열 오프셋은 이중 관례
-    // 충돌로 엉뚱한 행 판독 — ple-check value 4.4배 왜곡의 원인).
-    const size_t kbase = (size_t)tt * 12800 + s * 2560; // kv 팩 판독(행폭 12800)
-    const size_t base = (size_t)tt * 10240 + s * 2560;  // r 판독·gated/normed 기록
-    const size_t wb = s * 2560; // 노름 가중 스트림 오프셋
+    const size_t kbase = (size_t)tt * 12800 + s * 2560;
+    const size_t base = (size_t)tt * 10240 + s * 2560;
+    const size_t wb = s * 2560;
     const float* k = key + kbase;
     const float* q = r + base;
     float kk = 0.0f, qq = 0.0f;
@@ -176,14 +129,10 @@ extern "C" __global__ void fn_ple_gate(const float* __restrict__ key,
         __syncthreads();
     }
     const float rq = rsqrtf(red[0] / 2560.0f + eps);
-    // d = ⟨k_n, q_n⟩/√H — 정규화 값의 곱을 f32 순서로 누산(참조 커널은
-    // 중간 스칼라를 bf16 경계 반올림 — 우리 체인은 f32 단일 클래스,
-    // 골든 판정은 M2 토큰 대조).
     float dot = 0.0f;
     #pragma unroll
     for (int j = 0; j < 10; ++j) {
         const int i = tid + j * 256;
-        // [fix 2026-10-21] nk/nq는 업로드에서 +1 합성 — 평범 곱(이중 +1 제거).
         const float kn = k[i] * rk * nk[wb + i];
         const float qn = q[i] * rq * nq[wb + i];
         dot += kn * qn;
@@ -217,14 +166,10 @@ extern "C" __global__ void fn_ple_gate(const float* __restrict__ key,
     for (int j = 0; j < 10; ++j) {
         const int i = tid + j * 256;
         const float gv = gated[base + i];
-        // [fix 2026-10-21] nc도 업로드 +1 — 평범 곱(이중 +1 제거).
         normed[base + i] = gv * rg * nc[wb + i];
     }
 }
 
-// 숏컨브(depthwise k4·dil3·10240ch) + PLE 잔차 가산 — grid = (t, 10240/256).
-// 상태 state[slot][9][10240] = 청크 직전 9입력(절대 위치 start−9..start−1).
-// R[t][c] += gated[t][c] + silu(Σ_k w[c·4+k]·tap(t−3k)).
 extern "C" __global__ void fn_ple_conv(const float* __restrict__ normed,
                                        const float* __restrict__ gated,
                                        float* __restrict__ r,
@@ -236,9 +181,6 @@ extern "C" __global__ void fn_ple_conv(const float* __restrict__ normed,
     if (tt >= t) return;
     const int c = blockIdx.y * blockDim.x + threadIdx.x;
     if (c >= 10240) return;
-    // [fix 2026-10-21] 탭 오프셋 = t+3k−9(오라클 ple.rs conv_y 전수 —
-    // k=0이 가장 오래된 t−9, k=3이 현재). 종전 jj=t−3k는 가중-탭 짝이
-    // 반전(층1 y0 발산의 원인).
     float acc = 0.0f;
     #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -257,20 +199,12 @@ extern "C" __global__ void fn_ple_conv(const float* __restrict__ normed,
     r[off] += gated[off] + acc / (1.0f + __expf(-acc));
 }
 
-// conv 상태 갱신 — new_state[i] = normed[t−9+i] (src<0 = 구 state[i+t] 유지,
-// 초기 청크는 0). grid = (1, 10240/256).
 extern "C" __global__ void fn_ple_conv_wb(const float* __restrict__ normed,
                                           float* __restrict__ state, int t,
                                           int has_init)
 {
     const int c = blockIdx.y * blockDim.x + threadIdx.x;
     if (c >= 10240) return;
-    // [fix 2026-10-21] t<9 청크의 **시프트 누락** — 오라클(ple.rs ⑥)은
-    // new[i] = x[t_end−9+i] = (청크 내) normed[t−9+i] 또는 구 state[t+i].
-    // 종전 커널은 src<0에서 구 state[i]를 그대로 남겨(시프트 없이) t<9
-    // 다중청크에서 conv 윈도우가 어긋났다 — chunk=2 eval PPL 140.4 vs
-    // chunk=64 20.9(청크 불변성 붕괴)로 발견. i 오름차순 쓰기·i+t 읽기는
-    // 쓰기 전 판독이라 in-place 안전(스레드=채널 열, 상호 겹침 없음).
     #pragma unroll
     for (int i = 0; i < 9; ++i) {
         const int src = t - 9 + i;
@@ -284,16 +218,13 @@ extern "C" __global__ void fn_ple_conv_wb(const float* __restrict__ normed,
     }
 }
 
-// ── GDN 출력게이트 sigmoid판(FN output_gate_type) ────────────────────────
-// gdn.cu gdn_gate의 silu(z)를 sigmoid(z)로 교체한 FN 전용 복제(gdn.cu은
-// 27B/35B 골든 fatbin — 바이트 불변 유지). 나머지 산술·레이아웃 동일.
 extern "C" __global__ void gdn_gate_sig(
-    const float* __restrict__ o_lc,  // [T][h_v*128] lc
-    const float* __restrict__ z,     // [T][h_v*128] HF
-    const float* __restrict__ nw,    // [L][128]
-    float* __restrict__ gated,       // [T][h_v*128] HF
-    float* __restrict__ gated32,     // x32(roundtrip) — nullable
-    unsigned short* __restrict__ gated16, // f16 미러 — nullable
+    const float* __restrict__ o_lc,
+    const float* __restrict__ z,
+    const float* __restrict__ nw,
+    float* __restrict__ gated,
+    float* __restrict__ gated32,
+    unsigned short* __restrict__ gated16,
     int t_len, int layer, int h_k, int h_v)
 {
     __shared__ float red[128];
@@ -312,7 +243,6 @@ extern "C" __global__ void gdn_gate_sig(
     }
     float inv = 1.0f / sqrtf(red[0] / 128.0f + 1e-6f);
     float zv = z[t * (h_v * 128) + h * 128 + tid];
-    // FN 계약: o = W_o[σ(z) ⊙ RMSNorm(y)] — silu 대비 분모 z 제거만.
     float gv = ov * inv * nw[layer * 128 + tid] * (1.0f / (1.0f + __expf(-zv)));
     gated[t * (h_v * 128) + h * 128 + tid] = gv;
     if (gated32 != (float*)0) {
@@ -326,20 +256,13 @@ extern "C" __global__ void gdn_gate_sig(
     }
 }
 
-// ── 전문가 배치 GEMV(스트리밍 mcache 간접) ──────────────────────────────
-// gptq4.cu w4a16_gemv_experts_g32_bf16의 FN 판들 — 바이트동결된 gptq4.cu
-// 대신 fn.cu에 자체 포함. 행본체 산술 = gemv_row_body 미러(64레인·f64
-// tree64·fmaf 3-op — k 128배수 계약).
-// [2026-10-21] g32·f16 추가 — FN CT 전문가(weight_packed [n][k/8] ·
-// weight_scale F16 [n][k/32]). 종전 g32_bf16은 f16 비트를 bf16으로 해석해
-// 전문가 출력 전체 왜곡(fn-moe-check: 라우터·선택 정합인데 출력 발산).
-#define FN_SCMAX 128 // k ≤ 32*128 = 4096(FN 전문가 k = 2560/640 → kg 80/20)
+#define FN_SCMAX 128
 
 
 __device__ __forceinline__ void fn_gemv_row_g128(
-    const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
-    const unsigned short* __restrict__ s,  // [n][k/128] f16 스케일
-    const float* __restrict__ x,           // [k] f32(원시 — 플레인 경로)
+    const unsigned* __restrict__ q,
+    const unsigned short* __restrict__ s,
+    const float* __restrict__ x,
     float* __restrict__ out, int o, int k)
 {
     if (o < 0) return;
@@ -366,7 +289,7 @@ __device__ __forceinline__ void fn_gemv_row_g128(
             const unsigned qw = __ldcs(qp);
             const float2 xv = *xp;
             const unsigned byte = (qw >> sh) & 0xFFu;
-            const float scv = sc[jj]; // g128: 그룹 = 128폭 청크 그대로
+            const float scv = sc[jj];
             const float w0 = fmaf((float)(byte & 0xFu), scv, -8.0f * scv);
             const float w1 = fmaf((float)(byte >> 4), scv, -8.0f * scv);
             acc = fmaf(w0, xv.x, acc);
@@ -421,11 +344,10 @@ extern "C" __global__ void w4a16_gemv_experts_g128_f16(
                      x + xoff, out + (size_t)sl * n, o, k);
 }
 
-// g32·f16 행본체 — 128폭 청크는 4스케일 그룹(레인 16개씩: 그룹 4jj+(l>>4)).
 __device__ __forceinline__ void fn_gemv_row_g32_f16(
-    const unsigned* __restrict__ q,        // [n][k/8] u32 (lsb-first 니블)
-    const unsigned short* __restrict__ s,  // [n][k/32] f16 스케일
-    const float* __restrict__ x,           // [k] f32(원시 — 플레인 경로)
+    const unsigned* __restrict__ q,
+    const unsigned short* __restrict__ s,
+    const float* __restrict__ x,
     float* __restrict__ out, int o, int k)
 {
     if (o < 0) return;
@@ -441,7 +363,7 @@ __device__ __forceinline__ void fn_gemv_row_g32_f16(
     const unsigned* qrow = q + (size_t)o * k8;
     const int jn = k >> 7;
     const int sh = 8 * (l & 3);
-    const int sgrp = l >> 4; // 청크 내 그룹 오프셋(16레인 = 32원소 = 1그룹)
+    const int sgrp = l >> 4;
     float acc = 0.0f;
     int j = 0;
     const unsigned* qp = qrow + (l >> 2);
@@ -453,7 +375,7 @@ __device__ __forceinline__ void fn_gemv_row_g32_f16(
             const unsigned qw = __ldcs(qp);
             const float2 xv = *xp;
             const unsigned byte = (qw >> sh) & 0xFFu;
-            const float scv = sc[4 * jj + sgrp]; // g32: 청크당 4그룹
+            const float scv = sc[4 * jj + sgrp];
             const float w0 = fmaf((float)(byte & 0xFu), scv, -8.0f * scv);
             const float w1 = fmaf((float)(byte >> 4), scv, -8.0f * scv);
             acc = fmaf(w0, xv.x, acc);
@@ -509,8 +431,6 @@ extern "C" __global__ void w4a16_gemv_experts_g32_f16(
 }
 
 
-// [QSA] attn.cu 헬퍼 사본(독립 컴파일 — decode.cu 선례). attn_part_step의
-// 청크 온라인 소프트맥스와 동일 산식(값 계약 동일).
 #define ATTN_CHUNK_QSA 256
 struct QsaKvRowPtrs {
     signed char* k;
@@ -580,12 +500,6 @@ __device__ __forceinline__ void attn_part_step_qsa(KDot kdot, VAcc vacc,
     __syncthreads();
 }
 
-// ── [QSA 2026-10-20] 선택 집합 어텐션 — attn_fwd3s_part_q의 행 순회만
-// sel 리스트(절대 행 번호)로 교체한 FN 인덱서 판(part 레이아웃 258 동일 —
-// attn_fwd3s_merge를 splits=1로 그대로 재소비). 수치 클래스 = part_q 계열
-// (q f32·K int8·온라인 소프트맥스 f32) — FN 골든은 오라클(QSA CPU) 대조.
-// sel = [t][sel_stride] 패딩 -1, nsel = [t] 행별 개수. kdot의 masked 행은
-// -1e30(기여 0 — attn_part_step 계약).
 extern "C" __global__ void attn_qsa_part(
     const float* __restrict__ qh,
     const unsigned long long* __restrict__ dblk_tab,

@@ -1,39 +1,20 @@
-//! CUDA 드라이버 API 수동 바인딩 — nvcuda.dll / libcuda.so.1 런타임 해석
-//! (2026-10-04).
-//!
-//! 계약: 새 크레이트 금지 → cuda-sys 등 도입 없이 시그니처를 손작성한다.
-//! 링크 방침: 정적 extern 링크(`#[link(name = "cuda")]`)는 CUDA 런타임이
-//! 없는 기기에서 기본 빌드를 깨뜨린다 — 런타임 해석만 한다
-//! (Windows: LoadLibraryA, unix: dlopen — libc은 기존 의존).
-//! 시그니처는 CUDA 13.4 nvcuda.dll 수출표와 대조 확인(2026-10-04 dumpbin).
-//! 계 alloc/memcpy/free는 _v2 심볼에 바인딩 — CUDA 13.4에서 평명(非_v2)
-//! 수출은 프라이머리 유지 컨텍스트를 인식하지 못해 CUresult=201로 실패함을
-//! 실측 확인(평명 cuMemAlloc=201 vs cuMemAlloc_v2=0, 동일 유효 컨텍스트).
-//! CUDA 11+ 헤더에서 cuMemAlloc 등은 _v2의 매크로 별칭 — _v2가 정규 경로.
 
 use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void};
 use std::sync::OnceLock;
 
-/// CUdevice — 디바이스 서수 식별자.
 pub type CUdevice = c_int;
-/// CUdeviceptr — 64비트 디바이스 포인터(부호 없는 64비트 규격).
 pub type CUdeviceptr = u64;
 pub type CUcontext = *mut c_void;
 pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 pub type CUstream = *mut c_void;
-/// CUgraph/CUgraphExec — 그래프 캡처 핸들(불투명).
 pub type CUgraph = *mut c_void;
 pub type CUgraphExec = *mut c_void;
 pub type CUevent = *mut c_void;
 
-/// CUresult — 드라이버 API 반환 코드(0 = CUDA_SUCCESS).
 pub type CUresult = c_uint;
 pub const CUDA_SUCCESS: CUresult = 0;
 
-/// 확실한 코드만 명명 — 그 외는 드라이버 표준 문구로 보고(오표기 위험 차단).
-/// [2026-10-09 H] 미지 코드는 cuGetErrorString 원문을 덧붙인다(드라이버
-/// 미로드 시에는 종전처럼 숫자만).
 pub fn err_text(r: CUresult) -> String {
     match r {
         CUDA_SUCCESS => "성공".into(),
@@ -47,10 +28,8 @@ pub fn err_text(r: CUresult) -> String {
         _ => {
             if let Ok(drv) = Driver::get() {
                 let mut p: *const c_char = std::ptr::null();
-                // SAFETY: 함수표는 로드 완료(Driver 계약) — p는 아웃 포인터.
                 let rc = unsafe { (drv.get_error_string)(r, &mut p) };
                 if rc == CUDA_SUCCESS && !p.is_null() {
-                    // SAFETY: 드라이버가 NUL 종료 정적 문자열 반환(프로세스 수명).
                     let s = unsafe { std::ffi::CStr::from_ptr(p) };
                     return format!("{} (CUresult={r})", s.to_string_lossy());
                 }
@@ -60,17 +39,14 @@ pub fn err_text(r: CUresult) -> String {
     }
 }
 
-// ── 드라이버 함수 시그니처(손작성 — 헤더 미러, 2026-10-04) ──
 pub type CuInitFn = unsafe extern "system" fn(flags: c_uint) -> CUresult;
 pub type CuDeviceGetCountFn = unsafe extern "system" fn(count: *mut c_int) -> CUresult;
 pub type CuDeviceGetFn = unsafe extern "system" fn(dev: *mut CUdevice, ordinal: c_int) -> CUresult;
 
-// CUdevice_attribute — 모니터링(장치 능력)용 부분집합.
-pub const CU_DEVICE_ATTRIBUTE_CLOCK_RATE: c_int = 13; // SM 최대 클럭(kHz)
+pub const CU_DEVICE_ATTRIBUTE_CLOCK_RATE: c_int = 13;
 pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
-pub const CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE: c_int = 36; // kHz
-pub const CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH: c_int = 37; // bits
-// [2026-10-18] 마린 GEMM 동적 smem 옵트인 상한(바이트) — vLLM marlin_mm과 동형.
+pub const CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE: c_int = 36;
+pub const CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH: c_int = 37;
 pub const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: c_int = 97;
 pub type CuDeviceGetNameFn =
     unsafe extern "system" fn(name: *mut c_char, len: c_int, dev: CUdevice) -> CUresult;
@@ -92,62 +68,44 @@ pub type CuMemcpyHtoDFn =
     unsafe extern "system" fn(dst: CUdeviceptr, src: *const c_void, bytes: usize) -> CUresult;
 pub type CuMemcpyDtoHFn =
     unsafe extern "system" fn(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult;
-/// cuMemcpyDtoD_v2 — 디바이스 내 복사. 호스트 왕복 없는 디바이스 체인의
-/// 필수 요소: GEMV 입출력을 상주 버퍼 사이에
-/// 직접 옮긴다.
-/// cuMemcpyHtoDAsync_v2 — 4바이트 위치 갱신 등 상습 소형 업로드용.
-/// 동기 HtoD는 호출마다 스트림 배수(체인에서 층당 8ms 실측).
 pub type CuMemcpyHtoDAsyncFn = unsafe extern "system" fn(
     dst: CUdeviceptr,
     src: *const c_void,
     bytes: usize,
     stream: CUstream,
 ) -> CUresult;
-/// cuMemcpyDtoDAsync_v2 — 디바이스 체인 핫패스용. 동기 DtoD는 호출마다
-/// 스트림을 배수해 체인(토큰당 수백 회 복사)에서 GP가 놀게 된다
-/// (2026-10-08 실측: 체인 189ms/토큰 → 비동기 전환으로 왕복 제거).
 pub type CuMemcpyDtoDAsyncFn = unsafe extern "system" fn(
     dst: CUdeviceptr,
     src: CUdeviceptr,
     bytes: usize,
     stream: CUstream,
 ) -> CUresult;
-/// cuStreamCreate — 실스트림 생성(그래프 캡처 전제 — 레거시 0은 캡처 불가).
 pub type CuStreamCreateFn =
     unsafe extern "system" fn(ph_stream: *mut CUstream, flags: c_uint) -> CUresult;
-/// cuStreamWaitEvent — 스트림이 이벤트를 대기([B3] shared 꼬리 포크/조인).
 pub type CuStreamWaitEventFn =
     unsafe extern "system" fn(s: CUstream, ev: CUevent, flags: c_uint) -> CUresult;
-/// cuMemHostAlloc — pinned 호스트 메모리(캡처 가능한 async 복사 소스/목적).
 pub type CuMemHostAllocFn =
     unsafe extern "system" fn(pp: *mut *mut c_void, bytes: usize, flags: c_uint) -> CUresult;
 pub type CuMemFreeHostFn = unsafe extern "system" fn(p: *mut c_void) -> CUresult;
-/// cuMemHostGetDevicePointer — pinned 호스트 메모리의 디바이스 가시 주소(UVA).
-/// 호스트 KV 티어(커널 직접 접근)의 표 주소 원천.
 pub type CuMemHostGetDevicePointerFn = unsafe extern "system" fn(
     pdev: *mut CUdeviceptr,
     phost: *mut c_void,
     flags: c_uint,
 ) -> CUresult;
-/// cuMemcpyDtoHAsync_v2 — 캡처 가능한 비동기 판독(pinned 목적지).
 pub type CuMemcpyDtoHAsyncFn = unsafe extern "system" fn(
     dst: *mut c_void,
     src: CUdeviceptr,
     bytes: usize,
     stream: CUstream,
 ) -> CUresult;
-/// cuStreamBeginCapture — 모드: 0=GLOBAL, 1=THREAD_LOCAL, 2=RELAXED.
 pub type CuStreamBeginCaptureFn =
     unsafe extern "system" fn(stream: CUstream, mode: c_uint) -> CUresult;
 pub type CuStreamEndCaptureFn =
     unsafe extern "system" fn(stream: CUstream, ph_graph: *mut CUgraph) -> CUresult;
-/// cuGraphInstantiateWithFlags — 실행 핸들 생성(flags=0).
 pub type CuGraphInstantiateWithFlagsFn =
     unsafe extern "system" fn(ph_exec: *mut CUgraphExec, graph: CUgraph, flags: u64) -> CUresult;
 pub type CuGraphLaunchFn =
     unsafe extern "system" fn(exec: CUgraphExec, stream: CUstream) -> CUresult;
-/// [§4.3 2026-10-11] cuGraphUpload — instantiate 직후 명시 업로드(첫 launch의
-/// implicit upload가 device spin 뒤 대기하는 비용 제거).
 pub type CuGraphUploadFn =
     unsafe extern "system" fn(exec: CUgraphExec, stream: CUstream) -> CUresult;
 pub type CuGraphExecDestroyFn = unsafe extern "system" fn(exec: CUgraphExec) -> CUresult;
@@ -168,41 +126,27 @@ pub type CuLaunchKernelFn = unsafe extern "system" fn(
 ) -> CUresult;
 pub type CuStreamSynchronizeFn = unsafe extern "system" fn(stream: CUstream) -> CUresult;
 pub type CuMemFreeFn = unsafe extern "system" fn(dptr: CUdeviceptr) -> CUresult;
-/// cuFuncSetAttribute — 함수 속성 설정(G5 scan 동적 공유 61,828B의
-/// opt-in: CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES=8).
 pub type CuFuncSetAttributeFn =
     unsafe extern "system" fn(f: CUfunction, attrib: c_uint, value: c_int) -> CUresult;
 
-/// cuEventCreate — 타임스탬프 이벤트(진단 타이머 P8).
 pub type CuEventCreateFn = unsafe extern "system" fn(ev: *mut CUevent, flags: c_uint) -> CUresult;
-/// cuEventRecord — 스트림에 이벤트 기록(비동기·비블로킹).
 pub type CuEventRecordFn = unsafe extern "system" fn(ev: CUevent, s: CUstream) -> CUresult;
-/// cuEventElapsedTime — 두 이벤트 간 경과(ms f32).
 pub type CuEventElapsedTimeFn =
     unsafe extern "system" fn(ms: *mut f32, a: CUevent, b: CUevent) -> CUresult;
-/// cuEventDestroy.
 pub type CuEventDestroyFn = unsafe extern "system" fn(ev: CUevent) -> CUresult;
 
-/// cuEventSynchronize — CPU가 이벤트 완료까지 대기(핀드 링 버퍼 재사용 담보).
 pub type CuEventSynchronizeFn = unsafe extern "system" fn(ev: CUevent) -> CUresult;
 
-/// cuMemGetInfo_v2 — 가용/전체 디바이스 메모리(바이트). B6:
-/// 리소스 가드의 CUDA 런타임 VRAM 조회용(현재 컨텍스트 기준).
 pub type CuMemGetInfoFn =
     unsafe extern "system" fn(free: *mut usize, total: *mut usize) -> CUresult;
 
-/// cuMemHostRegister_v2 — 기존 호스트 버퍼 pin(핀드 DMA 소스, P7).
 pub type CuMemHostRegisterFn =
     unsafe extern "system" fn(p: *mut c_void, bytes: usize, flags: c_uint) -> CUresult;
-/// cuMemHostUnregister — pin 해제(버퍼 해제 전 필수).
 pub type CuMemHostUnregisterFn = unsafe extern "system" fn(p: *mut c_void) -> CUresult;
 
-/// cuGetErrorString — CUresult → 드라이버 표준 문구(H: err_text 확대).
 pub type CuGetErrorStringFn =
     unsafe extern "system" fn(r: CUresult, p_str: *mut *const c_char) -> CUresult;
 
-/// cuMemsetD8Async — 디바이스 0 채움(H: zero_dev의 동기 h2d 청크 대체).
-/// 스트림 인자를 받는 async 계열이라 평명 심볼이 정규(_v2 분기 없음).
 pub type CuMemsetD8AsyncFn = unsafe extern "system" fn(
     dst: CUdeviceptr,
     uc: c_uchar,
@@ -210,28 +154,15 @@ pub type CuMemsetD8AsyncFn = unsafe extern "system" fn(
     stream: CUstream,
 ) -> CUresult;
 
-// ── VMM(Virtual Memory Management) — 2026-10-12 추가 ──
-// VRAM 탄력성(공존 시나리오): 물리 할당(cuMemCreate)과 가상 주소
-// 예약(cuMemAddressReserve)을 분리해, unmap/release 후 재매핑이
-// 가능하게 하는 API군. 타입 레이아웃은 CUDA 13.0 cuda.h의 _v1 ABI를
-// 미러(로컬 헤더 실측 2026-10-12). VMM 계열은 CUDA 10.2 도입 이후
-// 시그니처 동결 — _v2 변형 없이 평명 심볼이 정규 경로다.
 
-/// CUmemGenericAllocationHandle — VMM 물리 할당 핸들(u64 규격).
 pub type CUmemGenericAllocationHandle = u64;
 
-// CUmemAllocationProp/type — 고정(pinned) 할당만 사용.
 pub const CU_MEM_ALLOCATION_TYPE_PINNED: c_int = 0x1;
-// CUmemAllocationProp/requestedHandleTypes — 내보내기 미사용.
 pub const CU_MEM_HANDLE_TYPE_NONE: c_int = 0x0;
-// CUmemLocation/type — 디바이스 위치(id는 디바이스 서수).
 pub const CU_MEM_LOCATION_TYPE_DEVICE: c_int = 0x1;
-// CUmemAccessDesc/flags — 읽기+쓰기 허용(READ 0x1 | WRITE 0x2).
 pub const CU_MEM_ACCESS_FLAGS_PROT_READWRITE: c_uint = 0x3;
-// cuMemGetAllocationGranularity option — 최소 요구 세목.
 pub const CU_MEM_ALLOC_GRANULARITY_MINIMUM: c_uint = 0x0;
 
-/// CUmemLocation — { 위치 종류, 식별자 }(cuda.h 미러).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CUmemLocation {
@@ -239,16 +170,12 @@ pub struct CUmemLocation {
     pub id: c_int,
 }
 
-/// CUmemAccessDesc — 접근 권한 부여 요청 1건(cuMemSetAccess 인자).
-/// 참고: CUDA 13 헤더의 타입명은 CUmemAccessDescriptor가 아니라
-/// CUmemAccessDesc다(구 명칭과 달라 헤더 우선).
 #[repr(C)]
 pub struct CUmemAccessDesc {
     pub location: CUmemLocation,
     pub flags: c_uint,
 }
 
-/// CUmemAllocationProp::allocFlags — 압축·GPUDirect 미사용(전 0).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CUmemAllocationPropAllocFlags {
@@ -258,8 +185,6 @@ pub struct CUmemAllocationPropAllocFlags {
     pub reserved: [u8; 4],
 }
 
-/// CUmemAllocationProp — VMM 물리 할당 속성. 디바이스 로컬 PINNED
-/// 경로만 사용: win32_handle_meta_data=null, alloc_flags 전 0.
 #[repr(C)]
 pub struct CUmemAllocationProp {
     pub ty: c_int,
@@ -269,22 +194,16 @@ pub struct CUmemAllocationProp {
     pub alloc_flags: CUmemAllocationPropAllocFlags,
 }
 
-// ABI 가드 — cuda.h _v1 레이아웃과 크기가 어긋나면 컴파일 시점에
-// 실패해야 한다(드라이버에 구조체 포인터를 넘기므로 정합이 계약).
 const _: () = assert!(std::mem::size_of::<CUmemLocation>() == 8);
 const _: () = assert!(std::mem::size_of::<CUmemAccessDesc>() == 12);
 const _: () = assert!(std::mem::size_of::<CUmemAllocationProp>() == 32);
 
-/// cuMemCreate — VMM 물리 할당(핸들 발급). 크기는 granularity 배수
-/// 여야 한다(호스트가 올림 책임).
 pub type CuMemCreateFn = unsafe extern "system" fn(
     handle: *mut CUmemGenericAllocationHandle,
     bytes: usize,
     prop: *const CUmemAllocationProp,
     flags: u64,
 ) -> CUresult;
-/// cuMemAddressReserve — VA 영역 예약(alignment=0이면 드라이버가
-/// granularity 정렬 선택, addr=0이면 임의 위치).
 pub type CuMemAddressReserveFn = unsafe extern "system" fn(
     ptr: *mut CUdeviceptr,
     bytes: usize,
@@ -292,7 +211,6 @@ pub type CuMemAddressReserveFn = unsafe extern "system" fn(
     addr: CUdeviceptr,
     flags: u64,
 ) -> CUresult;
-/// cuMemMap — 물리 핸들을 예약 VA에 매핑(offset=물리측 오프셋, 0 고정).
 pub type CuMemMapFn = unsafe extern "system" fn(
     ptr: CUdeviceptr,
     bytes: usize,
@@ -300,30 +218,22 @@ pub type CuMemMapFn = unsafe extern "system" fn(
     handle: CUmemGenericAllocationHandle,
     flags: u64,
 ) -> CUresult;
-/// cuMemSetAccess — 매핑 영역 접근 권한(desc 배열 count건).
 pub type CuMemSetAccessFn = unsafe extern "system" fn(
     ptr: CUdeviceptr,
     bytes: usize,
     desc: *const CUmemAccessDesc,
     count: usize,
 ) -> CUresult;
-/// cuMemUnmap — VA 매핑 해제(물리 할당은 유지).
 pub type CuMemUnmapFn = unsafe extern "system" fn(ptr: CUdeviceptr, bytes: usize) -> CUresult;
-/// cuMemRelease — 물리 할당 반납(전 매핑 해제 후 유효).
 pub type CuMemReleaseFn =
     unsafe extern "system" fn(handle: CUmemGenericAllocationHandle) -> CUresult;
-/// cuMemAddressFree — VA 예약 해제.
 pub type CuMemAddressFreeFn = unsafe extern "system" fn(ptr: CUdeviceptr, bytes: usize) -> CUresult;
-/// cuMemGetAllocationGranularity — prop 기준 최소/권장 세목(바이트).
-/// 과제 명세의 "cuMemAllocationGranularity"는 드라이버 수출 심볼이
-/// 아니며 이 이름이 정규(2026-10-12 cuda.h 대조).
 pub type CuMemGetAllocationGranularityFn = unsafe extern "system" fn(
     granularity: *mut usize,
     prop: *const CUmemAllocationProp,
     option: c_uint,
 ) -> CUresult;
 
-/// 해석 완료된 드라이버 함수표 — 전부 순수 함수 포인터(Send+Sync 자동).
 pub(crate) struct Driver {
     pub init: CuInitFn,
     pub device_get_count: CuDeviceGetCountFn,
@@ -357,19 +267,14 @@ pub(crate) struct Driver {
     pub graph_destroy: CuGraphDestroyFn,
     pub mem_free: CuMemFreeFn,
 
-    /// cuMemGetInfo_v2 — 가드 VRAM 프로브(B6).
     pub mem_get_info: CuMemGetInfoFn,
     pub func_set_attribute: CuFuncSetAttributeFn,
 
-    /// 미지 오류 코드 문구(H) — err_text 폴백.
     pub get_error_string: CuGetErrorStringFn,
-    /// 호스트 핀드 등록/해제(P7-fix).
     pub host_register: CuMemHostRegisterFn,
     pub host_unregister: CuMemHostUnregisterFn,
-    /// 디바이스 0 채움(H) — zero_dev 경로.
     pub memset_d8_async: CuMemsetD8AsyncFn,
 
-    /// VMM(VRAM 탄력성) — 물리/VA 분리 할당 + 해제·세목 조회(2026-10-12).
     pub mem_create: CuMemCreateFn,
     pub mem_address_reserve: CuMemAddressReserveFn,
     pub mem_map: CuMemMapFn,
@@ -379,7 +284,6 @@ pub(crate) struct Driver {
     pub mem_address_free: CuMemAddressFreeFn,
     pub mem_get_allocation_granularity: CuMemGetAllocationGranularityFn,
 
-    /// 진단 타이머(P8) — 이벤트 4종.
     pub event_create: CuEventCreateFn,
     pub event_record: CuEventRecordFn,
     pub event_elapsed: CuEventElapsedTimeFn,
@@ -388,20 +292,13 @@ pub(crate) struct Driver {
 }
 
 impl Driver {
-    /// 프로세스 최초 1회 해석(OnceLock 캐시 — 실패 사유도 재보고).
     pub fn get() -> Result<&'static Driver, String> {
         static D: OnceLock<Result<Driver, String>> = OnceLock::new();
-        // SAFETY: OnceLock 초기화 경로 — 단일 스레드 진입 보장, 함수표는 이후 불변.
         D.get_or_init(|| unsafe { Self::load() })
             .as_ref()
             .map_err(|e| format!("rawcuda: CUDA 드라이버 로드 실패: {e}"))
     }
 
-    /// 라이브러리 핸들은 해제하지 않는다(프로세스 수명 — ADR-0014 영속 규칙과
-    /// 동일 취급, dlclose/FreeLibrary 금지).
-    ///
-    /// # Safety
-    /// 초기화 경로(OnceLock)에서만 호출 — 함수 포인터 transmute 포함.
     unsafe fn load() -> Result<Driver, String> {
         let lib = loader::open()?;
         macro_rules! sym {
@@ -409,7 +306,6 @@ impl Driver {
                 loader::sym(lib, $name)?
             };
         }
-        // SAFETY: 수출표 대조 완료 심볼 — 시그니처는 cuda.h 미러(위 손작성).
         unsafe {
             Ok(Driver {
                 init: std::mem::transmute::<*mut c_void, CuInitFn>(sym!("cuInit")),
@@ -470,8 +366,6 @@ impl Driver {
                 mem_free_host: std::mem::transmute::<*mut c_void, CuMemFreeHostFn>(sym!(
                     "cuMemFreeHost"
                 )),
-                // cuda.h는 이 이름을 `_v2`로 매핑한다(평문 심볼 = 레거시 ABI —
-                // 실측 2026-10-16: 평문 호출이 CUDA_ERROR_INVALID_CONTEXT=201).
                 mem_host_get_device_pointer: std::mem::transmute::<
                     *mut c_void,
                     CuMemHostGetDevicePointerFn,
@@ -564,11 +458,9 @@ impl Driver {
     }
 }
 
-/// 플랫폼 로더 — Windows kernel32 / unix dlopen(libc 기존 의존).
 mod loader {
     use std::ffi::c_void;
 
-    /// NUL 종료 심볼명 편의 — b"cuXxx\0" 인자용.
     pub fn cstr(name: &[u8]) -> *const u8 {
         debug_assert!(name.ends_with(b"\0"));
         name.as_ptr()
@@ -583,7 +475,6 @@ mod loader {
 
     #[cfg(windows)]
     pub fn open() -> Result<*mut c_void, String> {
-        // SAFETY: nvcuda.dll 로드 — 부작용은 모듈 참조수 증가뿐(해제 없음).
         let h = unsafe { LoadLibraryA(cstr(b"nvcuda.dll\0")) };
         if h.is_null() {
             Err("nvcuda.dll 로드 실패 — NVIDIA 드라이버 미설치?".into())
@@ -596,7 +487,6 @@ mod loader {
     pub fn sym(lib: *mut c_void, name: &str) -> Result<*mut c_void, String> {
         let mut b = name.as_bytes().to_vec();
         b.push(0);
-        // SAFETY: lib는 open()이 돌려준 유효 핸들, b는 NUL 종료.
         let p = unsafe { GetProcAddress(lib, cstr(&b)) };
         if p.is_null() {
             Err(format!("심볼 없음: {name} (nvcuda.dll 버전 불일치?)"))
@@ -605,10 +495,6 @@ mod loader {
         }
     }
 
-    // unix 수동 dl 바인딩 — std 외 크레이트 금지 계약으로 libc 크레이트를
-    // 쓰지 않는다. glibc 2.34+는 dlopen/dlsym이 libc 내장(구분 libdl 폐지)이고
-    // std 타깃은 libc에 링크되므로 extern "C" 선언만으로 해석된다(2026-10-07
-    // 리눅스 포팅). RTLD_NOW=2는 glibc·musl 공통값.
     #[cfg(unix)]
     const RTLD_NOW: std::ffi::c_int = 2;
 
@@ -620,9 +506,7 @@ mod loader {
 
     #[cfg(unix)]
     pub fn open() -> Result<*mut c_void, String> {
-        // 바이트 문자열 길이가 달라 [u8; N] 배열 단일형이 불가 — 슬라이스로.
         for cand in [&b"libcuda.so.1\0"[..], &b"libcuda.so\0"[..]] {
-            // SAFETY: 드라이버 라이브러리 로드 — 참조수 증가만(해제 없음).
             let h = unsafe { dlopen(cstr(cand) as *const std::ffi::c_char, RTLD_NOW) };
             if !h.is_null() {
                 return Ok(h);
@@ -635,7 +519,6 @@ mod loader {
     pub fn sym(lib: *mut c_void, name: &str) -> Result<*mut c_void, String> {
         let mut b = name.as_bytes().to_vec();
         b.push(0);
-        // SAFETY: lib는 open()이 돌려준 유효 핸들, b는 NUL 종료.
         let p = unsafe { dlsym(lib, cstr(&b) as *const std::ffi::c_char) };
         if p.is_null() {
             Err(format!("심볼 없음: {name}"))

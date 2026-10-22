@@ -1,31 +1,3 @@
-//! [FN D1→재팩 2026-10-20] GPTQ(auto_round) → CT(compressed-tensors) 무손실 재패커.
-//!
-//! D1 판정(커밋 39787db0 — engine.rs fn_qzeros_sym_scan 전수 스캔): 전문가
-//! qzeros 전 니블 = 7 상수 → zero-point = 7+1(vLLM zero_offset) = **8** =
-//! CT sym zp=8와 동일. 따라서 GPTQ→CT 재팩은 **무손실 순수 니블 전치**다.
-//!
-//! [비트계약 — engine.rs expert_triple 실측]
-//! - GPTQ qweight I32[kw, n] (kw=k/8): 워드 (jw, r)이 입력 j=jw·8..jw·8+7의
-//!   니블 8개(LSB-first)를 행 r로 담는다.
-//! - CT weight_packed I32[n, kw] (lane.rs §3.6 lsb-first): 워드 (r, jw)이 같은
-//!   니블 8개를 같은 위치로 담는다 → **워드 값 자체가 불변**, 순수 u32 전치.
-//!   packed[r·kw + jw] = qweight[jw·n + r].
-//! - scales F16[kg, n] → weight_scale F16[n, kg] — **비트 그대로** 전치.
-//! - qzeros I32[kg, n/8]은 폐기(재팩 시 전수 상수 0x77777777 검증 후 버림).
-//! - weight_shape I64[2] = (n, k) 신규 생성.
-//!
-//! [대상] 48층 × 512전문가 × {gate,up,down} = 73,728 투영만 변환. 형상은
-//! 실측 쌍 (n,k) ∈ {(640,2560),(2560,640)}로 고정(예외 = 즉시 거부).
-//! gate/up k=2560·n=640 / down k=640·n=2560, g=128.
-//!
-//! [출력 구조] 소스 model-* 샤드 경계를 그대로 미러(샤드 재구성 — 전문가
-//! 트리플은 소스에서 샤드 내 완결 실측)하되 연속 재번호(00001-of-000NN).
-//! PLE 샤드(model-plefp8-*)는 파일 단위 복사. 나머지 텐서(BF16 민감층·
-//! embed·head 등)는 원시 바이트 그대로 재기록. config.json의
-//! quantization_config만 CT(pack-quantized int4 sym g128)로 치환.
-//!
-//! [성능] mmap 읽기 + 스트리밍 쓰기(샤드당 워커 1 — 쓰기 순차 유지),
-//! 진행 로그. GPU 무사용.
 
 use super::engine;
 use crate::st::{StArchive, StDtype, StEntry};
@@ -36,28 +8,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// gptq 그룹 크기 — engine.rs GPTQ_GROUP과 동일 계약(단일 상산 출처는
-/// 엔진 쪽이지만 재패커는 core 내부라 여기 재정의 없이 상수 참조).
 const G: usize = 128;
-/// qzeros 정상 워드 — 전 니블 7(zero=8). D1 판정값.
 const QZ_WORD: u32 = 0x7777_7777;
-/// 전문가 투영 허용 형상 (n, k) 실측 쌍.
 const SHAPES: [(usize, usize); 2] = [(640, 2560), (2560, 640)];
 
-/// 전문가 투영 이름(.qweight 등 접미사 전) 판별.
 fn expert_base(name: &str) -> Option<&str> {
     name.strip_suffix(".qweight")
         .filter(|b| b.contains(".mlp.experts."))
 }
 
-/// 텐서 이름 JSON 안전성 — safetensors 이름은 [A-Za-z0-9_.-]만(헤더 직렬화
-/// 무이스케이프 계약). 백슬래시·따옴표 등이 오면 즉시 거부.
 fn name_safe(name: &str) -> bool {
     name.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
-/// 재구성 대상 model-* 샤드 파일명 판별(^model-\d+-of-\d+\.safetensors$).
 fn is_model_shard(file: &str) -> bool {
     let Some(stem) = file.strip_suffix(".safetensors") else {
         return false;
@@ -74,23 +38,19 @@ fn is_model_shard(file: &str) -> bool {
         && b.bytes().all(|c| c.is_ascii_digit())
 }
 
-/// 샤드 하나의 출력 계획 — 항목은 이름 정렬순(결정론적 출력).
 enum Out {
-    /// gptq 트리플 → CT 트리플(weight_packed · weight_scale · weight_shape).
     Repack {
         base: String,
         n: usize,
         kw: usize,
         kg: usize,
     },
-    /// 원시 바이트 그대로 재기록.
     Copy { name: String, nbytes: u64 },
 }
 
 impl Out {
     fn nbytes(&self) -> u64 {
         match self {
-            // packed + scale(g32 복제 ×4) + shape
             Out::Repack { n, kw, kg, .. } => {
                 (*n as u64) * (*kw as u64) * 4 + (*n as u64) * (*kg as u64) * 4 * 2 + 16
             }
@@ -125,16 +85,12 @@ impl Out {
                 .collect()
             }
             Out::Copy { name, nbytes } => {
-                // dtype/shape은 헤더 기록 시점 엔트리에서 조립 — 여기(인덱스
-                // 용)이름만 유효. 빈 목록을 돌려주면 index.json에서 복사
-                // 텐서가 누락된다(합성 테스트 실측).
                 vec![(name.clone(), "", Vec::new(), *nbytes)]
             }
         }
     }
 }
 
-/// gptq 트리플 형상 검증(엔진 expert_triple 미러 + 실측 형상 고정) → (n, kw, kg).
 fn check_triple(ar: &StArchive, base: &str) -> Result<(usize, usize, usize), String> {
     let eq: &StEntry = ar
         .entry(&format!("{base}.qweight"))
@@ -166,18 +122,15 @@ fn check_triple(ar: &StArchive, base: &str) -> Result<(usize, usize, usize), Str
     Ok((n, kw, kg))
 }
 
-/// 아카이브 전체 샤드 mmap(엔진 Model::load 동일 계약).
 fn mmap_all(ar: &StArchive) -> Result<Vec<memmap2::Mmap>, String> {
     let mut v = Vec::new();
     for p in ar.shard_paths() {
         let f = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
-        // SAFETY: 읽기 전용 매핑 — 수정하지 않는다(엔진 mmap 동일 계약).
         v.push(unsafe { memmap2::Mmap::map(&f).map_err(|e| e.to_string())? });
     }
     Ok(v)
 }
 
-/// mmap 상 텐서 원시 슬라이스.
 fn tbytes<'a>(ar: &StArchive, mmaps: &'a [memmap2::Mmap], name: &str) -> Result<&'a [u8], String> {
     let e = ar.entry(name).ok_or_else(|| format!("텐서 부재: {name}"))?;
     let base = ar
@@ -190,7 +143,6 @@ fn tbytes<'a>(ar: &StArchive, mmaps: &'a [memmap2::Mmap], name: &str) -> Result<
         .ok_or_else(|| format!("슬라이스 범위 위반: {name}"))
 }
 
-/// 투영 1개 변환: qzeros 전수 검증 → packed 워드 전치 → scale 비트 전치 → shape.
 fn repack_triple<W: Write>(
     ar: &StArchive,
     mmaps: &[memmap2::Mmap],
@@ -203,8 +155,6 @@ fn repack_triple<W: Write>(
     let qw = tbytes(ar, mmaps, &format!("{base}.qweight"))?;
     let qz = tbytes(ar, mmaps, &format!("{base}.qzeros"))?;
     let sc = tbytes(ar, mmaps, &format!("{base}.scales"))?;
-    // qzeros 전수 상수 검증 — 무손실(sym zp=8) 계약의 관문. 하나라도 어긋나면
-    // 이 재패커의 전제가 무너진다(명시 거부 — GPTQ-asym 경로 필요).
     for (i, c) in qz.as_chunks::<4>().0.iter().enumerate() {
         let w = u32::from_le_bytes(*c);
         if w != QZ_WORD {
@@ -213,7 +163,6 @@ fn repack_triple<W: Write>(
             ));
         }
     }
-    // packed[n, kw] u32 — qweight[kw, n]의 순수 워드 전치(니블 위치 불변).
     let mut pk = vec![0u8; n * kw * 4];
     for jw in 0..kw {
         let row = &qw[jw * n * 4..(jw + 1) * n * 4];
@@ -224,10 +173,6 @@ fn repack_triple<W: Write>(
     }
     out.write_all(&pk)
         .map_err(|e| format!("{base}.packed: {e}"))?;
-    // weight_scale[n, kg32] F16 — scales[kg, n] 전치 + **g128→g32 스케일 복제**.
-    // [FN M1 2026-10-20] FN 전문가(g128)를 기존 g32 마린 MoE 경로에 태우기
-    // 위해 각 g128 스케일을 4개 g32 그룹에 복제 — 니블 불변·스케일 동값으로
-    // 디큐트 값 비트동일(상위 그룹 스케일의 자식 그룹 재사용). kg32 = k/32.
     let kg32 = kg * (G / 32);
     let mut s = vec![0u8; n * kg32 * 2];
     for gi in 0..kg {
@@ -241,7 +186,6 @@ fn repack_triple<W: Write>(
     }
     out.write_all(&s)
         .map_err(|e| format!("{base}.scale: {e}"))?;
-    // weight_shape I64[2] = (n, k).
     let k = kw * 8;
     out.write_all(&(n as i64).to_le_bytes())
         .and_then(|_| out.write_all(&(k as i64).to_le_bytes()))
@@ -249,7 +193,6 @@ fn repack_triple<W: Write>(
     Ok(())
 }
 
-/// 재패커 실행 보고.
 #[derive(Debug)]
 pub struct RepackStats {
     pub experts: usize,
@@ -274,13 +217,10 @@ impl std::fmt::Display for RepackStats {
     }
 }
 
-/// 전체 재팩 — src(FN gptq 원본) → dst(CT 트리플 새 디렉터리).
 pub fn repack(src_dir: &Path, dst_dir: &Path) -> Result<RepackStats, String> {
     repack_inner(src_dir, dst_dir, 48 * 512 * 3)
 }
 
-/// 본체 — expect_experts = 이 모델 패밀리의 전문가 투영 수 계약(FN 실측
-/// 73,728. 합성 테스트는 축소판을 넣는다).
 fn repack_inner(
     src_dir: &Path,
     dst_dir: &Path,
@@ -290,8 +230,7 @@ fn repack_inner(
     let ar = StArchive::open(src_dir).map_err(|e| format!("소스: {e}"))?;
     let mmaps = Arc::new(mmap_all(&ar)?);
 
-    // 샤드 분류: model-* 재구성 / 나머지(plefp8 등) 파일 복사.
-    let mut rebuild: Vec<(usize, String)> = Vec::new(); // (src shard, src 파일명)
+    let mut rebuild: Vec<(usize, String)> = Vec::new();
     let mut filecopy: Vec<(usize, String)> = Vec::new();
     for (i, p) in ar.shard_paths().iter().enumerate() {
         let fname = p
@@ -309,7 +248,6 @@ fn repack_inner(
         return Err("model-* 샤드 부재 — FN 배포 구조 아님".into());
     }
 
-    // 샤드별 출력 계획(이름 정렬순 — 결정론).
     let mut plans = Vec::new();
     let mut experts = 0usize;
     for (out_i, (shard, _src_name)) in rebuild.iter().enumerate() {
@@ -337,7 +275,6 @@ fn repack_inner(
             } else if name.contains(".mlp.experts.")
                 && (name.ends_with(".qzeros") || name.ends_with(".scales"))
             {
-                // 트리플 동반 — qweight에서 이미 처리.
             } else {
                 outs.push(Out::Copy {
                     name: name.clone(),
@@ -357,7 +294,6 @@ fn repack_inner(
         ));
     }
 
-    // 출력 디렉터리 준비 — 이미 결과 조각이 있으면 거부(재시도 안전).
     std::fs::create_dir_all(dst_dir).map_err(|e| format!("출력 디렉터리: {e}"))?;
     for (out_name, _, _) in &plans {
         let p = dst_dir.join(out_name);
@@ -371,7 +307,6 @@ fn repack_inner(
         }
     }
 
-    // PLE 등 파일 복사분 바이트(진행률 분모).
     let copy_bytes: u64 = filecopy
         .iter()
         .filter_map(|(i, _)| ar.shard_paths().get(*i).map(|p| p.metadata().ok()))
@@ -392,8 +327,6 @@ fn repack_inner(
         total_out as f64 / (1u64 << 30) as f64
     );
 
-    // index.json 본문·파생 수치는 스코프 전 계획 기준으로 선행 완성 —
-    // plans/filecopy는 스코프 클로저로 이동하기 때문.
     let _ = ();
     let mut wm = String::from("{\"metadata\":{\"total_size\":");
     wm.push_str(&total_out.to_string());
@@ -412,7 +345,6 @@ fn repack_inner(
             }
         }
     }
-    // 파일 복사 샤드의 엔트리는 원본 이름·원본 샤드 파일명 그대로.
     let mut copy_names: Vec<(String, String)> = Vec::new();
     for (shard, fname) in &filecopy {
         for (name, e) in ar.entries() {
@@ -438,7 +370,6 @@ fn repack_inner(
         ));
     }
 
-    // 워커: 재구성 샤드당 1 + 파일 복사당 1 — 순차 쓰기 유지 채널 수집.
     let n_workers = plans.len() + filecopy.len();
     let ple_files = filecopy.len();
     let bytes_done = Arc::new(AtomicU64::new(0));
@@ -472,7 +403,6 @@ fn repack_inner(
             });
         }
         drop(tx);
-        // 진행 로그 — 3초 간격 수신 타임아웃 활용.
         let t_start = Instant::now();
         loop {
             match rx.recv_timeout(Duration::from_secs(3)) {
@@ -517,12 +447,9 @@ fn repack_inner(
     std::fs::write(dst_dir.join("model.safetensors.index.json"), &wm)
         .map_err(|e| format!("index.json: {e}"))?;
 
-    // config.json — quantization_config 값만 CT로 치환(나머지 원문 보존).
     write_config(src_dir, dst_dir)?;
-    // 부속 파일(tokenizer·template·runtime — mtp 가중치 제외).
     copy_aux(src_dir, dst_dir)?;
 
-    // 출력 구조 자체검증 — 헤더 재파싱 + W4a16Model 완전 개방(트리플·양자 계약).
     let out_ar = StArchive::open(dst_dir).map_err(|e| format!("자체검증: {e}"))?;
     if out_ar.entries().len() != expect_total {
         return Err(format!(
@@ -551,7 +478,6 @@ fn repack_inner(
     })
 }
 
-/// 샤드 1개 기록: 헤더(크기 선행 계산) → 데이터 스트리밍 → fsync.
 fn write_shard(
     ar: &StArchive,
     mmaps: &[memmap2::Mmap],
@@ -561,7 +487,6 @@ fn write_shard(
     bytes_done: &AtomicU64,
 ) -> Result<u64, String> {
     let t0 = Instant::now();
-    // 헤더 직렬화 — data_offsets는 크기 합으로 선행 확정.
     let mut hdr = String::from("{\"__metadata__\":{\"format\":\"pt\"}");
     let mut off = 0u64;
     for o in outs {
@@ -628,7 +553,6 @@ fn write_shard(
     Ok(written)
 }
 
-/// dtype → safetensors 헤더 문자열(st.rs parse의 역매핑).
 fn dtype_name(d: StDtype) -> &'static str {
     match d {
         StDtype::F16 => "F16",
@@ -642,8 +566,6 @@ fn dtype_name(d: StDtype) -> &'static str {
     }
 }
 
-/// config.json 복사 + quantization_config 값 치환(brace 매칭 — 문자열 내부
-/// 중괄호 무시, w4a16.rs extract_embedded_quant 동일 알고리즘 위치 반환판).
 fn write_config(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
     let cfg = std::fs::read_to_string(src_dir.join("config.json"))
         .map_err(|e| format!("config.json: {e}"))?;
@@ -696,9 +618,6 @@ fn write_config(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// CT quantization_config 본문 — w4a16.rs check_quant 계약(compressed-tensors
-/// ·pack-quantized·int4·sym·g128) 충족. ignore = FN 원본 extra_config의
-/// BF16/FP8 제외 패밀리(전문가 라우팅 선형만 양자화 대상).
 const CT_QUANT_CONFIG: &str = r#"{
     "config_groups": {
       "group_0": {
@@ -739,8 +658,6 @@ const CT_QUANT_CONFIG: &str = r#"{
     "quant_method": "compressed-tensors"
   }"#;
 
-/// 부속 파일 복사 — tokenizer·템플릿·메타·runtime(mtp 가중치 제외: 본 과제
-/// 대상 = 라우팅 전문가 73,728 텐서 한정, mtp-int4-g32는 별도 g32 GPTQ 팩).
 fn copy_aux(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
     const FILES: &[&str] = &[
         "tokenizer.json",
@@ -770,7 +687,6 @@ fn copy_aux(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 디렉터리 재귀 복사 — skip_top: 최상위 자식 이름 제외 목록.
 fn copy_tree(src: &Path, dst: &Path, skip_top: &[&str]) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("{dst:?}: {e}"))?;
     for e in std::fs::read_dir(src).map_err(|e| format!("{src:?}: {e}"))? {
@@ -791,10 +707,6 @@ fn copy_tree(src: &Path, dst: &Path, skip_top: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// 동치 검증 — 표본 전문가 전 행 CT 디큐트(w4a16 스토어 경로·lane.rs 계약)
-/// vs GPTQ 직접 디큐트(engine.rs expert_row) **비트일치** 판정.
-/// 함께: packed 워드 ↔ qweight 워드 전수 대조 + scale 비트 대조(니블 전치
-/// 무손실의 직접 증명 — (q−8)·s 곱은 q=8/s=0에서 변형을 숨길 수 있어).
 pub fn verify_sample(
     src_dir: &Path,
     dst_dir: &Path,
@@ -825,8 +737,6 @@ pub fn verify_sample(
                     .map_err(|e| format!("{base}: {e}"))?;
                 let (kw, kg) = (k / 8, k / g);
                 for r in 0..n {
-                    // CT 행 디큐트 — lane.rs dot_row_w4a16_lane_parts와 동일
-                    // 니블 계약(lsb-first, zp=8)·engine.rs half_f32 공유.
                     let want = gq
                         .expert_row(&base, r)
                         .map_err(|er| format!("{base}: {er}"))?;
@@ -845,7 +755,6 @@ pub fn verify_sample(
                     }
                     rows += 1;
                 }
-                // 워드·스케일 비트 직접 대조(전수).
                 for r in 0..n {
                     for jw in 0..kw {
                         let a = u32::from_le_bytes(
@@ -860,8 +769,6 @@ pub fn verify_sample(
                         }
                         words += 1;
                     }
-                    // g32 복제 검증 — 원본 g128 스케일이 4자식 그룹에 동값.
-                    // (여기 kg = CT 스토어 그룹 개수 = k/32 — 원본은 kg/4개.)
                     let rep_n = G / 32;
                     for gi128 in 0..(kg / rep_n) {
                         let bq = [gs[2 * (gi128 * n + r)], gs[2 * (gi128 * n + r) + 1]];
@@ -892,7 +799,6 @@ pub fn verify_sample(
 mod tests {
     use super::*;
 
-    /// 샤드 판별 — model-* 숫자 샤드만 재구성, plefp8 등은 파일 복사.
     #[test]
     fn shard_classify() {
         assert!(is_model_shard("model-00001-of-00017.safetensors"));
@@ -902,7 +808,6 @@ mod tests {
         assert!(!is_model_shard("model.safetensors"));
     }
 
-    /// 이름 안전성 — 이스케이프 필요 문자 거부.
     #[test]
     fn name_safety() {
         assert!(name_safe(
@@ -912,8 +817,6 @@ mod tests {
         assert!(!name_safe("bad\\name"));
     }
 
-    /// gptq → CT 트리플 합성 왕복 — 실측 형상(n=640,k=2560)으로 워커 직접
-    /// 호출 없이 repack 전체 경로(헤더·index·config splice 포함) 검증.
     #[test]
     fn repack_synthetic_roundtrip() {
         let tmp = std::env::temp_dir().join(format!("fn-repack-test-{}", std::process::id()));
@@ -923,8 +826,6 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
 
-        // ── 합성 소스: 1층 × 2전문가 × 3투영 + 밀집 1 + ple풍 샤드 1.
-        // LCG — 결정론적 유사랜덤 워드(니블 전 범위).
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         let mut rnd = move || {
             seed ^= seed << 13;
@@ -944,7 +845,6 @@ mod tests {
                 ));
                 off += data.len() as u64;
             }
-            // 첫 항목 앞 콤마 정리
             let hdr = hdr.replacen("{,", "{", 1) + "}";
             let mut buf = Vec::new();
             buf.extend_from_slice(&(hdr.len() as u64).to_le_bytes());
@@ -955,7 +855,6 @@ mod tests {
             std::fs::write(dir.join(file), &buf).unwrap();
         };
 
-        // gate_proj(n=640,k=2560) 1개 + down_proj(n=2560,k=640) 1개 — 두 형상 모두.
         let triples = [
             (
                 "model.language_model.layers.0.mlp.experts.0.gate_proj",
@@ -1013,7 +912,6 @@ mod tests {
                 .collect();
             want_scales.push((base.to_string(), sv, n, kg));
         }
-        // 밀집 복사 대상 1개.
         let dense = (0..1024).flat_map(|i| (i as u16).to_le_bytes()).collect();
         model_ents.push((
             "model.language_model.layers.0.mlp.gate.weight".to_string(),
@@ -1022,7 +920,6 @@ mod tests {
             dense,
         ));
         write_st(&src, "model-00001-of-00002.safetensors", model_ents);
-        // 두 번째 model 샤드(빈 재구성 경로) + ple풍 샤드(F32 1텐서).
         write_st(&src, "model-00002-of-00002.safetensors", vec![]);
         let ple: Vec<u8> = (0..64).flat_map(|i| (i as f32).to_le_bytes()).collect();
         write_st(
@@ -1035,7 +932,6 @@ mod tests {
                 ple.clone(),
             )],
         );
-        // index + config.
         let mut wm = String::from("{\"weight_map\":{");
         let names0 = [
             "model.language_model.layers.0.mlp.experts.0.gate_proj",
@@ -1062,13 +958,11 @@ mod tests {
         )
         .unwrap();
 
-        // ── 실행.
         let stats = repack_inner(&src, &dst, 2).expect("재팩 실패");
         assert_eq!(stats.experts, 2);
-        assert_eq!(stats.tensors, 8); // 2트리플×3 + 밀집 1 + ple 1
+        assert_eq!(stats.tensors, 8);
         assert_eq!(stats.ple_files, 1);
 
-        // ── 출력 검증: 아카이브 개방 + 트리플 직접 대조.
         let out = StArchive::open(&dst).expect("출력 개방 실패");
         for (base, wv, n, kw) in &want_words {
             let e = out.entry(&format!("{base}.weight_packed")).expect("packed");
@@ -1103,7 +997,6 @@ mod tests {
             let k = kw * 8;
             assert_eq!(nk, (*n as i64, k as i64));
         }
-        // 밀집·ple 원시 보존.
         assert_eq!(
             out.read("model.language_model.layers.0.mlp.gate.weight")
                 .unwrap()
@@ -1115,7 +1008,6 @@ mod tests {
                 .unwrap(),
             ple
         );
-        // W4a16Model 완전 개방(quant splice · 트리플 계약).
         let store = W4a16Model::open(&dst).expect("W4a16 open 실패");
         assert_eq!(store.n_lins(), 2);
         assert_eq!(store.group(), 32);
@@ -1126,7 +1018,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// qzeros 비상수 — 즉시 거부(D1 게이트).
     #[test]
     fn repack_rejects_nonconstant_qzeros() {
         let tmp = std::env::temp_dir().join(format!("fn-repack-neg-{}", std::process::id()));
@@ -1135,13 +1026,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
-        // 최소 트리플 1개 — qzeros 1워드 오염. 형상은 실측 쌍 유지(작게 못
-        // 줄인다 — check_triple 고정 계약).
         let (n, k) = (640usize, 2560usize);
         let (kw, kg) = (k / 8, k / 128);
         let qw = vec![0u8; kw * n * 4];
         let mut qz = vec![0x77u8; kg * (n / 8) * 4];
-        qz[0] = 0x76; // 니블 하나 어긋남
+        qz[0] = 0x76;
         let sc = vec![0u8; kg * n * 2];
         let ents = vec![
             (
@@ -1186,8 +1075,6 @@ mod tests {
             "{\"weight_map\":{\"model.language_model.layers.0.mlp.experts.0.gate_proj.qweight\":\"model-00001-of-00001.safetensors\",\"model.language_model.layers.0.mlp.experts.0.gate_proj.qzeros\":\"model-00001-of-00001.safetensors\",\"model.language_language.layers.0.mlp.experts.0.gate_proj.scales\":\"model-00001-of-00001.safetensors\"}}",
         )
         .unwrap();
-        // index의 scales 이름 오타 → StArchive가 먼저 거부하는 경로와 무관하게
-        // 여기선 qzeros 검증 도달이 목적 — 정확한 이름으로 재작성.
         std::fs::write(
             src.join("model.safetensors.index.json"),
             "{\"weight_map\":{\"model.language_model.layers.0.mlp.experts.0.gate_proj.qweight\":\"model-00001-of-00001.safetensors\",\"model.language_model.layers.0.mlp.experts.0.gate_proj.qzeros\":\"model-00001-of-00001.safetensors\",\"model.language_model.layers.0.mlp.experts.0.gate_proj.scales\":\"model-00001-of-00001.safetensors\"}}",
@@ -1199,9 +1086,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// 실모델 동치 검증 — LLM170_FN_MODEL(GPTQ 원본) + LLM170_FN_MODEL_CT
-    /// (재팩 출력) 지정 시에만 실행(CI·회귀 무관 — fn_probe 게이트 패턴).
-    /// 표본: 층 {0,23,47} × 전문가 {0,7,511} × 3투영 — **전 행** 비트일치.
     #[test]
     fn fn_repack_equiv_real_model() {
         let (Some(src), Some(dst)) = (

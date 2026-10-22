@@ -1,8 +1,5 @@
 use super::super::*;
 
-/// [2026-10-18] 마린 인스턴스 심볼 표 — assets/marlin.cu 채리픽 13종과 1:1
-/// (threads, thread_m_blocks, thread_n_blocks(=N/16), thread_k_blocks(=K/16)).
-/// 맹글명은 툴체인·시그니처 계약 고정 — 추출 = cuobjdump -symbols.
 fn marlin_sym(threads: u32, m: usize, tn: usize, tk: usize) -> Option<&'static str> {
     Some(match (threads, m, tn, tk) {
         (128, 1, 4, 8) => {
@@ -48,9 +45,6 @@ fn marlin_sym(threads: u32, m: usize, tn: usize, tk: usize) -> Option<&'static s
     })
 }
 
-/// [2026-10-19] g32(group_blocks=2) 판 — assets/marlin_g32.cu 채리픽 13종과 1:1.
-/// gemma4 dense(g32·bf16) t>16 경로 소비(맹글명은 툴체인 계약 — 재추출 절차
-/// = marlin_g32.cu 빌드 후 cuobjdump -symbols).
 fn marlin_g32_sym(threads: u32, m: usize, tn: usize, tk: usize) -> Option<&'static str> {
     Some(match (threads, m, tn, tk) {
         (128, 1, 4, 8) => {
@@ -97,13 +91,6 @@ fn marlin_g32_sym(threads: u32, m: usize, tn: usize, tk: usize) -> Option<&'stat
 }
 
 impl W4a16Dec {
-    /// [2026-10-18] vLLM 마린 GEMM 시도(27B dense t≥16 g128 · [2026-10-19]
-    /// gemma4 dense t>16 g32) — 벤더 assets/marlin/(Apache-2.0). 재패킹
-    /// (lins_mk)·스케일 순열(lins_msc) 사본이 있을 때만 동작 — 부재 시
-    /// Ok(false)로 기존 경로 폴백(운영 계약: 사본 부재 = 용량/형상 계약
-    /// 미충족일 때만). C = f16 스크래치 → `w4a16_h2f`로 f32(y_out).
-    /// M 분할·타일 픽 = vLLM marlin_mm 휴리스틱 이식(max_par 16/128, m블록 4캡).
-    /// group = 128(f16·27B, marlin.fatbin) | 32(bf16·gemma4, marlin_g32.fatbin).
     pub(in crate::rawcuda::w4a16_dec) fn marlin_gemm_try(
         &mut self,
         name: &str,
@@ -132,7 +119,6 @@ impl W4a16Dec {
             self.dmc = self.realloc_buf(self.dmc, need, need, "dmc_cap")?;
         }
         let c16 = self.dmc.ptr;
-        // locks = sms×4 int32(0 초기화) — 커널이 스스로 리셋(재사용 계약).
         if self.dmlock == 0 {
             let bytes = self.cc.sm_count().max(1) as usize * 16;
             let p = self.cc.alloc(bytes)?;
@@ -212,7 +198,6 @@ impl W4a16Dec {
             c_off += m_split * n;
             rest -= m_split;
         }
-        // f16 C → f32(y_out) — 엔진 스트림 dtype 계약.
         let fh = self.cc.function("w4a16_h2f")?;
         let nn2 = t * n / 2;
         let mut n2 = nn2 as i32;

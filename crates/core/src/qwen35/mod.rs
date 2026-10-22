@@ -1,17 +1,3 @@
-//! qwen35 (Qwen3.8-27B 계열) CPU 참조 엔진.
-//!
-//! 그래프 배선: `~/local_llm/llama.cpp/src/models/qwen35.cpp` (2026-08-30 판).
-//! 하이퍼파라미터(27B): n_embd 5120, FFN 17408(SwiGLU), vocab 248320,
-//! rms_eps 1e-6, ctx 262144. 64층 = 12×(3×GDN→FFN + 1×GatedAttn→FFN)
-//! (full_attention_interval=4 → full-attn il∈{3,7,…,63}), block_count=65.
-//! - 잔차: h += attn(rms(h)); h += ffn(rms_post(h)) — FFN 분기는 **post**-attn norm
-//! - GDN층(interval≠3): qkv → depthwise conv+SiLU → L2 norm(q,k) → GDN → rms_norm·silu(z) → ssm_out
-//! - Full-attn층(interval==3): wq는 Q‖gate 퓨전 [5120, 12288] 헤드별 인터리브
-//!   (스트라이드 2·head_dim) → per-head rms norm(q,k) [256] → RoPE half-split
-//!   (n_rot 64, base 1e7 — 텍스트 토큰에서 mrope 구간 [11,11,10]과 동치)
-//!   → GQA(24Q/4KV, scale 1/√256) → ⊙sigmoid(gate) → wo. KV f16 64 KiB/token(16층).
-//! - 하이퍼파라미터는 config.json 메타에서 동적 로드 (소형 검증 모델 지원).
-//! - f32 KV, f32 GDN 상태 (참조 정확도 우선).
 
 pub mod bind;
 mod diag;
@@ -33,7 +19,6 @@ use crate::quant::dequant_row;
 pub enum ModelError {
     MissingTensor(String),
     BadHparam(&'static str),
-    /// W4A16 디렉터리 로더 오류(§3.5 A안 직접 로드).
     W4a16(String),
 }
 
@@ -49,18 +34,12 @@ impl std::fmt::Display for ModelError {
 
 impl std::error::Error for ModelError {}
 
-/// 가중치 소스 — **W4A16 디렉터리 단일**(2026-10-08).
-/// 세부 접근은 `w4a16` 로더(mmap 슬라이스 + 순열 사본).
 pub struct Model {
     w4: Box<crate::w4a16::W4a16Model>,
-    /// qwen3_5 아키텍처 바인딩 설정(config.json).
     cfg: bind::QwenCfg,
-    /// V축 순열 사본(지연 1회 구축).
     perm: std::sync::OnceLock<bind::PermStore>,
     pub hp: Hparams,
     pub token_pieces: Vec<String>,
-    /// f32 norm 가중 디양자화 캐시(llama-vllm P13 계열) — 첫 호출 1회
-    /// 디양자화 후 재사용(수치 불변). 값 경로 매 포워드 층별 norm 재디양자 제거.
     f32_cache: std::cell::RefCell<std::collections::HashMap<String, Vec<f32>>>,
 }
 
@@ -73,9 +52,6 @@ macro_rules! span_block {
 pub(crate) use span_block;
 
 impl Model {
-    /// W4A16 디렉터리 로드(§3.5 직접 로드) — config.json에서 하이퍼파라미터,
-    /// tokenizer.json/vocab.json에서 조각표. 소스 검증은 W4A16 로더의
-    /// validate()가 전수(트리플·커버리지).
     pub fn load(dir: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         profile_span!("model::load_w4a16");
         let w4 =
@@ -129,29 +105,22 @@ impl Model {
         for name in ["token_embd.weight", "output.weight"] {
             m.w(name).ok_or(ModelError::MissingTensor(name.into()))?;
         }
-        // output_norm은 Synth(norm +1) — f32_vec 경유로 실재·형상 검증.
         m.f32_vec("output_norm.weight")?;
         Ok(m)
     }
 
-    /// 무게 뷰 — W4A16 이름맵으로 슬라이스/분리버퍼 구성.
     pub fn w(&self, name: &str) -> Option<Weight<'_>> {
         w4_weight(self, name)
     }
 
-    /// 엔진 접점 이름 전수(상주 로더/W3 배선용).
     pub fn engine_names(&self) -> Vec<String> {
         bind::engine_names(&self.cfg)
     }
 
-    /// [2026-10-16] 스토어 접근(읽기 전용) — 상주 적재의 O_DIRECT 직결 좌표.
     pub fn store(&self) -> &crate::w4a16::W4a16Model {
         &self.w4
     }
 
-    /// 상주 적재 원시 텐서 이름 — `w4_weight_raw`와 동일 해석(이름만):
-    /// Quant = (packed, Some(scale)) · Plain = (weight, None) · Synth = None.
-    /// (mmap 우회 직독이 필요한 곳 — 바이트는 `store().tensor_range`로.)
     pub fn w_raw_names(&self, name: &str) -> Option<(String, Option<String>)> {
         use bind::Eng;
         match bind::eng(name)? {
@@ -170,8 +139,6 @@ impl Model {
         }
     }
 
-    /// 전문가 트리플 원시 텐서 이름 — (packed, scale). 바인딩 이름 규칙은
-    /// `expert_at`·`expert_slice`와 동일 단일 출처(bind::expert_base).
     pub fn expert_names(&self, il: usize, e: usize, proj: &str) -> (String, String) {
         let base = bind::expert_base(il, e, proj);
         (
@@ -180,16 +147,10 @@ impl Model {
         )
     }
 
-    /// 임베딩 행 1개(tok) — W3 GPU 체인 입력(호스트 스테이징).
     pub fn embed_row(&self, tok: u32) -> Result<Vec<f32>, ModelError> {
         let Some(bind::Eng::Plain { name, .. }) = bind::eng("token_embd.weight") else {
             return Err(ModelError::MissingTensor("token_embd.weight".into()));
         };
-        // [2026-10-09 P4] mmap 슬라이스 경유 — 종전 토큰마다 File::open+
-        // seek+read_exact(+close)의 3~4 syscall + 할당. mmap에서 행 바이트를
-        // 직접 취해 같은 decode_f32로 디코드한다(값 동일 — 같은 오프셋·같은
-        // 디코더). mmap 부재(비정상) 시 종전 경로 폴백.
-        // 이득: 프리필(청크당 토큰 수만큼)·디코드 토큰당 syscall 0.
         if let (Some(buf), Some(e)) = (self.w4.tensor_slice(&name), self.w4.entry(&name))
             && e.shape.len() == 2
         {
@@ -206,7 +167,6 @@ impl Model {
             .map_err(|e| ModelError::W4a16(e.to_string()))
     }
 
-    /// MoE 전문가 트리플 슬라이스(W4-1) — 서버 GPU 전문가 테이블 구성용.
     pub fn expert_slice(
         &self,
         il: usize,
@@ -216,13 +176,11 @@ impl Model {
         self.w4.expert_at(&bind::expert_base(il, e, proj))
     }
 
-    /// MoE 전문가 양자 파라미터 — (group, scale_bf16) 실측.
     pub fn expert_quant(&self) -> (usize, bool) {
         let base = bind::expert_base(0, 0, "gate_proj");
         (self.w4.group(), self.w4.scale_is_bf16(&base))
     }
 
-    /// MoE 전문가 Weight(W4-1) — 스토어 트리플에서 직접 구성(30k 이름맵 무경유).
     pub fn expert_w(&self, il: usize, e: usize, proj: &str) -> Option<Weight<'_>> {
         let base = bind::expert_base(il, e, proj);
         let (data, scale, n, k) = self.w4.expert_at(&base)?;
@@ -237,14 +195,10 @@ impl Model {
         })
     }
 
-    /// 원본(HF) 무게 — W3 GPU 체인용. GPU 커널은 순열을 내부에서
-    /// 처리하므로(l2perm scatter·gate p_inv) 순열 사본을 주면 이중 순열이
-    /// 된다. CPU 엔진은 순열 사본(w())을 쓰고, GPU는 이쪽을 쓴다.
     pub fn w_raw(&self, name: &str) -> Option<Weight<'_>> {
         w4_weight_raw(&self.w4, name)
     }
 
-    /// 원본(HF) f32 벡터 — 순열·synth 보정 없이(1D/2D 모두).
     pub fn raw_f32_vec(&self, name: &str) -> Result<Vec<f32>, ModelError> {
         let hf = match bind::eng(name) {
             Some(bind::Eng::Synth { name, .. }) | Some(bind::Eng::Plain { name, .. }) => name,
@@ -259,7 +213,6 @@ impl Model {
                 .plain_vec_f32(&hf)
                 .map_err(|e| ModelError::W4a16(e.to_string()))
         } else {
-            // 랭크 ≥2(conv1d는 [conv_ch,1,4]) — 행 원시 바이트 → f32.
             let rows = *e.shape.first().unwrap_or(&0);
             let raw = self
                 .w4
@@ -270,7 +223,6 @@ impl Model {
         }
     }
 
-    /// V축 순열 사본(지연 1회 구축 — 48 선형층 qkv-v/z/out + alpha/beta).
     fn perm_store(&self) -> &bind::PermStore {
         self.perm
             .get_or_init(|| bind::build_perm(&self.w4, &self.cfg))
@@ -287,9 +239,6 @@ impl Model {
         }
         let w4 = &self.w4;
         let v = match bind::eng(name) {
-            // 정규화는 HF zero-centered(w−1 저장) — 로드 시 +1 보정.
-            // ssm_a는 −exp(A_log), dt_bias/A_log·conv는 V헤드 순열 합성
-            // (엔진 subhead-major 계약 — perm: 1 인덱스·2 채널).
             Some(bind::Eng::Synth {
                 name: hf,
                 plus1,
@@ -321,7 +270,6 @@ impl Model {
                 }
                 v
             }
-            // 플레인 2D(BF16) — Weight 경유 디양자화(행 순열 포함).
             _ => self.wchk(name)?.dequant_f32_vec(),
         };
         self.f32_cache
@@ -335,8 +283,6 @@ impl Model {
     }
 }
 
-/// 원본(HF) Weight 구성 — 순열 사본 비경유(W3 GPU 체인용).
-/// 플레인(무양자) Weight — MoE(35B) 어텐션 투영이 BF16인 케이스의 공용 경로.
 fn plain_weight<'a>(w4: &'a crate::w4a16::W4a16Model, hf: &str) -> Option<Weight<'a>> {
     use crate::wtype::WType;
     let e = w4.entry(hf)?;
@@ -364,8 +310,6 @@ fn w4_weight_raw<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Wei
     use bind::Eng;
     match bind::eng(name)? {
         Eng::Quant { base, .. } => {
-            // MoE(35B) 폴백: 트리플이 없고 같은 베이스의 플레인(BF16)이 있으면
-            // 그쪽을 쓴다 — 스토어 내용이 진실(아치 분기 없이 동일 엔진 이름).
             let Some((n, k)) = w4.lin_shape(&base) else {
                 return plain_weight(w4, &format!("{base}.weight"));
             };
@@ -384,17 +328,12 @@ fn w4_weight_raw<'a>(w4: &'a crate::w4a16::W4a16Model, name: &str) -> Option<Wei
     }
 }
 
-/// W4A16 소스의 Weight 구성 — Quant는 분리 버퍼(packed+scale), Plain은
-/// 원시 슬라이스(ty는 dtype에서). Synth(norm류)는 None —
-/// f32_vec 전용 계약(호출부가 w()로 요구하지 않는다).
 fn w4_weight<'a>(m: &'a Model, name: &str) -> Option<Weight<'a>> {
     use crate::wtype::WType;
     use bind::{Eng, PV};
     let w4 = &m.w4;
     match bind::eng(name)? {
         Eng::Quant { base, vperm } => {
-            // MoE(35B) 폴백 — 같은 베이스의 플레인(BF16). V축 순열은 양자화
-            // 경로와 동일 규약으로 적용한다(엔진 subhead-major 계약).
             let Some((n, k)) = w4.lin_shape(&base) else {
                 let hf = format!("{base}.weight");
                 return match vperm {
@@ -471,7 +410,6 @@ fn w4_weight<'a>(m: &'a Model, name: &str) -> Option<Weight<'a>> {
     }
 }
 
-/// 시퀀스 상태
 pub struct SeqState {
     pub pos: u32,
     pub(crate) gdn_s: Vec<Vec<f32>>,
@@ -510,8 +448,6 @@ impl Engine {
         Engine { model, seqs }
     }
 
-    /// 시퀀스 상태 전체 초기화 (무상태 HTTP 서버용).
-    /// ctx는 기존 KV 용량에서 역산 (첫 kv_k 길이).
     pub fn reset_states(&mut self) {
         let n_kv = self.model.hp.n_kv;
         let hd = self.model.hp.head_dim;
@@ -525,8 +461,6 @@ impl Engine {
         }
     }
 
-    /// 슬롯 단위 상태 초기화 (연속 배칭 서버) — 해당 시퀀스의
-    /// KV/GDN/conv 상태만 영점화, 다른 슬롯은 간섭 없음.
     pub fn reset_seq(&mut self, seq: usize) {
         let n_kv = self.model.hp.n_kv;
         let hd = self.model.hp.head_dim;
@@ -538,8 +472,6 @@ impl Engine {
         self.seqs[seq] = SeqState::new(&self.model, ctx);
     }
 
-    /// 배치 포워드: batch[i] = seq_ids[i] 시퀀스의 토큰(행간 동일 길이).
-    /// seq_ids: 배치 행 → 엔진 시퀀스 id 매핑 (prefill은 단일, decode는 활성 집합).
     fn forward(
         &mut self,
         seq_ids: &[usize],
@@ -548,8 +480,6 @@ impl Engine {
         self.forward_emb(seq_ids, batch, None)
     }
 
-    /// forward 변형 — 임베딩 행 사전 조달 시 rows 직접 사용.
-    /// rows.len() == 전체 토큰 수 필수. None이면 token_embd 디양자화.
     fn forward_emb(
         &mut self,
         seq_ids: &[usize],
@@ -589,7 +519,6 @@ impl Engine {
         let mut recr_idx = 0usize;
         for il in 0..hp.n_layer {
             let norm_w = self.model.f32_vec(&format!("blk.{il}.attn_norm.weight"))?;
-            // 잔차: pre-norm 원본 보존 (qwen35.cpp:162-184 — inpSA)
             let residual: Vec<Vec<f32>> = xs.clone();
             for x in xs.iter_mut() {
                 *x = rms_norm(x, &norm_w, hp.eps);
@@ -622,8 +551,6 @@ impl Engine {
                 .model
                 .f32_vec(&format!("blk.{il}.post_attention_norm.weight"))?;
             if hp.n_experts > 0 {
-                // MoE FFN(W4-1, 35B-A3B) — dense와 동일 계약: normed 계산 후
-                // 잔차(ffn_residual) 가산은 여기서.
                 let mut normed: Vec<Vec<f32>> = vec![vec![0.0f32; n_embd]; n_tok];
                 for (i, x) in xs.iter().enumerate() {
                     normed[i] = rms_norm(x, &post_w, hp.eps);
@@ -697,7 +624,6 @@ impl Engine {
             }
         }
 
-        // output_norm + logits (시퀀스별 마지막 토큰만)
         let out_norm = self.model.f32_vec("output_norm.weight")?;
         let head = self.model.wchk("output.weight")?;
         let mut result = Vec::with_capacity(n_seqs);
@@ -729,7 +655,6 @@ impl Engine {
         Ok(logits)
     }
 
-    /// np 배치 greedy 디코드 — 토큰만 회수 (logits 전사 회피).
     pub fn decode_np_greedy(
         &mut self,
         seq_ids: &[usize],
@@ -739,13 +664,11 @@ impl Engine {
         Ok(logits.iter().map(|l| greedy(l)).collect())
     }
 
-    /// greedy 디코드 — decode + argmax.
     pub fn decode_greedy(&mut self, seq: usize, token: u32) -> Result<u32, ModelError> {
         let logits = self.decode(&[seq], &[token])?;
         Ok(crate::qwen35::greedy(&logits[0]))
     }
 
-    /// 표면형 근사 디토크 (표시용 — 정식 BPE 디토크나이저는 후속)
     pub fn piece(&self, tok: u32) -> String {
         self.model
             .token_pieces
@@ -757,20 +680,12 @@ impl Engine {
     }
 }
 
-/// greedy argmax — `matmul::greedy_from`과 동일 의미(동률 최저인덱스).
-/// 구현 중복 제거: 단일 구현 재수출.
 pub use crate::matmul::greedy_from as greedy;
 
-/// [2.J 2026-10-13] serve의 ctx 파생·기동 가드 입력 — config만 판독(전체 로드 없음).
 pub struct CtxInfo {
-    /// 모델 전역 ctx 상한(max_position_embeddings).
     pub ctx: usize,
-    /// [K6-3] GDN 상태 바이트/슬롯(f32) — 기동 예산 회계(문맥 추가분).
     pub gdn_state_bytes_per_slot: u64,
-    /// KV(int8)+스케일 바이트/토큰 추정 — 엔진 할당과 같은 항
-    /// (full층 × kv헤드 × head_dim × 2B(K+V) + full층 × kv헤드 × 2 × 4B 스케일).
     pub kv_bytes_per_token: u64,
-    /// dense FFN(전문가 0) — VRAM 가드에서 가중치 전량 요구 판단.
     pub dense: bool,
 }
 
@@ -781,8 +696,6 @@ pub fn ctx_info(dir: &std::path::Path) -> Result<CtxInfo, String> {
     let sc = full * c.kv_heads as u64 * 2 * 4;
     Ok(CtxInfo {
         ctx: c.max_pos,
-        // GDN(선형) 층 = 전체 − 전체/간격(=3/4). [상태 채택 2026-10-13]
-        // 라이브 상태 = f16(2B) + 행별 스케일 f32(128/층헤드) — 예산 회계 동일 항.
         gdn_state_bytes_per_slot: {
             let n_gdn = c.layers as u64 - c.layers as u64 / c.full_interval.max(1) as u64;
             let hv = c.linear_num_value_heads as u64;

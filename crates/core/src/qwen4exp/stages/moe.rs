@@ -1,27 +1,8 @@
-//! MoE FFN 스테이지 — 512전문가 top-10 + shared(gemma4/qwen35 MoE 미러).
-//!
-//! 텐서 계약(FN 실측): gate(라우터) BF16 [512,2560] · 전문가 gptq int4
-//! 트리플(gate/up [640,2560] · down [2560,640], g128) · shared_expert
-//! gate/up/down BF16 + shared_expert_gate [1,2560].
-//! 라우팅 = 전체 softmax → top-k → 재정규화(qwen35 select_topk 재사용 —
-//! vllm Qwen3NextSparseMoeBlock 시맨틱).
-//!
-//! [오라클 병렬화 2026-10-21] 3페이즈 재구성(engine::par_ranges — 비트동일):
-//! A) (t,e) 유닛 병렬 — h[t][e] = silu(gw·x)⊙(uw·x). 전문가 게이트/업
-//!    디양자화가 지배 비용(토큰×전문가마다 전량 재디양자화 — 종전 순차
-//!    구조의 낭비 그대로, 분할만)이라 유닛 자기완결로 병렬화.
-//! B) shared 사전계산(토큰 병렬) — sgate·s_out(BF16 matvec — 임계 미만
-//!    순차, 중첩 없음).
-//! C) (t,행밴드) 유닛 병렬 — out[t][r] = Σ_e(선택 순서) w·dot(dw_e[r], h_e)
-//!    에 sgate·s_out[t][r]를 마지막 가산. 행별 전문가 가산 순서·shared
-//!    마지막 가산 순서는 순차판과 동일(비트동일). hs·out은 평탄 버퍼
-//!    (유닛별 상호배타 원소 기록 — 중첩 Vec raw 인덱싱 회피).
 
 use super::super::engine::{Model, SendPtr, par_ranges};
 use crate::ops::{sigmoid, silu};
 use crate::qwen35::stages::moe::select_topk;
 
-/// C페이즈 행밴드 폭(2560행 → 10밴드 — 유닛 그레인 ≈ 1.6M MAC).
 const OUT_BAND: usize = 256;
 
 pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
@@ -37,14 +18,11 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
     }
     let (hidden, top_k) = (cfg.hidden_size, cfg.top_k);
     let n_tok = xs.len();
-    // 라우팅 — 토큰 순차(소형 matvec [512,2560]).
     let mut sels: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n_tok);
     for x in xs {
         let logits = m.matvec_bf16(&format!("{l}.gate.weight"), x)?;
         sels.push(select_topk(&logits, top_k));
     }
-    // 선택 전문가 존재 사전검증(병렬 본체의 expect는 여기서 보증 —
-    // gptq 트리플은 {p}.qweight 형태로 존재).
     for sel in &sels {
         for &(e, _) in sel {
             for p in ["gate_proj", "up_proj", "down_proj"] {
@@ -52,10 +30,6 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
             }
         }
     }
-    // A) h — 평탄 [n_tok×top_k], 유닛 (t,e) 병렬.
-    // SAFETY: hs 기록 원소 u=(t,ei)는 유닛마다 상호배타 — 병렬 쓰기 레이스
-    // 없음. 스코프 조인 전에 모든 기록이 완료된다(구조는 gdn.rs ar_pool
-    // SendPtr 선례와 동일).
     let mut hs: Vec<Vec<f32>> = vec![Vec::new(); n_tok * top_k];
     {
         let hs_ptr = SendPtr::new(hs.as_mut_ptr());
@@ -81,8 +55,6 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
             }
         });
     }
-    // B) shared 사전계산 — sgate[t]·s_out[t](토큰 병렬).
-    // SAFETY: 기록 인덱스 t는 유닛별 상호배타.
     let mut sgate = vec![0.0f32; n_tok];
     let mut s_out: Vec<Vec<f32>> = vec![Vec::new(); n_tok];
     {
@@ -119,9 +91,6 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
             }
         });
     }
-    // C) 출력 — 평탄 [n_tok×hidden], 유닛 (t,행밴드) 병렬. 전문가 순서·
-    // shared 마지막 가산은 순차판과 동일(비트동일).
-    // SAFETY: 기록 원소 t·hidden+r은 유닛별 상호배타.
     let mut flat = vec![0.0f32; n_tok * hidden];
     {
         let out_ptr = SendPtr::new(flat.as_mut_ptr());

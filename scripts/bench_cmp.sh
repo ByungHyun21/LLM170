@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# CMP 170HX 표준 배터리 — CMP기 전용(sm_80 행 라벨; 4090 = bench_4090.sh).
-# 표 행을 **그대로 출력**한다(측정 1회 = README 갱신 — 세트를 표와 일치시켜 이중 측정 제거).
-# **조용한 창 전용** — 공식 기록 규율(2026-10-17): 이전 실행(모델 1회 로드)이 끝나고
-#   다른 무거운 잡(빌드·eval·타 엔진)이 없을 때만. 부하 중 실행 수치는 기록 금지.
-# 세트(README CMP 표와 동일): pp 512,1024,4096 + tg128@4k + np4(27B·35B).
-# 부가 기록(판정 밖 참고): GPU0 SM클럭·전력·스로틀(5초 샘플) · 커밋 해시.
-#
-# 사용: scripts/bench_cmp.sh [--reps N]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN=${BIN:-./target/release/llm170}
@@ -38,7 +30,7 @@ trap cleanup EXIT
 
 echo "# 전력 상한(GPU0): $(nvidia-smi -q -i 0 -d POWER 2>/dev/null | grep -m1 'Power Limit' || echo '조회 불가')" >&2
 
-gpu_busy() { # GPU0 idle 사용률 중앙값(%) — 점유 탐지(무거운 잡 잔존)
+gpu_busy() {
     local v=()
     for _ in 1 2 3 4 5; do
         v+=("$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -i 0)")
@@ -47,7 +39,7 @@ gpu_busy() { # GPU0 idle 사용률 중앙값(%) — 점유 탐지(무거운 잡 
     printf '%s\n' "${v[@]}" | sort -n | sed -n 3p
 }
 
-row() { # 파일 np사용(1/0)
+row() {
     python3 - "$1" "$2" "$DATE" <<'PY'
 import re, sys
 path, usenp, date = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -68,7 +60,7 @@ print('| CUDA (170HX, 180 W, ' + date + ') | ' + ' | '.join(cells) + ' |')
 PY
 }
 
-run_model() { # 라벨 경로 np(1/0)
+run_model() {
     local label=$1 model=$2 np=$3
     pkill -x llm170 2>/dev/null || true
     sleep 2

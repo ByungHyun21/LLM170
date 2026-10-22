@@ -1,7 +1,6 @@
 use super::*;
 
 impl W4a16Dec {
-    /// [A9 진단] t행 GEMV 벤치(ms/회) — 지정 선형 반복.
     pub fn bench_gemv_t(&mut self, name: &str, t: usize, reps: usize) -> Result<f64, String> {
         let (_, _, n, k) = self.lin_spec(name)?;
         let x = self.cc.alloc(t * k * 4)?;
@@ -22,18 +21,11 @@ impl W4a16Dec {
         r
     }
 
-    /// 플레인 GEMM 자가 점검 — 배치 GEMM(t=8) vs 토큰별 GEMV 비트 비교
-    /// (판정 계약: 플레인 경로는 토큰 수준이나 같은 레인/환원 순서라 동일해야
-    /// 한다 — 다르면 t 처리 결함).
-    /// [2026-10-09] 텐서코어 도구·수치 스모크 — bf16 mma.m16n8k16 → f32 누적을
-    /// CPU 참조(bf16 RN 반올림 입력 + f32 k순 합)와 대조. 차이는 누적 순서뿐
-    /// (허용오차 1e-4). 1b(플레인 mma GEMM) 착륙 전 도구·프래그먼트 검증.
     pub fn mma_smoke(&mut self) -> Result<String, String> {
         let _g = self.cc.guard()?;
         let a = crate::rawcuda::assets::asset("smoke");
         self.cc
             .load_fatbin(a.name, &crate::rawcuda::assets::asset_bytes(a)?, a.syms)?;
-        // 결정적 준난수 ∈ [-1, 1) — 곱·합 ≤ 16이라 f32 누적순서 오차 ~1e-6.
         let mk = |n: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| {
@@ -42,7 +34,6 @@ impl W4a16Dec {
                 .collect()
         };
         let (a, b) = (mk(16 * 16), mk(16 * 8));
-        // bf16 RN(짝수) — 커널 __floats2bfloat162_rn과 동일 규약.
         let bf = |x: f32| -> f32 {
             let u = x.to_bits();
             f32::from_bits((u.wrapping_add(0x7FFF + ((u >> 16) & 1))) & 0xFFFF_0000)
@@ -63,9 +54,7 @@ impl W4a16Dec {
         let db = self.cc.alloc(b.len() * 4)?;
         let dc = self.cc.alloc(cref.len() * 4)?;
         let r = (|| -> Result<Vec<f32>, String> {
-            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) };
-            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let bb = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u8, b.len() * 4) };
             self.cc.h2d(da, ab)?;
             self.cc.h2d(db, bb)?;
@@ -118,16 +107,13 @@ impl W4a16Dec {
         let x: Vec<f32> = (0..t * k)
             .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 2048.0 - 0.5)
             .collect();
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
         let dx = self.cc.alloc(t * k * 4)?;
         let da = self.cc.alloc(t * n * 4)?;
         let db = self.cc.alloc(t * n * 4)?;
         let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
             self.cc.h2d(dx, xb)?;
-            // A: 배치 GEMM(v1, t=8)
             self.plain_gemm_launch(&name, dx, da, t)?;
-            // B: 토큰별 GEMV(t=1) ×8 → 이어붙임
             let mut bl = Vec::with_capacity(t * n);
             for ti in 0..t {
                 self.plain_gemv_launch(&name, dx + (ti * k * 4) as u64, db)?;
@@ -164,8 +150,6 @@ impl W4a16Dec {
         ))
     }
 
-    /// MoE 자가 점검 — 직접 GEMV vs 배치(간접) GEMV 비트 비교(층0·전문가0·
-    /// gate_proj). 상주 기기 브링업·회귀 판정용.
     pub fn moe_selfcheck(&mut self) -> Result<String, String> {
         if !self.moe.moe_resident || self.moe.n_experts == 0 {
             return Err("moe_selfcheck: 상주 MoE 구성 필요".into());
@@ -177,23 +161,18 @@ impl W4a16Dec {
         if self.moe.moe_tab.is_empty() {
             return Err("moe_selfcheck: 테이블 부재".into());
         }
-        // x — 결정적(splitmix64 계열 상수) ±0.5.
         let x: Vec<f32> = (0..k)
             .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 2048.0 - 0.5)
             .collect();
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
         let dx = self.cc.alloc(k * 4)?;
         let da = self.cc.alloc(n * 4)?;
         let db = self.cc.alloc(n * 4)?;
         let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
             self.cc.h2d(dx, xb)?;
-            // 직접 — moe_tab[0] = (층0, 전문가0, gate_proj).
             let e0 = self.moe.moe_tab[0];
             self.gemv_launch_raw(e0.0, e0.2, n, k, dx, da)?;
-            // 배치 — idx=[0], base=0, nslots=1.
             let idx = [0u32];
-            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let ib = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, 4) };
             self.cc.h2d(self.moe.moe_idx, ib)?;
             self.gemv_experts_launch(0, 1, dx, 0, 1, db, n, k)?;
@@ -237,8 +216,6 @@ impl W4a16Dec {
         ))
     }
 
-    /// GEMV 전 선형 1회 순회(벤치) — 실사용과 동일한 DRAM 스트림(13.9GB ≫ L2).
-    /// 반환: (ms/회, 가중치 바이트 합). x는 k별 1.0 f32(수치 무의미).
     pub fn gemv_walk_bench(&mut self, reps: usize) -> Result<(f64, u64), String> {
         let _g = self.cc.guard()?;
         let mut mk = 0usize;
@@ -250,7 +227,6 @@ impl W4a16Dec {
             wb += (n * k / 2) as u64;
         }
         let xf: Vec<f32> = vec![1.0f32; mk];
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         let dx = self.cc.alloc(xf.len() * 4)?;
         self.cc.h2d(dx, xb)?;
@@ -275,19 +251,12 @@ impl W4a16Dec {
         Ok((ms, wb))
     }
 
-    /// mma GEMM 수치 게이트(허용오차) — split 원본(w4a16_gemm_g128) vs
-    /// w4a16_gemm_g128_mma 출력을 같은 x로 비교. (T1 검증 — 계약 완화 후
-    /// 비트 대신 허용오차 판정.)
     pub fn mma_diff_check(&mut self, name: &str, t: usize) -> Result<String, String> {
         let _g = self.cc.guard()?;
-        // 플레인(bf16)이면 T2 경로로.
         if !self.lins.contains_key(name) {
             return self.mma_diff_plain(name, t);
         }
         let (dq, ds, n, k) = self.lin_spec(name)?;
-        // [split 계약 정합 2026-10-17] mma 커널의 x는 f16 — 종전 f32 버퍼를
-        // 그대로 넘겨 허위 NaN 보고(커널 f16 전환 시 프로브 미갱신 결함).
-        // 값을 f16 격자로 스냅해 양측 동일값: FFMA=f32(스냅) · mma=f16 비트.
         let xf: Vec<f32> = (0..t * k)
             .map(|i| {
                 let v =
@@ -296,7 +265,6 @@ impl W4a16Dec {
             })
             .collect();
         let xh: Vec<u16> = xf.iter().map(|&v| crate::f32_to_f16(v)).collect();
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4/×2).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         let hb = unsafe { std::slice::from_raw_parts(xh.as_ptr() as *const u8, xh.len() * 2) };
         let dx = self.cc.alloc(t * k * 4)?;
@@ -306,7 +274,6 @@ impl W4a16Dec {
         let da = self.cc.alloc(t * n * 4)?;
         let db = self.cc.alloc(t * n * 4)?;
         let r = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
-            // 원본(8행/블록, 512스레드).
             let f = self.cc.function("w4a16_gemm_g128")?;
             let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx, da);
             let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
@@ -319,7 +286,6 @@ impl W4a16Dec {
                     &mut p_q, &mut p_s, &mut p_x, &mut p_y, &mut p_n, &mut p_k, &mut p_t,
                 ),
             )?;
-            // mma(32×64, 256스레드).
             let fm = self.cc.function("w4a16_gemm_g128_mma")?;
             let (mut m_q, mut m_s, mut m_x, mut m_y) = (dq, ds, dx16, db);
             let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
@@ -372,7 +338,6 @@ impl W4a16Dec {
                 bad += 1;
             }
         }
-        // 불량 위치 패턴(첫 5개 + 행·열 분포) — 디버그.
         let mut firstbad: Vec<(usize, usize)> = Vec::new();
         let mut badrows = std::collections::BTreeSet::new();
         let mut badcols = std::collections::BTreeSet::new();
@@ -399,13 +364,6 @@ impl W4a16Dec {
         ))
     }
 
-    /// [marlin 스테이지 2, 2026-10-12] marlin B 배치 mma GEMM A/B —
-    /// w4a16_gemm_g128_mma(기준) vs w4a16_gemm_g128_marlin(신규), 같은 f16 x.
-    /// 이론상 비트동일: 디퀀트가 종전 deq_pair_b와 같은 값((n−8)·s의 단일 RNE
-    /// — marlin 매직 상수 경로도 exact 중간값) + k 순서·프래그먼트 분할 동일.
-    /// 불일치면 허용오차·첫불량 (행,열)을 병기한다.
-    /// qm = 호스트 core::marlin::marlin_repack_q 산출([k/16][n/64][128] u32).
-    /// 계약: g128·f16 스케일 split 선형 전용.
     pub fn marlin_diff_check(
         &mut self,
         name: &str,
@@ -426,7 +384,6 @@ impl W4a16Dec {
                 qm.len()
             ));
         }
-        // x — 결정적 f32 → f16(두 커널 공통 입력; mma 커널 계약 f16).
         let x16: Vec<u16> = (0..t * k)
             .map(|i| {
                 let v =
@@ -434,12 +391,10 @@ impl W4a16Dec {
                 crate::f32_to_f16(v)
             })
             .collect();
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×2).
         let xb = unsafe { std::slice::from_raw_parts(x16.as_ptr() as *const u8, x16.len() * 2) };
         let dx = self.cc.alloc(t * k * 2)?;
         self.cc.h2d(dx, xb)?;
         let dqm = self.cc.alloc(qm.len() * 4)?;
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let qb = unsafe { std::slice::from_raw_parts(qm.as_ptr() as *const u8, qm.len() * 4) };
         self.cc.h2d(dqm, qb)?;
         let da = self.cc.alloc(t * n * 4)?;
@@ -520,9 +475,6 @@ impl W4a16Dec {
         ))
     }
 
-    /// [marlin S2 디버그] 소형 합성 케이스 자체 점검 — 커널만 격리 검증.
-    /// 서버가 qm(재패킹됨)·s·x16·기대출력을 만들어 넘긴다. x=1.0·s=1.0·
-    /// 정수 니블 패턴이면 기대값 = 정수(Σ(nib−8))이라 mma f32 누적도 비트정확.
     pub fn marlin_selfcheck(
         &mut self,
         sym: &str,
@@ -538,7 +490,6 @@ impl W4a16Dec {
         k: usize,
     ) -> Result<String, String> {
         let _g = self.cc.guard()?;
-        // 스케일 크기 = g128(k/128) 또는 g32(k/32) 계약(변형 커널 수용).
         if qm.len() != (k / 16) * (n / 64) * 128
             || (s.len() != n * (k / 128) && s.len() != n * (k / 32))
             || x16.len() != t * k
@@ -546,15 +497,12 @@ impl W4a16Dec {
         {
             return Err("marlin-selfcheck: 계약 위반(qm/s/x/expect 크기)".into());
         }
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
         let qb = unsafe {
             std::slice::from_raw_parts(qm.as_ptr() as *const u8, std::mem::size_of_val(qm))
         };
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
         let sb = unsafe {
             std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s))
         };
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
         let xb = unsafe {
             std::slice::from_raw_parts(x16.as_ptr() as *const u8, std::mem::size_of_val(x16))
         };
@@ -613,12 +561,6 @@ impl W4a16Dec {
         ))
     }
 
-    /// [marlin S2, 2026-10-12] 두 mma GEMM 시간 비교 — 기존 mma vs marlin,
-    /// 같은 f16 x·같은 grid·같은 회차. pp 채택 판정용(골든 전 단계 계측).
-    /// [2.A-② 2026-10-13] `cold=true` — 256MB d2d 플러시를 런치 사이에 끼워
-    /// L2를 비운다(소형-M 표의 "L2 편향" 제거 — 검증/np4 판정은 HBM 조건).
-    /// vs_gemv는 t=1(w4a16_gemv_g128) 외에 t≥2(생산 TR 커널 w4a16_gemv_g128_t)도
-    /// 지원 — 검증 t=5·np4 t=4의 실제 비교 상대.
     pub fn marlin_bench(
         &mut self,
         name: &str,
@@ -648,24 +590,20 @@ impl W4a16Dec {
                 crate::f32_to_f16(v)
             })
             .collect();
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×2).
         let xb = unsafe { std::slice::from_raw_parts(x16.as_ptr() as *const u8, x16.len() * 2) };
         let dx = self.cc.alloc(t * k * 2)?;
         self.cc.h2d(dx, xb)?;
         let dqm = self.cc.alloc(qm.len() * 4)?;
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let qb = unsafe { std::slice::from_raw_parts(qm.as_ptr() as *const u8, qm.len() * 4) };
         self.cc.h2d(dqm, qb)?;
         let da = self.cc.alloc(t * n * 4)?;
         let db = self.cc.alloc(t * n * 4)?;
-        // [G4 2026-10-12] 행-GEMV 비교 모드 — 같은 LCG 값의 f32 x(GEMV 계약).
         let dx32 = if vs_gemv {
             let x32: Vec<f32> = (0..t * k)
                 .map(|i| {
                     ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5
                 })
                 .collect();
-            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let xb32 =
                 unsafe { std::slice::from_raw_parts(x32.as_ptr() as *const u8, x32.len() * 4) };
             let d = self.cc.alloc(t * k * 4)?;
@@ -698,7 +636,6 @@ impl W4a16Dec {
         let run_cmp = |me: &Self, py: CUdeviceptr| -> Result<(), String> {
             if vs_gemv {
                 if t == 1 {
-                    // [G4] t=1 행-GEMV(w4a16_gemv_g128 — grid n·64레인·f32 x).
                     let f = me.cc.function("w4a16_gemv_g128")?;
                     let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx32, py);
                     let (mut p_n, mut p_k) = (n as i32, k as i32);
@@ -712,8 +649,6 @@ impl W4a16Dec {
                         ),
                     )
                 } else {
-                    // [2.A-②] t≥2 생산 TR 커널(w4a16_gemv_g128_t, 256스레드·
-                    // GEMV_TR 블록) — 검증 t=5/np4 t=4의 실제 상대.
                     let f = me.cc.function("w4a16_gemv_g128_t")?;
                     let (mut p_q, mut p_s, mut p_x, mut p_y) = (dq, ds, dx32, py);
                     let (mut p_n, mut p_k, mut p_t) = (n as i32, k as i32, t as i32);
@@ -740,9 +675,6 @@ impl W4a16Dec {
             }
         };
         let r = if cold {
-            // [2.A-②] 콜드 모드 — 런치마다 L2 플러시(256MB d2d)+sync. 시간 =
-            // (플러시+런치) − (플러시+sync) 베이스라인(호스트 sync 오버헤드
-            // 동일 조건 감산 — 두 상대 공정).
             let bytes = 256usize << 20;
             let f0 = self.cc.alloc(bytes)?;
             let f1 = self.cc.alloc(bytes)?;
@@ -795,7 +727,6 @@ impl W4a16Dec {
                     run(self, msym, dqm, db, mbm, mbn, mthr)?;
                 }
                 self.cc.sync()?;
-                // 인터리브 라운드 — 순서·열 상태 바이어스 제거.
                 let rounds = 4usize;
                 let per = (reps / rounds).max(1);
                 let (mut ta, mut tb) = (0f64, 0f64);
@@ -837,8 +768,6 @@ impl W4a16Dec {
         ))
     }
 
-    /// [FA2 2026-10-12] 프리필 어텐션 벤치 — prep 포함 기존(part_qg+merge) vs
-    /// FA2 왕복(인터리브·최소 2라운드). 입력은 결정적 업로드.
     pub fn attn_fa2_bench(
         &mut self,
         slot: usize,
@@ -861,7 +790,6 @@ impl W4a16Dec {
         let kin: Vec<f32> = (0..t_len * kvd).map(|_| rnd()).collect();
         let vin: Vec<f32> = (0..t_len * kvd).map(|_| rnd()).collect();
         self.ensure_attn_bufs(t_len)?;
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
         let b =
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         self.cc.h2d(self.attn.dqg_a, b(&qg))?;
@@ -906,9 +834,6 @@ impl W4a16Dec {
         ))
     }
 
-    /// [FA2 2026-10-12] FA2 프리필 어텐션 A/B — 같은 입력으로 기존(prep+part_qg+
-    /// merge)과 attn_fa2_qg 출력 비교. 수치 클래스(q f16·P f16·스코어 mma)로
-    /// ~5e-4 이하 기대 — rel>5e-3 카운트가 결함 판정.
     pub fn attn_fa2_diff(
         &mut self,
         slot: usize,
@@ -929,9 +854,7 @@ impl W4a16Dec {
         let qg: Vec<f32> = (0..t_len * qgd).map(|_| rnd()).collect();
         let kin: Vec<f32> = (0..t_len * kvd).map(|_| rnd()).collect();
         let vin: Vec<f32> = (0..t_len * kvd).map(|_| rnd()).collect();
-        // 참조 = legacy 경로(prep + part_qg + merge) — 체인 대신 직접 시퀀스.
         self.ensure_attn_bufs(t_len)?;
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰.
         let b =
             |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         self.cc.h2d(self.attn.dqg_a, b(&qg))?;
@@ -951,7 +874,6 @@ impl W4a16Dec {
             .map(|c| f32::from_le_bytes(*c))
             .collect();
         self.attn_prep_launch(slot, layer, t_len, aq, ak, av)?;
-        // FA2 — prep이 기록한 dqh/KV를 그대로 소비(out32/out16은 dx 버퍼 기록).
         self.attn_fa2_launch(slot, layer, t_len, self.attn.dqg_a)?;
         let mut buf = vec![0u8; t_len * qdd * 4];
         self.cc.d2h(&mut buf, self.attn.doutv_a)?;
@@ -989,7 +911,6 @@ impl W4a16Dec {
         ))
     }
 
-    /// [진단] ew 커널 독립 벤치 — 순수 커널 처리량(파이프라인 무관).
     pub fn bench_ew(&mut self) -> Result<String, String> {
         let _g = self.cc.guard()?;
         let n = 245_760usize;
@@ -997,7 +918,6 @@ impl W4a16Dec {
         let du = self.cc.alloc(n * 4)?;
         let dy = self.cc.alloc(n * 4)?;
         let v: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.1 - 0.3).collect();
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let b = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 4) };
         self.cc.h2d(dg, b)?;
         self.cc.h2d(du, b)?;
@@ -1036,13 +956,11 @@ impl W4a16Dec {
         ))
     }
 
-    /// MoE top-k 게이트 — 호스트 moe_topk vs 디바이스 w4a16_moe_topk_t.
     pub fn moe_topk_check(&mut self, t: usize, n: usize, k: usize) -> Result<String, String> {
         let _g = self.cc.guard()?;
         let lg: Vec<f32> = (0..t * n)
             .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 2048.0 - 0.5)
             .collect();
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let lb = unsafe { std::slice::from_raw_parts(lg.as_ptr() as *const u8, lg.len() * 4) };
         let dl = self.cc.alloc(t * n * 4)?;
         let di = self.cc.alloc(t * k * 4)?;
@@ -1105,13 +1023,11 @@ impl W4a16Dec {
         ))
     }
 
-    /// 플레인 mma 수치 게이트 — v3(원본) vs bf16 mma.
     pub(super) fn mma_diff_plain(&mut self, name: &str, t: usize) -> Result<String, String> {
         let (w, n, k) = self.plain_spec(name)?;
         let xf: Vec<f32> = (0..t * k)
             .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5)
             .collect();
-        // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let xb = unsafe { std::slice::from_raw_parts(xf.as_ptr() as *const u8, xf.len() * 4) };
         let dx = self.cc.alloc(t * k * 4)?;
         self.cc.h2d(dx, xb)?;
@@ -1133,7 +1049,7 @@ impl W4a16Dec {
             let fm = self.cc.function("w4a16_gemm_bf16_mma2")?;
             let (mut m_w, mut m_x, mut m_o) = (w, dx, db);
             let (mut m_n, mut m_k, mut m_t) = (n as i32, k as i32, t as i32);
-            let mut m_b = 0i32; // [FLA-10] 게이트는 f32 경로(xbf=0).
+            let mut m_b = 0i32;
             self.cc.launch(
                 fm,
                 t.div_ceil(GEMM_BMMA_M) as u32,
@@ -1185,7 +1101,6 @@ impl W4a16Dec {
         ))
     }
 
-    /// 플레인 GEMM 단발 발사(벤치·진단 — T2 mma 비교용).
     pub fn plain_bench_launch(
         &mut self,
         name: &str,
@@ -1196,7 +1111,6 @@ impl W4a16Dec {
         self.plain_gemm_launch(name, x, y, t)
     }
 
-    /// GEMV 단발 발사(벤치·진단 — import 없이 이름·x·y만).
     pub fn gemv_bench_launch(
         &mut self,
         name: &str,
@@ -1206,11 +1120,6 @@ impl W4a16Dec {
         self.gemv_launch(name, x, y)
     }
 
-    /// [split-k marlin 디코드 2026-10-17] t=1 커널 단독 벤치 — 현행 생산 GEMV
-    /// (`w4a16_gemv_g128` — grid n·64스레드·f32 x) 대비 sk(sk1+reduce)를
-    /// ksp∈{1,2,4,8}∩(k/128)%ksp==0 전수 측정. qm/s/x/y는 상주·합성 버퍼,
-    /// 재패킹 사본은 업로드 이중 버퍼(lins_mk)를 그대로 사용(생산 포인터).
-    /// 값 대조(sk vs GEMV)도 1회 — maxabs/maxrel 허용오차 신호(게이트 전).
     pub fn decode_bench(&mut self, name: &str, reps: usize, cold: bool) -> Result<String, String> {
         let _g = self.cc.guard()?;
         let (dq, ds, n, k) = self.lin_spec(name)?;
@@ -1232,7 +1141,6 @@ impl W4a16Dec {
         let x32: Vec<f32> = (0..k)
             .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32 / 4096.0 - 0.5)
             .collect();
-        // SAFETY: 로컬 Vec의 유효 수명 내 바이트 뷰(길이 = 원소수×2/×4).
         let hb = unsafe { std::slice::from_raw_parts(x16.as_ptr() as *const u8, x16.len() * 2) };
         let fb = unsafe { std::slice::from_raw_parts(x32.as_ptr() as *const u8, x32.len() * 4) };
         let dxh = self.cc.alloc(k * 2)?;
@@ -1241,8 +1149,8 @@ impl W4a16Dec {
         self.cc.h2d(dxf, fb)?;
         let blocks = n.div_ceil(256);
         let part = self.cc.alloc(blocks * 16 * 256 * 4)?;
-        let ya = self.cc.alloc(n * 4)?; // GEMV
-        let yb = self.cc.alloc(n * 4)?; // sk
+        let ya = self.cc.alloc(n * 4)?;
+        let yb = self.cc.alloc(n * 4)?;
         let ksps: Vec<usize> = [1usize, 2, 4, 8, 16]
             .into_iter()
             .filter(|&p| (k / 128) % p == 0)
@@ -1287,7 +1195,6 @@ impl W4a16Dec {
                 Ok(())
             }
         };
-        // 콜드 모드 플러시 버퍼(256MB d2d — marlin_bench와 동일 조건).
         let flush_bytes = 256usize << 20;
         let (f0, f1) = if cold {
             (self.cc.alloc(flush_bytes)?, self.cc.alloc(flush_bytes)?)
@@ -1295,7 +1202,6 @@ impl W4a16Dec {
             (0, 0)
         };
         let r = (|| -> Result<Vec<String>, String> {
-            // 워밍 + 값 대조(sk 첫 ksp vs GEMV).
             run_gemv(self, ya)?;
             run_sk(self, yb, ksps[0])?;
             self.cc.sync()?;
@@ -1315,9 +1221,6 @@ impl W4a16Dec {
             let rounds = 4usize;
             let per = (reps / rounds).max(1);
             for _ in 0..rounds {
-                // GEMV 기준 — [콜드 계측 수정] 플러시(256MB d2d)+sync는
-                // 시간에서 제외(커널만 적산 — 종전 포함 측정은 플러시 ~0.35ms가
-                // 전 형상을 동일값으로 눌러 왜곡).
                 let mut t0 = std::time::Instant::now();
                 for _ in 0..per {
                     if cold {
@@ -1385,20 +1288,15 @@ impl W4a16Dec {
         Ok(r?.join("\n"))
     }
 
-    /// [split-k marlin 디코드] 커널 격리 자체점검 — 합성 n=256·k=512·s=1·x=1
-    /// (기대 = Σ(nib−8) 정수 → f32 누적 비트정확)로 sk1(ksp 1..4)과
-    /// 2세그먼트 테이블판(w4a16_gemv_sk_marlin)을 정오 판정. 배선 전 결함
-    /// (repack·부분합·reduce·패딩)을 커널 단위에서 잡는다.
     pub fn decode_selfcheck(&mut self) -> Result<String, String> {
         let _g = self.cc.guard()?;
         let (n, k) = (256usize, 512usize);
         let q: Vec<u32> = (0..n * k / 8)
             .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) ^ 0x1234_5678u32)
             .collect();
-        let s: Vec<u16> = vec![0x3C00; n * k / 128]; // f16 1.0
+        let s: Vec<u16> = vec![0x3C00; n * k / 128];
         let x16: Vec<u16> = vec![0x3C00; k];
         let qm = llm170_core::marlin::marlin_repack_q(&q, n, k)?;
-        // 기대값 — 정수 Σ(nib−8) (f32 비트정확).
         let mut want = vec![0f32; n];
         for c in 0..n {
             let mut acc = 0i64;
@@ -1409,7 +1307,6 @@ impl W4a16Dec {
             want[c] = acc as f32;
         }
         let dqm = self.cc.alloc(qm.len() * 4)?;
-        // SAFETY: 로컬 Vec<u32>/u16의 유효 수명 내 바이트 뷰.
         let qb = unsafe { std::slice::from_raw_parts(qm.as_ptr() as *const u8, qm.len() * 4) };
         let sb = unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
         let xb = unsafe { std::slice::from_raw_parts(x16.as_ptr() as *const u8, x16.len() * 2) };
@@ -1418,7 +1315,7 @@ impl W4a16Dec {
         self.cc.h2d(ds, sb)?;
         let dx = self.cc.alloc(xb.len())?;
         self.cc.h2d(dx, xb)?;
-        let blocks = n.div_ceil(256); // 1
+        let blocks = n.div_ceil(256);
         let part = self.cc.alloc(blocks * 4 * 256 * 4)?;
         let y = self.cc.alloc(n * 4)?;
         let mut out = Vec::new();
@@ -1474,7 +1371,6 @@ impl W4a16Dec {
             self.cc.sync()?;
             check(&got, &format!("sk1 ksp={ksp}"));
         }
-        // 테이블 2세그먼트(같은 가중 2본 — 같은 out 2개) — multi 판 경로.
         {
             let (y2, part2) = (self.cc.alloc(n * 4)?, self.cc.alloc(2 * 2 * 256 * 4)?);
             let tab: Vec<u64> = vec![

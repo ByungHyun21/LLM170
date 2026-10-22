@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Qwen3.6-35B-A3B W4A16(g32·CT pack-quantized) 다운로드 — CMP 셋업 2026-10-16.
-# 소스: Avesed/Qwen3.6-35B-A3B-INT4-W4A16 — 지문 대조로 특정(g32·moe_ffn 512·256전문가
-#   top-8·23.9GiB = 상주 회계 23.8G 정합; 로컬 디렉터리명과 정확 일치).
-# 대상: ../models/Qwen3.6-35B-A3B-INT4-W4A16 (swap_models.sh M_35B 경로 동일)
-# 규칙: 모델은 한 번에 1개씩(사용자 지시 2026-10-16). 재실행 = 완료 파일 스킵 + 이어받기.
 set -euo pipefail
 REPO="Avesed/Qwen3.6-35B-A3B-INT4-W4A16"
 NAME="Qwen3.6-35B-A3B-INT4-W4A16"

@@ -1,24 +1,13 @@
-//! BPE 토크나이저 — llama.cpp `llama-vocab.cpp`·`unicode.cpp` 미러.
-//!
-//! 대상 pre: `qwen35`·`qwen2` (양대 게이트 모델). GPT-2 바이트 수준 BPE 전체 경로:
-//! 특수 토큰 최장 분할 → pre-tokenizer 분할(qwen35/qwen2 커스텀 스플리터) →
-//! bytes_to_unicode 인코딩 → 병합 랭크 우선순위 큐 루프.
-//! 미지원 pre는 기존 탐욕 최장일치(`encode_greedy`)로 폴백 — 기동은 유지.
-//! 디코딩(`piece_bytes`)은 기존 c2b 역표를 그대로 사용.
 
 use crate::unicode_data as udata;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 
-// unicode_cpt_flags 비트 (llama.cpp unicode.h 동일 값)
 const F_NUMBER: u16 = 0x0002;
 const F_LETTER: u16 = 0x0004;
 const F_ACCENT: u16 = 0x0010;
 const F_WHITESPACE: u16 = 0x0100;
 
-/// [D5 2026-10-09] 자작 곱셈 해시 — 짧은 바이트 키(토큰 조각·병합 키)에서
-/// SipHash는 과하다(로컬 단일 사용자 서버 — DoS 저항 불필요).
-/// splitmix64 계열 상수 곱 + 회전, 8바이트 청크 + 꼬리.
 #[derive(Default)]
 struct MulHasher(u64);
 
@@ -43,45 +32,30 @@ impl std::hash::Hasher for MulHasher {
     }
 }
 
-/// 빠른 해시 맵(바이트·문자 키 전용 맵들).
 type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<MulHasher>>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pre {
     Qwen35,
     Qwen2,
-    /// gemma4 — normalizer `Replace(" "→"▁")` + 문자 단위 BPE + `<0xXX>` 바이트
-    /// 폴백(pre_tokenizer `Split(" ")`는 정규화 후 무효과 — HF 실측).
     Gemma,
     Other,
 }
 
 pub struct Tokenizer {
     vocab: Vec<String>,
-    /// 토큰 원문 바이트 → id (llama.cpp text_to_token — 바이트 정확 매칭)
     text_to_id: FastMap<Box<[u8]>, u32>,
-    /// 병합 키 = len_le32 ++ left ++ right → 랭크 (llama.cpp find_bpe_rank)
     bpe_ranks: FastMap<Vec<u8>, u32>,
-    /// 특수 토큰 — parse_special=true 파티션용(special ∪ special_user,
-    /// 본문 바이트 길이 내림차순 **로드 시 1회 정렬** — D5).
     special: Vec<(String, u32)>,
-    /// USER_DEFINED 특수 토큰 — parse_special=false에서도 분할 (llama.cpp 규칙).
     special_user: Vec<(String, u32)>,
     pre: Pre,
     ignore_merges: bool,
-    /// GPT-2 bytes_to_unicode 역표 (조각 문자 → 원바이트) — 디코딩용.
     c2b: FastMap<char, u8>,
-    /// 원바이트 → 조각 문자 — 인코딩용.
     b2c: FastMap<u8, char>,
-    /// 탐욕 폴백용 바이트열 → id (기존 index와 동일 규칙).
     greedy_index: FastMap<Vec<u8>, u32>,
-    /// [D5] 완전 일치 텍스트 캐시 — 동일 요청 재인코딩 제거(유계 FIFO).
     encode_cache: std::sync::Mutex<EncodeCache>,
 }
 
-/// [D5 2026-10-09] 동일 텍스트 재인코딩 캐시 — 재시도·중복 요청에서 BPE
-/// 재계산 제거. **완전 일치만** — 접두 재개는 BPE 병합이 조각 경계를 넘을 수
-/// 있어 시임 안전이 보장되지 않는다(필요 시 조각 단위 캐시 + 시임 검증).
 struct EncodeCache {
     map: HashMap<String, std::sync::Arc<[u32]>>,
     order: std::collections::VecDeque<String>,
@@ -93,7 +67,6 @@ impl EncodeCache {
         self.map.get(text).map(|a| a.to_vec())
     }
     fn put(&mut self, text: &str, ids: &[u32]) {
-        // 짧은 텍스트는 비용 대비 이득 없음(해시·복사 > BPE).
         if text.len() < 32 || self.map.contains_key(text) {
             return;
         }
@@ -108,14 +81,11 @@ impl EncodeCache {
 }
 
 impl Tokenizer {
-    /// 조각 문자열 조회(판정 보조 — 바이트-유니코드 표기 그대로, 디코딩 아님).
-    /// needle 문자열 판정(생성 토큰화 변동 대응)이 사용한다.
     pub fn piece(&self, id: u32) -> Option<&str> {
         self.vocab.get(id as usize).map(|s| s.as_str())
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
-        // 모델 = W4A16 디렉터리(2026-10-08 단일 트랙).
         if path.is_dir() {
             return Self::from_hf_dir(path);
         }
@@ -125,7 +95,6 @@ impl Tokenizer {
         ))
     }
 
-    /// 공통 꼬리 — 바이트 표·인덱스 조립(from_hf_dir 공유).
     fn from_parts(
         vocab: &[String],
         bpe_ranks: FastMap<Vec<u8>, u32>,
@@ -134,13 +103,10 @@ impl Tokenizer {
         pre: Pre,
         ignore_merges: bool,
     ) -> Result<Self, String> {
-        // [D5] 파티션용 통합 목록을 로드 시 1회 정렬 — 종전엔 encode 호출마다
-        // chain+collect+sort를 했다. special_ctl(CONTROL/UNKNOWN계) ∪ user.
         let mut special = special_ctl;
         special.extend(special_user.iter().cloned());
         special.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
         special_user.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
-        // GPT-2 bytes_to_unicode 정/역표 (기존 구현과 동일)
         let mut c2b: FastMap<char, u8> = FastMap::default();
         let mut b2c: FastMap<u8, char> = FastMap::default();
         {
@@ -172,7 +138,6 @@ impl Tokenizer {
             if !bytes.is_empty() {
                 greedy_index.entry(bytes).or_insert(i as u32);
             }
-            // llama.cpp token_to_id: 후발 덮어씀(중복시 마지막 승)
             text_to_id.insert(t.as_bytes().into(), i as u32);
         }
         Ok(Tokenizer {
@@ -194,14 +159,7 @@ impl Tokenizer {
         })
     }
 
-    /// W4A16 디렉터리 — vocab.json(조각→id) + merges.txt(BPE 순위) +
-    /// tokenizer_config.json(added_tokens_decoder 특수 토큰) + config.json
-    /// (model_type → pre 스플리터).
-    /// 파서는 llm170_core::json 재사용.
     fn from_hf_dir(dir: &Path) -> Result<Self, String> {
-        // 토큰 조각표 — vocab.json(HF 벌크) 우선, 없으면 tokenizer.json.
-        // (W4A16 HF 배포는 vocab.json/merges.txt 부재 실측 — tokenizer.json의
-        // model.vocab + added_tokens 병합으로 대체.)
         let tok_json: Option<llm170_core::json::Json> = if dir.join("vocab.json").is_file() {
             None
         } else {
@@ -231,7 +189,6 @@ impl Tokenizer {
                 max_id = max_id.max(id as usize);
                 pairs.push((piece.clone(), id as u32));
             }
-            // added_tokens(특수 토큰 — EOS 포함) 병합.
             if let Some(llm170_core::json::Json::Arr(items)) = tj.get("added_tokens") {
                 for it in items {
                     let id = it.get("id").and_then(llm170_core::json::Json::as_f64);
@@ -270,9 +227,6 @@ impl Tokenizer {
             vocab[*id as usize] = piece.clone();
         }
 
-        // 병합 순위 — 표준 키(첫 ' ' 분할, 선발 우선). # 헤더는
-        // 순위 소모 없이 스킵(HF 변환기 배열 순서와 정렬).
-        // merges.txt 우선, tokenizer.json이면 model.merges(문자열 배열) 파생.
         let mut bpe_ranks: FastMap<Vec<u8>, u32> = FastMap::default();
         let mut rank = 0u32;
         let push_merge =
@@ -289,7 +243,6 @@ impl Tokenizer {
                 tj.get("model").and_then(|m| m.get("merges"))
             {
                 for m in ms {
-                    // 두 형식: ["a","b"] 배열쌍(HF 최신 — 실측) · "a b" 문자열.
                     match m {
                         llm170_core::json::Json::Arr(pair) if pair.len() == 2 => {
                             if let (Some(a), Some(b)) = (pair[0].as_str(), pair[1].as_str()) {
@@ -310,9 +263,6 @@ impl Tokenizer {
             let merges_txt = std::fs::read_to_string(dir.join("merges.txt"))
                 .map_err(|e| format!("merges.txt: {e}"))?;
             for line in merges_txt.lines() {
-                // [2026-10-19] 헤더 스킵은 정확히 "#version"만 — 종전
-                // `starts_with('#')`는 실제 병합 줄 "# #"(rank 294)·"## ##"(538)을
-                // 스킵해 '#' 계열 병합 전부가 실패했다(HF 대조로 적발: "##" → [2,2]).
                 if line.is_empty() || line.starts_with("#version") {
                     continue;
                 }
@@ -325,7 +275,6 @@ impl Tokenizer {
             }
         }
 
-        // 특수 토큰 — added_tokens_decoder {id: {content, special}}.
         let mut special: Vec<(String, u32)> = Vec::new();
         let mut ignore_merges = false;
         if let Ok(tc) = std::fs::read_to_string(dir.join("tokenizer_config.json"))
@@ -367,9 +316,6 @@ impl Tokenizer {
                 }
             }
         }
-        // 폴백: tokenizer_config의 added_tokens_decoder가 비어 있으면
-        // tokenizer.json added_tokens에서 수집(HF 최신 배포 — 실측:
-        // W4A16 AutoRound는 decoder 부재·added_tokens 33종에 special 플래그).
         let mut special_user: Vec<(String, u32)> = Vec::new();
         {
             let mut seen: std::collections::HashSet<u32> =
@@ -407,7 +353,6 @@ impl Tokenizer {
         special.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
         special_user.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
-        // pre 스플리터 — config.json model_type 계열.
         let mut pre = Pre::Other;
         if let Ok(cfg) = std::fs::read_to_string(dir.join("config.json"))
             && let Ok(cj) = llm170_core::json::Json::parse(&cfg)
@@ -415,10 +360,6 @@ impl Tokenizer {
             && let Some((_, mt)) = cobj.iter().find(|(k, _)| k == "model_type")
             && let Some(mt) = mt.as_str()
         {
-            // [2026-10-19] 접두 매치 — qwen3_5_moe(35B-A3B)가 정확 일치 "qwen3_5"에
-            // 걸리지 않아 탐욕 폴백(Pre::Other)으로 떨어지던 버그: BPE가 아닌
-            // 최장일치 인코딩 → HF 대비 93% 토큰 경계 불일치·OOD 토큰열 →
-            // 35B PPL 15.5(vs vLLM/HF 9.5) 실측. 정규식 실측 = 27B/35B/FN 동일.
             pre = if mt.starts_with("qwen3_5") || mt.starts_with("qwen4") {
                 Pre::Qwen35
             } else if mt.starts_with("qwen2") || mt.starts_with("qwen3") {
@@ -432,16 +373,10 @@ impl Tokenizer {
 
         Self::from_parts(&vocab, bpe_ranks, special, special_user, pre, ignore_merges)
     }
-    /// 토큰 조각의 원 바이트열 (바이트 수준 BPE 역매핑).
-    /// 어휘 비었는지(A19) — part1/part2 어느 쪽에도 토크나이저가
-    /// 없으면 load가 Ok(empty)를 돌려주므로 serve 텍스트 요청에 치명 여부를
-    /// 호출자가 판정해야 한다.
     pub fn is_empty(&self) -> bool {
         self.vocab.is_empty()
     }
 
-    /// [2026-10-09 D4] 문자당 Vec 할당 없이 out에 append — 종전 flat_map(vec![b])
-    /// 체인이 문자마다 힙 할당이었다(토큰마다).
     pub fn piece_bytes_into(&self, tok: u32, out: &mut Vec<u8>) {
         let Some(p) = self.vocab.get(tok as usize) else {
             return;
@@ -461,8 +396,6 @@ impl Tokenizer {
         }
     }
 
-    /// gemma4 디토크 — `<0xXX>` → 원바이트, `▁` → 공백, 그 외 원문.
-    /// (GPT-2 c2b 역표는 gemma4에서 U+0100.. 문자를 오매핑 — 사용 금지.)
     fn piece_bytes_gemma(&self, p: &str, out: &mut Vec<u8>) {
         if p.len() == 6
             && p.starts_with("<0x")
@@ -482,8 +415,6 @@ impl Tokenizer {
         }
     }
 
-    /// 텍스트 → 토큰 (특수 토큰 해석 포함 — llama-server 채팅 경로와 동일).
-    /// [D5] 완전 일치 재인코딩 캐시 경유(값은 비캐시 경로와 동일).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         if let Ok(c) = self.encode_cache.lock()
             && let Some(ids) = c.get(text)
@@ -497,7 +428,6 @@ impl Tokenizer {
         ids
     }
 
-    /// 특수 토큰 미해석 판 (llama-tokenize 기본값과 동일 — 검증용).
     pub fn encode_opts(&self, text: &str, parse_special: bool) -> Vec<u32> {
         if self.pre == Pre::Other || text.is_empty() {
             return self.encode_greedy(text);
@@ -518,7 +448,6 @@ impl Tokenizer {
         out
     }
 
-    /// 기존 탐욕 최장일치 (Pre::Other 폴백).
     pub fn encode_greedy(&self, text: &str) -> Vec<u32> {
         let bytes = text.as_bytes();
         let mut out = Vec::new();
@@ -552,13 +481,9 @@ impl Tokenizer {
         out
     }
 
-    // ── 특수 토큰 파티션 (llama.cpp tokenizer_st_partition 미러) ──
 
     fn partition_special<'a>(&self, text: &'a str, parse_special: bool) -> Vec<Frag<'a>> {
         let mut frags = vec![Frag::Text(text)];
-        // [D5] 정렬은 로드 시 1회 — 종전엔 호출마다 chain+collect+sort였다.
-        // special = 통합(parse=true), special_user = USER_DEFINED(항상 분할,
-        // llama.cpp 규칙) — 양쪽 모두 길이 내림차순.
         let ordered: &[(String, u32)] = if parse_special {
             &self.special
         } else {
@@ -598,11 +523,9 @@ impl Tokenizer {
         frags
     }
 
-    // ── BPE 조각 토큰화 (llm_tokenizer_bpe_session::tokenize 미러) ──
 
     fn bpe_fragment(&self, text: &str, out: &mut Vec<u32>) {
         let cpts: Vec<u32> = text.chars().map(|c| c as u32).collect();
-        // 코드포인트 → 원 바이트 오프셋
         let mut boff = Vec::with_capacity(cpts.len() + 1);
         let mut bo = 0usize;
         for c in text.chars() {
@@ -614,7 +537,6 @@ impl Tokenizer {
         let accent = self.pre == Pre::Qwen35;
         for (s, len) in split_pre(&cpts, accent) {
             let wb = &bytes[boff[s]..boff[s + len]];
-            // 바이트 인코딩 문자열 + 심볼별 시작 오프셋(1심볼 = 원바이트 1개)
             let mut enc = String::with_capacity(wb.len() * 2);
             let mut soff: Vec<usize> = Vec::with_capacity(wb.len() + 1);
             for &b in wb {
@@ -629,7 +551,6 @@ impl Tokenizer {
                 out.push(id);
                 continue;
             }
-            // 심볼 (start, len) — 초기 1심볼 = 인코딩 문자 1개
             let mut syms: Vec<(usize, usize)> = (0..wb.len())
                 .map(|i| (soff[i], soff[i + 1] - soff[i]))
                 .collect();
@@ -640,9 +561,9 @@ impl Tokenizer {
             }
             while let Some(b) = heap.pop() {
                 if syms[b.li].1 != b.ln || syms[b.ri].1 != b.rn {
-                    continue; // 갱신된 bigram
+                    continue;
                 }
-                syms[b.li].1 += syms[b.ri].1; // 좌측 흡수
+                syms[b.li].1 += syms[b.ri].1;
                 syms[b.ri].1 = 0;
                 let mut p = b.li;
                 while p > 0 && syms[p - 1].1 == 0 {
@@ -667,7 +588,6 @@ impl Tokenizer {
                 if let Some(&id) = self.text_to_id.get(piece) {
                     out.push(id);
                 } else {
-                    // 바이트 폴백 — 미매칭 바이트는 조용히 스킵 (llama.cpp 동일)
                     for j in 0..piece.len() {
                         if let Some(&id) = self.text_to_id.get(&piece[j..j + 1]) {
                             out.push(id);
@@ -678,13 +598,6 @@ impl Tokenizer {
         }
     }
 
-    // ── gemma4 조각 BPE (HF tokenizers BPE · byte_fallback) ──
-    //
-    // 정규화: 공백 → `▁`. pre_tokenizer `Split(" ")`는 정규화 후 공백이 남지
-    // 않아 무효과 — 병합은 문자 단위 심볼열 전체에 적용된다(HF 실측:
-    // "x  y" → ['x','▁▁','y']). 단일 문자가 어휘에 없으면 그 문자의 UTF-8
-    // 바이트를 `<0xXX>` 토큰으로 즉시 방출 — 바이트 토큰은 병합에 참여하지
-    // 않으므로(HF BPE 동일) 병합 런을 그 지점에서 끊는다.
     fn bpe_fragment_gemma(&self, text: &str, out: &mut Vec<u32>) {
         if text.contains(' ') {
             let norm = text.replace(' ', "▁");
@@ -694,7 +607,6 @@ impl Tokenizer {
         }
     }
 
-    /// 문자 단위 런 분할 + 바이트 폴백 방출.
     fn bpe_runs_gemma(&self, s: &str, out: &mut Vec<u32>) {
         let mut run_lo = 0usize;
         for (b, ch) in s.char_indices() {
@@ -719,7 +631,6 @@ impl Tokenizer {
         }
     }
 
-    /// 병합 런 — 심볼 = 문자(어휘 조각), 병합 키 = 조각 바이트열(기존 랭크 규칙).
     fn bpe_run_gemma(&self, run: &str, out: &mut Vec<u32>) {
         let eb = run.as_bytes();
         if self.ignore_merges
@@ -739,7 +650,7 @@ impl Tokenizer {
         }
         while let Some(b) = heap.pop() {
             if syms[b.li].1 != b.ln || syms[b.ri].1 != b.rn {
-                continue; // 갱신된 bigram
+                continue;
             }
             syms[b.li].1 += syms[b.ri].1;
             syms[b.ri].1 = 0;
@@ -766,7 +677,6 @@ impl Tokenizer {
             if let Some(&id) = self.text_to_id.get(piece) {
                 out.push(id);
             } else {
-                // 바이트 폴백 — `<0xXX>` 조각.
                 for &byte in piece {
                     let name = format!("<0x{byte:02X}>");
                     if let Some(&id) = self.text_to_id.get(name.as_bytes()) {
@@ -832,13 +742,10 @@ impl PartialOrd for Bigram {
 }
 impl Ord for Bigram {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-        // 팝 순서 = (rank, left) 오름차순 (llama.cpp comparator 미러) —
-        // BinaryHeap은 최대 우선 팝이므로 순서 역전.
         (o.rank, o.li).cmp(&(self.rank, self.li))
     }
 }
 
-// ── 유니코드 분류 (llama.cpp unicode-data 테이블 조회) ──
 
 fn flags_bits(cpt: u32) -> u16 {
     let i = match udata::RANGES_FLAGS.binary_search_by(|&(s, _)| s.cmp(&cpt)) {
@@ -859,8 +766,6 @@ fn tolower(cpt: u32) -> u32 {
     }
 }
 
-/// qwen35/qwen2 pre-tokenizer 분할 (unicode_regex_split_custom_qwen{35,2} 미러).
-/// 반환: (start, len) — 코드포인트 좌표. `accent` = qwen35 (\p{M} 포함).
 fn split_pre(cpts: &[u32], accent: bool) -> Vec<(usize, usize)> {
     let end = cpts.len();
     let mut segs = Vec::new();
@@ -871,10 +776,9 @@ fn split_pre(cpts: &[u32], accent: bool) -> Vec<(usize, usize)> {
         }
         *prev_end = e;
     };
-    // [^\s\p{L}(\p{M})\p{N}] 판정 — qwen2는 accent 제외
     let bad_symbol = |p: usize| -> bool {
         if p >= end {
-            return true; // 범위 밖 = 루프 정지 의미
+            return true;
         }
         let f = flags_bits(cpts[p]);
         f & (F_WHITESPACE | F_LETTER | F_NUMBER) != 0 || (accent && f & F_ACCENT != 0)
@@ -892,7 +796,6 @@ fn split_pre(cpts: &[u32], accent: bool) -> Vec<(usize, usize)> {
         let cpt = cpts[pos];
         let flags = flags_bits(cpt);
 
-        // (?i:'s|'t|'re|'ve|'m|'ll|'d)
         if cpt == b'\'' as u32 && pos + 1 < end {
             let nxt = tolower(cpts[pos + 1]);
             if matches!(nxt, 0x73 | 0x74 | 0x6D | 0x64) {
@@ -910,7 +813,6 @@ fn split_pre(cpts: &[u32], accent: bool) -> Vec<(usize, usize)> {
             }
         }
 
-        // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+  (qwen2: \p{L}+)
         if cpt != 0x0D && cpt != 0x0A && flags & F_NUMBER == 0 && (is_lm(pos) || is_lm(pos + 1)) {
             pos += 1;
             while is_lm(pos) {
@@ -920,14 +822,12 @@ fn split_pre(cpts: &[u32], accent: bool) -> Vec<(usize, usize)> {
             continue;
         }
 
-        // \p{N}
         if flags & F_NUMBER != 0 {
             pos += 1;
             add(&mut segs, &mut prev_end, pos);
             continue;
         }
 
-        // " "?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
         if !bad_symbol(if cpt == 0x20 { pos + 1 } else { pos }) {
             pos += usize::from(cpt == 0x20);
             while !bad_symbol(pos) {
@@ -949,25 +849,21 @@ fn split_pre(cpts: &[u32], accent: bool) -> Vec<(usize, usize)> {
             nw += 1;
         }
 
-        // \s*[\r\n]+
         if last_rn > 0 {
             pos = last_rn;
             add(&mut segs, &mut prev_end, pos);
             continue;
         }
-        // \s+(?!\S)
         if nw > 1 && pos + nw < end {
             pos += nw - 1;
             add(&mut segs, &mut prev_end, pos);
             continue;
         }
-        // \s+
         if nw > 0 {
             pos += nw;
             add(&mut segs, &mut prev_end, pos);
             continue;
         }
-        // no match
         pos += 1;
         add(&mut segs, &mut prev_end, pos);
     }
@@ -978,14 +874,12 @@ fn split_pre(cpts: &[u32], accent: bool) -> Vec<(usize, usize)> {
 mod tests {
     use super::*;
 
-    /// 최소 토크나이저 — 조각 a/b/c + 병합 (a,b). Pre::Other(탐욕 경로).
     fn tiny() -> Tokenizer {
         let vocab: Vec<String> = ["a", "b", "c", "ab"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let mut ranks: FastMap<Vec<u8>, u32> = FastMap::default();
-        // 키 = len_le32 ++ left ++ right.
         let mut key = vec![1u8, 0, 0, 0];
         key.push(b'a');
         key.push(b'b');
@@ -996,7 +890,7 @@ mod tests {
     #[test]
     fn encode_cache_is_used_and_consistent() {
         let t = tiny();
-        let text = "abcabcabcabcabcabcabcabcabcabcabcabc"; // 36바이트 ≥ 32(캐시 대상)
+        let text = "abcabcabcabcabcabcabcabcabcabcabcabc";
         let uncached = t.encode_opts(text, true);
         let first = t.encode(text);
         assert_eq!(first, uncached, "캐시 미스 결과 = 비캐시");
@@ -1004,13 +898,12 @@ mod tests {
             t.encode_cache.lock().unwrap().map.contains_key(text),
             "첫 encode 후 캐시 등록"
         );
-        let second = t.encode(text); // 캐시 히트 경로
+        let second = t.encode(text);
         assert_eq!(second, uncached, "캐시 히트 결과 = 비캐시");
     }
 
     #[test]
     fn special_lists_pre_sorted() {
-        // 로드 시 정렬 계약 — partition 결과의 토큰 순서가 길이 우선과 일치.
         let mut ranks: FastMap<Vec<u8>, u32> = FastMap::default();
         ranks.insert(vec![0u8, 0, 0, 0], 0);
         let vocab: Vec<String> = ["x"].iter().map(|s| s.to_string()).collect();
@@ -1027,14 +920,12 @@ mod tests {
         );
     }
 
-    /// gemma4 모드 — 정규화(공백→▁)·문자 BPE·바이트 폴백·디토크.
     #[test]
     fn gemma_mode_normalize_merge_fallback_decode() {
         let pieces = [
             "▁", "a", "b", "▁a", "▁b", "ab", "<0xF0>", "<0x9F>", "<0x98>", "<0x80>",
         ];
         let vocab: Vec<String> = pieces.iter().map(|s| s.to_string()).collect();
-        // 병합: (▁,a)·(▁,b)·(a,b) — 키 = len_le32 ++ first ++ second.
         let mut ranks: FastMap<Vec<u8>, u32> = FastMap::default();
         for (rank, (f, s)) in [("▁", "a"), ("▁", "b"), ("a", "b")].into_iter().enumerate() {
             let mut key = Vec::new();
@@ -1045,14 +936,9 @@ mod tests {
         }
         let t = Tokenizer::from_parts(&vocab, ranks, Vec::new(), Vec::new(), Pre::Gemma, false)
             .unwrap();
-        // "a b" → 정규화 "a▁b" → ['a','▁b'] (▁+b 병합).
         assert_eq!(t.encode_opts("a b", false), vec![1, 4]);
-        // 연속 공백 → '▁▁'는 단일 문자 아님(어휘에 없음) → 바이트 폴백 불가
-        // (▁는 어휘에 있으므로 런 2개 심볼) — 병합 없음 → ['▁','▁'].
         assert_eq!(t.encode_opts("  ", false), vec![0, 0]);
-        // 어휘에 없는 문자(😀 = F0 9F 98 80) → 바이트 폴백 4토큰.
         assert_eq!(t.encode_opts("😀", false), vec![6, 7, 8, 9]);
-        // 디토크 왕복 — ▁→공백·바이트 조각 복원.
         let mut bytes = Vec::new();
         for id in t.encode_opts("a b", false) {
             t.piece_bytes_into(id, &mut bytes);

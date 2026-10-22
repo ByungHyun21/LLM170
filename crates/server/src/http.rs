@@ -1,38 +1,12 @@
-//! HTTP/1.1 서버 — OpenAI·Anthropic 호환 엔드포인트.
-//!
-//! 의존 0 (std::net) — 수동 파싱, 단일 스레드 요청 직렬 처리
-//! (LLM 디코드가 병목이라 동시성 불필요).
-//! 엔진은 백그라운드 스레드 1개가 요청 큐를 소비 — 생성 중 소켓은 SSE로 스트리밍.
-//!
-//! 엔드포인트:
-//!   GET  /health                      — {"status":"ok"}
-//!   GET  /v1/models                   — 모델 목록
-//!   POST /tokenize                    — {"content"} → {"tokens":[...]} (탐욕 최장일치)
-//!   POST /v1/completions              — prompt: 토큰 id 배열|텍스트, greedy
-//!   POST /v1/chat/completions         — messages[].content (단순 연결), SSE 스트림
-//!   POST /v1/messages (Anthropic)     — messages[].content, SSE 스트리밍
-//!
-//! 토크나이저는 탐욕 최장일치 근사 — 자기일관(self-consistent) 검증용.
-//! llama.cpp 토큰 경계와 완전 일치하지 않음 (주석 참조).
 
 use crate::engine::{InferRequest, InferResult, SlotJob};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// 기동 준비 완료 플래그 — 기동 워밍업(slot_loop 진입 시) 전에는 /health가 503.
-/// llama-server의 /health가 모델 로드·슬롯 초기화 후에야 200을 주는 것과 같은
-/// 계약이다(2026-09-17: 워밍업 없는 첫 요청이 지연 초기화 raw_init을 뒤집어써
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 pub static READY: AtomicBool = AtomicBool::new(false);
-/// QA-11: slot_loop 스레드 사망(패닉) — 신규 요청을 "queue full" 오보 503 대신
-/// 명시적 사유로 거부하고 진행 중 요청의 채널 단절을 감지 가능하게.
 pub static ENGINE_DEAD: AtomicBool = AtomicBool::new(false);
-/// 서버 ctx 상한 — serve 실효 상한(풀 유래, min(모델, kv-mem))을 핸들러에
-/// 전달(107 W2: 종전 LLM170_CTX env 기본 4096이 --ctx 8192 엔진과 불일치해
-/// 조용히 거절).
 pub static SERVER_CTX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-/// [2026-10-16] 모델 전역 ctx 상한(config) — OAI 판정에서 모델 몫(출력
-/// 클램프 대상)과 풀 몫(SERVER_CTX — 초과 = 거부)을 분리한다.
 pub static SERVER_MODEL_MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 pub fn serve(
@@ -41,11 +15,6 @@ pub fn serve(
     slots: usize,
     queue_flag: Option<usize>,
 ) -> Result<(), String> {
-    // [K6-3 --slots 폐지 2026-10-13] 문맥 수는 호출자(main)의 내부 상수 —
-    // 구 "플래그 > env > 기본 1" 계통은 제거됐다(env 기본 1이 조용히 직렬
-    // 서버를 만들던 함정도 함께 소멸). 동시성 = min(문맥, 풀 입장).
-    // 대기열 기본 512(2026-09-16, 사용자 지시): 대기 작업은 토큰 배열+채널뿐인
-    // 호스트 객체(건당 수백 바이트)라 넉넉해도 비용이 없고, 동시 요청 폭주 시
     let qcap = match queue_flag {
         Some(q) => q,
         None => llm170_diag::flag::val("LLM170_QUEUE")
@@ -54,8 +23,6 @@ pub fn serve(
     };
     let (tx, rx) = std::sync::mpsc::sync_channel::<SlotJob>(qcap);
     let eng = crate::engine::build_slots(req.clone(), slots);
-    // [2026-10-16] 실효 요청 상한 확정 — 적재 후 실블록 기준(풀 floor 몫
-    // 반영). OAI 입장 전 거부(SERVER_CTX)가 이 값을 본다(무클램프·무 auto).
     let pool_cap = eng.kv_cap_tokens();
     let cap = if pool_cap >= 512 {
         req.ctx.min(pool_cap)
@@ -68,8 +35,6 @@ pub fn serve(
         "# effective cap: {cap} tokens = min(model max {}, kv-mem 풀 실블록 {pool_cap})",
         req.model_max_ctx
     );
-    // [2026-10-16] KV 계층 회계 — VRAM/호스트 실할당·오프로드율(요청 우선 배치의
-    // 관측 요건: 운영자가 보고 kv-mem·링크 부담을 조정).
     let (kv_vram, kv_host, host_blocks, total_blocks) = eng.kv_tier_bytes();
     let (free_vram, free_host) = eng.kv_tier_free();
     if host_blocks > 0 {
@@ -81,10 +46,7 @@ pub fn serve(
             100.0 * host_blocks as f64 / total_blocks.max(1) as f64
         );
     }
-    // B20: 적재 완료 — 전역 적재 락 해제(다음 기동의 재판정이 이 상주분을 본다).
     crate::resource::release_load_lock();
-    // QA-11: 엔진 스레드 패닉 포착 — 종전엔 스레드가 죽어도 큐가 살아
-    // try_send 성공 → 요청이 영구 행업, 원인은 stderr 1회뿐이었다.
     std::thread::spawn(move || {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::engine::slot_loop(eng, rx, slots)
@@ -95,14 +57,6 @@ pub fn serve(
             READY.store(false, Ordering::Release);
         }
     });
-    // QA-10 + [파이프라인 2026-10-22]: 바인딩은 적재 **및 기동 워밍업 이후**.
-    // 종전 역순(bind→적재)은 커널 백로그가 TCP만 받아주는 무응답 창(QA-10),
-    // 적재 후에도 slot_loop 내 워밍업(전 슬롯 더미 프리필+그래프 캡처, 수 초)이
-    // 배너 뒤에 진행돼 첫 요청이 채널에서 워밍업 잔여를 통째로 큐대기로 뒤집어썼다
-    // (27B 실측: 청 콜드 TTFT 1976ms 중 큐대기 1300ms — ttft_harness S1).
-    // READY(워밍업 완료 시점에 slot_loop가 설정) 또는 엔진 사망 플래그를 기다린
-    // 뒤 바인딩·배너한다. 300s 안전 밸브는 워밍업 교착 시에도 전송 계층이
-    // 살아서 503/진단을 내보내게 하는 최후 수단(watchdog이 원인을 보고).
     let t_warm = std::time::Instant::now();
     while !READY.load(Ordering::Acquire) && !ENGINE_DEAD.load(Ordering::Acquire) {
         if t_warm.elapsed() > std::time::Duration::from_secs(300) {
@@ -116,15 +70,10 @@ pub fn serve(
         Err(e) => return Err(e.to_string()),
     };
     eprintln!("# llm170-server listening on http://{addr}");
-    // [H 2026-10-09] 연결 상한 — 종전엔 수락마다 스레드를 무제한 생성했다.
-    // 초과분은 503 후 즉시 종료(스레드·소켓 자원 보호).
     let conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
-        // [2026-10-09 P5] 소형 SSE 프레임 × Nagle 지연 제거 — 연결당 1회.
         let _ = stream.set_nodelay(true);
-        // [H] 쓰기 타임아웃 — 소켓 버퍼가 찬 slow consumer에 write가 영구
-        // 블록되어 워커 스레드가 매달리는 것 방지(SSE는 write 실패로 조기 종료).
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(120)));
         let n = conns.fetch_add(1, Ordering::AcqRel);
         if n >= MAX_CONNS {
@@ -145,10 +94,8 @@ pub fn serve(
     Ok(())
 }
 
-/// 동시 연결 상한(수락 스레드 폭주 방지) — 슬롯·큐와 무관한 전송 계층 가드.
 const MAX_CONNS: usize = 256;
 
-/// 연결 카운터 감소 가드 — accept 실패/패닉 경로에서도 누수 없이 감소.
 struct ConnGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
 impl Drop for ConnGuard {
@@ -165,24 +112,18 @@ pub(crate) struct HttpReq {
     pub(crate) body: String,
 }
 
-/// QA-2: 요청 본문 상한 — Content-Length 무상한 vec![0; len]이 가상 메모리
-/// +16.8GB 점유(2026-09-30 실측) 후 read_exact 영구 블록. 프롬프트 JSON 여유.
 const MAX_BODY: usize = 64 << 20;
 
-/// 라인 상한 — 요청 라인·헤더 라인 각각 8KB(S2). `read_line`은 무상한이라
-/// `\n` 미송신 클라가 타임아웃(120s)까지 버퍼를 키울 수 있었다.
 const MAX_LINE: usize = 8 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HEADER_LINES: usize = 128;
 
-/// 라인 리더 오류 — TooLong은 상태코드 응답(431/414) 대상.
 #[derive(Debug)]
 enum LineErr {
     Io(std::io::Error),
     TooLong,
 }
 
-/// `\n`까지 최대 max 바이트 라인 1개 — EOF면 None(S2).
 fn read_line_bounded<R: BufRead>(r: &mut R, max: usize) -> Result<Option<Vec<u8>>, LineErr> {
     let mut out: Vec<u8> = Vec::new();
     loop {
@@ -212,24 +153,15 @@ fn read_line_bounded<R: BufRead>(r: &mut R, max: usize) -> Result<Option<Vec<u8>
     }
 }
 
-/// 요청 파싱 오류 — 상태 응답이 필요한 경우와 연결 종료를 구분(S2 테스트 표면).
 #[derive(Debug)]
 enum ReqErr {
-    /// (상태코드, 사유문구, 내부 메시지) — 호출부가 응답을 송신.
     Status(u16, &'static str, String),
-    /// 응답 없이 연결 종료(EOF 등).
     Plain(String),
 }
 
-/// 요청 1개 파싱 본체 — BufReader 인자(유닛테스트: Cursor 주입).
-/// 리더를 밖에서 유지하면 파이프라인 잔여 바이트가 보존된다(소비는 정확히
-/// 요청 1개분 — 프로덕션 keep-alive 재사용은 P2 항목).
 fn read_request_from<R: Read>(reader: &mut BufReader<R>) -> Result<HttpReq, ReqErr> {
     let req_line = match read_line_bounded(reader, MAX_LINE) {
         Ok(Some(v)) => v,
-        // EOF(keep-alive 연결이 끊긴 경우) — 종전엔 빈 요청으로 파싱돼 404 응답을
-        // 무한히 재전송하는 스핀이 됐다(닫힌 소켓 read 는 즉시 0 반환): 유휴 서버가
-        // 코어 하나를 태우고 system time 이 2/3 를 차지했다(2026-09-17 실측).
         Ok(None) => return Err(ReqErr::Plain("eof".into())),
         Err(LineErr::TooLong) => {
             return Err(ReqErr::Status(
@@ -245,9 +177,6 @@ fn read_request_from<R: Read>(reader: &mut BufReader<R>) -> Result<HttpReq, ReqE
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("/").to_string();
     let mut len = 0usize;
-    // A18: 헤더 라인 상한·개수 상한 — 무상한 push로 악성/고장
-    // 클라가 수십 GB를 소비한 사고 재발 방지. 변형 CL·chunked는 즉시 400
-    // (len=0로 조용히 빈 바디 처리하던 종전 동작은 오해 백롭).
     let mut hdr_lines = 0usize;
     let mut hdr_bytes = 0usize;
     let mut bad_cl = false;
@@ -255,7 +184,7 @@ fn read_request_from<R: Read>(reader: &mut BufReader<R>) -> Result<HttpReq, ReqE
     loop {
         let h = match read_line_bounded(reader, MAX_LINE) {
             Ok(Some(v)) => v,
-            Ok(None) => break, // 헤더 중 EOF — 아래 빈 헤더 취급(바디 0).
+            Ok(None) => break,
             Err(LineErr::TooLong) => {
                 return Err(ReqErr::Status(
                     431,
@@ -297,9 +226,6 @@ fn read_request_from<R: Read>(reader: &mut BufReader<R>) -> Result<HttpReq, ReqE
         ));
     }
     if chunked {
-        // [A13] chunked 지원(2026-10-09 사용자 결정) — 크기줄(hex)[;ext] CRLF +
-        // 데이터 CRLF 반복, 크기 0에서 종료(트레일러 헤더 소비). 본문 상한은
-        // Content-Length 경로와 동일(MAX_BODY) — 초과 시 413(읽지 않고 거부).
         let mut body: Vec<u8> = Vec::new();
         loop {
             let szline = match read_line_bounded(reader, MAX_LINE) {
@@ -327,7 +253,6 @@ fn read_request_from<R: Read>(reader: &mut BufReader<R>) -> Result<HttpReq, ReqE
                 }
             };
             if n == 0 {
-                // 트레일러: 빈 줄까지 소비(있으면).
                 loop {
                     match read_line_bounded(reader, MAX_LINE) {
                         Ok(Some(v)) if !v.iter().all(u8::is_ascii_whitespace) => continue,
@@ -367,7 +292,6 @@ fn read_request_from<R: Read>(reader: &mut BufReader<R>) -> Result<HttpReq, ReqE
         });
     }
     if len > MAX_BODY {
-        // QA-2: 413 응답 후 절단 — 상한 초과 본문은 읽지도 않는다.
         return Err(ReqErr::Status(
             413,
             "Payload Too Large",
@@ -387,10 +311,7 @@ fn read_request_from<R: Read>(reader: &mut BufReader<R>) -> Result<HttpReq, ReqE
     })
 }
 
-/// 연결당 리더 1개를 받는다(H 2026-10-09) — 종전엔 호출마다 BufReader를
-/// 새로 만들어, 선행 판독분(파이프라인 잔여 바이트)이 리더와 함께 폐기됐다.
 pub(crate) fn read_request(reader: &mut BufReader<TcpStream>) -> Result<HttpReq, String> {
-    // QA-2: 읽기 타임아웃 — 헤더/바디 미완 송신(절단·slow-loris) 영구 블록 방지.
     let _ = reader
         .get_ref()
         .set_read_timeout(Some(std::time::Duration::from_secs(120)));
@@ -412,9 +333,9 @@ pub(crate) fn resp(stream: &mut TcpStream, code: u16, ct: &str, body: &str) {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
-        413 => "Payload Too Large", // QA-8: 폴백 "OK"로 "413 OK"가 나가던 결함
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
-        503 => "Service Unavailable", // QA-8: 워밍업 /health가 "503 OK"였다
+        503 => "Service Unavailable",
         _ => "OK",
     };
     let _ = write!(
@@ -431,8 +352,6 @@ pub(crate) fn resp_sse_open(stream: &mut TcpStream) {
     );
 }
 
-/// [I 2026-10-10] SSE 주석 프레임 — ':'으로 시작하는 줄은 클라이언트가 무시.
-/// 토큰 공백(장문 프리필 TTFT 수십 초 등)에 보내 프록시·클라 타임아웃을 막는다.
 pub(crate) fn sse_comment_frame(text: &str) -> String {
     format!(": {text}\n\n")
 }
@@ -442,19 +361,14 @@ pub(crate) fn sse_comment(stream: &mut TcpStream, text: &str) -> std::io::Result
     stream.flush()
 }
 
-/// [K0 2026-10-12] 피어 생존 스파이 — keep-alive 타임아웃마다 논블로킹
-/// peek 1회: 클라 절단(RST/FIN)을 쓰기 버퍼 성공에 가려진 채 기다리지
-/// 않고 즉시 관측한다. WouldBlock/TimedOut = 생존 · Ok(0)/Err(연결) = 절단.
 pub(crate) fn peer_alive(stream: &mut TcpStream) -> bool {
     use std::io::Read;
     if stream.set_nonblocking(true).is_err() {
-        return true; // 상태 전환 실패 — 보수적으로 생존 간주
+        return true;
     }
-    // SSE 업스트림 요청은 이미 완결돼 수신 데이터가 없다 — 1바이트 읽기
-    // 소비 무해: WouldBlock/TimedOut = 생존, EOF/Reset/BrokenPipe = 절단.
     let mut b = [0u8; 1];
     let mut alive = match stream.read(&mut b) {
-        Ok(0) => false, // EOF(FIN 절단) — 수신 데이터 유무와 무관하게 연결 종료
+        Ok(0) => false,
         Ok(_) => true,
         Err(e) => !matches!(
             e.kind(),
@@ -464,18 +378,15 @@ pub(crate) fn peer_alive(stream: &mut TcpStream) -> bool {
         ),
     };
     if stream.set_nonblocking(false).is_err() {
-        alive = false; // 원복 실패 — 이후 블로킹 쓰기가 불안정하니 절단 처리
+        alive = false;
     }
     alive
 }
 
-/// [D 2026-10-10] 어드미션 게이트 응답 — 429 Too Many Requests + Retry-After.
-/// 큐 포화(하드게이트) 전용 — 로딩/엔진 사망은 503(호출부 판단).
 pub(crate) fn resp_429(stream: &mut TcpStream, body: &str) {
     let _ = stream.write_all(admission_429(body).as_bytes());
 }
 
-/// 429 응답 조립 — 순수 함수(전송 계약 테스트 표면).
 pub(crate) fn admission_429(body: &str) -> String {
     format!(
         "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
@@ -483,11 +394,6 @@ pub(crate) fn admission_429(body: &str) -> String {
     )
 }
 
-/// 쓰기 오류를 반환한다 — 종전 `let _ =`가 절단된
-/// 클라이언트로의 쓰기 실패를 삼켜, 잔여 n_predict를 GPU가 끝까지 계산했다.
-/// [2026-10-09 P5] 프레임을 문자열로 조립해 단일 write_all — 종전 write!는
-/// 포맷 조각마다 write(2)(프레임당 ~5회) + Nagle과 겹쳐 스톨 소지.
-/// 값/의미 불변(전송 바이트 동일).
 pub(crate) fn sse(stream: &mut TcpStream, event: &str, data: &str) -> std::io::Result<()> {
     let mut frame = String::with_capacity(event.len() + data.len() + 16);
     frame.push_str("event: ");
@@ -501,8 +407,6 @@ pub(crate) fn sse(stream: &mut TcpStream, event: &str, data: &str) -> std::io::R
 
 #[cfg(test)]
 mod req_tests {
-    //! S2: 요청 파싱 매트릭스 — 431/414/400/413/EOF/파이프라인 소비.
-    //! `read_request_from`이 impl Read를 받으므로 Cursor로 전수 검증한다.
 
     use super::*;
     use std::io::{BufReader, Cursor};
@@ -528,7 +432,6 @@ mod req_tests {
 
     #[test]
     fn chunked_body_ok() {
-        // [A13] chunked 요청 — 조각 2개 + 종료(0) + 트레일러.
         let body = "{\"prompt\":\"hi\"}";
         let (a, b) = body.split_at(5);
         let req = format!(
@@ -538,7 +441,6 @@ mod req_tests {
         );
         let r = parse(req.as_bytes()).expect("chunked");
         assert_eq!(r.body, body);
-        // 잘못된 크기줄 → 400.
         match parse(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n") {
             Err(ReqErr::Status(400, _, _)) => {}
             _ => panic!("400 기대(chunk size)"),
@@ -547,14 +449,12 @@ mod req_tests {
 
     #[test]
     fn long_lines_are_bounded() {
-        // 요청 라인 8KB 초과(개행 없음) → 414.
         let mut line = b"GET /".to_vec();
         line.extend(std::iter::repeat_n(b'a', MAX_LINE + 16));
         match parse(&line) {
             Err(ReqErr::Status(414, _, _)) => {}
             other => panic!("414 기대: {:?}", other.err().map(|e| format!("{e:?}"))),
         }
-        // 헤더 라인 8KB 초과 → 431.
         let mut req = b"GET / HTTP/1.1\r\nX-Big: ".to_vec();
         req.extend(std::iter::repeat_n(b'b', MAX_LINE + 16));
         req.extend_from_slice(b"\r\n\r\n");
@@ -562,7 +462,6 @@ mod req_tests {
             Err(ReqErr::Status(431, _, _)) => {}
             _ => panic!("431 기대(헤더 라인)"),
         }
-        // 헤더 라인 수 128 초과 → 431.
         let mut req = b"GET / HTTP/1.1\r\n".to_vec();
         for i in 0..(MAX_HEADER_LINES + 4) {
             req.extend_from_slice(format!("X-{i}: 1\r\n").as_bytes());
@@ -576,18 +475,14 @@ mod req_tests {
 
     #[test]
     fn cl_and_te_guards() {
-        // 변형 CL → 400.
         match parse(b"POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n") {
             Err(ReqErr::Status(400, _, _)) => {}
             _ => panic!("400 기대(CL)"),
         }
-        // chunked는 A13으로 지원 — 정상 종료(0)까지 오면 빈 본문 수용,
-        // 미완(EOF)은 Plain 오류(400 아님).
         match parse(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n") {
             Ok(r) => assert!(r.body.is_empty()),
             Err(e) => panic!("chunked 수용 기대: {e:?}"),
         }
-        // 상한 초과 CL → 413.
         let req = format!(
             "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
             MAX_BODY + 1
@@ -600,12 +495,10 @@ mod req_tests {
 
     #[test]
     fn eof_and_pipeline_consumption() {
-        // 빈 입력 → EOF(응답 없음).
         match parse(b"") {
             Err(ReqErr::Plain(m)) => assert_eq!(m, "eof"),
             _ => panic!("eof 기대"),
         }
-        // 파이프라인: 리더를 유지하면 두 번째 요청이 그대로 남아 있다.
         let two = b"GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n";
         let mut r = BufReader::new(Cursor::new(two.to_vec()));
         let a = read_request_from(&mut r).expect("1st");
@@ -614,7 +507,6 @@ mod req_tests {
         assert_eq!(b.path, "/b");
     }
 
-    /// [D] 어드미션 게이트 429 — 상태줄·Retry-After·Content-Length 계약.
     #[test]
     fn admission_429_contract() {
         let body = "{\"error\":\"queue full — admission gate\"}";
@@ -628,7 +520,6 @@ mod req_tests {
         assert!(r.ends_with(&format!("\r\n\r\n{body}")), "{r}");
     }
 
-    /// [I] SSE keep-alive 주석 프레임 — ':' 줄 + 빈 줄(클라 무시 계약).
     #[test]
     fn sse_comment_frame_contract() {
         assert_eq!(sse_comment_frame("keep-alive"), ": keep-alive\n\n");

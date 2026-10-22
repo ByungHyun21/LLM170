@@ -1,24 +1,14 @@
-//! [PP 3차 2026-10-17] serve 2카드 엔진 — shard.rs 직렬 오케스트레이터 승격.
-//! 코디네이터 소유: SCHED/slot_pos/KV 회계/스펙 롤백(1차 = 스펙 OFF 강제).
-//! 샤드A(카드0, 창 [0,k)) → 경계 잔차 d2h → 샤드B(카드1, 창 [k,n)) → head.
-//! 토큰열 = 단일 GPU serve와 동일(골든 판정 — backend pp2shard 패리티 승계).
-//! 1차 제약(비목표): 오버랩 더블버퍼·배치 체인 팬아웃(직렬 위임)·kstep·
-//! 스펙/MTP·MoE 샤딩·4카드.
 
 use super::QwenEngine;
 use llm170_backend_gpu::{forward_2shard, forward_2shard_argmax};
 use std::path::Path;
 
-/// 2샤드 서빙 엔진 — 동일 인터페이스(GpuEngine 위임면)·내부 직렬 위임.
 pub struct PpEngine {
     a: Box<QwenEngine>,
     b: Box<QwenEngine>,
 }
 
 impl PpEngine {
-    /// 27B 32/32 연속 분할 — k = n_layer/2(홀수 층 거부). KV 예산·상한은
-    /// 호출부가 **전체** 값을 주면 샤드별로 절반씩 나눠 적용한다(각 샤드의
-    /// KV 아레나는 전층 어텐션 기준으로 잡히므로 절반 배분 = 보수 상한).
     pub fn load(
         dir: &Path,
         n_slots: usize,
@@ -57,7 +47,6 @@ impl PpEngine {
             Some((k, n_layer)),
         ) {
             Ok(b) => Box::new(b),
-            // 샤드B 실패 시 샤드A 부분 할당 정리(재시도 루프 VRAM 회수 계약).
             Err(e) => {
                 a.dec.free_all_device();
                 return Err(e);
@@ -66,7 +55,6 @@ impl PpEngine {
         Ok(PpEngine { a, b })
     }
 
-    /// 1토큰 로짓 — qwen logits 미러(head_gpu=B 소유; CPU head 참조는 B).
     fn logits_1(&mut self, slot: usize, row: &[f32]) -> Result<Vec<f32>, String> {
         if self.b.head_gpu {
             let mut lg = forward_2shard(&mut self.a.dec, &mut self.b.dec, slot, row, 1, true)?;
@@ -79,8 +67,6 @@ impl PpEngine {
         Ok(lg)
     }
 
-    /// 1토큰 greedy — B의 디바이스 argmax(단일 GPU forward_device_argmax
-    /// 동일 커널 — 골든 토큰열 판정).
     fn token_greedy(&mut self, slot: usize, row: &[f32]) -> Result<u32, String> {
         if self.b.head_gpu {
             return forward_2shard_argmax(&mut self.a.dec, &mut self.b.dec, slot, row);
@@ -89,29 +75,20 @@ impl PpEngine {
         Ok(llm170_core::matmul::greedy_from(&lg))
     }
 
-    /// 시퀀스 prefill → 마지막 로짓 — qwen prefill 미러(호스트 임베딩 행 +
-    /// forward_2shard 청크; GPU gather 경로와 값 동일 — 골든 계약).
-    /// softcap 미적용 = 단일 경로 prefill과 동일 표면.
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
-        // [⑰-1] impl 경유(중간 청크 헤드 스킵 공유) — want=true = 종전 계약.
         self.prefill_impl(seq, tokens, true)
             .map(|o| o.unwrap_or_default())
     }
 
-    /// [파이프라인 2026-10-22] greedy 프리필 — 2샤드 경로는 로짓 회수 후
-    /// 호스트 greedy(동작 불변; 단일 경로 qwen의 디바이스 argmax와 토큰
-    /// 계약 동일 — greedy_from 미러).
     pub fn prefill_greedy(&mut self, seq: usize, tokens: &[u32]) -> Result<u32, String> {
         let l = self.prefill(seq, tokens)?;
         Ok(llm170_core::qwen35::greedy(&l))
     }
 
-    /// [파이프라인 2026-10-22] 혼합 청크 상한 — 2샤드 27B는 종전 정책(128).
     pub fn prefill_mixed_cap(&self) -> usize {
         128
     }
 
-    /// [⑰-1] 상태 전진 전용 — 중간 청크 헤드·d2h 스킵(qwen prefill_state와 동일 계약).
     pub fn prefill_state(&mut self, seq: usize, tokens: &[u32]) -> Result<(), String> {
         self.prefill_impl(seq, tokens, false).map(|_| ())
     }
@@ -189,7 +166,6 @@ impl PpEngine {
         })
     }
 
-    /// 배치 디코드 로짓 — 슬롯별 직렬(1차 제약: 배치 체인 팬아웃 비목표).
     pub fn decode(&mut self, seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
         let rows = self.a.embed_rows(tokens)?;
         let h = self.a.model.hp.n_embd;
@@ -200,7 +176,6 @@ impl PpEngine {
         Ok(out)
     }
 
-    /// 배치 greedy — 슬롯별 직렬 디바이스 argmax.
     pub fn decode_np_greedy(
         &mut self,
         seq_ids: &[usize],
@@ -214,13 +189,11 @@ impl PpEngine {
         Ok(out)
     }
 
-    /// 단일 greedy 디코드.
     pub fn decode_greedy(&mut self, seq: usize, token: u32) -> Result<u32, String> {
         let row = self.a.model.embed_row(token).map_err(|e| e.to_string())?;
         self.token_greedy(seq, &row)
     }
 
-    /// kstep 장치 루프 — 1차 미지원(Err → sched 기존 토큰당 경로 폴백).
     pub fn decode_greedy_k(
         &mut self,
         _seq: usize,
@@ -231,9 +204,6 @@ impl PpEngine {
         Err("pp 1차: kstep 미지원 — 토큰당 경로 폴백".into())
     }
 
-    /// 혼합 배치(그리디+샘플) — 행별로 디바이스 argmax(토큰) + head 로짓
-    /// (raw — 단일 GPU 배치 경로와 동일하게 softcap 미적용)을 산출.
-    /// 1차 제약: 행당 체인 2회(성능 비목표 — 값 보존 우선).
     pub fn decode_np_mixed(
         &mut self,
         seq_ids: &[usize],
@@ -267,7 +237,6 @@ impl PpEngine {
         Ok((toks, flat))
     }
 
-    /// 배치 디코드 로짓(샘플링) — 슬롯별 직렬 + softcap(qwen 미러).
     pub fn decode_np_logits(
         &mut self,
         seq_ids: &[usize],
@@ -282,13 +251,11 @@ impl PpEngine {
         Ok(out)
     }
 
-    // ── 상태·KV — 양쪽 샤드 소유(코디네이터가 필요분만 전파) ──
 
     pub fn kv_grow(&mut self, slot: usize, n_tokens: usize) -> Result<usize, String> {
         let na = self.a.dec.kv_grow(slot, n_tokens)?;
         let nb = match self.b.dec.kv_grow(slot, n_tokens) {
             Ok(v) => v,
-            // B 실패 시 A의 확보분을 되돌려 정합 유지(다음 틱 재시도).
             Err(e) => {
                 let _ = self.a.dec.kv_release(slot);
                 return Err(e);
@@ -364,7 +331,6 @@ impl PpEngine {
         self.a.reuse_valid(slot, l, prompt_len)
     }
 
-    // ── 스펙/MTP — 1차 강제 OFF(골든 우선) ──
 
     pub fn enable_spec(&mut self) -> Result<(), String> {
         Err("pp 1차: 스펙 미지원(강제 OFF)".into())
@@ -423,13 +389,10 @@ impl PpEngine {
         false
     }
 
-    /// [⑰-spec 2026-10-18] 위임 no-op — PP 1차는 스펙/MTP 강제 OFF(골든
-    /// 우선)라 선캡처 대상이 아니다.
     pub fn warm_spec_graphs(&mut self, _n_slots: usize, _eos: u32) -> Result<(), String> {
         Ok(())
     }
 
-    // ── 관측·메타 — A 대표(합산 가능분은 합산) ──
 
     pub fn apply_tuning(&mut self, t: super::Tuning) -> Result<(), String> {
         self.a.apply_tuning(t)?;

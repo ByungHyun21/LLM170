@@ -1,39 +1,7 @@
 #!/usr/bin/env bash
-# W4A16 스모크 — 참조(CPU)·GPU 체인·serve 종단 + 명시 거부 판정.
-# 2026-10-08 단일 트랙(W3-3: GPU 서빙 착륙).
-#
-# 판정:
-#   1. A(27B): 참조(CPU) greedy 토큰열 골든 접두 일치 — 오라클.
-#   2. B(27B): GPU 체인(w4a16-gpu) 토큰열 골든 접두 일치.
-#   3. C(27B): serve HTTP 종단 — 배너 runtime=cuda + 골든 접두 + 배치 불변성
-#      (동시 2요청 = 슬롯 0·1 배치 체인 토큰 = 단일 경로 골든).
-#   4. D(35B-A3B INT4 g32): 참조(CPU) MoE 오라클 — W4-1(2026-10-08) g32/bf16
-#      전문가 + 라우터 top-8·shared 게이트. 골든 접두 일치 + 로드 완전성.
-#   5. D2(35B) GPU 체인(MoE) — w4a16-gpu 골든 접두(플레인 bf16 + 전문가 상주).
-#   6. D3(35B) 다중 청크(35토큰 = 32+3) — 배치 프리필 t≤32의 CPU/GPU 골든.
-#      (2026-10-09 교훈: 3토큰 케이스는 단일 청크만 탄다 — 다중 청크를 상시
-#       검증한다. 이 케이스가 gdn_exp 도메인 결함을 잡는 그물이다.)
-#   7. E(FN FP8PLE): stage-1 식별 통과(config 판독 — 브링업 보류 계약) +
-#      serve 자원 가드 명시 거부(148.7GiB > 가용 — 2026-10-17 실측).
-#   8. G(27B): 장문 600·4000토큰 — lim>256(attn 분할)·다중 청크 경로 골든.
-#   9. G2(35B): 장문 600·4000토큰 — 동일(35B MoE).
-#  10. H(스펙 옵트인): --spec 4 골든 접두(27B/35B) — 검증=t=1 등가·보정 경로 회귀.
-#  6b. D4(35B): 스트리밍 serve(--moe streaming) 골든 — 전문가 LRU 캐시 경로 판정.
-#      [버그수정 2026-10-13] t≤8 스테이징 삽입이 가중치 업로드를 빠뜨려(유령 슬롯)
-#      스트리밍 출력이 오염됐다(워밍업/프리필 → t=1 디코드까지 전파) — 상시 판정.
-# 장문 골든(600/4000)은 GPU 동결(2회 재현) — CPU 대조는 35토큰 한계(D3).
-# 경로 회귀 검출용(값 변경 시 원인 판정 후 재동결).
-# [KVQ 채택 2026-10-10] int8 KV가 단일 경로 — 구 F(KVQ) 섹션은 기본 경로와
-# 동일해져 제거. 35B 600 골든은 int8 채택값으로 재동결(2회 재현).
-# 사용법: scripts/swap_models.sh [--section a,d2,d4,...]
-#   섹션 키(콤마 선택, 미지정 = 전체): a 3a c 3b d d2 d3 d4 e g g2 h k j g4 g4e
-#   게이트(#9): 섹션 실행 결과 = 전체 실행의 해당 섹션 결과와 동일(회귀 없음).
 set -u
 cd "$(dirname "$0")/.."
 BIN=./target/release/llm170
-# [테스트 재설계 2026-10-22] 골든 = 승인 시점 출력 스냅샷 — 단일 원장
-# scripts/goldens.tsv 에서만 값 관리(동결일·출처·판정 가능 축 note 포함).
-# 값 변경 절차 = 회귀 원인 판정 → 원장 갱신(사유 note) — 본문 인라인 금지.
 gval() { awk -F'\t' -v k="$1" '$1==k{print $2}' scripts/goldens.tsv; }
 GOLDEN=$(gval serve27.prefix)
 GOLDENFN5=$(gval fn5.prefix)
@@ -44,18 +12,12 @@ GOLDEN35_600=$(gval moe35.long600)
 GOLDEN35_4K=$(gval moe35.long4k)
 GOLDEN35L=$(gval moe35.chunk35)
 P35L="148678,65233,202419,156037,16072,154029,156504,30,149285,65233,195939,149820,152091,150868,54581,155180,177992,12434,170819,149820,152091,16869,201523,229231,204817,13,153343,51643,155497,171699,25845,159667,32762,189291,13"
-# A2: 동시 실행 충돌 방지 — 실행별 런 디렉터리·포트(고정 18210/고정 파일명 해소).
 mkdir -p /tmp/opencode
 RUN=$(mktemp -d /tmp/opencode/w4a16-smoke.XXXXXX)
 PORT=$((18210 + ($$ % 400)))
 
-# [2026-10-16 #9] 섹션 필터 — 기본 전체. 예: --section d2,d4 (35B GPU·스트리밍만).
 SECTIONS=all
 if [ $# -ge 1 ] && [ "$1" = "--fast" ]; then
-    # [검증 티어 2026-10-22] 패스트 레인 = 3a,c (가드 + serve 골든·배치 불변성,
-    # 실로드 2회 ≈ 2분). 스케줄·파이프라인·서빙 축 변경의 착수 게이트.
-    # 수치 경로(커널·산술·샘플링) 변경은 전체 실행 필수 — 골든 재동결만이
-    # 참조 재유도(a,d,d3)를 대체한다.
     set -- "--section" "3a,c"
 fi
 if [ "$1" = "--section" ] && [ $# -eq 2 ]; then
@@ -94,7 +56,6 @@ fail=0
 SUMMARY=()
 note() { echo "[w4a16] $*"; SUMMARY+=("$*"); }
 
-# ── 1. A(27B) 참조 토큰 ──
 if want a; then
     note "[1/10] A(27B) 참조 실행 — w4a16-ref"
     timeout 900 "$BIN" w4a16-ref "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
@@ -107,18 +68,10 @@ if want a; then
     esac
 fi
 
-# ── 2. B(27B) GPU 체인 — [검수 통합 2026-10-14] [3b]의 600토큰 프로브가 같은
-# 골든 접두를 판정한다(모델 로드 1회 절감) — 별도 8토큰 런 제거.
 want 3b && note "[2/10] B(27B) GPU 체인 — [3b] 600토큰 런에 흡수(골든 접두 동일 계약)"
 
-# ── 3a. serve kv-mem 가드 (W1+W3 — 필수·최소·호스트 여유 상한·--ctx 폐지) ──
 if want 3a; then
     note "[3a/10] serve --kv-mem 가드 — 무 auto·최소·호스트 여유 상한 거부·--ctx 폐지"
-    # [2026-10-16 수정] 종전 "23G 거부" 기대는 W1(VRAM 단일 풀) 시절 값 — W3 호스트
-    # 2계층에서 kv-mem > VRAM은 정상(초과분 = 핀드 호스트 아레나). 그 검사가
-    # timeout 없이 serve 대기에 물려 W1 작성 후 첫 실행에서 스모크가 정지했다.
-    # 새 계약: ① 실제 상한 = 호스트부 ≤ 가용 RAM − 예약(100G 그물) ② VRAM 초과분은
-    # 호스트 분할 수용(기동 확인 후 종료) ③ 모든 프로브 timeout.
     if timeout 120 "$BIN" serve --model "$M_27B" --port 18098 > "$RUN/sv0.log" 2>&1; then
       echo "[w4a16] FAIL: --kv-mem 누락이 통과됨"; fail=1
     elif grep -q -- "--kv-mem" "$RUN/sv0.log"; then note "kv-mem 필수 거부 OK: $(head -1 "$RUN/sv0.log")"
@@ -131,9 +84,6 @@ if want 3a; then
     else
       echo "[w4a16] FAIL: kv-mem 최소 거부 사유 불명 — ${RUN}/sv1.log"; fail=1
     fi
-    # [2026-10-16 CMP] 상한 거부 기대치를 기기 유도로 — 100G 하드코딩은 4090
-    # (24G VRAM+64G RAM) 기준이라 CMP(64G+107G)에서는 합법 수용(호스트부가
-    # 가용 RAM 안)이라 가드 아닌 타임아웃으로 죽었다. 거부 유발 = 양 여유의 2배.
     SV4_G=$(( ( $(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0) / 1024
               + $(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo) ) * 2 ))
     if timeout 120 "$BIN" serve --model "$M_27B" --kv-mem "${SV4_G}G" --port 18098 > "$RUN/sv4.log" 2>&1; then
@@ -148,9 +98,6 @@ if want 3a; then
     else
       echo "[w4a16] FAIL: --ctx 폐지 사유 불명 — ${RUN}/sv2.log"; fail=1
     fi
-    # ② W3 분할 수용 — kv-mem 12G. [2026-10-16 CMP] 4090은 VRAM부 자연 상한
-    # (2.7G)로 분할됐으나 64G 카드는 12G 전부 VRAM에 들어 kv-tier 라인이 없다.
-    # 진단 노브로 VRAM부 상한 강제(W3 하네스 전용 배치 파라미터 — 수치 불변).
     : > "$RUN/sv3.log"
     LLM170_KV_VRAM_MB=2048 "$BIN" serve --model "$M_27B" --kv-mem 12G --port 18103 > "$RUN/sv3.log" 2>&1 &
     SERVE_PID=$!
@@ -169,15 +116,11 @@ if want 3a; then
     fi
 fi
 
-# ── 3. C(27B) serve HTTP 종단 ──
 if want c; then
     note "[3/10] C(27B) serve HTTP — runtime=cuda + 골든 접두"
     : > "$RUN/c.log"
-    # [2026-10-22] 128M→256M — 슬롯 8 상향 후 워밍업(8×528tk)+스펙 그래프
-    # 캡처가 4096토큰 풀을 소진(KvPool 블록 소진 → 입장 교찰 실측).
     "$BIN" serve --model "$M_27B" --kv-mem 256M --port "$PORT" > "$RUN/c.log" 2>&1 &
     SERVE_PID=$!
-    # A2: 기기 전체 pkill 금지 — 이 실행의 서버 PID만 종료(개발 서버 보호).
     trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
     for i in $(seq 1 100); do
       sleep 3
@@ -185,10 +128,6 @@ if want c; then
     done
     curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
       -d '{"prompt":[148678,65233,202419],"max_tokens":8,"temperature":0}' > "$RUN/c.json"
-    # [배치 불변성 2026-10-13] 동시 2요청 — 슬롯 0·1이 배치 체인으로 묶여도 토큰은
-    # 단일 경로와 동일해야 한다. 가드 배경: 상태 f16+스케일 채택이 단일 경로에만
-    # 배선돼 np·다중 슬롯이 illegal access로 죽던 회귀(스케일 슬롯 기저 128× OOB +
-    # 배치 체인 sc 누락) — 슬롯 0만 검사하던 종전 스모크가 통과시켰다.
     curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
       -d '{"prompt":[148678,65233,202419],"max_tokens":8,"temperature":0}' > "$RUN/c2a.json" &
     C2A=$!
@@ -232,10 +171,6 @@ except Exception:
     done
 fi
 
-# ── 3b. 그래프 replay KV 블록(512) 경계 교차 — 디코드 중 성장 경로 ──
-# [2026-10-14] 그래프 경로가 kv_ensure(온디맨드 성장)를 우회해 경계 교차 시
-# 미할당 테이블 엔트리를 판독(illegal access — np2 tg768 실측)하던 결함의 가드.
-# 프리필이 블록을 선확보하는 장문 배터리·스모크 경로에서는 잠복했던 클래스.
 if want 3b; then
     note "[3b] 그래프 경로 KV 경계 교차 — 단문→600토큰(단일 그래프+배치 그래프)"
     timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 600 --ctx 1024 \
@@ -256,7 +191,6 @@ if want 3b; then
     fi
 fi
 
-# ── 4. D(35B INT4 g32) 참조 오라클(W4-1 MoE) ──
 if want d; then
     note "[4/10] D(35B INT4 g32) 참조 실행 — w4a16-ref (MoE g32/bf16)"
     timeout 2400 "$BIN" w4a16-ref "$M_35B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 \
@@ -269,8 +203,6 @@ if want d; then
     esac
 fi
 
-# ── 5. D2+D3(35B) GPU 체인 + 다중 청크(GPU) — [검수 통합 2026-10-14] 시나리오
-# 2종(단문·P35L)을 모델 로드 1회로. 시나리오별 `s0/s1-tokens:` 판정.
 if want d2; then
     note "[5/10] D2+D3(35B) GPU 체인 — 다중 시나리오(단문+P35L·MoE)"
     timeout 1800 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens 148678,65233,202419 --prompt-tokens "$P35L" \
@@ -289,7 +221,6 @@ if want d2; then
     esac
 fi
 
-# ── 6. D3(35B) 다중 청크(35토큰) 참조(CPU) ──
 if want d3; then
     note "[6/10] D3(35B) 다중 청크 참조(CPU) — 배치 프리필 t≤32 골든"
     timeout 2400 "$BIN" w4a16-ref "$M_35B" --prompt-tokens "$P35L" --n-predict 8 --ctx 1024 \
@@ -302,7 +233,6 @@ if want d3; then
     esac
 fi
 
-# ── 6b. D4(35B) 스트리밍 serve — 전문가 LRU 캐시 경로 골든 ──
 if want d4; then
     note "[6b] D4(35B) 스트리밍 serve — --moe streaming 골든(캐시 경로)"
     : > "$RUN/d4.log"
@@ -333,11 +263,6 @@ except Exception:
     esac
 fi
 
-# ── 7. E(FN FP8PLE) stage-1 식별 + serve 자원 가드 명시 거부 ──
-# [2026-10-17 사용자 결정] FN 브링업 보류(stage-1)에 맞춰 갱신: 종전엔
-# w4a16-load가 자원 가드에 거부되길 기대했으나 이제 stage-1 식별(config
-# 판독)이 정상 통과다 — 로더 = stage-1 계약 판정, 자원 가드 거부 = serve
-# 경로(148.7GiB 필요 > 가용 — 적재 전 즉시 거부, 실측 메시지 유지).
 if want e; then
     note "[7/10] E(FN FP8PLE) stage-1 식별 + serve 자원 가드 거부"
     if timeout 60 "$BIN" w4a16-load "$M_FN" > "$RUN/e.log" 2>&1; then
@@ -352,17 +277,12 @@ if want e; then
     if timeout 60 "$BIN" serve --model "$M_FN" --kv-mem 1G --port 18099 > "$RUN/e2.log" 2>&1; then
       echo "[w4a16] FAIL: serve 가드가 통과시킴(148.7GiB) — ${RUN}/e2.log"; fail=1
     elif grep -q "insufficient resources" "$RUN/e2.log"; then
-      # [2026-10-16] 'rsrc-guard' 광역 매칭 제거 — 적재 락 대기("…대기(B20)")도
-      # rsrc-guard 접두를 달고 있어 타 llm170 동시 실행 시 false-pass였다.
       note "serve 가드 거부 OK: $(head -1 "$RUN/e2.log")"
     elif grep -q "미지원 아키텍처" "$RUN/e2.log"; then
-      # [2026-10-21] FN serve 배선 전 — 아치 단계 즉시 거부도 동일 의도
-      # (조용한 오서빙 방지). 배선 후엔 이 분기 삭제(가드 검사로 복귀).
       note "serve 아치 거부 OK(FN serve 미배선): $(head -1 "$RUN/e2.log")"
     else
       echo "[w4a16] FAIL: serve 가드 외 사유(락 대기 포함) — ${RUN}/e2.log"; fail=1
     fi
-    # [2026-10-21] GPU 5톤 골든 — 브링업 체인 정합(이후 단계적 확대).
     if timeout 420 "$BIN" w4a16-gpu "$M_FN" --prompt-tokens 148678,65233,202419,771,99012 \
       > "$RUN/e3.out" 2> "$RUN/e3.log"; then
       E3=$(grep -m1 'argmax ' "$RUN/e3.out" | grep -o 'argmax [0-9]*' | awk '{print $2}')
@@ -376,8 +296,6 @@ if want e; then
     fi
 fi
 
-# ── 8. G(27B) 장문 600·4000토큰 — lim>256·다중 청크
-# [검수 통합 2026-10-14] 2시나리오 1런(모델 로드 1회) — s0=600·s1=4000.
 if want g; then
     note "[8/10] G(27B) 장문 600/4000토큰 GPU 골든(2시나리오 1런)"
     timeout 1800 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens "$P600" --prompt-tokens "$P4000" \
@@ -396,7 +314,6 @@ if want g; then
     esac
 fi
 
-# ── 10. G2(35B) 장문 600·4000토큰 — [검수 통합] 2시나리오 1런.
 if want g2; then
     note "[9/10] G2(35B) 장문 600/4000토큰 GPU 골든(2시나리오 1런)"
     timeout 1800 "$BIN" w4a16-gpu "$M_35B" --prompt-tokens "$P600" --prompt-tokens "$P4000" \
@@ -415,7 +332,6 @@ if want g2; then
     esac
 fi
 
-# ── 10. H(스펙 옵트인) --spec 4 골든 접두 ──
 if want h; then
     note "[10/10] H(스펙) --spec 4 골든 접두 — 27B/35B"
     timeout 900 "$BIN" w4a16-gpu "$M_27B" --prompt-tokens 148678,65233,202419 --n-predict 8 --ctx 1024 --spec 4 \
@@ -438,10 +354,6 @@ fi
 
 if want k; then
     note "[12/12] K(스펙 항등) — 128토큰 서브: 스펙 on/off 토큰 동일 + 라운드 발화 + 골든 접두"
-    # [비결정성 회귀 가드 2026-10-13·커밋 45ae1b08] 융합(ngram) 보정 롤백 오프바이원이
-    # 스펙 발화 시 후속 토큰을 오염시켰다 — 스펙은 무손실이어야 하므로, 같은 요청의
-    # 스펙 on/off 출력이 **토큰 단위로 동일**해야 한다. 라운드 미발화면 검사 무효
-    # (spec_rounds ≥ 1 확인). SPEC_OFF는 진단 플래그(성능 경로만 끔 — 무손실).
     K_OK=0
     for pair in "on:" "off:LLM170_SPEC_OFF=1"; do
       mode="${pair%%:*}"; envs="${pair#*:}"
@@ -483,9 +395,6 @@ elif t_on != t_off:
 elif r_on < 1:
     print("FAIL 라운드 미발화 — 검사 무효")
 elif t_on[:len(gold)] != gold:
-    # [무료 다중 검증 2026-10-15] on==off만으로는 둘이 함께 드리프트해도 통과한다 —
-    # 접두를 동결 골든과 대조(이미 수집된 토큰 — 추가 로드 0; H는 프로브 경로,
-    # 여기는 서브+스펙 경로의 골든 셀).
     print(f"FAIL 골든 접두 불일치(스펙 on): got={t_on[:len(gold)]} want={gold}")
 else:
     print(f"OK rounds={r_on} tokens={len(t_on)} golden-prefix OK")
@@ -499,8 +408,7 @@ fi
 
 if want j; then
     note "[11/11] J(수치 지문) — 128토큰 창 PPL 동결 대조 (Q2 · 서브토큰 드리프트)"
-    FP="scripts/eval-data/fingerprint.tsv"   # 로컬 원장(푸시 제외)
-    # [gemma4 2026-10-14] 세 번째 = gemma4 — 비채팅 프로토콜(add_bos 강제 → --bos 2).
+    FP="scripts/eval-data/fingerprint.tsv"
     for pair in "$M_27B:27B:" "$M_35B:35B:" "$M_G4:gemma4:--bos 2"; do
       d="${pair%%:*}"; rest="${pair#*:}"; n="${rest%%:*}"; extra="${rest#*:}"
       jout=$(timeout 900 "$BIN" w4a16-eval ppl "$d" --corpus scripts/eval-data/corpus-en.txt \
@@ -528,9 +436,6 @@ sys.exit(0 if ok else 1)
     done
 fi
 
-# ── G4. gemma4-26B-A4B(QAT W4A16 g32) — P3 v0 서빙 경로 ──
-# [gemma4 P3 2026-10-14] CPU 오라클 동일 실행 대조(마진 인지 게이트) + infer 골든.
-# 프롬프트 = tokenize --chat '{"messages":[{"role":"user","content":"안녕하세요"}]}'.
 if want g4; then
     G4_PROMPT="2,105,2364,107,61659,106,107,105,4368,107,100,45518,107,101"
     G4_GOLDEN="61659,236888,131147,237372,199825,236761,94485,237293,220757"
@@ -547,20 +452,14 @@ if want g4; then
         *) echo "[w4a16] FAIL: G4 판정 — $(echo "$A" | grep '판정:')"; fail=1;;
       esac
       echo "=== G4f. gemma4 np16 배치 등가 — t≤16 커널 상시 그물 ==="
-      # [2.N 2026-10-15] 15ba3702가 호스트 청크 상한만 올리고 gptq4의 t-row GEMV
-      # 케이스(9..16)를 빠뜨린 회귀의 검출 그물 — 케이스 부재면 t=16 조건 커널이
-      # 조용히 무기록(no-op)되어 np16-check가 단일 경로 등가 FAIL로 터진다.
-      # 디코드 배치 t=16은 서빙(다중 슬롯 동시 배치)에서 실제로 타는 경로다.
       A=$(timeout 900 "$BIN" bench --model "$M_G4" --pp 16 --tg 8 --np 16 --ctx 1024 2>&1)
       case "$A" in
         *"np16-check | 단일 경로 등가 OK"*) note "G4f np16 등가 OK";;
         *) echo "[w4a16] FAIL: G4f np16 — $(echo "$A" | grep -o 'np16-check.*' | head -1)"; fail=1;;
       esac
       echo "=== G4c. gemma4 HTTP 서브(채팅 · 아치 렌더·정지 토큰) ==="
-      # [W1] --ctx(serve) 폐지 — kv-mem ≥ 블록 1개(512토큰)면 충분(요청은 소형).
       "$BIN" serve --model "$M_G4" --kv-mem 128M --port 18099 > "$RUN/g4c.log" 2>&1 &
       G4_PID=$!
-      # A2 규율: 이 실행의 PID만 종료(전역 pkill 금지).
       trap 'kill "$G4_PID" 2>/dev/null' EXIT
       for i in $(seq 1 100); do
         sleep 3
@@ -590,9 +489,6 @@ except Exception:
         "$G4_GOLDEN"*) note "G4b infer 골든 OK: $(echo "$C" | head -c 60)";;
         *) echo "[w4a16] FAIL: G4b infer 토큰 — $(echo "$C" | head -c 60)"; fail=1;;
       esac
-      # G4d: 스트리밍 전문가(비상주 — 저하 사다리) HTTP 경로. [2026-10-14] t=1
-      # 단일 청크 전환이 t행 MoE(g4_moe_host_t — 스트리밍 미지원)로 폴백을
-      # 오염시킨 회귀를 잡는 그물 — 비상주 구성은 v0 호스트 체인(g4_step)이 정본.
       echo "=== G4d. gemma4 HTTP 서브(--moe streaming — 저하 사다리) ==="
       "$BIN" serve --model "$M_G4" --kv-mem 128M --moe streaming --port 18100 > "$RUN/g4d.log" 2>&1 &
       G4_PID=$!
@@ -621,11 +517,6 @@ except Exception:
     fi
 fi
 
-# ── G4e. 접두 재사용 정합 — 콜드↔웜 토큰 동일 + 부분 재사용 발화 ──
-# [2026-10-14] 재사용 Stage 1(엔진 pos 복원·finish 불변식 클램프·빈 프리필
-# 가드)의 상시 그물: 동일 프롬프트를 (콜드 B1) → (절단 A·max8) → (웜 B2)
-# 순서로 보내 B1==B2(토큰열)와 `# prefix-cache` 발화를 판정한다. qwen 동반
-# (체크포인트 부분 경로 — 공유 assign_slot 편집의 무영향 확인).
 if want g4e; then
     cat > "$RUN/g4e_cmp.py" <<'PYCMP'
 import json, sys
@@ -644,11 +535,6 @@ for name, mt in [("rB", 16), ("rA", 8)]:
             "max_tokens": mt, "temperature": 0}
     open(f'{run}/reuse-{name}.json', 'w', encoding='utf-8').write(json.dumps(body))
 PYG4E
-    # [2026-10-16 수정] gemma4 KV ≈128KiB/토큰 — kv-mem 512M(4096토큰 풀)에서는
-    # 2242토큰 프롬프트의 2번째 요청부터 kv 압박이 접두 캐시를 회수해 재사용이
-    # 소멸했다(전 요청 콜드 — 스모크 G4e 실패로 적발. 회수 자체는 요청 우선
-    # 원칙상 정상 동작 = 테스트 구성 문제). gemma4 1G(8192토큰)·qwen27 512M로
-    # 모델별 여유를 준다.
     for pair in "$M_G4:gemma4:18101:1G" "$M_27B:qwen27:18102:512M"; do
       d="${pair%%:*}"; rest="${pair#*:}"; n="${rest%%:*}"; rest="${rest#*:}"; port="${rest%%:*}"; kv="${rest#*:}"
       "$BIN" serve --model "$d" --kv-mem "$kv" --port "$port" > "$RUN/g4e-$n.log" 2>&1 &

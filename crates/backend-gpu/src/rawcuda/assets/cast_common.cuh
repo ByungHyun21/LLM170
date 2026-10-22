@@ -1,10 +1,4 @@
-// ── f16 비트 변환 공용 계약(2026-10-08) ──
 #pragma once
-// h2f: f16 비트 → f32(정확 — 서브노멀 정규화 루프 포함, libdevice 미사용).
-// f2h: f32 → f16 비트(RN-even, 서브노멀·inf/nan) — 호스트 w4a16_dec::f32_to_f16
-// 과 비트동일 계약. 이 두 함수는 **단일 정의**이며 모든 커널이 이 헤더를
-// include 한다(gptq4/norm/ew) — 4중 수동 복사 시절의 드리프트 방지.
-// 반드시 동형으로 수정할 것(서버 cast_contract 테스트가 호스트 쪽을 전수 대조).
 
 __device__ __forceinline__ float h2f(unsigned short h) {
     unsigned sign = (unsigned)(h >> 15) << 31;
@@ -15,7 +9,6 @@ __device__ __forceinline__ float h2f(unsigned short h) {
         if (m == 0) {
             bits = sign;
         } else {
-            // 서브노멀 — Rust half_to_f32와 동일 정규화 루프.
             int ee = 127 - 15 + 1;
             unsigned f = m;
             while ((f & 0x400u) == 0) {
@@ -33,8 +26,6 @@ __device__ __forceinline__ float h2f(unsigned short h) {
     return __uint_as_float(bits);
 }
 
-// f32 → f16 비트(RN-even, 서브노멀·inf/nan) — 호스트 w4a16_dec::f32_to_f16
-// 과 비트동일 계약(디바이스 체인 캐스트). 반드시 동형으로 수정할 것.
 __device__ __forceinline__ unsigned short f2h(float v) {
     unsigned b = __float_as_uint(v);
     unsigned sign = (unsigned short)((b >> 16) & 0x8000u);

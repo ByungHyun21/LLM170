@@ -1,4 +1,3 @@
-//! GDN층 스테이지 — CPU 참조 경로. 수치 경로 불변.
 
 use super::super::{ModelError, SeqState, span_block};
 use super::Ctx;
@@ -6,7 +5,6 @@ use crate::ops::{l2_norm, sigmoid, silu, softplus};
 use crate::qwen35::{mm_batch, mm_group};
 use llm170_diag::profile_span;
 
-/// GDN층: qkv/게이트/베타/알파/아웃 프로젝션 — 디스패치 경유.
 pub(crate) fn gdn_layer(
     ctx: &Ctx,
     seqs: &mut [SeqState],
@@ -28,11 +26,10 @@ pub(crate) fn gdn_layer(
     let walpha = ctx.model.wchk(&format!("blk.{il}.ssm_alpha.weight"))?;
     let ssm_a = ctx.model.f32_vec(&format!("blk.{il}.ssm_a"))?;
     let dt_bias = ctx.model.f32_vec(&format!("blk.{il}.ssm_dt.bias"))?;
-    let conv_w = ctx.model.f32_vec(&format!("blk.{il}.ssm_conv1d.weight"))?; // [conv_k][conv_ch] 행 우선
+    let conv_w = ctx.model.f32_vec(&format!("blk.{il}.ssm_conv1d.weight"))?;
     let ssm_norm_w = ctx.model.f32_vec(&format!("blk.{il}.ssm_norm.weight"))?;
     let wout = ctx.model.wchk(&format!("blk.{il}.ssm_out.weight"))?;
 
-    // qkv·z·beta·alpha는 전부 동일 입력 xs — 1그룹 배치.
     let mut group: [Vec<Vec<f32>>; 4] = [
         vec![vec![0.0f32; conv_ch]; n_tok],
         vec![vec![0.0f32; d_inner]; n_tok],
@@ -77,7 +74,6 @@ pub(crate) fn gdn_layer(
             for t in 0..t_len {
                 let row = s * t_len + t;
                 for c in 0..conv_ch {
-                    // ggml ssm_conv: weight {d_conv, d_inner} 행 우선 → w[c*conv_k + j]
                     let mut sum = conv_w[c * conv_k + (conv_k - 1)] * qkv[row][c];
                     for j in 0..conv_k - 1 {
                         sum += conv_w[c * conv_k + j] * conv_state[j * conv_ch + c];
@@ -87,7 +83,6 @@ pub(crate) fn gdn_layer(
                         conv_state[j * conv_ch + c] = conv_state[(j + 1) * conv_ch + c];
                     }
                     conv_state[(conv_k - 2) * conv_ch + c] = qkv[row][c];
-                    // 레이아웃: q [k heads] | k [k heads] | v [v heads]
                     if c < k_len {
                         q_all[row * k_len + c] = out_c;
                     } else if c < 2 * k_len {
@@ -149,11 +144,6 @@ pub(crate) fn gdn_layer(
                 dt_rank,
             );
         }
-        // [2.G 진단 2026-10-13] GDN 라이브 상태 크기 통계(LLM170_DUMP=gdst) —
-        // 상태 양자화 후보 판정용: 원소 크기 분포(f16 서브노멀 질량)와 행(kdim)
-        // 별 최대값(행-스케일 설계 여지), 전역 최대(오버플로 여지).
-        // 실측(27B en 64토큰): |S|max≤35·서브노멀(<6e-5) 12~28% — raw f16은
-        // 35B에서 밴드 초과(+1.55%)의 주 원인(채널 스케일 부재, bf16 대조로 확인).
         if llm170_diag::dump::opts().key("gdst") {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static GDST_N: AtomicUsize = AtomicUsize::new(0);
@@ -190,7 +180,6 @@ pub(crate) fn gdn_layer(
         }
     }
 
-    // norm_gated: rms_norm(core)·silu(z) per head → ssm_out
     let mut gated = vec![vec![0.0f32; d_inner]; n_tok];
     {
         profile_span!("cpu::gdn_normgated");

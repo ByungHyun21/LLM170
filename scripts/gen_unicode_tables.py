@@ -31,7 +31,6 @@ def singles(body: str):
 
 
 ranges_flags = pairs(extract("unicode_ranges_flags"))
-# sentinel: last entry is {MAX_CODEPOINTS, x} — keep as-is (start exclusive bound)
 assert ranges_flags[-1][0] == 0x110000, hex(ranges_flags[-1][0])
 whitespace = sorted(set(singles(extract("unicode_set_whitespace"))))
 lowercase = pairs(extract("unicode_map_lowercase"))

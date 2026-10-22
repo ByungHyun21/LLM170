@@ -1,16 +1,10 @@
-//! span — 이름 기반 구간 누적 프로파일러.
-//!
-//! debug 빌드 또는 `profile` feature에서만 계측, release 기본은 zero-cost.
-//! 사용 규칙: `profile_span!`은 **스코프당 1개**. 같은 함수에서 순차 구간을 잴
-//! 때는 블록 `{ ... }`으로 스코프를 분리한다 (가드가 스코프 끝에 Drop되므로).
 
-/// 계측 활성 조건: debug 빌드 또는 `profile` feature.
 #[cfg(any(debug_assertions, feature = "profile"))]
 mod imp {
     use std::sync::Mutex;
     use std::time::Instant;
 
-    const MAX_EVENTS: usize = 1 << 22; // 4M span — 초과 시 무음 누락 (OOM 방지)
+    const MAX_EVENTS: usize = 1 << 22;
 
     #[derive(Debug)]
     struct Aggregate {
@@ -41,7 +35,6 @@ mod imp {
         }
     }
 
-    /// span 시작. 반환값을 스코프 끝까지 유지할 것.
     pub fn span(name: &'static str) -> SpanGuard {
         SpanGuard {
             name,
@@ -49,7 +42,6 @@ mod imp {
         }
     }
 
-    /// 누적 리포트: 총 소요 기준 내림차순. 계측된 게 없으면 None.
     pub fn report() -> Option<String> {
         let reg = registry().lock().ok()?;
         if reg.is_empty() {
@@ -89,7 +81,6 @@ mod imp {
         Some(out)
     }
 
-    /// 계측 버퍼 초기화 (재측정 시작 시).
     pub fn reset() {
         if let Ok(mut reg) = registry().lock() {
             reg.clear();

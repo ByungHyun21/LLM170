@@ -1,26 +1,7 @@
-//! 모니터링 스냅샷 — 외부 폴러(JSON) + Prometheus 텍스트 (2026-10-09).
-//!
-//! 전제(사용자): CMP 4장 1대 · 서버 1~2개 — 외부 폴러가 각 인스턴스를 긁고
-//! **시계열 누적은 폴러 쪽**에서 한다. 서버는 **최신 스냅샷 1장**만 유지한다
-//! (히스토리·링버퍼 없음, 모든 값은 덮어쓰기).
-//!
-//! 설계:
-//! - **CUDA 호출을 HTTP 경로에서 완전 배제** — 전용 샘플러 스레드(1Hz)가
-//!   장치별 VRAM(`VramSampler` — 기동 시 1회 retain)과 /proc(RSS·
-//!   MemAvailable·MemTotal)을 읽어 원자값에 게시. 핸들러는 읽기+조립만
-//!   (스크랩 빈도와 무관한 비용 — /health와 동급).
-//! - 누적 카운터는 SCHED(AtomicU64)의 "최신 누적값" — 스크래퍼가 두 스냅샷
-//!   차분으로 처리량을 계산한다(스크래이프 리셋 트릭 없음).
-//! - GPU 라벨: **전 장치 열거**(한 프로세스가 여러 장을 쓰는 미래 대비).
-//! - VRAM free/total 의미론: **기기 전체** 값 — 이 프로세스 귀속이 아니다
-//!   (공유 기기에서는 타 프로세스 포함; 독점 배포 가정).
-//! - 인스턴스 식별: `LLM170_INSTANCE`(선택) + 모델/ctx/slots/장치 수.
-//! - 메모리: 원자값 u64 몇 개 + 슬롯 뷰(<1KB) — 총 2KB 미만.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// 슬롯 상태 뷰 — slot_loop가 저빈도(≤1Hz)로 게시(최신값만).
 #[derive(Clone, Default)]
 pub struct SlotView {
     pub id: usize,
@@ -32,70 +13,47 @@ pub struct SlotView {
     pub err_count: u32,
 }
 
-/// 정적 정보(기동 1회 — 이후 불변).
 pub struct Info {
     pub instance: String,
     pub model: String,
     pub ctx: usize,
-    /// [2.J] 모델 전역 ctx 상한(0 = 미상) — /v1/models·/stats 노출.
     pub model_max_ctx: usize,
-    /// [2.M] 배치 플래너 요약(매니페스트 범주·티어 — 무적재 산출).
     pub plan: String,
     pub n_slots: usize,
-    /// 모델 파일 총합(디스크 — 분류의 기준점).
     pub model_bytes: u64,
-    /// [2026-10-16] 운영자 `--kv-mem`(KV 총량 — 무 auto).
     pub kv_mem: u64,
-    /// 실효 요청 상한(토큰) = min(모델 최대, 풀) — kv-mem 유래.
     pub pool_cap_tokens: usize,
 }
 
-/// 메모리 분류 뷰 — slot_loop가 저빈도 게시(모델이 시스템을 쓰는 방식).
 #[derive(Clone, Default)]
 pub struct MemView {
-    /// VRAM 상주 가중치(비전문가 + 상주 전문가).
     pub weights_gpu: u64,
-    /// VRAM KV 캐시(호스트 확장분 제외).
     pub kv_gpu: u64,
-    /// [2026-10-16] 호스트 KV 아레나(핀드·디바이스 매핑) 바이트.
     pub kv_host: u64,
-    /// [2026-10-16] KV 블록 계층 회계 — (호스트 블록, 전체 블록).
     pub kv_host_blocks: u64,
     pub kv_blocks_total: u64,
-    /// [2026-10-16] 티어별 **자유** 블록(가용 — 배치가 아니라 잔여).
     pub kv_free_vram: u64,
     pub kv_free_host: u64,
-    /// CPU 오프로드 가중치(스트리밍 전문가 — 호스트에서 토큰별 업로드).
     pub offload_cpu: u64,
-    /// CPU PLE 오프로드(미구현 W4-2 — 0).
     pub ple_cpu: u64,
-    /// 토큰당 활성 가중치 바이트(실효 대역폭 = 이 값 × tg tok/s).
     pub active_per_token: u64,
-    /// MoE 배치: "none" | "resident" | "streaming".
     pub moe_mode: String,
-    /// [§2.M ① 2026-10-15] 스트리밍 전문가 LRU 캐시 — (hits, miss, k슬롯/층).
     pub moe_cache: (u64, u64, usize),
-    /// [2026-10-16] 메모리 배치 권고(관측 전용) — 0=hold 1=prefer_kv 2=prefer_cache.
     pub mem_advice: u8,
 }
 
-/// 복사(io) 뷰 — 런타임/적재 분리. 각 항목 = [h2d, d2h, d2d] × (바이트, ns, 호출).
 #[derive(Clone, Copy, Default)]
 pub struct IoView {
-    /// 서빙 구간 누적(토큰당 스트리밍·로짓 판독 등 — 병목 판독용).
     pub runtime: [(u64, u64, u64); 3],
-    /// 적재 구간(가중치 업로드 — 1회).
     pub load: [(u64, u64, u64); 3],
 }
 
 struct Shared {
     info: Info,
     started: std::time::Instant,
-    /// 기동 직후(엔진 적재 전) 프리 VRAM — gpu_used = before − now.
     free_before: Vec<AtomicU64>,
     gpu_free: Vec<AtomicU64>,
     gpu_total: Vec<AtomicU64>,
-    /// 장치 능력·이름(정적 — 대역폭 피크·SM).
     caps: Vec<llm170_backend_gpu::DeviceCaps>,
     names: Vec<String>,
     mem: Mutex<MemView>,
@@ -108,12 +66,9 @@ struct Shared {
 
 static SNAP: OnceLock<Shared> = OnceLock::new();
 
-/// 기동 시 1회 — 정적 정보 등록 + 샘플러 스레드 시작.
-/// 장치 수는 `VramSampler`가 실제 열거한 값(드라이버 실측)을 쓴다.
 pub fn init(info: Info) {
     let sampler = llm170_backend_gpu::VramSampler::new();
     let n = sampler.as_ref().map(|s| s.device_count()).unwrap_or(0);
-    // 엔진 적재 **전** 프리 VRAM 기록(적재 후 델타 = 이 프로세스 VRAM).
     let before: Vec<u64> = sampler
         .as_ref()
         .map(|s| {
@@ -145,7 +100,7 @@ pub fn init(info: Info) {
         slots: Mutex::new(Vec::new()),
     };
     if SNAP.set(shared).is_err() {
-        return; // 중복 init — 무시
+        return;
     }
     std::thread::Builder::new()
         .name("llm170-metrics".into())
@@ -153,7 +108,6 @@ pub fn init(info: Info) {
         .ok();
 }
 
-/// 샘플러 루프 — 1Hz. 실패 장치는 이전 값 유지(0으로 덮지 않음).
 fn sampler_loop(sampler: Option<llm170_backend_gpu::VramSampler>) {
     loop {
         let Some(shared) = SNAP.get() else {
@@ -183,7 +137,6 @@ fn sampler_loop(sampler: Option<llm170_backend_gpu::VramSampler>) {
     }
 }
 
-/// 메모리 분류 게시(slot_loop — 최신값 덮어쓰기).
 pub fn publish_memory(v: MemView) {
     if let Some(s) = SNAP.get()
         && let Ok(mut g) = s.mem.lock()
@@ -192,7 +145,6 @@ pub fn publish_memory(v: MemView) {
     }
 }
 
-/// 복사(io) 게시(slot_loop — 최신값 덮어쓰기).
 pub fn publish_io(v: IoView) {
     if let Some(s) = SNAP.get()
         && let Ok(mut g) = s.io.lock()
@@ -201,7 +153,6 @@ pub fn publish_io(v: IoView) {
     }
 }
 
-/// 슬롯 뷰 게시(slot_loop — 최신값 덮어쓰기).
 pub fn publish_slots(v: Vec<SlotView>) {
     if let Some(s) = SNAP.get()
         && let Ok(mut g) = s.slots.lock()
@@ -210,22 +161,18 @@ pub fn publish_slots(v: Vec<SlotView>) {
     }
 }
 
-/// Prometheus 게이지 1줄(HELP/TYPE 포함).
 fn pm_gauge(o: &mut String, name: &str, help: &str, val: String) {
     o.push_str(&format!(
         "# HELP {name} {help}\n# TYPE {name} gauge\n{val}\n"
     ));
 }
 
-/// Prometheus 누적 카운터 1줄.
 fn pm_counter(o: &mut String, name: &str, help: &str, val: u64) {
     o.push_str(&format!(
         "# HELP {name} {help}\n# TYPE {name} counter\n{name} {val}\n"
     ));
 }
 
-/// JSON 문자열 이스케이프(최소 — 따옴표/역슬래시/제어문자).
-/// [2026-10-16] 메모리 배치 권고 이름(관측 전용 — /stats).
 fn advice_name(v: u8) -> &'static str {
     match v {
         1 => "prefer_kv",
@@ -247,9 +194,6 @@ fn esc(s: &str) -> String {
     o
 }
 
-/// JSON 스냅샷 — 외부 폴러용(수 KB). 메모리는 **모델 중심 분류**:
-/// 각 컴포넌트가 gpu/cpu 어디에 얼마나 있는지(현행 KV·PLE는 gpu 전량/미구현).
-/// [2.J] 실효/모델 최대 ctx — /v1/models·외부 폴러용(풀 도입 시 실효가 pool-파생으로 대체).
 pub fn effective_ctx() -> usize {
     SNAP.get().map(|s| s.info.ctx).unwrap_or(0)
 }
@@ -386,7 +330,6 @@ pub fn json() -> String {
         },
         sc.prefix_tokens.load(Ordering::Relaxed),
         {
-            // [K1] 히트율 = 재사용 토큰 / 프롬프트 토큰(누적 기준).
             let pt = sc.prompt_tokens.load(Ordering::Relaxed);
             if pt > 0 {
                 sc.prefix_tokens.load(Ordering::Relaxed) as f64 / pt as f64
@@ -435,7 +378,6 @@ pub fn json() -> String {
     )
 }
 
-/// Prometheus 텍스트 — 표준 도구 호환(부가; 주 타깃은 JSON 폴러).
 pub fn prometheus() -> String {
     let Some(s) = SNAP.get() else {
         return String::new();
@@ -562,7 +504,6 @@ pub fn prometheus() -> String {
         "speculative verify round wall us (x1000)",
         sc.spec_ms.load(Ordering::Relaxed) / 1000,
     );
-    // [2.A-④ 2026-10-13] 경제성 게이트 — 모드·소스·비용 EMA(ms/토큰).
     pm_gauge(
         &mut o,
         "llm170_spec_econ_on",
@@ -625,7 +566,6 @@ pub fn prometheus() -> String {
         "Prefix-cache reused tokens",
         sc.prefix_tokens.load(Ordering::Relaxed),
     );
-    // [K1 2026-10-12] 재사용 분해 — 전체-접두/체크포인트 히트 횟수 + 히트율 게이지.
     pm_counter(
         &mut o,
         "llm170_prefix_reuse_full_total",
@@ -661,16 +601,13 @@ mod tests {
 
     #[test]
     fn json_escapes_and_shape() {
-        // 미초기화 상태 — 폴러가 파싱 가능한 JSON이어야 한다.
         let j = json();
         assert!(j.starts_with('{') && j.ends_with('}'), "{j}");
-        // 이스케이프 규칙.
         assert_eq!(esc("a\"b\\c\nd"), "a\\\"b\\\\c d");
     }
 
     #[test]
     fn prometheus_is_empty_before_init() {
-        // init 전에는 빈 문자열(핸들러가 200 + 빈 본문 — 폴러 무해).
         assert!(prometheus().is_empty() || prometheus().contains("llm170_"));
     }
 }

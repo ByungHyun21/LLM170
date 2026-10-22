@@ -1,14 +1,8 @@
-//! 배치/프리필 체인(t≥2) — [R5 2026-10-10] chains.rs에서 분리.
-//! chain_t가 프리필 청크(GEMM/mma 경로)와 스펙 검증(all=true)·eval
-//! 로짓 모드를 소유한다. 디코드(t=1) 체인은 chains.rs.
 
 use super::*;
 
 impl W4a16Dec {
-    // ── [§2.K-① 2026-10-14] upload.rs에서 이동(순수 이동 — 코드 무변) ──
 
-    /// [S3-1] 프리필(t≥2) — 토큰 id 배열 직접 진입. id h2d → gather(dres) →
-    /// 체인. 값은 forward_prefill(행 경로)와 동일(골든 계약).
     pub fn forward_prefill_toks(
         &mut self,
         slot: usize,
@@ -30,19 +24,12 @@ impl W4a16Dec {
             return Err(format!("forward_prefill_toks: 토큰 범위 위반 {bad}"));
         }
         self.ensure_chain_bufs()?;
-        // SAFETY: toks 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let tb = unsafe { std::slice::from_raw_parts(toks.as_ptr() as *const u8, t * 4) };
         self.cc.h2d_async(self.dtg, tb)?;
         self.embed_gather_launch(self.dtg, self.dres, t)?;
         self.chain_t_sel(slot, None, t, head, false, false, false)
     }
 
-    /// [파이프라인 2026-10-22] greedy 프리필(t≥2, 임베딩 상주) — 마지막 행만
-    /// head+argmax(디바이스) 후 토큰 1개(4B) 회수. 종전 greedy 최종 청크는
-    /// 로짓 전사 D2H(어휘×4B ≈ 600KB pageable — 슬로패스 수 ms)를 매 요청
-    /// 치렀다. argmax = `w4a16_argmax_min`(min-index-on-tie = 호스트
-    /// greedy_from 미러 — 디코드 forward_device_argmax 동일 커널) → 토큰 불변.
-    /// softcap 등 호스트 로짓 후처리가 있는 모델은 호출부가 로짓 경로 유지.
     pub fn forward_prefill_toks_greedy(
         &mut self,
         slot: usize,
@@ -63,18 +50,13 @@ impl W4a16Dec {
             return Err(format!("forward_prefill_toks_greedy: 토큰 범위 위반 {bad}"));
         }
         self.ensure_chain_bufs()?;
-        // SAFETY: toks 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
         let tb = unsafe { std::slice::from_raw_parts(toks.as_ptr() as *const u8, t * 4) };
         self.cc.h2d_async(self.dtg, tb)?;
         self.embed_gather_launch(self.dtg, self.dres, t)?;
         let v = self.chain_t_sel(slot, None, t, true, false, false, true)?;
         Ok(v[0] as u32)
     }
-    // ── CUDA Graph(체인 캡처 — P1) ──
 
-    /// 배치 체인(t∈2..=8) — 프리필 청크. GEMM(t≥2) 경로 + 배치 버퍼.
-    /// 반환: 마지막 행의 xn(또는 head면 로짓). t≥2 GEMM은 w4a16-gemm
-    /// 게이트가 비트 판정(행별 64레인·tree64 동일) — t=1 경로와 계약 동일.
     pub(super) fn chain_device_t(
         &mut self,
         slot: usize,
@@ -85,15 +67,6 @@ impl W4a16Dec {
         self.chain_t(slot, rows, t, head, false, false, false)
     }
 
-    /// [A-1] 스펙 검증 체인 — `all`=true면 **전 위치** 최종 노름+배치 head+
-    /// 배치 argmax로 토큰 t개(id를 f32로)를 반환(상태·pos는 전진).
-    /// 롤백은 호출부(상태 복원 + pos 되감기) 소관.
-    /// [eval 2026-10-10] `logits`=true(all과 함께)면 argmax 대신 [t][head_n]
-    /// 로짓을 회수한다(청크 프리필 PPL 가속 — eval 프로브 전용).
-    /// [파이프라인 2026-10-22] `last_argmax`=true(head와 함께)면 **마지막 행만**
-    /// head GEMV + argmax(`w4a16_argmax_min` — min-index tie = 호스트
-    /// greedy_from 미러) 후 토큰 1개(id를 f32로) 회수 — all=true의 전-행
-    /// 배치 head와 달리 비용이 t에 비례하지 않는다(greedy 프리필 최종 청크용).
     pub(super) fn chain_t(
         &mut self,
         slot: usize,
@@ -107,8 +80,6 @@ impl W4a16Dec {
         self.chain_t_sel(slot, Some(rows), t, head, all, logits, last_argmax)
     }
 
-    /// [S3-1 2026-10-11] 입력 선택판 — Some = 호스트 행 h2d, None = dres 기채움
-    /// (임베딩 gather 경로가 사전 기록). 나머지 계약·산술은 chain_t와 동일.
     pub(super) fn chain_t_sel(
         &mut self,
         slot: usize,
@@ -134,7 +105,6 @@ impl W4a16Dec {
         if pos as usize + t > cap {
             return Err(format!("{CTX_OVERFLOW}: pos{pos}+T{t} > kvcap{cap}"));
         }
-        // [K6-3] KV 온디맨드 확보(슬랙 2행) — t≥2 진입 공통(프리필·검증).
         self.kv_ensure(slot, pos as usize + t + 2)?;
         if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("chain_device_t: 디코더 상수 미등록".into());
@@ -145,40 +115,28 @@ impl W4a16Dec {
         self.ensure_attn_bufs(t)?;
         let dyt = self.ensure_dyt(t)?;
         if let Some(r) = rows {
-            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let rb = unsafe { std::slice::from_raw_parts(r.as_ptr() as *const u8, r.len() * 4) };
             self.cc.h2d_async(self.dres, rb)?;
         }
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let h = self.hidden;
         let mut ab = self.dab_dev;
-        // [k2 (b) 2026-10-17] 층 창 — 기본 전체창이라 순회·값 불변. gi는 창
-        // 시작 직전 GDN 층 개수만큼 건너뛴 절대 인덱스(전체창 = 0).
         let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
         let win = self.window;
         let owns_final = win.owns_final(self.n_layers);
         let mut gi = win.gdn_start(interval);
-        // 플레인(MoE) 모드 — bf16 GEMM(x 원시 f32), FFN은 MoE 배치.
         let plain = self.plain_weights;
-        // [P10] GEMM 상한 — mma 경로(t≥16)는 t 무제한, FFMA 폴백
-        // 커널(G4_GTMAX/G4_TMAX2=32)만 32 상한. 폴백으로 t>32를 태우지 않는다.
         let gemm_mma = t >= 16;
         if t > GEMM_FFMA_TMAX && !gemm_mma {
             return Err(format!(
                 "chain_device_t: t={t} > {GEMM_FFMA_TMAX} — FFMA 폴백 상한(t<16 진단 또는 t<16)"
             ));
         }
-        // [§7 2026-10-11] t≤8(TR 도메인)은 GemvT(행=블록, 8행/블록) — 종전
-        // Gemm(FFMA, G4_GTMAX=32 슬롯 중 t만 유효)은 검증 t=5에서 6.4× 낭비.
-        // TR 커널은 배치 디코드 체인과 동일 경로 — 행별 산술이 t=1 GEMV와
-        // 비트동일(스펙 골든 접두로 검증). t≥9는 종전 Gemm.
         let lp = if t <= GEMV_TR {
             LinPath::GemvT
         } else {
             LinPath::Gemm
         };
-        // [S2 2026-10-11] t≤8(GemvT)은 다중세그먼트 융합 경로(스펙 검증·
-        // 소형 청크) — t≥9(Gemm)는 종전 단독 런치 유지.
         let fuse = matches!(lp, LinPath::GemvT);
         for off in 0..win.n() {
             let il = win.abs(off);
@@ -187,10 +145,8 @@ impl W4a16Dec {
                 .norm_resid_dev(2 * il, self.dres, ab, t, xh)
                 .map_err(|e| format!("T{il} input norm: {e}"))?;
             let branch = if (il + 1).is_multiple_of(interval) {
-                // [R10] 4변형 → lin_forward 단일 디스패치(Gemm 경로).
                 let xin = if plain { xn } else { xh };
                 if fuse {
-                    // [S2] q/k/v 3런치 → 다중세그먼트 1런치.
                     self.gemv_multi_t_dev(plain, il, 0, xin, t)
                         .map_err(|e| format!("T{il} qkv: {e}"))?;
                 } else {
@@ -201,11 +157,8 @@ impl W4a16Dec {
                 self.attn_chain_dev_run(slot, il / interval, t, s0, s1, s1b)
                     .map_err(|e| format!("T{il} attn: {e}"))?
             } else {
-                // [P6] xh(=dx32)는 norm_resid_dev가 h2f(f2h(xn)) 융합 기록 —
-                // cast 재계산 없음(값 불변·골든 검증). [S2] qkv/z도 같은 x.
                 let xin = if plain { xn } else { xh };
                 if fuse {
-                    // [S2] qkv/z 2런치 → 1런치.
                     self.gemv_multi_t_dev(plain, il, 0, xin, t)
                         .map_err(|e| format!("T{il} qkvz: {e}"))?;
                 } else {
@@ -227,16 +180,11 @@ impl W4a16Dec {
                 self.lin_forward(plain, lp, &lo, branch, dyt, t)?;
             } else {
                 let (_, _, _, ko) = self.lin_spec(&lo)?;
-                // [4.1 2026-10-11] branch 생산자 융합 — cast_x32 노드 제거
-                // (mma는 dx16 미러, FFMA는 dx32를 읽는다 — 둘 다 생산자 기록).
                 if self.dx32.cap < t * ko || self.dx16.cap < t * ko {
                     return Err(format!("T{il} branch 융합: dx32/dx16 부족 {}", t * ko));
                 }
                 self.lin_forward(plain, lp, &lo, self.dx32.ptr, dyt, t)?;
             }
-            // [P10] cast_x32(t×ko)가 dx32를 재할당했을 수 있다 — 노름 융합
-            // 기록(xn32)은 **현재** 포인터를 다시 확인한다. 옛 포인터를 계속
-            // 쓰면 비행 커널이 해제 버퍼에 기록한다(새니타이저 OOB 실측).
             let xh = self.ensure_dx32(t * h)?;
             let xn2 = self
                 .norm_resid_dev(2 * il + 1, self.dres, dyt, t, xh)
@@ -246,10 +194,9 @@ impl W4a16Dec {
                     .moe_ffn_dev_t(il, xn2, t)
                     .map_err(|e| format!("T{il} moe: {e}"))?;
             } else {
-                let xh3 = xh; // 노름 융합 기록
+                let xh3 = xh;
                 let _ = xn2;
                 if fuse {
-                    // [S2 2026-10-11] gate/up 2런치 → 다중세그먼트 1런치.
                     self.gemv_multi_t_dev(false, il, 1, xh3, t)
                         .map_err(|e| format!("T{il} gateup: {e}"))?;
                 } else {
@@ -258,32 +205,24 @@ impl W4a16Dec {
                 }
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
-                // [4.1 2026-10-11] ew 융합 — cast_x32 노드 제거.
                 self.ew_dev_fused(s0, s1, s2, t * kd)?;
                 self.lin_forward(false, lp, &dn, self.dx32.ptr, s3, t)?;
                 ab = s3;
             }
         }
-        // [A2 2026-10-11] 2048 경계 — 접두 재사용 체크포인트(GDN 상태+conv
-        // 링, 순수 복사 — 산술 불변). 실패는 무시(기능만 미제공).
         let endp = pos + t as u32;
         if !self.graph.capture_no_host && endp.is_multiple_of(512) {
             let _ = self.checkpoint_gdn(slot, endp);
         }
         if all {
-            // [k2 (b)] 전 위치 head/argmax는 마지막 층 소유 창만(비최종 샤드의
-            // 검증 경로는 코디네이터 단계 소관). 전체창 = 항상 통과.
             if !owns_final {
                 return Err("chain_t: 비최종 창 — 전 위치 head/argmax는 마지막 샤드 소관".into());
             }
-            // [A-1] 전 위치 최종 노름 → 배치 head → 배치 argmax → 토큰 t개.
             let xn_all = self
                 .norm_resid_dev(2 * self.n_layers, self.dres, ab, t, 0)
                 .map_err(|e| format!("S final norm: {e}"))?;
             self.ensure_batch_bufs()?;
             if logits && t > BATCH_DEC_MAX {
-                // [eval] t>8 — head GEMV-T 상한(G4_TMAX) 초과: 행별 표준 GEMV
-                // (행=블록 DRAM 포화 경로 — eval 전용).
                 for r in 0..t {
                     self.head_gemv_launch(
                         xn_all + (r * self.hidden) as u64 * 4,
@@ -294,8 +233,6 @@ impl W4a16Dec {
                 self.head_gemv_t_launch(xn_all, self.dbatch_lg, t)?;
             }
             if logits {
-                // [eval] 로짓 회수 모드 — argmax 대신 [t][head_n] d2h.
-                // (행별 표준 GEMV 대안은 실측 더 느림 — head_gemv_t 유지.)
                 let mut ob = vec![0u8; t * self.head_n * 4];
                 self.cc
                     .d2h_async(ob.as_mut_ptr(), self.dbatch_lg, ob.len())?;
@@ -324,7 +261,6 @@ impl W4a16Dec {
                     &mut crate::rawcuda::args::l4(&mut p_l, &mut p_n, &mut p_t, &mut p_a),
                 )?;
             }
-            // SAFETY: self 소유 pinned 스크래치 단독 가변 접근(수명=self).
             let tb = unsafe {
                 std::slice::from_raw_parts_mut(self.graph.pin_batch_tok as *mut u8, t * 4)
             };
@@ -342,9 +278,6 @@ impl W4a16Dec {
                 })
                 .collect());
         }
-        // 마지막 행만 최종 노름(+head) — 중간 행 로짓은 불필요(상각).
-        // [k2 (b)] 최종 노름은 마지막 층 소유 창만 — 비최종 창은 잔차 행을
-        // 핸드오프(다음 샤드 입력)로 회수. head는 최종 창 전용. 전체창 무변.
         let last = (t - 1) as u64 * (h as u64) * 4;
         let (xn_last, out_rows) = if owns_final {
             (
@@ -353,9 +286,6 @@ impl W4a16Dec {
                 h,
             )
         } else {
-            // [k2 (c) 1단 2026-10-17] 비최종 창 — 전 t행 경계 잔차(dres+ab)를
-            // 다음 샤드 입력으로 회수(t=1 체인과 같은 axpy w=1.0 가산 —
-            // 전체창 계층 연속과 비트동일). 반환 폭 = t×hidden.
             self.axpy_dev(1.0, ab, self.dres, t * h)?;
             (self.dres, t * h)
         };
@@ -367,9 +297,6 @@ impl W4a16Dec {
                 out_rows * 4
             }
         ];
-        // [파이프라인 2026-10-22] greedy 최종 청크 — 로짓 전사 D2H 대신
-        // 디바이스 argmax 4B. 커널/규칙 = 디코드 forward_device_argmax와
-        // 동일(w4a16_argmax_min, min-index-on-tie) → 토큰 불변.
         let mut tok4 = [0u8; 4];
         if head {
             if self.head_w == 0 || !owns_final {
@@ -392,8 +319,6 @@ impl W4a16Dec {
                 )?;
                 self.cc.d2h_async(tok4.as_mut_ptr(), self.argmax_out, 4)?;
             } else {
-                // 동기 d2h 금지 — 그래프 캡처가 만든 커스텀(비차단) 스트림과
-                // 경합한다(실측: serve 배치 프리필 쓰레기 토큰). 스트림 순서 복사.
                 self.cc
                     .d2h_async(ob.as_mut_ptr(), self.head_out, self.head_n * 4)?;
             }
@@ -416,7 +341,6 @@ impl W4a16Dec {
         if head {
             llm170_diag::fp::fp_record("gpu.logits", &v);
         } else {
-            // [k2 (c)] 비최종 창 반환은 t행 잔차 — 지문은 마지막 행만(계약 폭).
             llm170_diag::fp::fp_record("gpu.xn", &v[v.len() - h..]);
         }
         Ok(v)

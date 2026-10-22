@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Qwen3.8-Flash-Next W4A16+FP8PLE 다운로드 — CMP 셋업 2026-10-16. (125GiB급 — 가장 김)
-# 소스: albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE — 로컬 디렉터리명과 정확 일치(4090 원장
-#   "local albucino checkpoint"). 지문: g128 sym auto-round·512전문가 top-10·moe 640·120.1GiB.
-# 대상: ../models/Qwen3.8-Flash-Next-W4A16-FP8PLE (swap_models.sh M_FN 경로 동일)
-# 규칙: 모델은 한 번에 1개씩(사용자 지시 2026-10-16). 재실행 = 완료 파일 스킵 + 이어받기.
 set -euo pipefail
 REPO="albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE"
 NAME="Qwen3.8-Flash-Next-W4A16-FP8PLE"

@@ -1,17 +1,6 @@
-//! W4A16(GPTQ4·g128·sym) 레인 미러 — **CPU 비트 계약** (GPU 커널 판정 기준).
-//!
-//! AutoRound auto_gptq 규약: qrow 워드 j의 니블 j%8 = 원소 8·(j/8)+(j%8).
-//! lsb-first **확정**(2026-10-08, w4a16-xcheck — 동일 기저 27B 원본 대조
-//! corr(lsb) 0.991~0.994 vs corr(msb) ≈0.01, §3.6 종결).
-//! zrow = 로더가 행별 언팩한 zp(그룹당 1개, sym 전형 8), srow = 그룹 f16 스케일.
-//! GPU gemm_gptq4(64레인)와 동일 연산열: 레인 l = 원소 l, l+64, … f32 누산 →
-//! f64 레인 배열 → tree64.
 
-/// 64레인 환원 — warp 트리 순서 (GPU __shfl_down 16,8,4,2,1 ×2 + 상위 가산).
-/// 비트계약: 커널 환원과 동일 순서.
 pub fn tree64(v: &[f64; 64]) -> f64 {
     let mut a = *v;
-    // 상/하 절반 쌍 가산 후 32레인 트리 (GPU 커널 환원과 동일 순서)
     for i in 0..32 {
         a[i] += a[i + 32];
     }
@@ -23,14 +12,11 @@ pub fn tree64(v: &[f64; 64]) -> f64 {
     a[0]
 }
 
-/// f16 비트(u16) → f32 (IEEE half, 정확 변환 — deq::half_to_f32 공유).
 #[inline]
 fn f16b(v: u16) -> f32 {
     super::deq::half_to_f32(v)
 }
 
-/// W4A16 행 내적 미러 — 활성 x는 f16 비트(u16) 슬라이스(res_hc f16 버스 계약).
-/// zrow는 로더가 행별 언팩한 zp(그룹당 1워드, 값 0..15).
 pub fn dot_row_w4a16_lane(qrow: &[u32], zrow: &[u32], srow: &[u16], x: &[u16]) -> f32 {
     tree64(&dot_row_w4a16_lane_parts(qrow, zrow, srow, x)) as f32
 }
@@ -43,9 +29,6 @@ pub fn dot_row_w4a16_lane_parts(qrow: &[u32], zrow: &[u32], srow: &[u16], x: &[u
     lane_parts_scale(qrow, zrow, x, 128, |g| f16b(srow[g]))
 }
 
-/// 일반화 계약(W4-1) — 그룹 크기 + 스케일 접근자 공용 **단일 구현**.
-/// 산술은 g128·f16 경로와 완전 동일(레인 l = i=l,l+64,… f32 누산, mul·add
-/// 분리 → f64 tree64). g32(35B 전문가)는 그룹 = i/32, 스케일은 BF16 디코드값.
 pub fn dot_row_w4a16_lane_group(
     qrow: &[u32],
     zrow: &[u32],
@@ -56,7 +39,6 @@ pub fn dot_row_w4a16_lane_group(
     tree64(&lane_parts_scale(qrow, zrow, x, group, |g| srow_f32[g])) as f32
 }
 
-/// 레인 부분합 — 그룹·스케일 접근자 일반형(내부 단일 구현).
 fn lane_parts_scale<F: Fn(usize) -> f32>(
     qrow: &[u32],
     zrow: &[u32],
@@ -91,7 +73,6 @@ fn lane_parts_scale<F: Fn(usize) -> f32>(
 mod w4a16_tests {
     use super::*;
 
-    /// f32 → f16 비트 (정규수 round-to-nearest — 테스트 전용).
     fn to_f16(v: f32) -> u16 {
         let b = v.to_bits();
         let sign = ((b >> 16) & 0x8000) as u16;
@@ -116,7 +97,7 @@ mod w4a16_tests {
 
     #[test]
     fn w4a16_lane_matches_scalar() {
-        let k = 256usize; // g128 × 2그룹
+        let k = 256usize;
         let mut seed = 0x9e37_79b9u64;
         let mut rnd = || {
             seed ^= seed << 13;
@@ -128,7 +109,6 @@ mod w4a16_tests {
         for v in qrow.iter_mut() {
             *v = rnd() as u32;
         }
-        // zp 그룹별 상이(8 고정 아님) — 감산 경로 포함 검증
         let mut zrow = vec![0u32; k / 128];
         for v in zrow.iter_mut() {
             *v = (rnd() % 16) as u32;
@@ -159,8 +139,6 @@ mod w4a16_tests {
 
     #[test]
     fn f16b_is_ieee_half() {
-        // 회귀 가드: bf16식 비트 시프트로 퇴화하지 않는다(2026-10-08 정정 —
-        // 스케일은 실측 f16, 예: 0x3800=0.5).
         assert_eq!(f16b(0x3C00), 1.0);
         assert_eq!(f16b(0x3800), 0.5);
         assert_eq!(f16b(0xC000), -2.0);
@@ -168,8 +146,7 @@ mod w4a16_tests {
 
     #[test]
     fn w4a16_lane_g32_bf16_scale() {
-        // W4-1: g32 + BF16 스케일(35B 전문가 실측) — 일반화 경로 검증.
-        let k = 256usize; // g32 × 8그룹
+        let k = 256usize;
         let mut seed = 0x1234_5678u64;
         let mut rnd = || {
             seed ^= seed << 13;
@@ -179,7 +156,6 @@ mod w4a16_tests {
         };
         let qrow: Vec<u32> = (0..k / 8).map(|_| rnd() as u32).collect();
         let zrow: Vec<u32> = (0..k / 32).map(|_| (rnd() % 16) as u32).collect();
-        // BF16 스케일 비트(상위 16bit) — bf16→f32는 정확 확장.
         let srow: Vec<f32> = (0..k / 32)
             .map(|_| {
                 let v = 0.25f32 + (rnd() % 100) as f32 / 400.0;
@@ -190,7 +166,6 @@ mod w4a16_tests {
             .map(|_| to_f16((rnd() % 2000) as f32 / 1000.0 - 1.0))
             .collect();
         let got = dot_row_w4a16_lane_group(&qrow, &zrow, &srow, &x, 32);
-        // 스칼라 미러(같은 산술 순서 — 레인 누산 후 tree64).
         let mut lanes = [0.0f64; 64];
         for l in 0..64usize {
             let mut acc = 0.0f32;
@@ -209,7 +184,6 @@ mod w4a16_tests {
 
     #[test]
     fn w4a16_sym_zp8_center() {
-        // zp=8·q=8 → 전 기여 0 — 니블 추출 자체 검증
         let k = 128usize;
         let qrow = vec![0x8888_8888u32; k / 8];
         let zrow = vec![8u32; 1];

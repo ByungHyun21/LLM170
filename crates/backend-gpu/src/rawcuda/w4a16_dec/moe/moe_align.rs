@@ -1,14 +1,6 @@
 use super::super::*;
 
 impl W4a16Dec {
-    /// [P11] 전문가-우선 슬롯 순열 발사(프리필 전용) — w4a16_moe_align2.
-    /// n_exp ≤ 1024 계약(초과 시 호출부가 종전 경로로 폴백).
-    /// [A/B 2026-10-16] O(n) 스캐터(1612ad35)+핀드 idx 스테이징(24c3b395) 결합의
-    /// 35B 스트리밍 동일 세션 A/B(교차 2R·중앙값): pp512 +3.5% · pp2048 +2.4%
-    /// (ns=4096 구간; tg는 노이즈로 미확정).
-    /// [2026-10-18] v2 = moe.cu 병렬 스캐터(단일 스레드 O(nslots) 제거 —
-    /// 103.8→34.7µs/발사). 출력 순열 동일(비트동일 — 해시 불변).
-    /// A/B pp512 +1.7%·pp1024 +1.4%.
     pub(in crate::rawcuda::w4a16_dec) fn moe_align_launch(
         &self,
         nslots: usize,
@@ -29,15 +21,7 @@ impl W4a16Dec {
         )
     }
 
-    /// 라우터 top-k 디바이스(P1) — 게이트 GEMV는 [B-4] 다중 세그먼트 런치가
-    /// 수행(moe_multi_gate). 여기는 drt 로짓 → idx/wt 선택만.
     pub(in crate::rawcuda::w4a16_dec) fn moe_topk_dev(&mut self) -> Result<(), String> {
-        // [B-3 2026-10-10] t=1도 **워프 병렬 topk_t** — 종전 단일 스레드
-        // 커널(R3에서 제거 — 구 w4a16_moe_topk)은 128전문가 softmax+8라운드를
-        // 한 스레드가 순차 처리(층당 수µs × 40층). 시맨틱은 동일 미러
-        // (gptq4.cu 주석) — 골든으로 판정.
-        // [B-4 후속 2026-10-10] n=128은 레지스터 전용 커널(비트동일) —
-        // 종전 topk_t t=1 실측 10.2µs(2,474명령·로컬메모리 왕복).
         if self.moe.n_experts == 256 {
             let f = self.cc.function("w4a16_moe_topk256")?;
             let (mut p_lg, mut p_ix, mut p_wt) =
@@ -65,9 +49,6 @@ impl W4a16Dec {
         )
     }
 
-    /// [B6/B7 2026-10-12] 디바이스 top-k(id/wt, moe_idx/moe_wt) → 호스트 목록.
-    /// 스트리밍 스테이징은 id 선택만 필요 — 종전 라우터 로짓 128 d2h+호스트
-    /// 정렬(moe_route)을 대체한다(시맨틱은 topk_t가 미러 — 골든 판정).
     pub(in crate::rawcuda::w4a16_dec) fn moe_read_selection(
         &mut self,
     ) -> Result<Vec<(usize, f32)>, String> {

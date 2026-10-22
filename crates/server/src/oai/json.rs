@@ -1,6 +1,3 @@
-//! oai JSON 파서·메시지 렌더 — 순수 문자열 헬퍼(R3 분할).
-// --- 최소 JSON 파싱 (중첩 없는 평탄 필드 추출) ---
-/// 단순 이스케이프 1글자 해석(`n`,`t`,`u` 이외).
 pub(super) fn push_simple(out: &mut String, c: char) {
     match c {
         'n' => out.push('\n'),
@@ -11,15 +8,10 @@ pub(super) fn push_simple(out: &mut String, c: char) {
         '/' => out.push('/'),
         '"' => out.push('"'),
         '\\' => out.push('\\'),
-        // 미지의 이스케이프는 관례대로 문자를 그대로 통과시킨다.
         other => out.push(other),
     }
 }
 
-/// `tail` 앞 4자리 16진수를 잘라내 `(값, 소비 후 나머지)`.
-/// 4자리가 모자라면 `None`이고 나머지는 **소비한 만큼만** 잘라낸 위치다 —
-/// 호출부가 원문 보존 후 그 지점부터 파싱을 재개해야 닫는 따옴표를
-/// 올바르게 처리할 수 있다.
 pub(super) fn take_hex4(tail: &str) -> (Option<u32>, &str) {
     let mut v: u32 = 0;
     let mut rest = tail;
@@ -38,8 +30,6 @@ pub(super) fn take_hex4(tail: &str) -> (Option<u32>, &str) {
     (if n == 4 { Some(v) } else { None }, rest)
 }
 
-/// 이스케이프 하나를 해석해 `(결과, 소비 후 나머지)`를 돌려준다.
-/// 입력 `rest`는 `\` 다음부터 시작한다.
 pub(super) fn take_escape(rest: &str) -> (String, &str) {
     let Some(first) = rest.chars().next() else {
         return (String::new(), rest);
@@ -52,11 +42,8 @@ pub(super) fn take_escape(rest: &str) -> (String, &str) {
     }
     let (hi, after) = take_hex4(&rest[1..]);
     let Some(hi) = hi else {
-        // 형식 이상 — `\u`만 원문 보존하고 소비한 16진수 뒤에서 재개한다.
-        // 남은 문자열을 통째로 삼키면 닫는 따옴표를 놓쳐 파싱이 무너진다.
         return ("\\u".to_string(), after);
     };
-    // 상위 서로게이트면 뒤따르는 `\uXXXX` 하위와 짝을 이룬다(BMP 밖 문자).
     if (0xD800..0xDC00).contains(&hi) {
         let low_src = after.strip_prefix("\\u").unwrap_or("");
         let (lo, after2) = take_hex4(low_src);
@@ -66,7 +53,6 @@ pub(super) fn take_escape(rest: &str) -> (String, &str) {
         {
             return (c.to_string(), after2);
         }
-        // 짝이 안 맞으면 상위만 보존(무손실).
         return (format!("\\u{hi:04x}"), after);
     }
     match char::from_u32(hi) {
@@ -75,7 +61,6 @@ pub(super) fn take_escape(rest: &str) -> (String, &str) {
     }
 }
 
-/// 값 1개(문자열/숫자/리터럴/배열/객체)의 끝 오프셋 — 문자열·깊이 추적.
 pub(super) fn value_end(body: &str, start: usize) -> Option<usize> {
     let b = body.as_bytes();
     match b.get(start)? {
@@ -104,7 +89,6 @@ pub(super) fn value_end(body: &str, start: usize) -> Option<usize> {
             None
         }
         _ => {
-            // 숫자·true/false/null — 구분자 전까지.
             let mut i = start;
             while i < b.len() && !matches!(b[i], b',' | b'}' | b']' | b' ' | b'\n' | b'\t' | b'\r')
             {
@@ -115,10 +99,6 @@ pub(super) fn value_end(body: &str, start: usize) -> Option<usize> {
     }
 }
 
-/// 최상위 객체에서 `key` 직계 멤버의 **값 슬라이스**(S1).
-/// 종전 `find("\"key\":")`는 중첩 객체(예: messages 내 content 문자열)의
-/// 같은 키를 먼저 잡아 샘플러·stop·model을 오염시킬 수 있었다 — 스캔은
-/// 문자열·이스케이프·중첩 깊이를 추적해 직계 멤버만 본다.
 pub(super) fn jmember<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     let b = body.as_bytes();
     let mut i = body.find('{')? + 1;
@@ -127,7 +107,7 @@ pub(super) fn jmember<'a>(body: &'a str, key: &str) -> Option<&'a str> {
             i += 1;
         }
         if i >= b.len() || b[i] != b'"' {
-            return None; // '}' 또는 비정상 — 종료(호출부 기본값).
+            return None;
         }
         let (k, used) = jparse_string(&body[i..])?;
         i += used;
@@ -178,9 +158,6 @@ pub(super) fn jarr_u32(body: &str, key: &str) -> Option<Vec<u32>> {
     )
 }
 
-/// 따옴표로 시작하는 JSON 문자열 1개 파싱 — (값, 소비 바이트 수).
-/// jstr·jarr_str·jmember 공용. 이스케이프는 take_escape 재사용
-/// (`\uXXXX`·서로게이트 페어를 jstr과 동일 규약으로 디코딩).
 pub(super) fn jparse_string(s: &str) -> Option<(String, usize)> {
     if s.as_bytes().first() != Some(&b'"') {
         return None;
@@ -203,8 +180,6 @@ pub(super) fn jparse_string(s: &str) -> Option<(String, usize)> {
     }
 }
 
-/// 문자열 배열 필드 파싱 (예: "stop": ["a", "b"]) — 최소 파서.
-/// 원소는 jparse_string로 소비 — 문자열 안의 `]`에서 절단하지 않는다(S1).
 pub(super) fn jarr_str(body: &str, key: &str) -> Option<Vec<String>> {
     let inner = jmember(body, key)?.strip_prefix('[')?.strip_suffix(']')?;
     let mut out = Vec::new();
@@ -229,8 +204,6 @@ pub(super) fn jarr_str(body: &str, key: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// 요청 stop 파싱 — OpenAI "stop"(문자열|배열)과 Anthropic
-/// "stop_sequences"(배열) 통합. 반환: (stop 문자열 목록, stop 문자열 포함 여부).
 pub(super) fn jstop(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(s) = jstr(body, "stop") {
@@ -243,9 +216,6 @@ pub(super) fn jstop(body: &str) -> Vec<String> {
     out
 }
 
-/// JSON 배열 내 최상위 객체 조각들 추출 — 중괄호 균형(문자열 리터럴 내부
-/// { } 무시). jmessages_render·jcontent가 공유(A14 — 원본은
-/// jmessages_render 인라인이었다).
 pub(super) fn jblocks(arr: &str) -> Vec<&str> {
     let mut objs = Vec::new();
     let bytes = arr.as_bytes();
@@ -292,9 +262,6 @@ pub(super) fn jblocks(arr: &str) -> Vec<&str> {
     objs
 }
 
-/// content 필드 추출(A14) — Anthropic 표준은 블록 배열
-/// ([{"type":"text","text":"..."}])이라 문자열 전용 jstr은 조용히 빈 값을
-/// 돌려줬다(빈 프롬프트 붕괴). text 블록을 연결하고 비-text 블록은 건너뛴다.
 pub(super) fn jcontent(o: &str) -> Option<String> {
     if let Some(s) = jstr(o, "content") {
         return Some(s);
@@ -311,10 +278,6 @@ pub(super) fn jcontent(o: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// role 인지 멀티턴 렌더링 — system/user/assistant 턴별
-/// im_start 블록 + 마지막 generation prompt(마지막 턴이 assistant면 생략).
-/// 정합 제약: 단일 user 메시지(시스템 없음)는 종전 단일 턴 출력과 바이트 동일
-/// (verify 토큰 대면 표면 — 회귀 금지).
 pub(super) fn jmessages_render(body: &str) -> String {
     let Some(mpos) = body.find("\"messages\"") else {
         return String::new();
@@ -325,7 +288,6 @@ pub(super) fn jmessages_render(body: &str) -> String {
     };
     let arr = &seg[ob..];
     let objs = jblocks(arr);
-    // 원문 연결(종전 출력) — content에 이미 템플릿이 있으면 원문 통과(종전 동작).
     let mut raw = String::new();
     for o in &objs {
         if let Some(c) = jcontent(o) {
@@ -337,7 +299,6 @@ pub(super) fn jmessages_render(body: &str) -> String {
         return raw;
     }
     let mut out = String::new();
-    // A14: 최상위 system 필드 — Anthropic 표준은 messages 밖에 있다.
     if let Some(sys) = jstr(body, "system")
         && !sys.is_empty()
     {
@@ -364,12 +325,6 @@ pub(super) fn jmessages_render(body: &str) -> String {
     out
 }
 
-/// gemma4 챗 렌더 — 최소 턴 렌더(2026-10-14 HF `chat_template.jinja` 대조).
-/// 구조: `<bos>` + (system 있으면) `<|turn>system\n{sys}<turn|>\n` +
-/// 턴별 `<|turn>{role}\n{content}<turn|>\n`(assistant→model) + 생성 프롬프트
-/// `<|turn>model\n<|channel>thought\n<channel|>`(thinking 비활성 — 즉답 모드).
-/// 정규화: 각 content는 trim(템플릿 `| trim`). tools·reasoning 파서·jinja 전체는
-/// 비범위(서빙 배선은 P3).
 pub(crate) fn gmessages_render(body: &str) -> String {
     let Some(mpos) = body.find("\"messages\"") else {
         return String::new();
@@ -380,8 +335,6 @@ pub(crate) fn gmessages_render(body: &str) -> String {
     };
     let objs = jblocks(&seg[ob..]);
     let mut out = String::from("<bos>");
-    // system 블록 — Anthropic 최상위 `system`(messages 밖) 또는
-    // messages[0]의 system/developer(HF 템플릿은 첫 system 하나만 낸다).
     let mut rest: &[&str] = &objs;
     let mut sys: Option<String> = None;
     if let Some(s) = jstr(body, "system") {
@@ -424,10 +377,6 @@ pub(crate) fn gmessages_render(body: &str) -> String {
     out
 }
 
-/// 아치별 챗 스펙 — 렌더 함수 + 정지 토큰(EOS 집합).
-/// EOS 출처: qwen = 어휘 상수(`EOS_EOT`), gemma4 = generation_config
-/// `eos_token_id=[1,106,50]`. 서빙(sched·HTTP 스트림) 소비는 P3 — 지금은
-/// `tokenize --chat` 프로브가 렌더·토큰화 검증에 쓴다.
 pub(crate) struct ChatSpec {
     pub render: fn(&str) -> String,
     pub eos: &'static [u32],
@@ -449,9 +398,6 @@ pub(crate) fn chat_spec(arch: &str) -> Option<ChatSpec> {
     }
 }
 
-/// [P3 gemma4 2026-10-14] 아치별 메시지 렌더 — chat_spec 레지스트리 경유.
-/// 종전 oai 핸들러가 jmessages_render(qwen)를 직접 호출해 gemma4에 qwen
-/// 템플릿이 주입됐다(실측: <|im_end|> 반복·prompt_tokens 24≠14).
 pub(crate) fn messages_render(body: &str) -> String {
     let arch = crate::engine::arch();
     match chat_spec(&arch) {
@@ -460,9 +406,6 @@ pub(crate) fn messages_render(body: &str) -> String {
     }
 }
 
-/// messages 배열에 내용 있는 메시지가 하나라도 있는가(H 2026-10-09).
-/// 종전엔 빈 messages가 렌더 후 assistant 접두만 남아 200으로 진행됐다 —
-/// completions의 빈 prompt 400과 표면 불일치(빈 프롬프트 붕괴).
 pub(super) fn has_message_content(body: &str) -> bool {
     let Some(mpos) = body.find("\"messages\"") else {
         return false;
@@ -476,8 +419,6 @@ pub(super) fn has_message_content(body: &str) -> bool {
         .any(|o| jcontent(o).is_some_and(|c| !c.is_empty()))
 }
 
-/// 요청 본문에서 샘플링 파라미터 추출 — 미지정시 None (greedy, 종전 동작).
-/// OpenAI 파라미터 명칭: temperature·top_k·top_p·min_p·repeat_penalty·seed.
 pub(super) fn parse_sampler(body: &str) -> Option<llm170_core::sampler::SamplerParams> {
     let temperature = jnum(body, "temperature").unwrap_or(0.0) as f32;
     let top_k = jnum(body, "top_k").unwrap_or(0.0).max(0.0) as usize;
@@ -497,7 +438,6 @@ pub(super) fn parse_sampler(body: &str) -> Option<llm170_core::sampler::SamplerP
     if !p.is_greedy() { Some(p) } else { None }
 }
 
-/// [P8 2026-10-16] 위치 지정 블록 — at(절대 인덱스의 '{')부터 대응 닫기까지.
 pub(super) fn jblock_at(s: &str, at: usize) -> Option<&str> {
     let b = s.as_bytes();
     if at >= b.len() || b[at] != b'{' {
@@ -507,8 +447,6 @@ pub(super) fn jblock_at(s: &str, at: usize) -> Option<&str> {
     let mut in_s = false;
     let mut esc = false;
     for i in at..b.len() {
-        // [P0-D4 2026-10-16] 표준 상태기계 — 이중 백슬래시(\\)에서 esc가
-        // 유지되며 다음 '"'를 놓쳐 in_s 패리티가 플립했다(블록 절단).
         if esc {
             esc = false;
         } else if b[i] == b'\\' && in_s {
@@ -529,9 +467,6 @@ pub(super) fn jblock_at(s: &str, at: usize) -> Option<&str> {
     None
 }
 
-/// [P0-D7 2026-10-16] 배열 구간 경계(시작 '[' 인덱스 → 대응 ']') — 문자열
-/// 인식 깊이 카운트. 종전 `find(']')`는 중첩 배열(required·enum)에서 절단해
-/// tools 파싱을 전면 비활성화했다.
 pub(super) fn jarr_span(s: &str, open_idx: usize) -> Option<usize> {
     let b = s.as_bytes();
     if open_idx >= b.len() || b[open_idx] != b'[' {
@@ -561,7 +496,6 @@ pub(super) fn jarr_span(s: &str, open_idx: usize) -> Option<usize> {
     None
 }
 
-/// [P0-D6] 키의 배열 값 구간 원문('[..]' 경계 포함) — jarr_span 결합.
 pub(super) fn jstrs_span(b: &str, key: &str) -> Option<String> {
     let pat = format!("\"{key}\":");
     let kp = b.find(&pat)? + pat.len();
@@ -570,9 +504,7 @@ pub(super) fn jstrs_span(b: &str, key: &str) -> Option<String> {
     Some(b[ob..=cl].to_string())
 }
 
-/// [P0-D6] enum 값 배열이 **순수 문자열 배열**인지 판정(비문자열 혼재 = 미지원).
 pub(super) fn jarr_pure_strings(s: &str) -> Option<Vec<String>> {
-    // s = '[' ... ']' 전체 구간.
     let close = jarr_span(s, 0)?;
     let inner = &s[1..close];
     if inner.trim().is_empty() {
@@ -586,9 +518,6 @@ pub(super) fn jarr_pure_strings(s: &str) -> Option<Vec<String>> {
         if b[i] == b'"' {
             saw_any = true;
             let st = i + 1;
-            // [수정 2026-10-16] 표준 이스케이프 상태기계 — 종전 `b[j-1] != '\\'`
-            // 판정은 문자열 끝의 이스케이프 백슬래시(`\\` 뒤 `"`)를 오판해
-            // 폴백(무제약)으로 흘렸다(D4에서 고친 스캐너들과 동일 규약으로 통일).
             let mut j = st;
             let mut esc = false;
             while j < b.len() {
@@ -609,25 +538,21 @@ pub(super) fn jarr_pure_strings(s: &str) -> Option<Vec<String>> {
         } else if b[i] == b',' || (b[i] as char).is_whitespace() {
             i += 1;
         } else {
-            // 따옴표 없는 원소(숫자·true 등) = 혼재.
             return None;
         }
     }
     saw_any.then_some(out)
 }
 
-/// [P8] object의 properties (키, 값 블록) — 순서 보존.
 pub(super) fn jobject_props(b: &str) -> Option<Vec<(String, String)>> {
     let pp = b.find("\"properties\"")?;
     let ob = b[pp..].find('{')? + pp;
     let blk = jblock_at(b, ob)?;
-    // 블록 내부: "키": {노드} — 문자열 스캔.
     let mut out = Vec::new();
     let bytes = blk.as_bytes();
     let mut i = 1usize;
     while i < bytes.len() {
         if bytes[i] == b'"' {
-            // 키 문자열.
             let ks = i + 1;
             let mut j = ks;
             while j < bytes.len() && bytes[j] != b'"' {
@@ -637,7 +562,6 @@ pub(super) fn jobject_props(b: &str) -> Option<Vec<(String, String)>> {
                 j += 1;
             }
             let key = blk[ks..j].to_string();
-            // 콜론 + 노드 블록.
             let mut k = j + 1;
             while k < bytes.len() && (bytes[k] as char).is_whitespace() {
                 k += 1;

@@ -1,7 +1,5 @@
 plans/
-# docs/ — 원장·공개 문서 모두 푸시 제외(사용자 지시 2026-09-30). plans/·reference/와 동일 취급.
 docs/
-# 로컬 eval 픽스처(코퍼스·지문 — scripts/eval-data)
 scripts/eval-data/
 target*/
 docs-inner/
@@ -10,13 +8,10 @@ AGENTS.md
 results.*
 pmc*
 
-# 빌드 부산물(셰이더 의존성 파일)
 .d
 *.d
 *.swp
 
-# 로컬 전용: ulw 증거·골 원장(사용자 지시 2026-10-06 — 히스토리에서도 제거)
 .omo/
-# 로컬 전용: ROCm rpath rustflags(기기별 절대경로 — 파일은 디스크에 유지)
 .cargo/
 reference/

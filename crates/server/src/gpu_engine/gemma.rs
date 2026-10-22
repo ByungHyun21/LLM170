@@ -1,27 +1,18 @@
-//! gpu_engine.rs에서 분해(순수 이동 — 코드 무변).
 use super::g4::{g4_chunk, g4_step};
 use super::upload_g4::{G4HostCfg, upload_model_g4};
 use llm170_backend_gpu::W4a16Dec;
 use std::path::Path;
 
-/// gemma4 서빙 엔진 — v0 체인(P2-3). spec·kstep·배치 체인은 후속 트랙
-/// (순수 어텐션 롤백 = KV 절단 — v0는 슬롯 직렬).
 pub struct GemmaEngine {
     model: llm170_core::gemma4::Model,
     cfg: G4HostCfg,
     dec: W4a16Dec,
-    /// [tuning-sweep W1/W2 2026-10-16] bench --sweep 노브 — serve는 항상 Default.
     pub tuning: super::Tuning,
     #[allow(dead_code)]
     n_slots: usize,
 }
 
 impl GemmaEngine {
-    /// 모델 로드 + 상주 업로드(upload_model_g4 — 선형·노름 8행/층·어텐션
-    /// 테이블·rope·MoE(g32/전문가)·head(원문 embed 행별 int8)).
-    /// kv_reserve는 시그니처 통일용으로 받고 소비하지 않는다 — gemma4는 KV
-    /// 실할당(set_attn)이 MoE 판정보다 먼저라 여유가 이미 KV를 제외한 값이다
-    /// (차감 추가 = 이중차감. qwen은 반대 순서라 reserve를 쓴다).
     pub fn load(
         dir: &Path,
         n_slots: usize,
@@ -34,14 +25,9 @@ impl GemmaEngine {
         let model = llm170_core::gemma4::Model::load(dir).map_err(|e| e.to_string())?;
         let hp = model.hp.clone();
         let mut dec = W4a16Dec::new(n_slots, hp.n_embd, hp.n_layer)?;
-        // [디버그 배선 2026-10-15] qwen과 동형 — 층별 지문(dump 키) + 그래프 자동 OFF
-        // (g4_graph_ok). 종전엔 GemmaEngine이 세팅하지 않아 서빙에선 무출력이었다.
         dec.debug_layers = llm170_diag::dump::opts().key("debug_layers");
-        // [K6-3 예산] 풀 예산(여유 VRAM 파생) — upload_model_g4(내부 set_attn) 전에 설정.
         dec.set_kv_budget(kv_budget);
-        // [2026-10-16] 2계층 — VRAM 상한 초과분은 호스트 아레나.
         dec.set_kv_vram_cap(kv_vram_cap);
-        // [D2 검수] 적재 실패 시 부분 할당 정리 — qwen load와 동일 위생.
         match Self::fill(&mut dec, &model, ctx) {
             Ok(cfg) => Ok(GemmaEngine {
                 model,
@@ -57,13 +43,11 @@ impl GemmaEngine {
         }
     }
 
-    /// [tuning-sweep W1/W2 2026-10-16] --sweep 노브 적용(qwen과 동일 계약).
     pub fn apply_tuning(&mut self, t: super::Tuning) -> Result<(), String> {
         self.tuning = t;
         self.dec.set_lru_tuning(t.lru_cap, t.lru_frac)
     }
 
-    /// sched/spec.rs n-gram 초안 노브(기본 3/48).
     pub fn ngram_knobs(&self) -> (usize, usize) {
         (
             self.tuning.ngram_n.unwrap_or(0),
@@ -71,28 +55,18 @@ impl GemmaEngine {
         )
     }
 
-    /// 컨텍스트 생성 **후** 적재 본체(upload_model_g4 + 층별 pes).
-    /// 실패는 호출부(load)가 `dec.free_all_device()`로 정리한다.
     fn fill(
         dec: &mut W4a16Dec,
         model: &llm170_core::gemma4::Model,
         ctx: usize,
     ) -> Result<G4HostCfg, String> {
         let cfg = upload_model_g4(dec, model, ctx)?;
-        // 층별 pes(μ_e) 디바이스 상주(t행 MoE 경로용 — 1회). layer_scalar는
-        // upload_model_g4가 등록(엔진·eval·프로브 공용 단일 계약).
         for il in 0..model.hp.n_layer {
             dec.set_g4_pes(il, cfg.pes_row(il, model.hp.n_experts))?;
         }
         Ok(cfg)
     }
 
-    /// 1토큰 스텝 — **t행 청크 t=1**(단일 경로: 배치·프리필·spec과 동일 커널·
-    /// 클래스 — t행 GEMV는 t=1 GEMV와 같은 산술 순서). 호스트 체인의 층당
-    /// ~14왕복(h2d/launch/d2h/sync)이 청크에선 ~8로 줄어든다.
-    /// **전문가 비상주(스트리밍)에선 v0 호스트 체인(g4_step)으로 폴백** — t행
-    /// MoE(g4_moe_dev_t)가 스트리밍 미지원이라, 배치·프리필의 비상주 분기가
-    /// 모두 수렴하는 이 스텝이 저하 사다리의 단일 통로다.
     fn step(&mut self, seq: usize, tok: u32, softcap: bool) -> Result<Vec<f32>, String> {
         let pos = self.dec.slot_pos[seq];
         self.dec.kv_grow(seq, pos as usize + 1)?;
@@ -107,7 +81,6 @@ impl GemmaEngine {
                 softcap,
             )?;
             self.dec.slot_pos[seq] = pos + 1;
-            // [2.N Stage 2] 스트리밍 경로도 확정 위치 — KV 트림은 MoE 상주와 무관.
             self.maybe_trim(seq)?;
             return Ok(lg);
         }
@@ -124,46 +97,24 @@ impl GemmaEngine {
             softcap,
         )?;
         self.dec.slot_pos[seq] = pos + 1;
-        // [2.N Stage 2] 확정 1토큰 — 플로어 전진 가능.
         self.maybe_trim(seq)?;
         Ok(lgs.into_iter().next().unwrap_or_default())
     }
 
-    /// 프리필 — t행 청크 경로(가중 상각). 반환 = 마지막 로짓.
-    /// 스트리밍(비상주 전문가)은 t행 미지원 → t=1 스텝 폴백.
-    /// [2.N T16-reg 2026-10-15] **청크 16 채택** — T=16 인스턴스의 스필/레지스터
-    /// 압박(gptq4 g32_t STACK 256B·moe bf16_t REG 48→94·head i8_t 65→90)이
-    /// pp −13~14%의 원인이었다. 커널 행별 x 포인터 배열(xp[T])을 단일 베이스 +
-    /// 컴파일타임 오프셋으로 제거한 뒤 동일 세션 교차 A/B(수정 fatbin, 2라운드·
-    /// SM 2805MHz): **pp16 +13.5% · pp256 +16.2%**(대 chunk8) · 디코드 불변 —
-    /// 방향 역전으로 청크 16이 정본.
-    /// [A1 2026-10-15 nsys/ncu 직측 — 차기 t 확대 근거] pp 갭(vLLM 30~58×)의
-    /// 지배 항 = **청크 t 상각**: 전문가 가중치 = 청크당 ~11.4GB 고정(union
-    /// 포화·L2 부분 상쇄 — t 무관) → bytes/토큰 = 11.4GB/t: t16 712MB vs
-    /// vLLM(배치≈1024) 13.7MB = 52×(잔차 포함 실측 pp1024 갭 57.9×). glu/down은
-    /// DRAM 87%/48% 포화(커널 개선 여지 없음)·dense t행 GEMV는 DRAM 8~11%·
-    /// SM 38~41% 지연(청크 예산 33%)·head는 청크당 고정 738MB. 차기 = t=64
-    /// (dense는 mma 재개 조건 — M64 타일 포화).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
         self.prefill_impl(seq, tokens, true)
             .map(|o| o.unwrap_or_default())
     }
 
-    /// [파이프라인 2026-10-22] greedy 프리필 — gemma는 softcap 로짓 후처리가
-    /// 있어(호스트 적용) 디바이스 argmax가 토큰을 보존하지 않는다 →
-    /// 기존 로짓 경로 + 호스트 greedy(동작 불변).
     pub fn prefill_greedy(&mut self, seq: usize, tokens: &[u32]) -> Result<u32, String> {
         let l = self.prefill(seq, tokens)?;
         Ok(llm170_core::qwen35::greedy(&l))
     }
 
-    /// [파이프라인 2026-10-22] 혼합 청크 상한 — gemma4는 유지(128, 종전 정책).
     pub fn prefill_mixed_cap(&self) -> usize {
         128
     }
 
-    /// [⑰-1 2026-10-18] 상태 전진 전용 — 중간 청크 헤드·로짓 d2h 스킵
-    /// (서브 청크당 608KB pageable D2H 낭비 제거 — qwen과 동일 계약).
     pub fn prefill_state(&mut self, seq: usize, tokens: &[u32]) -> Result<(), String> {
         self.prefill_impl(seq, tokens, false).map(|_| ())
     }
@@ -178,11 +129,7 @@ impl GemmaEngine {
             return Err("prefill: 빈 프롬프트 — 토큰 1개 이상 필요".into());
         }
         let mut last = Vec::new();
-        // [A2 2026-10-15] **청크 64 실험** — A1 귀속(전문가 bytes/토큰 = 11.4GB/t)
-        // 검증: 전문가·topk·attn은 t 직지원, t행 GEMV 계열(선형·라우터)은 호스트
-        // 행 분할(≤16 스위치 — 행별 비트동일). 상한 = G4_CHUNK_MAX(단일 출처).
         let t_chunk = if self.dec.moe_experts_resident() {
-            // [tuning-sweep W2] 청크 노브 — 상한은 G4_CHUNK_MAX로 클램프(계약 보존).
             self.tuning
                 .chunk_t
                 .unwrap_or(llm170_backend_gpu::G4_CHUNK_MAX)
@@ -210,7 +157,7 @@ impl GemmaEngine {
                     &cpos,
                     &rows,
                     chunk.len(),
-                    want, // [⑰-1] 중간 청크 = 헤드 스킵
+                    want,
                     true,
                 )?;
                 self.dec.slot_pos[seq] = pos + chunk.len() as u32;
@@ -219,20 +166,14 @@ impl GemmaEngine {
                 }
             }
         }
-        // [2.N Stage 2] 프리필 확정 — 플로어 전진 가능.
         self.maybe_trim(seq)?;
         Ok(if want { Some(last) } else { None })
     }
 
-    /// 슬롯 배치 1토큰 — **이종 슬롯·위치 t행 청크**(가중 상각) + 행별 로짓.
-    /// 스트리밍 전문가·t>16은 슬롯별 t=1 폴백.
     pub fn decode(&mut self, seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
         self.decode_sc(seq_ids, tokens, true)
     }
 
-    /// [⑮③ 2026-10-18] softcap 플래그판 — greedy 전용 소비(전부-그리디 배치:
-    /// decode_np_greedy·스텝)는 소프트캡 생략(argmax 단조 불변 = 토큰 동일,
-    /// 호스트 tanh 262144개/토큰 ≈ 2.2ms 절감). 로짓(샘플·혼합) 소비는 true.
     fn decode_sc(
         &mut self,
         seq_ids: &[usize],
@@ -260,7 +201,6 @@ impl GemmaEngine {
             }
             return Ok(out);
         }
-        // 배치 청크 — 행 = 슬롯(임베딩·pos·KV 확보) → 디바이스 t행 체인.
         let mut rows = Vec::with_capacity(t * self.model.hp.n_embd);
         let mut pos: Vec<u32> = Vec::with_capacity(t);
         for (&s, &tok) in seq_ids.iter().zip(tokens.iter()) {
@@ -283,14 +223,12 @@ impl GemmaEngine {
         for (i, &s) in seq_ids.iter().enumerate() {
             self.dec.slot_pos[s] = pos[i] + 1;
         }
-        // [2.N Stage 2] 배치 확정 — 슬롯별 플로어 전진 가능.
         for &s in seq_ids {
             self.maybe_trim(s)?;
         }
         Ok(lgs)
     }
 
-    /// 슬롯 배치 greedy — step + argmax.
     pub fn decode_np_greedy(
         &mut self,
         seq_ids: &[usize],
@@ -304,13 +242,10 @@ impl GemmaEngine {
     }
 
     pub fn decode_greedy(&mut self, seq: usize, token: u32) -> Result<u32, String> {
-        // greedy 소비 — 소프트캡 생략(argmax 단조 불변, 토큰 동일).
         let lg = self.step(seq, token, false)?;
         Ok(llm170_core::matmul::greedy_from(&lg))
     }
 
-    /// 혼합 배치 — (그리디 토큰, 평탄 로짓). v0는 슬롯 직렬(그리디 행=토큰,
-    /// 샘플 행=로짓 소비 — qwen 계약과 동일 의미).
     pub fn decode_np_mixed(
         &mut self,
         seq_ids: &[usize],
@@ -328,7 +263,6 @@ impl GemmaEngine {
         Ok((toks, flat))
     }
 
-    /// 배치 로짓(샘플링 슬롯) — 평탄 [t][head_n].
     pub fn decode_np_logits(
         &mut self,
         seq_ids: &[usize],
@@ -342,7 +276,6 @@ impl GemmaEngine {
         Ok(flat)
     }
 
-    /// 슬롯 리셋 — KV 블록 회수 + pos 0(새 요청).
     pub fn reset_seq(&mut self, seq: usize) -> Result<(), String> {
         let _ = self.dec.kv_release(seq);
         if seq < self.dec.slot_pos.len() {
@@ -351,20 +284,16 @@ impl GemmaEngine {
         Ok(())
     }
 
-    /// spec 활성 — 순수 어텐션 롤백 = **pos 되감기**(KV는 다음 쓰기가 덮고,
-    /// 판독은 pos까지만 — 상태 스냅샷 불요). 초안 = n-gram(스케줄러 측).
     pub fn enable_spec(&mut self) -> Result<(), String> {
         Ok(())
     }
     pub fn spec_on(&self) -> bool {
         true
     }
-    /// 검증 라운드 — [last]+drafts 행(연속 위치)을 t행 청크로 통과 → 행별 그리디.
     pub fn spec_verify(&mut self, slot: usize, rows: &[f32], t: usize) -> Result<Vec<u32>, String> {
         let lgs = self.spec_run(slot, rows, t)?;
         Ok(lgs.iter().map(|l| llm170_core::gemma4::greedy(l)).collect())
     }
-    /// 검증 행별 로짓(샘플드 거절샘플링 — 평탄 [t][vocab]).
     pub fn spec_verify_logits(
         &mut self,
         slot: usize,
@@ -378,11 +307,7 @@ impl GemmaEngine {
         }
         Ok(flat)
     }
-    /// 검증 공용 — t행 청크 + KV 확보(pos 전진은 청크가 수행).
     fn spec_run(&mut self, slot: usize, rows: &[f32], t: usize) -> Result<Vec<Vec<f32>>, String> {
-        // g4 체인 상한 = 8. 전방 행 상한의 단일 출처는
-        // `llm170_backend_gpu::SPEC_VERIFY_TMAX`(=9, qwen 계약) — g4는 그보다
-        // 한 행 낮은 자체 제약(계약 2..=8). TMAX 변경 시 이 값도 동시 확인.
         if !(2..=8).contains(&t) {
             return Err(format!("g4 spec: t={t} (2..=8 계약)"));
         }
@@ -417,22 +342,13 @@ impl GemmaEngine {
         false
     }
 
-    /// [⑰-spec 2026-10-18] 위임 no-op — gemma4는 MTP/kstep 선캡처 대상이
-    /// 아니다(전 슬롯 더미 워밍이 실경로 캡처를 담당).
     pub fn warm_spec_graphs(&mut self, _n_slots: usize, _eos: u32) -> Result<(), String> {
         Ok(())
     }
 
-    /// [접두 재사용 2026-10-14] 엔진 소비 위치 — 순수 어텐션은 상태가 pos뿐.
     pub fn seq_pos(&self, slot: usize) -> u32 {
         self.dec.slot_pos.get(slot).copied().unwrap_or(0)
     }
-    /// 부분 접두 복원 — 순수 어텐션: 상태 = KV + pos뿐이라 pos만 되돌린다
-    /// (KV 잔존 행은 다음 쓰기가 덮고, 판독은 pos까지 — spec_rollback과 동일
-    /// 계약). upto > pos는 불가(호출부가 콜드 경로로). 반환 = 복원 pos.
-    /// [2.N Stage 2] 플로어 백스톱 — `floor > upto`면 해제 행이 접미사 재기록
-    /// 아래에 있어 복원 불가(호출부는 콜드 경로로). prompt−sw 조건은 스케줄러
-    /// 측 reuse_valid가 본다(여기에 prompt 길이가 없다).
     pub fn restore_prefix(&mut self, slot: usize, upto: u32) -> Result<u32, String> {
         if slot >= self.n_slots {
             return Err(format!(
@@ -444,13 +360,6 @@ impl GemmaEngine {
         if upto == 0 || upto > p {
             return Err(format!("gemma4: restore_prefix {upto} > pos {p}"));
         }
-        // [재사용 클래스 정합 2026-10-20] 복원 위치를 **콜드 청크 그리드로
-        // 양자화(내림)**한다. 프리필 경로가 t>8 FA2 어텐션·t>16 마린 GEMM
-        // 클래스(t≤8/16 = part_g4·GEMV f32 클래스)로 분기한 뒤로, 임의 위치
-        // 되감기는 같은 행을 콜드와 다른 산술 클래스로 재계산해 재사용 정합
-        // (콜드==웜 토큰)을 깬다(실측: 2241 되감기 → t=1 재계산 행이 토큰 10
-        // 플립). 그리드 = prefill()과 동일 t_chunk(단일 출처) — 경계가 같으면
-        // 행별 클래스·타일 구성까지 비트동일. 재계산 ≤511행 추가(≈0.1s).
         let t_grid = if self.dec.moe_experts_resident() {
             self.tuning
                 .chunk_t
@@ -488,26 +397,21 @@ impl GemmaEngine {
     pub fn kv_blocks_needed(&self, n_tokens: usize) -> usize {
         self.dec.kv_blocks_needed(n_tokens)
     }
-    /// [2026-10-16] 실블록 유래 단일 요청 상한(토큰).
     pub fn kv_cap_tokens(&self) -> usize {
         self.dec.kv_cap_tokens()
     }
-    /// [2026-10-16] 슬롯 점유 블록(aging 예측 입력).
     pub fn kv_used_blocks(&self, slot: usize) -> usize {
         self.dec.kv_used_blocks(slot)
     }
-    /// [2026-10-16] KV 계층 회계 — (VRAM 바이트, 호스트 바이트, 호스트 블록, 전체 블록).
     pub fn kv_tier_bytes(&self) -> (u64, u64, usize, usize) {
         self.dec.kv_tier_bytes()
     }
-    /// [2026-10-16] KV 티어별 자유 블록 — (VRAM 자유, 호스트 자유).
     pub fn kv_tier_free(&self) -> (usize, usize) {
         self.dec.kv_tier_free()
     }
     pub fn kv_release_slot(&mut self, slot: usize) -> usize {
         self.dec.kv_release(slot)
     }
-    /// 표시용 조각(gemma4 모델 조각표 — ▁→공백).
     pub fn piece(&self, tok: u32) -> String {
         self.model
             .token_pieces
@@ -518,11 +422,7 @@ impl GemmaEngine {
     pub fn prof_report(&mut self, _label: &str) -> Result<String, String> {
         Err("gemma4: prof_report 미지원(v0)".into())
     }
-    // MTP·spec 계열 — gemma4 v0 미지원(호출부는 spec/mtp 비활성 게이트로
-    // 진입 자체가 없다. 시그니처 정합용 명시 거부).
     pub fn spec_rollback(&mut self, _slot: usize, _keep: usize) -> Result<(), String> {
-        // 순수 어텐션 — 복원할 상태 없음. 수용 접두 이후 KV 행은 다음 쓰기가
-        // 덮는다(판독은 pos까지 — 잔존 행 무해). pos는 spec_rewind_pos 소관.
         Ok(())
     }
     pub fn spec_rewind_pos(&mut self, slot: usize, n: u32) -> Result<(), String> {
@@ -566,15 +466,12 @@ impl GemmaEngine {
         self.dec.moe_mode()
     }
 
-    /// [§2.M ①] 스트리밍 전문가 LRU 캐시 계측 위임.
     pub fn mcache_stats(&self) -> (u64, u64, usize) {
         self.dec.mcache_stats()
     }
     pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
         self.dec.copy_stats()
     }
-    /// 정지 토큰 — gemma4 EOS는 [1,106,50], 대표 1(<eos>). 전체 목록은
-    /// 서빙 스톱 레지스트리(oai chat_spec)·스모크가 소유.
     pub fn eos(&self) -> u32 {
         1
     }
@@ -588,25 +485,14 @@ impl GemmaEngine {
         self.model.hp.n_embd
     }
 
-    /// [k2 (b) 2026-10-17] 디코더 층 창(기본 전체창) — GpuEngine 위임용.
     pub fn layer_window(&self) -> llm170_backend_gpu::LayerWindow {
         self.dec.layer_window()
     }
 
-    /// [k2 (b)] 내 창이 마지막 층 소유(head 담당 샤드 판정).
     pub fn owns_final_layer(&self) -> bool {
         self.dec.owns_final_layer()
     }
 
-    /// [2.N Stage 2] 접두 재사용 유효 판정 — 스케줄러가 restore_prefix 호출
-    /// 전에 문의한다(전체·부분 공용). 조건(둘 다 필요):
-    /// ① `floor ≤ l` — 접미사 프리필이 l부터 전부 재기록하므로 floor 미만
-    /// 행은 다시 기록되지 않는다. l이 floor보다 낮으면 그 행들은 해제된
-    /// 채로 남아 이후 판독을 오염시킨다 → 콜드(전량 재계산).
-    /// ② `floor ≤ prompt_len − sw` — 디코드는 `[lim−sw, lim)`만 읽고 lim은
-    /// prompt_len부터 커지므로, 이 조건이 floor 미만 행의 비마스크 판독을
-    /// 원천 차단한다(FA2의 마스크 밖 물리 판독은 무조건 −1e30 대입이라 무해).
-    /// 풀층은 트림 대상이 아니라 조건과 무관하다.
     pub fn reuse_valid(&self, slot: usize, l: usize, prompt_len: usize) -> bool {
         reuse_valid(
             self.dec.kv_floor_of(slot),
@@ -616,9 +502,6 @@ impl GemmaEngine {
         )
     }
 
-    /// [2.N Stage 2] 확정 위치 기준 플로어 전진 — 커밋 경로(step·prefill·
-    /// decode) 꼬리에서만 호출한다. spec 검증(spec_run)은 투기 위치라 트림
-    /// 금지(되감기 시 플로어가 위치를 앞지르면 오염).
     fn maybe_trim(&mut self, slot: usize) -> Result<(), String> {
         let pos = self.dec.slot_pos.get(slot).copied().unwrap_or(0);
         let f = floor_for_pos(pos, self.model.hp.sw as u32);
@@ -630,8 +513,6 @@ impl GemmaEngine {
     }
 }
 
-/// [2.N Stage 2] 위치→플로어(행) — `pos−sw−여유`를 512 경계로 내림.
-/// 여유 512(1블록)는 spec 되감기(≤8)·청크 정렬을 흡수한다. pos가 짧으면 0.
 fn floor_for_pos(pos: u32, sw: u32) -> u32 {
     const SLACK: u32 = 512;
     if pos > sw + SLACK {
@@ -641,7 +522,6 @@ fn floor_for_pos(pos: u32, sw: u32) -> u32 {
     }
 }
 
-/// [2.N Stage 2] 재사용 유효 순수 판정(테스트 표면).
 fn reuse_valid(floor: u32, l: u32, prompt_len: u32, sw: u32) -> bool {
     floor <= l && floor <= prompt_len.saturating_sub(sw)
 }
@@ -650,7 +530,6 @@ fn reuse_valid(floor: u32, l: u32, prompt_len: u32, sw: u32) -> bool {
 mod tests {
     use super::{floor_for_pos, reuse_valid};
 
-    /// 플로어 양자화 — 512 경계 내림·단조·짧으면 0.
     #[test]
     fn floor_quantized_monotone() {
         let sw = 1024;
@@ -662,7 +541,6 @@ mod tests {
         assert!(floor_for_pos(9000, sw) >= floor_for_pos(8192, sw), "단조");
     }
 
-    /// 재사용 가드 — 트림 슬롯의 짧은 접두 복원은 콜드.
     #[test]
     fn reuse_guard_needs_floor_below_l_and_window() {
         let sw = 1024;

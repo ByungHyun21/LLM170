@@ -1,7 +1,4 @@
-//! CPU matmul — 스레드 수 · 단행/배치 내적 + W4A16 split arm(분리 버퍼 디양자화).
 
-/// 가용 스레드 수(1회 캐시) — 종전 호출마다 available_parallelism(절반은
-/// /proc·sched_getaffinity 판독)이었다. [P12] OnceLock 상수화.
 pub fn n_threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -14,18 +11,12 @@ pub fn n_threads() -> usize {
 use super::weight::Weight;
 use llm170_diag::profile_span;
 
-/// [P12] 상수 풀 실행 — GDN AR 풀 재사용(호출마다 thread::scope OS 스폰 제거).
-/// 잡이 'static이어야 하므로 호출자 소유 버퍼는 원시 포인터로 캡처하고,
-/// run_par가 전원 완료 카운터에 도달한 뒤에만 반환함으로써 수명을 증명한다
-/// (gdn::ar_pool 계약과 동일 — SAFETY는 각 호출부).
 fn run_rows(n: usize, job: impl Fn(usize) -> Box<dyn FnOnce() + Send + 'static>) {
     crate::gdn::ar_pool::run_par(n, job);
 }
 
 pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
     profile_span!("cpu::matmul1");
-    // W4A16 split(§3.5 A안 직접 로드) — 분리 버퍼 디양자화 + f32 내적.
-    // f32 레퍼런스(비트 격리 계약은 quant lane 소관).
     let n_in = w.n_in as usize;
     let nt = n_threads().max(1).min(out.len().max(1));
     let rows_per = out.len().div_ceil(nt).max(1);
@@ -34,7 +25,6 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
         let scale = w
             .aux
             .expect("w4a16 split: aux(scale) 필수 계약 — Model::w 보장");
-        // [2026-10-19 진리층] hi-prec — f64 정확항 + 보상 누산(quant::exact).
         if crate::quant::exact::hi_prec() {
             let (group, sbf) = (w.group, w.scale_bf16);
             let qb = n_in / 2;
@@ -60,8 +50,6 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
         let (xp, xl) = (x.as_ptr() as usize, x.len());
         let (op, olen) = (out.as_mut_ptr() as usize, out.len());
         let (group, sbf) = (w.group, w.scale_bf16);
-        // SAFETY: op는 이 호출의 &mut out(길이 olen) — 잡은 run_rows(전원 완료
-        // 대기) 안에서만 실행되고 반환 전에 끝난다. dp/xp도 호출 내 수명.
         run_rows(nch, move |g| {
             Box::new(move || {
                 let data = unsafe { std::slice::from_raw_parts(dp as *const u8, dl) };
@@ -87,7 +75,6 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
     let (xp, xl) = (x.as_ptr() as usize, x.len());
     let (op, olen) = (out.as_mut_ptr() as usize, out.len());
     let (ty, n_in_w) = (w.ty, w.n_in);
-    // SAFETY: 위 split arm과 동일 계약(op = 이 호출의 &mut out).
     run_rows(nch, move |g| {
         Box::new(move || {
             let data = unsafe { std::slice::from_raw_parts(dp as *const u8, dl) };
@@ -108,16 +95,11 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
     });
 }
 
-/// 배치(소유 행) — 참조 변형으로 위임(호환 래퍼).
 pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
     let refs: Vec<&[f32]> = xs.iter().map(|v| v.as_slice()).collect();
     matmul_batch_ref(&refs, w, outs);
 }
 
-/// 배치(참조 행): outs[t][o] = Σ_i xs[t][i]·W[o,i].
-/// 행(o)별로 한 번 디양자화해 B 토큰과 내적 — prefill에서 디양자화 비용 상각.
-/// 스레드별 로컬 결과 [T][rows_per] → 조인 후 스캐터 (행 슬라이스 교차 차입 회피).
-/// [P12 E3] 참조 입력 — 호출부의 토큰 행 clone(프리필에서 층당 수십 MB) 제거.
 pub fn matmul_batch_ref(xs: &[&[f32]], w: &Weight, outs: &mut [Vec<f32>]) {
     profile_span!("cpu::matmulB");
     let n_in = w.n_in as usize;
@@ -127,8 +109,6 @@ pub fn matmul_batch_ref(xs: &[&[f32]], w: &Weight, outs: &mut [Vec<f32>]) {
     let nt = n_threads().max(1).min(n_out.max(1));
     let rows_per = n_out.div_ceil(nt).max(1);
     let nch = n_out.div_ceil(rows_per);
-    // 평탄 버퍼(계약: 잡 g는 자기 몫 [g*lstride, (g+1)*lstride)만 접근).
-    // Vec<Vec>의 as_mut_ptr은 헤더 배열이라 f32 데이터 포인터가 아니다(실측 오염).
     let lstride = t * rows_per;
     let mut locals: Vec<f32> = vec![0.0f32; nch * lstride];
     let locals_base = locals.as_mut_ptr() as usize;
@@ -142,10 +122,8 @@ pub fn matmul_batch_ref(xs: &[&[f32]], w: &Weight, outs: &mut [Vec<f32>]) {
         _ => (0usize, 0usize),
     };
     let (group, sbf) = (w.group, w.scale_bf16);
-    // SAFETY: locals_base는 이 호출의 로컬 버퍼(잡 g는 자기 몫 lstride만 접근) —
-    // run_rows(전원 완료 대기)가 반환 전 완료를 보장. dp/xp도 호출 내 수명.
     run_rows(nch, move |g| {
-        let xp = xp.clone(); // 잡마다 복제(Fn 클로저는 캡처를 move할 수 없다)
+        let xp = xp.clone();
         Box::new(move || {
             let data = unsafe { std::slice::from_raw_parts(dp as *const u8, dl) };
             let local = unsafe {
@@ -186,9 +164,6 @@ pub fn matmul_batch_ref(xs: &[&[f32]], w: &Weight, outs: &mut [Vec<f32>]) {
     }
 }
 
-/// W4A16 split 행 디양자화 — data=packed[n][k/8 u32], scale=[n][k/group],
-/// zp=8(sym 상수). 그룹·스케일 dtype 일반화(W4-1: g128/f16 27B · g32/bf16 35B).
-/// cpu matmul 전용(레퍼런스 f32 — 비트 계약은 lane 소관).
 fn dequant_row_w4a16_split(
     q: &[u8],
     s: &[u8],
@@ -218,7 +193,6 @@ fn dequant_row_w4a16_split(
     }
 }
 
-/// logits → argmax (greedy와 동일 의미, 트레이트 기본구현용).
 pub fn greedy_from(logits: &[f32]) -> u32 {
     let mut best = 0usize;
     let mut bv = f32::NEG_INFINITY;
@@ -234,8 +208,6 @@ pub fn greedy_from(logits: &[f32]) -> u32 {
         }
     }
     if top2 {
-        // 107 W1: 근접타이 마진 계측 — 두 변형의 아그맥스 뒤집힘이 합법
-        // 타이인지(마진 < 엡실론) 판정하는 1회 측정용 계측.
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
@@ -252,7 +224,6 @@ pub fn greedy_from(logits: &[f32]) -> u32 {
 mod tests {
     use super::{dequant_row_w4a16_split, greedy_from};
 
-    /// I: split arm 행 디양자화 — g128/f16(27B). 니블 j = j, 스케일 1.0/0.5.
     #[test]
     fn split_dequant_row_g128_f16() {
         let (k, group) = (256usize, 128usize);
@@ -265,8 +236,8 @@ mod tests {
             q[w * 4..w * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         let mut s = Vec::new();
-        s.extend_from_slice(&0x3C00u16.to_le_bytes()); // f16 1.0
-        s.extend_from_slice(&0x3800u16.to_le_bytes()); // f16 0.5
+        s.extend_from_slice(&0x3C00u16.to_le_bytes());
+        s.extend_from_slice(&0x3800u16.to_le_bytes());
         let mut out = vec![0f32; k];
         dequant_row_w4a16_split(&q, &s, 0, k, group, false, &mut out);
         for (i, v) in out.iter().enumerate() {
@@ -276,7 +247,6 @@ mod tests {
         }
     }
 
-    /// I: split arm 행 디양자화 — g32/bf16(35B). 스케일 전부 bf16 1.0.
     #[test]
     fn split_dequant_row_g32_bf16() {
         let (k, group) = (64usize, 32usize);
@@ -284,13 +254,13 @@ mod tests {
         for w in 0..k / 8 {
             let mut word: u32 = 0;
             for j in 0..8u32 {
-                word |= ((7 - j) & 0xF) << (4 * j); // 역순 니블 — 인덱스 규약 확인
+                word |= ((7 - j) & 0xF) << (4 * j);
             }
             q[w * 4..w * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         let mut s = Vec::new();
         for _ in 0..2 {
-            s.extend_from_slice(&0x3F80u16.to_le_bytes()); // bf16 1.0
+            s.extend_from_slice(&0x3F80u16.to_le_bytes());
         }
         let mut out = vec![0f32; k];
         dequant_row_w4a16_split(&q, &s, 0, k, group, true, &mut out);
@@ -300,9 +270,6 @@ mod tests {
         }
     }
 
-    /// greedy 아그맥스 계약(2026-10-09): 엄격 비교 → 동률은 최저 인덱스,
-    /// NaN은 순위 제외(비교 false), 전부 NaN이면 0 — 실수 경로는 finiteness
-    /// 필터가 선행한다는 전제(서버 GPU argmax도 같은 의미론을 미러).
     #[test]
     fn greedy_first_max_nan_contract() {
         assert_eq!(greedy_from(&[1.0, 3.0, 2.0]), 1);

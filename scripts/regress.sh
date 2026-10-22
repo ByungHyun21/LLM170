@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# [테스트 재설계 2026-10-22] 검증 티어 러너 — 매 변경 루틴의 단일 진입점.
-#
-#   scripts/regress.sh t0    T0(~1분): 프리플라이트 + 전 크레이트 유닛테스트(무GPU)
-#   scripts/regress.sh t1    T1(~15s): tiny 고정재료 CPU↔GPU 같은 실행 등가(골든 불변)
-#   scripts/regress.sh t2    T2(~2분): 실모델 캐나리 — 자원 가드 + serve 골든·배치 불변
-#   scripts/regress.sh all   t0+t1+t2
-#
-# 원칙(AGENTS VERIFICATION TIERS): 변경 축과 무관한 게이트를 매 변경마다 돌리지
-# 않는다. 수치 경로(커널·산술·샘플링) 변경·캠페인 머지 = swap_models.sh 전체 +
-# w4a16-eval ±3% + ab-bench(같은 세션). 골든 값 = scripts/goldens.tsv 단일 원장.
-# tiny 재료 결정론 = scripts/gen_tiny_w4a16.py(시드 고정 — 재생성 동일 바이트).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 TIER="${1:-all}"

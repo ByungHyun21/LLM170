@@ -1,40 +1,26 @@
 use super::*;
-// A3: 핸드롤 JSON 파서군·경계 유틸·렌더의 유닛테스트 — 전부
-// CPU 순수(무 GPU). 변형 JSON·UTF-8 절단·stop 오버랩·블록 content가
-// 종전 무검증이었다.
 
 #[test]
 fn jstr_shapes() {
     assert_eq!(jstr(r#"{"a":"x"}"#, "a").as_deref(), Some("x"));
     assert_eq!(jstr(r#"{"a":  "spaced" }"#, "a").as_deref(), Some("spaced"));
-    // 이스케이프 보존(unescape 여부는 계약상 원문 — 소비자 esc가 왕복)
     assert!(jstr(r#"{"a":"he said "hi""}"#, "a").is_some());
     assert_eq!(jstr(r#"{"a":123}"#, "a"), None);
     assert_eq!(jstr(r#"{"b":"y"}"#, "a"), None);
 }
 
-/// 2026-10-07: `\uXXXX`를 실제로 디코딩해야 한다. 종전 구현은 `\u`를
-/// `other` 갈래로 흘려 `u`만 남겼다(`\uc778` → `uc778`) — 비ASCII를
-/// 이스케이프해 보내는 클라이언트(파이썬 json.dumps 기본값)의 한국어가
-/// 조용히 깨졌다. 게이트는 토큰 ID를 직접 넘겨 이 경로를 걷지 않는다.
 #[test]
 fn jstr_unicode_escape() {
-    // BMP 한국자
     assert_eq!(jstr(r#"{"a":"서울"}"#, "a").as_deref(), Some("서울"));
-    // BMP 밖 문자(서로게이트 페어) — 😀
     assert_eq!(jstr(r#"{"a":"😀"}"#, "a").as_deref(), Some("😀"));
-    // 한글 + 이모지 혼합
     assert_eq!(
         jstr(r#"{"a":"한국어 😀 mix"}"#, "a").as_deref(),
         Some("한국어 😀 mix")
     );
-    // 기존 단순 이스케이프는 그대로
     assert_eq!(jstr(r#"{"a":"x\ny"}"#, "a").as_deref(), Some("x\ny"));
-    // 형식이 깨진 이스케이프는 원문 보존(무손실) — 조용히 지우지 않는다
     assert_eq!(jstr(r#"{"a":"\uZZZZ"}"#, "a").as_deref(), Some("\\uZZZZ"));
 }
 
-/// S1: 중첩 객체/문자열 안의 같은 키가 최상위 값을 오염시키지 않는다.
 #[test]
 fn jmember_ignores_nested_keys() {
     let b =
@@ -50,7 +36,6 @@ fn jmember_ignores_nested_keys() {
     assert_eq!(jarr_str(b5, "stop"), Some(vec!["END".to_string()]));
 }
 
-/// S1: stop 배열 원소 안의 `]`가 절단을 만들지 않는다(종전 find(']')).
 #[test]
 fn jarr_str_keeps_brackets_in_strings() {
     assert_eq!(
@@ -65,7 +50,6 @@ fn jarr_str_keeps_brackets_in_strings() {
     assert_eq!(jstop(r#"{"stop":["a]b"]}"#), vec!["a]b".to_string()]);
 }
 
-/// 값 슬라이스 경계 — 중첩 배열/객체 끝·이스케이프 따옴표.
 #[test]
 fn jmember_value_bounds() {
     let b = r#"{"a":[1,[2,3],{"x":"}"}],"b":7}"#;
@@ -96,7 +80,6 @@ fn jstop_variants() {
         jstop(r#"{"stop":["A","B"]}"#),
         vec!["A".to_string(), "B".to_string()]
     );
-    // Anthropic stop_sequences(A14 경로)
     assert_eq!(
         jstop(r#"{"stop_sequences":["\n\n"]}"#),
         vec!["\n\n".to_string()]
@@ -109,26 +92,21 @@ fn earliest_stop_boundaries() {
     let stops = vec!["AB".to_string()];
     assert_eq!(earliest_stop("xxAByy", &stops, 0), Some((2, 2)));
     assert_eq!(earliest_stop("", &stops, 0), None);
-    // 빈 stop은 무시(무한 절단 방지 계약)
     assert_eq!(earliest_stop("any", &[String::new()], 0), None);
-    // 가장 이른 등장 선택
     let two = vec!["YY".to_string(), "XX".to_string()];
     assert_eq!(earliest_stop("aXXbYY", &two, 0), Some((1, 2)));
-    // D4 창 경계 — from 이후에서도 절대 위치를 돌려준다.
     assert_eq!(earliest_stop("aXXbYY", &two, 2), Some((4, 2)));
 }
 
 #[test]
 fn floor_char_boundary_multibyte() {
-    let s = "한글abc"; // '한' 3바이트
+    let s = "한글abc";
     assert_eq!(floor_char_boundary(s, 0), 0);
-    // 2바이트 지점은 경계 아님 → 0으로 보정
     assert_eq!(floor_char_boundary(s, 2), 0);
     assert_eq!(floor_char_boundary(s, 3), 3);
     assert_eq!(floor_char_boundary(s, 9), 9);
 }
 
-/// H(2026-10-09): 빈 messages 표면 — chat/anthropic 400 판정.
 #[test]
 fn empty_messages_surface() {
     assert!(!has_message_content(r#"{"messages":[]}"#));
@@ -139,7 +117,6 @@ fn empty_messages_surface() {
     assert!(has_message_content(
         r#"{"messages":[{"role":"user","content":"hi"}]}"#
     ));
-    // Anthropic 블록 배열 content.
     assert!(has_message_content(
         r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#
     ));
@@ -150,27 +127,21 @@ fn jblocks_nested_and_strings() {
     let arr = r#"[{"r":"a","c":"{x}"},{"r":"b"}]"#;
     let objs = jblocks(arr);
     assert_eq!(objs.len(), 2);
-    assert!(objs[0].contains(r#""c":"{x}""#)); // 문자열 내 중괄호 무시
-    // 빈 배열
+    assert!(objs[0].contains(r#""c":"{x}""#));
     assert!(jblocks("[]").is_empty());
-    // 비객체 원시 배열
     assert!(jblocks("[1,2]").is_empty());
 }
 
 #[test]
 fn jcontent_string_and_blocks() {
-    // 문자열 content — 종전 호환
     assert_eq!(jcontent(r#"{"content":"hi"}"#).as_deref(), Some("hi"));
-    // 블록 배열(A14) — text 블록 연결, 비-text 건너뜀
     let o = r#"{"content":[{"type":"text","text":"a"},{"type":"image","src":"x"},{"type":"text","text":"b"}]}"#;
     assert_eq!(jcontent(o).as_deref(), Some("ab"));
-    // content 없음
     assert_eq!(jcontent(r#"{"role":"user"}"#), None);
 }
 
 #[test]
 fn jmessages_render_system_and_blocks() {
-    // 최상위 system 필드(A14) — system 턴 선행
     let b = r#"{"system":"be brief","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}"#;
     let r = jmessages_render(b);
     assert!(r.contains(
@@ -185,13 +156,11 @@ hello<|im_end|>"
         "<|im_start|>assistant
 "
     ));
-    // 블록 배열이 없던 종전 형태(문자열 content) 동작 유지
     let b2 = r#"{"messages":[{"role":"user","content":"plain"}]}"#;
     assert!(jmessages_render(b2).contains(
         "<|im_start|>user
 plain"
     ));
-    // 원문 템플릿 통과 경로
     let b3 = r#"{"messages":[{"role":"user","content":"<|im_start|>raw"}]}"#;
     assert!(jmessages_render(b3).contains("<|im_start|>raw"));
 }
@@ -203,25 +172,19 @@ fn esc_roundtrip_control_chars() {
     assert_eq!(crate::json::esc("tab\t"), "tab\\t");
 }
 
-/// [R3] TextStream — 홀드백(부분 stop 유출 방지)·stop 절단·잔여 플러시.
 #[test]
 fn text_stream_holdback_and_stop() {
-    // stop 없음: 홀드백 0 → 즉시 방출.
     let mut ts = TextStream::new(vec![], false);
     assert_eq!(ts.push_text("abc").as_deref(), Some("abc"));
     assert!(ts.flush().is_none());
-    // stop "END": 홀드백 2 — "abcEN"까지는 "abc"만 방출(EN 보류).
     let mut ts = TextStream::new(vec!["END".into()], false);
     assert_eq!(ts.push_text("abcEN").as_deref(), Some("abc"));
-    // "D"로 stop 완성 — stop 본문 미포함(include_stop=false), stopped=true.
     assert!(ts.push_text("D").is_none());
     assert!(ts.stopped && ts.trunc);
     assert!(ts.flush().is_none());
-    // include_stop=true — stop 본문 포함 방출.
     let mut ts = TextStream::new(vec!["END".into()], true);
     assert_eq!(ts.push_text("abcEN").as_deref(), Some("abc"));
     assert_eq!(ts.push_text("D").as_deref(), Some("END"));
-    // 잔여 플러시(stop 미도달) — 홀드백(최장 stop-1 = 2B)은 보류된다.
     let mut ts = TextStream::new(vec!["END".into()], false);
     assert!(ts.push_text("hi").is_none(), "2B는 홀드백 보류");
     assert_eq!(ts.flush(), Some("hi"));
@@ -235,12 +198,9 @@ fn text_stream_holdback_and_stop() {
     assert_eq!(ts.flush(), Some("zz"));
 }
 
-/// [R3-fix] 멀티바이트 stop — 스캔 창(from)이 문자 중간에 떨어져도 패닉 금지
-/// (종전 잠복 버그: 한글 본문 + 한글 stop에서 acc[base..] 패닉).
 #[test]
 fn text_stream_multibyte_stop_no_panic() {
     let mut ts = TextStream::new(vec!["。".into()], false);
-    // " 의"(4B) → "미"(3B) — scan_from=2가 '의' 중간이 되는 시퀀스.
     assert_eq!(
         ts.push_text(" 의").as_deref(),
         Some(" "),
@@ -248,38 +208,29 @@ fn text_stream_multibyte_stop_no_panic() {
     );
     assert_eq!(ts.push_text("미").as_deref(), Some("의"));
     assert_eq!(ts.push_text("는").as_deref(), Some("미"));
-    // stop 도달 — 직전 텍스트는 방출되고 stop 본문은 미포함.
     assert_eq!(ts.push_text("。").as_deref(), Some("는"));
     assert!(ts.stopped && ts.trunc);
 }
 
-/// [2026-10-16·사용자 확정] cap_output — 모델 초과 = vLLM식 출력 클램프,
-/// 풀 초과 = 거부(풀은 순서 문제 — 클램프 대상 아님), 경계 판정.
 #[test]
 fn cap_output_policies() {
     let s = crate::sched::admit::RESERVE_SLACK;
     let max = 262_144usize;
-    // 사용자 예: 모델 256k·입력 200k·출력 100k → 클램프 = 모델 최대−프롬프트−슬랙.
     let c = cap_output(200_000, 100_000, max, 1 << 40, s);
     assert_eq!(c.tg, max - 200_000 - s, "모델 초과분은 출력 클램프(vLLM식)");
     assert_eq!(c.verdict, OutputVerdict::Ok);
-    // 모델 내 = 원값 보존.
     let c = cap_output(3, 8, max, 1 << 40, s);
     assert_eq!((c.tg, c.verdict), (8, OutputVerdict::Ok));
-    // 풀 경계: 예약 == 풀 = 허용, 1 초과 = 거부.
     let pool = 3 + 8 + s;
     let c = cap_output(3, 8, max, pool, s);
     assert_eq!((c.tg, c.verdict), (8, OutputVerdict::Ok));
     let c = cap_output(3, 9, max, pool, s);
     assert_eq!((c.tg, c.verdict), (9, OutputVerdict::PoolExceeded));
-    // 모델 클램프 후에도 풀 초과 = 거부(클램프 tg 보존 — 로그·메시지 일관).
     let c = cap_output(200_000, 100_000, max, 150_000, s);
     assert_eq!(c.tg, max - 200_000 - s);
     assert_eq!(c.verdict, OutputVerdict::PoolExceeded);
-    // 프롬프트가 모델 한계(슬랙 포함) = 거부.
     let c = cap_output(max - s, 1, max, 1 << 40, s);
     assert_eq!(c.verdict, OutputVerdict::PromptTooLong);
-    // 풀 < 모델 한계: 클램프 불발(원값)이어도 풀이 원인이면 거부.
     let c = cap_output(1_000, 5_000, max, 2_000, s);
     assert_eq!((c.tg, c.verdict), (5_000, OutputVerdict::PoolExceeded));
 }

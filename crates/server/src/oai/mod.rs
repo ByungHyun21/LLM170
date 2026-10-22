@@ -1,7 +1,3 @@
-//! OAI/Anthropic 페이로드 계층 (http.rs에서 순수 이동).
-//! JSON 파서군(j*)·메시지 렌더·샘플러·stop 유틸·요청 라우팅(handle)과
-//! OAI/Anthropic 방출 러너가 산다. 전송(resp/sse/read_request/serve)은
-//! http.rs — 이 층은 바이트 해석과 프로토콜 스키만 담는다.
 use crate::engine::SlotJob;
 use crate::http::{
     ENGINE_DEAD, READY, SERVER_CTX, SERVER_MODEL_MAX, TokOut, read_request, resp, resp_sse_open,
@@ -20,8 +16,6 @@ pub(crate) use self::json::chat_spec;
 use self::json::*;
 use self::stream::*;
 
-/// 요청 출력 상한 판정 결과 — `tg`는 항상 모델 클램프를 반영(거부 시에도
-/// 보존 — 로그·메시지 일관).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OutputCap {
     pub tg: usize,
@@ -31,19 +25,10 @@ pub(crate) struct OutputCap {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum OutputVerdict {
     Ok,
-    /// 프롬프트+슬랙 ≥ 모델 최대 — 잘라도 생성 불가.
     PromptTooLong,
-    /// 클램프 후에도 예약이 풀 총량 초과 — 거부(풀은 순서·대기 문제 —
-    /// 요청 크기 제한으로 풀 압박을 풀지 않는다).
     PoolExceeded,
 }
 
-/// [2026-10-16·사용자 확정] 생성한도 상한 — **모델 초과분은 vLLM식 출력
-/// 클램프**, 풀(예약) 초과는 거부:
-/// ① 프롬프트+슬랙 ≥ 모델 최대 → 거부(모델 물리 한계),
-/// ② 프롬프트+출력+슬랙 > 모델 최대 → 출력 클램프(tg = 모델 최대−프롬프트−슬랙;
-///    사용자가 모델 수용량을 오해한 요청도 서비스 지속),
-/// ③ 클램프 후 프롬프트+출력+슬랙 > 풀 총량 → 거부.
 pub(crate) fn cap_output(
     prompt: usize,
     n_predict: usize,
@@ -66,7 +51,6 @@ pub(crate) fn cap_output(
     OutputCap { tg, verdict }
 }
 
-/// 유닉스 초.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -74,21 +58,18 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// OAI 응답 id — 프로세스 단조 카운터로 충돌 없는 유일값.
 fn oai_id() -> String {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("cmpl-{}-{n}", std::process::id())
 }
 
-/// Anthropic 메시지 id — 별도 카운터(OAI id와 네임스페이스 분리).
 fn anthropic_msg_id() -> String {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("msg_llm170-{n}")
 }
 
-/// 문자 경계로 내림 보정 (UTF-8 안전 절단) — 스트림 holdback 계산용.
 fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     while i > 0 && !s.is_char_boundary(i) {
         i -= 1;
@@ -96,9 +77,7 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
-/// 응답 포맷 컨텍스트 — 엔드포인트별 조립에 필요한 최소값.
 struct EmitFmt {
-    /// [P0-D3 2026-10-16] 선언된 도구 이름집합 — 래핑은 name∈집합일 때만.
     tool_names: Option<Vec<String>>,
     chat: bool,
     model: String,
@@ -106,11 +85,8 @@ struct EmitFmt {
     include_stop: bool,
 }
 
-/// qwen 어휘 <end_of_turn> — chat/anthropic 조기 정지 토큰 (EOS 248044와 구분).
 const STOP_EOT: u32 = 248046;
 
-/// [P3 gemma4 2026-10-14] 아치별 정지 토큰 — chat_spec 레지스트리 eos(+qwen
-/// 채널 정지 248046 보존·미등록 기본 STOP_EOT).
 fn stops_for_arch() -> Vec<u32> {
     use llm170_core::qwen35::bind as q;
     let arch = crate::engine::arch();
@@ -118,7 +94,7 @@ fn stops_for_arch() -> Vec<u32> {
         .map(|s| s.eos.to_vec())
         .unwrap_or_default();
     if q::arch_supported(&arch) && !v.contains(&STOP_EOT) {
-        v.push(STOP_EOT); // 종전 qwen 동작 보존(채널 정지)
+        v.push(STOP_EOT);
     }
     if v.is_empty() {
         v.push(STOP_EOT);
@@ -130,14 +106,11 @@ pub(crate) fn handle(
     stream: TcpStream,
     tx: std::sync::mpsc::SyncSender<SlotJob>,
 ) -> Result<(), String> {
-    // [H 2026-10-09] 연결당 BufReader 1개 — 요청마다 재생성하면 선행 판독분
-    // (파이프라인 잔여 바이트)이 리더와 함께 폐기돼 keep-alive 파이프라이닝이
-    // 조용히 깨졌다.
     let mut reader = std::io::BufReader::new(stream);
     loop {
         let req = match read_request(&mut reader) {
             Ok(r) => r,
-            Err(_) => return Ok(()), // 연결 종료
+            Err(_) => return Ok(()),
         };
         let stream = reader.get_mut();
         match (req.method.as_str(), req.path.as_str()) {
@@ -149,8 +122,6 @@ pub(crate) fn handle(
                 }
             }
             ("GET", "/v1/models") => {
-                // [2.J 2026-10-13] 실효 ctx 광고 — max_model_len = min(모델 최대,
-                // 풀 파생[K6 후]) — 현재는 파생 전이라 엔진 ctx와 동일값.
                 let eff = crate::metrics::effective_ctx();
                 let mmax = crate::metrics::model_max_ctx();
                 resp(
@@ -162,8 +133,6 @@ pub(crate) fn handle(
                     ),
                 )
             }
-            // 모니터링 — 최신 스냅샷 1장(시계열 누적은 외부 폴러 몫).
-            // /stats = JSON(주 타깃), /metrics = Prometheus 텍스트(표준 호환).
             ("GET", "/stats") => resp(stream, 200, "application/json", &crate::metrics::json()),
             ("GET", "/metrics") => resp(
                 stream,
@@ -216,7 +185,6 @@ pub(crate) fn handle(
                     ids,
                     n_predict,
                     stream_mode,
-                    // completions는 text_completion 포맷.
                     &EmitFmt {
                         tool_names: None,
                         chat: false,
@@ -234,8 +202,6 @@ pub(crate) fn handle(
                     .unwrap_or(jnum(&req.body, "n_predict").unwrap_or(24.0))
                     .max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
-                // [H 2026-10-09] 빈 messages 거부 — 렌더가 assistant 접두만
-                // 남겨 빈 디코드로 200이 나가던 표면 불일치.
                 if !has_message_content(&req.body) {
                     resp(
                         stream,
@@ -245,7 +211,6 @@ pub(crate) fn handle(
                     );
                     continue;
                 }
-                // role 인지 멀티턴 렌더링(시스템 프롬프트 보존).
                 let text = json::messages_render(&req.body);
                 let ids = crate::engine::greedy_encode(&text);
                 run_and_emit(
@@ -269,7 +234,6 @@ pub(crate) fn handle(
             ("POST", "/v1/messages") => {
                 let n_predict = jnum(&req.body, "max_tokens").unwrap_or(24.0).max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
-                // [H 2026-10-09] 빈 messages 거부 — chat과 동일 표면.
                 if !has_message_content(&req.body) {
                     resp(
                         stream,
@@ -288,7 +252,7 @@ pub(crate) fn handle(
                     n_predict,
                     stream_mode,
                     parse_sampler(&req.body),
-                    jstop(&req.body), // A14: stop_sequences(jstop이 배열 파싱)
+                    jstop(&req.body),
                 );
             }
             _ => resp(stream, 404, "application/json", "{\"error\":\"not found\"}"),
@@ -296,9 +260,6 @@ pub(crate) fn handle(
     }
 }
 
-/// 슬롯 잡 enqueue 공통 — 채널 쌍 생성·SlotJob 조립·큐 송신.
-/// Err면 이미 응답을 썼다(큐 포화 429 / 엔진 사망 503). 반환: (최종 결과
-/// 수신기, 스트림 토큰 수신기 — 비스트림 모드는 진행 채널이 그대로 닫힌다).
 #[allow(clippy::type_complexity)]
 fn enqueue_job(
     stream: &mut TcpStream,
@@ -316,7 +277,6 @@ fn enqueue_job(
     (),
 > {
     if ENGINE_DEAD.load(Ordering::Acquire) {
-        // QA-11: 엔진 스레드 사망 — "queue full" 오보 방지.
         resp(
             stream,
             503,
@@ -333,20 +293,13 @@ fn enqueue_job(
         constraint,
         sampler,
         stops,
-        // QA-3: 비스트림도 progress 채널 부여 — 핸들러가 prx를 잡고 폴링
-        // 대기하며 절단 시 drop → slot_emit 송신 실패 → cancelled(스트림과
-        // 동일 메커니즘). 종전 비스트림은 절단 감지 자체가 없었다.
         progress: Some(ptx),
         out: otx,
         queued: std::time::Instant::now(),
         aging_blocked: false,
     };
-    // [D 2026-10-10] 어드미션 하드게이트 — 큐 포화는 429(재시도 가능)로 구분.
-    // 종전엔 사망/포화가 같은 503 "queue full"이라 클라이언트가 재시도 여부를
-    // 판단할 수 없었다(Retry-After 부재).
     match tx.try_send(job) {
         Ok(()) => {
-            // [B5/I] 큐 깊이 게이지 — 스케줄러 수신 시 -1(sched::slot_loop).
             crate::sched::SCHED
                 .queue_depth
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -368,8 +321,6 @@ fn enqueue_job(
     Ok((orx, prx))
 }
 
-/// QA-3: 비차단 peek로 클라이언트 절단 판정 — EOF(0) 또는 커널 접속 에러만
-/// 절단. 데이터 도착(파이프라인 후속 요청)은 생존으로 본다.
 fn peer_gone(stream: &mut TcpStream) -> bool {
     let _ = stream.set_nonblocking(true);
     let mut b = [0u8; 1];
@@ -387,18 +338,13 @@ fn peer_gone(stream: &mut TcpStream) -> bool {
     }
 }
 
-/// [P0-D3] 요청 tools[].function.name 집합 — 빈/파싱 실패 = None.
 pub(crate) fn parse_tool_names(body: &str) -> Option<Vec<String>> {
-    // [P0-D7 2026-10-16] 배열 경계 = 문자열 인식 매칭(jarr_span) — 종전
-    // find(']')는 중첩 배열(required·enum·type:array)에서 절단해 첫 블록을
-    // 미완결로 폐기 → 래핑 전면 비활성(기능 회귀)했다.
     let tp = body.find("\"tools\"")?;
     let ob = body[tp..].find('[')? + tp;
     let close = crate::oai::json::jarr_span(body, ob)?;
     let names: Vec<String> = crate::oai::json::jblocks(&body[ob..=close])
         .iter()
         .filter_map(|blk| {
-            // name은 function 객체 내부에 중첩 — jmember는 최상위만 읽는다.
             let fval = crate::oai::json::jmember(blk, "function")?;
             let fobj = fval.trim_start().strip_prefix('{')?;
             crate::oai::json::jstr(&format!("{{{fobj}"), "name")
@@ -407,8 +353,6 @@ pub(crate) fn parse_tool_names(body: &str) -> Option<Vec<String>> {
     (!names.is_empty()).then_some(names)
 }
 
-/// [P8] 제약 출력 → tool_calls 배열 JSON(조각). {name,arguments} 단일 또는
-/// 배열(병렬). 파싱 불가 = None.
 pub(crate) fn wrap_tool_calls(names: &[String], acc: &str) -> Option<String> {
     let t = acc.trim();
     let objs: Vec<&str> = if t.starts_with('[') {
@@ -421,11 +365,9 @@ pub(crate) fn wrap_tool_calls(names: &[String], acc: &str) -> Option<String> {
     let mut calls = Vec::new();
     for (i, o) in objs.iter().enumerate() {
         let name = crate::oai::json::jstr(o, "name")?;
-        // [P0-D3] 선언된 도구만 — 미선언 name은 래핑하지 않는다(오포장 방지).
         if !names.iter().any(|n| n == &name) {
             return None;
         }
-        // arguments 값 = 중첩 객체/배열 원문(jblock) 또는 문자열 JSON.
         let args = raw_value(o, "arguments").unwrap_or_else(|| "{}".into());
         calls.push(format!(
             "{{\"id\":\"call_{i}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}",
@@ -436,7 +378,6 @@ pub(crate) fn wrap_tool_calls(names: &[String], acc: &str) -> Option<String> {
     Some(calls.join(","))
 }
 
-/// [P8] 객체의 값 원문 추출(중첩 {} / [] / 스칼라 문자열).
 fn raw_value(o: &str, key: &str) -> Option<String> {
     let pat = format!("\"{key}\":");
     let kp = o.find(&pat)? + pat.len();
@@ -457,7 +398,6 @@ fn raw_value(o: &str, key: &str) -> Option<String> {
             let mut esc = false;
             let mut j = i;
             while j < b.len() {
-                // [P0-D4] 표준 상태기계(이중 백슬래시 수정 — json.rs 동일).
                 if esc {
                     esc = false;
                 } else if b[j] == b'\\' && in_s {
@@ -480,7 +420,6 @@ fn raw_value(o: &str, key: &str) -> Option<String> {
         }
         b'"' => crate::oai::json::jstr(o, key).map(|s| s.to_string()),
         _ => {
-            // 따옴표 없는 스칼라 — 콤마/닫기까지.
             let mut j = i;
             while j < b.len() && b[j] != b',' && b[j] != b'}' {
                 j += 1;
@@ -490,7 +429,6 @@ fn raw_value(o: &str, key: &str) -> Option<String> {
     }
 }
 
-/// [P8] 요청 → Schema(없음 None).
 fn schema_constraint(body: &str) -> Option<schema::Schema> {
     let sch = schema::schema_from_request(body);
     if sch.is_none() && body.contains("\"json_schema\"") {
@@ -510,9 +448,6 @@ fn run_and_emit(
     sampler: Option<llm170_core::sampler::SamplerParams>,
     constraint: Option<crate::oai::schema::Schema>,
 ) {
-    // [H 2026-10-09] 빈 프롬프트는 전 엔드포인트 동일 400 — 종전엔 빈 배열은
-    // 400인데 빈 문자열 prompt·빈 chat 렌더는 통과해 스케줄러가 0번 토큰에서
-    // 조용히 디코드했다(표면 불일치).
     if ids.is_empty() {
         resp(
             stream,
@@ -522,10 +457,6 @@ fn run_and_emit(
         );
         return;
     }
-    // [K6 입장 규약 2026-10-13] 프롬프트 초과 = 입장 전 거부(context_length_exceeded).
-    // [2026-10-16·사용자 확정] 모델 ctx 초과분 = vLLM식 **출력 클램프**
-    // (max_tokens = 모델 최대 − 프롬프트 − 슬랙) — 용량 오해 요청도 처리.
-    // 풀(예약) 초과만 거부 — 풀은 입장 순서로 조정한다(요청 크기 제한 아님).
     let pool_cap = *SERVER_CTX.get().unwrap_or(&4096);
     let model_max = *SERVER_MODEL_MAX.get().unwrap_or(&usize::MAX);
     let slack = crate::sched::admit::RESERVE_SLACK;
@@ -568,9 +499,6 @@ fn run_and_emit(
     };
     let prompt_len = ids.len();
     let constraint_was_active = constraint.is_some();
-    // [P0-D5b 2026-10-16] 제약 완결 토큰 = stops.first — completions처럼 stops가
-    // 비면 0토큰이 무한 방출된다(종료 판정 = eos ∨ stops 멤버십). 아치 종결자
-    // 보충으로 종결을 보장한다.
     let mut stops = stops;
     if constraint_was_active && stops.is_empty() {
         stops = stops_for_arch();
@@ -580,8 +508,6 @@ fn run_and_emit(
         return;
     };
     if !stream_mode {
-        // QA-3: 폴링 대기 — 절단 감지 시 prx가 이 스코프를 벗어나 drop 되고
-        // 다음 slot_emit부터 cancelled. 종전엔 n_predict 전량을 GPU에서 실행.
         let mut toks = Vec::new();
         let err: Option<String>;
         loop {
@@ -593,11 +519,9 @@ fn run_and_emit(
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if peer_gone(stream) {
-                        return; // 절단 — 응답 불필요, 잡 정리만
+                        return;
                     }
                 }
-                // QA-9: 송신측 소멸(QA-1 수리 전 무한루프가 만들던 상황 등) —
-                // 빈 200 대신 명시적 오류.
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     err = Some("engine result channel closed".into());
                     break;
@@ -613,8 +537,6 @@ fn run_and_emit(
             );
             return;
         }
-        // stop 문자열 응답 절단 — 토큰 순회하며 누적 텍스트에
-        // 최초 등장 시 절단. 서버 측 절단은 과도 방안(엔진 조기 정지는 후속 항목).
         let mut det = crate::engine::Detok::new();
         let mut acc = String::new();
         let mut ntok = 0usize;
@@ -633,8 +555,6 @@ fn run_and_emit(
                 }
             }
         }
-        // OAI 표준 비스트림 응답(id/created/model/object/
-        // choices/usage) — 종전 소비자를 위한 tokens·text는 유지.
         let finish = if trunc {
             "stop"
         } else if toks.len() >= n_predict {
@@ -645,9 +565,6 @@ fn run_and_emit(
         let esc = crate::json::esc(&acc);
         let arr: Vec<String> = toks[..ntok].iter().map(|t| t.to_string()).collect();
         let (id, created) = (oai_id(), now_secs());
-        // [P8 2026-10-16] tool_calls 래핑 — 제약 출력이 {name,arguments}(배열
-        // 허용 = 병렬)이면 tool_calls 포맷으로 재구성(원문 content 보존 아님 —
-        // 함수 호출 응답은 arguments가 본체). 파싱 실패 시 통과(일반 JSON).
         let tool_wrap = fmt
             .tool_names
             .as_deref()
@@ -695,7 +612,6 @@ fn run_and_emit(
     let (id, created) = (oai_id(), now_secs());
     let model_esc = crate::json::esc(&fmt.model);
     if fmt.chat {
-        // 첫 청크 — role delta(id/created/model 포함 표준 계약).
         let frame = sse(
             stream,
             "message",
@@ -707,20 +623,12 @@ fn run_and_emit(
             return;
         }
     }
-    // 토큰 생성 즉시 SSE — 장문 요청이 완료까지 굳지 않게 (2026-09-01).
-    // [R3] 디톡·홀드백·stop 스캔은 TextStream(Anthropic 러너와 공유).
     let mut ts = TextStream::new(fmt.stop_strs.clone(), fmt.include_stop);
     let mut ntok = 0usize;
-    // [I 2026-10-10] keep-alive — [K0 2026-10-12] 주기 5s→1s: 토큰 공백 중
-    // 프록시·클라 타임아웃 방지와 **절단 감지 상한**을 겸한다(쓰기 실패 =
-    // prx drop → cancelled/조기 반납 — 5s면 슬롯 점유가 그만큼 지연).
     loop {
         let t = match prx.recv_timeout(std::time::Duration::from_secs(1)) {
             Ok(crate::sched::ProgressFrame::Tok(t)) => t,
             Ok(crate::sched::ProgressFrame::Ping) => {
-                // [K0-fin] Ping도 recv 타임아웃을 리셋한다 — 프리필 중
-                // 절단 감지가 타임아웃 갈래로 못 넘어오는 자기모순 해소:
-                // Ping마다(≈청크 간격) peer 스파이로 즉시 검사.
                 if !crate::http::peer_alive(stream) {
                     return;
                 }
@@ -736,32 +644,26 @@ fn run_and_emit(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        // 정지 토큰은 텍스트로 방출하지 않는다(비스트림은 finish_slot이
-        // 트림하지만 스트림 델타는 여기서 걸러야 새어나가지 않는다).
         if t == llm170_core::qwen35::EOS_EOT || t == STOP_EOT {
             break;
         }
         ntok += 1;
         if let Some(piece) = ts.push(t) {
             let piece = crate::json::esc(piece);
-            // 쓰기 실패(클라 절단) 시 즉시 탈출 — prx drop → cancelled 경로.
             if emit_delta(stream, fmt, &id, created, &model_esc, &piece).is_err() {
                 return;
             }
         }
         if ts.stopped {
-            break; // prx drop → 기존 cancelled 경로로 슬롯 회수
+            break;
         }
     }
-    // 잔여 보류분 플러시(stop 없이 종료 시).
     if let Some(piece) = ts.flush() {
         let piece = crate::json::esc(piece);
         let _ = emit_delta(stream, fmt, &id, created, &model_esc, &piece);
     }
     let trunc = ts.trunc;
-    let final_res = orx.recv(); // 최종 결과 수령 (종료 정리)
-    // [D 2026-10-10] 엔진 확정 실패의 스트림 직렬화 — 종전엔 실패해도 정상
-    // finish("stop")+[DONE]으로 뭉개 클라이언트가 잘린 응답을 성공으로 오인했다.
+    let final_res = orx.recv();
     let err: Option<String> = match &final_res {
         Ok(r) => r.error.clone(),
         Err(_) => Some("engine result channel closed".into()),
@@ -788,7 +690,6 @@ fn run_and_emit(
         "stop"
     };
     if fmt.chat {
-        // 종료 청크 — finish_reason 후 [DONE](기존 계약 유지).
         let _ = sse(
             stream,
             "message",
@@ -798,10 +699,6 @@ fn run_and_emit(
         );
     }
     let _ = sse(stream, "done", "[DONE]");
-    // QA-2 연계 수리: SSE 완료 후 연결 종료. curl류 클라이언트는
-    // [DONE]을 인지하지 못해 서버의 keep-alive 대기에 묶였고 — 무타임아웃
-    // 시대엔 무한 대기, read_timeout(120s) 도입 후엔 요청마다 +120s 꼬리가
-    // 붙었다(실측: 6s 생성 + 120s 꼬리 = 126.4s). 스트림은 완료 즉시 FIN.
     let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
@@ -812,10 +709,8 @@ fn run_and_emit_anthropic(
     n_predict: usize,
     stream_mode: bool,
     sampler: Option<llm170_core::sampler::SamplerParams>,
-    // A14: stop_sequences — jstop이 문자열·배열 모두 파싱.
     stop_strs: Vec<String>,
 ) {
-    // [H 2026-10-09] 빈 프롬프트 — OAI·Anthropic 동일 400(이중 표면 제거).
     if ids.is_empty() {
         resp(
             stream,
@@ -825,9 +720,6 @@ fn run_and_emit_anthropic(
         );
         return;
     }
-    // [K6 입장 규약 2026-10-13] 프롬프트 초과 = 거부(context_length_exceeded).
-    // [2026-10-16·사용자 확정] 모델 초과 = vLLM식 출력 클램프 · 풀 초과 = 거부
-    // (run_and_emit과 동일 — cap_output 단일 출처).
     let pool_cap = *SERVER_CTX.get().unwrap_or(&4096);
     let model_max = *SERVER_MODEL_MAX.get().unwrap_or(&usize::MAX);
     let slack = crate::sched::admit::RESERVE_SLACK;
@@ -876,14 +768,12 @@ fn run_and_emit_anthropic(
         n_predict,
         stops_for_arch(),
         sampler,
-        None, // anthropic — json_schema 미지원(P8 범위: OpenAI 경로)
+        None,
     ) else {
         return;
     };
     if stream_mode {
         resp_sse_open(stream);
-        // [H 2026-10-09] message_start 스텁 보강 — SDK가 요구하는
-        // id/type/model/content/usage 골격(종전 role 하나뿐).
         let msg_id = anthropic_msg_id();
         let _ = sse(
             stream,
@@ -892,17 +782,12 @@ fn run_and_emit_anthropic(
                 "{{\"type\":\"message_start\",\"message\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"llm170\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":{prompt_len},\"output_tokens\":0}}}}}}"
             ),
         );
-        // [R3] 디톡·홀드백·stop 스캔은 TextStream(OAI 러너와 공유).
         let mut ts = TextStream::new(stop_strs.clone(), false);
-        // [H] stop_reason 판정용 생성 수 — 정지 토큰(미방출)은 제외.
         let mut n_out = 0usize;
-        // [I 2026-10-10] keep-alive — [K0] OAI 경로와 동일(1s 주석 프레임 —
-        // 절단 감지 상한 단축).
         loop {
             let t = match prx.recv_timeout(std::time::Duration::from_secs(1)) {
                 Ok(crate::sched::ProgressFrame::Tok(t)) => t,
                 Ok(crate::sched::ProgressFrame::Ping) => {
-                    // [K0-fin] OAI 경로와 동일 — Ping마다 peer 스파이.
                     if !crate::http::peer_alive(stream) {
                         return;
                     }
@@ -919,7 +804,7 @@ fn run_and_emit_anthropic(
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             };
             if t == llm170_core::qwen35::EOS_EOT || t == STOP_EOT {
-                break; // 정지 토큰 미방출(스트림 델타)
+                break;
             }
             n_out += 1;
             if let Some(piece) = ts.push(t) {
@@ -936,7 +821,6 @@ fn run_and_emit_anthropic(
                 break;
             }
         }
-        // 잔여 보류분 플러시(stop 없이 종료 시).
         if let Some(piece) = ts.flush() {
             let esc = crate::json::esc(piece);
             let _ = sse(
@@ -949,8 +833,6 @@ fn run_and_emit_anthropic(
         }
         let stopped = ts.stopped;
         let final_res = orx.recv();
-        // [D 2026-10-10] 확정 실패 — Anthropic error 이벤트 직렬화
-        // (정상 message_delta/message_stop 위장 금지).
         let err: Option<String> = match &final_res {
             Ok(r) => r.error.clone(),
             Err(_) => Some("engine result channel closed".into()),
@@ -967,8 +849,6 @@ fn run_and_emit_anthropic(
             let _ = stream.shutdown(std::net::Shutdown::Write);
             return;
         }
-        // [H 2026-10-09] max_tokens 방출 — 종전엔 length 정지도 end_turn으로
-        // 뭉갰다(Anthropic 규약 위반).
         let reason = if stopped {
             "stop_sequence"
         } else if n_out >= n_predict {
@@ -987,7 +867,6 @@ fn run_and_emit_anthropic(
         let _ = stream.shutdown(std::net::Shutdown::Write);
         return;
     }
-    // QA-3/9: run_and_emit 비스트림과 동일 — 폴링 대기로 절단 감지 + 에러 전파.
     let mut all = Vec::new();
     let err: Option<String>;
     loop {
@@ -1022,14 +901,11 @@ fn run_and_emit_anthropic(
     }
     let mut det = crate::engine::Detok::new();
     let mut text: String = all.iter().map(|&t| det.push(t)).collect();
-    // A14: stop_sequences 절단(비스트림) — stop 본문 미포함이 Anthropic 규약.
     let stopped = earliest_stop(&text, &stop_strs, 0);
     if let Some((sp, _)) = stopped {
         text.truncate(sp);
     }
     let esc = crate::json::esc(&text);
-    // [H 2026-10-09] stop_reason 우선순위(stop_sequence > max_tokens > end_turn)
-    // + usage 골격 — 종전엔 length 정지도 end_turn으로 뭉갰다.
     let reason = if stopped.is_some() {
         "stop_sequence"
     } else if all.len() >= n_predict {

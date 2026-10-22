@@ -1,18 +1,11 @@
-//! 엔진 파사드 — qwen35/qwen4exp 통합, 아키텍처 자동 판별.
 
 use std::path::PathBuf;
 
-/// 모델 경로 포맷 판정 — 2026-10-08 단일 트랙:
-/// 수용은 **W4A16 디렉터리 단일** — 그 외는 명시 에러로 안내.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ModelFormat {
-    /// compressed-tensors(weight_packed 3조)·auto-gptq(qweight/qzeros) 패킹.
-    /// arch = config.json 아키텍처 식별자(로더 레지스트리 키).
     W4A16 { arch: String },
 }
 
-/// 포맷 스니핑 — 디렉터리 내 safetensors 내용 기반(index.json 우선, 없으면
-/// 첫 샤드 헤더 접두). 그 외 파일·디렉터리는 탈락 에러.
 pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
     if path.is_file() {
         return Err(format!(
@@ -27,7 +20,6 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
     let hay: Option<String> = if index.is_file() {
         std::fs::read_to_string(&index).ok()
     } else {
-        // index 없음: 첫 샤드 헤더(8바이트 길이 + JSON) 접두 판독.
         let shard = std::fs::read_dir(path).ok().and_then(|rd| {
             rd.flatten().map(|e| e.path()).find(|p| {
                 p.file_name()
@@ -40,14 +32,13 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
             let mut f = std::fs::File::open(p).ok()?;
             let mut lenb = [0u8; 8];
             f.read_exact(&mut lenb).ok()?;
-            let hlen = u64::from_le_bytes(lenb).min(1 << 20) as usize; // 접두 1MB
+            let hlen = u64::from_le_bytes(lenb).min(1 << 20) as usize;
             let mut buf = vec![0u8; hlen];
             f.read_exact(&mut buf).ok()?;
             String::from_utf8_lossy(&buf).into_owned().into()
         })
     };
     let Some(hay) = hay else {
-        // safetensors 없는 디렉터리 — config.json(architectures) 유무로 안내.
         if path.join("config.json").is_file() {
             return Err(format!(
                 "미지원 포맷: HF config 배포(architectures) — {} (지원: W4A16 디렉터리)",
@@ -66,7 +57,6 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
         ));
     }
     if hay.contains("weight_packed") || hay.contains("qweight") {
-        // 아키텍처 레지스트리 게이트 — 로더 dispatch의 키.
         let Some(arch) = llm170_core::qwen35::bind::dir_arch(path) else {
             return Err(format!(
                 "아키텍처 판별 불가(config.json architectures/model_type 부재): {}",
@@ -96,11 +86,6 @@ pub fn sniff_format(path: &std::path::Path) -> Result<ModelFormat, String> {
     ))
 }
 
-/// [2.J 2026-10-13] serve 런치 정책 — CLI가 env(진단)보다 우선한다.
-/// spec: 0=auto(경제성 게이트) · 1=mtp · 2=ngram · 3=off(평범).
-/// moe:  0=auto(여유 VRAM으로 상주/스트리밍) · 1=resident 강제 · 2=streaming 강제.
-/// ple:  0=ssd(기본 본진) · 1=ram 승격 · 2=vram 승격 — 계층 규칙은 PLE 보유
-///       모델(FN) 브링업 때 배선; 현행(27B/35B/gemma4)은 로그 전용.
 pub static SPEC_POLICY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_POLICY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PLE_POLICY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -163,84 +148,59 @@ pub fn parse_moe_policy(v: &str) -> Option<u8> {
 #[derive(Clone)]
 pub struct InferRequest {
     pub model: PathBuf,
-    /// 실효 요청 상한(토큰) = min(모델 전역 ctx, 풀 총량 — kv-mem 유래).
-    /// [2026-10-16] `--ctx` 폐지 이후의 유일한 상한 소스. 엔진 cap·
-    /// `SERVER_CTX`(OAI 입장 전 거부 판정)·`/stats`가 모두 이 값을 쓴다.
     pub ctx: usize,
-    /// 모델 전역 상한(config 파생) — 적재 후 실블록 상한과 재비교(관측·로그).
     pub model_max_ctx: usize,
-    /// [K6-3 예산] KV 아레나 예산(바이트 — `--kv-mem` 그대로. None = 프로브/null).
     pub kv_budget: Option<u64>,
-    /// [2026-10-16] VRAM 티어 상한(서버 검증 — 초과분은 호스트 아레나 확장).
     pub kv_vram_cap: Option<u64>,
-    /// [2.M 사다리] KV 풀 실할당 추정 = min(예산, ctx×문맥수×KV/토큰).
-    /// 전문가 상주(auto) 판정에서 KV 몫을 먼저 떼는 데 쓴다(0/None = 종전 규칙).
     pub kv_reserve: Option<u64>,
-    /// [PP 3차 2026-10-17] GPU 카드 수(1 = 현행 단일 경로 불변, 2 = PP 2샤드).
     pub cards: usize,
 }
 
 pub struct InferResult {
     pub tokens: Vec<u32>,
-    /// QA-1: 엔진 확정 실패 사유 — None이면 정상 종료. 종전엔 에러 필드가
-    /// 없어 실패 통보 경로 자체가 없었다(슬롯 스피너 + 클라이언트 영구 대기).
     pub error: Option<String>,
 }
 
 pub struct Engine(pub Box<crate::gpu_engine::GpuEngine>);
 
 impl Engine {
-    /// 메모리 분류(모니터링) — (가중치, KV, CPU 오프로드, PLE 오프로드).
     pub fn mem_stats(&self) -> (u64, u64, u64, u64) {
         self.0.mem_stats()
     }
 
-    /// 토큰당 활성 가중치 바이트(실효 대역폭 계산용).
     pub fn active_weight_bytes(&self) -> u64 {
         self.0.active_weight_bytes()
     }
 
-    /// MoE 배치 모드 — "none" | "resident" | "streaming".
     pub fn moe_mode(&self) -> &'static str {
         self.0.moe_mode()
     }
 
-    /// [§2.M ①] 스트리밍 전문가 LRU 캐시 계측 — (hits, miss, k).
     pub fn mcache_stats(&self) -> (u64, u64, usize) {
         self.0.mcache_stats()
     }
 
-    /// [2026-10-16] 실블록 유래 단일 요청 상한(토큰) — kv-mem 풀의
-    /// floor(블록/층) 몫 반영. 적재 후 실효 cap 확정(http::serve)에 쓴다.
     pub fn kv_cap_tokens(&self) -> usize {
         self.0.kv_cap_tokens()
     }
 
-    /// [2026-10-16] KV 계층 회계 — (VRAM 바이트, 호스트 바이트, 호스트 블록, 전체 블록).
     pub fn kv_tier_bytes(&self) -> (u64, u64, usize, usize) {
         self.0.kv_tier_bytes()
     }
 
-    /// [2026-10-16] KV 티어별 자유 블록 — (VRAM 자유, 호스트 자유).
     pub fn kv_tier_free(&self) -> (usize, usize) {
         self.0.kv_tier_free()
     }
 
-    /// 복사 계측 — [h2d, d2h, d2d] × (바이트, ns, 호출).
     pub fn copy_stats(&self) -> [(u64, u64, u64); 3] {
         self.0.copy_stats()
     }
 
-    /// 정지 토큰(F5 — 하드코드 248044 일반화): 아치별 상수(엔진 위임 —
-    /// gemma4는 [1,106,50] 중 대표 1, 전체 목록은 서빙 스톱 레지스트리).
     pub fn eos(&self) -> u32 {
         self.0.eos()
     }
 }
 
-/// P0-4(§10-2): 기동 배너 1줄 고정 — 스왑 시 "무엇으로 도는지"를 로그만으로
-/// 판정한다(B1·B21의 라벨 문제를 계약으로 흡수). offload/attach는 각 엔진
-/// 조립 지점의 사실.
 fn banner(
     model: &std::path::Path,
     fmt: &str,
@@ -260,7 +220,6 @@ fn banner(
 }
 
 pub fn build_slots(req: InferRequest, n_slots: usize) -> Engine {
-    // W3-3: GPU 경로 단일 — 가중치 VRAM 상주(호스트 스테이징 체인).
     let eng = load_gpu_retry(
         &req.model,
         n_slots,
@@ -283,14 +242,11 @@ pub fn build_slots(req: InferRequest, n_slots: usize) -> Engine {
 }
 
 impl Engine {
-    /// 슬롯 단위 리셋 위임.
     pub fn reset_seq(&mut self, seq: usize) {
         let _ = self.0.reset_seq(seq);
     }
 }
 
-/// 멀티바이트 꼬리를 버퍼에 유지하고 완결 접두만 방출.
-/// 매핑은 Tokenizer::load의 인코더 변환과 동일 (Ġ/Ċ/latin1/utf8).
 pub struct Detok {
     buf: Vec<u8>,
 }
@@ -300,9 +256,7 @@ impl Detok {
         Self { buf: Vec::new() }
     }
 
-    /// 토큰 1개 투입 → 지금까지 완결된 텍스트 방출.
     pub fn push(&mut self, tok: u32) -> String {
-        // [2026-10-09 D4] out-param 변형 — 토큰당 중간 Vec 할당 제거.
         if let Some(t) = TOKENIZER.get() {
             t.piece_bytes_into(tok, &mut self.buf);
         }
@@ -313,8 +267,6 @@ impl Detok {
     }
 }
 
-/// 완결 UTF-8 접두 길이 — 미완 멀티바이트(조각 경계 분할)는 홀드백.
-/// [I 2026-10-10] Detok에서 순수 함수로 추출(테스트 표면).
 fn complete_utf8_prefix(b: &[u8]) -> usize {
     let mut v = 0usize;
     while v < b.len() {
@@ -333,15 +285,11 @@ fn complete_utf8_prefix(b: &[u8]) -> usize {
 }
 
 use crate::sched::load_gpu_retry;
-/// 글로벌 토크나이저 (serve 시 1회 적재).
 pub use crate::sched::{SlotJob, slot_loop};
 
 pub static TOKENIZER: std::sync::OnceLock<crate::tokenize::Tokenizer> = std::sync::OnceLock::new();
-/// [P3 gemma4 2026-10-14] 서빙 아치(config.json architectures) — oai 렌더·정지
-/// 토큰 레지스트리(chat_spec) 키. 로드 시 1회 확정(load_gpu_retry).
 pub static ARCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// 현재 아치(미설정 = 빈 문자열 — 레지스트리 미등록 기본 경로).
 pub fn arch() -> String {
     ARCH.get().cloned().unwrap_or_default()
 }
@@ -354,23 +302,18 @@ pub fn greedy_encode(text: &str) -> Vec<u32> {
 mod tests {
     use super::complete_utf8_prefix;
 
-    /// I: Detok 멀티바이트 홀드백 — 조각이 나뉘어 도착해도 완결 접두만 방출.
     #[test]
     fn detok_holdback_multibyte() {
-        // '한'(U+D55C = ED 95 9C)이 2조각으로.
         assert_eq!(
             complete_utf8_prefix(&[0xED, 0x95]),
             0,
             "미완 3바이트 홀드백"
         );
         assert_eq!(complete_utf8_prefix(&[0xED, 0x95, 0x9C]), 3);
-        // 😀(F0 9F 98 80) 3조각.
         assert_eq!(complete_utf8_prefix(&[0xF0, 0x9F, 0x98]), 0);
         assert_eq!(complete_utf8_prefix(&[0xF0, 0x9F, 0x98, 0x80]), 4);
-        // ASCII + 미완 꼬리.
         assert_eq!(complete_utf8_prefix(b"ab\xC3"), 2);
-        assert_eq!(complete_utf8_prefix(b"ab\xC3\xA9"), 4); // é
-        // 연속 바이트 단독 선두 — 전진 금지.
+        assert_eq!(complete_utf8_prefix(b"ab\xC3\xA9"), 4);
         assert_eq!(complete_utf8_prefix(&[0x80, 0x80]), 0);
         assert_eq!(complete_utf8_prefix(b"abc"), 3);
         assert_eq!(complete_utf8_prefix(b""), 0);
@@ -381,7 +324,6 @@ mod tests {
 mod policy_tests {
     use super::*;
 
-    /// [2.J] CLI 정책 파서 — 유효값/거부.
     #[test]
     fn policy_parsers() {
         assert_eq!(parse_spec_policy("auto"), Some(0));

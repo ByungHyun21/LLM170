@@ -28,7 +28,7 @@ def st_header(repo, shard):
     """샤드 헤더 JSON(길이 접두 8B + 헤더 본체) — Range 2회."""
     url = f"{BASE}/{repo}/resolve/main/{shard}"
     n = int.from_bytes(fetch(url, (0, 7)), "little")
-    hdr_len = min(n, 12_000_000)  # 상식 상한(비정상 샤드 방어)
+    hdr_len = min(n, 12_000_000)
     return json.loads(fetch(url, (8, 8 + hdr_len - 1)))
 
 
@@ -50,7 +50,7 @@ def main():
                 for k, v in (groups or {}).items():
                     w = v.get("weights", {}) if isinstance(v, dict) else {}
                     print(f"quant[{q}][{k}] group={w.get('group_size')} num_bits={w.get('num_bits')}")
-            except Exception as e:  # noqa: BLE001 — 진단 도구
+            except Exception as e:
                 print(f"quant[{q}] parse fail: {e}")
     idx = {}
     for x in files:
@@ -66,7 +66,6 @@ def main():
             if sub in name:
                 targets.setdefault(wmap[name], []).append(name)
     if not wmap:
-        # 샤드 목록에서 첫 샤드로 요약
         shards = [x["path"] for x in files if x["path"].endswith(".safetensors")]
         if shards:
             targets[shards[0]] = []
@@ -77,7 +76,6 @@ def main():
             v = h.get(name)
             print(f"   {name} {v['dtype'] if v else 'MISSING'} {v['shape'] if v else ''}")
         if not names:
-            # 트리플 요약: packed/scale/shape 개수 + 대표 shape + 스케일 열 분포
             pk = [k for k in h if k.endswith("weight_packed")]
             sc = {tuple(v["shape"][1:2]) for k, v in h.items()
                   if k.endswith("weight_scale")}

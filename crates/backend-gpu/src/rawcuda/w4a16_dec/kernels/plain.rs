@@ -1,10 +1,7 @@
 use super::super::*;
 
 impl W4a16Dec {
-    // ── 플레인 bf16(MoE 모델 — 35B) + MoE FFN ──
 
-    /// bf16 GEMV — 행=블록(w4a16_gemv_bf16), x는 **원시 f32**(h2f 왕복 없음).
-    /// 플레인 경로 판정은 토큰 수준(골든) — split 경로의 레인/환원 구조 미러.
     pub(in crate::rawcuda::w4a16_dec) fn plain_gemv_launch(
         &self,
         name: &str,
@@ -24,8 +21,6 @@ impl W4a16Dec {
         )
     }
 
-    /// 플레인 bf16 GEMM(t≤8) — x는 원시 f32 [t][k](h2f 왕복 없음),
-    /// 가중치 1회 판독 × t토큰 재사용(프리필 청크의 dense 경로).
     pub(in crate::rawcuda::w4a16_dec) fn plain_gemm_launch(
         &mut self,
         name: &str,
@@ -34,9 +29,6 @@ impl W4a16Dec {
         t: usize,
     ) -> Result<(), String> {
         let (w, n, k) = self.plain_spec(name)?;
-        // [T2] bf16 mma GEMM(단일 경로). t≥16에서만
-        // (타일 M32 — 부분 타일은 가드로 동작하나 이득이 작음). 검증: 35B 600
-        // 토큰 동일, 골든 유지, 허용오차 ~1e-3(bf16 활성 반올림).
         if t >= 16 {
             {
                 static ONCE: std::sync::atomic::AtomicBool =
@@ -45,9 +37,6 @@ impl W4a16Dec {
                     eprintln!("[TC] mma GEMM 경로 진입: {name} n={n} k={k} t={t}");
                 }
             }
-            // [FLA-10 2026-10-10] A 미러 — f32 x를 bf16으로 선변환(L2 A
-            // 재판독 절반 — bf16_mma L2 68% 바운드 실측). cast_bf16과 커널
-            // 내 f2bf16이 비트동일 → 결과 불변.
             let need = t * k * 2;
             if need > self.dabf.cap {
                 self.dabf = self.realloc_buf(self.dabf, need, need, "dabf_cap")?;
@@ -64,14 +53,8 @@ impl W4a16Dec {
                     &mut crate::rawcuda::args::l3(&mut c_in, &mut c_out, &mut c_n),
                 )?;
             }
-            // [B5 2026-10-20] 대형 형상 mma3(M64×N128·KC64 — moepp.cu 헤더).
-            // 35B 프리필 지배 3형상(qkv/q 8192·z 4096·out/o 2048) 전용.
-            // 값은 mma2와 비트동일(같은 k 승순 f32 누산 — 도메인 게이트
-            // 미만은 기존 mma2/16 경로 불변).
             if t >= 64 && n >= 2048 && n.is_multiple_of(128) && k.is_multiple_of(64) {
                 let f = self.cc.function("w4a16_gemm_bf16_mma3")?;
-                // 동적 smem 55296B(xs 2×64×72·ws 2×128×72 half) — opt-in 후
-                // launch_shared(launch의 shared=0 고정 해제 — ctx 계약).
                 const B3_SMEM: u32 = 2 * (64 + 128) * (64 + 8) * 2;
                 self.cc.set_dynamic_smem(f, B3_SMEM)?;
                 let (mut p_w, mut p_x, mut p_o) = (w, self.dabf.ptr, y_out);
@@ -87,11 +70,7 @@ impl W4a16Dec {
                     ),
                 );
             }
-            // [M16 2026-10-11] 그리드 기아 형상이면 M16 변형(블록 2배) —
-            // 값은 MM32와 비트동일(같은 k 순서·mma). 판정: M32 타일 수 < SM 수.
             let tiles32 = t.div_ceil(GEMM_BMMA_M) as u64 * n.div_ceil(GEMM_BMMA_N) as u64;
-            // [실측 2026-10-18] 임계 2×SM→4×SM(M16 확대): 비트동일·35B pp512
-            // −0.3%·pp1024 −0.6% — 평탄/열세, 2× 유지(M16 축 소진).
             let m16 = tiles32 < 2 * self.cc.sm_count().max(1) as u64;
             let f = self.cc.function(if m16 {
                 "w4a16_gemm_bf16_mma2_16"
@@ -111,9 +90,6 @@ impl W4a16Dec {
                 ),
             );
         }
-        // [B2] v3(8행/블록 + 행별 smem + k청크) 상시 — t=1은 GEMV 경로라
-        // 여기 오지 않으므로(t≥2) 실질 임계치 = t≥2. v1(t≤8 전용)은 x 재판독이
-        // 있어 v3 대비 열위, 산술 순서는 동일 명시(plain_gemm_selfcheck 게이트).
         let v3 = t > 1;
         let f = self.cc.function(if v3 {
             "w4a16_gemm_bf16_t"
@@ -145,7 +121,6 @@ impl W4a16Dec {
         }
     }
 
-    /// [A9] 배치 t행 GEMV(플레인 bf16) — 원시 f32 x, 행별 GEMV 비트동일.
     pub(in crate::rawcuda::w4a16_dec) fn plain_gemv_t_launch(
         &mut self,
         name: &str,
@@ -156,7 +131,6 @@ impl W4a16Dec {
         self.plain_gemv_t_launch_on(self.cc.stream, name, x_dev, y_dev, t)
     }
 
-    /// [B3] t행 플레인 GEMV — 보조 스트림 발사 변형(shared 꼬리 포크).
     pub(in crate::rawcuda::w4a16_dec) fn plain_gemv_t_launch_on(
         &mut self,
         s: ffi::CUstream,
@@ -181,7 +155,6 @@ impl W4a16Dec {
         )
     }
 
-    /// 플레인 GEMV → 스테이징 dst 직접 쓰기 + 폭 검사.
     pub(in crate::rawcuda::w4a16_dec) fn plain_stage_x32(
         &self,
         name: &str,
@@ -196,7 +169,6 @@ impl W4a16Dec {
         self.plain_gemv_launch(name, x_dev, dst)
     }
 
-    /// 플레인 GEMV → self.dy.ptr.
     pub(in crate::rawcuda::w4a16_dec) fn plain_gemv_dev(
         &mut self,
         name: &str,

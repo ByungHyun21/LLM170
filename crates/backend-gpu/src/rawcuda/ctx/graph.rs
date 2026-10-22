@@ -1,14 +1,8 @@
 use super::*;
 
 impl CudaCtx {
-    /// 그래프 캡처 개시(GLOBAL) — 이후 이 스트림의 발사가 그래프 노드로
-    /// 기록된다(실행 아님). 캡처 중 동기 복사·alloc·sync는 금지.
-    /// [B3 2026-10-12] THREAD_LOCAL(1)→GLOBAL(0): 보조 스트림 포크/조인
-    /// (moe shared 꼬리)을 그래프 노드로 포착하려면 컨텍스트 전 스트림이
-    /// 캡처에 참여해야 한다(단일 스레드 디코더 — 다른 스트림 발사원 없음).
     pub fn capture_begin(&self) -> Result<(), String> {
         self.prof.capturing.set(true);
-        // SAFETY: stream은 create_stream이 설정한 유효 핸들.
         unsafe {
             let r = (self.drv.stream_begin_capture)(self.stream, 0);
             if r != CUDA_SUCCESS {
@@ -21,10 +15,8 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// 캡처 종료 → 그래프 핸들. 실패 시에도 캡처 상태는 해제된다.
     pub fn capture_end(&self) -> Result<ffi::CUgraph, String> {
         self.prof.capturing.set(false);
-        // SAFETY: 출력은 스택 로컬 — 그래프 핸들은 호출자 소유(graph_destroy).
         unsafe {
             let mut g: ffi::CUgraph = std::ptr::null_mut();
             let r = (self.drv.stream_end_capture)(self.stream, &mut g);
@@ -35,11 +27,8 @@ impl CudaCtx {
         }
     }
 
-    /// 그래프 인스턴스화 — 실행 핸들(캡처 1회·replay N회).
-    /// clippy allow — launch와 동일 판정(불투명 핸들).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn graph_instantiate(&self, g: ffi::CUgraph) -> Result<ffi::CUgraphExec, String> {
-        // SAFETY: g는 capture_end가 돌려준 유효 그래프.
         unsafe {
             let mut e: ffi::CUgraphExec = std::ptr::null_mut();
             let r = (self.drv.graph_instantiate)(&mut e, g, 0);
@@ -53,11 +42,8 @@ impl CudaCtx {
         }
     }
 
-    /// 그래프 실행 — 전 노드를 1회 launch로 제출.
-    /// clippy allow — launch와 동일 판정(불투명 핸들).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn graph_launch(&self, e: ffi::CUgraphExec) -> Result<(), String> {
-        // SAFETY: e는 graph_instantiate가 돌려준 유효 실행 핸들.
         unsafe {
             let r = (self.drv.graph_launch)(e, self.stream);
             if r != CUDA_SUCCESS {
@@ -67,11 +53,8 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// [§4.3] 그래프 업로드 — instantiate 직후 1회(같은 스트림에 선행 제출).
-    /// clippy allow — launch와 동일 판정(불투명 핸들).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn graph_upload(&self, e: ffi::CUgraphExec) -> Result<(), String> {
-        // SAFETY: e는 graph_instantiate가 돌려준 유효 실행 핸들.
         unsafe {
             let r = (self.drv.graph_upload)(e, self.stream);
             if r != CUDA_SUCCESS {
@@ -81,11 +64,8 @@ impl CudaCtx {
         Ok(())
     }
 
-    /// 그래프·실행 핸들 해제.
-    /// clippy allow — launch와 동일 판정(불투명 핸들).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn graph_destroy(&self, e: ffi::CUgraphExec, g: ffi::CUgraph) -> Result<(), String> {
-        // SAFETY: 두 핸들 모두 본 모듈이 발급한 유효 핸들(중복 해제 금지 계약).
         unsafe {
             if !e.is_null() {
                 let r = (self.drv.graph_exec_destroy)(e);

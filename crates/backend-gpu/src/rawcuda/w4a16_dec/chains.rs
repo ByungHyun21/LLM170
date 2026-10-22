@@ -1,8 +1,6 @@
 use super::*;
 
 impl W4a16Dec {
-    /// 1토큰 forward(호스트 스테이징) — 최종 노름 입력(head 입력)을 반환.
-    /// KV·GDN 상태를 슬롯 위치만큼 전진시킨다.
     pub fn forward(&mut self, slot: usize, embed_row: &[f32]) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
         if embed_row.len() != self.hidden || slot >= self.n_slots {
@@ -15,14 +13,12 @@ impl W4a16Dec {
                 "{CTX_OVERFLOW}: slot{slot} pos={pos} >= kvcap={cap}"
             ));
         }
-        // [K6-3] KV 온디맨드 확보(슬랙 2행) — t=1 진입 공통.
         self.kv_ensure(slot, pos as usize + 3)?;
         if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("forward: 디코더 상수 미등록".into());
         }
         let dres = self.cc.alloc(self.hidden * 4)?;
         let result = (|| {
-            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             let row = unsafe {
                 std::slice::from_raw_parts(embed_row.as_ptr() as *const u8, self.hidden * 4)
             };
@@ -44,8 +40,6 @@ impl W4a16Dec {
         dres: CUdeviceptr,
     ) -> Result<Vec<f32>, String> {
         let mut ab = vec![0.0f32; self.hidden];
-        // [k2 (b) 2026-10-17] 층 창 — 기본 전체창(0..n_layers)이라 순회·값 불변.
-        // gi(GDN 상태 인덱스)는 절대 순서 세기라 창 시작만큼 건너뛴다.
         let interval = self.attn.attn.map(|a| a.interval).unwrap_or(4);
         let win = self.window;
         let mut gi = win.gdn_start(interval);
@@ -132,8 +126,6 @@ impl W4a16Dec {
                 );
             }
         }
-        // [k2 (b)] 최종 노름(2*n_layers 행)은 마지막 층 소유 창만 — 비최종
-        // 창은 잔차 ab를 핸드오프(다음 샤드 입력)로 반환. 전체창 무변.
         let xn = if win.owns_final(self.n_layers) {
             self.norm_resid_staged(2 * self.n_layers, dres, &ab)
                 .map_err(|e| format!("final norm: {e}"))?
@@ -145,11 +137,6 @@ impl W4a16Dec {
         Ok(xn)
     }
 
-    /// 슬롯 상태 0화(GDN 링/스캔 + pp + pos + 행 스케일).
-    /// [검수 통합 2026-10-14] 행 스케일(sc)도 부팅 상태(1.0)로 재초기화 — 종전엔
-    /// 잔류해 같은 요청의 f16 반올림이 슬롯 이력에 따라 달라졌다(실측: 35B 4K
-    /// 골든 근접동률 198↔271이 직전 시나리오 유무로 플립). 상태 0이므로 스케일
-    /// 값 자체는 무해하지만, 반올림 기준이 달라지는 계약 갭이었다.
     pub fn reset_state(&mut self, slot: usize) -> Result<(), String> {
         let _g = self.cc.guard()?;
         if slot >= self.n_slots {
@@ -159,7 +146,7 @@ impl W4a16Dec {
         self.attn_set_pos(slot, 0)?;
         if let Some(dims) = self.gdn.gdn {
             let ring_bytes = dims.n_gdn * 3 * dims.conv_ch() * 4;
-            let st_bytes = dims.n_gdn * dims.h_v * 128 * 128 * 2; // f16 행-스케일
+            let st_bytes = dims.n_gdn * dims.h_v * 128 * 128 * 2;
             let sc_n = dims.n_gdn * dims.h_v * 128;
             let ring_off = (slot * dims.n_gdn * 3 * dims.conv_ch()) as u64 * 4;
             let (st_slot, sc_slot) = super::gdn::gdn_state_offsets(&dims, slot);
@@ -167,20 +154,13 @@ impl W4a16Dec {
             let sc_off = sc_slot as u64 * 4;
             Self::zero_dev(&self.cc, self.gdn.dring + ring_off, ring_bytes)?;
             Self::zero_dev(&self.cc, self.gdn.dgst + st_off, st_bytes)?;
-            // [P1 2026-10-16] 스케일 초기화 = d2d(스트림 비동기) — 종전 동기
-            // 페이지어블 h2d(sc_n×4B, 35B 884KB)가 파이프라인을 정지시켰다
-            // (reset은 타 슬롯 디코드 진행 중 호출 — ITL 드레인). 원본
-            // dsc_ones는 set_gdn이 1회 적재.
             self.cc
                 .d2d(self.gdn.dsc + sc_off, self.gdn.dsc_ones, sc_n * 4)?;
         }
         Ok(())
     }
 
-    // ── 디바이스 체인(S10 — 왕복 제거) ──
 
-    /// 1토큰 forward(디바이스 체인) — 왕복은 임베딩 업로드 1회 + 최종 xn
-    /// 판독 1회뿐. 산술은 스테이징 경로와 같은 커널·같은 순서(층 4주기).
     pub(super) fn chain_device(
         &mut self,
         slot: usize,
@@ -197,48 +177,31 @@ impl W4a16Dec {
                 "{CTX_OVERFLOW}: slot{slot} pos={pos} >= kvcap={cap}"
             ));
         }
-        // [K6-3] KV 온디맨드 확보(슬랙 2행) — t=1 진입 공통.
         self.kv_ensure(slot, pos as usize + 3)?;
         if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("forward_device: 디코더 상수 미등록".into());
         }
         self.ensure_chain_bufs()?;
         let row = if self.graph.capture_pinned_src {
-            // 캡처 중: pageable async 복사는 캡처 불가 — pinned 버퍼를 소스로
-            // 기록하고 replay가 실행 직전에 내용을 채운다.
-            // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
             unsafe {
                 std::slice::from_raw_parts(self.graph.pin_embed as *const u8, self.hidden * 4)
             }
         } else {
-            // SAFETY: 로컬 슬라이스의 유효 수명 내 바이트 뷰(길이 = 원소수×4).
             unsafe { std::slice::from_raw_parts(embed_row.as_ptr() as *const u8, self.hidden * 4) }
         };
         self.cc.h2d_async(self.dres, row)?;
         self.chain_device_body(slot)
     }
 
-    /// [K-STEP §3.4 ① 2026-10-12] 체인 본체 — dres에 이미 조립된 임베딩 행을
-    /// 소비하는 순수 부분(chain_device에서 h2d만 분리). K-스텝 그래프가
-    /// w4a16_embed_gather로 dres를 채운 뒤 이 본체를 캡처한다(입력 소스만
-    /// h2d → gather 교체, 커널열·순서 불변 → 토큰열 판정 동일 —
-    /// mtp_fwd_launch의 emb_h2d=false와 동형). 캡처 중 안전성 보장은
-    /// warm_for_capture(호출부 ensure_kstep_graph)이 기존 t=1 그래프와
-    /// 동일하게 담당한다.
     pub(super) fn chain_device_body(&mut self, slot: usize) -> Result<CUdeviceptr, String> {
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let mut ab = self.dab_dev;
-        // [k2 (b) 2026-10-17] 층 창 — 기본 전체창이라 순회·값 불변. gi는 창
-        // 시작 직전 GDN 층 개수만큼 건너뛴 절대 인덱스(전체창 = 0).
         let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
         let win = self.window;
         let mut gi = win.gdn_start(interval);
-        // 플레인 모드(MoE 모델) — GEMV는 bf16(head_bf16), x는 원시 f32
-        // (h2f 왕복 없음 — CPU 플레인 matmul 계약과 동일). FFN은 MoE.
         let plain = self.plain_weights;
         for off in 0..win.n() {
             let il = win.abs(off);
-            // 노름이 x32를 융합 기록(cast_x32 노드 제거) — q/k/v(또는 qkv/z) 공유.
             let x32 = if plain {
                 0
             } else {
@@ -248,14 +211,8 @@ impl W4a16Dec {
                 .norm_resid_dev(2 * il, self.dres, ab, 1, x32)
                 .map_err(|e| format!("L{il} input norm: {e}"))?;
             let branch = if (il + 1).is_multiple_of(interval) {
-                // [S2 2026-10-11] q/k/v 단독 3런치 → 다중세그먼트 1런치(테이블은
-                // ensure_chain_bufs 1회 작성 — 값 비트동일).
                 let xin = if plain { xn } else { x32 };
-                // [split-k marlin 2026-10-17] t=1 branch — 재패킹 상주 그룹은
-                // sk 런치(x f16 미러 — norm이 융합 기록). 미구성 = 기존 multi
-                // GEMV 폴백. 누산 재결합 허용 오차 클래스(±3% 이중게이트).
                 if !plain && self.sk_multi_dev(il, 0, self.dx16.ptr)? {
-                    // sk 발사 완료(ksp>1이면 2단 reduce 동반).
                 } else {
                     self.gemv_multi_dev(plain, il, 0, xin)
                         .map_err(|e| format!("L{il} qkv: {e}"))?;
@@ -264,7 +221,6 @@ impl W4a16Dec {
                     .map_err(|e| format!("L{il} attn: {e}"))?
             } else {
                 let xin = if plain { xn } else { x32 };
-                // [S2] qkv/z 2런치 → 1런치. [split-k marlin] branch 동일 폴백.
                 if !plain && self.sk_multi_dev(il, 0, self.dx16.ptr)? {
                 } else {
                     self.gemv_multi_dev(plain, il, 0, xin)
@@ -286,12 +242,9 @@ impl W4a16Dec {
                     .map_err(|e| format!("L{il} {lo}: {e}"))?
             } else {
                 let (_, _, n, ko) = self.lin_spec(&lo)?;
-                // [4.1 2026-10-11] branch 생산자(merge/gate)가 x32/미러 동시
-                // 기록 — cast_x32 노드 제거(값 비트동일).
                 if self.dx32.cap < ko || self.dx16.cap < ko {
                     return Err(format!("L{il} branch 융합: dx32/dx16 부족 {ko}"));
                 }
-                // [split-k marlin] t=1 단일 세그먼트 — 재패킹 상주면 sk 런치.
                 let dy = self.ensure_dy(n)?;
                 if self.sk_single_dev(&lo, self.dx16.ptr, dy)? {
                     dy
@@ -300,32 +253,25 @@ impl W4a16Dec {
                         .map_err(|e| format!("L{il} {lo}: {e}"))?
                 }
             };
-            // [P10] cast_x32(ko) 재할당 대비 — 현재 dx32 재확인(위 주석 참조).
             let x32 = self.ensure_dx32(self.hidden)?;
             let xn2 = self
                 .norm_resid_dev(2 * il + 1, self.dres, out, 1, x32)
                 .map_err(|e| format!("L{il} post norm: {e}"))?;
             if plain {
-                // MoE FFN(35B-A3B) — 잔차 ab = MoE 출력(dmo).
                 ab = self
                     .moe_ffn_dev(il, xn2)
                     .map_err(|e| format!("L{il} moe: {e}"))?;
             } else {
-                let x32n = x32; // 노름 융합 기록
+                let x32n = x32;
                 let _ = xn2;
-                // [S2 2026-10-11] gate/up 2런치 → 다중세그먼트 1런치.
-                // [split-k marlin] t=1 gate/up — 재패킹 상주 그룹은 sk 런치.
                 if !self.sk_multi_dev(il, 1, self.dx16.ptr)? {
                     self.gemv_multi_dev(false, il, 1, x32n)
                         .map_err(|e| format!("L{il} gateup: {e}"))?;
                 }
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
-                // [4.1 2026-10-11] ew가 x32/미러 동시 기록 — cast 노드 제거.
                 self.ew_dev_fused(s0, s1, s2, kd)
                     .map_err(|e| format!("L{il} ew: {e}"))?;
-                // down은 s3 직접 쓰기 — dy 경유 d2d 제거. [split-k marlin]
-                // 재패킹 상주면 sk(k=17408 등 긴 k에 k분할로 SM 포화).
                 if !self.sk_single_dev(&dn, self.dx16.ptr, s3)? {
                     self.gemv_launch(&dn, self.dx32.ptr, s3)
                         .map_err(|e| format!("L{il} down: {e}"))?;
@@ -357,34 +303,20 @@ impl W4a16Dec {
                 );
             }
         }
-        // [k2 (b) 2026-10-17] 최종 노름은 마지막 층 소유 창만 — 비최종 창은
-        // 잔차 ab를 핸드오프 포인터로 반환(다음 샤드 입력). 전체창 무변.
         let xn_final = if win.owns_final(self.n_layers) {
             self.norm_resid_dev(2 * self.n_layers, self.dres, ab, 1, 0)
                 .map_err(|e| format!("final norm: {e}"))?
         } else {
-            // [k2 (c) 1단 2026-10-17] 경계 잔차 = dres + ab — 노름 커널의
-            // v = x + ab와 같은 f32 가산 1회(axpy w=1.0). 다음 샤드 첫 노름이
-            // x + 0(dab_dev 영)으로 합쳐져 전체창과 비트동일 경로가 된다.
             self.axpy_dev(1.0, ab, self.dres, self.hidden)?;
             self.dres
         };
         Ok(xn_final)
     }
 
-    /// [A9 2026-10-10] 배치 디코드 단일 체인 — 슬롯별 1토큰(t=n_active)을
-    /// 한 번에 통과한다. 가중 커널(GEMM·MoE·head)은 t행 배치로 상각하고,
-    /// 상태 커널(attn KV/pos·GDN 링/트리오)은 토큰별 슬롯 자원을 쓴다.
-    /// 반환: 슬롯 순서의 다음 토큰(argmax, greedy 전용).
-    /// 전제(호출부 가드): t∈2..=BATCH_DEC_MAX · 전 슬롯 greedy ·
-    /// MoE면 상주 모드 · head/argmax 등록. 그래프 밖(직접 발사) 경로.
-    /// [A9] 배치 체인 1회 발사 — 행/pos는 핀드(pin_batch_in/pos)에서 읽어
-    /// h2d 노드로 기록된다(캡처 가능). sync·slot_pos 갱신은 호출부 소관.
     pub(super) fn batch_launch(&mut self, slots: &[usize], t: usize) -> Result<(), String> {
         if self.norm_w_rows < 2 * self.n_layers + 1 || self.gdn.gdn.is_none() {
             return Err("batch_launch: 디코더 상수 미등록".into());
         }
-        // [K6-3] 슬롯별 KV 온디맨드 확보(슬랙 2행) — 배치 체인 진입 공통.
         for &sl in slots {
             let p = self.slot_pos.get(sl).copied().unwrap_or(0) as usize;
             self.kv_ensure(sl, p + t + 2)?;
@@ -396,7 +328,6 @@ impl W4a16Dec {
         self.ensure_batch_bufs()?;
         let dyt = self.ensure_dyt(t)?;
         {
-            // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
             let rb = unsafe {
                 std::slice::from_raw_parts(
                     self.graph.pin_batch_in as *const u8,
@@ -404,14 +335,10 @@ impl W4a16Dec {
                 )
             };
             self.cc.h2d_async(self.dres, rb)?;
-            // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
             let pb = unsafe {
                 std::slice::from_raw_parts(self.graph.pin_batch_pos as *const u8, self.n_slots * 4)
             };
             self.cc.h2d_async(self.attn.dpp, pb)?;
-            // [배치 행 퓨전 2026-10-14] 행별 메타 5종 상향(캡처 시 노드로 기록 —
-            // replay마다 핀드 내용을 복사). 호출부(forward_device_argmax_batch)가
-            // 핀드를 슬롯에서 기입한다.
             for (pin, dev) in [
                 (self.graph.pin_row_blk, self.drow_blk),
                 (self.graph.pin_row_pp, self.drow_pp),
@@ -419,7 +346,6 @@ impl W4a16Dec {
                 (self.graph.pin_row_st, self.drow_st),
                 (self.graph.pin_row_sc, self.drow_sc),
             ] {
-                // SAFETY: 핀드 5종 = pinned_alloc(tmax*8) — t ≤ tmax(호출 전제).
                 let b = unsafe { std::slice::from_raw_parts(pin as *const u8, t * 8) };
                 self.cc.h2d_async(dev, b)?;
             }
@@ -427,9 +353,6 @@ impl W4a16Dec {
         let [s0, s1, s1b, s2, s3] = self.dchain;
         let h = self.hidden;
         let mut ab = self.dab_dev;
-        // [k2 (b) 2026-10-17] 층 창 — 기본 전체창이라 순회·값 불변. 배치 체인은
-        // head/argmax까지 묶여 있어 마지막 층 소유 창만 허용(비최종 샤드의
-        // 배치 경로는 코디네이터 단계 소관).
         let interval = self.attn.attn.ok_or("attn: 형상 미등록")?.interval;
         let win = self.window;
         if !win.owns_final(self.n_layers) {
@@ -447,8 +370,6 @@ impl W4a16Dec {
                 .norm_resid_dev(2 * il, self.dres, ab, t, xh)
                 .map_err(|e| format!("B{il} input norm: {e}"))?;
             let branch = if (il + 1).is_multiple_of(interval) {
-                // [S2 2026-10-11] q/k/v 3런치 → 다중세그먼트 1런치(테이블 공용
-                // — t=1 판과 동일 메타, grid만 Σceil(n/TR)).
                 let xin = if plain { xn } else { xh };
                 self.gemv_multi_t_dev(plain, il, 0, xin, t)
                     .map_err(|e| format!("B{il} qkv: {e}"))?;
@@ -456,7 +377,6 @@ impl W4a16Dec {
                     .map_err(|e| format!("B{il} attn: {e}"))?
             } else {
                 let xin = if plain { xn } else { xh };
-                // [S2] qkv/z 2런치 → 1런치.
                 self.gemv_multi_t_dev(plain, il, 0, xin, t)
                     .map_err(|e| format!("B{il} qkvz: {e}"))?;
                 let g = self
@@ -474,7 +394,6 @@ impl W4a16Dec {
                 self.lin_forward(plain, LinPath::GemvT, &lo, branch, dyt, t)?;
             } else {
                 let (_, _, _, ko) = self.lin_spec(&lo)?;
-                // [4.1 2026-10-11] branch 생산자 융합 — cast_x32 노드 제거.
                 if self.dx32.cap < t * ko || self.dx16.cap < t * ko {
                     return Err(format!("B{il} branch 융합: dx32/dx16 부족 {}", t * ko));
                 }
@@ -491,18 +410,15 @@ impl W4a16Dec {
             } else {
                 let xh3 = xh;
                 let _ = xn2;
-                // [S2 2026-10-11] gate/up 2런치 → 다중세그먼트 1런치.
                 self.gemv_multi_t_dev(false, il, 1, xh3, t)
                     .map_err(|e| format!("B{il} gateup: {e}"))?;
                 let dn = format!("blk.{il}.ffn_down.weight");
                 let (_, _, _, kd) = self.lin_spec(&dn)?;
-                // [4.1 2026-10-11] ew 융합 — cast_x32 노드 제거.
                 self.ew_dev_fused(s0, s1, s2, t * kd)?;
                 self.lin_forward(false, LinPath::GemvT, &dn, self.dx32.ptr, s3, t)?;
                 ab = s3;
             }
         }
-        // 전 행 최종 노름 → 배치 head(가중 판독 상각) → 배치 argmax → 1회 d2h.
         let xn_all = self
             .norm_resid_dev(2 * self.n_layers, self.dres, ab, t, 0)
             .map_err(|e| format!("B final norm: {e}"))?;
@@ -519,16 +435,13 @@ impl W4a16Dec {
                 &mut crate::rawcuda::args::l4(&mut p_l, &mut p_n, &mut p_t, &mut p_a),
             )?;
         }
-        // SAFETY: self 소유 pinned 스크래치의 단독 가변 접근(수명=self).
         let tb =
             unsafe { std::slice::from_raw_parts_mut(self.graph.pin_batch_tok as *mut u8, t * 4) };
         self.cc.d2h_async(tb.as_mut_ptr(), self.dbatch_am, t * 4)?;
         Ok(())
     }
 
-    /// [A9] 핀드 토큰 판독(sync 후).
     pub(super) fn batch_read_tokens(&self, t: usize) -> Vec<u32> {
-        // SAFETY: self.pin_*는 pinned_alloc 소유 호스트 스크래치(수명=self).
         let tb =
             unsafe { std::slice::from_raw_parts(self.graph.pin_batch_tok as *const u8, t * 4) };
         (0..t)
@@ -536,10 +449,6 @@ impl W4a16Dec {
             .collect()
     }
 
-    /// [S11 2026-10-11] 배치 로짓 판독 — dbatch_lg[t][head_n] d2h(핀드).
-    /// 배치 head(gemv_bf16_t)의 행별 산술은 t=1 판과 동일(비트동일 계약 —
-    /// 행별 64레인 tree)이므로 호스트 샘플러가 보는 값·순서가 직렬 경로와
-    /// 같다 → 샘플링 토큰열 불변. 호출 전 배치 체인 sync 완료가 계약.
     pub fn batch_read_logits(&mut self, t: usize) -> Result<Vec<f32>, String> {
         let _g = self.cc.guard()?;
         if t == 0 || t > BATCH_DEC_MAX || self.dbatch_lg == 0 {
@@ -547,11 +456,9 @@ impl W4a16Dec {
         }
         self.ensure_batch_bufs()?;
         let bytes = t * self.head_n * 4;
-        // pin_batch_lg는 pinned_alloc 소유 스크래치(수명=self) — d2h가 전량 재기록.
         self.cc
             .d2h_async(self.graph.pin_batch_lg as *mut u8, self.dbatch_lg, bytes)?;
         self.cc.sync()?;
-        // SAFETY: 방금 d2h로 채운 pinned 버퍼의 바이트 뷰(bytes = 원소수×4).
         let pb = unsafe { std::slice::from_raw_parts(self.graph.pin_batch_lg as *const u8, bytes) };
         Ok(pb
             .as_chunks::<4>()

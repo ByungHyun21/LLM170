@@ -1,21 +1,11 @@
-//! watchdog — 진행 스텔 감시.
-//!
-//! `LLM170_WATCHDOG=<sec>`: 백엔드 디스패치마다 `bump()`가 진동한다. 별도 스레드가 `<sec>` 이상 무진동이면 op 링의 마지막 태그와
-//! 최근 기록을 덤프한다. `LLM170_WATCHDOG_FAIL=1`이면 SIGKILL 로 자결 —
-//! 벤치 스크립트가 무한 대기하지 않게 한다.
-//!
-//! op 링은 `record_op(tag)` 로 채운다(길이 32, Mutex — 디스패치 경로이나
-//! 와치독이 켜졌을 때만 기록해 상시 비용을 없앤다).
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-/// 진행 심박 — 커널/스텝 진행 지점에서 `bump()`로 증가, 와치독이 감시.
 static HEARTBEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 심박 1회 — 디스패치/스텝 진행 지점에서 호출한다.
 pub fn bump() {
     HEARTBEAT.fetch_add(1, Ordering::Relaxed);
 }
@@ -34,13 +24,10 @@ pub fn on() -> bool {
     ON.load(Ordering::Relaxed)
 }
 
-/// 스텔 보고 횟수 — QA-22: watchdog-selftest가 보고 여부를
-/// 판정 가능하게 하는 관측값(미기동 감지).
 pub fn reports() -> u64 {
     REPORTS.load(Ordering::Relaxed)
 }
 
-/// 디스패치 1건 기록(와치독 활성 시에만 링에 적립).
 pub fn record_op(tag: &'static str) {
     if !on() {
         return;
@@ -56,7 +43,6 @@ pub fn record_op(tag: &'static str) {
     }
 }
 
-/// 와치독 스폰 — env 파싱은 호출부(main). `sec` 클램프 [1, 3600].
 pub fn spawn(sec: u64, fail: bool) {
     ON.store(true, Ordering::Relaxed);
     let period = Duration::from_secs(sec.clamp(1, 3600));
@@ -97,7 +83,6 @@ pub fn spawn(sec: u64, fail: bool) {
                     eprintln!("[watchdog] FAIL 모드 — 프로세스 강제 종료");
                     std::process::exit(137);
                 }
-                // 비 FAIL: 재보고 주기 리셋(스팸 방지) — 스텔 지속 시 1회/period.
                 since = Instant::now();
             }
         }

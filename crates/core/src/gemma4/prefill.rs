@@ -1,12 +1,8 @@
-//! gemma4 프리필 — 임베딩 행 조립(병렬) + 1024 청크 forward.
 
 use super::*;
 
 impl Engine {
-    /// 시퀀스 prefill: 전체 토큰 적립 + 마지막 위치 logits.
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
-        // 임베딩 행 병렬 디코드(√h 베이크 포함) — Model(RefCell) 비경유:
-        // 원시 테이블 뷰 + 스케일만 캡처한다(스레드 안전).
         let (buf, cols) = self.model.embed_table()?;
         let scale = self.model.embed_scale();
         let mut rows: Vec<Vec<f32>> = tokens.iter().map(|_| Vec::new()).collect();
@@ -25,7 +21,6 @@ impl Engine {
                 });
             }
         });
-        // 1024토큰 청크 — 청킹은 수치 불변(캐시 순차 적립).
         let chunk: usize = 1024;
         let mut last = None;
         for (ch_t, ch_r) in tokens.chunks(chunk).zip(rows.chunks(chunk)) {
@@ -36,8 +31,6 @@ impl Engine {
         Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]))
     }
 
-    /// 체크포인트 저장 — 전 시퀀스 (pos + 전층 KV f32). 벡터 순서:
-    /// kv_k[0..L) 뒤 kv_v[0..L). 코덱 계약 = `crate::ckpt` 문서.
     pub fn ckpt_save(&self) -> Result<Vec<u8>, ModelError> {
         let no = || ModelError::W4a16("ckpt: 빈 엔진".into());
         let s0 = self.seqs.first().ok_or_else(no)?;
@@ -57,7 +50,6 @@ impl Engine {
         Ok(crate::ckpt::encode(crate::ckpt::ARCH_GEMMA, ctx, seqs))
     }
 
-    /// 체크포인트 복원 — 매직·아치·시퀀스 수·벡터 수·길이 전부 대조(불일치 거부).
     pub fn ckpt_load(&mut self, blob: &[u8]) -> Result<(), ModelError> {
         let bad = |m: String| ModelError::W4a16(format!("ckpt: {m}"));
         let (arch, _ctx, seqs) = crate::ckpt::decode(blob).map_err(bad)?;

@@ -6,7 +6,6 @@ rust-version = "1.99"
 
 [features]
 default = []
-# profiler span 게이트 — backend-gpu(core)의 profile feature와 동일 이름.
 profile = []
 
 [dependencies]

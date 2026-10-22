@@ -1,9 +1,3 @@
-//! GPU 서빙 엔진 — W4A16 CUDA 디바이스 체인 + GPU head.
-//!
-//! W3-3 착륙 후 성능 캠페인(2026-10-08): 활성은 디바이스 상주(왕복은
-//! 토큰당 임베딩 업로드 + 로짓 판독뿐), head는 head_bf16 커널(bf16
-//! →f32 시프트 + k 직렬 f32 내적 — CPU 참조와 동일 순서).
-//! 판정 기준은 토큰열(골든)이다.
 
 use llm170_backend_gpu::W4a16Dec;
 use std::path::Path;
@@ -27,27 +21,14 @@ pub(crate) use self::upload_g4::{G4HostCfg, upload_model_g4};
 pub struct QwenEngine {
     model: llm170_core::qwen35::Model,
     dec: W4a16Dec,
-    #[allow(dead_code)] // reset_states(진단/복구) 전용
+    #[allow(dead_code)]
     n_slots: usize,
-    /// GPU head 상주 여부(bf16 output.weight 업로드 성공).
     head_gpu: bool,
-    /// [gemma4 P2 2026-10-14] 최종 로짓 softcap(0=미적용) — 장치 argmax는
-    /// 단조 불변이라 커널 무접촉, **호스트로 나오는 로짓**(샘플링·PPL/eval·
-    /// 검증)에만 적용한다. 값은 config.json 파생(모델별).
     softcap: f32,
-    /// [MTP 2026-10-12] 모델 자체 MTP 초안기 활성(27B dense v1).
     mtp: bool,
-    /// [tuning-sweep W1/W2 2026-10-16] bench --sweep 노브 — serve/infer는 항상
-    /// Default(프로덕션 단일 값 불변). 전부 None = 상수 경로와 동일.
     pub tuning: Tuning,
 }
 
-/// [tuning-sweep W1/W2 2026-10-16] bench --sweep 조작 노브(플랜 tuning-sweep §2).
-/// - A계층(인자화): ngram n/m — sched/spec.rs 초안 경로(bench 직접 경로엔 미기여, serve 측정은 2차 스윕)
-/// - B계층(재구성): chunk_t(프리필 청크 — prefill_tmax 클램프 경유)·LRU(cap·frac)
-/// - GEMV_TR 등 .cu 미러 상수는 런타임 노브 금지(커널 레이아웃 미러 — 2차 재빌드 스윕 소관)
-///
-/// 무결성 = W0 해시 실드: 노브 값이 달라도 측정 스트림 해시는 불변이어야 한다.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Tuning {
     pub ngram_n: Option<usize>,
@@ -56,16 +37,8 @@ pub struct Tuning {
     pub lru_cap: Option<usize>,
     pub lru_frac: Option<u64>,
 }
-/// [R16] 프리필 청크 tmax 정책 — 순수 함수(테스트 표면).
-/// 규칙: MoE 스트리밍은 캐시 스테이징 기반 t≤8 청크(종전 t=1 폴백 — 512토큰
-/// ~9.3s), 그 외는 `LLM170_PREFILL_T`(진단 오버라이드) 또는 기본 512
-/// (가중치 상각), 1..=512.
 pub fn prefill_tmax(is_moe: bool, resident: bool, env: Option<&str>) -> usize {
     if is_moe && !resident {
-        // [P6 2026-10-15] 8 유지 — t>8 실험: ①union 가드 실효(distinct 71 >
-        // 캐시 70 — 구조 상한 8·top_k ≤ k) ②캐시 확대(k=96)+t=12는 그룹 경로
-        // illegal access로 파킹. env(≤12)는 허용 — moe_stage_t 가드가 상한을
-        // 지킨다(실패는 즉시·명시).
         return env
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(8)
@@ -80,7 +53,6 @@ pub fn prefill_tmax(is_moe: bool, resident: bool, env: Option<&str>) -> usize {
 mod tests {
     use super::prefill_tmax;
 
-    /// [R16] 프리필 tmax 정책 — 스트리밍 MoE 폴백·env 오버라이드·상한.
     #[test]
     fn prefill_tmax_policy() {
         assert_eq!(
@@ -119,19 +91,13 @@ mod tests {
     }
 }
 
-// ──────────────────── [gemma4 P3 2026-10-14] 서빙 아치 디스패치 ────────────────────
-// qwen(QwenEngine)·gemma4(GemmaEngine)를 단일 타입으로 — P2-3 v0 체인 그대로
-// (호스트 스테이징·f32 활성 클래스·g4 커널군·g32 GEMV·int8 KV/head).
 
-/// 서빙 엔진 — 아치 디스패치 단일 타입(호출부는 이 타입만 쓴다).
 pub enum GpuEngine {
     Qwen(Box<QwenEngine>),
     Gemma(Box<GemmaEngine>),
-    /// [PP 3차 2026-10-17] 2카드 직렬 파이프라인(--cards 2 전용).
     Pp(Box<PpEngine>),
 }
 
-/// 위임 매크로 — &mut self 메서드.
 macro_rules! engine_delegate_mut {
     ($($name:ident($($a:ident: $t:ty),*) -> $r:ty;)*) => {
         impl GpuEngine {
@@ -148,7 +114,6 @@ macro_rules! engine_delegate_mut {
     };
 }
 
-/// 위임 매크로 — &self 메서드.
 macro_rules! engine_delegate_ref {
     ($($name:ident($($a:ident: $t:ty),*) -> $r:ty;)*) => {
         impl GpuEngine {
@@ -227,7 +192,6 @@ engine_delegate_ref! {
 }
 
 impl GpuEngine {
-    /// 아치 스니핑 후 해당 엔진 로드 — 서빙 진입 단일 경로.
     pub fn load(
         dir: &Path,
         n_slots: usize,
@@ -259,7 +223,6 @@ impl GpuEngine {
 }
 
 impl GpuEngine {
-    /// [PP 3차 2026-10-17] 2카드 로드 — qwen(dense 27B) 전용. cards=2 진입.
     pub fn load_pp(
         dir: &Path,
         n_slots: usize,

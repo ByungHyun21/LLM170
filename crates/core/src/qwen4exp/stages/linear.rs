@@ -1,28 +1,9 @@
-//! linear(GDN류)층 스테이지 — Qwen3-Next GatedDeltaNet 미러.
-//!
-//! 텐서 계약(FN 실측, 2560 hidden): in_proj_qkv [10240,2560](q 2048|k 2048|v
-//! 6144 — qwen35와 동일 레이아웃) · in_proj_a/b [48,2560] · in_proj_z
-//! [6144,2560] · conv1d [10240,1,4] · A_log/dt_bias [48] · norm [128]
-//! · out_proj [2560,6144]. 코어 = `crate::gdn::gdn_chunk_seq`(h_k=16·h_v=48
-//! ·d=128 — qwen35와 동일 형상 계약).
-//!
-//! 프로브 계약: 상태 0에서 1청크 forward(conv 히스토리 좌측 0패딩).
-//! q/k 정규화 = l2_norm(가중치 없음 — Qwen3-Next 계약). [D0 2026-10-20]
-//! 출력게이트 = sigmoid(config output_gate_type — FN 실측; 논문 Eq.11
-//! o=W_o[σ(W_zx)⊙RMSNorm(y)], vLLM RMSNormGated activation 인자).
-//! norm[128] = **평범 RMSNorm 가중치(+1 금지)** — vLLM RMSNormGated는
-//! plain `x_normed*weight`(layernorm.py forward_static)이고 체크포인트
-//! 실측 평균 ≈0.97(zero-centered 원시 w가 아님) → `f32_vec` 그대로
-//! (q/k_norm·hc_norm 등 Gemma 노름만 `Model::norm_vec` +1).
-//! [D2 2026-10-20] `forward_state` — conv 히스토리(k−1토큰 in_proj_qkv
-//! 출력)·GDN 상태를 전달하는 상태ful 경로(오라클 디코드).
 
 use super::super::engine::Model;
 use crate::gdn::gdn_chunk_seq;
 use crate::gdn_norm::{GdnGate, gdn_norm_gated};
 use crate::ops::{l2_norm, sigmoid, silu, softplus};
 
-/// 상태 0 프로브 — 상태ful `forward_state`의 1청크 래퍼.
 pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
     let qkv_n = m
         .ent(&format!(
@@ -35,8 +16,6 @@ pub fn forward(m: &Model, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, S
     forward_state(m, il, xs, &mut hist, &mut st, qkv_n)
 }
 
-/// [D2] 상태ful GDN forward — `conv_hist` = 직전 토큰 in_proj_qkv 출력
-/// (최대 k−1개·vLLM conv 상태 계약), `st` = GDN 상태[h_v·d·d](입출).
 pub fn forward_state(
     m: &Model,
     il: usize,
@@ -52,7 +31,6 @@ pub fn forward_state(
     let d = cfg.linear_head_dim;
     let v_len = h_v * d;
 
-    // 형상·dtype 체크 — qkv 폭은 호출부 전달값과 대조.
     let eq = m.ent(&format!("{l}.in_proj_qkv.weight"))?;
     if *eq.shape.first().ok_or("in_proj_qkv shape 부재")? as usize != qkv_n {
         return Err("in_proj_qkv 폭 불일치".into());
@@ -70,7 +48,7 @@ pub fn forward_state(
         .last()
         .copied()
         .unwrap_or(0) as usize;
-    let conv_w = m.f32_vec(&format!("{l}.conv1d.weight"))?; // [ch][1][k] 행 우선
+    let conv_w = m.f32_vec(&format!("{l}.conv1d.weight"))?;
     let dt_bias = m.f32_vec(&format!("{l}.dt_bias"))?;
     let a_log = m.f32_vec(&format!("{l}.A_log"))?;
     let norm_w = m.f32_vec(&format!("{l}.norm.weight"))?;
@@ -88,7 +66,6 @@ pub fn forward_state(
         ));
     }
 
-    // 투영 — qkv·z·a·b 동일 입력.
     let qkv: Vec<Vec<f32>> = (0..n_tok)
         .map(|t| m.matvec_bf16(&format!("{l}.in_proj_qkv.weight"), &xs[t]))
         .collect::<Result<_, _>>()?;
@@ -102,7 +79,6 @@ pub fn forward_state(
         .map(|t| m.matvec_bf16(&format!("{l}.in_proj_b.weight"), &xs[t]))
         .collect::<Result<_, _>>()?;
 
-    // 게이트 파라미터 — g = softplus(a + dt_bias)·(−exp(A_log)) (qwen35 계약).
     let mut beta_all = vec![0.0f32; n_tok * h_v];
     let mut g_all = vec![0.0f32; n_tok * h_v];
     for t in 0..n_tok {
@@ -112,7 +88,6 @@ pub fn forward_state(
         }
     }
 
-    // causal conv1d(청크 앞은 conv_hist — 부족분/미초기화 0) + silu → q|k|v.
     let mut q_all = vec![0.0f32; n_tok * k_len];
     let mut k_all = vec![0.0f32; n_tok * k_len];
     let mut v_all = vec![0.0f32; n_tok * v_len];
@@ -143,14 +118,12 @@ pub fn forward_state(
             }
         }
     }
-    // conv 히스토리 갱신 — 최근 k−1개의 원시 qkv.
     for row in qkv {
         conv_hist.push(row);
         if conv_hist.len() > conv_k - 1 {
             conv_hist.remove(0);
         }
     }
-    // q/k per-head l2_norm.
     for row in 0..n_tok {
         for h in 0..h_k {
             let b0 = row * k_len + h * d;
@@ -161,7 +134,6 @@ pub fn forward_state(
         }
     }
 
-    // [gdn-check] 코어 입력 지문(행0) — beta/g 전원소 + 스캔 후 o.
     if llm170_diag::dump::opts().key("debug_layers") {
         let f2 = |v: &[f32]| -> String {
             v.iter()
@@ -175,14 +147,6 @@ pub fn forward_state(
             f2(&g_all[..h_v]),
         );
     }
-    // [v헤드 페어링 2026-10-21] FN 체크포인트 v축은 group-major(엔진 순서와
-    // 역방향) — HF v헤드 h의 k헤드 = h/G(G=h_v/h_k). 근거: FLA GVA 커널
-    // (`chunk_fwd.py` `i_h // (HV // H)`·`fused_recurrent.py` `i_h = i_hv //
-    // (HV // H)`)·qwen35 로더 계약("HF 원본 group-major — subhead-major
-    // 순열 사본 필수"). gdn_chunk_seq/gdn_ar_batch 코어는 subhead-major
-    // 페어링(h%h_k)이므로 v·beta·g를 엔진 순서로 순열해 호출하고 출력 o를
-    // 역순열한다(상태 st[h_v][d·d]는 엔진 순서로 영구 유지 — 청크·디코드
-    // 전 경로 동일 순열이라 연속성 보존). h_v==h_k이면 항등순열.
     let g_gva = h_v / h_k;
     let hf_of = |e: usize| g_gva * (e % h_k) + e / h_k;
     let (mut v_sub, mut beta_sub, mut g_sub, mut o_sub) = (
@@ -200,7 +164,6 @@ pub fn forward_state(
                 .copy_from_slice(&v_all[t * v_len + h * d..t * v_len + (h + 1) * d]);
         }
     }
-    // GDN 코어 — 상태 입출(청크 경계 연속).
     let mut o_all = vec![0.0f32; n_tok * v_len];
     gdn_chunk_seq(
         &q_all, &k_all, &v_sub, &beta_sub, &g_sub, st, &mut o_sub, n_tok, h_k, h_v,
@@ -213,7 +176,6 @@ pub fn forward_state(
         }
     }
 
-    // norm_gated: rms_norm(o, norm[128])·게이트(config — FN=sigmoid) → out_proj.
     let gate = if cfg.output_gate_sigmoid {
         GdnGate::Sigmoid
     } else {

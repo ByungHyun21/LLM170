@@ -1,23 +1,3 @@
-// ── [⑥ 2026-10-18] MoE 프리필 grp 커널의 **A=f16 단일패스** 변형 ──
-// 원본: gptq4.cu `w4a16_gemm_g32_mma_grp2`(게이트/업 2N 융합) ·
-//       moe.cu `w4a16_gemm_g32_mma_grp_d64`(down N64) — A = (hi|lo) u32
-//       2-pass(mma 2회: A_hi·B + A_lo·B, k스텝당 A 로드 8 + hilo 분해 8ALU).
-//
-// 배경(ncu 실측 2026-10-18, 35B pp512·180W):
-//   grp2 5.37ms/층 — 스톨 지배 = wait(고정지연 의존) 33.6% + math_pipe 9.6%,
-//   mma 파이프 유휴·SM 48.6%·reg 79(점유 3블록/SM). A 2패스가 k스텝당
-//   mma·프래그먼트 ALU를 배증하는 구조라 지배 스톨에 정면으로 겹친다.
-//
-// 본 변형: A = f16(RNE) 단일 — cast_hilo의 hi 성분과 비트동일(lo 항 제거).
-//   k스텝당 mma 8→4회·A 프래그먼트 (로드 8+hilo ALU 8) → 로드 4.
-//   A 스테이징 바이트도 절반(2B/원소). B(가중치)는 원판 그대로 f16 단일.
-//
-// 수치 클래스: f16-A는 과거 실측(2026-10-15) en PPL +0.17%·agree 98.6%
-// 밴드 — 채택 판정은 eval 골든/게이트(2026-10-18 개정·노이즈 클래스 조항).
-//
-// gptq4.cu/moe.cu는 바이트 동결(코드젠 드로우 보존) 유지 — 본 파일이 대체
-// 경로이며 채택 확정 시 원판 정리(삭제+드로우 채택)를 별도로 한다.
-// [빌드 계약] -fmad=false — gptq4/moe와 동일 산식 계약.
 
 #include <cuda_fp16.h>
 
@@ -26,20 +6,13 @@
 
 #define GRP_M 64
 #define GRP_N 32
-#define GRP_KC 64 // [⑥-h 2026-10-18] 32→64 — 배리어 절반·스테이징 2iter/스레드(LDG 상각)
+#define GRP_KC 64
 #define DGRP_M 64
 #define DGRP_N 64
-#define DGRP_KC 64 // [⑥-h] 32→64 (동일 근거)
-#define BMMA_N 64 // [⑥-g] moe.cu 로컬 define 미러(플레인 bf16 mma N타일)
-// [⑥-c2 2026-10-18] m-타일 z분할 수 — 슬롯 분포 편중(97+ 슬롯 전문가 존재,
-// 실측 moe-cnt)으로 단일 블록이 mtiles를 직렬 처리하면 테일이 지배:
-// grid.x = 전문가×PP_MZ, 블록 = (e = x/PP_MZ, mz = x%PP_MZ), m타일 = mz부터
-// PP_MZ 스트라이드. 산술 불변 = 비트동일. 호스트 MOE_PP_MZ와 동일 계약.
+#define DGRP_KC 64
+#define BMMA_N 64
 #define PP_MZ 4
 
-// [⑥-e 2026-10-18] ldmatrix — fragment smem 재판독(8× 중복)을 1명령으로.
-// A는 x4(비전치), B는 x2(비전치 — mma.col B 프래그먼트와 분배 일치. .trans는
-// 전치돼 계통 오류 — moe.cu 실측 이력).
 __device__ __forceinline__ void ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2,
                                        unsigned& r3, const void* p) {
     const unsigned a = (unsigned)__cvta_generic_to_shared(p);
@@ -55,20 +28,11 @@ __device__ __forceinline__ void ldm_x2(unsigned& r0, unsigned& r1, const void* p
                  : "r"(a));
 }
 
-// [⑥-f 2026-10-18] 디큐트 전용 초경량 f32→f16 — `cvt.rn.f16.f32` 단일 명령.
-// (g4_common의 f2h는 호스트 전수 대조용 서브노멀 정규화 루프 + 분기 —
-// SASS 실측 원소당 ~20명령·BSSY/BSYNC 2쌍. 본 입력 = (nib−8)·sc — 정확한
-// ≤15비트 곱(sc는 f16 값의 f32 정확 표현)이라 HW cvt RNE = 소프트 f2h RNE와
-// 동일 결과(서브노멀 출력 포함) — 비트동일은 벤치 해시로 검증.)
 __device__ __forceinline__ unsigned short deq_hi_v(unsigned qw, int j, float sc) {
     const int nib = (int)((qw >> (4 * j)) & 0xFu) - 8;
     return __half_as_ushort(__float2half_rn((float)nib * sc));
 }
 
-// [⑥] f32 → f16(RNE) 미러 — 단일패스 A 소스(hilo_pack의 hi 성분과 비트동일).
-// [⑥-i 2026-10-18] f2h(소프트) → __float2half_rn(HW cvt 1명령) — 캐스트도
-// ⑥-f와 동일 클래스(원소당 ~20명령→1). 유한 입력에서 RNE 동일(비트동일 —
-// 벤치 해시 검증; NaN 페이로드만 상이 — 활성값 비해당).
 extern "C" __global__ void w4a16_cast_f16(const float* __restrict__ in,
                                           unsigned short* __restrict__ out, int n) {
     const int i4 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -86,12 +50,6 @@ extern "C" __global__ void w4a16_cast_f16(const float* __restrict__ in,
     }
 }
 
-// [⑥-g 2026-10-18] 플레인 bf16 mma — cp.async 이중버퍼 변형(moe.cu bmma_body 대체).
-// ncu(원판): 1웨이브·Mem 78.8%·long_sb 29%·barrier 26.6%·MIO 11% — 청크당 동기
-// 스테이징(LDG→STS)이 LSU/지연을 노출. cp.async는 레지스터 경유 없이 global→smem
-// 직행 + wait_group 파이프라인으로 배리어를 결과 대기로 대체. KC=32라 2단 버퍼
-// smem 15.4KB — 점유(8블록) 불변. 값·k 순서·mma 불변 = 비트동일(해시 검증).
-// xbf=1(프로덕션): bf16 미러 순수 복사 / xbf=0(프로브 게이트): f32→bf16 변환.
 __device__ __forceinline__ unsigned short f2bf16_v(float v) {
     const unsigned u = __float_as_uint(v);
     return (unsigned short)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
@@ -247,22 +205,7 @@ extern "C" __global__ void w4a16_gemm_bf16_mma2_16(
     bmma_body2<16>(w, x, out, n, k, t, xbf);
 }
 
-// ── [B5 2026-10-20] 플레인 bf16 mma3 — M64×N128 타일·KC64 ──
-// 35B 프리필 잔여 최대 축: 현행 mma2(M32×N64·KC32)는 ncu 실측 Mem 62%·
-// Compute 50%·점유 40% — ldmatrix/스테이징 대비 mma 비율(6:4)이 낮아
-// LSU 파이프가 지배. g128 채택 원장(102dd618 계열 — KC64 채택·N256/M128
-// 기각·M64+N128 국소최적)의 타일 구성을 bf16으로 이식:
-//   - 워프 2m×4n(각 m32×n32) — ldm:mma = 6:8(0.75, mma2의 1.5 절반)
-//   - KC 32→64 — 배리어·commit/wait_group 왕복 ÷2(k=2048에서 64→32회)
-//   - FLOP/스테이징바이트 21→43 — B(가중치) smem 트래픽 절감
-// 스케줄: A 64×(KC+8)·B 128×(KC+8) half ×2버퍼 = 55.3KB(2블록/SM).
-// 산술·k 순서·mma 명령은 mma2와 동일(같은 k 승순 f32 누산) = **비트동일**
-// (패딩 행/열은 0 기여 — 쓰기 가드로 미기록). 도메인: t≥64·n≥2048·k%64=0
-// (in_proj_qkv/q 8192·in_proj_z 4096·out/o 2048 — 호스트 게이트 미만은
-// 기존 mma2/16 경로 불변).
 #define BMMA3_KC 64
-// 55.3KB — 정적 한계(48KB) 초과로 동적 smem(호스트 set_dynamic_smem 사전
-// opt-in — marlin/G5 scan 계약. xs [2][64][72] → ws [2][128][72] half 순).
 extern __shared__ __align__(16) unsigned short b3sm[];
 #define B3_XS(st, r, c) (b3sm + ((st) * 64 + (r)) * (BMMA3_KC + 8) + (c))
 #define B3_WS(st, r, c) \
@@ -278,14 +221,13 @@ extern __shared__ __align__(16) unsigned short b3sm[];
     const int warp = tid >> 5;
     const int g = lane >> 2;
     const int tt = lane & 3;
-    const int mt = (warp >> 2) * 32; // 2 m워프 × 32 = M64
-    const int ntw = (warp & 3) * 32; // 4 n워프 × 32 = N128
-    float c[2][4][4];                // 2 m프래그먼트 × 4 n프래그먼트
+    const int mt = (warp >> 2) * 32;
+    const int ntw = (warp & 3) * 32;
+    float c[2][4][4];
 #pragma unroll
     for (int i = 0; i < 32; ++i) {
         ((float*)c)[i] = 0.0f;
     }
-    // A는 bf16 미러(호스트 cast_bf16 선행 — mma2 xbf=1 프로덕션 계약 동일).
     auto stage = [&](int st, int k0) {
         for (int e = tid; e < 64 * BMMA3_KC / 8; e += 256) {
             const int r = e / (BMMA3_KC / 8);
@@ -382,14 +324,6 @@ extern __shared__ __align__(16) unsigned short b3sm[];
 #undef B3_WS
 }
 
-// grp2 f16-A — 게이트·업 2N 융합(N64 = 게이트 32 + 업 32), M=전문가 슬롯 수.
-// [⑥-d 2026-10-18] __launch_bounds__(256,4) — 점유 3→4블록(reg 70→≤64, 이슈율
-// 2.4/4·wait 32% 스톨을 워프 수로 메움; xs 스트라이드 반감으로 smem 20.5KB).
-// [⑥-a 실측 기각 — 2026-10-18: 쌍 디큐트] `deq_hi_v`(원소당 ~7명령)를 쌍
-// 처리(BFE·2×I2F·2×FMUL·cvt.rn.f16x2.f32·u32 store)로: 비트동일·35B pp −0.3%
-// = 중립. **SASS 대조: grp2_f16 768→1112(+45%)** — ptxas가 원판을 이미 쌍
-// packing(수작업 = 코드젠 역전 — ⑥-d '수작업 half2 +명령'의 SASS 재확인).
-// +45% 명령에도 시간 중립 = 스테이징 ALU 비지배. 잔여 = 레이아웃급 재설계뿐.
 template <bool SC_F16>
 __device__ void grp2_f16_impl(
     const unsigned long long* __restrict__ tab, int base,
@@ -417,13 +351,10 @@ __device__ void grp2_f16_impl(
     const int warp = tid >> 5;
     const int g = lane >> 2;
     const int tt = lane & 3;
-    const int mt = (warp >> 1) * 16; // 4 m워프 × 16 = M64
-    const int ntw = (warp & 1) * 32; // 2 n워프 × 32 = N64(게이트 32+업 32)
+    const int mt = (warp >> 1) * 16;
+    const int ntw = (warp & 1) * 32;
     const int k8 = k >> 3;
-    const int kg = k >> 5; // g32
-    // A f16 — 행 스트라이드 40half(80B): 원소 32 + 뱅크패딩 8. 워드 인덱스
-    // (r*20 + j/2) → 레인 뱅크 20g+tt = 전역 무충돌(160B 스트라이드의 2-way
-    // 충돌 제거) + smem 반감([⑥-d 2026-10-18]).
+    const int kg = k >> 5;
     __shared__ __align__(16) unsigned short xs[2][GRP_M][GRP_KC + 8];
     __shared__ unsigned short ws[2][2 * GRP_N][GRP_KC + 8];
     const unsigned mtiles = (cnt + GRP_M - 1) / GRP_M;
@@ -477,8 +408,6 @@ __device__ void grp2_f16_impl(
                 const float scf = SC_F16
                     ? __half2float(__ushort_as_half(scb))
                     : __uint_as_float((unsigned)scb << 16);
-                // 스트리밍 힌트 — B는 블록별 1회 판독(재사용 없음),
-                // L2를 A 재사용에 남긴다.
                 const unsigned qw = live ? __ldcs(&q[(size_t)rr * k8 + (gi >> 3)]) : 0u;
                 if (live) {
 #pragma unroll
@@ -507,8 +436,6 @@ __device__ void grp2_f16_impl(
 #pragma unroll
             for (int ks = 0; ks < GRP_KC / 16; ++ks) {
                 const int kb = ks * 16;
-                // [⑥-e] ldmatrix: A x4(레인 0-15 = 행 mt+0..15·열 kb, 16-31 = +8열),
-                // B x2(레인 0-7 = n행·열 kb, 8-15 = +8열) — 프래그먼트 값 동일(비트동일).
                 const int lrow = (lane & 15);
                 const int lcol = (lane & 16) ? 8 : 0;
                 unsigned a0, a1, a2, a3;
@@ -551,7 +478,6 @@ __device__ void grp2_f16_impl(
     }
 }
 
-// grp_d64 f16-A — down 단일 투영 N64.
 template <bool SC_F16>
 __device__ void grp_d64_f16_impl(
     const unsigned long long* __restrict__ tab, int base,
@@ -576,11 +502,10 @@ __device__ void grp_d64_f16_impl(
     const int warp = tid >> 5;
     const int g = lane >> 2;
     const int tt = lane & 3;
-    const int mt = (warp >> 1) * 16; // 4 m워프 × 16 = M64
-    const int ntw = (warp & 1) * 32; // 2 n워프 × 32 = N64
+    const int mt = (warp >> 1) * 16;
+    const int ntw = (warp & 1) * 32;
     const int k8 = k >> 3;
-    const int kg = k >> 5; // g32
-    // A f16 — 행 스트라이드 40half(80B): 원소 32 + 뱅크패딩 8(무충돌 — ⑥-d).
+    const int kg = k >> 5;
     __shared__ __align__(16) unsigned short xs[2][DGRP_M][DGRP_KC + 8];
     __shared__ unsigned short ws[2][DGRP_N][DGRP_KC + 8];
     const unsigned mtiles = (cnt + DGRP_M - 1) / DGRP_M;
@@ -660,7 +585,6 @@ __device__ void grp_d64_f16_impl(
 #pragma unroll
             for (int ks = 0; ks < DGRP_KC / 16; ++ks) {
                 const int kb = ks * 16;
-                // [⑥-e] ldmatrix (grp2_f16와 동일 계약 — 비트동일).
                 const int lrow = (lane & 15);
                 const int lcol = (lane & 16) ? 8 : 0;
                 unsigned a0, a1, a2, a3;
@@ -701,7 +625,6 @@ __device__ void grp_d64_f16_impl(
     }
 }
 
-// [FN 2026-10-21] 스케일 f16판 심볼 — CT weight_scale F16(g32) 대응.
 extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemm_g32_mma_grp2_f16(
     const unsigned long long* __restrict__ tab, int base,
     const unsigned* __restrict__ gslot, const unsigned* __restrict__ gcnt,

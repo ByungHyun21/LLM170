@@ -1,13 +1,4 @@
-//! 기본 연산: norms, 활성화, RoPE — llama.cpp ggml-cpu 시맨틱스 대응.
-//!
-//! - rms_norm: f64 누적, scale = 1/sqrt(mean(x²)+eps), 감마는 (w+1) 보정 저장값 그대로 곱.
-//! - l2_norm: scale = 1/max(sqrt(Σx²), eps) (ops.cpp — eps 는 floor).
-//! - rope: 인접 페어 (2i, 2i+1), θ_p = base^(−p/n_pairs). IMROPE의 텍스트 전용 퇴화형
-//!   (모든 위치 성분이 동일하면 표준 RoPE와 동일 — ggml mrope_cache_init 참조).
 
-/// 제곱합 표준 순서 (2026-09-02, P0): 32세그먼트 병렬 친화적 구조 —
-/// 각 세그먼트 f64 순차 누산 후 세그먼트 합을 순차 결합.
-/// GPU rms_rows_part/finish 커널과 동일 순서 → 병렬화해도 비트 일치.
 pub fn sq_sum(x: &[f32]) -> f64 {
     const SEG: usize = 32;
     let n = x.len();
@@ -19,8 +10,6 @@ pub fn sq_sum(x: &[f32]) -> f64 {
             break;
         }
         let hi = (lo + chunk).min(n);
-        // f32 세그먼트 누산 (GPU f64 1/16 레이트 병목 동일 적용) —
-        // 세그먼트 결합만 f64 (GPU rms_part/finish와 쌍).
         let mut part = 0.0f32;
         for &v in &x[lo..hi] {
             part += v * v;
@@ -31,7 +20,6 @@ pub fn sq_sum(x: &[f32]) -> f64 {
 }
 
 pub fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
-    // H(2026-10-09): 종전 zip은 짧은 쪽에서 조용히 절단 — 계약 위반은 즉시.
     assert_eq!(x.len(), w.len(), "rms_norm: x/w 길이 불일치");
     let sum = sq_sum(x);
     let scale = 1.0 / ((sum / x.len() as f64 + eps as f64).sqrt() as f32);
@@ -39,7 +27,6 @@ pub fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 }
 
 pub fn l2_norm(x: &[f32], eps: f32) -> Vec<f32> {
-    // 순차 f32 (GPU l2_rows2_scale와 쌍 — 32세그먼트 아님)
     let mut sum = 0.0f32;
     for &v in x {
         sum += v * v;
@@ -48,9 +35,6 @@ pub fn l2_norm(x: &[f32], eps: f32) -> Vec<f32> {
     x.iter().map(|&v| v * scale).collect()
 }
 
-/// f64 fma 호너 올림-정확 exp — HIP 커널 exp_cr과 동일 연산열 (비트 동일).
-/// glibc expf는 ½ulp 오차(2026-09-03 실측 244/4096 불일치) — W4A8
-/// 비트계약상 양 플랫폼이 같은 알고리즘을 쓴다.
 pub fn exp_cr(x: f32) -> f32 {
     let xd = x as f64;
     if xd > 88.72 {
@@ -61,7 +45,6 @@ pub fn exp_cr(x: f32) -> f32 {
     }
     const LN2_HI: f64 = 6.931_471_803_691_238e-1;
     const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
-    // log2(e) — std 상수와 비트 동일(참조 미러 값 보존).
     const INV_LN2: f64 = std::f64::consts::LOG2_E;
     let kd = (xd * INV_LN2).round_ties_even();
     let k = kd as i64;
@@ -88,8 +71,6 @@ pub fn exp_cr(x: f32) -> f32 {
     (p * scale) as f32
 }
 
-/// f64 자연로그 — atanh 급수 fma 호너. HIP 커널 ln_cr과 동일 연산열.
-/// 정규수 v ≥ 1 전용 (softplus log1p 경로 — y+1 ≥ 1).
 pub fn ln_cr(v: f64) -> f64 {
     let bits = v.to_bits();
     let e = ((bits >> 52) & 0x7ff) as i64;
@@ -97,7 +78,6 @@ pub fn ln_cr(v: f64) -> f64 {
     let m = f64::from_bits((bits & !(0x7ffu64 << 52)) | (1023u64 << 52));
     let t = (m - 1.0) / (m + 1.0);
     let t2 = t * t;
-    // atanh 급수: ln(m) = 2t(1 + t²/3 + t⁴/5 + …) — s^25/25 절단
     let mut q = 1.0f64 / 25.0;
     q = q.mul_add(t2, 1.0 / 23.0);
     q = q.mul_add(t2, 1.0 / 21.0);
@@ -111,7 +91,6 @@ pub fn ln_cr(v: f64) -> f64 {
     q = q.mul_add(t2, 1.0 / 5.0);
     q = q.mul_add(t2, 1.0 / 3.0);
     q = q.mul_add(t2, 1.0);
-    // ln(v) = ln(m) + k·ln2 — 2단 ln2 (LN2_HI + LN2_LO) fma 합
     let lnm = 2.0 * t * q;
     const LN2_HI: f64 = 6.931_471_803_691_238e-1;
     const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
@@ -141,23 +120,10 @@ pub fn softplus(x: f32) -> f32 {
     if x > 20.0 { x } else { log1p_cr(exp_cr(x)) }
 }
 
-/// 헤드 벡터의 첫 n_rot 차원에 RoPE 적용 (나머지 통과).
-/// qwen35 = IMROPE → **NEOX 페어링**: 페어 p = (p, p + n_rot/2),
-/// θ_p = base^(−2p/n_rot). 텍스트 전용에서는 모든 위치 성분이 같아 표준 NEOX와 동일.
-/// (ggml.h: GGML_ROPE_TYPE_IMROPE 40 — "still NEOX ordering")
-/// RoPE 단일 헤드 — f64 중간연산: f32×f32 곱·차는 f64에서 전부 정확(
-/// FMA 수축 무영향), 최종 1회 f32 반올림. GPU ew::qk_norm_rope와 동일
-/// 연산열 (2026-09-02 브리지 제거 — P1 수축 RCA의 해법).
 pub fn rope_head(head: &mut [f32], pos: u32, n_rot: usize, base: f32) {
     rope_head_dim(head, pos, n_rot, n_rot, base);
 }
 
-/// HF RoPE 일반형(rotate_half·emb=cat(freqs,freqs)) — 부분 회전 + head_dim 분모.
-/// θ_p = base^(−2p/head_dim) (p = 0..n_rot/2), 페어 = (p, p + head_dim/2).
-/// n_rot == head_dim이면 연속 전차원 회전(rope_head와 동일 수식 — Gemma4
-/// 슬라이딩층). n_rot < head_dim이면 **비연속 두 블록**(앞 n_rot/2 + 뒤 n_rot/2)
-/// — Gemma4 풀층(512차원 중 128만 회전 — HF proportional RoPE의 0-패딩
-/// cat(f,f)와 동치).
 pub fn rope_head_dim(head: &mut [f32], pos: u32, n_rot: usize, head_dim: usize, base: f32) {
     let half = head_dim / 2;
     let pairs = n_rot / 2;
@@ -172,30 +138,24 @@ pub fn rope_head_dim(head: &mut [f32], pos: u32, n_rot: usize, head_dim: usize, 
     }
 }
 
-/// 가중 없는 RMS 정규화 — Gemma4 v_norm·router.norm(감마 없음). sq_sum 공유.
 pub fn rms_norm_plain(x: &[f32], eps: f32) -> Vec<f32> {
     let sum = sq_sum(x);
     let scale = 1.0 / ((sum / x.len() as f64 + eps as f64).sqrt() as f32);
     x.iter().map(|&v| v * scale).collect()
 }
 
-/// gelu tanh 근사 — HF `gelu_pytorch_tanh`(0.5x(1+tanh(√(2/π)(x+0.044715x³)))).
 #[inline]
 pub fn gelu_tanh(x: f32) -> f32 {
-    const C: f32 = 0.797_884_6; // √(2/π)
+    const C: f32 = 0.797_884_6;
     let x3 = x * x * x;
     0.5 * x * (1.0 + (C * (x + 0.044_715 * x3)).tanh())
 }
 
-/// 최종 로짓 softcap — HF `final_logit_softcapping`(c>0: c·tanh(x/c), 그 외 항등).
-/// **argmax 단조 불변**(그리디 토큰 무영향) — PPL·샘플링·검증 로짓에만 의미.
-/// (gemma4 c=30 — CPU 오라클·GPU 호스트 로짓 경로가 같은 식을 쓴다.)
 #[inline]
 pub fn logit_softcap(x: f32, c: f32) -> f32 {
     if c > 0.0 { c * (x / c).tanh() } else { x }
 }
 
-/// f32 → BF16 라운드(RNE) → f32 — 임베딩 √h 베이크(CPU·GPU 동일 바이트 계약).
 pub fn bf16_rne(v: f32) -> f32 {
     let bits = v.to_bits();
     let lsb = (bits >> 16) & 1;
@@ -207,7 +167,6 @@ pub fn bf16_rne(v: f32) -> f32 {
 mod tests {
     use super::*;
 
-    /// H(2026-10-09): zip 조용 절단 금지 — 길이 불일치는 즉시 패닉.
     #[test]
     #[should_panic(expected = "길이 불일치")]
     fn rms_norm_length_mismatch_panics() {
@@ -216,23 +175,19 @@ mod tests {
 
     #[test]
     fn rms_norm_unit_scale() {
-        // w=1, x=1 → rms_norm = 1/sqrt(1+eps) 근사.
         let y = rms_norm(&[1.0f32; 4], &[1.0f32; 4], 0.0);
         for v in y {
             assert!((v - 1.0).abs() < 1e-5, "{v}");
         }
     }
 
-    /// 로짓 softcap — 항등(c=0)·고정값·단조·포화(HF final_logit_softcapping).
     #[test]
     fn logit_softcap_identity_monotone_saturates() {
         assert_eq!(logit_softcap(3.5, 0.0), 3.5, "c=0 항등");
         assert_eq!(logit_softcap(0.0, 30.0), 0.0);
         let y = logit_softcap(30.0, 30.0);
         assert!((y - 30.0 * 1.0f32.tanh()).abs() < 1e-6, "{y}");
-        // 단조(그리디 argmax 불변 근거).
         assert!(logit_softcap(-10.0, 30.0) < logit_softcap(10.0, 30.0));
-        // 큰 x는 ±30으로 포화(f32에서 tanh→1.0 = 정확히 30 반올림).
         let big = logit_softcap(1000.0, 30.0);
         assert!(big > 29.9 && big <= 30.0, "{big}");
     }

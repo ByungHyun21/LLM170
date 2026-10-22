@@ -1,10 +1,3 @@
-//! fp — 스테이지 지문(fingerprint) 기록·비교.
-//!
-//! 각 스테이지의 출력 버퍼를 FNV-1a 64 해시 + max-abs + 첫 비순수로 요약해
-//! 파일에 기록한다. 두 실행의 파일을 `diag diff`로 비교해 최초 발산
-//! 스테이지를 자동 특정한다.
-//!
-//! 게이트: `LLM170_FP_FILE=경로` — 미설정 시 제로 코스트(원자 1회).
 
 use std::io::Write;
 use std::sync::Mutex;
@@ -18,7 +11,6 @@ fn writer() -> &'static Mutex<Option<std::fs::File>> {
     W.get_or_init(|| Mutex::new(None))
 }
 
-/// 초기화 — `LLM170_FP_FILE` 경로로 출력 파일을 열고 게이트 on.
 pub fn init_from_env() {
     let path = match std::env::var("LLM170_FP_FILE") {
         Ok(p) if !p.is_empty() => p,
@@ -41,7 +33,6 @@ pub fn enabled() -> bool {
     ON.load(Ordering::Relaxed)
 }
 
-/// 스테이지 지문 기록 — FNV-1a 64 + max-abs + 첫 비순수 인덱스.
 pub fn fp_record(stage: &str, data: &[f32]) {
     if !enabled() {
         return;
@@ -67,7 +58,6 @@ pub fn fp_record(stage: &str, data: &[f32]) {
             "{stage}\t{hash:016x}\t{max_abs:.6e}\t{}",
             first_nonfinite.map_or(-1, |i| i as i64)
         );
-        // NaN guard: 첫 비순수 발견 시 경고 (LLM170_FP_NAN=1이면 exit).
         if let Some(idx) = first_nonfinite {
             eprintln!("diag::fp: NaN/Inf at stage '{stage}' index {idx}");
             if std::env::var_os("LLM170_FP_NAN").is_some() {
@@ -77,8 +67,6 @@ pub fn fp_record(stage: &str, data: &[f32]) {
     }
 }
 
-/// 두 지문 파일 비교 — 최초 불일치 스테이지 반환.
-/// 반환: (최초 불일치 스테이지, 전체 불일치 목록, 상세).
 pub fn fp_diff(path_a: &str, path_b: &str) -> Result<DiffReport, String> {
     let parse = |p: &str| -> Result<Vec<(String, u64, f64, i64)>, String> {
         let text = std::fs::read_to_string(p).map_err(|e| format!("읽기 실패 {p}: {e}"))?;
@@ -127,7 +115,6 @@ pub fn fp_diff(path_a: &str, path_b: &str) -> Result<DiffReport, String> {
     })
 }
 
-/// 지문 비교 보고서.
 pub struct DiffReport {
     pub first_mismatch: Option<(usize, String)>,
     pub total_stages: usize,

@@ -24,9 +24,6 @@ class MarlinScalarType<vllm::kFloat16.id()> {
   using scalar_t4 = half2;
   using scalar_32bit_t = half2;
 
-  // Matrix fragments for tensor core instructions; their precise layout is
-  // documented here:
-  // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
   using FragA = Vec<half2, 4>;
   using FragB = Vec<half2, 2>;
   using FragC = Vec<float, 4>;
@@ -144,6 +141,6 @@ class MarlinScalarType2<__nv_fp8_e4m3>
 template <>
 class MarlinScalarType2<int8_t> : public MarlinScalarType<vllm::kS8.id()> {};
 
-}  // namespace MARLIN_NAMESPACE_NAME
+}
 
 #endif

@@ -7,36 +7,25 @@ pub struct VramSampler {
     names: Vec<String>,
 }
 
-/// 장치 능력(정적) — 모니터링. CMP 170HX처럼 대역폭/연산 비대칭 카드 판독용.
 #[derive(Clone, Copy, Default)]
 pub struct DeviceCaps {
     pub sm_count: u32,
-    /// SM 최대 클럭(kHz).
     pub sm_clock_khz: u32,
-    /// 메모리 클럭(kHz — 실제 클럭, DDR 배수는 peak_bw에서).
     pub mem_clock_khz: u32,
     pub bus_width_bits: u32,
 }
 
 impl DeviceCaps {
-    /// 이론 피크 대역폭(bytes/s) — DDR: 2 × 메모리클럭 × 버스폭 / 8.
-    /// 검증: A100/HBM2e 1215MHz×5120bit → 1.55TB/s · 4090 GDDR6X
-    /// 10501MHz×384bit → 1008GB/s — 두 실스펙과 일치하는 공식.
     pub fn peak_bw_bytes(&self) -> u64 {
         2 * self.mem_clock_khz as u64 * 1000 * self.bus_width_bits as u64 / 8
     }
 }
 
-// SAFETY: 컨텍스트 핸들은 Send가 아니지만, 이 샘플러는 **단일 스레드**
-// (모니터링 샘플러 스레드)가 소유·사용한다 — retain한 컨텍스트는 프로세스
-// 수명 유지되고, sample()은 current 전환 후 mem_get_info만 한다.
 unsafe impl Send for VramSampler {}
 
 impl VramSampler {
-    /// 전체 CUDA 장치 열거 + primary context retain. 실패 장치는 건너뛴다.
     pub fn new() -> Option<Self> {
         let drv = ffi::Driver::get().ok()?;
-        // SAFETY: 프로브 경로 — 장치 열거·컨텍스트 유지(프로세스 수명).
         unsafe {
             if (drv.init)(0) != CUDA_SUCCESS {
                 return None;
@@ -57,7 +46,6 @@ impl VramSampler {
                 if (drv.device_primary_ctx_retain)(&mut ctx, dev) != CUDA_SUCCESS {
                     continue;
                 }
-                // 장치 능력(정적) — 실패 속성은 0 유지.
                 let attr = |a: std::os::raw::c_int| -> u32 {
                     let mut v: std::os::raw::c_int = 0;
                     if (drv.device_get_attribute)(&mut v, a, dev) == CUDA_SUCCESS {
@@ -104,20 +92,16 @@ impl VramSampler {
         self.ctxs.len()
     }
 
-    /// 장치 능력(정적) — 대역폭 피크·SM.
     pub fn caps(&self) -> &[DeviceCaps] {
         &self.caps
     }
 
-    /// 장치 이름.
     pub fn names(&self) -> &[String] {
         &self.names
     }
 
-    /// 장치별 (free, total) — 실패 장치는 None(게시 측이 0 유지).
     pub fn sample(&self) -> Vec<Option<(u64, u64)>> {
         let mut out = Vec::with_capacity(self.ctxs.len());
-        // SAFETY: retain한 컨텍스트로 current 전환 후 mem_get_info.
         unsafe {
             for &ctx in &self.ctxs {
                 if (self.drv.ctx_set_current)(ctx) != CUDA_SUCCESS {
@@ -136,13 +120,8 @@ impl VramSampler {
     }
 }
 
-/// cuInit → 디바이스 프라이머리 컨텍스트 유지 → cuMemGetInfo_v2.
-/// 모듈 로드 없음(가드는 모델 적재 전 단계). 실패 시 None(호출부가 B17 정책
-/// 으로 거부 — Option 계약). [k2 (a) 2026-10-16] 디바이스 명시 — 다중 카드에서
-/// 엔진 소유 디바이스의 여유를 읽는다(cuda_mem_free = 디바이스 0 종전 프록시).
 pub fn cuda_mem_free_dev(ordinal: i32) -> Option<(u64, u64)> {
     let drv = ffi::Driver::get().ok()?;
-    // SAFETY: 출력은 스택 로컬 — 프로브 경로, 컨텍스트 유지는 프로세스 수명.
     unsafe {
         if (drv.init)(0) != CUDA_SUCCESS {
             return None;
@@ -166,7 +145,6 @@ pub fn cuda_mem_free_dev(ordinal: i32) -> Option<(u64, u64)> {
     }
 }
 
-/// 종전 동작 = 디바이스 0(엔진 밖 사전 프로브 — 플래너·배너·plan CLI).
 pub fn cuda_mem_free() -> Option<(u64, u64)> {
     cuda_mem_free_dev(0)
 }

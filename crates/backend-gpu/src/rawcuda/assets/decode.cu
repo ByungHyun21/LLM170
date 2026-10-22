@@ -1,52 +1,16 @@
-// [split-k marlin 디코드 2026-10-17] t=1 GEMV 대체 커널 — 신규 독립 .cu.
-// 분리 사유(코드젠 고정 — gemma4.cu 헤더와 동일 계약): 공유 fatbin(gptq4/moe)에
-// 커널을 추가하면 재컴파일이 타 커널 코드젠을 재추첨한다(실측 회귀 사례).
-// 본 파일은 독립 컴파일 — 기존 fatbin 바이트 불변.
-//
-// 설계: moe.cu `w4a16_gemm_g128_marlin_m16`(M16×N256·128스레드·cp.async 4단)의
-// 디큐트(LOP3 매직상수 — I2F 무경유)·k 순서·프래그먼트 분할을 그대로 계승하고,
-// **k축 분할**로 그리드를 (Σceil(n_s/256))×ksp로 확장한다 — t=1 디코드 형상
-// (n=5120..17408)에서 n/256 블록 수(20..68)가 70SM 미달해 기존 marlin이
-// 소형 n에서 패했던 원인(그리드 미포화)을 해소한다(예: n=5120 → 20블록×ksp4
-// = 80블록). 부분합 = **고정 소스 2단 감산**: 각 (n블록, k분할)이
-// part[gblk][ks][256] 고정 위치에 f32 부분합을 기록하고(atomic 무경유),
-// reduce 커널이 ks 오름차순 고정 순서로 합산 — 실행마다 동일 비트.
-// ksp=1이면 부분합 경유 없이 out 직접 기록(reduce 런치 생략).
-//
-// 누산 클래스: 커널 내 k 순서는 M64/M16 마린과 동일(각 k 부분구간에 대해
-// 행별 동일 시퀀스), 분할 경계의 f32 재결합만 추가 — 허용오차 클래스(±3%
-// 이중게이트, 판정은 메인 소관). 커널 자체는 완전 결정적.
-//
-// 계약: t=1 전용 · qm = core::marlin::marlin_repack_q 산출
-// ([k/16][n/64][128] u32) · s = 원본 [n][k/128] f16(marlin_permute_scales
-// 불요 — 커널이 원본 순서로 판독) · x = [k] f16(체인 dx16 미러) ·
-// k%128==0 · (k/128)%ksp==0 · part = [Σceil(n_s/256)][ksp][256] f32(호스트
-// 보장). t=1이므로 M16 타일의 행 1..15는 0패딩(TC 낭비이나 B 판독량·
-// 디큐트 시퀀스는 불변 — 메모리 바운드 t=1에서 무해).
-// 빌드 계약: -fmad=false(gptq4 계열 일관 — 소스 내 fmad 민감 연산 없음).
 #include <cuda_fp16.h>
 #include "g4_common.cuh"
 
-#define SK_KC 32     // k청크(스테이지 단위) — m16 마린과 동일
-// [⑬③ 실측 기각 원장 — 2026-10-18: sk_marlin 마이크로 노브 소진]
-// (1) lb(128,5): REG 128→96·스필 0(5블록) — 비트동일·**27B tg −2.1%**
-// (96레그 ILP 손실 — lb(128,4) 유지). (2) SK_STAGES 4→6: 아래 `stc = cid &
-// (SK_STAGES-1)` = **2^n 마스크 전제**(6=0b101 → 슬롯 충돌 — 해시 변화로 검출);
-// STAGES=8은 smem 43KB로 4→3블록 역행 → 깊이 폐쇄. 교훈: 링 마스크 = 2^n만.
-// (3) ncu: DRAM 41~45%·wait 31%·점유 25%(reg128·1.83웨이브) = 의존성 바운드 —
-// 잔여 = 구조 재편(w루프 인터리브·KC64 — 별도 세션·소액).
-#define SK_STAGES 4  // cp.async 파이프라인 단수
+#define SK_KC 32
+#define SK_STAGES 4
 
-// ── 이하 3개 헬퍼는 moe.cu 정의의 사본(독립 컴파일 — 값 계약 동일) ──
 
-// lop3 = (a & b) | c (lut 0xEA).
 __device__ __forceinline__ unsigned sk_and_or(unsigned a, unsigned b, unsigned c) {
     unsigned r;
     asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
     return r;
 }
 
-// u32 → (lo, hi) half2 2개: lo = (니블0−8, 니블4−8), hi = (니블1−8, 니블5−8).
 __device__ __forceinline__ void sk_deq(unsigned q, unsigned* lo, unsigned* hi) {
     const unsigned sub8 = 0x64086408u;
     const unsigned mul16 = 0x2c002c00u;
@@ -62,7 +26,6 @@ __device__ __forceinline__ void sk_deq(unsigned q, unsigned* lo, unsigned* hi) {
     *hi = *reinterpret_cast<const unsigned*>(&hb);
 }
 
-// f16x2 × {s,s} (hmul2) — s2 = (s|s<<16).
 __device__ __forceinline__ unsigned sk_scale(unsigned v, unsigned s2) {
     const __half2 a = *reinterpret_cast<const __half2*>(&v);
     const __half2 b = *reinterpret_cast<const __half2*>(&s2);
@@ -80,23 +43,20 @@ __device__ __forceinline__ void sk_mma(float* c, unsigned a0, unsigned a1,
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// 본체 — m16(moe.cu)의 k루프를 [gi_lo, gi_lo+gp) 부분구간으로 파라미터화.
-// n0 = 이 블록의 n기저(256폭) · gblk = 런치 전역 블록 인덱스(part 색인) ·
-// ks = k분할 인덱스(blockIdx.y) · ksp>1이면 part에, ksp==1이면 out 직접.
 __device__ __forceinline__ void sk_marlin_body(
     const unsigned* __restrict__ qm, const unsigned short* __restrict__ s,
     const unsigned short* __restrict__ x, float* __restrict__ out,
     float* __restrict__ part, int n, int k, int n0, int gblk, int ks,
     int ksp, int gi_lo, int gp)
 {
-    constexpr int A_STAGE = 16 * (SK_KC + 8);       // M16행(행0만 실값)
-    constexpr int B_STAGE = (SK_KC / 16) * 4 * 128; // N256 = n64 4개
+    constexpr int A_STAGE = 16 * (SK_KC + 8);
+    constexpr int B_STAGE = (SK_KC / 16) * 4 * 128;
     __shared__ __align__(16) unsigned short xs[SK_STAGES * A_STAGE];
     __shared__ __align__(16) unsigned wb[SK_STAGES * B_STAGE];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
-    const int wn = tid >> 5; // n64 블록 0..3
+    const int wn = tid >> 5;
     const int nt_n = n >> 6;
     const int kg = k >> 7;
     const int n16 = lane >> 2;
@@ -107,14 +67,14 @@ __device__ __forceinline__ void sk_marlin_body(
             const int r = tid >> 2;
             const int c8 = (tid & 3) * 8;
             unsigned short* const d = xs + st * A_STAGE + r * (SK_KC + 8) + c8;
-            if (r == 0) { // t=1 — 행0만 실로드, 나머지 0패딩(m16과 동일 값)
+            if (r == 0) {
                 cp_async16(d, x + k0 + c8);
             } else {
                 *reinterpret_cast<uint4*>(d) = make_uint4(0u, 0u, 0u, 0u);
             }
         }
         for (int e = tid; e < (SK_KC / 16) * 128; e += 128) {
-            const int tl = e >> 5; // kl*4 + ntl
+            const int tl = e >> 5;
             const int j = e & 31;
             const int ntg = (n0 >> 6) + (tl & 3);
             unsigned* const d = wb + st * B_STAGE + tl * 128 + j * 4;
@@ -122,7 +82,6 @@ __device__ __forceinline__ void sk_marlin_body(
                 cp_async16(
                     d, &qm[((size_t)((k0 >> 4) + (tl >> 2)) * nt_n + ntg) * 128 + j * 4]);
             } else {
-                // n 패딩 — 니블 8 = 영 기여(스케일 행도 클램프).
                 *reinterpret_cast<uint4*>(d) =
                     make_uint4(0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u);
             }
@@ -139,10 +98,9 @@ __device__ __forceinline__ void sk_marlin_body(
     stage(0, gi_lo << 7);
     asm volatile("cp.async.commit_group;");
 
-    const int nch = gp * (128 / SK_KC); // 이 블록의 총 청크 수
+    const int nch = gp * (128 / SK_KC);
     int cid = 0;
     for (int gi = gi_lo; gi < gi_lo + gp; ++gi) {
-        // 그룹 스케일 — 그룹 내 모든 청크가 동일(청크 ⊆ g128 그룹).
         {
             const int nb = n0 + wn * 64;
 #pragma unroll
@@ -197,9 +155,6 @@ __device__ __forceinline__ void sk_marlin_body(
         }
     }
 
-    // 에필로그(t=1) — m16n8k16 C 프래그먼트 행0(n16==0 레인만 유효).
-    // ksp>1: part[(gblk*ksp+ks)*256 + (col−n0)] 전량 기록(패딩 열 포함 —
-    // reduce가 col<n 가드). ksp==1: out 직접(m16 에필로그와 동일 순서).
 #pragma unroll
     for (int f = 0; f < 8; ++f) {
         if (n16 != 0) {
@@ -222,13 +177,10 @@ __device__ __forceinline__ void sk_marlin_body(
     }
 }
 
-// ── 다중세그먼트(t=1 branch·gate/up) — tab [count][5] = (qm, s, out, n, k) ──
-// grid = (Σceil(n_s/256), ksp) · 128스레드. blockIdx.x → 세그먼트 선형 탐색
-// (count ≤ 3 — 테이블 L1 상주). 값은 세그먼트 단독 sk1 런치와 동일(행 독립).
 extern "C" __global__ void __launch_bounds__(128, 4) w4a16_gemv_sk_marlin(
-    const unsigned long long* __restrict__ tab, // [count][5]: qm, s, out, n, k
-    const unsigned short* __restrict__ x,       // 공통 x [k] f16
-    float* __restrict__ part,                   // [Σceil(n_s/256)][ksp][256]
+    const unsigned long long* __restrict__ tab,
+    const unsigned short* __restrict__ x,
+    float* __restrict__ part,
     int count, int ksp)
 {
     const int blk = blockIdx.x;
@@ -252,10 +204,8 @@ extern "C" __global__ void __launch_bounds__(128, 4) w4a16_gemv_sk_marlin(
                    blockIdx.y, ksp, blockIdx.y * gp, gp);
 }
 
-// 2단 감산(테이블판) — grid = Σceil(n_s/256)블록 × 256스레드(열당 1).
-// ks 오름차순 고정 순서 합산 — 실행마다 동일 비트.
 extern "C" __global__ void w4a16_gemv_sk_reduce(
-    const unsigned long long* __restrict__ tab, // [count][5]
+    const unsigned long long* __restrict__ tab,
     const float* __restrict__ part, int count, int ksp)
 {
     const int gblk = blockIdx.x;
@@ -287,13 +237,12 @@ extern "C" __global__ void w4a16_gemv_sk_reduce(
     out[col] = v;
 }
 
-// ── 단일 세그먼트(t=1 attn_output·ssm_out·ffn_down) — 직접 인자 ──
 extern "C" __global__ void __launch_bounds__(128, 4) w4a16_gemv_sk1_marlin(
-    const unsigned* __restrict__ qm,      // [k/16][n/64][128] u32 (marlin B)
-    const unsigned short* __restrict__ s, // [n][k/128] f16
-    const unsigned short* __restrict__ x, // [k] f16
-    float* __restrict__ out,              // [n] f32(ksp==1 직접 기록)
-    float* __restrict__ part,             // [ceil(n/256)][ksp][256] f32
+    const unsigned* __restrict__ qm,
+    const unsigned short* __restrict__ s,
+    const unsigned short* __restrict__ x,
+    float* __restrict__ out,
+    float* __restrict__ part,
     int n, int k, int ksp)
 {
     const int gp = (k >> 7) / ksp;

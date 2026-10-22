@@ -1,14 +1,3 @@
-//! gemma4 (Gemma-4-26B-A4B) CPU 참조 엔진 — qwen35 미러·병렬(trait 추출 없음).
-//!
-//! 그래프(2026-10-14 HF `modeling_gemma4.py` 대조):
-//! - 30층 = 25 sliding(SW 1024·Q16×256·KV8·θ1e4) + 5 full(5/11/17/23/29 —
-//!   Q16×512·KV2·k_eq_v(V:=v_norm(k_proj))) · 층별 dims라 rope도 2종.
-//! - 층 = `attn → post_attn_norm → +r` → dense MLP(pre_ff)와 MoE(pre_ff_2)를
-//!   **병렬** 계산 → `post_ff_norm1(m) + post_ff_norm2(e)` → post_ff_norm → +r
-//!   → **×layer_scalar**(전 층).
-//! - RMSNorm = 직접 승수(+1 아님) · 노름류는 f32 · 라우터 = 가중 없는 RMS.
-//! - embed = E·√h(fp32 곱 → BF16 라운드 — 입력 임베딩만. head는 원본 E).
-//! - head tied(텐서 없음) · logits = softcap(30·tanh(l/30)).
 
 pub mod bind;
 pub mod hparams;
@@ -22,7 +11,6 @@ use std::path::Path;
 pub enum ModelError {
     MissingTensor(String),
     BadHparam(&'static str),
-    /// W4A16 디렉터리 로더 오류.
     W4a16(String),
 }
 
@@ -40,15 +28,12 @@ impl std::error::Error for ModelError {}
 
 use crate::matmul::Weight;
 
-/// 가중치 소스 — W4A16 디렉터리(스토어 mmap 직결).
 pub struct Model {
     w4: Box<crate::w4a16::W4a16Model>,
     cfg: bind::GemmaCfg,
     pub hp: Hparams,
     pub token_pieces: Vec<String>,
-    /// f32 노름·스칼라 디양자화 캐시(1회).
     f32_cache: std::cell::RefCell<std::collections::HashMap<String, Vec<f32>>>,
-    /// 입력 임베딩 √h(곱은 f32, 저장은 BF16 라운드 — CPU·GPU 동일 바이트).
     embed_scale: f32,
 }
 
@@ -102,13 +87,10 @@ impl Model {
         Ok(m)
     }
 
-    /// 풀층 k_eq_v — v_proj 없이 v = v_norm(k_proj 원시).
     pub fn kv_eq_v(&self, il: usize) -> bool {
         self.cfg.kv_eq_v(il)
     }
 
-    /// MoE 전문가 슬라이스 — (packed ptr/len, scale ptr/len) × (il,e,proj).
-    /// qwen35 `expert_slice` 미러(업로드 테이블 조립용).
     pub fn expert_slice(
         &self,
         il: usize,
@@ -118,14 +100,11 @@ impl Model {
         self.w4.expert_at(&bind::expert_base(il, e, proj))
     }
 
-    /// MoE 전문가 양자 파라미터 — (group, scale_bf16) 실측.
     pub fn expert_quant(&self) -> (usize, bool) {
         let base = bind::expert_base(0, 0, "gate_proj");
         (self.w4.group(), self.w4.scale_is_bf16(&base))
     }
 
-    /// 엔진 접점 이름 전수(업로드·체인 배선용) — qwen35 engine_names 미러.
-    /// 층 접미사는 gemma4 바인딩(`bind::eng`)과 1:1.
     pub fn engine_names(&self) -> Vec<String> {
         let mut v = vec![
             "token_embd.weight".to_string(),
@@ -161,7 +140,6 @@ impl Model {
         v
     }
 
-    /// 임베딩 √h 스케일(병렬 프리필용).
     pub fn embed_scale(&self) -> f32 {
         self.embed_scale
     }
@@ -188,12 +166,10 @@ impl Model {
             .ok_or_else(|| ModelError::MissingTensor(name.into()))
     }
 
-    /// [2026-10-16] 스토어 접근(읽기 전용) — 상주 적재의 O_DIRECT 직결 좌표.
     pub fn store(&self) -> &crate::w4a16::W4a16Model {
         &self.w4
     }
 
-    /// 상주 적재 원시 텐서 이름 — `w()`와 동일 해석(이름만).
     pub fn w_names(&self, name: &str) -> Option<(String, Option<String>)> {
         use bind::Eng;
         match bind::eng(name)? {
@@ -205,8 +181,6 @@ impl Model {
         }
     }
 
-    /// 전문가 트리플 원시 텐서 이름 — (packed, scale) — bind::expert_base
-    /// 단일 출처(expert_slice와 동일 규칙).
     pub fn expert_names(&self, il: usize, e: usize, proj: &str) -> (String, String) {
         let base = bind::expert_base(il, e, proj);
         (
@@ -215,7 +189,6 @@ impl Model {
         )
     }
 
-    /// f32 벡터(노름·스칼라·라우터 가중) — 1회 디양자화 캐시.
     pub fn f32_vec(&self, name: &str) -> Result<Vec<f32>, ModelError> {
         if let Some(v) = self.f32_cache.borrow().get(name) {
             return Ok(v.clone());
@@ -241,8 +214,6 @@ impl Model {
         Ok(v)
     }
 
-    /// 입력 임베딩 행 — E(tok)·√h. 곱은 f32, **BF16 라운드 저장**(베이크) —
-    /// GPU 업로드 테이블과 동일 바이트 계약.
     pub fn embed_row(&self, tok: u32) -> Result<Vec<f32>, ModelError> {
         let (buf, cols) = self.embed_table()?;
         let mut v = Vec::with_capacity(cols);
@@ -250,7 +221,6 @@ impl Model {
         Ok(v)
     }
 
-    /// 임베딩 원시 뷰 — (bf16 바이트, 열 수). 병렬 프리필이 Model 비경유로 쓴다.
     pub fn embed_table(&self) -> Result<(&[u8], usize), ModelError> {
         let name = "model.language_model.embed_tokens.weight";
         let e = self
@@ -264,7 +234,6 @@ impl Model {
         Ok((buf, e.shape[1] as usize))
     }
 
-    /// 전문가 트리플 슬라이스 → Weight (`expert_at` 무경유 접근자).
     pub fn expert_w(&self, il: usize, e: usize, proj: &str) -> Option<Weight<'_>> {
         let base = bind::expert_base(il, e, proj);
         let (data, scale, n, k) = self.w4.expert_at(&base)?;
@@ -280,8 +249,6 @@ impl Model {
     }
 }
 
-/// 임베딩 원시 행(bf16) → √h 베이크 f32 행 — 스레드 안전(Model 비경유).
-/// 곱은 f32, 저장은 BF16 라운드(CPU·GPU 동일 바이트).
 pub fn bake_embed_row(buf: &[u8], cols: usize, tok: u32, scale: f32, out: &mut Vec<f32>) {
     out.clear();
     let off = tok as usize * cols * 2;
@@ -292,7 +259,6 @@ pub fn bake_embed_row(buf: &[u8], cols: usize, tok: u32, scale: f32, out: &mut V
     }
 }
 
-/// 플레인(BF16) Weight — 2D 텐서(라우터·head). 1D는 `f32_vec` 전용.
 fn plain_weight<'a>(w4: &'a crate::w4a16::W4a16Model, hf: &str) -> Option<Weight<'a>> {
     use crate::wtype::WType;
     let e = w4.entry(hf)?;
@@ -316,7 +282,6 @@ fn plain_weight<'a>(w4: &'a crate::w4a16::W4a16Model, hf: &str) -> Option<Weight
     })
 }
 
-/// 시퀀스 상태 — 전 층 KV(f32 참조).
 pub struct SeqState {
     pub pos: u32,
     pub(crate) kv_k: Vec<Vec<f32>>,
@@ -350,7 +315,6 @@ impl Engine {
         Engine { model, seqs }
     }
 
-    /// 시퀀스 상태 전체 초기화 — ctx는 기존 KV 용량에서 역산.
     pub fn reset_states(&mut self) {
         let ctx = self
             .seqs
@@ -362,14 +326,12 @@ impl Engine {
         }
     }
 
-    /// 슬롯 단위 초기화(연속 배칭).
     pub fn reset_seq(&mut self, seq: usize) {
         let hp = &self.model.hp;
         let ctx = self.seqs[seq].kv_k[0].len() / (hp.n_kv[0] * hp.head_dim[0]);
         self.seqs[seq] = SeqState::new(&self.model, ctx);
     }
 
-    /// 배치 포워드 — batch[i] = seq_ids[i]의 토큰열(행간 동일 길이).
     pub fn forward(
         &mut self,
         seq_ids: &[usize],
@@ -378,7 +340,6 @@ impl Engine {
         self.forward_emb(seq_ids, batch, None)
     }
 
-    /// forward 변형 — 임베딩 행 사전 조달(프리필).
     fn forward_emb(
         &mut self,
         seq_ids: &[usize],
@@ -408,7 +369,6 @@ impl Engine {
             }
         };
         for il in 0..hp.n_layer {
-            // ── 어텐션 블록 ──
             let residual: Vec<Vec<f32>> = xs.clone();
             let attn_norm = self.model.f32_vec(&format!("blk.{il}.attn_norm.weight"))?;
             for x in xs.iter_mut() {
@@ -425,7 +385,6 @@ impl Engine {
                     xs[t][i] = residual[t][i] + h[i];
                 }
             }
-            // ── FFN 병렬(dense + MoE) ──
             let residual2: Vec<Vec<f32>> = xs.clone();
             let pre_ff = self
                 .model
@@ -476,7 +435,6 @@ impl Engine {
                 eprintln!("gemma4 layer {il:>2} max|x|={mx:.4} nan={nan}");
             }
         }
-        // ── 최종 노름 + head(tied) + softcap ──
         let out_norm = self.model.f32_vec("output_norm.weight")?;
         let head = self.model.wchk("output.weight")?;
         let mut result = Vec::with_capacity(n_seqs);
@@ -506,7 +464,6 @@ impl Engine {
         Ok(logits)
     }
 
-    /// np 배치 greedy — 토큰만 회수.
     pub fn decode_np_greedy(
         &mut self,
         seq_ids: &[usize],
@@ -521,7 +478,6 @@ impl Engine {
         Ok(greedy(&logits[0]))
     }
 
-    /// 표시용 근사 디토크(정식 BPE 디토크는 tokenize.rs 소관).
     pub fn piece(&self, tok: u32) -> String {
         self.model
             .token_pieces
@@ -531,31 +487,18 @@ impl Engine {
     }
 }
 
-/// greedy argmax — 동률 최저인덱스(공용 계약).
 pub use crate::matmul::greedy_from as greedy;
 
-/// [P3 2026-10-14] 서빙 계획 파생 — **층별 KV 일반화**(이종 dims: 슬라이딩
-/// kv_local×head_dim_local·풀 kv_global×head_dim_global). kv_bpt = int8
-/// K+V(1B/원소) + 행×헤드 스케일 f32(4B). 순수 어텐션이므로 GDN 상태 0.
-/// [ⓑ 2026-10-14 정합] 보고값 = **아레나 실청구** — KV 아레나는 층별 테이블이
-/// 아니라 **최대 클래스**(kv_heads×d 최대)로 전 층을 청구한다(block_k=512·kvd
-/// ×K/V 2아레나 + ksc/vsc f32). 정확 층별 클래스 = −8.4%(124,800→114,320
-/// B/token) 여지지만 업로드 계약 변경이라 차기 최적화. 풀 산정·ctx 가드는
-/// 실청구를 봐야 한다(과소보고 금지).
-/// [2.N Stage 2] 플로어 트림은 이 보고를 바꾸지 않는다 — 풀 산정은 전량 기준
-/// (보수적), 트림은 런타임 자유 풀에만 반영된다.
 pub fn ctx_info(dir: &std::path::Path) -> Result<crate::qwen35::CtxInfo, String> {
     let cfg = bind::GemmaCfg::load(dir).map_err(|e| e.to_string())?;
     Ok(ctx_info_from_cfg(&cfg))
 }
 
-/// ⓑ 마감 — ctx 산식 순수 분리(테스트 표면). 아레나 set_attn의 최대 클래스
-/// 청구와 동일식이어야 한다(어긋나면 풀 과소 산정).
 pub fn ctx_info_from_cfg(cfg: &bind::GemmaCfg) -> crate::qwen35::CtxInfo {
     let kvd = (cfg.kv_local as u64 * cfg.head_dim_local as u64)
         .max(cfg.kv_global as u64 * cfg.head_dim_global as u64);
     let kvh = (cfg.kv_local as u64).max(cfg.kv_global as u64);
-    let per_layer = 2 * (kvd + kvh * 4); // K+V int8 + ksc/vsc f32
+    let per_layer = 2 * (kvd + kvh * 4);
     crate::qwen35::CtxInfo {
         ctx: cfg.max_pos,
         gdn_state_bytes_per_slot: 0,

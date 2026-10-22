@@ -1,8 +1,6 @@
-//! 디양자화 — 플레인(F32·F16·Bf16) 행 전개. W4A16 split은 비경유(matmul arm).
 
 use crate::wtype::WType;
 
-/// IEEE 754 binary16 → f32
 pub fn half_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
     let exp = ((h >> 10) & 0x1f) as u32;
@@ -12,7 +10,6 @@ pub fn half_to_f32(h: u16) -> f32 {
             if frac == 0 {
                 sign << 31
             } else {
-                // subnormal
                 let mut e = 127 - 15 + 1;
                 let mut f = frac;
                 while f & 0x400 == 0 {
@@ -33,7 +30,6 @@ pub fn bf16_to_f32(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
 
-/// 한 행(k 원소)을 f32 로 펼친다. `data` 는 해당 텐서의 데이터 시작 바이트.
 pub fn dequant_row(ty: WType, data: &[u8], row: u64, k: u64, out: &mut [f32]) {
     let (blck, bsize) = ty.block_info();
     let blocks = (k / blck) as usize;
@@ -57,8 +53,6 @@ pub fn dequant_row(ty: WType, data: &[u8], row: u64, k: u64, out: &mut [f32]) {
                 };
             }
         }
-        // W4A16 split은 분리 버퍼(packed+scale) — dequant_row 비경유 계약.
-        // 여기 도달하면 로더/이름맵 결함이다(조용한 오염 방지 — 즉시 패닉).
         other => unimplemented!("dequant_row: 지원 밖 타입 {other:?}"),
     }
 }
@@ -69,7 +63,6 @@ mod tests {
 
     #[test]
     fn plains_dequant_row() {
-        // F32
         let mut data = Vec::new();
         data.extend_from_slice(&1.0f32.to_le_bytes());
         data.extend_from_slice(&(-2.5f32).to_le_bytes());
@@ -77,7 +70,6 @@ mod tests {
         dequant_row(WType::F32, &data, 0, 2, &mut out);
         assert_eq!(out, [1.0, -2.5]);
 
-        // F16(1.0=0x3C00)·Bf16(1.0=0x3F80)
         let mut out1 = [0.0f32; 1];
         dequant_row(WType::F16, &[0x00, 0x3C], 0, 1, &mut out1);
         assert_eq!(out1[0], 1.0);

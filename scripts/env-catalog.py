@@ -15,7 +15,6 @@ import re
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PAT = re.compile(r"LLM170_[A-Z0-9_]+")
-# 이름 규칙 기반 추정 분류 (운영/검증/진단/실험·플랜 옵인)
 DIAG_PAT = re.compile(r"(KTRACE|TRACE|DBG|DEBUG|TIME|PROF|DUMP|PTRACE|WALL|SRV_TIME|NP_TIME|LAUNCH|PPROF)")
 VERIFY_PAT = re.compile(r"(EXACT|CHECK|GATE|DIFF|REF|SELF|PROBE)")
 ABLATION_PAT = re.compile(r"^(LLM170_)?(NO_|F32|KV8|ATOM|SPLIT|TILE|BATCH|FUSE)")

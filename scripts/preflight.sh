@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# W10 프리플라이트 — 커밋 전 로컬 검증 단일 진실 공급원
-#
-# 검증: (1) rustfmt, (2) clippy -D warnings, (3) cargo 경고 0,
-#       (4) env 스냅샷↔라이브 동치(108 P1), (5) 스테일 fatbin 가드
-#       (.cu/cast_common.cuh/g4_common.cuh가 fatbin보다 새로우면 FAIL —
-#        grep|tail 사고 클래스).
-# [2026-10-08] 단일 트랙 재편 — spv·charhash
-# 스텝 제거. W4A16 커널(W2) 도입 시 그 게이트는 새 스크립트로 붙인다.
-# 사용: scripts/preflight.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -50,35 +41,30 @@ for cu in "$A"/*.cu; do
         echo "FAIL — $(basename "$cu") 가 fatbin보다 새로움(리빌드: scripts/build_cuda_kernels.sh)"; stale=1
     fi
 done
-# cast_common.cuh는 gptq4/norm/ew/gdn/attn이 include(헤더 변경도 리빌드 대상).
 for n in gptq4 norm ew gdn attn embed; do
     fb="$A/$n.fatbin"
     if [[ ! -f "$fb" || "$A/cast_common.cuh" -nt "$fb" ]]; then
         echo "FAIL — cast_common.cuh 가 $n.fatbin보다 새로움(리빌드 필요)"; stale=1
     fi
 done
-# g4_common.cuh는 gptq4/moe가 include(R5 분할 — 헤더 변경도 리빌드 대상).
 for n in gptq4 moe; do
     fb="$A/$n.fatbin"
     if [[ ! -f "$fb" || "$A/g4_common.cuh" -nt "$fb" ]]; then
         echo "FAIL — g4_common.cuh 가 $n.fatbin보다 새로움(리빌드 필요)"; stale=1
     fi
 done
-# [2.N 2026-10-15] 내용 무결성 — FATBINS.manifest 대조(build_cuda_kernels.sh가
-# 갱신). mtime 가드만으로는 "소스 변경 + 재빌드 누락(mtime 역전)"과 "fatbin
-# 바이트 외부 복원" 사고를 못 잡는다(실측).
 if [ ! -f "$A/FATBINS.manifest" ]; then
     echo "FAIL — FATBINS.manifest 부재(scripts/build_cuda_kernels.sh로 생성)"; stale=1
 else
     while read -r s f n; do
         [ -n "${n:-}" ] || continue
-        if [ "$n" = marlin ]; then # [2026-10-18] 벤더 헤더 전량 포함(빌드 스크립트와 동일식)
+        if [ "$n" = marlin ]; then
             cs=$(cat "$A/marlin.cu" $A/marlin/*.h $A/marlin/*.cuh $A/marlin/core/*.hpp \
                 $A/marlin/torch/headeronly/util/Exception.h | sha256sum | cut -d' ' -f1)
-        elif [ "$n" = marlin_g32 ]; then # [2026-10-19] 동일식(벤더 헤더 marlin/)
+        elif [ "$n" = marlin_g32 ]; then
             cs=$(cat "$A/marlin_g32.cu" $A/marlin/*.h $A/marlin/*.cuh $A/marlin/core/*.hpp \
                 $A/marlin/torch/headeronly/util/Exception.h | sha256sum | cut -d' ' -f1)
-        elif [ "$n" = marlin_moe ]; then # [2026-10-19] 동일식
+        elif [ "$n" = marlin_moe ]; then
             cs=$(cat "$A/marlin_moe.cu" $A/marlin_moe/*.h \
                 $A/marlin_moe/quantization/marlin/*.h* $A/marlin_moe/core/*.hpp \
                 $A/marlin_moe/torch/headeronly/util/Exception.h | sha256sum | cut -d' ' -f1)

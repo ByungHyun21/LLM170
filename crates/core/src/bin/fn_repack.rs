@@ -1,21 +1,9 @@
-//! [FN D1→재팩 2026-10-20] GPTQ→CT 무손실 재패커 독립 바이너리.
-//!
-//! 용법:
-//!   fn_repack <gptq_dir> <dst_ct_dir>
-//!       라우팅 전문가 73,728 투영 gptq 트리플 → CT 트리플 니블 전치.
-//!       나머지 텐서 원시 재기록 · PLE 샤드 파일 복사 · config quant 치환.
-//!   fn_repack verify <gptq_dir> <ct_dir> [--layers 0,23,47] [--experts 0,7,511]
-//!       동치 검증 — CT 디큐트(w4a16 경로) vs GPTQ 직접 디큐트 전 행 비트일치.
-//!
-//! server/main.rs와 무관한 별도 타깃(diag는 core에 의존해 순환 — core
-//! src/bin 자동 발견, 매니페스트 변경 0). GPU 무사용·mmap 스트리밍.
 
 use llm170_core::qwen4exp::repack;
 use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    // OOM 킬러 지정 희생자 — llm170 본체와 동일 규약(초대형 mmap 보호).
     if llm170_diag::flag::val("LLM170_NO_OOM_ADJ").is_none() {
         let _ = std::fs::write("/proc/self/oom_score_adj", b"1000");
     }
@@ -74,7 +62,6 @@ fn next_val<'a, I: Iterator<Item = &'a String>>(it: &mut I, flag: &str) -> Resul
         .ok_or_else(|| format!("{flag} 값 필요"))
 }
 
-/// 쉼표 목록 → u64(빈 토큰 거부).
 fn parse_csv(v: &str) -> Result<Vec<u64>, String> {
     v.split(',')
         .map(|t| {

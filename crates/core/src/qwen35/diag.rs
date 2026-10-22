@@ -1,15 +1,10 @@
-//! qwen35 진단 잔재 격리 (B4 — qwen4exp/frame/diag.rs 패턴).
-//! G0(GDN)/A3(어텐션) 계측 덤프 — 본체(layers.rs)와 분리해 조사 코드가
-//! 값 경로를 오염하지 않게 한다. 호출부 게이트 = `LLM170_DUMP=debug_layers`.
 
-/// 비트 xor 체크섬(가중) — VkD 대조용.
 fn wxor(v: &[f32]) -> u64 {
     v.iter()
         .map(|&x| (x.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15))
         .fold(0u64, |a, b| a ^ b)
 }
 
-/// G0: GDN 배치 입력·출력 체크섬(레이어 0, t_len==1 경로).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn g0_gdn(
     r0: usize,
@@ -24,7 +19,6 @@ pub(super) fn g0_gdn(
     k_len: usize,
     dt_rank: usize,
 ) {
-    // t_len 무관 마지막 행 기준 (per-token VkD 대조용)
     let last = r1 - 1;
     let sumo: f64 = o_all[last * v_len..(last + 1) * v_len]
         .iter()
@@ -47,12 +41,10 @@ pub(super) fn g0_gdn(
     eprintln!("  G0dbg exp_cr(g) xor={xce:016x}");
 }
 
-/// A3: 어텐션 층 norm 직후 q 판 표본.
 pub(super) fn a3_normed(xs0: &[f32]) {
     eprintln!("  A3dbg normed[0..6]={:?}", &xs0[0..6]);
 }
 
-/// A3: CPU 어텐션 직전 캐시·게이트 표본.
 pub(super) fn a3_cache(
     pos: usize,
     b0: usize,

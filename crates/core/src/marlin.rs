@@ -1,25 +1,4 @@
-//! [marlin 착수 2026-10-12] 호스트측 marlin 재패킹 — 1단계(repack만).
-//!
-//! 계약: **원본·CPU 미러 불변, VRAM 배치만 교체**. 이 모듈은 GPTQ qweight
-//! ([n][k/8] u32 — lsb-first 니블, 우리 로더 레이아웃)를 marlin B 배치
-//! ([k/16][n/64][128] u32)로 변환하고, 스케일을 marlin 순서로 재배열한다.
-//! 레퍼런스: reference/GPTQModel/gptqmodel_ext/marlin/gptq_marlin_repack.cu
-//! (no-perm 경로 — 우리 W4A16은 고정 gs 그룹이라 g_idx/perm 불요) +
-//! reference/vllm-venv/.../marlin_utils.py의 get_scale_perms/permute_scales.
-//!
-//! 니블 매핑(repack.cu num_bits==4, pack_idx={0,2,4,6,1,3,5,7}):
-//!   출력 u32 = vals[{0,2,4,6,1,3,5,7}]를 니블 0..7로.
-//!   vals[i]   = nibble(k=tc_row+off[i], n=cur_n)       (i<4)
-//!   vals[4+i] = nibble(k=tc_row+off[i], n=cur_n+8)
-//!   off = {0,1,8,9} · tc_row = (tid%4)*2 · tc_col = tid/4 · cur_n =
-//!   warp*16+tc_col · 타일 인덱스 = th_id*4 + warp.
-//!   ⇒ u32 하나 = (k+0,k+8,k+0,k+8,k+1,k+9,k+1,k+9)×(j,j,j+8,j+8) 조합.
-//!
-//! 스케일(get_scale_perms 그룹 경로): 64-청크마다 new[p] = old[p//8 + 8*(p%8)]
-//! (k/gs 그룹 × n-청크 64 순회). 스케일 레이아웃 = [k/gs][n] (마린 규약).
 
-/// GPTQ qweight [n][k/8] → marlin B [k/16][n/64][128] u32 (no-g_idx).
-/// 입력 니블 = (n, k) 가중치의 4bit (lsb-first, k 오름차순).
 pub fn marlin_repack_q(q: &[u32], n: usize, k: usize) -> Result<Vec<u32>, String> {
     if !k.is_multiple_of(16) || !n.is_multiple_of(64) {
         return Err(format!("marlin repack: k={k}%16·n={n}%64 계약 위반"));
@@ -63,7 +42,6 @@ pub fn marlin_repack_q(q: &[u32], n: usize, k: usize) -> Result<Vec<u32>, String
     Ok(out)
 }
 
-/// 스케일 [n][k/gs] f32 → marlin [k/gs][n] (64-청크 순열 포함).
 pub fn marlin_permute_scales(s: &[f32], n: usize, k: usize, gs: usize) -> Result<Vec<f32>, String> {
     if !n.is_multiple_of(64) || !k.is_multiple_of(gs) {
         return Err(format!("marlin scales: n={n}%64·k={k}%gs={gs} 계약 위반"));
@@ -92,7 +70,6 @@ pub fn marlin_permute_scales(s: &[f32], n: usize, k: usize, gs: usize) -> Result
 mod tests {
     use super::*;
 
-    /// repack의 역변환(테스트 전용) — 원본 (n,k) 니블을 marlin 배치에서 복원.
     fn unrepack(out: &[u32], n: usize, k: usize) -> Vec<u32> {
         let k8 = k / 8;
         let mut q = vec![0u32; n * k8];
@@ -128,7 +105,6 @@ mod tests {
 
     #[test]
     fn repack_roundtrip() {
-        // 결정적 LCG — 임의 4bit (n=128, k=64).
         let (n, k) = (128usize, 64usize);
         let mut seed: u64 = 0x1234_5678_9abc_def0;
         let mut q = vec![0u32; n * (k / 8)];
@@ -146,8 +122,6 @@ mod tests {
 
     #[test]
     fn scale_perm_roundtrip() {
-        // 순열의 가역성: 64-청크 perm을 두 번 적용하면 원복(자기역 아님 확인용 —
-        // 여기서는 규약 고정: new[p]=old[p/8+8*(p%8)] 그대로 검증).
         let (n, k, gs) = (64usize, 128usize, 128usize);
         let s: Vec<f32> = (0..n * (k / gs)).map(|i| i as f32).collect();
         let out = marlin_permute_scales(&s, n, k, gs).unwrap();

@@ -1,15 +1,9 @@
-//! safetensors 아카이브 리더 — 헤더 파서 + 샤드 인덱스 + 직독.
-//! (2026-10-08 단일 트랙 재편에서 core로 이관 — W4A16 로더 공용 자산.)
-//!
-//! API 계약은 이관 전과 동일: entries()/entry()/read()/read_into()/
-//! shard_paths()/shard_data_base(). 오류는 `StError`.
 
 use crate::json::Json;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// safetensors 계열 오류 — thiserror 없이 Display 직구현(규약).
 #[derive(Debug)]
 pub enum StError {
     Io(std::io::Error),
@@ -53,7 +47,6 @@ impl From<String> for StError {
 
 pub type StResult<T> = std::result::Result<T, StError>;
 
-/// safetensors dtype — 모델 배포에 실제 등장하는 종류만.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StDtype {
     F16,
@@ -63,8 +56,6 @@ pub enum StDtype {
     I32,
     I64,
     U8,
-    /// [FN 2단계 2026-10-17] PLE ngram 임베딩(float8_e4m3fn, 1B).
-    /// 디코드 자체는 3차 — 여기선 헤더 판독·형상 검증만.
     F8E4M3,
 }
 
@@ -93,14 +84,12 @@ impl StDtype {
     }
 }
 
-/// 단일 텐서 엔트리. `begin/end`는 샤드 데이터 섹션 기준 오프셋.
 #[derive(Debug, Clone)]
 pub struct StEntry {
     pub dtype: StDtype,
     pub shape: Vec<u64>,
     pub begin: u64,
     pub end: u64,
-    /// 데이터가 있는 샤드(0-base).
     pub shard: usize,
 }
 
@@ -113,12 +102,10 @@ impl StEntry {
 #[derive(Debug)]
 struct Shard {
     path: PathBuf,
-    /// 데이터 섹션 시작(= 8 + 헤더길이).
     data_base: u64,
     data_len: u64,
 }
 
-/// safetensors 아카이브 — 단일 파일 또는 dir(index.json 샤드 묶음).
 #[derive(Debug)]
 pub struct StArchive {
     shards: Vec<Shard>,
@@ -126,7 +113,6 @@ pub struct StArchive {
 }
 
 impl StArchive {
-    /// `.safetensors` 파일 하나 또는 샤드 디렉터리를 연다.
     pub fn open(path: &Path) -> StResult<Self> {
         llm170_diag::profile_span!("st::open");
         if path.is_dir() {
@@ -154,7 +140,6 @@ impl StArchive {
                 let file = file
                     .as_str()
                     .ok_or_else(|| StError::BadHeader("weight_map value not a string".into()))?;
-                // H(2026-10-09): 중복 이름은 종전 마지막 우선(조용) — 거부.
                 if entries.insert(name.clone(), file.to_string()).is_some() {
                     return Err(StError::BadHeader(format!(
                         "index.json: weight_map 중복 이름 {name}"
@@ -165,7 +150,6 @@ impl StArchive {
                 }
             }
         } else {
-            // index 없음: 디렉터리 내 model*.safetensors 전부(단일 파일 규약).
             for e in std::fs::read_dir(dir)? {
                 let e = e?;
                 let name = e.file_name();
@@ -189,7 +173,6 @@ impl StArchive {
             let path = dir.join(fname);
             let shard_entries = Self::parse_shard(&path, si, &mut shards)?;
             if idx_path.exists() {
-                // index가 있으면 엔트리는 weight_map이 지정한 샤드에만 귀속.
                 for name in entries
                     .iter()
                     .filter(|(_, f)| f.as_str() == fname)
@@ -208,8 +191,6 @@ impl StArchive {
             }
         }
         if idx_path.exists() {
-            // H(2026-10-09): weight_map이 지정했는데 샤드 헤더에 없는 텐서는
-            // 종전 조용히 누락 — 로드 시점에 즉시 거부(원인 추적 가능하게).
             let mut missing: Vec<&str> = entries
                 .keys()
                 .filter(|n| !out.contains_key(*n))
@@ -230,7 +211,6 @@ impl StArchive {
         })
     }
 
-    /// 단일 샤드 헤더 파싱 — (이름 → 엔트리). shard 벡터에 파일 정보 추가.
     fn parse_shard(
         path: &Path,
         shard: usize,
@@ -240,7 +220,6 @@ impl StArchive {
         let mut lenb = [0u8; 8];
         std::io::Read::read_exact(&mut f, &mut lenb)?;
         let hlen = u64::from_le_bytes(lenb);
-        // 상한: 16GiB 텐서 × 수천 개보다 넉넉히.
         if hlen == 0 || hlen > (1 << 30) {
             return Err(StError::BadHeader(format!(
                 "{}: header len {hlen}",
@@ -280,8 +259,6 @@ impl StArchive {
             let Some(expect) = numel.checked_mul(dtype.nbytes()) else {
                 return Err(StError::BadHeader(format!("{name}: numel overflow")));
             };
-            // H(2026-10-09): 반전 offsets는 u64 감산 언더플로(디버그 패닉) —
-            // 여기서 즉시 거부.
             if offs[1] < offs[0] {
                 return Err(StError::BadHeader(format!(
                     "{name}: data_offsets 반전 {}..{}",
@@ -322,10 +299,6 @@ impl StArchive {
         self.entries.get(name)
     }
 
-    /// 텐서 원시 바이트를 호출자 버퍼로 직독(대형 상주 적재 — Vec 회피).
-    ///
-    /// # Safety
-    /// `out`은 `cap >= nbytes(name)` 바이트의 쓰기 가능 영역이어야 한다.
     pub unsafe fn read_into(&self, name: &str, out: *mut u8, cap: usize) -> StResult<()> {
         let e = self
             .entries
@@ -348,7 +321,6 @@ impl StArchive {
         std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(sh.data_base + e.begin))?;
         let mut off = 0usize;
         while off < n {
-            // SAFETY: 상단 계약 — cap 내 영역만 기입.
             let w = unsafe {
                 std::io::Read::read(
                     &mut f,
@@ -366,17 +338,14 @@ impl StArchive {
         Ok(())
     }
 
-    /// 샤드 파일 경로(엔진 mmap용).
     pub fn shard_paths(&self) -> Vec<&Path> {
         self.shards.iter().map(|s| s.path.as_path()).collect()
     }
 
-    /// 샤드 i의 데이터 섹션 절대 오프셋.
     pub fn shard_data_base(&self, i: usize) -> Option<u64> {
         self.shards.get(i).map(|s| s.data_base)
     }
 
-    /// 텐서 원시 바이트를 읽는다(검증·참조 경로 — 엔진 적재는 mmap 별도).
     pub fn read(&self, name: &str) -> StResult<Vec<u8>> {
         let e = self
             .entries
@@ -416,7 +385,6 @@ mod tests {
         p
     }
 
-    /// H(2026-10-09) 경화 — 반전 data_offsets(감산 언더플로)는 열기에서 거부.
     #[test]
     fn rejects_inverted_offsets() {
         let p = tmp_file(
@@ -429,7 +397,6 @@ mod tests {
         assert!(matches!(r, Err(StError::BadHeader(_))), "반전 offsets 거부");
     }
 
-    /// H 경화 — 선언 바이트 ≠ numel×nbytes는 거부(조용 처리 금지).
     #[test]
     fn rejects_size_mismatch() {
         let p = tmp_file(

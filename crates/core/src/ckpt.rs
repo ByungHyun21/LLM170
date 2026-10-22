@@ -1,14 +1,3 @@
-//! CPU 참조 엔진 체크포인트 코덱 — 순수 바이트 직렬화(의존 없음).
-//!
-//! 용도: 장문 오라클(`w4a16-ref`)의 중단·재개. 엔진 상태(pos + 전층 상태
-//! f32 벡터 전부)를 그대로 덤프한다. 형식(전부 LE):
-//! ```text
-//! magic 8B "LLM170CK" · ver u32=1 · arch u32 · n_seqs u32 · ctx u32
-//! per seq: pos u32 · n_vecs u32 · per vec: len u32 + len×f32(4B)
-//! ```
-//! 벡터 순서는 아치 계약(호출부 문서): gemma4 = kv_k[0..L)·kv_v[0..L),
-//! qwen35 = kv_k·kv_v·gdn_s·conv. 로드는 매직·버전·아치·시퀀스 수·벡터 수·
-//! 길이를 전부 대조한다(불일치는 거부 — 조용한 오염 금지).
 
 pub const MAGIC: &[u8; 8] = b"LLM170CK";
 pub const VER: u32 = 1;
@@ -28,7 +17,6 @@ fn get_u32(b: &[u8], p: &mut usize) -> Result<u32, String> {
     Ok(x)
 }
 
-/// 인코딩 — seqs[i] = (pos, 상태 벡터 슬라이스열).
 pub fn encode(arch: u32, ctx: u32, seqs: Vec<(u32, Vec<&[f32]>)>) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(MAGIC);
@@ -50,7 +38,6 @@ pub fn encode(arch: u32, ctx: u32, seqs: Vec<(u32, Vec<&[f32]>)>) -> Vec<u8> {
     v
 }
 
-/// 디코딩 — (arch, ctx, per-seq (pos, 벡터열)). 호출부가 아치·형상을 대조한다.
 pub fn decode(blob: &[u8]) -> Result<(u32, u32, Vec<(u32, Vec<Vec<f32>>)>), String> {
     let mut p = 8usize;
     if blob.len() < 8 || &blob[..8] != MAGIC {
@@ -101,7 +88,6 @@ pub fn decode(blob: &[u8]) -> Result<(u32, u32, Vec<(u32, Vec<Vec<f32>>)>), Stri
 mod tests {
     use super::*;
 
-    /// 라운드트립 + 비트 보존.
     #[test]
     fn roundtrip_bit_exact() {
         let a = vec![1.5f32, -2.25, f32::from_bits(0x3f800001)];
@@ -121,7 +107,6 @@ mod tests {
         assert!(seqs[1].1.is_empty());
     }
 
-    /// 손상·오타입 거부.
     #[test]
     fn rejects_corrupt() {
         let a = [1.0f32];
@@ -130,7 +115,6 @@ mod tests {
         blob[0] = b'X';
         assert!(decode(&blob).is_err(), "매직 거부");
         let mut blob2 = encode(ARCH_QWEN, 128, vec![(0, vec![&a[..]])]);
-        // 버전 필드(8..12) 변조.
         blob2[8] = 99;
         assert!(decode(&blob2).is_err(), "버전 거부");
     }

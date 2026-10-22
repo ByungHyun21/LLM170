@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# (2026-10-17) TTFT 3시나리오 + 동시성 하네스 — plan §5⑦(CMP 본무대).
-# 시나리오: S1 콜드(고유 프롬프트) · S2 전체-접두(동일 재요청) · S3 체크포인트
-# (700토큰 공통 시스템 접두 + 상이 접미 — 512 경계 체크포인트 재사용).
-# 동시성: C∈{2,4,8} 동시 발사(절반 공유 접두·절반 고유) — 큐 대기·TTFT 확산.
-# 수집: /stats — ttft_ms_avg×requests_total 차분(구간 TTFT 합) · queue_wait_us_total
-#       · prefix_reuse ratio. 클라이언트 벽시계(완단) 참고 병기.
-# 사용: scripts/ttft_harness.sh [모델] [포트] [--kv-mem 값]
 set -u
 BIN=${BIN:-target/release/llm170}
 M=${1:-../models/Qwen3.8-27B-W4A16-AutoRound}
@@ -15,7 +8,6 @@ RUN=${RUN:-/tmp/opencode/ttft-$(date +%H%M%S)}
 mkdir -p "$RUN"
 note() { echo "  [ttft] $*"; }
 
-# 결정론 프롬프트(LCG — prefix_harness 동일 계열, vocab 안전역 200000)
 python3 - "$RUN" <<'PYBODY'
 import json, sys
 run = sys.argv[1]
@@ -29,13 +21,12 @@ def lcg_list(seed, n):
 def w(name, toks):
     json.dump({"prompt": toks, "max_tokens": 16, "temperature": 0},
               open(f"{run}/{name}.json", "w"))
-P = lcg_list(0x1234_5678, 700)              # 공통 시스템 접두
-w("s1_cold",  lcg_list(0xDEAD_BEEF, 700))   # 고유(접두 공유 없음)
-w("s2_full",  P + [11, 22, 33])             # 전체 접두 재사용 후보
-w("s3_ckpt",  P + [44, 55, 66, 77])         # 700 공통 + 상이 접미(체크포인트)
+P = lcg_list(0x1234_5678, 700)
+w("s1_cold",  lcg_list(0xDEAD_BEEF, 700))
+w("s2_full",  P + [11, 22, 33])
+w("s3_ckpt",  P + [44, 55, 66, 77])
 for c in (2, 4, 8):
     for i in range(c):
-        # 절반은 공유 접두·절반 고유 — 혼합 부하
         if i % 2 == 0:
             w(f"c{c}_{i}", P + [c, i])
         else:
@@ -53,8 +44,7 @@ print(s.get("requests",0), s.get("ttft_ms_avg",0), s.get("queue_wait_ms_avg",0))
 for _ in $(seq 1 100); do sleep 3; grep -qm1 listening "$RUN/s.log" && break; done
 grep -qm1 listening "$RUN/s.log" || { echo "serve 기동 실패"; exit 1; }
 
-# 시나리오별: 요청 1회 · (avg·n) 차분으로 구간 TTFT 합 산출
-scn() { # $1=파일 기본명 $2=라벨
+scn() {
   local A B
   A=$(snap); curl -s -X POST "http://127.0.0.1:$PORT/v1/completions" \
       -H 'Content-Type: application/json' -d @"$RUN/$1.json" > /dev/null
@@ -82,7 +72,6 @@ for C in 2 4 8; do
       -H 'Content-Type: application/json' -d @"$RUN/c${C}_${i}.json" > /dev/null &
     cpids="$cpids $!"
   done
-  # shellcheck disable=SC2086
   wait $cpids
   T1=$(date +%s.%N); B=$(snap)
   python3 -c "

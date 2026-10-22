@@ -1,12 +1,10 @@
-//! probes/w4a16/gpu.rs에서 분해(순수 이동 — 코드 무변).
 use crate::probes::{arg, arg_str};
 
-/// 파싱된 w4a16-gpu 옵션 묶음 — [R9] 순수 이동(기존 gpu_run 로컬 변수 그대로).
 pub(super) struct GpuArgs {
     pub(super) prompts: Vec<Vec<u32>>,
     pub(super) n_predict: usize,
-    pub(super) spec_k: usize,    // [A-1] 스페큘러티브 초안 상한(0=off).
-    pub(super) spec_check: bool, // [A-1 진단] 검증 vs t=1 디코드 토큰 대조.
+    pub(super) spec_k: usize,
+    pub(super) spec_check: bool,
     pub(super) ctx: usize,
     pub(super) no_head: bool,
     pub(super) moe_check: bool,
@@ -21,29 +19,24 @@ pub(super) struct GpuArgs {
     pub(super) bench_gemv_t: Option<(String, usize, usize)>,
     pub(super) bench_plain: Option<(String, usize, usize)>,
     pub(super) mma_diff: Option<(String, usize)>,
-    pub(super) marlin_diff: Option<(String, usize)>, // [marlin S2] A/B 재패킹 게이트
-    pub(super) marlin_selfcheck: Option<(usize, usize, usize, bool)>, // (t, k, n, m16)
-    pub(super) marlin_selfcheck32: Option<(usize, usize, usize)>, // [marlin g32] bf16 자체점검
-    pub(super) marlin_bench: Vec<(String, usize, usize, String)>, // [marlin S2] mma 대비 벤치
-    /// [2.A-② 2026-10-13] marlin-bench 콜드 모드(L2 플러시 — HBM 조건 근사).
+    pub(super) marlin_diff: Option<(String, usize)>,
+    pub(super) marlin_selfcheck: Option<(usize, usize, usize, bool)>,
+    pub(super) marlin_selfcheck32: Option<(usize, usize, usize)>,
+    pub(super) marlin_bench: Vec<(String, usize, usize, String)>,
     pub(super) marlin_cold: bool,
-    /// [split-k marlin 디코드 2026-10-17] t=1 sk 커널 벤치(이름, reps).
     pub(super) decode_bench: Vec<(String, usize)>,
-    /// [sk] 콜드 모드(L2 플러시 — marlin_cold와 동일 조건).
     pub(super) decode_cold: bool,
-    /// [sk] 커널 격리 자체점검(합성 — 모델 무게 불요).
     pub(super) decode_selfcheck: bool,
-    pub(super) marlin_ref: Option<(String, usize)>, // [marlin S2] 실무게 64행 참조 대조
-    pub(super) attn_fa2: Vec<(usize, usize, u32)>,  // [FA2] A/B (t, layer, pos0)
-    pub(super) attn_fa2_bench: Vec<(usize, usize, usize, u32)>, // [FA2] (t, layer, reps, pos0)
-    pub(super) mode_ref: u8,                        // 0 실값, 1 s→1, 2 x→1, 3 둘 다 1
-    pub(super) kcap: usize,                         // ref k 상한(이분탐색용)
+    pub(super) marlin_ref: Option<(String, usize)>,
+    pub(super) attn_fa2: Vec<(usize, usize, u32)>,
+    pub(super) attn_fa2_bench: Vec<(usize, usize, usize, u32)>,
+    pub(super) mode_ref: u8,
+    pub(super) kcap: usize,
     pub(super) moe_topk_check: Option<(usize, usize, usize)>,
     pub(super) h2d_mb: usize,
-    pub(super) bench: Option<(String, usize, usize)>, // (lin, t, reps)
+    pub(super) bench: Option<(String, usize, usize)>,
 }
 
-/// 인자 파싱 — [R9] 순수 이동(gpu_run 앞부분).
 pub(super) fn parse_args(args: &[String]) -> Result<GpuArgs, String> {
     let dir = arg_str(args, 0, "");
     if dir.is_empty() {

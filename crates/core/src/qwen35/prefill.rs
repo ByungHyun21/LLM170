@@ -1,15 +1,11 @@
-//! Engine 프리필 — 행 조립(스레드) + 1024 청크 forward.
 
 use super::*;
 
 impl Engine {
-    /// 시퀀스 prefill: 전체 토큰 적립 + 마지막 logits.
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
         let n = self.model.hp.n_embd;
-        // 제자리 borrow — token_embd 전체 to_vec(636MB) 복사를 회피한다.
         let cache: Vec<Vec<f32>> = {
             let embd = self.model.wchk("token_embd.weight")?;
-            // 행 단위 병렬 디양자화 (단일 스레드면 pp512에서 ~20ms가 붙는다).
             let mut rows: Vec<Vec<f32>> = tokens.iter().map(|_| vec![0.0f32; n]).collect();
             let nt = crate::matmul::n_threads().max(1).min(rows.len().max(1));
             let per = rows.len().div_ceil(nt).max(1);
@@ -29,7 +25,6 @@ impl Engine {
             });
             rows
         };
-        // 1024토큰 청크 — 청킹은 수치 불변(GDN chunked·attention 캐시 순차 적립).
         let chunk: usize = 1024;
         let mut last = None;
         for (ch_t, ch_r) in tokens.chunks(chunk).zip(cache.chunks(chunk)) {
@@ -40,8 +35,6 @@ impl Engine {
         Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]))
     }
 
-    /// 체크포인트 저장 — 전 시퀀스 (pos + 상태 전부). 벡터 순서:
-    /// kv_k[0..F)·kv_v[0..F)·gdn_s[0..R)·conv[0..R). 코덱 계약 = `crate::ckpt` 문서.
     pub fn ckpt_save(&self) -> Result<Vec<u8>, ModelError> {
         let no = || ModelError::W4a16("ckpt: 빈 엔진".into());
         let s0 = self.seqs.first().ok_or_else(no)?;
@@ -68,7 +61,6 @@ impl Engine {
         Ok(crate::ckpt::encode(crate::ckpt::ARCH_QWEN, ctx, seqs))
     }
 
-    /// 체크포인트 복원 — 매직·아치·시퀀스 수·벡터 수·길이 전부 대조(불일치 거부).
     pub fn ckpt_load(&mut self, blob: &[u8]) -> Result<(), ModelError> {
         let bad = |m: String| ModelError::W4a16(format!("ckpt: {m}"));
         let (arch, _ctx, seqs) = crate::ckpt::decode(blob).map_err(bad)?;

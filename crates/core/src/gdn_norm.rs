@@ -1,11 +1,6 @@
-//! D1 — GDN층 공유 norm_gated 코어(z-게이트 silu↔sigmoid 파라미터화).
-//! z-게이트 활성화(silu↔sigmoid)만 파라미터화 — 양쪽 레이어의 나머지
-//! 오케스트레이션(상태 유형·GPU 훅·시퀀스 레이아웃)은 구조적으로 달라
-//! 그대로 둔다(D8/D9 판정 준거 — 중복 없는 간접화 회피).
 
 use crate::ops::{rms_norm, sigmoid, silu};
 
-/// 게이트 활성화 종류 — qwen35=silu, qwen4exp(Flash-Next)=sigmoid.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GdnGate {
     Silu,
@@ -20,9 +15,6 @@ fn gate_act(g: GdnGate, x: f32) -> f32 {
     }
 }
 
-/// norm_gated: 헤드별 rms_norm(o) · gate(z) → gated[t][h·d_state .. +d_state].
-/// 행 레이아웃: o_all/z는 [n_tok][v_len] 플랫, gated는 [n_tok][d_inner].
-/// 원문 루프와 동일 순서(헤드→원소, rms_norm 벡터 복제 포함) — 비트 불변.
 pub fn gdn_norm_gated(
     gate: GdnGate,
     o_all: &[f32],
