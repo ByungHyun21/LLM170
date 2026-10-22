@@ -106,7 +106,9 @@ pub(crate) fn load_gpu_retry(
         };
         match loaded {
             Ok(mut e) => {
-                if let Err(err) = e.enable_spec() {
+                if crate::engine::spec_enabled_by_policy()
+                    && let Err(err) = e.enable_spec()
+                {
                     eprintln!("# spec 비활성: {err}");
                 }
                 return e;

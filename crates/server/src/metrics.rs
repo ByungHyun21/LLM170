@@ -510,6 +510,24 @@ pub fn prometheus() -> String {
         "spec economics gate (1=spec, 0=plain)",
         format!("llm170_spec_econ_on {}", sc.econ_on.load(Ordering::Relaxed)),
     );
+    pm_gauge(
+        &mut o,
+        "llm170_spec_policy",
+        "spec policy (0=auto/off, 1=mtp, 2=ngram, 3=off)",
+        format!(
+            "llm170_spec_policy {}",
+            crate::engine::SPEC_POLICY.load(Ordering::Relaxed)
+        ),
+    );
+    pm_gauge(
+        &mut o,
+        "llm170_spec_enabled",
+        "spec explicitly enabled by policy (1=yes, 0=no)",
+        format!(
+            "llm170_spec_enabled {}",
+            u8::from(crate::engine::spec_enabled_by_policy())
+        ),
+    );
     let econ_cost = |v: &std::sync::atomic::AtomicU64, n: &std::sync::atomic::AtomicU64| -> f64 {
         if n.load(Ordering::Relaxed) == 0 {
             0.0

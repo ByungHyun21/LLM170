@@ -117,12 +117,23 @@ pub fn parse_spec_policy(v: &str) -> Option<u8> {
     }
 }
 
-pub fn mtp_upload_on(pp: bool) -> bool {
+pub fn spec_enabled_by_policy() -> bool {
+    matches!(
+        SPEC_POLICY.load(std::sync::atomic::Ordering::Relaxed),
+        1 | 2
+    )
+}
+
+pub fn spec_reason() -> &'static str {
     match SPEC_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
-        2 | 3 => false,
-        1 => true,
-        _ => !pp || llm170_diag::flag::val("LLM170_PP_MTP") == Some("1"),
+        1 | 2 => "explicit",
+        3 => "off",
+        _ => "auto off",
     }
+}
+
+pub fn mtp_upload_on(_pp: bool) -> bool {
+    SPEC_POLICY.load(std::sync::atomic::Ordering::Relaxed) == 1
 }
 
 pub fn spec_name() -> &'static str {

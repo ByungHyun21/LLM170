@@ -29,6 +29,7 @@ llm170 — 순수 Rust 추론 엔진 (현행 트랙: CUDA + W4A16 단일)
       llama-bench 규격 PP/TG/NP 측정(엔진 직접 — HTTP 무경유, 합성 LCG 토큰).
   llm170 serve --model <w4a16_dir> --kv-mem <총량> [--port N] [--queue N]
               [--ple ssd|ram|vram] [--spec auto|mtp|ngram|off] [--moe auto|resident|streaming|hybrid]
+              (--spec auto = off; mtp/ngram only when explicitly requested)
               [--cards N]
       OpenAI/Anthropic 호환 HTTP 서버. KV 총량 = --kv-mem(필수·무 auto — 권고는 `llm170 plan`).
       [PP 3차] --cards 2 = 2카드 직렬 파이프라인(스펙/MTP 강제 OFF — 토큰열 = 단일 카드와 동일).
@@ -395,8 +396,9 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 fmt_mem(kv_mem)
             );
             eprintln!(
-                "# policy: spec={}(CLI) moe={}(CLI) ple={}(CLI/기본) — env 진단(LLM170_SPEC_DRAFT_SOURCE/MOE_RESIDENT)보다 우선",
+                "# policy: spec={}[{}](CLI) moe={}(CLI) ple={}(CLI/기본) — env 진단(MOE_RESIDENT)보다 우선",
                 crate::engine::spec_name(),
+                crate::engine::spec_reason(),
                 crate::engine::moe_name(),
                 crate::engine::ple_name()
             );

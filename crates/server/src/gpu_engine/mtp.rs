@@ -4,8 +4,7 @@ impl QwenEngine {
     pub fn mtp_drafts_on(&self) -> bool {
         match crate::engine::SPEC_POLICY.load(std::sync::atomic::Ordering::Relaxed) {
             1 => self.mtp,
-            2 | 3 => false,
-            _ => self.mtp && llm170_diag::flag::val("LLM170_SPEC_DRAFT_SOURCE") != Some("ngram"),
+            _ => false,
         }
     }
 

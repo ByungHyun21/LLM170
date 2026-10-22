@@ -99,7 +99,7 @@ pub(super) fn econ_pick_k(cur: usize, emas: [Option<f64>; 4]) -> usize {
 }
 
 pub(super) fn econ_plan(mtp_avail: bool) -> Option<(u8, usize)> {
-    if crate::engine::SPEC_POLICY.load(Ordering::Relaxed) == 3
+    if !crate::engine::spec_enabled_by_policy()
         || llm170_diag::flag::on_nonzero("LLM170_SPEC_OFF")
     {
         return None;
