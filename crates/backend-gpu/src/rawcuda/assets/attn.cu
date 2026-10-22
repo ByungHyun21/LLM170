@@ -233,7 +233,7 @@ extern "C" __global__ void attn_prep_q(
     }
 }
 
-#define ATTN_TMAX 512
+#define ATTN_TMAX 1024
 #define ATTN_SPLIT_GRAIN 32
 #define ATTN_CHUNK 256
 template <typename KDot, typename VAcc>

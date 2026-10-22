@@ -44,9 +44,10 @@ pub fn prefill_tmax(is_moe: bool, resident: bool, env: Option<&str>) -> usize {
             .unwrap_or(8)
             .clamp(1, 12);
     }
+    let base = if is_moe { 512 } else { 1024 };
     env.and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(512)
-        .clamp(1, 512)
+        .unwrap_or(base)
+        .clamp(1, base)
 }
 
 #[cfg(test)]
@@ -71,7 +72,7 @@ mod tests {
             "MoE 스트리밍 env 상한 클램프(가드가 지킴)"
         );
         assert_eq!(prefill_tmax(true, true, None), 512, "MoE 상주 = 기본 512");
-        assert_eq!(prefill_tmax(false, false, None), 512, "dense = 기본 512");
+        assert_eq!(prefill_tmax(false, false, None), 1024, "dense = 기본 1024");
         assert_eq!(
             prefill_tmax(false, false, Some("128")),
             128,
@@ -79,13 +80,13 @@ mod tests {
         );
         assert_eq!(
             prefill_tmax(false, false, Some("99999")),
-            512,
+            1024,
             "상한 클램프"
         );
         assert_eq!(prefill_tmax(false, false, Some("0")), 1, "하한 클램프");
         assert_eq!(
             prefill_tmax(false, false, Some("abc")),
-            512,
+            1024,
             "파싱 실패 = 기본"
         );
     }
