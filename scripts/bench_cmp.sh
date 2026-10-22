@@ -16,7 +16,6 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-DATE=$(date +%F)
 TMP=$(mktemp -d /tmp/opencode/benchcmp.XXXXXX)
 
 nvidia-smi --query-gpu=clocks.sm,power.draw,clocks_throttle_reasons.active \
@@ -40,9 +39,9 @@ gpu_busy() {
 }
 
 row() {
-    python3 - "$1" "$2" "$DATE" <<'PY'
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
 import re, sys
-path, usenp, date = sys.argv[1], sys.argv[2], sys.argv[3]
+model, cards, path, usenp = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 pp, tg, npv = {}, {}, None
 for line in open(path):
     m = re.match(r'pp(\d+) \| rep\d+ \| *[\d.]+ ms \| *([\d.]+) t/s', line)
@@ -54,23 +53,19 @@ for line in open(path):
     m = re.match(r'np(\d+)\(tg\d+\) \| .* \| *([\d.]+) t/s', line)
     if m:
         npv = m.group(2)
-cells = [pp.get(512, '-'), pp.get(1024, '-'), pp.get(4096, '-'),
-         tg.get(4096, '-'), npv if usenp == '1' else '—']
-print('| CUDA (170HX, 180 W, ' + date + ') | ' + ' | '.join(cells) + ' |')
+cells = [pp.get(512, '—'), pp.get(1024, '—'), pp.get(4096, '—'),
+         tg.get(4096, '—'), npv if usenp == '1' else '—']
+print(f'| {model} | {cards} | ' + ' | '.join(cells) + ' |')
 PY
 }
 
 run_model() {
-    local label=$1 model=$2 np=$3
+    local label=$1 cards=$2 model=$3 np=$4
     pkill -x llm170 2>/dev/null || true
     sleep 2
     local busy
     busy=$(gpu_busy)
-    echo "# GPU idle util ${busy}%$([ "${busy:-0}" -ge 10 ] && echo ' — 경고: 점유 의심(수치 오염 가능)' || echo ' (청정)')" >&2
-    echo "## $label"
-    echo
-    echo "| row | pp512 | pp1024 | pp4096 | tg128@4k | np4 |"
-    echo "|---|---|---|---|---|---|"
+    echo "# $label — GPU idle util ${busy}%$([ "${busy:-0}" -ge 10 ] && echo ' — 경고: 점유 의심(수치 오염 가능)' || echo ' (청정)')" >&2
     local npflag=()
     if [ "$np" = 1 ]; then npflag=(--np 4); fi
     timeout 3600 "$BIN" bench --model "$model" --pp 512,1024,4096 --tg 128 \
@@ -78,13 +73,15 @@ run_model() {
         echo "bench 실패: $label — $(tail -2 "$TMP/err.txt" | tr '\n' ' ')" >&2
         return 1
     }
-    row "$TMP/out.txt" "$np"
-    echo
+    row "$label" "$cards" "$TMP/out.txt" "$np"
 }
 
-run_model "Qwen3.8-27B-W4A16 (g128, dense GDN)" "$M27" 1
-run_model "Qwen3.6-35B-A3B-W4A16 (g32, MoE resident)" "$M35" 1
-run_model "Gemma-4-26B-A4B-it-QAT-W4A16 (g32, MoE resident)" "$MG4" 0
+echo "# measured $(date -u +%FT%TZ) · $(git rev-parse --short HEAD)" >&2
+echo "| model | cards | pp512 | pp1024 | pp4096 | tg128@4k | np4 |"
+echo "|---|---|---|---|---|---|---|"
+run_model "Qwen3.8-27B-W4A16" 1 "$M27" 1
+run_model "Qwen3.6-35B-A3B-W4A16" 1 "$M35" 1
+run_model "Gemma-4-26B-A4B-it-QAT-W4A16" 1 "$MG4" 0
 
 kill "$SMPID" 2>/dev/null || true
 sleep 1
