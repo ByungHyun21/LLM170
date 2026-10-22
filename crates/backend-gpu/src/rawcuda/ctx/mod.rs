@@ -2,16 +2,20 @@
 use crate::rawcuda::ffi::{self, CUDA_SUCCESS, CUdeviceptr, CUfunction, CUstream};
 use std::collections::HashMap;
 
-pub const PROF_CATS: [&str; 14] = [
+pub const PROF_CATS: [&str; 16] = [
     "misc", "norm", "gemv", "gemm", "gdn", "attn", "ew", "head", "moe", "scan", "l2perm", "conv",
-    "gate", "grp",
+    "gate", "grp", "marlin", "h2f",
 ];
 
 pub static HOST_LAUNCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static HOST_LAUNCH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn prof_cat(name: &str) -> usize {
-    if name.contains("scan") {
+    if name.contains("h2f") {
+        15
+    } else if name.contains("marlin") {
+        14
+    } else if name.contains("scan") {
         9
     } else if name.contains("l2perm") {
         10
